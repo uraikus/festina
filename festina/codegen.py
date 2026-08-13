@@ -1,23 +1,45 @@
 """LLVM IR code generation -- claude.md #47 (executable generation) and
 the runtime-facing halves of #7/#8 (entry point + startup), #26 (arrays),
-#29-31 (automatic SQLite schema sync), #41/#42 (log/fail), #45 (string
-interpolation), #55-57 (int.toFloat(), Math.floor/ceil/round/trunc,
-division/modulo by zero).
+#29-31 (automatic SQLite schema sync), #32-34 (sqlite() queries,
+parameterized queries, query result types), #41/#42 (log/fail), #45
+(string interpolation), #55-57 (int.toFloat(), Math.floor/ceil/round/
+trunc, division/modulo by zero).
 
 Scope: primitives (int/float/bool/text), global and local variables and
 constants, functions, if/else, return, the full expression grammar
 (arithmetic/comparison/logical/ternary/template strings), structs
 (GEP field access; see the heap-allocation note below), arrays (arr[T]
 literals, indexed get/set, nesting -- see the FESTINA_ARRAY_LLVM_TYPE
-note below), and automatic table schema sync against festina.sqlite via
-the festina_runtime C helpers.
+note below), automatic table schema sync against festina.sqlite via
+the festina_runtime C helpers, and sqlite() queries (SELECT into
+arr[Table], parameterized INSERT/UPDATE/DELETE -- see the "Query rows"
+note below).
 
 NOT implemented yet (raises CodegenError with a clear message):
-sqlite() queries and parameterized statements (so arr[Table] stays
-unusable -- claude.md never defines a way to construct a Table-typed
-value without a query), graphics (img/drawRect/...), audio
-(aud/loadAudio/...), and `on eventName` event handlers. See README.md
-for the up-to-date status list.
+graphics (img/drawRect/...), audio (aud/loadAudio/...), and
+`on eventName` event handlers. See README.md for the up-to-date status
+list.
+
+Query rows (claude.md #32-34): sqlite()'s result, when assigned to a
+declared arr[Table], is built by festina_runtime's
+festina_sqlite_collect_rows -- each row is `col_count` consecutive
+8-byte slots (never narrower, regardless of the column's actual Festina
+type), addressed here the same way: `_member_ptr`'s TableType branch
+does a flat `getelementptr i8, ptr row, i64 (field_index * 8)` rather
+than a named LLVM struct type, so there's no struct-layout/alignment
+rule to keep in sync between this file and festina_runtime.c beyond
+"every field is one 8-byte slot, in declared order" (see
+festina_runtime.h's doc comment on festina_sqlite_collect_rows for the
+full rationale). Columns map to a table's declared fields *by
+position*, not by name, matching claude.md #34's own `SELECT *`
+example. sqlite()'s optional second argument (bound parameters) must be
+a literal array expression (`ast.ArrayLit`), not an arbitrary
+expression -- claude.md #33's own example (`[1, 'Patrick']`) is itself
+a heterogeneously-typed literal, which Festina's normal arr[T] typing
+rules don't allow as a real array *value*; treating it as special call
+syntax instead (each element bound individually, by its own type, at
+compile time) sidesteps that without changing arr[T] semantics
+elsewhere.
 
 Uses LLVM's opaque-pointer IR (`ptr` everywhere) to match clang 15+'s
 default, so no manual bitcasting between pointer "flavors" is needed.
@@ -133,10 +155,12 @@ def _llvm_type(t):
     if isinstance(t, types_mod.ArrayType):
         return FESTINA_ARRAY_LLVM_TYPE
     if isinstance(t, types_mod.TableType):
-        raise CodegenError(
-            "table-typed values are not implemented yet (only automatic "
-            "table schema sync is; sqlite() queries into arr[Table] are not)"
-        )
+        # claude.md #32-34: a table-typed value is one row from a query
+        # result -- like StructType, it's always a pointer to the row's
+        # own storage (here, the flat byte-slot buffer
+        # festina_sqlite_collect_rows allocates; see _member_ptr's
+        # TableType branch), never an inline aggregate.
+        return "ptr"
     if isinstance(t, types_mod.ImageType):
         raise CodegenError("img / graphics are not implemented yet")
     if isinstance(t, types_mod.AudioType):
@@ -180,6 +204,11 @@ class CodeGen:
         self.entry_stmts = []                  # top-level statements for __festina_main
         self.func_decls = {}                   # name -> ast.FuncDecl (for signatures)
         self.cur_block = None                  # label of the block currently being emitted into
+        self.uses_sqlite = False               # any sqlite() call anywhere -- see _emit_sqlite_call
+        self._table_arrays_cache = {}          # table name -> (names_global, types_global, ncols);
+                                                # schema sync and query codegen can both ask for the
+                                                # same table's column-name/type globals, and emitting
+                                                # them twice would redefine the same LLVM global names
 
     # ---- naming ----
     def tmp(self):
@@ -219,6 +248,20 @@ class CodeGen:
                 return i
         raise CodegenError(f"struct '{struct_name}' has no field '{field_name}'")
 
+    # ---- table layout (claude.md #32-34) ----
+    def table_fields(self, name):
+        """Ordered [(field_name, Type)] for a declared table, mirroring
+        struct_fields -- self.tables stores raw type-expr strings (see
+        semantic.analyze_table), not resolved Type objects, so each
+        lookup resolves on demand."""
+        return [(fname, self._resolve(traw, None)) for fname, traw in self.tables[name].items()]
+
+    def table_field_index(self, table_name, field_name):
+        for i, (fname, _) in enumerate(self.table_fields(table_name)):
+            if fname == field_name:
+                return i
+        raise CodegenError(f"table '{table_name}' has no field '{field_name}'")
+
     # ---- entry point ----
     def generate(self, program):
         for stmt in program.body:
@@ -231,6 +274,14 @@ class CodeGen:
         module.append(f'; generated from {self.filename} -- claude.md #47')
         module.append("")
         module.extend(self._runtime_declares())
+        module.append("")
+        # claude.md #29, #32-34: one process-wide database handle, opened
+        # once in main() (see _emit_main_and_entry) and read by every
+        # sqlite() call site, wherever in the program it appears --
+        # unconditionally emitted (harmless if unreferenced) rather than
+        # gated on self.tables/self.uses_sqlite, so nothing else has to
+        # track whether this global exists.
+        module.append("@__festina_db = global ptr null")
         module.append("")
         module.extend(self._struct_type_defs())
         module.append("")
@@ -259,6 +310,14 @@ class CodeGen:
             "declare i1 @festina_str_eq(ptr, ptr)",
             "declare ptr @festina_db_open()",
             "declare void @festina_sync_table(ptr, ptr, ptr, ptr, i32)",
+            # claude.md #32-34: sqlite() queries.
+            "declare ptr @festina_sqlite_prepare(ptr, ptr)",
+            "declare void @festina_sqlite_bind_int(ptr, i32, i64)",
+            "declare void @festina_sqlite_bind_float(ptr, i32, double)",
+            "declare void @festina_sqlite_bind_text(ptr, i32, ptr)",
+            "declare void @festina_sqlite_bind_null(ptr, i32)",
+            "declare void @festina_sqlite_exec(ptr)",
+            "declare void @festina_sqlite_collect_rows(ptr, i32, ptr, ptr, ptr)",
             "declare ptr @malloc(i64)",
             "declare ptr @calloc(i64, i64)",
             # claude.md #56: Math.floor/ceil/round/trunc, via LLVM's
@@ -554,7 +613,7 @@ class CodeGen:
         if isinstance(expr, ast.UnaryOp):
             return self._emit_unary(expr, env, lines)
         if isinstance(expr, ast.Call):
-            return self._emit_call(expr, env, lines)
+            return self._emit_call(expr, env, lines, expected_type=None)
         raise CodegenError(f"cannot generate code for expression {type(expr).__name__}",
                             file=self.filename, line=getattr(expr, "line", 0),
                             column=getattr(expr, "column", 0))
@@ -608,6 +667,12 @@ class CodeGen:
             if expected_type == FLOAT:
                 return FLOAT_NULL_CONST, FLOAT
             return "null", expected_type
+        if isinstance(node, ast.Call):
+            # sqlite()'s codegen needs to know the *declared* target type
+            # to tell a `SELECT` captured into arr[Table] apart from a
+            # statement whose result is discarded (INSERT/UPDATE/DELETE,
+            # or a SELECT nobody captures) -- see _emit_sqlite_call.
+            return self._emit_call(node, env, lines, expected_type)
         return self._emit_expr(node, env, lines)
 
     def _sizeof(self, llvm_ty, lines):
@@ -698,6 +763,15 @@ class CodeGen:
             lines.append(f"  {out} = getelementptr {elem_llvm_ty}, ptr {data_ptr}, i64 {idx_val}")
             return out, elem_type
         obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+        if isinstance(obj_type, types_mod.TableType):
+            # claude.md #32-34: a table-typed value is one query result
+            # row -- flat `field_index * 8` byte offset, not a named
+            # struct GEP; see the module docstring's "Query rows" note.
+            idx = self.table_field_index(obj_type.name, expr.prop)
+            ftype = self.table_fields(obj_type.name)[idx][1]
+            out = self.tmp()
+            lines.append(f"  {out} = getelementptr i8, ptr {obj_val}, i64 {idx * 8}")
+            return out, ftype
         if not isinstance(obj_type, types_mod.StructType):
             raise CodegenError(f"cannot access field '{expr.prop}' on {types_mod.type_name(obj_type)}",
                                 file=self.filename, line=expr.line, column=expr.column)
@@ -885,7 +959,7 @@ class CodeGen:
             return out, vtype
         return val, vtype  # unary '+' is a no-op
 
-    def _emit_call(self, expr, env, lines):
+    def _emit_call(self, expr, env, lines, expected_type=None):
         callee = expr.callee
         if isinstance(callee, ast.Identifier):
             name = callee.name
@@ -907,9 +981,7 @@ class CodeGen:
                 lines.append(f"  call void @festina_fail(ptr {text_val})")
                 return "0", None
             if name == "sqlite":
-                raise CodegenError("sqlite() queries are not implemented yet "
-                                    "(automatic table schema sync is)",
-                                    file=self.filename, line=callee.line)
+                return self._emit_sqlite_call(expr, env, lines, expected_type)
             if name in ("drawRect", "drawCircle", "drawText", "drawImage",
                         "loadImage", "loadAudio"):
                 raise CodegenError(f"'{name}' (graphics/audio) is not implemented yet",
@@ -955,6 +1027,115 @@ class CodeGen:
         raise CodegenError("only calls to named functions are implemented",
                             file=self.filename, line=getattr(expr, "line", 0))
 
+    # ---- sqlite() queries (claude.md #32-34) ----
+    def _emit_sqlite_call(self, expr, env, lines, expected_type):
+        """`expected_type` is the declared type of wherever this call's
+        result flows into (a var's declared type, a param type, a return
+        type, ... -- whatever _emit_value_for was threading through).
+        When it's arr[TableType(name)], this is a SELECT whose rows get
+        collected into that array (_emit_sqlite_collect); otherwise the
+        statement just runs to completion and any result is discarded
+        (festina_sqlite_exec), covering INSERT/UPDATE/DELETE and a SELECT
+        nobody captures."""
+        self.uses_sqlite = True
+        callee = expr.callee
+        if not expr.args:
+            raise CodegenError("sqlite() requires at least a SQL string argument",
+                                file=self.filename, line=callee.line)
+        sql_val, sql_type = self._emit_expr(expr.args[0], env, lines)
+        if sql_type != TEXT:
+            raise CodegenError(
+                f"sqlite()'s first argument must be text, found {types_mod.type_name(sql_type)}",
+                file=self.filename, line=callee.line)
+
+        db_val = self.tmp()
+        lines.append(f"  {db_val} = load ptr, ptr @__festina_db")
+        stmt_val = self.tmp()
+        lines.append(f"  {stmt_val} = call ptr @festina_sqlite_prepare(ptr {db_val}, ptr {sql_val})")
+
+        if len(expr.args) > 1:
+            self._emit_sqlite_bind_params(expr.args[1], stmt_val, env, lines)
+
+        table_type = expected_type.element if isinstance(expected_type, types_mod.ArrayType) else None
+        if isinstance(table_type, types_mod.TableType):
+            arr_val = self._emit_sqlite_collect(stmt_val, table_type, lines)
+            return arr_val, expected_type
+
+        lines.append(f"  call void @festina_sqlite_exec(ptr {stmt_val})")
+        return "0", None
+
+    def _emit_sqlite_bind_params(self, params_node, stmt_val, env, lines):
+        # claude.md #33's own example binds a heterogeneously-typed
+        # literal ([1, 'Patrick']) -- Festina's normal arr[T] rules
+        # require a single element type, so a real arr[T] *value* can't
+        # represent that. Treating the parameter list as special call
+        # syntax (a literal array expression, each element bound
+        # individually by its own type at compile time) sidesteps the
+        # conflict instead of loosening arr[T] itself; see the module
+        # docstring's "Query rows" note.
+        if not isinstance(params_node, ast.ArrayLit):
+            raise CodegenError(
+                "sqlite()'s second argument (bound parameters) must be a "
+                "literal array, e.g. sqlite(sql, [1, 'Patrick'])",
+                file=self.filename, line=getattr(params_node, "line", 0))
+        for i, elem in enumerate(params_node.elements):
+            idx = i + 1  # sqlite3_bind_* parameters are 1-indexed
+            if isinstance(elem, ast.NullLit):
+                lines.append(f"  call void @festina_sqlite_bind_null(ptr {stmt_val}, i32 {idx})")
+                continue
+            val, vtype = self._emit_expr(elem, env, lines)
+            if vtype == INT:
+                lines.append(f"  call void @festina_sqlite_bind_int(ptr {stmt_val}, i32 {idx}, i64 {val})")
+            elif vtype == FLOAT:
+                lines.append(f"  call void @festina_sqlite_bind_float(ptr {stmt_val}, i32 {idx}, double {val})")
+            elif vtype == TEXT:
+                lines.append(f"  call void @festina_sqlite_bind_text(ptr {stmt_val}, i32 {idx}, ptr {val})")
+            elif vtype == BOOL:
+                # claude.md #30: bool maps to SQLite INTEGER, same as int.
+                z = self.tmp()
+                lines.append(f"  {z} = zext i1 {val} to i64")
+                lines.append(f"  call void @festina_sqlite_bind_int(ptr {stmt_val}, i32 {idx}, i64 {z})")
+            else:
+                raise CodegenError(
+                    "sqlite() parameters must be int/float/bool/text/null, "
+                    f"found {types_mod.type_name(vtype)}",
+                    file=self.filename, line=getattr(elem, "line", 0))
+
+    def _emit_sqlite_collect(self, stmt_val, table_type, lines):
+        table_name = table_type.name
+        cols = self.tables[table_name]
+        _, types_global, ncols = self._table_arrays(table_name, cols)
+
+        n_slot = self.tmp()
+        lines.append(f"  {n_slot} = alloca i64")
+        data_slot = self.tmp()
+        lines.append(f"  {data_slot} = alloca ptr")
+        lines.append(
+            f"  call void @festina_sqlite_collect_rows(ptr {stmt_val}, i32 {ncols}, "
+            f"ptr {types_global}, ptr {n_slot}, ptr {data_slot})"
+        )
+        n_val = self.tmp()
+        lines.append(f"  {n_val} = load i64, ptr {n_slot}")
+        data_val = self.tmp()
+        lines.append(f"  {data_val} = load ptr, ptr {data_slot}")
+
+        # Same {i64 length, ptr data} header _emit_array_lit builds --
+        # festina_sqlite_collect_rows's out_data is already an array of
+        # row pointers (one 8-byte pointer per row), exactly the layout
+        # an arr[T] data pointer expects when _llvm_type(T) is "ptr"
+        # (true for TableType, same as StructType) -- no repacking needed.
+        header = f"%arr.hdr.{self._unique()}"
+        lines.append(f"  {header} = alloca {FESTINA_ARRAY_LLVM_TYPE}")
+        len_ptr = self.tmp()
+        lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
+        lines.append(f"  store i64 {n_val}, ptr {len_ptr}")
+        data_field_ptr = self.tmp()
+        lines.append(f"  {data_field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
+        lines.append(f"  store ptr {data_val}, ptr {data_field_ptr}")
+        out = self.tmp()
+        lines.append(f"  {out} = load {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}")
+        return out
+
     # ---- entry function / main ----
     def _emit_main_and_entry(self):
         lines = []
@@ -972,8 +1153,13 @@ class CodeGen:
         entry_func.append("}")
 
         main_lines = ["define i32 @main() {", "entry:"]
-        if self.tables:
+        # self.uses_sqlite is only reliably set by this point because every
+        # function body (self.func_defs) and every entry statement (the
+        # loop above) has already been emitted -- see the module
+        # docstring's ordering note, or generate()'s call order.
+        if self.tables or self.uses_sqlite:
             main_lines.append("  %db = call ptr @festina_db_open()")
+            main_lines.append("  store ptr %db, ptr @__festina_db")
             for tname, cols in self.tables.items():
                 names_global, types_global, ncols = self._table_arrays(tname, cols)
                 main_lines.append(
@@ -987,6 +1173,13 @@ class CodeGen:
         return entry_func + [""] + main_lines
 
     def _table_arrays(self, table_name, cols):
+        # Cached because both schema sync (main()) and a sqlite() query
+        # against the same table (anywhere in the program) need these same
+        # two globals -- emitting them a second time would redefine the
+        # same LLVM global names (a link/parse error).
+        cached = self._table_arrays_cache.get(table_name)
+        if cached is not None:
+            return cached
         names = list(cols.keys())
         types = list(cols.values())
         names_arr = f"@{table_name}.cols"
@@ -995,7 +1188,9 @@ class CodeGen:
         type_ptrs = ", ".join(f"ptr {self.string_const(t)}" for t in types)
         self.extra_globals.append(f"{names_arr} = private constant [{len(names)} x ptr] [{name_ptrs}]")
         self.extra_globals.append(f"{types_arr} = private constant [{len(types)} x ptr] [{type_ptrs}]")
-        return names_arr, types_arr, len(names)
+        result = (names_arr, types_arr, len(names))
+        self._table_arrays_cache[table_name] = result
+        return result
 
     def _emit_toplevel_stmt(self, stmt, env, ctx):
         lines = ctx["lines"]

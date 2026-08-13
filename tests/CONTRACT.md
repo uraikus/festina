@@ -10,7 +10,13 @@ needs neither Python nor `festina/` to run. Automatic SQLite table
 creation and schema synchronization (claude.md #28-31) is implemented
 for real against `festina.sqlite`, including the temp-table rebuild path
 for dropped/retyped columns, with data preservation verified by the
-`claude.md #31` worked examples as tests. Arrays (claude.md #26) are
+`claude.md #31` worked examples as tests. `sqlite()` queries (claude.md
+#32-34) are implemented too -- `SELECT` into a declared `arr[Table]`
+with field access on the resulting rows, and parameterized
+`INSERT`/`UPDATE`/`DELETE`/`SELECT` via a literal params array (see
+festina/codegen.py's module docstring's "Query rows" note for the row
+representation and the params-must-be-a-literal-array restriction).
+Arrays (claude.md #26) are
 implemented too -- literals, indexed get/set, nesting, function
 params/return values -- though claude.md never specifies `.length`,
 bounds checking, or a loop construct to iterate one with, so none of
@@ -34,7 +40,7 @@ specifically required to *use* Festina, just some working C compiler
 `festina/cli.py`'s `_run_tool` also turns a genuinely missing dependency
 (pkg-config, or any C compiler) into a specific, actionable error naming
 it and how to install it, rather than a raw exception -- verified
-directly by hiding each tool from PATH in turn. All 213 tests in this
+directly by hiding each tool from PATH in turn. All 219 tests in this
 directory pass against it (0 skipped, given a working C compiler -- see
 below).
 
@@ -54,9 +60,10 @@ as the escape hatch, rather than picking a side ad hoc in code with no
 spec backing either way.
 
 See README.md's "Implementation Status" section for the current
-implemented-vs-not matrix; the short version: `sqlite()` queries,
-graphics, audio, and event handlers all parse and type-check but raise a
-clear `CodegenError` ("not implemented yet") rather than generating IR.
+implemented-vs-not matrix; the short version: graphics, audio, and event
+handlers all parse and type-check but raise a clear `CodegenError` ("not
+implemented yet") rather than generating IR. `sqlite()` queries no
+longer belong on that list -- see above.
 
 Separately, `compiler/` (`lexer.py`, `parser.py`, `codegen.py`, `jsc.py`)
 remains a different, older prototype that compiles a small JS subset --
@@ -83,9 +90,13 @@ It skips (with a distinct, toolchain-specific reason) if no C compiler
 is on `PATH` at all -- unlike the `SPEC_UNIMPLEMENTED_REASON` skips
 above, this isn't "the feature doesn't exist," it's "this environment
 can't link native code." Tests for constructs codegen genuinely doesn't
-support yet (`sqlite()` queries, graphics, audio, events) don't need a
-C compiler at all -- they only call `festina.codegen.generate_ir()` and
-assert it raises.
+support yet (graphics, audio, events) don't need a C compiler at all --
+they only call `festina.codegen.generate_ir()` and assert it raises.
+The one exception on the sqlite() side is
+`test_non_literal_params_argument_is_a_clear_error`, which checks a
+compile-time restriction (params must be a literal array) the same
+no-C-compiler way, even though `sqlite()` itself is otherwise fully
+implemented.
 
 `tests/test_llvm_backend.py` tests `festina.llvm_backend` directly and
 only needs libLLVM itself (via its own `llvm_backend` fixture's
@@ -197,13 +208,21 @@ festina/
         # get/set + nesting, all arr[T] lowered to one fixed
         # `%struct._FestinaArray = type { i64, ptr }` -- see the module
         # docstring), automatic table schema sync via the festina_runtime
-        # C helpers, Math.floor/ceil/round/trunc (LLVM intrinsics) and
-        # int.toFloat() (sitofp), division/modulo by zero returning a
-        # reserved null sentinel (INT_NULL_CONST / FLOAT_NULL_CONST) via
-        # real control flow rather than a trapping instruction. Raises
-        # CodegenError (a CompileError subclass, category="not
-        # implemented") for sqlite() queries, graphics, audio, and event
-        # handlers.
+        # C helpers, sqlite() queries (SELECT into a declared arr[Table],
+        # parameterized INSERT/UPDATE/DELETE/SELECT via a literal params
+        # array -- table-typed values are `ptr`-to-row like structs, field
+        # access is a flat `field_index * 8` byte GEP rather than a named
+        # struct type; see the module docstring's "Query rows" note and
+        # CodeGen.table_fields/table_field_index/_emit_sqlite_call/
+        # _emit_sqlite_bind_params/_emit_sqlite_collect), Math.floor/ceil/
+        # round/trunc (LLVM intrinsics) and int.toFloat() (sitofp),
+        # division/modulo by zero returning a reserved null sentinel
+        # (INT_NULL_CONST / FLOAT_NULL_CONST) via real control flow rather
+        # than a trapping instruction. Raises CodegenError (a CompileError
+        # subclass, category="not implemented") for graphics, audio, and
+        # event handlers -- and also (category="not implemented" but a
+        # genuine compile-time restriction, not a missing feature) when
+        # sqlite()'s second argument isn't a literal array expression.
 
     llvm_backend.py
         def available() -> bool           # libLLVM found+loaded in this process?
@@ -240,15 +259,23 @@ festina/
 
 Runtime ABI: `runtime/festina_runtime.h`/`.c` implement the C side
 codegen's `declare`s call into -- `festina_log_*`/`festina_fail` (#41,
-#42), `festina_str_*` (string interpolation, #9/#45), and
+#42), `festina_str_*` (string interpolation, #9/#45),
 `festina_db_open`/`festina_sync_table` (#8, #28-31: schema
 create/add-column/rebuild-with-CAST, using the same declared-vs-existing
 diff `sqlite_schema.py` computes, reimplemented in C since the compiled
-executable can't depend on Python at runtime).
+executable can't depend on Python at runtime), and
+`festina_sqlite_prepare`/`_bind_int`/`_bind_float`/`_bind_text`/
+`_bind_null`/`_exec`/`_collect_rows` (#32-34: sqlite() queries --
+`_collect_rows` packs each result row as `col_count` consecutive 8-byte
+slots, exactly the layout codegen's flat `field_index * 8` byte GEP
+reads back, so no struct-alignment rule needs to be kept in sync between
+the two languages; see festina_runtime.h's doc comment on
+`festina_sqlite_collect_rows` and codegen.py's module docstring's "Query
+rows" note, which describe the same design from each side).
 
 ## Running
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 213 passed, 0 skipped (needs a C compiler)
+pytest tests/                          # 219 passed, 0 skipped (needs a C compiler)
 ```
