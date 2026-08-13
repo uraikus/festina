@@ -29,7 +29,10 @@ Festina is under active development. Everything else in this README
 describes the full target language from `claude.md`; this section is
 the ground truth for what actually runs today.
 
-**Test suite:** 261/261 passing, 0 skipped, 0 failed (`pytest tests/`).
+**Test suite:** 263 tests, 0 failed (`pytest tests/`) — 261 passed/2
+skipped by default (the 2 need `pyinstaller`, an opt-in build-time-only
+dependency for the packaged-binary tests; see [Setup](#setup)), or all
+263 passed/0 skipped with it installed.
 See [`tests/`](tests/) and [`tests/CONTRACT.md`](tests/CONTRACT.md) for
 the spec-driven suite this is measured against — every test cites the
 `claude.md` section it checks.
@@ -78,7 +81,7 @@ right now:
 | Stage | What | Status |
 |---|---|---|
 | 1. Static-link sqlite3 into compiled programs | A Festina program built here no longer needs `libsqlite3.so` on the machine that *runs* it (falls back to a normal dynamic link if no static archive is available in the build environment) | ✅ done |
-| 2. Package the compiler frontend as a real binary (no separate Python install to *run the compiler*) | — | not started |
+| 2. Package the compiler frontend as a real binary (no separate Python install to *run the compiler*) | `scripts/package_compiler.sh` bundles `festina/` (plus a real Python interpreter) into a single standalone binary via PyInstaller — verified to compile and link a real program with `python`/`python3` shadowed by an always-failing command on `PATH`. Still needs a C compiler/linker at runtime (that part is stages 1/3/4, unaffected) — this only removes the Python dependency | ✅ done |
 | 3. Drive libLLVM directly instead of shelling out to the `clang` binary | `festina/llvm_backend.py` compiles the generated LLVM IR to an object file in-process via libLLVM's C API (ctypes) — `clang` is no longer *specifically* required; `gcc` (or any working C compiler/linker) now works too, since the only thing left for it to do is compile `festina_runtime.c` and link plain object files. Falls back to the original clang-only pipeline automatically if libLLVM can't be loaded, so this is purely additive | ✅ done |
 | 4. Embed LLD too, removing the last external dependency (a system linker) | Some C compiler/linker still has to be present to compile `festina_runtime.c` and link — that's a meaningfully smaller ask than clang/LLVM specifically, but not yet zero | not started |
 
@@ -88,7 +91,11 @@ the `festina` compiler itself. Verified concretely, not just reasoned
 about: `gcc` genuinely can't handle a `.ll` file at all (it hands it to
 `ld`, which treats it as a corrupt linker script and fails) — compiling
 the IR ourselves is what actually broadens compiler compatibility, not
-just a style preference.
+just a style preference. Stage 2 was verified the same way — actually
+running the packaged binary with every `python`/`python3*` on `PATH`
+replaced by a command that always fails (see
+`tests/test_packaging.py`), not just checking that PyInstaller reports
+success.
 
 Known limitations, all deliberate per `claude.md #54`'s ambiguity rule
 (unspecified stays unresolved rather than invented) or explicitly
@@ -152,14 +159,15 @@ scoped out rather than silently missing:
 
 ### Setup
 
-Two different dependency lists, and they're not the same size — this is
-the practical payoff of the staged plan above.
+Three different dependency lists, and they're not the same size — this
+is the practical payoff of the staged plan above.
 
-**To *use* the compiler** (`bin/festina program.f`) on a fresh system:
+**To *use* the compiler from a checkout** (`bin/festina program.f`) on a
+fresh system:
 
 | Dependency | Why | Required? |
 |---|---|---|
-| Python 3 | Runs the compiler frontend itself (`bin/festina` execs `python3 -m festina.cli`) — packaging it as a standalone binary is stage 2, not done yet | Required |
+| Python 3 | Runs the compiler frontend itself (`bin/festina` execs `python3 -m festina.cli`) — only if running from source; see the packaged-binary option below to avoid this entirely | Required (unless using the packaged binary) |
 | A C compiler (`clang` or `gcc`) | Compiles `festina_runtime.c` and links the final binary | Required (either works, per stage 3) |
 | `libsqlite3-dev` (headers) | `festina_runtime.c` does `#include <sqlite3.h>` | Required |
 | `pkg-config` | Locates sqlite3's compile/link flags | Required |
@@ -182,6 +190,21 @@ spirit — `brew install llvm sqlite pkg-config` — though that combination
 isn't verified in this repo's own test environment the way the
 Debian/Ubuntu one is.
 
+**To *use* a packaged `festina` binary** (stage 2 — built via
+`./scripts/package_compiler.sh`, or downloaded from wherever a
+maintainer published one): the same list above, minus Python 3 — the
+packaged binary embeds its own interpreter, verified by actually running
+it with every `python`/`python3*` on `PATH` replaced by a command that
+always fails (`tests/test_packaging.py`). Building the binary yourself
+needs one more thing, PyInstaller — a build-time-only dependency, not
+something the resulting binary or festina/ itself needs:
+
+```bash
+pip install -r requirements-build.txt  # pyinstaller
+./scripts/package_compiler.sh          # -> ./dist/festina
+./dist/festina examples/hello.f -o hello
+```
+
 **To *run* a program someone already compiled with Festina**: usually
 nothing beyond libc/libm, already present on essentially any machine —
 confirmed via `ldd` on a compiled binary. The one conditional dependency
@@ -192,7 +215,7 @@ sure.
 
 ```bash
 pip install -r requirements-dev.txt   # pytest, for the test suite
-pytest tests/                         # 261 passed
+pytest tests/                         # 263 passed
 
 ./bin/festina examples/hello.f -o hello
 ./hello

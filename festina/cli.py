@@ -16,6 +16,15 @@ dependency list):
   static archive is available (_sqlite_link_flags), so a program built
   here doesn't need libsqlite3.so present on the machine that *runs* it
   -- falls back to a normal dynamic link otherwise.
+- stage 2: this module (specifically compile_file/main) is what
+  packaging/festina_entry.py + scripts/package_compiler.sh bundle into
+  a standalone binary via PyInstaller -- *using* the compiler no longer
+  needs a separate Python install, just the packaged binary itself
+  (still needs a C compiler/linker at runtime to actually build a
+  Festina program, same as ever -- stage 2 only removes the Python
+  dependency, not the C toolchain one). See _data_root() below for how
+  runtime/festina_runtime.c gets found once this module is no longer
+  running from an ordinary file on disk.
 - stage 3: the LLVM IR -> object file step is done in-process via
   festina.llvm_backend (libLLVM's C API through ctypes), not by handing
   the .ll file to clang. That used to be the reason `cc` specifically
@@ -50,7 +59,24 @@ from . import codegen as codegen_mod
 from . import llvm_backend
 from .errors import CompileError
 
-_RUNTIME_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runtime")
+def _data_root():
+    """Base directory to resolve bundled data (currently just runtime/)
+    against. Under "real compilation, minimal setup" stage 2's packaged
+    binary (claude.md #59; see packaging/festina_entry.py and
+    scripts/package_compiler.sh), the running process is PyInstaller's
+    --onefile self-extraction -- files added via --add-data land in a
+    temp dir exposed as sys._MEIPASS, not this file's ordinary on-disk
+    location (this module itself is loaded from inside a bundle archive
+    at that point, not a real .py file on a real path). Falls back to
+    the normal source-tree layout otherwise (dev checkout, or any other
+    way of running festina/ that isn't the packaged binary)."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return meipass
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+_RUNTIME_DIR = os.path.join(_data_root(), "runtime")
 _RUNTIME_C = os.path.join(_RUNTIME_DIR, "festina_runtime.c")
 
 _sqlite_link_cache = {}

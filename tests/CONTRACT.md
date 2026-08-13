@@ -31,22 +31,27 @@ scoping rule and `while true`) and #66 (postfix `++`/`--` on mutable
 `int` variables) -- there's still no `break`/`continue` (claude.md
 doesn't define either).
 
-"Real compilation, minimal setup" stages 1 and 3 -- claude.md #59, added
-alongside these two stages to make the requirement explicit rather than
-implicit in the implementation -- are also done (see README.md's
+"Real compilation, minimal setup" stages 1, 2, and 3 -- claude.md #59,
+added alongside these stages to make the requirement explicit rather
+than implicit in the implementation -- are also done (see README.md's
 "Deployment"/"Setup" sections for the full staged plan and the current
 dependency list): sqlite3 is statically linked into compiled programs
-(no libsqlite3.so needed to *run* one), and `festina/llvm_backend.py`
-compiles the generated LLVM IR to an object file itself via libLLVM's C
-API rather than handing a .ll file to clang -- clang is no longer
-specifically required to *use* Festina, just some working C compiler
-(gcc verified working end to end). Per #59's fourth point,
-`festina/cli.py`'s `_run_tool` also turns a genuinely missing dependency
-(pkg-config, or any C compiler) into a specific, actionable error naming
-it and how to install it, rather than a raw exception -- verified
-directly by hiding each tool from PATH in turn. All 261 tests in this
-directory pass against it (0 skipped, given a working C compiler -- see
-below).
+(no libsqlite3.so needed to *run* one), `scripts/package_compiler.sh`
+packages `festina/` into a standalone binary via PyInstaller (no Python
+install needed to *use the compiler* with that binary -- verified by
+running it with every `python`/`python3*` on `PATH` replaced by a
+command that always fails), and `festina/llvm_backend.py` compiles the
+generated LLVM IR to an object file itself via libLLVM's C API rather
+than handing a .ll file to clang -- clang is no longer specifically
+required to *use* Festina, just some working C compiler (gcc verified
+working end to end). Per #59's fourth point, `festina/cli.py`'s
+`_run_tool` also turns a genuinely missing dependency (pkg-config, or
+any C compiler) into a specific, actionable error naming it and how to
+install it, rather than a raw exception -- verified directly by hiding
+each tool from PATH in turn. All 263 tests in this directory pass
+against it: 261 given a working C compiler, plus 2 more
+(`tests/test_packaging.py`) given `pyinstaller` too -- both skip
+cleanly, independently, without either dependency (see below).
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -137,6 +142,18 @@ behavior (a compiled loop actually iterating the right number of times,
 loop-variable scoping surviving a real function frame, an iterative
 Fibonacci) lives in `test_codegen.py`'s `TestLoops` and
 `TestArrayLength`.
+
+`tests/test_packaging.py` covers stage 2 (claude.md #59) -- it actually
+runs `scripts/package_compiler.sh`, a real PyInstaller build (tens of
+seconds, via a session-scoped fixture so every test in the file reuses
+one build rather than re-packaging per test), and then runs the
+resulting binary with `python`/`python3*` shadowed on `PATH` by a
+command that always fails, the same "prove it, don't just reason about
+it" standard the rest of this test suite holds itself to. Skips cleanly
+if `pyinstaller` isn't installed -- deliberately not in
+requirements-dev.txt, since nothing about developing or testing
+`festina/` itself should need it (claude.md #59's own principle,
+applied to this repo's own tooling, not just what it generates).
 
 ## Public API implemented
 
@@ -290,7 +307,20 @@ festina/
         #   instead of a raw FileNotFoundError (check=False alone does
         #   NOT catch this case -- it only suppresses a nonzero exit
         #   code, not a failure to launch the binary at all).
+        # _data_root() -> str: stage 2 -- resolves runtime/ against
+        #   sys._MEIPASS when running as PyInstaller's packaged binary
+        #   (this module isn't loaded from a real on-disk .py file at
+        #   that point) instead of this file's own on-disk location.
 ```
+
+Packaging (stage 2, claude.md #59): `packaging/festina_entry.py` is the
+PyInstaller entry point (`from festina.cli import main`) --
+`scripts/package_compiler.sh` bundles it plus `runtime/festina_runtime.c/h`
+(via `--add-data`, so `_data_root()` above can find them post-packaging)
+into a single binary at `dist/festina` by default. Not part of
+`festina/`'s own public API -- these are repo-level build tooling, same
+category as `bin/festina` (which remains the normal dev-from-source
+entry point, unchanged).
 
 Runtime ABI: `runtime/festina_runtime.h`/`.c` implement the C side
 codegen's `declare`s call into -- `festina_log_*`/`festina_fail` (#41,
@@ -312,5 +342,6 @@ rows" note, which describe the same design from each side).
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 261 passed, 0 skipped (needs a C compiler)
+pytest tests/                          # 261 passed, 2 skipped (needs a C compiler; the
+                                        # 2 skips need `pip install pyinstaller` too)
 ```

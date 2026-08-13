@@ -151,3 +151,10 @@ __pycache__/
 # that declares a table (claude.md #29), including if you run one of
 # examples/*.f from the repo root while trying things out manually.
 festina.sqlite
+
+# "Real compilation, minimal setup" stage 2 -- scripts/package_compiler.sh's
+# PyInstaller build output (a large, machine-specific binary; not something
+# to commit) and PyInstaller's own scratch directories.
+/dist/
+/build/
+*.spec
