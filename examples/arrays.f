@@ -12,3 +12,9 @@ log(scores[1])
 
 arr[arr[int]] grid = [[1, 2], [3, 4]]
 log(grid[1][1])
+
+// claude.md #60, #63: for loops + .length -- the compiler's own worked
+// example (claude.md #60's "array iteration example").
+for int x = 0, x < scores.length, x++ {
+    log(scores[x])
+}

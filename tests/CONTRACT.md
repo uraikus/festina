@@ -18,14 +18,18 @@ festina/codegen.py's module docstring's "Query rows" note for the row
 representation and the params-must-be-a-literal-array restriction).
 Arrays (claude.md #26) are
 implemented too -- literals, indexed get/set, nesting, function
-params/return values -- though claude.md never specifies `.length`,
-bounds checking, or a loop construct to iterate one with, so none of
+params/return values, and (claude.md #63) `.length` -- though claude.md
+still doesn't specify bounds checking or array growth, so neither of
 those exist (see festina/codegen.py's module docstring). claude.md
 #55-58 (added after a design review of the first codegen pass turned up
 real bugs -- see below) are implemented too: int/float never convert
 implicitly in any operator, `int.toFloat()`/`Math.floor/ceil/round/trunc`
 are the only conversions, division/modulo by zero returns `null` instead
-of crashing, and struct/table names live in their own namespace.
+of crashing, and struct/table names live in their own namespace. So are
+claude.md #60/#61 (`for`/`while` loops, including the loop-variable
+scoping rule and `while true`) and #66 (postfix `++`/`--` on mutable
+`int` variables) -- there's still no `break`/`continue` (claude.md
+doesn't define either).
 
 "Real compilation, minimal setup" stages 1 and 3 -- claude.md #59, added
 alongside these two stages to make the requirement explicit rather than
@@ -40,7 +44,7 @@ specifically required to *use* Festina, just some working C compiler
 `festina/cli.py`'s `_run_tool` also turns a genuinely missing dependency
 (pkg-config, or any C compiler) into a specific, actionable error naming
 it and how to install it, rather than a raw exception -- verified
-directly by hiding each tool from PATH in turn. All 219 tests in this
+directly by hiding each tool from PATH in turn. All 261 tests in this
 directory pass against it (0 skipped, given a working C compiler -- see
 below).
 
@@ -122,6 +126,14 @@ there for the three bugs #55-58 were written in response to (see
 "Status" above): a struct returned by value, and `null`/scientific-notation
 float literals compiling and linking successfully.
 
+`tests/test_loops.py` covers claude.md #60/#61/#63/#66 (for/while
+loops, `.length`, postfix `++`/--) at the parser/semantic level, same
+split as `test_numeric_conversion.py`; the matching end-to-end runtime
+behavior (a compiled loop actually iterating the right number of times,
+loop-variable scoping surviving a real function frame, an iterative
+Fibonacci) lives in `test_codegen.py`'s `TestLoops` and
+`TestArrayLength`.
+
 ## Public API implemented
 
 ```
@@ -146,10 +158,10 @@ festina/
 
     ast.py
         Program, ImportDecl, VarDecl, Param, FieldDecl, FuncDecl,
-        StructDecl, TableDecl, EventHandler, Block, IfStmt, Return,
-        ExprStmt, Identifier, NumberLit, StringLit, BoolLit, NullLit,
-        TemplateLit, ArrayLit, Assign, Ternary, LogicalOp, BinOp,
-        UnaryOp, Member, Call, ArrayTypeExpr
+        StructDecl, TableDecl, EventHandler, Block, IfStmt, WhileStmt,
+        ForStmt, Return, ExprStmt, Identifier, NumberLit, StringLit,
+        BoolLit, NullLit, TemplateLit, ArrayLit, Assign, Ternary,
+        LogicalOp, BinOp, UnaryOp, PostfixOp, Member, Call, ArrayTypeExpr
 
     types.py
         PrimitiveType(name) / StructType(name) / TableType(name) /
@@ -183,6 +195,16 @@ festina/
         # Math.floor/ceil/round/trunc(x:float) -> int and
         # int_value.toFloat() -> float are recognized as Call-on-Member
         # patterns, not real declarations (no "Math" symbol exists).
+        # claude.md #60/#61: WhileStmt/ForStmt conditions must be bool
+        # (check_condition_bool, same helper if/ternary use); a ForStmt's
+        # init variable gets its own child Scope so it's visible in the
+        # condition/update/body but nothing analyzed after the loop can
+        # see it. claude.md #63: `.length` on an ArrayType resolves to
+        # int and is the *only* valid non-computed field an array has;
+        # assigning to it is rejected before the generic Assign
+        # type-check runs (that check alone can't tell a read from a
+        # write target). claude.md #66: PostfixOp requires its operand be
+        # an Identifier resolving to a non-constant int.
 
     sqlite_schema.py
         TYPE_MAP: dict[str, str]                        # claude.md #30
@@ -201,13 +223,22 @@ festina/
     codegen.py
         def generate_ir(program, analyzed, filename="main.f") -> str
         # emits opaque-pointer LLVM IR text. Supports: primitives,
-        # global/local vars & consts, functions, if/else, the full
-        # expression grammar, structs (heap-allocated via calloc, GEP
-        # field access -- see the module docstring's "Struct storage" note
-        # for why not a stack alloca), arrays (arr[T] literals + indexed
-        # get/set + nesting, all arr[T] lowered to one fixed
+        # global/local vars & consts, functions, if/else, for/while loops
+        # (_emit_for/_emit_while -- ordinary structured control flow, the
+        # same _start_block/label pattern _emit_if uses; a for-loop's
+        # init variable lives in a child Env scoped to just that
+        # statement), the full expression grammar including postfix
+        # ++/-- (_emit_postfix -- load/add-or-sub-1/store on the
+        # operand's slot, returns the pre-increment value), structs
+        # (heap-allocated via calloc, GEP field access -- see the module
+        # docstring's "Struct storage" note for why not a stack alloca),
+        # arrays (arr[T] literals + indexed get/set + nesting + .length,
+        # all arr[T] lowered to one fixed
         # `%struct._FestinaArray = type { i64, ptr }` -- see the module
-        # docstring), automatic table schema sync via the festina_runtime
+        # docstring; .length is `extractvalue` on the array's own value,
+        # bypassing the pointer-based field-access path entirely since
+        # not every array-typed expression is addressable), automatic
+        # table schema sync via the festina_runtime
         # C helpers, sqlite() queries (SELECT into a declared arr[Table],
         # parameterized INSERT/UPDATE/DELETE/SELECT via a literal params
         # array -- table-typed values are `ptr`-to-row like structs, field
@@ -277,5 +308,5 @@ rows" note, which describe the same design from each side).
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 219 passed, 0 skipped (needs a C compiler)
+pytest tests/                          # 261 passed, 0 skipped (needs a C compiler)
 ```

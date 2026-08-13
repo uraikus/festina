@@ -224,9 +224,11 @@ class TestStructs:
 
 class TestArrays:
     """claude.md #26: arr[T] with elements sized/typed at compile time,
-    from a literal, read and written by index. No .length, no growth, no
-    loop construct -- claude.md doesn't specify any of those (see the
-    module docstring in festina/codegen.py), so they aren't implemented."""
+    from a literal, read and written by index. `.length` (#63) and
+    for/while loops (#60/#61) are covered in TestArrayLength and
+    TestLoops below. No growth and no bounds checking -- claude.md
+    doesn't specify either (see the module docstring in
+    festina/codegen.py), so they aren't implemented."""
 
     def test_literal_index_read(self, compile_and_run):
         result = compile_and_run("arr[int] nums = [10, 20, 30]\nlog(nums[0])\nlog(nums[2])")
@@ -312,6 +314,154 @@ class TestArrays:
         """
         result = compile_and_run(source)
         assert result.stdout.splitlines() == ["1", "4"]
+
+
+class TestArrayLength:
+    """claude.md #63: every array has a built-in read-only `.length`."""
+
+    def test_length_of_literal(self, compile_and_run):
+        result = compile_and_run("arr[int] values = [1, 2, 3]\nlog(values.length)")
+        assert result.stdout.strip() == "3"
+
+    def test_length_of_empty_array(self, compile_and_run):
+        result = compile_and_run("arr[int] values = []\nlog(values.length)")
+        assert result.stdout.strip() == "0"
+
+    def test_length_updates_after_reassignment(self, compile_and_run):
+        source = """
+        arr[int] values = [1, 2]
+        values = [1, 2, 3, 4, 5]
+        log(values.length)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "5"
+
+
+class TestLoops:
+    """claude.md #60 (for loops), #61 (while loops), #66 (postfix ++/--)."""
+
+    def test_for_loop_array_iteration_example(self, compile_and_run):
+        # The exact worked example from claude.md #60.
+        source = """
+        arr[int] array = [10, 20, 30]
+        for int x = 0, x < array.length, x++ {
+            log(array[x])
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["10", "20", "30"]
+
+    def test_for_loop_counts_from_zero(self, compile_and_run):
+        result = compile_and_run("for int x = 0, x < 5, x++ {\n    log(x)\n}")
+        assert result.stdout.splitlines() == ["0", "1", "2", "3", "4"]
+
+    def test_for_loop_with_decrement_update(self, compile_and_run):
+        result = compile_and_run("for int x = 3, x > 0, x-- {\n    log(x)\n}")
+        assert result.stdout.splitlines() == ["3", "2", "1"]
+
+    def test_for_loop_body_never_runs_when_condition_starts_false(self, compile_and_run):
+        source = "for int x = 0, x < 0, x++ {\n    log('never')\n}\nlog('after')"
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "after"
+
+    def test_for_loop_init_variable_does_not_leak_past_the_loop(self, compile_and_run):
+        # claude.md #60: "The initialization variable is scoped to the
+        # loop body" -- a same-named outer variable must be unaffected.
+        source = """
+        int x = 99
+        for int x = 0, x < 3, x++ {
+        }
+        log(x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "99"
+
+    def test_nested_for_loops(self, compile_and_run):
+        source = """
+        for int i = 0, i < 2, i++ {
+            for int j = 0, j < 2, j++ {
+                log(i * 10 + j)
+            }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "1", "10", "11"]
+
+    def test_while_loop_counts_up(self, compile_and_run):
+        source = """
+        int e = 0
+        while e < 5 {
+            log(e)
+            e++
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "1", "2", "3", "4"]
+
+    def test_while_loop_body_never_runs_when_condition_starts_false(self, compile_and_run):
+        source = "int e = 10\nwhile e < 5 {\n    log('never')\n}\nlog('after')"
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "after"
+
+    def test_while_true_exits_via_return_inside_the_loop(self, compile_and_run):
+        # claude.md has no `break`/`continue` -- the only documented way
+        # out of an infinite loop's body is `return` from the enclosing
+        # function (see festina/codegen.py's module docstring).
+        source = """
+        void func run() {
+            int count = 0
+            while true {
+                log(count)
+                count++
+                if count == 3 {
+                    return
+                }
+            }
+        }
+        run()
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "1", "2", "done"]
+
+    def test_postfix_increment_and_decrement(self, compile_and_run):
+        source = """
+        int i = 5
+        i++
+        log(i)
+        i--
+        i--
+        log(i)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["6", "4"]
+
+    def test_postfix_increment_returns_pre_increment_value(self, compile_and_run):
+        # Standard postfix semantics: `i++` evaluates to the value *before*
+        # incrementing.
+        source = "int i = 5\nlog(i++)\nlog(i)"
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["5", "6"]
+
+    def test_iterative_fibonacci(self, compile_and_run):
+        # A real loop-driven computation, not just a counter -- exercises
+        # for + array-free accumulation together.
+        source = """
+        int func fibIter(n:int) {
+            int a = 0
+            int b = 1
+            for int i = 0, i < n, i++ {
+                int next = a + b
+                a = b
+                b = next
+            }
+            return a
+        }
+        log(fibIter(10))
+        log(fibIter(20))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["55", "6765"]
 
 
 class TestNumericConversion:

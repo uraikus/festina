@@ -12,6 +12,7 @@ SPEC_KEYWORDS = frozenset({
     "int", "float", "bool", "text", "blob", "arr", "struct", "table",
     "img", "aud", "null", "true", "false", "void", "func", "const",
     "import", "if", "else", "on", "fail", "log", "sqlite",
+    "for", "while",  # claude.md #60, #61
 })
 
 # Extra control tokens the parser needs distinct token types for, so it
@@ -37,7 +38,9 @@ TOKEN_SPEC = [
     ("LPAREN", r"\("), ("RPAREN", r"\)"),
     ("LBRACE", r"\{"), ("RBRACE", r"\}"),
     ("LBRACK", r"\["), ("RBRACK", r"\]"),
-    ("OP", r"===|!==|==|!=|<=|>=|&&|\|\||[+\-*/%=<>!?:.,;]"),
+    # claude.md #66: postfix ++/-- -- must come before the single-char
+    # +/- alternatives so `x++` lexes as one OP token, not `+` `+`.
+    ("OP", r"===|!==|==|!=|<=|>=|&&|\|\||\+\+|--|[+\-*/%=<>!?:.,;]"),
     ("IDENT", r"[A-Za-z_][A-Za-z0-9_]*"),
 ]
 MASTER_RE = re.compile("|".join(f"(?P<{n}>{p})" for n, p in TOKEN_SPEC), re.DOTALL)

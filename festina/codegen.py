@@ -3,15 +3,17 @@ the runtime-facing halves of #7/#8 (entry point + startup), #26 (arrays),
 #29-31 (automatic SQLite schema sync), #32-34 (sqlite() queries,
 parameterized queries, query result types), #41/#42 (log/fail), #45
 (string interpolation), #55-57 (int.toFloat(), Math.floor/ceil/round/
-trunc, division/modulo by zero).
+trunc, division/modulo by zero), #60/#61 (for/while loops), #63 (array
+.length), #66 (postfix ++/--).
 
 Scope: primitives (int/float/bool/text), global and local variables and
-constants, functions, if/else, return, the full expression grammar
-(arithmetic/comparison/logical/ternary/template strings), structs
-(GEP field access; see the heap-allocation note below), arrays (arr[T]
-literals, indexed get/set, nesting -- see the FESTINA_ARRAY_LLVM_TYPE
-note below), automatic table schema sync against festina.sqlite via
-the festina_runtime C helpers, and sqlite() queries (SELECT into
+constants, functions, if/else, for/while loops, return, the full
+expression grammar (arithmetic/comparison/logical/ternary/template
+strings/postfix ++/--), structs (GEP field access; see the
+heap-allocation note below), arrays (arr[T] literals, indexed get/set,
+nesting, `.length` -- see the FESTINA_ARRAY_LLVM_TYPE note below),
+automatic table schema sync against festina.sqlite via the
+festina_runtime C helpers, and sqlite() queries (SELECT into
 arr[Table], parameterized INSERT/UPDATE/DELETE -- see the "Query rows"
 note below).
 
@@ -63,17 +65,21 @@ global struct's `zeroinitializer` -- local and global structs now start
 identically rather than one being zeroed and the other garbage.
 
 Array representation: claude.md #26 specifies arr[T]'s type-resolution
-rules but not its runtime representation, push/pop-style operations, a
-length accessor, or any loop construct to iterate one with (the spec has
-no `for`/`while` at all) -- claude.md #54's ambiguity rule says to treat
-undefined behavior as unresolved rather than invent it, so this codegen
-only implements what #26 actually specifies: declaring an arr[T]
-(elements sized and typed at compile time -- #26's own wording),
-constructing one from an array literal, and reading/writing an element
-by an arbitrary index expression. No `.length`, no growth, no bounds
-checking (documented in README.md as a known gap, consistent with #14's
-performance-first / low-runtime-overhead priority in the absence of a
-spec requirement either way).
+rules but not its runtime representation or push/pop-style operations
+-- claude.md #54's ambiguity rule says to treat undefined behavior as
+unresolved rather than invent it, so those still aren't implemented.
+#63 and #60/#61 (added later than #26) do specify a length accessor and
+loop constructs, and both are implemented: `.length` is read via
+`extractvalue` on the array's own `{i64, ptr}` value (see
+`_emit_expr`'s Member handling) rather than through `_member_ptr`,
+since not every array-typed expression is addressable and `.length` is
+read-only anyway; for/while loops (`_emit_for`/`_emit_while`) are
+ordinary structured control flow, no different in kind from `_emit_if`.
+No growth, no bounds checking (documented in README.md as a known gap,
+consistent with #14's performance-first / low-runtime-overhead priority
+in the absence of a spec requirement either way), and no `break`/
+`continue` (claude.md doesn't define either -- the only documented way
+out of a loop body early is `return` from the enclosing function).
 
 Every arr[T], regardless of T, lowers to the same fixed-size aggregate
 FESTINA_ARRAY_LLVM_TYPE = `%struct._FestinaArray = type { i64, ptr }`
@@ -501,6 +507,12 @@ class CodeGen:
         if isinstance(stmt, ast.IfStmt):
             self._emit_if(stmt, env, return_type, ctx)
             return
+        if isinstance(stmt, ast.WhileStmt):
+            self._emit_while(stmt, env, return_type, ctx)
+            return
+        if isinstance(stmt, ast.ForStmt):
+            self._emit_for(stmt, env, return_type, ctx)
+            return
         if isinstance(stmt, ast.Block):
             inner = self._emit_block(stmt, env, return_type, lines)
             ctx["terminated"] = inner["terminated"]
@@ -539,6 +551,60 @@ class CodeGen:
             ctx["terminated"] = True
         else:
             self._start_block(end_label, lines)
+
+    def _emit_while(self, stmt, env, return_type, ctx):
+        # claude.md #61. Never sets ctx["terminated"] even if the body
+        # always returns -- the condition can be false on the very first
+        # check, so control can always fall through to while.end,
+        # regardless of what happens inside the body.
+        lines = ctx["lines"]
+        cond_label = self.label("while.cond")
+        body_label = self.label("while.body")
+        end_label = self.label("while.end")
+
+        lines.append(f"  br label %{cond_label}")
+        self._start_block(cond_label, lines)
+        cond_val, _ = self._emit_expr(stmt.test, env, lines)
+        lines.append(f"  br i1 {cond_val}, label %{body_label}, label %{end_label}")
+
+        self._start_block(body_label, lines)
+        body_ctx = self._emit_block(stmt.body, env, return_type, lines)
+        if not body_ctx["terminated"]:
+            lines.append(f"  br label %{cond_label}")
+
+        self._start_block(end_label, lines)
+
+    def _emit_for(self, stmt, env, return_type, ctx):
+        # claude.md #60. `loop_env` holds just the init variable, scoped
+        # to this statement only (see the semantic.py note this mirrors)
+        # -- _emit_block below nests the body under loop_env, not env, so
+        # the variable is visible in test/update/body but env itself
+        # (and anything emitted after this statement) never sees it.
+        lines = ctx["lines"]
+        loop_env = Env(env)
+        init_ctx = {"lines": lines, "terminated": False}
+        self._emit_stmt(stmt.init, loop_env, return_type, init_ctx)
+
+        cond_label = self.label("for.cond")
+        body_label = self.label("for.body")
+        update_label = self.label("for.update")
+        end_label = self.label("for.end")
+
+        lines.append(f"  br label %{cond_label}")
+        self._start_block(cond_label, lines)
+        cond_val, _ = self._emit_expr(stmt.test, loop_env, lines)
+        lines.append(f"  br i1 {cond_val}, label %{body_label}, label %{end_label}")
+
+        self._start_block(body_label, lines)
+        body_ctx = self._emit_block(stmt.body, loop_env, return_type, lines)
+        if not body_ctx["terminated"]:
+            lines.append(f"  br label %{update_label}")
+
+        self._start_block(update_label, lines)
+        self._emit_expr(stmt.update, loop_env, lines)
+        lines.append(f"  br label %{cond_label}")
+
+        self._start_block(end_label, lines)
 
     _uid = 0
 
@@ -595,6 +661,21 @@ class CodeGen:
             lines.append(f"  {out} = load {_llvm_type(type_)}, ptr {ref}")
             return out, type_
         if isinstance(expr, ast.Member):
+            if not expr.computed and expr.prop == "length":
+                # claude.md #63: unlike struct/table field access,
+                # .length isn't addressable via a GEP -- an arr[T] value
+                # is a plain {i64, ptr} aggregate *value* (not a pointer
+                # to one; see the module docstring), and not every
+                # array-typed expression is even an lvalue (e.g. a
+                # function call's return value). extractvalue on the
+                # object's value works uniformly regardless, and .length
+                # is read-only anyway (see semantic.py), so there's never
+                # a need to go through _member_ptr for it.
+                obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+                if isinstance(obj_type, types_mod.ArrayType):
+                    out = self.tmp()
+                    lines.append(f"  {out} = extractvalue {FESTINA_ARRAY_LLVM_TYPE} {obj_val}, 0")
+                    return out, INT
             return self._emit_member_load(expr, env, lines)
         if isinstance(expr, ast.ArrayLit):
             # No contextual element type here -- reached only when an
@@ -612,6 +693,8 @@ class CodeGen:
             return self._emit_binop(expr, env, lines)
         if isinstance(expr, ast.UnaryOp):
             return self._emit_unary(expr, env, lines)
+        if isinstance(expr, ast.PostfixOp):
+            return self._emit_postfix(expr, env, lines)
         if isinstance(expr, ast.Call):
             return self._emit_call(expr, env, lines, expected_type=None)
         raise CodegenError(f"cannot generate code for expression {type(expr).__name__}",
@@ -958,6 +1041,21 @@ class CodeGen:
                 lines.append(f"  {out} = sub i64 0, {val}")
             return out, vtype
         return val, vtype  # unary '+' is a no-op
+
+    def _emit_postfix(self, expr, env, lines):
+        # claude.md #66: postfix ++/-- -- semantic.py has already
+        # verified expr.operand is a mutable int Identifier by the time
+        # codegen ever sees this node. Returns the *pre*-increment value,
+        # standard postfix semantics, even though every current caller
+        # (ExprStmt, a for-loop's update clause) discards the result.
+        ref, _ = env.lookup(expr.operand.name)
+        old = self.tmp()
+        lines.append(f"  {old} = load i64, ptr {ref}")
+        new = self.tmp()
+        op = "add" if expr.op == "++" else "sub"
+        lines.append(f"  {new} = {op} i64 {old}, 1")
+        lines.append(f"  store i64 {new}, ptr {ref}")
+        return old, INT
 
     def _emit_call(self, expr, env, lines, expected_type=None):
         callee = expr.callee

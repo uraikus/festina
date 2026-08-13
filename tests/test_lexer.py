@@ -8,6 +8,7 @@ RESERVED_WORDS = [
     "int", "float", "bool", "text", "blob", "arr", "struct", "table",
     "img", "aud", "null", "true", "false", "void", "func", "const",
     "import", "if", "else", "on", "fail", "log", "sqlite",
+    "for", "while",  # claude.md #60, #61
 ]
 
 
@@ -75,6 +76,22 @@ class TestReservedWords:
         assert hasattr(lexer, "KEYWORDS")
         for word in RESERVED_WORDS:
             assert word in lexer.KEYWORDS
+
+
+class TestPostfixOperators:
+    """claude.md #66: `++`/`--` must lex as one token each, not two
+    single-char `+`/`-` OP tokens."""
+
+    @pytest.mark.parametrize("op", ["++", "--"])
+    def test_postfix_operator_is_one_token(self, lexer, op):
+        tokens = [t for t in lexer.tokenize(f"i{op}") if t.type != "EOF"]
+        assert [t.type for t in tokens] == ["IDENT", "OP"]
+        assert tokens[1].value == op
+
+    def test_adjacent_plus_operators_still_lex_separately(self, lexer):
+        # `i + +1` (unary plus) must not be swallowed into a single `++`.
+        tokens = [t for t in lexer.tokenize("i + +1") if t.type != "EOF"]
+        assert [t.value for t in tokens] == ["i", "+", "+", 1]
 
 
 class TestSourceFileConvention:

@@ -170,10 +170,52 @@ def analyze(program, filename="<string>"):
         if isinstance(expr, ast.Call):
             return _infer_call(expr, scope)
         if isinstance(expr, ast.Assign):
+            # claude.md #63: ".length" is read-only -- caught here, before
+            # the generic infer(expr.target) below, which would otherwise
+            # happily type-check `arr.length = n` as a plain int
+            # assignment (the ArrayType branch in _infer_member has no
+            # way to tell a read apart from a write target).
+            if (isinstance(expr.target, ast.Member) and not expr.target.computed
+                    and expr.target.prop == "length"
+                    and isinstance(infer(expr.target.obj, scope), types_mod.ArrayType)):
+                raise CompileError(
+                    "'.length' is read-only and cannot be assigned to",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid assignment",
+                )
             target_type = infer(expr.target, scope)
             value_type = infer(expr.value, scope)
             check_assignable(target_type, value_type, expr)
             return target_type
+        if isinstance(expr, ast.PostfixOp):
+            # claude.md #66: postfix ++/-- -- valid only on a mutable int
+            # variable.
+            if not isinstance(expr.operand, ast.Identifier):
+                raise CompileError(
+                    f"'{expr.op}' can only be used on a variable, not an arbitrary expression",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid operand type",
+                )
+            sym = scope.lookup(expr.operand.name)
+            if sym is None:
+                raise CompileError(
+                    f"unknown variable '{expr.operand.name}'",
+                    file=filename, line=expr.operand.line, column=expr.operand.column,
+                    category="unknown variable",
+                )
+            if sym.type != _INT:
+                raise CompileError(
+                    f"'{expr.op}' requires an int operand, found {types_mod.type_name(sym.type)}",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid operand type",
+                )
+            if sym.kind == "constant":
+                raise CompileError(
+                    f"cannot use '{expr.op}' on constant '{expr.operand.name}'",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid operand type",
+                )
+            return _INT
         if isinstance(expr, ast.Ternary):
             cond_type = infer(expr.test, scope)
             check_condition_bool(cond_type, expr)
@@ -243,6 +285,18 @@ def analyze(program, filename="<string>"):
                     category="invalid field access",
                 )
             return resolve(columns[expr.prop], expr)
+        if isinstance(obj_type, types_mod.ArrayType):
+            # claude.md #63: the only field an array has is the built-in
+            # read-only `.length` (int) -- anything else is an error, not
+            # a permissive fallthrough, matching how struct/table field
+            # access is handled just above.
+            if expr.prop != "length":
+                raise CompileError(
+                    f"array has no field '{expr.prop}' (did you mean '.length'?)",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            return types_mod.PrimitiveType("int")
         if isinstance(obj_type, (types_mod.ImageType, types_mod.AudioType)):
             return None  # permissive: methods like .play()/.isPlaying() aren't modeled
         raise CompileError(
@@ -379,6 +433,25 @@ def analyze(program, filename="<string>"):
                     analyze_statement(stmt.orelse, scope, return_type)
                 else:
                     analyze_block(stmt.orelse, scope, return_type)
+        elif isinstance(stmt, ast.WhileStmt):
+            # claude.md #61: condition must be bool, no truthy/falsy
+            # conversion -- same rule check_condition_bool already
+            # enforces for if/ternary.
+            cond_type = infer(stmt.test, scope)
+            check_condition_bool(cond_type, stmt)
+            analyze_block(stmt.body, scope, return_type)
+        elif isinstance(stmt, ast.ForStmt):
+            # claude.md #60: "the initialization variable is scoped to
+            # the loop body" -- a fresh scope holds just the loop
+            # variable, and analyze_block below nests the body under
+            # *that* (not the outer scope), so the variable is visible
+            # in the condition/update/body but nowhere after the loop.
+            loop_scope = Scope(scope)
+            analyze_var_decl(stmt.init, loop_scope, is_global=False)
+            cond_type = infer(stmt.test, loop_scope)
+            check_condition_bool(cond_type, stmt)
+            infer(stmt.update, loop_scope)
+            analyze_block(stmt.body, loop_scope, return_type)
         elif isinstance(stmt, ast.Return):
             if stmt.value is not None:
                 actual = infer(stmt.value, scope)
