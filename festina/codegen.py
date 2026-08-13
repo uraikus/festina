@@ -1,15 +1,16 @@
 """LLVM IR code generation -- claude.md #47 (executable generation) and
 the runtime-facing halves of #7/#8 (entry point + startup), #26 (arrays),
 #29-31 (automatic SQLite schema sync), #41/#42 (log/fail), #45 (string
-interpolation).
+interpolation), #55-57 (int.toFloat(), Math.floor/ceil/round/trunc,
+division/modulo by zero).
 
 Scope: primitives (int/float/bool/text), global and local variables and
 constants, functions, if/else, return, the full expression grammar
 (arithmetic/comparison/logical/ternary/template strings), structs
-(stack-allocated, GEP field access), arrays (arr[T] literals, indexed
-get/set, nesting -- see the FESTINA_ARRAY_LLVM_TYPE note below), and
-automatic table schema sync against festina.sqlite via the
-festina_runtime C helpers.
+(GEP field access; see the heap-allocation note below), arrays (arr[T]
+literals, indexed get/set, nesting -- see the FESTINA_ARRAY_LLVM_TYPE
+note below), and automatic table schema sync against festina.sqlite via
+the festina_runtime C helpers.
 
 NOT implemented yet (raises CodegenError with a clear message):
 sqlite() queries and parameterized statements (so arr[Table] stays
@@ -20,6 +21,24 @@ for the up-to-date status list.
 
 Uses LLVM's opaque-pointer IR (`ptr` everywhere) to match clang 15+'s
 default, so no manual bitcasting between pointer "flavors" is needed.
+
+Struct storage is always heap-allocated (calloc), never a stack alloca,
+even for a struct declared local to a function. claude.md #43 prefers
+stack allocation "when the value's lifetime permits it," which would be
+true for a struct that provably never leaves its declaring function --
+but this codegen doesn't do escape analysis, and a struct's address
+genuinely can outlive its function (returned, stored in an array or
+another struct's field, ...). Stack-allocating unconditionally silently
+corrupted every one of those cases (verified: returning a local struct
+by value produced garbage at the call site). calloc'ing every struct is
+the simple, uniformly-correct choice per #54's ambiguity rule ("prefer
+the simplest implementation" / "prefer performance" only when it doesn't
+also mean "prefer incorrect") -- at the cost of leaking, same tradeoff
+arrays already make (see below) and for the same underlying reason: no
+GC/refcounting runtime exists yet to free either one (claude.md #43).
+calloc (not malloc) so uninitialized fields read as zero, matching a
+global struct's `zeroinitializer` -- local and global structs now start
+identically rather than one being zeroed and the other garbage.
 
 Array representation: claude.md #26 specifies arr[T]'s type-resolution
 rules but not its runtime representation, push/pop-style operations, a
@@ -35,14 +54,47 @@ performance-first / low-runtime-overhead priority in the absence of a
 spec requirement either way).
 
 Every arr[T], regardless of T, lowers to the same fixed-size aggregate
-`%struct.FestinaArray = type { i64, ptr }` (length, data pointer) --
-Festina's own type system (not the generated IR) is what keeps different
-arr[T] values from mixing, exactly like festina.types keeps
-PrimitiveType/StructType/etc. distinct without a runtime tag (claude.md
-#11). The data pointer is malloc'd and never freed -- claude.md #43
-promises automatic memory management the compiler doesn't implement yet
-(no GC, no refcounting runtime), so for now arrays leak; see README.md.
+FESTINA_ARRAY_LLVM_TYPE = `%struct._FestinaArray = type { i64, ptr }`
+(length, data pointer) -- Festina's own type system (not the generated
+IR) is what keeps different arr[T] values from mixing, exactly like
+festina.types keeps PrimitiveType/StructType/etc. distinct without a
+runtime tag (claude.md #11). Named `_FestinaArray` (leading underscore)
+rather than a plainer name specifically to make an accidental collision
+with a user-declared `struct _FestinaArray { ... }` less likely --
+Festina's identifier grammar still technically allows a user to write
+that exact name, so this lowers the odds without eliminating the
+possibility; a Festina identifier can never collide with an LLVM name
+containing a `.` in the middle the way `struct_llvm_name` produces
+(`%struct.Name`), so a scheme that didn't reuse that "%struct." prefix
+at all would close the gap completely if it's ever worth the churn. The
+data pointer is malloc'd and never freed -- claude.md #43 promises
+automatic memory management this compiler doesn't implement yet (no GC,
+no refcounting runtime), so for now arrays leak; see README.md.
+
+Null for int/float (claude.md #10, #25, #57): i64/double have no spare
+bit pattern for "null" the way a pointer has NULL, and LLVM's `null`
+literal is only valid for pointer types -- storing it into an i64/double
+slot is a link error (verified). Represented with a reserved sentinel
+instead (INT_NULL_CONST = i64 minimum; FLOAT_NULL_CONST = a quiet NaN),
+per #57's "implementation-defined" allowance. This is what
+division/modulo by zero produce (#57) and what a literal `null` lowers
+to when assigned/passed/returned as int or float (see
+_emit_value_for) -- before this change the bare "null" keyword was used
+unconditionally, which broke exactly the same way `int x = null` did.
+Using an already-null int or float as an operand in further arithmetic
+is unresolved per #57 --
+NaN naturally propagates through float arithmetic (for free), but
+INT_NULL_CONST is just an ordinary (if extreme) i64 to int arithmetic,
+so it does not propagate the same way. `bool` has the identical "null
+literal for a non-pointer type" problem (verified: same link error) but
+is NOT fixed here -- claude.md never asked for bool-null specifically,
+and fixing it would mean widening bool from i1 to a multi-value
+encoding everywhere bool is stored (fields, params, array elements),
+well beyond the int/float scope this change actually needed. Tracked as
+a known gap in README.md rather than silently left unmentioned.
 """
+import struct
+
 from . import ast
 from . import types as types_mod
 from . import semantic as semantic_mod
@@ -53,7 +105,17 @@ INT = types_mod.PrimitiveType("int")
 FLOAT = types_mod.PrimitiveType("float")
 TEXT = types_mod.PrimitiveType("text")
 
-FESTINA_ARRAY_LLVM_TYPE = "%struct.FestinaArray"
+FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
+
+# claude.md #57: division/modulo by zero returns null; null has no spare
+# bit pattern in a plain i64/double, so it's a reserved sentinel instead
+# (see the module docstring's "Null for int/float" note).
+INT_NULL_CONST = "-9223372036854775808"  # i64 minimum
+FLOAT_NULL_CONST = "0x7FF8000000000000"  # a quiet NaN, as a raw double bit pattern
+MATH_INTRINSICS = {
+    "floor": "llvm.floor.f64", "ceil": "llvm.ceil.f64",
+    "round": "llvm.round.f64", "trunc": "llvm.trunc.f64",
+}
 
 
 class CodegenError(CompileError):
@@ -198,6 +260,13 @@ class CodeGen:
             "declare ptr @festina_db_open()",
             "declare void @festina_sync_table(ptr, ptr, ptr, ptr, i32)",
             "declare ptr @malloc(i64)",
+            "declare ptr @calloc(i64, i64)",
+            # claude.md #56: Math.floor/ceil/round/trunc, via LLVM's
+            # built-in intrinsics rather than a runtime C function.
+            "declare double @llvm.floor.f64(double)",
+            "declare double @llvm.ceil.f64(double)",
+            "declare double @llvm.round.f64(double)",
+            "declare double @llvm.trunc.f64(double)",
         ]
 
     def _struct_type_defs(self):
@@ -326,14 +395,21 @@ class CodeGen:
         if isinstance(stmt, ast.VarDecl):
             type_ = self._resolve(stmt.type_expr, stmt)
             if isinstance(type_, types_mod.StructType):
-                # Two allocas, same trick as the global case: `slot`
-                # holds a *pointer* to the struct's own storage, kept
-                # uniform with every other type so Identifier lookup
-                # never needs a struct special-case.
+                # `slot` holds a *pointer* to the struct's own storage,
+                # kept uniform with every other type so Identifier lookup
+                # never needs a struct special-case. That storage is
+                # calloc'd, not a stack alloca -- see the module
+                # docstring's "Struct storage is always heap-allocated"
+                # note for why (a stack-allocated struct's address can
+                # outlive its function: returned, put in an array, stored
+                # in another struct's field -- verified to silently
+                # corrupt memory when it does).
                 uid = self._unique()
+                struct_ty = self.struct_llvm_name(type_.name)
+                size_val = self._sizeof(struct_ty, lines)
                 backing = f"%{stmt.name}.storage.{uid}"
                 slot = f"%{stmt.name}.{uid}"
-                lines.append(f"  {backing} = alloca {self.struct_llvm_name(type_.name)}")
+                lines.append(f"  {backing} = call ptr @calloc(i64 1, i64 {size_val})")
                 lines.append(f"  {slot} = alloca ptr")
                 lines.append(f"  store ptr {backing}, ptr {slot}")
                 env.define(stmt.name, slot, type_)
@@ -413,13 +489,14 @@ class CodeGen:
 
     # ---- expressions ----
     def _coerce(self, val, from_type, to_type, lines):
-        if from_type == to_type or to_type is None:
-            return val
-        if from_type == INT and to_type == FLOAT:
-            out = self.tmp()
-            lines.append(f"  {out} = sitofp i64 {val} to double")
-            return out
-        return val  # null literals / permissive builtin returns
+        # claude.md #55: int and float never convert implicitly, not even
+        # on assignment -- semantic.py already rejects a mismatched
+        # int/float assignment before codegen ever runs, so there is no
+        # remaining case that needs a numeric promotion here. What's left
+        # is genuinely permissive by design: a null literal (from_type is
+        # None or NULL-ish) or an unconstrained builtin return (e.g.
+        # sqlite()) flowing into a concretely-typed slot.
+        return val
 
     def _emit_expr(self, expr, env, lines):
         if isinstance(expr, ast.NumberLit):
@@ -431,6 +508,12 @@ class CodeGen:
         if isinstance(expr, ast.StringLit):
             return self._const_string(expr.value, lines), TEXT
         if isinstance(expr, ast.NullLit):
+            # No declared-type context here (see _emit_value_for for the
+            # version that has one) -- "null" is only valid IR for a
+            # pointer type, which covers every Festina type reachable
+            # without context (text/blob/struct/array all lower to `ptr`
+            # or a pointer-holding aggregate). int/float/bool can't reach
+            # this path uniformly assigned/coerced (see _emit_value_for).
             return "null", None
         if isinstance(expr, ast.TemplateLit):
             return self._emit_template(expr, env, lines), TEXT
@@ -512,9 +595,19 @@ class CodeGen:
         """Like _emit_expr, but for positions where the *declared* type is
         already known (a var's declared type, a param's type, a function's
         return type) -- lets an array literal pick its element type from
-        context instead of guessing from its own elements."""
+        context instead of guessing from its own elements, and lets a
+        bare `null` literal pick the right runtime encoding (claude.md
+        #10/#25/#57): "null" the LLVM keyword for text/blob/struct/array
+        (all pointer-backed), but the reserved sentinel constants for
+        int/float, which have no spare bit pattern for a real null."""
         if isinstance(node, ast.ArrayLit):
             return self._emit_array_lit(node, env, lines, expected_type)
+        if isinstance(node, ast.NullLit):
+            if expected_type == INT:
+                return INT_NULL_CONST, INT
+            if expected_type == FLOAT:
+                return FLOAT_NULL_CONST, FLOAT
+            return "null", expected_type
         return self._emit_expr(node, env, lines)
 
     def _sizeof(self, llvm_ty, lines):
@@ -705,13 +798,25 @@ class CodeGen:
             raise CodegenError(f"operator '{expr.op}' is not supported on text",
                                 file=self.filename, line=expr.line)
 
-        use_float = FLOAT in (left_type, right_type)
-        if use_float:
-            left_val = self._coerce(left_val, left_type, FLOAT, lines)
-            right_val = self._coerce(right_val, right_type, FLOAT, lines)
+        # claude.md #55: int and float never mix directly -- semantic.py
+        # already rejected a genuine mismatch before codegen ever runs, so
+        # reaching here with different numeric types is a compiler bug,
+        # not a user error; this is a consistency check, not a promotion
+        # (there's no implicit numeric conversion left in this codegen).
+        if left_type in (INT, FLOAT) and right_type in (INT, FLOAT) and left_type != right_type:
+            raise CodegenError(
+                f"internal error: mismatched numeric operands ({left_type!r}, {right_type!r}) "
+                "reached codegen -- semantic analysis should have rejected this",
+                file=self.filename, line=expr.line,
+            )
+        use_float = left_type == FLOAT
 
-        arith = {"+": "add", "-": "sub", "*": "mul", "/": "sdiv", "%": "srem"}
-        farith = {"+": "fadd", "-": "fsub", "*": "fmul", "/": "fdiv", "%": "frem"}
+        if expr.op in ("/", "%"):
+            out = self._emit_divmod(expr.op, left_val, right_val, use_float, lines)
+            return out, (FLOAT if use_float else INT)
+
+        arith = {"+": "add", "-": "sub", "*": "mul"}
+        farith = {"+": "fadd", "-": "fsub", "*": "fmul"}
         icmp = {"<": "slt", ">": "sgt", "<=": "sle", ">=": "sge", "==": "eq", "!=": "ne"}
         fcmp = {"<": "olt", ">": "ogt", "<=": "ole", ">=": "oge", "==": "oeq", "!=": "one"}
 
@@ -729,6 +834,42 @@ class CodeGen:
                 lines.append(f"  {out} = icmp {icmp[expr.op]} {ty} {left_val}, {right_val}")
             return out, BOOL
         raise CodegenError(f"unsupported operator '{expr.op}'", file=self.filename, line=expr.line)
+
+    def _emit_divmod(self, op, left_val, right_val, is_float, lines):
+        """claude.md #57: division/modulo by zero returns null instead of
+        crashing. For int specifically, `sdiv`/`srem` by zero is undefined
+        behavior at the hardware level (SIGFPE) -- checking *after*
+        computing would be too late, and a `select` would still evaluate
+        the trapping instruction unconditionally, so this has to be real
+        control flow that skips the division entirely on the zero path."""
+        llvm_ty = "double" if is_float else "i64"
+        zero_lit = "0.0" if is_float else "0"
+        null_const = FLOAT_NULL_CONST if is_float else INT_NULL_CONST
+        cmp_instr = "fcmp oeq" if is_float else "icmp eq"
+
+        is_zero = self.tmp()
+        lines.append(f"  {is_zero} = {cmp_instr} {llvm_ty} {right_val}, {zero_lit}")
+
+        zero_label = self.label("divzero")
+        nonzero_label = self.label("divnonzero")
+        end_label = self.label("divend")
+        lines.append(f"  br i1 {is_zero}, label %{zero_label}, label %{nonzero_label}")
+
+        self._start_block(zero_label, lines)
+        zero_pred = self.cur_block
+        lines.append(f"  br label %{end_label}")
+
+        self._start_block(nonzero_label, lines)
+        instr = {"float": {"/": "fdiv", "%": "frem"}, "int": {"/": "sdiv", "%": "srem"}}["float" if is_float else "int"][op]
+        result = self.tmp()
+        lines.append(f"  {result} = {instr} {llvm_ty} {left_val}, {right_val}")
+        nonzero_pred = self.cur_block
+        lines.append(f"  br label %{end_label}")
+
+        self._start_block(end_label, lines)
+        out = self.tmp()
+        lines.append(f"  {out} = phi {llvm_ty} [ {null_const}, %{zero_pred} ], [ {result}, %{nonzero_pred} ]")
+        return out
 
     def _emit_unary(self, expr, env, lines):
         val, vtype = self._emit_expr(expr.operand, env, lines)
@@ -790,6 +931,27 @@ class CodeGen:
                 lines.append(f"  {out} = call {_llvm_type(ret_type)} @{name}({args_ir})")
                 return out, ret_type
             raise CodegenError(f"unknown function '{name}'", file=self.filename, line=callee.line)
+        if isinstance(callee, ast.Member) and not callee.computed:
+            # claude.md #56: Math.floor/ceil/round/trunc(x:float) -> int
+            if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
+                    and callee.prop in MATH_INTRINSICS):
+                val, vtype = self._emit_expr(expr.args[0], env, lines)
+                if vtype != FLOAT:
+                    raise CodegenError(
+                        f"Math.{callee.prop}() expects a float argument, found {types_mod.type_name(vtype)}",
+                        file=self.filename, line=callee.line)
+                rounded = self.tmp()
+                lines.append(f"  {rounded} = call double @{MATH_INTRINSICS[callee.prop]}(double {val})")
+                out = self.tmp()
+                lines.append(f"  {out} = fptosi double {rounded} to i64")
+                return out, INT
+            # claude.md #55: int.toFloat() -> float
+            if callee.prop == "toFloat" and not expr.args:
+                val, vtype = self._emit_expr(callee.obj, env, lines)
+                if vtype == INT:
+                    out = self.tmp()
+                    lines.append(f"  {out} = sitofp i64 {val} to double")
+                    return out, FLOAT
         raise CodegenError("only calls to named functions are implemented",
                             file=self.filename, line=getattr(expr, "line", 0))
 
@@ -853,10 +1015,17 @@ def generate_ir(program, analyzed, filename="main.f"):
 
 
 def _format_double(v):
-    # LLVM wants a hex float form to be exact, but for the plain decimal
-    # literals this front end produces, %f-with-lots-of-precision round
-    # trips fine and stays human-readable in the emitted .ll.
-    return repr(float(v))
+    # repr(float) used to be used here directly, on the assumption its
+    # decimal form always round-trips into something LLVM's IR parser
+    # accepts -- it doesn't: repr() switches to scientific notation for
+    # small/large magnitudes (e.g. 1e-07), and LLVM's double-literal
+    # grammar rejects that (verified: "integer constant must have integer
+    # type", i.e. it doesn't parse as a float literal at all). LLVM's `0x`
+    # hex-float form takes the raw IEEE-754 bit pattern directly, so it's
+    # exact and unambiguous regardless of magnitude -- no formatting edge
+    # cases to enumerate.
+    bits = struct.unpack(">Q", struct.pack(">d", float(v)))[0]
+    return f"0x{bits:016X}"
 
 
 def _encode_c_string(text):

@@ -14,9 +14,29 @@ for dropped/retyped columns, with data preservation verified by the
 implemented too -- literals, indexed get/set, nesting, function
 params/return values -- though claude.md never specifies `.length`,
 bounds checking, or a loop construct to iterate one with, so none of
-those exist (see festina/codegen.py's module docstring). All 162 tests
-in this directory pass against it (0 skipped, given a `clang` toolchain
--- see below).
+those exist (see festina/codegen.py's module docstring). claude.md
+#55-58 (added after a design review of the first codegen pass turned up
+real bugs -- see below) are implemented too: int/float never convert
+implicitly in any operator, `int.toFloat()`/`Math.floor/ceil/round/trunc`
+are the only conversions, division/modulo by zero returns `null` instead
+of crashing, and struct/table names live in their own namespace. All 202
+tests in this directory pass against it (0 skipped, given a `clang`
+toolchain -- see below).
+
+claude.md #55-58 exist because of bugs a design review found by actually
+running compiled programs, not just reading the code: returning a struct
+by value handed the caller a pointer into an already-popped stack frame
+(silently printed garbage); `int x = null` / `float x = null` failed to
+link (`null` is only valid IR for a pointer type, and i64/double have no
+spare bit pattern for it); and a float literal small/large enough that
+Python's `repr()` used scientific notation (e.g. `0.0000001`) also failed
+to link, for the same "not valid float-literal syntax" reason. Fixing
+the null representation properly created an opening to also resolve a
+pre-existing inconsistency (assignment strictly rejected mixed int/float,
+but arithmetic silently allowed it) -- claude.md #55-56 close that gap by
+making the stricter behavior the rule everywhere, with `Math`/`.toFloat()`
+as the escape hatch, rather than picking a side ad hoc in code with no
+spec backing either way.
 
 See README.md's "Implementation Status" section for the current
 implemented-vs-not matrix; the short version: `sqlite()` queries,
@@ -47,6 +67,16 @@ feature doesn't exist," it's "this environment can't link native code."
 Tests for constructs codegen genuinely doesn't support yet (`sqlite()`
 queries, graphics, audio, events) don't need `clang` at all -- they only
 call `festina.codegen.generate_ir()` and assert it raises.
+
+`tests/test_numeric_conversion.py` covers claude.md #55-58 at the
+parser/semantic level only (same `parser`/`semantic`/`errors` fixtures as
+the rest of the front-end suite, no `clang` needed); the matching runtime
+behavior (Math/`.toFloat()`'s actual output, division-by-zero surviving
+and producing *something* rather than crashing) is tested end-to-end in
+`test_codegen.py`'s `TestNumericConversion`, plus regression coverage
+there for the three bugs #55-58 were written in response to (see
+"Status" above): a struct returned by value, and `null`/scientific-notation
+float literals compiling and linking successfully.
 
 ## Public API implemented
 
@@ -102,7 +132,13 @@ festina/
         # festina-type-name-str}), .imports (list of raw import paths).
         # Single left-to-right pass; every fixture in this repo declares
         # structs/tables/functions before use, so no forward-reference
-        # resolution was needed.
+        # resolution was needed. structs/tables are never cross-checked
+        # against Scope (claude.md #58: separate namespace by design, not
+        # an accidental gap). claude.md #55/#56: BinOp rejects int/float
+        # operands that differ (any operator, not just arithmetic);
+        # Math.floor/ceil/round/trunc(x:float) -> int and
+        # int_value.toFloat() -> float are recognized as Call-on-Member
+        # patterns, not real declarations (no "Math" symbol exists).
 
     sqlite_schema.py
         TYPE_MAP: dict[str, str]                        # claude.md #30
@@ -122,13 +158,19 @@ festina/
         def generate_ir(program, analyzed, filename="main.f") -> str
         # emits opaque-pointer LLVM IR text. Supports: primitives,
         # global/local vars & consts, functions, if/else, the full
-        # expression grammar, structs (stack-allocated, GEP field
-        # access), arrays (arr[T] literals + indexed get/set + nesting,
-        # all arr[T] lowered to one fixed {i64 length, ptr data} type --
-        # see the module docstring), automatic table schema sync via the
-        # festina_runtime C helpers. Raises CodegenError (a CompileError
-        # subclass, category="not implemented") for sqlite() queries,
-        # graphics, audio, and event handlers.
+        # expression grammar, structs (heap-allocated via calloc, GEP
+        # field access -- see the module docstring's "Struct storage" note
+        # for why not a stack alloca), arrays (arr[T] literals + indexed
+        # get/set + nesting, all arr[T] lowered to one fixed
+        # `%struct._FestinaArray = type { i64, ptr }` -- see the module
+        # docstring), automatic table schema sync via the festina_runtime
+        # C helpers, Math.floor/ceil/round/trunc (LLVM intrinsics) and
+        # int.toFloat() (sitofp), division/modulo by zero returning a
+        # reserved null sentinel (INT_NULL_CONST / FLOAT_NULL_CONST) via
+        # real control flow rather than a trapping instruction. Raises
+        # CodegenError (a CompileError subclass, category="not
+        # implemented") for sqlite() queries, graphics, audio, and event
+        # handlers.
 
     cli.py
         def compile_file(entry_path, output_path=None, emit_llvm=False,
@@ -151,5 +193,5 @@ executable can't depend on Python at runtime).
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 162 passed, 0 skipped (needs clang)
+pytest tests/                          # 202 passed, 0 skipped (needs clang)
 ```

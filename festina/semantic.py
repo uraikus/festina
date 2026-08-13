@@ -1,6 +1,10 @@
 """Semantic analysis -- claude.md #48 (error categories), #49 (symbol
 table), #50 (type checking), plus the type-resolution/truthiness/equality
-rules from #12-20 and the struct/table distinction from #27, #28, #35.
+rules from #12-20, the struct/table distinction from #27, #28, #35, and
+#55/#56 (int/float never mix directly; Math.floor/ceil/round/trunc and
+int.toFloat() are the only conversions). #58 (struct/table namespace):
+struct/table names live in `structs`/`tables`, never cross-checked
+against `Scope` (variables/functions) -- separate namespaces by design.
 
 `analyze(program)` walks the AST top to bottom. None of this repo's
 fixtures need forward references (structs/tables/functions are always
@@ -22,6 +26,14 @@ _BUILTIN_RETURN_TYPES = {
     "loadImage": types_mod.ImageType(),
     "loadAudio": types_mod.AudioType(),
 }
+
+# claude.md #55: int and float never mix directly in a binary operator.
+_INT = types_mod.PrimitiveType("int")
+_FLOAT = types_mod.PrimitiveType("float")
+_NUMERIC_TYPES = (_INT, _FLOAT)
+
+# claude.md #56: float -> int, with an explicit rounding decision.
+MATH_FUNCTIONS = {"floor", "ceil", "round", "trunc"}
 
 
 class _NullType:
@@ -175,6 +187,15 @@ def analyze(program, filename="<string>"):
         if isinstance(expr, ast.BinOp):
             left = infer(expr.left, scope)
             right = infer(expr.right, scope)
+            # claude.md #55: int and float never mix directly, in any
+            # binary operator -- arithmetic, comparison, or equality.
+            if left in _NUMERIC_TYPES and right in _NUMERIC_TYPES and left != right:
+                raise CompileError(
+                    f"cannot use {expr.op} directly between int and float; "
+                    "convert one side first (int.toFloat(), or Math.floor/ceil/round/trunc for float -> int)",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid operand type",
+                )
             if expr.op in ("==", "!=", "<", ">", "<=", ">="):
                 return types_mod.PrimitiveType("bool")
             if left == types_mod.PrimitiveType("float") or right == types_mod.PrimitiveType("float"):
@@ -249,6 +270,27 @@ def analyze(program, filename="<string>"):
                         category="invalid function argument type",
                     )
             return sym.type
+        if isinstance(callee, ast.Member) and not callee.computed:
+            # claude.md #56: Math.floor/ceil/round/trunc(x:float) -> int
+            if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
+                    and callee.prop in MATH_FUNCTIONS):
+                if len(expr.args) != 1:
+                    raise CompileError(
+                        f"Math.{callee.prop}() expects exactly 1 argument, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                arg_type = infer(expr.args[0], scope)
+                if arg_type is not None and arg_type is not NULL and arg_type != _FLOAT:
+                    raise CompileError(
+                        f"Math.{callee.prop}() expects a float argument, found {types_mod.type_name(arg_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return _INT
+            # claude.md #55: int.toFloat() -> float
+            if callee.prop == "toFloat" and not expr.args and infer(callee.obj, scope) == _INT:
+                return _FLOAT
         # Member call, e.g. music.play() -- validates the member access itself.
         infer(callee, scope)
         for a in expr.args:

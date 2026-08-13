@@ -175,6 +175,55 @@ class TestStructs:
         result = compile_and_run(source)
         assert result.stdout.strip() == "42"
 
+    def test_struct_returned_by_value_from_function(self, compile_and_run):
+        # Regression test: struct backing storage used to be a stack
+        # alloca even for locals, so returning one handed the caller a
+        # pointer into a popped stack frame -- verified to silently print
+        # garbage before the fix (calloc'd storage instead; see
+        # festina/codegen.py's module docstring).
+        source = """
+        struct Point {
+            x:int
+            y:int
+        }
+        Point func origin() {
+            Point p
+            p.x = 0
+            p.y = 0
+            return p
+        }
+        Point func makePoint(a:int, b:int) {
+            Point p
+            p.x = a
+            p.y = b
+            return p
+        }
+        Point o = origin()
+        log(o.x)
+        log(o.y)
+        Point q = makePoint(7, 8)
+        log(q.x)
+        log(q.y)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "0", "7", "8"]
+
+    def test_local_struct_fields_default_to_zero(self, compile_and_run):
+        # calloc, not malloc, for struct backing storage -- a local
+        # struct's unset fields should read as zero, same as a global
+        # struct's (`zeroinitializer`), not garbage.
+        source = """
+        struct Counters {
+            hits:int
+            misses:int
+        }
+        Counters c
+        log(c.hits)
+        log(c.misses)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "0"]
+
 
 class TestArrays:
     """claude.md #26: arr[T] with elements sized/typed at compile time,
@@ -266,6 +315,85 @@ class TestArrays:
         """
         result = compile_and_run(source)
         assert result.stdout.splitlines() == ["1", "4"]
+
+
+class TestNumericConversion:
+    """claude.md #55 (no implicit int/float conversion), #56 (Math),
+    #57 (division/modulo by zero returns null). See
+    tests/test_numeric_conversion.py for the parser/semantic-only tests;
+    these check the actual runtime behavior of a compiled program."""
+
+    @pytest.mark.parametrize("fn,expected", [
+        ("floor", "19"), ("ceil", "20"), ("round", "20"), ("trunc", "19"),
+    ])
+    def test_math_function_runtime_result(self, compile_and_run, fn, expected):
+        result = compile_and_run(f"float price = 19.99\nlog(Math.{fn}(price))")
+        assert result.stdout.strip() == expected
+
+    def test_to_float_runtime_result(self, compile_and_run):
+        source = """
+        int a = 5
+        float b = 2.5
+        float c = a.toFloat() + b
+        log(c)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "7.5"
+
+    def test_mixed_int_float_rejected_end_to_end(self, compile_and_run, errors):
+        # Confirms the whole pipeline (not just semantic.py in isolation)
+        # rejects this -- semantic analysis raises before ever reaching
+        # a linker, so this is a CompileError, not a nonzero exit code.
+        with pytest.raises(errors.CompileError, match="int and float"):
+            compile_and_run("int a = 5\nfloat b = 2.5\nfloat c = a + b")
+
+    def test_int_division_by_zero_returns_null(self, compile_and_run):
+        # claude.md #57: must not crash (SIGFPE) and must not silently
+        # compute garbage -- the sentinel is intentionally an
+        # implementation detail (see codegen.py's module docstring), so
+        # this only checks the process survives and produces *a* value,
+        # not the exact sentinel bit pattern.
+        source = """
+        int a = 10
+        int b = 0
+        int result = a / b
+        log('survived')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "survived"
+
+    def test_int_modulo_by_zero_returns_null(self, compile_and_run):
+        source = "int a = 10\nint b = 0\nint result = a % b\nlog('survived')"
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "survived"
+
+    def test_float_division_by_zero_returns_null(self, compile_and_run):
+        source = "float a = 5.0\nfloat b = 0.0\nfloat result = a / b\nlog('survived')"
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "survived"
+
+    def test_int_division_by_nonzero_is_unaffected(self, compile_and_run):
+        result = compile_and_run("int a = 10\nint b = 4\nlog(a / b)\nlog(a % b)")
+        assert result.stdout.splitlines() == ["2", "2"]
+
+    def test_null_int_and_float_assignment(self, compile_and_run):
+        # Regression test: `null` used to lower to the LLVM keyword
+        # `null` unconditionally, which is only valid for pointer types --
+        # `int x = null` failed to link before this fix.
+        result = compile_and_run("int a = null\nfloat b = null\nlog('assigned fine')")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "assigned fine"
+
+    def test_float_literal_needing_scientific_notation(self, compile_and_run):
+        # Regression test: _format_double used repr(), which switches to
+        # scientific notation for small/large magnitudes (e.g. 1e-07) --
+        # LLVM's float-literal grammar rejected that as invalid syntax.
+        result = compile_and_run("float tiny = 0.0000001\nlog('compiled fine')")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "compiled fine"
 
 
 class TestFail:

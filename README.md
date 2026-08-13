@@ -27,7 +27,7 @@ Festina is under active development. Everything else in this README
 describes the full target language from `claude.md`; this section is
 the ground truth for what actually runs today.
 
-**Test suite:** 162/162 passing, 0 skipped, 0 failed (`pytest tests/`).
+**Test suite:** 202/202 passing, 0 skipped, 0 failed (`pytest tests/`).
 See [`tests/`](tests/) and [`tests/CONTRACT.md`](tests/CONTRACT.md) for
 the spec-driven suite this is measured against — every test cites the
 `claude.md` section it checks.
@@ -44,22 +44,49 @@ runtime, and *runs* as a standalone executable (no Python or the
 | Semantic analysis | ✅ type resolution, struct/table distinction, bool-only conditions, function arg/return checking, all `#48` error categories |
 | Primitives (`int` / `float` / `bool` / `text` / `blob`) | ✅ |
 | Variables / constants | ✅ global and local |
-| Functions | ✅ typed params, return values, `void` |
+| Functions | ✅ typed params, return values, `void`, structs returned by value |
 | Control flow | ✅ `if`/`else`, ternary, `&&` / `||` (short-circuit), all operators |
 | String interpolation | ✅ `` `Hello ${name}` `` |
 | `log()` / `fail()` | ✅ |
-| Structs | ✅ declaration, field read/write, passed to functions |
+| Structs | ✅ declaration, field read/write, passed to and returned from functions |
 | **Arrays (`arr[T]`)** | ✅ literals, indexed read/write by any index expression, nesting, as function params/return values, as struct-array elements — see the caveats below and in `festina/codegen.py`'s module docstring |
+| **Numeric conversion (`claude.md #55/#56`)** | ✅ int and float never mix implicitly, in any operator (arithmetic *or* comparison) — `int.toFloat()` and `Math.floor/ceil/round/trunc(x)` are the only conversions, both compile-time-checked and runtime-tested |
+| **Division/modulo by zero (`claude.md #57`)** | ✅ returns `null` instead of crashing the process, for both `int` and `float` |
 | **Automatic SQLite schema sync** | ✅ `festina.sqlite` opens/creates itself; tables are created, and columns added/dropped/retyped with existing data preserved via a temp-table rebuild — the `claude.md #31` worked examples all pass as tests |
 | Native executables | ✅ `bin/festina program.f -o program` produces a real, standalone binary |
 
-Two known caveats on arrays, both because claude.md #26 never specifies
-this behavior (per #54's ambiguity rule, unspecified stays unresolved
-rather than invented): there's no `.length` or loop construct to iterate
-one with (claude.md has no `for`/`while` at all), and array data is
-`malloc`'d and never freed — claude.md #43 promises automatic memory
-management this compiler doesn't implement yet (no GC, no refcounting).
-Indexing also isn't bounds-checked.
+Known limitations, all deliberate per `claude.md #54`'s ambiguity rule
+(unspecified stays unresolved rather than invented) or explicitly
+scoped out rather than silently missing:
+
+- Arrays have no `.length` or loop construct to iterate one with
+  (claude.md has no `for`/`while` at all), aren't bounds-checked, and
+  their data is `malloc`'d and never freed — claude.md #43 promises
+  automatic memory management this compiler doesn't implement yet (no
+  GC, no refcounting). The same is true of struct storage, which is
+  always heap-allocated (`calloc`) rather than stack-allocated, even for
+  a struct local to one function — a stack-allocated struct's address
+  can genuinely outlive its function (returned, stored in an array or
+  another struct), which used to silently corrupt memory; see the
+  "Struct storage is always heap-allocated" note in
+  `festina/codegen.py`'s module docstring.
+- `bool` has the same "no representable `null`" problem `int`/`float`
+  used to (LLVM's `null` literal is only valid for pointer types, and
+  `i1` has no spare bit pattern) — `bool x = null` still fails to
+  compile. Not fixed: doing so means widening `bool`'s representation
+  everywhere it's stored (fields, params, array elements), well beyond
+  what fixing `int`/`float` needed.
+- Every `arr[T]` lowers to one shared internal type, currently named
+  `_FestinaArray` specifically to make an accidental collision with a
+  same-named user struct unlikely — but Festina's identifier grammar
+  still technically permits a user to write `struct _FestinaArray`, so
+  this lowers the odds without eliminating the possibility.
+- `drawRect`/`drawCircle`/`drawText`/`drawImage`/`loadImage`/`loadAudio`
+  aren't reserved words (unlike `log`/`fail`/`sqlite`, which are lexer
+  keywords) — declaring a function with one of those names silently
+  shadows the builtin at every call site rather than erroring. Left as
+  is since none of them are implemented yet anyway; worth reserving
+  properly once they are.
 
 ### Not implemented yet
 
@@ -83,7 +110,7 @@ on Debian/Ubuntu).
 
 ```bash
 pip install -r requirements-dev.txt   # pytest, for the test suite
-pytest tests/                         # 162 passed
+pytest tests/                         # 202 passed
 
 ./bin/festina examples/hello.f -o hello
 ./hello
@@ -184,6 +211,50 @@ if ready {
     log('Ready')
 }
 ```
+
+## Numeric Conversion
+
+> **Status:** implemented, compile-time-checked and runtime-tested — see [Implementation Status](#implementation-status).
+
+`int` and `float` never mix directly — not in arithmetic, and not in comparisons:
+
+```festina
+int a = 5
+float b = 2.5
+float c = a + b     // compile-time error
+```
+
+Convert one side explicitly. Every `int` has a `.toFloat()` method:
+
+```festina
+int a = 5
+float b = 2.5
+float c = a.toFloat() + b
+```
+
+Going from `float` to `int` means picking a rounding rule, so it's a `Math` function rather than a single method:
+
+```festina
+float price = 19.99
+int total = Math.ceil(price) + 3
+```
+
+```text
+Math.floor(x:float) -> int
+Math.ceil(x:float) -> int
+Math.round(x:float) -> int
+Math.trunc(x:float) -> int
+```
+
+Division and modulo by zero don't crash the program — they return `null`:
+
+```festina
+int a = 10
+int b = 0
+int result = a / b   // null, not a crash
+```
+
+This applies to both `int` and `float`. `null` already has no natural bit pattern in a plain `i64`/`double` the way it does for a pointer, so the runtime represents it with a reserved value internally — an implementation detail, not something Festina source code inspects directly.
 
 ## Structs
 

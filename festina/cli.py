@@ -52,7 +52,10 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
                                  capture_output=True, text=True, check=False).stdout.split()
         libs = subprocess.run(["pkg-config", "--libs", "sqlite3"],
                                capture_output=True, text=True, check=False).stdout.split()
-        cmd = [cc, "-O2", ir_path, _RUNTIME_C, *cflags, *libs, "-o", output_path]
+        # -lm: claude.md #56's Math.floor/ceil/round/trunc lower to LLVM
+        # intrinsics that call into libm (round() in particular isn't
+        # inlined by clang the way floor/ceil/trunc often are).
+        cmd = [cc, "-O2", ir_path, _RUNTIME_C, *cflags, *libs, "-lm", "-o", output_path]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise CompileError(

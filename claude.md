@@ -1260,3 +1260,88 @@ When implementing behavior that is not explicitly specified:
 10. If behavior genuinely cannot be determined from this specification, treat it as an unresolved language-design decision rather than inventing behavior.
 
 The compiler implementation must follow this specification rather than assuming behavior from JavaScript, TypeScript, SQLite, or another language when Festina has explicitly defined its own behavior.
+
+
+55. NUMERIC CONVERSION
+
+int and float do not mix directly.
+
+Example (invalid):
+
+int a = 5
+float b = 2.5
+float c = a + b
+
+The compiler must reject this at compile time.
+
+This applies to every binary operator, not only arithmetic: comparison and equality operators (<, >, <=, >=, ==, !=) also require both operands to be the same numeric type. Comparing an int directly to a float is a compile-time error.
+
+To combine an int and a float, convert one of them explicitly first.
+
+Every int value has a method that returns the equivalent float:
+
+int a = 5
+float b = 2.5
+float c = a.toFloat() + b
+
+Converting a float to an int requires a rounding decision, so it is done through the Math functions in section 56 rather than a single method:
+
+float price = 19.99
+int total = Math.ceil(price) + 3
+
+This section overrides any implicit numeric promotion that might otherwise be assumed from JavaScript familiarity (section 45): Festina does not perform implicit conversion between int and float.
+
+
+56. MATH
+
+A global Math namespace provides explicit float-to-int conversion, mirroring JavaScript's Math object:
+
+Math.floor(x:float) -> int
+Math.ceil(x:float) -> int
+Math.round(x:float) -> int
+Math.trunc(x:float) -> int
+
+Example:
+
+float price = 19.99
+int rounded = Math.ceil(price)
+
+Other Math functions (for example Math.abs, Math.sqrt, Math.pow, Math.min, Math.max) are not yet specified.
+
+
+57. DIVISION AND MODULO BY ZERO
+
+Division (/) or modulo (%) by zero does not raise a runtime error and does not crash the program.
+
+Instead, the result is null.
+
+Example:
+
+int a = 10
+int b = 0
+int result = a / b
+
+result is null.
+
+This applies to both int and float operands.
+
+Since null must be representable for every type that can be divided (section 10), the compiler must choose a runtime representation capable of distinguishing null from every valid value of that type -- for example, a reserved sentinel value, or a NaN-based encoding for float. The exact representation is implementation-defined.
+
+Using a null int or null float as an operand in further arithmetic is not specified by this section and is treated as unresolved per section 54.
+
+
+58. STRUCT/TABLE NAMESPACE
+
+struct and table names occupy a namespace separate from variables, constants, and functions.
+
+Example:
+
+struct User {
+    name:text
+}
+
+int User = 5
+
+is valid: the struct type User and the variable User do not conflict, because struct/table names and variable/function/constant names are resolved independently. This mirrors the same separation found in many statically typed languages (for example, C's separate tag namespace for struct/enum/union names).
+
+No duplicate-declaration error is required across these two namespaces -- only within each one.
