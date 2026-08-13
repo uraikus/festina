@@ -1359,3 +1359,138 @@ When more than one implementation would satisfy a requirement, prefer the one th
 4. Fails with a clear, actionable error identifying the missing dependency and how to obtain it, rather than a raw or unclear error, when a required dependency is genuinely missing.
 
 This does not require eliminating every external dependency at any cost. Section 54's ambiguity rules still apply: weigh this against simplicity and performance rather than treating it as an override. It does mean an implementation should not introduce an unnecessary external dependency, or depend on a specific tool where a more common or already-required one would do.
+
+
+59. MINIMAL DEPENDENCIES AND SETUP
+
+(Beginning after the existing section 59 in the original document, add the following new sections.)
+
+60. FOR LOOPS
+
+Festina supports C-style counted loops.
+
+Syntax:
+
+for initialization, condition, update {
+}
+
+Example:
+
+for int x = 0, x < 10, x++ {
+    log(x)
+}
+
+Array iteration example:
+
+for int x = 0, x < array.length, x++ {
+    log(array[x])
+}
+
+Execution order:
+
+1. Execute initialization once.
+2. Evaluate condition.
+3. If condition is false, exit loop.
+4. Execute loop body.
+5. Execute update expression.
+6. Repeat from step 2.
+
+The condition must resolve to bool.
+
+The initialization variable is scoped to the loop body.
+
+Valid update expressions include:
+
+i++
+i--
+
+61. WHILE LOOPS
+
+Festina supports while loops.
+
+Syntax:
+
+while condition {
+}
+
+Examples:
+
+int e = 0
+
+while e < 10 {
+    log(e)
+    e++
+}
+
+Infinite loop:
+
+while true {
+    log('running')
+}
+
+The condition must resolve to bool.
+
+Festina does not perform truthy/falsy conversion when evaluating loop conditions.
+
+62. ARRAY LITERALS
+
+Arrays may be initialized using array literals.
+
+Syntax:
+
+arr[T] values = [ ... ]
+
+Examples:
+
+arr[int] numbers = [1, 2, 3]
+
+arr[text] names = [
+    'Patrick',
+    'Sarah',
+    'John'
+]
+
+The compiler must verify that every element is compatible with the declared array element type.
+
+63. ARRAY LENGTH
+
+Every array provides a built-in read-only property:
+
+.length
+
+Example:
+
+arr[int] values = [1, 2, 3]
+
+log(values.length)
+
+The type of .length is int.
+
+65. ARRAY INDEXING
+
+Arrays support zero-based indexing.
+
+Example:
+
+arr[int] values = [1, 2, 3]
+
+log(values[0])
+log(values[1])
+log(values[2])
+
+The index expression must resolve to int.
+
+66. POSTFIX INCREMENT AND DECREMENT
+
+Festina supports postfix increment and decrement operators.
+
+Supported operators:
+
+++
+--
+
+These operators are valid only on mutable integer variables.
+
+The operand must be int.
+
+Using increment or decrement on any other type is a compile-time error.
