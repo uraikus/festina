@@ -16,11 +16,10 @@ which is the actual point: it's no longer clang *specifically* that
 using Festina depends on, just "some C compiler," a meaningfully
 smaller ask.
 
-This module follows the same ctypes-against-libLLVM-C pattern this
-repo's own jit_run.py already uses for JIT execution (written for
-environments with libLLVM but no clang/llc CLI tools) -- extended here
-for ahead-of-time object-file emission via LLVMTargetMachineEmitToFile
-instead of MCJIT execution.
+Uses ctypes against libLLVM's C API directly -- suitable for
+environments with libLLVM but no clang/llc CLI tools -- for
+ahead-of-time object-file emission via LLVMTargetMachineEmitToFile
+(as opposed to MCJIT execution).
 
 If libLLVM can't be found or loaded, `available()` returns False and
 festina/cli.py falls back to shelling out to clang on the .ll file
