@@ -146,3 +146,8 @@ vite.config.ts.timestamp-*
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Festina -- created automatically at runtime by any compiled program
+# that declares a table (claude.md #29), including if you run one of
+# examples/*.f from the repo root while trying things out manually.
+festina.sqlite

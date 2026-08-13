@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# The Festina compiler CLI -- claude.md #1: "The compiler executable must
+# be named: festina". (It lives under bin/ because the repository root
+# already has a festina/ package directory of the same name; a plain file
+# and a directory can't share one name on the same filesystem path.) This
+# wrapper just execs the Python implementation in festina/cli.py.
+#
+# Usage: bin/festina main.f [-o output] [--emit-llvm]
+set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+exec python3 -m festina.cli "$@"

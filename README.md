@@ -14,9 +14,171 @@ text func greet(name:text) {
     return `Hello, ${name}!`
 }
 
-arr[People] people = sqlite('SELECT * FROM People')
-
 log(greet('Festina'))
+```
+
+*(This exact example runs today — `festina.sqlite` and the `People`
+table are created/synced automatically at startup even though nothing
+queries it yet; see [Implementation Status](#implementation-status).)*
+
+## Implementation Status
+
+Festina is under active development. Everything else in this README
+describes the full target language from `claude.md`; this section is
+the ground truth for what actually runs today.
+
+**Test suite:** 213/213 passing, 0 skipped, 0 failed (`pytest tests/`).
+See [`tests/`](tests/) and [`tests/CONTRACT.md`](tests/CONTRACT.md) for
+the spec-driven suite this is measured against — every test cites the
+`claude.md` section it checks.
+
+### Implemented and working end to end
+
+Compiles, type-checks, generates real LLVM IR, links against a native C
+runtime, and *runs* as a standalone executable (no Python or the
+`festina` package needed at runtime):
+
+| Area | Status |
+|---|---|
+| Lexer / parser | ✅ full grammar — imports, types, structs, tables, functions, events, control flow, template strings |
+| Semantic analysis | ✅ type resolution, struct/table distinction, bool-only conditions, function arg/return checking, all `#48` error categories |
+| Primitives (`int` / `float` / `bool` / `text` / `blob`) | ✅ |
+| Variables / constants | ✅ global and local |
+| Functions | ✅ typed params, return values, `void`, structs returned by value |
+| Control flow | ✅ `if`/`else`, ternary, `&&` / `||` (short-circuit), all operators |
+| String interpolation | ✅ `` `Hello ${name}` `` |
+| `log()` / `fail()` | ✅ |
+| Structs | ✅ declaration, field read/write, passed to and returned from functions |
+| **Arrays (`arr[T]`)** | ✅ literals, indexed read/write by any index expression, nesting, as function params/return values, as struct-array elements — see the caveats below and in `festina/codegen.py`'s module docstring |
+| **Numeric conversion (`claude.md #55/#56`)** | ✅ int and float never mix implicitly, in any operator (arithmetic *or* comparison) — `int.toFloat()` and `Math.floor/ceil/round/trunc(x)` are the only conversions, both compile-time-checked and runtime-tested |
+| **Division/modulo by zero (`claude.md #57`)** | ✅ returns `null` instead of crashing the process, for both `int` and `float` |
+| **Automatic SQLite schema sync** | ✅ `festina.sqlite` opens/creates itself; tables are created, and columns added/dropped/retyped with existing data preserved via a temp-table rebuild — the `claude.md #31` worked examples all pass as tests |
+| Native executables | ✅ `bin/festina program.f -o program` produces a real, standalone binary |
+
+### Deployment: real compilation, minimal setup
+
+claude.md #59 requires minimizing the dependencies needed both to use
+the compiler and to run a compiled program, preferring broader tool
+compatibility over depending on one specific tool, and failing with a
+clear, actionable error when a dependency really is missing. This
+section tracks progress against that requirement — see [Setup](#setup)
+below for the concrete, current dependency list.
+
+Getting Festina closer to "one binary, nothing to install" the way Go
+manages it (Go ships its own compiler *and* linker, statically links its
+runtime, and mostly avoids libc — see the project discussion this table
+tracks). Staged, since a full rewrite of the backend isn't realistic
+right now:
+
+| Stage | What | Status |
+|---|---|---|
+| 1. Static-link sqlite3 into compiled programs | A Festina program built here no longer needs `libsqlite3.so` on the machine that *runs* it (falls back to a normal dynamic link if no static archive is available in the build environment) | ✅ done |
+| 2. Package the compiler frontend as a real binary (no separate Python install to *run the compiler*) | — | not started |
+| 3. Drive libLLVM directly instead of shelling out to the `clang` binary | `festina/llvm_backend.py` compiles the generated LLVM IR to an object file in-process via libLLVM's C API (ctypes) — `clang` is no longer *specifically* required; `gcc` (or any working C compiler/linker) now works too, since the only thing left for it to do is compile `festina_runtime.c` and link plain object files. Falls back to the original clang-only pipeline automatically if libLLVM can't be loaded, so this is purely additive | ✅ done |
+| 4. Embed LLD too, removing the last external dependency (a system linker) | Some C compiler/linker still has to be present to compile `festina_runtime.c` and link — that's a meaningfully smaller ask than clang/LLVM specifically, but not yet zero | not started |
+
+Stages 2 and 4 don't remove anything end users of *compiled Festina
+programs* depend on — they're about what it takes to install and run
+the `festina` compiler itself. Verified concretely, not just reasoned
+about: `gcc` genuinely can't handle a `.ll` file at all (it hands it to
+`ld`, which treats it as a corrupt linker script and fails) — compiling
+the IR ourselves is what actually broadens compiler compatibility, not
+just a style preference.
+
+Known limitations, all deliberate per `claude.md #54`'s ambiguity rule
+(unspecified stays unresolved rather than invented) or explicitly
+scoped out rather than silently missing:
+
+- Arrays have no `.length` or loop construct to iterate one with
+  (claude.md has no `for`/`while` at all), aren't bounds-checked, and
+  their data is `malloc`'d and never freed — claude.md #43 promises
+  automatic memory management this compiler doesn't implement yet (no
+  GC, no refcounting). The same is true of struct storage, which is
+  always heap-allocated (`calloc`) rather than stack-allocated, even for
+  a struct local to one function — a stack-allocated struct's address
+  can genuinely outlive its function (returned, stored in an array or
+  another struct), which used to silently corrupt memory; see the
+  "Struct storage is always heap-allocated" note in
+  `festina/codegen.py`'s module docstring.
+- `bool` has the same "no representable `null`" problem `int`/`float`
+  used to (LLVM's `null` literal is only valid for pointer types, and
+  `i1` has no spare bit pattern) — `bool x = null` still fails to
+  compile. Not fixed: doing so means widening `bool`'s representation
+  everywhere it's stored (fields, params, array elements), well beyond
+  what fixing `int`/`float` needed.
+- Every `arr[T]` lowers to one shared internal type, currently named
+  `_FestinaArray` specifically to make an accidental collision with a
+  same-named user struct unlikely — but Festina's identifier grammar
+  still technically permits a user to write `struct _FestinaArray`, so
+  this lowers the odds without eliminating the possibility.
+- `drawRect`/`drawCircle`/`drawText`/`drawImage`/`loadImage`/`loadAudio`
+  aren't reserved words (unlike `log`/`fail`/`sqlite`, which are lexer
+  keywords) — declaring a function with one of those names silently
+  shadows the builtin at every call site rather than erroring. Left as
+  is since none of them are implemented yet anyway; worth reserving
+  properly once they are.
+
+### Not implemented yet
+
+| Area | Status |
+|---|---|
+| `sqlite()` queries into `arr[Table]` | ❌ schema sync works, fetching/inserting rows doesn't yet |
+| Parameterized queries | ❌ |
+| Graphics (`drawRect`, `img`, Cairo) | ❌ |
+| Audio (`aud`, `loadAudio`) | ❌ |
+| `on eventName` event handlers | ❌ |
+| Multi-file compilation in the CLI | ⚠️ `festina.imports` resolves import graphs and is tested standalone; `bin/festina` itself still only compiles a single file |
+
+`compiler/` in this repository is a separate, older prototype that
+compiles a small JavaScript subset — unrelated to the `festina/` package
+this status section describes.
+
+### Setup
+
+Two different dependency lists, and they're not the same size — this is
+the practical payoff of the staged plan above.
+
+**To *use* the compiler** (`bin/festina program.f`) on a fresh system:
+
+| Dependency | Why | Required? |
+|---|---|---|
+| Python 3 | Runs the compiler frontend itself (`bin/festina` execs `python3 -m festina.cli`) — packaging it as a standalone binary is stage 2, not done yet | Required |
+| A C compiler (`clang` or `gcc`) | Compiles `festina_runtime.c` and links the final binary | Required (either works, per stage 3) |
+| `libsqlite3-dev` (headers) | `festina_runtime.c` does `#include <sqlite3.h>` | Required |
+| `pkg-config` | Locates sqlite3's compile/link flags | Required |
+| `llvm` (provides `libLLVM`) | Lets `festina/llvm_backend.py` compile IR directly (stage 3's fast path, and the one that makes `gcc` usable at all) | Recommended — without it, the C compiler must specifically be `clang`, since only clang can parse `.ll` text (verified: `gcc` hands it to `ld`, which fails treating it as a corrupt linker script) |
+
+Missing any of these fails with a specific, actionable error (claude.md
+#59) rather than a raw traceback — naming the tool and how to get it.
+
+Debian/Ubuntu:
+
+```bash
+sudo apt install clang libsqlite3-dev pkg-config
+```
+
+`clang` conveniently pulls in `libLLVM` as a dependency, covering both
+the fast path and its fallback in one line. (`gcc` works too for the
+fast path, but only if `libLLVM` is separately present — `clang` is the
+simpler single recommendation.) macOS (Homebrew) should be similar in
+spirit — `brew install llvm sqlite pkg-config` — though that combination
+isn't verified in this repo's own test environment the way the
+Debian/Ubuntu one is.
+
+**To *run* a program someone already compiled with Festina**: usually
+nothing beyond libc/libm, already present on essentially any machine —
+confirmed via `ldd` on a compiled binary. The one conditional dependency
+is `libsqlite3.so`, and only if the machine that *compiled* it didn't
+have a static `libsqlite3.a` available (falls back to dynamic linking in
+that case, per stage 1) — check any specific binary with `ldd` to be
+sure.
+
+```bash
+pip install -r requirements-dev.txt   # pytest, for the test suite
+pytest tests/                         # 213 passed
+
+./bin/festina examples/hello.f -o hello
+./hello
 ```
 
 ## Why Festina?
@@ -115,6 +277,50 @@ if ready {
 }
 ```
 
+## Numeric Conversion
+
+> **Status:** implemented, compile-time-checked and runtime-tested — see [Implementation Status](#implementation-status).
+
+`int` and `float` never mix directly — not in arithmetic, and not in comparisons:
+
+```festina
+int a = 5
+float b = 2.5
+float c = a + b     // compile-time error
+```
+
+Convert one side explicitly. Every `int` has a `.toFloat()` method:
+
+```festina
+int a = 5
+float b = 2.5
+float c = a.toFloat() + b
+```
+
+Going from `float` to `int` means picking a rounding rule, so it's a `Math` function rather than a single method:
+
+```festina
+float price = 19.99
+int total = Math.ceil(price) + 3
+```
+
+```text
+Math.floor(x:float) -> int
+Math.ceil(x:float) -> int
+Math.round(x:float) -> int
+Math.trunc(x:float) -> int
+```
+
+Division and modulo by zero don't crash the program — they return `null`:
+
+```festina
+int a = 10
+int b = 0
+int result = a / b   // null, not a crash
+```
+
+This applies to both `int` and `float`. `null` already has no natural bit pattern in a plain `i64`/`double` the way it does for a pointer, so the runtime represents it with a reserved value internally — an implementation detail, not something Festina source code inspects directly.
+
 ## Structs
 
 Structs provide familiar object-like syntax while remaining statically typed.
@@ -136,6 +342,11 @@ user.active = true
 Structs are native in-memory types.
 
 ## Built-in SQLite
+
+> **Status:** automatic table creation and schema sync (the section right
+> after this one) are implemented and tested. `sqlite()` queries and
+> parameterized statements below are not implemented yet — see
+> [Implementation Status](#implementation-status).
 
 SQLite is a first-class part of Festina.
 
@@ -199,6 +410,11 @@ This means database schema changes can be made directly in the Festina source ra
 
 ## Arrays
 
+> **Status:** implemented — literals, indexed read/write, nesting,
+> function params/return values. No `.length` and not bounds-checked
+> (claude.md doesn't specify either); data currently leaks (no GC yet).
+> See [Implementation Status](#implementation-status).
+
 Arrays are strongly typed:
 
 ```festina
@@ -215,6 +431,9 @@ arr[arr[int]] matrix
 ```
 
 ## Graphics
+
+> **Status:** not implemented yet, including the event handlers below —
+> see [Implementation Status](#implementation-status).
 
 Festina includes global graphics functions backed by Cairo.
 
@@ -240,6 +459,8 @@ on click(x:int, y:int) {
 
 ## Audio
 
+> **Status:** not implemented yet — see [Implementation Status](#implementation-status).
+
 Audio uses the `aud` type:
 
 ```festina
@@ -257,6 +478,11 @@ music.isPlaying()
 ```
 
 ## Imports
+
+> **Status:** import resolution (recursive, deduplicated, cycle-checked)
+> is implemented and tested in `festina.imports`, but `bin/festina`
+> doesn't call it yet — it compiles a single file only. See
+> [Implementation Status](#implementation-status).
 
 Festina uses a deliberately simple import system:
 
@@ -303,19 +529,17 @@ Executable
 
 The goal is high performance without sacrificing a familiar development experience.
 
-The compiler executable itself is:
-
-```text
-festina
-```
-
-For example:
+The compiler executable itself is `festina`. In this repository it lives
+at `bin/festina` — a plain file named `festina` can't sit next to a
+`festina/` package directory at the repo root, so the wrapper script is
+one level down instead:
 
 ```bash
-festina main.f
+bin/festina main.f
 ```
 
-produces a native executable.
+produces a native executable (this part is implemented and tested today
+— see [Implementation Status](#implementation-status)).
 
 ## Design Philosophy
 
@@ -332,9 +556,13 @@ Festina is not intended to be JavaScript with a different compiler. It is a comp
 
 ## Project Status
 
-Festina is currently under development.
+See [Implementation Status](#implementation-status) near the top of this
+README for exactly what runs today versus what's still pending, and the
+current test pass rate.
 
-The language specification is evolving alongside the compiler and runtime. Features described here represent the intended direction of the language and may change during development.
+The language specification (`claude.md`) is evolving alongside the
+compiler and runtime. Features described here represent the intended
+direction of the language and may change during development.
 
 ## License
 
