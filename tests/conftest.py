@@ -12,9 +12,9 @@ import pytest
 
 SPEC_UNIMPLEMENTED_REASON = (
     "festina.{mod} is not implemented yet -- claude.md describes the "
-    "Festina language spec, but no `festina` package exists in this repo "
-    "yet (compiler/ is an unrelated JS-subset prototype). "
-    "See tests/CONTRACT.md for the assumed API this suite targets."
+    "Festina language spec, but the `festina` package doesn't have this "
+    "module (yet). See tests/CONTRACT.md for the assumed API this suite "
+    "targets."
 )
 
 

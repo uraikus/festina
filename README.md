@@ -150,10 +150,6 @@ scoped out rather than silently missing:
 | `on eventName` event handlers | ❌ |
 | Multi-file compilation in the CLI | ⚠️ `festina.imports` resolves import graphs and is tested standalone; `bin/festina` itself still only compiles a single file |
 
-`compiler/` in this repository is a separate, older prototype that
-compiles a small JavaScript subset — unrelated to the `festina/` package
-this status section describes.
-
 ### Setup
 
 Two different dependency lists, and they're not the same size — this is

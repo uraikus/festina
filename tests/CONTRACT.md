@@ -69,9 +69,13 @@ handlers all parse and type-check but raise a clear `CodegenError` ("not
 implemented yet") rather than generating IR. `sqlite()` queries no
 longer belong on that list -- see above.
 
-Separately, `compiler/` (`lexer.py`, `parser.py`, `codegen.py`, `jsc.py`)
-remains a different, older prototype that compiles a small JS subset --
-unrelated to `festina/` and not exercised by these tests.
+(An earlier, unrelated JS-subset prototype -- `compiler/`, plus
+`build.sh`/`jit_run.py`/`run_jit.sh` and `runtime/runtime.c` for
+building/running it -- used to live alongside `festina/` in this repo.
+It predated `festina/` and was never exercised by these tests; removed
+as unrelated clutter once `festina/llvm_backend.py` made its
+JIT-without-clang trick (`jit_run.py`'s whole reason for existing)
+redundant for the real language too.)
 
 ## Why the tests are structured this way
 
@@ -259,9 +263,9 @@ festina/
         def available() -> bool           # libLLVM found+loaded in this process?
         def emit_object_file(ir_text, out_path, filename="<ir>") -> None
         class LLVMBackendError(Exception): ...
-        # ctypes bindings against libLLVM's C API (same pattern as this
-        # repo's own top-level jit_run.py, extended for AOT object
-        # emission via LLVMTargetMachineEmitToFile instead of MCJIT).
+        # ctypes bindings against libLLVM's C API for ahead-of-time
+        # object emission (LLVMTargetMachineEmitToFile), not JIT
+        # execution (MCJIT).
         # RelocMode is pinned to PIC to match this system's PIE-by-default
         # linking (verified: LLVMRelocDefault produces relocations `ld`
         # rejects for a PIE). available() is False (never raises) if
