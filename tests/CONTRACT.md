@@ -21,15 +21,22 @@ implicitly in any operator, `int.toFloat()`/`Math.floor/ceil/round/trunc`
 are the only conversions, division/modulo by zero returns `null` instead
 of crashing, and struct/table names live in their own namespace.
 
-"Real compilation, minimal setup" stages 1 and 3 are also done (see
-README.md's "Deployment" section for the full staged plan): sqlite3 is
-statically linked into compiled programs (no libsqlite3.so needed to
-*run* one), and `festina/llvm_backend.py` compiles the generated LLVM IR
-to an object file itself via libLLVM's C API rather than handing a .ll
-file to clang -- clang is no longer specifically required to *use*
-Festina, just some working C compiler (gcc verified working end to end).
-All 211 tests in this directory pass against it (0 skipped, given a
-working C compiler -- see below).
+"Real compilation, minimal setup" stages 1 and 3 -- claude.md #59, added
+alongside these two stages to make the requirement explicit rather than
+implicit in the implementation -- are also done (see README.md's
+"Deployment"/"Setup" sections for the full staged plan and the current
+dependency list): sqlite3 is statically linked into compiled programs
+(no libsqlite3.so needed to *run* one), and `festina/llvm_backend.py`
+compiles the generated LLVM IR to an object file itself via libLLVM's C
+API rather than handing a .ll file to clang -- clang is no longer
+specifically required to *use* Festina, just some working C compiler
+(gcc verified working end to end). Per #59's fourth point,
+`festina/cli.py`'s `_run_tool` also turns a genuinely missing dependency
+(pkg-config, or any C compiler) into a specific, actionable error naming
+it and how to install it, rather than a raw exception -- verified
+directly by hiding each tool from PATH in turn. All 213 tests in this
+directory pass against it (0 skipped, given a working C compiler -- see
+below).
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -87,7 +94,12 @@ full C-compiler skip, since this module doesn't touch a C compiler.
 `test_codegen.py`'s `TestMinimalBuildDependencies` covers the two ends
 of stage 3 concretely: gcc actually producing a working binary when
 libLLVM is available, and the original clang-only pipeline still
-working (via `monkeypatch`) when it isn't.
+working (via `monkeypatch`) when it isn't. `TestMissingDependencyErrors`
+covers claude.md #59's fourth point (a missing dependency must fail
+clearly) by actually hiding pkg-config/cc from a synthetic PATH (a
+`path_without` fixture, via `monkeypatch.setenv`) and asserting on the
+resulting error message, rather than just testing `_run_tool` in
+isolation.
 
 `tests/test_numeric_conversion.py` covers claude.md #55-58 at the
 parser/semantic level only (same `parser`/`semantic`/`errors` fixtures as
@@ -217,6 +229,13 @@ festina/
         #     cc, which must then actually be clang.
         # Single-file only for now (doesn't call festina.imports yet).
         # def main(argv) -> int is the `bin/festina` entry point.
+        # _run_tool(cmd) -> subprocess.CompletedProcess: claude.md #59 --
+        #   wraps every pkg-config/cc invocation so a genuinely missing
+        #   tool raises CompileError("'<tool>' is not installed or not
+        #   on PATH -- <install hint>", category="missing dependency")
+        #   instead of a raw FileNotFoundError (check=False alone does
+        #   NOT catch this case -- it only suppresses a nonzero exit
+        #   code, not a failure to launch the binary at all).
 ```
 
 Runtime ABI: `runtime/festina_runtime.h`/`.c` implement the C side
@@ -231,5 +250,5 @@ executable can't depend on Python at runtime).
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 211 passed, 0 skipped (needs a C compiler)
+pytest tests/                          # 213 passed, 0 skipped (needs a C compiler)
 ```

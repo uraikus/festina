@@ -27,7 +27,7 @@ Festina is under active development. Everything else in this README
 describes the full target language from `claude.md`; this section is
 the ground truth for what actually runs today.
 
-**Test suite:** 211/211 passing, 0 skipped, 0 failed (`pytest tests/`).
+**Test suite:** 213/213 passing, 0 skipped, 0 failed (`pytest tests/`).
 See [`tests/`](tests/) and [`tests/CONTRACT.md`](tests/CONTRACT.md) for
 the spec-driven suite this is measured against — every test cites the
 `claude.md` section it checks.
@@ -56,6 +56,13 @@ runtime, and *runs* as a standalone executable (no Python or the
 | Native executables | ✅ `bin/festina program.f -o program` produces a real, standalone binary |
 
 ### Deployment: real compilation, minimal setup
+
+claude.md #59 requires minimizing the dependencies needed both to use
+the compiler and to run a compiled program, preferring broader tool
+compatibility over depending on one specific tool, and failing with a
+clear, actionable error when a dependency really is missing. This
+section tracks progress against that requirement — see [Setup](#setup)
+below for the concrete, current dependency list.
 
 Getting Festina closer to "one binary, nothing to install" the way Go
 manages it (Go ships its own compiler *and* linker, statically links its
@@ -126,16 +133,49 @@ scoped out rather than silently missing:
 compiles a small JavaScript subset — unrelated to the `festina/` package
 this status section describes.
 
-### Building and running
+### Setup
 
-Requires a C compiler (`clang` or `gcc`) and the `sqlite3` development
-headers (`libsqlite3-dev` on Debian/Ubuntu). `clang` is preferred if
-both are present — it doubles as the fallback path if `libLLVM` can't
-be loaded — but isn't required specifically; see the stage 3 row above.
+Two different dependency lists, and they're not the same size — this is
+the practical payoff of the staged plan above.
+
+**To *use* the compiler** (`bin/festina program.f`) on a fresh system:
+
+| Dependency | Why | Required? |
+|---|---|---|
+| Python 3 | Runs the compiler frontend itself (`bin/festina` execs `python3 -m festina.cli`) — packaging it as a standalone binary is stage 2, not done yet | Required |
+| A C compiler (`clang` or `gcc`) | Compiles `festina_runtime.c` and links the final binary | Required (either works, per stage 3) |
+| `libsqlite3-dev` (headers) | `festina_runtime.c` does `#include <sqlite3.h>` | Required |
+| `pkg-config` | Locates sqlite3's compile/link flags | Required |
+| `llvm` (provides `libLLVM`) | Lets `festina/llvm_backend.py` compile IR directly (stage 3's fast path, and the one that makes `gcc` usable at all) | Recommended — without it, the C compiler must specifically be `clang`, since only clang can parse `.ll` text (verified: `gcc` hands it to `ld`, which fails treating it as a corrupt linker script) |
+
+Missing any of these fails with a specific, actionable error (claude.md
+#59) rather than a raw traceback — naming the tool and how to get it.
+
+Debian/Ubuntu:
+
+```bash
+sudo apt install clang libsqlite3-dev pkg-config
+```
+
+`clang` conveniently pulls in `libLLVM` as a dependency, covering both
+the fast path and its fallback in one line. (`gcc` works too for the
+fast path, but only if `libLLVM` is separately present — `clang` is the
+simpler single recommendation.) macOS (Homebrew) should be similar in
+spirit — `brew install llvm sqlite pkg-config` — though that combination
+isn't verified in this repo's own test environment the way the
+Debian/Ubuntu one is.
+
+**To *run* a program someone already compiled with Festina**: usually
+nothing beyond libc/libm, already present on essentially any machine —
+confirmed via `ldd` on a compiled binary. The one conditional dependency
+is `libsqlite3.so`, and only if the machine that *compiled* it didn't
+have a static `libsqlite3.a` available (falls back to dynamic linking in
+that case, per stage 1) — check any specific binary with `ldd` to be
+sure.
 
 ```bash
 pip install -r requirements-dev.txt   # pytest, for the test suite
-pytest tests/                         # 211 passed
+pytest tests/                         # 213 passed
 
 ./bin/festina examples/hello.f -o hello
 ./hello

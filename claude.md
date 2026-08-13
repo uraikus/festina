@@ -1345,3 +1345,17 @@ int User = 5
 is valid: the struct type User and the variable User do not conflict, because struct/table names and variable/function/constant names are resolved independently. This mirrors the same separation found in many statically typed languages (for example, C's separate tag namespace for struct/enum/union names).
 
 No duplicate-declaration error is required across these two namespaces -- only within each one.
+
+
+59. MINIMAL DEPENDENCIES AND SETUP
+
+Both using the Festina compiler and running a compiled Festina program should require as few external dependencies as practical.
+
+When more than one implementation would satisfy a requirement, prefer the one that:
+
+1. Requires fewer separately-installed tools to compile a Festina program.
+2. Requires fewer runtime dependencies for the resulting executable.
+3. Works with more than one common toolchain (for example, more than one C compiler) rather than depending on a single specific one, when a broader-compatible alternative is available at similar implementation cost.
+4. Fails with a clear, actionable error identifying the missing dependency and how to obtain it, rather than a raw or unclear error, when a required dependency is genuinely missing.
+
+This does not require eliminating every external dependency at any cost. Section 54's ambiguity rules still apply: weigh this against simplicity and performance rather than treating it as an override. It does mean an implementation should not introduce an unnecessary external dependency, or depend on a specific tool where a more common or already-required one would do.

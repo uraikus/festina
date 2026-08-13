@@ -608,3 +608,44 @@ class TestMinimalBuildDependencies:
         result = subprocess.run([str(out)], cwd=tmp_path, capture_output=True, text=True, timeout=15)
         assert result.returncode == 0
         assert result.stdout.strip() == "built via fallback"
+
+
+class TestMissingDependencyErrors:
+    """claude.md #59: a genuinely missing dependency must fail with a
+    clear, actionable message naming it and how to install it -- not a
+    raw exception. Verified directly: subprocess.run(..., check=False)
+    does *not* catch "the executable doesn't exist at all" the way it
+    catches a nonzero exit code, so this needs its own handling
+    (festina/cli.py's _run_tool)."""
+
+    @pytest.fixture
+    def path_without(self, tmp_path, monkeypatch):
+        """A PATH containing everything currently on PATH except the
+        named tool(s), by symlinking every other resolvable tool into an
+        empty dir and pointing PATH at just that dir."""
+        def _make(*hidden_tools):
+            bin_dir = tmp_path / "bin_without_tool"
+            bin_dir.mkdir()
+            needed = {"python3", "bash", "sh", "env", "dirname", "basename",
+                      "pkg-config", "clang", "gcc", "cc", "ld", "as"}
+            for name in needed - set(hidden_tools):
+                found = shutil.which(name)
+                if found:
+                    (bin_dir / name).symlink_to(found)
+            monkeypatch.setenv("PATH", str(bin_dir))
+            return str(bin_dir)
+        return _make
+
+    def test_missing_pkg_config_gives_actionable_error(self, parser, semantic, codegen, cli_mod, errors, tmp_path, path_without):
+        path_without("pkg-config")
+        src = tmp_path / "main.f"
+        src.write_text("log('hi')")
+        with pytest.raises(errors.CompileError, match="pkg-config.*install"):
+            cli_mod.compile_file(str(src), str(tmp_path / "out"), cc="clang")
+
+    def test_missing_cc_gives_actionable_error(self, parser, semantic, codegen, cli_mod, errors, tmp_path, path_without):
+        path_without("clang", "gcc", "cc")
+        src = tmp_path / "main.f"
+        src.write_text("log('hi')")
+        with pytest.raises(errors.CompileError, match="clang.*install"):
+            cli_mod.compile_file(str(src), str(tmp_path / "out"), cc="clang")

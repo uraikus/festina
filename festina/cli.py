@@ -1,4 +1,4 @@
-"""The `festina` compiler CLI -- claude.md #1, #47.
+"""The `festina` compiler CLI -- claude.md #1, #47, #59.
 
     festina main.f              # -> ./main (native executable)
     festina main.f -o app       # -> ./app
@@ -8,8 +8,9 @@ Pipeline (claude.md #47): source -> parse -> semantic analysis -> LLVM IR
 -> object file -> link -> native executable. The resulting executable
 does not need Python or the festina package to run (claude.md #47).
 
-"Real compilation, minimal setup" (see README.md's "Deployment"
-section for the full staged plan):
+"Real compilation, minimal setup" (claude.md #59; see README.md's
+"Deployment"/"Setup" sections for the full staged plan and the current
+dependency list):
 
 - stage 1: sqlite3 is statically linked into the compiled program when a
   static archive is available (_sqlite_link_flags), so a program built
@@ -26,6 +27,14 @@ section for the full staged plan):
   If libLLVM can't be loaded in this process at all,
   _compile_via_clang_ir_frontend below is the original pipeline,
   unchanged, as a fallback -- this is purely additive.
+
+claude.md #59 also requires a genuinely missing dependency to fail with
+a clear, actionable error rather than a raw one -- _run_tool below wraps
+every external-tool invocation for exactly that (verified: without it, a
+missing pkg-config surfaced as a bare "[Errno 2] No such file or
+directory: 'pkg-config'"; check=False alone doesn't catch this, it only
+suppresses a nonzero *exit code*, not a failure to launch the binary at
+all).
 """
 import argparse
 import hashlib
@@ -54,8 +63,40 @@ def _default_output_name(entry_path):
     return base or "a.out"
 
 
+# claude.md #59: a missing dependency must fail with a clear, actionable
+# error naming it and how to get it -- not a raw exception. Centralized
+# here since every external-tool invocation in this module (pkg-config,
+# cc, in either order) can hit "the tool itself doesn't exist," which
+# `subprocess.run(..., check=False)` alone does *not* catch: check=False
+# only suppresses a nonzero *exit code*, not FileNotFoundError from
+# failing to launch a binary that isn't there at all (verified: with
+# pkg-config hidden from PATH, this used to surface as a bare
+# "[Errno 2] No such file or directory: 'pkg-config'").
+_INSTALL_HINTS = {
+    "pkg-config": "install it, e.g. `apt install pkg-config` on Debian/Ubuntu "
+                  "or `brew install pkg-config` on macOS -- used to locate sqlite3's compiler flags",
+    "clang": "install a C compiler, e.g. `apt install clang` on Debian/Ubuntu "
+             "or `brew install llvm` on macOS -- see README.md's Setup section",
+    "gcc": "install a C compiler, e.g. `apt install gcc` on Debian/Ubuntu -- see README.md's Setup section",
+    "cc": "install a C compiler (clang or gcc) -- see README.md's Setup section",
+}
+
+
+def _run_tool(cmd, **kwargs):
+    """subprocess.run, but a missing executable becomes a clear
+    CompileError naming the tool and how to install it, instead of a raw
+    FileNotFoundError."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    except FileNotFoundError:
+        tool = cmd[0]
+        hint = _INSTALL_HINTS.get(tool, "install it and make sure it's on PATH")
+        raise CompileError(f"'{tool}' is not installed or not on PATH -- {hint}",
+                            category="missing dependency")
+
+
 def _pkg_config(*args):
-    result = subprocess.run(["pkg-config", *args], capture_output=True, text=True, check=False)
+    result = _run_tool(["pkg-config", *args], check=False)
     return result.stdout.split()
 
 
@@ -70,7 +111,7 @@ def _can_link(cc, extra_flags):
         out = os.path.join(d, "probe")
         with open(src, "w", encoding="utf-8") as f:
             f.write("int main(void) { return 0; }\n")
-        result = subprocess.run([cc, src, *extra_flags, "-o", out], capture_output=True, text=True)
+        result = _run_tool([cc, src, *extra_flags, "-o", out])
         return result.returncode == 0
 
 
@@ -117,7 +158,7 @@ def _ensure_runtime_object(cc):
 
     cflags = _pkg_config("--cflags", "sqlite3")
     cmd = [cc, "-O2", "-c", _RUNTIME_C, *cflags, "-o", obj_path]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = _run_tool(cmd)
     if result.returncode != 0:
         raise CompileError(f"failed to compile the Festina runtime:\n{result.stderr}", category="link error")
     return obj_path
@@ -162,7 +203,7 @@ def _compile_via_libllvm(ir, entry_path, output_path, cc, link_libs):
                                 file=entry_path, category="codegen error")
         runtime_obj = _ensure_runtime_object(cc)
         cmd = [cc, obj_path, runtime_obj, *link_libs, "-o", output_path]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = _run_tool(cmd)
         if result.returncode != 0:
             raise CompileError(f"native linking failed:\n{result.stderr}",
                                 file=entry_path, category="link error")
@@ -179,7 +220,7 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, link_libs):
         ir_path = tmp.name
     try:
         cmd = [cc, "-O2", ir_path, _RUNTIME_C, *link_libs, "-o", output_path]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = _run_tool(cmd)
         if result.returncode != 0:
             raise CompileError(f"native linking failed:\n{result.stderr}",
                                 file=entry_path, category="link error")
