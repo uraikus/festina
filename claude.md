@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-Festina is a statically typed, LLVM-compiled programming language designed for speed, simplicity, and desktop application development.
+Festina is a statically typed, LLVM-compiled programming language designed for speed, simplicity, and native application development.
 
 Its syntax and conventions are heavily inspired by JavaScript. Festina should remain JavaScript-like unless a deviation is explicitly specified by this language specification.
 
@@ -18,6 +18,7 @@ The primary goals are:
 * Simple syntax familiar to JavaScript developers.
 * Built-in SQLite integration.
 * Built-in graphics and multimedia support.
+* A compiler capable of eventually becoming self-hosting.
 
 Repository:
 
@@ -25,7 +26,7 @@ https://github.com/uraikus/festina
 
 ---
 
-# 2. General Language Philosophy
+# 2. Language Philosophy
 
 Festina should follow JavaScript conventions wherever practical.
 
@@ -43,7 +44,145 @@ Festina should compile to native machine code through LLVM rather than relying o
 
 ---
 
-# 3. Variables and Types
+# 3. Compiler
+
+The Festina compiler itself is distributed as a native executable named:
+
+```text
+festina
+```
+
+The compiler should be capable of accepting a Festina source file as its entry point:
+
+```bash
+festina main.f
+```
+
+The compiler may produce an executable based on the entry filename:
+
+```text
+main
+```
+
+An output filename may be specified:
+
+```bash
+festina main.f -o myapp
+```
+
+which produces:
+
+```text
+myapp
+```
+
+The compiler should eventually support commands such as:
+
+```bash
+festina build main.f
+festina run main.f
+festina check main.f
+festina fmt main.f
+festina version
+```
+
+The exact CLI syntax may evolve, but the `festina` executable should remain the primary compiler and development tool.
+
+---
+
+# 4. Compiler Architecture
+
+The compiler should generally follow this pipeline:
+
+```text
+Festina Source
+      ↓
+Import Resolver
+      ↓
+Unified Compilation Unit
+      ↓
+Lexer
+      ↓
+Parser
+      ↓
+AST
+      ↓
+Semantic Analysis
+      ↓
+Type Checking
+      ↓
+Optimization
+      ↓
+LLVM IR
+      ↓
+LLVM Optimization
+      ↓
+Native Machine Code
+      ↓
+Executable
+```
+
+The compiler should use LLVM as its native code-generation backend.
+
+The initial compiler implementation may be written in a language such as Rust, Zig, C++, or another suitable systems language.
+
+The architecture should be designed so that Festina can eventually compile its own compiler.
+
+---
+
+# 5. Self-Hosting
+
+Festina should be designed with eventual self-hosting as a long-term goal.
+
+The initial compiler may be implemented in another systems programming language.
+
+Once Festina is sufficiently mature, the compiler itself should be capable of being rewritten in Festina.
+
+The intended bootstrapping process is conceptually:
+
+```text
+Stage 1:
+
+Host language compiler
+        ↓
+Festina compiler
+        ↓
+Native festina executable
+```
+
+Then:
+
+```text
+Stage 2:
+
+Host compiler
+        ↓
+Compiles Festina-written Festina compiler
+        ↓
+Native Festina compiler
+```
+
+Eventually:
+
+```text
+Stage 3:
+
+festina
+    ↓
+compiles
+    ↓
+Festina compiler
+    ↓
+new festina
+```
+
+The compiler should therefore avoid architectural decisions that would prevent the language from eventually implementing its own lexer, parser, semantic analyzer, optimizer, CLI, and LLVM backend.
+
+The self-hosted compiler should remain capable of producing the same native executable targets as the original compiler.
+
+---
+
+# 6. Variables and Types
 
 Festina uses explicit static type declarations.
 
@@ -82,7 +221,7 @@ Festina should avoid implicit type coercion.
 
 ---
 
-# 4. Integers and Floating-Point Values
+# 7. Integers and Floating-Point Values
 
 `int` represents an integer value.
 
@@ -94,7 +233,7 @@ Primitive values should be kept in native memory whenever possible.
 
 ---
 
-# 5. Booleans
+# 8. Booleans
 
 Festina provides:
 
@@ -128,7 +267,7 @@ if enabled {
 }
 ```
 
-The language should not allow:
+Invalid:
 
 ```festina
 text name = 'Patrick'
@@ -139,7 +278,7 @@ if name {
 
 ---
 
-# 6. Equality
+# 9. Equality
 
 Festina uses:
 
@@ -169,7 +308,7 @@ if age == 18 {
 
 ---
 
-# 7. Conditional Statements
+# 10. Conditional Statements
 
 Parentheses around `if` conditions are optional.
 
@@ -193,7 +332,7 @@ Festina does not use JavaScript truthy or falsy semantics.
 
 ---
 
-# 8. Ternary Operator
+# 11. Ternary Operator
 
 Festina supports the JavaScript-style ternary operator:
 
@@ -203,7 +342,7 @@ text result = score > 50 ? 'pass' : 'fail'
 
 ---
 
-# 9. Strings
+# 12. Strings
 
 Festina uses JavaScript-like string literals.
 
@@ -224,7 +363,7 @@ log(`Hello ${name}`)
 
 ---
 
-# 10. Semicolons
+# 13. Semicolons
 
 Semicolons are optional.
 
@@ -237,7 +376,7 @@ log(name)
 
 ---
 
-# 11. Functions
+# 14. Functions
 
 Functions use the following syntax:
 
@@ -274,7 +413,7 @@ void func updateUser() {
 
 ---
 
-# 12. Constants
+# 15. Constants
 
 Immutable values are declared using `const`.
 
@@ -289,7 +428,7 @@ The compiler should use the immutability of constants to perform optimizations w
 
 ---
 
-# 13. Arrays
+# 16. Arrays
 
 Arrays are the primary collection type in Festina.
 
@@ -317,7 +456,7 @@ Arrays are the primary non-SQLite collection type in the language.
 
 ---
 
-# 14. Structs
+# 17. Structs
 
 Structs represent typed in-memory objects.
 
@@ -347,7 +486,7 @@ Structs should be represented using native memory rather than SQLite.
 
 ---
 
-# 15. Database Tables
+# 18. Database Tables
 
 SQLite is a first-class part of Festina.
 
@@ -369,7 +508,7 @@ This distinction allows structs to be used for high-performance in-memory data w
 
 ---
 
-# 16. SQLite
+# 19. SQLite
 
 SQLite is globally available.
 
@@ -404,7 +543,7 @@ SQLite should be abstracted from normal language operations while remaining dire
 
 ---
 
-# 17. Memory Management
+# 20. Memory Management
 
 Festina uses automatic memory management while prioritizing native performance.
 
@@ -433,7 +572,7 @@ The compiler should aggressively optimize temporary values, stack allocations, c
 
 ---
 
-# 18. Error Handling
+# 21. Error Handling
 
 Festina uses `fail()` rather than `throw`.
 
@@ -449,7 +588,7 @@ if test != true {
 
 ---
 
-# 19. Logging
+# 22. Logging
 
 Festina uses:
 
@@ -471,7 +610,7 @@ log('Hello World')
 
 ---
 
-# 20. Binary Files
+# 23. Binary Files
 
 `blob` represents arbitrary binary data.
 
@@ -485,7 +624,7 @@ The runtime may load the referenced file into memory as necessary.
 
 ---
 
-# 21. Images
+# 24. Images
 
 `img` represents image resources.
 
@@ -501,9 +640,11 @@ Images may be passed directly to graphics functions:
 drawImage(profile, 0, 0)
 ```
 
+Supported formats are determined by the runtime.
+
 ---
 
-# 22. Audio
+# 25. Audio
 
 `aud` represents audio resources.
 
@@ -526,7 +667,7 @@ The runtime determines which audio formats are supported.
 
 ---
 
-# 23. Graphics
+# 26. Graphics
 
 Festina provides global graphics functions backed by Cairo.
 
@@ -546,11 +687,11 @@ drawText('Hello', 20, 20)
 drawImage(profile, 0, 0)
 ```
 
-Graphics functionality should be exposed primarily through global functions rather than requiring an explicit GUI object.
+Graphics functionality should primarily be exposed through global functions rather than requiring an explicit GUI object.
 
 ---
 
-# 24. Event Listeners
+# 27. Event Listeners
 
 Event listeners are declared directly in Festina source files using `on`.
 
@@ -574,7 +715,7 @@ The runtime automatically registers these handlers with the application event sy
 
 ---
 
-# 25. Enumerations
+# 28. Enumerations
 
 Festina supports enumerations.
 
@@ -599,7 +740,7 @@ Enums should have an efficient native representation.
 
 ---
 
-# 26. Modules and Imports
+# 29. Modules and Imports
 
 Festina uses a compile-time file inclusion system.
 
@@ -623,7 +764,7 @@ causes the compiler to read and incorporate `utils.f` before compiling the progr
 
 ---
 
-## Recursive Imports
+# 30. Recursive Imports
 
 Imported files may themselves import other files.
 
@@ -649,7 +790,7 @@ main.f
       └── graphics.f
 ```
 
-becomes a single compilation unit containing the contents of:
+becomes a single compilation unit containing:
 
 ```text
 graphics.f
@@ -661,7 +802,7 @@ in dependency order.
 
 ---
 
-## Duplicate Imports
+# 31. Duplicate Imports
 
 The compiler must never import the same file more than once.
 
@@ -690,7 +831,7 @@ must not cause `a.f` to be processed twice.
 
 ---
 
-# 27. Compilation Order
+# 32. Compilation Order
 
 Compilation should occur in the following conceptual stages.
 
@@ -698,13 +839,11 @@ Compilation should occur in the following conceptual stages.
 
 The compiler identifies the file supplied as the program's entry file.
 
-For example:
+Example:
 
 ```text
 main.f
 ```
-
----
 
 ## Stage 2: Resolve Imports
 
@@ -713,8 +852,6 @@ The compiler recursively processes every `import` statement.
 Each file is processed only once.
 
 Dependencies must be processed before the files that depend upon them.
-
----
 
 ## Stage 3: Construct Unified Source
 
@@ -730,13 +867,9 @@ Conceptually:
 
 The entry file must be processed last.
 
----
-
 ## Stage 4: Parse
 
 The unified source is parsed into the Festina AST.
-
----
 
 ## Stage 5: Generate Program Entry
 
@@ -766,7 +899,7 @@ The generated function becomes the program's execution entry point.
 
 ---
 
-# 28. Program Startup
+# 33. Program Startup
 
 Imported files must be completely processed before the entry file begins execution.
 
@@ -802,7 +935,7 @@ Top-level executable code in the entry file is placed into the generated entry f
 
 ---
 
-# 29. Top-Level Declarations
+# 34. Top-Level Declarations
 
 The following may exist at file scope:
 
@@ -839,43 +972,29 @@ Imported files should primarily contain declarations, definitions, and reusable 
 
 ---
 
-# 30. Compiler Architecture
+# 35. Runtime Architecture
 
-Festina should compile through LLVM.
+The generated executable should contain or link against the runtime components required by the Festina program.
 
-The compiler should generally follow this pipeline:
+The runtime may provide:
 
-```text
-Festina Source
-      ↓
-Import Resolver
-      ↓
-Unified Compilation Unit
-      ↓
-Lexer
-      ↓
-Parser
-      ↓
-AST
-      ↓
-Semantic Analysis
-      ↓
-Type Checking
-      ↓
-Optimization
-      ↓
-LLVM IR
-      ↓
-LLVM Optimization
-      ↓
-Native Machine Code
-      ↓
-Executable
-```
+* SQLite integration.
+* Cairo graphics.
+* Window management.
+* Event handling.
+* Audio playback.
+* Image loading.
+* File handling.
+* Memory-management support.
+* Standard library functionality.
+
+Runtime functionality should remain as lightweight as possible.
+
+Unused runtime functionality should ideally be excluded from the final executable through compiler and linker optimization.
 
 ---
 
-# 31. Performance Requirements
+# 36. Performance Requirements
 
 Performance is a primary design goal.
 
@@ -893,6 +1012,8 @@ The compiler should:
 * Avoid dynamic typing.
 * Avoid implicit type coercion.
 * Use LLVM optimization capabilities extensively.
+* Minimize runtime startup overhead.
+* Link only the runtime components required by the program when practical.
 
 Language features should not be added merely for flexibility if they introduce significant runtime overhead.
 
@@ -900,7 +1021,7 @@ Festina should provide JavaScript-like syntax with native compiled performance.
 
 ---
 
-# 32. Standard Library Philosophy
+# 37. Standard Library Philosophy
 
 The standard library should favor simple, direct APIs.
 
@@ -921,11 +1042,11 @@ The goal is to avoid unnecessary boilerplate for common operations.
 
 ---
 
-# 33. JavaScript Compatibility Philosophy
+# 38. JavaScript Compatibility Philosophy
 
 Festina is JavaScript-like, not JavaScript-compatible.
 
-Developers should be able to recognize familiar constructs such as:
+Developers should recognize familiar constructs such as:
 
 ```text
 Objects
@@ -946,3 +1067,41 @@ while Festina maintains:
 * No dynamic runtime type system.
 
 When a JavaScript feature conflicts with Festina's performance or type-safety goals, Festina should favor its own statically typed semantics.
+
+---
+
+# 39. Example Festina Program
+
+A minimal Festina application may look like:
+
+```festina
+import database.f
+import ui.f
+
+struct User {
+    id:int
+    name:text
+}
+
+const text appName = 'Festina'
+
+void func greet(user:User) {
+    log(`Hello ${user.name}`)
+}
+
+on click(x:int, y:int) {
+    log(`Clicked at ${x}, ${y}`)
+}
+
+drawRect(0, 0, 100, 100)
+
+User user
+user.id = 1
+user.name = 'Patrick'
+
+greet(user)
+
+log(appName)
+```
+
+The compiler resolves all imports, removes duplicate imports, combines the source files into one compilation unit, analyzes and compiles the complete program through LLVM, generates the native executable, and then begins execution through the automatically generated entry function.
