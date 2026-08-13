@@ -27,7 +27,7 @@ Festina is under active development. Everything else in this README
 describes the full target language from `claude.md`; this section is
 the ground truth for what actually runs today.
 
-**Test suite:** 202/202 passing, 0 skipped, 0 failed (`pytest tests/`).
+**Test suite:** 203/203 passing, 0 skipped, 0 failed (`pytest tests/`).
 See [`tests/`](tests/) and [`tests/CONTRACT.md`](tests/CONTRACT.md) for
 the spec-driven suite this is measured against — every test cites the
 `claude.md` section it checks.
@@ -54,6 +54,25 @@ runtime, and *runs* as a standalone executable (no Python or the
 | **Division/modulo by zero (`claude.md #57`)** | ✅ returns `null` instead of crashing the process, for both `int` and `float` |
 | **Automatic SQLite schema sync** | ✅ `festina.sqlite` opens/creates itself; tables are created, and columns added/dropped/retyped with existing data preserved via a temp-table rebuild — the `claude.md #31` worked examples all pass as tests |
 | Native executables | ✅ `bin/festina program.f -o program` produces a real, standalone binary |
+
+### Deployment: real compilation, minimal setup
+
+Getting Festina closer to "one binary, nothing to install" the way Go
+manages it (Go ships its own compiler *and* linker, statically links its
+runtime, and mostly avoids libc — see the project discussion this table
+tracks). Staged, since a full rewrite of the backend isn't realistic
+right now:
+
+| Stage | What | Status |
+|---|---|---|
+| 1. Static-link sqlite3 into compiled programs | A Festina program built here no longer needs `libsqlite3.so` on the machine that *runs* it (falls back to a normal dynamic link if no static archive is available in the build environment) | ✅ done |
+| 2. Package the compiler frontend as a real binary (no separate Python install to *run the compiler*) | — | not started |
+| 3. Drive libLLVM directly instead of shelling out to the `clang` binary, so using Festina no longer requires a separate clang/LLVM install | — | not started |
+| 4. Embed LLD too, removing the last external dependency (a system linker) | — | not started |
+
+Stages 2-4 don't remove anything end users of *compiled Festina
+programs* depend on — they're about what it takes to install and run
+the `festina` compiler itself.
 
 Known limitations, all deliberate per `claude.md #54`'s ambiguity rule
 (unspecified stays unresolved rather than invented) or explicitly
@@ -110,7 +129,7 @@ on Debian/Ubuntu).
 
 ```bash
 pip install -r requirements-dev.txt   # pytest, for the test suite
-pytest tests/                         # 202 passed
+pytest tests/                         # 203 passed
 
 ./bin/festina examples/hello.f -o hello
 ./hello

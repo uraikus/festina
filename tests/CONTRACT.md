@@ -19,7 +19,7 @@ those exist (see festina/codegen.py's module docstring). claude.md
 real bugs -- see below) are implemented too: int/float never convert
 implicitly in any operator, `int.toFloat()`/`Math.floor/ceil/round/trunc`
 are the only conversions, division/modulo by zero returns `null` instead
-of crashing, and struct/table names live in their own namespace. All 202
+of crashing, and struct/table names live in their own namespace. All 203
 tests in this directory pass against it (0 skipped, given a `clang`
 toolchain -- see below).
 
@@ -193,5 +193,5 @@ executable can't depend on Python at runtime).
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 202 passed, 0 skipped (needs clang)
+pytest tests/                          # 203 passed, 0 skipped (needs clang)
 ```

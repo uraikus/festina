@@ -14,7 +14,9 @@ Two kinds of tests here:
   is on PATH, since that's an environment limitation, not a missing
   Festina feature.
 """
+import shutil
 import sqlite3
+import subprocess
 
 import pytest
 
@@ -529,3 +531,30 @@ class TestAutomaticSqliteSchemaSync:
         result = compile_and_run("log('no tables here')")
         assert result.returncode == 0
         assert not (tmp_path / "festina.sqlite").exists()
+
+
+class TestMinimalRuntimeDependencies:
+    """"Real compilation, minimal setup" stage 1: a compiled program
+    shouldn't need libsqlite3.so installed on the machine that runs it,
+    if a static sqlite3 archive was available at compile time (see
+    festina/cli.py's _sqlite_link_flags)."""
+
+    def test_compiled_binary_does_not_dynamically_link_libsqlite3(self, compile_and_run, tmp_path):
+        # compile_and_run's own fixture skip (no clang) covers this test
+        # too; ldd is the other half of the toolchain this needs.
+        if not shutil.which("ldd"):
+            pytest.skip("ldd not on PATH -- cannot inspect the binary's dynamic dependencies")
+        from festina import cli as cli_mod
+
+        _, statically_linked = cli_mod._sqlite_link_flags(shutil.which("clang"))
+        if not statically_linked:
+            pytest.skip("no static libsqlite3.a available in this environment -- "
+                        "_sqlite_link_flags already fell back to dynamic linking, "
+                        "which is the correct behavior, just not what this test checks")
+
+        compile_and_run("table People {\n    id:int\n}\nlog('built')")
+        binary = tmp_path / "program"
+        assert binary.exists()
+
+        ldd_output = subprocess.run(["ldd", str(binary)], capture_output=True, text=True).stdout
+        assert "libsqlite3" not in ldd_output
