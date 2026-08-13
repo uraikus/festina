@@ -1361,10 +1361,6 @@ When more than one implementation would satisfy a requirement, prefer the one th
 This does not require eliminating every external dependency at any cost. Section 54's ambiguity rules still apply: weigh this against simplicity and performance rather than treating it as an override. It does mean an implementation should not introduce an unnecessary external dependency, or depend on a specific tool where a more common or already-required one would do.
 
 
-59. MINIMAL DEPENDENCIES AND SETUP
-
-(Beginning after the existing section 59 in the original document, add the following new sections.)
-
 60. FOR LOOPS
 
 Festina supports C-style counted loops.

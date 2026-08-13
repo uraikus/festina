@@ -39,6 +39,9 @@ _RELOC_PIC = 2
 _CODEGEN_OPT_DEFAULT = 2  # LLVMCodeGenLevelDefault
 _CODE_MODEL_DEFAULT = 0   # LLVMCodeModelDefault
 _OBJECT_FILE = 1          # LLVMObjectFile (LLVMCodeGenFileType)
+# LLVMRunPasses pipeline text -- matches what `clang -O2` runs on IR
+# before handing it to the backend (see the _bind() docstring note).
+_OPT_PASSES = "default<O2>"
 
 # LLVMInitializeX86Target() etc. are per-architecture symbols (the
 # "native target" macro clang normally expands at compile time doesn't
@@ -118,6 +121,26 @@ class _Binding:
         self.emit_to_file = fn("LLVMTargetMachineEmitToFile", ctypes.c_bool,
                                 [c_void_p, c_void_p, c_char_p, c_int, ctypes.POINTER(c_char_p)])
 
+        # LLVMRunPasses (the "new pass manager" C API, LLVM 13+): runs the
+        # actual IR-level optimization pipeline (mem2reg, inlining,
+        # tail-call opt, GVN, ...) that CodeGenOptLevel alone does NOT --
+        # that only tunes the backend's instruction selection/scheduling.
+        # Without this, every local var stays a stack alloca with
+        # explicit reloads and no call ever gets inlined/tail-call
+        # optimized; verified concretely (see the project's benchmark
+        # discussion) that skipping this step alone accounted for
+        # Festina running ~2x slower than clang/gcc -O2 on identical
+        # logic -- running "default<O2>" here closed nearly the entire
+        # gap. `clang -O2` on a .ll file (the fallback path) already gets
+        # this for free from its own driver; this fast path has to ask
+        # for it explicitly since it talks to libLLVM directly.
+        self.create_pass_builder_options = fn("LLVMCreatePassBuilderOptions", c_void_p, [])
+        self.dispose_pass_builder_options = fn("LLVMDisposePassBuilderOptions", None, [c_void_p])
+        self.run_passes = fn("LLVMRunPasses", c_void_p,
+                              [c_void_p, c_char_p, c_void_p, c_void_p])
+        self.get_error_message = fn("LLVMGetErrorMessage", c_char_p, [c_void_p])
+        self.dispose_error_message = fn("LLVMDisposeErrorMessage", None, [c_char_p])
+
 
 _binding_instance = None
 
@@ -179,6 +202,21 @@ def emit_object_file(ir_text, out_path, filename="<ir>"):
                                   _CODEGEN_OPT_DEFAULT, _RELOC_PIC, _CODE_MODEL_DEFAULT)
     if not tm:
         raise LLVMBackendError("failed to create an LLVM target machine")
+
+    # See the _bind() docstring note on run_passes: this is the step that
+    # actually optimizes the IR (mem2reg, inlining, tail-call opt, ...),
+    # not just tunes backend instruction selection.
+    pb_options = b.create_pass_builder_options()
+    try:
+        pass_err = b.run_passes(mod, _OPT_PASSES.encode("ascii"), tm, pb_options)
+        if pass_err:
+            msg_ptr = b.get_error_message(pass_err)
+            message = msg_ptr.decode(errors="replace") if msg_ptr else "unknown optimization error"
+            if msg_ptr:
+                b.dispose_error_message(msg_ptr)
+            raise LLVMBackendError(f"LLVM optimization passes failed: {message}")
+    finally:
+        b.dispose_pass_builder_options(pb_options)
 
     emit_err = ctypes.c_char_p()
     if b.emit_to_file(tm, mod, out_path.encode("utf-8"), _OBJECT_FILE, ctypes.byref(emit_err)):
