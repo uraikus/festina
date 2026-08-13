@@ -1,10 +1,11 @@
 """Code generation -- claude.md #47 (executable generation), plus the
-runtime-facing halves of #7/#8 (entry point + startup), #28-31 (automatic
-SQLite schema sync), #41/#42 (log/fail), #45 (string interpolation).
+runtime-facing halves of #7/#8 (entry point + startup), #26 (arrays),
+#28-31 (automatic SQLite schema sync), #41/#42 (log/fail), #45 (string
+interpolation).
 
 Two kinds of tests here:
 
-- CodegenError tests for not-yet-implemented constructs (arrays, sqlite()
+- CodegenError tests for not-yet-implemented constructs (sqlite()
   queries, graphics, audio, events) only need festina.codegen itself --
   no C toolchain required, so they always run.
 - End-to-end tests actually compile a Festina program to a native
@@ -25,10 +26,6 @@ class TestNotImplementedYet:
         program = parser.parse(source, filename=filename)
         analyzed = semantic.analyze(program, filename=filename)
         return codegen.generate_ir(program, analyzed, filename=filename)
-
-    def test_array_declaration_is_not_implemented(self, parser, semantic, codegen, errors):
-        with pytest.raises(errors.CompileError, match="array"):
-            self._generate(parser, semantic, codegen, "arr[int] values")
 
     def test_sqlite_query_is_not_implemented(self, parser, semantic, codegen, errors):
         source = "table People {\n    id:int\n}\narr[People] people = sqlite('SELECT * FROM People')"
@@ -177,6 +174,98 @@ class TestStructs:
         """
         result = compile_and_run(source)
         assert result.stdout.strip() == "42"
+
+
+class TestArrays:
+    """claude.md #26: arr[T] with elements sized/typed at compile time,
+    from a literal, read and written by index. No .length, no growth, no
+    loop construct -- claude.md doesn't specify any of those (see the
+    module docstring in festina/codegen.py), so they aren't implemented."""
+
+    def test_literal_index_read(self, compile_and_run):
+        result = compile_and_run("arr[int] nums = [10, 20, 30]\nlog(nums[0])\nlog(nums[2])")
+        assert result.stdout.splitlines() == ["10", "30"]
+
+    def test_indexed_write(self, compile_and_run):
+        source = """
+        arr[int] nums = [1, 2, 3]
+        nums[1] = 99
+        log(nums[1])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "99"
+
+    def test_index_by_variable_expression(self, compile_and_run):
+        source = """
+        arr[int] nums = [5, 6, 7]
+        int i = 2
+        log(nums[i])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "7"
+
+    def test_array_of_floats_and_text(self, compile_and_run):
+        source = """
+        arr[float] prices = [1.5, 2.5, 3.0]
+        arr[text] names = ['a', 'b', 'c']
+        log(prices[1])
+        log(names[2])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["2.5", "c"]
+
+    def test_declaration_without_initializer(self, compile_and_run):
+        # claude.md #26's own examples (`arr[int] numbers`) have no
+        # initializer.
+        result = compile_and_run("arr[int] empty\nlog('declared fine')")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "declared fine"
+
+    def test_nested_arrays(self, compile_and_run):
+        # claude.md #26: "Nested arrays are valid: arr[arr[int]] matrix".
+        source = """
+        arr[arr[int]] matrix = [[1, 2], [3, 4]]
+        log(matrix[0][1])
+        log(matrix[1][0])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["2", "3"]
+
+    def test_array_as_function_parameter_and_return_value(self, compile_and_run):
+        source = """
+        int func sum3(nums:arr[int]) {
+            return nums[0] + nums[1] + nums[2]
+        }
+        arr[int] func makeRange(a:int, b:int) {
+            return [a, b, a + b]
+        }
+        log(sum3([1, 2, 3]))
+        arr[int] r = makeRange(3, 4)
+        log(r[0])
+        log(r[1])
+        log(r[2])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["6", "3", "4", "7"]
+
+    def test_array_of_structs(self, compile_and_run):
+        source = """
+        struct Point {
+            x:int
+            y:int
+        }
+        Point p1
+        p1.x = 1
+        p1.y = 2
+        Point p2
+        p2.x = 3
+        p2.y = 4
+        arr[Point] points = [p1, p2]
+        log(points[0].x)
+        log(points[1].y)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "4"]
 
 
 class TestFail:

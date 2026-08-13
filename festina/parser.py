@@ -156,7 +156,7 @@ class Parser:
         if t.type == "func":
             raise self.err(t, "invalid function declaration",
                             "functions require an explicit return type, e.g. 'text func name() { }'")
-        if self.peek(1).type == "func":
+        if self._starts_func_decl():
             return self.parse_func_decl()
         if t.type == "LBRACE":
             return self.parse_block()
@@ -175,6 +175,32 @@ class Parser:
         if t0.type == "IDENT" and t1.type == "IDENT":
             return True
         return False
+
+    def _starts_func_decl(self):
+        """True if the statement at the current position is
+        `<return-type> func name(...)`. A plain `self.peek(1).type ==
+        'func'` isn't enough once the return type is `arr[T]` -- that's
+        multiple tokens (arr, [, T, ]), possibly nested (arr[arr[int]]),
+        so this walks past a full type expression first."""
+        end = self._type_expr_end(self.i)
+        return self.toks[end].type == "func"
+
+    def _type_expr_end(self, i):
+        """Index of the token just past the type expression starting at
+        token i, without consuming anything. Doesn't validate the type is
+        well-formed -- parse_type() does that once we actually parse it;
+        this only needs to skip past it far enough to check for 'func'."""
+        if i >= len(self.toks):
+            return i
+        if self.toks[i].type == "arr":
+            i += 1
+            if i < len(self.toks) and self.toks[i].type == "LBRACK":
+                i += 1
+                i = self._type_expr_end(i)
+                if i < len(self.toks) and self.toks[i].type == "RBRACK":
+                    i += 1
+            return i
+        return i + 1
 
     def parse_import(self):
         self.eat("import")

@@ -1,22 +1,47 @@
 """LLVM IR code generation -- claude.md #47 (executable generation) and
-the runtime-facing halves of #7/#8 (entry point + startup), #29-31
-(automatic SQLite schema sync), #41/#42 (log/fail), #45 (string
+the runtime-facing halves of #7/#8 (entry point + startup), #26 (arrays),
+#29-31 (automatic SQLite schema sync), #41/#42 (log/fail), #45 (string
 interpolation).
 
 Scope: primitives (int/float/bool/text), global and local variables and
 constants, functions, if/else, return, the full expression grammar
 (arithmetic/comparison/logical/ternary/template strings), structs
-(stack-allocated, GEP field access), and automatic table schema sync
-against festina.sqlite via the festina_runtime C helpers.
+(stack-allocated, GEP field access), arrays (arr[T] literals, indexed
+get/set, nesting -- see the FESTINA_ARRAY_LLVM_TYPE note below), and
+automatic table schema sync against festina.sqlite via the
+festina_runtime C helpers.
 
 NOT implemented yet (raises CodegenError with a clear message):
-arrays (arr[T] as a real data structure), sqlite() queries and
-parameterized statements, graphics (img/drawRect/...), audio
+sqlite() queries and parameterized statements (so arr[Table] stays
+unusable -- claude.md never defines a way to construct a Table-typed
+value without a query), graphics (img/drawRect/...), audio
 (aud/loadAudio/...), and `on eventName` event handlers. See README.md
 for the up-to-date status list.
 
 Uses LLVM's opaque-pointer IR (`ptr` everywhere) to match clang 15+'s
 default, so no manual bitcasting between pointer "flavors" is needed.
+
+Array representation: claude.md #26 specifies arr[T]'s type-resolution
+rules but not its runtime representation, push/pop-style operations, a
+length accessor, or any loop construct to iterate one with (the spec has
+no `for`/`while` at all) -- claude.md #54's ambiguity rule says to treat
+undefined behavior as unresolved rather than invent it, so this codegen
+only implements what #26 actually specifies: declaring an arr[T]
+(elements sized and typed at compile time -- #26's own wording),
+constructing one from an array literal, and reading/writing an element
+by an arbitrary index expression. No `.length`, no growth, no bounds
+checking (documented in README.md as a known gap, consistent with #14's
+performance-first / low-runtime-overhead priority in the absence of a
+spec requirement either way).
+
+Every arr[T], regardless of T, lowers to the same fixed-size aggregate
+`%struct.FestinaArray = type { i64, ptr }` (length, data pointer) --
+Festina's own type system (not the generated IR) is what keeps different
+arr[T] values from mixing, exactly like festina.types keeps
+PrimitiveType/StructType/etc. distinct without a runtime tag (claude.md
+#11). The data pointer is malloc'd and never freed -- claude.md #43
+promises automatic memory management the compiler doesn't implement yet
+(no GC, no refcounting runtime), so for now arrays leak; see README.md.
 """
 from . import ast
 from . import types as types_mod
@@ -27,6 +52,8 @@ BOOL = types_mod.PrimitiveType("bool")
 INT = types_mod.PrimitiveType("int")
 FLOAT = types_mod.PrimitiveType("float")
 TEXT = types_mod.PrimitiveType("text")
+
+FESTINA_ARRAY_LLVM_TYPE = "%struct.FestinaArray"
 
 
 class CodegenError(CompileError):
@@ -42,7 +69,7 @@ def _llvm_type(t):
     if isinstance(t, types_mod.StructType):
         return "ptr"
     if isinstance(t, types_mod.ArrayType):
-        raise CodegenError("arrays (arr[T]) are not implemented yet")
+        return FESTINA_ARRAY_LLVM_TYPE
     if isinstance(t, types_mod.TableType):
         raise CodegenError(
             "table-typed values are not implemented yet (only automatic "
@@ -170,10 +197,13 @@ class CodeGen:
             "declare i1 @festina_str_eq(ptr, ptr)",
             "declare ptr @festina_db_open()",
             "declare void @festina_sync_table(ptr, ptr, ptr, ptr, i32)",
+            "declare ptr @malloc(i64)",
         ]
 
     def _struct_type_defs(self):
-        lines = []
+        # claude.md #26: every arr[T] -- regardless of T -- lowers to the
+        # same fixed-size {length, data} header; see the module docstring.
+        lines = [f"{FESTINA_ARRAY_LLVM_TYPE} = type {{ i64, ptr }}"]
         for name in self.struct_order:
             fields = self.struct_fields(name)
             field_types = ", ".join(_llvm_type(t) for _, t in fields)
@@ -205,6 +235,12 @@ class CodeGen:
             return "0"
         if llvm_ty == "double":
             return "0.0"
+        if llvm_ty.startswith("%struct."):
+            # Named aggregate types (currently just FESTINA_ARRAY_LLVM_TYPE
+            # reaches this branch -- struct-typed globals are handled
+            # separately in _global_var_defs) can't use "null"; a plain
+            # "ptr null" only works for actual pointer types.
+            return "zeroinitializer"
         return "null"
 
     def _string_const_defs(self):
@@ -309,7 +345,7 @@ class CodeGen:
             lines.append(f"  {slot} = alloca {llvm_ty}")
             env.define(stmt.name, slot, type_)
             if stmt.init is not None:
-                val, vtype = self._emit_expr(stmt.init, env, lines)
+                val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
                 val = self._coerce(val, vtype, type_, lines)
                 lines.append(f"  store {llvm_ty} {val}, ptr {slot}")
             return
@@ -322,7 +358,7 @@ class CodeGen:
                     self._emit_expr(stmt.value, env, lines)  # side effects only
                 lines.append("  ret void")
             else:
-                val, vtype = self._emit_expr(stmt.value, env, lines)
+                val, vtype = self._emit_value_for(stmt.value, env, lines, return_type)
                 val = self._coerce(val, vtype, return_type, lines)
                 lines.append(f"  ret {_llvm_type(return_type)} {val}")
             ctx["terminated"] = True
@@ -418,6 +454,12 @@ class CodeGen:
             return out, type_
         if isinstance(expr, ast.Member):
             return self._emit_member_load(expr, env, lines)
+        if isinstance(expr, ast.ArrayLit):
+            # No contextual element type here -- reached only when an
+            # array literal appears somewhere _emit_value_for's callers
+            # don't thread a declared type through (e.g. nested inside
+            # another expression). Falls back to the elements' own type.
+            return self._emit_array_lit(expr, env, lines, expected_type=None)
         if isinstance(expr, ast.Assign):
             return self._emit_assign(expr, env, lines)
         if isinstance(expr, ast.Ternary):
@@ -466,6 +508,80 @@ class CodeGen:
             raise CodegenError(f"cannot interpolate a value of type {types_mod.type_name(type_)}")
         return out
 
+    def _emit_value_for(self, node, env, lines, expected_type):
+        """Like _emit_expr, but for positions where the *declared* type is
+        already known (a var's declared type, a param's type, a function's
+        return type) -- lets an array literal pick its element type from
+        context instead of guessing from its own elements."""
+        if isinstance(node, ast.ArrayLit):
+            return self._emit_array_lit(node, env, lines, expected_type)
+        return self._emit_expr(node, env, lines)
+
+    def _sizeof(self, llvm_ty, lines):
+        """sizeof(llvm_ty) as a runtime i64, via the standard
+        getelementptr-on-null trick -- avoids reimplementing LLVM's
+        struct layout/alignment rules in Python."""
+        ptr_val = self.tmp()
+        lines.append(f"  {ptr_val} = getelementptr {llvm_ty}, ptr null, i64 1")
+        size_val = self.tmp()
+        lines.append(f"  {size_val} = ptrtoint ptr {ptr_val} to i64")
+        return size_val
+
+    def _emit_array_lit(self, expr, env, lines, expected_type=None):
+        # claude.md #26: "Arrays may contain supported primitive types,
+        # structs, tables, and other array types" -- table elements are
+        # rejected by _llvm_type(TableType) below, since there's no way
+        # to construct a Table-typed value without sqlite() queries yet.
+        expected_elem = expected_type.element if isinstance(expected_type, types_mod.ArrayType) else None
+
+        values = []
+        elem_type = expected_elem
+        for e in expr.elements:
+            if isinstance(e, ast.ArrayLit) and isinstance(expected_elem, types_mod.ArrayType):
+                val, vtype = self._emit_array_lit(e, env, lines, expected_elem)
+            else:
+                val, vtype = self._emit_value_for(e, env, lines, expected_elem)
+            if expected_elem is not None:
+                val = self._coerce(val, vtype, expected_elem, lines)
+                vtype = expected_elem
+            values.append(val)
+            elem_type = elem_type or vtype
+
+        if elem_type is None:
+            raise CodegenError(
+                "cannot infer the element type of an empty array literal without a declared type",
+                file=self.filename, line=getattr(expr, "line", 0),
+            )
+        elem_llvm_ty = _llvm_type(elem_type)
+        n = len(values)
+
+        header = f"%arr.hdr.{self._unique()}"
+        lines.append(f"  {header} = alloca {FESTINA_ARRAY_LLVM_TYPE}")
+        len_ptr = self.tmp()
+        lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
+        lines.append(f"  store i64 {n}, ptr {len_ptr}")
+
+        data_ptr = self.tmp()
+        if n == 0:
+            lines.append(f"  {data_ptr} = call ptr @malloc(i64 0)")
+        else:
+            elem_size = self._sizeof(elem_llvm_ty, lines)
+            total_size = self.tmp()
+            lines.append(f"  {total_size} = mul i64 {elem_size}, {n}")
+            lines.append(f"  {data_ptr} = call ptr @malloc(i64 {total_size})")
+            for i, val in enumerate(values):
+                elem_ptr = self.tmp()
+                lines.append(f"  {elem_ptr} = getelementptr {elem_llvm_ty}, ptr {data_ptr}, i64 {i}")
+                lines.append(f"  store {elem_llvm_ty} {val}, ptr {elem_ptr}")
+
+        data_field_ptr = self.tmp()
+        lines.append(f"  {data_field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
+        lines.append(f"  store ptr {data_ptr}, ptr {data_field_ptr}")
+
+        out = self.tmp()
+        lines.append(f"  {out} = load {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}")
+        return out, types_mod.ArrayType(elem_type)
+
     def _emit_member_load(self, expr, env, lines):
         ptr, ftype = self._member_ptr(expr, env, lines)
         out = self.tmp()
@@ -474,8 +590,20 @@ class CodeGen:
 
     def _member_ptr(self, expr, env, lines):
         if expr.computed:
-            raise CodegenError("computed member access (arr[i]) is not implemented yet",
-                                file=self.filename, line=getattr(expr, "line", 0))
+            # claude.md #26: arr[i] -- `expr.prop` is the index expression
+            # (see parser.parse_call_member), not a field name.
+            obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+            if not isinstance(obj_type, types_mod.ArrayType):
+                raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",
+                                    file=self.filename, line=getattr(expr, "line", 0))
+            idx_val, _ = self._emit_expr(expr.prop, env, lines)
+            data_ptr = self.tmp()
+            lines.append(f"  {data_ptr} = extractvalue {FESTINA_ARRAY_LLVM_TYPE} {obj_val}, 1")
+            elem_type = obj_type.element
+            elem_llvm_ty = _llvm_type(elem_type)
+            out = self.tmp()
+            lines.append(f"  {out} = getelementptr {elem_llvm_ty}, ptr {data_ptr}, i64 {idx_val}")
+            return out, elem_type
         obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
         if not isinstance(obj_type, types_mod.StructType):
             raise CodegenError(f"cannot access field '{expr.prop}' on {types_mod.type_name(obj_type)}",
@@ -488,18 +616,22 @@ class CodeGen:
         return out, ftype
 
     def _emit_assign(self, expr, env, lines):
-        val, vtype = self._emit_expr(expr.value, env, lines)
+        # The target's declared type is resolved *before* the value, so an
+        # array-literal RHS (e.g. `nums = [4, 5, 6]`) can pick its element
+        # type from the target instead of guessing from its own elements.
         if isinstance(expr.target, ast.Identifier):
             found = env.lookup(expr.target.name)
             if found is None:
                 raise CodegenError(f"unknown variable '{expr.target.name}'",
                                     file=self.filename, line=expr.target.line)
             ref, ttype = found
+            val, vtype = self._emit_value_for(expr.value, env, lines, ttype)
             val = self._coerce(val, vtype, ttype, lines)
             lines.append(f"  store {_llvm_type(ttype)} {val}, ptr {ref}")
             return val, ttype
         if isinstance(expr.target, ast.Member):
             ptr, ftype = self._member_ptr(expr.target, env, lines)
+            val, vtype = self._emit_value_for(expr.value, env, lines, ftype)
             val = self._coerce(val, vtype, ftype, lines)
             lines.append(f"  store {_llvm_type(ftype)} {val}, ptr {ptr}")
             return val, ftype
@@ -645,8 +777,8 @@ class CodeGen:
                 decl = self.func_decls[name]
                 arg_vals = []
                 for arg_expr, param in zip(expr.args, decl.params):
-                    val, vtype = self._emit_expr(arg_expr, env, lines)
                     ptype = self._resolve(param.type_expr, decl)
+                    val, vtype = self._emit_value_for(arg_expr, env, lines, ptype)
                     val = self._coerce(val, vtype, ptype, lines)
                     arg_vals.append(f"{_llvm_type(ptype)} {val}")
                 ret_ref, ret_type = env.lookup(name)
@@ -708,7 +840,7 @@ class CodeGen:
         if isinstance(stmt, ast.VarDecl):
             ref, type_ = env.lookup(stmt.name)
             if stmt.init is not None:
-                val, vtype = self._emit_expr(stmt.init, env, lines)
+                val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
                 val = self._coerce(val, vtype, type_, lines)
                 lines.append(f"  store {_llvm_type(type_)} {val}, ptr {ref}")
             return

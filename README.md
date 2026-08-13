@@ -27,7 +27,7 @@ Festina is under active development. Everything else in this README
 describes the full target language from `claude.md`; this section is
 the ground truth for what actually runs today.
 
-**Test suite:** 155/155 passing, 0 skipped, 0 failed (`pytest tests/`).
+**Test suite:** 162/162 passing, 0 skipped, 0 failed (`pytest tests/`).
 See [`tests/`](tests/) and [`tests/CONTRACT.md`](tests/CONTRACT.md) for
 the spec-driven suite this is measured against — every test cites the
 `claude.md` section it checks.
@@ -49,14 +49,22 @@ runtime, and *runs* as a standalone executable (no Python or the
 | String interpolation | ✅ `` `Hello ${name}` `` |
 | `log()` / `fail()` | ✅ |
 | Structs | ✅ declaration, field read/write, passed to functions |
+| **Arrays (`arr[T]`)** | ✅ literals, indexed read/write by any index expression, nesting, as function params/return values, as struct-array elements — see the caveats below and in `festina/codegen.py`'s module docstring |
 | **Automatic SQLite schema sync** | ✅ `festina.sqlite` opens/creates itself; tables are created, and columns added/dropped/retyped with existing data preserved via a temp-table rebuild — the `claude.md #31` worked examples all pass as tests |
 | Native executables | ✅ `bin/festina program.f -o program` produces a real, standalone binary |
+
+Two known caveats on arrays, both because claude.md #26 never specifies
+this behavior (per #54's ambiguity rule, unspecified stays unresolved
+rather than invented): there's no `.length` or loop construct to iterate
+one with (claude.md has no `for`/`while` at all), and array data is
+`malloc`'d and never freed — claude.md #43 promises automatic memory
+management this compiler doesn't implement yet (no GC, no refcounting).
+Indexing also isn't bounds-checked.
 
 ### Not implemented yet
 
 | Area | Status |
 |---|---|
-| `arr[T]` as a real data structure | ❌ parses and type-checks; codegen raises a clear "not implemented yet" error |
 | `sqlite()` queries into `arr[Table]` | ❌ schema sync works, fetching/inserting rows doesn't yet |
 | Parameterized queries | ❌ |
 | Graphics (`drawRect`, `img`, Cairo) | ❌ |
@@ -75,7 +83,7 @@ on Debian/Ubuntu).
 
 ```bash
 pip install -r requirements-dev.txt   # pytest, for the test suite
-pytest tests/                         # 155 passed
+pytest tests/                         # 162 passed
 
 ./bin/festina examples/hello.f -o hello
 ./hello
@@ -266,8 +274,10 @@ This means database schema changes can be made directly in the Festina source ra
 
 ## Arrays
 
-> **Status:** not implemented yet. `arr[T]` type-checks correctly, but
-> codegen raises a clear error for it — see [Implementation Status](#implementation-status).
+> **Status:** implemented — literals, indexed read/write, nesting,
+> function params/return values. No `.length` and not bounds-checked
+> (claude.md doesn't specify either); data currently leaks (no GC yet).
+> See [Implementation Status](#implementation-status).
 
 Arrays are strongly typed:
 

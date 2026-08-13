@@ -10,12 +10,16 @@ needs neither Python nor `festina/` to run. Automatic SQLite table
 creation and schema synchronization (claude.md #28-31) is implemented
 for real against `festina.sqlite`, including the temp-table rebuild path
 for dropped/retyped columns, with data preservation verified by the
-`claude.md #31` worked examples as tests. All 155 tests in this
-directory pass against it (0 skipped, given a `clang` toolchain -- see
-below).
+`claude.md #31` worked examples as tests. Arrays (claude.md #26) are
+implemented too -- literals, indexed get/set, nesting, function
+params/return values -- though claude.md never specifies `.length`,
+bounds checking, or a loop construct to iterate one with, so none of
+those exist (see festina/codegen.py's module docstring). All 162 tests
+in this directory pass against it (0 skipped, given a `clang` toolchain
+-- see below).
 
 See README.md's "Implementation Status" section for the current
-implemented-vs-not matrix; the short version: arrays, `sqlite()` queries,
+implemented-vs-not matrix; the short version: `sqlite()` queries,
 graphics, audio, and event handlers all parse and type-check but raise a
 clear `CodegenError` ("not implemented yet") rather than generating IR.
 
@@ -40,9 +44,9 @@ runtime and runs the resulting binary. That fixture skips (with a
 distinct, toolchain-specific reason) if `clang` isn't on `PATH` --
 unlike the `SPEC_UNIMPLEMENTED_REASON` skips above, this isn't "the
 feature doesn't exist," it's "this environment can't link native code."
-Tests for constructs codegen genuinely doesn't support yet (arrays,
-`sqlite()` queries, graphics, audio, events) don't need `clang` at all --
-they only call `festina.codegen.generate_ir()` and assert it raises.
+Tests for constructs codegen genuinely doesn't support yet (`sqlite()`
+queries, graphics, audio, events) don't need `clang` at all -- they only
+call `festina.codegen.generate_ir()` and assert it raises.
 
 ## Public API implemented
 
@@ -119,9 +123,11 @@ festina/
         # emits opaque-pointer LLVM IR text. Supports: primitives,
         # global/local vars & consts, functions, if/else, the full
         # expression grammar, structs (stack-allocated, GEP field
-        # access), automatic table schema sync via the festina_runtime
-        # C helpers. Raises CodegenError (a CompileError subclass,
-        # category="not implemented") for arr[T], sqlite() queries,
+        # access), arrays (arr[T] literals + indexed get/set + nesting,
+        # all arr[T] lowered to one fixed {i64 length, ptr data} type --
+        # see the module docstring), automatic table schema sync via the
+        # festina_runtime C helpers. Raises CodegenError (a CompileError
+        # subclass, category="not implemented") for sqlite() queries,
         # graphics, audio, and event handlers.
 
     cli.py
@@ -145,5 +151,5 @@ executable can't depend on Python at runtime).
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 155 passed, 0 skipped (needs clang)
+pytest tests/                          # 162 passed, 0 skipped (needs clang)
 ```
