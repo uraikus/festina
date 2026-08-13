@@ -1,6 +1,6 @@
-Festina — AI Agent Implementation Specification
+FESTINA — AI AGENT IMPLEMENTATION SPECIFICATION
 
-PROJECT
+1. PROJECT
 
 Festina is a statically typed programming language designed for high-performance native applications.
 
@@ -23,68 +23,72 @@ Performance > Flexibility
 
 Secondary priorities:
 
-Simplicity
-Predictability
-Static typing
-Low runtime overhead
-Familiar syntax
-Native performance
-CORE IMPLEMENTATION PRINCIPLES
+- Simplicity
+- Predictability
+- Static typing
+- Low runtime overhead
+- Familiar syntax
+- Native performance
+
+
+2. CORE IMPLEMENTATION PRINCIPLES
 
 An AI agent implementing Festina must follow these principles:
 
-Do not invent language behavior that is not specified.
-Prefer compile-time validation over runtime validation.
-Prefer native LLVM representations over runtime abstractions.
-Do not introduce JavaScript-style implicit coercion.
-Do not introduce JavaScript truthy/falsy behavior.
-Keep primitive values in native memory.
-Keep struct values separate from SQLite.
-Treat table as a database-backed type.
-Resolve all types during semantic analysis.
-Resolve all imports before compilation.
-Never import the same file twice.
-Generate the program entry point automatically.
-Do not require the programmer to explicitly initialize SQLite.
-All default SQLite operations use festina.sqlite.
-Preserve the distinction between compile-time declarations and runtime execution.
-COMPILER PIPELINE
+1. Do not invent language behavior that is not specified.
+2. Prefer compile-time validation over runtime validation.
+3. Prefer native LLVM representations over unnecessary runtime abstractions.
+4. Do not introduce JavaScript-style implicit coercion.
+5. Do not introduce JavaScript truthy/falsy behavior.
+6. Resolve all types during semantic analysis.
+7. Resolve all imports before compilation.
+8. Never import the same file more than once.
+9. Generate the program entry point automatically.
+10. SQLite requires no explicit initialization by the programmer.
+11. All default SQLite operations use festina.sqlite.
+12. The Festina source declaration is authoritative for SQLite table schemas.
+13. Preserve the distinction between compile-time declarations and runtime execution.
+14. Prefer simple implementations with low runtime overhead.
+
+
+3. COMPILER PIPELINE
 
 The compiler should follow this conceptual pipeline:
 
 Source Files
-↓
+    ↓
 Import Resolution
-↓
+    ↓
 Unified Compilation Unit
-↓
+    ↓
 Lexing
-↓
+    ↓
 Parsing
-↓
+    ↓
 AST
-↓
+    ↓
 Name Resolution
-↓
+    ↓
 Type Resolution
-↓
+    ↓
 Semantic Analysis
-↓
+    ↓
 Table Metadata Generation
-↓
+    ↓
 Entry Function Generation
-↓
+    ↓
 LLVM IR Generation
-↓
+    ↓
 LLVM Optimization
-↓
+    ↓
 Native Linking
-↓
+    ↓
 Executable
 
-Do not generate LLVM IR before name and type resolution has completed.
+LLVM IR generation must occur only after name resolution, type resolution, and semantic analysis have completed.
 
-SOURCE FILES
+
+4. SOURCE FILES
 
 Festina source files use the .f extension.
 
@@ -94,9 +98,10 @@ main.f
 database.f
 ui.f
 
-IMPORTS
 
-Imports use exactly:
+5. IMPORTS
+
+Imports use:
 
 import file.f
 
@@ -106,57 +111,50 @@ No require() syntax is used.
 
 Imports are compile-time operations.
 
-An import means:
-
-"Include this file and all of its dependencies in the current compilation unit."
+An import includes the specified file and all of its dependencies in the current compilation unit.
 
 Example:
 
 import database.f
 import ui.f
 
-The imported files do not become runtime modules.
+Imported files do not become runtime modules.
 
-IMPORT RESOLUTION
+
+6. IMPORT RESOLUTION
 
 Import resolution must be recursive.
 
 Given:
 
 main.f
-├── ui.f
-│ └── graphics.f
-└── database.f
+ ├── ui.f
+ │    └── graphics.f
+ └── database.f
 
-the compiler must resolve:
+the compiler must resolve the dependency order before compilation.
 
-graphics.f
-ui.f
-database.f
-main.f
+Each source file must be processed only once.
 
-before parsing the final compilation unit.
-
-A file must only be imported once.
-
-Use canonical/normalized absolute paths when determining whether two imports refer to the same file.
+The compiler should use canonical paths when determining whether a file has already been imported.
 
 For example:
 
 ./utils.f
 src/../utils.f
 
-must resolve to the same file if they refer to the same canonical path.
+must be treated as the same file when they resolve to the same canonical path.
 
-Circular imports must not cause infinite recursion.
+Circular imports must be detected and must not cause infinite recursion.
 
-For example:
+Example:
 
 a.f → b.f → a.f
 
-must result in each file being processed once.
+The compiler must report the circular dependency or otherwise handle it deterministically without repeatedly processing either file.
 
-ENTRY FILE
+
+7. ENTRY FILE
 
 The file passed directly to the compiler is the entry file.
 
@@ -168,52 +166,54 @@ main.f is the entry file.
 
 Imported files are processed before the entry file.
 
-The entry file's executable statements are automatically placed into a generated entry function.
+The programmer does not need to define main().
 
-The programmer does not need to write main().
+Executable statements in the entry file are automatically placed into a generated program entry function.
 
-Conceptually:
+For example:
 
 log('Hello')
 
-becomes:
+is conceptually transformed into:
 
 void func __festina_main() {
-log('Hello')
+    log('Hello')
 }
 
-The exact internal name may differ, but the behavior must be equivalent.
+The exact internal name is implementation-defined.
 
-The generated entry function is the program's runtime entry point.
+The generated entry function is the runtime entry point of the application.
 
-PROGRAM STARTUP
 
-Startup must occur in this order:
+8. PROGRAM STARTUP
 
-Resolve entry file.
-Resolve all imports.
-Remove duplicate imports.
-Detect circular imports.
-Order dependencies.
-Parse all source files.
-Build symbol tables.
-Resolve all names.
-Resolve all types.
-Validate semantic rules.
-Collect table declarations.
-Generate SQLite table initialization.
-Generate the entry function.
-Generate LLVM IR.
-Optimize LLVM IR.
-Link the executable.
-Start the application.
-Open/create festina.sqlite.
-Ensure declared tables exist.
-Execute the generated entry function.
+Program initialization must follow this order:
 
-Table initialization must occur before application code attempts to use those tables.
+1. Resolve the entry file.
+2. Recursively resolve all imports.
+3. Remove duplicate imports.
+4. Detect circular imports.
+5. Establish dependency order.
+6. Parse all source files.
+7. Build symbol tables.
+8. Resolve all names.
+9. Resolve all types.
+10. Perform semantic validation.
+11. Collect table declarations.
+12. Generate SQLite schema synchronization.
+13. Generate the entry function.
+14. Generate LLVM IR.
+15. Optimize LLVM IR.
+16. Link the native executable.
+17. Start the application.
+18. Open or create festina.sqlite.
+19. Synchronize all declared table schemas.
+20. Execute the generated entry function.
 
-LEXICAL CONVENTIONS
+SQLite schema synchronization must occur before application code attempts to access the declared tables.
+
+
+9. LEXICAL CONVENTIONS
 
 Festina generally follows JavaScript conventions for literals and operators.
 
@@ -224,7 +224,7 @@ Supported string literals:
 
 Template strings support interpolation:
 
-Hello ${name}
+`Hello ${name}`
 
 Semicolons are optional.
 
@@ -233,9 +233,10 @@ Preferred style:
 text name = 'Festina'
 log(name)
 
-PRIMITIVE TYPES
 
-Festina has the following primitive types:
+10. PRIMITIVE TYPES
+
+Festina provides the following primitive types:
 
 int
 float
@@ -251,11 +252,12 @@ int value = null
 text name = null
 bool enabled = null
 
-The compiler must preserve type information even when a value is null.
+The compiler must preserve the underlying type when a value is null.
 
-TYPE CATEGORIES
 
-The compiler must distinguish types by category.
+11. TYPE CATEGORIES
+
+The compiler must distinguish between the following type categories.
 
 Primitive types:
 
@@ -276,8 +278,6 @@ Database types:
 
 table
 
-The compiler must never determine a type category through textual guessing.
-
 Each type must have an explicit internal representation.
 
 For example:
@@ -289,13 +289,14 @@ ArrayType(PrimitiveType(INT))
 ArrayType(StructType(User))
 ArrayType(TableType(People))
 
-TYPE RESOLUTION
+
+12. TYPE RESOLUTION
 
 When the compiler encounters:
 
 arr[T]
 
-it must resolve T through the compiler's symbol/type table.
+it must resolve T through the compiler's symbol and type tables.
 
 Example:
 
@@ -304,13 +305,13 @@ arr[int] values
 resolves to:
 
 ArrayType(
-PrimitiveType(INT)
+    PrimitiveType(INT)
 )
 
 Example:
 
 struct User {
-name:text
+    name:text
 }
 
 arr[User] users
@@ -318,13 +319,13 @@ arr[User] users
 resolves to:
 
 ArrayType(
-StructType(User)
+    StructType(User)
 )
 
 Example:
 
 table People {
-name:text
+    name:text
 }
 
 arr[People] people
@@ -332,12 +333,15 @@ arr[People] people
 resolves to:
 
 ArrayType(
-TableType(People)
+    TableType(People)
 )
 
-The compiler must not use special string matching to determine whether T is a primitive, struct, or table.
+The compiler must resolve the identifier according to the declarations in scope.
 
-UNKNOWN TYPES
+The compiler must not infer the type category from naming conventions.
+
+
+13. UNKNOWN TYPES
 
 An unknown type is a compile-time error.
 
@@ -345,11 +349,12 @@ Example:
 
 arr[Person] people
 
-when Person has not been declared must produce an error similar to:
+when Person has not been declared should produce an error similar to:
 
 error: unknown type 'Person'
 
-INTEGER
+
+14. INTEGER
 
 int is a native integer type.
 
@@ -359,9 +364,8 @@ int count = 100
 
 The compiler should use an appropriate LLVM integer representation.
 
-Do not represent ordinary integers as SQLite rows.
 
-FLOATING POINT
+15. FLOATING-POINT VALUES
 
 float is a native floating-point type.
 
@@ -369,7 +373,8 @@ Example:
 
 float percentage = 98.5
 
-BOOLEANS
+
+16. BOOLEANS
 
 bool represents boolean values.
 
@@ -379,27 +384,21 @@ true
 false
 null
 
-Internally, booleans may use:
+The runtime representation of bool may use:
 
-true → 1
+true  → 1
 false → 0
 
-However, the semantic type remains bool.
+The semantic type remains bool.
 
-Do not allow arbitrary values to automatically become booleans.
+Only boolean expressions may be used where a boolean condition is required.
 
-Invalid:
 
-text name = 'Patrick'
+17. TRUTHINESS
 
-if name {
-}
+Festina does not use JavaScript truthy/falsy semantics.
 
-TRUTHINESS
-
-Festina does not implement JavaScript truthiness.
-
-Do not treat the following as implicitly boolean:
+The following values must not automatically become boolean conditions:
 
 0
 1
@@ -408,18 +407,20 @@ Do not treat the following as implicitly boolean:
 'hello'
 null
 arrays
-objects
+structs
+tables
 
-Only expressions whose type is bool may be used as conditions.
+A conditional expression must have type bool.
 
-EQUALITY
+
+18. EQUALITY
 
 Supported equality operators:
 
 ==
 !=
 
-Unsupported:
+Unsupported operators:
 
 ===
 !==
@@ -427,38 +428,41 @@ Unsupported:
 Example:
 
 if value == 10 {
-log('Ten')
+    log('Ten')
 }
 
-The compiler must reject === and !==.
+The compiler must report a compile-time error when === or !== is used.
 
-CONDITIONALS
 
-Parentheses are optional.
+19. CONDITIONALS
 
-Both are valid:
+Parentheses around conditions are optional.
+
+Both forms are valid:
 
 if test {
-log('yes')
+    log('yes')
 }
 
 if (test) {
-log('yes')
+    log('yes')
 }
 
 The condition must resolve to bool.
 
-TERNARY
 
-The JavaScript-style ternary operator is supported:
+20. TERNARY OPERATOR
+
+Festina supports the JavaScript-style ternary operator:
 
 text result = test ? 'yes' : 'no'
 
-The condition must be boolean.
+The condition must have type bool.
 
-VARIABLES
 
-Variables use:
+21. VARIABLES
+
+Variables are declared using:
 
 type name = value
 
@@ -468,12 +472,10 @@ int count = 10
 text name = 'Festina'
 bool enabled = true
 
-Do not use JavaScript declarations:
+Festina does not use var or let.
 
-var
-let
 
-CONSTANTS
+22. CONSTANTS
 
 Constants use:
 
@@ -485,7 +487,8 @@ const text name = 'Festina'
 
 Constants should be available for compiler optimization.
 
-FUNCTIONS
+
+23. FUNCTIONS
 
 Function syntax is:
 
@@ -495,17 +498,18 @@ return_type func name(arguments) {
 Example:
 
 text func returnHello() {
-text value = 'hello'
-return value
+    text value = 'hello'
+    return value
 }
 
-A function without a return value uses void:
+A function that does not return a value uses void:
 
 void func sayHello() {
-log('Hello')
+    log('Hello')
 }
 
-FUNCTION ARGUMENTS
+
+24. FUNCTION ARGUMENTS
 
 Function arguments use:
 
@@ -514,17 +518,18 @@ name:type
 Example:
 
 text func logStr(str:text) {
-log(str)
-return str
+    log(str)
+    return str
 }
 
 Multiple arguments:
 
 int func add(a:int, b:int) {
-return a + b
+    return a + b
 }
 
-NULL
+
+25. NULL
 
 null represents the absence of a value.
 
@@ -538,9 +543,10 @@ User user = null
 
 The compiler must preserve the underlying type.
 
-null is not a boolean and must not participate in truthiness conversion.
+null is not a boolean and must not participate in implicit boolean conversion.
 
-ARRAYS
+
+26. ARRAYS
 
 Arrays use:
 
@@ -553,11 +559,16 @@ arr[text] names
 arr[User] users
 arr[People] people
 
-Arrays may contain primitive types, structs, tables, or other supported types.
+Arrays may contain supported primitive types, structs, tables, and other array types.
 
 The array element type must be resolved at compile time.
 
-STRUCTS
+Nested arrays are valid:
+
+arr[arr[int]] matrix
+
+
+27. STRUCTS
 
 Structs are native in-memory objects.
 
@@ -566,12 +577,14 @@ Structs may only be declared in global scope.
 Example:
 
 struct User {
-id:int
-name:text
-active:bool
+    id:int
+    name:text
+    active:bool
 }
 
-A struct instance behaves similarly to a JavaScript object:
+A struct instance behaves similarly to a JavaScript object while remaining statically typed.
+
+Example:
 
 User user
 
@@ -581,94 +594,156 @@ user.active = true
 
 Struct fields are statically typed.
 
-Structs are not SQLite tables.
+Structs are not database tables.
 
-Declaring a struct must not automatically create a SQLite table.
+Declaring a struct does not create a SQLite table.
 
-TABLES
 
-Tables are SQLite-backed data models.
+28. TABLES
+
+Tables are SQLite-backed persistent data models.
 
 Example:
 
 table People {
-id:int
-name:text
-age:int
+    id:int
+    name:text
+    age:int
 }
 
-A table declaration must automatically ensure that the corresponding SQLite table exists.
+A table declaration automatically ensures that the corresponding SQLite table exists and that its schema matches the Festina declaration.
 
-Conceptually:
+The Festina table declaration is authoritative.
 
-CREATE TABLE IF NOT EXISTS People (
-id INTEGER,
-name TEXT,
-age INTEGER
-);
+When the application loads, Festina must compare each declared table against the corresponding table in festina.sqlite.
 
-The programmer must not have to manually execute this statement.
+If the table does not exist, it must be created.
 
-AUTOMATIC SQLITE DATABASE
+If the table exists but differs from the Festina declaration, the SQLite schema must be synchronized with the Festina declaration.
+
+Schema synchronization must support:
+
+- Adding columns that exist in the Festina declaration but not in SQLite.
+- Removing columns that exist in SQLite but not in the Festina declaration.
+- Updating column definitions when the declared Festina type differs from the SQLite type.
+- Creating tables that do not exist.
+- Preserving existing data whenever possible.
+
+When SQLite cannot perform a requested schema change directly, Festina may use a temporary table and data migration.
+
+The programmer does not need to write schema migration code.
+
+
+29. AUTOMATIC SQLITE DATABASE
 
 Every Festina application automatically uses:
 
 festina.sqlite
 
-The database requires no explicit initialization.
+The database is opened or created automatically.
 
 The programmer does not need to:
 
-Open the database.
-Create the database.
-Configure a connection.
-Provide a database path.
+- Create the database.
+- Open a database connection.
+- Initialize SQLite.
+- Configure a database path.
 
-The runtime/compiler handles this automatically.
+All normal Festina SQLite operations use festina.sqlite.
 
-SQLITE TYPE MAPPING
 
-The initial mapping is:
+30. SQLITE TYPE MAPPING
 
-Festina SQLite
+The initial type mapping is:
 
-int → INTEGER
-float → REAL
-bool → INTEGER
-text → TEXT
-blob → BLOB
+Festina     SQLite
 
-bool uses 0 and 1 in SQLite.
+int      →  INTEGER
+float    →  REAL
+bool     →  INTEGER
+text     →  TEXT
+blob     →  BLOB
 
-AUTOMATIC TABLE CREATION
+bool values are stored as 0 or 1.
+
+
+31. AUTOMATIC TABLE CREATION AND SCHEMA SYNCHRONIZATION
 
 Given:
 
 table People {
-id:int
-name:text
+    id:int
+    name:text
 }
 
-the generated application must ensure:
+the application must ensure that festina.sqlite contains a matching People table before application code accesses it.
+
+If People does not exist, create it using the equivalent of:
 
 CREATE TABLE IF NOT EXISTS People (
-id INTEGER,
-name TEXT
+    id INTEGER,
+    name TEXT
 );
 
-This must occur before the entry function executes.
+If People already exists, compare its schema against the Festina declaration.
 
-If People already exists, it must not be deleted or recreated.
+The Festina declaration is authoritative.
 
-The initial implementation does not need to automatically migrate an existing table when its declaration changes unless migration functionality is explicitly added later.
+The synchronization process must:
 
-SQLITE QUERIES
+1. Create missing tables.
+2. Add missing columns.
+3. Remove undeclared columns.
+4. Update incompatible column definitions.
+5. Preserve existing data whenever possible.
+6. Use temporary tables and data migration when SQLite cannot perform the required alteration directly.
 
-SQLite is accessed through the global:
+Schema synchronization occurs during application initialization before the generated entry function executes.
 
-sqlite()
+The programmer does not need to write CREATE TABLE, ALTER TABLE, migration, or database initialization code.
 
-function.
+Example:
+
+table People {
+    id:int
+    name:text
+}
+
+If the existing SQLite schema is:
+
+People (
+    id INTEGER,
+    name TEXT,
+    obsolete TEXT
+)
+
+the application must modify the database so that it becomes equivalent to:
+
+People (
+    id INTEGER,
+    name TEXT
+)
+
+If the Festina declaration later becomes:
+
+table People {
+    id:int
+    full_name:text
+}
+
+the application must synchronize the database accordingly:
+
+People (
+    id INTEGER,
+    full_name TEXT
+)
+
+Schema synchronization must happen automatically each time the application loads.
+
+
+32. SQLITE QUERIES
+
+SQLite is accessed through the global sqlite() function.
 
 Example:
 
@@ -678,66 +753,82 @@ No import is required.
 
 No database initialization is required.
 
-All queries operate against:
+All SQLite queries use:
 
 festina.sqlite
 
-PARAMETERIZED SQLITE QUERIES
+
+33. PARAMETERIZED SQLITE QUERIES
 
 Parameterized queries must be supported.
 
 Example:
 
 sqlite(
-'INSERT INTO People (id, name) VALUES (?, ?)',
-[1, 'Patrick']
+    'INSERT INTO People (id, name) VALUES (?, ?)',
+    [1, 'Patrick']
 )
 
-Parameters are passed using an array.
+Query parameters are passed as an array.
 
-QUERY RESULT TYPES
 
-A query against a table may produce:
+34. QUERY RESULT TYPES
+
+A query against a declared table may produce an array of that table type.
+
+Example:
+
+table People {
+    id:int
+    name:text
+}
 
 arr[People] people = sqlite('SELECT * FROM People')
 
-The compiler knows that People is a TableType.
+The compiler resolves People as:
 
-The resulting array is therefore:
+TableType(People)
+
+and the array as:
 
 ArrayType(TableType(People))
 
-The compiler must use the table definition to determine the expected row structure.
+The table declaration defines the expected fields and their types.
 
-STRUCT/TABLE SEPARATION
 
-This distinction is mandatory:
+35. STRUCT/TABLE DISTINCTION
 
-struct User
+struct and table are distinct language constructs.
 
-means:
+A struct:
 
-native in-memory type
+struct User {
+    name:text
+}
 
-while:
+represents a native in-memory type.
 
-table Users
+A table:
 
-means:
+table Users {
+    name:text
+}
 
-SQLite-backed persistent type
+represents persistent SQLite data.
 
-Do not merge these concepts internally.
+They must remain distinct in the compiler's type system.
 
-BLOB
+
+36. BLOB
 
 blob represents binary data.
 
 Example:
 
-blob explosion = 'path/to/file'
+blob data = 'path/to/file'
 
-IMAGE
+
+37. IMAGE
 
 The image type is:
 
@@ -747,13 +838,14 @@ Example:
 
 img profile = loadImage('path/to/profile.png')
 
-Images may be passed to:
+Images may be passed to graphics functions:
 
 drawImage(profile, 0, 0)
 
-Supported formats are determined by the runtime.
+Supported image formats are determined by the runtime.
 
-AUDIO
+
+38. AUDIO
 
 The audio type is:
 
@@ -771,7 +863,8 @@ music.isPlaying()
 
 isPlaying() returns bool.
 
-GRAPHICS
+
+39. GRAPHICS
 
 Graphics operations are exposed as global functions.
 
@@ -789,7 +882,8 @@ Graphics are backed by Cairo.
 
 No GUI import is required.
 
-EVENTS
+
+40. EVENTS
 
 Event listeners use:
 
@@ -799,30 +893,30 @@ on eventName(arguments) {
 Example:
 
 on mouse(x:int, y:int) {
-log(Mouse moved over canvas on x: ${x}, y: ${y})
+    log(`Mouse moved over canvas on x: ${x}, y: ${y}`)
 }
 
 Example:
 
 on click(x:int, y:int) {
-log(Mouse clicked on canvas at ${x}, ${y})
+    log(`Mouse clicked on canvas at ${x}, ${y}`)
 }
 
-The runtime automatically registers declared listeners.
+The runtime automatically registers declared event handlers.
 
-LOGGING
+
+41. LOGGING
 
 Use:
 
 log('Hello')
 
-Do not require:
-
-console.log()
-
 log() is a built-in global function.
 
-FAILURE
+It replaces the need for console.log().
+
+
+42. FAILURE
 
 Use:
 
@@ -833,97 +927,90 @@ instead of throw.
 Example:
 
 if test != true {
-fail('Test failed')
+    fail('Test failed')
 }
 
 The initial implementation should treat fail() as a runtime failure mechanism.
 
-MEMORY MANAGEMENT
+
+43. MEMORY MANAGEMENT
 
 Festina uses automatic memory management.
 
 The programmer does not manually allocate or free memory.
 
-The compiler should prefer stack allocation over heap allocation when the lifetime permits it.
+The compiler should prefer stack allocation when the value's lifetime permits it.
 
-Primitive values should use native LLVM representations.
+The compiler should use native representations for primitive values.
 
-Do not implement ordinary primitive variables using SQLite pointer tables.
+Heap allocation should only be used when required by the value's lifetime, size, or semantics.
 
-For example:
+The compiler should automatically release or reclaim memory when values are no longer reachable according to the runtime's memory-management strategy.
 
-int example = 166
 
-must not require:
-
-INSERT INTO int_pointers ...
-
-The compiler should generate an appropriate native integer representation.
-
-PERFORMANCE
+44. PERFORMANCE
 
 Performance is a primary language requirement.
 
 Prefer compile-time work over runtime work where practical.
 
-The compiler should use LLVM optimizations such as:
+The compiler should use LLVM optimization capabilities, including where applicable:
 
-Constant folding.
-Dead-code elimination.
-Function inlining.
-Constant propagation.
-Allocation optimization.
-Unused-code elimination.
+- Constant folding.
+- Dead-code elimination.
+- Function inlining.
+- Constant propagation.
+- Allocation optimization.
+- Unused-code elimination.
 
-Avoid:
+Avoid unnecessary:
 
-Dynamic reflection.
-Runtime type inference.
-Unnecessary boxing.
-Unnecessary heap allocation.
-Dynamic dispatch where static dispatch is possible.
-Implicit conversions that require runtime work.
-JAVASCRIPT-LIKE FEATURES
+- Runtime reflection.
+- Dynamic type checking.
+- Boxing.
+- Heap allocation.
+- Dynamic dispatch.
+- Runtime conversions.
 
-Festina should retain familiar JavaScript conventions where they do not conflict with the type system or performance goals.
+
+45. JAVASCRIPT-LIKE FEATURES
+
+Festina should retain familiar JavaScript conventions where they do not conflict with the static type system or performance goals.
 
 Supported or intended features include:
 
-String interpolation.
-Ternary operator.
-Objects through structs.
-Arrays.
-Date.
-Property access.
+- String interpolation.
+- Ternary operator.
+- Objects through structs.
+- Arrays.
+- Date.
+- Property access.
 
-Festina should not inherit JavaScript's dynamic runtime semantics.
+Festina does not inherit JavaScript's dynamic runtime semantics.
 
-BUILT-IN SQLITE INTEGRATION
 
-SQLite should behave as a built-in application feature rather than a library that requires configuration.
+46. BUILT-IN SQLITE INTEGRATION
 
-This must work without:
+SQLite is a built-in feature of Festina.
 
-import sqlite
-require('sqlite')
-openDatabase()
-initializeDatabase()
-
-The programmer should simply write:
+The programmer should be able to write:
 
 table People {
-name:text
+    name:text
 }
 
 arr[People] people = sqlite('SELECT * FROM People')
 
-The runtime handles:
+without importing a SQLite library or initializing a database.
+
+The runtime automatically manages:
 
 festina.sqlite
 
-automatically.
+and automatically creates and synchronizes declared tables when necessary.
 
-EXECUTABLE GENERATION
+
+47. EXECUTABLE GENERATION
 
 The compiler must produce native executables.
 
@@ -931,75 +1018,78 @@ Example:
 
 festina main.f
 
-The resulting executable must not require the Festina source files to execute.
+The resulting executable must not require Festina source files to execute.
 
 The intended architecture is:
 
 Festina source
-↓
+      ↓
 LLVM IR
-↓
+      ↓
 Machine code
-↓
+      ↓
 Native executable
 
-COMPILER ERRORS
+
+48. COMPILER ERRORS
 
 Errors should be reported at the earliest reasonable stage.
 
-Examples of compile-time errors:
+Compile-time errors include:
 
-Unknown type.
-Unknown variable.
-Unknown function.
-Unknown struct.
-Unknown table.
-Invalid function argument type.
-Invalid return type.
-Invalid condition type.
-Duplicate declaration.
-Invalid import.
-Circular import.
-Unsupported operator.
-Invalid field access.
+- Unknown type.
+- Unknown variable.
+- Unknown function.
+- Unknown struct.
+- Unknown table.
+- Invalid function argument type.
+- Invalid return type.
+- Invalid condition type.
+- Duplicate declaration.
+- Invalid import.
+- Circular import.
+- Unsupported operator.
+- Invalid field access.
 
 Error messages should include:
 
-File.
-Line.
-Column.
-Error category.
-Human-readable explanation.
+- File.
+- Line.
+- Column.
+- Error category.
+- Human-readable explanation.
 
 Example:
 
 main.f:12:5: error: condition must be bool, found text
 
-SYMBOL TABLE
+
+49. SYMBOL TABLE
 
 The compiler should maintain explicit symbol information.
 
-At minimum, symbols should distinguish:
+Symbols should distinguish at minimum:
 
-Variable.
-Constant.
-Function.
-Struct.
-Table.
-Enum.
+- Variable.
+- Constant.
+- Function.
+- Struct.
+- Table.
+- Enum.
 
-Types should distinguish:
+Types should distinguish at minimum:
 
-PrimitiveType.
-StructType.
-TableType.
-ArrayType.
-ImageType.
-AudioType.
+- PrimitiveType.
+- StructType.
+- TableType.
+- ArrayType.
+- ImageType.
+- AudioType.
 
-Do not determine symbol meaning by string conventions after parsing.
+The compiler should resolve symbols during semantic analysis rather than relying on naming conventions.
 
-TYPE CHECKING
+
+50. TYPE CHECKING
 
 Type checking must happen before LLVM generation.
 
@@ -1039,9 +1129,10 @@ arr[People] people
 
 provided People is declared as a table.
 
-RESERVED LANGUAGE FEATURES
 
-The following concepts have defined meanings and should not be repurposed without changing the language specification:
+51. RESERVED LANGUAGE FEATURES
+
+The following names have defined language meanings:
 
 int
 float
@@ -1067,7 +1158,8 @@ fail
 log
 sqlite
 
-EXAMPLE PROGRAM
+
+52. EXAMPLE PROGRAM
 
 A valid Festina application may look like:
 
@@ -1075,30 +1167,31 @@ import database.f
 import ui.f
 
 table People {
-id:int
-name:text
+    id:int
+    name:text
 }
 
 struct User {
-id:int
-name:text
+    id:int
+    name:text
 }
 
 const text appName = 'Festina'
 
 text func greet(user:User) {
-text message = Hello ${user.name}
-log(message)
-return message
+    text message = `Hello ${user.name}`
+    log(message)
+    return message
 }
 
 on click(x:int, y:int) {
-log(Clicked at ${x}, ${y})
+    log(`Clicked at ${x}, ${y}`)
 }
 
 drawRect(0, 0, 100, 100)
 
 User user
+
 user.id = 1
 user.name = 'Patrick'
 
@@ -1111,56 +1204,59 @@ log(appName)
 The application startup behavior is:
 
 Resolve imports
-↓
+    ↓
 Build complete compilation unit
-↓
+    ↓
 Resolve symbols
-↓
+    ↓
 Resolve types
-↓
-Detect table People
-↓
-Generate SQLite initialization
-↓
+    ↓
+Collect table declarations
+    ↓
+Generate SQLite schema synchronization
+    ↓
 Generate entry function
-↓
+    ↓
 Compile through LLVM
-↓
+    ↓
 Create/open festina.sqlite
-↓
-CREATE TABLE IF NOT EXISTS People
-↓
+    ↓
+Synchronize declared tables
+    ↓
 Execute application
 
-NON-GOALS
 
-Unless explicitly added to the specification, do not implement:
+53. NON-GOALS
 
-JavaScript truthiness.
-var.
-let.
-===.
-!==.
-throw.
-require().
-Runtime module loading.
-Dynamic typing.
-Implicit type coercion.
-Mandatory database initialization.
-Manual database connection management.
-IMPLEMENTATION RULE FOR AMBIGUITY
+Unless explicitly added to the language specification, do not implement:
 
-When implementing a feature not fully specified by this document:
+- JavaScript truthiness.
+- var.
+- let.
+- ===.
+- !==.
+- throw.
+- require().
+- Runtime module loading.
+- Dynamic typing.
+- Implicit type coercion.
+- Manual SQLite initialization.
+- Manual SQLite connection management.
 
-Prefer the simplest implementation.
-Prefer compile-time behavior.
-Prefer native representation.
-Prefer JavaScript-like syntax.
-Prefer static typing.
-Prefer performance.
-Do not introduce new syntax without necessity.
-Do not silently change existing semantics.
-If multiple implementations satisfy the specification, choose the implementation with the lowest runtime overhead.
-If behavior genuinely cannot be determined from this specification, treat it as an unresolved language-design decision rather than inventing behavior.
 
-The compiler implementation must remain faithful to this specification rather than assuming behavior from JavaScript, TypeScript, SQLite, or another language where Festina has explicitly defined different semantics.
+54. IMPLEMENTATION RULE FOR AMBIGUITY
+
+When implementing behavior that is not explicitly specified:
+
+1. Prefer the simplest implementation.
+2. Prefer compile-time behavior.
+3. Prefer native representations.
+4. Prefer JavaScript-like syntax.
+5. Prefer static typing.
+6. Prefer performance.
+7. Do not introduce new syntax without necessity.
+8. Do not silently change existing semantics.
+9. If multiple implementations satisfy the specification, choose the implementation with the lowest runtime overhead.
+10. If behavior genuinely cannot be determined from this specification, treat it as an unresolved language-design decision rather than inventing behavior.
+
+The compiler implementation must follow this specification rather than assuming behavior from JavaScript, TypeScript, SQLite, or another language when Festina has explicitly defined its own behavior.
