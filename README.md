@@ -18,8 +18,10 @@ log(greet('Festina'))
 ```
 
 *(This exact example runs today — `festina.sqlite` and the `People`
-table are created/synced automatically at startup even though nothing
-queries it yet; see [Implementation Status](#implementation-status).)*
+table are created/synced automatically at startup, though this
+particular snippet doesn't query it; `sqlite()` queries work too, see
+[Built-in SQLite](#built-in-sqlite) and
+[Implementation Status](#implementation-status).)*
 
 ## Implementation Status
 
@@ -27,7 +29,7 @@ Festina is under active development. Everything else in this README
 describes the full target language from `claude.md`; this section is
 the ground truth for what actually runs today.
 
-**Test suite:** 213/213 passing, 0 skipped, 0 failed (`pytest tests/`).
+**Test suite:** 219/219 passing, 0 skipped, 0 failed (`pytest tests/`).
 See [`tests/`](tests/) and [`tests/CONTRACT.md`](tests/CONTRACT.md) for
 the spec-driven suite this is measured against — every test cites the
 `claude.md` section it checks.
@@ -53,6 +55,7 @@ runtime, and *runs* as a standalone executable (no Python or the
 | **Numeric conversion (`claude.md #55/#56`)** | ✅ int and float never mix implicitly, in any operator (arithmetic *or* comparison) — `int.toFloat()` and `Math.floor/ceil/round/trunc(x)` are the only conversions, both compile-time-checked and runtime-tested |
 | **Division/modulo by zero (`claude.md #57`)** | ✅ returns `null` instead of crashing the process, for both `int` and `float` |
 | **Automatic SQLite schema sync** | ✅ `festina.sqlite` opens/creates itself; tables are created, and columns added/dropped/retyped with existing data preserved via a temp-table rebuild — the `claude.md #31` worked examples all pass as tests |
+| **`sqlite()` queries (`claude.md #32-34`)** | ✅ `SELECT` into a declared `arr[Table]` (with field access on the resulting rows), parameterized `INSERT`/`UPDATE`/`DELETE`/`SELECT` via a literal params array, `NULL` columns round-trip as the same null sentinel used elsewhere — see the caveats below |
 | Native executables | ✅ `bin/festina program.f -o program` produces a real, standalone binary |
 
 ### Deployment: real compilation, minimal setup
@@ -117,13 +120,22 @@ scoped out rather than silently missing:
   shadows the builtin at every call site rather than erroring. Left as
   is since none of them are implemented yet anyway; worth reserving
   properly once they are.
+- `sqlite()`'s optional second argument (bound parameters) must be a
+  literal array expression (e.g. `sqlite(sql, [1, 'Patrick'])`), not an
+  arbitrary `arr[T]`-typed variable or expression — claude.md #33's own
+  example is itself a heterogeneously-typed literal, which a real
+  `arr[T]` *value* can't represent under Festina's normal (homogeneous)
+  array typing, so the params list is special call syntax instead
+  (each element bound individually, by its own type, at compile time).
+  Passing anything else there is a clear compile-time error, not a
+  runtime one. Query result columns map onto a declared table's fields
+  *by position*, not by name, matching claude.md #34's own `SELECT *`
+  example.
 
 ### Not implemented yet
 
 | Area | Status |
 |---|---|
-| `sqlite()` queries into `arr[Table]` | ❌ schema sync works, fetching/inserting rows doesn't yet |
-| Parameterized queries | ❌ |
 | Graphics (`drawRect`, `img`, Cairo) | ❌ |
 | Audio (`aud`, `loadAudio`) | ❌ |
 | `on eventName` event handlers | ❌ |
@@ -175,7 +187,7 @@ sure.
 
 ```bash
 pip install -r requirements-dev.txt   # pytest, for the test suite
-pytest tests/                         # 213 passed
+pytest tests/                         # 219 passed
 
 ./bin/festina examples/hello.f -o hello
 ./hello
@@ -343,10 +355,11 @@ Structs are native in-memory types.
 
 ## Built-in SQLite
 
-> **Status:** automatic table creation and schema sync (the section right
-> after this one) are implemented and tested. `sqlite()` queries and
-> parameterized statements below are not implemented yet — see
-> [Implementation Status](#implementation-status).
+> **Status:** implemented and tested end to end — automatic table
+> creation and schema sync (the section right after this one), `sqlite()`
+> queries into a declared `arr[Table]`, and parameterized statements
+> below. See [Implementation Status](#implementation-status) for the
+> caveats (params must be a literal array; columns map by position).
 
 SQLite is a first-class part of Festina.
 

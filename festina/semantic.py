@@ -228,6 +228,21 @@ def analyze(program, filename="<string>"):
                     category="invalid field access",
                 )
             return fields[expr.prop]
+        if isinstance(obj_type, types_mod.TableType):
+            # claude.md #34: a query against a declared table produces
+            # arr[TableType(name)] -- field access on a row (e.g.
+            # `people[0].name`) resolves against that table's declared
+            # columns, same as a struct field except `tables` stores raw
+            # type-expr strings rather than already-resolved Type objects
+            # (see analyze_table above), so each lookup resolves on demand.
+            columns = tables.get(obj_type.name, {})
+            if expr.prop not in columns:
+                raise CompileError(
+                    f"table '{obj_type.name}' has no field '{expr.prop}'",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            return resolve(columns[expr.prop], expr)
         if isinstance(obj_type, (types_mod.ImageType, types_mod.AudioType)):
             return None  # permissive: methods like .play()/.isPlaying() aren't modeled
         raise CompileError(

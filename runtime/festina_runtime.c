@@ -235,3 +235,122 @@ void festina_sync_table(sqlite3 *db, const char *table_name,
     snprintf(rename_sql, sizeof(rename_sql), "ALTER TABLE %s RENAME TO %s;", new_table, table_name);
     festina_exec(db, rename_sql);
 }
+
+/* ---- sqlite() queries -- claude.md #32-34 ---- */
+
+/* Kept in sync with festina/codegen.py's INT_NULL_CONST / FLOAT_NULL_CONST
+ * -- see that module's "Null for int/float" docstring note. */
+static int64_t festina_null_int(void) {
+    return INT64_MIN;
+}
+
+static double festina_null_float(void) {
+    uint64_t bits = 0x7FF8000000000000ULL;  /* a quiet NaN */
+    double d;
+    memcpy(&d, &bits, sizeof(d));
+    return d;
+}
+
+sqlite3_stmt *festina_sqlite_prepare(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        char msg[1024];
+        snprintf(msg, sizeof(msg), "sqlite error preparing '%s': %s", sql, sqlite3_errmsg(db));
+        festina_fail(msg);
+    }
+    return stmt;
+}
+
+void festina_sqlite_bind_int(sqlite3_stmt *stmt, int32_t idx, int64_t val) {
+    sqlite3_bind_int64(stmt, idx, val);
+}
+
+void festina_sqlite_bind_float(sqlite3_stmt *stmt, int32_t idx, double val) {
+    sqlite3_bind_double(stmt, idx, val);
+}
+
+void festina_sqlite_bind_text(sqlite3_stmt *stmt, int32_t idx, const char *val) {
+    if (val) {
+        sqlite3_bind_text(stmt, idx, val, -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, idx);
+    }
+}
+
+void festina_sqlite_bind_null(sqlite3_stmt *stmt, int32_t idx) {
+    sqlite3_bind_null(stmt, idx);
+}
+
+void festina_sqlite_exec(sqlite3_stmt *stmt) {
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        /* discard row data -- e.g. a SELECT whose result isn't captured */
+    }
+    if (rc != SQLITE_DONE) {
+        sqlite3 *db = sqlite3_db_handle(stmt);
+        char msg[512];
+        snprintf(msg, sizeof(msg), "sqlite error executing statement: %s", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        festina_fail(msg);
+    }
+    sqlite3_finalize(stmt);
+}
+
+/* claude.md #34: row layout is col_count 8-byte slots per row -- see
+ * this function's doc comment in festina_runtime.h for the full
+ * rationale (matches how festina/codegen.py reads a row back). */
+void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
+                                  const char **col_types,
+                                  int64_t *out_length, void **out_data) {
+    int64_t capacity = 8;
+    void **rows = malloc(capacity * sizeof(void *));
+    if (!rows) festina_fail("out of memory in festina_sqlite_collect_rows");
+    int64_t count = 0;
+    int rc;
+
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (count >= capacity) {
+            capacity *= 2;
+            void **grown = realloc(rows, capacity * sizeof(void *));
+            if (!grown) festina_fail("out of memory in festina_sqlite_collect_rows");
+            rows = grown;
+        }
+
+        int64_t *row = malloc(col_count * sizeof(int64_t));
+        if (!row) festina_fail("out of memory in festina_sqlite_collect_rows");
+
+        for (int32_t c = 0; c < col_count; c++) {
+            const char *t = col_types[c];
+            int is_null = sqlite3_column_type(stmt, c) == SQLITE_NULL;
+            if (strcmp(t, "float") == 0) {
+                double d = is_null ? festina_null_float() : sqlite3_column_double(stmt, c);
+                memcpy(&row[c], &d, sizeof(double));
+            } else if (strcmp(t, "text") == 0 || strcmp(t, "blob") == 0) {
+                char *copy = NULL;
+                if (!is_null) {
+                    const unsigned char *txt = sqlite3_column_text(stmt, c);
+                    copy = strdup(txt ? (const char *)txt : "");
+                }
+                memcpy(&row[c], &copy, sizeof(char *));
+            } else {
+                /* int, bool -- claude.md #30 maps bool to SQLite INTEGER too */
+                row[c] = is_null ? festina_null_int() : sqlite3_column_int64(stmt, c);
+            }
+        }
+
+        rows[count++] = row;
+    }
+
+    if (rc != SQLITE_DONE) {
+        sqlite3 *db = sqlite3_db_handle(stmt);
+        char msg[512];
+        snprintf(msg, sizeof(msg), "sqlite error reading rows: %s", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        festina_fail(msg);
+    }
+    sqlite3_finalize(stmt);
+
+    *out_length = count;
+    *out_data = rows;
+}

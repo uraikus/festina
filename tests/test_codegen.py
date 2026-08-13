@@ -1,13 +1,13 @@
 """Code generation -- claude.md #47 (executable generation), plus the
 runtime-facing halves of #7/#8 (entry point + startup), #26 (arrays),
-#28-31 (automatic SQLite schema sync), #41/#42 (log/fail), #45 (string
-interpolation).
+#28-34 (automatic SQLite schema sync, sqlite() queries), #41/#42
+(log/fail), #45 (string interpolation).
 
 Two kinds of tests here:
 
-- CodegenError tests for not-yet-implemented constructs (sqlite()
-  queries, graphics, audio, events) only need festina.codegen itself --
-  no C toolchain required, so they always run.
+- CodegenError tests for not-yet-implemented constructs (graphics,
+  audio, events) only need festina.codegen itself -- no C toolchain
+  required, so they always run.
 - End-to-end tests actually compile a Festina program to a native
   executable (via the `compile_and_run` fixture) and check its real
   stdout/exit code/festina.sqlite -- these skip cleanly if no C compiler
@@ -28,11 +28,6 @@ class TestNotImplementedYet:
         program = parser.parse(source, filename=filename)
         analyzed = semantic.analyze(program, filename=filename)
         return codegen.generate_ir(program, analyzed, filename=filename)
-
-    def test_sqlite_query_is_not_implemented(self, parser, semantic, codegen, errors):
-        source = "table People {\n    id:int\n}\narr[People] people = sqlite('SELECT * FROM People')"
-        with pytest.raises(errors.CompileError, match="sqlite"):
-            self._generate(parser, semantic, codegen, source)
 
     def test_graphics_call_is_not_implemented(self, parser, semantic, codegen, errors):
         with pytest.raises(errors.CompileError, match="drawRect"):
@@ -531,6 +526,132 @@ class TestAutomaticSqliteSchemaSync:
         result = compile_and_run("log('no tables here')")
         assert result.returncode == 0
         assert not (tmp_path / "festina.sqlite").exists()
+
+
+class TestSqliteQueries:
+    """claude.md #32-34: sqlite() queries, parameterized queries, and
+    query result types (arr[Table])."""
+
+    def test_select_into_arr_table_with_field_access(self, compile_and_run):
+        source = """
+        table People {
+            id:int
+            name:text
+            score:float
+        }
+        sqlite('INSERT INTO People (id, name, score) VALUES (?, ?, ?)', [1, 'Patrick', 9.5])
+        sqlite('INSERT INTO People (id, name, score) VALUES (?, ?, ?)', [2, 'Ada', 10.0])
+        arr[People] people = sqlite('SELECT * FROM People ORDER BY id')
+        log(people[0].id)
+        log(people[0].name)
+        log(people[0].score)
+        log(people[1].name)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["1", "Patrick", "9.5", "Ada"]
+
+    def test_parameterized_insert_and_select(self, compile_and_run):
+        # claude.md #33's own example: sqlite(sql, [1, 'Patrick']) -- a
+        # heterogeneously-typed literal bound as parameters.
+        source = """
+        table People {
+            id:int
+            name:text
+        }
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'Patrick'])
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [2, 'Ada'])
+        arr[People] found = sqlite('SELECT * FROM People WHERE id = ?', [2])
+        log(found[0].name)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "Ada"
+
+    def test_null_column_value_round_trips(self, compile_and_run):
+        # claude.md #57: a SQL NULL column comes back as the same
+        # reserved null sentinel used elsewhere for a null float (a quiet
+        # NaN -- see test_float_division_by_zero_returns_null and the
+        # module docstring's "Null for int/float" note), not a crash or a
+        # 0.0.
+        source = """
+        table People {
+            id:int
+            score:float
+        }
+        sqlite('INSERT INTO People (id, score) VALUES (?, ?)', [1, null])
+        arr[People] people = sqlite('SELECT * FROM People')
+        log(people[0].score)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "nan"
+
+    def test_columns_map_by_position_not_name(self, compile_and_run):
+        # claude.md #34: "The table declaration defines the expected
+        # fields and their types" -- a query returning the same columns
+        # in the same order (even via a differently-aliased SELECT) still
+        # maps positionally onto the declared table.
+        source = """
+        table People {
+            id:int
+            name:text
+        }
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'Patrick'])
+        arr[People] people = sqlite('SELECT id AS whatever, name AS anything FROM People')
+        log(people[0].name)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "Patrick"
+
+    def test_exec_only_query_discards_result(self, compile_and_run):
+        # A statement whose result isn't captured into an arr[Table]
+        # (here, INSERT) just runs to completion.
+        source = """
+        table People {
+            id:int
+        }
+        sqlite('INSERT INTO People (id) VALUES (1)')
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_non_literal_params_argument_is_a_clear_error(self, parser, semantic, codegen, errors):
+        # claude.md #33's params must be a literal array -- see the
+        # module docstring's "Query rows" note for why (a real arr[T]
+        # value can't represent claude.md's own heterogeneously-typed
+        # example).
+        source = """
+        table People {
+            id:int
+        }
+        arr[int] ids = [1]
+        sqlite('SELECT * FROM People WHERE id = ?', ids)
+        """
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        with pytest.raises(errors.CompileError, match="literal array"):
+            codegen.generate_ir(program, analyzed, filename="main.f")
+
+    def test_schema_sync_and_query_against_same_table_do_not_collide(self, compile_and_run):
+        # _table_arrays' globals are shared between schema sync (main())
+        # and query codegen -- this would previously have redefined the
+        # same LLVM globals (a link error) if not cached.
+        source = """
+        table People {
+            id:int
+            name:text
+        }
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'Patrick'])
+        arr[People] people = sqlite('SELECT * FROM People')
+        log(people[0].name)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "Patrick"
 
 
 class TestMinimalRuntimeDependencies:

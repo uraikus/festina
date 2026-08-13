@@ -26,6 +26,13 @@ table Visits {
     place:text
 }
 
+// claude.md #32-34: sqlite() queries -- a parameterized INSERT, then a
+// SELECT collected into a declared arr[Table], with field access on
+// each resulting row.
+sqlite('INSERT INTO Visits (id, place) VALUES (?, ?)', [1, 'the summit'])
+arr[Visits] visits = sqlite('SELECT * FROM Visits')
+log(`visit ${visits[0].id}: ${visits[0].place}`)
+
 Point origin
 origin.x = 0
 origin.y = 0
