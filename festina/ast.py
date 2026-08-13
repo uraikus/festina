@@ -112,6 +112,31 @@ class ExprStmt(Node):
         self.expr = expr
 
 
+class WhileStmt(Node):
+    """claude.md #61."""
+
+    def __init__(self, test, body, line=0, column=0):
+        self.test = test
+        self.body = body
+        self.line = line
+        self.column = column
+
+
+class ForStmt(Node):
+    """claude.md #60. `init` is a VarDecl (the loop variable, scoped to
+    this statement); `update` is an arbitrary expression, evaluated for
+    its side effect at the end of each iteration (typically a
+    PostfixOp -- claude.md #60's own list of valid update expressions)."""
+
+    def __init__(self, init, test, update, body, line=0, column=0):
+        self.init = init
+        self.test = test
+        self.update = update
+        self.body = body
+        self.line = line
+        self.column = column
+
+
 # ---- expressions ----
 
 class Identifier(Node):
@@ -192,6 +217,18 @@ class UnaryOp(Node):
     def __init__(self, op, operand):
         self.op = op
         self.operand = operand
+
+
+class PostfixOp(Node):
+    """claude.md #66: postfix ++/--. Only ever valid on a mutable int
+    variable (an Identifier) -- enforced in semantic.py, not the parser,
+    same pattern as every other type restriction in this codebase."""
+
+    def __init__(self, op, operand, line=0, column=0):
+        self.op = op
+        self.operand = operand
+        self.line = line
+        self.column = column
 
 
 class Member(Node):

@@ -151,6 +151,10 @@ class Parser:
             return self.parse_event_handler()
         if t.type == "if":
             return self.parse_if()
+        if t.type == "while":
+            return self.parse_while()
+        if t.type == "for":
+            return self.parse_for()
         if t.type == "return":
             return self.parse_return()
         if t.type == "func":
@@ -288,6 +292,35 @@ class Parser:
             orelse = self.parse_if() if self.at("if") else self.parse_block()
         return ast.IfStmt(test, then, orelse, t.line, t.column)
 
+    def parse_while(self):
+        # claude.md #61: `while condition { }` -- condition parens are
+        # optional, same convention as parse_if.
+        t = self.eat("while")
+        if self.at("LPAREN"):
+            self.eat("LPAREN")
+            test = self.parse_expression()
+            self.eat("RPAREN")
+        else:
+            test = self.parse_expression()
+        body = self.parse_block()
+        return ast.WhileStmt(test, body, t.line, t.column)
+
+    def parse_for(self):
+        # claude.md #60: `for initialization, condition, update { }` --
+        # comma-separated, no parens. `init` is always a fresh
+        # declaration (claude.md's own examples and "the initialization
+        # variable is scoped to the loop body" wording both assume this);
+        # parse_var_decl's optional trailing `_semi()` is a harmless
+        # no-op here since the next token is a comma, not `;`.
+        t = self.eat("for")
+        init = self.parse_var_decl()
+        self.eat_op(",")
+        test = self.parse_expression()
+        self.eat_op(",")
+        update = self.parse_expression()
+        body = self.parse_block()
+        return ast.ForStmt(init, test, update, body, t.line, t.column)
+
     def parse_return(self):
         t = self.eat("return")
         value = None
@@ -394,6 +427,11 @@ class Parser:
                 node = ast.Call(node, args)
             else:
                 break
+        # claude.md #66: postfix ++/-- -- highest precedence, binds
+        # tighter than unary, same as call/member access.
+        if self.at_op("++", "--"):
+            op_tok = self.eat()
+            node = ast.PostfixOp(op_tok.value, node, op_tok.line, op_tok.column)
         return node
 
     def parse_args(self):

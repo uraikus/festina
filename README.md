@@ -29,7 +29,7 @@ Festina is under active development. Everything else in this README
 describes the full target language from `claude.md`; this section is
 the ground truth for what actually runs today.
 
-**Test suite:** 219/219 passing, 0 skipped, 0 failed (`pytest tests/`).
+**Test suite:** 261/261 passing, 0 skipped, 0 failed (`pytest tests/`).
 See [`tests/`](tests/) and [`tests/CONTRACT.md`](tests/CONTRACT.md) for
 the spec-driven suite this is measured against — every test cites the
 `claude.md` section it checks.
@@ -48,10 +48,12 @@ runtime, and *runs* as a standalone executable (no Python or the
 | Variables / constants | ✅ global and local |
 | Functions | ✅ typed params, return values, `void`, structs returned by value |
 | Control flow | ✅ `if`/`else`, ternary, `&&` / `||` (short-circuit), all operators |
+| **Loops (`claude.md #60/#61`)** | ✅ `for init, cond, update { }` and `while cond { }`, including the loop-variable scoping rule and `while true` infinite loops — no `break`/`continue` (claude.md doesn't define either; `return` from the enclosing function is the only documented way out early) |
+| **Postfix `++`/`--` (`claude.md #66`)** | ✅ mutable `int` variables only, compile-time-checked |
 | String interpolation | ✅ `` `Hello ${name}` `` |
 | `log()` / `fail()` | ✅ |
 | Structs | ✅ declaration, field read/write, passed to and returned from functions |
-| **Arrays (`arr[T]`)** | ✅ literals, indexed read/write by any index expression, nesting, as function params/return values, as struct-array elements — see the caveats below and in `festina/codegen.py`'s module docstring |
+| **Arrays (`arr[T]`)** | ✅ literals, indexed read/write by any index expression, nesting, `.length` (`claude.md #63`), as function params/return values, as struct-array elements — see the caveats below and in `festina/codegen.py`'s module docstring |
 | **Numeric conversion (`claude.md #55/#56`)** | ✅ int and float never mix implicitly, in any operator (arithmetic *or* comparison) — `int.toFloat()` and `Math.floor/ceil/round/trunc(x)` are the only conversions, both compile-time-checked and runtime-tested |
 | **Division/modulo by zero (`claude.md #57`)** | ✅ returns `null` instead of crashing the process, for both `int` and `float` |
 | **Automatic SQLite schema sync** | ✅ `festina.sqlite` opens/creates itself; tables are created, and columns added/dropped/retyped with existing data preserved via a temp-table rebuild — the `claude.md #31` worked examples all pass as tests |
@@ -92,17 +94,24 @@ Known limitations, all deliberate per `claude.md #54`'s ambiguity rule
 (unspecified stays unresolved rather than invented) or explicitly
 scoped out rather than silently missing:
 
-- Arrays have no `.length` or loop construct to iterate one with
-  (claude.md has no `for`/`while` at all), aren't bounds-checked, and
-  their data is `malloc`'d and never freed — claude.md #43 promises
-  automatic memory management this compiler doesn't implement yet (no
-  GC, no refcounting). The same is true of struct storage, which is
-  always heap-allocated (`calloc`) rather than stack-allocated, even for
-  a struct local to one function — a stack-allocated struct's address
-  can genuinely outlive its function (returned, stored in an array or
-  another struct), which used to silently corrupt memory; see the
-  "Struct storage is always heap-allocated" note in
-  `festina/codegen.py`'s module docstring.
+- Arrays aren't bounds-checked, don't grow, and their data is `malloc`'d
+  and never freed — claude.md #43 promises automatic memory management
+  this compiler doesn't implement yet (no GC, no refcounting). The same
+  is true of struct storage, which is always heap-allocated (`calloc`)
+  rather than stack-allocated, even for a struct local to one function —
+  a stack-allocated struct's address can genuinely outlive its function
+  (returned, stored in an array or another struct), which used to
+  silently corrupt memory; see the "Struct storage is always
+  heap-allocated" note in `festina/codegen.py`'s module docstring.
+- No `break`/`continue` — claude.md #60/#61 define `for`/`while` but
+  don't define either, so the only documented way out of a loop body
+  early is `return` from the enclosing function (see
+  `TestLoops.test_while_true_exits_via_return_inside_the_loop` in
+  `tests/test_codegen.py` for a worked example). A `for` loop's update
+  expression is evaluated as an arbitrary expression, not restricted to
+  just `i++`/`i--` at the implementation level — claude.md #60 lists
+  those as the valid forms but doesn't say the update clause can be
+  *nothing else*, so this doesn't add a restriction beyond what's typed.
 - `bool` has the same "no representable `null`" problem `int`/`float`
   used to (LLVM's `null` literal is only valid for pointer types, and
   `i1` has no spare bit pattern) — `bool x = null` still fails to
@@ -187,7 +196,7 @@ sure.
 
 ```bash
 pip install -r requirements-dev.txt   # pytest, for the test suite
-pytest tests/                         # 219 passed
+pytest tests/                         # 261 passed
 
 ./bin/festina examples/hello.f -o hello
 ./hello
@@ -424,8 +433,8 @@ This means database schema changes can be made directly in the Festina source ra
 ## Arrays
 
 > **Status:** implemented — literals, indexed read/write, nesting,
-> function params/return values. No `.length` and not bounds-checked
-> (claude.md doesn't specify either); data currently leaks (no GC yet).
+> `.length`, function params/return values. Not bounds-checked
+> (claude.md doesn't specify it); data currently leaks (no GC yet).
 > See [Implementation Status](#implementation-status).
 
 Arrays are strongly typed:
@@ -441,6 +450,57 @@ Nested arrays are also possible:
 
 ```festina
 arr[arr[int]] matrix
+```
+
+Every array has a built-in read-only `.length`:
+
+```festina
+arr[int] values = [1, 2, 3]
+log(values.length)
+```
+
+## Loops
+
+> **Status:** implemented — `for` and `while`, including loop-variable
+> scoping and `while true`. No `break`/`continue` (claude.md doesn't
+> define either); the only documented way out of a loop body early is
+> `return` from the enclosing function. See
+> [Implementation Status](#implementation-status).
+
+C-style counted loops:
+
+```festina
+for int x = 0, x < 10, x++ {
+    log(x)
+}
+```
+
+Iterating an array with `.length`:
+
+```festina
+for int x = 0, x < array.length, x++ {
+    log(array[x])
+}
+```
+
+`while` loops:
+
+```festina
+int e = 0
+
+while e < 10 {
+    log(e)
+    e++
+}
+```
+
+Postfix `++`/`--` work on any mutable `int` variable, not just inside a
+loop header:
+
+```festina
+int i = 0
+i++
+i--
 ```
 
 ## Graphics
