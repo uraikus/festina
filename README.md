@@ -1,132 +1,292 @@
-# festina
-A JavaScript like language that compiles via LLVM to binary.
+# Festina
 
-# jsc — a JavaScript-subset compiler targeting LLVM
+**A fast, modern programming language with the simplicity of JavaScript and the power of native compilation.**
 
-Compiles a restricted subset of JavaScript to real LLVM IR, backed by a C
-runtime that implements the dynamic value system, plus bindings to
-**libsqlite3** (a `better-sqlite3`-style API) and **cairo** (a Canvas 2D
-`getContext('2d')`-style API).
+Festina is a new programming language designed to make native application development approachable without sacrificing performance.
 
-```
-JS source --[lexer.py]--> tokens --[parser.py]--> AST --[codegen.py]--> LLVM IR (.ll)
-                                                                            |
-                                              clang/llc  <-------  or  libLLVM JIT
-                                                  |
-                                         native binary, linked against
-                                         runtime.c + libsqlite3 + libcairo
-```
+It takes the syntax developers already know from JavaScript and combines it with static typing, LLVM compilation, built-in databases, graphics, audio, and native executables.
 
-## Layout
+> **Write code that feels familiar. Compile code that runs fast.**
 
-```
-compiler/
-  lexer.py      tokenizer
-  parser.py     recursive-descent parser -> AST
-  ast_nodes.py  AST node classes
-  codegen.py    AST -> LLVM IR text
-  jsc.py        CLI: jsc.py input.js -o output.ll
-runtime/
-  runtime.h/.c       value system, operators, array/object/string/number
-                     methods, console.log, sqlite + canvas bindings
-  sqlite3_shim.h     hand-written sqlite3 C ABI declarations (no -dev
-                     package needed, since the ABI has been stable for
-                     20 years and only the shared lib is required)
-examples/
-  basics.js          for-loops, if/else, arrays, objects, strings, numbers
-  sqlite_canvas.js   better-sqlite3-style + canvas-style demo
-build.sh             build a native binary with a real clang/LLVM toolchain
-run_jit.sh           run via ctypes+libLLVM JIT (no clang needed)
-jit_run.py           the ctypes JIT runner used by run_jit.sh
+[GitHub Repository](https://github.com/uraikus/festina)
+
+## Why Festina?
+
+Modern programming often forces developers to choose between convenience and performance.
+
+JavaScript is remarkably productive, but its dynamic nature and runtime model are not ideal for every application. Systems languages provide excellent performance, but often require considerably more complexity.
+
+Festina aims for a different balance.
+
+```text
+JavaScript-like syntax
+        +
+Static typing
+        +
+LLVM native compilation
+        +
+Built-in application features
+        =
+Fast, approachable native software
 ```
 
-## Quick start
+Festina is designed to feel familiar from the first line of code.
 
-**With a full clang/LLVM toolchain** (e.g. `apt install clang libsqlite3-dev libcairo2-dev`):
+---
+
+## A Familiar Language
+
+If you know JavaScript, much of Festina will look immediately recognizable.
+
+```festina
+text func greet(name:text) {
+    log(`Hello, ${name}!`)
+}
+
+greet('World')
 ```
-./build.sh examples/basics.js out
-./out
+
+You get familiar features such as:
+
+* String interpolation
+* Ternary expressions
+* Arrays
+* Objects through structs
+* Property access
+* `Date`
+* Simple event handlers
+
+But Festina removes many of JavaScript's dynamic behaviors in favor of predictable, statically typed code.
+
+---
+
+## Native Performance
+
+Festina programs compile through LLVM into native executables.
+
+There is no requirement for a JavaScript engine or interpreter to run your application.
+
+The goal is simple:
+
+**Write approachable code and ship a real native application.**
+
+Festina is designed with performance in mind from the language level upward, including efficient memory management, minimal runtime overhead, and aggressive compiler optimization.
+
+---
+
+## Batteries Included
+
+Festina is designed for applications, not just algorithms.
+
+Common functionality is built directly into the language and runtime.
+
+### SQLite
+
+Database access is built in.
+
+```festina
+table users {
+    id:int
+    name:text
+}
+
+arr[users] people = sqlite('select * from users')
 ```
 
-**Without clang** (this sandbox only has `libLLVM-*.so`, no `clang`/`llc`
-binaries and no network access to install them) — the same IR is instead
-parsed, verified, and JIT-executed directly through LLVM's C API via
-ctypes, which is what was used to test everything below:
+No database framework or configuration ceremony is required for basic applications.
+
+### Graphics
+
+Create graphical applications with simple global functions:
+
+```festina
+drawRect(0, 0, 100, 100)
+drawCircle(50, 50, 25)
+drawText('Hello Festina', 20, 20)
 ```
-gcc -c -fPIC -O2 -o runtime/runtime.o runtime/runtime.c
-gcc -shared -fPIC -O2 -o runtime/libjsruntime.so runtime/runtime.o \
-    /lib/x86_64-linux-gnu/libsqlite3.so.0 -lcairo -lm
-./run_jit.sh examples/basics.js
+
+### Images
+
+```festina
+img logo = loadImage('logo.png')
+
+drawImage(logo, 0, 0)
 ```
-Both paths compile the *same* `.ll` IR — `build.sh` just also does the final
-IR→object→link steps that `clang` normally does for you.
 
-## What's supported
+### Audio
 
-- **Types**: numbers, strings, booleans, `null`/`undefined`, arrays, objects
-- **Control flow**: `if`/`else`, `for(;;)`, `while`
-- **Functions**: top-level `function` declarations, arrow functions (used
-  chiefly as callbacks for `map`/`filter`/`forEach`)
-- **console**: `console.log(...)`
-- **Array methods**: `push`, `pop`, `length`, `map`, `filter`, `forEach`,
-  `join`, `indexOf`, `includes`, `slice`
-- **Object**: literals, `obj.prop` / `obj['prop']` get/set, `Object.keys`,
-  `Object.values`
-- **String methods**: `length`, `slice`, `indexOf`, `includes`, `split`,
-  `toUpperCase`, `toLowerCase`, `charAt`, `trim`
-- **Number methods**: `toFixed`, `toString`
-- **`better-sqlite3`-style API**: `new Database(path)`, `db.exec(sql)`,
-  `db.prepare(sql)` → `stmt.run(...)`, `stmt.get(...)`, `stmt.all(...)`,
-  `db.close()` — implemented directly against `libsqlite3`'s C ABI
-- **Canvas 2D-style API**: `createCanvas(w,h)`, `canvas.getContext('2d')`,
-  `fillStyle`/`strokeStyle`/`lineWidth`, `fillRect`/`strokeRect`/`clearRect`,
-  `beginPath`/`moveTo`/`lineTo`/`arc`/`closePath`, `fill`/`stroke`,
-  `fillText`, `canvas.toBuffer(path)` (writes a PNG) — implemented directly
-  against `cairo`'s C API
+```festina
+aud music = loadAudio('music.mp3')
 
-Both example programs in `examples/` run successfully through the full
-pipeline, including real SQL queries against an in-memory SQLite database
-and a real PNG rendered by cairo (blue rectangle + red circle + black line).
+music.play()
+```
 
-## Design simplifications (read before extending)
+### Events
 
-This is a real, working compiler, but it takes shortcuts a production
-implementation wouldn't, in the interest of covering the requested feature
-set concretely rather than partially covering a much larger one:
+Interactive applications can respond to events directly:
 
-- **Every JS value is boxed** as a heap-allocated tagged `JSValue*` (like
-  `T_NUMBER`/`T_STRING`/`T_ARRAY`/...). This makes codegen uniform (every
-  expression is just an `i8*`) at the cost of performance — there's no
-  unboxed fast path for numeric loops. A real implementation would use
-  LLVM's type system properly (e.g. NaN-boxing or unboxed doubles with
-  guards).
-- **No garbage collection.** Allocations are simply leaked. Fine for
-  short-lived scripts and demos; not for long-running programs.
-- **No true block scoping.** All `let`/`const`/`var`/parameters within a
-  function are hoisted to allocas in the entry block (the classic
-  "Kaleidoscope tutorial" approach), so shadowing between nested blocks
-  isn't handled the way real JS scoping works.
-- **No closures.** Arrow functions compile to ordinary top-level LLVM
-  functions; they can't capture outer variables by reference. They work
-  fine as `map`/`filter`/`forEach` callbacks that only use their own
-  parameters.
-- **Method dispatch is mostly syntactic**, not type-checked: `.push()`
-  always means "array push", `.toUpperCase()` always means "string
-  method", etc. `indexOf`/`slice`/`includes` (which exist on both arrays
-  and strings) are resolved by *runtime* type tag instead, since those
-  are genuinely ambiguous — everything else assumes the obvious type
-  for that method name.
-- **`require('better-sqlite3')` / `require('canvas')` are no-ops.** The
-  compiler recognizes `Database`, `createCanvas`, and `Object` as builtins
-  by identifier name regardless of what (if anything) they were bound to,
-  rather than implementing a real module system.
-- **Canvas fill/stroke color is a single shared cairo "source color"**,
-  matching the common case (set a style, immediately fill/stroke) but not
-  simultaneous independent fill/stroke colors mid-path.
-- **No exceptions/try-catch, no `switch`, no template literals, no
-  destructuring beyond the one `require()` pattern**, no classes, no
-  `async`/`await`, no regex.
+```festina
+on click(x:int, y:int) {
+    log(`Clicked at ${x}, ${y}`)
+}
+```
 
-Extending any of these is mechanical (the codegen and runtime are both
-straightforward, uniform, and small enough to read end to end) but was out
-of scope for the requested feature set.
+The goal is to make common application development feel straightforward rather than requiring a large collection of libraries and frameworks.
+
+---
+
+## Simple Types
+
+Festina uses explicit types without requiring excessive ceremony.
+
+```festina
+int age = 32
+text name = 'Patrick'
+bool active = true
+float score = 98.5
+```
+
+Arrays are typed:
+
+```festina
+arr[text] names = ['Patrick', 'John', 'Mary']
+```
+
+Structs provide familiar object-like data:
+
+```festina
+struct User {
+    id:int
+    name:text
+}
+
+User user
+user.id = 1
+user.name = 'Patrick'
+```
+
+The result is code that remains easy to read while giving the compiler much more information to optimize.
+
+---
+
+## No JavaScript Runtime Required
+
+Festina is inspired by JavaScript without depending on JavaScript to execute.
+
+A Festina application is compiled into a native executable.
+
+```text
+main.f
+   ↓
+Festina
+   ↓
+LLVM
+   ↓
+Native Executable
+```
+
+That means Festina is intended to be suitable for applications that need to be distributed as standalone native software.
+
+---
+
+## Simple Imports
+
+Festina keeps project organization straightforward.
+
+```festina
+import database.f
+import ui.f
+import utilities.f
+```
+
+Imports are resolved at compile time and combined into the application.
+
+There is no complicated runtime module system to configure.
+
+Festina automatically prevents the same source file from being included more than once.
+
+---
+
+## No Boilerplate `main()`
+
+A simple Festina program can simply contain executable code:
+
+```festina
+log('Hello World')
+```
+
+You don't need to create a `main()` function just to get started.
+
+Festina automatically creates the program entry point when compiling the application's entry file.
+
+---
+
+## One Tool
+
+The compiler is distributed as:
+
+```bash
+festina
+```
+
+Compile an application:
+
+```bash
+festina main.f
+```
+
+Specify an output name:
+
+```bash
+festina main.f -o myapp
+```
+
+The intention is for `festina` to eventually become a complete development tool for building, running, checking, formatting, and distributing Festina applications.
+
+---
+
+## Built to Grow
+
+Festina is being designed with a long-term goal of becoming self-hosting.
+
+The initial compiler can be implemented using an established systems language and LLVM.
+
+Eventually, Festina should be capable of compiling the Festina compiler itself.
+
+The ultimate goal is simple:
+
+> **Festina written in Festina, compiled by Festina.**
+
+---
+
+## What Festina Is For
+
+Festina is particularly well suited to applications where you want:
+
+* Native executables
+* Good performance
+* Simple syntax
+* Built-in databases
+* Graphical interfaces
+* Multimedia
+* Event-driven applications
+* A small and approachable language
+* Less boilerplate than traditional systems programming
+
+It is intended to occupy the space between highly dynamic application languages and lower-level systems languages.
+
+---
+
+## Project Status
+
+Festina is under active development.
+
+The language and compiler are evolving, and some features described here may not yet be available in the current release.
+
+The project is currently focused on establishing the language, compiler, native code generation, runtime, and core application features.
+
+Contributions, experimentation, and feedback are welcome.
+
+## License
+
+Festina is released under the MIT License.
