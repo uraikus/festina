@@ -4,6 +4,9 @@ See tests/CONTRACT.md for why these tests target a `festina` package that
 doesn't exist yet, and what its assumed API looks like.
 """
 import importlib
+import shutil
+import subprocess
+import sys
 
 import pytest
 
@@ -70,6 +73,46 @@ def sqlite_schema():
 @pytest.fixture
 def compiler_mod():
     return import_spec_module("compiler")
+
+
+@pytest.fixture
+def codegen():
+    return import_spec_module("codegen")
+
+
+@pytest.fixture
+def cli_mod():
+    return import_spec_module("cli")
+
+
+@pytest.fixture
+def compile_and_run(tmp_path, codegen, cli_mod):
+    """Compile a Festina source string to a native executable and run it.
+
+    Skips with a clear reason if clang isn't on PATH -- this is a
+    toolchain-availability skip (distinct from the SPEC_UNIMPLEMENTED_REASON
+    skips above), since codegen.py itself is implemented either way.
+    Specifically clang, not just any C compiler: it generates plain-text
+    LLVM IR (.ll), which only clang (of common compilers) consumes
+    directly -- gcc has no .ll frontend.
+    """
+    cc = shutil.which("clang")
+    if not cc:
+        pytest.skip("clang not on PATH -- cannot assemble/link the "
+                     "generated LLVM IR against the Festina runtime")
+
+    def _run(source, filename="main.f", args=None):
+        src_path = tmp_path / filename
+        src_path.write_text(source)
+        out_path = tmp_path / "program"
+        cli_mod.compile_file(str(src_path), str(out_path), cc=cc)
+        result = subprocess.run(
+            [str(out_path), *(args or [])],
+            cwd=tmp_path, capture_output=True, text=True, timeout=15,
+        )
+        return result
+
+    return _run
 
 
 @pytest.fixture

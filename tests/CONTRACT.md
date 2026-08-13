@@ -2,16 +2,22 @@
 
 ## Status
 
-The `festina/` package at the repository root now implements the front
-end of the spec in `claude.md`: lexing, parsing, type resolution, semantic
-analysis, and SQLite schema-sync planning. All 133 tests in this
-directory pass against it.
+The `festina/` package at the repository root implements the front end
+of the spec in `claude.md` (lexing, parsing, type resolution, semantic
+analysis) **and** now a real LLVM codegen backend + native C runtime:
+`bin/festina program.f -o program` produces a standalone executable that
+needs neither Python nor `festina/` to run. Automatic SQLite table
+creation and schema synchronization (claude.md #28-31) is implemented
+for real against `festina.sqlite`, including the temp-table rebuild path
+for dropped/retyped columns, with data preservation verified by the
+`claude.md #31` worked examples as tests. All 155 tests in this
+directory pass against it (0 skipped, given a `clang` toolchain -- see
+below).
 
-Still unimplemented, and out of scope for `festina/`: LLVM IR generation,
-native linking, and producing an actual `festina` executable (claude.md
-#47), and the runtime pieces (graphics/Cairo, audio, actually opening
-`festina.sqlite` and executing queries). Those need the front end this
-package provides, but aren't covered by this test suite.
+See README.md's "Implementation Status" section for the current
+implemented-vs-not matrix; the short version: arrays, `sqlite()` queries,
+graphics, audio, and event handlers all parse and type-check but raise a
+clear `CodegenError` ("not implemented yet") rather than generating IR.
 
 Separately, `compiler/` (`lexer.py`, `parser.py`, `codegen.py`, `jsc.py`)
 remains a different, older prototype that compiles a small JS subset --
@@ -27,6 +33,16 @@ an existing module still fails loudly (verified directly: a deliberately
 broken stub module raises, it doesn't skip). Each test's docstring/comment
 cites the `claude.md` section it encodes, so a failure points straight at
 the rule in question.
+
+`tests/test_codegen.py` additionally uses a `compile_and_run` fixture
+that actually invokes `clang` to link generated IR against the Festina
+runtime and runs the resulting binary. That fixture skips (with a
+distinct, toolchain-specific reason) if `clang` isn't on `PATH` --
+unlike the `SPEC_UNIMPLEMENTED_REASON` skips above, this isn't "the
+feature doesn't exist," it's "this environment can't link native code."
+Tests for constructs codegen genuinely doesn't support yet (arrays,
+`sqlite()` queries, graphics, audio, events) don't need `clang` at all --
+they only call `festina.codegen.generate_ir()` and assert it raises.
 
 ## Public API implemented
 
@@ -96,11 +112,38 @@ festina/
         def compile_source(source, filename="main.f") -> CompileResult
         class CompileResult: ast, symbols, tables, structs, imports,
                               entry_function_name
+        # front-end only (parse + analyze); does not invoke codegen.
+
+    codegen.py
+        def generate_ir(program, analyzed, filename="main.f") -> str
+        # emits opaque-pointer LLVM IR text. Supports: primitives,
+        # global/local vars & consts, functions, if/else, the full
+        # expression grammar, structs (stack-allocated, GEP field
+        # access), automatic table schema sync via the festina_runtime
+        # C helpers. Raises CodegenError (a CompileError subclass,
+        # category="not implemented") for arr[T], sqlite() queries,
+        # graphics, audio, and event handlers.
+
+    cli.py
+        def compile_file(entry_path, output_path=None, emit_llvm=False,
+                          cc="clang") -> str
+        # drives parse -> analyze -> generate_ir -> clang, linking
+        # against runtime/festina_runtime.c. Single-file only for now
+        # (doesn't call festina.imports yet). def main(argv) -> int is
+        # the `bin/festina` entry point.
 ```
+
+Runtime ABI: `runtime/festina_runtime.h`/`.c` implement the C side
+codegen's `declare`s call into -- `festina_log_*`/`festina_fail` (#41,
+#42), `festina_str_*` (string interpolation, #9/#45), and
+`festina_db_open`/`festina_sync_table` (#8, #28-31: schema
+create/add-column/rebuild-with-CAST, using the same declared-vs-existing
+diff `sqlite_schema.py` computes, reimplemented in C since the compiled
+executable can't depend on Python at runtime).
 
 ## Running
 
 ```
-pip install pytest
-pytest tests/
+pip install -r requirements-dev.txt   # pytest
+pytest tests/                          # 155 passed, 0 skipped (needs clang)
 ```
