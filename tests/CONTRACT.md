@@ -1,104 +1,101 @@
 # Test contract for the Festina language spec (`claude.md`)
 
-## Why this exists
+## Status
 
-`claude.md` at the repository root is a specification for the **Festina**
-language and compiler that an AI agent is meant to implement. As of this
-commit, the code under `compiler/` (`lexer.py`, `parser.py`, `codegen.py`,
-`jsc.py`) does **not** implement that spec — it's a separate, older
-prototype that compiles a small subset of JavaScript itself (`var`/`let`,
-`function`, no static types, no `table`/`struct`/`arr[T]`, no `sqlite()`
-builtin, no reserved words from `claude.md` section 51 at all).
+The `festina/` package at the repository root now implements the front
+end of the spec in `claude.md`: lexing, parsing, type resolution, semantic
+analysis, and SQLite schema-sync planning. All 133 tests in this
+directory pass against it.
 
-This directory contains a **spec-driven unit test suite** for `claude.md`,
-written against a `festina` Python package that does not exist yet. Every
-test module calls `pytest.importorskip(...)` on the specific `festina.*`
-submodule it needs, so:
+Still unimplemented, and out of scope for `festina/`: LLVM IR generation,
+native linking, and producing an actual `festina` executable (claude.md
+#47), and the runtime pieces (graphics/Cairo, audio, actually opening
+`festina.sqlite` and executing queries). Those need the front end this
+package provides, but aren't covered by this test suite.
 
-- Today, running `pytest tests/` collects everything and **skips** it,
-  with a clear reason pointing back at this file. Nothing fails, nothing
-  is silently ignored.
-- As soon as someone adds `festina/lexer.py`, the lexer tests in
-  `test_lexer.py` start actually running (and, once the implementation
-  matches the spec, passing) — without touching the test files.
-- Each test docstring/comment cites the `claude.md` section number it
-  encodes, so a failing test points straight at the rule it's checking.
+Separately, `compiler/` (`lexer.py`, `parser.py`, `codegen.py`, `jsc.py`)
+remains a different, older prototype that compiles a small JS subset --
+unrelated to `festina/` and not exercised by these tests.
 
-This is intentionally a spec-first suite (TDD scaffold) for the Festina
-language described in `claude.md`, not a test of the existing `compiler/`
-prototype (which implements a different, unrelated JS subset and has no
-`table`/`struct`/`arr[T]`/`sqlite()`/etc. support at all).
+## Why the tests are structured this way
 
-## Assumed public API
+Every test module gets its `festina.*` submodule through a conftest.py
+fixture (`import_spec_module`) rather than a plain `import festina.x`. If
+a module is later removed or renamed, tests against it skip with a clear
+reason instead of erroring the whole session -- but a real bug *inside*
+an existing module still fails loudly (verified directly: a deliberately
+broken stub module raises, it doesn't skip). Each test's docstring/comment
+cites the `claude.md` section it encodes, so a failure points straight at
+the rule in question.
 
-Nothing here is set in stone — it's a reasonable, minimal surface inferred
-from `claude.md`, meant to give an implementer a concrete target. Adjust
-the tests alongside the real API as it's built, keeping each test's cited
-spec section as the source of truth.
+## Public API implemented
 
 ```
 festina/
     errors.py
         class CompileError(Exception):
-            file: str
-            line: int
-            column: int
-            category: str      # e.g. "unknown type", "unsupported operator"
-            message: str
+            file, line, column, category, message
             # str(err) == "{file}:{line}:{column}: error: {message}"
-            # (see claude.md #48, example in #48: main.f:12:5: error: ...)
-
         class CircularImportError(CompileError): ...
 
     lexer.py
-        KEYWORDS: frozenset[str]      # claude.md #51
+        KEYWORDS: frozenset[str]           # claude.md #51 (+ a few
+                                            # internal-only control words:
+                                            # return/var/let/throw)
+        SOURCE_EXTENSION = ".f"            # claude.md #4
         class Token: type, value, line, column
-        def tokenize(source: str, filename: str = "<string>") -> list[Token]
-
-    parser.py
-        def parse(source: str, filename: str = "<string>") -> ast.Program
-        # raises festina.errors.CompileError on invalid syntax
+        def tokenize(source, filename="<string>") -> list[Token]
+        # backtick templates with ${...} splice the interpolated
+        # expression's own tokens into the stream (TSTRING_START/MID/END
+        # bracket them); `import <path>` reads the rest of the line as a
+        # single PATH token rather than tokenizing it as an expression.
 
     ast.py
-        Program, ImportDecl, VarDecl, ConstDecl, FuncDecl, Param,
-        StructDecl, TableDecl, FieldDecl, IfStmt, Ternary, BinOp,
-        EqualityOp, Identifier, Literal, ArrayTypeExpr, EventHandler, ...
+        Program, ImportDecl, VarDecl, Param, FieldDecl, FuncDecl,
+        StructDecl, TableDecl, EventHandler, Block, IfStmt, Return,
+        ExprStmt, Identifier, NumberLit, StringLit, BoolLit, NullLit,
+        TemplateLit, ArrayLit, Assign, Ternary, LogicalOp, BinOp,
+        UnaryOp, Member, Call, ArrayTypeExpr
 
     types.py
-        class PrimitiveType(name): ...   # INT/FLOAT/BOOL/TEXT/BLOB
-        class StructType(name): ...
-        class TableType(name): ...
-        class ArrayType(element): ...
-        class ImageType(): ...
-        class AudioType(): ...
-        def resolve_type(type_expr, symbol_table) -> Type
-        # raises CompileError(category="unknown type") when undeclared (#13)
+        PrimitiveType(name) / StructType(name) / TableType(name) /
+        ArrayType(element) / ImageType() / AudioType()   -- frozen
+        dataclasses, so equality/hashing work out of the box.
+        type_name(t) -> str   # for error messages, e.g. "arr[int]"
+
+    parser.py
+        def parse(source, filename="<string>") -> ast.Program
+        # raises festina.errors.CompileError for invalid syntax,
+        # var/let/throw, ===/ !==, missing return types, untyped
+        # params/fields, malformed imports, etc.
 
     imports.py
         def resolve_imports(entry_path: str) -> list[str]
-        # returns canonical, deduplicated file paths, dependencies before
-        # the entry file (#6, #7, #8); raises CircularImportError on
-        # a -> b -> a style cycles without infinite recursion (#6)
+        # canonical (os.path.realpath), deduplicated, dependency-first
+        # order; raises CircularImportError on cycles (including
+        # self-imports) without recursing infinitely.
 
     semantic.py
-        def analyze(program: ast.Program) -> AnalyzedProgram
-        # raises CompileError for the categories listed in claude.md #48
+        def analyze(program, filename="<string>") -> AnalyzedProgram
+        # AnalyzedProgram: .symbols (name -> Symbol, global scope),
+        # .structs (name -> {field: Type}), .tables (name -> {field:
+        # festina-type-name-str}), .imports (list of raw import paths).
+        # Single left-to-right pass; every fixture in this repo declares
+        # structs/tables/functions before use, so no forward-reference
+        # resolution was needed.
 
     sqlite_schema.py
-        TYPE_MAP: dict[str, str]        # claude.md #30
-        def plan_sync(declared: dict[str, str],
-                       existing: dict[str, str] | None) -> SchemaSyncPlan
-        class SchemaSyncPlan:
-            create: bool
-            add_columns: dict[str, str]
-            drop_columns: list[str]
-            alter_columns: dict[str, str]
+        TYPE_MAP: dict[str, str]                        # claude.md #30
+        def plan_sync(declared, existing) -> SchemaSyncPlan
+        class SchemaSyncPlan: create, add_columns, drop_columns,
+                               alter_columns
+        create_table_ddl(...) / sync_ddl(...)  # best-effort SQL, not
+        exercised by the tests
 
     compiler.py
-        def compile_source(source: str, filename: str = "main.f") -> CompileResult
-        class CompileResult:
-            ast, symbols, tables: dict[str, dict[str, str]]
-            entry_function_name: str
+        def compile_source(source, filename="main.f") -> CompileResult
+        class CompileResult: ast, symbols, tables, structs, imports,
+                              entry_function_name
 ```
 
 ## Running
