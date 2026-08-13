@@ -19,9 +19,17 @@ those exist (see festina/codegen.py's module docstring). claude.md
 real bugs -- see below) are implemented too: int/float never convert
 implicitly in any operator, `int.toFloat()`/`Math.floor/ceil/round/trunc`
 are the only conversions, division/modulo by zero returns `null` instead
-of crashing, and struct/table names live in their own namespace. All 203
-tests in this directory pass against it (0 skipped, given a `clang`
-toolchain -- see below).
+of crashing, and struct/table names live in their own namespace.
+
+"Real compilation, minimal setup" stages 1 and 3 are also done (see
+README.md's "Deployment" section for the full staged plan): sqlite3 is
+statically linked into compiled programs (no libsqlite3.so needed to
+*run* one), and `festina/llvm_backend.py` compiles the generated LLVM IR
+to an object file itself via libLLVM's C API rather than handing a .ll
+file to clang -- clang is no longer specifically required to *use*
+Festina, just some working C compiler (gcc verified working end to end).
+All 211 tests in this directory pass against it (0 skipped, given a
+working C compiler -- see below).
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -59,14 +67,27 @@ cites the `claude.md` section it encodes, so a failure points straight at
 the rule in question.
 
 `tests/test_codegen.py` additionally uses a `compile_and_run` fixture
-that actually invokes `clang` to link generated IR against the Festina
-runtime and runs the resulting binary. That fixture skips (with a
-distinct, toolchain-specific reason) if `clang` isn't on `PATH` --
-unlike the `SPEC_UNIMPLEMENTED_REASON` skips above, this isn't "the
-feature doesn't exist," it's "this environment can't link native code."
-Tests for constructs codegen genuinely doesn't support yet (`sqlite()`
-queries, graphics, audio, events) don't need `clang` at all -- they only
-call `festina.codegen.generate_ir()` and assert it raises.
+that actually compiles+links generated IR against the Festina runtime
+and runs the resulting binary. It prefers `clang` but accepts `gcc`/`cc`
+too (stage 3 means the C compiler no longer needs an LLVM-IR-text
+frontend, just the ability to compile festina_runtime.c and link object
+files -- see festina/cli.py and festina/llvm_backend.py's docstrings).
+It skips (with a distinct, toolchain-specific reason) if no C compiler
+is on `PATH` at all -- unlike the `SPEC_UNIMPLEMENTED_REASON` skips
+above, this isn't "the feature doesn't exist," it's "this environment
+can't link native code." Tests for constructs codegen genuinely doesn't
+support yet (`sqlite()` queries, graphics, audio, events) don't need a
+C compiler at all -- they only call `festina.codegen.generate_ir()` and
+assert it raises.
+
+`tests/test_llvm_backend.py` tests `festina.llvm_backend` directly and
+only needs libLLVM itself (via its own `llvm_backend` fixture's
+`available()` check) -- a narrower requirement than `compile_and_run`'s
+full C-compiler skip, since this module doesn't touch a C compiler.
+`test_codegen.py`'s `TestMinimalBuildDependencies` covers the two ends
+of stage 3 concretely: gcc actually producing a working binary when
+libLLVM is available, and the original clang-only pipeline still
+working (via `monkeypatch`) when it isn't.
 
 `tests/test_numeric_conversion.py` covers claude.md #55-58 at the
 parser/semantic level only (same `parser`/`semantic`/`errors` fixtures as
@@ -172,13 +193,30 @@ festina/
         # implemented") for sqlite() queries, graphics, audio, and event
         # handlers.
 
+    llvm_backend.py
+        def available() -> bool           # libLLVM found+loaded in this process?
+        def emit_object_file(ir_text, out_path, filename="<ir>") -> None
+        class LLVMBackendError(Exception): ...
+        # ctypes bindings against libLLVM's C API (same pattern as this
+        # repo's own top-level jit_run.py, extended for AOT object
+        # emission via LLVMTargetMachineEmitToFile instead of MCJIT).
+        # RelocMode is pinned to PIC to match this system's PIE-by-default
+        # linking (verified: LLVMRelocDefault produces relocations `ld`
+        # rejects for a PIE). available() is False (never raises) if
+        # libLLVM can't be found/loaded or the process architecture isn't
+        # one of the target-init symbol names this module knows.
+
     cli.py
         def compile_file(entry_path, output_path=None, emit_llvm=False,
                           cc="clang") -> str
-        # drives parse -> analyze -> generate_ir -> clang, linking
-        # against runtime/festina_runtime.c. Single-file only for now
-        # (doesn't call festina.imports yet). def main(argv) -> int is
-        # the `bin/festina` entry point.
+        # drives parse -> analyze -> generate_ir, then:
+        #   llvm_backend.available() -> compile IR to an object file via
+        #     llvm_backend directly (stage 3), cc only compiles the
+        #     (cached) runtime and links plain object files -- gcc works.
+        #   otherwise -> original fallback: hand the .ll file straight to
+        #     cc, which must then actually be clang.
+        # Single-file only for now (doesn't call festina.imports yet).
+        # def main(argv) -> int is the `bin/festina` entry point.
 ```
 
 Runtime ABI: `runtime/festina_runtime.h`/`.c` implement the C side
@@ -193,5 +231,5 @@ executable can't depend on Python at runtime).
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 203 passed, 0 skipped (needs clang)
+pytest tests/                          # 211 passed, 0 skipped (needs a C compiler)
 ```

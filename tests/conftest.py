@@ -86,20 +86,28 @@ def cli_mod():
 
 
 @pytest.fixture
+def llvm_backend():
+    return import_spec_module("llvm_backend")
+
+
+@pytest.fixture
 def compile_and_run(tmp_path, codegen, cli_mod):
     """Compile a Festina source string to a native executable and run it.
 
-    Skips with a clear reason if clang isn't on PATH -- this is a
-    toolchain-availability skip (distinct from the SPEC_UNIMPLEMENTED_REASON
-    skips above), since codegen.py itself is implemented either way.
-    Specifically clang, not just any C compiler: it generates plain-text
-    LLVM IR (.ll), which only clang (of common compilers) consumes
-    directly -- gcc has no .ll frontend.
+    Skips with a clear reason if no usable C compiler is on PATH -- this
+    is a toolchain-availability skip (distinct from the
+    SPEC_UNIMPLEMENTED_REASON skips above), since codegen.py itself is
+    implemented either way. Prefers clang but accepts gcc too: as of
+    "real compilation, minimal setup" stage 3, festina.llvm_backend
+    compiles the LLVM IR itself (when available) rather than handing the
+    .ll file to the C compiler, so cc's job is just compiling
+    festina_runtime.c and linking plain object files -- work gcc does
+    exactly as well as clang. See festina/cli.py's module docstring.
     """
-    cc = shutil.which("clang")
+    cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
     if not cc:
-        pytest.skip("clang not on PATH -- cannot assemble/link the "
-                     "generated LLVM IR against the Festina runtime")
+        pytest.skip("no C compiler (clang/gcc/cc) on PATH -- cannot "
+                     "compile/link the Festina runtime and the generated code")
 
     def _run(source, filename="main.f", args=None):
         src_path = tmp_path / filename

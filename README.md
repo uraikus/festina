@@ -27,7 +27,7 @@ Festina is under active development. Everything else in this README
 describes the full target language from `claude.md`; this section is
 the ground truth for what actually runs today.
 
-**Test suite:** 203/203 passing, 0 skipped, 0 failed (`pytest tests/`).
+**Test suite:** 211/211 passing, 0 skipped, 0 failed (`pytest tests/`).
 See [`tests/`](tests/) and [`tests/CONTRACT.md`](tests/CONTRACT.md) for
 the spec-driven suite this is measured against — every test cites the
 `claude.md` section it checks.
@@ -67,12 +67,16 @@ right now:
 |---|---|---|
 | 1. Static-link sqlite3 into compiled programs | A Festina program built here no longer needs `libsqlite3.so` on the machine that *runs* it (falls back to a normal dynamic link if no static archive is available in the build environment) | ✅ done |
 | 2. Package the compiler frontend as a real binary (no separate Python install to *run the compiler*) | — | not started |
-| 3. Drive libLLVM directly instead of shelling out to the `clang` binary, so using Festina no longer requires a separate clang/LLVM install | — | not started |
-| 4. Embed LLD too, removing the last external dependency (a system linker) | — | not started |
+| 3. Drive libLLVM directly instead of shelling out to the `clang` binary | `festina/llvm_backend.py` compiles the generated LLVM IR to an object file in-process via libLLVM's C API (ctypes) — `clang` is no longer *specifically* required; `gcc` (or any working C compiler/linker) now works too, since the only thing left for it to do is compile `festina_runtime.c` and link plain object files. Falls back to the original clang-only pipeline automatically if libLLVM can't be loaded, so this is purely additive | ✅ done |
+| 4. Embed LLD too, removing the last external dependency (a system linker) | Some C compiler/linker still has to be present to compile `festina_runtime.c` and link — that's a meaningfully smaller ask than clang/LLVM specifically, but not yet zero | not started |
 
-Stages 2-4 don't remove anything end users of *compiled Festina
+Stages 2 and 4 don't remove anything end users of *compiled Festina
 programs* depend on — they're about what it takes to install and run
-the `festina` compiler itself.
+the `festina` compiler itself. Verified concretely, not just reasoned
+about: `gcc` genuinely can't handle a `.ll` file at all (it hands it to
+`ld`, which treats it as a corrupt linker script and fails) — compiling
+the IR ourselves is what actually broadens compiler compatibility, not
+just a style preference.
 
 Known limitations, all deliberate per `claude.md #54`'s ambiguity rule
 (unspecified stays unresolved rather than invented) or explicitly
@@ -124,12 +128,14 @@ this status section describes.
 
 ### Building and running
 
-Requires `clang` and the `sqlite3` development headers (`libsqlite3-dev`
-on Debian/Ubuntu).
+Requires a C compiler (`clang` or `gcc`) and the `sqlite3` development
+headers (`libsqlite3-dev` on Debian/Ubuntu). `clang` is preferred if
+both are present — it doubles as the fallback path if `libLLVM` can't
+be loaded — but isn't required specifically; see the stage 3 row above.
 
 ```bash
 pip install -r requirements-dev.txt   # pytest, for the test suite
-pytest tests/                         # 203 passed
+pytest tests/                         # 211 passed
 
 ./bin/festina examples/hello.f -o hello
 ./hello

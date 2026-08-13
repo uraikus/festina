@@ -558,3 +558,53 @@ class TestMinimalRuntimeDependencies:
 
         ldd_output = subprocess.run(["ldd", str(binary)], capture_output=True, text=True).stdout
         assert "libsqlite3" not in ldd_output
+
+
+class TestMinimalBuildDependencies:
+    """"Real compilation, minimal setup" stage 3: using Festina shouldn't
+    require clang *specifically*. Before this stage, cc had to be clang
+    because it was handed the .ll file directly (the only common
+    compiler with an LLVM-IR-text frontend); now festina.llvm_backend
+    compiles that step itself via libLLVM, so cc's remaining job --
+    compiling festina_runtime.c and linking plain object files -- is
+    compiler-agnostic. See festina/cli.py's module docstring."""
+
+    def test_gcc_works_as_cc_when_libllvm_is_available(self, parser, semantic, codegen, tmp_path, llvm_backend):
+        if not shutil.which("gcc"):
+            pytest.skip("gcc not on PATH")
+        if not llvm_backend.available():
+            pytest.skip("libLLVM unavailable -- gcc-as-cc only works via the "
+                        "libLLVM path (the clang-IR-frontend fallback needs clang)")
+        from festina import cli as cli_mod
+
+        src = tmp_path / "main.f"
+        src.write_text("table People {\n    id:int\n    name:text\n}\nlog('built with gcc')")
+        out = tmp_path / "program"
+        cli_mod.compile_file(str(src), str(out), cc="gcc")
+        assert out.exists()
+
+        result = subprocess.run([str(out)], cwd=tmp_path, capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "built with gcc"
+
+    def test_falls_back_to_clang_ir_frontend_when_libllvm_unavailable(self, parser, semantic, codegen, tmp_path, monkeypatch):
+        clang = shutil.which("clang")
+        if not clang:
+            pytest.skip("clang not on PATH -- nothing to fall back to")
+        from festina import cli as cli_mod, llvm_backend
+
+        class _Unavailable:
+            lib = None
+
+        monkeypatch.setattr(llvm_backend, "_binding_instance", _Unavailable())
+        assert llvm_backend.available() is False
+
+        src = tmp_path / "main.f"
+        src.write_text("log('built via fallback')")
+        out = tmp_path / "program"
+        cli_mod.compile_file(str(src), str(out), cc=clang)
+        assert out.exists()
+
+        result = subprocess.run([str(out)], cwd=tmp_path, capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "built via fallback"

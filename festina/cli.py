@@ -5,21 +5,30 @@
     festina main.f --emit-llvm  # -> prints LLVM IR to stdout, no linking
 
 Pipeline (claude.md #47): source -> parse -> semantic analysis -> LLVM IR
--> clang (assembles + links against the Festina runtime) -> native
-executable. The resulting executable does not need Python or the
-festina package to run (claude.md #47).
+-> object file -> link -> native executable. The resulting executable
+does not need Python or the festina package to run (claude.md #47).
 
-sqlite3 is statically linked into the compiled program when a static
-archive is available (_sqlite_link_flags), so a program built here
-doesn't need libsqlite3.so present on the machine that runs it -- falls
-back to a normal dynamic link otherwise, so this still works in
-environments that only ship the shared library. This is step 1 of
-"minimal setup to use Festina" (see the project's design discussion);
-step 2 is removing the *build-time* dependency on a separately-installed
-clang/LLVM, which this module doesn't address yet -- `cc` here still
-shells out to a real `clang` (or whatever `--cc` points at).
+"Real compilation, minimal setup" (see README.md's "Deployment"
+section for the full staged plan):
+
+- stage 1: sqlite3 is statically linked into the compiled program when a
+  static archive is available (_sqlite_link_flags), so a program built
+  here doesn't need libsqlite3.so present on the machine that *runs* it
+  -- falls back to a normal dynamic link otherwise.
+- stage 3: the LLVM IR -> object file step is done in-process via
+  festina.llvm_backend (libLLVM's C API through ctypes), not by handing
+  the .ll file to clang. That used to be the reason `cc` specifically
+  had to be clang -- gcc has no .ll frontend at all (verified: it hands
+  the file to `ld`, which fails treating it as a broken linker script).
+  With that step handled ourselves, whatever's left for `cc` to do
+  (compile festina_runtime.c, link plain object files) is compiler-
+  agnostic, so any working C compiler/linker now works, not just clang.
+  If libLLVM can't be loaded in this process at all,
+  _compile_via_clang_ir_frontend below is the original pipeline,
+  unchanged, as a fallback -- this is purely additive.
 """
 import argparse
+import hashlib
 import os
 import shutil
 import subprocess
@@ -29,6 +38,7 @@ import tempfile
 from . import parser as parser_mod
 from . import semantic as semantic_mod
 from . import codegen as codegen_mod
+from . import llvm_backend
 from .errors import CompileError
 
 _RUNTIME_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runtime")
@@ -90,6 +100,29 @@ def _sqlite_link_flags(cc):
     return flags
 
 
+def _ensure_runtime_object(cc):
+    """Compile festina_runtime.c to an object file once and reuse it
+    (cached in the system temp dir, keyed by mtime and by which `cc`
+    compiled it) instead of recompiling the same unchanging file on
+    every `festina compile` invocation. The temp dir (rather than
+    alongside the source in runtime/) sidesteps a read-only package
+    install being unable to cache anything there."""
+    cache_dir = os.path.join(tempfile.gettempdir(), "festina-runtime-cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cc_key = hashlib.sha1(cc.encode()).hexdigest()[:8]
+    obj_path = os.path.join(cache_dir, f"festina_runtime.{cc_key}.o")
+
+    if os.path.exists(obj_path) and os.path.getmtime(obj_path) >= os.path.getmtime(_RUNTIME_C):
+        return obj_path
+
+    cflags = _pkg_config("--cflags", "sqlite3")
+    cmd = [cc, "-O2", "-c", _RUNTIME_C, *cflags, "-o", obj_path]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise CompileError(f"failed to compile the Festina runtime:\n{result.stderr}", category="link error")
+    return obj_path
+
+
 def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
     with open(entry_path, encoding="utf-8") as f:
         source = f.read()
@@ -102,24 +135,56 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
         return ir
 
     output_path = output_path or _default_output_name(entry_path)
+    # -lm: claude.md #56's Math.floor/ceil/round/trunc lower to LLVM
+    # intrinsics that call into libm (round() in particular isn't inlined
+    # by clang/gcc the way floor/ceil/trunc often are).
+    sqlite_link_flags, _ = _sqlite_link_flags(cc)
+    link_libs = [*sqlite_link_flags, "-lm"]
+
+    if llvm_backend.available():
+        _compile_via_libllvm(ir, entry_path, output_path, cc, link_libs)
+    else:
+        _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, link_libs)
+    return output_path
+
+
+def _compile_via_libllvm(ir, entry_path, output_path, cc, link_libs):
+    """Stage 3: compile IR to an object file ourselves via libLLVM. The
+    only work left for `cc` is compiling festina_runtime.c (cached) and
+    linking plain object files -- no longer requires clang specifically,
+    since it never sees LLVM IR text at all."""
+    with tempfile.TemporaryDirectory() as d:
+        obj_path = os.path.join(d, "program.o")
+        try:
+            llvm_backend.emit_object_file(ir, obj_path, filename=entry_path)
+        except llvm_backend.LLVMBackendError as e:
+            raise CompileError(f"LLVM object emission failed:\n{e}",
+                                file=entry_path, category="codegen error")
+        runtime_obj = _ensure_runtime_object(cc)
+        cmd = [cc, obj_path, runtime_obj, *link_libs, "-o", output_path]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise CompileError(f"native linking failed:\n{result.stderr}",
+                                file=entry_path, category="link error")
+
+
+def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, link_libs):
+    """Fallback used only when libLLVM couldn't be loaded in this process
+    -- the original pipeline, handing the .ll file straight to `cc`
+    (which then must actually be clang, or another compiler with an LLVM
+    IR frontend -- unlike the libLLVM path above, this one does require
+    that specifically)."""
     with tempfile.NamedTemporaryFile(suffix=".ll", mode="w", delete=False) as tmp:
         tmp.write(ir)
         ir_path = tmp.name
     try:
-        sqlite_link_flags, _ = _sqlite_link_flags(cc)
-        # -lm: claude.md #56's Math.floor/ceil/round/trunc lower to LLVM
-        # intrinsics that call into libm (round() in particular isn't
-        # inlined by clang the way floor/ceil/trunc often are).
-        cmd = [cc, "-O2", ir_path, _RUNTIME_C, *sqlite_link_flags, "-lm", "-o", output_path]
+        cmd = [cc, "-O2", ir_path, _RUNTIME_C, *link_libs, "-o", output_path]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            raise CompileError(
-                f"native linking failed:\n{result.stderr}",
-                file=entry_path, category="link error",
-            )
+            raise CompileError(f"native linking failed:\n{result.stderr}",
+                                file=entry_path, category="link error")
     finally:
         os.unlink(ir_path)
-    return output_path
 
 
 def main(argv=None):
@@ -127,7 +192,9 @@ def main(argv=None):
     ap.add_argument("input", help="entry .f file")
     ap.add_argument("-o", "--output", help="output executable path (default: input filename without .f)")
     ap.add_argument("--emit-llvm", action="store_true", help="print LLVM IR to stdout instead of linking")
-    ap.add_argument("--cc", default=shutil.which("clang") or "clang", help="C compiler/linker to invoke (default: clang)")
+    default_cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc") or "clang"
+    ap.add_argument("--cc", default=default_cc,
+                     help="C compiler/linker to invoke (default: clang, gcc, or cc, whichever is found first)")
     args = ap.parse_args(argv)
 
     try:
@@ -143,8 +210,13 @@ def main(argv=None):
         print(result)
     else:
         _, sqlite_static = _sqlite_link_flags(args.cc)  # cached by compile_file's own call
-        note = "" if sqlite_static else " (sqlite3 linked dynamically -- no static libsqlite3.a found)"
-        print(f"festina: wrote {result}{note}")
+        notes = []
+        if not sqlite_static:
+            notes.append("sqlite3 linked dynamically -- no static libsqlite3.a found")
+        if not llvm_backend.available():
+            notes.append("libLLVM unavailable -- compiled via clang's IR frontend instead")
+        suffix = f" ({'; '.join(notes)})" if notes else ""
+        print(f"festina: wrote {result}{suffix}")
     return 0
 
 

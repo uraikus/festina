@@ -1,0 +1,185 @@
+"""Drive libLLVM directly (via ctypes and its C API) to turn Festina's
+generated LLVM IR into an object file, in-process -- no `clang`/`llc`
+subprocess involved for this step.
+
+"Real compilation, minimal setup" stage 3 (see README.md's "Deployment"
+section for the full staged plan). Historically `festina/cli.py` handed
+the whole `.ll` file to `clang`, which understands LLVM IR text as one
+of its accepted input formats. That's a *clang-specific* frontend
+feature -- plain `cc`/`gcc` doesn't recognize `.ll` at all (verified:
+gcc hands it to `ld`, which treats it as a broken linker script and
+fails). Compiling the IR ourselves means the only thing left for an
+external C compiler to do is compile festina_runtime.c and link plain
+object files together -- work gcc can do exactly as well as clang,
+which is the actual point: it's no longer clang *specifically* that
+using Festina depends on, just "some C compiler," a meaningfully
+smaller ask.
+
+This module follows the same ctypes-against-libLLVM-C pattern this
+repo's own jit_run.py already uses for JIT execution (written for
+environments with libLLVM but no clang/llc CLI tools) -- extended here
+for ahead-of-time object-file emission via LLVMTargetMachineEmitToFile
+instead of MCJIT execution.
+
+If libLLVM can't be found or loaded, `available()` returns False and
+festina/cli.py falls back to shelling out to clang on the .ll file
+directly, exactly like before this module existed -- this is additive,
+not a replacement path that could regress anything.
+"""
+import ctypes
+import ctypes.util
+import platform
+
+# Reloc mode: LLVMRelocPIC. Needed to match this system's PIE-by-default
+# linking -- LLVMRelocDefault (0) produces relocations `ld` rejects when
+# linking a PIE (verified: "relocation R_X86_64_32 ... can not be used
+# when making a PIE object").
+_RELOC_PIC = 2
+_CODEGEN_OPT_DEFAULT = 2  # LLVMCodeGenLevelDefault
+_CODE_MODEL_DEFAULT = 0   # LLVMCodeModelDefault
+_OBJECT_FILE = 1          # LLVMObjectFile (LLVMCodeGenFileType)
+
+# LLVMInitializeX86Target() etc. are per-architecture symbols (the
+# "native target" macro clang normally expands at compile time doesn't
+# exist as a single exported symbol in the shared library) -- map the
+# Python-reported machine name to the LLVM target-init prefix.
+_ARCH_INIT_PREFIX = {
+    "x86_64": "X86", "amd64": "X86",
+    "aarch64": "AArch64", "arm64": "AArch64",
+}
+
+
+class LLVMBackendError(Exception):
+    pass
+
+
+def _find_libllvm():
+    name = ctypes.util.find_library("LLVM")
+    candidates = [name] if name else []
+    candidates += [ctypes.util.find_library(f"LLVM-{v}") for v in range(20, 12, -1)]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            return ctypes.CDLL(candidate)
+        except OSError:
+            continue
+    return None
+
+
+class _Binding:
+    """Lazily loads libLLVM and binds just the C API calls this module
+    needs. A single instance is reused (see `_binding()`) so the shared
+    library is only opened once per process."""
+
+    def __init__(self):
+        self.lib = _find_libllvm()
+        if self.lib is None:
+            return
+        arch_prefix = _ARCH_INIT_PREFIX.get(platform.machine().lower())
+        if arch_prefix is None:
+            self.lib = None  # unsupported architecture -- caller falls back to clang
+            return
+        self._bind(arch_prefix)
+
+    def _bind(self, arch_prefix):
+        lib = self.lib
+        c_char_p, c_void_p, c_int = ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int
+
+        def fn(name, restype, argtypes):
+            f = getattr(lib, name)
+            f.restype = restype
+            f.argtypes = argtypes
+            return f
+
+        self.init_target_info = fn(f"LLVMInitialize{arch_prefix}TargetInfo", None, [])
+        self.init_target = fn(f"LLVMInitialize{arch_prefix}Target", None, [])
+        self.init_target_mc = fn(f"LLVMInitialize{arch_prefix}TargetMC", None, [])
+        self.init_asm_printer = fn(f"LLVMInitialize{arch_prefix}AsmPrinter", None, [])
+
+        self.context_create = fn("LLVMContextCreate", c_void_p, [])
+        self.create_membuf = fn("LLVMCreateMemoryBufferWithMemoryRangeCopy", c_void_p,
+                                 [c_char_p, ctypes.c_size_t, c_char_p])
+        self.parse_ir = fn("LLVMParseIRInContext", ctypes.c_bool,
+                            [c_void_p, c_void_p, ctypes.POINTER(c_void_p), ctypes.POINTER(c_char_p)])
+        self.verify_module = fn("LLVMVerifyModule", ctypes.c_bool,
+                                 [c_void_p, c_int, ctypes.POINTER(c_char_p)])
+        self.dispose_message = fn("LLVMDisposeMessage", None, [c_char_p])
+
+        self.default_target_triple = fn("LLVMGetDefaultTargetTriple", c_char_p, [])
+        self.host_cpu_name = fn("LLVMGetHostCPUName", c_char_p, [])
+        self.host_cpu_features = fn("LLVMGetHostCPUFeatures", c_char_p, [])
+        self.set_target = fn("LLVMSetTarget", None, [c_void_p, c_char_p])
+        self.get_target_from_triple = fn("LLVMGetTargetFromTriple", ctypes.c_bool,
+                                          [c_char_p, ctypes.POINTER(c_void_p), ctypes.POINTER(c_char_p)])
+        self.create_target_machine = fn("LLVMCreateTargetMachine", c_void_p,
+                                         [c_void_p, c_char_p, c_char_p, c_char_p, c_int, c_int, c_int])
+        self.emit_to_file = fn("LLVMTargetMachineEmitToFile", ctypes.c_bool,
+                                [c_void_p, c_void_p, c_char_p, c_int, ctypes.POINTER(c_char_p)])
+
+
+_binding_instance = None
+
+
+def _binding():
+    global _binding_instance
+    if _binding_instance is None:
+        _binding_instance = _Binding()
+    return _binding_instance
+
+
+def available():
+    """True if libLLVM was found, loaded, and this process's architecture
+    is one this module knows the target-init symbol names for."""
+    return _binding().lib is not None
+
+
+def emit_object_file(ir_text, out_path, filename="<ir>"):
+    """Compile LLVM IR text to a native object file at `out_path`, using
+    libLLVM directly. Raises LLVMBackendError on any failure (bad IR,
+    verifier failure, target/codegen error) -- callers should treat that
+    the same as a clang failure, not fall back silently mid-compile."""
+    b = _binding()
+    if b.lib is None:
+        raise LLVMBackendError("libLLVM is not available in this process")
+
+    b.init_target_info()
+    b.init_target()
+    b.init_target_mc()
+    b.init_asm_printer()
+
+    ir_bytes = ir_text.encode("utf-8")
+    ctx = b.context_create()
+    buf = b.create_membuf(ir_bytes, len(ir_bytes), filename.encode("utf-8", "replace"))
+
+    mod = ctypes.c_void_p()
+    err = ctypes.c_char_p()
+    if b.parse_ir(ctx, buf, ctypes.byref(mod), ctypes.byref(err)):
+        message = err.value.decode(errors="replace") if err.value else "unknown parse error"
+        raise LLVMBackendError(f"LLVM IR parse error: {message}")
+
+    verify_err = ctypes.c_char_p()
+    # LLVMVerifierFailureAction = 1 (ReturnStatusAction): report, don't abort the process.
+    if b.verify_module(mod, 1, ctypes.byref(verify_err)):
+        message = verify_err.value.decode(errors="replace") if verify_err.value else "unknown verify error"
+        raise LLVMBackendError(f"LLVM IR verification failed: {message}")
+
+    triple = b.default_target_triple()
+    b.set_target(mod, triple)
+    target = ctypes.c_void_p()
+    target_err = ctypes.c_char_p()
+    if b.get_target_from_triple(triple, ctypes.byref(target), ctypes.byref(target_err)):
+        message = target_err.value.decode(errors="replace") if target_err.value else "unknown target error"
+        raise LLVMBackendError(f"could not resolve target '{triple.decode()}': {message}")
+
+    cpu = b.host_cpu_name()
+    features = b.host_cpu_features()
+    tm = b.create_target_machine(target, triple, cpu, features,
+                                  _CODEGEN_OPT_DEFAULT, _RELOC_PIC, _CODE_MODEL_DEFAULT)
+    if not tm:
+        raise LLVMBackendError("failed to create an LLVM target machine")
+
+    emit_err = ctypes.c_char_p()
+    if b.emit_to_file(tm, mod, out_path.encode("utf-8"), _OBJECT_FILE, ctypes.byref(emit_err)):
+        message = emit_err.value.decode(errors="replace") if emit_err.value else "unknown codegen error"
+        raise LLVMBackendError(f"object emission failed: {message}")
