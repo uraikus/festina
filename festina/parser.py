@@ -107,6 +107,12 @@ class Parser:
             inner = self.parse_type()
             self.eat("RBRACK")
             return ast.ArrayTypeExpr(inner)
+        if self.at("map"):
+            self.eat("map")
+            self.eat("LBRACK")
+            inner = self.parse_type()
+            self.eat("RBRACK")
+            return ast.MapTypeExpr(inner)
         if self.peek().type in TYPE_KEYWORDS:
             return self.eat().type
         if self.at("IDENT"):
@@ -189,7 +195,7 @@ class Parser:
     def _looks_like_declaration(self):
         t0 = self.peek(0)
         t1 = self.peek(1)
-        if t0.type in TYPE_KEYWORDS or t0.type == "arr":
+        if t0.type in TYPE_KEYWORDS or t0.type in ("arr", "map"):
             return True
         if t0.type == "IDENT" and t1.type == "IDENT":
             return True
@@ -211,7 +217,7 @@ class Parser:
         this only needs to skip past it far enough to check for 'func'."""
         if i >= len(self.toks):
             return i
-        if self.toks[i].type == "arr":
+        if self.toks[i].type in ("arr", "map"):
             i += 1
             if i < len(self.toks) and self.toks[i].type == "LBRACK":
                 i += 1
@@ -514,6 +520,24 @@ class Parser:
                     self.eat()
             self.eat("RBRACK")
             return ast.ArrayLit(elems)
+        if t.type == "LBRACE":
+            # claude.md #72: { key: value, ... } -- a map literal. Only
+            # ever reached from expression position (parse_primary is
+            # never called while parsing a statement, where '{' means a
+            # block instead -- see parse_statement's own LBRACE check,
+            # which runs first and never falls through to here), so
+            # there's no ambiguity with block syntax to resolve.
+            self.eat("LBRACE")
+            entries = []
+            while not self.at("RBRACE"):
+                key = self.parse_assign_expr()
+                self.eat_op(":")
+                value = self.parse_assign_expr()
+                entries.append((key, value))
+                if self.at_op(","):
+                    self.eat()
+            self.eat("RBRACE")
+            return ast.MapLit(entries, t.line, t.column)
         raise self.err(t, "invalid syntax", f"unexpected token {t.type}({t.value!r})")
 
     def parse_template(self):

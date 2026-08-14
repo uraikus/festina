@@ -1,0 +1,214 @@
+"""claude.md #72: map[T] -- literals, indexed get/set, .forEach().
+
+Lexer/parser/semantic-level tests only -- see tests/test_codegen.py's
+TestMaps for the real compile-and-run end-to-end coverage of these same
+sections.
+"""
+import pytest
+
+
+class TestMapType:
+    """claude.md #72: `map[T]` as a type -- mirrors arr[T] syntactically
+    (parser.parse_type), but keys are always text, so only T (the value
+    type) is spelled out."""
+
+    def test_map_type_parses_as_a_var_decl(self, parser):
+        parser.parse("map[int] scores = {}")
+
+    def test_map_of_text_parses(self, parser):
+        parser.parse("map[text] names = {}")
+
+    def test_nested_map_of_struct_parses(self, parser, semantic):
+        source = "struct P { x:int }\nmap[P] points = {}"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_map_as_function_param_and_return_type_parses(self, parser, semantic):
+        source = "map[int] func identity(m:map[int]) {\n    return m\n}\nidentity({})"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_map_of_array_is_a_compile_error(self, parser, semantic, errors):
+        # claude.md #72: a map value is stored in one fixed-size slot,
+        # which an arr[T] value (a 16-byte {length, data} pair) doesn't
+        # fit in -- see types.MapType's own doc comment.
+        program = parser.parse("map[arr[int]] bad = {}")
+        with pytest.raises(errors.CompileError, match="map values cannot be"):
+            semantic.analyze(program)
+
+    def test_map_of_map_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("map[map[int]] bad = {}")
+        with pytest.raises(errors.CompileError, match="map values cannot be"):
+            semantic.analyze(program)
+
+
+class TestMapLiteral:
+    """claude.md #72: { key: value, ... } -- every key must be text."""
+
+    def test_empty_map_literal_parses(self, parser, semantic):
+        program = parser.parse("map[int] m = {}")
+        semantic.analyze(program)
+
+    def test_literal_with_string_keys_parses(self, parser, semantic):
+        program = parser.parse("map[int] m = {'a': 1, 'b': 2}")
+        semantic.analyze(program)
+
+    def test_literal_with_a_variable_key_parses(self, parser, semantic):
+        # claude.md #72: an unquoted identifier key is a reference to
+        # that variable's own text value -- NOT bareword-as-string-name
+        # shorthand the way a plain JS object literal has.
+        source = "text npc2Id = 'npc2'\nmap[int] m = {npc2Id: 15}"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_literal_infers_map_type(self, parser, semantic):
+        program = parser.parse("map[int] m = {'a': 1}")
+        semantic.analyze(program)
+
+    def test_non_text_key_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("map[int] m = {5: 1}")
+        with pytest.raises(errors.CompileError, match="map key must be text"):
+            semantic.analyze(program)
+
+    def test_bool_key_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("map[int] m = {true: 1}")
+        with pytest.raises(errors.CompileError, match="map key must be text"):
+            semantic.analyze(program)
+
+
+class TestMapIndexing:
+    """claude.md #72: npcHealths['npc1'] / npcHealths[key] -- read and
+    write, both via computed Member access (the same grammar arr[T]
+    indexing already uses, dispatched on the receiver's type)."""
+
+    def test_read_with_a_string_literal_key_parses(self, parser, semantic):
+        source = "map[int] m = {'a': 1}\nlog(m['a'])"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_read_with_a_variable_key_parses(self, parser, semantic):
+        source = "map[int] m = {'a': 1}\ntext k = 'a'\nlog(m[k])"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_read_infers_the_maps_value_type(self, parser, semantic):
+        source = "map[int] m = {'a': 1}\nint x = m['a']"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_int_key_is_a_compile_error(self, parser, semantic, errors):
+        source = "map[int] m = {'a': 1}\nlog(m[5])"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match="map key must be text"):
+            semantic.analyze(program)
+
+    def test_write_to_a_new_key_parses(self, parser, semantic):
+        source = "map[int] m = {}\nm['a'] = 5"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_write_to_an_existing_key_parses(self, parser, semantic):
+        source = "map[int] m = {'a': 1}\nm['a'] = 5"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_write_with_a_variable_key_parses(self, parser, semantic):
+        source = "map[int] m = {}\ntext k = 'a'\nm[k] = 5"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_write_with_wrong_value_type_is_a_compile_error(self, parser, semantic, errors):
+        source = "map[int] m = {}\nm['a'] = 'not an int'"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_indexing_a_non_map_non_array_is_a_compile_error(self, parser, semantic, errors):
+        source = "int x = 5\nlog(x['a'])"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match="cannot index into"):
+            semantic.analyze(program)
+
+
+class TestMapForEach:
+    """claude.md #72: map.forEach(callback) -- callback must be an
+    already-declared function taking exactly (value, key:text) and
+    returning nothing, checked structurally the same way setTimeout's
+    callback is."""
+
+    def test_forEach_with_a_matching_callback_parses(self, parser, semantic):
+        source = """
+        void func logHealth(h:int, key:text) {
+            log(key)
+        }
+        map[int] m = {'a': 1}
+        m.forEach(logHealth)
+        """
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_forEach_argument_must_be_a_declared_function(self, parser, semantic, errors):
+        source = "map[int] m = {'a': 1}\nm.forEach(5)"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_forEach_argument_must_be_an_identifier_not_an_expression(self, parser, semantic, errors):
+        source = """
+        void func f(h:int, key:text) { log(key) }
+        map[int] m = {'a': 1}
+        m.forEach(f())
+        """
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_forEach_callback_wrong_first_param_type_is_a_compile_error(self, parser, semantic, errors):
+        source = """
+        void func f(h:text, key:text) { log(h) }
+        map[int] m = {'a': 1}
+        m.forEach(f)
+        """
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match="first parameter"):
+            semantic.analyze(program)
+
+    def test_forEach_callback_wrong_second_param_type_is_a_compile_error(self, parser, semantic, errors):
+        source = """
+        void func f(h:int, key:int) { log(h) }
+        map[int] m = {'a': 1}
+        m.forEach(f)
+        """
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match="second parameter"):
+            semantic.analyze(program)
+
+    def test_forEach_callback_wrong_param_count_is_a_compile_error(self, parser, semantic, errors):
+        source = """
+        void func f(h:int) { log(h) }
+        map[int] m = {'a': 1}
+        m.forEach(f)
+        """
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_forEach_callback_must_return_nothing(self, parser, semantic, errors):
+        source = """
+        int func f(h:int, key:text) { return h }
+        map[int] m = {'a': 1}
+        m.forEach(f)
+        """
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_forEach_on_a_non_map_is_a_compile_error(self, parser, semantic, errors):
+        source = """
+        void func f(h:int, key:text) { log(h) }
+        arr[int] a = [1, 2]
+        a.forEach(f)
+        """
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)

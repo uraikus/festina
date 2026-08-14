@@ -190,10 +190,19 @@ for the full design writeup.
 - **No network exposure.** Festina has no networking support yet (see
   [todo.md](todo.md)) — a compiled program's only external interfaces
   today are the local filesystem (`festina.sqlite`, `loadImage()`/
-  `loadAudio()` paths) and, if it uses graphics, the local X server. This
+  `loadAudio()` paths, and — since `DatabaseURL`/`environment.NAME`
+  (`claude.md #70/#71`) landed — the process's own environment
+  variables), and, if it uses graphics, the local X server. This
   significantly narrows what "attack surface" even means for a Festina
   program right now; that will change once HTTP support lands, and this
-  document will grow accordingly.
+  document will grow accordingly. `environment.NAME` is a direct,
+  read-only `getenv()` wrapper (`festina_getenv`) with no parsing or
+  interpretation of the result — a compiled program that does something
+  security-sensitive with an environment variable's value (including
+  `DatabaseURL = environment.NAME` picking the database file itself) is
+  exactly as exposed as any other program trusting its own environment,
+  no more and no less; this runtime adds no additional risk on top of
+  that.
 - **No unsafe deserialization.** `sqlite()` query results are read
   through SQLite's own typed column API (`sqlite3_column_*`), not parsed
   from an untrusted byte stream by hand.

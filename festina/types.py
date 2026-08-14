@@ -59,12 +59,31 @@ class AudioType:
 
 @dataclass(frozen=True)
 class RegexType:
-    """claude.md #67 -- created only via the regex() builtin, never a
-    dedicated literal syntax, so (unlike StructType/TableType) there's
-    only ever one shape of this type; no fields to distinguish."""
+    """claude.md #67 -- a regex value's pattern/flags live in the
+    runtime pointer value (see festina_regex_compile), never the static
+    type, whether created via a /pattern/flags literal or the regex()
+    builtin -- so (unlike StructType/TableType) there's only ever one
+    shape of this type; no fields to distinguish."""
 
     def __repr__(self):
         return "RegexType()"
+
+
+@dataclass(frozen=True)
+class MapType:
+    """claude.md #72: map[T] -- keys are always text (never part of the
+    type itself, the same way an array's index isn't), so only the
+    value type distinguishes one map[T] from another. `value` may be
+    any Type except ArrayType/MapType itself -- resolve_type_name
+    rejects those at the point a map[T] type is resolved, since a map's
+    runtime representation (festina_runtime.c's FestinaMapEntry) stores
+    each value in one fixed 8-byte slot, the same convention sqlite
+    query rows already use, and neither an array value (16 bytes: a
+    length plus a data pointer) nor another map value fits in that."""
+    value: object  # another Type instance
+
+    def __repr__(self):
+        return f"MapType({self.value!r})"
 
 
 def type_name(t):
@@ -85,4 +104,6 @@ def type_name(t):
         return "aud"
     if isinstance(t, RegexType):
         return "regex"
+    if isinstance(t, MapType):
+        return f"map[{type_name(t.value)}]"
     return str(t)

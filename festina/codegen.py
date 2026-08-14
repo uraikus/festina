@@ -11,7 +11,11 @@ division/modulo by zero), #60/#61 (for/while loops), #63 (array
 .length), #66 (postfix ++/--), #67-68 (regex(), .test(), .match(),
 .replace()/.replaceAll() -- see _emit_regex_call and the Member-call
 handling in _emit_call), #69 (setTimeout/setInterval/clearTimeout/
-clearInterval -- see the "Timers" note below).
+clearInterval -- see the "Timers" note below), #70 (DatabaseURL -- see
+_emit_main_and_entry), #71 (environment.NAME/environment[keyExpr] --
+see _emit_environment_get), #72 (map[T] -- literals, indexed get/set,
+.forEach() -- see _emit_map_lit/_emit_map_get/_emit_map_set/
+_emit_map_foreach_trampoline).
 #37, #39, #40 also cover `on key`/`on resize`/`on close` and the
 clientWidth/clientHeight globals (see the "Graphics" note below).
 
@@ -245,11 +249,34 @@ AUDIO = types_mod.AudioType()
 
 FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
 
+# claude.md #72: map[T] -- same two-field shape as _FestinaArray above
+# (i64 count, ptr to the backing storage) but kept as its own distinct
+# LLVM type name rather than reusing FESTINA_ARRAY_LLVM_TYPE outright:
+# the two are never interchangeable (a map's `ptr` field points at an
+# array of FestinaMapEntry {key, value} pairs, not raw element values,
+# and only festina_map_set/_get/_for_each know how to read it), so
+# giving them separate names catches an accidental mix-up in the IR
+# itself rather than relying on convention alone.
+FESTINA_MAP_LLVM_TYPE = "%struct._FestinaMap"
+
 # claude.md #57: division/modulo by zero returns null; null has no spare
 # bit pattern in a plain i64/double, so it's a reserved sentinel instead
 # (see the module docstring's "Null for int/float" note).
 INT_NULL_CONST = "-9223372036854775808"  # i64 minimum
 FLOAT_NULL_CONST = "0x7FF8000000000000"  # a quiet NaN, as a raw double bit pattern
+# claude.md #72: the exact same quiet-NaN bit pattern as FLOAT_NULL_CONST
+# above, spelled as a plain decimal integer instead of LLVM's hex-float
+# literal syntax -- needed because festina_map_get's "value to return if
+# the key is missing" parameter is always i64 (map values of every
+# element type flow through this one generically-typed runtime function
+# -- see _emit_map_get), and LLVM's `0x...` literal form is *only* ever
+# parsed as a floating-point bit pattern, never as a hex integer
+# constant (verified directly: `add i64 0x7FF8000000000000, 0` fails to
+# parse) -- so the i64 context needs this same bit pattern spelled out
+# in decimal instead. 9221120237041090560 == 0x7FF8000000000000, keeping
+# both constants in sync is this comment's job since nothing enforces it
+# structurally.
+FLOAT_NULL_CONST_AS_I64 = "9221120237041090560"
 MATH_INTRINSICS = {
     "floor": "llvm.floor.f64", "ceil": "llvm.ceil.f64",
     "round": "llvm.round.f64", "trunc": "llvm.trunc.f64",
@@ -290,6 +317,8 @@ def _llvm_type(t):
         # claude.md #67: a compiled regex_t*, opaque to codegen -- see
         # _emit_regex_call.
         return "ptr"
+    if isinstance(t, types_mod.MapType):
+        return FESTINA_MAP_LLVM_TYPE
     raise CodegenError(f"cannot generate code for type {t!r}")
 
 
@@ -359,6 +388,11 @@ class CodeGen:
                                                 # file needs to be linked in at all, so a program
                                                 # that never touches audio doesn't pull in
                                                 # libasound (see cli.py's _ensure_runtime_objects)
+        self.database_url_expr = None          # claude.md #70: DatabaseURL's value expression, or
+                                                # None -- set from program.database_url in generate()
+                                                # (festina.imports.build_program already extracted and
+                                                # validated its *position*; see _emit_main_and_entry
+                                                # for where this actually gets evaluated)
 
     # ---- naming ----
     def tmp(self):
@@ -414,6 +448,7 @@ class CodeGen:
 
     # ---- entry point ----
     def generate(self, program):
+        self.database_url_expr = getattr(program, "database_url", None)
         for stmt in program.body:
             # claude.md #6: a multi-file program (festina.imports.
             # build_program) is one merged ast.Program, but errors
@@ -472,7 +507,12 @@ class CodeGen:
             "declare ptr @festina_str_from_bool(i1)",
             "declare ptr @festina_str_concat(ptr, ptr)",
             "declare i1 @festina_str_eq(ptr, ptr)",
-            "declare ptr @festina_db_open()",
+            # claude.md #70: DatabaseURL -- path is festina.sqlite's
+            # location, NULL/empty meaning "use the default" (a plain
+            # string constant already covers the no-directive case, so
+            # this is only ever actually NULL if a DatabaseURL expression
+            # itself somehow evaluates to a null text value at runtime).
+            "declare ptr @festina_db_open(ptr)",
             "declare void @festina_sync_table(ptr, ptr, ptr, ptr, i32)",
             # claude.md #32-34: sqlite() queries.
             "declare ptr @festina_sqlite_prepare(ptr, ptr)",
@@ -522,6 +562,20 @@ class CodeGen:
             "declare i1 @festina_audio_is_playing(ptr)",
             "declare ptr @malloc(i64)",
             "declare ptr @calloc(i64, i64)",
+            # claude.md #71: environment.NAME / environment[keyExpr].
+            "declare ptr @festina_getenv(ptr)",
+            # claude.md #72: map[T] -- count_ptr/entries_ptr (the two
+            # fields of a FESTINA_MAP_LLVM_TYPE value's storage slot,
+            # always passed by address so festina_map_set can grow the
+            # backing array in place) are always `ptr`/`ptr` regardless
+            # of T; the value itself is always passed/returned as a raw
+            # i64 (every map value type's bit pattern fits in 8 bytes --
+            # see types.MapType's doc comment -- codegen reinterprets
+            # to/from the real LLVM type at each call site, see
+            # _map_value_to_i64/_i64_to_map_value).
+            "declare void @festina_map_set(ptr, ptr, ptr, i64)",
+            "declare i64 @festina_map_get(i64, ptr, ptr, i64)",
+            "declare void @festina_map_for_each(i64, ptr, ptr)",
             # claude.md #56: Math.floor/ceil/round/trunc, via LLVM's
             # built-in intrinsics rather than a runtime C function.
             "declare double @llvm.floor.f64(double)",
@@ -533,7 +587,14 @@ class CodeGen:
     def _struct_type_defs(self):
         # claude.md #26: every arr[T] -- regardless of T -- lowers to the
         # same fixed-size {length, data} header; see the module docstring.
-        lines = [f"{FESTINA_ARRAY_LLVM_TYPE} = type {{ i64, ptr }}"]
+        # claude.md #72: every map[T] -- regardless of T -- lowers to the
+        # identical-shaped {count, entries} header, for the same reason
+        # (see FESTINA_MAP_LLVM_TYPE's own comment on why it's still a
+        # distinct name rather than reusing _FestinaArray outright).
+        lines = [
+            f"{FESTINA_ARRAY_LLVM_TYPE} = type {{ i64, ptr }}",
+            f"{FESTINA_MAP_LLVM_TYPE} = type {{ i64, ptr }}",
+        ]
         for name in self.struct_order:
             fields = self.struct_fields(name)
             field_types = ", ".join(_llvm_type(t) for _, t in fields)
@@ -940,6 +1001,13 @@ class CodeGen:
             lines.append(f"  {out} = load {_llvm_type(type_)}, ptr {ref}")
             return out, type_
         if isinstance(expr, ast.Member):
+            # claude.md #71: environment.NAME / environment[keyExpr] --
+            # checked structurally (an Identifier literally named
+            # "environment"), before ever touching expr.obj as a real
+            # expression -- there's no storage/value behind that
+            # identifier to emit (see semantic.py's matching check).
+            if isinstance(expr.obj, ast.Identifier) and expr.obj.name == "environment":
+                return self._emit_environment_get(expr, env, lines)
             if not expr.computed and expr.prop == "length":
                 # claude.md #63: unlike struct/table field access,
                 # .length isn't addressable via a GEP -- an arr[T] value
@@ -955,6 +1023,26 @@ class CodeGen:
                     out = self.tmp()
                     lines.append(f"  {out} = extractvalue {FESTINA_ARRAY_LLVM_TYPE} {obj_val}, 0")
                     return out, INT
+            if expr.computed:
+                # claude.md #26/#72: arr[i] / map[key] -- expr.obj is
+                # emitted exactly once here, then branched on by type,
+                # rather than delegating to _member_ptr (which would
+                # emit it again from scratch) -- correct not just
+                # efficient, since expr.obj could be an arbitrary
+                # expression with side effects (e.g. a function call
+                # returning an array or map).
+                obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+                if isinstance(obj_type, types_mod.MapType):
+                    key_val, _ = self._emit_expr(expr.prop, env, lines)
+                    return self._emit_map_get(obj_val, obj_type.value, key_val, lines)
+                if not isinstance(obj_type, types_mod.ArrayType):
+                    raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",
+                                        file=self.filename, line=getattr(expr, "line", 0))
+                idx_val, _ = self._emit_expr(expr.prop, env, lines)
+                ptr, elem_type = self._array_elem_ptr(obj_val, obj_type, idx_val, lines)
+                out = self.tmp()
+                lines.append(f"  {out} = load {_llvm_type(elem_type)}, ptr {ptr}")
+                return out, elem_type
             return self._emit_member_load(expr, env, lines)
         if isinstance(expr, ast.ArrayLit):
             # No contextual element type here -- reached only when an
@@ -962,6 +1050,10 @@ class CodeGen:
             # don't thread a declared type through (e.g. nested inside
             # another expression). Falls back to the elements' own type.
             return self._emit_array_lit(expr, env, lines, expected_type=None)
+        if isinstance(expr, ast.MapLit):
+            # Same reasoning as ArrayLit just above -- no contextual
+            # value type here, falls back to the entries' own values.
+            return self._emit_map_lit(expr, env, lines, expected_type=None)
         if isinstance(expr, ast.Assign):
             return self._emit_assign(expr, env, lines)
         if isinstance(expr, ast.Ternary):
@@ -1023,6 +1115,8 @@ class CodeGen:
         int/float, which have no spare bit pattern for a real null."""
         if isinstance(node, ast.ArrayLit):
             return self._emit_array_lit(node, env, lines, expected_type)
+        if isinstance(node, ast.MapLit):
+            return self._emit_map_lit(node, env, lines, expected_type)
         if isinstance(node, ast.NullLit):
             if expected_type == INT:
                 return INT_NULL_CONST, INT
@@ -1102,28 +1196,220 @@ class CodeGen:
         lines.append(f"  {out} = load {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}")
         return out, types_mod.ArrayType(elem_type)
 
+    def _emit_map_lit(self, expr, env, lines, expected_type=None):
+        """claude.md #72: { key: value, ... } -- built the same way
+        _emit_array_lit builds an array literal: a temporary header
+        alloca (needed here, unlike a fixed-size array, because
+        festina_map_set has to mutate count/entries in place as each
+        entry is added -- see _emit_map_set), one festina_map_set call
+        per entry in source order (so a repeated key naturally ends up
+        "last one wins", with no separate dedup pass needed), then a
+        single `load` of the finished {count, entries} value out of that
+        header at the end -- same "build in a scratch slot, load the
+        final value once" shape _emit_array_lit already uses."""
+        expected_value = expected_type.value if isinstance(expected_type, types_mod.MapType) else None
+
+        header = f"%map.hdr.{self._unique()}"
+        lines.append(f"  {header} = alloca {FESTINA_MAP_LLVM_TYPE}")
+        count_ptr = self.tmp()
+        lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
+        lines.append(f"  store i64 0, ptr {count_ptr}")
+        entries_field_ptr = self.tmp()
+        lines.append(f"  {entries_field_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
+        lines.append(f"  store ptr null, ptr {entries_field_ptr}")
+
+        value_type = expected_value
+        for key_expr, val_expr in expr.entries:
+            # Keys are always text (claude.md #72; semantic.py already
+            # rejected anything else) -- _emit_value_for still routes a
+            # bare `null` key through NullLit's own text-context handling
+            # correctly (a plain LLVM `null` pointer, which
+            # festina_map_set/_get and festina_str_eq all already treat
+            # as an empty string, same as everywhere else text does).
+            key_val, _ = self._emit_value_for(key_expr, env, lines, TEXT)
+            val_val, vtype = self._emit_value_for(val_expr, env, lines, expected_value)
+            if expected_value is not None:
+                val_val = self._coerce(val_val, vtype, expected_value, lines)
+                vtype = expected_value
+            value_type = value_type or vtype
+            self._emit_map_set(header, value_type, key_val, val_val, lines)
+
+        if value_type is None:
+            raise CodegenError(
+                "cannot infer the value type of an empty map literal without a declared type",
+                file=self.filename, line=getattr(expr, "line", 0),
+            )
+
+        out = self.tmp()
+        lines.append(f"  {out} = load {FESTINA_MAP_LLVM_TYPE}, ptr {header}")
+        return out, types_mod.MapType(value_type)
+
+    def _map_value_to_i64(self, val, value_type, lines):
+        """Reinterprets an already-emitted value of the given map value
+        type into the raw i64 every map runtime function deals in
+        generically, regardless of T (see _runtime_declares's own
+        comment on festina_map_set/_get/_for_each) -- the inverse of
+        _i64_to_map_value."""
+        llvm_ty = _llvm_type(value_type)
+        if llvm_ty == "i64":
+            return val
+        out = self.tmp()
+        if llvm_ty == "double":
+            lines.append(f"  {out} = bitcast double {val} to i64")
+        elif llvm_ty == "i1":
+            lines.append(f"  {out} = zext i1 {val} to i64")
+        else:  # "ptr" -- text/blob/struct/table/img/aud/regex all lower to ptr
+            lines.append(f"  {out} = ptrtoint ptr {val} to i64")
+        return out
+
+    def _i64_to_map_value(self, raw, value_type, lines):
+        """The inverse of _map_value_to_i64 -- reinterprets a raw i64
+        (festina_map_get's return value, or a map .forEach() callback
+        trampoline's own raw parameter -- see _emit_map_foreach_trampoline)
+        back into the given map value type's real LLVM representation."""
+        llvm_ty = _llvm_type(value_type)
+        if llvm_ty == "i64":
+            return raw
+        out = self.tmp()
+        if llvm_ty == "double":
+            lines.append(f"  {out} = bitcast i64 {raw} to double")
+        elif llvm_ty == "i1":
+            lines.append(f"  {out} = trunc i64 {raw} to i1")
+        else:  # "ptr"
+            lines.append(f"  {out} = inttoptr i64 {raw} to ptr")
+        return out
+
+    def _map_missing_default(self, value_type):
+        """claude.md #72: "if the key is not present, the result is
+        null" -- the i64 handed to festina_map_get as the value to
+        return outright when the key isn't found, computed per Festina
+        type here (compile time), the same as every other "which null
+        representation" decision in this codebase (see the module
+        docstring's "Null for int/float" note) -- festina_map_get itself
+        has no idea what T a given map's values are (it only ever sees
+        raw i64 payloads), so it can't make this choice on its own."""
+        llvm_ty = _llvm_type(value_type)
+        if llvm_ty == "i64":
+            return INT_NULL_CONST
+        if llvm_ty == "double":
+            return FLOAT_NULL_CONST_AS_I64
+        # "ptr" (NULL is already 0, exactly Festina's own null-for-text/
+        # blob/struct/etc. the same way it is everywhere else) and "i1"
+        # (bool has no null representation at all yet -- see todo.md;
+        # this falls back to plain 0/false, the same zero-value an
+        # uninitialized bool slot already gets elsewhere, not a new
+        # invented behavior) both use plain 0.
+        return "0"
+
+    def _emit_map_get(self, obj_val, value_type, key_val, lines):
+        """claude.md #72: npcHealths['npc1'] -- count/entries are pulled
+        directly out of the already-emitted map VALUE (extractvalue,
+        exactly like array indexing's own data-pointer field -- no
+        addressability needed for a read, unlike a write; see
+        _emit_map_set)."""
+        count = self.tmp()
+        lines.append(f"  {count} = extractvalue {FESTINA_MAP_LLVM_TYPE} {obj_val}, 0")
+        entries = self.tmp()
+        lines.append(f"  {entries} = extractvalue {FESTINA_MAP_LLVM_TYPE} {obj_val}, 1")
+        default = self._map_missing_default(value_type)
+        raw = self.tmp()
+        lines.append(f"  {raw} = call i64 @festina_map_get(i64 {count}, ptr {entries}, ptr {key_val}, i64 {default})")
+        return self._i64_to_map_value(raw, value_type, lines), value_type
+
+    def _emit_map_set(self, map_ptr, value_type, key_val, value_val, lines):
+        """claude.md #72: npcHealths['npc1'] = 30 (and the equivalent
+        per-entry calls a map literal builds itself out of -- see
+        _emit_map_lit). Unlike a read, this needs the map's own
+        ADDRESS (`map_ptr`, a `ptr` to its {count, entries} storage
+        slot -- from a variable's own alloca/global, a struct field's
+        GEP, or (during literal construction) the literal's own scratch
+        header alloca), not just its value, since festina_map_set can
+        grow the backing entries array and has to write the new
+        count/entries back into that same slot for the change to
+        actually stick."""
+        count_ptr = self.tmp()
+        lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 0")
+        entries_ptr = self.tmp()
+        lines.append(f"  {entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 1")
+        raw_val = self._map_value_to_i64(value_val, value_type, lines)
+        lines.append(f"  call void @festina_map_set(ptr {count_ptr}, ptr {entries_ptr}, ptr {key_val}, i64 {raw_val})")
+
+    def _emit_environment_get(self, expr, env, lines):
+        """claude.md #71: environment.NAME / environment[keyExpr]. NAME
+        (dot access) is a compile-time-known string constant; keyExpr
+        (bracket access) is an arbitrary already-type-checked text
+        expression -- either way this ends up calling festina_getenv
+        with a `ptr` to the name text, returning NULL (Festina's own
+        null-for-text, unchanged) if that variable isn't set."""
+        if expr.computed:
+            key_val, _ = self._emit_expr(expr.prop, env, lines)
+        else:
+            key_val = self.string_const(expr.prop)
+        out = self.tmp()
+        lines.append(f"  {out} = call ptr @festina_getenv(ptr {key_val})")
+        return out, TEXT
+
     def _emit_member_load(self, expr, env, lines):
         ptr, ftype = self._member_ptr(expr, env, lines)
         out = self.tmp()
         lines.append(f"  {out} = load {_llvm_type(ftype)}, ptr {ptr}")
         return out, ftype
 
-    def _member_ptr(self, expr, env, lines):
-        if expr.computed:
-            # claude.md #26: arr[i] -- `expr.prop` is the index expression
-            # (see parser.parse_call_member), not a field name.
-            obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
-            if not isinstance(obj_type, types_mod.ArrayType):
-                raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",
+    def _array_elem_ptr(self, obj_val, obj_type, idx_val, lines):
+        """Given an already-emitted arr[T] value, its ArrayType, and an
+        already-emitted int index value, returns (ptr, element_type) --
+        a pointer to that element's storage slot. Shared by _emit_expr's
+        computed-Member read dispatch and _emit_assign's write dispatch
+        so obj_val/idx_val are each the caller's own single emission,
+        never re-emitted here -- see _emit_expr's own comment on why an
+        object expression might not be safe to emit twice."""
+        data_ptr = self.tmp()
+        lines.append(f"  {data_ptr} = extractvalue {FESTINA_ARRAY_LLVM_TYPE} {obj_val}, 1")
+        elem_type = obj_type.element
+        elem_llvm_ty = _llvm_type(elem_type)
+        out = self.tmp()
+        lines.append(f"  {out} = getelementptr {elem_llvm_ty}, ptr {data_ptr}, i64 {idx_val}")
+        return out, elem_type
+
+    def _try_addressable(self, expr, env, lines):
+        """Resolves `expr` to (address, value, type) for _emit_assign's
+        computed-Member target dispatch (map[key] = v / arr[i] = v),
+        which needs an actual ADDRESS for a map target (festina_map_set
+        mutates count/entries in place -- see _emit_map_set) but only
+        ever needs a VALUE for an array target (indexing works directly
+        off the {length, data} value via extractvalue, the data pointer
+        it holds is already its own independent heap allocation -- see
+        _array_elem_ptr). Exactly one of address/value is non-None:
+        address, for the same two forms _member_ptr's struct/table field
+        access already knows how to address (a plain variable, or a
+        non-computed field of one); value, for anything else (a
+        function call, another computed index, ...) -- which also means
+        a map[key] = v target on anything other than a plain variable or
+        field is a compile error (see _emit_assign), since there's no
+        way to mutate a map value that doesn't live anywhere addressable.
+        `expr` is emitted at most once regardless of which case applies."""
+        if isinstance(expr, ast.Identifier):
+            found = env.lookup(expr.name)
+            if found is None:
+                raise CodegenError(f"unknown variable '{expr.name}'",
                                     file=self.filename, line=getattr(expr, "line", 0))
-            idx_val, _ = self._emit_expr(expr.prop, env, lines)
-            data_ptr = self.tmp()
-            lines.append(f"  {data_ptr} = extractvalue {FESTINA_ARRAY_LLVM_TYPE} {obj_val}, 1")
-            elem_type = obj_type.element
-            elem_llvm_ty = _llvm_type(elem_type)
-            out = self.tmp()
-            lines.append(f"  {out} = getelementptr {elem_llvm_ty}, ptr {data_ptr}, i64 {idx_val}")
-            return out, elem_type
+            ref, ttype = found
+            return ref, None, ttype
+        if isinstance(expr, ast.Member) and not expr.computed:
+            ptr, ftype = self._member_ptr(expr, env, lines)
+            return ptr, None, ftype
+        val, vtype = self._emit_expr(expr, env, lines)
+        return None, val, vtype
+
+    def _member_ptr(self, expr, env, lines):
+        # Struct/table field access only -- computed (array/map
+        # indexing) member access never reaches this function anymore;
+        # it's handled directly in _emit_expr (reads) and _emit_assign
+        # (writes, via _try_addressable/_array_elem_ptr above), each
+        # needing expr.obj emitted exactly once before branching on its
+        # type (map vs array), which delegating to this function
+        # (re-emitting expr.obj from scratch every time it's called)
+        # can't guarantee.
         obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
         if isinstance(obj_type, types_mod.TableType):
             # claude.md #32-34: a table-typed value is one query result
@@ -1159,7 +1445,36 @@ class CodeGen:
             lines.append(f"  store {_llvm_type(ttype)} {val}, ptr {ref}")
             return val, ttype
         if isinstance(expr.target, ast.Member):
-            ptr, ftype = self._member_ptr(expr.target, env, lines)
+            if expr.target.computed:
+                # claude.md #72: npcHealths['npc1'] = 30 / npcHealths[key] = 30
+                addr, val_of_obj, obj_type = self._try_addressable(expr.target.obj, env, lines)
+                if isinstance(obj_type, types_mod.MapType):
+                    if addr is None:
+                        raise CodegenError(
+                            "a map assignment target must be a plain variable or field, "
+                            "not an arbitrary expression",
+                            file=self.filename, line=getattr(expr.target, "line", 0))
+                    key_val, _ = self._emit_expr(expr.target.prop, env, lines)
+                    val, vtype = self._emit_value_for(expr.value, env, lines, obj_type.value)
+                    val = self._coerce(val, vtype, obj_type.value, lines)
+                    self._emit_map_set(addr, obj_type.value, key_val, val, lines)
+                    return val, obj_type.value
+                # claude.md #26: arr[i] = v -- unlike a map target, an
+                # array only ever needs its VALUE (see _try_addressable's
+                # own comment), so this works whether expr.target.obj was
+                # addressable or not.
+                if not isinstance(obj_type, types_mod.ArrayType):
+                    raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",
+                                        file=self.filename, line=getattr(expr.target, "line", 0))
+                if addr is not None:
+                    obj_val = self.tmp()
+                    lines.append(f"  {obj_val} = load {FESTINA_ARRAY_LLVM_TYPE}, ptr {addr}")
+                else:
+                    obj_val = val_of_obj
+                idx_val, _ = self._emit_expr(expr.target.prop, env, lines)
+                ptr, ftype = self._array_elem_ptr(obj_val, obj_type, idx_val, lines)
+            else:
+                ptr, ftype = self._member_ptr(expr.target, env, lines)
             val, vtype = self._emit_value_for(expr.value, env, lines, ftype)
             val = self._coerce(val, vtype, ftype, lines)
             lines.append(f"  store {_llvm_type(ftype)} {val}, ptr {ptr}")
@@ -1418,6 +1733,16 @@ class CodeGen:
                     out = self.tmp()
                     lines.append(f"  {out} = sitofp i64 {val} to double")
                     return out, FLOAT
+            # int/float/bool.toText() -> text -- an explicit spelling of
+            # exactly the stringification template interpolation already
+            # does under the hood (_to_text, shared with _emit_template),
+            # for a value that needs converting outside of a template
+            # (e.g. building a plain text value to pass elsewhere, or a
+            # map .forEach() callback formatting its own log line).
+            if callee.prop == "toText" and not expr.args:
+                val, vtype = self._emit_expr(callee.obj, env, lines)
+                if vtype in (INT, FLOAT, BOOL):
+                    return self._to_text(val, vtype, lines), TEXT
             # claude.md #67: pattern.test(value:text) -> bool
             if callee.prop == "test":
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
@@ -1474,8 +1799,56 @@ class CodeGen:
                     out = self.tmp()
                     lines.append(f"  {out} = call i1 @festina_audio_is_playing(ptr {obj_val})")
                     return out, BOOL
+            # claude.md #72: npcHealths.forEach(callback)
+            if callee.prop == "forEach":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.MapType):
+                    # semantic.py already checked expr.args[0] is an
+                    # ast.Identifier resolving to a correctly-shaped
+                    # declared function -- its own LLVM symbol is just
+                    # its Festina name, same convention every other
+                    # user-function reference in this file already uses.
+                    callback_name = f"@{expr.args[0].name}"
+                    trampoline_name = self._emit_map_foreach_trampoline(obj_type.value, callback_name)
+                    count = self.tmp()
+                    lines.append(f"  {count} = extractvalue {FESTINA_MAP_LLVM_TYPE} {obj_val}, 0")
+                    entries = self.tmp()
+                    lines.append(f"  {entries} = extractvalue {FESTINA_MAP_LLVM_TYPE} {obj_val}, 1")
+                    lines.append(
+                        f"  call void @festina_map_for_each(i64 {count}, ptr {entries}, ptr {trampoline_name})")
+                    return "0", None
         raise CodegenError("only calls to named functions are implemented",
                             file=self.filename, line=getattr(expr, "line", 0))
+
+    def _emit_map_foreach_trampoline(self, value_type, callback_name):
+        """claude.md #72: generates and registers (self.func_defs) a
+        small internal function bridging festina_map_for_each's always-
+        i64-valued C callback signature (void(int64_t, const char*) --
+        see _runtime_declares's own comment) to the user's real forEach()
+        callback, whose LLVM-level signature depends on the map's actual
+        value type (e.g. `double` for a map[float], not i64). Calling a
+        double-taking function through an i64-typed function pointer
+        would be a genuine calling-convention mismatch on plenty of
+        real ABIs, not just an LLVM type-checker technicality, so this
+        always generates a real, correctly-typed trampoline rather than
+        relying on the two shapes happening to be compatible -- the same
+        "declared types must actually match at every call site" rule
+        every other function-pointer registration in this file already
+        follows (e.g. festina_register_click_handler's fixed
+        `void(i64,i64)` signature, matched exactly by semantic.py's
+        _EVENT_SIGNATURES check on `on click`'s own declared params)."""
+        uid = self._unique()
+        trampoline_name = f"@__festina_maptrampoline_{uid}"
+        value_llvm_ty = _llvm_type(value_type)
+
+        body = [f"define void {trampoline_name}(i64 %raw, ptr %key) {{", "entry:"]
+        reinterpreted = self._i64_to_map_value("%raw", value_type, body)
+        body.append(f"  call void {callback_name}({value_llvm_ty} {reinterpreted}, ptr %key)")
+        body.append("  ret void")
+        body.append("}")
+        self.func_defs.extend(body)
+        self.func_defs.append("")
+        return trampoline_name
 
     # ---- regex() / .test() / .match() / .replace() / .replaceAll() (claude.md #67-68) ----
     def _emit_regex_call(self, expr, env, lines):
@@ -1721,7 +2094,25 @@ class CodeGen:
         # emitted -- see the module docstring's ordering note, or
         # generate()'s call order.
         if self.tables or self.uses_sqlite:
-            main_lines.append("  %db = call ptr @festina_db_open()")
+            # claude.md #70: DatabaseURL, evaluated here -- in main()'s
+            # own prologue, before festina_db_open() -- rather than as
+            # an ordinary entry statement (which would run far too late,
+            # inside __festina_main(), after the database is already
+            # open with whatever path was used). This also means the
+            # expression runs before every OTHER global's own init
+            # expression (those are ordinary entry statements, run
+            # inside __festina_main()) -- referencing another global
+            # variable here would see its zero value, not its
+            # initializer's result; environment.NAME and a plain string
+            # literal/template (the only cases claude.md #70 itself
+            # shows) are unaffected by this, since neither depends on
+            # any other global.
+            if self.database_url_expr is not None:
+                url_val, url_type = self._emit_value_for(self.database_url_expr, self.global_env, main_lines, TEXT)
+                url_val = self._coerce(url_val, url_type, TEXT, main_lines)
+            else:
+                url_val = self.string_const("festina.sqlite")
+            main_lines.append(f"  %db = call ptr @festina_db_open(ptr {url_val})")
             main_lines.append("  store ptr %db, ptr @__festina_db")
             for tname, cols in self.tables.items():
                 names_global, types_global, ncols = self._table_arrays(tname, cols)

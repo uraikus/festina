@@ -13,6 +13,7 @@ SPEC_KEYWORDS = frozenset({
     "img", "aud", "null", "true", "false", "void", "func", "const",
     "import", "if", "else", "on", "fail", "log", "sqlite",
     "for", "while",  # claude.md #60, #61
+    "map",  # claude.md #72
 })
 
 # Extra control tokens the parser needs distinct token types for, so it

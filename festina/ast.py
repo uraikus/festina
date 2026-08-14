@@ -29,6 +29,15 @@ class ArrayTypeExpr(Node):
         self.element = element
 
 
+class MapTypeExpr(Node):
+    """`map[T]` as it appears in a type position -- claude.md #72. Keys
+    are always text, so (mirroring ArrayTypeExpr) only the value type
+    needs spelling out."""
+
+    def __init__(self, value):
+        self.value = value
+
+
 class Param(Node):
     def __init__(self, name, type_expr):
         self.name = name
@@ -177,6 +186,23 @@ class TemplateLit(Node):
 class ArrayLit(Node):
     def __init__(self, elements):
         self.elements = elements
+
+
+class MapLit(Node):
+    """claude.md #72: { key: value, ... } -- `entries` is a list of
+    (key_expr, value_expr) pairs, in source order (so codegen can build
+    the map by emitting one festina_map_set per entry in that same
+    order, giving "last write wins" for a repeated key for free, with
+    no separate dedup pass needed). Every key_expr must be text
+    (checked in semantic.py, same as array indexing's int check) --
+    there is no bareword-as-string-literal shorthand the way a plain JS
+    object literal has: an unquoted identifier key is a reference to
+    that variable, not its own name."""
+
+    def __init__(self, entries, line=0, column=0):
+        self.entries = entries
+        self.line = line
+        self.column = column
 
 
 class RegexLit(Node):
