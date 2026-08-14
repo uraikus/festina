@@ -570,6 +570,91 @@ class TestEntryPoint:
         assert result.stdout.strip() == "hello from entry"
 
 
+class TestMultiFileCompilation:
+    """claude.md #5, #6: `import file.f` pulls a file and its whole
+    dependency graph into the current compilation unit -- one real
+    compiled program spanning multiple source files, not per-file
+    namespacing or runtime modules."""
+
+    def test_struct_and_function_shared_across_files(self, compile_multi_and_run):
+        files = {
+            "main.f": (
+                "import shapes.f\n"
+                "Point p\n"
+                "p.x = 3\n"
+                "p.y = 4\n"
+                "log(describe(p))\n"
+            ),
+            "shapes.f": (
+                "struct Point {\n    x:int\n    y:int\n}\n"
+                "text func describe(p:Point) {\n"
+                "    return `(${p.x}, ${p.y})`\n"
+                "}\n"
+            ),
+        }
+        result = compile_multi_and_run(files)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "(3, 4)"
+
+    def test_transitive_imports(self, compile_multi_and_run):
+        # main.f -> ui.f -> database.f
+        files = {
+            "main.f": "import ui.f\nshowGreeting()\n",
+            "ui.f": "import database.f\nvoid func showGreeting() {\n    log(greeting())\n}\n",
+            "database.f": "text func greeting() {\n    return 'hello from database.f'\n}\n",
+        }
+        result = compile_multi_and_run(files)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "hello from database.f"
+
+    def test_diamond_import_is_not_duplicated(self, compile_multi_and_run):
+        # main.f imports both ui.f and database.f directly, and ui.f also
+        # imports database.f -- claude.md #6: "each source file must be
+        # processed only once." If database.f's `table Items` were
+        # emitted twice, this would fail to compile (duplicate LLVM
+        # globals) rather than merely produce a wrong answer.
+        files = {
+            "main.f": (
+                "import ui.f\n"
+                "import database.f\n"
+                "sqlite('INSERT INTO Items (id) VALUES (1)')\n"
+                "arr[Items] items = sqlite('SELECT * FROM Items')\n"
+                "log(items.length)\n"
+            ),
+            "ui.f": "import database.f\n",
+            "database.f": "table Items {\n    id:int\n}\n",
+        }
+        result = compile_multi_and_run(files)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "1"
+
+    def test_table_declared_in_imported_file_syncs_schema(self, compile_multi_and_run, tmp_path):
+        files = {
+            "main.f": "import schema.f\nlog('synced')\n",
+            "schema.f": "table People {\n    id:int\n    name:text\n}\n",
+        }
+        result = compile_multi_and_run(files)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "synced"
+        assert (tmp_path / "festina.sqlite").exists()
+
+    def test_compile_error_in_an_imported_file_is_reported(self, cli_mod, errors, tmp_path):
+        # Full-pipeline version of TestBuildProgram's equivalent check in
+        # test_imports.py -- goes through festina.cli.compile_file itself.
+        # No C compiler needed: this fails during semantic analysis,
+        # before compile_file ever reaches the link step.
+        files = {
+            "main.f": "import broken.f\nlog('start')\n",
+            "broken.f": "log(undefinedVariable)\n",
+        }
+        for relpath, content in files.items():
+            p = tmp_path / relpath
+            p.write_text(content)
+        with pytest.raises(errors.CompileError) as exc_info:
+            cli_mod.compile_file(str(tmp_path / "main.f"), str(tmp_path / "out"))
+        assert "broken.f" in str(exc_info.value)
+
+
 class TestAutomaticSqliteSchemaSync:
     """claude.md #8, #28-31: festina.sqlite is created/opened
     automatically and each declared table's schema is synchronized

@@ -29,10 +29,10 @@ Festina is under active development. Everything else in this README
 describes the full target language from `claude.md`; this section is
 the ground truth for what actually runs today.
 
-**Test suite:** 263 tests, 0 failed (`pytest tests/`) — 261 passed/2
+**Test suite:** 273 tests, 0 failed (`pytest tests/`) — 271 passed/2
 skipped by default (the 2 need `pyinstaller`, an opt-in build-time-only
 dependency for the packaged-binary tests; see [Setup](#setup)), or all
-263 passed/0 skipped with it installed.
+273 passed/0 skipped with it installed.
 See [`tests/`](tests/) and [`tests/CONTRACT.md`](tests/CONTRACT.md) for
 the spec-driven suite this is measured against — every test cites the
 `claude.md` section it checks.
@@ -46,6 +46,7 @@ runtime, and *runs* as a standalone executable (no Python or the
 | Area | Status |
 |---|---|
 | Lexer / parser | ✅ full grammar — imports, types, structs, tables, functions, events, control flow, template strings |
+| **Multi-file compilation (`claude.md #5/#6`)** | ✅ `import file.f` pulls the whole dependency graph into one compilation unit — recursive resolution, canonical-path dedup, circular-import detection, cross-file struct/table/function/global references, correct per-file error attribution even though it's all one merged program internally |
 | Semantic analysis | ✅ type resolution, struct/table distinction, bool-only conditions, function arg/return checking, all `#48` error categories |
 | Primitives (`int` / `float` / `bool` / `text` / `blob`) | ✅ |
 | Variables / constants | ✅ global and local |
@@ -155,7 +156,6 @@ scoped out rather than silently missing:
 | Graphics (`drawRect`, `img`, Cairo) | ❌ |
 | Audio (`aud`, `loadAudio`) | ❌ |
 | `on eventName` event handlers | ❌ |
-| Multi-file compilation in the CLI | ⚠️ `festina.imports` resolves import graphs and is tested standalone; `bin/festina` itself still only compiles a single file |
 
 ### Setup
 
@@ -215,7 +215,7 @@ sure.
 
 ```bash
 pip install -r requirements-dev.txt   # pytest, for the test suite
-pytest tests/                         # 263 passed
+pytest tests/                         # 271 passed, 2 skipped (see Test suite above)
 
 ./bin/festina examples/hello.f -o hello
 ./hello
@@ -571,9 +571,10 @@ music.isPlaying()
 
 ## Imports
 
-> **Status:** import resolution (recursive, deduplicated, cycle-checked)
-> is implemented and tested in `festina.imports`, but `bin/festina`
-> doesn't call it yet — it compiles a single file only. See
+> **Status:** implemented and tested end to end — recursive resolution,
+> canonical-path deduplication, circular-import detection
+> (`festina.imports`), and `bin/festina` actually compiles the whole
+> multi-file dependency graph as one program. See
 > [Implementation Status](#implementation-status).
 
 Festina uses a deliberately simple import system:

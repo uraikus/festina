@@ -53,7 +53,7 @@ import subprocess
 import sys
 import tempfile
 
-from . import parser as parser_mod
+from . import imports as imports_mod
 from . import semantic as semantic_mod
 from . import codegen as codegen_mod
 from . import llvm_backend
@@ -191,10 +191,12 @@ def _ensure_runtime_object(cc):
 
 
 def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
-    with open(entry_path, encoding="utf-8") as f:
-        source = f.read()
-
-    program = parser_mod.parse(source, filename=entry_path)
+    # claude.md #5, #6: resolves entry_path's full import graph (a plain
+    # single-file program is the degenerate case -- just entry_path on
+    # its own) and merges every file into one ast.Program, in dependency
+    # order, each top-level statement tagged with the file it actually
+    # came from so errors below still name the right file.
+    program = imports_mod.build_program(entry_path)
     analyzed = semantic_mod.analyze(program, filename=entry_path)
     ir = codegen_mod.generate_ir(program, analyzed, filename=entry_path)
 

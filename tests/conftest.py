@@ -90,24 +90,29 @@ def llvm_backend():
     return import_spec_module("llvm_backend")
 
 
-@pytest.fixture
-def compile_and_run(tmp_path, codegen, cli_mod):
-    """Compile a Festina source string to a native executable and run it.
-
-    Skips with a clear reason if no usable C compiler is on PATH -- this
-    is a toolchain-availability skip (distinct from the
-    SPEC_UNIMPLEMENTED_REASON skips above), since codegen.py itself is
-    implemented either way. Prefers clang but accepts gcc too: as of
-    "real compilation, minimal setup" stage 3, festina.llvm_backend
-    compiles the LLVM IR itself (when available) rather than handing the
-    .ll file to the C compiler, so cc's job is just compiling
-    festina_runtime.c and linking plain object files -- work gcc does
-    exactly as well as clang. See festina/cli.py's module docstring.
-    """
+def _require_c_compiler():
+    """Shared by compile_and_run/compile_multi_and_run: skip with a
+    clear, toolchain-specific reason if no usable C compiler is on
+    PATH -- distinct from the SPEC_UNIMPLEMENTED_REASON skips above,
+    since codegen.py itself is implemented either way; this is "this
+    environment can't link native code," not "the feature doesn't
+    exist." Prefers clang but accepts gcc too: as of "real compilation,
+    minimal setup" stage 3, festina.llvm_backend compiles the LLVM IR
+    itself (when available) rather than handing the .ll file to the C
+    compiler, so cc's job is just compiling festina_runtime.c and
+    linking plain object files -- work gcc does exactly as well as
+    clang. See festina/cli.py's module docstring."""
     cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
     if not cc:
         pytest.skip("no C compiler (clang/gcc/cc) on PATH -- cannot "
                      "compile/link the Festina runtime and the generated code")
+    return cc
+
+
+@pytest.fixture
+def compile_and_run(tmp_path, codegen, cli_mod):
+    """Compile a Festina source string to a native executable and run it."""
+    cc = _require_c_compiler()
 
     def _run(source, filename="main.f", args=None):
         src_path = tmp_path / filename
@@ -135,3 +140,24 @@ def write_source(tmp_path):
         return tmp_path
 
     return _write
+
+
+@pytest.fixture
+def compile_multi_and_run(tmp_path, codegen, cli_mod, write_source):
+    """Like compile_and_run, but for a multi-file program (claude.md #5,
+    #6): takes {relpath: source} plus which file is the entry point,
+    writes them all, compiles the entry (pulling in its own imports),
+    and runs the result."""
+    cc = _require_c_compiler()
+
+    def _run(files: dict, entry="main.f", args=None):
+        root = write_source(files)
+        out_path = tmp_path / "program"
+        cli_mod.compile_file(str(root / entry), str(out_path), cc=cc)
+        result = subprocess.run(
+            [str(out_path), *(args or [])],
+            cwd=tmp_path, capture_output=True, text=True, timeout=15,
+        )
+        return result
+
+    return _run
