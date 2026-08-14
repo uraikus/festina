@@ -209,6 +209,7 @@
   }
   pre.code .kw { color: var(--code-keyword); }
   pre.code .str { color: var(--code-string); }
+  pre.code .re { color: var(--code-string); opacity: 0.85; }
   pre.code .cm { color: var(--code-comment); font-style: italic; }
   pre.code .mut { color: var(--code-muted); }
 
@@ -477,8 +478,8 @@ music.play()
 setTimeout(showMessage, 1000)
 setInterval(tick, 500)
 
-<span class="cm">// Regex</span>
-<span class="str">'room 42'</span>.replace(regex(<span class="str">'[0-9]+'</span>), <span class="str">'N'</span>)</pre>
+<span class="cm">// Regex, JS-style literals</span>
+<span class="str">'room 42'</span>.replace(<span class="re">/[0-9]+/</span>, <span class="str">'N'</span>)</pre>
   </div>
 </section>
 
