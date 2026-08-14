@@ -294,11 +294,53 @@ other SQL metacharacter in the first place; and every `log()`/
 format-string vulnerability despite text values flowing directly into
 `printf`-family calls throughout.
 
+Binary slimming (also claude.md #59: "if a canvas isn't used, keep the
+binary slim") split the single `runtime/festina_runtime.c` into three
+translation units -- `festina_runtime.c` (core: log/fail/string
+interpolation/sqlite/regex/timers), `festina_runtime_graphics.c` (Cairo/
+X11), and `festina_runtime_audio.c` (ALSA), sharing declarations through
+`festina_runtime.h` (public) and a new `festina_runtime_internal.h`
+(timer bookkeeping shared between core and graphics only). Before the
+split, a compiled program that never used graphics or audio still linked
+against `libcairo`/`libX11`/`libasound` -- confirmed directly: a trivial
+`log('hello')` program pulled in 24 shared libraries and Xlib/Cairo/ALSA
+transitively at ~1.5MB. The obvious-looking fix
+(`-ffunction-sections -fdata-sections` at compile time,
+`-Wl,--gc-sections -Wl,--as-needed` at link time) was tried first and
+disproven empirically: it shrank the binary correctly (dead code really
+was eliminated -- `readelf --dyn-syms` showed zero remaining undefined
+references to any Cairo/X11/ALSA symbol) but `readelf -d`/`ldd` still
+showed all three libraries as `NEEDED` regardless, because `--as-needed`
+decides whether a library is needed against the *whole translation unit*
+any live symbol pulls in, before `--gc-sections` has pruned anything out
+of it -- with everything in one `.o`, that whole-file decision always
+came out "needed." Splitting into separate object files sidesteps the
+problem entirely: `festina/cli.py`'s `_runtime_objects_and_link_libs`
+now only ever passes the graphics/audio object files (and their
+pkg-config cflags/libs) to `cc` when `CodeGen.uses_graphics_code`/
+`uses_audio` say the program actually calls something from them, so an
+unused feature's library is never on the link line to begin with, not
+merely dead-code-eliminated from it. `CodeGen.uses_graphics_code` is
+deliberately a separate, broader flag than the pre-existing
+`uses_graphics` (which still only gates lazily opening a canvas window):
+`loadImage()` alone doesn't open a window (see its own doc comment above)
+but `festina_load_image()` still lives in the graphics object file, so
+linking needs the broader signal even though window-opening doesn't. The
+previously-unified `festina_run_event_loop` (X11 `select()`-multiplexed
+timers+graphics) is now graphics-only, calling back into a new
+`festina_next_timer_deadline()`/`festina_fire_expired_timers()` seam
+(`festina_runtime_internal.h`) for timer state that still lives entirely
+in core; a timers-only program (no graphics) now calls a new
+`festina_run_timer_loop()` instead, staying pure-POSIX with no X11
+dependency at all. Verified end to end via `ldd`/`readelf -d` on real
+compiled binaries for all four combinations (neither/graphics-only/
+audio-only/both) -- see `tests/test_codegen.py::TestSlimBinaries`.
+
 "Real compilation, minimal setup" stages 1, 2, and 3 -- claude.md #59,
 added alongside these stages to make the requirement explicit rather
-than implicit in the implementation -- are also done (see README.md's
-"Deployment"/"Setup" sections for the full staged plan and the current
-dependency list): sqlite3 is statically linked into compiled programs
+than implicit in the implementation -- are also done (see setup.md for
+the full staged plan and the current dependency list): sqlite3 is
+statically linked into compiled programs
 (no libsqlite3.so needed to *run* one), `scripts/package_compiler.sh`
 packages `festina/` into a standalone binary via PyInstaller (no Python
 install needed to *use the compiler* with that binary -- verified by
@@ -315,7 +357,7 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 430 tests in this directory pass against it: 422 given a working C
+All 434 tests in this directory pass against it: 426 given a working C
 compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
 too, plus 6 more (`tests/test_codegen.py::TestGraphics`'s interactive
 click/mouse/key/resize tests, the one confirming the initial
@@ -342,8 +384,9 @@ making the stricter behavior the rule everywhere, with `Math`/`.toFloat()`
 as the escape hatch, rather than picking a side ad hoc in code with no
 spec backing either way.
 
-See README.md's "Implementation Status" section for the current
-implemented-vs-not matrix; the short version: nothing is left
+See api.md for the current language/standard library reference and this
+file's own "Status" section above for the implemented-vs-not matrix; the
+short version: nothing is left
 unimplemented anymore -- every claude.md construct this compiler
 targets generates real code now (audio was the last one; see above).
 
@@ -1030,7 +1073,7 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 422 passed, 8 skipped (needs a C compiler; 2 of
+pytest tests/                          # 426 passed, 8 skipped (needs a C compiler; 2 of
                                         # the skips need `pip install pyinstaller` too,
                                         # the other 6 need Xvfb + xdotool installed)
 ```

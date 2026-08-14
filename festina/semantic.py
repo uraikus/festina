@@ -775,7 +775,7 @@ def analyze(program, filename="<string>"):
         # one of those names would therefore compile fine but be
         # permanently unreachable -- every call to it resolves to the
         # builtin instead, silently. This used to be accepted (see
-        # README.md's now-corrected note) on the reasoning that none of
+        # security.md's audit writeup) on the reasoning that none of
         # graphics/audio/timers were implemented yet, so the collision
         # couldn't actually bite; now that they are, it can.
         if decl.name in BUILTIN_FUNCTIONS:

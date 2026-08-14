@@ -102,9 +102,9 @@ def _require_c_compiler():
     exist." Prefers clang but accepts gcc too: as of "real compilation,
     minimal setup" stage 3, festina.llvm_backend compiles the LLVM IR
     itself (when available) rather than handing the .ll file to the C
-    compiler, so cc's job is just compiling festina_runtime.c and
-    linking plain object files -- work gcc does exactly as well as
-    clang. See festina/cli.py's module docstring."""
+    compiler, so cc's job is just compiling the runtime translation
+    units and linking plain object files -- work gcc does exactly as
+    well as clang. See festina/cli.py's module docstring."""
     cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
     if not cc:
         pytest.skip("no C compiler (clang/gcc/cc) on PATH -- cannot "
@@ -146,10 +146,11 @@ def audio_null_env(tmp_path):
     no /dev/snd node at all, `snd_pcm_open(..., "default", ...)` fails
     with "cannot find card '0'" otherwise). Unlike Xvfb, this needs no
     extra tool install -- the null plugin ships inside alsa-lib itself,
-    which festina_runtime.c already links against unconditionally (see
-    festina/cli.py) -- so tests using this don't need their own opt-in
-    skip tier the way the Xvfb-based graphics tests do; they only need
-    the same C-compiler availability compile_and_run already requires.
+    which festina_runtime_audio.c links against whenever a program
+    actually uses audio (see festina/cli.py's per-feature object file
+    selection) -- so tests using this don't need their own opt-in skip
+    tier the way the Xvfb-based graphics tests do; they only need the
+    same C-compiler availability compile_and_run already requires.
     Pass the returned dict as compile_and_run's `env=` argument.
     """
     home = tmp_path / "alsa_home"

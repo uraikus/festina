@@ -1598,6 +1598,84 @@ class TestMinimalRuntimeDependencies:
         assert "libsqlite3" not in ldd_output
 
 
+class TestSlimBinaries:
+    """claude.md #59's binary-slimming requirement: "if a canvas isn't
+    used, make sure the binary remains slim". The runtime is split into
+    core/graphics/audio translation units (runtime/festina_runtime.c/
+    _graphics.c/_audio.c) specifically so a compiled program's `cc`
+    invocation only ever gets -lcairo/-lX11/-lasound on its command line
+    when that program actually uses graphics/audio (see festina/cli.py's
+    _runtime_objects_and_link_libs, driven by CodeGen.uses_graphics/
+    uses_graphics_code/uses_audio) -- confirmed here by inspecting the
+    linked binary's actual dynamic dependencies (ldd), not just that
+    compilation succeeded, since --gc-sections/--as-needed alone was
+    verified NOT to remove an unused library from a single-object-file
+    build (the linker's "is this needed" decision is made against the
+    whole translation unit before dead-code elimination runs)."""
+
+    def _ldd(self, binary):
+        if not shutil.which("ldd"):
+            pytest.skip("ldd not on PATH -- cannot inspect the binary's dynamic dependencies")
+        return subprocess.run(["ldd", str(binary)], capture_output=True, text=True).stdout
+
+    def test_graphics_and_audio_free_binary_links_neither(self, compile_and_run, tmp_path):
+        compile_and_run("log('hi')")
+        ldd_output = self._ldd(tmp_path / "program")
+        assert "libcairo" not in ldd_output
+        assert "libX11" not in ldd_output
+        assert "libasound" not in ldd_output
+
+    def test_graphics_binary_links_cairo_and_x11_but_not_alsa(self, tmp_path):
+        if not (shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")):
+            pytest.skip("no C compiler (clang/gcc/cc) on PATH")
+        from festina import cli as cli_mod
+
+        src = tmp_path / "main.f"
+        src.write_text("drawRect(1, 1, 2, 2)")
+        out = tmp_path / "program"
+        cli_mod.compile_file(str(src), str(out), cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
+        ldd_output = self._ldd(out)
+        assert "libcairo" in ldd_output
+        assert "libX11" in ldd_output
+        assert "libasound" not in ldd_output
+
+    def test_audio_binary_links_alsa_but_not_cairo_or_x11(self, tmp_path):
+        if not (shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")):
+            pytest.skip("no C compiler (clang/gcc/cc) on PATH")
+        from festina import cli as cli_mod
+
+        # Loading a nonexistent file fails at *runtime*, not compile
+        # time (claude.md #38's loadAudio() has no compile-time path
+        # validation) -- irrelevant here, this only checks what got
+        # linked, never runs the binary.
+        src = tmp_path / "main.f"
+        src.write_text("aud music = loadAudio('nonexistent.wav')")
+        out = tmp_path / "program"
+        cli_mod.compile_file(str(src), str(out), cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
+        ldd_output = self._ldd(out)
+        assert "libasound" in ldd_output
+        assert "libcairo" not in ldd_output
+        assert "libX11" not in ldd_output
+
+    def test_loadimage_alone_still_links_successfully_without_opening_a_window(self, tmp_path):
+        # Regression test: loadImage() deliberately does NOT set
+        # CodeGen.uses_graphics (see _emit_graphics_call's doc comment --
+        # decoding a PNG needs no X server), but festina_load_image()
+        # still lives in the graphics object file, not core. Without
+        # CodeGen.uses_graphics_code as a separate, broader linking
+        # signal, this compiled fine but failed to *link*
+        # ("undefined reference to festina_load_image").
+        if not (shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")):
+            pytest.skip("no C compiler (clang/gcc/cc) on PATH")
+        from festina import cli as cli_mod
+
+        src = tmp_path / "main.f"
+        src.write_text("img icon = loadImage('nonexistent.png')")
+        out = tmp_path / "program"
+        cli_mod.compile_file(str(src), str(out), cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
+        assert out.exists()
+
+
 class TestMinimalBuildDependencies:
     """"Real compilation, minimal setup" stage 3: using Festina shouldn't
     require clang *specifically*. Before this stage, cc had to be clang
@@ -1674,8 +1752,18 @@ class TestMissingDependencyErrors:
             return str(bin_dir)
         return _make
 
-    def test_missing_pkg_config_gives_actionable_error(self, parser, semantic, codegen, cli_mod, errors, tmp_path, path_without):
+    def test_missing_pkg_config_gives_actionable_error(self, parser, semantic, codegen, cli_mod, errors, tmp_path, path_without, monkeypatch):
         path_without("pkg-config")
+        # claude.md #59's per-feature object file split (see
+        # festina/cli.py's _RUNTIME_FEATURES) means a graphics/audio-free
+        # program like this one never calls pkg-config for cairo-xlib/
+        # alsa at all -- only sqlite3, which is always needed. sqlite3's
+        # own flags are cached process-wide (_sqlite_link_cache, keyed by
+        # `cc`) across every compile_file call in this test session, so
+        # without clearing it here, an earlier test's successful compile
+        # would make this one a silent cache hit that never calls
+        # pkg-config, never noticing it's missing.
+        monkeypatch.setattr(cli_mod, "_sqlite_link_cache", {})
         src = tmp_path / "main.f"
         src.write_text("log('hi')")
         with pytest.raises(errors.CompileError, match="pkg-config.*install"):

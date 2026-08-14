@@ -152,6 +152,14 @@ __pycache__/
 # examples/*.f from the repo root while trying things out manually.
 festina.sqlite
 
+# benchmark.md's build outputs -- benchmarks/run_benchmarks.py builds
+# into a temp dir itself, so these only appear if a binary is compiled
+# by hand directly into benchmarks/ (e.g. `bin/festina benchmarks/fib.f
+# -o benchmarks/fib`).
+benchmarks/hello
+benchmarks/fib
+benchmarks/loop_sum
+
 # "Real compilation, minimal setup" stage 2 -- scripts/package_compiler.sh's
 # PyInstaller build output (a large, machine-specific binary; not something
 # to commit) and PyInstaller's own scratch directories.

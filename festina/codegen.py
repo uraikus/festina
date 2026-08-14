@@ -34,8 +34,9 @@ note below), and aud/loadAudio()/.play()/.stop()/.isPlaying() (a real
 ALSA output device, WAV audio only -- see the "Audio" note below).
 
 Nothing is left unimplemented -- every claude.md section this compiler
-targets generates real code now. See README.md for the up-to-date
-status list.
+targets generates real code now. See api.md for the language/standard
+library reference and tests/CONTRACT.md's "Status" section for the
+up-to-date implemented-vs-not detail.
 
 Graphics (claude.md #37, #39, #40): a real on-screen window (Xlib +
 Cairo's Xlib surface backend), not a file written to disk -- "Graphics
@@ -182,7 +183,7 @@ loop constructs, and both are implemented: `.length` is read via
 since not every array-typed expression is addressable and `.length` is
 read-only anyway; for/while loops (`_emit_for`/`_emit_while`) are
 ordinary structured control flow, no different in kind from `_emit_if`.
-No growth, no bounds checking (documented in README.md as a known gap,
+No growth, no bounds checking (documented in todo.md as a known gap,
 consistent with #14's performance-first / low-runtime-overhead priority
 in the absence of a spec requirement either way), and no `break`/
 `continue` (claude.md doesn't define either -- the only documented way
@@ -204,7 +205,7 @@ containing a `.` in the middle the way `struct_llvm_name` produces
 at all would close the gap completely if it's ever worth the churn. The
 data pointer is malloc'd and never freed -- claude.md #43 promises
 automatic memory management this compiler doesn't implement yet (no GC,
-no refcounting runtime), so for now arrays leak; see README.md.
+no refcounting runtime), so for now arrays leak; see todo.md.
 
 Null for int/float (claude.md #10, #25, #57): i64/double have no spare
 bit pattern for "null" the way a pointer has NULL, and LLVM's `null`
@@ -226,7 +227,7 @@ is NOT fixed here -- claude.md never asked for bool-null specifically,
 and fixing it would mean widening bool from i1 to a multi-value
 encoding everywhere bool is stored (fields, params, array elements),
 well beyond the int/float scope this change actually needed. Tracked as
-a known gap in README.md rather than silently left unmentioned.
+a known gap in todo.md rather than silently left unmentioned.
 """
 import struct
 
@@ -342,6 +343,22 @@ class CodeGen:
         self.uses_timers = False               # any setTimeout()/setInterval() call anywhere --
                                                 # NOT clearTimeout()/clearInterval() alone; see
                                                 # _emit_timer_call and _emit_main_and_entry
+        self.uses_graphics_code = False        # any drawRect/drawCircle/drawText/drawImage/
+                                                # loadImage call anywhere -- a strict superset of
+                                                # uses_graphics (see _emit_graphics_call's doc
+                                                # comment on why loadImage() alone does NOT set
+                                                # uses_graphics), purely a linking signal like
+                                                # uses_audio below: cli.py links the graphics
+                                                # (Cairo/X11) runtime object file whenever this is
+                                                # true, whether or not a window ever actually opens
+        self.uses_audio = False                # any loadAudio()/.play()/.stop()/.isPlaying()
+                                                # anywhere -- purely a linking signal (unlike
+                                                # uses_graphics/uses_timers, nothing in codegen
+                                                # branches on it): cli.py reads it after generate()
+                                                # to decide whether the ALSA-linked runtime object
+                                                # file needs to be linked in at all, so a program
+                                                # that never touches audio doesn't pull in
+                                                # libasound (see cli.py's _ensure_runtime_objects)
 
     # ---- naming ----
     def tmp(self):
@@ -492,6 +509,12 @@ class CodeGen:
             "declare i64 @festina_set_interval(ptr, i64)",
             "declare void @festina_clear_timeout(i64)",
             "declare void @festina_clear_interval(i64)",
+            # Timers-without-graphics blocking loop -- pure POSIX (no
+            # X11), lives in the core runtime; see _emit_main_and_entry.
+            # A `declare` alone never forces linking anything (only an
+            # actual `call` does), so this is safe to emit unconditionally
+            # for every program, same as festina_run_event_loop above.
+            "declare void @festina_run_timer_loop()",
             # claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying().
             "declare ptr @festina_load_audio(ptr)",
             "declare void @festina_audio_play(ptr)",
@@ -1339,6 +1362,7 @@ class CodeGen:
             if name in ("setTimeout", "setInterval", "clearTimeout", "clearInterval"):
                 return self._emit_timer_call(name, expr, env, lines)
             if name == "loadAudio":
+                self.uses_audio = True
                 path_val, _ = self._emit_expr(expr.args[0], env, lines)
                 out = self.tmp()
                 lines.append(f"  {out} = call ptr @festina_load_audio(ptr {path_val})")
@@ -1497,6 +1521,7 @@ class CodeGen:
         the edge case of loading an image without ever drawing it,
         where requiring a window/display would be an artificial
         restriction claude.md never asks for."""
+        self.uses_graphics_code = True
         args = [self._emit_expr(a, env, lines)[0] for a in expr.args]
         if name == "loadImage":
             out = self.tmp()
@@ -1701,7 +1726,7 @@ class CodeGen:
             for event_name, symbol in self.event_handlers.items():
                 main_lines.append(f"  call void @{register_fn[event_name]}(ptr {symbol})")
         main_lines.append("  call void @__festina_main()")
-        if self.uses_graphics or self.uses_timers:
+        if self.uses_graphics:
             # claude.md #40's "canvas" only means something while a
             # window is actually open -- block here, after the entry
             # function's own top-level statements have run (so anything
@@ -1709,10 +1734,20 @@ class CodeGen:
             # mouse/key/resize/close and any pending setTimeout/
             # setInterval callbacks until there's nothing left to wait
             # for (see festina_run_event_loop's own doc comment in
-            # festina_runtime.h/.c). A program that uses neither skips
-            # this entirely and exits immediately after __festina_main(),
-            # exactly as it always has.
+            # festina_runtime.h/graphics.c). festina_run_event_loop lives
+            # in the graphics translation unit (X11 select()-based), so
+            # it's only ever declared-and-called -- never linked in --
+            # for a program that actually opens a window; see cli.py's
+            # per-feature object file selection.
             main_lines.append("  call void @festina_run_event_loop()")
+        elif self.uses_timers:
+            # No window, but setTimeout/setInterval callbacks still need
+            # a blocking loop to fire in -- festina_run_timer_loop is the
+            # pure-POSIX (nanosleep-based, no X11 at all) equivalent that
+            # lives in the core translation unit, so a timers-only
+            # program never needs to link the graphics object file just
+            # to wait for its callbacks.
+            main_lines.append("  call void @festina_run_timer_loop()")
         main_lines.append("  ret i32 0")
         main_lines.append("}")
 
