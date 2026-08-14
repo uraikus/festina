@@ -44,6 +44,31 @@ class TestNoImplicitIntFloatConversion:
             semantic.analyze(program)
 
 
+class TestToText:
+    """int/float/bool.toText() -- an explicit spelling of the same
+    stringification template interpolation already does implicitly for
+    these three types."""
+
+    @pytest.mark.parametrize("decl", ["int a = 5", "float a = 5.0", "bool a = true"])
+    def test_to_text_on_int_float_bool_produces_text(self, parser, semantic, decl):
+        program = parser.parse(f"{decl}\ntext s = a.toText()")
+        semantic.analyze(program)  # must not raise
+
+    def test_to_text_on_text_is_rejected(self, parser, semantic, errors):
+        program = parser.parse("text a = 'x'\ntext s = a.toText()")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_to_text_with_an_argument_is_rejected(self, parser, semantic, errors):
+        # toText() takes no arguments -- with one, it doesn't match the
+        # recognized zero-arg pattern at all, so it falls through to
+        # the generic "unknown member call" handling, same as any other
+        # unrecognized Call-on-Member.
+        program = parser.parse("int a = 5\ntext s = a.toText(1)")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+
 class TestMath:
     """claude.md #56: Math.floor/ceil/round/trunc convert float -> int."""
 

@@ -1316,6 +1316,13 @@ int total = Math.ceil(price) + 3
 
 This section overrides any implicit numeric promotion that might otherwise be assumed from JavaScript familiarity (section 45): Festina does not perform implicit conversion between int and float.
 
+int, float, and bool values also each have a toText() method, returning the same text representation string interpolation (section 45) already produces for that value:
+
+int count = 5
+text s = count.toText()
+
+log(`${count}`) and log(count.toText()) therefore always produce identical output for an int/float/bool value -- toText() exists for when that text value is needed outside of a template, e.g. to pass elsewhere or build up separately.
+
 
 56. MATH
 
@@ -1627,3 +1634,90 @@ clearTimeout(id)
 clearInterval(id)
 
 A program keeps running as long as it has a pending timeout or an uncleared interval, exactly as in JavaScript -- clearing every interval (or letting every timeout fire) lets it exit normally.
+
+
+70. DATABASE CONFIGURATION
+
+By default the automatic SQLite database (#8, #29) is always festina.sqlite in the current working directory. The entry file may override this by making its very first line, before any other code and before any import:
+
+DatabaseURL = path
+
+path must be a text expression. Example:
+
+DatabaseURL = 'game_saves.sqlite'
+DatabaseURL = environment.DATABASE_URL
+
+If DatabaseURL does not appear as the entry file's first statement, the default (festina.sqlite) is used. DatabaseURL appearing anywhere other than the first statement of the entry file is a compile-time error. DatabaseURL has no effect in an imported file -- it is only recognized in the file actually passed to the compiler.
+
+
+71. ENVIRONMENT VARIABLES
+
+Environment variables are read through the global environment object:
+
+environment.NAME
+
+This returns the value of the environment variable NAME as text, or null if it is not set. NAME may also be given as a computed (bracket) key, which must be a text expression:
+
+environment['NAME']
+
+Example:
+
+text apiKey = environment.API_KEY
+if apiKey == null {
+    fail('API_KEY is not set')
+}
+
+environment is read-only -- assigning to environment.NAME (or environment['NAME']) is a compile-time error. environment cannot be used by itself (without a .NAME or ['NAME']) -- doing so is a compile-time error.
+
+
+72. MAPS
+
+The map type associates text keys with values of one declared type:
+
+map[T]
+
+Where T may be any type a map value can hold except another map or an array (a map value is stored in a single fixed-size slot internally, which an array or map value does not fit in).
+
+A map is created with a map literal:
+
+map[T] name = { key: value, key: value, ... }
+
+Every key expression must be text -- a plain string literal, or any other expression that evaluates to text (a variable, a template string, ...). It is not a bareword/identifier-as-string shorthand: an unquoted identifier used as a key is a reference to that variable's text value, not the identifier's own name.
+
+Example:
+
+text npc2Id = 'npc2'
+map[int] npcHealths = { 'npc1': 10, npc2Id: 15 }
+map[text] npcNames = { 'npc1': 'jim', npc2Id: 'john' }
+
+An empty map literal is written {}.
+
+If the same key appears more than once in a literal, the last value for that key wins.
+
+A map value is read by indexing with a text key:
+
+npcHealths['npc1']
+npcHealths[npc2Id]
+
+If the key is not present in the map, the result is null.
+
+A map value is written the same way:
+
+npcHealths['npc1'] = 30
+npcHealths[npc2Id] = 30
+
+Assigning to a key that does not yet exist adds it; assigning to an existing key replaces its value.
+
+Every map supports:
+
+map.forEach(callback)
+
+callback must be the name of an already-declared function taking exactly two parameters -- the value (typed the same as the map's declared value type) and the key (text) -- and returning nothing. It is called once for each entry currently in the map. The order entries are visited in is not specified.
+
+Example:
+
+void func logHealth(h:int, key:text) {
+    log(`${key} ${h.toText()}`)
+}
+
+npcHealths.forEach(logHealth)

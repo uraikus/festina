@@ -129,3 +129,32 @@ class TestIndividualExamples:
         assert lines[2].startswith("isPlaying() after 100ms: ")
         assert lines[3] == "stopping early"
         assert lines[4] == "isPlaying() after stop(): false"
+
+    def test_maps_demo_runs_correctly(self, cli_mod, tmp_path):
+        result = _run_example(cli_mod, tmp_path, "maps.f")
+        lines = result.stdout.splitlines()
+        assert lines[:4] == ["10", "15", "jim", "john"]
+        # A missing key on an int-valued map logs the same int-null
+        # sentinel a plain `int a = 1 / 0` would (claude.md #57) -- not
+        # a special maps-only encoding.
+        assert lines[4] == "-9223372036854775808"
+        assert lines[5:7] == ["30", "5"]
+        # forEach's visit order isn't specified (claude.md #72) -- sort
+        # before comparing.
+        assert sorted(lines[7:]) == ["npc1: 30", "npc2: 15", "npc3: 5"]
+
+    def test_config_demo_uses_the_default_database_without_the_env_var(self, cli_mod, tmp_path, monkeypatch):
+        monkeypatch.delenv("FESTINA_DB_PATH", raising=False)
+        result = _run_example(cli_mod, tmp_path, "config.f", cwd=tmp_path)
+        assert result.stdout.splitlines() == [
+            "visit 1: the summit",
+            "API_KEY is not set (that is fine -- this is just a demo)",
+        ]
+        assert (tmp_path / "festina.sqlite").exists()
+
+    def test_config_demo_honors_the_database_url_env_var(self, cli_mod, tmp_path):
+        result = _run_example(cli_mod, tmp_path, "config.f", cwd=tmp_path,
+                               env={"FESTINA_DB_PATH": "custom_config.sqlite"})
+        assert result.returncode == 0
+        assert (tmp_path / "custom_config.sqlite").exists()
+        assert not (tmp_path / "festina.sqlite").exists()
