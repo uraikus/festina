@@ -34,13 +34,15 @@ implemented too: `festina.imports.build_program` resolves the full
 import graph and merges every file into one compilation unit, and
 `bin/festina`/`festina.cli.compile_file` actually call it now (they
 used to only ever compile the single entry file). So is claude.md
-#67/#68 (regex, string match/replace): `regex()` is a builtin function
-(like `sqlite()`/`loadImage()`, not a dedicated `/pattern/` literal),
-`.test()`, `.match()`, and `.replace()`/`.replaceAll()` are recognized
-Call-on-Member patterns the same way `Math.floor`/`int.toFloat()`
-already are, and the whole feature is built on POSIX extended regular
-expressions (`<regex.h>`, already part of libc) rather than a bundled
-or external regex engine, per claude.md #59.
+#67/#68 (regex, string match/replace) -- `.test()`, `.match()`, and
+`.replace()`/`.replaceAll()` are recognized Call-on-Member patterns the
+same way `Math.floor`/`int.toFloat()` already are, and the whole feature
+is built on POSIX extended regular expressions (`<regex.h>`, already
+part of libc) rather than a bundled or external regex engine, per
+claude.md #59. A regex value was originally constructible only via a
+`regex()` builtin function call (like `sqlite()`/`loadImage()`), with no
+dedicated literal syntax at all -- see this section's later "JS-style
+regex literal syntax" paragraph below for why and how that changed.
 claude.md #37/#39/#40 (`img`/`loadImage()`, `drawRect`/`drawCircle`/
 `drawText`/`drawImage`, `on click`/`on mouse`/`on key`/`on resize`/`on
 close`, `clientWidth`/`clientHeight`) are implemented too, per the
@@ -357,17 +359,77 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 434 tests in this directory pass against it: 426 given a working C
+All 503 tests in this directory pass against it: 493 given a working C
 compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
-too, plus 6 more (`tests/test_codegen.py::TestGraphics`'s interactive
-click/mouse/key/resize tests, the one confirming the initial
-`clientWidth`/`clientHeight` values, and `TestTimers`'s combined
-graphics-and-timers test) given `Xvfb`+`xdotool` too -- all skip
-cleanly, independently, without any of those three (see below).
-`tests/test_audio.py`/`TestAudio` need none of the three either --
-the null-device technique they use (see conftest.py's
+too, plus 8 more given `Xvfb`+`xdotool` too
+(`tests/test_codegen.py::TestGraphics`'s interactive click/mouse/key/
+resize tests, the one confirming the initial `clientWidth`/
+`clientHeight` values, `TestTimers`'s combined graphics-and-timers test,
+and `TestExampleGraphicsAndGame`'s two example-driven tests below) --
+all skip cleanly, independently, without any of those three (see
+below). `tests/test_audio.py`/`TestAudio` need none of the three
+either -- the null-device technique they use (see conftest.py's
 `audio_null_env`) needs no extra tool install, only the C compiler
 `compile_and_run` already requires.
+
+`examples/` grew beyond the original hello/basic/arrays/geometry/
+multifile/regex set: `timers.f` (setTimeout/setInterval), `graphics.f`
+(drawing + all five event handlers), `audio.f` (loadAudio/play/stop/
+isPlaying, with a small generated `beep.wav` fixture), `fizzbuzz.f` (a
+dependency-free loops/modulo tour), and `tic_tac_toe.f` -- a real,
+playable two-player game (click a cell, alternating X/O, win detection
+across all eight lines) built entirely around this runtime's actual
+drawing model: every draw call paints in solid black and there's no
+"clear"/erase function (see festina_runtime.h's Graphics doc comment),
+so the game deliberately never needs to undraw anything, marks just
+accumulate the way a real pen-and-paper game would. Verified against a
+real (virtual) X server, including the win-detection path (three clicks
+completing a line), not just reasoned about. `tests/test_examples.py`
+compiles every file in `examples/` and checks the deterministic ones'
+exact stdout; `graphics.f`/`tic_tac_toe.f` (the two needing a display)
+get their own interactive coverage in
+`tests/test_codegen.py::TestExampleGraphicsAndGame` instead, next to
+`TestGraphics`'s own Xvfb helpers.
+
+JS-style regex literal syntax (`claude.md #67`, requested directly, not
+found by an audit): `/pattern/flags` is now a real grammar construct
+(`ast.RegexLit`) alongside the pre-existing `regex(pattern, flags)`
+function -- mirroring JS's own split between a `/pattern/` literal and
+`new RegExp(...)`, since a literal's pattern/flags are fixed at compile
+time (no interpolation, unlike a template string) while `regex()`
+remains the only way to build a pattern that isn't known until runtime.
+claude.md #67 used to explicitly rule this out ("No regex literal syntax
+... is used") specifically because of the classic JS lexical ambiguity
+between a leading `/` starting a regex literal and `/` as the division
+operator -- resolved here the same way real JS lexers resolve it, not
+by inventing a different rule: `festina/lexer.py`'s
+`_regex_literal_may_start_here` treats a `/` as trying to open a regex
+literal everywhere *except* immediately after a token that could itself
+end an expression (an identifier, a literal, `)`/`]`, postfix `++`/`--`)
+-- a denylist, deliberately permissive by default, checked against a
+comment always winning (`//`/`/*` never even attempt a regex-literal
+parse) and an unterminated attempt (no closing `/` before a newline)
+falling back to plain division rather than raising. Flags are validated
+for real at parse time (`Parser.parse_primary`'s `REGEX` handling) --
+only `i` (case-insensitive, matching `regex()`'s own flag) and `g`
+(accepted for familiarity, but a deliberate no-op: `.replace()`/
+`.replaceAll()` already say first-vs-every-match explicitly, the same
+distinction JS's `g` flag controls implicitly) are accepted; any other
+letter, or a repeated flag, is a clear compile error -- something
+`regex()`'s flags *argument* can never offer, since it's an arbitrary
+runtime `text` expression the compiler can't inspect. Escaping: `\/`
+inside a literal unescapes to a literal `/` (JS's own delimiter-escape
+convention, meaningless to POSIX `regcomp()`, which never requires `/`
+escaped at all); every other backslash sequence (`\w`, `\d`, `\s`, `\.`,
+`\\`, ...) passes through untouched to `regcomp()` -- verified directly
+that glibc's `regcomp()` accepts `\w`/`\d`/`\s`/`\b` etc. as GNU
+extensions even in `REG_EXTENDED` mode, so the familiar JS shorthand
+classes work in practice, not just POSIX ERE's own narrower official
+escape set. Verified end to end (lexer disambiguation matrix, parser
+flag validation, and real compiled programs) -- see
+`tests/test_lexer.py::TestRegexLiterals`,
+`tests/test_regex.py::TestRegexLiteral`, and
+`tests/test_codegen.py::TestRegexLiteral`.
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -501,7 +563,10 @@ verified by actually letting `compile_and_run`'s subprocess timeout be
 the judge, not just eyeballing the output -- and an invalid pattern
 must fail at *runtime* with a clear message (claude.md #67 says so
 explicitly), not at compile time, since nothing in this pipeline
-parses regex syntax itself before handing it to `regcomp()`.
+parses regex syntax itself before handing it to `regcomp()`. The
+`TestRegexLiteral` classes alongside `test_regex.py`/`TestRegex` (see
+this section's own "JS-style regex literal syntax" paragraph above)
+cover the same ground for the `/pattern/flags` literal form.
 
 `tests/test_graphics.py` covers claude.md #37/#39/#40 (image, graphics,
 events) at the parser/semantic level, same split as `test_regex.py` --
@@ -679,9 +744,11 @@ festina/
         PrimitiveType(name) / StructType(name) / TableType(name) /
         ArrayType(element) / ImageType() / AudioType() / RegexType()
         -- frozen dataclasses, so equality/hashing work out of the box.
-        RegexType() has no fields (claude.md #67: created only via the
-        regex() builtin, never a dedicated literal, so there's only one
-        shape of it -- unlike StructType/TableType). Likewise ImageType()
+        RegexType() has no fields (claude.md #67: a regex value's
+        pattern/flags live in the runtime pointer value, not the static
+        type, whether it was created via a /pattern/flags literal --
+        ast.RegexLit -- or the regex() builtin, so there's only one
+        shape of it either way -- unlike StructType/TableType). Likewise ImageType()
         (claude.md #37: `img`, created only via loadImage()) has no
         fields -- codegen.py lowers it to `ptr` (an opaque Cairo surface),
         the same convention as StructType/TableType/RegexType.
@@ -1073,7 +1140,7 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 426 passed, 8 skipped (needs a C compiler; 2 of
+pytest tests/                          # 493 passed, 10 skipped (needs a C compiler; 2 of
                                         # the skips need `pip install pyinstaller` too,
-                                        # the other 6 need Xvfb + xdotool installed)
+                                        # the other 8 need Xvfb + xdotool installed)
 ```

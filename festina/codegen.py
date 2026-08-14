@@ -892,6 +892,19 @@ class CodeGen:
             # or a pointer-holding aggregate). int/float/bool can't reach
             # this path uniformly assigned/coerced (see _emit_value_for).
             return "null", None
+        if isinstance(expr, ast.RegexLit):
+            # claude.md #67: /pattern/flags -- compiles to exactly the
+            # same festina_regex_compile() call _emit_regex_call emits
+            # for regex(pattern, flags), just with both arguments already
+            # known string constants instead of arbitrary sub-expressions
+            # (a literal's pattern/flags are fixed at parse time, so
+            # there's no need to route through the general call-argument
+            # machinery _emit_regex_call uses for the dynamic case).
+            pattern_val = self._const_string(expr.pattern, lines)
+            flags_val = self._const_string(expr.flags, lines)
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_regex_compile(ptr {pattern_val}, ptr {flags_val})")
+            return out, REGEX
         if isinstance(expr, ast.TemplateLit):
             return self._emit_template(expr, env, lines), TEXT
         if isinstance(expr, ast.Identifier):

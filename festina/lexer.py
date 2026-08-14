@@ -45,6 +45,95 @@ TOKEN_SPEC = [
 ]
 MASTER_RE = re.compile("|".join(f"(?P<{n}>{p})" for n, p in TOKEN_SPEC), re.DOTALL)
 
+# claude.md #67: /pattern/flags regex literals. The classic JS lexical
+# ambiguity -- a leading '/' could be division (`a / b`) or the start of
+# a regex literal (`/foo/`) -- is resolved the same way real JS lexers
+# resolve it: a regex literal can only start where an *expression* is
+# expected, never immediately after something that could itself be the
+# tail end of one. `_EXPR_ENDING_TOKEN_TYPES`/`_EXPR_ENDING_OP_VALUES`
+# are exactly those "tail end of an expression" tokens -- everything
+# else (an operator, `(`/`[`/`{`, `,`, start of input, ...) means a `/`
+# here is trying to open a regex literal instead. This is deliberately a
+# denylist (permissive by default) rather than an exhaustive allowlist:
+# getting it wrong for some keyword this grammar never actually places
+# next to a bare `/` costs nothing, while missing a real "this ends an
+# expression" case would misparse ordinary division.
+_EXPR_ENDING_TOKEN_TYPES = frozenset({
+    "IDENT", "NUMBER", "STRING", "TSTRING_END",
+    "RPAREN", "RBRACK",
+    "true", "false", "null",
+    # log/fail/sqlite are lexer keywords but behave as plain identifiers
+    # in expression position (see parser.parse_primary) -- `log / 2`
+    # should lex as division, not attempt a regex literal at the `/`.
+    "log", "fail", "sqlite",
+})
+_EXPR_ENDING_OP_VALUES = frozenset({"++", "--"})
+
+
+def _regex_literal_may_start_here(prev_token):
+    if prev_token is None:  # start of input, or the start of a `${...}`
+        return True         # template interpolation's own sub-tokenize call
+    if prev_token.type in _EXPR_ENDING_TOKEN_TYPES:
+        return False
+    if prev_token.type == "OP" and prev_token.value in _EXPR_ENDING_OP_VALUES:
+        return False
+    return True
+
+
+def _try_lex_regex_literal(source, start):
+    """Attempt to lex a /pattern/flags literal starting at `source[start]`
+    ('/', already confirmed by the caller not to be opening a `//`/`/*`
+    comment). Returns (pattern, flags, end_pos), or None if this isn't a
+    validly terminated regex literal -- unterminated before end of line
+    or end of input, which almost certainly means the '/' actually was
+    division and something after it just happens to contain more '/'
+    characters (or a genuine syntax error the parser will catch its own
+    way). Regex literals can't span multiple lines, matching JS.
+
+    Flag characters are collected but not validated here (the lexer has
+    no CompileError-with-location machinery the way the parser does) --
+    see Parser.parse_primary's REGEX handling for the actual "is this a
+    supported flag" check, now possible at compile time (unlike
+    regex()'s flags *argument*, whose value is an arbitrary runtime
+    text expression the compiler can't inspect)."""
+    n = len(source)
+    i = start + 1
+    pattern_chars = []
+    while i < n and source[i] != "/":
+        if source[i] == "\n":
+            return None
+        if source[i] == "\\" and i + 1 < n:
+            if source[i + 1] == "/":
+                # \/ is JS's own delimiter-escape syntax -- POSIX
+                # regcomp() never requires (or expects) '/' to be
+                # escaped at all, so this unescapes straight to a
+                # literal '/' in the pattern text passed to the runtime,
+                # rather than being passed through as "\/" (which glibc's
+                # regcomp would otherwise choke on -- backslash followed
+                # by an ordinary character with no defined escape meaning).
+                pattern_chars.append("/")
+            else:
+                # Every other backslash sequence (\w, \d, \s, \., \\, ...)
+                # is passed straight through untouched -- glibc's regcomp
+                # accepts \w/\d/\s/\b etc. as GNU extensions even in
+                # REG_EXTENDED mode (verified directly against this
+                # runtime's own libc), so the familiar JS shorthand
+                # classes work in practice, not just POSIX ERE's own
+                # narrower official escape set.
+                pattern_chars.append(source[i])
+                pattern_chars.append(source[i + 1])
+            i += 2
+            continue
+        pattern_chars.append(source[i])
+        i += 1
+    if i >= n or source[i] != "/":
+        return None
+    i += 1  # consume the closing '/'
+    flags_start = i
+    while i < n and source[i].isalpha():
+        i += 1
+    return "".join(pattern_chars), source[flags_start:i], i
+
 
 class Token:
     __slots__ = ("type", "value", "line", "column")
@@ -137,7 +226,30 @@ def tokenize(source, filename="<string>"):
         idx = bisect.bisect_right(line_starts, p) - 1
         return idx + 1, p - line_starts[idx] + 1
 
+    # The last token actually emitted (WS/COMMENT never count, since
+    # they're never emitted at all) -- None at the very start, and
+    # implicitly reset to None on every recursive tokenize() call this
+    # function makes for a `${...}` template interpolation, which is
+    # exactly right: a fresh expression context starts there too. Read
+    # by _regex_literal_may_start_here to disambiguate a leading '/'.
+    prev_significant = None
+
     while pos < n:
+        if (source[pos] == "/" and source[pos:pos + 2] not in ("//", "/*")
+                and _regex_literal_may_start_here(prev_significant)):
+            regex_result = _try_lex_regex_literal(source, pos)
+            if regex_result is not None:
+                pattern, flags, end = regex_result
+                line, col = loc(pos)
+                tok = Token("REGEX", (pattern, flags), line, col)
+                tokens.append(tok)
+                prev_significant = tok
+                pos = end
+                continue
+            # Not a validly terminated regex literal after all (e.g. no
+            # closing '/' before a newline) -- fall through to ordinary
+            # tokenization below, which lexes the '/' as plain division.
+
         m = MASTER_RE.match(source, pos)
         if not m:
             line, col = loc(pos)
@@ -158,17 +270,21 @@ def tokenize(source, filename="<string>"):
                 path_line, path_col = loc(pos)
                 tokens.append(Token("PATH", raw_path, path_line, path_col))
                 pos += rest_m.end()
+            prev_significant = tokens[-1]
             continue
 
         if kind == "IDENT" and text in KEYWORDS:
             tokens.append(Token(text, text, line, col))
+            prev_significant = tokens[-1]
             continue
         if kind == "IDENT":
             tokens.append(Token("IDENT", text, line, col))
+            prev_significant = tokens[-1]
             continue
 
         if kind == "STRING":
             tokens.append(Token("STRING", _unescape(text[1:-1]), line, col))
+            prev_significant = tokens[-1]
             continue
 
         if kind == "TEMPLATE":
@@ -177,6 +293,7 @@ def tokenize(source, filename="<string>"):
             str_parts = [t for is_expr, t in segments if not is_expr]
             if not expr_parts:
                 tokens.append(Token("STRING", _unescape(str_parts[0]), line, col))
+                prev_significant = tokens[-1]
                 continue
             tokens.append(Token("TSTRING_START", _unescape(str_parts[0]), line, col))
             for k, expr_text in enumerate(expr_parts):
@@ -185,15 +302,18 @@ def tokenize(source, filename="<string>"):
                 is_last = k == len(expr_parts) - 1
                 part_value = _unescape(str_parts[k + 1])
                 tokens.append(Token("TSTRING_END" if is_last else "TSTRING_MID", part_value, line, col))
+            prev_significant = tokens[-1]
             continue
 
         if kind == "NUMBER":
             value = float(text) if "." in text else int(text)
             tokens.append(Token("NUMBER", value, line, col))
+            prev_significant = tokens[-1]
             continue
 
         # LPAREN/RPAREN/LBRACE/RBRACE/LBRACK/RBRACK/OP
         tokens.append(Token(kind, text, line, col))
+        prev_significant = tokens[-1]
 
     line, col = loc(n)
     tokens.append(Token("EOF", None, line, col))

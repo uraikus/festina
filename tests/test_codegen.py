@@ -25,6 +25,8 @@ import wave
 
 import pytest
 
+_EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
+
 
 # ---- no C toolchain needed -- IR-text-only checks ----
 
@@ -720,6 +722,67 @@ class TestGraphics:
             proc.wait(timeout=5)
 
 
+class TestExampleGraphicsAndGame:
+    """Interactive regression coverage for examples/graphics.f and
+    examples/tic_tac_toe.f -- the two examples that need a real (or
+    virtual) X server, so they can't join tests/test_examples.py's
+    plain compile-and-check-stdout sweep. Lives here, not there, so it
+    can reuse this file's own _find_window/_wait_for_output helpers and
+    x_display/run_graphics_program fixtures, the same as TestGraphics
+    above and TestTimers's combined graphics+timers test below."""
+
+    def test_graphics_demo_dispatches_click_key_and_resize(self, run_graphics_program, x_display):
+        source = open(os.path.join(_EXAMPLES_DIR, "graphics.f")).read()
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            text = _wait_for_output(stdout_path, lambda t: "canvas started at 800x600" in t)
+            assert "canvas started at 800x600" in text
+
+            time.sleep(0.3)  # keyboard focus -- see TestGraphics's own note on this
+            subprocess.run(["xdotool", "mousemove", "--window", wid, "100", "100"], env=env, check=True)
+            subprocess.run(["xdotool", "click", "--window", wid, "1"], env=env, check=True)
+            subprocess.run(["xdotool", "key", "--window", wid, "a"], env=env, check=True)
+            subprocess.run(["xdotool", "windowsize", wid, "900", "700"], env=env, check=True)
+
+            text = _wait_for_output(stdout_path, lambda t: "resized to 900x700" in t)
+            assert "clicked at 100, 100" in text
+            assert "key pressed: a" in text
+            assert "resized to 900x700" in text
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_tic_tac_toe_detects_a_win(self, run_graphics_program, x_display):
+        # Same board layout as the example's own source (GRID_X=250,
+        # GRID_Y=150, CELL=100) -- clicks the top row for X, the middle
+        # row for O, then the rest of the top row, so X wins with three
+        # across the top: (0,0), (1,0), (2,0).
+        source = open(os.path.join(_EXAMPLES_DIR, "tic_tac_toe.f")).read()
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+
+            def click(x, y):
+                subprocess.run(["xdotool", "mousemove", "--window", wid, str(x), str(y)], env=env, check=True)
+                subprocess.run(["xdotool", "click", "--window", wid, "1"], env=env, check=True)
+                time.sleep(0.15)
+
+            click(300, 200)  # X: top-left
+            click(300, 300)  # O: middle-left
+            click(400, 200)  # X: top-middle
+            click(400, 300)  # O: middle-middle
+            click(500, 200)  # X: top-right -- completes the top row
+
+            text = _wait_for_output(stdout_path, lambda t: "X wins!" in t)
+            assert "X wins!" in text
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
 class TestTimers:
     """claude.md #69: setTimeout/setInterval/clearTimeout/clearInterval.
     Added because Festina otherwise has no way to schedule work after
@@ -1121,6 +1184,81 @@ class TestRegex:
         assert result.returncode == 1
         assert "invalid regex pattern" in result.stderr
         assert "unreachable" not in result.stdout
+
+
+class TestRegexLiteral:
+    """claude.md #67: /pattern/flags -- same end-to-end behavior as
+    TestRegex above (a literal compiles down to exactly the same
+    festina_regex_compile() call), just via the new literal syntax."""
+
+    def test_test_matches_and_does_not_match(self, compile_and_run):
+        source = """
+        regex digits = /[0-9]+/
+        log(digits.test('room 42'))
+        log(digits.test('no numbers'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_i_flag_matches_case_insensitively(self, compile_and_run):
+        source = """
+        regex greeting = /^hello$/i
+        log(greeting.test('HELLO'))
+        log(greeting.test('goodbye'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_g_flag_is_accepted_and_still_only_case_sensitive_by_default(self, compile_and_run):
+        # 'g' alone has no additional effect (see the parser's own
+        # comment on _SUPPORTED_REGEX_FLAGS) -- this just confirms
+        # accepting it doesn't silently turn on case-insensitivity too.
+        source = """
+        regex digits = /[a-z]+/g
+        log(digits.test('room'))
+        log(digits.test('ROOM'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_word_shorthand_class_matches_via_glibcs_gnu_extension(self, compile_and_run):
+        # \w -- not official POSIX ERE syntax, but glibc's regcomp()
+        # supports it as a GNU extension even in REG_EXTENDED mode
+        # (verified directly against this runtime's own libc) -- this is
+        # exactly the case that makes the JS-familiar shorthand classes
+        # work in practice, not just the narrower official POSIX escapes.
+        result = compile_and_run(r"log(/\w+/.test('hello world'))")
+        assert result.stdout.strip() == "true"
+
+    def test_combined_flags_from_the_readme_example(self, compile_and_run):
+        result = compile_and_run(r"log(/\w+/gi.test('Hello'))")
+        assert result.stdout.strip() == "true"
+
+    def test_match_returns_first_match(self, compile_and_run):
+        result = compile_and_run("log('room 42, building 7'.match(/[0-9]+/))")
+        assert result.stdout.strip() == "42"
+
+    def test_replace_all_with_regex_literal_search(self, compile_and_run):
+        result = compile_and_run("log('a1b2c3'.replaceAll(/[0-9]/, '-'))")
+        assert result.stdout.strip() == "a-b-c-"
+
+    def test_escaped_slash_in_a_literal_pattern_matches_a_literal_slash(self, compile_and_run):
+        result = compile_and_run(r"log(/a\/b/.test('a/b'))")
+        assert result.stdout.strip() == "true"
+
+    def test_used_directly_without_a_named_variable(self, compile_and_run):
+        # No `regex x = ...` in between -- the literal is itself a
+        # complete expression, usable anywhere a regex value is.
+        result = compile_and_run("log(/[0-9]+/.test('42'))")
+        assert result.stdout.strip() == "true"
+
+    def test_a_real_division_right_after_this_feature_still_works(self, compile_and_run):
+        # End-to-end confirmation that adding regex literals didn't
+        # break ordinary division anywhere a human could plausibly
+        # confuse the two -- see test_lexer.py::TestRegexLiterals for
+        # the exhaustive disambiguation matrix at the tokenizer level.
+        result = compile_and_run("int a = 10\nint b = 2\nlog(a / b)")
+        assert result.stdout.strip() == "5"
 
 
 class TestNumericConversion:
