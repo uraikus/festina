@@ -146,10 +146,12 @@ char *festina_regex_replace(void *compiled, const char *text,
  * nothing else -- no title bar, menu, or other chrome drawn by this
  * runtime.
  *
- * Canvas size is a fixed 800x600 (FESTINA_CANVAS_WIDTH/HEIGHT in
+ * Canvas size starts at a fixed 800x600 (FESTINA_CANVAS_WIDTH/HEIGHT in
  * festina_runtime.c) -- claude.md has no syntax for declaring a canvas
  * size, so this is an implementation-defined default, not derived from
- * anything in the spec.
+ * anything in the spec. It can change afterwards if the window is
+ * resized (see `on resize` below); festina_client_width/_height always
+ * report the *current* size, not the startup default.
  *
  * Drawing model: every draw call paints onto an in-memory Cairo image
  * surface (the "backing store") and immediately blits it to the visible
@@ -165,13 +167,17 @@ char *festina_regex_replace(void *compiled, const char *text,
  * festina_graphics_init creates the window; festina_graphics_run is the
  * blocking event loop (Expose -> repaint from the backing store,
  * ButtonPress -> the registered click handler if any, MotionNotify ->
- * the registered mouse handler if any, the window's close button ->
- * return). Both are only ever called by generated code when the
- * program actually uses a graphics function or declares an `on
- * click`/`on mouse` handler (see CodeGen.uses_graphics in
- * festina/codegen.py) -- a program that doesn't never opens a window,
- * exactly like festina_db_open() only ever runs for a program that
- * declares a `table`.
+ * the registered mouse handler if any, KeyPress -> the registered key
+ * handler if any, ConfigureNotify with a genuine size change -> resize
+ * the backing store and call the registered resize handler if any, the
+ * window's close button -> call the registered close handler if any,
+ * then return). Both festina_graphics_init/_run are only ever called by
+ * generated code when the program actually uses a graphics function,
+ * references clientWidth/clientHeight, or declares an `on
+ * click`/`mouse`/`key`/`resize`/`close` handler (see
+ * CodeGen.uses_graphics in festina/codegen.py) -- a program that
+ * doesn't never opens a window, exactly like festina_db_open() only
+ * ever runs for a program that declares a `table`.
  *
  * festina_load_image supports PNG only, via Cairo's own built-in
  * decoder -- claude.md #37: "Supported image formats are determined by
@@ -179,11 +185,36 @@ char *festina_regex_replace(void *compiled, const char *text,
  * pulling in another image-format library.
  *
  * festina_register_click_handler/_mouse_handler take a fixed
- * `void (*)(int64_t, int64_t)` signature because claude.md #40's own
- * examples always declare `on click(x:int, y:int)` / `on
- * mouse(x:int, y:int)` with exactly those two int parameters --
- * festina/semantic.py enforces that any `on click`/`on mouse` handler
- * actually declared this way before codegen ever emits a call here.
+ * `void (*)(int64_t, int64_t)` signature, festina_register_key_handler
+ * takes a fixed `void (*)(const char *)` signature, and
+ * festina_register_resize_handler/_close_handler take a fixed
+ * `void (*)(void)` signature -- each matches the parameters claude.md
+ * #40's own worked example declares for that event exactly
+ * (`on click(x:int, y:int)`, `on key(key:text)`, `on resize()`, ...);
+ * festina/semantic.py's _EVENT_SIGNATURES enforces that any handler for
+ * one of these five names is actually declared that way before codegen
+ * ever emits a call here, so a mismatch would otherwise be a silent ABI
+ * mismatch rather than a caught compile error. The key handler's text
+ * comes from XLookupString (a key that types a character, e.g. "a",
+ * "5", " ") falling back to XKeysymToString (a named key with no text
+ * of its own, e.g. "Left", "Escape", "Return") -- see
+ * festina_graphics_run's own comment in festina_runtime.c. `on resize`
+ * intentionally clears the canvas back to white at the new size rather
+ * than preserving old content, matching how resizing a browser's
+ * `<canvas>` element also clears it (clientWidth/clientHeight below are
+ * themselves named after that DOM API). `on close` cannot cancel the
+ * close -- there's no "prevent default" mechanism here, it's purely a
+ * chance to react (e.g. log a message, save state) before the window
+ * actually goes away.
+ *
+ * festina_client_width/_height report the canvas's *current* size (not
+ * a compile-time constant, since `on resize` can change it) -- called
+ * for a bare `clientWidth`/`clientHeight` reference in Festina code
+ * (see the special case in codegen.py's _emit_expr; there's no
+ * "property access without a call" concept anywhere else in this
+ * runtime, so this is its own small special case rather than reusing
+ * the BUILTIN_FUNCTIONS/_BUILTIN_SIGNATURES machinery the draw
+ * functions and loadImage use, which all assume a Call).
  */
 #define FESTINA_CANVAS_WIDTH 800
 #define FESTINA_CANVAS_HEIGHT 600
@@ -197,5 +228,10 @@ void *festina_load_image(const char *path);
 void festina_draw_image(void *img, int64_t x, int64_t y);
 void festina_register_click_handler(void (*handler)(int64_t, int64_t));
 void festina_register_mouse_handler(void (*handler)(int64_t, int64_t));
+void festina_register_key_handler(void (*handler)(const char *));
+void festina_register_resize_handler(void (*handler)(void));
+void festina_register_close_handler(void (*handler)(void));
+int64_t festina_client_width(void);
+int64_t festina_client_height(void);
 
 #endif

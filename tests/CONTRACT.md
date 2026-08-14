@@ -42,30 +42,46 @@ already are, and the whole feature is built on POSIX extended regular
 expressions (`<regex.h>`, already part of libc) rather than a bundled
 or external regex engine, per claude.md #59.
 claude.md #37/#39/#40 (`img`/`loadImage()`, `drawRect`/`drawCircle`/
-`drawText`/`drawImage`, `on click`/`on mouse`) are implemented too, per
-the user's own clarification that this means a real on-screen window --
+`drawText`/`drawImage`, `on click`/`on mouse`/`on key`/`on resize`/`on
+close`, `clientWidth`/`clientHeight`) are implemented too, per the
+user's own clarification that this means a real on-screen window --
 "not a file" -- showing only the drawing canvas ("a canvas renderer",
 not a GUI with any chrome): X11 (Xlib) + Cairo's Xlib surface backend,
 not a GUI toolkit (GTK/SDL2/Qt), since claude.md #59 favors the smallest
 dependency that does the job and both X11 and Cairo were already
 available in the dev environment. The window is undecorated (Motif WM
-hints), fixed at 800x600, and opened lazily -- `CodeGen.uses_graphics`
+hints), starts at 800x600, and is opened lazily -- `CodeGen.uses_graphics`
 (mirroring the pre-existing `uses_sqlite` flag) is set by any `draw*`
-call or an `on click`/`on mouse` handler declaration, gating
+call, a bare `clientWidth`/`clientHeight` reference, or an `on
+click`/`mouse`/`key`/`resize`/`close` handler declaration, gating
 `festina_graphics_init()`/`festina_graphics_run()` calls in `main()` --
 *except* `loadImage()` alone, which deliberately does NOT set it: Cairo
 decodes PNGs from its own in-memory decoder, needing no X server at all,
 so a program that only loads an image (never drawing it or opening a
-window) shouldn't be forced to have a display. `on click`/`on mouse` are
-the only two event names with a real runtime source (matching claude.md
-#40's own only two worked examples) and are required to declare exactly
-`(x:int, y:int)` -- the C runtime registers them through a fixed
-`void (*)(int64_t, int64_t)` function pointer, so any other signature
-would be a silent ABI mismatch rather than just an unusual choice; any
-other event name still compiles (it's ordinary code) but is simply dead,
-since nothing ever fires it. Verified against a real (virtual) X server,
-not just reasoned about -- see "Why the tests are structured this way"
-below for `tests/test_graphics.py`/`TestGraphics`.
+window) shouldn't be forced to have a display. click/mouse/key/resize/
+close are the only five event names with a real runtime source (matching
+claude.md #40's own worked examples) and each is required to declare a
+fixed signature (`(x:int, y:int)` for click/mouse, `(key:text)` for key,
+no parameters for resize/close) -- the C runtime registers each through
+a fixed function-pointer type per event, so a mismatched signature would
+be a silent ABI mismatch rather than just an unusual choice; any other
+event name still compiles (it's ordinary code) but is simply dead, since
+nothing ever fires it. `on resize` fires on a genuine window size change
+(X11's ConfigureNotify) and clears the canvas back to white at the new
+size (matching how resizing a browser's `<canvas>` element also clears
+it -- `clientWidth`/`clientHeight` are themselves named after that DOM
+API); `on close` fires right before the window actually closes, on the
+same WM_DELETE_WINDOW ClientMessage the window's own standard
+close-button handling already used, and cannot cancel the close.
+`clientWidth`/`clientHeight` are read-only global ints reporting the
+canvas's *current* size (not a compile-time constant, since a resize can
+change it) -- pre-registered directly into semantic.py's `global_scope`
+so `Scope.define`'s own duplicate-declaration check rejects a user
+variable/function/struct/table with either name for free, and blocked
+from assignment the same way claude.md #63's `.length` already is.
+Verified against a real (virtual) X server, not just reasoned about --
+see "Why the tests are structured this way" below for
+`tests/test_graphics.py`/`TestGraphics`.
 
 "Real compilation, minimal setup" stages 1, 2, and 3 -- claude.md #59,
 added alongside these stages to make the requirement explicit rather
@@ -88,11 +104,12 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 333 tests in this directory pass against it: 329 given a working C
+All 349 tests in this directory pass against it: 342 given a working C
 compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
-too, plus 2 more (`tests/test_codegen.py::TestGraphics`'s interactive
-click/mouse tests) given `Xvfb`+`xdotool` too -- all skip cleanly,
-independently, without any of those three (see below).
+too, plus 5 more (`tests/test_codegen.py::TestGraphics`'s interactive
+click/mouse/key/resize tests, plus the one confirming the initial
+`clientWidth`/`clientHeight` values) given `Xvfb`+`xdotool` too -- all
+skip cleanly, independently, without any of those three (see below).
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -232,45 +249,69 @@ parses regex syntax itself before handing it to `regcomp()`.
 events) at the parser/semantic level, same split as `test_regex.py` --
 argument-count/type checking for `drawRect`/`drawCircle`/`drawText`/
 `drawImage`/`loadImage` against the fixed signature each one's own
-claude.md example uses, and the `on click`/`on mouse`
-`(x:int, y:int)`-only restriction (while an unrecognized event name
-stays unconstrained, since only those two have a runtime source at
-all). `test_codegen.py`'s `TestGraphics` covers the same feature end to
-end, in three tiers: (1) `test_compiles_and_links_successfully`, which
-needs only a C compiler (no display) since it never runs the binary;
-(2) `test_missing_display_is_a_clear_runtime_error`,
+claude.md example uses; the fixed-signature restriction on `on
+click`/`mouse`/`key`/`resize`/`close` (while an unrecognized event name
+stays unconstrained, since only those five have a runtime source at
+all); and `clientWidth`/`clientHeight` -- usable as a plain int
+identifier (including inside a template literal, e.g. in an `on resize`
+body), rejected on assignment (`category="invalid assignment"`, the
+same as claude.md #63's `.length`), and rejected on redeclaration
+(`Scope.define`'s own "already declared" check, exercised for free
+since these two are pre-registered into `global_scope` -- see
+semantic.py's `_CLIENT_SIZE_GLOBALS`). `test_codegen.py`'s `TestGraphics`
+covers the same feature end to end, in three tiers: (1)
+`test_compiles_and_links_successfully`, which needs only a C compiler
+(no display) since it never runs the binary; (2)
+`test_missing_display_is_a_clear_runtime_error`,
 `test_invalid_image_path_is_a_clear_runtime_error`, and
 `test_program_without_graphics_never_opens_a_window`, which run the
 compiled binary with `DISPLAY` deliberately unset via `compile_and_run`
 -- the last of these is what actually proves `loadImage()` alone and a
 graphics-free program never require a display, not just what the code
-comments claim; and (3) the two interactive tests,
-`test_click_dispatches_to_handler_with_correct_coordinates` and
-`test_mouse_move_dispatches_to_handler_with_correct_coordinates`, which
-use two new conftest.py fixtures -- `x_display` (an existing `DISPLAY`
-if set, otherwise a throwaway `Xvfb` instance, polled for real
+comments claim; and (3) five interactive tests --
+`test_click_dispatches_to_handler_with_correct_coordinates`,
+`test_mouse_move_dispatches_to_handler_with_correct_coordinates`,
+`test_key_dispatches_printable_and_named_keys` (a printable key like
+"a" comes back as itself, a non-printable one like Escape falls back to
+X11's own key name -- both asserted in one test, in the order the keys
+were sent, since a compiled program's `log()` output is itself ordered),
+`test_client_size_matches_the_initial_canvas_before_any_resize` (finding
+the window at all is itself part of what's being proved here: that a
+bare `clientWidth`/`clientHeight` reference opens one), and
+`test_resize_dispatches_to_handler_and_updates_client_size` (drives an
+actual `xdotool windowsize` and checks the handler saw the new size) --
+which use two new conftest.py fixtures -- `x_display` (an existing
+`DISPLAY` if set, otherwise a throwaway `Xvfb` instance, polled for real
 readiness rather than a fixed sleep, since a fixed sleep proved flaky
 under full-suite load) and `run_graphics_program` (compiles and starts
 the binary in the background, line-buffered via `stdbuf -oL` since a
 graphics program blocks in its event loop rather than exiting) -- and
 drive the real rendered window with real simulated input via `xdotool`
 (finding the window by its title, "Festina", via `xdotool search`),
-asserting the handler actually ran with the right coordinates by
-reading the program's own `log()` output back. Both skip cleanly and
-independently if `Xvfb`/`xdotool` aren't installed, the same
-opt-in/environment-dependent tier as `compile_and_run`'s C-compiler
-skip and `test_packaging.py`'s `pyinstaller` skip. Pixel-level rendering
-correctness (that `drawRect`/`drawCircle`/`drawText`/`drawImage` paint
-at the right position, not just that the program doesn't crash) was
-verified manually via `xwd`+`netpbm` screenshots of a real running
-window rather than automated, a deliberate choice to avoid pulling in
-more image-comparison tooling for a check the interactive dispatch
-tests above don't need; the close-button/`WM_DELETE_WINDOW` path is
-also not covered automatically, since a bare Xvfb instance runs no
-window manager to translate `xdotool windowclose` into the
-`ClientMessage` a real desktop would send -- an environment limitation
-of the test setup, not a gap in the app's own (standard) handling of
-that protocol.
+asserting each handler actually ran with the right data by reading the
+program's own `log()` output back -- polled for (via a `_wait_for_output`
+helper), not just slept-then-read-once-and-asserted, for the same
+"flaky in isolation vs. under full-suite load" reason `x_display`
+itself polls for Xvfb readiness rather than sleeping a fixed amount (the
+`test_resize_...` test above is what actually surfaced this: reliable
+alone, occasionally failed as part of the full suite before the fix).
+All five skip cleanly and independently if `Xvfb`/`xdotool` aren't
+installed, the same opt-in/environment-dependent tier as
+`compile_and_run`'s C-compiler skip and `test_packaging.py`'s
+`pyinstaller` skip. Pixel-level rendering correctness (that
+`drawRect`/`drawCircle`/`drawText`/`drawImage` paint at the right
+position, not just that the program doesn't crash) was verified
+manually via `xwd`+`netpbm` screenshots of a real running window rather
+than automated, a deliberate choice to avoid pulling in more
+image-comparison tooling for a check the interactive dispatch tests
+above don't need; `on close` is the one handler NOT covered by an
+automated dispatch test, for the same reason the close-button/
+`WM_DELETE_WINDOW` path itself already wasn't before `on close` existed
+-- both fire off the identical ClientMessage, and a bare Xvfb instance
+runs no window manager to translate `xdotool windowclose` into it
+(verified directly: it leaves the process running rather than firing
+anything) -- an environment limitation of the test setup, not a gap in
+the app's own (standard) handling of that protocol.
 
 ## Public API implemented
 
@@ -375,10 +416,20 @@ festina/
         # builtin dispatch branch); builtins with no entry there --
         # log/fail/sqlite/loadAudio -- stay fully permissive, unchanged
         # from before. claude.md #40: analyze_event_handler requires an
-        # `on click`/`on mouse` handler to declare exactly
-        # `(x:int, y:int)` -- any other event name is unconstrained,
-        # since only those two have a runtime event source at all (see
-        # codegen.py below).
+        # `on click`/`mouse`/`key`/`resize`/`close` handler to declare
+        # exactly the signature _EVENT_SIGNATURES has for it
+        # (`(x:int, y:int)` for click/mouse, `(key:text)` for key, no
+        # parameters for resize/close) -- any other event name is
+        # unconstrained, since only those five have a runtime event
+        # source at all (see codegen.py below). claude.md #39:
+        # clientWidth/clientHeight (_CLIENT_SIZE_GLOBALS) are
+        # pre-registered directly into global_scope as read-only `int`
+        # Symbols before any user code is analyzed, so a plain reference
+        # resolves through the same Identifier/Scope.lookup path a real
+        # global variable would, Scope.define's own "already declared"
+        # check rejects a colliding user declaration for free, and the
+        # Assign branch above rejects assigning to either one the same
+        # way it already rejects assigning to `.length`.
 
     sqlite_schema.py
         TYPE_MAP: dict[str, str]                        # claude.md #30
@@ -433,18 +484,26 @@ festina/
         # above for the design): _emit_graphics_call handles drawRect/
         # drawCircle/drawText/drawImage/loadImage (an `img` value is
         # `ptr` to an opaque Cairo surface, same convention as
-        # struct/table/regex values); _emit_event_handler emits an
-        # `on click`/`on mouse`/... handler as an ordinary internal
-        # function (`@__festina_on_<name>`, never in func_decls/
-        # global_env since it's not user-callable) and, only for
-        # click/mouse specifically, records it in self.event_handlers
-        # and sets self.uses_graphics; self.uses_graphics (mirroring the
-        # pre-existing self.uses_sqlite) gates emitting
+        # struct/table/regex values); a bare `clientWidth`/`clientHeight`
+        # reference is special-cased at the top of the Identifier branch
+        # in _emit_expr (there's no "property access without a call"
+        # concept anywhere else in this file, so this couldn't reuse the
+        # Call-based builtin dispatch _emit_graphics_call itself uses),
+        # emitting a call to festina_client_width()/_height() and
+        # setting self.uses_graphics; _emit_event_handler emits an `on
+        # click`/`mouse`/`key`/`resize`/`close`/... handler as an
+        # ordinary internal function (`@__festina_on_<name>`, never in
+        # func_decls/global_env since it's not user-callable) and, only
+        # for those five names specifically, records it in
+        # self.event_handlers and sets self.uses_graphics; self.uses_graphics
+        # (mirroring the pre-existing self.uses_sqlite) gates emitting
         # festina_graphics_init()/_run() calls around __festina_main() in
         # _emit_main_and_entry, and self.event_handlers drives emitting
-        # festina_register_click_handler/_register_mouse_handler calls
-        # there too -- loadImage() alone deliberately does not set
-        # uses_graphics (see _emit_graphics_call's docstring). Raises
+        # festina_register_click_handler/_register_mouse_handler/
+        # _register_key_handler/_register_resize_handler/
+        # _register_close_handler calls there too -- loadImage() alone
+        # deliberately does not set uses_graphics (see
+        # _emit_graphics_call's docstring). Raises
         # CodegenError (a CompileError subclass, category="not
         # implemented") only for audio (loadAudio) now -- and also
         # (category="not implemented" but a genuine compile-time
@@ -527,27 +586,44 @@ byte at a time when that happens -- verified directly in
 `tests/test_codegen.py::TestRegex::test_replace_all_zero_width_match_does_not_hang`,
 which would time out (not just assert wrong output) if this were ever
 broken again. `festina_graphics_init`/`_run`, `festina_draw_rect`/
-`_draw_circle`/`_draw_text`/`_draw_image`, `festina_load_image`, and
-`festina_register_click_handler`/`_register_mouse_handler` (#37/#39/#40:
-image/graphics/events) open a real X11 window via Xlib and render onto
-it via Cairo's Xlib surface backend -- see festina_runtime.h's doc
-comment for the full design (undecorated via Motif WM hints, fixed
-800x600 canvas, solid-black-only fill, PNG-only `loadImage` since that's
-Cairo's own built-in decoder, the backing-store-plus-blit-on-Expose
-strategy a bare Cairo Xlib surface needs since it has no memory of prior
-drawing, and the fixed `void (*)(int64_t, int64_t)` handler signature
-that's the whole reason claude.md #40's `on click`/`on mouse` are
-signature-restricted at the semantic.py level above). `festina_graphics_run`
-blocks in a standard Xlib event loop (`Expose` -> re-blit,
-`ButtonPress`/`MotionNotify` -> call the registered click/mouse handler
-if any, `WM_DELETE_WINDOW` `ClientMessage` -> clean up and return) until
-the window is closed.
+`_draw_circle`/`_draw_text`/`_draw_image`, `festina_load_image`,
+`festina_register_click_handler`/`_register_mouse_handler`/
+`_register_key_handler`/`_register_resize_handler`/
+`_register_close_handler`, and `festina_client_width`/`_height`
+(#37/#39/#40: image/graphics/events) open a real X11 window via Xlib and
+render onto it via Cairo's Xlib surface backend -- see
+festina_runtime.h's doc comment for the full design (undecorated via
+Motif WM hints, an 800x600 starting canvas size that can change after a
+resize, solid-black-only fill, PNG-only `loadImage` since that's Cairo's
+own built-in decoder, the backing-store-plus-blit-on-Expose strategy a
+bare Cairo Xlib surface needs since it has no memory of prior drawing,
+and the fixed function-pointer signature per event -- `void
+(*)(int64_t, int64_t)` for click/mouse, `void (*)(const char *)` for
+key, `void (*)(void)` for resize/close -- that's the whole reason
+claude.md #40's five event handlers are each signature-restricted at
+the semantic.py level above). `festina_graphics_run` blocks in a
+standard Xlib event loop (`Expose` -> re-blit, `ButtonPress`/
+`MotionNotify` -> call the registered click/mouse handler if any,
+`KeyPress` -> call the registered key handler if any, with the pressed
+key's text from `XLookupString` for an ordinary printable character or
+`XKeysymToString`'s X11 key name otherwise (e.g. "Escape", "Return",
+"Left") for anything else, `ConfigureNotify` with a genuine size change
+-> recreate the backing store at the new size (clearing the canvas back
+to white, same as resizing a browser's `<canvas>` element) and call the
+registered resize handler if any, `WM_DELETE_WINDOW` `ClientMessage` ->
+call the registered close handler if any, then clean up and return)
+until the window is closed. `festina_graphics_init` also calls
+`XSetInputFocus` right after mapping the window -- needed for `KeyPress`
+events to reach it at all under a bare Xvfb instance, which (like the
+`WM_DELETE_WINDOW`-forwarding gap noted above) runs no window manager to
+hand focus over the way a real desktop would; harmless either way, since
+a real desktop's WM normally does the same thing itself on click/map.
 
 ## Running
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 329 passed, 4 skipped (needs a C compiler; 2 of
+pytest tests/                          # 342 passed, 7 skipped (needs a C compiler; 2 of
                                         # the skips need `pip install pyinstaller` too,
-                                        # the other 2 need Xvfb + xdotool installed)
+                                        # the other 5 need Xvfb + xdotool installed)
 ```

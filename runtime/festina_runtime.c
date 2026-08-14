@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <X11/Xlib.h>
+#include <X11/Xutil.h> /* XLookupString/XKeysymToString -- `on key` */
 #include <cairo/cairo-xlib.h>
 #include "festina_runtime.h"
 
@@ -554,6 +555,15 @@ static cairo_surface_t *g_window_surface = NULL;
 static cairo_surface_t *g_backing_surface = NULL;
 static void (*g_click_handler)(int64_t, int64_t) = NULL;
 static void (*g_mouse_handler)(int64_t, int64_t) = NULL;
+static void (*g_key_handler)(const char *) = NULL;
+static void (*g_resize_handler)(void) = NULL;
+static void (*g_close_handler)(void) = NULL;
+/* The canvas's *current* size -- starts at FESTINA_CANVAS_WIDTH/HEIGHT
+ * but tracks the window's real size after an `on resize`-triggering
+ * ConfigureNotify (see festina_graphics_run); festina_client_width/
+ * _height read these, not the compile-time constants. */
+static int64_t g_canvas_width = FESTINA_CANVAS_WIDTH;
+static int64_t g_canvas_height = FESTINA_CANVAS_HEIGHT;
 
 static void festina_graphics_require_init(void) {
     if (!g_display) {
@@ -584,13 +594,24 @@ void festina_graphics_init(void) {
                      sizeof(hints) / sizeof(long));
 
     XStoreName(g_display, g_window, "Festina");
-    XSelectInput(g_display, g_window, ExposureMask | ButtonPressMask | PointerMotionMask);
+    XSelectInput(g_display, g_window,
+                 ExposureMask | ButtonPressMask | PointerMotionMask |
+                 KeyPressMask | StructureNotifyMask);
     g_wm_delete_atom = XInternAtom(g_display, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(g_display, g_window, &g_wm_delete_atom, 1);
 
     XMapWindow(g_display, g_window);
+    XSync(g_display, False); /* the map must reach the server before ... */
+    /* ... this: with no window manager to hand focus over (as under a
+     * bare Xvfb instance -- see tests/test_codegen.py's TestGraphics),
+     * nothing else would ever give this window keyboard focus, and `on
+     * key` would never fire. A real desktop's WM normally does this on
+     * click/map; asking directly is harmless either way. */
+    XSetInputFocus(g_display, g_window, RevertToParent, CurrentTime);
     XFlush(g_display);
 
+    g_canvas_width = FESTINA_CANVAS_WIDTH;
+    g_canvas_height = FESTINA_CANVAS_HEIGHT;
     g_window_surface = cairo_xlib_surface_create(g_display, g_window, DefaultVisual(g_display, screen),
                                                   FESTINA_CANVAS_WIDTH, FESTINA_CANVAS_HEIGHT);
     g_backing_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
@@ -680,6 +701,28 @@ void festina_register_mouse_handler(void (*handler)(int64_t, int64_t)) {
     g_mouse_handler = handler;
 }
 
+void festina_register_key_handler(void (*handler)(const char *)) {
+    g_key_handler = handler;
+}
+
+void festina_register_resize_handler(void (*handler)(void)) {
+    g_resize_handler = handler;
+}
+
+void festina_register_close_handler(void (*handler)(void)) {
+    g_close_handler = handler;
+}
+
+int64_t festina_client_width(void) {
+    festina_graphics_require_init();
+    return g_canvas_width;
+}
+
+int64_t festina_client_height(void) {
+    festina_graphics_require_init();
+    return g_canvas_height;
+}
+
 void festina_graphics_run(void) {
     if (!g_display) return; /* graphics were never actually used -- nothing to run */
 
@@ -692,8 +735,60 @@ void festina_graphics_run(void) {
             if (g_click_handler) g_click_handler(ev.xbutton.x, ev.xbutton.y);
         } else if (ev.type == MotionNotify) {
             if (g_mouse_handler) g_mouse_handler(ev.xmotion.x, ev.xmotion.y);
+        } else if (ev.type == KeyPress) {
+            if (g_key_handler) {
+                /* A key that types an ordinary printable character
+                 * (letters, digits, punctuation, space) comes back as
+                 * that character through the buffer XLookupString fills
+                 * in. Anything else -- Enter/Escape/Backspace/arrow
+                 * keys/... -- either comes back empty or as an
+                 * unprintable control character (e.g. 0x1B for Escape,
+                 * 0x0D for Return), neither of which is a useful `text`
+                 * value, so those fall back to XKeysymToString's X11 key
+                 * name instead (e.g. "Return", "Escape", "Left") --
+                 * there's no claude.md-defined naming scheme for these,
+                 * so this is simply X11's own. */
+                char buf[32];
+                KeySym keysym;
+                int len = XLookupString(&ev.xkey, buf, sizeof(buf) - 1, &keysym, NULL);
+                if (len > 0 && (unsigned char)buf[0] >= 0x20 && (unsigned char)buf[0] != 0x7F) {
+                    buf[len] = '\0';
+                    g_key_handler(buf);
+                } else {
+                    const char *name = XKeysymToString(keysym);
+                    g_key_handler(name ? name : "");
+                }
+            }
+        } else if (ev.type == ConfigureNotify) {
+            /* ConfigureNotify fires on more than just a resize (e.g. a
+             * move), so only treat it as `on resize` when the size
+             * genuinely changed. */
+            int64_t new_w = ev.xconfigure.width;
+            int64_t new_h = ev.xconfigure.height;
+            if (new_w != g_canvas_width || new_h != g_canvas_height) {
+                g_canvas_width = new_w;
+                g_canvas_height = new_h;
+                cairo_xlib_surface_set_size(g_window_surface, new_w, new_h);
+                /* claude.md #39's own examples never draw relative to a
+                 * canvas size (there's no syntax for one), so there's no
+                 * spec-defined way to preserve old content sanely across
+                 * a resize -- clear back to white at the new size, the
+                 * same behavior resizing a browser's <canvas> element
+                 * has, which clientWidth/clientHeight are named after. */
+                cairo_surface_destroy(g_backing_surface);
+                g_backing_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, new_w, new_h);
+                cairo_t *cr = cairo_create(g_backing_surface);
+                cairo_set_source_rgb(cr, 1, 1, 1);
+                cairo_paint(cr);
+                cairo_destroy(cr);
+                festina_graphics_present();
+                if (g_resize_handler) g_resize_handler();
+            }
         } else if (ev.type == ClientMessage) {
-            if ((Atom)ev.xclient.data.l[0] == g_wm_delete_atom) break;
+            if ((Atom)ev.xclient.data.l[0] == g_wm_delete_atom) {
+                if (g_close_handler) g_close_handler();
+                break;
+            }
         }
     }
 

@@ -68,6 +68,36 @@ _REGEX = types_mod.RegexType()
 # claude.md #56: float -> int, with an explicit rounding decision.
 MATH_FUNCTIONS = {"floor", "ceil", "round", "trunc"}
 
+# claude.md #40: these five event names are the only ones with a real
+# runtime source (an X11 event of some kind -- see festina_runtime.h's
+# doc comment on festina_graphics_run), so only they get a fixed-
+# signature check; codegen registers each compiled handler with the
+# runtime through a fixed C function-pointer type per event, so a
+# mismatched signature would be a silent ABI mismatch, not just an
+# unusual choice. Any other event name (analyze_event_handler leaves it
+# unconstrained) still compiles but is simply dead code -- nothing ever
+# fires it. Each entry is (required-arg-types, human-readable signature
+# for the error message) -- resize/close take no arguments, so their
+# tuple is empty and `param_types != sig` alone (no separate length
+# check needed) catches both "too many" and "wrong type" mistakes.
+_EVENT_SIGNATURES = {
+    "click": ((_INT, _INT), "(x:int, y:int)"),
+    "mouse": ((_INT, _INT), "(x:int, y:int)"),
+    "key": ((_TEXT,), "(key:text)"),
+    "resize": ((), "no parameters"),
+    "close": ((), "no parameters"),
+}
+
+# claude.md #39: clientWidth/clientHeight report the canvas window's
+# current size as read-only global ints (borrowing the name from the
+# DOM's Element.clientWidth/clientHeight, which they're the closest
+# analogue to) -- pre-registered directly into global_scope below so a
+# plain identifier reference just works through the same Scope.lookup
+# every real global variable uses, and so Scope.define's own
+# "already declared" check rejects a user var/function/struct/table
+# with either name for free, with no extra machinery here.
+_CLIENT_SIZE_GLOBALS = ("clientWidth", "clientHeight")
+
 
 class _NullType:
     def __repr__(self):
@@ -149,6 +179,10 @@ def analyze(program, filename="<string>"):
     tables = {}
     imports = []
 
+    # claude.md #39: clientWidth/clientHeight, see _CLIENT_SIZE_GLOBALS above.
+    for _name in _CLIENT_SIZE_GLOBALS:
+        global_scope.define(_name, Symbol(_name, _INT, "constant", None), None, filename)
+
     def resolve(type_expr, node=None):
         return resolve_type_name(type_expr, structs, tables, filename, node)
 
@@ -215,6 +249,17 @@ def analyze(program, filename="<string>"):
                     and isinstance(infer(expr.target.obj, scope), types_mod.ArrayType)):
                 raise CompileError(
                     "'.length' is read-only and cannot be assigned to",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid assignment",
+                )
+            # claude.md #39: clientWidth/clientHeight are read-only too --
+            # same reasoning and same "catch it before the generic
+            # target_type/value_type check below" placement as .length
+            # above, since that check alone has no way to tell a read
+            # from a write target.
+            if isinstance(expr.target, ast.Identifier) and expr.target.name in _CLIENT_SIZE_GLOBALS:
+                raise CompileError(
+                    f"'{expr.target.name}' is read-only and cannot be assigned to",
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid assignment",
                 )
@@ -520,22 +565,17 @@ def analyze(program, filename="<string>"):
         analyze_block(decl.body, func_scope, return_type=return_type)
 
     def analyze_event_handler(decl):
-        # claude.md #40: "click" and "mouse" are the only two event
-        # sources this runtime actually generates (an X11 ButtonPress /
-        # MotionNotify against the graphics canvas -- see
-        # festina_runtime.h's doc comment on festina_graphics_run), and
-        # claude.md's own examples for both always declare exactly
-        # `(x:int, y:int)` -- codegen registers the compiled handler
-        # with the runtime via a fixed `void (*)(int64_t, int64_t)`
-        # function pointer, so a different signature here would be a
-        # silent ABI mismatch, not just an unusual choice. Any other
-        # event name is unconstrained (and simply never fires -- there's
-        # no event source claude.md defines for it).
-        if decl.name in ("click", "mouse"):
-            param_types = [resolve(p.type_expr, decl) for p in decl.params]
-            if len(decl.params) != 2 or param_types != [_INT, _INT]:
+        # claude.md #40: see _EVENT_SIGNATURES above -- click/mouse/key/
+        # resize/close get a fixed-signature check; any other event name
+        # is unconstrained (and simply never fires -- there's no event
+        # source claude.md defines for it).
+        entry = _EVENT_SIGNATURES.get(decl.name)
+        if entry is not None:
+            sig, help_text = entry
+            param_types = tuple(resolve(p.type_expr, decl) for p in decl.params)
+            if param_types != sig:
                 raise CompileError(
-                    f"on {decl.name}(...) must declare exactly (x:int, y:int), "
+                    f"on {decl.name}(...) must declare exactly {help_text}, "
                     f"matching claude.md #40's own example",
                     file=filename, line=decl.line, column=decl.column,
                     category="invalid function argument type",
