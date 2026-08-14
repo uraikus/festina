@@ -9,6 +9,7 @@ RESERVED_WORDS = [
     "img", "aud", "null", "true", "false", "void", "func", "const",
     "import", "if", "else", "on", "fail", "log", "sqlite",
     "for", "while",  # claude.md #60, #61
+    "map",  # claude.md #72
 ]
 
 

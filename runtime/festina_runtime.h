@@ -37,9 +37,15 @@ int8_t festina_str_eq(const char *a, const char *b);
 /*
  * claude.md #8, #29, #31: automatic SQLite database + schema sync.
  *
- * festina_db_open opens (creating if necessary) festina.sqlite in the
- * current working directory -- claude.md #29 fixes this filename, the
- * programmer never supplies a path.
+ * festina_db_open opens (creating if necessary) `path` -- always
+ * festina.sqlite in the current working directory (claude.md #29's
+ * default) unless the program's entry file overrides it with a
+ * DatabaseURL directive (claude.md #70), in which case codegen passes
+ * that expression's own runtime value here instead. A NULL or empty
+ * path falls back to the "festina.sqlite" default rather than failing
+ * -- see this function's own comment in festina_runtime.c for why that
+ * can legitimately happen even with a DatabaseURL directive present
+ * (e.g. environment.DATABASE_URL when that variable isn't set).
  *
  * festina_sync_table brings a single declared table's schema in line
  * with `col_names`/`col_types` (parallel arrays, `col_types` holding
@@ -49,7 +55,7 @@ int8_t festina_str_eq(const char *a, const char *b);
  * a column's type in place -- preserving the data in every column that
  * survives the change.
  */
-sqlite3 *festina_db_open(void);
+sqlite3 *festina_db_open(const char *path);
 void festina_sync_table(sqlite3 *db, const char *table_name,
                          const char **col_names, const char **col_types,
                          int32_t ncols);
@@ -376,5 +382,64 @@ void *festina_load_audio(const char *path);
 void festina_audio_play(void *audio);
 void festina_audio_stop(void *audio);
 int8_t festina_audio_is_playing(void *audio);
+
+/*
+ * claude.md #71: environment.NAME / environment[keyExpr].
+ *
+ * festina_getenv wraps getenv() directly -- its NULL-if-unset return is
+ * already exactly Festina's own null-for-text sentinel, so there's no
+ * translation to do (see this function's own comment in
+ * festina_runtime.c for why the result isn't copied/strdup'd either).
+ */
+char *festina_getenv(const char *name);
+
+/*
+ * claude.md #72: map[T] -- { key: value, ... } literals,
+ * npcHealths[key] read/write, npcHealths.forEach(callback).
+ *
+ * A map value is a `{ i64 count, ptr entries }` pair at the LLVM level
+ * (festina/codegen.py's FESTINA_MAP_LLVM_TYPE) -- the same two-field
+ * shape as arr[T]'s own `{ i64 length, ptr data }`, just never
+ * interchangeable with it (see FESTINA_MAP_LLVM_TYPE's own comment):
+ * `entries` points to a flat array of FestinaMapEntry { key, value }
+ * pairs (opaque to codegen, only ever passed straight through as a
+ * `void *`), found by a linear scan (festina_map_find in
+ * festina_runtime.c -- not a hash table; see that function's own
+ * comment on why that's a deliberate, documented tradeoff, not an
+ * oversight).
+ *
+ * Every map value type's payload -- int, float, bool, text, blob,
+ * struct, table, img, aud, regex (never another arr[T]/map[T]; see
+ * types.MapType's own doc comment for why those don't fit) -- travels
+ * through these three functions as a raw i64 regardless of T, since
+ * this runtime has no idea what T a given map's values actually are;
+ * festina/codegen.py reinterprets to/from each value's real LLVM
+ * representation at every call site (_map_value_to_i64/
+ * _i64_to_map_value), including inside a small per-call trampoline
+ * function for .forEach()'s callback (_emit_map_foreach_trampoline),
+ * needed because the callback's own LLVM signature depends on T (e.g.
+ * `double` for a map[float]) and can't be called through an i64-typed
+ * function pointer directly without a real calling-convention mismatch
+ * on plenty of real ABIs.
+ *
+ * festina_map_set takes `count`/`entries` BY ADDRESS (pointers into the
+ * map value's own storage slot, not the map "object" -- there isn't a
+ * separate one), since adding a new key may need to grow the backing
+ * array and the caller needs to see that change; festina_map_get and
+ * festina_map_for_each only ever read, so they take `count`/`entries`
+ * directly (already extracted from an ordinary map value with
+ * `extractvalue`, no addressability needed).
+ *
+ * A missing key: "the result is null" (claude.md #72) --
+ * festina_map_get returns `default_value` outright when the key isn't
+ * found, already computed by codegen as the correct null representation
+ * for this map's value type (int/float/pointer all have their own,
+ * different encoding -- see the module docstring's "Null for int/float"
+ * note; this function has no idea what T is, so it can't make that
+ * choice itself).
+ */
+void festina_map_set(int64_t *count, void **entries, const char *key, int64_t value);
+int64_t festina_map_get(int64_t count, void *entries, const char *key, int64_t default_value);
+void festina_map_for_each(int64_t count, void *entries, void (*callback)(int64_t, const char *));
 
 #endif

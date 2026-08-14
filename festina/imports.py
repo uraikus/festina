@@ -63,6 +63,55 @@ def resolve_imports(entry_path):
     return order
 
 
+def _is_database_url_assignment(stmt):
+    """claude.md #70: `DatabaseURL = <expr>` -- syntactically nothing
+    but an ordinary assignment-expression-statement (Festina has no
+    dedicated grammar for this; DatabaseURL isn't a lexer keyword or a
+    pre-declared variable), recognized here purely by matching the
+    exact AST shape a parsed `Identifier("DatabaseURL") = expr`
+    statement has."""
+    return (isinstance(stmt, ast_mod.ExprStmt)
+            and isinstance(stmt.expr, ast_mod.Assign)
+            and isinstance(stmt.expr.target, ast_mod.Identifier)
+            and stmt.expr.target.name == "DatabaseURL")
+
+
+def _extract_database_url(body, path):
+    """claude.md #70: pulls a `DatabaseURL = <expr>` directive out of
+    the ENTRY file's own top-level statement list (called only for the
+    entry file -- see build_program below; an imported file's own
+    top-level statements never pass through here at all, so the same
+    assignment written in one just flows through as ordinary code and
+    fails semantic analysis with "unknown variable 'DatabaseURL'"
+    instead of silently doing something).
+
+    Position is enforced here, not semantic.py, since it's fundamentally
+    about *this file's own statement order before multi-file merging* --
+    by the time semantic.py sees the merged Program, the entry file's
+    statements are no longer contiguous or first (resolve_imports puts
+    dependencies before the entry file, so the entry file's own
+    statements are actually LAST in the merged body).
+
+    Returns (value_expr_or_None, remaining_body) -- `body` itself is
+    left untouched; codegen.py reads the returned expression off
+    ast.Program.database_url (see build_program) and evaluates it in
+    main()'s own prologue, before festina_db_open() -- never as an
+    ordinary top-level statement, which would run far too late (inside
+    __festina_main(), after the database is already open)."""
+    for i, stmt in enumerate(body):
+        if _is_database_url_assignment(stmt):
+            if i != 0:
+                raise CompileError(
+                    "DatabaseURL = ... must be the first statement in the entry "
+                    "file, before any other code or import",
+                    file=path, line=getattr(stmt.expr, "line", 0),
+                    column=getattr(stmt.expr, "column", 0),
+                    category="invalid syntax",
+                )
+            return stmt.expr.value, body[1:]
+    return None, body
+
+
 def build_program(entry_path):
     """Resolve entry_path's full import graph and parse every file into
     one merged ast.Program, in dependency order -- claude.md #5: "An
@@ -78,13 +127,24 @@ def build_program(entry_path):
     still name the right file even though everything from here on is
     one ast.Program -- see semantic.analyze's and codegen.CodeGen's own
     notes on how that tag gets used (both re-read it once per top-level
-    statement rather than once for the whole compile)."""
+    statement rather than once for the whole compile).
+
+    The returned Program also carries a `database_url` attribute
+    (claude.md #70) -- the entry file's own DatabaseURL directive's
+    value expression, or None if it didn't have one."""
+    entry_real = os.path.realpath(entry_path)
     body = []
+    database_url = None
     for path in resolve_imports(entry_path):
         with open(path, encoding="utf-8") as f:
             source = f.read()
         program = parser_mod.parse(source, filename=path)
-        for stmt in program.body:
+        stmts = program.body
+        if path == entry_real:
+            database_url, stmts = _extract_database_url(stmts, path)
+        for stmt in stmts:
             stmt.file = path
-        body.extend(program.body)
-    return ast_mod.Program(body)
+        body.extend(stmts)
+    merged = ast_mod.Program(body)
+    merged.database_url = database_url
+    return merged

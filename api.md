@@ -52,6 +52,8 @@ blob      -- binary data (shares text's representation; text -> blob
              assignment is allowed, the reverse is not)
 arr[T]    -- homogeneous array of any of the above, a struct, or a
              declared table's row type
+map[T]    -- text-keyed map of any of the above except arr[T]/map[T]
+             itself (see the Maps section below)
 struct    -- user-declared record type
 table     -- a struct that's also backed by a SQLite table
 img       -- an image loaded via loadImage() (opaque handle)
@@ -79,6 +81,15 @@ rather than crashing:
 
 ```festina
 int result = 10 / 0   // null
+```
+
+`int`/`float`/`bool` also each have `.toText()`, returning the same
+text template interpolation already produces for that value implicitly
+— useful when that text is needed outside of a template:
+
+```festina
+int count = 5
+log(count.toText())   // "5" -- identical to log(`${count}`)
 ```
 
 ## Variables, constants, functions
@@ -169,6 +180,38 @@ numbers[0] = 10
 Not bounds-checked; data is never freed (no GC yet — see
 [todo.md](todo.md)).
 
+## Maps
+
+```festina
+text npc2Id = 'npc2'
+map[int] npcHealths = {'npc1': 10, npc2Id: 15}   // keys are always text
+map[text] npcNames = {'npc1': 'jim', npc2Id: 'john'}
+
+npcHealths['npc1']          // -> 10
+npcHealths[npc2Id]          // -> 15 -- a key can be any text expression
+npcHealths['missing']       // -> null -- a missing key, not an error
+
+npcHealths['npc1'] = 30     // updates an existing key
+npcHealths['npc3'] = 5      // adds a new one
+
+void func logHealth(h:int, key:text) {
+    log(`${key} ${h.toText()}`)
+}
+npcHealths.forEach(logHealth)   // (value, key) -- visit order is unspecified
+```
+
+An unquoted identifier key (`npc2Id` above) is a reference to that
+variable's own text value, not bareword-as-string-name shorthand the
+way a plain JS object literal has. `map[T]`'s `T` may be any type
+except `arr[...]`/`map[...]` itself (a map value is stored in one
+fixed-size slot, which those two don't fit in). `.forEach()`'s callback
+must be an already-declared function taking exactly `(value, key:text)`
+and returning nothing, the same "bare name of a declared function"
+restriction `setTimeout`'s callback has. Not a hash table internally —
+lookup/insert are O(n) over the entry count, a deliberate simplicity
+tradeoff for what's meant to be a small, config/game-state-shaped
+collection, not a large-scale data structure.
+
 ## Built-in SQLite
 
 ```festina
@@ -187,6 +230,44 @@ preserved via a temp-table rebuild) to match the declaration exactly.
 `sqlite()`'s optional second argument (bound parameters) must be a
 literal array expression, not an arbitrary `arr[T]` value. Query result
 columns map onto a declared table's fields by position, not by name.
+
+### Database configuration
+
+`festina.sqlite` is the default, but the entry file's very first line
+(before any other code and before any `import`) may override it:
+
+```festina
+DatabaseURL = 'game_saves.sqlite'
+```
+
+`path` may be any text expression, including `environment.NAME` (see
+[Environment variables](#environment-variables) below) — useful for
+picking the database path per-deployment without recompiling:
+
+```festina
+DatabaseURL = environment.DATABASE_URL
+```
+
+`DatabaseURL` appearing anywhere other than the entry file's first
+statement is a compile-time error; it has no effect at all in an
+imported file (only the file actually passed to the compiler is
+checked).
+
+## Environment variables
+
+```festina
+text apiKey = environment.API_KEY
+text home = environment['HOME']       // computed key -- must be text
+
+if apiKey == null {
+    fail('API_KEY is not set')
+}
+```
+
+Returns the named environment variable as `text`, or `null` if it
+isn't set. Read-only (assigning to `environment.NAME` is a compile-time
+error) and can't be used by itself without a `.NAME`/`[keyExpr]` — both
+are also compile-time errors, not runtime ones.
 
 ## Regex
 

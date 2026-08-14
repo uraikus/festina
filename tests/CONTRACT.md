@@ -359,7 +359,7 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 503 tests in this directory pass against it: 493 given a working C
+All 589 tests in this directory pass against it: 579 given a working C
 compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
 too, plus 8 more given `Xvfb`+`xdotool` too
 (`tests/test_codegen.py::TestGraphics`'s interactive click/mouse/key/
@@ -384,7 +384,10 @@ drawing model: every draw call paints in solid black and there's no
 so the game deliberately never needs to undraw anything, marks just
 accumulate the way a real pen-and-paper game would. Verified against a
 real (virtual) X server, including the win-detection path (three clicks
-completing a line), not just reasoned about. `tests/test_examples.py`
+completing a line), not just reasoned about. `maps.f` (map[T] literals/
+indexing/`.forEach()`) and `config.f` (`DatabaseURL`/`environment.NAME`,
+the latter's own doc comment explaining why it has to be the file's
+very first line) rounded the set out further. `tests/test_examples.py`
 compiles every file in `examples/` and checks the deterministic ones'
 exact stdout; `graphics.f`/`tic_tac_toe.f` (the two needing a display)
 get their own interactive coverage in
@@ -430,6 +433,123 @@ flag validation, and real compiled programs) -- see
 `tests/test_lexer.py::TestRegexLiterals`,
 `tests/test_regex.py::TestRegexLiteral`, and
 `tests/test_codegen.py::TestRegexLiteral`.
+
+Three more directly-requested features, all new claude.md territory
+(#70-72), landed together:
+
+- **`DatabaseURL = <expr>`** (claude.md #70) overrides `festina.sqlite`'s
+  default location, but only when it's the entry file's own literal
+  first statement, before any other code or `import` -- enforced in
+  `festina.imports.build_program` (`_extract_database_url`), not
+  semantic.py, since it's fundamentally about *that file's own
+  statement order before multi-file merging*: by the time semantic.py
+  sees the merged Program, the entry file's statements are no longer
+  contiguous or first (dependencies come before the entry file in
+  `resolve_imports`'s own order). The extracted value expression is
+  threaded through as `ast.Program.database_url` (`None` if absent) and
+  evaluated by codegen.py's `_emit_main_and_entry` directly in `main()`'s
+  prologue, before `festina_db_open()` -- never as an ordinary top-level
+  statement, which would run far too late (inside `__festina_main()`,
+  after the database is already open). `festina_db_open` itself grew a
+  `path` parameter (was `void`), falling back to `"festina.sqlite"` for
+  a NULL/empty one so a DatabaseURL expression that evaluates to unset
+  environment data doesn't crash. Written entirely with syntax the
+  parser already supported (`DatabaseURL = expr` is an ordinary
+  assignment-expression-statement -- there's no dedicated grammar for
+  it at all), recognized purely by matching that exact AST shape. See
+  `tests/test_database_url.py` (extraction/position, real files on
+  disk) and `tests/test_codegen.py::TestDatabaseURL` (the actual
+  database file used, including from `environment.DATABASE_URL`).
+- **`environment.NAME` / `environment[keyExpr]`** (claude.md #71) wraps
+  `getenv()`, returning `text` or `null` (already exactly `getenv`'s own
+  NULL-if-unset return, no translation needed). Unlike
+  `clientWidth`/`clientHeight`, `environment` is never a valid bare
+  value (only `.NAME`/`[keyExpr]` mean anything, and NAME is arbitrary),
+  so it's pre-registered into `global_scope` purely for
+  `Scope.define`'s collision protection (a user can't redeclare it) --
+  actual dispatch (`semantic.py`'s `_infer_member`, `codegen.py`'s
+  `_emit_expr`) special-cases the AST shape (an `Identifier` literally
+  named `"environment"`) directly, before ever treating it as a real
+  variable reference, precisely so `environment.NAME` still resolves
+  correctly even though a bare `environment` reference is deliberately
+  rejected with a specific error. Read-only, same placement/reasoning as
+  `.length`/`clientWidth`'s own read-only checks. See
+  `tests/test_environment.py` and
+  `tests/test_codegen.py::TestEnvironment`.
+- **`map[T]`** (claude.md #72) -- `{ key: value, ... }` literals
+  (`ast.MapLit`), `npcHealths[key]` read/write (reusing the existing
+  computed-`Member` grammar array indexing already has, dispatched on
+  the receiver's type), and `.forEach(callback)`. Keys are always text
+  -- an unquoted identifier key is a reference to that variable, not
+  bareword-as-string-name shorthand the way a plain JS object literal
+  has (semantic.py checks every key's type explicitly, not just the
+  last one the way `ArrayLit`'s value-type inference currently does --
+  a key genuinely needs checking every time, since nothing else ever
+  constrains it the way a declared `map[T]`'s value slot constrains
+  values). A missing key reads back as `null` -- `festina_map_get`
+  returns a `default_value` argument outright when the key isn't found,
+  computed by codegen per the map's *value* type (int/float/pointer
+  each have their own null encoding -- see the "Null for int/float"
+  note below -- the runtime function itself has no idea what T is, only
+  ever seeing raw i64 payloads).
+
+  Runtime representation: a map value is `{ i64 count, ptr entries }`
+  at the LLVM level (`FESTINA_MAP_LLVM_TYPE`) -- the *identical* shape
+  to `arr[T]`'s own `{ i64 length, ptr data }`, but kept as a distinct
+  named type rather than reusing `_FestinaArray` outright, so an
+  accidental mix-up is caught in the IR itself. `entries` points to a
+  flat, linearly-scanned array of `FestinaMapEntry { key, value }`
+  pairs (`runtime/festina_runtime.c`) -- not a hash table, a deliberate,
+  documented tradeoff (`festina_map_find`'s own comment): maps are
+  meant for small, game/config-shaped key sets (claude.md #72's own
+  worked example is a handful of NPC health/name entries), and this
+  runtime already favors simple, obviously-correct implementations over
+  algorithmic sophistication elsewhere too (`arr[T]` has no hashing or
+  ordering either). `map[T]`'s `T` may be anything `arr[T]`'s own
+  element type can be *except* `arr[...]`/`map[...]` itself -- a 16-byte
+  array value (or another map value) doesn't fit in the one 8-byte slot
+  every map value is stored in, the same slot size
+  `festina_sqlite_collect_rows`'s row layout already uses. Every value
+  type's payload -- int, float, bool, text, blob, struct, table, img,
+  aud, regex -- travels through `festina_map_set`/`_get`/`_for_each` as
+  a raw `i64` regardless of T (this runtime has no idea what T a given
+  map's values are), reinterpreted to/from each value's real LLVM
+  representation at every call site (`codegen.py`'s
+  `_map_value_to_i64`/`_i64_to_map_value`) -- including inside a small,
+  per-`.forEach()`-call synthesized trampoline function
+  (`_emit_map_foreach_trampoline`), needed because the user's callback's
+  own LLVM signature depends on T (e.g. `double` for a `map[float]`) and
+  can't be called through an `i64`-typed function pointer directly
+  without a genuine calling-convention mismatch on real ABIs -- verified
+  for all four reinterpretation shapes (`i64` passthrough, `double`
+  bitcast, `i1` zext/trunc, `ptr` inttoptr/ptrtoint, the last covering
+  both `text` and a `struct`-valued map) with real compiled programs.
+  `festina_map_set` takes `count`/`entries` *by address* (a pointer into
+  the map value's own storage slot -- a plain variable's alloca/global,
+  a struct field's GEP, or a literal's own scratch header alloca during
+  construction), since adding a new key may grow the backing array and
+  the caller needs to see that change; assigning into a map whose own
+  storage isn't addressable this way (e.g. `someFunc()['key'] = v`,
+  where `someFunc()` returns a `map[T]`) is a specific compile-time
+  error rather than silently doing nothing or corrupting memory. Grows
+  by exactly one entry per insert (no capacity doubling, no separate
+  capacity field tracked) -- simpler to reason about and, given maps
+  are expected to stay small, not a real performance cost in practice.
+
+  Also added alongside this (not itself claude.md #72, but discovered
+  to be needed for a natural `.forEach()` callback body, per the
+  request that motivated it): `int`/`float`/`bool.toText()`, an
+  explicit spelling of the exact same stringification template
+  interpolation (`_to_text`) already does implicitly for these three
+  types -- `log(x.toText())` and `` log(`${x}`) `` always produce
+  identical output.
+
+  See `tests/test_maps.py` (parser/semantic),
+  `tests/test_codegen.py::TestMaps` (real compile-and-run, including
+  every value-type reinterpretation case and the struct-field/
+  non-addressable-assignment edge cases), and
+  `tests/test_numeric_conversion.py::TestToText` /
+  `tests/test_codegen.py::TestNumericConversion`'s `toText` tests.
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -1140,7 +1260,7 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 493 passed, 10 skipped (needs a C compiler; 2 of
+pytest tests/                          # 579 passed, 10 skipped (needs a C compiler; 2 of
                                         # the skips need `pip install pyinstaller` too,
                                         # the other 8 need Xvfb + xdotool installed)
 ```

@@ -56,6 +56,25 @@ void festina_fail(const char *msg) {
     exit(1);
 }
 
+/* ---- environment variables -- claude.md #71 ---- */
+
+char *festina_getenv(const char *name) {
+    /* getenv()'s own return value is either a pointer owned by the
+     * process environment (must not be freed, mutated, or held past a
+     * later setenv/putenv touching the same name) or NULL if unset --
+     * NULL is already exactly Festina's own null-for-text sentinel
+     * (claude.md #71: "or null if it is not set"), so this needs no
+     * translation at all. Not strdup'd: nothing in this runtime ever
+     * frees a text value (see the module docstring's "no GC yet"
+     * note), and the process's own environment block outlives every
+     * compiled Festina program's own execution regardless, so aliasing
+     * it directly is safe here specifically (unlike, say, festina_
+     * map_set's key, which *does* copy -- see its own comment on why
+     * that one case is different). */
+    if (!name) name = "";
+    return getenv(name);
+}
+
 /* ---- string interpolation -- claude.md #9, #45 ---- */
 
 char *festina_str_from_int(int64_t v) {
@@ -113,13 +132,19 @@ static void festina_exec(sqlite3 *db, const char *sql) {
     }
 }
 
-sqlite3 *festina_db_open(void) {
+sqlite3 *festina_db_open(const char *path) {
+    /* claude.md #70: DatabaseURL overrides the default -- codegen always
+     * passes a real string (either the compiled-in "festina.sqlite"
+     * constant, or the DatabaseURL expression's own value), but a NULL
+     * or empty path is treated the same as "no override" defensively,
+     * since a DatabaseURL expression is still an arbitrary runtime text
+     * value (e.g. environment.DATABASE_URL) that could come back unset. */
+    if (!path || !*path) path = "festina.sqlite";
     sqlite3 *db = NULL;
-    /* claude.md #29: always festina.sqlite, opened/created automatically. */
-    int rc = sqlite3_open("festina.sqlite", &db);
+    int rc = sqlite3_open(path, &db);
     if (rc != SQLITE_OK) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "cannot open festina.sqlite: %s",
+        char msg[512];
+        snprintf(msg, sizeof(msg), "cannot open %s: %s", path,
                  db ? sqlite3_errmsg(db) : "unknown error");
         festina_fail(msg);
     }
@@ -754,5 +779,114 @@ void festina_run_timer_loop(void) {
             nanosleep(&ts, NULL);
         }
         festina_fire_expired_timers();
+    }
+}
+
+/* ---- maps -- claude.md #72 ---- */
+
+/* One key/value pair -- `value` is a raw 8-byte payload meaning
+ * whatever the compiled program's own map[T] says it means (int64_t
+ * bits, a double's raw bits, or a pointer -- see festina/codegen.py's
+ * _map_value_to_i64/_i64_to_map_value for the reinterpretation, done
+ * entirely on the LLVM IR side, since this runtime has no idea what T
+ * a given map's values are, only ever seeing the already-flattened i64
+ * payload). The same "one fixed-size slot per value" convention
+ * festina_sqlite_collect_rows's row layout and every arr[T]'s own
+ * per-element storage already use. */
+typedef struct {
+    char *key;      /* owned copy -- see festina_map_set's own comment */
+    int64_t value;
+} FestinaMapEntry;
+
+/* Linear scan, not a hash table -- maps in Festina are meant for small,
+ * game/config-shaped key sets (see claude.md #72's own worked example:
+ * a handful of NPC health/name entries), and this runtime already
+ * favors simple, obviously-correct implementations over algorithmic
+ * sophistication elsewhere too (arr[T] itself has no hashing or
+ * ordered structure either) -- a deliberate, documented tradeoff
+ * (claude.md #54's ambiguity rule: correctness over micro-optimizing
+ * something the spec doesn't ask for), not an oversight. A map with a
+ * genuinely large number of entries would see O(n) get/set cost;
+ * revisit if that becomes a real problem for a real program. */
+static FestinaMapEntry *festina_map_find(int64_t count, void *entries, const char *key) {
+    FestinaMapEntry *arr = (FestinaMapEntry *)entries;
+    for (int64_t i = 0; i < count; i++) {
+        if (festina_str_eq(arr[i].key, key)) return &arr[i];
+    }
+    return NULL;
+}
+
+/* claude.md #72: npcHealths['npc1'] = 30 -- and the equivalent
+ * per-entry calls a map literal itself builds out of (see
+ * festina/codegen.py's _emit_map_lit). `count`/`entries` point INTO
+ * the map value's own storage (its LLVM alloca/global slot, or --
+ * during literal construction -- a scratch header alloca; see
+ * _emit_map_set's own comment), not a separate map "object" -- updating
+ * an existing key never needs to touch them, but adding a new one may
+ * need to grow the backing array, which has to write the new
+ * count/entries back into that same slot for the change to actually be
+ * visible to the caller (the same "write results back through an
+ * out-pointer" shape festina_sqlite_collect_rows already uses for its
+ * own row array).
+ *
+ * Grows by exactly one entry (a realloc to count+1) rather than
+ * doubling capacity -- no separate capacity field is tracked anywhere
+ * (this function is otherwise stateless between calls), and maps are
+ * expected to stay small (see festina_map_find's own comment), so the
+ * extra reallocs a doubling strategy would avoid aren't a real cost in
+ * practice; tracking one fewer field is worth more here than the
+ * micro-optimization would be. */
+void festina_map_set(int64_t *count, void **entries, const char *key, int64_t value) {
+    if (!key) key = "";
+    FestinaMapEntry *found = festina_map_find(*count, *entries, key);
+    if (found) {
+        found->value = value;
+        return;
+    }
+    FestinaMapEntry *grown = realloc(*entries, (size_t)(*count + 1) * sizeof(FestinaMapEntry));
+    if (!grown) festina_fail("out of memory growing a map");
+    /* Copied, not aliased to the caller's own key pointer -- this map
+     * may outlive whatever Festina value `key` came from (a local
+     * variable going out of scope doesn't free anything in this
+     * runtime -- see the module docstring's "no GC yet" note -- but
+     * relying on that would be fragile and unclear to read), and a
+     * literal key expression's string constant could in principle be
+     * reused/interned differently by a future compiler change. Leaks,
+     * like every other heap allocation in this runtime -- the same
+     * accepted tradeoff, not a new one. */
+    grown[*count].key = strdup(key);
+    if (!grown[*count].key) festina_fail("out of memory growing a map");
+    grown[*count].value = value;
+    *entries = grown;
+    (*count)++;
+}
+
+/* claude.md #72: npcHealths['npc1'] -- "if the key is not present, the
+ * result is null." default_value is already the correct null
+ * representation for this map's value type, computed by codegen (see
+ * _map_missing_default) -- this function has no idea what T is, only
+ * ever seeing raw i64 payloads, so it can't make that choice itself. */
+int64_t festina_map_get(int64_t count, void *entries, const char *key, int64_t default_value) {
+    if (!key) key = "";
+    FestinaMapEntry *found = festina_map_find(count, entries, key);
+    return found ? found->value : default_value;
+}
+
+/* claude.md #72: npcHealths.forEach(callback). "The order entries are
+ * visited in is not specified" -- this iterates in insertion order
+ * simply because that's how the backing array happens to be laid out,
+ * not a guarantee being made deliberately; nothing here should be
+ * relied on beyond every current entry being visited exactly once.
+ * `count` is captured once, by the caller, before this loop starts --
+ * if `callback` itself mutates this same map (adds a key, changes an
+ * existing value) or calls .forEach() again, that's explicitly
+ * unspecified behavior here, unlike festina_fire_expired_timers (which
+ * *is* deliberately hardened against a timer callback growing/clearing
+ * the timer list mid-iteration) -- claude.md #72 was never asked to
+ * make that same guarantee for maps. */
+void festina_map_for_each(int64_t count, void *entries, void (*callback)(int64_t, const char *)) {
+    FestinaMapEntry *arr = (FestinaMapEntry *)entries;
+    for (int64_t i = 0; i < count; i++) {
+        callback(arr[i].value, arr[i].key);
     }
 }

@@ -106,6 +106,22 @@ _EVENT_SIGNATURES = {
 # with either name for free, with no extra machinery here.
 _CLIENT_SIZE_GLOBALS = ("clientWidth", "clientHeight")
 
+# claude.md #71: `environment` -- unlike clientWidth/clientHeight above,
+# this is never a valid *value* on its own (only environment.NAME or
+# environment[keyExpr] mean anything, and NAME is arbitrary -- there's
+# no fixed set of members to register the way clientWidth/clientHeight
+# are their own two complete globals). So this name is pre-registered
+# into global_scope purely for Scope.define's "already declared"
+# collision protection (same free "a user can't redeclare this name"
+# guarantee clientWidth/clientHeight get) -- its Symbol's `type` is
+# never actually read anywhere; _infer_member and the bare-Identifier
+# check below both special-case the AST shape (an Identifier literally
+# named "environment") directly, before any real type-based dispatch,
+# precisely so environment.NAME still resolves correctly even though a
+# bare `environment` reference is deliberately rejected (see the
+# Identifier branch in infer()).
+_ENVIRONMENT_NAME = "environment"
+
 
 class _NullType:
     def __repr__(self):
@@ -161,6 +177,22 @@ class AnalyzedProgram:
 def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None):
     if isinstance(type_expr, ast.ArrayTypeExpr):
         return types_mod.ArrayType(resolve_type_name(type_expr.element, structs, tables, filename, node))
+    if isinstance(type_expr, ast.MapTypeExpr):
+        value_type = resolve_type_name(type_expr.value, structs, tables, filename, node)
+        # claude.md #72: a map value is stored in one fixed 8-byte slot
+        # (see types.MapType's own doc comment) -- an ArrayType (16
+        # bytes: length + data pointer) or another MapType simply
+        # doesn't fit, so this is rejected here at the point a map[T]
+        # type is resolved, the same "unknown type"-shaped error a
+        # genuinely undefined type name gets below.
+        if isinstance(value_type, (types_mod.ArrayType, types_mod.MapType)):
+            raise CompileError(
+                f"map values cannot be {types_mod.type_name(value_type)} -- a map value is "
+                f"stored in a single fixed-size slot, which an array or another map doesn't fit in",
+                file=filename, line=getattr(node, "line", 0), column=getattr(node, "column", 0),
+                category="unknown type",
+            )
+        return types_mod.MapType(value_type)
     name = type_expr
     if name in types_mod.PRIMITIVE_NAMES:
         return types_mod.PrimitiveType(name)
@@ -186,10 +218,15 @@ def analyze(program, filename="<string>"):
     structs = {}
     tables = {}
     imports = []
+    entry_filename = filename  # see the DatabaseURL check at the bottom
 
     # claude.md #39: clientWidth/clientHeight, see _CLIENT_SIZE_GLOBALS above.
     for _name in _CLIENT_SIZE_GLOBALS:
         global_scope.define(_name, Symbol(_name, _INT, "constant", None), None, filename)
+    # claude.md #71: environment, see _ENVIRONMENT_NAME above -- type is
+    # irrelevant (never consulted), only here so redeclaring it is a
+    # duplicate-declaration error like any other reserved global.
+    global_scope.define(_ENVIRONMENT_NAME, Symbol(_ENVIRONMENT_NAME, None, "constant", None), None, filename)
 
     def resolve(type_expr, node=None):
         return resolve_type_name(type_expr, structs, tables, filename, node)
@@ -254,7 +291,42 @@ def analyze(program, filename="<string>"):
             for e in expr.elements:
                 elem_type = infer(e, scope)
             return types_mod.ArrayType(elem_type) if elem_type is not None else None
+        if isinstance(expr, ast.MapLit):
+            # claude.md #72: { key: value, ... } -- every key must be
+            # text (checked per-entry, unlike ArrayLit's value type
+            # above which only ever keeps the *last* element's type --
+            # a key's type genuinely needs checking every time, since
+            # nothing else ever constrains it the way a declared
+            # map[T]'s value slot constrains values). value_type follows
+            # ArrayLit's own convention exactly: None (needs a declared
+            # type for context, e.g. an empty `{}`) if there's nothing
+            # to infer it from.
+            value_type = None
+            for key_expr, val_expr in expr.entries:
+                key_type = infer(key_expr, scope)
+                if key_type is not None and key_type is not NULL and key_type != _TEXT:
+                    raise CompileError(
+                        f"map key must be text, found {types_mod.type_name(key_type)}",
+                        file=filename, line=getattr(key_expr, "line", 0), column=getattr(key_expr, "column", 0),
+                        category="invalid operand type",
+                    )
+                value_type = infer(val_expr, scope)
+            return types_mod.MapType(value_type) if value_type is not None else None
         if isinstance(expr, ast.Identifier):
+            # claude.md #71: `environment` alone means nothing -- only
+            # environment.NAME/environment[keyExpr] do (see
+            # _ENVIRONMENT_NAME above). Checked by name, before the
+            # generic scope.lookup below, since environment IS present
+            # in global_scope (for collision protection only) and would
+            # otherwise silently return its placeholder `type=None`
+            # here instead of a clear, specific error.
+            if expr.name == _ENVIRONMENT_NAME:
+                raise CompileError(
+                    f"'{_ENVIRONMENT_NAME}' must be accessed as {_ENVIRONMENT_NAME}.NAME "
+                    f"(e.g. {_ENVIRONMENT_NAME}.DATABASE_URL), not used by itself",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
             sym = scope.lookup(expr.name)
             if sym is None:
                 raise CompileError(
@@ -289,6 +361,17 @@ def analyze(program, filename="<string>"):
             if isinstance(expr.target, ast.Identifier) and expr.target.name in _CLIENT_SIZE_GLOBALS:
                 raise CompileError(
                     f"'{expr.target.name}' is read-only and cannot be assigned to",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid assignment",
+                )
+            # claude.md #71: environment.NAME/environment[keyExpr] are
+            # read-only too -- same placement/reasoning as .length and
+            # clientWidth/clientHeight just above.
+            if (isinstance(expr.target, ast.Member)
+                    and isinstance(expr.target.obj, ast.Identifier)
+                    and expr.target.obj.name == _ENVIRONMENT_NAME):
+                raise CompileError(
+                    f"'{_ENVIRONMENT_NAME}' is read-only and cannot be assigned to",
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid assignment",
                 )
@@ -427,9 +510,40 @@ def analyze(program, filename="<string>"):
         return None
 
     def _infer_member(expr, scope):
+        # claude.md #71: environment.NAME / environment[keyExpr] --
+        # checked structurally (an Identifier literally named
+        # "environment"), before the generic infer(expr.obj, scope)
+        # below, since environment isn't a real value to infer the type
+        # of (see _ENVIRONMENT_NAME's own comment) -- it's a namespace,
+        # not a variable, so its "object" is never actually evaluated.
+        if isinstance(expr.obj, ast.Identifier) and expr.obj.name == _ENVIRONMENT_NAME:
+            if expr.computed:
+                key_type = infer(expr.prop, scope) if isinstance(expr.prop, ast.Node) else None
+                if key_type is not None and key_type is not NULL and key_type != _TEXT:
+                    raise CompileError(
+                        f"{_ENVIRONMENT_NAME}[...] key must be text, found {types_mod.type_name(key_type)}",
+                        file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                        category="invalid operand type",
+                    )
+            return _TEXT
         obj_type = infer(expr.obj, scope)
         if expr.computed:
             idx_type = infer(expr.prop, scope) if isinstance(expr.prop, ast.Node) else None
+            if isinstance(obj_type, types_mod.MapType):
+                # claude.md #72: npcHealths['npc1'] / npcHealths[key] --
+                # keys are always text (never int, unlike array
+                # indexing just below), and a missing key is not a
+                # compile-time concern at all (it's claude.md #72's own
+                # "returns null" runtime behavior -- see codegen.py's
+                # _emit_map_get), so there's nothing else to check here
+                # beyond the key's own type.
+                if idx_type is not None and idx_type is not NULL and idx_type != _TEXT:
+                    raise CompileError(
+                        f"map key must be text, found {types_mod.type_name(idx_type)}",
+                        file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                        category="invalid operand type",
+                    )
+                return obj_type.value
             if not isinstance(obj_type, types_mod.ArrayType):
                 raise CompileError(
                     f"cannot index into {types_mod.type_name(obj_type)}",
@@ -647,6 +761,14 @@ def analyze(program, filename="<string>"):
             # claude.md #55: int.toFloat() -> float
             if callee.prop == "toFloat" and not expr.args and infer(callee.obj, scope) == _INT:
                 return _FLOAT
+            # int/float/bool.toText() -> text -- an explicit spelling of
+            # the same stringification template interpolation already
+            # does implicitly for these three types (see codegen.py's
+            # _to_text); the receiver check is against the SAME three
+            # types _to_text itself handles, kept in sync deliberately.
+            if (callee.prop == "toText" and not expr.args
+                    and infer(callee.obj, scope) in (_INT, _FLOAT, types_mod.PrimitiveType("bool"))):
+                return _TEXT
             # claude.md #67: pattern.test(value:text) -> bool
             if callee.prop == "test" and infer(callee.obj, scope) == _REGEX:
                 if len(expr.args) != 1:
@@ -731,6 +853,66 @@ def analyze(program, filename="<string>"):
                         category="invalid function argument type",
                     )
                 return types_mod.PrimitiveType("bool")
+            # claude.md #72: npcHealths.forEach(callback) -- the callback
+            # is checked structurally, the same way setTimeout/
+            # setInterval's callback is above: it has to be the bare
+            # name of an already-declared function (Festina has no
+            # first-class functions/closures), not an arbitrary
+            # expression, since its *declaration* (parameter types) is
+            # what's being validated here, not its value.
+            if callee.prop == "forEach":
+                obj_type = infer(callee.obj, scope)
+                if isinstance(obj_type, types_mod.MapType):
+                    if len(expr.args) != 1:
+                        raise CompileError(
+                            f"forEach() expects exactly 1 argument (a callback function), "
+                            f"got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    callback_expr = expr.args[0]
+                    if not isinstance(callback_expr, ast.Identifier):
+                        raise CompileError(
+                            "forEach()'s argument must be the name of a declared function, "
+                            "not an arbitrary expression",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    callback_sym = scope.lookup(callback_expr.name)
+                    if callback_sym is None or callback_sym.kind != "function":
+                        raise CompileError(
+                            f"'{callback_expr.name}' is not a declared function",
+                            file=filename, line=callback_expr.line, column=callback_expr.column,
+                            category="unknown function",
+                        )
+                    params = callback_sym.node.params
+                    value_type_name = types_mod.type_name(obj_type.value)
+                    expected_sig = f"({value_type_name} value, text key)"
+                    if callback_sym.type is not None or len(params) != 2:
+                        raise CompileError(
+                            f"the callback passed to forEach() must take exactly 2 parameters "
+                            f"(the map's value, then its key) and return nothing -- declare it as "
+                            f"'void func {callback_expr.name}(v:{value_type_name}, key:text) {{ ... }}'",
+                            file=filename, line=callback_expr.line, column=callback_expr.column,
+                            category="invalid function argument type",
+                        )
+                    value_param_type = resolve(params[0].type_expr, callee)
+                    key_param_type = resolve(params[1].type_expr, callee)
+                    if value_param_type != obj_type.value:
+                        raise CompileError(
+                            f"forEach()'s callback first parameter must be {value_type_name} "
+                            f"(this map's value type), found {types_mod.type_name(value_param_type)}",
+                            file=filename, line=callback_expr.line, column=callback_expr.column,
+                            category="invalid function argument type",
+                        )
+                    if key_param_type != _TEXT:
+                        raise CompileError(
+                            f"forEach()'s callback second parameter must be text (the map's key), "
+                            f"found {types_mod.type_name(key_param_type)}",
+                            file=filename, line=callback_expr.line, column=callback_expr.column,
+                            category="invalid function argument type",
+                        )
+                    return None
         # Member call, e.g. someUnknownMethod() on a struct-shaped
         # receiver -- validates the member access itself (so an unknown
         # method on a real type still fails with a specific message
@@ -918,5 +1100,24 @@ def analyze(program, filename="<string>"):
         # today's single-file callers.
         filename = getattr(stmt, "file", filename)
         analyze_statement(stmt, global_scope, None)
+
+    # claude.md #70: DatabaseURL = <expr> -- festina.imports.build_program
+    # already validated *position* (first statement of the entry file,
+    # before any other code or import) and pulled the value expression
+    # out to program.database_url; this is the one thing left to check,
+    # the same as any other value: it must actually be text. Uses
+    # entry_filename (captured before the loop above reassigned
+    # `filename` statement by statement) since this expression always
+    # comes from the entry file specifically -- build_program never
+    # recognizes it in an imported file.
+    if getattr(program, "database_url", None) is not None:
+        database_url_type = infer(program.database_url, global_scope)
+        if database_url_type is not None and database_url_type is not NULL and database_url_type != _TEXT:
+            raise CompileError(
+                f"DatabaseURL must be text, found {types_mod.type_name(database_url_type)}",
+                file=entry_filename, line=getattr(program.database_url, "line", 0),
+                column=getattr(program.database_url, "column", 0),
+                category="invalid assignment",
+            )
 
     return AnalyzedProgram(global_scope.vars, structs, tables, imports)

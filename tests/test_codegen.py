@@ -373,6 +373,178 @@ class TestArrayLength:
         assert result.stdout.strip() == "5"
 
 
+class TestMaps:
+    """claude.md #72: map[T] -- { key: value, ... } literals, indexed
+    get/set, .forEach()."""
+
+    def test_literal_with_string_and_variable_keys(self, compile_and_run):
+        source = """
+        text npc2Id = 'npc2'
+        map[int] npcHealths = {'npc1': 10, npc2Id: 15}
+        log(npcHealths['npc1'])
+        log(npcHealths[npc2Id])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["10", "15"]
+
+    def test_map_of_text_values(self, compile_and_run):
+        source = """
+        text npc2Id = 'npc2'
+        map[text] npcNames = {'npc1': 'jim', npc2Id: 'john'}
+        log(npcNames['npc1'])
+        log(npcNames[npc2Id])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["jim", "john"]
+
+    def test_missing_key_returns_null(self, compile_and_run):
+        # claude.md #72: "If the key is not present in the map, the
+        # result is null" -- text's null already prints as an empty
+        # line (see TestRegex's identical match()-with-no-match test).
+        source = """
+        map[text] m = {'a': 'x'}
+        log('before')
+        log(m['missing'])
+        log('after')
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["before", "", "after"]
+
+    def test_missing_key_on_int_map_returns_the_int_null_sentinel(self, compile_and_run):
+        # Same null representation int already uses everywhere else
+        # (e.g. division by zero -- claude.md #57) -- not a special
+        # case invented for maps.
+        div_by_zero = compile_and_run("int a = 1\nint b = 0\nlog(a / b)")
+        missing_key = compile_and_run("map[int] m = {'a': 1}\nlog(m['missing'])")
+        assert missing_key.stdout == div_by_zero.stdout
+
+    def test_empty_map_literal(self, compile_and_run):
+        result = compile_and_run("map[int] m = {}\nlog(m['x'])")
+        assert result.returncode == 0
+
+    def test_duplicate_key_in_a_literal_last_one_wins(self, compile_and_run):
+        result = compile_and_run("map[int] m = {'a': 1, 'a': 2}\nlog(m['a'])")
+        assert result.stdout.strip() == "2"
+
+    def test_write_adds_a_new_key(self, compile_and_run):
+        source = """
+        map[int] m = {'a': 1}
+        m['b'] = 2
+        log(m['a'])
+        log(m['b'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "2"]
+
+    def test_write_replaces_an_existing_key(self, compile_and_run):
+        source = """
+        map[int] m = {'a': 1}
+        m['a'] = 30
+        log(m['a'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "30"
+
+    def test_write_with_a_variable_key(self, compile_and_run):
+        source = """
+        text npc2Id = 'npc2'
+        map[int] npcHealths = {'npc1': 10, npc2Id: 15}
+        npcHealths[npc2Id] = 30
+        log(npcHealths[npc2Id])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "30"
+
+    def test_zero_initialized_map_variable_behaves_as_empty(self, compile_and_run):
+        source = """
+        map[text] m
+        log(m['x'])
+        m['x'] = 'now set'
+        log(m['x'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["", "now set"]
+
+    def test_map_as_a_struct_field(self, compile_and_run):
+        source = """
+        struct Holder {
+            scores:map[int]
+        }
+        Holder h
+        h.scores = {'a': 1}
+        h.scores['b'] = 2
+        log(h.scores['a'])
+        log(h.scores['b'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "2"]
+
+    def test_map_assignment_on_a_non_addressable_target_is_a_clear_error(self, parser, semantic, codegen, errors):
+        source = """
+        map[int] func getMap() {
+            map[int] m = {'a': 1}
+            return m
+        }
+        getMap()['a'] = 5
+        """
+        program = parser.parse(source)
+        analyzed = semantic.analyze(program)
+        with pytest.raises(errors.CompileError, match="plain variable or field"):
+            codegen.generate_ir(program, analyzed)
+
+    def test_forEach_visits_every_entry(self, compile_and_run):
+        source = """
+        void func logHealth(h:int, key:text) {
+            log(`${key} ${h.toText()}`)
+        }
+        map[int] npcHealths = {'npc1': 10, 'npc2': 15}
+        npcHealths.forEach(logHealth)
+        """
+        result = compile_and_run(source)
+        assert sorted(result.stdout.splitlines()) == ["npc1 10", "npc2 15"]
+
+    def test_forEach_with_a_float_valued_map(self, compile_and_run):
+        # Exercises the .forEach() trampoline's float (double)
+        # reinterpretation path specifically -- see
+        # _emit_map_foreach_trampoline's own comment on why a real
+        # trampoline is needed at all, not just for int.
+        source = """
+        void func logPrice(v:float, key:text) {
+            log(`${key} ${v}`)
+        }
+        map[float] prices = {'apple': 1.5}
+        prices.forEach(logPrice)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "apple 1.5"
+
+    def test_forEach_with_a_bool_valued_map(self, compile_and_run):
+        source = """
+        void func logFlag(v:bool, key:text) {
+            log(`${key} ${v}`)
+        }
+        map[bool] flags = {'ready': true}
+        flags.forEach(logFlag)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "ready true"
+
+    def test_forEach_with_a_struct_valued_map(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func logPoint(v:Point, key:text) {
+            log(`${key}: (${v.x},${v.y})`)
+        }
+        Point origin
+        origin.x = 0
+        origin.y = 0
+        map[Point] points = {'origin': origin}
+        points.forEach(logPoint)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "origin: (0,0)"
+
+
 class TestLoops:
     """claude.md #60 (for loops), #61 (while loops), #66 (postfix ++/--)."""
 
@@ -1284,6 +1456,23 @@ class TestNumericConversion:
         result = compile_and_run(source)
         assert result.stdout.strip() == "7.5"
 
+    def test_to_text_runtime_result(self, compile_and_run):
+        source = """
+        int i = 42
+        float f = 3.14
+        bool b = true
+        log(i.toText())
+        log(f.toText())
+        log(b.toText())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["42", "3.14", "true"]
+
+    def test_to_text_matches_template_interpolation(self, compile_and_run):
+        result = compile_and_run("int i = 42\nlog(i.toText())\nlog(`${i}`)")
+        lines = result.stdout.splitlines()
+        assert lines[0] == lines[1]
+
     def test_mixed_int_float_rejected_end_to_end(self, compile_and_run, errors):
         # Confirms the whole pipeline (not just semantic.py in isolation)
         # rejects this -- semantic analysis raises before ever reaching
@@ -1581,6 +1770,78 @@ class TestAutomaticSqliteSchemaSync:
         assert result.returncode == 1
         assert "too long for this compiler's fixed-size buffer" in result.stderr
         assert "unreachable" not in result.stdout
+
+
+class TestDatabaseURL:
+    """claude.md #70: DatabaseURL = <expr>, the entry file's own first
+    statement, overriding festina.sqlite's default location."""
+
+    def test_no_directive_uses_the_default_filename(self, compile_and_run, tmp_path):
+        result = compile_and_run("table People {\n    id:int\n}\nlog('built')")
+        assert result.returncode == 0
+        assert (tmp_path / "festina.sqlite").exists()
+
+    def test_string_literal_directive_changes_the_path(self, compile_and_run, tmp_path):
+        source = "DatabaseURL = 'custom.sqlite'\ntable People {\n    id:int\n}\nlog('built')"
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert (tmp_path / "custom.sqlite").exists()
+        assert not (tmp_path / "festina.sqlite").exists()
+
+    def test_directive_from_environment_variable(self, compile_and_run, tmp_path):
+        source = "DatabaseURL = environment.DB_PATH\ntable People {\n    id:int\n}\nlog('built')"
+        result = compile_and_run(source, env={"DB_PATH": "from_env.sqlite"})
+        assert result.returncode == 0
+        assert (tmp_path / "from_env.sqlite").exists()
+
+    def test_data_actually_lands_in_the_configured_database(self, compile_and_run, tmp_path):
+        source = """
+        DatabaseURL = 'game.sqlite'
+        table People {
+            id:int
+            name:text
+        }
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'Patrick'])
+        arr[People] people = sqlite('SELECT * FROM People')
+        log(people[0].name)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "Patrick"
+        import sqlite3
+        conn = sqlite3.connect(tmp_path / "game.sqlite")
+        rows = conn.execute("SELECT name FROM People").fetchall()
+        assert rows == [("Patrick",)]
+
+
+class TestEnvironment:
+    """claude.md #71: environment.NAME / environment[keyExpr]."""
+
+    def test_reads_a_set_variable(self, compile_and_run):
+        result = compile_and_run("log(environment.FESTINA_TEST_VAR)", env={"FESTINA_TEST_VAR": "hello"})
+        assert result.stdout.strip() == "hello"
+
+    def test_unset_variable_is_null(self, compile_and_run, monkeypatch):
+        monkeypatch.delenv("FESTINA_DEFINITELY_UNSET_VAR", raising=False)
+        result = compile_and_run("log('before')\nlog(environment.FESTINA_DEFINITELY_UNSET_VAR)\nlog('after')")
+        assert result.stdout.splitlines() == ["before", "", "after"]
+
+    def test_computed_access_with_a_variable_key(self, compile_and_run):
+        source = "text k = 'FESTINA_TEST_VAR'\nlog(environment[k])"
+        result = compile_and_run(source, env={"FESTINA_TEST_VAR": "computed"})
+        assert result.stdout.strip() == "computed"
+
+    def test_null_check_pattern(self, compile_and_run, monkeypatch):
+        monkeypatch.delenv("FESTINA_DEFINITELY_UNSET_VAR", raising=False)
+        source = """
+        text apiKey = environment.FESTINA_DEFINITELY_UNSET_VAR
+        if apiKey == null {
+            log('not set')
+        } else {
+            log('set')
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "not set"
 
 
 class TestSqliteQueries:
