@@ -16,6 +16,15 @@ dependency list):
   static archive is available (_sqlite_link_flags), so a program built
   here doesn't need libsqlite3.so present on the machine that *runs* it
   -- falls back to a normal dynamic link otherwise.
+- stage 2: this module (specifically compile_file/main) is what
+  packaging/festina_entry.py + scripts/package_compiler.sh bundle into
+  a standalone binary via PyInstaller -- *using* the compiler no longer
+  needs a separate Python install, just the packaged binary itself
+  (still needs a C compiler/linker at runtime to actually build a
+  Festina program, same as ever -- stage 2 only removes the Python
+  dependency, not the C toolchain one). See _data_root() below for how
+  runtime/festina_runtime.c gets found once this module is no longer
+  running from an ordinary file on disk.
 - stage 3: the LLVM IR -> object file step is done in-process via
   festina.llvm_backend (libLLVM's C API through ctypes), not by handing
   the .ll file to clang. That used to be the reason `cc` specifically
@@ -44,13 +53,30 @@ import subprocess
 import sys
 import tempfile
 
-from . import parser as parser_mod
+from . import imports as imports_mod
 from . import semantic as semantic_mod
 from . import codegen as codegen_mod
 from . import llvm_backend
 from .errors import CompileError
 
-_RUNTIME_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runtime")
+def _data_root():
+    """Base directory to resolve bundled data (currently just runtime/)
+    against. Under "real compilation, minimal setup" stage 2's packaged
+    binary (claude.md #59; see packaging/festina_entry.py and
+    scripts/package_compiler.sh), the running process is PyInstaller's
+    --onefile self-extraction -- files added via --add-data land in a
+    temp dir exposed as sys._MEIPASS, not this file's ordinary on-disk
+    location (this module itself is loaded from inside a bundle archive
+    at that point, not a real .py file on a real path). Falls back to
+    the normal source-tree layout otherwise (dev checkout, or any other
+    way of running festina/ that isn't the packaged binary)."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return meipass
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+_RUNTIME_DIR = os.path.join(_data_root(), "runtime")
 _RUNTIME_C = os.path.join(_RUNTIME_DIR, "festina_runtime.c")
 
 _sqlite_link_cache = {}
@@ -165,10 +191,12 @@ def _ensure_runtime_object(cc):
 
 
 def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
-    with open(entry_path, encoding="utf-8") as f:
-        source = f.read()
-
-    program = parser_mod.parse(source, filename=entry_path)
+    # claude.md #5, #6: resolves entry_path's full import graph (a plain
+    # single-file program is the degenerate case -- just entry_path on
+    # its own) and merges every file into one ast.Program, in dependency
+    # order, each top-level statement tagged with the file it actually
+    # came from so errors below still name the right file.
+    program = imports_mod.build_program(entry_path)
     analyzed = semantic_mod.analyze(program, filename=entry_path)
     ir = codegen_mod.generate_ir(program, analyzed, filename=entry_path)
 

@@ -1,10 +1,11 @@
 """LLVM IR code generation -- claude.md #47 (executable generation) and
-the runtime-facing halves of #7/#8 (entry point + startup), #26 (arrays),
-#29-31 (automatic SQLite schema sync), #32-34 (sqlite() queries,
-parameterized queries, query result types), #41/#42 (log/fail), #45
-(string interpolation), #55-57 (int.toFloat(), Math.floor/ceil/round/
-trunc, division/modulo by zero), #60/#61 (for/while loops), #63 (array
-.length), #66 (postfix ++/--).
+the runtime-facing halves of #5/#6 (multi-file compilation -- see
+CodeGen.filename's note in generate()), #7/#8 (entry point + startup),
+#26 (arrays), #29-31 (automatic SQLite schema sync), #32-34 (sqlite()
+queries, parameterized queries, query result types), #41/#42
+(log/fail), #45 (string interpolation), #55-57 (int.toFloat(),
+Math.floor/ceil/round/trunc, division/modulo by zero), #60/#61
+(for/while loops), #63 (array .length), #66 (postfix ++/--).
 
 Scope: primitives (int/float/bool/text), global and local variables and
 constants, functions, if/else, for/while loops, return, the full
@@ -197,7 +198,8 @@ class Env:
 class CodeGen:
     def __init__(self, analyzed, filename="main.f"):
         self.analyzed = analyzed
-        self.filename = filename
+        self.entry_filename = filename         # the file actually passed to the compiler -- see generate()
+        self.filename = filename               # mutated per top-level statement (see generate()); used by every error site
         self.structs = analyzed.structs       # name -> {field: Type}
         self.struct_order = list(analyzed.structs.keys())
         self.tables = analyzed.tables          # name -> {field: festina-type-name}
@@ -271,13 +273,27 @@ class CodeGen:
     # ---- entry point ----
     def generate(self, program):
         for stmt in program.body:
+            # claude.md #6: a multi-file program (festina.imports.
+            # build_program) is one merged ast.Program, but errors
+            # should still point at whichever source file a statement
+            # actually came from. self.filename is read fresh at every
+            # error site (never cached into a local), so mutating it
+            # here -- right before processing each top-level statement --
+            # is enough to correctly attribute everything that
+            # statement's codegen touches, however deeply nested (a
+            # function body, its own nested blocks, ...), until the next
+            # top-level statement (possibly from a different file)
+            # updates it again. A single-file program tags every
+            # statement with that one file (see build_program), so this
+            # is a no-op behavior change for today's single-file callers.
+            self.filename = getattr(stmt, "file", self.filename)
             self._toplevel(stmt)
         # Emitted first so any table-column globals it discovers land in
         # self.extra_globals before that list is read below.
         entry_and_main = self._emit_main_and_entry()
         module = []
         module.append('; ModuleID = "festina"')
-        module.append(f'; generated from {self.filename} -- claude.md #47')
+        module.append(f'; generated from {self.entry_filename} -- claude.md #47')
         module.append("")
         module.extend(self._runtime_declares())
         module.append("")
@@ -1241,6 +1257,7 @@ class CodeGen:
         env = self.global_env
         self.cur_block = "entry"
         for stmt in self.entry_stmts:
+            self.filename = getattr(stmt, "file", self.filename)  # see generate()'s note
             self._emit_toplevel_stmt(stmt, env, entry_ctx)
         if not entry_ctx["terminated"]:
             lines.append("  ret void")

@@ -5,7 +5,9 @@ once), and circular-import detection without infinite recursion.
 """
 import os
 
+from . import ast as ast_mod
 from . import lexer as lexer_mod
+from . import parser as parser_mod
 from .errors import CompileError, CircularImportError
 
 
@@ -59,3 +61,30 @@ def resolve_imports(entry_path):
 
     visit(entry_path)
     return order
+
+
+def build_program(entry_path):
+    """Resolve entry_path's full import graph and parse every file into
+    one merged ast.Program, in dependency order -- claude.md #5: "An
+    import includes the specified file and all of its dependencies in
+    the current compilation unit," i.e. a single translation unit (like
+    C's #include), not per-file namespacing or runtime modules. A
+    program with no imports at all is the same thing degenerately (just
+    entry_path on its own), so this is also the normal single-file
+    compile path now -- see festina/cli.py's compile_file.
+
+    Each top-level statement is tagged with the file it actually came
+    from (`.file`) so downstream errors (semantic analysis, codegen)
+    still name the right file even though everything from here on is
+    one ast.Program -- see semantic.analyze's and codegen.CodeGen's own
+    notes on how that tag gets used (both re-read it once per top-level
+    statement rather than once for the whole compile)."""
+    body = []
+    for path in resolve_imports(entry_path):
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        program = parser_mod.parse(source, filename=path)
+        for stmt in program.body:
+            stmt.file = path
+        body.extend(program.body)
+    return ast_mod.Program(body)

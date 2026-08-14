@@ -75,3 +75,74 @@ class TestImportResolution:
         })
         with pytest.raises(errors.CompileError):
             imports_mod.resolve_imports(str(root / "a.f"))
+
+
+class TestBuildProgram:
+    """claude.md #5: "An import includes the specified file and all of
+    its dependencies in the current compilation unit" -- build_program
+    merges every file in the import graph into one ast.Program, in
+    dependency order, so cross-file declarations (structs, tables,
+    functions, globals) resolve like they were one file all along."""
+
+    def test_merges_every_file_in_dependency_order(self, imports_mod, write_source):
+        root = write_source({
+            "main.f": "import database.f\nlog('main')\n",
+            "database.f": "log('database')\n",
+        })
+        program = imports_mod.build_program(str(root / "main.f"))
+        # database.f's log() comes before main.f's own statements
+        # (its own `import database.f` line included, unchanged --
+        # ImportDecl is already a no-op in both semantic.py and
+        # codegen.py), matching resolve_imports' dependency-first order.
+        kinds = [type(stmt).__name__ for stmt in program.body]
+        assert kinds == ["ExprStmt", "ImportDecl", "ExprStmt"]
+        assert program.body[0].file.endswith("database.f")
+        assert program.body[1].file.endswith("main.f")
+        assert program.body[2].file.endswith("main.f")
+
+    def test_cross_file_struct_reference_resolves(self, imports_mod, semantic, write_source):
+        # A struct declared in one file, used as a function parameter
+        # type in another -- only works at all if they're genuinely one
+        # compilation unit (claude.md #5), not separately-analyzed files.
+        root = write_source({
+            "main.f": "import shapes.f\nPoint p\np.x = 1\nlog(describe(p))\n",
+            "shapes.f": (
+                "struct Point {\n    x:int\n}\n"
+                "text func describe(p:Point) {\n    return `x=${p.x}`\n}\n"
+            ),
+        })
+        program = imports_mod.build_program(str(root / "main.f"))
+        analyzed = semantic.analyze(program, filename=str(root / "main.f"))
+        assert "Point" in analyzed.structs
+        assert "describe" in analyzed.symbols
+
+    def test_duplicate_declaration_across_files_is_rejected(self, imports_mod, semantic, errors, write_source):
+        root = write_source({
+            "main.f": "import other.f\nint counter = 5\n",
+            "other.f": "int counter = 0\n",
+        })
+        program = imports_mod.build_program(str(root / "main.f"))
+        with pytest.raises(errors.CompileError, match="already declared"):
+            semantic.analyze(program, filename=str(root / "main.f"))
+
+    def test_error_in_an_imported_file_names_that_file_not_the_entry_file(
+        self, imports_mod, semantic, errors, write_source
+    ):
+        root = write_source({
+            "main.f": "import broken.f\nlog('start')\n",
+            "broken.f": "log(undefinedVariable)\n",
+        })
+        entry = str(root / "main.f")
+        program = imports_mod.build_program(entry)
+        with pytest.raises(errors.CompileError) as exc_info:
+            semantic.analyze(program, filename=entry)
+        assert "broken.f" in str(exc_info.value)
+        assert str(exc_info.value).split(":")[0].endswith("broken.f")
+
+    def test_single_file_program_is_unaffected(self, imports_mod, semantic, write_source):
+        # No imports at all -- build_program should behave exactly like
+        # parsing that one file directly (the degenerate case).
+        root = write_source({"main.f": "log('solo')\n"})
+        program = imports_mod.build_program(str(root / "main.f"))
+        assert len(program.body) == 1
+        semantic.analyze(program, filename=str(root / "main.f"))

@@ -8,7 +8,15 @@ against `Scope` (variables/functions) -- separate namespaces by design.
 
 `analyze(program)` walks the AST top to bottom. None of this repo's
 fixtures need forward references (structs/tables/functions are always
-declared before use), so a single left-to-right pass is enough.
+declared before use), so a single left-to-right pass is enough. This
+also makes multi-file compilation (claude.md #5-6) work with no extra
+machinery here: festina.imports.build_program already merged every
+file's statements into one `program.body`, in dependency order, before
+analyze() ever sees it -- the only thing this module does specially for
+that is re-read each top-level statement's originating file (`.file`,
+set by build_program) into the `filename` closure variable right before
+analyzing it, so errors still name the right file (see the loop at the
+bottom of analyze()).
 """
 from . import ast
 from . import types as types_mod
@@ -469,6 +477,20 @@ def analyze(program, filename="<string>"):
             analyze_statement(stmt, scope, return_type)
 
     for stmt in program.body:
+        # claude.md #6: a multi-file program (festina.imports.build_program)
+        # is one merged ast.Program, but errors should still point at
+        # whichever source file a statement actually came from. Every
+        # nested function above closes over `filename` as a free
+        # variable, resolved fresh on each call (Python's late-binding
+        # closures) rather than captured once -- so reassigning it here,
+        # right before analyzing each top-level statement, is enough to
+        # correctly thread the right filename through everything that
+        # statement's analysis touches, however deeply nested, with no
+        # changes needed to any individual `raise CompileError(...)` site.
+        # A single-file program tags every statement with that one file
+        # (see build_program), so this is a no-op change of behavior for
+        # today's single-file callers.
+        filename = getattr(stmt, "file", filename)
         analyze_statement(stmt, global_scope, None)
 
     return AnalyzedProgram(global_scope.vars, structs, tables, imports)

@@ -1,0 +1,7 @@
+pyinstaller>=6
+
+# Only needed to build a standalone `festina` compiler binary
+# (./scripts/package_compiler.sh -- "real compilation, minimal setup"
+# stage 2, claude.md #59). Not needed to develop or test festina/
+# itself -- see requirements-dev.txt for that -- and not a dependency
+# of the resulting binary or of any compiled Festina program either.
