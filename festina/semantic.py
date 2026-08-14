@@ -237,6 +237,14 @@ def analyze(program, filename="<string>"):
             return types_mod.PrimitiveType("bool")
         if isinstance(expr, ast.NullLit):
             return NULL
+        if isinstance(expr, ast.RegexLit):
+            # claude.md #67: /pattern/flags -- same RegexType() a
+            # regex(...) call infers (see BUILTIN_FUNCTIONS/
+            # _BUILTIN_RETURN_TYPES above); flags were already validated
+            # for real (unsupported/duplicate letters) by the parser,
+            # since a literal's flags are compile-time-known text, unlike
+            # regex()'s flags argument.
+            return types_mod.RegexType()
         if isinstance(expr, ast.TemplateLit):
             for e in expr.exprs:
                 infer(e, scope)
