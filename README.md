@@ -29,11 +29,12 @@ Festina is under active development. Everything else in this README
 describes the full target language from `claude.md`; this section is
 the ground truth for what actually runs today.
 
-**Test suite:** 349 tests, 0 failed (`pytest tests/`) — 342 passed/7
+**Test suite:** 378 tests, 0 failed (`pytest tests/`) — 370 passed/8
 skipped by default (2 need `pyinstaller`, an opt-in build-time-only
-dependency for the packaged-binary tests; 5 need `Xvfb`/`xdotool` to
-open and interact with a real window for the graphics tests; see
-[Setup](#setup)), or all 349 passed/0 skipped with those installed.
+dependency for the packaged-binary tests; 6 need `Xvfb`/`xdotool` to
+open and interact with a real window for the graphics and combined
+graphics+timers tests; see [Setup](#setup)), or all 378 passed/0
+skipped with those installed.
 See [`tests/`](tests/) and [`tests/CONTRACT.md`](tests/CONTRACT.md) for
 the spec-driven suite this is measured against — every test cites the
 `claude.md` section it checks.
@@ -59,6 +60,7 @@ runtime, and *runs* as a standalone executable (no Python or the
 | `log()` / `fail()` | ✅ |
 | **Regex, string match/replace (`claude.md #67/#68`)** | ✅ `regex()`, `.test()`, `.match()`, `.replace()`/`.replaceAll()` (search may be text or regex) — POSIX extended regular expressions (no bundled/external regex engine — see [Setup](#setup)); no capture groups, backreferences, or non-greedy quantifiers (POSIX ERE's own limits, not something worked around here) |
 | **Graphics (`claude.md #37/#39/#40`)** | ✅ `img`/`loadImage()`, `drawRect`/`drawCircle`/`drawText`/`drawImage`, `on click`/`on mouse`/`on key`/`on resize`/`on close`, `clientWidth`/`clientHeight` — a real on-screen X11 window rendered via Cairo, verified against an actual virtual display, not just reasoned about (see [Graphics](#graphics) below for the caveats: canvas starts at 800×600, solid black only, PNG-only images) |
+| **Timers (`claude.md #69`)** | ✅ `setTimeout`/`setInterval`/`clearTimeout`/`clearInterval` — JS-style scheduling; the callback must be an already-declared, zero-argument, `void`-returning function (Festina has no first-class functions/closures) — see [Timers](#timers) below for the design, including how this combines with graphics |
 | Structs | ✅ declaration, field read/write, passed to and returned from functions |
 | **Arrays (`arr[T]`)** | ✅ literals, indexed read/write by any index expression, nesting, `.length` (`claude.md #63`), as function params/return values, as struct-array elements — see the caveats below and in `festina/codegen.py`'s module docstring |
 | **Numeric conversion (`claude.md #55/#56`)** | ✅ int and float never mix implicitly, in any operator (arithmetic *or* comparison) — `int.toFloat()` and `Math.floor/ceil/round/trunc(x)` are the only conversions, both compile-time-checked and runtime-tested |
@@ -192,7 +194,9 @@ Notably absent: anything for `regex()`/`.test()`/`.match()`/`.replace()`
 (claude.md #67/#68) — they're built on POSIX extended regular
 expressions (`<regex.h>`), already part of libc everywhere this list's
 C compiler already requires libc, so regex support adds zero new
-dependencies. Graphics is the opposite case: Cairo is a genuinely new
+dependencies. [Timers](#timers) (claude.md #69) are the same story:
+`clock_gettime`/`nanosleep`/`select` are all POSIX, already part of
+libc too. Graphics is the opposite case: Cairo is a genuinely new
 dependency (claude.md #39 itself requires it — "Graphics are backed by
 Cairo"), and windowing needs libX11 alongside it (see [Regex and
 String Matching](#regex-and-string-matching) vs.
@@ -247,21 +251,22 @@ it needs.
 
 ```bash
 pip install -r requirements-dev.txt   # pytest, for the test suite
-pytest tests/                         # 342 passed, 7 skipped (see Test suite above)
+pytest tests/                         # 370 passed, 8 skipped (see Test suite above)
 
 ./bin/festina examples/hello.f -o hello
 ./hello
 ```
 
-The 7 skips above need tools that aren't Python packages, so they're
+The 8 skips above need tools that aren't Python packages, so they're
 not in any requirements file — `pip install`s nothing for them.
 `pyinstaller` covers 2 (see the packaged-binary section above); `Xvfb`
 (a virtual X server) and `xdotool` (simulates clicks, mouse movement,
-key presses, and resizing) cover the other 5, needed only to test
-claude.md #37/#39/#40's graphics functions and event handlers against a
-real window without an actual display attached (`sudo apt install xvfb
-xdotool` on Debian/Ubuntu) — a real `$DISPLAY` works too, if one is
-already available.
+key presses, and resizing) cover the other 6, needed only to test
+claude.md #37/#39/#40's graphics functions/event handlers and claude.md
+#69's timers-combined-with-graphics case against a real window without
+an actual display attached (`sudo apt install xvfb xdotool` on
+Debian/Ubuntu) — a real `$DISPLAY` works too, if one is already
+available.
 
 ## Why Festina?
 
@@ -718,6 +723,58 @@ this compiler's own choices rather than anything from the spec:
   movement, key presses, and resizes) until the window is closed, then
   exits normally. There's no way to close the window from Festina code
   itself.
+
+## Timers
+
+> **Status:** implemented — `setTimeout`/`setInterval`/`clearTimeout`/
+> `clearInterval`, matching JavaScript's own. Verified end to end,
+> including alongside an open graphics window, not just reasoned about
+> — see `tests/test_codegen.py`'s `TestTimers`.
+
+Festina has no first-class functions or closures, so the callback can
+only be the bare name of an already-declared, zero-argument,
+`void`-returning function — not an arbitrary expression or an inline
+function literal:
+
+```festina
+void func showMessage() {
+    log('Delayed message')
+}
+
+setTimeout(showMessage, 1000)
+```
+
+```festina
+void func tick() {
+    log('tick')
+}
+
+int intervalId = setInterval(tick, 500)
+```
+
+Both return an `int` timer id, usable with either `clearTimeout()` or
+`clearInterval()` — the two are interchangeable, matching JS, where
+`clearTimeout()`/`clearInterval()` never throw on an unknown or
+already-fired id either:
+
+```festina
+clearInterval(intervalId)
+```
+
+A program keeps running as long as it has a pending `setTimeout()` or
+an uncleared `setInterval()` — exactly like a real JS runtime, an
+uncleared interval keeps the process alive forever, and it has to be
+stopped externally (or via `clearInterval()`) the same way. Once every
+timeout has fired and every interval has been cleared, the program
+exits normally.
+
+Timers combine with [graphics](#graphics): if a program uses both, a
+single event loop multiplexes X11 events (clicks, key presses,
+resizes, ...) with pending timer deadlines, so a `setInterval` callback
+and an `on click` handler both stay responsive at the same time — not
+just one blocking the other. A timers-only program never opens a
+window, and a graphics-only program never touches the timer machinery
+— each is its own opt-in, same as every other feature here.
 
 ## Audio
 

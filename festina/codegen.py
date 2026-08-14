@@ -40,9 +40,11 @@ PNG needs no window; see _emit_graphics_call's own note) in main()
 before __festina_main() runs, exactly
 the same "only pay for what you use" pattern uses_sqlite already
 follows for festina_db_open(); a program that never touches graphics
-never opens a window. After __festina_main() returns, if graphics were
-used, main() blocks in festina_graphics_run() (Expose/click/mouse/key/
-resize/window-close) until the window is closed. Canvas size starts at
+never opens a window. After __festina_main() returns, if graphics or
+timers (see "Timers" below) were used, main() blocks in
+festina_run_event_loop() (Expose/click/mouse/key/resize/window-close,
+interleaved with any pending timers) until the window is closed. Canvas
+size starts at
 a fixed 800x600 and every shape/text draws in solid black -- claude.md
 has no syntax for declaring a size or a color, so both are
 implementation-defined defaults, not derived from the spec; the size
@@ -73,6 +75,27 @@ decorations, the backing-store redraw strategy, why Xlib instead of a
 GUI toolkit) is in festina_runtime.h's doc comment, verified against an
 actual rendered window (not just reasoned about) via a virtual X server
 -- see tests/test_codegen.py's TestGraphics.
+
+Timers (claude.md #69: setTimeout/setInterval/clearTimeout/
+clearInterval): the callback can only be the bare name of an
+already-declared `void func name() { }`, since Festina has no
+first-class functions or closures -- semantic.py's
+_infer_call enforces this structurally rather than through the normal
+expression-typing path, and _emit_timer_call below just needs that
+function's own LLVM symbol (`@<name>`, already exactly the `void
+(*)(void)` function pointer festina_set_timeout/_interval expect -- the
+same convention `on resize`/`on close` handlers already use). Opened
+lazily via CodeGen.uses_timers, a separate flag from uses_graphics
+(set only by setTimeout/setInterval, not clearTimeout/clearInterval
+alone) since a timers-only program never opens a window and a
+graphics-only program never touches the timer machinery -- but both
+flags gate the same festina_run_event_loop() call in main(), which
+multiplexes X11 events with timer deadlines when both are in play. See
+festina_runtime.h's doc comment on festina_set_timeout/_interval for
+the full runtime design, including when a program with pending timers
+actually exits (matching Node's "exits once the event loop is empty"
+behavior) and why an uncleared setInterval keeps a program running
+forever, exactly like in a real JS runtime.
 
 Query rows (claude.md #32-34): sqlite()'s result, when assigned to a
 declared arr[Table], is built by festina_runtime's
@@ -280,6 +303,9 @@ class CodeGen:
                                                 # _emit_graphics_call and _emit_main_and_entry
         self.event_handlers = {}               # "click"/"mouse" -> @__festina_on_<name> -- see
                                                 # _emit_event_handler and _emit_main_and_entry
+        self.uses_timers = False               # any setTimeout()/setInterval() call anywhere --
+                                                # NOT clearTimeout()/clearInterval() alone; see
+                                                # _emit_timer_call and _emit_main_and_entry
 
     # ---- naming ----
     def tmp(self):
@@ -411,7 +437,7 @@ class CodeGen:
             "declare ptr @festina_regex_replace(ptr, ptr, ptr, i1)",
             # claude.md #37, #39, #40: img, graphics functions, click/mouse events.
             "declare void @festina_graphics_init()",
-            "declare void @festina_graphics_run()",
+            "declare void @festina_run_event_loop()",
             "declare void @festina_draw_rect(i64, i64, i64, i64)",
             "declare void @festina_draw_circle(i64, i64, i64)",
             "declare void @festina_draw_text(ptr, i64, i64)",
@@ -424,6 +450,12 @@ class CodeGen:
             "declare void @festina_register_close_handler(ptr)",
             "declare i64 @festina_client_width()",
             "declare i64 @festina_client_height()",
+            # setTimeout/setInterval/clearTimeout/clearInterval -- not
+            # part of claude.md; see the module docstring's "Timers" note.
+            "declare i64 @festina_set_timeout(ptr, i64)",
+            "declare i64 @festina_set_interval(ptr, i64)",
+            "declare void @festina_clear_timeout(i64)",
+            "declare void @festina_clear_interval(i64)",
             "declare ptr @malloc(i64)",
             "declare ptr @calloc(i64, i64)",
             # claude.md #56: Math.floor/ceil/round/trunc, via LLVM's
@@ -1242,6 +1274,8 @@ class CodeGen:
                 return self._emit_regex_call(expr, env, lines)
             if name in ("drawRect", "drawCircle", "drawText", "drawImage", "loadImage"):
                 return self._emit_graphics_call(name, expr, env, lines)
+            if name in ("setTimeout", "setInterval", "clearTimeout", "clearInterval"):
+                return self._emit_timer_call(name, expr, env, lines)
             if name == "loadAudio":
                 raise CodegenError("'loadAudio' (audio) is not implemented yet",
                                     file=self.filename, line=callee.line)
@@ -1402,6 +1436,39 @@ class CodeGen:
             lines.append(f"  call void @festina_draw_image(ptr {img}, i64 {x}, i64 {y})")
         return "0", None
 
+    # ---- setTimeout/setInterval/clearTimeout/clearInterval (claude.md
+    # #69 -- see the module docstring's "Timers" note) ----
+    def _emit_timer_call(self, name, expr, env, lines):
+        """setTimeout/setInterval's first argument is the bare name of an
+        already-declared `void func name() { }` (semantic.py's
+        _infer_call checked this structurally, not through the normal
+        expression-typing path -- Festina has no first-class functions/closures).
+        That means expr.args[0] is always an ast.Identifier here, never
+        an arbitrary expression to run through _emit_expr -- its LLVM
+        symbol is simply `@<name>` (see _emit_func), already exactly the
+        `void (*)(void)` function pointer festina_set_timeout/_interval
+        expect, the same convention `on resize`/`on close` handlers
+        already use.
+
+        Sets self.uses_timers (mirroring self.uses_graphics) so main()
+        knows to block in festina_run_event_loop() after __festina_main()
+        returns -- but only for setTimeout/setInterval, which actually
+        schedule ongoing work; clearTimeout()/clearInterval() alone
+        don't, the same "only pay for what you use" reasoning
+        self.uses_graphics already applies to loadImage()."""
+        if name in ("setTimeout", "setInterval"):
+            self.uses_timers = True
+            callback_symbol = f"@{expr.args[0].name}"
+            delay_val, _ = self._emit_expr(expr.args[1], env, lines)
+            fn = "festina_set_timeout" if name == "setTimeout" else "festina_set_interval"
+            out = self.tmp()
+            lines.append(f"  {out} = call i64 @{fn}(ptr {callback_symbol}, i64 {delay_val})")
+            return out, INT
+        id_val, _ = self._emit_expr(expr.args[0], env, lines)
+        fn = "festina_clear_timeout" if name == "clearTimeout" else "festina_clear_interval"
+        lines.append(f"  call void @{fn}(i64 {id_val})")
+        return "0", None
+
     # ---- sqlite() queries (claude.md #32-34) ----
     def _emit_sqlite_call(self, expr, env, lines, expected_type):
         """`expected_type` is the declared type of wherever this call's
@@ -1553,17 +1620,18 @@ class CodeGen:
             for event_name, symbol in self.event_handlers.items():
                 main_lines.append(f"  call void @{register_fn[event_name]}(ptr {symbol})")
         main_lines.append("  call void @__festina_main()")
-        if self.uses_graphics:
+        if self.uses_graphics or self.uses_timers:
             # claude.md #40's "canvas" only means something while a
             # window is actually open -- block here, after the entry
             # function's own top-level statements have run (so anything
             # drawn there is already visible), handling Expose/click/
-            # mouse/close until the window is closed (see
-            # festina_graphics_run's own doc comment in
-            # festina_runtime.h). A program that never uses graphics
-            # skips this entirely and exits immediately after
-            # __festina_main(), exactly as it always has.
-            main_lines.append("  call void @festina_graphics_run()")
+            # mouse/key/resize/close and any pending setTimeout/
+            # setInterval callbacks until there's nothing left to wait
+            # for (see festina_run_event_loop's own doc comment in
+            # festina_runtime.h/.c). A program that uses neither skips
+            # this entirely and exits immediately after __festina_main(),
+            # exactly as it always has.
+            main_lines.append("  call void @festina_run_event_loop()")
         main_lines.append("  ret i32 0")
         main_lines.append("}")
 

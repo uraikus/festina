@@ -1584,3 +1584,38 @@ text b = 'a1b2c3'.replaceAll(regex('[0-9]'), '-')
 If search is text, matching is a literal substring match, not a pattern match.
 
 If there is no match, replace() and replaceAll() return the original value unchanged.
+
+
+69. TIMERS
+
+Festina provides JavaScript-style timers as global functions:
+
+setTimeout(callback, delayMs)
+setInterval(callback, delayMs)
+
+callback must be the name of an already-declared function that takes no parameters and returns nothing.
+
+Example:
+
+void func showMessage() {
+    log('Delayed message')
+}
+
+setTimeout(showMessage, 1000)
+
+setInterval repeats the callback every delayMs milliseconds until cancelled:
+
+void func tick() {
+    log('tick')
+}
+
+setInterval(tick, 500)
+
+Both setTimeout() and setInterval() return an int timer id.
+
+Timers are cancelled with:
+
+clearTimeout(id)
+clearInterval(id)
+
+A program keeps running as long as it has a pending timeout or an uncleared interval, exactly as in JavaScript -- clearing every interval (or letting every timeout fire) lets it exit normally.

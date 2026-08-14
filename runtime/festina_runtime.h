@@ -164,17 +164,19 @@ char *festina_regex_replace(void *compiled, const char *text,
  * (drawRect/drawCircle/drawText) take no color argument, so there is
  * nothing to make configurable yet.
  *
- * festina_graphics_init creates the window; festina_graphics_run is the
- * blocking event loop (Expose -> repaint from the backing store,
- * ButtonPress -> the registered click handler if any, MotionNotify ->
- * the registered mouse handler if any, KeyPress -> the registered key
- * handler if any, ConfigureNotify with a genuine size change -> resize
- * the backing store and call the registered resize handler if any, the
- * window's close button -> call the registered close handler if any,
- * then return). Both festina_graphics_init/_run are only ever called by
- * generated code when the program actually uses a graphics function,
- * references clientWidth/clientHeight, or declares an `on
- * click`/`mouse`/`key`/`resize`/`close` handler (see
+ * festina_graphics_init creates the window; festina_run_event_loop
+ * (see the "Timers" note further down -- it handles both graphics and
+ * timer events, not just graphics despite its history) is the blocking
+ * event loop while a window is open (Expose -> repaint from the
+ * backing store, ButtonPress -> the registered click handler if any,
+ * MotionNotify -> the registered mouse handler if any, KeyPress -> the
+ * registered key handler if any, ConfigureNotify with a genuine size
+ * change -> resize the backing store and call the registered resize
+ * handler if any, the window's close button -> call the registered
+ * close handler if any, then return). festina_graphics_init is only
+ * ever called by generated code when the program actually uses a
+ * graphics function, references clientWidth/clientHeight, or declares
+ * an `on click`/`mouse`/`key`/`resize`/`close` handler (see
  * CodeGen.uses_graphics in festina/codegen.py) -- a program that
  * doesn't never opens a window, exactly like festina_db_open() only
  * ever runs for a program that declares a `table`.
@@ -198,9 +200,9 @@ char *festina_regex_replace(void *compiled, const char *text,
  * comes from XLookupString (a key that types a character, e.g. "a",
  * "5", " ") falling back to XKeysymToString (a named key with no text
  * of its own, e.g. "Left", "Escape", "Return") -- see
- * festina_graphics_run's own comment in festina_runtime.c. `on resize`
- * intentionally clears the canvas back to white at the new size rather
- * than preserving old content, matching how resizing a browser's
+ * festina_handle_graphics_event's own comment in festina_runtime.c.
+ * `on resize` intentionally clears the canvas back to white at the new
+ * size rather than preserving old content, matching how resizing a browser's
  * `<canvas>` element also clears it (clientWidth/clientHeight below are
  * themselves named after that DOM API). `on close` cannot cancel the
  * close -- there's no "prevent default" mechanism here, it's purely a
@@ -215,12 +217,19 @@ char *festina_regex_replace(void *compiled, const char *text,
  * runtime, so this is its own small special case rather than reusing
  * the BUILTIN_FUNCTIONS/_BUILTIN_SIGNATURES machinery the draw
  * functions and loadImage use, which all assume a Call).
+ *
+ * festina_run_event_loop is what main() actually blocks in after
+ * __festina_main() returns, whenever a program uses graphics, timers
+ * (see setTimeout/setInterval below), or both (CodeGen.uses_graphics
+ * or CodeGen.uses_timers in festina/codegen.py) -- it used to be named
+ * festina_graphics_run, back when graphics was the only thing that
+ * could ever block here.
  */
 #define FESTINA_CANVAS_WIDTH 800
 #define FESTINA_CANVAS_HEIGHT 600
 
 void festina_graphics_init(void);
-void festina_graphics_run(void);
+void festina_run_event_loop(void);
 void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h);
 void festina_draw_circle(int64_t x, int64_t y, int64_t r);
 void festina_draw_text(const char *text, int64_t x, int64_t y);
@@ -233,5 +242,50 @@ void festina_register_resize_handler(void (*handler)(void));
 void festina_register_close_handler(void (*handler)(void));
 int64_t festina_client_width(void);
 int64_t festina_client_height(void);
+
+/*
+ * setTimeout/setInterval/clearTimeout/clearInterval -- claude.md #69.
+ * Festina otherwise has no way to schedule work after the fact, the
+ * same gap JS's setTimeout/setInterval fill.
+ *
+ * The callback can only be the bare name of an already-declared
+ * `void func name() { ... }` -- Festina has no first-class functions
+ * or closures (see codegen.py's "functions are not first-class values
+ * yet" CodegenError), so an arbitrary expression or inline function
+ * literal was never on the table; festina/semantic.py's _infer_call
+ * enforces this structurally (the argument must be an ast.Identifier
+ * resolving to a declared, zero-parameter, void-returning function),
+ * not through the normal expression-typing path. That function's own
+ * LLVM symbol is already exactly the `void (*)(void)` function pointer
+ * these take -- the same convention festina_register_resize_handler/
+ * _close_handler already use for a callback with no arguments.
+ *
+ * setTimeout/setInterval both return an int timer id, usable with
+ * clearTimeout()/clearInterval() (interchangeably, in fact -- both are
+ * simply an alias for "deactivate this id if it exists," matching how
+ * JS's clearTimeout()/clearInterval() are also interchangeable and
+ * never throw on an unknown or already-fired id).
+ *
+ * Scheduling is cooperative and single-threaded, like JS's own event
+ * loop -- a Festina program is never preempted mid-statement to run a
+ * timer callback. Instead, timers only ever fire from inside
+ * festina_run_event_loop: with graphics in use, on every pass through
+ * its select()-driven X11/timer multiplexing (so `on click` and a
+ * `setInterval` callback both stay responsive together); without
+ * graphics, in a loop that sleeps until the next deadline and fires it,
+ * for as long as there's still an active timer to wait for. A program
+ * that only ever calls setTimeout() exits once every one-shot timeout
+ * has fired; one that calls setInterval() and never clears it runs
+ * forever, exactly like an uncleared setInterval() would in a real JS
+ * runtime -- it has to be stopped externally (or via clearInterval())
+ * the same way. See festina_run_event_loop's own doc comment in
+ * festina_runtime.c for the full loop design, including why an
+ * interval callback is rescheduled from "now" rather than from its
+ * missed deadline (avoids a burst of catch-up calls after a stall).
+ */
+int64_t festina_set_timeout(void (*callback)(void), int64_t delay_ms);
+int64_t festina_set_interval(void (*callback)(void), int64_t delay_ms);
+void festina_clear_timeout(int64_t id);
+void festina_clear_interval(int64_t id);
 
 #endif

@@ -54,7 +54,7 @@ hints), starts at 800x600, and is opened lazily -- `CodeGen.uses_graphics`
 (mirroring the pre-existing `uses_sqlite` flag) is set by any `draw*`
 call, a bare `clientWidth`/`clientHeight` reference, or an `on
 click`/`mouse`/`key`/`resize`/`close` handler declaration, gating
-`festina_graphics_init()`/`festina_graphics_run()` calls in `main()` --
+`festina_graphics_init()`/`festina_run_event_loop()` calls in `main()` --
 *except* `loadImage()` alone, which deliberately does NOT set it: Cairo
 decodes PNGs from its own in-memory decoder, needing no X server at all,
 so a program that only loads an image (never drawing it or opening a
@@ -83,6 +83,42 @@ Verified against a real (virtual) X server, not just reasoned about --
 see "Why the tests are structured this way" below for
 `tests/test_graphics.py`/`TestGraphics`.
 
+claude.md #69 (setTimeout/setInterval/clearTimeout/clearInterval) is
+implemented too -- JS-style timers, added because Festina otherwise had
+no way to schedule work after the fact. Since Festina has no
+first-class functions or closures, the callback can only be the bare
+name of an already-declared, zero-parameter, void-returning function --
+semantic.py's `_infer_call` checks this structurally (an
+`ast.Identifier` resolving to a `Symbol` with `kind == "function"`,
+`type is None`, and an empty `node.params`), not through the normal
+expression-typing path, since the identifier isn't being used as a
+*value* here, its *declaration* is what's being validated. That
+function's own LLVM symbol (`@<name>`) is already exactly the `void
+(*)(void)` function pointer the runtime's `festina_set_timeout`/
+`_set_interval` expect -- the same convention `on resize`/`on close`
+handlers already use, so `_emit_timer_call` needs no IR machinery of
+its own beyond that. `CodeGen.uses_timers` (set only by setTimeout/
+setInterval, not clearTimeout/clearInterval alone) is a separate flag
+from `uses_graphics` -- a timers-only program never opens a window, and
+a graphics-only program never touches the timer machinery -- but both
+gate the same call in `main()`, now named `festina_run_event_loop`
+(renamed from `festina_graphics_run`, which is what it was called back
+when graphics was the only thing that could ever block there): with
+graphics in use, it multiplexes X11 events and timer deadlines on one
+`select()` call so both an `on click` handler and a `setInterval`
+callback stay responsive together, not just one or the other; without
+graphics, it sleeps until the next timer deadline and fires it, for as
+long as there's still an active timer to wait for, exactly matching
+Node's "exits once the event loop is empty" behavior -- a program that
+only calls setTimeout() exits once every one-shot timeout has fired,
+while one that calls setInterval() and never clears it runs forever,
+exactly like an uncleared setInterval() would in a real JS runtime.
+Verified end to end, including the combined graphics-and-timers case
+(a `setInterval` callback and an `on click` handler both firing while
+the same window stays open) against a real (virtual) X server -- see
+"Why the tests are structured this way" below for
+`tests/test_timers.py`/`TestTimers`.
+
 "Real compilation, minimal setup" stages 1, 2, and 3 -- claude.md #59,
 added alongside these stages to make the requirement explicit rather
 than implicit in the implementation -- are also done (see README.md's
@@ -104,12 +140,13 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 349 tests in this directory pass against it: 342 given a working C
+All 378 tests in this directory pass against it: 370 given a working C
 compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
-too, plus 5 more (`tests/test_codegen.py::TestGraphics`'s interactive
-click/mouse/key/resize tests, plus the one confirming the initial
-`clientWidth`/`clientHeight` values) given `Xvfb`+`xdotool` too -- all
-skip cleanly, independently, without any of those three (see below).
+too, plus 6 more (`tests/test_codegen.py::TestGraphics`'s interactive
+click/mouse/key/resize tests, the one confirming the initial
+`clientWidth`/`clientHeight` values, and `TestTimers`'s combined
+graphics-and-timers test) given `Xvfb`+`xdotool` too -- all skip
+cleanly, independently, without any of those three (see below).
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -313,6 +350,44 @@ runs no window manager to translate `xdotool windowclose` into it
 anything) -- an environment limitation of the test setup, not a gap in
 the app's own (standard) handling of that protocol.
 
+`tests/test_timers.py` covers claude.md #69 (setTimeout/setInterval/
+clearTimeout/clearInterval) at the parser/semantic level: the callback
+must be a bare identifier naming an already-declared, zero-parameter,
+void-returning function (rejecting a variable name, an undeclared name,
+a function with parameters, and a function with a return value, each as
+their own test); the delay argument must be `int`; clearTimeout/
+clearInterval each take exactly one `int` argument and return nothing;
+both setTimeout and setInterval return `int` (a timer id). Almost all of
+`test_codegen.py`'s `TestTimers` needs no display at all -- a
+timers-only program never opens a window (`CodeGen.uses_timers` is
+separate from `uses_graphics`) -- so it mostly uses `compile_and_run`
+like any other runtime-behavior test: a timeout firing once,
+an interval firing repeatedly until `clearInterval`, `clearTimeout`
+cancelling a still-pending callback, a callback scheduling *another*
+timer from inside itself (proving `festina_run_event_loop` recomputes
+the earliest deadline fresh every pass rather than fixing it once at
+loop entry, and that growing the runtime's timer array via `realloc`
+from inside a callback that's itself being called from a loop iterating
+that same array is safe), and a timers-only program actually exiting
+once every timeout has fired. `test_uncleared_interval_keeps_the_program_running`
+is the one case `compile_and_run`'s fixed 15s subprocess timeout can't
+cleanly demonstrate (it would only make the test slow, not prove
+anything a shorter wait doesn't already show), so it drives the
+compiled binary directly instead -- start it in the background, confirm
+it's still alive and still logging after a short wait, then kill it
+directly, the same backgrounded-process pattern `run_graphics_program`
+uses for graphics. `test_timers_and_graphics_work_together` is the one
+test in the class that needs a real display (`x_display`/
+`run_graphics_program`, reusing the `_find_window`/`_wait_for_output`
+helpers this file promoted from `TestGraphics` methods to module-level
+functions once `TestTimers` also needed them): it opens a window with
+both a `setInterval` and an `on click` handler, confirms the interval
+fires on its own, then confirms a real simulated click still dispatches
+correctly *and* the interval keeps firing both before and after it --
+proving `festina_run_event_loop`'s `select()` call is genuinely
+multiplexing both event sources, not just alternating between them or
+starving one.
+
 ## Public API implemented
 
 ```
@@ -429,7 +504,17 @@ festina/
         # global variable would, Scope.define's own "already declared"
         # check rejects a colliding user declaration for free, and the
         # Assign branch above rejects assigning to either one the same
-        # way it already rejects assigning to `.length`.
+        # way it already rejects assigning to `.length`. claude.md #69:
+        # setTimeout/setInterval get their own branch in _infer_call,
+        # checked *before* the generic BUILTIN_FUNCTIONS dispatch below
+        # (not through it), since validating their first argument (a
+        # callback) is structural, not type-based -- it must be an
+        # ast.Identifier resolving to a Symbol with kind == "function",
+        # type is None (void), and an empty node.params (Festina has no
+        # first-class functions/closures, so nothing else was ever a
+        # candidate); both return int (a timer id). clearTimeout/
+        # clearInterval get a simpler adjacent branch: exactly one int
+        # argument, returning nothing.
 
     sqlite_schema.py
         TYPE_MAP: dict[str, str]                        # claude.md #30
@@ -497,13 +582,27 @@ festina/
         # for those five names specifically, records it in
         # self.event_handlers and sets self.uses_graphics; self.uses_graphics
         # (mirroring the pre-existing self.uses_sqlite) gates emitting
-        # festina_graphics_init()/_run() calls around __festina_main() in
-        # _emit_main_and_entry, and self.event_handlers drives emitting
+        # festina_graphics_init()/festina_run_event_loop() calls around
+        # __festina_main() in _emit_main_and_entry, and
+        # self.event_handlers drives emitting
         # festina_register_click_handler/_register_mouse_handler/
         # _register_key_handler/_register_resize_handler/
         # _register_close_handler calls there too -- loadImage() alone
         # deliberately does not set uses_graphics (see
-        # _emit_graphics_call's docstring). Raises
+        # _emit_graphics_call's docstring). claude.md #69:
+        # _emit_timer_call handles setTimeout/setInterval/clearTimeout/
+        # clearInterval -- setTimeout/setInterval's callback argument is
+        # always an ast.Identifier at this point (semantic.py already
+        # checked it structurally), so its LLVM symbol is simply
+        # `@<name>` (from _emit_func), passed straight through as the
+        # `ptr` argument to festina_set_timeout/_set_interval; sets
+        # self.uses_timers, a separate flag from self.uses_graphics
+        # (set only by setTimeout/setInterval, not clearTimeout/
+        # clearInterval alone) since a timers-only program never opens a
+        # window and a graphics-only program never touches the timer
+        # machinery -- but self.uses_graphics *or* self.uses_timers both
+        # gate the same festina_run_event_loop() call in
+        # _emit_main_and_entry. Raises
         # CodegenError (a CompileError subclass, category="not
         # implemented") only for audio (loadAudio) now -- and also
         # (category="not implemented" but a genuine compile-time
@@ -601,8 +700,12 @@ and the fixed function-pointer signature per event -- `void
 (*)(int64_t, int64_t)` for click/mouse, `void (*)(const char *)` for
 key, `void (*)(void)` for resize/close -- that's the whole reason
 claude.md #40's five event handlers are each signature-restricted at
-the semantic.py level above). `festina_graphics_run` blocks in a
-standard Xlib event loop (`Expose` -> re-blit, `ButtonPress`/
+the semantic.py level above). Event dispatch itself lives in a helper,
+`festina_handle_graphics_event` (one already-read `XEvent` in, `0`/`1`
+out signaling whether this was the window-close request) -- factored
+out of what used to be `festina_graphics_run`'s own `while(1)` loop body
+so `festina_run_event_loop` (below) can drive it either as-is or
+interleaved with timer processing: `Expose` -> re-blit, `ButtonPress`/
 `MotionNotify` -> call the registered click/mouse handler if any,
 `KeyPress` -> call the registered key handler if any, with the pressed
 key's text from `XLookupString` for an ordinary printable character or
@@ -611,19 +714,51 @@ key's text from `XLookupString` for an ordinary printable character or
 -> recreate the backing store at the new size (clearing the canvas back
 to white, same as resizing a browser's `<canvas>` element) and call the
 registered resize handler if any, `WM_DELETE_WINDOW` `ClientMessage` ->
-call the registered close handler if any, then clean up and return)
-until the window is closed. `festina_graphics_init` also calls
-`XSetInputFocus` right after mapping the window -- needed for `KeyPress`
-events to reach it at all under a bare Xvfb instance, which (like the
-`WM_DELETE_WINDOW`-forwarding gap noted above) runs no window manager to
-hand focus over the way a real desktop would; harmless either way, since
-a real desktop's WM normally does the same thing itself on click/map.
+call the registered close handler if any and report "stop." Cleanup on
+stop is its own helper too, `festina_graphics_teardown`. `festina_graphics_init`
+also calls `XSetInputFocus` right after mapping the window -- needed for
+`KeyPress` events to reach it at all under a bare Xvfb instance, which
+(like the `WM_DELETE_WINDOW`-forwarding gap noted above) runs no window
+manager to hand focus over the way a real desktop would; harmless either
+way, since a real desktop's WM normally does the same thing itself on
+click/map.
+
+`festina_set_timeout`/`_set_interval` (claude.md #69) each add an entry
+to a dynamic `FestinaTimer` array (`g_timers`, growing via `realloc`,
+compacting out inactive entries first so a program that creates and
+clears many one-shot timeouts over time doesn't grow it unboundedly)
+and return a monotonically increasing `int64_t` id;
+`festina_clear_timeout`/`_clear_interval` are both simply "deactivate
+this id if it exists" (interchangeable, like in JS -- neither throws on
+an unknown or already-fired id). `festina_fire_expired_timers` walks
+that array by index (never caching a `FestinaTimer*` across a
+`callback()` call, since a callback is ordinary Festina code and can
+itself grow/reallocate `g_timers` via another `setTimeout`/`setInterval`,
+or deactivate an entry -- including its own -- via `clearTimeout`/
+`clearInterval`) firing anything whose deadline (`CLOCK_MONOTONIC`,
+via `clock_gettime`) has passed, rescheduling an interval from *now*
+rather than its missed deadline (avoiding a burst of catch-up calls
+after a stall). `festina_run_event_loop` (renamed from
+`festina_graphics_run`, which is what it was called back when graphics
+was the only thing that could ever block there) is what `main()` blocks
+in whenever `CodeGen.uses_graphics` or `CodeGen.uses_timers` -- with a
+window open, it multiplexes X11 events and timer deadlines on one
+`select()` call (`ConnectionNumber(g_display)`, with a timeout computed
+from the earliest pending timer or none at all) so both stay responsive
+together, exiting (and tearing down the window) on close, timers or
+not; without a window, it sleeps until the next deadline (`nanosleep`)
+and fires it, for as long as there's still an active timer to wait for,
+returning once there genuinely isn't one left -- matching Node's "exits
+once the event loop is empty" behavior, including that an uncleared
+`setInterval` keeps a graphics-free program running forever, exactly
+like a real JS runtime, until it's stopped externally or via
+`clearInterval()`.
 
 ## Running
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 342 passed, 7 skipped (needs a C compiler; 2 of
+pytest tests/                          # 370 passed, 8 skipped (needs a C compiler; 2 of
                                         # the skips need `pip install pyinstaller` too,
-                                        # the other 5 need Xvfb + xdotool installed)
+                                        # the other 6 need Xvfb + xdotool installed)
 ```
