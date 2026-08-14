@@ -189,9 +189,10 @@ read-only anyway; for/while loops (`_emit_for`/`_emit_while`) are
 ordinary structured control flow, no different in kind from `_emit_if`.
 No growth, no bounds checking (documented in todo.md as a known gap,
 consistent with #14's performance-first / low-runtime-overhead priority
-in the absence of a spec requirement either way), and no `break`/
-`continue` (claude.md doesn't define either -- the only documented way
-out of a loop body early is `return` from the enclosing function).
+in the absence of a spec requirement either way). `break`/`continue`
+(claude.md #73) target the *nearest* enclosing for/while loop -- see
+self._loop_targets' own comment for why that's a plain stack rather than
+something threaded through ctx the way `terminated` is.
 
 Every arr[T], regardless of T, lowers to the same fixed-size aggregate
 FESTINA_ARRAY_LLVM_TYPE = `%struct._FestinaArray = type { i64, ptr }`
@@ -225,13 +226,37 @@ Using an already-null int or float as an operand in further arithmetic
 is unresolved per #57 --
 NaN naturally propagates through float arithmetic (for free), but
 INT_NULL_CONST is just an ordinary (if extreme) i64 to int arithmetic,
-so it does not propagate the same way. `bool` has the identical "null
-literal for a non-pointer type" problem (verified: same link error) but
-is NOT fixed here -- claude.md never asked for bool-null specifically,
-and fixing it would mean widening bool from i1 to a multi-value
-encoding everywhere bool is stored (fields, params, array elements),
-well beyond the int/float scope this change actually needed. Tracked as
-a known gap in todo.md rather than silently left unmentioned.
+so it does not propagate the same way.
+
+Null for bool: `bool` had the identical "null literal for a non-pointer
+type" problem (verified: same link error) -- fixed the same way, but
+with one extra step int/float didn't need. `bool`'s natural LLVM
+representation, i1, has only two possible bit patterns, both already
+meaningful (0=false, 1=true) -- there is no spare pattern to reserve the
+way i64/double have plenty. So BOOL now lowers to i8 (_llvm_type),
+wide enough for a third reserved value (BOOL_NULL_CONST = 2) while still
+only ever needing 1 byte of storage, same as i1 would have. This widens
+every stored/passed bool value uniformly (variables, struct/table
+fields, array/map elements, function params/returns) -- but a
+comparison or `&&`/`||`/`!` result is still only ever a genuine LLVM i1
+the instant it's produced (icmp/fcmp/xor all require it), so every one
+of those gets a `zext i1 ... to i8` immediately before being treated as
+a "bool value" the rest of codegen deals with, and _bool_cond does the
+inverse (`icmp ne i8 ..., 0`) at the handful of places that need a real
+i1 back to actually branch on (if/while/for conditions, ternary,
+&&/||'s own short-circuit test, !). The five runtime functions that take
+or return a Festina bool (festina_log_bool, festina_str_from_bool,
+festina_str_eq, festina_regex_test, festina_audio_is_playing) already
+declared their C-side parameter/return as `int8_t`, not `_Bool` or `int`
+-- their LLVM `declare`s used to say `i1` anyway (a latent, mostly-
+harmless ABI mismatch that happened to work because only 0/1 were ever
+produced); moving those declares to `i8` alongside this fix corrects
+that too, not just serves the null feature. Using an already-null bool
+as a condition, or as an operand to `!`/`&&`/`||`, is unresolved per
+#57's same "implementation-defined" allowance int/float's own null
+sentinels get -- _bool_cond's own comment covers exactly what happens
+(nonzero, so treated as truthy), which is a consistent, documented
+choice rather than proper defined behavior.
 """
 import struct
 
@@ -264,6 +289,12 @@ FESTINA_MAP_LLVM_TYPE = "%struct._FestinaMap"
 # (see the module docstring's "Null for int/float" note).
 INT_NULL_CONST = "-9223372036854775808"  # i64 minimum
 FLOAT_NULL_CONST = "0x7FF8000000000000"  # a quiet NaN, as a raw double bit pattern
+# See the module docstring's "Null for bool" note: bool widened from i1
+# to i8 specifically to make room for this -- 2 is neither 0 (false) nor
+# 1 (true), and (unlike int/float's sentinels) is already a valid literal
+# for both an i8 and an i64 context as plain text, so no separate
+# "_AS_I64" variant is needed the way FLOAT_NULL_CONST_AS_I64 exists below.
+BOOL_NULL_CONST = "2"
 # claude.md #72: the exact same quiet-NaN bit pattern as FLOAT_NULL_CONST
 # above, spelled as a plain decimal integer instead of LLVM's hex-float
 # literal syntax -- needed because festina_map_get's "value to return if
@@ -291,7 +322,12 @@ class CodegenError(CompileError):
 
 def _llvm_type(t):
     if isinstance(t, types_mod.PrimitiveType):
-        return {"int": "i64", "float": "double", "bool": "i1",
+        # "bool": "i8", not "i1" -- see the module docstring's "Null for
+        # bool" note (BOOL_NULL_CONST needs a third bit pattern i1 can't
+        # provide). A genuine i1 (from icmp/fcmp/xor) is still used
+        # transiently wherever LLVM itself requires one -- see
+        # _bool_cond and every zext-to-i8-immediately-after site.
+        return {"int": "i64", "float": "double", "bool": "i8",
                 "text": "ptr", "blob": "ptr"}[t.name]
     if isinstance(t, types_mod.StructType):
         return "ptr"
@@ -393,6 +429,19 @@ class CodeGen:
                                                 # (festina.imports.build_program already extracted and
                                                 # validated its *position*; see _emit_main_and_entry
                                                 # for where this actually gets evaluated)
+        self._loop_targets = []                # stack of (continue_label, break_label) for the
+                                                # innermost currently-being-emitted for/while loop --
+                                                # claude.md #73: break/continue always target the
+                                                # *nearest* enclosing loop, so this is a plain stack,
+                                                # pushed/popped around each loop body's own emission
+                                                # (_emit_while/_emit_for), not threaded through ctx --
+                                                # it needs to keep working unchanged through arbitrarily
+                                                # nested if/block statements inside that body, which is
+                                                # exactly what a shared instance-level stack gives for
+                                                # free. semantic.py has already rejected a break/continue
+                                                # outside any loop by the time codegen runs, so this
+                                                # being empty here would only ever fire on a compiler bug
+                                                # -- see _emit_stmt's own defensive check.
         self._regex_lit_cache = {}             # id(ast.RegexLit node) -> its private cache global's
                                                 # name -- see _emit_cached_regex_lit; keyed by node
                                                 # identity (not pattern text) so two textually
@@ -506,14 +555,20 @@ class CodeGen:
         return [
             "declare void @festina_log_int(i64)",
             "declare void @festina_log_float(double)",
-            "declare void @festina_log_bool(i1)",
+            # i8, not i1 -- see the module docstring's "Null for bool"
+            # note. Every one of the i8-typed bool declares below matches
+            # this runtime function's own C signature exactly (int8_t,
+            # not _Bool/int) -- these used to say i1 despite that, a
+            # latent ABI mismatch that happened to work only because 0/1
+            # were the only values ever produced.
+            "declare void @festina_log_bool(i8)",
             "declare void @festina_log_text(ptr)",
             "declare void @festina_fail(ptr)",
             "declare ptr @festina_str_from_int(i64)",
             "declare ptr @festina_str_from_float(double)",
-            "declare ptr @festina_str_from_bool(i1)",
+            "declare ptr @festina_str_from_bool(i8)",
             "declare ptr @festina_str_concat(ptr, ptr)",
-            "declare i1 @festina_str_eq(ptr, ptr)",
+            "declare i8 @festina_str_eq(ptr, ptr)",
             # claude.md #70: DatabaseURL -- path is festina.sqlite's
             # location, NULL/empty meaning "use the default" (a plain
             # string constant already covers the no-directive case, so
@@ -531,10 +586,10 @@ class CodeGen:
             "declare void @festina_sqlite_collect_rows(ptr, i32, ptr, ptr, ptr)",
             # claude.md #67-68: regex(), .test(), .match(), .replace()/.replaceAll().
             "declare ptr @festina_regex_compile(ptr, ptr)",
-            "declare i1 @festina_regex_test(ptr, ptr)",
+            "declare i8 @festina_regex_test(ptr, ptr)",
             "declare ptr @festina_regex_match(ptr, ptr)",
-            "declare ptr @festina_str_replace(ptr, ptr, ptr, i1)",
-            "declare ptr @festina_regex_replace(ptr, ptr, ptr, i1)",
+            "declare ptr @festina_str_replace(ptr, ptr, ptr, i8)",
+            "declare ptr @festina_regex_replace(ptr, ptr, ptr, i8)",
             # claude.md #37, #39, #40: img, graphics functions, click/mouse events.
             "declare void @festina_graphics_init()",
             "declare void @festina_run_event_loop()",
@@ -566,7 +621,7 @@ class CodeGen:
             "declare ptr @festina_load_audio(ptr)",
             "declare void @festina_audio_play(ptr)",
             "declare void @festina_audio_stop(ptr)",
-            "declare i1 @festina_audio_is_playing(ptr)",
+            "declare i8 @festina_audio_is_playing(ptr)",
             "declare ptr @malloc(i64)",
             "declare ptr @calloc(i64, i64)",
             # claude.md #71: environment.NAME / environment[keyExpr].
@@ -629,7 +684,7 @@ class CodeGen:
 
     def _zero_value(self, type_):
         llvm_ty = _llvm_type(type_)
-        if llvm_ty in ("i64", "i1"):
+        if llvm_ty in ("i64", "i1", "i8"):
             return "0"
         if llvm_ty == "double":
             return "0.0"
@@ -833,6 +888,28 @@ class CodeGen:
         if isinstance(stmt, ast.ForStmt):
             self._emit_for(stmt, env, return_type, ctx)
             return
+        if isinstance(stmt, ast.BreakStmt):
+            # semantic.py already rejects this outside any loop, so an
+            # empty stack here would mean a compiler bug, not bad source.
+            if not self._loop_targets:
+                raise CodegenError("'break' outside a loop", file=self.filename,
+                                    line=stmt.line, column=stmt.column)
+            _, break_label = self._loop_targets[-1]
+            lines.append(f"  br label %{break_label}")
+            ctx["terminated"] = True
+            return
+        if isinstance(stmt, ast.ContinueStmt):
+            if not self._loop_targets:
+                raise CodegenError("'continue' outside a loop", file=self.filename,
+                                    line=stmt.line, column=stmt.column)
+            # for a `for` loop this is the update block, not the
+            # condition block directly -- claude.md #60's step order
+            # still runs the update expression before the next check,
+            # exactly like a normal iteration would; see _emit_for.
+            continue_label, _ = self._loop_targets[-1]
+            lines.append(f"  br label %{continue_label}")
+            ctx["terminated"] = True
+            return
         if isinstance(stmt, ast.Block):
             inner = self._emit_block(stmt, env, return_type, lines)
             ctx["terminated"] = inner["terminated"]
@@ -844,10 +921,11 @@ class CodeGen:
     def _emit_if(self, stmt, env, return_type, ctx):
         lines = ctx["lines"]
         cond_val, _ = self._emit_expr(stmt.test, env, lines)
+        cond = self._bool_cond(cond_val, lines)
         then_label = self.label("if.then")
         else_label = self.label("if.else")
         end_label = self.label("if.end")
-        lines.append(f"  br i1 {cond_val}, label %{then_label}, label %{else_label}")
+        lines.append(f"  br i1 {cond}, label %{then_label}, label %{else_label}")
 
         self._start_block(then_label, lines)
         then_ctx = self._emit_block(stmt.then, env, return_type, lines)
@@ -885,10 +963,17 @@ class CodeGen:
         lines.append(f"  br label %{cond_label}")
         self._start_block(cond_label, lines)
         cond_val, _ = self._emit_expr(stmt.test, env, lines)
-        lines.append(f"  br i1 {cond_val}, label %{body_label}, label %{end_label}")
+        cond = self._bool_cond(cond_val, lines)
+        lines.append(f"  br i1 {cond}, label %{body_label}, label %{end_label}")
 
         self._start_block(body_label, lines)
-        body_ctx = self._emit_block(stmt.body, env, return_type, lines)
+        # claude.md #73: continue re-checks the condition directly (no
+        # update expression for a while loop); break exits past end_label.
+        self._loop_targets.append((cond_label, end_label))
+        try:
+            body_ctx = self._emit_block(stmt.body, env, return_type, lines)
+        finally:
+            self._loop_targets.pop()
         if not body_ctx["terminated"]:
             lines.append(f"  br label %{cond_label}")
 
@@ -913,10 +998,19 @@ class CodeGen:
         lines.append(f"  br label %{cond_label}")
         self._start_block(cond_label, lines)
         cond_val, _ = self._emit_expr(stmt.test, loop_env, lines)
-        lines.append(f"  br i1 {cond_val}, label %{body_label}, label %{end_label}")
+        cond = self._bool_cond(cond_val, lines)
+        lines.append(f"  br i1 {cond}, label %{body_label}, label %{end_label}")
 
         self._start_block(body_label, lines)
-        body_ctx = self._emit_block(stmt.body, loop_env, return_type, lines)
+        # claude.md #73: continue for a `for` loop still runs the update
+        # expression before the next condition check -- routing it to
+        # update_label (not cond_label directly) gives that for free,
+        # same as a normal fall-through iteration.
+        self._loop_targets.append((update_label, end_label))
+        try:
+            body_ctx = self._emit_block(stmt.body, loop_env, return_type, lines)
+        finally:
+            self._loop_targets.pop()
         if not body_ctx["terminated"]:
             lines.append(f"  br label %{update_label}")
 
@@ -942,6 +1036,21 @@ class CodeGen:
         # None or NULL-ish) or an unconstrained builtin return (e.g.
         # sqlite()) flowing into a concretely-typed slot.
         return val
+
+    def _bool_cond(self, val, lines):
+        """Narrows an already-emitted BOOL value (i8 -- see the module
+        docstring's "Null for bool" note) down to a genuine i1, the only
+        type LLVM's `br` ever accepts. Used at every place a Festina
+        condition actually becomes a branch: if/while/for, ternary,
+        &&/||'s own short-circuit test, and `!`. Treats the reserved null
+        sentinel (BOOL_NULL_CONST, nonzero) as truthy -- using an
+        already-null bool as a condition is unresolved, same allowance
+        claude.md #57 already gives int/float's own null sentinels in
+        further arithmetic; this is a documented, consistent choice, not
+        a claim that it's meaningful."""
+        out = self.tmp()
+        lines.append(f"  {out} = icmp ne i8 {val}, 0")
+        return out
 
     def _emit_expr(self, expr, env, lines):
         if isinstance(expr, ast.NumberLit):
@@ -1102,7 +1211,7 @@ class CodeGen:
         elif type_ == FLOAT:
             lines.append(f"  {out} = call ptr @festina_str_from_float(double {val})")
         elif type_ == BOOL:
-            lines.append(f"  {out} = call ptr @festina_str_from_bool(i1 {val})")
+            lines.append(f"  {out} = call ptr @festina_str_from_bool(i8 {val})")
         else:
             raise CodegenError(f"cannot interpolate a value of type {types_mod.type_name(type_)}")
         return out
@@ -1115,7 +1224,8 @@ class CodeGen:
         bare `null` literal pick the right runtime encoding (claude.md
         #10/#25/#57): "null" the LLVM keyword for text/blob/struct/array
         (all pointer-backed), but the reserved sentinel constants for
-        int/float, which have no spare bit pattern for a real null."""
+        int/float/bool, none of which have a spare bit pattern for a
+        real null (see the module docstring)."""
         if isinstance(node, ast.ArrayLit):
             return self._emit_array_lit(node, env, lines, expected_type)
         if isinstance(node, ast.MapLit):
@@ -1125,6 +1235,8 @@ class CodeGen:
                 return INT_NULL_CONST, INT
             if expected_type == FLOAT:
                 return FLOAT_NULL_CONST, FLOAT
+            if expected_type == BOOL:
+                return BOOL_NULL_CONST, BOOL
             return "null", expected_type
         if isinstance(node, ast.Call):
             # sqlite()'s codegen needs to know the *declared* target type
@@ -1259,8 +1371,8 @@ class CodeGen:
         out = self.tmp()
         if llvm_ty == "double":
             lines.append(f"  {out} = bitcast double {val} to i64")
-        elif llvm_ty == "i1":
-            lines.append(f"  {out} = zext i1 {val} to i64")
+        elif llvm_ty == "i8":
+            lines.append(f"  {out} = zext i8 {val} to i64")
         else:  # "ptr" -- text/blob/struct/table/img/aud/regex all lower to ptr
             lines.append(f"  {out} = ptrtoint ptr {val} to i64")
         return out
@@ -1276,8 +1388,8 @@ class CodeGen:
         out = self.tmp()
         if llvm_ty == "double":
             lines.append(f"  {out} = bitcast i64 {raw} to double")
-        elif llvm_ty == "i1":
-            lines.append(f"  {out} = trunc i64 {raw} to i1")
+        elif llvm_ty == "i8":
+            lines.append(f"  {out} = trunc i64 {raw} to i8")
         else:  # "ptr"
             lines.append(f"  {out} = inttoptr i64 {raw} to ptr")
         return out
@@ -1296,12 +1408,13 @@ class CodeGen:
             return INT_NULL_CONST
         if llvm_ty == "double":
             return FLOAT_NULL_CONST_AS_I64
-        # "ptr" (NULL is already 0, exactly Festina's own null-for-text/
-        # blob/struct/etc. the same way it is everywhere else) and "i1"
-        # (bool has no null representation at all yet -- see todo.md;
-        # this falls back to plain 0/false, the same zero-value an
-        # uninitialized bool slot already gets elsewhere, not a new
-        # invented behavior) both use plain 0.
+        if llvm_ty == "i8":
+            # BOOL_NULL_CONST ("2") is already a valid i64-context literal
+            # as-is -- see its own comment for why no separate "_AS_I64"
+            # variant is needed the way FLOAT_NULL_CONST_AS_I64 exists.
+            return BOOL_NULL_CONST
+        # "ptr" -- NULL is already 0, exactly Festina's own null-for-text/
+        # blob/struct/etc. the same way it is everywhere else.
         return "0"
 
     def _emit_map_get(self, obj_val, value_type, key_val, lines):
@@ -1486,10 +1599,11 @@ class CodeGen:
 
     def _emit_ternary(self, expr, env, lines):
         cond_val, _ = self._emit_expr(expr.test, env, lines)
+        cond = self._bool_cond(cond_val, lines)
         then_label = self.label("tern.then")
         else_label = self.label("tern.else")
         end_label = self.label("tern.end")
-        lines.append(f"  br i1 {cond_val}, label %{then_label}, label %{else_label}")
+        lines.append(f"  br i1 {cond}, label %{then_label}, label %{else_label}")
 
         self._start_block(then_label, lines)
         cons_val, cons_type = self._emit_expr(expr.cons, env, lines)
@@ -1508,7 +1622,8 @@ class CodeGen:
         return out, cons_type
 
     def _emit_logical(self, expr, env, lines):
-        left_val, _ = self._emit_expr(expr.left, env, lines)
+        left_val, _ = self._emit_expr(expr.left, env, lines)  # i8 BOOL value
+        left_cond = self._bool_cond(left_val, lines)
         rhs_label = self.label("logic.rhs")
         end_label = self.label("logic.end")
         start_label = self.label("logic.start")
@@ -1520,29 +1635,66 @@ class CodeGen:
         lines.append(f"  br label %{start_label}")
         self._start_block(start_label, lines)
         if expr.op == "&&":
-            lines.append(f"  br i1 {left_val}, label %{rhs_label}, label %{end_label}")
+            lines.append(f"  br i1 {left_cond}, label %{rhs_label}, label %{end_label}")
         else:
-            lines.append(f"  br i1 {left_val}, label %{end_label}, label %{rhs_label}")
+            lines.append(f"  br i1 {left_cond}, label %{end_label}, label %{rhs_label}")
         self._start_block(rhs_label, lines)
-        right_val, _ = self._emit_expr(expr.right, env, lines)
+        right_val, _ = self._emit_expr(expr.right, env, lines)  # i8 BOOL value
         rhs_pred = self.cur_block  # may differ from rhs_label if expr.right had its own branches
         lines.append(f"  br label %{end_label}")
         self._start_block(end_label, lines)
         out = self.tmp()
-        lines.append(f"  {out} = phi i1 [ {left_val}, %{start_label} ], [ {right_val}, %{rhs_pred} ]")
+        # phi over the actual i8 BOOL values (left_val/right_val), not
+        # left_cond -- the short-circuited result is whichever *value*
+        # won, same as JS/&&/|| semantics generally, not a freshly
+        # recomputed true/false.
+        lines.append(f"  {out} = phi i8 [ {left_val}, %{start_label} ], [ {right_val}, %{rhs_pred} ]")
         return out, BOOL
 
     def _emit_binop(self, expr, env, lines):
-        left_val, left_type = self._emit_expr(expr.left, env, lines)
-        right_val, right_type = self._emit_expr(expr.right, env, lines)
+        # A bare `null` literal compared against a concretely-typed int/
+        # float/bool operand (e.g. `x == null`) needs that operand's own
+        # null sentinel (INT_NULL_CONST/FLOAT_NULL_CONST/BOOL_NULL_CONST),
+        # not the generic LLVM `null` keyword _emit_expr's own NullLit
+        # branch produces unconditionally -- `null` is only valid IR for
+        # a pointer type, so `icmp eq i64 %x, null` is itself invalid IR
+        # (verified) regardless of what the *other* operand's value is.
+        # Routing the null side through _emit_value_for, with the other
+        # (already-emitted) operand's type as context, is exactly the
+        # same "does this position have a declared type to pick a null
+        # encoding from" pattern _emit_value_for already exists for (var
+        # decls, params, returns) -- a binary comparison is just one more
+        # such position. Only applies when exactly one side is a literal
+        # null; `null == null` has no type context on *either* side to
+        # infer from and stays unresolved, same as before this fix (an
+        # exceedingly rare, not obviously meaningful expression to begin
+        # with -- claude.md #54's ambiguity rule, same as this file's
+        # other deliberately-left corner cases).
+        if isinstance(expr.right, ast.NullLit) and not isinstance(expr.left, ast.NullLit):
+            left_val, left_type = self._emit_expr(expr.left, env, lines)
+            right_val, right_type = self._emit_value_for(expr.right, env, lines, left_type)
+        elif isinstance(expr.left, ast.NullLit) and not isinstance(expr.right, ast.NullLit):
+            right_val, right_type = self._emit_expr(expr.right, env, lines)
+            left_val, left_type = self._emit_value_for(expr.left, env, lines, right_type)
+        else:
+            left_val, left_type = self._emit_expr(expr.left, env, lines)
+            right_val, right_type = self._emit_expr(expr.right, env, lines)
 
         if left_type == TEXT or right_type == TEXT:
             if expr.op in ("==", "!="):
                 out = self.tmp()
-                lines.append(f"  {out} = call i1 @festina_str_eq(ptr {left_val}, ptr {right_val})")
+                # i8, matching festina_str_eq's updated declare -- this
+                # is already the final BOOL value, no zext needed, unlike
+                # the icmp/fcmp path below (festina_str_eq only ever
+                # produces 0 or 1, never BOOL_NULL_CONST).
+                lines.append(f"  {out} = call i8 @festina_str_eq(ptr {left_val}, ptr {right_val})")
                 if expr.op == "!=":
                     neg = self.tmp()
-                    lines.append(f"  {neg} = xor i1 {out}, 1")
+                    # A plain xor still flips 0<->1 correctly at i8 width
+                    # -- out is guaranteed exactly 0 or 1 (see above), so
+                    # this needs no icmp/zext round trip the way a
+                    # genuine i1 source would.
+                    lines.append(f"  {neg} = xor i8 {out}, 1")
                     return neg, BOOL
                 return out, BOOL
             if expr.op == "+":
@@ -1581,11 +1733,17 @@ class CodeGen:
             lines.append(f"  {out} = {op} {ty} {left_val}, {right_val}")
             return out, (FLOAT if use_float else INT)
         if expr.op in icmp:
+            # icmp/fcmp always produce a genuine i1 (LLVM has no other
+            # option) -- that's an intermediate here, not the final BOOL
+            # value, so it gets its own tmp and an immediate zext into
+            # `out` (i8) rather than being returned directly.
+            cmp_out = self.tmp()
             if use_float:
-                lines.append(f"  {out} = fcmp {fcmp[expr.op]} double {left_val}, {right_val}")
+                lines.append(f"  {cmp_out} = fcmp {fcmp[expr.op]} double {left_val}, {right_val}")
             else:
-                ty = "i64" if left_type != BOOL else "i1"
-                lines.append(f"  {out} = icmp {icmp[expr.op]} {ty} {left_val}, {right_val}")
+                ty = "i64" if left_type != BOOL else "i8"
+                lines.append(f"  {cmp_out} = icmp {icmp[expr.op]} {ty} {left_val}, {right_val}")
+            lines.append(f"  {out} = zext i1 {cmp_out} to i8")
             return out, BOOL
         raise CodegenError(f"unsupported operator '{expr.op}'", file=self.filename, line=expr.line)
 
@@ -1629,7 +1787,15 @@ class CodeGen:
         val, vtype = self._emit_expr(expr.operand, env, lines)
         out = self.tmp()
         if expr.op == "!":
-            lines.append(f"  {out} = xor i1 {val}, 1")
+            # val is i8 (see _llvm_type) -- narrow to a genuine i1 first
+            # (same _bool_cond every other condition uses, so `!` treats
+            # an already-null bool the same "nonzero is truthy" way a
+            # bare `if x` would), negate, then widen the result back to
+            # the i8 every BOOL value is represented as.
+            cond = self._bool_cond(val, lines)
+            negated = self.tmp()
+            lines.append(f"  {negated} = xor i1 {cond}, 1")
+            lines.append(f"  {out} = zext i1 {negated} to i8")
             return out, BOOL
         if expr.op == "-":
             if vtype == FLOAT:
@@ -1752,7 +1918,7 @@ class CodeGen:
                 if obj_type == REGEX:
                     arg_val, _ = self._emit_expr(expr.args[0], env, lines)
                     out = self.tmp()
-                    lines.append(f"  {out} = call i1 @festina_regex_test(ptr {obj_val}, ptr {arg_val})")
+                    lines.append(f"  {out} = call i8 @festina_regex_test(ptr {obj_val}, ptr {arg_val})")
                     return out, BOOL
             # claude.md #68: value.match(pattern:regex) -> text (or null)
             if callee.prop == "match":
@@ -1774,7 +1940,7 @@ class CodeGen:
                     if search_type == REGEX:
                         lines.append(
                             f"  {out} = call ptr @festina_regex_replace(ptr {search_val}, ptr {obj_val}, "
-                            f"ptr {replacement_val}, i1 {replace_all})"
+                            f"ptr {replacement_val}, i8 {replace_all})"
                         )
                     else:
                         # search_type is TEXT, or None from a bare `null`
@@ -1782,7 +1948,7 @@ class CodeGen:
                         # search pointer defensively -- see the runtime).
                         lines.append(
                             f"  {out} = call ptr @festina_str_replace(ptr {obj_val}, ptr {search_val}, "
-                            f"ptr {replacement_val}, i1 {replace_all})"
+                            f"ptr {replacement_val}, i8 {replace_all})"
                         )
                     return out, TEXT
             # claude.md #38: music.play() / music.stop() / music.isPlaying()
@@ -1800,7 +1966,7 @@ class CodeGen:
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if obj_type == AUDIO:
                     out = self.tmp()
-                    lines.append(f"  {out} = call i1 @festina_audio_is_playing(ptr {obj_val})")
+                    lines.append(f"  {out} = call i8 @festina_audio_is_playing(ptr {obj_val})")
                     return out, BOOL
             # claude.md #72: npcHealths.forEach(callback)
             if callee.prop == "forEach":
@@ -2093,8 +2259,12 @@ class CodeGen:
                 lines.append(f"  call void @festina_sqlite_bind_text(ptr {stmt_val}, i32 {idx}, ptr {val})")
             elif vtype == BOOL:
                 # claude.md #30: bool maps to SQLite INTEGER, same as int.
+                # An already-null bool (BOOL_NULL_CONST) binds as plain
+                # 2 here rather than a real SQL NULL -- same "unresolved"
+                # territory as using one in further boolean logic (see
+                # the module docstring), not a new special case.
                 z = self.tmp()
-                lines.append(f"  {z} = zext i1 {val} to i64")
+                lines.append(f"  {z} = zext i8 {val} to i64")
                 lines.append(f"  call void @festina_sqlite_bind_int(ptr {stmt_val}, i32 {idx}, i64 {z})")
             else:
                 raise CodegenError(

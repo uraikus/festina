@@ -146,6 +146,28 @@ class ForStmt(Node):
         self.column = column
 
 
+class BreakStmt(Node):
+    """claude.md #73: exits the nearest enclosing for/while loop
+    immediately. No value, no target label -- Festina has no labeled
+    break the way some JS-inspired languages do (unspecified, so not
+    invented -- claude.md #54)."""
+
+    def __init__(self, line=0, column=0):
+        self.line = line
+        self.column = column
+
+
+class ContinueStmt(Node):
+    """claude.md #73: skips directly to the next iteration of the
+    nearest enclosing for/while loop -- for a `for` loop this still runs
+    the update expression first (claude.md #60's own step order), same
+    as continue's JS/C meaning."""
+
+    def __init__(self, line=0, column=0):
+        self.line = line
+        self.column = column
+
+
 # ---- expressions ----
 
 class Identifier(Node):

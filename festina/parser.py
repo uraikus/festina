@@ -178,6 +178,10 @@ class Parser:
             return self.parse_for()
         if t.type == "return":
             return self.parse_return()
+        if t.type == "break":
+            return self.parse_break()
+        if t.type == "continue":
+            return self.parse_continue()
         if t.type == "func":
             raise self.err(t, "invalid function declaration",
                             "functions require an explicit return type, e.g. 'text func name() { }'")
@@ -349,6 +353,20 @@ class Parser:
             value = self.parse_expression()
         self._semi()
         return ast.Return(value, t.line, t.column)
+
+    def parse_break(self):
+        # claude.md #73: a bare keyword, no value -- validated as
+        # actually being inside a loop by semantic.py, not here (the
+        # parser has no notion of "inside a loop", same division of
+        # labor as every other semantic-level check in this compiler).
+        t = self.eat("break")
+        self._semi()
+        return ast.BreakStmt(t.line, t.column)
+
+    def parse_continue(self):
+        t = self.eat("continue")
+        self._semi()
+        return ast.ContinueStmt(t.line, t.column)
 
     # ---- expressions ----
     def parse_expression(self):

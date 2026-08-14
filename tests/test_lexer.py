@@ -10,6 +10,7 @@ RESERVED_WORDS = [
     "import", "if", "else", "on", "fail", "log", "sqlite",
     "for", "while",  # claude.md #60, #61
     "map",  # claude.md #72
+    "break", "continue",  # claude.md #73
 ]
 
 
