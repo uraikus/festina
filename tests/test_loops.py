@@ -66,6 +66,65 @@ class TestWhileLoopSyntax:
         semantic.analyze(program)
 
 
+class TestBreakAndContinue:
+    """claude.md #73: break/continue, valid only inside a for/while loop,
+    targeting the nearest enclosing one."""
+
+    def test_break_in_a_for_loop_parses(self, parser, semantic):
+        source = "for int i = 0, i < 10, i++ {\n    break\n}"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_continue_in_a_for_loop_parses(self, parser, semantic):
+        source = "for int i = 0, i < 10, i++ {\n    continue\n}"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_break_in_a_while_loop_parses(self, parser, semantic):
+        source = "while true {\n    break\n}"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_continue_in_a_while_loop_parses(self, parser, semantic):
+        source = "while true {\n    continue\n}"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_break_inside_an_if_inside_a_loop_parses(self, parser, semantic):
+        # break/continue reach through if/block nesting to the nearest
+        # *loop*, not just their immediately enclosing block.
+        source = "for int i = 0, i < 10, i++ {\n    if i == 5 {\n        break\n    }\n}"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_break_outside_any_loop_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("break")
+        with pytest.raises(errors.CompileError, match="'break' can only be used inside a for/while loop"):
+            semantic.analyze(program)
+
+    def test_continue_outside_any_loop_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("continue")
+        with pytest.raises(errors.CompileError, match="'continue' can only be used inside a for/while loop"):
+            semantic.analyze(program)
+
+    def test_break_inside_an_if_but_outside_any_loop_is_still_a_compile_error(self, parser, semantic, errors):
+        # An if isn't a loop -- being nested inside one doesn't excuse it.
+        source = "if true {\n    break\n}"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match="'break' can only be used"):
+            semantic.analyze(program)
+
+    def test_break_inside_a_function_declared_outside_any_loop_is_a_compile_error(self, parser, semantic, errors):
+        # A function's own body starts its own loop context -- it can
+        # never inherit "inside a loop" from wherever it happens to be
+        # declared (functions aren't declared inside loop bodies in
+        # practice, but the body's own statements are what matters here).
+        source = "void func f() {\n    break\n}"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match="'break' can only be used"):
+            semantic.analyze(program)
+
+
 class TestArrayLength:
     """claude.md #63: every array has a built-in read-only `.length`."""
 

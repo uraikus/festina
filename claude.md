@@ -1723,3 +1723,30 @@ void func logHealth(h:int, key:text) {
 }
 
 npcHealths.forEach(logHealth)
+
+
+73. BREAK AND CONTINUE
+
+break exits the nearest enclosing for or while loop immediately. No further statements in the loop body run, and the loop's condition is not checked again.
+
+continue skips directly to the next iteration of the nearest enclosing for or while loop. For a for loop, the update expression still runs before the condition is checked again, the same as it would at the end of a normal iteration; for a while loop, continue goes straight to the condition check.
+
+Using break or continue outside of a for or while loop is a compile error.
+
+break and continue only affect the nearest enclosing loop. A loop nested inside another loop's body is unaffected by a break or continue in the outer loop, and vice versa.
+
+Example:
+
+for int i = 0, i < 10, i++ {
+    if i == 5 {
+        break
+    }
+    if i % 2 == 0 {
+        continue
+    }
+    log(i)
+}
+
+This logs 1, 3.
+
+There is no labeled break or continue targeting an outer loop specifically -- only return from the enclosing function can exit more than one loop at once.

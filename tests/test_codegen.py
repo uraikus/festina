@@ -619,9 +619,10 @@ class TestLoops:
         assert result.stdout.strip() == "after"
 
     def test_while_true_exits_via_return_inside_the_loop(self, compile_and_run):
-        # claude.md has no `break`/`continue` -- the only documented way
-        # out of an infinite loop's body is `return` from the enclosing
-        # function (see festina/codegen.py's module docstring).
+        # `return` from the enclosing function still works as a way out
+        # of an infinite loop's body too, same as before claude.md #73
+        # added break/continue -- this isn't the only way out anymore
+        # (see TestBreakAndContinue below), just still a valid one.
         source = """
         void func run() {
             int count = 0
@@ -677,6 +678,133 @@ class TestLoops:
         """
         result = compile_and_run(source)
         assert result.stdout.splitlines() == ["55", "6765"]
+
+
+class TestBreakAndContinue:
+    """claude.md #73."""
+
+    def test_break_stops_the_loop_immediately(self, compile_and_run):
+        source = """
+        for int i = 0, i < 10, i++ {
+            if i == 5 {
+                break
+            }
+            log(i)
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "1", "2", "3", "4"]
+
+    def test_continue_skips_the_rest_of_that_iteration(self, compile_and_run):
+        source = """
+        for int i = 0, i < 5, i++ {
+            if i % 2 == 0 {
+                continue
+            }
+            log(i)
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "3"]
+
+    def test_claude_mds_own_worked_example(self, compile_and_run):
+        # claude.md #73's own example: "This logs 1, 3."
+        source = """
+        for int i = 0, i < 10, i++ {
+            if i == 5 {
+                break
+            }
+            if i % 2 == 0 {
+                continue
+            }
+            log(i)
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "3"]
+
+    def test_continue_in_a_for_loop_still_runs_the_update_expression(self, compile_and_run):
+        # claude.md #73: "the update expression still runs before the
+        # condition is checked again" -- if continue skipped straight to
+        # the condition instead, i would never advance and this would
+        # loop forever (or time out); it doesn't.
+        source = """
+        for int i = 0, i < 5, i++ {
+            continue
+        }
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "done"
+
+    def test_break_in_a_while_loop(self, compile_and_run):
+        source = """
+        int i = 0
+        while true {
+            if i >= 3 {
+                break
+            }
+            log(i)
+            i++
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "1", "2"]
+
+    def test_continue_in_a_while_loop(self, compile_and_run):
+        source = """
+        int i = 0
+        while i < 5 {
+            i++
+            if i % 2 == 0 {
+                continue
+            }
+            log(i)
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "3", "5"]
+
+    def test_break_only_exits_the_innermost_loop(self, compile_and_run):
+        source = """
+        for int i = 0, i < 3, i++ {
+            for int j = 0, j < 3, j++ {
+                if j == 1 {
+                    break
+                }
+                log(`${i},${j}`)
+            }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0,0", "1,0", "2,0"]
+
+    def test_continue_only_affects_the_innermost_loop(self, compile_and_run):
+        source = """
+        for int i = 0, i < 2, i++ {
+            for int j = 0, j < 3, j++ {
+                if j == 1 {
+                    continue
+                }
+                log(`${i},${j}`)
+            }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0,0", "0,2", "1,0", "1,2"]
+
+    def test_statements_after_break_in_the_same_block_are_not_run(self, compile_and_run):
+        source = """
+        for int i = 0, i < 3, i++ {
+            if i == 1 {
+                break
+                log('unreachable')
+            }
+            log(i)
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0"]
 
 
 def _find_window(display, timeout=20):
@@ -1526,6 +1654,89 @@ class TestNumericConversion:
         result = compile_and_run("int a = null\nfloat b = null\nlog('assigned fine')")
         assert result.returncode == 0
         assert result.stdout.strip() == "assigned fine"
+
+    def test_null_bool_assignment(self, compile_and_run):
+        # Regression test: same "null is only valid IR for a pointer
+        # type" link failure as int/float, but bool needed one extra
+        # step to fix -- see festina/codegen.py's module docstring's
+        # "Null for bool" note (bool widened from i1 to i8 to make room
+        # for a third, reserved value).
+        result = compile_and_run("bool a = null\nlog('assigned fine')")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "assigned fine"
+
+    def test_comparing_a_null_int_against_the_null_literal(self, compile_and_run):
+        # Regression test, found alongside the bool-null fix: `x == null`
+        # for a concretely-typed int/float/bool operand used to reach
+        # codegen as `icmp eq i64 %x, null` -- also invalid IR (null is
+        # only valid for a pointer type), independent of bool at all.
+        result = compile_and_run("int a = 1 / 0\nlog(a == null)")
+        assert result.stdout.strip() == "true"
+
+    def test_comparing_a_non_null_int_against_the_null_literal(self, compile_and_run):
+        result = compile_and_run("int a = 5\nlog(a == null)")
+        assert result.stdout.strip() == "false"
+
+    def test_comparing_a_null_float_against_the_null_literal(self, compile_and_run):
+        # Unlike int/bool, this is "false", not "true" -- FLOAT_NULL_CONST
+        # is a real NaN, and IEEE-754's `oeq`/`one` ("ordered" compares,
+        # which is what claude.md's == / != already lower to -- see
+        # _emit_binop's fcmp dict) are false for *any* comparison
+        # involving NaN, including a NaN compared with itself. This test
+        # exists to confirm the fix at least compiles/runs cleanly now
+        # (it used to be an LLVM IR parse error -- see the int case
+        # above) -- not to claim float null-checking via == is reliable
+        # the way it is for int/bool, which it structurally can't be
+        # without changing every == / != to unordered compares, a
+        # separate, unrelated design decision this fix doesn't make.
+        result = compile_and_run("float a = 1.0 / 0.0\nlog(a == null)")
+        assert result.stdout.strip() == "false"
+
+    def test_comparing_a_null_bool_against_the_null_literal(self, compile_and_run):
+        result = compile_and_run("bool a = null\nlog(a == null)")
+        assert result.stdout.strip() == "true"
+
+    def test_comparing_a_non_null_bool_against_the_null_literal(self, compile_and_run):
+        result = compile_and_run("bool a = true\nlog(a == null)")
+        assert result.stdout.strip() == "false"
+
+    def test_null_bool_survives_a_function_call_round_trip(self, compile_and_run):
+        source = """
+        bool func identity(b:bool) {
+            return b
+        }
+        log(identity(null) == null)
+        log(identity(false) == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_null_bool_struct_field(self, compile_and_run):
+        source = """
+        struct Flag { value:bool }
+        Flag f
+        f.value = null
+        log(f.value == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+
+    def test_ordinary_bool_logic_is_unaffected_by_the_widened_representation(self, compile_and_run):
+        # claude.md #21/#22-ish sanity check: none of &&/||/!/==/!= on
+        # ordinary (non-null) bool values should have changed behavior
+        # just because the underlying storage widened from i1 to i8.
+        source = """
+        bool a = true
+        bool b = false
+        log(a && b)
+        log(a || b)
+        log(!a)
+        log(!b)
+        log(a == b)
+        log(a != b)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["false", "true", "false", "true", "false", "true"]
 
     def test_float_literal_needing_scientific_notation(self, compile_and_run):
         # Regression test: _format_double used repr(), which switches to

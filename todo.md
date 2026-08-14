@@ -97,6 +97,60 @@ it yet. First step is likely a `claude.md` addition (the spec has led
 every feature built so far, including this one's own audit process) and
 a benchmarks addition once real (server) benchmarks are possible.
 
+## Memory management
+
+`claude.md #43` promises "automatic memory management" — the compiler
+should "automatically release or reclaim memory when values are no
+longer reachable." Today, arrays and struct storage are heap-allocated
+(`malloc`/`calloc`) and never freed at all — a real resource leak in any
+long-running program, though not a memory-safety issue on its own (see
+[security.md](security.md)'s "known, accepted memory-management gap"
+note: no use-after-free, no double-free, since nothing is ever freed).
+
+This is deliberately still not implemented, and deliberately not
+attempted casually — not because it's unimportant, but because the two
+obvious ways to close it are a much bigger, riskier undertaking than
+either landing a new language feature (`map[T]`, `break`/`continue`,
+...) or fixing a compile-time gap (a mismatched-type error reaching
+codegen, a missing null representation):
+
+- **Stack-allocate a struct/array that provably never outlives its
+  declaring function**, instead of always heap-allocating. This was
+  already tried, in an earlier pass, in the most naive form (stack-
+  allocate every local struct unconditionally) — and reverted after it
+  was verified to silently corrupt memory: a struct's address can
+  genuinely outlive its function (returned, stored in an array or
+  another struct's field, ...), and a stack allocation doesn't survive
+  that (see `festina/codegen.py`'s module docstring, "Struct storage is
+  always heap-allocated"). Doing this correctly needs real escape
+  analysis (does this value's address ever get returned, stored into a
+  longer-lived array/struct/global, or passed to something that might
+  retain it?) — genuinely tricky to get exhaustively right, and a wrong
+  answer here doesn't fail loudly, it silently reads garbage at some
+  later, disconnected point in the program, exactly the failure mode
+  already verified once.
+- **Reference counting** (or a real tracing GC) for heap-allocated
+  arrays/structs — increment on every assignment/parameter pass/store
+  into another value, decrement when a scope's variables go out of
+  scope, free at zero. This is the more complete answer to what claude.md
+  #43 actually asks for, but touches nearly every place a value is
+  assigned, passed, stored, or a scope exits — a large surface area to
+  get right, and an incorrect refcount (an early free, or a missed
+  increment before something else drops its own reference) *is* a real
+  memory-safety bug — a genuine regression from today's "leaks but is
+  otherwise memory-safe" state, not a wash. Cycles are also a real
+  question to resolve one way or another (rare in Festina's language
+  model, given no closures/first-class functions and no direct self-
+  referential struct fields, but not provably impossible without
+  checking).
+
+Given the size and risk of either path, this needs a dedicated design
+pass (and, given this project's own established pattern, almost
+certainly a `claude.md` addition first, spelling out exactly which
+strategy and what tradeoffs it accepts) rather than being folded into an
+unrelated change as a side effect. Not attempted here for that reason,
+not because it was overlooked.
+
 ## Smaller, not yet tracked elsewhere
 
 Not roadmap items in the same sense as the three above — known gaps
@@ -105,11 +159,10 @@ called out in [`tests/CONTRACT.md`](tests/CONTRACT.md) and
 ambiguity rule (unspecified stays unresolved rather than invented),
 listed here only so they aren't lost:
 
-- No `break`/`continue` (claude.md doesn't define either).
 - No garbage collection / automatic memory management for arrays and
-  structs (`claude.md #43` promises this; not implemented).
-- `bool x = null` still doesn't compile (unlike `int`/`float`, which
-  were fixed — see [security.md](security.md)).
+  structs (`claude.md #43` promises this; not implemented -- see
+  "Memory management" below, a deliberately separate, larger writeup
+  rather than a one-line bullet here).
 - `regex(pattern, flags)` -- the dynamic builtin call, not a
   `/pattern/flags` literal (those are now cached, compiled once per
   source location on first reach -- see tests/CONTRACT.md) -- still

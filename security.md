@@ -213,3 +213,11 @@ for the full design writeup.
   in a long-running process, not a safety issue (no use-after-free, no
   double-free, since nothing is ever freed at all) — tracked as a known
   limitation, not something this document treats as a finding.
+  Deliberately not attempted casually: both realistic fixes (escape-
+  analysis-based stack allocation, or real reference counting) trade
+  this safe-but-leaky state for one where a wrong answer *is* a genuine
+  memory-safety regression (a stray use-after-free or double-free)
+  instead of a resource leak — see [todo.md](todo.md#memory-management)
+  for the full writeup, including a naive version of the stack-
+  allocation approach that was already tried and verified to corrupt
+  memory.

@@ -359,7 +359,7 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 610 tests in this directory pass against it: 600 given a working C
+All 639 tests in this directory pass against it: 629 given a working C
 compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
 too, plus 8 more given `Xvfb`+`xdotool` too
 (`tests/test_codegen.py::TestGraphics`'s interactive click/mouse/key/
@@ -630,6 +630,137 @@ literal-literal case it used to use is the newly-rejected one), and
 `tests/test_environment.py::TestEnvironmentIsReserved`'s updated
 message assertions.
 
+A follow-up pass revisited todo.md's own "smaller, not yet tracked"
+list and closed two of its four items outright, found and fixed one
+more bug while doing so, and deliberately did NOT attempt a third
+(memory management) despite being asked -- explained below.
+
+- **`break`/`continue` (claude.md #73, new).** claude.md never defined
+  either before this, so (per #54's ambiguity rule) they didn't exist --
+  `return` from the enclosing function was the only documented way out
+  of a loop body early. Added as a genuine spec addition (a new
+  section, not just an implementation gap being closed), because the
+  semantics are unambiguous and standard for a JS-inspired language --
+  `break` exits the nearest enclosing loop immediately; `continue`
+  skips to the next iteration, still running a `for` loop's update
+  expression first (same as a normal iteration would). Both are a
+  compile error outside any loop (`semantic.py` threads a `loop_depth`
+  counter through statement analysis, incremented entering a
+  while/for's body, reset to 0 -- not inherited -- entering a nested
+  function's own body, since a function is its own boundary regardless
+  of where it happens to be lexically declared; an `if`/plain `{ }`
+  block does NOT reset it, since those aren't loop boundaries).
+  Codegen (`CodeGen._loop_targets`, a stack of `(continue_label,
+  break_label)` pairs pushed/popped around each loop body's own
+  emission in `_emit_while`/`_emit_for`) needed no new control-flow
+  machinery beyond what if/while/for already use -- `break`/`continue`
+  just emit an unconditional `br` to the nearest loop's targets and set
+  `ctx["terminated"] = True`, the exact same "nothing after this in the
+  block gets emitted" mechanism `return` already uses. Reaches through
+  arbitrarily nested if/block statements to the nearest *loop*
+  specifically because `_loop_targets` is a plain instance-level stack,
+  not threaded through `ctx` the way `terminated` is. See
+  `tests/test_loops.py::TestBreakAndContinue` (parser/semantic) and
+  `tests/test_codegen.py::TestBreakAndContinue` (real compile-and-run,
+  including claude.md #73's own worked example verbatim, nested loops,
+  and dead-code-after-break not being emitted).
+
+- **`bool x = null` (claude.md #10/#25/#57, closing a documented gap).**
+  Same root cause as `int x = null`/`float x = null`'s own original fix
+  (`null` is only valid LLVM IR for a pointer type -- storing it into a
+  non-pointer slot is a link error) but needed one extra step those
+  didn't: i64/double have plenty of spare bit patterns to reserve as a
+  sentinel, but bool's natural representation, i1, has exactly two
+  possible values, both already meaningful (0=false, 1=true) -- no room
+  for a third. Fixed by widening `_llvm_type(BOOL)` from `i1` to `i8`
+  (`BOOL_NULL_CONST = 2`), while keeping every place LLVM itself
+  requires a genuine i1 (branch conditions, `icmp`/`fcmp`/`xor`) working
+  through a new `_bool_cond` helper (`icmp ne i8 ..., 0`) and immediate
+  `zext`s at the point a comparison/logical-op's i1 result becomes a
+  "BOOL value" the rest of codegen deals with -- `_emit_if`/`_emit_while`/
+  `_emit_for`/`_emit_ternary`'s conditions, `_emit_logical`'s short-
+  circuit test (its phi itself stays over the actual i8 operand values,
+  same JS-style "returns whichever operand won" semantics as before,
+  just at the new width), and `_emit_unary`'s `!` (narrow, xor, widen
+  back). An already-null bool used as a condition, or as an operand to
+  `!`/`&&`/`||`, is unresolved -- `_bool_cond` treats it as truthy
+  (nonzero), a documented, consistent choice, not a claim it's
+  meaningful, same allowance claude.md #57 already gives int/float's own
+  null sentinels in further arithmetic. This widening is uniform
+  everywhere a bool value is stored or passed (variables, struct/table
+  fields, array/map elements, function params/returns, sqlite binding,
+  `map[bool]`'s missing-key default) since it all flows through the one
+  `_llvm_type` source of truth -- verified directly for every one of
+  those, not just plain variables. Bonus find while doing this: the five
+  runtime functions that take/return a Festina bool
+  (`festina_log_bool`, `festina_str_from_bool`, `festina_str_eq`,
+  `festina_regex_test`, `festina_audio_is_playing`) already declared
+  their C-side signature as `int8_t`, not `_Bool`/`int` -- their LLVM
+  `declare`s said `i1` anyway, a latent (if mostly harmless, since only
+  0/1 were ever produced) ABI mismatch predating this fix entirely;
+  moving those five declares to `i8` alongside the null work corrects
+  that too.
+
+- **`x == null` for a concretely-typed int/float/bool `x` (bug, found
+  while testing the bool-null fix above, not itself new scope).**
+  `_emit_binop` used to emit both operands via plain `_emit_expr`,
+  which -- for a bare `null` literal on either side -- always produces
+  the generic LLVM `null` keyword (correct for text/struct/array, the
+  only context `_emit_expr`'s own `NullLit` branch has to work with, no
+  declared-type context available). For an int/float/bool operand this
+  produced literally invalid IR (`icmp eq i64 %x, null` -- verified as a
+  pre-existing bug, independent of bool-null entirely: `int a = 1 / 0
+  \n log(a == null)` already failed identically before any of this
+  session's bool work). Fixed by having `_emit_binop` route a `NullLit`
+  operand through `_emit_value_for` with the *other* (already-emitted)
+  operand's type as context -- the same "does this position have a
+  declared type to pick a null encoding from" pattern `_emit_value_for`
+  already exists for (var decls, params, returns), a binary comparison
+  is just one more such position. Deliberately does NOT handle `null ==
+  null` (neither side has any type context to infer a representation
+  from) -- confirmed that already failed identically before this fix
+  too, an exceedingly rare, not obviously meaningful expression to
+  write in the first place (claude.md #54's ambiguity rule, same as
+  this file's other deliberately-left corner cases, e.g. `arr[int] a =
+  [5, null]`'s trailing-null quirk). One more wrinkle specific to float:
+  comparing a null float against `null` is `false`, not `true` --
+  `FLOAT_NULL_CONST` is a real quiet NaN, and IEEE-754's *ordered*
+  compares (`oeq`/`one`, what claude.md's `==`/`!=` already lower to)
+  are false for any comparison involving NaN, including a NaN against
+  itself. Not something this fix changes or could reasonably fix as a
+  side effect -- float null-checking via `==` structurally can't be as
+  reliable as int/bool's without changing what `==`/`!=` mean for every
+  float comparison, a separate, unrelated design decision -- documented
+  directly in the regression test rather than quietly asserted around.
+
+  See `tests/test_codegen.py::TestNumericConversion`'s new
+  `test_null_bool_assignment` and its neighbors (function-call round
+  trip, struct field, ordinary non-null bool logic unaffected by the
+  width change) and the four new `test_comparing_a_null_*_against_the_
+  null_literal`/`test_comparing_a_non_null_*` cases.
+
+- **Memory management (claude.md #43) -- deliberately NOT attempted,
+  despite being asked.** Arrays and struct storage still leak (heap-
+  allocated, never freed) -- this remains true after this pass. The two
+  ways to actually close this (escape-analysis-based stack allocation
+  for values that provably never leave their declaring function; real
+  reference counting) are both substantially larger and, critically,
+  *riskier* than every other fix in this file: a wrong answer doesn't
+  fail loudly the way a type error or a missing null representation
+  does, it silently corrupts memory or frees something still reachable
+  at some later, disconnected point in the program. This isn't
+  theoretical -- an earlier pass already tried the naive version of the
+  first approach (stack-allocate every local struct unconditionally)
+  and verified it corrupts memory (see `festina/codegen.py`'s "Struct
+  storage is always heap-allocated" note). Getting this right needs a
+  dedicated design pass of its own (and, per this project's own
+  established pattern, almost certainly a `claude.md` addition first,
+  same as `break`/`continue` got one here) rather than being folded into
+  a batch of otherwise well-scoped, individually-testable fixes as a
+  side effect. See todo.md's own "Memory management" section for the
+  full writeup of both approaches and exactly why each is risky, not
+  just "not done yet."
+
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
 by value handed the caller a pointer into an already-popped stack frame
@@ -713,13 +844,14 @@ there for the three bugs #55-58 were written in response to (see
 "Status" above): a struct returned by value, and `null`/scientific-notation
 float literals compiling and linking successfully.
 
-`tests/test_loops.py` covers claude.md #60/#61/#63/#66 (for/while
-loops, `.length`, postfix `++`/--) at the parser/semantic level, same
-split as `test_numeric_conversion.py`; the matching end-to-end runtime
-behavior (a compiled loop actually iterating the right number of times,
-loop-variable scoping surviving a real function frame, an iterative
-Fibonacci) lives in `test_codegen.py`'s `TestLoops` and
-`TestArrayLength`.
+`tests/test_loops.py` covers claude.md #60/#61/#63/#66/#73 (for/while
+loops, `.length`, postfix `++`/--, `break`/`continue`) at the parser/
+semantic level, same split as `test_numeric_conversion.py`; the matching
+end-to-end runtime behavior (a compiled loop actually iterating the
+right number of times, loop-variable scoping surviving a real function
+frame, an iterative Fibonacci, `break`/`continue` actually altering
+control flow at runtime) lives in `test_codegen.py`'s `TestLoops`,
+`TestArrayLength`, and `TestBreakAndContinue`.
 
 `tests/test_packaging.py` covers stage 2 (claude.md #59) -- it actually
 runs `scripts/package_compiler.sh`, a real PyInstaller build (tens of
@@ -935,9 +1067,13 @@ festina/
     ast.py
         Program, ImportDecl, VarDecl, Param, FieldDecl, FuncDecl,
         StructDecl, TableDecl, EventHandler, Block, IfStmt, WhileStmt,
-        ForStmt, Return, ExprStmt, Identifier, NumberLit, StringLit,
-        BoolLit, NullLit, TemplateLit, ArrayLit, Assign, Ternary,
-        LogicalOp, BinOp, UnaryOp, PostfixOp, Member, Call, ArrayTypeExpr
+        ForStmt, BreakStmt, ContinueStmt, Return, ExprStmt, Identifier,
+        NumberLit, StringLit, BoolLit, NullLit, TemplateLit, ArrayLit,
+        Assign, Ternary, LogicalOp, BinOp, UnaryOp, PostfixOp, Member,
+        Call, ArrayTypeExpr
+        # (this snapshot predates MapLit/MapTypeExpr/RegexLit too --
+        # kept here as a rough orientation sketch, not re-derived from
+        # ast.py on every change; ast.py itself is the source of truth)
 
     types.py
         PrimitiveType(name) / StructType(name) / TableType(name) /
@@ -1395,7 +1531,7 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 600 passed, 10 skipped (needs a C compiler; 2 of
+pytest tests/                          # 629 passed, 10 skipped (needs a C compiler; 2 of
                                         # the skips need `pip install pyinstaller` too,
                                         # the other 8 need Xvfb + xdotool installed)
 ```
