@@ -58,18 +58,19 @@ _TEXT = types_mod.PrimitiveType("text")
 # claude.md #37, #39: signatures for the builtins with real implementations
 # (drawCircle/drawText/drawImage/loadImage) -- matches each function's own
 # worked example in the spec exactly (e.g. drawRect(0, 0, 100, 100)).
-# Builtins with no entry here (log, fail, sqlite, loadAudio) stay
-# permissive: their args are inferred but not checked against a fixed
-# signature, either because claude.md leaves their shape open (log/fail)
-# or because they aren't implemented yet (loadAudio).
+# Builtins with no entry here (log, fail, sqlite) stay permissive:
+# their args are inferred but not checked against a fixed signature,
+# since claude.md leaves their shape open.
 _BUILTIN_SIGNATURES = {
     "drawRect": (_INT, _INT, _INT, _INT),
     "drawCircle": (_INT, _INT, _INT),
     "drawText": (_TEXT, _INT, _INT),
     "drawImage": (types_mod.ImageType(), _INT, _INT),
     "loadImage": (_TEXT,),
+    "loadAudio": (_TEXT,),  # claude.md #38
 }
 _REGEX = types_mod.RegexType()
+_AUDIO = types_mod.AudioType()
 
 # claude.md #56: float -> int, with an explicit rounding decision.
 MATH_FUNCTIONS = {"floor", "ceil", "round", "trunc"}
@@ -383,8 +384,15 @@ def analyze(program, filename="<string>"):
                     category="invalid field access",
                 )
             return types_mod.PrimitiveType("int")
-        if isinstance(obj_type, (types_mod.ImageType, types_mod.AudioType)):
-            return None  # permissive: methods like .play()/.isPlaying() aren't modeled
+        if isinstance(obj_type, types_mod.ImageType):
+            return None  # permissive: claude.md #37 defines no methods on img at all
+        # claude.md #38: aud's play()/stop()/isPlaying() are only
+        # recognized as Call-on-Member patterns (see _infer_call) --
+        # this branch is for a bare `music.play` reference with no
+        # call, which was never a valid thing to write, so it's a hard
+        # error like everything else below, not a silent fallthrough
+        # (AudioType used to share ImageType's permissive branch above,
+        # back when neither had any real methods modeled).
         raise CompileError(
             f"cannot access field '{expr.prop}' on {types_mod.type_name(obj_type)}",
             file=filename, line=expr.line, column=expr.column,
@@ -592,7 +600,33 @@ def analyze(program, filename="<string>"):
                         category="invalid function argument type",
                     )
                 return _TEXT
-        # Member call, e.g. music.play() -- validates the member access itself.
+            # claude.md #38: music.play() / music.stop() / music.isPlaying()
+            # -- the only three methods claude.md defines for aud, so
+            # (unlike log/fail/sqlite's deliberately open shape) any
+            # other method call on an aud value falls through to the
+            # generic "Member call" fallback below and fails there via
+            # _infer_member's now-strict AudioType handling, the same
+            # way an unknown struct field does.
+            if callee.prop in ("play", "stop") and infer(callee.obj, scope) == _AUDIO:
+                if expr.args:
+                    raise CompileError(
+                        f"{callee.prop}() takes no arguments, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return None
+            if callee.prop == "isPlaying" and infer(callee.obj, scope) == _AUDIO:
+                if expr.args:
+                    raise CompileError(
+                        f"isPlaying() takes no arguments, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return types_mod.PrimitiveType("bool")
+        # Member call, e.g. someUnknownMethod() on a struct-shaped
+        # receiver -- validates the member access itself (so an unknown
+        # method on a real type still fails with a specific message
+        # rather than silently passing through as untyped).
         infer(callee, scope)
         for a in expr.args:
             infer(a, scope)

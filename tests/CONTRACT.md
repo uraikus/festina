@@ -119,6 +119,45 @@ the same window stays open) against a real (virtual) X server -- see
 "Why the tests are structured this way" below for
 `tests/test_timers.py`/`TestTimers`.
 
+claude.md #38 (aud, loadAudio(), .play()/.stop()/.isPlaying()) is
+implemented too -- a loaded clip is `ptr` to an opaque `FestinaAudio`
+(decoded PCM plus playback state, same lower-to-`ptr` convention as
+img/regex/table values), and play()/stop()/isPlaying() are ordinary
+Call-on-Member patterns in both semantic.py and codegen.py, the same
+family as Math.floor/the regex methods above -- claude.md enumerates
+exactly these three methods for `aud`, so (unlike log()/fail()/
+sqlite()'s deliberately open shape) any other method call on an `aud`
+value is now a compile error rather than the permissive fallthrough
+`aud`/`img` used to share back when neither had any real methods
+modeled. `loadAudio()` only supports WAV (16-bit PCM) -- claude.md's
+own example names a `.mp3`, but unlike Cairo (which decodes PNG on its
+own) nothing this project already depends on can decode MP3 without a
+real new library, so WAV -- parsed directly in festina_runtime.c with
+zero decoder dependencies at all -- is the implementation-defined
+choice, the same kind of call PNG-only images already made for a
+different reason. Playback runs through a real ALSA ("default") output
+device -- picked for the same "smallest dependency that does the job"
+reasoning that picked Xlib over a GUI toolkit for graphics -- opened
+*synchronously* inside `festina_audio_play()` itself (so a missing or
+unusable device fails loudly and immediately, festina_fail(), the same
+as "could not open the X display" for graphics) before the actual PCM
+writing moves to a background pthread, so a playing clip doesn't block
+the rest of the program the way having a separate `isPlaying()` to
+poll implies it shouldn't. Two guarantees make the test suite below
+deterministic rather than timing-dependent: `isPlaying()` is true the
+instant `play()` returns (the flag is set synchronously, before the
+thread is even spawned) and false the instant `stop()` returns (`stop()`
+joins the thread before returning, rather than merely signaling it).
+Calling `play()` again while already playing restarts from the
+beginning (stopping the previous thread first) -- claude.md doesn't say
+what play()-while-playing should do; this is the least surprising
+choice, matching a browser's own `<audio>` element. Audio does not keep
+a program running the way an uncleared `setInterval` does -- if the
+program reaches its natural end while a clip is still playing, the
+process exits anyway. Verified end to end against a real (virtual) ALSA
+device -- see "Why the tests are structured this way" below for
+`tests/test_audio.py`/`TestAudio`.
+
 "Real compilation, minimal setup" stages 1, 2, and 3 -- claude.md #59,
 added alongside these stages to make the requirement explicit rather
 than implicit in the implementation -- are also done (see README.md's
@@ -140,13 +179,17 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 378 tests in this directory pass against it: 370 given a working C
+All 399 tests in this directory pass against it: 391 given a working C
 compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
 too, plus 6 more (`tests/test_codegen.py::TestGraphics`'s interactive
 click/mouse/key/resize tests, the one confirming the initial
 `clientWidth`/`clientHeight` values, and `TestTimers`'s combined
 graphics-and-timers test) given `Xvfb`+`xdotool` too -- all skip
 cleanly, independently, without any of those three (see below).
+`tests/test_audio.py`/`TestAudio` need none of the three either --
+the null-device technique they use (see conftest.py's
+`audio_null_env`) needs no extra tool install, only the C compiler
+`compile_and_run` already requires.
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -164,11 +207,9 @@ as the escape hatch, rather than picking a side ad hoc in code with no
 spec backing either way.
 
 See README.md's "Implementation Status" section for the current
-implemented-vs-not matrix; the short version: only audio (`aud`,
-`loadAudio`) still parses and type-checks but raises a clear
-`CodegenError` ("not implemented yet") rather than generating IR.
-`sqlite()` queries and graphics/events no longer belong on that list --
-see above.
+implemented-vs-not matrix; the short version: nothing is left
+unimplemented anymore -- every claude.md construct this compiler
+targets generates real code now (audio was the last one; see above).
 
 (An earlier, unrelated JS-subset prototype -- `compiler/`, plus
 `build.sh`/`jit_run.py`/`run_jit.sh` and `runtime/runtime.c` for
@@ -198,9 +239,10 @@ files -- see festina/cli.py and festina/llvm_backend.py's docstrings).
 It skips (with a distinct, toolchain-specific reason) if no C compiler
 is on `PATH` at all -- unlike the `SPEC_UNIMPLEMENTED_REASON` skips
 above, this isn't "the feature doesn't exist," it's "this environment
-can't link native code." Tests for constructs codegen genuinely doesn't
-support yet (only audio now) don't need a C compiler at all -- they
-only call `festina.codegen.generate_ir()` and assert it raises.
+can't link native code." Nothing codegen genuinely doesn't support
+remains (audio was the last one -- see "Status" above), so this tier
+is nearly empty now; what's left in `TestUnrecognizedEventName` just
+inspects generated IR text directly, no C compiler needed either way.
 The one exception on the sqlite() side is
 `test_non_literal_params_argument_is_a_clear_error`, which checks a
 compile-time restriction (params must be a literal array) the same
@@ -388,6 +430,43 @@ proving `festina_run_event_loop`'s `select()` call is genuinely
 multiplexing both event sources, not just alternating between them or
 starving one.
 
+`tests/test_audio.py` covers claude.md #38 (aud, loadAudio(), .play()/
+.stop()/.isPlaying()) at the parser/semantic level, same split as
+`test_timers.py` -- argument-count/type checking for loadAudio();
+play()/stop()/isPlaying() taking no arguments and isPlaying() returning
+bool; an unrecognized method or a non-`aud` receiver both being compile
+errors (claude.md enumerates exactly three methods for `aud`, so this
+isn't the permissive fallthrough `log()`/`fail()`/`sqlite()` get).
+`test_codegen.py`'s `TestAudio` covers the same feature end to end, and
+notably needs no opt-in skip tier the way `TestGraphics` does: the
+null-device technique it uses (`audio_null_env` in conftest.py -- a
+`$HOME/.asoundrc` redirecting ALSA's "default" PCM device to ALSA's own
+built-in null plugin, the real ALSA config mechanism, not something
+festina-specific, the audio equivalent of pointing `DISPLAY` at a
+throwaway Xvfb) needs no extra tool install, since the null plugin
+ships inside alsa-lib itself, which festina_runtime.c already links
+against unconditionally -- so every test in this class only needs what
+`compile_and_run` already requires, a working C compiler. Verified this
+way rather than assumed: `snd_pcm_open(..., "default", ...)` genuinely
+fails in this project's own dev environment without the override
+(no `/dev/snd` node exists at all), and genuinely succeeds with it.
+Coverage includes the two guarantees the rest of `TestAudio` leans on
+to stay deterministic instead of timing-dependent (`isPlaying()` true
+immediately after `play()`, false immediately after `stop()` --
+verified directly, not just against a comment claiming it), `stop()` on
+an already-idle clip being a safe no-op, calling `play()` again while
+already playing not crashing or hanging, and the clear-error path for
+a missing device, an unreadable path, and a non-WAV file each getting
+their own test. `test_timers_and_audio_work_together` is the one test
+that reuses claude.md #69's `setTimeout` to poll for a clip finishing
+on its own (no `stop()` call) -- proof that the background playback
+thread and the main-thread timer event loop coexist correctly, neither
+blocking the other. `_write_wav` (a plain module-level function in
+test_codegen.py, using the stdlib `wave` module -- no new test
+dependency) generates the minimal valid 16-bit PCM WAV fixture every
+playback-success test needs; the error-path tests need either no file
+at all or deliberately invalid bytes instead.
+
 ## Public API implemented
 
 ```
@@ -514,7 +593,20 @@ festina/
         # first-class functions/closures, so nothing else was ever a
         # candidate); both return int (a timer id). clearTimeout/
         # clearInterval get a simpler adjacent branch: exactly one int
-        # argument, returning nothing.
+        # argument, returning nothing. claude.md #38: loadAudio(text) ->
+        # aud is a _BUILTIN_SIGNATURES entry, same as loadImage();
+        # play()/stop()/isPlaying() are recognized Call-on-Member
+        # patterns on an AudioType receiver, same family as
+        # Math.floor/the regex methods -- claude.md enumerates exactly
+        # these three methods for aud, so (unlike log/fail/sqlite's
+        # deliberately open shape) any other method call on an aud
+        # value falls through to the generic "unknown member" path and
+        # fails there, the same way an unknown struct field does
+        # (AudioType used to share ImageType's fully-permissive
+        # _infer_member fallback, back when neither had any real
+        # methods modeled -- img still does, since claude.md #37
+        # defines no methods on img at all, but aud's fallback is now a
+        # hard error like everything else in _infer_member).
 
     sqlite_schema.py
         TYPE_MAP: dict[str, str]                        # claude.md #30
@@ -602,12 +694,22 @@ festina/
         # window and a graphics-only program never touches the timer
         # machinery -- but self.uses_graphics *or* self.uses_timers both
         # gate the same festina_run_event_loop() call in
-        # _emit_main_and_entry. Raises
-        # CodegenError (a CompileError subclass, category="not
-        # implemented") only for audio (loadAudio) now -- and also
-        # (category="not implemented" but a genuine compile-time
-        # restriction, not a missing feature) when sqlite()'s second
-        # argument isn't a literal array expression.
+        # _emit_main_and_entry. claude.md #38: loadAudio(path) emits
+        # `call ptr @festina_load_audio(ptr path)`, returning an
+        # AudioType value (`ptr`, same lower-to-`ptr` convention as
+        # img/regex/table); play()/stop()/isPlaying() are Member-call
+        # dispatch branches (same family as Math.floor/the regex
+        # methods) emitting a single call each to
+        # festina_audio_play/_stop/_is_playing -- no IR-level machinery
+        # of its own, unlike graphics/timers there's no CodeGen flag
+        # gating anything for audio, since play()/stop()/isPlaying()
+        # need no lazy setup the way opening a window or entering the
+        # event loop does. Raises CodegenError (a CompileError
+        # subclass, category="not implemented") now only for a genuine
+        # compile-time restriction, not a missing feature: when
+        # sqlite()'s second argument isn't a literal array expression
+        # -- every claude.md construct this compiler targets otherwise
+        # generates real code (audio was the last thing that didn't).
 
     llvm_backend.py
         def available() -> bool           # libLLVM found+loaded in this process?
@@ -754,11 +856,45 @@ once the event loop is empty" behavior, including that an uncleared
 like a real JS runtime, until it's stopped externally or via
 `clearInterval()`.
 
+`festina_load_audio`, `festina_audio_play`/`_stop`/`_is_playing`
+(#38: aud, loadAudio(), .play()/.stop()/.isPlaying()) play a clip
+through a real ALSA output device. `festina_load_audio` parses a WAV
+file's RIFF/`fmt `/`data` chunks directly (no decoder dependency at
+all -- claude.md's own example names a `.mp3`, but WAV is the
+implementation-defined choice here, the same kind of call PNG-only
+images already made for a different reason), rejecting anything that
+isn't 16-bit PCM with a clear error, and returns an opaque
+`FestinaAudio*` (decoded samples plus playback state, behind a mutex).
+`festina_audio_play` opens and configures the ALSA "default" device
+*synchronously*, right there in the call itself (a missing or unusable
+device fails loudly and immediately via `festina_fail()`, the same as
+"could not open the X display" for graphics) before spawning a
+background pthread that streams the PCM in small chunks, checking a
+stop flag between each one so `festina_audio_stop` gets a prompt
+response rather than waiting out the whole clip; the "is this clip
+playing" flag is set *before* that thread is even spawned, so
+`festina_audio_is_playing` is guaranteed true immediately after
+`festina_audio_play` returns, not just "usually true by then."
+`festina_audio_stop` signals the thread and *joins* it before
+returning, so `festina_audio_is_playing` is equally guaranteed false
+the instant `festina_audio_stop` returns; calling it when nothing is
+playing is a safe no-op. Calling `festina_audio_play` again while
+already playing restarts from the beginning, stopping the previous
+thread first. A clip that reaches its own natural end also clears the
+flag, but its thread is never explicitly joined by anything in that
+case -- an accepted, documented tradeoff for a typically short-lived
+compiled program (the OS reclaims everything at process exit
+regardless), not machinery this runtime bothers building. See
+festina_runtime.h's doc comment on `festina_load_audio` for the full
+design, verified against a real (virtual) ALSA device via
+`$HOME/.asoundrc`'s null plugin, not just reasoned about -- see
+`tests/test_codegen.py::TestAudio`.
+
 ## Running
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 370 passed, 8 skipped (needs a C compiler; 2 of
+pytest tests/                          # 391 passed, 8 skipped (needs a C compiler; 2 of
                                         # the skips need `pip install pyinstaller` too,
                                         # the other 6 need Xvfb + xdotool installed)
 ```

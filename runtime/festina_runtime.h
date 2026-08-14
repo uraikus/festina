@@ -288,4 +288,63 @@ int64_t festina_set_interval(void (*callback)(void), int64_t delay_ms);
 void festina_clear_timeout(int64_t id);
 void festina_clear_interval(int64_t id);
 
+/*
+ * claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying().
+ *
+ * Playback goes through a real ALSA ("default") output device --
+ * ALSA (libasound) rather than a toolkit like SDL_mixer or a
+ * PulseAudio client, since it's the lowest-level standard Linux audio
+ * API and this project already leans toward the smallest dependency
+ * that does the job (claude.md #59; the same reasoning that picked
+ * Xlib over a GUI toolkit for graphics).
+ *
+ * festina_load_audio only supports WAV (16-bit PCM) -- claude.md's own
+ * example names a `.mp3`, but unlike Cairo (which decodes PNG on its
+ * own, so images support PNG "for free") nothing this project already
+ * depends on can decode MP3 without a real new library, so WAV -- a
+ * container simple enough to parse directly in festina_runtime.c with
+ * zero decoder dependencies at all -- is the implementation-defined
+ * choice here, the same kind of call PNG-only images already made.
+ * Anything else (a compressed WAV, 8/24/32-bit PCM, an actual MP3,
+ * ...) fails at load time with a clear message, not a crash or silent
+ * garbage.
+ *
+ * festina_audio_play(): calling play() opens (and configures) the ALSA
+ * device *synchronously*, right there in the play() call itself -- not
+ * on the background thread described below -- so a missing or unusable
+ * audio device fails loudly and immediately at the call site
+ * (festina_fail(), same as "could not open the X display" for
+ * graphics) rather than silently doing nothing on a thread with no way
+ * to report the failure back. Once the device is open, the actual
+ * writing of PCM data happens on a background pthread, so a playing
+ * clip doesn't block the rest of the program -- matching what having a
+ * separate isPlaying() to poll, and a separate stop() to interrupt,
+ * both imply about play() being non-blocking. Calling play() again
+ * while a clip is already playing restarts it from the beginning
+ * (stopping the previous playback thread first) -- claude.md #38
+ * doesn't say what play()-while-playing should do; this is the least
+ * surprising choice, matching a browser's own `<audio>` element.
+ *
+ * festina_audio_stop() signals the background thread and *joins* it
+ * before returning, so festina_audio_is_playing() is guaranteed false
+ * the instant stop() returns, not just "false soon" -- calling stop()
+ * when nothing is playing is a safe no-op. A clip that reaches its own
+ * natural end (never stopped) also sets playing back to false, but its
+ * thread is never explicitly joined by anything in that case -- for a
+ * typical short-lived compiled Festina program this is an accepted,
+ * deliberate tradeoff (the OS reclaims everything at process exit
+ * regardless) rather than machinery to track and join every
+ * already-finished playback thread that nothing asked to stop.
+ *
+ * Audio does not keep a program running the way an uncleared
+ * setInterval does (see festina_set_interval above) -- if main()
+ * reaches its natural end while a clip is still playing, the process
+ * exits anyway (mirroring a page's audio stopping when the tab
+ * closes), it does not wait for playback to finish.
+ */
+void *festina_load_audio(const char *path);
+void festina_audio_play(void *audio);
+void festina_audio_stop(void *audio);
+int8_t festina_audio_is_playing(void *audio);
+
 #endif

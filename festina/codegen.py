@@ -4,11 +4,14 @@ CodeGen.filename's note in generate()), #7/#8 (entry point + startup),
 #26 (arrays), #29-31 (automatic SQLite schema sync), #32-34 (sqlite()
 queries, parameterized queries, query result types), #37, #39, #40
 (img, graphics functions, click/mouse events -- see the "Graphics"
-note below), #41/#42 (log/fail), #45 (string interpolation), #55-57
-(int.toFloat(), Math.floor/ceil/round/trunc, division/modulo by zero),
-#60/#61 (for/while loops), #63 (array .length), #66 (postfix ++/--),
-#67-68 (regex(), .test(), .match(), .replace()/.replaceAll() -- see
-_emit_regex_call and the Member-call handling in _emit_call).
+note below), #38 (aud, loadAudio(), .play()/.stop()/.isPlaying() --
+see the "Audio" note below), #41/#42 (log/fail), #45 (string
+interpolation), #55-57 (int.toFloat(), Math.floor/ceil/round/trunc,
+division/modulo by zero), #60/#61 (for/while loops), #63 (array
+.length), #66 (postfix ++/--), #67-68 (regex(), .test(), .match(),
+.replace()/.replaceAll() -- see _emit_regex_call and the Member-call
+handling in _emit_call), #69 (setTimeout/setInterval/clearTimeout/
+clearInterval -- see the "Timers" note below).
 #37, #39, #40 also cover `on key`/`on resize`/`on close` and the
 clientWidth/clientHeight globals (see the "Graphics" note below).
 
@@ -23,12 +26,16 @@ festina_runtime C helpers, sqlite() queries (SELECT into arr[Table],
 parameterized INSERT/UPDATE/DELETE -- see the "Query rows" note
 below), regex()/.test()/.match()/.replace()/.replaceAll() (POSIX
 extended regular expressions via the festina_runtime C helpers -- no
-bundled regex engine, see festina_runtime.h's doc comment on why), and
+bundled regex engine, see festina_runtime.h's doc comment on why),
 img/drawRect/drawCircle/drawText/drawImage/`on click`/`on mouse` (a
-real X11 window rendered via Cairo -- see the "Graphics" note below).
+real X11 window rendered via Cairo -- see the "Graphics" note below),
+setTimeout/setInterval/clearTimeout/clearInterval (see the "Timers"
+note below), and aud/loadAudio()/.play()/.stop()/.isPlaying() (a real
+ALSA output device, WAV audio only -- see the "Audio" note below).
 
-NOT implemented yet (raises CodegenError with a clear message): audio
-(aud/loadAudio/...). See README.md for the up-to-date status list.
+Nothing is left unimplemented -- every claude.md section this compiler
+targets generates real code now. See README.md for the up-to-date
+status list.
 
 Graphics (claude.md #37, #39, #40): a real on-screen window (Xlib +
 Cairo's Xlib surface backend), not a file written to disk -- "Graphics
@@ -96,6 +103,31 @@ the full runtime design, including when a program with pending timers
 actually exits (matching Node's "exits once the event loop is empty"
 behavior) and why an uncleared setInterval keeps a program running
 forever, exactly like in a real JS runtime.
+
+Audio (claude.md #38): a loaded clip (`ptr` to an opaque
+FestinaAudio -- decoded PCM samples plus playback state, same
+lower-to-`ptr` convention as img/regex/table values) plays through a
+real ALSA output device -- ALSA (libasound) rather than a toolkit like
+SDL_mixer or a PulseAudio client, since it's the lowest-level standard
+Linux audio API and this project already leans toward the smallest
+dependency that does the job (claude.md #59; same reasoning that picked
+Xlib over a GUI toolkit for graphics). loadAudio() only supports WAV
+(16-bit PCM) -- claude.md's own example names a `.mp3`, but unlike
+Cairo (which decodes PNG on its own) nothing this project already
+depends on can decode MP3 without a real new library, so WAV -- a
+container simple enough to parse directly in festina_runtime.c with no
+decoder dependency at all -- is the implementation-defined choice here,
+the same kind of call PNG-only images already made. play()/stop()/
+isPlaying() are ordinary Call-on-Member patterns (same family as
+Math.floor/int.toFloat()/the regex methods above), each emitting a
+single call to festina_audio_play/_stop/_is_playing; there's no IR-level
+machinery of its own; the interesting part -- playback actually running
+on a background thread so a playing clip doesn't block the rest of the
+program, matching what having a separate isPlaying() to poll implies --
+is entirely in the runtime. See festina_runtime.h's doc comment on
+festina_load_audio for the full design (why ALSA's "default" device,
+the play-while-playing restart semantics, thread-safety between
+play()/stop()/isPlaying() and the background thread).
 
 Query rows (claude.md #32-34): sqlite()'s result, when assigned to a
 declared arr[Table], is built by festina_runtime's
@@ -208,6 +240,7 @@ INT = types_mod.PrimitiveType("int")
 FLOAT = types_mod.PrimitiveType("float")
 TEXT = types_mod.PrimitiveType("text")
 REGEX = types_mod.RegexType()
+AUDIO = types_mod.AudioType()
 
 FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
 
@@ -248,7 +281,10 @@ def _llvm_type(t):
         # pointer -- see _emit_call's loadImage/drawImage handling.
         return "ptr"
     if isinstance(t, types_mod.AudioType):
-        raise CodegenError("aud / audio are not implemented yet")
+        # claude.md #38: a loaded clip is an opaque FestinaAudio pointer
+        # (decoded PCM samples + playback state) -- see _emit_call's
+        # loadAudio/.play()/.stop()/.isPlaying() handling.
+        return "ptr"
     if isinstance(t, types_mod.RegexType):
         # claude.md #67: a compiled regex_t*, opaque to codegen -- see
         # _emit_regex_call.
@@ -450,12 +486,17 @@ class CodeGen:
             "declare void @festina_register_close_handler(ptr)",
             "declare i64 @festina_client_width()",
             "declare i64 @festina_client_height()",
-            # setTimeout/setInterval/clearTimeout/clearInterval -- not
-            # part of claude.md; see the module docstring's "Timers" note.
+            # claude.md #69: setTimeout/setInterval/clearTimeout/clearInterval
+            # -- see the module docstring's "Timers" note.
             "declare i64 @festina_set_timeout(ptr, i64)",
             "declare i64 @festina_set_interval(ptr, i64)",
             "declare void @festina_clear_timeout(i64)",
             "declare void @festina_clear_interval(i64)",
+            # claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying().
+            "declare ptr @festina_load_audio(ptr)",
+            "declare void @festina_audio_play(ptr)",
+            "declare void @festina_audio_stop(ptr)",
+            "declare i1 @festina_audio_is_playing(ptr)",
             "declare ptr @malloc(i64)",
             "declare ptr @calloc(i64, i64)",
             # claude.md #56: Math.floor/ceil/round/trunc, via LLVM's
@@ -1277,8 +1318,10 @@ class CodeGen:
             if name in ("setTimeout", "setInterval", "clearTimeout", "clearInterval"):
                 return self._emit_timer_call(name, expr, env, lines)
             if name == "loadAudio":
-                raise CodegenError("'loadAudio' (audio) is not implemented yet",
-                                    file=self.filename, line=callee.line)
+                path_val, _ = self._emit_expr(expr.args[0], env, lines)
+                out = self.tmp()
+                lines.append(f"  {out} = call ptr @festina_load_audio(ptr {path_val})")
+                return out, AUDIO
             if name in self.func_decls:
                 decl = self.func_decls[name]
                 arg_vals = []
@@ -1356,6 +1399,23 @@ class CodeGen:
                             f"ptr {replacement_val}, i1 {replace_all})"
                         )
                     return out, TEXT
+            # claude.md #38: music.play() / music.stop() / music.isPlaying()
+            if callee.prop == "play":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if obj_type == AUDIO:
+                    lines.append(f"  call void @festina_audio_play(ptr {obj_val})")
+                    return "0", None
+            if callee.prop == "stop":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if obj_type == AUDIO:
+                    lines.append(f"  call void @festina_audio_stop(ptr {obj_val})")
+                    return "0", None
+            if callee.prop == "isPlaying":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if obj_type == AUDIO:
+                    out = self.tmp()
+                    lines.append(f"  {out} = call i1 @festina_audio_is_playing(ptr {obj_val})")
+                    return out, BOOL
         raise CodegenError("only calls to named functions are implemented",
                             file=self.filename, line=getattr(expr, "line", 0))
 

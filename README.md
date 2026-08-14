@@ -29,12 +29,14 @@ Festina is under active development. Everything else in this README
 describes the full target language from `claude.md`; this section is
 the ground truth for what actually runs today.
 
-**Test suite:** 378 tests, 0 failed (`pytest tests/`) — 370 passed/8
+**Test suite:** 399 tests, 0 failed (`pytest tests/`) — 391 passed/8
 skipped by default (2 need `pyinstaller`, an opt-in build-time-only
 dependency for the packaged-binary tests; 6 need `Xvfb`/`xdotool` to
 open and interact with a real window for the graphics and combined
-graphics+timers tests; see [Setup](#setup)), or all 378 passed/0
-skipped with those installed.
+graphics+timers tests; see [Setup](#setup)), or all 399 passed/0
+skipped with those installed. Audio's tests need neither — the
+null-device technique they use (see [Audio](#audio) below) needs no
+extra tool install.
 See [`tests/`](tests/) and [`tests/CONTRACT.md`](tests/CONTRACT.md) for
 the spec-driven suite this is measured against — every test cites the
 `claude.md` section it checks.
@@ -61,6 +63,7 @@ runtime, and *runs* as a standalone executable (no Python or the
 | **Regex, string match/replace (`claude.md #67/#68`)** | ✅ `regex()`, `.test()`, `.match()`, `.replace()`/`.replaceAll()` (search may be text or regex) — POSIX extended regular expressions (no bundled/external regex engine — see [Setup](#setup)); no capture groups, backreferences, or non-greedy quantifiers (POSIX ERE's own limits, not something worked around here) |
 | **Graphics (`claude.md #37/#39/#40`)** | ✅ `img`/`loadImage()`, `drawRect`/`drawCircle`/`drawText`/`drawImage`, `on click`/`on mouse`/`on key`/`on resize`/`on close`, `clientWidth`/`clientHeight` — a real on-screen X11 window rendered via Cairo, verified against an actual virtual display, not just reasoned about (see [Graphics](#graphics) below for the caveats: canvas starts at 800×600, solid black only, PNG-only images) |
 | **Timers (`claude.md #69`)** | ✅ `setTimeout`/`setInterval`/`clearTimeout`/`clearInterval` — JS-style scheduling; the callback must be an already-declared, zero-argument, `void`-returning function (Festina has no first-class functions/closures) — see [Timers](#timers) below for the design, including how this combines with graphics |
+| **Audio (`claude.md #38`)** | ✅ `aud`/`loadAudio()`, `.play()`/`.stop()`/`.isPlaying()` — plays through a real ALSA output device on a background thread, verified against a real (virtual) device, not just reasoned about (see [Audio](#audio) below for the caveats: WAV audio only, not claude.md's own `.mp3` example) |
 | Structs | ✅ declaration, field read/write, passed to and returned from functions |
 | **Arrays (`arr[T]`)** | ✅ literals, indexed read/write by any index expression, nesting, `.length` (`claude.md #63`), as function params/return values, as struct-array elements — see the caveats below and in `festina/codegen.py`'s module docstring |
 | **Numeric conversion (`claude.md #55/#56`)** | ✅ int and float never mix implicitly, in any operator (arithmetic *or* comparison) — `int.toFloat()` and `Math.floor/ceil/round/trunc(x)` are the only conversions, both compile-time-checked and runtime-tested |
@@ -165,12 +168,6 @@ scoped out rather than silently missing:
   one — claude.md #67 says so explicitly, since the Python compiler
   doesn't parse regex syntax itself.
 
-### Not implemented yet
-
-| Area | Status |
-|---|---|
-| Audio (`aud`, `loadAudio`) | ❌ |
-
 ### Setup
 
 Three different dependency lists, and they're not the same size — this
@@ -185,7 +182,8 @@ fresh system:
 | A C compiler (`clang` or `gcc`) | Compiles `festina_runtime.c` and links the final binary | Required (either works, per stage 3) |
 | `libsqlite3-dev` (headers) | `festina_runtime.c` does `#include <sqlite3.h>` | Required |
 | `libcairo2-dev` + `libx11-dev` (headers) | `festina_runtime.c` does `#include <cairo/cairo.h>`/`<X11/Xlib.h>` (claude.md #37/#39's img/graphics functions) — needed to *compile* the runtime even for a program that never draws anything, same as sqlite3's headers | Required |
-| `pkg-config` | Locates sqlite3's and Cairo/X11's compile/link flags | Required |
+| `libasound2-dev` (headers) | `festina_runtime.c` does `#include <alsa/asoundlib.h>` (claude.md #38's audio playback) — needed to *compile* the runtime even for a program that never plays anything, same story as Cairo/X11 above | Required |
+| `pkg-config` | Locates sqlite3's, Cairo/X11's, and ALSA's compile/link flags | Required |
 | `llvm` (provides `libLLVM`) | Lets `festina/llvm_backend.py` compile IR directly (stage 3's fast path, and the one that makes `gcc` usable at all) | Recommended — without it, the C compiler must specifically be `clang`, since only clang can parse `.ll` text (verified: `gcc` hands it to `ld`, which fails treating it as a corrupt linker script) |
 
 Missing any of these fails with a specific, actionable error (claude.md
@@ -196,17 +194,19 @@ expressions (`<regex.h>`), already part of libc everywhere this list's
 C compiler already requires libc, so regex support adds zero new
 dependencies. [Timers](#timers) (claude.md #69) are the same story:
 `clock_gettime`/`nanosleep`/`select` are all POSIX, already part of
-libc too. Graphics is the opposite case: Cairo is a genuinely new
-dependency (claude.md #39 itself requires it — "Graphics are backed by
-Cairo"), and windowing needs libX11 alongside it (see [Regex and
-String Matching](#regex-and-string-matching) vs.
-[Graphics](#graphics) below for why one added nothing and the other
-did).
+libc too. Graphics and [Audio](#audio) are the opposite case: Cairo is
+a genuinely new dependency (claude.md #39 itself requires it —
+"Graphics are backed by Cairo"), windowing needs libX11 alongside it,
+and audio needs ALSA (`libasound2-dev`) — the lowest-level standard
+Linux audio API, picked for the same "smallest dependency that does the
+job" reason Xlib was picked over a GUI toolkit (see [Regex and String
+Matching](#regex-and-string-matching) vs. [Graphics](#graphics) below
+for why one added nothing and the other did).
 
 Debian/Ubuntu:
 
 ```bash
-sudo apt install clang libsqlite3-dev libcairo2-dev libx11-dev pkg-config
+sudo apt install clang libsqlite3-dev libcairo2-dev libx11-dev libasound2-dev pkg-config
 ```
 
 `clang` conveniently pulls in `libLLVM` as a dependency, covering both
@@ -251,7 +251,7 @@ it needs.
 
 ```bash
 pip install -r requirements-dev.txt   # pytest, for the test suite
-pytest tests/                         # 370 passed, 8 skipped (see Test suite above)
+pytest tests/                         # 391 passed, 8 skipped (see Test suite above)
 
 ./bin/festina examples/hello.f -o hello
 ./hello
@@ -778,12 +778,16 @@ window, and a graphics-only program never touches the timer machinery
 
 ## Audio
 
-> **Status:** not implemented yet — see [Implementation Status](#implementation-status).
+> **Status:** implemented — plays through a real ALSA output device,
+> on a background thread so a playing clip doesn't block the rest of
+> the program. Verified against a real (virtual) audio device, not
+> just reasoned about — see `tests/test_codegen.py`'s `TestAudio`. See
+> [Implementation Status](#implementation-status) for the caveat below.
 
 Audio uses the `aud` type:
 
 ```festina
-aud music = loadAudio('music.mp3')
+aud music = loadAudio('music.wav')
 
 music.play()
 ```
@@ -795,6 +799,46 @@ music.play()
 music.stop()
 music.isPlaying()
 ```
+
+`isPlaying()` reflects reality precisely at the boundaries that matter:
+it's `true` the instant `play()` returns, and `false` the instant
+`stop()` returns (not just "soon after either") — so this is safe to
+rely on immediately, with no need to wait-and-poll:
+
+```festina
+music.play()
+log(music.isPlaying())   // true
+
+music.stop()
+log(music.isPlaying())   // false
+```
+
+Calling `play()` again while a clip is already playing restarts it
+from the beginning, the same as calling `.play()` again on a browser's
+`<audio>` element mid-playback. A clip that reaches its own natural end
+sets `isPlaying()` back to `false` on its own, with no `stop()` needed.
+
+Implementation-defined details claude.md doesn't specify, so these are
+this compiler's own choices rather than anything from the spec:
+
+- `loadAudio()` only supports WAV (16-bit PCM) — **claude.md's own
+  example names a `.mp3`**, but unlike Cairo (which decodes PNG on its
+  own, so images support PNG "for free") nothing this project already
+  depends on can decode MP3 without a real new library, so WAV — a
+  container simple enough to parse with zero decoder dependencies at
+  all — is the call made here, the same kind PNG-only images already
+  made for a different reason. Anything else (a compressed WAV,
+  8/24/32-bit PCM, an actual MP3, ...) fails at load time with a clear
+  message, not a crash.
+- Playback goes through ALSA specifically (not SDL_mixer, not a
+  PulseAudio client) — the lowest-level standard Linux audio API,
+  picked for the same "smallest dependency that does the job" reason
+  Xlib was picked over a GUI toolkit for graphics.
+- A playing clip does not keep the program running the way an
+  uncleared `setInterval` does — if the program's top-level code
+  finishes while a clip is still playing, the process exits anyway
+  (mirroring a page's audio stopping when the tab closes), it doesn't
+  wait for playback to finish.
 
 ## Imports
 

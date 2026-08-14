@@ -117,18 +117,45 @@ def compile_and_run(tmp_path, codegen, cli_mod):
     """Compile a Festina source string to a native executable and run it."""
     cc = _require_c_compiler()
 
-    def _run(source, filename="main.f", args=None):
+    def _run(source, filename="main.f", args=None, env=None):
         src_path = tmp_path / filename
         src_path.write_text(source)
         out_path = tmp_path / "program"
         cli_mod.compile_file(str(src_path), str(out_path), cc=cc)
+        run_env = dict(os.environ, **env) if env else None
         result = subprocess.run(
             [str(out_path), *(args or [])],
             cwd=tmp_path, capture_output=True, text=True, timeout=15,
+            env=run_env,
         )
         return result
 
     return _run
+
+
+@pytest.fixture
+def audio_null_env(tmp_path):
+    """A HOME override whose .asoundrc redirects ALSA's "default" PCM
+    device to ALSA's own built-in null plugin -- a real ALSA mechanism
+    (not festina-specific, the same $HOME/.asoundrc lookup a real
+    desktop's ALSA config would use), the audio equivalent of `DISPLAY`
+    pointing at a throwaway Xvfb for graphics: lets claude.md #38's
+    play()/stop()/isPlaying() actually open a "device" and stream real
+    PCM data to it without needing real sound hardware or a running
+    audio server, neither of which this dev environment has (verified:
+    no /dev/snd node at all, `snd_pcm_open(..., "default", ...)` fails
+    with "cannot find card '0'" otherwise). Unlike Xvfb, this needs no
+    extra tool install -- the null plugin ships inside alsa-lib itself,
+    which festina_runtime.c already links against unconditionally (see
+    festina/cli.py) -- so tests using this don't need their own opt-in
+    skip tier the way the Xvfb-based graphics tests do; they only need
+    the same C-compiler availability compile_and_run already requires.
+    Pass the returned dict as compile_and_run's `env=` argument.
+    """
+    home = tmp_path / "alsa_home"
+    home.mkdir()
+    (home / ".asoundrc").write_text("pcm.!default {\n    type null\n}\n")
+    return {"HOME": str(home)}
 
 
 @pytest.fixture

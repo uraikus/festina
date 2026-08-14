@@ -5,9 +5,11 @@ runtime-facing halves of #7/#8 (entry point + startup), #26 (arrays),
 
 Two kinds of tests here:
 
-- CodegenError tests for not-yet-implemented constructs (audio) only
-  need festina.codegen itself -- no C toolchain required, so they
-  always run.
+- Tests needing no C toolchain at all -- either they only check that
+  festina.codegen raises a CompileError (nothing left actually needs
+  this treatment; every claude.md construct this compiler targets now
+  generates real code), or, like TestUnrecognizedEventName below, they
+  only inspect the generated IR text directly.
 - End-to-end tests actually compile a Festina program to a native
   executable (via the `compile_and_run` fixture) and check its real
   stdout/exit code/festina.sqlite -- these skip cleanly if no C compiler
@@ -19,21 +21,18 @@ import shutil
 import sqlite3
 import subprocess
 import time
+import wave
 
 import pytest
 
 
-# ---- not-yet-implemented constructs raise clearly, no toolchain needed ----
+# ---- no C toolchain needed -- IR-text-only checks ----
 
-class TestNotImplementedYet:
+class TestUnrecognizedEventName:
     def _generate(self, parser, semantic, codegen, source, filename="main.f"):
         program = parser.parse(source, filename=filename)
         analyzed = semantic.analyze(program, filename=filename)
         return codegen.generate_ir(program, analyzed, filename=filename)
-
-    def test_audio_call_is_not_implemented(self, parser, semantic, codegen, errors):
-        with pytest.raises(errors.CompileError, match="loadAudio"):
-            self._generate(parser, semantic, codegen, "aud music = loadAudio('a.mp3')")
 
     def test_unrecognized_event_name_still_compiles_but_is_never_called(self, parser, semantic, codegen):
         # claude.md #40 only ever shows "click" and "mouse" -- any other
@@ -848,6 +847,152 @@ class TestTimers:
         finally:
             proc.terminate()
             proc.wait(timeout=5)
+
+
+def _write_wav(path, duration_s=0.2, sample_rate=8000, channels=1):
+    """A minimal, valid 16-bit PCM WAV file (silence -- only the
+    container format matters for claude.md #38's loadAudio())."""
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(b"\x00\x00" * int(duration_s * sample_rate) * channels)
+
+
+class TestAudio:
+    """claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying().
+
+    Unlike TestGraphics, none of this needs an opt-in skip tier: the
+    null-device trick audio_null_env uses (see conftest.py) needs no
+    extra tool install the way Xvfb does -- ALSA's null plugin ships
+    inside alsa-lib itself, which festina_runtime.c already links
+    against unconditionally. So every test here only needs what
+    compile_and_run already requires: a working C compiler.
+
+    Two of the deterministic-by-design guarantees these tests lean on
+    (see festina_runtime.c's festina_audio_play/_stop for why each is
+    actually guaranteed, not just usually true): isPlaying() is true
+    the instant play() returns (the flag is set synchronously, before
+    the background playback thread is even spawned), and isPlaying()
+    is false the instant stop() returns (stop() joins the thread before
+    returning, it doesn't just signal it and hope).
+    """
+
+    def test_compiles_and_links_successfully(self, cli_mod, tmp_path):
+        # No audio device needed -- just confirms codegen emits valid IR
+        # and the result links against ALSA/pthread successfully
+        # (claude.md #59: audio is a real new link-time dependency --
+        # see festina/cli.py's alsa wiring).
+        if not (shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")):
+            pytest.skip("no C compiler (clang/gcc/cc) on PATH")
+        source = """
+        aud music = loadAudio('nonexistent.wav')
+        music.play()
+        music.stop()
+        log(music.isPlaying())
+        """
+        src_path = tmp_path / "main.f"
+        src_path.write_text(source)
+        out_path = tmp_path / "program"
+        result_path = cli_mod.compile_file(str(src_path), str(out_path))
+        assert result_path == str(out_path)
+        assert out_path.exists()
+
+    def test_missing_audio_device_is_a_clear_runtime_error(self, compile_and_run, tmp_path):
+        wav_name = "clip.wav"
+        _write_wav(tmp_path / wav_name)
+        # A fresh, empty HOME (no .asoundrc) -- guarantees ALSA's
+        # "default" device resolution fails the same way it does in
+        # this dev sandbox generally (verified: no /dev/snd node at
+        # all), regardless of whatever the real test-runner's own
+        # environment happens to have.
+        empty_home = tmp_path / "empty_home"
+        empty_home.mkdir()
+        result = compile_and_run(
+            f"aud music = loadAudio('{wav_name}')\nmusic.play()\nlog('unreachable')",
+            env={"HOME": str(empty_home)},
+        )
+        assert result.returncode == 1
+        assert "could not open an audio output device" in result.stderr
+        assert "unreachable" not in result.stdout
+
+    def test_invalid_audio_path_is_a_clear_runtime_error(self, compile_and_run):
+        result = compile_and_run(
+            "aud music = loadAudio('/nonexistent/path.wav')\nlog('unreachable')"
+        )
+        assert result.returncode == 1
+        assert "could not open audio file" in result.stderr
+        assert "unreachable" not in result.stdout
+
+    def test_non_wav_file_is_a_clear_runtime_error(self, compile_and_run, tmp_path):
+        (tmp_path / "bad.wav").write_bytes(b"this is not a wav file at all")
+        result = compile_and_run("aud music = loadAudio('bad.wav')\nlog('unreachable')")
+        assert result.returncode == 1
+        assert "only 16-bit PCM WAV audio is supported" in result.stderr
+        assert "unreachable" not in result.stdout
+
+    def test_is_playing_true_immediately_after_play(self, compile_and_run, tmp_path, audio_null_env):
+        _write_wav(tmp_path / "clip.wav")
+        source = (
+            "aud music = loadAudio('clip.wav')\n"
+            "music.play()\n"
+            "log(music.isPlaying())\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_is_playing_false_immediately_after_stop(self, compile_and_run, tmp_path, audio_null_env):
+        _write_wav(tmp_path / "clip.wav")
+        source = (
+            "aud music = loadAudio('clip.wav')\n"
+            "music.play()\n"
+            "music.stop()\n"
+            "log(music.isPlaying())\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "false"
+
+    def test_stop_when_nothing_playing_is_a_safe_no_op(self, compile_and_run, tmp_path, audio_null_env):
+        _write_wav(tmp_path / "clip.wav")
+        source = "aud music = loadAudio('clip.wav')\nmusic.stop()\nlog(music.isPlaying())\n"
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "false"
+
+    def test_calling_play_again_while_playing_restarts_without_crashing(
+        self, compile_and_run, tmp_path, audio_null_env
+    ):
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = (
+            "aud music = loadAudio('clip.wav')\n"
+            "music.play()\n"
+            "music.play()\n"
+            "log(music.isPlaying())\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_timers_and_audio_work_together(self, compile_and_run, tmp_path, audio_null_env):
+        # A short clip finishes (isPlaying() -> false) on its own, with
+        # no stop() call -- checked from a setTimeout callback, proving
+        # audio playback and the timer event loop coexist correctly
+        # (the background playback thread doesn't block __festina_main()
+        # or festina_run_event_loop() on the main thread).
+        _write_wav(tmp_path / "clip.wav", duration_s=0.05)
+        source = (
+            "aud music = loadAudio('clip.wav')\n"
+            "void func check() {\n"
+            "    log(`playing after delay: ${music.isPlaying()}`)\n"
+            "}\n"
+            "music.play()\n"
+            "setTimeout(check, 200)\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "playing after delay: false"
 
 
 class TestRegex:
