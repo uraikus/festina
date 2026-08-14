@@ -196,6 +196,19 @@ user.name = 'Patrick'
 Structs are native in-memory records — declaration, field read/write,
 and passing to/returning from functions by value.
 
+Memory for structs, arrays, and maps is managed automatically — no
+manual allocation or freeing. A local struct/`arr[T]`/`map[T]`
+declared in a function, event handler, `if` branch, `while` body, or
+`for` body, and never returned, stored anywhere longer-lived, or passed
+to another function, is reclaimed automatically as soon as control
+leaves the block it was declared in — for a value declared inside a
+loop body, that means every iteration, not deferred until the function
+eventually returns; `break`/`continue` reclaim it too, the same as
+reaching the end of that iteration normally would. A value that does
+escape (returned, stored somewhere longer-lived, passed to another
+function) is reclaimed by a later stage not yet implemented — see
+[todo.md](todo.md#memory-management).
+
 ## Arrays
 
 ```festina

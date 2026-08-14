@@ -1750,3 +1750,22 @@ for int i = 0, i < 10, i++ {
 This logs 1, 3.
 
 There is no labeled break or continue targeting an outer loop specifically -- only return from the enclosing function can exit more than one loop at once.
+
+
+74. AUTOMATIC MEMORY RECLAMATION (STAGE 1: NON-ESCAPING LOCALS)
+
+This section describes the first stage of section 43's automatic memory management promise. It is deliberately incremental -- only some memory is reclaimed automatically by this stage. Memory not covered by this stage behaves exactly as before: heap-allocated and not yet reclaimed. A later stage will extend this coverage; nothing in this section should be read as the complete picture of section 43.
+
+A local variable of struct, arr[T], or map[T] type, declared directly in the body of a function, event handler, if branch, while body, or for body, is automatically freed as soon as control leaves the block it was declared in, if the compiler can prove its value never outlives that block's own enclosing function or handler.
+
+The compiler proves this the same way regardless of which block the variable is declared in: by checking every place that variable's name appears anywhere in the enclosing function or handler body, not just within its own declaring block. If the variable is used only to read or write its own fields or elements (v.field, v.field = x, v[i], v[i] = x, v.someMethod(...)), its value cannot have been stored anywhere else, passed anywhere else, or returned, and it is safe to free automatically. If the variable's name appears anywhere else -- as a return value, as an argument to any function call, as the value or target of a plain assignment, as an element of an array or map literal, or in any other position, anywhere in the function or handler -- the compiler does not attempt to prove anything further about it, and it is not freed automatically. This is a conservative check: it only ever concludes a variable is safe to free when it can prove this from the syntax of the function or handler alone. When it cannot prove this, the variable leaks exactly as it does today. This must never free a variable whose safety was not proven.
+
+"As soon as control leaves the block it was declared in" is deliberately not "when the enclosing function or handler returns": a variable declared inside a for or while loop's body is freed at the end of every iteration that reaches the end of the loop body, not deferred until the loop itself finishes or the function eventually returns. break and continue leaving a loop early free every such variable declared since that loop's body began (including ones declared in an if branch nested inside the loop body) before actually transferring control, the same as reaching the natural end of the loop body would. A variable declared outside a loop and merely used inside it (read or written through its own fields/elements, which is always safe regardless of where the variable itself was declared) is unaffected by that loop's own break/continue -- only variables declared since the loop's own body began are freed by them.
+
+This stage does not yet analyze:
+
+- Whether a value passed as an argument to another function is retained by that function. Any use as a call argument is treated as escaping, unconditionally, even if the called function does not actually retain it.
+- Fields within a freed struct that are themselves struct, arr[T], or map[T] values. Freeing the outer struct does not free those nested allocations; they continue to leak independently until a later stage addresses them.
+- A freed map[T]'s own individual entries. Freeing a map frees its entries buffer as a whole, but each entry's key is its own separate allocation (independent of the map's declared value type, and independent of whether that value type is itself covered by this stage or not); those per-entry key allocations are not freed and continue to leak until a later stage addresses them.
+
+None of these are safety gaps -- each one simply means less memory is reclaimed automatically than a more complete implementation would reclaim, not that anything is freed incorrectly. Extending coverage to these cases is expected in later stages, each documented as its own addition to this section or a new one, following the same rule: memory is only freed automatically where the compiler can prove it is safe.

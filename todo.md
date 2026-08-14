@@ -101,55 +101,107 @@ a benchmarks addition once real (server) benchmarks are possible.
 
 `claude.md #43` promises "automatic memory management" — the compiler
 should "automatically release or reclaim memory when values are no
-longer reachable." Today, arrays and struct storage are heap-allocated
-(`malloc`/`calloc`) and never freed at all — a real resource leak in any
-long-running program, though not a memory-safety issue on its own (see
-[security.md](security.md)'s "known, accepted memory-management gap"
-note: no use-after-free, no double-free, since nothing is ever freed).
+longer reachable." Arrays and struct storage are heap-allocated
+(`malloc`/`calloc`); until `claude.md #74` (stage 1, below) landed,
+none of it was ever freed — a real resource leak in any long-running
+program, though never a memory-safety issue on its own (see
+[security.md](security.md)'s note: no use-after-free, no double-free,
+since nothing was ever freed).
 
-This is deliberately still not implemented, and deliberately not
-attempted casually — not because it's unimportant, but because the two
-obvious ways to close it are a much bigger, riskier undertaking than
-either landing a new language feature (`map[T]`, `break`/`continue`,
-...) or fixing a compile-time gap (a mismatched-type error reaching
-codegen, a missing null representation):
+### Stage 1: non-escaping locals (done — claude.md #74)
 
-- **Stack-allocate a struct/array that provably never outlives its
-  declaring function**, instead of always heap-allocating. This was
-  already tried, in an earlier pass, in the most naive form (stack-
-  allocate every local struct unconditionally) — and reverted after it
-  was verified to silently corrupt memory: a struct's address can
-  genuinely outlive its function (returned, stored in an array or
-  another struct's field, ...), and a stack allocation doesn't survive
-  that (see `festina/codegen.py`'s module docstring, "Struct storage is
-  always heap-allocated"). Doing this correctly needs real escape
-  analysis (does this value's address ever get returned, stored into a
-  longer-lived array/struct/global, or passed to something that might
-  retain it?) — genuinely tricky to get exhaustively right, and a wrong
-  answer here doesn't fail loudly, it silently reads garbage at some
-  later, disconnected point in the program, exactly the failure mode
-  already verified once.
-- **Reference counting** (or a real tracing GC) for heap-allocated
-  arrays/structs — increment on every assignment/parameter pass/store
-  into another value, decrement when a scope's variables go out of
-  scope, free at zero. This is the more complete answer to what claude.md
-  #43 actually asks for, but touches nearly every place a value is
-  assigned, passed, stored, or a scope exits — a large surface area to
-  get right, and an incorrect refcount (an early free, or a missed
-  increment before something else drops its own reference) *is* a real
-  memory-safety bug — a genuine regression from today's "leaks but is
-  otherwise memory-safe" state, not a wash. Cycles are also a real
-  question to resolve one way or another (rare in Festina's language
-  model, given no closures/first-class functions and no direct self-
-  referential struct fields, but not provably impossible without
-  checking).
+A local struct/`arr[T]`/`map[T]` declared directly in a function, event
+handler, `if` branch, `while` body, or `for` body is freed automatically
+as soon as control leaves the block it was declared in, when
+`festina/escape_analysis.py` can prove — from the syntax of the whole
+enclosing function/handler alone — that its address never left it
+(never returned, never passed as a call argument, never stored into a
+global or another value, never reassigned). Critically, "as soon as
+control leaves the block" is not "when the function eventually
+returns": a value declared inside a loop body is freed at the end of
+*every* iteration that reaches the end of that body, and `break`/
+`continue` leaving a loop early free everything declared since that
+loop's own body began before actually transferring control — the
+same as reaching the loop body's natural end would. This is what
+actually matters for a long-running loop: without it, a loop-local
+value would leak once per iteration, unbounded, no matter how the
+function-level version of this same idea was scoped. See `claude.md
+#74` for the exact rule and its explicitly stated remaining
+limitations (below).
 
-Given the size and risk of either path, this needs a dedicated design
-pass (and, given this project's own established pattern, almost
-certainly a `claude.md` addition first, spelling out exactly which
-strategy and what tradeoffs it accepts) rather than being folded into an
-unrelated change as a side effect. Not attempted here for that reason,
-not because it was overlooked.
+Verified three ways, not just reasoned about, at each step of building
+this out (first the function-top-level-only version, then widened to
+cover nested `if`/`while`/`for` bodies including `break`/`continue`
+interaction): exhaustive unit tests of the analysis itself
+(`tests/test_escape_analysis.py`, every syntactic escaping/non-escaping
+pattern, no C compiler needed — unchanged by the nested-block widening,
+since the analysis was always whole-function-scoped from the start),
+end-to-end compile-and-run tests
+(`tests/test_codegen.py::TestAutomaticMemoryReclamation`, including the
+exact "return a struct by value" pattern that broke the earlier naive
+stack-allocation attempt below, and the critical "a value declared
+outside a loop and merely used inside it survives that loop's own
+break/continue" case), and real AddressSanitizer/LeakSanitizer runs
+against combined programs exercising every escaping/non-escaping
+pattern together, including deeply nested `if`-inside-loop with both
+`break` and `continue` firing across many iterations — zero ASAN
+errors both times, and LeakSanitizer's reported leaks matched the
+hand-derived expected count exactly in every run, including one where
+the "extra" leak turned out to be a real, distinct, already-documented
+gap (a global repeatedly reassigned to a freshly escaping value orphans
+its previous one — a structurally different kind of leak than anything
+escape analysis for non-escaping locals could ever address, confirmed
+by removing that one line and re-running to zero leaks).
+
+This was deliberately shipped as two separate, individually reviewable
+increments — first function-top-level-only, then widened to nested
+blocks and per-iteration loop freeing — rather than attempting the
+whole thing in one pass, exactly as originally planned.
+
+### What's still ahead
+
+- **Escape analysis is *always still followed by a real `calloc` +
+  `free`***, not true stack allocation — a real speed cost (allocator
+  traffic) that a genuine stack alloca would avoid entirely. Widening
+  stage 1's proof to also cover interprocedural reasoning (does a value
+  passed as a call argument actually get retained by the callee, or is
+  it provably only read/used transiently?) is what would let it safely
+  swap in a stack alloca instead of calloc+free for the values that
+  qualify — the nested-block and per-iteration-loop coverage stage 1
+  already has is not itself the blocker for this anymore, since a
+  stack alloca inside a loop body is exactly as sound as one inside a
+  plain function body (both are popped/reused the same way on the next
+  iteration/call); it's specifically the still-conservative "any call
+  argument escapes unconditionally" rule that would need real
+  interprocedural analysis before this could be considered. Still
+  governed by claude.md #74 (or a new stage within it), not a new
+  design.
+
+  A naive, unconditional version of stack allocation was tried once,
+  before stage 1 existed, and reverted after it was verified to
+  silently corrupt memory (a struct's address can genuinely outlive its
+  function -- returned, stored in an array or another struct's field --
+  and a stack allocation doesn't survive that; see
+  `festina/codegen.py`'s module docstring). Stage 1's own escape
+  analysis is the proof mechanism that naive attempt was missing --
+  widening it is the difference between "provably safe, narrow" (stage
+  1 today) and "provably safe, wide enough to also justify stack
+  allocation instead of calloc+free."
+- **Reference counting** (or a real tracing GC) for the values escape
+  analysis can't (or structurally never could) clear — genuinely shared
+  values, or ones stored somewhere long-lived on purpose (globals,
+  caches). This is the complete answer for the remainder stage 1's
+  approach can never reach on its own (a value that provably *does*
+  escape has nothing for escape analysis to do), but touches nearly
+  every place a value is assigned, passed, stored, or a scope exits — a
+  large surface area to get right, and an incorrect refcount (an early
+  free, or a missed increment) *is* a real memory-safety bug, a genuine
+  regression from "leaks but is memory-safe," not a wash. Cycles are
+  also a real question to resolve one way or another (rare in Festina's
+  language model, given no closures/first-class functions, but not
+  provably impossible without checking). Needs its own `claude.md`
+  addition and dedicated design pass before implementation, same as
+  every stage here — not attempted yet, not overlooked.
 
 ## Smaller, not yet tracked elsewhere
 
