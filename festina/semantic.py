@@ -54,6 +54,7 @@ _INT = types_mod.PrimitiveType("int")
 _FLOAT = types_mod.PrimitiveType("float")
 _NUMERIC_TYPES = (_INT, _FLOAT)
 _TEXT = types_mod.PrimitiveType("text")
+_BLOB = types_mod.PrimitiveType("blob")
 
 # claude.md #37, #39: signatures for the builtins with real implementations
 # (drawCircle/drawText/drawImage/loadImage) -- matches each function's own
@@ -196,6 +197,19 @@ def analyze(program, filename="<string>"):
     def check_assignable(declared, actual, node, what="value"):
         if actual is None or actual is NULL or declared is None:
             return
+        # claude.md #36: blob's only worked example ("blob data =
+        # 'path/to/file'") assigns a plain string literal -- which
+        # infers as `text` (there's no separate blob-literal syntax
+        # anywhere in claude.md) -- directly to a blob-declared
+        # variable. Without this, that example wouldn't compile at all,
+        # and blob would be completely unconstructible (no builtin
+        # returns one either), so text -> blob is allowed here
+        # one-directionally, matching the only direction claude.md ever
+        # shows; codegen needs no special coercion for it either, since
+        # blob and text already share the identical `ptr` runtime
+        # representation (see _llvm_type).
+        if declared == _BLOB and actual == _TEXT:
+            return
         if declared != actual:
             raise CompileError(
                 f"cannot assign {what} of type {types_mod.type_name(actual)} "
@@ -270,6 +284,27 @@ def analyze(program, filename="<string>"):
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid assignment",
                 )
+            # claude.md #22: a `const`-declared variable cannot be
+            # reassigned -- the whole point of "constant," and needed
+            # for "Constants should be available for compiler
+            # optimization" to actually hold (an optimization assuming
+            # a const never changes would be unsafe if reassignment
+            # were silently allowed). Checked here for the same reason
+            # .length/clientWidth's read-only checks are: the generic
+            # target_type/value_type check below only verifies type
+            # compatibility, it can't tell a legal write target from an
+            # illegal one. Postfix ++/-- already separately rejects a
+            # constant operand (see PostfixOp below) -- that's a
+            # different AST node, so it needs its own check rather than
+            # sharing this one.
+            if isinstance(expr.target, ast.Identifier):
+                target_sym = scope.lookup(expr.target.name)
+                if target_sym is not None and target_sym.kind == "constant":
+                    raise CompileError(
+                        f"cannot assign to constant '{expr.target.name}'",
+                        file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                        category="invalid assignment",
+                    )
             target_type = infer(expr.target, scope)
             value_type = infer(expr.value, scope)
             check_assignable(target_type, value_type, expr)
@@ -325,7 +360,53 @@ def analyze(program, filename="<string>"):
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid operand type",
                 )
-            if expr.op in ("==", "!=", "<", ">", "<=", ">="):
+            if expr.op in ("==", "!="):
+                # claude.md #18 shows == / != between two values of the
+                # same type; it never shows (and #2's "no implicit
+                # coercion" principle rules out) comparing genuinely
+                # different types like int and text. Without this check
+                # something like `5 == 'x'` passed straight through to
+                # codegen, which has no general fallback for a type
+                # mismatch here (only the text-specific branch of
+                # _emit_binop even looks at the operand types) and
+                # produced invalid LLVM IR instead of a clear compile
+                # error. NULL is valid against everything (#25); blob
+                # and text are mutually comparable since check_assignable
+                # already allows text -> blob assignment and they share
+                # the identical runtime representation (both `ptr`,
+                # compared via the same festina_str_eq either way).
+                compatible = (
+                    left is None or right is None
+                    or left is NULL or right is NULL
+                    or left == right
+                    or {left, right} == {_TEXT, _BLOB}
+                )
+                if not compatible:
+                    raise CompileError(
+                        f"cannot compare {types_mod.type_name(left)} and "
+                        f"{types_mod.type_name(right)} with {expr.op}",
+                        file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                        category="invalid operand type",
+                    )
+                return types_mod.PrimitiveType("bool")
+            if expr.op in ("<", ">", "<=", ">="):
+                # claude.md never defines ordering for anything but
+                # numbers, and codegen only ever implements int/float
+                # comparisons for these operators (text raises its own
+                # clear CodegenError already, but nothing stopped e.g.
+                # two `bool` operands from silently reaching codegen's
+                # numeric icmp path and being "ordered" in a way
+                # claude.md never sanctions).
+                numeric_or_null = (_INT, _FLOAT, NULL)
+                left_ok = left is None or left in numeric_or_null
+                right_ok = right is None or right in numeric_or_null
+                if not (left_ok and right_ok):
+                    raise CompileError(
+                        f"'{expr.op}' requires int or float operands, found "
+                        f"{types_mod.type_name(left)} and {types_mod.type_name(right)}",
+                        file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                        category="invalid operand type",
+                    )
                 return types_mod.PrimitiveType("bool")
             if left == types_mod.PrimitiveType("float") or right == types_mod.PrimitiveType("float"):
                 return types_mod.PrimitiveType("float")
@@ -346,6 +427,25 @@ def analyze(program, filename="<string>"):
                     f"cannot index into {types_mod.type_name(obj_type)}",
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid field access",
+                )
+            # claude.md #65: "The index expression must resolve to
+            # int" -- idx_type used to be inferred and then simply
+            # discarded, never actually checked against anything. A
+            # float or text index (e.g. `a[1.5]`, `a['x']`) passed
+            # semantic analysis and reached codegen, which emits a
+            # `getelementptr` using the index value's own LLVM
+            # representation regardless of its Festina type --
+            # producing invalid LLVM IR (a raw double or a `ptr` used
+            # where an `i64` GEP index is required) and a confusing
+            # internal "LLVM object emission failed" error instead of a
+            # clear compile-time one. Covers both a read (`a[i]`) and a
+            # write target (`a[i] = v`), since Assign's target_type
+            # also goes through this same function.
+            if idx_type is not None and idx_type is not NULL and idx_type != _INT:
+                raise CompileError(
+                    f"array index must be int, found {types_mod.type_name(idx_type)}",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid operand type",
                 )
             return obj_type.element
         if isinstance(obj_type, types_mod.StructType):
@@ -664,6 +764,29 @@ def analyze(program, filename="<string>"):
         scope.define(decl.name, Symbol(decl.name, declared_type, kind, decl), decl, filename)
 
     def analyze_func(decl):
+        # `log`/`fail`/`sqlite` are already lexer keywords, so a
+        # function can never be declared with those names in the first
+        # place -- but drawRect/drawCircle/drawText/drawImage/
+        # loadImage/loadAudio/regex/setTimeout/setInterval/
+        # clearTimeout/clearInterval are ordinary identifiers, only
+        # recognized as builtins by name inside _infer_call's Call
+        # dispatch (which always checks the builtin name *before* ever
+        # looking the name up in scope). A user function declared with
+        # one of those names would therefore compile fine but be
+        # permanently unreachable -- every call to it resolves to the
+        # builtin instead, silently. This used to be accepted (see
+        # README.md's now-corrected note) on the reasoning that none of
+        # graphics/audio/timers were implemented yet, so the collision
+        # couldn't actually bite; now that they are, it can.
+        if decl.name in BUILTIN_FUNCTIONS:
+            raise CompileError(
+                f"'{decl.name}' is a builtin function name and cannot be used to "
+                f"declare a function -- a function declared with this name would be "
+                f"permanently unreachable, since every call to '{decl.name}(...)' "
+                f"resolves to the builtin instead",
+                file=filename, line=decl.line, column=decl.column,
+                category="duplicate declaration",
+            )
         return_type = resolve(decl.return_type, decl) if decl.return_type != "void" else None
         global_scope.define(decl.name, Symbol(decl.name, return_type, "function", decl), decl, filename)
         func_scope = Scope(global_scope)
@@ -734,10 +857,32 @@ def analyze(program, filename="<string>"):
             infer(stmt.update, loop_scope)
             analyze_block(stmt.body, loop_scope, return_type)
         elif isinstance(stmt, ast.Return):
+            # claude.md #23: "A function that does not return a value
+            # uses void" implies the converse too -- a void function
+            # doesn't return one, and a non-void function does. Neither
+            # direction used to be checked: `void func f() { return 5 }`
+            # silently discarded the 5 (LLVM `ret void` regardless of
+            # what expression was given -- the expression itself was
+            # still evaluated, so a side-effecting return value's
+            # effects still happened, just its result vanished), and
+            # `int func f() { return }` (no value) fell through with
+            # nothing checked at all in either branch below.
             if stmt.value is not None:
                 actual = infer(stmt.value, scope)
-                if return_type is not None:
-                    check_assignable(return_type, actual, stmt, what="return value")
+                if return_type is None:
+                    raise CompileError(
+                        "cannot return a value from a void function",
+                        file=filename, line=getattr(stmt, "line", 0), column=getattr(stmt, "column", 0),
+                        category="invalid return type",
+                    )
+                check_assignable(return_type, actual, stmt, what="return value")
+            elif return_type is not None:
+                raise CompileError(
+                    f"function must return a value of type {types_mod.type_name(return_type)}, "
+                    f"not a bare 'return'",
+                    file=filename, line=getattr(stmt, "line", 0), column=getattr(stmt, "column", 0),
+                    category="invalid return type",
+                )
         elif isinstance(stmt, ast.Block):
             analyze_block(stmt, scope, return_type)
         elif isinstance(stmt, ast.ExprStmt):

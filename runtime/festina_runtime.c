@@ -114,6 +114,39 @@ static const char *festina_sql_type(const char *festina_type) {
     return "TEXT";
 }
 
+/* festina_sync_table below builds several SQL statements incrementally
+ * across a loop over the declared columns, in the form
+ * `pos += snprintf(buf + pos, sizeof(buf) - pos, ...)`. That pattern
+ * looks bounds-safe (it's the textbook idiom for it) but genuinely
+ * isn't: snprintf's return value is how many bytes *would* have been
+ * written if the buffer were big enough, not how many actually fit --
+ * so once accumulated output exceeds the buffer, `pos` exceeds
+ * `sizeof(buf)`, and the *next* iteration's `sizeof(buf) - pos` is
+ * computed as unsigned arithmetic between a smaller and a larger value,
+ * silently underflowing to a huge number close to SIZE_MAX. snprintf is
+ * then told it has ~18 exabytes of buffer to write into and gladly
+ * writes straight past the real (2048-or-so-byte) stack array --
+ * verified directly: a table with enough columns (or long enough
+ * column/table names) that the generated SQL exceeds one of these
+ * buffers reliably stack-smashes and crashes under AddressSanitizer.
+ * Called at the top of every loop iteration that accumulates into one
+ * of these buffers (and once more after the loop, before any final
+ * fixed-text append), so `sizeof(buf) - pos` is never computed once
+ * `pos` has already reached or passed `buf_size` -- turning what would
+ * be undetected memory corruption into a clear, actionable
+ * festina_fail() instead (a table with columns that simply can't fit
+ * in a fixed-size buffer is a real, if unusual, condition to handle,
+ * not something to grow the buffers arbitrarily large to rule out). */
+static void festina_check_sql_buffer(int pos, size_t buf_size, const char *what) {
+    if (pos < 0 || (size_t)pos >= buf_size) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "festina_sync_table: %s is too long for this compiler's fixed-size "
+                 "buffer (too many columns, or column/table names too long)", what);
+        festina_fail(msg);
+    }
+}
+
 #define FESTINA_MAX_COLS 64
 
 void festina_sync_table(sqlite3 *db, const char *table_name,
@@ -149,10 +182,12 @@ void festina_sync_table(sqlite3 *db, const char *table_name,
         char sql[2048];
         int pos = snprintf(sql, sizeof(sql), "CREATE TABLE IF NOT EXISTS %s (", table_name);
         for (int i = 0; i < ncols; i++) {
-            pos += snprintf(sql + pos, sizeof(sql) - pos, "%s%s %s", i ? ", " : "",
+            festina_check_sql_buffer(pos, sizeof(sql), "CREATE TABLE statement");
+            pos += snprintf(sql + pos, sizeof(sql) - (size_t)pos, "%s%s %s", i ? ", " : "",
                              col_names[i], festina_sql_type(col_types[i]));
         }
-        snprintf(sql + pos, sizeof(sql) - pos, ");");
+        festina_check_sql_buffer(pos, sizeof(sql), "CREATE TABLE statement");
+        snprintf(sql + pos, sizeof(sql) - (size_t)pos, ");");
         festina_exec(db, sql);
         return;
     }
@@ -204,10 +239,12 @@ void festina_sync_table(sqlite3 *db, const char *table_name,
     char create_sql[2048];
     int pos = snprintf(create_sql, sizeof(create_sql), "CREATE TABLE %s (", new_table);
     for (int i = 0; i < ncols; i++) {
-        pos += snprintf(create_sql + pos, sizeof(create_sql) - pos, "%s%s %s", i ? ", " : "",
+        festina_check_sql_buffer(pos, sizeof(create_sql), "CREATE TABLE statement");
+        pos += snprintf(create_sql + pos, sizeof(create_sql) - (size_t)pos, "%s%s %s", i ? ", " : "",
                          col_names[i], festina_sql_type(col_types[i]));
     }
-    snprintf(create_sql + pos, sizeof(create_sql) - pos, ");");
+    festina_check_sql_buffer(pos, sizeof(create_sql), "CREATE TABLE statement");
+    snprintf(create_sql + pos, sizeof(create_sql) - (size_t)pos, ");");
     festina_exec(db, create_sql);
 
     char dest_cols[1024] = "";
@@ -217,12 +254,14 @@ void festina_sync_table(sqlite3 *db, const char *table_name,
     for (int j = 0; j < ncols; j++) {
         for (int i = 0; i < n_existing; i++) {
             if (strcmp(existing_names[i], col_names[j]) == 0) {
-                dpos += snprintf(dest_cols + dpos, sizeof(dest_cols) - dpos, "%s%s", first ? "" : ", ", col_names[j]);
+                festina_check_sql_buffer(dpos, sizeof(dest_cols), "column list");
+                dpos += snprintf(dest_cols + dpos, sizeof(dest_cols) - (size_t)dpos, "%s%s", first ? "" : ", ", col_names[j]);
+                festina_check_sql_buffer(spos, sizeof(src_cols), "column list");
                 if (strcmp(existing_types[i], festina_sql_type(col_types[j])) != 0) {
-                    spos += snprintf(src_cols + spos, sizeof(src_cols) - spos, "%sCAST(%s AS %s)",
+                    spos += snprintf(src_cols + spos, sizeof(src_cols) - (size_t)spos, "%sCAST(%s AS %s)",
                                       first ? "" : ", ", col_names[j], festina_sql_type(col_types[j]));
                 } else {
-                    spos += snprintf(src_cols + spos, sizeof(src_cols) - spos, "%s%s", first ? "" : ", ", col_names[j]);
+                    spos += snprintf(src_cols + spos, sizeof(src_cols) - (size_t)spos, "%s%s", first ? "" : ", ", col_names[j]);
                 }
                 first = 0;
                 break;

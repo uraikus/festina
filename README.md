@@ -29,11 +29,11 @@ Festina is under active development. Everything else in this README
 describes the full target language from `claude.md`; this section is
 the ground truth for what actually runs today.
 
-**Test suite:** 399 tests, 0 failed (`pytest tests/`) — 391 passed/8
+**Test suite:** 430 tests, 0 failed (`pytest tests/`) — 422 passed/8
 skipped by default (2 need `pyinstaller`, an opt-in build-time-only
 dependency for the packaged-binary tests; 6 need `Xvfb`/`xdotool` to
 open and interact with a real window for the graphics and combined
-graphics+timers tests; see [Setup](#setup)), or all 399 passed/0
+graphics+timers tests; see [Setup](#setup)), or all 430 passed/0
 skipped with those installed. Audio's tests need neither — the
 null-device technique they use (see [Audio](#audio) below) needs no
 extra tool install.
@@ -140,13 +140,15 @@ scoped out rather than silently missing:
   still technically permits a user to write `struct _FestinaArray`, so
   this lowers the odds without eliminating the possibility.
 - `drawRect`/`drawCircle`/`drawText`/`drawImage`/`loadImage`/`loadAudio`/
-  `regex` aren't reserved words (unlike `log`/`fail`/`sqlite`, which are
-  lexer keywords) — declaring a function with one of those names
-  silently shadows the builtin at every call site rather than erroring.
-  Left as is for the graphics/audio functions since none of them are
-  implemented yet anyway; `regex` follows the same convention
-  deliberately, matching how `loadImage`/`loadAudio` are already
-  builtin *functions*, not dedicated keywords or literal syntax.
+  `regex`/`setTimeout`/`setInterval`/`clearTimeout`/`clearInterval`
+  aren't reserved *words* (unlike `log`/`fail`/`sqlite`, which are
+  lexer keywords) — but declaring a **function** with one of those
+  names is a compile-time error (`category="duplicate declaration"`):
+  since builtin-name dispatch always wins over a same-named user
+  function, that function would otherwise compile fine but be
+  permanently uncallable. A *variable* with one of those names is
+  still fine (only a function declaration collides, since only
+  `name(...)` call syntax is what the builtin dispatch intercepts).
 - `sqlite()`'s optional second argument (bound parameters) must be a
   literal array expression (e.g. `sqlite(sql, [1, 'Patrick'])`), not an
   arbitrary `arr[T]`-typed variable or expression — claude.md #33's own
@@ -167,6 +169,39 @@ scoped out rather than silently missing:
   with the underlying `regcomp()` error message), not a compile-time
   one — claude.md #67 says so explicitly, since the Python compiler
   doesn't parse regex syntax itself.
+
+### Fixed by a spec-compliance/security audit
+
+A dedicated audit pass (not incidental to any one feature) found and
+fixed eight real bugs across the type checker and the C runtime — full
+detail, including exact reasoning and regression tests, is in
+[`tests/CONTRACT.md`](tests/CONTRACT.md)'s "Status" section. The short
+version:
+
+- **A real stack buffer overflow**, the one genuine security finding:
+  a `table` declaration with enough columns (or long enough column/table
+  names) that the generated `CREATE TABLE`/migration SQL exceeded one
+  of several fixed-size stack buffers in `festina_sync_table`
+  (`runtime/festina_runtime.c`) reliably corrupted the stack — verified
+  as a real, reproducible crash under AddressSanitizer, not a
+  theoretical concern. Not a contrived adversarial input either: any
+  program with a sufficiently wide table could trigger it. Fixed and
+  re-verified clean under AddressSanitizer.
+- claude.md #36's own only worked example for `blob` failed to compile
+  at all (nothing else in the language could construct a blob value
+  either), and `log()` on the one blob value that could then exist
+  crashed the compiler itself with a bare Python exception.
+- `==`/`!=`/`<`/`>`/`<=`/`>=` between clearly incompatible types (e.g.
+  `5 == 'x'`, `'a' < 'b'`) and a non-`int` array index (e.g. `a[1.5]`)
+  both passed type-checking and reached codegen, which emitted invalid
+  LLVM IR and surfaced a confusing internal compiler error instead of
+  a clear one.
+- A `const` could be reassigned with plain `=` (only postfix `++`/`--`
+  was ever protected), a `void` function could return a value (silently
+  discarded) and a non-`void` function could bare-`return` with none.
+- Declaring a function with the same name as a builtin (`drawRect`,
+  `setTimeout`, ...) compiled but made that function permanently
+  uncallable — every call still resolved to the builtin.
 
 ### Setup
 
@@ -251,7 +286,7 @@ it needs.
 
 ```bash
 pip install -r requirements-dev.txt   # pytest, for the test suite
-pytest tests/                         # 391 passed, 8 skipped (see Test suite above)
+pytest tests/                         # 422 passed, 8 skipped (see Test suite above)
 
 ./bin/festina examples/hello.f -o hello
 ./hello

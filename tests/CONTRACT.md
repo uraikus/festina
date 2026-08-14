@@ -158,6 +158,142 @@ process exits anyway. Verified end to end against a real (virtual) ALSA
 device -- see "Why the tests are structured this way" below for
 `tests/test_audio.py`/`TestAudio`.
 
+A spec-compliance/security/robustness audit (prompted directly, not
+something the earlier per-feature work happened to already cover) found
+and fixed eight real bugs, all in `festina/semantic.py` unless noted,
+each with its own regression test (mostly in `tests/test_semantic_errors.py`;
+see individual test names below and each fix's own code comment for
+the full reasoning):
+
+- claude.md #36's own only worked example (`blob data =
+  'path/to/file'`) failed semantic analysis outright -- a string
+  literal infers as `text`, and `text`/`blob` were fully incompatible
+  types with no exception, meaning blob could never actually hold a
+  value at all (nothing else in the language constructs one either).
+  Fixed by allowing `text -> blob` assignment specifically, in
+  `check_assignable` -- the only direction claude.md's example ever
+  shows, and safe since both share the identical `ptr` runtime
+  representation. `log()` on the one blob value that could then exist
+  crashed the *compiler itself* with a bare Python `KeyError`
+  (`festina/codegen.py`; blob passed the "is this a PrimitiveType"
+  check in `log()`'s dispatch but had no entry in the type->runtime-
+  function dict) -- previously unreachable for the same reason, but a
+  real crash risk the instant blob became constructible. See
+  `tests/test_types.py::TestBlobImgAud` and
+  `tests/test_codegen.py::TestBlob`.
+- `==`/`!=`/`<`/`>`/`<=`/`>=` had no general type-compatibility check
+  at all beyond the existing int/float-mixing rule -- `5 == 'x'`,
+  `'a' < 'b'`, `bool == int`, all passed semantic analysis. The
+  equality/ordering cases reached codegen with no general fallback for
+  a genuine mismatch (only the text-specific branch of `_emit_binop`
+  even inspects operand types) and produced *invalid LLVM IR* --
+  `festina_str_eq(ptr 5, ...)`, a raw integer constant where a pointer
+  was required -- surfacing as a confusing internal "LLVM object
+  emission failed" error instead of a clear compile-time one. Fixed
+  with two new checks in the `BinOp` branch: `==`/`!=` require the
+  same type (NULL valid against anything per #25; blob/text mutually
+  comparable for the same reason as above), `<`/`>`/`<=`/`>=` require
+  both operands be int or float (matching what codegen actually
+  implements -- text already raised its own clean `CodegenError` for
+  this, but nothing stopped e.g. two `bool` operands from silently
+  reaching codegen's numeric `icmp` path).
+- Array indexing had the identical shape of bug: `_infer_member`'s
+  computed-index branch inferred the index expression's type and then
+  simply discarded it, never checking it against anything, despite
+  claude.md #65 explicitly saying "The index expression must resolve
+  to int." `a[1.5]`/`a['x']` both passed semantic analysis and reached
+  codegen, which emits a `getelementptr` using the index value's own
+  LLVM representation regardless of its Festina type -- a raw
+  `double`, or a `ptr`, where an `i64` GEP index is required -- again
+  invalid IR, again a confusing internal codegen error rather than a
+  clean one. Covers both a read (`a[i]`) and a write target
+  (`a[i] = v`), since `Assign`'s `target_type` goes through the same
+  `_infer_member` call.
+- A `const`-declared variable could be reassigned with plain `=`
+  (`const int x = 5; x = 10` compiled and silently changed `x`) --
+  postfix `++`/`--` already rejected a constant operand, but plain
+  assignment shared no such check. Undermines claude.md #22's own
+  "Constants should be available for compiler optimization": that
+  guarantee only holds if a const genuinely never changes. Fixed with
+  a `Symbol.kind == "constant"` check in the `Assign` branch, mirroring
+  the existing `.length`/`clientWidth` read-only checks' placement.
+- `void func f() { return 5 }` compiled -- the `5` was evaluated (so a
+  side-effecting return expression's side effects still happened) but
+  its result was silently discarded, `ret void` emitted regardless of
+  what was returned. `int func f() { return }` (bare return, no value,
+  in a non-void function) also compiled, with nothing checked in
+  either direction. claude.md #23's own void-vs-non-void distinction
+  ("A function that does not return a value uses void") directly
+  implies both directions are supposed to be errors; fixed in the
+  `Return` statement handling. The *other* direction claude.md is
+  silent on -- a non-void function whose body doesn't return on every
+  path, which still compiles and falls off the end returning that
+  type's zero value -- was deliberately left alone (per #54's
+  ambiguity rule: an undetermined case is not something to invent a
+  new restriction for) but is now explicitly documented as a
+  considered choice in `festina/codegen.py`'s `_emit_func`, where it
+  previously had no comment explaining it at all.
+- `drawRect`/`drawCircle`/`drawText`/`drawImage`/`loadImage`/
+  `loadAudio`/`regex`/`setTimeout`/`setInterval`/`clearTimeout`/
+  `clearInterval` aren't lexer keywords (unlike `log`/`fail`/`sqlite`),
+  so a user could declare `void func drawRect(...) { ... }` -- it
+  compiled fine, but every *call* to `drawRect(...)` still resolved to
+  the builtin (codegen's Call dispatch always checks the builtin name
+  first), making the user's own function permanently unreachable,
+  silently. README.md used to excuse this specifically because
+  graphics/audio/timers weren't implemented yet, so the collision
+  couldn't actually bite -- now that they are, it can, so `analyze_func`
+  now rejects declaring a function with any of these names
+  (`category="duplicate declaration"`). A *variable* with one of these
+  names is unaffected (only a function declaration collides, since only
+  `name(...)` call syntax is what builtin dispatch intercepts).
+- The one genuine security finding: `festina_sync_table`
+  (`runtime/festina_runtime.c`, #28-31) built several SQL statements
+  incrementally across a loop over the declared columns, in the
+  textbook-looking-but-actually-unsafe form
+  `pos += snprintf(buf + pos, sizeof(buf) - pos, ...)`. snprintf's
+  return value is how many bytes *would* have been written if the
+  buffer were big enough, not how many actually fit -- so once
+  accumulated output exceeds the buffer, the *next* iteration's
+  `sizeof(buf) - pos` is unsigned arithmetic between a smaller and
+  larger value, silently underflowing to a number near `SIZE_MAX`.
+  snprintf is then told it has ~18 exabytes of room and gladly writes
+  straight past the real (2048-or-so-byte) stack array. Verified as a
+  genuine, reproducible stack-smashing crash under AddressSanitizer: a
+  `table` declaration with enough columns, or long enough column/table
+  names, that the generated SQL exceeds one of four affected fixed-size
+  buffers (`sql`/`create_sql`, both 2048 bytes, plus `dest_cols`/
+  `src_cols`, both 1024 bytes, in the column-add and column-drop/retype
+  rebuild paths respectively) reliably corrupted the stack -- something
+  any Festina program with a sufficiently wide table could trigger, not
+  a contrived adversarial input. Fixed with a new
+  `festina_check_sql_buffer` helper, called at the top of every loop
+  iteration that accumulates into one of these buffers (and once more
+  after each loop, before any final fixed-text append) -- guaranteeing
+  `sizeof(buf) - pos` is never computed once `pos` has already reached
+  or passed the buffer size, turning what would be undetected memory
+  corruption into a clear `festina_fail()` naming the actual condition
+  ("too many columns, or column/table names too long") instead. Fix
+  verified the same way the bug was found: rebuilt against
+  AddressSanitizer, a 40-long-column table that used to crash now fails
+  cleanly with no ASAN report, and a normal small table still succeeds.
+  See `tests/test_codegen.py::TestAutomaticSqliteSchemaSync::test_a_table_too_wide_for_the_runtimes_sql_buffer_fails_cleanly`
+  for the (non-ASAN, since the normal test pipeline doesn't build with
+  it) regression coverage: it locks in the clean-failure behavior, not
+  memory safety itself, which was checked by hand at fix time instead.
+
+Two things this same audit pass confirmed were *not* bugs, worth
+recording so they aren't re-litigated: table/column names embedded
+directly into SQL text (unavoidable -- SQL can't parameterize
+identifiers) can't carry a SQL-injection payload through legitimate
+Festina syntax, since the lexer's own `IDENT` token
+(`[A-Za-z_][A-Za-z0-9_]*`) can't produce a quote, semicolon, or any
+other SQL metacharacter in the first place; and every `log()`/
+`festina_fail()` call in the runtime passes untrusted text as a `%s`
+*argument*, never as the format string itself, so there's no
+format-string vulnerability despite text values flowing directly into
+`printf`-family calls throughout.
+
 "Real compilation, minimal setup" stages 1, 2, and 3 -- claude.md #59,
 added alongside these stages to make the requirement explicit rather
 than implicit in the implementation -- are also done (see README.md's
@@ -179,7 +315,7 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 399 tests in this directory pass against it: 391 given a working C
+All 430 tests in this directory pass against it: 422 given a working C
 compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
 too, plus 6 more (`tests/test_codegen.py::TestGraphics`'s interactive
 click/mouse/key/resize tests, the one confirming the initial
@@ -894,7 +1030,7 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 391 passed, 8 skipped (needs a C compiler; 2 of
+pytest tests/                          # 422 passed, 8 skipped (needs a C compiler; 2 of
                                         # the skips need `pip install pyinstaller` too,
                                         # the other 6 need Xvfb + xdotool installed)
 ```

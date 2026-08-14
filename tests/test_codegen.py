@@ -140,6 +140,37 @@ class TestStrings:
         assert result.stdout.strip() == "(3, 4)"
 
 
+class TestBlob:
+    """claude.md #36: blob. Regression coverage for two real bugs a
+    spec-compliance pass found: claude.md's own only worked example
+    ("blob data = 'path/to/file'") failed semantic analysis outright
+    (a string literal infers as `text`, and blob/text were fully
+    incompatible with no exception -- meaning blob could never
+    actually hold a value at all, since nothing else in the language
+    constructs one either), and log() on the one blob value that
+    *could* somehow exist crashed the compiler itself with a bare
+    Python KeyError (blob passed the "is this a PrimitiveType" check
+    but had no entry in log()'s dispatch dict) rather than compiling
+    or raising a clean CompileError -- previously unreachable in
+    practice for the same reason, but a real crash risk once blob
+    became constructible."""
+
+    def test_blob_declaration_and_log_match_the_spec_example(self, compile_and_run):
+        result = compile_and_run("blob data = 'path/to/file'\nlog(data)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "path/to/file"
+
+    def test_blob_and_text_equality(self, compile_and_run):
+        source = (
+            "blob data = 'hello'\n"
+            "text t = 'hello'\n"
+            "log(data == t)\n"
+            "log(data == 'nope')\n"
+        )
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+
 class TestStructs:
     """claude.md #27: structs are native in-memory objects with typed,
     assignable fields."""
@@ -1389,6 +1420,29 @@ class TestAutomaticSqliteSchemaSync:
         result = compile_and_run("log('no tables here')")
         assert result.returncode == 0
         assert not (tmp_path / "festina.sqlite").exists()
+
+    def test_a_table_too_wide_for_the_runtimes_sql_buffer_fails_cleanly(self, compile_and_run):
+        # Security regression test: festina_sync_table builds several
+        # SQL statements incrementally across a loop over the declared
+        # columns, using the (deceptively unsafe -- see
+        # festina_check_sql_buffer's own comment in festina_runtime.c)
+        # `pos += snprintf(buf + pos, sizeof(buf) - pos, ...)` idiom.
+        # Once accumulated output exceeds the fixed-size buffer, the
+        # *next* call's "remaining space" computation used to
+        # underflow (unsigned arithmetic) to a huge number, hand
+        # snprintf permission to write far past the buffer, and
+        # genuinely stack-smash -- verified directly with
+        # AddressSanitizer before this was fixed. A table with enough
+        # columns (or long enough names) to overflow the 2048-byte
+        # CREATE TABLE buffer must now fail cleanly instead.
+        cols = "\n".join(
+            f"    col_{i}_{'x' * 60}:text" for i in range(40)
+        )
+        source = f"table Big {{\n{cols}\n}}\nlog('unreachable')"
+        result = compile_and_run(source)
+        assert result.returncode == 1
+        assert "too long for this compiler's fixed-size buffer" in result.stderr
+        assert "unreachable" not in result.stdout
 
 
 class TestSqliteQueries:

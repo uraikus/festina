@@ -607,6 +607,18 @@ class CodeGen:
 
         block = self._emit_block(decl.body, body_env, return_type, body_lines)
         if not block["terminated"]:
+            # claude.md never says whether a non-void function must
+            # return a value on every code path (unlike the
+            # void-vs-non-void distinction #23 itself draws, which
+            # analyze_statement's Return handling in semantic.py does
+            # enforce) -- #54's ambiguity rule treats a genuinely
+            # undetermined case like this as an implementation-defined
+            # choice, not something to invent a new restriction for.
+            # The choice made here: falling off the end of a non-void
+            # function's body returns that type's zero value
+            # (_zero_value below) rather than being a compile error --
+            # deterministic and never crashes, the same "prefer the
+            # simplest implementation" reasoning #54 itself asks for.
             if return_type is None:
                 block["lines"].append("  ret void")
             else:
@@ -1299,8 +1311,17 @@ class CodeGen:
                         f"log() only supports primitive values right now, "
                         f"found {types_mod.type_name(vtype)}",
                         file=self.filename, line=callee.line)
+                # claude.md #10 lists blob among the five primitive
+                # types with no exception carved out for log() (#41);
+                # blob shares text's exact `ptr`-to-bytes representation
+                # (see _llvm_type), so festina_log_text handles it too --
+                # this used to be a bare KeyError (blob passed the
+                # PrimitiveType check above but had no dict entry) since
+                # nothing could actually construct a blob value before
+                # check_assignable allowed text -> blob assignment.
                 fn = {"int": "festina_log_int", "float": "festina_log_float",
-                      "bool": "festina_log_bool", "text": "festina_log_text"}[vtype.name]
+                      "bool": "festina_log_bool", "text": "festina_log_text",
+                      "blob": "festina_log_text"}[vtype.name]
                 ty = _llvm_type(vtype)
                 lines.append(f"  call void @{fn}({ty} {val})")
                 return "0", None

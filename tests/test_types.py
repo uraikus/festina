@@ -130,10 +130,46 @@ class TestStructsVsTables:
 
 
 class TestBlobImgAud:
-    """claude.md #36 (blob), #37 (img), #38 (aud)."""
+    """claude.md #36 (blob), #37 (img), #38 (aud). img/aud get their own
+    dedicated, much deeper test files (test_graphics.py/TestGraphics,
+    test_audio.py/TestAudio) -- these two classes exist so every type
+    claude.md #10 lists gets at least this file's baseline coverage
+    too. blob doesn't have a dedicated file of its own (it has no
+    builtin functions/methods, unlike img/aud), so its own coverage
+    here goes a bit further: claude.md #36's only worked example is
+    exactly this parser.parse() call below, and it used to be the
+    *only* thing checked -- semantic analysis on that same source
+    actually failed (a plain string literal infers as `text`, and
+    `text`/`blob` were fully incompatible types with no exception),
+    meaning claude.md's own example didn't compile and nothing here
+    would have caught it."""
 
-    def test_blob_declaration_parses(self, parser):
-        parser.parse("blob data = 'path/to/file'")
+    def test_blob_declaration_parses_and_analyzes(self, parser, semantic):
+        program = parser.parse("blob data = 'path/to/file'")
+        semantic.analyze(program)
+
+    def test_blob_and_text_are_mutually_comparable(self, parser, semantic):
+        # blob and text share the identical runtime representation
+        # (both `ptr` -- see codegen.py's _llvm_type), so == between
+        # them is allowed, unlike a genuine type mismatch (e.g. int
+        # vs. text).
+        source = "blob data = 'x'\ntext t = 'x'\nlog(data == t)\nlog(data == 'x')"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_text_cannot_be_assigned_from_blob(self, parser, semantic, errors):
+        # The reverse direction claude.md never shows -- text -> blob
+        # is allowed (see above) because blob has no other way to be
+        # constructed at all; blob -> text has no such justification.
+        source = "blob data = 'x'\ntext t = data"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_int_cannot_be_assigned_to_blob(self, parser, semantic, errors):
+        program = parser.parse("blob data = 5")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
 
     def test_img_declaration_parses(self, parser):
         parser.parse("img profile = loadImage('path/to/profile.png')")
