@@ -77,10 +77,10 @@ class TestGraphicsFunctions:
 
 
 class TestEventHandlers:
-    """claude.md #40: `on eventName(arguments) { }` -- "click" and
-    "mouse" specifically must declare (x:int, y:int), matching
-    claude.md's own examples exactly (the runtime registers them as a
-    fixed-signature function pointer -- see
+    """claude.md #40: `on eventName(arguments) { }` -- click/mouse/key/
+    resize/close specifically must each declare a fixed signature
+    matching claude.md's own examples exactly (the runtime registers
+    each one as a fixed-signature function pointer -- see
     festina_runtime.h's doc comment)."""
 
     def test_click_handler_parses_and_analyzes(self, parser, semantic):
@@ -93,10 +93,25 @@ class TestEventHandlers:
         program = parser.parse(source)
         semantic.analyze(program)
 
+    def test_key_handler_parses_and_analyzes(self, parser, semantic):
+        source = "on key(key:text) {\n    log(key)\n}"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_resize_handler_parses_and_analyzes(self, parser, semantic):
+        source = "on resize() {\n    log('resized')\n}"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_close_handler_parses_and_analyzes(self, parser, semantic):
+        source = "on close() {\n    log('closing')\n}"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
     def test_unrecognized_event_name_is_unconstrained(self, parser, semantic):
         # claude.md #40 never restricts event names to a fixed set --
-        # only "click"/"mouse" get a signature requirement, because
-        # only those two have a runtime event source at all.
+        # only click/mouse/key/resize/close get a signature requirement,
+        # because only those five have a runtime event source at all.
         source = "on somethingElse(a:text, b:bool) {\n    log(a)\n}"
         program = parser.parse(source)
         semantic.analyze(program)
@@ -113,4 +128,56 @@ class TestEventHandlers:
         source = f"on {name}(x:text, y:int) {{\n    log(x)\n}}"
         program = parser.parse(source)
         with pytest.raises(errors.CompileError, match=name):
+            semantic.analyze(program)
+
+    def test_key_wrong_parameter_count_is_a_compile_error(self, parser, semantic, errors):
+        source = "on key() {\n    log('x')\n}"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match="key"):
+            semantic.analyze(program)
+
+    def test_key_wrong_parameter_type_is_a_compile_error(self, parser, semantic, errors):
+        source = "on key(key:int) {\n    log(key)\n}"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match="key"):
+            semantic.analyze(program)
+
+    @pytest.mark.parametrize("name", ["resize", "close"])
+    def test_resize_and_close_reject_any_parameters(self, parser, semantic, errors, name):
+        # resize/close take no arguments at all -- claude.md #40's own
+        # examples for both are `on resize()`/`on close()`.
+        source = f"on {name}(x:int) {{\n    log(x)\n}}"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match=name):
+            semantic.analyze(program)
+
+
+class TestClientSize:
+    """claude.md #39: clientWidth/clientHeight -- read-only global ints
+    reporting the canvas window's current size (borrowed from the DOM's
+    Element.clientWidth/clientHeight, the closest analogue)."""
+
+    def test_client_width_and_height_are_valid_int_identifiers(self, parser, semantic):
+        source = "log(clientWidth)\nlog(clientHeight)"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_usable_inside_a_template_literal_in_an_event_handler(self, parser, semantic):
+        source = "on resize() {\n    log(`size ${clientWidth}x${clientHeight}`)\n}"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    @pytest.mark.parametrize("name", ["clientWidth", "clientHeight"])
+    def test_assigning_to_it_is_a_compile_error(self, parser, semantic, errors, name):
+        program = parser.parse(f"{name} = 100")
+        with pytest.raises(errors.CompileError, match="read-only"):
+            semantic.analyze(program)
+
+    @pytest.mark.parametrize("name", ["clientWidth", "clientHeight"])
+    def test_declaring_a_variable_with_the_same_name_is_a_compile_error(self, parser, semantic, errors, name):
+        # Scope.define's own "already declared" check catches this for
+        # free, since clientWidth/clientHeight are pre-registered into
+        # global_scope -- see semantic.py's _CLIENT_SIZE_GLOBALS.
+        program = parser.parse(f"int {name} = 5")
+        with pytest.raises(errors.CompileError, match="already declared"):
             semantic.analyze(program)

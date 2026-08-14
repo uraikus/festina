@@ -488,10 +488,23 @@ class TestGraphics:
       drawCircle/drawText/drawImage all render at the right positions,
       in the right shapes -- not automated here (would add xwd/netpbm
       as further test-only dependencies for something the manual check
-      already gave high confidence in), but the click/mouse dispatch
-      tests below do run automatically, since xdotool + log() output is
-      enough to prove real coordinates reach the compiled handler
+      already gave high confidence in), but the click/mouse/key/resize
+      dispatch tests below do run automatically, since xdotool + log()
+      output is enough to prove real input reaches the compiled handler
       without needing to capture pixels at all.
+
+    `on close` is the one handler NOT covered here even though the
+    others in this tier are: it fires on the exact same WM_DELETE_WINDOW
+    ClientMessage the window's own close-button handling already uses,
+    and (as already true of that close-button path before `on close`
+    ever existed) a bare Xvfb instance runs no window manager to
+    translate `xdotool windowclose` into that message -- verified
+    directly: it leaves the process running rather than triggering the
+    handler. An environment limitation of the test setup, not a gap in
+    the app's own (standard) handling of that protocol -- see
+    festina_runtime.c's festina_graphics_run for the actual dispatch,
+    right alongside the click/mouse/key/resize dispatch this class does
+    verify.
     """
 
     def test_compiles_and_links_successfully(self, cli_mod, tmp_path):
@@ -507,12 +520,22 @@ class TestGraphics:
         drawCircle(50, 50, 25)
         drawText('Hello', 20, 20)
         drawImage(icon, 10, 10)
+        log(`${clientWidth}x${clientHeight}`)
 
         on click(x:int, y:int) {
             log(`click at ${x}, ${y}`)
         }
         on mouse(x:int, y:int) {
             log(`mouse at ${x}, ${y}`)
+        }
+        on key(key:text) {
+            log(`key ${key}`)
+        }
+        on resize() {
+            log(`resize ${clientWidth} ${clientHeight}`)
+        }
+        on close() {
+            log('closing')
         }
         """
         src_path = tmp_path / "main.f"
@@ -562,6 +585,24 @@ class TestGraphics:
             time.sleep(0.2)
         raise AssertionError("the Festina canvas window never appeared")
 
+    def _wait_for_output(self, stdout_path, predicate, timeout=10):
+        # Polls instead of a fixed sleep-then-assert, for the same
+        # reason x_display polls for Xvfb readiness instead of a fixed
+        # sleep (see conftest.py): reliable running one test in
+        # isolation but flaky under full-suite load, since dispatch
+        # latency (X server -> compiled handler -> log() -> this
+        # process's read) isn't constant. Returns the last text read so
+        # a timed-out caller's own assert still shows what actually
+        # came back, not just "timed out".
+        deadline = time.time() + timeout
+        text = ""
+        while time.time() < deadline:
+            text = stdout_path.read_text()
+            if predicate(text):
+                return text
+            time.sleep(0.1)
+        return text
+
     def test_click_dispatches_to_handler_with_correct_coordinates(self, run_graphics_program, x_display):
         source = "on click(x:int, y:int) {\n    log(`click ${x} ${y}`)\n}"
         proc, stdout_path = run_graphics_program(source)
@@ -570,8 +611,8 @@ class TestGraphics:
             env = dict(os.environ, DISPLAY=x_display)
             subprocess.run(["xdotool", "mousemove", "--window", wid, "150", "220"], env=env, check=True)
             subprocess.run(["xdotool", "click", "--window", wid, "1"], env=env, check=True)
-            time.sleep(0.5)
-            assert stdout_path.read_text().strip() == "click 150 220"
+            text = self._wait_for_output(stdout_path, lambda t: t.strip() != "")
+            assert text.strip() == "click 150 220"
         finally:
             proc.terminate()
             proc.wait(timeout=5)
@@ -583,8 +624,56 @@ class TestGraphics:
             wid = self._find_window(x_display)
             env = dict(os.environ, DISPLAY=x_display)
             subprocess.run(["xdotool", "mousemove", "--window", wid, "300", "400"], env=env, check=True)
-            time.sleep(0.5)
-            assert "mouse 300 400" in stdout_path.read_text()
+            text = self._wait_for_output(stdout_path, lambda t: "mouse 300 400" in t)
+            assert "mouse 300 400" in text
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_key_dispatches_printable_and_named_keys(self, run_graphics_program, x_display):
+        # claude.md #40: `on key(key:text)`. A printable key (e.g. "a")
+        # comes back as its own character; a non-printable one (e.g.
+        # Escape, whose ASCII value is an unprintable control code) is
+        # not a useful `text` value, so it falls back to X11's own key
+        # name instead -- see festina_runtime.c's festina_graphics_run.
+        source = "on key(key:text) {\n    log(`key ${key}`)\n}"
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = self._find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            # The window needs real keyboard focus for KeyPress events to
+            # reach it at all -- see festina_graphics_init's XSetInputFocus
+            # call, needed since a bare Xvfb instance runs no window
+            # manager to hand focus over the way a real desktop would.
+            time.sleep(0.3)
+            subprocess.run(["xdotool", "key", "--window", wid, "a"], env=env, check=True)
+            subprocess.run(["xdotool", "key", "--window", wid, "Escape"], env=env, check=True)
+            text = self._wait_for_output(stdout_path, lambda t: len(t.splitlines()) >= 2)
+            assert text.splitlines() == ["key a", "key Escape"]
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_client_size_matches_the_initial_canvas_before_any_resize(self, run_graphics_program, x_display):
+        source = "log(`${clientWidth}x${clientHeight}`)"
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            self._find_window(x_display)  # also proves a bare reference opens a window
+            text = self._wait_for_output(stdout_path, lambda t: t.strip() != "")
+            assert text.strip() == "800x600"
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_resize_dispatches_to_handler_and_updates_client_size(self, run_graphics_program, x_display):
+        source = "on resize() {\n    log(`resize ${clientWidth} ${clientHeight}`)\n}"
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = self._find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            subprocess.run(["xdotool", "windowsize", wid, "640", "480"], env=env, check=True)
+            text = self._wait_for_output(stdout_path, lambda t: "resize 640 480" in t)
+            assert "resize 640 480" in text
         finally:
             proc.terminate()
             proc.wait(timeout=5)

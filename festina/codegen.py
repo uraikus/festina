@@ -9,6 +9,8 @@ note below), #41/#42 (log/fail), #45 (string interpolation), #55-57
 #60/#61 (for/while loops), #63 (array .length), #66 (postfix ++/--),
 #67-68 (regex(), .test(), .match(), .replace()/.replaceAll() -- see
 _emit_regex_call and the Member-call handling in _emit_call).
+#37, #39, #40 also cover `on key`/`on resize`/`on close` and the
+clientWidth/clientHeight globals (see the "Graphics" note below).
 
 Scope: primitives (int/float/bool/text), global and local variables and
 constants, functions, if/else, for/while loops, return, the full
@@ -39,21 +41,38 @@ before __festina_main() runs, exactly
 the same "only pay for what you use" pattern uses_sqlite already
 follows for festina_db_open(); a program that never touches graphics
 never opens a window. After __festina_main() returns, if graphics were
-used, main() blocks in festina_graphics_run() (Expose/click/mouse/
-window-close) until the window is closed. Canvas size is a fixed
-800x600 and every shape/text draws in solid black -- claude.md has no
-syntax for declaring a size or a color, so both are implementation-
-defined defaults, not derived from the spec. `on click`/`on mouse`
-compile to a real function (_emit_event_handler) registered with the
-runtime as a `void (*)(int64_t, int64_t)` function pointer -- the only
-signature claude.md's own examples for those two ever show; any other
-declared event name still compiles (so its body is still checked) but
-is simply never called, since there's no event source this runtime
-generates for it. Full rationale (window decorations, the backing-store
-redraw strategy, why Xlib instead of a GUI toolkit) is in
-festina_runtime.h's doc comment, verified against an actual rendered
-window (not just reasoned about) via a virtual X server -- see
-tests/test_codegen.py's TestGraphics.
+used, main() blocks in festina_graphics_run() (Expose/click/mouse/key/
+resize/window-close) until the window is closed. Canvas size starts at
+a fixed 800x600 and every shape/text draws in solid black -- claude.md
+has no syntax for declaring a size or a color, so both are
+implementation-defined defaults, not derived from the spec; the size
+can change afterwards, though, if the window is resized (see `on
+resize` below). `on click`/`on mouse`/`on key`/`on resize`/`on close`
+each compile to a real function (_emit_event_handler) registered with
+the runtime as a fixed-signature function pointer (see
+_EVENT_SIGNATURES in semantic.py, and festina_runtime.h's declarations,
+for the exact signature each one gets) -- any other declared event name
+still compiles (so its body is still checked) but is simply never
+called, since there's no event source this runtime generates for it.
+`on resize` fires on a genuine size change (an X11 ConfigureNotify,
+e.g. from window-manager-driven resizing) and clears the canvas back to
+white at the new size -- see festina_runtime.h's doc comment for why
+(matching how resizing a browser's `<canvas>` element also clears it,
+which clientWidth/clientHeight below are themselves named after). `on
+close` fires right before the window actually closes (on the same
+WM_DELETE_WINDOW ClientMessage the window's own standard close-button
+handling already used) -- it cannot cancel the close, there's no
+"prevent default" here. clientWidth/clientHeight (a bare Identifier,
+not a Call -- see the special case at the top of the Identifier branch
+in _emit_expr) read the canvas's *current* size via
+festina_client_width()/_height() rather than a compile-time constant,
+since `on resize` can change it after startup; referencing either one
+sets self.uses_graphics just like a draw* call does, since querying a
+window's size implies a window exists. Full rationale (window
+decorations, the backing-store redraw strategy, why Xlib instead of a
+GUI toolkit) is in festina_runtime.h's doc comment, verified against an
+actual rendered window (not just reasoned about) via a virtual X server
+-- see tests/test_codegen.py's TestGraphics.
 
 Query rows (claude.md #32-34): sqlite()'s result, when assigned to a
 declared arr[Table], is built by festina_runtime's
@@ -400,6 +419,11 @@ class CodeGen:
             "declare void @festina_draw_image(ptr, i64, i64)",
             "declare void @festina_register_click_handler(ptr)",
             "declare void @festina_register_mouse_handler(ptr)",
+            "declare void @festina_register_key_handler(ptr)",
+            "declare void @festina_register_resize_handler(ptr)",
+            "declare void @festina_register_close_handler(ptr)",
+            "declare i64 @festina_client_width()",
+            "declare i64 @festina_client_height()",
             "declare ptr @malloc(i64)",
             "declare ptr @calloc(i64, i64)",
             # claude.md #56: Math.floor/ceil/round/trunc, via LLVM's
@@ -527,12 +551,15 @@ class CodeGen:
         ordinary callable -- an event handler is a listener, not
         something Festina code calls by name) exactly like _emit_func,
         minus a return type (event handlers never return a value).
-        "click"/"mouse" additionally get registered with the runtime as
-        a function pointer (see festina_runtime.h's doc comment on
-        festina_register_click_handler/_mouse_handler) -- the only two
-        event sources this runtime actually generates (claude.md #40's
-        own examples). Any other declared name still compiles (so a
-        typo/bug in its body is still caught) but is simply dead code:
+        click/mouse/key/resize/close additionally get registered with
+        the runtime as a function pointer (see festina_runtime.h's doc
+        comment on festina_register_click_handler/_mouse_handler/
+        _key_handler/_resize_handler/_close_handler) -- the only event
+        sources this runtime actually generates (claude.md #40's own
+        examples; semantic.py's _EVENT_SIGNATURES enforces the fixed
+        signature each one needs, matching the runtime's fixed function
+        pointer type for it). Any other declared name still compiles (so
+        a typo/bug in its body is still caught) but is simply dead code:
         nothing ever calls it."""
         symbol = f"@__festina_on_{decl.name}"
         param_types = [self._resolve(p.type_expr, decl) for p in decl.params]
@@ -558,7 +585,7 @@ class CodeGen:
         self.func_defs.extend(func)
         self.func_defs.append("")
 
-        if decl.name in ("click", "mouse"):
+        if decl.name in ("click", "mouse", "key", "resize", "close"):
             self.uses_graphics = True
             self.event_handlers[decl.name] = symbol
 
@@ -760,6 +787,20 @@ class CodeGen:
         if isinstance(expr, ast.TemplateLit):
             return self._emit_template(expr, env, lines), TEXT
         if isinstance(expr, ast.Identifier):
+            # claude.md #39: clientWidth/clientHeight -- a bare
+            # identifier, not a Call, so this can't go through the usual
+            # builtin-function dispatch; read the canvas's *current*
+            # size from the runtime (not a compile-time constant, since
+            # `on resize` can change it after startup -- see
+            # festina_client_width/_height's own doc comment) and set
+            # uses_graphics exactly like a draw* call does, since asking
+            # for the window's size implies a window exists.
+            if expr.name in ("clientWidth", "clientHeight"):
+                self.uses_graphics = True
+                fn = "festina_client_width" if expr.name == "clientWidth" else "festina_client_height"
+                out = self.tmp()
+                lines.append(f"  {out} = call i64 @{fn}()")
+                return out, INT
             if expr.name in self.func_decls:
                 raise CodegenError("functions are not first-class values yet "
                                     f"(found bare reference to '{expr.name}')",
@@ -1505,7 +1546,10 @@ class CodeGen:
         if self.uses_graphics:
             main_lines.append("  call void @festina_graphics_init()")
             register_fn = {"click": "festina_register_click_handler",
-                            "mouse": "festina_register_mouse_handler"}
+                            "mouse": "festina_register_mouse_handler",
+                            "key": "festina_register_key_handler",
+                            "resize": "festina_register_resize_handler",
+                            "close": "festina_register_close_handler"}
             for event_name, symbol in self.event_handlers.items():
                 main_lines.append(f"  call void @{register_fn[event_name]}(ptr {symbol})")
         main_lines.append("  call void @__festina_main()")

@@ -882,6 +882,13 @@ Graphics are backed by Cairo.
 
 No GUI import is required.
 
+The current size of the canvas window is available as:
+
+clientWidth
+clientHeight
+
+Both are read-only global int values.
+
 
 40. EVENTS
 
@@ -900,6 +907,24 @@ Example:
 
 on click(x:int, y:int) {
     log(`Mouse clicked on canvas at ${x}, ${y}`)
+}
+
+Example:
+
+on key(key:text) {
+    log(`Key pressed: ${key}`)
+}
+
+Example:
+
+on resize() {
+    log(`Canvas resized to ${clientWidth}x${clientHeight}`)
+}
+
+Example:
+
+on close() {
+    log('Canvas window closing')
 }
 
 The runtime automatically registers declared event handlers.
