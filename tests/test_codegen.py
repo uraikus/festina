@@ -464,6 +464,103 @@ class TestLoops:
         assert result.stdout.splitlines() == ["55", "6765"]
 
 
+class TestRegex:
+    """claude.md #67 (regular expressions), #68 (string match/replace)."""
+
+    def test_test_matches_and_does_not_match(self, compile_and_run):
+        source = """
+        regex digits = regex('[0-9]+')
+        log(digits.test('room 42'))
+        log(digits.test('no numbers'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_case_insensitive_flag(self, compile_and_run):
+        source = """
+        regex greeting = regex('^hello$', 'i')
+        log(greeting.test('HELLO'))
+        log(greeting.test('goodbye'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_match_returns_first_match(self, compile_and_run):
+        source = """
+        regex digits = regex('[0-9]+')
+        log('room 42, building 7'.match(digits))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "42"
+
+    def test_match_with_no_match_returns_null(self, compile_and_run):
+        # claude.md #68: match() returns null (claude.md #25: null is
+        # valid for every type) if there's no match -- text's null is
+        # represented as a plain NULL pointer (see festina_runtime.h's
+        # doc comment on festina_regex_match), which festina_log_text
+        # already prints as an empty line.
+        source = """
+        regex digits = regex('[0-9]+')
+        text found = 'no numbers here'.match(digits)
+        log('before')
+        log(found)
+        log('after')
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["before", "", "after"]
+
+    def test_replace_with_literal_text_search(self, compile_and_run):
+        result = compile_and_run("log('room 42'.replace('room', 'suite'))")
+        assert result.stdout.strip() == "suite 42"
+
+    def test_replace_only_replaces_first_occurrence(self, compile_and_run):
+        result = compile_and_run("log('a-b-c'.replace('-', '_'))")
+        assert result.stdout.strip() == "a_b-c"
+
+    def test_replace_all_replaces_every_occurrence(self, compile_and_run):
+        result = compile_and_run("log('a-b-c'.replaceAll('-', '_'))")
+        assert result.stdout.strip() == "a_b_c"
+
+    def test_replace_with_no_match_returns_original_unchanged(self, compile_and_run):
+        result = compile_and_run("log('hello world'.replace('zzz', 'nope'))")
+        assert result.stdout.strip() == "hello world"
+
+    def test_replace_all_with_regex_search(self, compile_and_run):
+        result = compile_and_run("log('a1b2c3'.replaceAll(regex('[0-9]'), '-'))")
+        assert result.stdout.strip() == "a-b-c-"
+
+    def test_replace_with_regex_search_first_match_only(self, compile_and_run):
+        result = compile_and_run("log('a1b2c3'.replace(regex('[0-9]'), '-'))")
+        assert result.stdout.strip() == "a-b2c3"
+
+    def test_replace_all_zero_width_match_does_not_hang(self, compile_and_run):
+        # claude.md #54's ambiguity rule doesn't cover this -- it's a
+        # straightforward correctness requirement, not something to
+        # leave unresolved: a pattern that can match zero-width (e.g.
+        # "x*" where there's no "x") must not spin the runtime forever.
+        result = compile_and_run("log('abc'.replaceAll(regex('x*'), '-'))")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "-a-b-c-"
+
+    def test_original_text_value_is_unchanged_after_replace(self, compile_and_run):
+        source = """
+        text original = 'room 42'
+        text renamed = original.replace('room', 'suite')
+        log(original)
+        log(renamed)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["room 42", "suite 42"]
+
+    def test_invalid_pattern_is_a_clear_runtime_error(self, compile_and_run):
+        # claude.md #67: "An invalid pattern is a runtime error (fail()),
+        # not a compile-time error."
+        result = compile_and_run("regex bad = regex('[unclosed')\nlog('unreachable')")
+        assert result.returncode == 1
+        assert "invalid regex pattern" in result.stderr
+        assert "unreachable" not in result.stdout
+
+
 class TestNumericConversion:
     """claude.md #55 (no implicit int/float conversion), #56 (Math),
     #57 (division/modulo by zero returns null). See

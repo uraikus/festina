@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <sqlite3.h>
+#include <regex.h>
 
 /* claude.md #41: log() */
 void festina_log_int(int64_t v);
@@ -87,5 +88,44 @@ void festina_sqlite_exec(sqlite3_stmt *stmt);
 void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
                                   const char **col_types,
                                   int64_t *out_length, void **out_data);
+
+/*
+ * claude.md #67-68: regex(), .test(), .match(), .replace()/.replaceAll().
+ *
+ * Built on POSIX extended regular expressions (regcomp/regexec from
+ * <regex.h>) rather than a bundled regex engine or an external library
+ * like PCRE -- claude.md #59's minimal-dependencies principle: POSIX
+ * regex is already part of libc on every platform this compiler
+ * already requires libc on, so this adds zero new dependencies, at the
+ * cost of a less expressive dialect than PCRE/JS regex (no
+ * lookaround, no non-greedy quantifiers, no \d-style shorthand
+ * classes -- POSIX ERE's own limitations, not something this file
+ * works around).
+ *
+ * festina_regex_compile compiles `pattern` once per call (REG_EXTENDED,
+ * plus REG_ICASE if `flags` contains 'i') and returns the resulting
+ * regex_t*, heap-allocated and never freed -- same "no GC yet, things
+ * leak" tradeoff every other heap allocation in this runtime already
+ * makes (see festina/codegen.py's module docstring). An invalid
+ * pattern calls festina_fail() with regerror()'s message -- claude.md
+ * #67: pattern validity is a runtime concern, the Python compiler
+ * doesn't parse regex syntax itself.
+ *
+ * festina_regex_match / festina_str_replace / festina_regex_replace
+ * all return a NULL char* for "no match" rather than a sentinel string
+ * -- NULL is already exactly how Festina represents a null `text`
+ * value (see festina/codegen.py's "Null for int/float" docstring note:
+ * text is pointer-backed, so the ordinary C NULL pointer *is* the null
+ * sentinel, unlike int/float which need INT_NULL_CONST/FLOAT_NULL_CONST).
+ * replace()/replaceAll() specifically return the *original* string
+ * unchanged (not NULL) when there's no match, per claude.md #68.
+ */
+void *festina_regex_compile(const char *pattern, const char *flags);
+int8_t festina_regex_test(void *compiled, const char *text);
+char *festina_regex_match(void *compiled, const char *text);
+char *festina_str_replace(const char *text, const char *search,
+                           const char *replacement, int8_t replace_all);
+char *festina_regex_replace(void *compiled, const char *text,
+                             const char *replacement, int8_t replace_all);
 
 #endif

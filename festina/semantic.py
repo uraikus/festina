@@ -5,6 +5,12 @@ rules from #12-20, the struct/table distinction from #27, #28, #35, and
 int.toFloat() are the only conversions). #58 (struct/table namespace):
 struct/table names live in `structs`/`tables`, never cross-checked
 against `Scope` (variables/functions) -- separate namespaces by design.
+#67/#68 (regex(), .test(), .match(), .replace()/.replaceAll()) follow
+the same "recognized Call-on-Member pattern" approach Math.floor/
+int.toFloat() already established -- Festina has no general concept of
+methods on primitive types, so each one is checked by name against the
+receiver's inferred type in _infer_call, not looked up in some method
+table.
 
 `analyze(program)` walks the AST top to bottom. None of this repo's
 fixtures need forward references (structs/tables/functions are always
@@ -22,23 +28,27 @@ from . import ast
 from . import types as types_mod
 from .errors import CompileError
 
-# claude.md #39, #41, #42, #32: builtin globals that don't need a
+# claude.md #39, #41, #42, #32, #67: builtin globals that don't need a
 # programmer declaration.
 BUILTIN_FUNCTIONS = {
     "log", "fail", "sqlite",
     "drawRect", "drawCircle", "drawText", "drawImage",
     "loadImage", "loadAudio",
+    "regex",
 }
 
 _BUILTIN_RETURN_TYPES = {
     "loadImage": types_mod.ImageType(),
     "loadAudio": types_mod.AudioType(),
+    "regex": types_mod.RegexType(),
 }
 
 # claude.md #55: int and float never mix directly in a binary operator.
 _INT = types_mod.PrimitiveType("int")
 _FLOAT = types_mod.PrimitiveType("float")
 _NUMERIC_TYPES = (_INT, _FLOAT)
+_TEXT = types_mod.PrimitiveType("text")
+_REGEX = types_mod.RegexType()
 
 # claude.md #56: float -> int, with an explicit rounding decision.
 MATH_FUNCTIONS = {"floor", "ceil", "round", "trunc"}
@@ -105,6 +115,8 @@ def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None
         return types_mod.ImageType()
     if name == "aud":
         return types_mod.AudioType()
+    if name == "regex":
+        return types_mod.RegexType()
     if name in structs:
         return types_mod.StructType(name)
     if name in tables:
@@ -368,6 +380,67 @@ def analyze(program, filename="<string>"):
             # claude.md #55: int.toFloat() -> float
             if callee.prop == "toFloat" and not expr.args and infer(callee.obj, scope) == _INT:
                 return _FLOAT
+            # claude.md #67: pattern.test(value:text) -> bool
+            if callee.prop == "test" and infer(callee.obj, scope) == _REGEX:
+                if len(expr.args) != 1:
+                    raise CompileError(
+                        f"test() expects exactly 1 argument, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                arg_type = infer(expr.args[0], scope)
+                if arg_type is not None and arg_type is not NULL and arg_type != _TEXT:
+                    raise CompileError(
+                        f"test() expects a text argument, found {types_mod.type_name(arg_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return types_mod.PrimitiveType("bool")
+            # claude.md #68: value.match(pattern:regex) -> text (or null,
+            # if there's no match -- claude.md #25: null is valid for
+            # every type).
+            if callee.prop == "match" and infer(callee.obj, scope) == _TEXT:
+                if len(expr.args) != 1:
+                    raise CompileError(
+                        f"match() expects exactly 1 argument, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                arg_type = infer(expr.args[0], scope)
+                if arg_type is not None and arg_type is not NULL and arg_type != _REGEX:
+                    raise CompileError(
+                        f"match() expects a regex argument, found {types_mod.type_name(arg_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return _TEXT
+            # claude.md #68: value.replace(search, replacement:text) -> text
+            #                value.replaceAll(search, replacement:text) -> text
+            # search may be text (a literal substring match) or regex.
+            if callee.prop in ("replace", "replaceAll") and infer(callee.obj, scope) == _TEXT:
+                if len(expr.args) != 2:
+                    raise CompileError(
+                        f"{callee.prop}() expects exactly 2 arguments, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                search_type = infer(expr.args[0], scope)
+                if search_type is not None and search_type is not NULL and search_type not in (_TEXT, _REGEX):
+                    raise CompileError(
+                        f"{callee.prop}()'s first argument must be text or regex, "
+                        f"found {types_mod.type_name(search_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                replacement_type = infer(expr.args[1], scope)
+                if replacement_type is not None and replacement_type is not NULL and replacement_type != _TEXT:
+                    raise CompileError(
+                        f"{callee.prop}()'s replacement argument must be text, "
+                        f"found {types_mod.type_name(replacement_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return _TEXT
         # Member call, e.g. music.play() -- validates the member access itself.
         infer(callee, scope)
         for a in expr.args:
