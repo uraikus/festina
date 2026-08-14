@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Festina — a fast, JavaScript-inspired language that compiles to native code</title>
-<meta name="description" content="Festina is a statically typed, JavaScript-inspired language that compiles through LLVM to a native executable, with SQLite, graphics, audio, and JS-style timers built in.">
+<title>Festina — a fast, simple language that compiles to native code</title>
+<meta name="description" content="Festina is a fast, statically typed language that compiles through LLVM to a native executable, with SQLite, graphics, audio, and timers built in.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23e8823a'/%3E%3Ctext x='50' y='68' font-size='60' font-family='monospace' font-weight='700' text-anchor='middle' fill='%231a1712'%3Ef%3C/text%3E%3C/svg%3E">
 <style>
   :root {
@@ -355,13 +355,12 @@
       <span class="badge">MIT license</span>
       <span class="badge">Linux</span>
     </div>
-    <h1>A fast, simple, JavaScript-inspired<br>language that compiles to <span class="accent">native code</span>.</h1>
+    <h1>A fast, simple language<br>that compiles to <span class="accent">native code</span>.</h1>
     <p class="lede">
-      Keep the syntax you already know. Drop the interpreter, the runtime
-      overhead, and the boilerplate. Festina compiles through LLVM to a
-      real, standalone executable — with SQLite, graphics, audio, and
-      JS-style timers built directly into the language, not bolted on as
-      libraries.
+      Drop the interpreter, the runtime overhead, and the boilerplate.
+      Festina compiles through LLVM to a real, standalone executable —
+      with SQLite, graphics, audio, and event-driven timers built
+      directly into the language, not bolted on as libraries.
     </p>
     <div class="cta-row">
       <a class="btn btn-primary" href="#why">Why Festina</a>
@@ -410,7 +409,7 @@ Hello, Festina!</pre>
         <p>A real on-screen canvas (<code>drawRect</code>, <code>on click</code>, …) and real audio playback (<code>loadAudio().play()</code>), backed by Cairo/X11 and ALSA.</p>
       </div>
       <div class="card">
-        <h3>JavaScript syntax, none of the surprises</h3>
+        <h3>Familiar syntax, none of the surprises</h3>
         <p>Template strings, ternaries, familiar control flow — but <code>int</code>/<code>float</code> never silently mix, and everything is statically typed and checked before it runs.</p>
       </div>
       <div class="card">
@@ -475,11 +474,11 @@ drawRect(0, 0, 100, 100)
 <span class="kw">aud</span> music = loadAudio(<span class="str">'music.wav'</span>)
 music.play()
 
-<span class="cm">// Timers, JS-style</span>
+<span class="cm">// Timers</span>
 setTimeout(showMessage, 1000)
 setInterval(tick, 500)
 
-<span class="cm">// Regex, JS-style literals</span>
+<span class="cm">// Regex, literal syntax</span>
 <span class="str">'room 42'</span>.replace(<span class="re">/[0-9]+/</span>, <span class="str">'N'</span>)
 
 <span class="cm">// Maps -- text-keyed, JS-object-literal-flavored</span>
@@ -600,12 +599,12 @@ npcHealths[<span class="str">'npc1'</span>] = 30
       <li>Simple language rules over extensive syntax</li>
       <li>Compile-time work over runtime work</li>
       <li>Native representations over unnecessary abstraction</li>
-      <li>Familiar syntax without JavaScript's dynamic semantics</li>
+      <li>Familiar syntax without dynamic-language semantics</li>
     </ul>
     <p class="section-intro" style="margin-top:16px;">
-      Festina is not JavaScript with a different compiler — it's a
-      compiled language that borrows syntax and ideas from JavaScript
-      where they make development easier.
+      Festina is not a scripting language with a compiler bolted on — it's
+      a compiled, statically typed language designed from the start for
+      native performance, that happens to keep its syntax approachable.
     </p>
   </div>
 </section>

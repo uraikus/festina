@@ -608,8 +608,8 @@ npcHealths.forEach(logHealth)   <span class="cm">// (value, key) -- visit order 
         <p class="muted">
           An unquoted identifier key (<code>npc2Id</code> above) is a
           reference to that variable's own text value, not
-          bareword-as-string-name shorthand the way a plain JS object
-          literal has. <code>map[T]</code>'s <code>T</code> may be any
+          bareword-as-string-name shorthand the way some object-literal
+          syntaxes allow. <code>map[T]</code>'s <code>T</code> may be any
           type except <code>arr[...]</code>/<code>map[...]</code> itself
           (a map value is stored in one fixed-size slot, which those two
           don't fit in). <code>.forEach()</code>'s callback must be an
@@ -687,7 +687,7 @@ sqlite(<span class="str">'INSERT INTO People (id, name) VALUES (?, ?)'</span>, [
 
       <section class="doc-section" id="regex">
         <h2>Regex <a class="anchor" href="#regex">#</a></h2>
-        <pre class="code"><span class="kw">regex</span> digits = <span class="re">/[0-9]+/</span>                    <span class="cm">// JS-style literal, POSIX extended regex underneath</span>
+        <pre class="code"><span class="kw">regex</span> digits = <span class="re">/[0-9]+/</span>                    <span class="cm">// literal syntax, POSIX extended regex underneath</span>
 <span class="kw">regex</span> ci = <span class="re">/^hello$/i</span>                      <span class="cm">// 'i' = case-insensitive; 'g' is also accepted (see below)</span>
 digits.test(<span class="str">'room 42'</span>)                     <span class="cm">// -&gt; bool</span>
 <span class="str">'room 42'</span>.match(digits)                     <span class="cm">// -&gt; text or null</span>
@@ -697,12 +697,11 @@ digits.test(<span class="str">'room 42'</span>)                     <span class=
           <code>flags</code> immediately follows the closing
           <code>/</code>, no space (<code>/pattern/flags</code>). Only
           <code>i</code> (case-insensitive) and <code>g</code> are
-          accepted — <code>g</code> is recognized for familiarity with
-          JavaScript but has no additional effect, since
-          <code>.replace()</code>/<code>.replaceAll()</code> already say
-          "first match" vs. "every match" explicitly, the same
-          distinction <code>g</code> controls implicitly in JS. Any other
-          flag letter is a compile-time error.
+          accepted — <code>g</code> is accepted but has no additional
+          effect, since <code>.replace()</code>/<code>.replaceAll()</code>
+          already say "first match" vs. "every match" explicitly instead
+          of relying on a flag to control that. Any other flag letter is
+          a compile-time error.
           <code>\w</code>/<code>\d</code>/<code>\s</code>/<code>\b</code>
           work as expected (glibc's <code>regcomp()</code> supports them
           as GNU extensions), but there are no capture groups,
@@ -713,9 +712,9 @@ digits.test(<span class="str">'room 42'</span>)                     <span class=
           A pattern/flags that aren't known until runtime (built from a
           variable or a template) can't use the literal syntax — the
           global <code>regex(pattern, flags)</code> function is still
-          available for that case, the same split JavaScript itself has
-          between a <code>/pattern/</code> literal and
-          <code>new RegExp(...)</code>:
+          available for that case: a literal for the common,
+          known-at-compile-time pattern, a function call for anything
+          assembled dynamically:
         </p>
         <pre class="code"><span class="kw">text</span> userPattern = someInput()
 <span class="kw">regex</span> dynamic = regex(userPattern)</pre>
@@ -762,10 +761,11 @@ log(<span class="str">`canvas is ${clientWidth}x${clientHeight}`</span>)
 setTimeout(tick, 1000)
 clearInterval(id)          <span class="cm">// clearTimeout()/clearInterval() are interchangeable</span></pre>
         <p>
-          JS-style scheduling. The program keeps running as long as a
+          Event-driven scheduling. The program keeps running as long as a
           <code>setTimeout</code> is pending or a <code>setInterval</code>
-          is uncleared — exactly like an uncleared JS interval keeping a
-          process alive. Combines with graphics: if a program uses both,
+          is uncleared — clearing every interval (or letting every
+          timeout fire) lets it exit normally. Combines with graphics: if
+          a program uses both,
           one event loop multiplexes X11 events and timer deadlines
           together so neither blocks the other.
         </p>
