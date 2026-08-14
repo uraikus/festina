@@ -28,13 +28,19 @@ from . import ast
 from . import types as types_mod
 from .errors import CompileError
 
-# claude.md #39, #41, #42, #32, #67: builtin globals that don't need a
-# programmer declaration.
+# claude.md #39, #41, #42, #32, #67, #69: builtin globals that don't
+# need a programmer declaration. setTimeout/setInterval/clearTimeout/
+# clearInterval are listed here for documentation/completeness, but
+# _infer_call actually dispatches them through their own branch before
+# ever reaching the BUILTIN_FUNCTIONS check below, since setTimeout/
+# setInterval's first argument (a callback) needs structural handling
+# no other builtin needs -- see the comment there.
 BUILTIN_FUNCTIONS = {
     "log", "fail", "sqlite",
     "drawRect", "drawCircle", "drawText", "drawImage",
     "loadImage", "loadAudio",
     "regex",
+    "setTimeout", "setInterval", "clearTimeout", "clearInterval",
 }
 
 _BUILTIN_RETURN_TYPES = {
@@ -70,7 +76,7 @@ MATH_FUNCTIONS = {"floor", "ceil", "round", "trunc"}
 
 # claude.md #40: these five event names are the only ones with a real
 # runtime source (an X11 event of some kind -- see festina_runtime.h's
-# doc comment on festina_graphics_run), so only they get a fixed-
+# doc comment on festina_run_event_loop), so only they get a fixed-
 # signature check; codegen registers each compiled handler with the
 # runtime through a fixed C function-pointer type per event, so a
 # mismatched signature would be a silent ABI mismatch, not just an
@@ -389,6 +395,73 @@ def analyze(program, filename="<string>"):
         callee = expr.callee
         if isinstance(callee, ast.Identifier):
             name = callee.name
+            if name in ("setTimeout", "setInterval"):
+                # claude.md #69 -- see BUILTIN_FUNCTIONS's comment
+                # above and festina_runtime.h's doc comment on
+                # festina_set_timeout/_interval. The callback has to be
+                # the bare name of an already-declared function (Festina
+                # has no first-class functions/closures -- see
+                # codegen.py's "functions are not first-class values yet"
+                # CodegenError), checked structurally here rather than
+                # through infer(), which would otherwise just return that
+                # function's own return type like any other identifier
+                # reference -- it's not being *used* as a value here, its
+                # *declaration* is what's being validated.
+                if len(expr.args) != 2:
+                    raise CompileError(
+                        f"{name}() expects 2 arguments (a callback function and a "
+                        f"delay in milliseconds), got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                callback_expr = expr.args[0]
+                if not isinstance(callback_expr, ast.Identifier):
+                    raise CompileError(
+                        f"{name}()'s first argument must be the name of a declared "
+                        f"function, not an arbitrary expression",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                callback_sym = scope.lookup(callback_expr.name)
+                if callback_sym is None or callback_sym.kind != "function":
+                    raise CompileError(
+                        f"'{callback_expr.name}' is not a declared function",
+                        file=filename, line=callback_expr.line, column=callback_expr.column,
+                        category="unknown function",
+                    )
+                if callback_sym.type is not None or callback_sym.node.params:
+                    raise CompileError(
+                        f"the callback passed to {name}() must take no parameters and "
+                        f"return nothing -- declare it as "
+                        f"'void func {callback_expr.name}() {{ ... }}'",
+                        file=filename, line=callback_expr.line, column=callback_expr.column,
+                        category="invalid function argument type",
+                    )
+                delay_type = infer(expr.args[1], scope)
+                if delay_type is not None and delay_type is not NULL and delay_type != _INT:
+                    raise CompileError(
+                        f"{name}()'s delay argument must be an int (milliseconds), "
+                        f"found {types_mod.type_name(delay_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return _INT  # a timer id, usable with clearTimeout()/clearInterval()
+            if name in ("clearTimeout", "clearInterval"):
+                if len(expr.args) != 1:
+                    raise CompileError(
+                        f"{name}() expects exactly 1 argument (a timer id), got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                id_type = infer(expr.args[0], scope)
+                if id_type is not None and id_type is not NULL and id_type != _INT:
+                    raise CompileError(
+                        f"{name}()'s argument must be an int (a timer id), "
+                        f"found {types_mod.type_name(id_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return None
             if name in BUILTIN_FUNCTIONS:
                 sig = _BUILTIN_SIGNATURES.get(name)
                 if sig is None:

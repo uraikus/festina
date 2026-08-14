@@ -2,7 +2,7 @@
  * Festina native runtime -- claude.md #41 (log), #42 (fail), #45 (string
  * interpolation), #29-31 (automatic SQLite database + schema sync),
  * #67-68 (regex, string match/replace), #37/#39/#40 (img, graphics,
- * click/mouse events).
+ * click/mouse/key/resize/close events), #69 (setTimeout/setInterval).
  *
  * This is a from-scratch runtime for the statically typed Festina
  * language.
@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>       /* clock_gettime/nanosleep -- setTimeout/setInterval */
+#include <sys/select.h> /* select() -- multiplexes X11 events with timers */
 #include <X11/Xlib.h>
 #include <X11/Xutil.h> /* XLookupString/XKeysymToString -- `on key` */
 #include <cairo/cairo-xlib.h>
@@ -560,8 +562,9 @@ static void (*g_resize_handler)(void) = NULL;
 static void (*g_close_handler)(void) = NULL;
 /* The canvas's *current* size -- starts at FESTINA_CANVAS_WIDTH/HEIGHT
  * but tracks the window's real size after an `on resize`-triggering
- * ConfigureNotify (see festina_graphics_run); festina_client_width/
- * _height read these, not the compile-time constants. */
+ * ConfigureNotify (see festina_handle_graphics_event);
+ * festina_client_width/_height read these, not the compile-time
+ * constants. */
 static int64_t g_canvas_width = FESTINA_CANVAS_WIDTH;
 static int64_t g_canvas_height = FESTINA_CANVAS_HEIGHT;
 
@@ -723,77 +726,252 @@ int64_t festina_client_height(void) {
     return g_canvas_height;
 }
 
-void festina_graphics_run(void) {
-    if (!g_display) return; /* graphics were never actually used -- nothing to run */
-
-    while (1) {
-        XEvent ev;
-        XNextEvent(g_display, &ev);
-        if (ev.type == Expose) {
-            festina_graphics_present();
-        } else if (ev.type == ButtonPress) {
-            if (g_click_handler) g_click_handler(ev.xbutton.x, ev.xbutton.y);
-        } else if (ev.type == MotionNotify) {
-            if (g_mouse_handler) g_mouse_handler(ev.xmotion.x, ev.xmotion.y);
-        } else if (ev.type == KeyPress) {
-            if (g_key_handler) {
-                /* A key that types an ordinary printable character
-                 * (letters, digits, punctuation, space) comes back as
-                 * that character through the buffer XLookupString fills
-                 * in. Anything else -- Enter/Escape/Backspace/arrow
-                 * keys/... -- either comes back empty or as an
-                 * unprintable control character (e.g. 0x1B for Escape,
-                 * 0x0D for Return), neither of which is a useful `text`
-                 * value, so those fall back to XKeysymToString's X11 key
-                 * name instead (e.g. "Return", "Escape", "Left") --
-                 * there's no claude.md-defined naming scheme for these,
-                 * so this is simply X11's own. */
-                char buf[32];
-                KeySym keysym;
-                int len = XLookupString(&ev.xkey, buf, sizeof(buf) - 1, &keysym, NULL);
-                if (len > 0 && (unsigned char)buf[0] >= 0x20 && (unsigned char)buf[0] != 0x7F) {
-                    buf[len] = '\0';
-                    g_key_handler(buf);
-                } else {
-                    const char *name = XKeysymToString(keysym);
-                    g_key_handler(name ? name : "");
-                }
-            }
-        } else if (ev.type == ConfigureNotify) {
-            /* ConfigureNotify fires on more than just a resize (e.g. a
-             * move), so only treat it as `on resize` when the size
-             * genuinely changed. */
-            int64_t new_w = ev.xconfigure.width;
-            int64_t new_h = ev.xconfigure.height;
-            if (new_w != g_canvas_width || new_h != g_canvas_height) {
-                g_canvas_width = new_w;
-                g_canvas_height = new_h;
-                cairo_xlib_surface_set_size(g_window_surface, new_w, new_h);
-                /* claude.md #39's own examples never draw relative to a
-                 * canvas size (there's no syntax for one), so there's no
-                 * spec-defined way to preserve old content sanely across
-                 * a resize -- clear back to white at the new size, the
-                 * same behavior resizing a browser's <canvas> element
-                 * has, which clientWidth/clientHeight are named after. */
-                cairo_surface_destroy(g_backing_surface);
-                g_backing_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, new_w, new_h);
-                cairo_t *cr = cairo_create(g_backing_surface);
-                cairo_set_source_rgb(cr, 1, 1, 1);
-                cairo_paint(cr);
-                cairo_destroy(cr);
-                festina_graphics_present();
-                if (g_resize_handler) g_resize_handler();
-            }
-        } else if (ev.type == ClientMessage) {
-            if ((Atom)ev.xclient.data.l[0] == g_wm_delete_atom) {
-                if (g_close_handler) g_close_handler();
-                break;
+/* Handles one already-read X11 event. Returns 0 if this was the
+ * window-close request (the caller should stop looping and tear down),
+ * 1 otherwise. Factored out of what used to be festina_graphics_run's
+ * own while(1) loop body so festina_run_event_loop (below) can drive
+ * it either as-is or interleaved with timer processing. */
+static int festina_handle_graphics_event(XEvent *ev) {
+    if (ev->type == Expose) {
+        festina_graphics_present();
+    } else if (ev->type == ButtonPress) {
+        if (g_click_handler) g_click_handler(ev->xbutton.x, ev->xbutton.y);
+    } else if (ev->type == MotionNotify) {
+        if (g_mouse_handler) g_mouse_handler(ev->xmotion.x, ev->xmotion.y);
+    } else if (ev->type == KeyPress) {
+        if (g_key_handler) {
+            /* A key that types an ordinary printable character
+             * (letters, digits, punctuation, space) comes back as
+             * that character through the buffer XLookupString fills
+             * in. Anything else -- Enter/Escape/Backspace/arrow
+             * keys/... -- either comes back empty or as an
+             * unprintable control character (e.g. 0x1B for Escape,
+             * 0x0D for Return), neither of which is a useful `text`
+             * value, so those fall back to XKeysymToString's X11 key
+             * name instead (e.g. "Return", "Escape", "Left") --
+             * there's no claude.md-defined naming scheme for these,
+             * so this is simply X11's own. */
+            char buf[32];
+            KeySym keysym;
+            int len = XLookupString(&ev->xkey, buf, sizeof(buf) - 1, &keysym, NULL);
+            if (len > 0 && (unsigned char)buf[0] >= 0x20 && (unsigned char)buf[0] != 0x7F) {
+                buf[len] = '\0';
+                g_key_handler(buf);
+            } else {
+                const char *name = XKeysymToString(keysym);
+                g_key_handler(name ? name : "");
             }
         }
+    } else if (ev->type == ConfigureNotify) {
+        /* ConfigureNotify fires on more than just a resize (e.g. a
+         * move), so only treat it as `on resize` when the size
+         * genuinely changed. */
+        int64_t new_w = ev->xconfigure.width;
+        int64_t new_h = ev->xconfigure.height;
+        if (new_w != g_canvas_width || new_h != g_canvas_height) {
+            g_canvas_width = new_w;
+            g_canvas_height = new_h;
+            cairo_xlib_surface_set_size(g_window_surface, new_w, new_h);
+            /* claude.md #39's own examples never draw relative to a
+             * canvas size (there's no syntax for one), so there's no
+             * spec-defined way to preserve old content sanely across
+             * a resize -- clear back to white at the new size, the
+             * same behavior resizing a browser's <canvas> element
+             * has, which clientWidth/clientHeight are named after. */
+            cairo_surface_destroy(g_backing_surface);
+            g_backing_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, new_w, new_h);
+            cairo_t *cr = cairo_create(g_backing_surface);
+            cairo_set_source_rgb(cr, 1, 1, 1);
+            cairo_paint(cr);
+            cairo_destroy(cr);
+            festina_graphics_present();
+            if (g_resize_handler) g_resize_handler();
+        }
+    } else if (ev->type == ClientMessage) {
+        if ((Atom)ev->xclient.data.l[0] == g_wm_delete_atom) {
+            if (g_close_handler) g_close_handler();
+            return 0;
+        }
     }
+    return 1;
+}
 
+static void festina_graphics_teardown(void) {
     cairo_surface_destroy(g_backing_surface);
     cairo_surface_destroy(g_window_surface);
     XDestroyWindow(g_display, g_window);
     XCloseDisplay(g_display);
+}
+
+/* ---- setTimeout/setInterval -- claude.md #69. Added because Festina
+ * otherwise has no way to schedule work after the fact. See
+ * festina_runtime.h's doc comment for the full design (why the
+ * callback is a bare function name, how this combines with the
+ * graphics event loop, when a program with pending timers actually
+ * exits). ---- */
+
+typedef struct {
+    int64_t id;
+    void (*callback)(void);
+    int64_t interval_ms;  /* only meaningful when is_interval */
+    int64_t is_interval;
+    double next_fire_time; /* CLOCK_MONOTONIC seconds */
+    int64_t active;        /* 0 once cleared, or once a one-shot has fired */
+} FestinaTimer;
+
+static FestinaTimer *g_timers = NULL;
+static int64_t g_timer_count = 0;
+static int64_t g_timer_capacity = 0;
+static int64_t g_next_timer_id = 1;
+
+static double festina_now_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static int64_t festina_add_timer(void (*callback)(void), int64_t delay_ms, int64_t is_interval) {
+    if (g_timer_count == g_timer_capacity) {
+        /* Compact out cleared/fired-and-done entries before growing --
+         * keeps a long-running program that creates+clears many
+         * one-shot timeouts over time from growing this array
+         * unboundedly. */
+        int64_t write = 0;
+        for (int64_t read = 0; read < g_timer_count; read++) {
+            if (g_timers[read].active) g_timers[write++] = g_timers[read];
+        }
+        g_timer_count = write;
+    }
+    if (g_timer_count == g_timer_capacity) {
+        g_timer_capacity = g_timer_capacity ? g_timer_capacity * 2 : 8;
+        FestinaTimer *grown = realloc(g_timers, (size_t)g_timer_capacity * sizeof(FestinaTimer));
+        if (!grown) festina_fail("out of memory growing the timer list");
+        g_timers = grown;
+    }
+    int64_t id = g_next_timer_id++;
+    FestinaTimer *t = &g_timers[g_timer_count++];
+    t->id = id;
+    t->callback = callback;
+    t->interval_ms = delay_ms;
+    t->is_interval = is_interval;
+    t->next_fire_time = festina_now_seconds() + (double)delay_ms / 1000.0;
+    t->active = 1;
+    return id;
+}
+
+int64_t festina_set_timeout(void (*callback)(void), int64_t delay_ms) {
+    return festina_add_timer(callback, delay_ms, 0);
+}
+
+int64_t festina_set_interval(void (*callback)(void), int64_t delay_ms) {
+    return festina_add_timer(callback, delay_ms, 1);
+}
+
+static void festina_clear_timer_id(int64_t id) {
+    for (int64_t i = 0; i < g_timer_count; i++) {
+        if (g_timers[i].id == id) {
+            g_timers[i].active = 0;
+            return;
+        }
+    }
+    /* Clearing an id that doesn't exist (already fired, already
+     * cleared, or never valid) is a silent no-op -- matching
+     * clearTimeout()/clearInterval() in JS, which never throw either. */
+}
+
+void festina_clear_timeout(int64_t id) { festina_clear_timer_id(id); }
+void festina_clear_interval(int64_t id) { festina_clear_timer_id(id); }
+
+/* Fires every timer whose next_fire_time has passed. Indexes into
+ * g_timers fresh on every access (never caches a pointer across a
+ * callback() call) since a callback is ordinary Festina code and can
+ * itself call setTimeout/setInterval (growing/reallocating g_timers)
+ * or clearTimeout/clearInterval (deactivating an entry, including its
+ * own) -- both need to be safe to do from inside a firing callback. */
+static void festina_fire_expired_timers(void) {
+    double now = festina_now_seconds();
+    for (int64_t i = 0; i < g_timer_count; i++) {
+        if (!g_timers[i].active || g_timers[i].next_fire_time > now) continue;
+        void (*callback)(void) = g_timers[i].callback;
+        if (g_timers[i].is_interval) {
+            /* Reschedule from *now*, not from the missed deadline, so a
+             * slow callback (or a long gap before the process got to
+             * run at all) doesn't cause a burst of catch-up calls --
+             * "at least this often," not "exactly this often". */
+            g_timers[i].next_fire_time = now + (double)g_timers[i].interval_ms / 1000.0;
+        } else {
+            g_timers[i].active = 0;
+        }
+        callback();
+        now = festina_now_seconds(); /* the callback took real time */
+    }
+}
+
+/* The unified blocking loop main() enters (via festina_run_event_loop)
+ * whenever a program uses graphics, timers, or both -- see
+ * CodeGen.uses_graphics/uses_timers in festina/codegen.py. With
+ * graphics: multiplexes X11 events and timer deadlines on the same
+ * select() call (via ConnectionNumber(g_display)) rather than picking
+ * one or the other, so `on click`/timers both stay responsive at once;
+ * exits when the window closes (timers, if any, are simply abandoned --
+ * matching a browser tab unloading). Without graphics: sleeps until the
+ * next timer deadline and fires it, forever, until there's truly
+ * nothing left to wait for (no active timers) -- matching Node's empty
+ * event loop exiting the process. An uncleared setInterval therefore
+ * keeps a graphics-free program running forever, exactly like in a real
+ * JS runtime; it needs to be stopped externally (or via
+ * clearInterval()) the same way. */
+void festina_run_event_loop(void) {
+    while (1) {
+        double earliest = -1.0;
+        for (int64_t i = 0; i < g_timer_count; i++) {
+            if (!g_timers[i].active) continue;
+            if (earliest < 0.0 || g_timers[i].next_fire_time < earliest) {
+                earliest = g_timers[i].next_fire_time;
+            }
+        }
+
+        if (g_display) {
+            if (!XPending(g_display)) {
+                int xfd = ConnectionNumber(g_display);
+                fd_set fds;
+                FD_ZERO(&fds);
+                FD_SET(xfd, &fds);
+                struct timeval tv;
+                struct timeval *tvp = NULL;
+                if (earliest >= 0.0) {
+                    double remaining = earliest - festina_now_seconds();
+                    if (remaining < 0.0) remaining = 0.0;
+                    tv.tv_sec = (long)remaining;
+                    tv.tv_usec = (long)((remaining - (double)tv.tv_sec) * 1e6);
+                    tvp = &tv;
+                }
+                select(xfd + 1, &fds, NULL, NULL, tvp);
+            }
+            int keep_going = 1;
+            while (XPending(g_display)) {
+                XEvent ev;
+                XNextEvent(g_display, &ev);
+                if (!festina_handle_graphics_event(&ev)) {
+                    keep_going = 0;
+                    break; /* stop on window-close, same as the old loop did */
+                }
+            }
+            festina_fire_expired_timers();
+            if (!keep_going) {
+                festina_graphics_teardown();
+                return;
+            }
+        } else {
+            if (earliest < 0.0) return; /* nothing left to wait for */
+            double remaining = earliest - festina_now_seconds();
+            if (remaining > 0.0) {
+                struct timespec ts;
+                ts.tv_sec = (time_t)remaining;
+                ts.tv_nsec = (long)((remaining - (double)ts.tv_sec) * 1e9);
+                nanosleep(&ts, NULL);
+            }
+            festina_fire_expired_timers();
+        }
+    }
 }

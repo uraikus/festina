@@ -468,6 +468,49 @@ class TestLoops:
         assert result.stdout.splitlines() == ["55", "6765"]
 
 
+def _find_window(display, timeout=20):
+    # 20s, not the 10s an isolated run needs comfortably -- TestGraphics
+    # compiles a fresh binary (a real gcc invocation) and spawns a fresh
+    # Xvfb instance per interactive test, back to back; under real
+    # contention (the full suite, or just a loaded sandbox) that
+    # occasionally pushes a single window's startup past 10s even though
+    # the underlying Xvfb/window-creation code itself is reliable in
+    # isolation (verified directly, outside pytest, with no failures in
+    # 15 repeated runs). Module-level (not a method) so TestTimers's one
+    # combined graphics+timers test can reuse it too.
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = subprocess.run(
+            ["xdotool", "search", "--name", "Festina"],
+            env=dict(os.environ, DISPLAY=display),
+            capture_output=True, text=True,
+        )
+        wids = result.stdout.split()
+        if wids:
+            return wids[0]
+        time.sleep(0.2)
+    raise AssertionError("the Festina canvas window never appeared")
+
+
+def _wait_for_output(stdout_path, predicate, timeout=20):
+    # Polls instead of a fixed sleep-then-assert, for the same reason
+    # x_display polls for Xvfb readiness instead of a fixed sleep (see
+    # conftest.py): reliable running one test in isolation but flaky
+    # under full-suite load, since dispatch latency (X server ->
+    # compiled handler -> log() -> this process's read) isn't constant.
+    # Returns the last text read so a timed-out caller's own assert
+    # still shows what actually came back, not just "timed out".
+    # Module-level for the same reason _find_window is.
+    deadline = time.time() + timeout
+    text = ""
+    while time.time() < deadline:
+        text = stdout_path.read_text()
+        if predicate(text):
+            return text
+        time.sleep(0.1)
+    return text
+
+
 class TestGraphics:
     """claude.md #37 (image), #39 (graphics), #40 (events) -- a real
     X11 window rendered via Cairo, not a file written to disk (see
@@ -502,9 +545,9 @@ class TestGraphics:
     directly: it leaves the process running rather than triggering the
     handler. An environment limitation of the test setup, not a gap in
     the app's own (standard) handling of that protocol -- see
-    festina_runtime.c's festina_graphics_run for the actual dispatch,
-    right alongside the click/mouse/key/resize dispatch this class does
-    verify.
+    festina_runtime.c's festina_handle_graphics_event for the actual
+    dispatch, right alongside the click/mouse/key/resize dispatch this
+    class does verify.
     """
 
     def test_compiles_and_links_successfully(self, cli_mod, tmp_path):
@@ -571,47 +614,15 @@ class TestGraphics:
         assert result.returncode == 0
         assert result.stdout.strip() == "no graphics here"
 
-    def _find_window(self, display, timeout=10):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            result = subprocess.run(
-                ["xdotool", "search", "--name", "Festina"],
-                env=dict(os.environ, DISPLAY=display),
-                capture_output=True, text=True,
-            )
-            wids = result.stdout.split()
-            if wids:
-                return wids[0]
-            time.sleep(0.2)
-        raise AssertionError("the Festina canvas window never appeared")
-
-    def _wait_for_output(self, stdout_path, predicate, timeout=10):
-        # Polls instead of a fixed sleep-then-assert, for the same
-        # reason x_display polls for Xvfb readiness instead of a fixed
-        # sleep (see conftest.py): reliable running one test in
-        # isolation but flaky under full-suite load, since dispatch
-        # latency (X server -> compiled handler -> log() -> this
-        # process's read) isn't constant. Returns the last text read so
-        # a timed-out caller's own assert still shows what actually
-        # came back, not just "timed out".
-        deadline = time.time() + timeout
-        text = ""
-        while time.time() < deadline:
-            text = stdout_path.read_text()
-            if predicate(text):
-                return text
-            time.sleep(0.1)
-        return text
-
     def test_click_dispatches_to_handler_with_correct_coordinates(self, run_graphics_program, x_display):
         source = "on click(x:int, y:int) {\n    log(`click ${x} ${y}`)\n}"
         proc, stdout_path = run_graphics_program(source)
         try:
-            wid = self._find_window(x_display)
+            wid = _find_window(x_display)
             env = dict(os.environ, DISPLAY=x_display)
             subprocess.run(["xdotool", "mousemove", "--window", wid, "150", "220"], env=env, check=True)
             subprocess.run(["xdotool", "click", "--window", wid, "1"], env=env, check=True)
-            text = self._wait_for_output(stdout_path, lambda t: t.strip() != "")
+            text = _wait_for_output(stdout_path, lambda t: t.strip() != "")
             assert text.strip() == "click 150 220"
         finally:
             proc.terminate()
@@ -621,10 +632,10 @@ class TestGraphics:
         source = "on mouse(x:int, y:int) {\n    log(`mouse ${x} ${y}`)\n}"
         proc, stdout_path = run_graphics_program(source)
         try:
-            wid = self._find_window(x_display)
+            wid = _find_window(x_display)
             env = dict(os.environ, DISPLAY=x_display)
             subprocess.run(["xdotool", "mousemove", "--window", wid, "300", "400"], env=env, check=True)
-            text = self._wait_for_output(stdout_path, lambda t: "mouse 300 400" in t)
+            text = _wait_for_output(stdout_path, lambda t: "mouse 300 400" in t)
             assert "mouse 300 400" in text
         finally:
             proc.terminate()
@@ -635,11 +646,11 @@ class TestGraphics:
         # comes back as its own character; a non-printable one (e.g.
         # Escape, whose ASCII value is an unprintable control code) is
         # not a useful `text` value, so it falls back to X11's own key
-        # name instead -- see festina_runtime.c's festina_graphics_run.
+        # name instead -- see festina_runtime.c's festina_handle_graphics_event.
         source = "on key(key:text) {\n    log(`key ${key}`)\n}"
         proc, stdout_path = run_graphics_program(source)
         try:
-            wid = self._find_window(x_display)
+            wid = _find_window(x_display)
             env = dict(os.environ, DISPLAY=x_display)
             # The window needs real keyboard focus for KeyPress events to
             # reach it at all -- see festina_graphics_init's XSetInputFocus
@@ -648,7 +659,7 @@ class TestGraphics:
             time.sleep(0.3)
             subprocess.run(["xdotool", "key", "--window", wid, "a"], env=env, check=True)
             subprocess.run(["xdotool", "key", "--window", wid, "Escape"], env=env, check=True)
-            text = self._wait_for_output(stdout_path, lambda t: len(t.splitlines()) >= 2)
+            text = _wait_for_output(stdout_path, lambda t: len(t.splitlines()) >= 2)
             assert text.splitlines() == ["key a", "key Escape"]
         finally:
             proc.terminate()
@@ -658,8 +669,8 @@ class TestGraphics:
         source = "log(`${clientWidth}x${clientHeight}`)"
         proc, stdout_path = run_graphics_program(source)
         try:
-            self._find_window(x_display)  # also proves a bare reference opens a window
-            text = self._wait_for_output(stdout_path, lambda t: t.strip() != "")
+            _find_window(x_display)  # also proves a bare reference opens a window
+            text = _wait_for_output(stdout_path, lambda t: t.strip() != "")
             assert text.strip() == "800x600"
         finally:
             proc.terminate()
@@ -669,11 +680,171 @@ class TestGraphics:
         source = "on resize() {\n    log(`resize ${clientWidth} ${clientHeight}`)\n}"
         proc, stdout_path = run_graphics_program(source)
         try:
-            wid = self._find_window(x_display)
+            wid = _find_window(x_display)
             env = dict(os.environ, DISPLAY=x_display)
             subprocess.run(["xdotool", "windowsize", wid, "640", "480"], env=env, check=True)
-            text = self._wait_for_output(stdout_path, lambda t: "resize 640 480" in t)
+            text = _wait_for_output(stdout_path, lambda t: "resize 640 480" in t)
             assert "resize 640 480" in text
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
+class TestTimers:
+    """claude.md #69: setTimeout/setInterval/clearTimeout/clearInterval.
+    Added because Festina otherwise has no way to schedule work after
+    the fact, the same gap JS's setTimeout/setInterval fill. See
+    festina/semantic.py's _infer_call (the setTimeout/setInterval
+    branch) and runtime/festina_runtime.h's doc comment for the full
+    design.
+
+    Most of this needs no display at all -- a timers-only program never
+    opens a window (CodeGen.uses_timers is a separate flag from
+    uses_graphics) -- so these mostly use compile_and_run like any other
+    runtime-behavior test. The one exception,
+    test_timers_and_graphics_work_together, is the one thing that
+    genuinely needs a real window: proving festina_run_event_loop's
+    select()-based multiplexing keeps both a `setInterval` callback and
+    `on click` responsive together, not just one or the other.
+    """
+
+    def test_timeout_fires_once_after_the_delay(self, compile_and_run):
+        source = (
+            "void func onTimeout() {\n"
+            "    log('fired')\n"
+            "}\n"
+            "log('start')\n"
+            "setTimeout(onTimeout, 10)\n"
+        )
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["start", "fired"]
+
+    def test_interval_fires_repeatedly_until_cleared(self, compile_and_run):
+        source = (
+            "int count = 0\n"
+            "int intervalId = 0\n"
+            "void func onInterval() {\n"
+            "    count = count + 1\n"
+            "    log(`tick ${count}`)\n"
+            "    if (count >= 3) {\n"
+            "        clearInterval(intervalId)\n"
+            "    }\n"
+            "}\n"
+            "intervalId = setInterval(onInterval, 5)\n"
+        )
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["tick 1", "tick 2", "tick 3"]
+
+    def test_clear_timeout_cancels_a_pending_callback(self, compile_and_run):
+        source = (
+            "void func shouldNotFire() {\n"
+            "    log('should not happen')\n"
+            "}\n"
+            "void func shouldFire() {\n"
+            "    log('fired')\n"
+            "}\n"
+            "int id = setTimeout(shouldNotFire, 50)\n"
+            "clearTimeout(id)\n"
+            "setTimeout(shouldFire, 5)\n"
+        )
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert "should not happen" not in result.stdout
+        assert "fired" in result.stdout
+
+    def test_callback_can_schedule_another_timer(self, compile_and_run):
+        # Proves a timer created *from inside* a firing callback is
+        # still picked up by the same run -- festina_run_event_loop
+        # recomputes the earliest deadline fresh on every pass rather
+        # than fixing it once at loop entry, and festina_add_timer's
+        # array can safely grow (realloc) from inside a callback that's
+        # itself being called from a loop iterating that same array.
+        source = (
+            "int calls = 0\n"
+            "void func step() {\n"
+            "    calls = calls + 1\n"
+            "    log(`step ${calls}`)\n"
+            "    if (calls < 3) {\n"
+            "        setTimeout(step, 5)\n"
+            "    }\n"
+            "}\n"
+            "setTimeout(step, 5)\n"
+        )
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["step 1", "step 2", "step 3"]
+
+    def test_program_with_only_timeouts_exits_once_they_all_fire(self, compile_and_run):
+        # No graphics, no uncleared interval -- festina_run_event_loop
+        # must actually return once there's nothing left to wait for,
+        # not block forever; compile_and_run's own subprocess timeout
+        # (15s) would turn a regression here into a hard failure rather
+        # than a slow pass, but this asserts on the normal, fast path.
+        source = "void func cb() {\n    log('done')\n}\nsetTimeout(cb, 5)\n"
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_uncleared_interval_keeps_the_program_running(self, tmp_path, codegen, cli_mod):
+        # The one JS-matching behavior compile_and_run's fixed 15s
+        # timeout can't cleanly demonstrate (it would just make the test
+        # slow, not prove anything a shorter wait doesn't already show)
+        # -- drive it directly instead: start the compiled program in
+        # the background, confirm it's still alive and still logging
+        # after a short wait, then kill it ourselves. No DISPLAY needed
+        # at all here -- this is exactly the "timers without graphics"
+        # case CodeGen.uses_timers exists to keep separate from
+        # uses_graphics.
+        if not (shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")):
+            pytest.skip("no C compiler (clang/gcc/cc) on PATH")
+        source = "void func tick() {\n    log('tick')\n}\nsetInterval(tick, 5)\n"
+        src_path = tmp_path / "main.f"
+        src_path.write_text(source)
+        out_path = tmp_path / "program"
+        cli_mod.compile_file(str(src_path), str(out_path))
+        stdout_path = tmp_path / "stdout.log"
+        proc = subprocess.Popen(
+            ["stdbuf", "-oL", str(out_path)],
+            cwd=tmp_path, stdout=open(stdout_path, "w"), stderr=subprocess.STDOUT,
+        )
+        try:
+            time.sleep(0.3)
+            assert proc.poll() is None, "an uncleared setInterval should keep the program running"
+            lines = stdout_path.read_text().splitlines()
+            assert len(lines) >= 2, f"expected multiple 'tick's by now, got {lines!r}"
+            assert all(line == "tick" for line in lines)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_timers_and_graphics_work_together(self, run_graphics_program, x_display):
+        source = (
+            "void func tick() {\n"
+            "    log('tick')\n"
+            "}\n"
+            "on click(x:int, y:int) {\n"
+            "    log(`click ${x} ${y}`)\n"
+            "}\n"
+            "drawRect(0, 0, 10, 10)\n"
+            "setInterval(tick, 15)\n"
+        )
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            text = _wait_for_output(stdout_path, lambda t: "tick" in t)
+            assert "tick" in text, "the interval never fired alongside the open window"
+
+            subprocess.run(["xdotool", "mousemove", "--window", wid, "5", "5"], env=env, check=True)
+            subprocess.run(["xdotool", "click", "--window", wid, "1"], env=env, check=True)
+            text = _wait_for_output(stdout_path, lambda t: "click 5 5" in t)
+            assert "click 5 5" in text
+            # The interval kept firing before *and* after the click --
+            # proves festina_run_event_loop's select() call is genuinely
+            # multiplexing both, not just alternating or starving one.
+            assert text.count("tick") >= 2
         finally:
             proc.terminate()
             proc.wait(timeout=5)
