@@ -359,7 +359,7 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 694 tests in this directory pass against it: 684 given a working C
+All 704 tests in this directory pass against it: 694 given a working C
 compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
 too, plus 8 more given `Xvfb`+`xdotool` too
 (`tests/test_codegen.py::TestGraphics`'s interactive click/mouse/key/
@@ -846,23 +846,112 @@ more bug while doing so, and deliberately did NOT attempt a third
   exit -- exactly the expected, standard leak-detector distinction
   between "never explicitly freed" and "genuinely unreachable."
 
-  Explicitly NOT covered by this stage (claude.md #74 itself states
+  (At the time of the paragraph above, before the nested-block/loop
+  widening described next, this stage still did NOT cover a value
+  declared inside a nested `if`/`while`/`for` block or a loop body at
+  all -- both closed by the follow-up increment below, in the same
+  session.) Still explicitly NOT covered (claude.md #74 itself states
   each of these, so a later stage's own test suite has a clear
-  before/after line): a value declared inside a nested `if`/`while`/
-  `for` block; a value declared inside a loop body at all (still leaks
-  on every iteration, unchanged); whether a value passed as a call
-  argument is actually retained by the callee (treated as escaping
-  unconditionally -- no interprocedural analysis yet); struct/array/map
-  *fields* within an otherwise-freed struct; and a freed map's own
-  per-entry keys. None of these are safety gaps -- each one only means
-  less memory is reclaimed automatically than a more complete
-  implementation would reclaim.
+  before/after line): whether a value passed as a call argument is
+  actually retained by the callee (treated as escaping unconditionally
+  -- no interprocedural analysis yet); struct/array/map *fields* within
+  an otherwise-freed struct; and a freed map's own per-entry keys. None
+  of these are safety gaps -- each one only means less memory is
+  reclaimed automatically than a more complete implementation would
+  reclaim.
+
+- **Memory management stage 1, widened: nested `if`/`while`/`for`
+  bodies and per-iteration loop freeing (claude.md #74, extended in the
+  same session).** The immediate follow-up to the paragraph above,
+  closing exactly the two limitations it called out. The meaningful
+  half of this isn't "nested blocks are now covered" in the abstract --
+  it's that a value declared inside a `for`/`while` loop's body is now
+  freed at the end of *every iteration that reaches the end of that
+  body*, not deferred until the loop finishes or the enclosing function
+  eventually returns. Without this, a loop-local struct/array/map would
+  leak once per iteration, unboundedly, regardless of how tightly the
+  function-level version of this same idea was scoped -- exactly the
+  highest-value gap flagged when stage 1 first shipped.
+
+  `escape_analysis.py` itself needed zero changes: `find_escaping_names`
+  was always whole-function-scoped (it already walked into nested `if`/
+  `while`/`for` bodies looking for escaping *uses*, regardless of where
+  a candidate happens to be *declared*), so the exact same analysis
+  result already answered "is this name safe" correctly no matter which
+  block declares it. Everything new is in `codegen.py`: `_emit_block`
+  (previously only used for a nested body, with `_emit_func_body` as a
+  separate top-level-only variant) now IS the one mechanism used
+  everywhere -- a function/handler's own top-level body included, via
+  the new small wrapper `_emit_analyzed_func_body` that computes
+  `find_escaping_names` once and exposes it through `self.
+  _current_escaping_names` for every `_emit_block` call reached while
+  that one function/handler is being emitted. `_emit_block` pushes its
+  own frame onto `self._active_free_locals` (now genuinely a stack of
+  per-block frames, not one frame per function) and frees just that
+  frame at its own natural, non-terminated exit.
+
+  The real new mechanism is `_emit_free_active_locals`'s `down_to`
+  parameter, and what calls it with which value: a `Return` frees
+  `down_to=0` -- every open frame at once, since returning exits every
+  nested scope simultaneously (a value declared at the top level *and*
+  one declared in a currently-open `if` both need freeing on the same
+  `ret`). A `Break`/`Continue` frees only down to the frame index
+  recorded in `self._loop_targets` (extended from `(continue_label,
+  break_label)` pairs to `(continue_label, break_label, free_depth)`
+  triples -- `free_depth` is `len(self._active_free_locals)` recorded
+  right before `_emit_while`/`_emit_for` push the loop body's own
+  frame) -- freeing the loop body's own frame and anything nested
+  deeper inside it (e.g. an `if` inside the loop containing the actual
+  `break`), but never anything below that index: a struct declared
+  *outside* the loop and merely read/written through its own fields
+  *inside* it (always safe under claude.md #74's own rule, regardless
+  of where the struct itself was declared) is correctly left alone by
+  that loop's own `break`/`continue`. Verified directly, not just
+  reasoned about
+  (`test_break_frees_the_loop_local_but_not_an_outer_scope_local`,
+  `test_outer_scope_struct_survives_break_and_continue_from_a_nested_loop`).
+  No double-free risk between a `Break`'s explicit free and
+  `_emit_block`'s own trailing natural-exit free either: the latter is
+  gated on `not ctx["terminated"]`, and `Break`/`Continue`/`Return` all
+  set `ctx["terminated"] = True` on their own path before returning, so
+  whichever one actually fires on a given execution is the only one
+  that ever runs -- different control-flow paths through the generated
+  IR, never both on the same path.
+
+  Verified the same three ways stage 1's own initial shipment was,
+  including a fresh AddressSanitizer/LeakSanitizer pass specifically
+  because the new machinery (multi-frame stack, `break`/`continue`
+  interaction) genuinely warranted re-verification, not just reusing
+  the earlier confidence: a combined program mixing loop-local structs,
+  `if`-nested-inside-loop locals, and both `break` and `continue` firing
+  repeatedly across many outer iterations -- zero ASAN errors, and (with
+  leak detection on) a genuine 499-object leak was found and traced
+  precisely to a *different*, already-understood, pre-existing leak
+  class entirely unrelated to this increment: a global reassigned
+  inside a loop (`globalStash = q`, `q` correctly treated as escaping
+  and never freed by this feature either way) orphans its *previous*
+  value on every reassignment but the last -- confirmed by removing
+  that one line and re-running to exactly zero leaks, zero errors, not
+  waved away as "probably fine."
+
+  See `tests/test_codegen.py::TestAutomaticMemoryReclamation`'s
+  `test_a_loop_local_struct_is_freed_inside_the_loop_body` (exactly one
+  `free()` call, and it's inside the loop body's own block, not just
+  once after the loop as a whole),
+  `test_break_frees_the_loop_local_but_not_an_outer_scope_local`,
+  `test_continue_frees_locals_declared_since_the_loop_body_began`,
+  `test_nested_if_inside_a_loop_frees_correctly_on_both_the_break_and_fallthrough_paths`,
+  and the matching compile-and-run correctness tests immediately after
+  them in the same class (including
+  `test_many_loop_iterations_with_nested_if_and_break_continue_does_not_crash`,
+  a heavier robustness check than stage 1's own equivalent, specifically
+  exercising the new per-iteration free + nested-if + break/continue
+  combination together, not just repeated function calls).
 
   See `todo.md`'s "Memory management" section for the full picture,
-  including what widening this stage's coverage (nested blocks, loops,
-  interprocedural reasoning) versus adding reference counting for
-  genuinely-escaping values would each still require, and why neither
-  is attempted yet.
+  including exactly what's still ahead (interprocedural analysis,
+  nested struct/array/map fields, map per-entry keys) and what
+  reference counting for genuinely-escaping values would still require.
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -1634,7 +1723,7 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 684 passed, 10 skipped (needs a C compiler; 2 of
+pytest tests/                          # 694 passed, 10 skipped (needs a C compiler; 2 of
                                         # the skips need `pip install pyinstaller` too,
                                         # the other 8 need Xvfb + xdotool installed)
 ```

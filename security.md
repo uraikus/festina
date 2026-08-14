@@ -216,21 +216,34 @@ for the full design writeup.
   `claude.md #74` (stage 1) now frees a local struct/`arr[T]`/`map[T]`
   automatically whenever `festina/escape_analysis.py` can prove, from
   the syntax of its declaring function/handler alone, that its address
-  never left it. Everything that stage's own scope doesn't cover yet
-  (values declared inside a nested block or a loop body, anything
-  passed as a call argument, nested struct/array/map fields within an
-  otherwise-freed value) still leaks exactly as before — a resource
-  leak in a long-running process, not a safety issue on its own, no
-  different in kind from the gap this note already accepted. What
-  changed is that stage 1's own fix was verified with the same rigor
-  the rest of this document's findings were: exhaustive unit tests of
-  the analysis itself, end-to-end compile-and-run tests including the
-  exact "return a struct by value" pattern the earlier naive stack-
-  allocation attempt below got wrong, and a real AddressSanitizer/
-  LeakSanitizer run (zero ASAN errors; LeakSanitizer's reported leaks
-  matched the hand-derived expected count exactly, not more) — see
-  [todo.md](todo.md#memory-management) for the full writeup, including
-  the naive stack-allocation attempt that was tried before stage 1
-  existed and reverted after being verified to corrupt memory, and
-  exactly what widening stage 1's coverage and adding reference counting
-  for the values it can't reach would each still require.
+  never left it — as soon as control leaves the block it was declared
+  in (a function/handler's own top-level body, or any nested `if`/
+  `while`/`for` body), not deferred until the function eventually
+  returns: a loop-body-declared value is freed every iteration, and
+  `break`/`continue` free everything declared since that loop's own
+  body began before actually leaving. Everything that stage's own scope
+  doesn't cover yet (whether a value passed as a call argument is
+  actually retained by the callee, nested struct/array/map fields
+  within an otherwise-freed value, a freed map's own per-entry keys)
+  still leaks exactly as before — a resource leak in a long-running
+  process, not a safety issue on its own, no different in kind from the
+  gap this note already accepted. What changed is that stage 1's own
+  fix, at every step of building it out, was verified with the same
+  rigor the rest of this document's findings were: exhaustive unit
+  tests of the analysis itself, end-to-end compile-and-run tests
+  including the exact "return a struct by value" pattern the earlier
+  naive stack-allocation attempt below got wrong and the critical
+  "a value merely used inside a loop, not declared inside it, survives
+  that loop's own break/continue" case, and real AddressSanitizer/
+  LeakSanitizer runs (zero ASAN errors each time; LeakSanitizer's
+  reported leaks matched the hand-derived expected count exactly every
+  time, including one run where the "extra" leak turned out to be a
+  real, separately-explained, structurally different gap -- a global
+  repeatedly reassigned orphaning its previous value -- confirmed by
+  removing that one line and re-running to zero leaks, not waved away)
+  — see [todo.md](todo.md#memory-management) for the full writeup,
+  including the naive stack-allocation attempt that was tried before
+  stage 1 existed and reverted after being verified to corrupt memory,
+  and exactly what widening stage 1's remaining coverage and adding
+  reference counting for the values it can't reach would each still
+  require.

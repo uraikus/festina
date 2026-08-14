@@ -911,11 +911,12 @@ class TestAutomaticMemoryReclamation:
         ir = self._ir(parser, semantic, codegen, source)
         assert "call void @free(" not in ir
 
-    def test_a_loop_local_struct_is_not_yet_analyzed(self, parser, semantic, codegen):
-        # claude.md #74's own stated stage-1 limitation: only top-level
-        # function-body declarations are covered so far, not ones nested
-        # inside a for/while body -- this must still leak, unchanged,
-        # not be (incorrectly or correctly) touched by this stage yet.
+    def test_a_loop_local_struct_is_freed_inside_the_loop_body(self, parser, semantic, codegen):
+        # claude.md #74's nested-block extension: a loop-body-declared
+        # non-escaping local is now freed at the end of *every*
+        # iteration -- exactly one free() call, and it must be inside
+        # the loop body's own block (part of the runtime back-edge
+        # cycle), not just once after the loop as a whole exits.
         source = """
         struct Point { x:int y:int }
         void func f() {
@@ -927,10 +928,14 @@ class TestAutomaticMemoryReclamation:
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @free(" not in ir
+        lines = ir.splitlines()
+        body_start = next(i for i, l in enumerate(lines) if l.strip() == "for.body3:")
+        body_end = next(i for i in range(body_start, len(lines)) if lines[i].strip().startswith("br label %for.update"))
+        body_lines = lines[body_start:body_end]
+        assert sum("call void @free(" in l for l in body_lines) == 1
+        assert ir.count("call void @free(") == 1
 
-    def test_a_nested_if_declared_struct_is_not_yet_analyzed(self, parser, semantic, codegen):
-        # Same stage-1 limitation, for a nested if instead of a loop.
+    def test_a_nested_if_declared_struct_is_freed_at_the_ifs_own_end(self, parser, semantic, codegen):
         source = """
         struct Point { x:int y:int }
         void func f(cond:bool) {
@@ -942,7 +947,78 @@ class TestAutomaticMemoryReclamation:
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @free(" not in ir
+        assert "call void @free(" in ir
+
+    def test_break_frees_the_loop_local_but_not_an_outer_scope_local(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            Point outer
+            outer.x = 100
+            for int i = 0, i < 5, i++ {
+                Point inner
+                inner.x = i
+                if inner.x == 2 {
+                    break
+                }
+                log(inner.x)
+            }
+            log(outer.x)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        break_block = next(i for i, l in enumerate(lines) if l.strip().startswith("if.then"))
+        break_block_end = next(i for i in range(break_block, len(lines)) if lines[i].strip().startswith("br label %for.end"))
+        break_lines = lines[break_block:break_block_end]
+        # Exactly one free() on the break path -- inner's, not outer's
+        # (outer is declared outside the loop, merely used inside it).
+        assert sum("call void @free(" in l for l in break_lines) == 1
+        # outer is still freed exactly once overall, at the function's
+        # own end (after the loop, whichever way it was exited).
+        assert ir.count("call void @free(") == 3  # inner (break path) + inner (fall-through path) + outer
+
+    def test_continue_frees_locals_declared_since_the_loop_body_began(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            for int i = 0, i < 5, i++ {
+                Point p
+                p.x = i
+                if p.x % 2 == 0 {
+                    continue
+                }
+                log(p.x)
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        continue_block = next(i for i, l in enumerate(lines) if l.strip().startswith("if.then"))
+        continue_block_end = next(i for i in range(continue_block, len(lines)) if lines[i].strip().startswith("br label %for.update"))
+        continue_lines = lines[continue_block:continue_block_end]
+        assert sum("call void @free(" in l for l in continue_lines) == 1
+
+    def test_nested_if_inside_a_loop_frees_correctly_on_both_the_break_and_fallthrough_paths(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            for int i = 0, i < 5, i++ {
+                Point p
+                p.x = i
+                if p.x == 3 {
+                    break
+                }
+                log(p.x)
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        # One free() on the break path (p, via break's own free-before-
+        # branch), one on the normal fall-through-to-next-iteration path
+        # (p, via the loop body's own natural end) -- two total, both p,
+        # never both taken on the same iteration.
+        assert ir.count("call void @free(") == 2
 
     def test_early_return_before_the_declaration_has_no_free_on_that_path(self, parser, semantic, codegen):
         source = """
@@ -1133,6 +1209,170 @@ class TestAutomaticMemoryReclamation:
         result = compile_and_run(source, args=None)
         assert result.returncode == 0
         assert result.stdout.strip() == "50000"
+
+    def test_nested_if_declared_struct_produces_correct_output(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f(cond:bool) {
+            if cond {
+                Point p
+                p.x = 5
+                log(p.x)
+            }
+            log('after')
+        }
+        f(true)
+        f(false)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["5", "after", "after"]
+
+    def test_loop_local_struct_produces_correct_output_every_iteration(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            for int i = 0, i < 5, i++ {
+                Point p
+                p.x = i * i
+                log(p.x)
+            }
+        }
+        f()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "1", "4", "9", "16"]
+
+    def test_break_and_continue_with_loop_local_structs_produce_correct_output(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func withBreak() {
+            for int i = 0, i < 5, i++ {
+                Point p
+                p.x = i
+                if p.x == 2 {
+                    break
+                }
+                log(p.x)
+            }
+            log('after break loop')
+        }
+        void func withContinue() {
+            for int i = 0, i < 5, i++ {
+                Point p
+                p.x = i
+                if p.x % 2 == 0 {
+                    continue
+                }
+                log(p.x)
+            }
+        }
+        withBreak()
+        withContinue()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "1", "after break loop", "1", "3"]
+
+    def test_outer_scope_struct_survives_break_and_continue_from_a_nested_loop(self, compile_and_run):
+        # The critical case: a struct declared OUTSIDE a loop and merely
+        # used (not declared) inside it must keep its correct value --
+        # break/continue only free locals declared since the loop's own
+        # body began, never anything from an outer scope.
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            Point outer
+            outer.x = 100
+            for int i = 0, i < 3, i++ {
+                Point inner
+                inner.x = i
+                if inner.x == 1 {
+                    break
+                }
+                log(inner.x + outer.x)
+            }
+            log(outer.x)
+        }
+        f()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["100", "100"]
+
+    def test_while_loop_local_struct_produces_correct_output(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            int i = 0
+            while i < 4 {
+                Point p
+                p.x = i
+                if p.x % 3 == 0 {
+                    Point r
+                    r.x = p.x * 100
+                    log(r.x)
+                }
+                i = i + 1
+            }
+        }
+        f()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "300"]
+
+    def test_struct_escaping_a_loop_into_a_global_still_works_correctly(self, compile_and_run):
+        # A value that genuinely escapes (assigned into a global) from
+        # inside a loop must never be freed, on any path, including
+        # break/continue -- it's excluded from every frame entirely,
+        # the same escape_analysis.find_escaping_names result as ever.
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            for int i = 0, i < 3, i++ {
+                Point p
+                p.x = i
+                g = p
+            }
+        }
+        f()
+        log(g.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "2"
+
+    def test_many_loop_iterations_with_nested_if_and_break_continue_does_not_crash(self, compile_and_run):
+        # A heavier robustness check than the stage-1 version above --
+        # this one exercises the actual new machinery: a loop-local
+        # struct freed every iteration, an if nested inside the loop
+        # body with its own struct local, and break/continue both firing
+        # repeatedly across many iterations, all in the same loop.
+        source = """
+        struct Point { x:int y:int }
+        void func run(n:int) {
+            Point outer
+            outer.x = 0
+            for int i = 0, i < n, i++ {
+                Point p
+                p.x = i
+                if p.x % 7 == 0 {
+                    continue
+                }
+                if p.x % 13 == 0 {
+                    break
+                }
+                Point q
+                q.x = p.x * 2
+                outer.x = outer.x + q.x
+            }
+            log(outer.x)
+        }
+        for int i = 0, i < 20000, i++ {
+            run(50)
+        }
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.splitlines()[-1] == "done"
 
 
 def _find_window(display, timeout=20):

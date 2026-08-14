@@ -110,50 +110,72 @@ since nothing was ever freed).
 
 ### Stage 1: non-escaping locals (done — claude.md #74)
 
-A local struct/`arr[T]`/`map[T]` declared directly in a function or
-event handler's own top-level body is now freed automatically at every
-return, when `festina/escape_analysis.py` can prove — from the syntax
-of that function/handler alone — that its address never left it (never
-returned, never passed as a call argument, never stored into a global
-or another value, never reassigned). See `claude.md #74` for the exact
-rule and, importantly, its explicitly stated stage-1 scope: this does
-NOT yet cover values declared inside a nested `if`/`while`/`for` block,
-values declared inside a loop body at all (those still leak on every
-iteration), interprocedural analysis (any call-argument use is treated
-as escaping unconditionally, even if the callee doesn't retain it), or
-nested struct/`arr[T]`/`map[T]` fields within an otherwise-freed value
-(including a freed map's own per-entry keys, individually allocated
-regardless of the map's value type).
+A local struct/`arr[T]`/`map[T]` declared directly in a function, event
+handler, `if` branch, `while` body, or `for` body is freed automatically
+as soon as control leaves the block it was declared in, when
+`festina/escape_analysis.py` can prove — from the syntax of the whole
+enclosing function/handler alone — that its address never left it
+(never returned, never passed as a call argument, never stored into a
+global or another value, never reassigned). Critically, "as soon as
+control leaves the block" is not "when the function eventually
+returns": a value declared inside a loop body is freed at the end of
+*every* iteration that reaches the end of that body, and `break`/
+`continue` leaving a loop early free everything declared since that
+loop's own body began before actually transferring control — the
+same as reaching the loop body's natural end would. This is what
+actually matters for a long-running loop: without it, a loop-local
+value would leak once per iteration, unbounded, no matter how the
+function-level version of this same idea was scoped. See `claude.md
+#74` for the exact rule and its explicitly stated remaining
+limitations (below).
 
-Verified three ways, not just reasoned about: exhaustive unit tests of
-the analysis itself (`tests/test_escape_analysis.py`, every syntactic
-escaping/non-escaping pattern, no C compiler needed), end-to-end
-compile-and-run tests (`tests/test_codegen.py::TestAutomaticMemoryReclamation`,
-including the exact "return a struct by value" pattern that broke the
-earlier naive stack-allocation attempt below), and a real
-AddressSanitizer/LeakSanitizer run against a combined program exercising
-every escaping/non-escaping pattern together across 1000+ calls — zero
-ASAN errors, and LeakSanitizer's reported leaks matched the hand-derived
-expected count exactly (the still-escaping cases, plus the known
-map-key-strdup gap above), not more.
+Verified three ways, not just reasoned about, at each step of building
+this out (first the function-top-level-only version, then widened to
+cover nested `if`/`while`/`for` bodies including `break`/`continue`
+interaction): exhaustive unit tests of the analysis itself
+(`tests/test_escape_analysis.py`, every syntactic escaping/non-escaping
+pattern, no C compiler needed — unchanged by the nested-block widening,
+since the analysis was always whole-function-scoped from the start),
+end-to-end compile-and-run tests
+(`tests/test_codegen.py::TestAutomaticMemoryReclamation`, including the
+exact "return a struct by value" pattern that broke the earlier naive
+stack-allocation attempt below, and the critical "a value declared
+outside a loop and merely used inside it survives that loop's own
+break/continue" case), and real AddressSanitizer/LeakSanitizer runs
+against combined programs exercising every escaping/non-escaping
+pattern together, including deeply nested `if`-inside-loop with both
+`break` and `continue` firing across many iterations — zero ASAN
+errors both times, and LeakSanitizer's reported leaks matched the
+hand-derived expected count exactly in every run, including one where
+the "extra" leak turned out to be a real, distinct, already-documented
+gap (a global repeatedly reassigned to a freshly escaping value orphans
+its previous one — a structurally different kind of leak than anything
+escape analysis for non-escaping locals could ever address, confirmed
+by removing that one line and re-running to zero leaks).
 
-This was deliberately scoped narrowly and shipped as its own reviewable
-increment rather than attempting full escape analysis (nested blocks,
-loops, interprocedural reasoning) in one pass — each of those is a
-natural, separately-testable follow-up increment to this same stage,
-not a new design.
+This was deliberately shipped as two separate, individually reviewable
+increments — first function-top-level-only, then widened to nested
+blocks and per-iteration loop freeing — rather than attempting the
+whole thing in one pass, exactly as originally planned.
 
 ### What's still ahead
 
 - **Escape analysis is *always still followed by a real `calloc` +
   `free`***, not true stack allocation — a real speed cost (allocator
   traffic) that a genuine stack alloca would avoid entirely. Widening
-  stage 1's proof (nested blocks, loop bodies, interprocedural
-  reasoning) to the point it could safely swap in a stack alloca instead
-  of calloc+free is the natural next increment, not a new design:
-  wider coverage under the exact same proof-before-freeing discipline
-  stage 1 already established, still governed by claude.md #74 (or a
-  new stage within it).
+  stage 1's proof to also cover interprocedural reasoning (does a value
+  passed as a call argument actually get retained by the callee, or is
+  it provably only read/used transiently?) is what would let it safely
+  swap in a stack alloca instead of calloc+free for the values that
+  qualify — the nested-block and per-iteration-loop coverage stage 1
+  already has is not itself the blocker for this anymore, since a
+  stack alloca inside a loop body is exactly as sound as one inside a
+  plain function body (both are popped/reused the same way on the next
+  iteration/call); it's specifically the still-conservative "any call
+  argument escapes unconditionally" rule that would need real
+  interprocedural analysis before this could be considered. Still
+  governed by claude.md #74 (or a new stage within it), not a new
+  design.
 
   A naive, unconditional version of stack allocation was tried once,
   before stage 1 existed, and reverted after it was verified to

@@ -18,8 +18,9 @@ see _emit_environment_get), #72 (map[T] -- literals, indexed get/set,
 _emit_map_foreach_trampoline), #73 (break/continue -- see
 self._loop_targets and _emit_stmt's BreakStmt/ContinueStmt handling),
 #74 (automatic reclamation of provably non-escaping struct/arr[T]/
-map[T] locals, stage 1 -- see escape_analysis.py, _emit_func_body, and
-_emit_free_active_locals).
+map[T] locals, stage 1, now covering nested if/while/for bodies and
+per-iteration loop-local freeing too -- see escape_analysis.py,
+_emit_analyzed_func_body, _emit_block, and _emit_free_active_locals).
 #37, #39, #40 also cover `on key`/`on resize`/`on close` and the
 clientWidth/clientHeight globals (see the "Graphics" note below).
 
@@ -192,9 +193,14 @@ declaring function/handler. Slower than true stack allocation would be
 (a real calloc + a real free, not a zero-cost stack pointer bump) but
 implementable as a genuinely separable, individually-verifiable first
 step -- see escape_analysis.py's own module docstring and
-CodeGen._emit_func_body/_emit_free_active_locals for the actual
-mechanism, and claude.md #74 for exactly what is and isn't covered by
-this first stage.
+CodeGen._emit_analyzed_func_body/_emit_block/_emit_free_active_locals
+for the actual mechanism, and claude.md #74 for exactly what is and
+isn't covered by this first stage. Freeing happens as soon as control
+actually leaves the declaring block -- a loop-body-declared value is
+freed every iteration, not deferred until the enclosing function
+eventually returns -- not just at the end of the function, so this
+already meaningfully bounds a long-running loop's memory even without
+ever choosing a stack alloca.
 
 Array representation: claude.md #26 specifies arr[T]'s type-resolution
 rules but not its runtime representation or push/pop-style operations
@@ -454,8 +460,8 @@ class CodeGen:
                                                 # (festina.imports.build_program already extracted and
                                                 # validated its *position*; see _emit_main_and_entry
                                                 # for where this actually gets evaluated)
-        self._loop_targets = []                # stack of (continue_label, break_label) for the
-                                                # innermost currently-being-emitted for/while loop --
+        self._loop_targets = []                # stack of (continue_label, break_label, free_depth) for
+                                                # the innermost currently-being-emitted for/while loop --
                                                 # claude.md #73: break/continue always target the
                                                 # *nearest* enclosing loop, so this is a plain stack,
                                                 # pushed/popped around each loop body's own emission
@@ -466,25 +472,47 @@ class CodeGen:
                                                 # free. semantic.py has already rejected a break/continue
                                                 # outside any loop by the time codegen runs, so this
                                                 # being empty here would only ever fire on a compiler bug
-                                                # -- see _emit_stmt's own defensive check.
+                                                # -- see _emit_stmt's own defensive check. free_depth
+                                                # (claude.md #74) is the self._active_free_locals frame
+                                                # index this loop's own body frame occupies, recorded
+                                                # right before _emit_block pushes it -- see that field's
+                                                # own comment and _emit_free_active_locals.
+        self._current_escaping_names = None    # claude.md #74: set (by _emit_analyzed_func_body) to
+                                                # escape_analysis.find_escaping_names's result for the
+                                                # function/handler body currently being emitted -- a
+                                                # name's escaping-ness is a property of the whole
+                                                # enclosing function, computed once, regardless of which
+                                                # nested block within it happens to declare that name.
+                                                # None outside any tracked function/handler body (e.g.
+                                                # __festina_main's own top-level statements, which
+                                                # claude.md #74 doesn't analyze at all) -- _emit_block
+                                                # skips all of #74's tracking entirely in that case. Never
+                                                # a stack: Festina has no nested function declarations
+                                                # reaching codegen (see _toplevel), so only ever one
+                                                # function/handler's body is being emitted at a time.
         self._active_free_locals = []          # claude.md #74: stack of "frames," one per currently-
-                                                # being-emitted function/event handler body (see
-                                                # _emit_func_body) -- each frame is a list of (storage
-                                                # ref, Type) for every non-escaping struct/arr[T]/map[T]
-                                                # local declared so far, on every path that's reached
-                                                # this point in program order. Appended to as
-                                                # _emit_func_body's own top-level statement loop reaches
-                                                # each qualifying VarDecl; consulted by
-                                                # _emit_free_active_locals at every Return (however
-                                                # deeply nested inside if/while/for) and at a function's
-                                                # own implicit fall-off-the-end exit. Empty outside any
-                                                # tracked function/handler body (e.g. __festina_main's
-                                                # own top-level statements, which claude.md #74 doesn't
-                                                # analyze at all) -- _emit_free_active_locals is a no-op
-                                                # then. Same "instance-level stack, not threaded through
-                                                # ctx" shape as _loop_targets above, for the same reason:
-                                                # it needs to keep working through arbitrary if/block
-                                                # nesting inside the tracked body.
+                                                # open block within the function/handler body being
+                                                # emitted -- not just its own top-level body anymore, but
+                                                # every if-then/if-else/while-body/for-body/plain nested
+                                                # block within it too (see _emit_block), each pushed on
+                                                # entry and popped on exit, mirroring the real block
+                                                # nesting structure. Each frame is a list of (storage ref,
+                                                # Type) for every non-escaping struct/arr[T]/map[T] local
+                                                # declared directly in that block, appended to as
+                                                # _emit_block's own statement loop reaches each qualifying
+                                                # VarDecl in program order. Consulted by
+                                                # _emit_free_active_locals -- a Return frees every open
+                                                # frame at once (down_to=0, the whole stack, since
+                                                # returning exits every nested scope simultaneously); a
+                                                # Break/Continue frees only the frames opened since the
+                                                # nearest enclosing loop's own body began (down_to = the
+                                                # frame index recorded alongside that loop's own entry in
+                                                # self._loop_targets); a block's own natural, non-
+                                                # terminated fall-through exit frees just its own single
+                                                # (topmost) frame. Same "instance-level stack, not
+                                                # threaded through ctx" shape as _loop_targets, for the
+                                                # same reason: it needs to keep working correctly through
+                                                # arbitrary nesting depth.
         self._regex_lit_cache = {}             # id(ast.RegexLit node) -> its private cache global's
                                                 # name -- see _emit_cached_regex_lit; keyed by node
                                                 # identity (not pattern text) so two textually
@@ -780,59 +808,32 @@ class CodeGen:
 
     # ---- functions ----
 
-    def _emit_func_body(self, block, parent_env, return_type, lines):
-        """Like _emit_block, but ONLY for a function/event handler's own
-        top-level body -- never for a nested if/while/for body, which
-        still goes through the ordinary _emit_block unchanged (claude.md
-        #74 doesn't analyze those yet; see that section's own stated
-        limitations).
+    def _emit_free_active_locals(self, lines, down_to=0):
+        """claude.md #74: frees every non-escaping local active in every
+        frame of self._active_free_locals from the top of the stack down
+        to (and including) index `down_to`.
 
-        Runs escape_analysis.find_escaping_names once for this body,
-        then walks its own top-level statements in program order,
-        maintaining self._active_free_locals so any Return anywhere in
-        the rest of this body -- however deeply nested inside if/while/
-        for -- frees exactly the non-escaping locals active at that
-        point, and never one declared later on a different path: a
-        candidate only gets added to the active set once this loop
-        actually reaches and finishes emitting its own VarDecl, so a
-        Return that textually precedes a later candidate's declaration
-        (necessarily nested inside an earlier if/while/for, since a
-        *top-level* Return before it would make the declaration dead
-        code -- unreachable, and never emitted at all) correctly never
-        tries to free something that was never allocated on that path.
-        """
-        scope = Env(parent_env)
-        escaping = escape_analysis.find_escaping_names(block)
-        ctx = {"lines": lines, "terminated": False}
-        self._active_free_locals.append([])
-        try:
-            for stmt in block.body:
-                if ctx["terminated"]:
-                    break
-                self._emit_stmt(stmt, scope, return_type, ctx)
-                if isinstance(stmt, ast.VarDecl) and stmt.name not in escaping:
-                    found = scope.lookup(stmt.name)
-                    if found is not None:
-                        ref, type_ = found
-                        if isinstance(type_, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
-                            self._active_free_locals[-1].append((ref, type_))
-            if not ctx["terminated"]:
-                self._emit_free_active_locals(lines)
-        finally:
-            self._active_free_locals.pop()
-        return ctx
+        down_to=0 (the default) frees every currently open frame --
+        correct for a Return, which exits the *entire* function/handler
+        at once, so every nested block's own still-open locals need
+        freeing together, not just the innermost one (see _emit_stmt's
+        Return handling). A Break/Continue only frees frames opened
+        since the nearest enclosing loop's own body began (down_to = the
+        frame index _emit_while/_emit_for recorded when that body's
+        frame was about to be pushed -- see self._loop_targets' own
+        comment) -- an outer function-level local merely *used* inside
+        that loop, not declared inside it, must NOT be freed by the
+        loop's own break/continue, and this is what keeps that true.
+        _emit_block's own natural (non-terminated) fall-through exit
+        frees just its own single frame (down_to = that frame's own,
+        topmost, index) before popping it.
 
-    def _emit_free_active_locals(self, lines):
-        """claude.md #74: frees every currently-active non-escaping
-        local (self._active_free_locals[-1]) -- called from _emit_stmt's
-        Return handling (after the return value, if any, has already
-        been computed -- see that call site's own comment on why the
-        order matters) and once more from _emit_func_body itself for a
-        function/handler that falls off its own end without an explicit
-        return. A no-op outside any tracked function/handler body
-        (self._active_free_locals empty -- e.g. __festina_main's own
+        A no-op if self._active_free_locals is empty (outside any
+        tracked function/handler body -- e.g. __festina_main's own
         top-level statements, which claude.md #74 doesn't analyze at
-        all).
+        all) or if `down_to` is already past the current top of stack
+        (nothing to free -- e.g. a block that never actually opened its
+        own frame because it isn't inside a tracked body).
 
         What "free" means differs by type, since only structs are
         represented as a pointer to their own backing storage -- arr[T]/
@@ -842,26 +843,52 @@ class CodeGen:
         FESTINA_ARRAY_LLVM_TYPE/FESTINA_MAP_LLVM_TYPE's own module
         docstring notes) -- so freeing one of those means loading the
         header value and freeing its second field, not the local itself.
+        Frames are freed innermost-first purely for readability of the
+        emitted IR -- each free() call is an independent allocation with
+        no interdependency, so the actual order never affects
+        correctness.
         """
-        if not self._active_free_locals:
+        if down_to >= len(self._active_free_locals):
             return
-        for ref, type_ in self._active_free_locals[-1]:
-            if isinstance(type_, types_mod.StructType):
-                loaded = self.tmp()
-                lines.append(f"  {loaded} = load ptr, ptr {ref}")
-                lines.append(f"  call void @free(ptr {loaded})")
-            elif isinstance(type_, types_mod.ArrayType):
-                loaded = self.tmp()
-                lines.append(f"  {loaded} = load {FESTINA_ARRAY_LLVM_TYPE}, ptr {ref}")
-                data_ptr = self.tmp()
-                lines.append(f"  {data_ptr} = extractvalue {FESTINA_ARRAY_LLVM_TYPE} {loaded}, 1")
-                lines.append(f"  call void @free(ptr {data_ptr})")
-            elif isinstance(type_, types_mod.MapType):
-                loaded = self.tmp()
-                lines.append(f"  {loaded} = load {FESTINA_MAP_LLVM_TYPE}, ptr {ref}")
-                entries_ptr = self.tmp()
-                lines.append(f"  {entries_ptr} = extractvalue {FESTINA_MAP_LLVM_TYPE} {loaded}, 1")
-                lines.append(f"  call void @free(ptr {entries_ptr})")
+        for frame in reversed(self._active_free_locals[down_to:]):
+            for ref, type_ in frame:
+                if isinstance(type_, types_mod.StructType):
+                    loaded = self.tmp()
+                    lines.append(f"  {loaded} = load ptr, ptr {ref}")
+                    lines.append(f"  call void @free(ptr {loaded})")
+                elif isinstance(type_, types_mod.ArrayType):
+                    loaded = self.tmp()
+                    lines.append(f"  {loaded} = load {FESTINA_ARRAY_LLVM_TYPE}, ptr {ref}")
+                    data_ptr = self.tmp()
+                    lines.append(f"  {data_ptr} = extractvalue {FESTINA_ARRAY_LLVM_TYPE} {loaded}, 1")
+                    lines.append(f"  call void @free(ptr {data_ptr})")
+                elif isinstance(type_, types_mod.MapType):
+                    loaded = self.tmp()
+                    lines.append(f"  {loaded} = load {FESTINA_MAP_LLVM_TYPE}, ptr {ref}")
+                    entries_ptr = self.tmp()
+                    lines.append(f"  {entries_ptr} = extractvalue {FESTINA_MAP_LLVM_TYPE} {loaded}, 1")
+                    lines.append(f"  call void @free(ptr {entries_ptr})")
+
+    def _emit_analyzed_func_body(self, decl, body_env, return_type, body_lines):
+        """claude.md #74: runs escape_analysis.find_escaping_names once
+        for decl's whole body and makes it available (self.
+        _current_escaping_names) to every _emit_block call this body's
+        emission reaches -- the function/handler's own top-level body
+        and every nested if/while/for body alike, all governed by that
+        one whole-function-scoped name set (a name's escaping-ness is a
+        property of the whole enclosing function, not of whichever block
+        it happens to be declared in -- see escape_analysis.py's own
+        module docstring). Reset back to None afterward: Festina has no
+        nested function declarations reaching codegen (a FuncDecl only
+        ever exists at a whole program's top level -- see _toplevel), so
+        this never needs to be a stack the way _active_free_locals and
+        _loop_targets are, just a single value cleared between one
+        function/handler's emission and the next."""
+        self._current_escaping_names = escape_analysis.find_escaping_names(decl.body)
+        try:
+            return self._emit_block(decl.body, body_env, return_type, body_lines)
+        finally:
+            self._current_escaping_names = None
 
     def _emit_func(self, decl):
         return_type = None if decl.return_type == "void" else self._resolve(decl.return_type, decl)
@@ -882,7 +909,7 @@ class CodeGen:
             body_lines.append(f"  store {_llvm_type(t)} %arg.{p.name}, ptr {slot}")
             body_env.define(p.name, slot, t)
 
-        block = self._emit_func_body(decl.body, body_env, return_type, body_lines)
+        block = self._emit_analyzed_func_body(decl, body_env, return_type, body_lines)
         if not block["terminated"]:
             # claude.md never says whether a non-void function must
             # return a value on every code path (unlike the
@@ -937,7 +964,7 @@ class CodeGen:
             body_lines.append(f"  store {_llvm_type(t)} %arg.{p.name}, ptr {slot}")
             body_env.define(p.name, slot, t)
 
-        block = self._emit_func_body(decl.body, body_env, None, body_lines)
+        block = self._emit_analyzed_func_body(decl, body_env, None, body_lines)
         if not block["terminated"]:
             block["lines"].append("  ret void")
 
@@ -953,12 +980,55 @@ class CodeGen:
 
     # ---- statements ----
     def _emit_block(self, block, parent_env, return_type, lines):
+        """claude.md #74: this is the ONE block-body emitter used
+        everywhere -- a function/event handler's own top-level body
+        (via _emit_analyzed_func_body), an if-then/if-else, a while/for
+        body, and a plain nested `{ }` block all go through this same
+        method. When self._current_escaping_names is set (i.e. this
+        block is somewhere inside a function/handler body #74 is
+        analyzing at all -- see _emit_analyzed_func_body), this pushes
+        its own frame onto self._active_free_locals, tracks every
+        directly-declared non-escaping struct/arr[T]/map[T] local into
+        it as that VarDecl is actually reached (in program order, so an
+        earlier Return/Break/Continue on a path that never reaches a
+        later declaration correctly never tries to free it), and frees
+        just that one frame -- self._emit_free_active_locals(lines,
+        down_to=<this frame's own index>) -- if this block reaches its
+        own natural (non-terminated) end, before popping it. A Return/
+        Break/Continue inside this block (however deeply nested in a
+        further-nested block within it) frees this frame -- and every
+        other frame it needs to -- itself, via _emit_stmt's own
+        handling; this method's own trailing free is correctly skipped
+        whenever that already happened, since it only runs when this
+        block's own ctx["terminated"] is still False.
+
+        Outside any tracked function/handler body (self.
+        _current_escaping_names is None -- __festina_main's own top-
+        level statements, which #74 doesn't analyze at all), this is
+        unchanged from before #74 existed: no frame, no tracking,
+        nothing freed."""
         env = Env(parent_env)
         ctx = {"lines": lines, "terminated": False}
-        for stmt in block.body:
-            if ctx["terminated"]:
-                break
-            self._emit_stmt(stmt, env, return_type, ctx)
+        tracking = self._current_escaping_names is not None
+        if tracking:
+            self._active_free_locals.append([])
+        try:
+            for stmt in block.body:
+                if ctx["terminated"]:
+                    break
+                self._emit_stmt(stmt, env, return_type, ctx)
+                if (tracking and isinstance(stmt, ast.VarDecl)
+                        and stmt.name not in self._current_escaping_names):
+                    found = env.lookup(stmt.name)
+                    if found is not None:
+                        ref, type_ = found
+                        if isinstance(type_, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+                            self._active_free_locals[-1].append((ref, type_))
+            if tracking and not ctx["terminated"]:
+                self._emit_free_active_locals(lines, down_to=len(self._active_free_locals) - 1)
+        finally:
+            if tracking:
+                self._active_free_locals.pop()
         return ctx
 
     def _emit_stmt(self, stmt, env, return_type, ctx):
@@ -1035,7 +1105,18 @@ class CodeGen:
             if not self._loop_targets:
                 raise CodegenError("'break' outside a loop", file=self.filename,
                                     line=stmt.line, column=stmt.column)
-            _, break_label = self._loop_targets[-1]
+            # claude.md #74: free every non-escaping local declared since
+            # this loop's own body began -- its own frame, and any
+            # further-nested block's frame between it and this break --
+            # BEFORE actually leaving, same as reaching the loop body's
+            # natural end would. free_depth is the frame index
+            # _emit_while/_emit_for recorded right before that body's own
+            # frame was pushed; it deliberately does NOT touch anything
+            # below that (an outer function-level local merely *used*
+            # inside this loop, not declared inside it, isn't this loop's
+            # to free).
+            _, break_label, free_depth = self._loop_targets[-1]
+            self._emit_free_active_locals(lines, down_to=free_depth)
             lines.append(f"  br label %{break_label}")
             ctx["terminated"] = True
             return
@@ -1047,7 +1128,11 @@ class CodeGen:
             # condition block directly -- claude.md #60's step order
             # still runs the update expression before the next check,
             # exactly like a normal iteration would; see _emit_for.
-            continue_label, _ = self._loop_targets[-1]
+            # claude.md #74: same free-before-leaving treatment as break
+            # above -- continuing still exits this iteration's own
+            # nested scopes, even though the loop itself continues.
+            continue_label, _, free_depth = self._loop_targets[-1]
+            self._emit_free_active_locals(lines, down_to=free_depth)
             lines.append(f"  br label %{continue_label}")
             ctx["terminated"] = True
             return
@@ -1110,7 +1195,11 @@ class CodeGen:
         self._start_block(body_label, lines)
         # claude.md #73: continue re-checks the condition directly (no
         # update expression for a while loop); break exits past end_label.
-        self._loop_targets.append((cond_label, end_label))
+        # claude.md #74: free_depth is recorded BEFORE _emit_block pushes
+        # the body's own frame, so it's exactly that frame's own index --
+        # break/continue free everything from there up, and nothing below.
+        free_depth = len(self._active_free_locals)
+        self._loop_targets.append((cond_label, end_label, free_depth))
         try:
             body_ctx = self._emit_block(stmt.body, env, return_type, lines)
         finally:
@@ -1147,7 +1236,9 @@ class CodeGen:
         # expression before the next condition check -- routing it to
         # update_label (not cond_label directly) gives that for free,
         # same as a normal fall-through iteration.
-        self._loop_targets.append((update_label, end_label))
+        # claude.md #74: see _emit_while's identical free_depth note.
+        free_depth = len(self._active_free_locals)
+        self._loop_targets.append((update_label, end_label, free_depth))
         try:
             body_ctx = self._emit_block(stmt.body, loop_env, return_type, lines)
         finally:
