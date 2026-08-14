@@ -48,6 +48,21 @@ _INT = types_mod.PrimitiveType("int")
 _FLOAT = types_mod.PrimitiveType("float")
 _NUMERIC_TYPES = (_INT, _FLOAT)
 _TEXT = types_mod.PrimitiveType("text")
+
+# claude.md #37, #39: signatures for the builtins with real implementations
+# (drawCircle/drawText/drawImage/loadImage) -- matches each function's own
+# worked example in the spec exactly (e.g. drawRect(0, 0, 100, 100)).
+# Builtins with no entry here (log, fail, sqlite, loadAudio) stay
+# permissive: their args are inferred but not checked against a fixed
+# signature, either because claude.md leaves their shape open (log/fail)
+# or because they aren't implemented yet (loadAudio).
+_BUILTIN_SIGNATURES = {
+    "drawRect": (_INT, _INT, _INT, _INT),
+    "drawCircle": (_INT, _INT, _INT),
+    "drawText": (_TEXT, _INT, _INT),
+    "drawImage": (types_mod.ImageType(), _INT, _INT),
+    "loadImage": (_TEXT,),
+}
 _REGEX = types_mod.RegexType()
 
 # claude.md #56: float -> int, with an explicit rounding decision.
@@ -330,8 +345,26 @@ def analyze(program, filename="<string>"):
         if isinstance(callee, ast.Identifier):
             name = callee.name
             if name in BUILTIN_FUNCTIONS:
-                for a in expr.args:
-                    infer(a, scope)
+                sig = _BUILTIN_SIGNATURES.get(name)
+                if sig is None:
+                    for a in expr.args:
+                        infer(a, scope)
+                else:
+                    if len(expr.args) != len(sig):
+                        raise CompileError(
+                            f"{name}() expects {len(sig)} argument(s), got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    for i, (arg_expr, expected) in enumerate(zip(expr.args, sig)):
+                        arg_type = infer(arg_expr, scope)
+                        if arg_type is not None and arg_type is not NULL and arg_type != expected:
+                            raise CompileError(
+                                f"{name}()'s argument {i + 1} expects "
+                                f"{types_mod.type_name(expected)}, found {types_mod.type_name(arg_type)}",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
                 return _BUILTIN_RETURN_TYPES.get(name)
             sym = scope.lookup(name)
             if sym is None or sym.kind != "function":
@@ -487,6 +520,26 @@ def analyze(program, filename="<string>"):
         analyze_block(decl.body, func_scope, return_type=return_type)
 
     def analyze_event_handler(decl):
+        # claude.md #40: "click" and "mouse" are the only two event
+        # sources this runtime actually generates (an X11 ButtonPress /
+        # MotionNotify against the graphics canvas -- see
+        # festina_runtime.h's doc comment on festina_graphics_run), and
+        # claude.md's own examples for both always declare exactly
+        # `(x:int, y:int)` -- codegen registers the compiled handler
+        # with the runtime via a fixed `void (*)(int64_t, int64_t)`
+        # function pointer, so a different signature here would be a
+        # silent ABI mismatch, not just an unusual choice. Any other
+        # event name is unconstrained (and simply never fires -- there's
+        # no event source claude.md defines for it).
+        if decl.name in ("click", "mouse"):
+            param_types = [resolve(p.type_expr, decl) for p in decl.params]
+            if len(decl.params) != 2 or param_types != [_INT, _INT]:
+                raise CompileError(
+                    f"on {decl.name}(...) must declare exactly (x:int, y:int), "
+                    f"matching claude.md #40's own example",
+                    file=filename, line=decl.line, column=decl.column,
+                    category="invalid function argument type",
+                )
         handler_scope = Scope(global_scope)
         for p in decl.params:
             handler_scope.define(p.name, Symbol(p.name, resolve(p.type_expr, decl), "parameter"), decl, filename)

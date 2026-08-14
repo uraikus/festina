@@ -41,6 +41,31 @@ Call-on-Member patterns the same way `Math.floor`/`int.toFloat()`
 already are, and the whole feature is built on POSIX extended regular
 expressions (`<regex.h>`, already part of libc) rather than a bundled
 or external regex engine, per claude.md #59.
+claude.md #37/#39/#40 (`img`/`loadImage()`, `drawRect`/`drawCircle`/
+`drawText`/`drawImage`, `on click`/`on mouse`) are implemented too, per
+the user's own clarification that this means a real on-screen window --
+"not a file" -- showing only the drawing canvas ("a canvas renderer",
+not a GUI with any chrome): X11 (Xlib) + Cairo's Xlib surface backend,
+not a GUI toolkit (GTK/SDL2/Qt), since claude.md #59 favors the smallest
+dependency that does the job and both X11 and Cairo were already
+available in the dev environment. The window is undecorated (Motif WM
+hints), fixed at 800x600, and opened lazily -- `CodeGen.uses_graphics`
+(mirroring the pre-existing `uses_sqlite` flag) is set by any `draw*`
+call or an `on click`/`on mouse` handler declaration, gating
+`festina_graphics_init()`/`festina_graphics_run()` calls in `main()` --
+*except* `loadImage()` alone, which deliberately does NOT set it: Cairo
+decodes PNGs from its own in-memory decoder, needing no X server at all,
+so a program that only loads an image (never drawing it or opening a
+window) shouldn't be forced to have a display. `on click`/`on mouse` are
+the only two event names with a real runtime source (matching claude.md
+#40's own only two worked examples) and are required to declare exactly
+`(x:int, y:int)` -- the C runtime registers them through a fixed
+`void (*)(int64_t, int64_t)` function pointer, so any other signature
+would be a silent ABI mismatch rather than just an unusual choice; any
+other event name still compiles (it's ordinary code) but is simply dead,
+since nothing ever fires it. Verified against a real (virtual) X server,
+not just reasoned about -- see "Why the tests are structured this way"
+below for `tests/test_graphics.py`/`TestGraphics`.
 
 "Real compilation, minimal setup" stages 1, 2, and 3 -- claude.md #59,
 added alongside these stages to make the requirement explicit rather
@@ -59,10 +84,15 @@ working end to end). Per #59's fourth point, `festina/cli.py`'s
 `_run_tool` also turns a genuinely missing dependency (pkg-config, or
 any C compiler) into a specific, actionable error naming it and how to
 install it, rather than a raw exception -- verified directly by hiding
-each tool from PATH in turn. All 307 tests in this directory pass
-against it: 305 given a working C compiler, plus 2 more
-(`tests/test_packaging.py`) given `pyinstaller` too -- both skip
-cleanly, independently, without either dependency (see below).
+each tool from PATH in turn; `_pkg_config` got the same treatment for a
+genuinely missing `.pc` package (a pre-existing gap that already applied
+to `sqlite3`, caught and fixed while wiring up graphics's own
+`cairo-xlib` pkg-config dependency, not something graphics introduced).
+All 333 tests in this directory pass against it: 329 given a working C
+compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
+too, plus 2 more (`tests/test_codegen.py::TestGraphics`'s interactive
+click/mouse tests) given `Xvfb`+`xdotool` too -- all skip cleanly,
+independently, without any of those three (see below).
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -80,10 +110,11 @@ as the escape hatch, rather than picking a side ad hoc in code with no
 spec backing either way.
 
 See README.md's "Implementation Status" section for the current
-implemented-vs-not matrix; the short version: graphics, audio, and event
-handlers all parse and type-check but raise a clear `CodegenError` ("not
-implemented yet") rather than generating IR. `sqlite()` queries no
-longer belong on that list -- see above.
+implemented-vs-not matrix; the short version: only audio (`aud`,
+`loadAudio`) still parses and type-checks but raises a clear
+`CodegenError` ("not implemented yet") rather than generating IR.
+`sqlite()` queries and graphics/events no longer belong on that list --
+see above.
 
 (An earlier, unrelated JS-subset prototype -- `compiler/`, plus
 `build.sh`/`jit_run.py`/`run_jit.sh` and `runtime/runtime.c` for
@@ -114,8 +145,8 @@ It skips (with a distinct, toolchain-specific reason) if no C compiler
 is on `PATH` at all -- unlike the `SPEC_UNIMPLEMENTED_REASON` skips
 above, this isn't "the feature doesn't exist," it's "this environment
 can't link native code." Tests for constructs codegen genuinely doesn't
-support yet (graphics, audio, events) don't need a C compiler at all --
-they only call `festina.codegen.generate_ir()` and assert it raises.
+support yet (only audio now) don't need a C compiler at all -- they
+only call `festina.codegen.generate_ir()` and assert it raises.
 The one exception on the sqlite() side is
 `test_non_literal_params_argument_is_a_clear_error`, which checks a
 compile-time restriction (params must be a literal array) the same
@@ -197,6 +228,50 @@ must fail at *runtime* with a clear message (claude.md #67 says so
 explicitly), not at compile time, since nothing in this pipeline
 parses regex syntax itself before handing it to `regcomp()`.
 
+`tests/test_graphics.py` covers claude.md #37/#39/#40 (image, graphics,
+events) at the parser/semantic level, same split as `test_regex.py` --
+argument-count/type checking for `drawRect`/`drawCircle`/`drawText`/
+`drawImage`/`loadImage` against the fixed signature each one's own
+claude.md example uses, and the `on click`/`on mouse`
+`(x:int, y:int)`-only restriction (while an unrecognized event name
+stays unconstrained, since only those two have a runtime source at
+all). `test_codegen.py`'s `TestGraphics` covers the same feature end to
+end, in three tiers: (1) `test_compiles_and_links_successfully`, which
+needs only a C compiler (no display) since it never runs the binary;
+(2) `test_missing_display_is_a_clear_runtime_error`,
+`test_invalid_image_path_is_a_clear_runtime_error`, and
+`test_program_without_graphics_never_opens_a_window`, which run the
+compiled binary with `DISPLAY` deliberately unset via `compile_and_run`
+-- the last of these is what actually proves `loadImage()` alone and a
+graphics-free program never require a display, not just what the code
+comments claim; and (3) the two interactive tests,
+`test_click_dispatches_to_handler_with_correct_coordinates` and
+`test_mouse_move_dispatches_to_handler_with_correct_coordinates`, which
+use two new conftest.py fixtures -- `x_display` (an existing `DISPLAY`
+if set, otherwise a throwaway `Xvfb` instance, polled for real
+readiness rather than a fixed sleep, since a fixed sleep proved flaky
+under full-suite load) and `run_graphics_program` (compiles and starts
+the binary in the background, line-buffered via `stdbuf -oL` since a
+graphics program blocks in its event loop rather than exiting) -- and
+drive the real rendered window with real simulated input via `xdotool`
+(finding the window by its title, "Festina", via `xdotool search`),
+asserting the handler actually ran with the right coordinates by
+reading the program's own `log()` output back. Both skip cleanly and
+independently if `Xvfb`/`xdotool` aren't installed, the same
+opt-in/environment-dependent tier as `compile_and_run`'s C-compiler
+skip and `test_packaging.py`'s `pyinstaller` skip. Pixel-level rendering
+correctness (that `drawRect`/`drawCircle`/`drawText`/`drawImage` paint
+at the right position, not just that the program doesn't crash) was
+verified manually via `xwd`+`netpbm` screenshots of a real running
+window rather than automated, a deliberate choice to avoid pulling in
+more image-comparison tooling for a check the interactive dispatch
+tests above don't need; the close-button/`WM_DELETE_WINDOW` path is
+also not covered automatically, since a bare Xvfb instance runs no
+window manager to translate `xdotool windowclose` into the
+`ClientMessage` a real desktop would send -- an environment limitation
+of the test setup, not a gap in the app's own (standard) handling of
+that protocol.
+
 ## Public API implemented
 
 ```
@@ -232,7 +307,10 @@ festina/
         -- frozen dataclasses, so equality/hashing work out of the box.
         RegexType() has no fields (claude.md #67: created only via the
         regex() builtin, never a dedicated literal, so there's only one
-        shape of it -- unlike StructType/TableType).
+        shape of it -- unlike StructType/TableType). Likewise ImageType()
+        (claude.md #37: `img`, created only via loadImage()) has no
+        fields -- codegen.py lowers it to `ptr` (an opaque Cairo surface),
+        the same convention as StructType/TableType/RegexType.
         type_name(t) -> str   # for error messages, e.g. "arr[int]"
 
     parser.py
@@ -291,6 +369,16 @@ festina/
         # family as Math.floor/int.toFloat() above -- checked by name
         # against the receiver's inferred type, not a real method table
         # (Festina has no general concept of methods on primitives).
+        # claude.md #37/#39: _BUILTIN_SIGNATURES maps drawRect/drawCircle/
+        # drawText/drawImage/loadImage to the fixed argument-type tuple
+        # each one's own claude.md example uses (checked in _infer_call's
+        # builtin dispatch branch); builtins with no entry there --
+        # log/fail/sqlite/loadAudio -- stay fully permissive, unchanged
+        # from before. claude.md #40: analyze_event_handler requires an
+        # `on click`/`on mouse` handler to declare exactly
+        # `(x:int, y:int)` -- any other event name is unconstrained,
+        # since only those two have a runtime event source at all (see
+        # codegen.py below).
 
     sqlite_schema.py
         TYPE_MAP: dict[str, str]                        # claude.md #30
@@ -340,10 +428,26 @@ festina/
         # Member-call dispatch Math.floor/int.toFloat() use -- a regex
         # value is `ptr` to an opaque, POSIX regex_t compiled fresh at
         # every regex() call site via the festina_runtime C helpers; no
-        # IR-level machinery of its own, it's all in the runtime). Raises
+        # IR-level machinery of its own, it's all in the runtime), and
+        # claude.md #37/#39/#40 (image/graphics/events -- see "Status"
+        # above for the design): _emit_graphics_call handles drawRect/
+        # drawCircle/drawText/drawImage/loadImage (an `img` value is
+        # `ptr` to an opaque Cairo surface, same convention as
+        # struct/table/regex values); _emit_event_handler emits an
+        # `on click`/`on mouse`/... handler as an ordinary internal
+        # function (`@__festina_on_<name>`, never in func_decls/
+        # global_env since it's not user-callable) and, only for
+        # click/mouse specifically, records it in self.event_handlers
+        # and sets self.uses_graphics; self.uses_graphics (mirroring the
+        # pre-existing self.uses_sqlite) gates emitting
+        # festina_graphics_init()/_run() calls around __festina_main() in
+        # _emit_main_and_entry, and self.event_handlers drives emitting
+        # festina_register_click_handler/_register_mouse_handler calls
+        # there too -- loadImage() alone deliberately does not set
+        # uses_graphics (see _emit_graphics_call's docstring). Raises
         # CodegenError (a CompileError subclass, category="not
-        # implemented") for graphics, audio, and event handlers -- and
-        # also (category="not implemented" but a genuine compile-time
+        # implemented") only for audio (loadAudio) now -- and also
+        # (category="not implemented" but a genuine compile-time
         # restriction, not a missing feature) when sqlite()'s second
         # argument isn't a literal array expression.
 
@@ -422,12 +526,28 @@ guard against a zero-length match looping forever (a pattern like
 byte at a time when that happens -- verified directly in
 `tests/test_codegen.py::TestRegex::test_replace_all_zero_width_match_does_not_hang`,
 which would time out (not just assert wrong output) if this were ever
-broken again.
+broken again. `festina_graphics_init`/`_run`, `festina_draw_rect`/
+`_draw_circle`/`_draw_text`/`_draw_image`, `festina_load_image`, and
+`festina_register_click_handler`/`_register_mouse_handler` (#37/#39/#40:
+image/graphics/events) open a real X11 window via Xlib and render onto
+it via Cairo's Xlib surface backend -- see festina_runtime.h's doc
+comment for the full design (undecorated via Motif WM hints, fixed
+800x600 canvas, solid-black-only fill, PNG-only `loadImage` since that's
+Cairo's own built-in decoder, the backing-store-plus-blit-on-Expose
+strategy a bare Cairo Xlib surface needs since it has no memory of prior
+drawing, and the fixed `void (*)(int64_t, int64_t)` handler signature
+that's the whole reason claude.md #40's `on click`/`on mouse` are
+signature-restricted at the semantic.py level above). `festina_graphics_run`
+blocks in a standard Xlib event loop (`Expose` -> re-blit,
+`ButtonPress`/`MotionNotify` -> call the registered click/mouse handler
+if any, `WM_DELETE_WINDOW` `ClientMessage` -> clean up and return) until
+the window is closed.
 
 ## Running
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 305 passed, 2 skipped (needs a C compiler; the
-                                        # 2 skips need `pip install pyinstaller` too)
+pytest tests/                          # 329 passed, 4 skipped (needs a C compiler; 2 of
+                                        # the skips need `pip install pyinstaller` too,
+                                        # the other 2 need Xvfb + xdotool installed)
 ```

@@ -1,7 +1,8 @@
 /*
  * Festina native runtime -- claude.md #41 (log), #42 (fail), #45 (string
  * interpolation), #29-31 (automatic SQLite database + schema sync),
- * #67-68 (regex, string match/replace).
+ * #67-68 (regex, string match/replace), #37/#39/#40 (img, graphics,
+ * click/mouse events).
  *
  * This is a from-scratch runtime for the statically typed Festina
  * language.
@@ -9,6 +10,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <X11/Xlib.h>
+#include <cairo/cairo-xlib.h>
 #include "festina_runtime.h"
 
 /* ---- log() / fail() -- claude.md #41, #42 ---- */
@@ -532,4 +535,170 @@ char *festina_regex_replace(void *compiled, const char *text,
     memcpy(out + out_len, cursor, rest_len + 1);
 
     return out;
+}
+
+/* ---- graphics -- claude.md #37, #39, #40 (see festina_runtime.h's doc comment) ---- */
+
+/* Motif WM hints -- the widely-honored (if not core-protocol) X11
+ * convention for requesting a window with no title bar/border/menu. */
+typedef struct {
+    unsigned long flags, functions, decorations;
+    long input_mode;
+    unsigned long status;
+} FestinaMotifWmHints;
+
+static Display *g_display = NULL;
+static Window g_window;
+static Atom g_wm_delete_atom;
+static cairo_surface_t *g_window_surface = NULL;
+static cairo_surface_t *g_backing_surface = NULL;
+static void (*g_click_handler)(int64_t, int64_t) = NULL;
+static void (*g_mouse_handler)(int64_t, int64_t) = NULL;
+
+static void festina_graphics_require_init(void) {
+    if (!g_display) {
+        festina_fail("a graphics function was called but the canvas window "
+                      "was never created (internal compiler error)");
+    }
+}
+
+void festina_graphics_init(void) {
+    g_display = XOpenDisplay(NULL);
+    if (!g_display) {
+        festina_fail("could not open the X display -- claude.md #39's graphics "
+                      "functions need a running X server (is $DISPLAY set?)");
+    }
+
+    int screen = DefaultScreen(g_display);
+    g_window = XCreateSimpleWindow(g_display, RootWindow(g_display, screen), 0, 0,
+                                    FESTINA_CANVAS_WIDTH, FESTINA_CANVAS_HEIGHT, 0,
+                                    BlackPixel(g_display, screen), WhitePixel(g_display, screen));
+
+    Atom mwm_hints_atom = XInternAtom(g_display, "_MOTIF_WM_HINTS", False);
+    FestinaMotifWmHints hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.flags = 2; /* MWM_HINTS_DECORATIONS */
+    hints.decorations = 0;
+    XChangeProperty(g_display, g_window, mwm_hints_atom, mwm_hints_atom, 32,
+                     PropModeReplace, (unsigned char *)&hints,
+                     sizeof(hints) / sizeof(long));
+
+    XStoreName(g_display, g_window, "Festina");
+    XSelectInput(g_display, g_window, ExposureMask | ButtonPressMask | PointerMotionMask);
+    g_wm_delete_atom = XInternAtom(g_display, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(g_display, g_window, &g_wm_delete_atom, 1);
+
+    XMapWindow(g_display, g_window);
+    XFlush(g_display);
+
+    g_window_surface = cairo_xlib_surface_create(g_display, g_window, DefaultVisual(g_display, screen),
+                                                  FESTINA_CANVAS_WIDTH, FESTINA_CANVAS_HEIGHT);
+    g_backing_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+                                                     FESTINA_CANVAS_WIDTH, FESTINA_CANVAS_HEIGHT);
+    cairo_t *cr = cairo_create(g_backing_surface);
+    cairo_set_source_rgb(cr, 1, 1, 1); /* white canvas background */
+    cairo_paint(cr);
+    cairo_destroy(cr);
+}
+
+/* Blits the backing store (source of truth for what's been drawn) onto
+ * the visible window -- called after every draw call for immediate
+ * feedback, and on every Expose event to repaint correctly. */
+static void festina_graphics_present(void) {
+    cairo_t *cr = cairo_create(g_window_surface);
+    cairo_set_source_surface(cr, g_backing_surface, 0, 0);
+    cairo_paint(cr);
+    cairo_destroy(cr);
+    cairo_surface_flush(g_window_surface);
+    XFlush(g_display);
+}
+
+void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
+    festina_graphics_require_init();
+    cairo_t *cr = cairo_create(g_backing_surface);
+    cairo_set_source_rgb(cr, 0, 0, 0);
+    cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
+    cairo_fill(cr);
+    cairo_destroy(cr);
+    festina_graphics_present();
+}
+
+void festina_draw_circle(int64_t x, int64_t y, int64_t r) {
+    festina_graphics_require_init();
+    cairo_t *cr = cairo_create(g_backing_surface);
+    cairo_set_source_rgb(cr, 0, 0, 0);
+    cairo_arc(cr, (double)x, (double)y, (double)r, 0.0, 2.0 * 3.14159265358979323846);
+    cairo_fill(cr);
+    cairo_destroy(cr);
+    festina_graphics_present();
+}
+
+void festina_draw_text(const char *text, int64_t x, int64_t y) {
+    festina_graphics_require_init();
+    if (!text) text = "";
+    cairo_t *cr = cairo_create(g_backing_surface);
+    cairo_set_source_rgb(cr, 0, 0, 0);
+    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 16);
+    cairo_move_to(cr, (double)x, (double)y);
+    cairo_show_text(cr, text);
+    cairo_destroy(cr);
+    festina_graphics_present();
+}
+
+void *festina_load_image(const char *path) {
+    if (!path) path = "";
+    /* claude.md #37: "Supported image formats are determined by the
+     * runtime" -- PNG only, via Cairo's own built-in decoder. */
+    cairo_surface_t *img = cairo_image_surface_create_from_png(path);
+    cairo_status_t status = cairo_surface_status(img);
+    if (status != CAIRO_STATUS_SUCCESS) {
+        char msg[512];
+        snprintf(msg, sizeof(msg), "could not load image '%s': %s (only PNG images are supported)",
+                 path, cairo_status_to_string(status));
+        cairo_surface_destroy(img);
+        festina_fail(msg);
+    }
+    return img;
+}
+
+void festina_draw_image(void *img, int64_t x, int64_t y) {
+    festina_graphics_require_init();
+    if (!img) return;
+    cairo_t *cr = cairo_create(g_backing_surface);
+    cairo_set_source_surface(cr, (cairo_surface_t *)img, (double)x, (double)y);
+    cairo_paint(cr);
+    cairo_destroy(cr);
+    festina_graphics_present();
+}
+
+void festina_register_click_handler(void (*handler)(int64_t, int64_t)) {
+    g_click_handler = handler;
+}
+
+void festina_register_mouse_handler(void (*handler)(int64_t, int64_t)) {
+    g_mouse_handler = handler;
+}
+
+void festina_graphics_run(void) {
+    if (!g_display) return; /* graphics were never actually used -- nothing to run */
+
+    while (1) {
+        XEvent ev;
+        XNextEvent(g_display, &ev);
+        if (ev.type == Expose) {
+            festina_graphics_present();
+        } else if (ev.type == ButtonPress) {
+            if (g_click_handler) g_click_handler(ev.xbutton.x, ev.xbutton.y);
+        } else if (ev.type == MotionNotify) {
+            if (g_mouse_handler) g_mouse_handler(ev.xmotion.x, ev.xmotion.y);
+        } else if (ev.type == ClientMessage) {
+            if ((Atom)ev.xclient.data.l[0] == g_wm_delete_atom) break;
+        }
+    }
+
+    cairo_surface_destroy(g_backing_surface);
+    cairo_surface_destroy(g_window_surface);
+    XDestroyWindow(g_display, g_window);
+    XCloseDisplay(g_display);
 }
