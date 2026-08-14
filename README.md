@@ -29,10 +29,11 @@ Festina is under active development. Everything else in this README
 describes the full target language from `claude.md`; this section is
 the ground truth for what actually runs today.
 
-**Test suite:** 307 tests, 0 failed (`pytest tests/`) — 305 passed/2
-skipped by default (the 2 need `pyinstaller`, an opt-in build-time-only
-dependency for the packaged-binary tests; see [Setup](#setup)), or all
-307 passed/0 skipped with it installed.
+**Test suite:** 333 tests, 0 failed (`pytest tests/`) — 329 passed/4
+skipped by default (2 need `pyinstaller`, an opt-in build-time-only
+dependency for the packaged-binary tests; 2 need `Xvfb`/`xdotool` to
+open and interact with a real window for the graphics tests; see
+[Setup](#setup)), or all 333 passed/0 skipped with those installed.
 See [`tests/`](tests/) and [`tests/CONTRACT.md`](tests/CONTRACT.md) for
 the spec-driven suite this is measured against — every test cites the
 `claude.md` section it checks.
@@ -57,6 +58,7 @@ runtime, and *runs* as a standalone executable (no Python or the
 | String interpolation | ✅ `` `Hello ${name}` `` |
 | `log()` / `fail()` | ✅ |
 | **Regex, string match/replace (`claude.md #67/#68`)** | ✅ `regex()`, `.test()`, `.match()`, `.replace()`/`.replaceAll()` (search may be text or regex) — POSIX extended regular expressions (no bundled/external regex engine — see [Setup](#setup)); no capture groups, backreferences, or non-greedy quantifiers (POSIX ERE's own limits, not something worked around here) |
+| **Graphics (`claude.md #37/#39/#40`)** | ✅ `img`/`loadImage()`, `drawRect`/`drawCircle`/`drawText`/`drawImage`, `on click`/`on mouse` — a real on-screen X11 window rendered via Cairo, verified against an actual virtual display, not just reasoned about (see [Graphics](#graphics) below for the caveats: fixed 800×600 canvas, solid black only, PNG-only images) |
 | Structs | ✅ declaration, field read/write, passed to and returned from functions |
 | **Arrays (`arr[T]`)** | ✅ literals, indexed read/write by any index expression, nesting, `.length` (`claude.md #63`), as function params/return values, as struct-array elements — see the caveats below and in `festina/codegen.py`'s module docstring |
 | **Numeric conversion (`claude.md #55/#56`)** | ✅ int and float never mix implicitly, in any operator (arithmetic *or* comparison) — `int.toFloat()` and `Math.floor/ceil/round/trunc(x)` are the only conversions, both compile-time-checked and runtime-tested |
@@ -165,9 +167,7 @@ scoped out rather than silently missing:
 
 | Area | Status |
 |---|---|
-| Graphics (`drawRect`, `img`, Cairo) | ❌ |
 | Audio (`aud`, `loadAudio`) | ❌ |
-| `on eventName` event handlers | ❌ |
 
 ### Setup
 
@@ -182,7 +182,8 @@ fresh system:
 | Python 3 | Runs the compiler frontend itself (`bin/festina` execs `python3 -m festina.cli`) — only if running from source; see the packaged-binary option below to avoid this entirely | Required (unless using the packaged binary) |
 | A C compiler (`clang` or `gcc`) | Compiles `festina_runtime.c` and links the final binary | Required (either works, per stage 3) |
 | `libsqlite3-dev` (headers) | `festina_runtime.c` does `#include <sqlite3.h>` | Required |
-| `pkg-config` | Locates sqlite3's compile/link flags | Required |
+| `libcairo2-dev` + `libx11-dev` (headers) | `festina_runtime.c` does `#include <cairo/cairo.h>`/`<X11/Xlib.h>` (claude.md #37/#39's img/graphics functions) — needed to *compile* the runtime even for a program that never draws anything, same as sqlite3's headers | Required |
+| `pkg-config` | Locates sqlite3's and Cairo/X11's compile/link flags | Required |
 | `llvm` (provides `libLLVM`) | Lets `festina/llvm_backend.py` compile IR directly (stage 3's fast path, and the one that makes `gcc` usable at all) | Recommended — without it, the C compiler must specifically be `clang`, since only clang can parse `.ll` text (verified: `gcc` hands it to `ld`, which fails treating it as a corrupt linker script) |
 
 Missing any of these fails with a specific, actionable error (claude.md
@@ -191,12 +192,17 @@ Notably absent: anything for `regex()`/`.test()`/`.match()`/`.replace()`
 (claude.md #67/#68) — they're built on POSIX extended regular
 expressions (`<regex.h>`), already part of libc everywhere this list's
 C compiler already requires libc, so regex support adds zero new
-dependencies.
+dependencies. Graphics is the opposite case: Cairo is a genuinely new
+dependency (claude.md #39 itself requires it — "Graphics are backed by
+Cairo"), and windowing needs libX11 alongside it (see [Regex and
+String Matching](#regex-and-string-matching) vs.
+[Graphics](#graphics) below for why one added nothing and the other
+did).
 
 Debian/Ubuntu:
 
 ```bash
-sudo apt install clang libsqlite3-dev pkg-config
+sudo apt install clang libsqlite3-dev libcairo2-dev libx11-dev pkg-config
 ```
 
 `clang` conveniently pulls in `libLLVM` as a dependency, covering both
@@ -222,21 +228,39 @@ pip install -r requirements-build.txt  # pyinstaller
 ./dist/festina examples/hello.f -o hello
 ```
 
-**To *run* a program someone already compiled with Festina**: usually
-nothing beyond libc/libm, already present on essentially any machine —
-confirmed via `ldd` on a compiled binary. The one conditional dependency
-is `libsqlite3.so`, and only if the machine that *compiled* it didn't
-have a static `libsqlite3.a` available (falls back to dynamic linking in
-that case, per stage 1) — check any specific binary with `ldd` to be
-sure.
+**To *run* a program someone already compiled with Festina**: this list
+grew with graphics support (claude.md #37/#39) — confirmed via `ldd` on
+a compiled binary, not just reasoned about. Before graphics, this was
+close to nothing beyond libc/libm (plus `libsqlite3.so` conditionally,
+per stage 1's static-link-when-possible). Now every compiled program
+also dynamically links `libcairo.so`/`libX11.so` and their own
+transitive dependencies (fontconfig, freetype, libpng, the X11
+client-side stack, ...) — *even a program that never calls a graphics
+function or opens a window*, since `festina_runtime.c` is one object
+file linked into every program regardless of which parts it actually
+uses (same reasoning as the compile-time header dependency above).
+Static-linking Cairo/X11 the way stage 1 does for sqlite3 would undo
+this, but hasn't been done (Cairo's own dependency tree is large
+enough that it's a bigger undertaking than sqlite3's single-library
+case was) — check any specific binary with `ldd` to see exactly what
+it needs.
 
 ```bash
 pip install -r requirements-dev.txt   # pytest, for the test suite
-pytest tests/                         # 305 passed, 2 skipped (see Test suite above)
+pytest tests/                         # 329 passed, 4 skipped (see Test suite above)
 
 ./bin/festina examples/hello.f -o hello
 ./hello
 ```
+
+The 4 skips above need tools that aren't Python packages, so they're
+not in any requirements file — `pip install`s nothing for them.
+`pyinstaller` covers 2 (see the packaged-binary section above); `Xvfb`
+(a virtual X server) and `xdotool` (simulates clicks/mouse movement)
+cover the other 2, needed only to test claude.md #37/#39's graphics
+functions against a real window without an actual display attached
+(`sudo apt install xvfb xdotool` on Debian/Ubuntu) — a real `$DISPLAY`
+works too, if one is already available.
 
 ## Why Festina?
 
@@ -589,13 +613,24 @@ unchanged too.
 
 ## Graphics
 
-> **Status:** not implemented yet, including the event handlers below —
-> see [Implementation Status](#implementation-status).
+> **Status:** implemented — a real on-screen window (Xlib + Cairo's
+> Xlib surface backend, not a file written to disk), opened
+> automatically the first time a program draws something or declares
+> `on click`/`on mouse`. Verified against an actual rendered window via
+> a virtual X server (`Xvfb`), not just reasoned about — see
+> `tests/test_codegen.py`'s `TestGraphics`. See
+> [Implementation Status](#implementation-status) for the caveats
+> below.
 
 Festina includes global graphics functions backed by Cairo.
 
 ```festina
 drawRect(0, 0, 100, 100)
+```
+
+```festina
+drawCircle(50, 50, 25)
+drawText('Hello', 20, 20)
 ```
 
 Images use the `img` type:
@@ -612,7 +647,40 @@ Event handlers can be declared directly in the source:
 on click(x:int, y:int) {
     log(`Clicked at ${x}, ${y}`)
 }
+
+on mouse(x:int, y:int) {
+    log(`Mouse moved over canvas on x: ${x}, y: ${y}`)
+}
 ```
+
+A program that never calls a graphics function and never declares `on
+click`/`on mouse` never opens a window — the canvas only appears when
+something actually needs it, the same way `festina.sqlite` only gets
+touched by a program that declares a `table`.
+
+Implementation-defined details claude.md doesn't specify, so these are
+this compiler's own choices rather than anything from the spec:
+
+- The canvas is a fixed 800×600 and undecorated (no title bar/border —
+  via the Motif WM hints convention, which most window managers honor
+  but isn't part of the core X11 protocol, so a specific one could
+  still ignore it). There's no syntax for declaring a different size.
+- Every shape and piece of text draws in solid black — none of
+  claude.md's own `drawRect`/`drawCircle`/`drawText` examples take a
+  color argument, so there's nothing to make configurable yet.
+- `loadImage()` only supports PNG, via Cairo's own built-in decoder —
+  claude.md #37 leaves supported formats up to "the runtime," and PNG
+  is the one format Cairo can decode without another dependency.
+- `on click`/`on mouse` must declare exactly `(x:int, y:int)`,
+  matching claude.md's own examples for both — the runtime registers
+  the compiled handler as a fixed-signature function pointer. Any
+  other declared event name still compiles, but never fires — there's
+  no event source this runtime generates for it (claude.md #40 only
+  ever shows click and mouse).
+- After the program's top-level code finishes running, if a window was
+  opened, the process blocks (handling redraws and clicks/mouse
+  movement) until the window is closed, then exits normally. There's
+  no way to close the window from Festina code itself.
 
 ## Audio
 

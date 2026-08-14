@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <sqlite3.h>
 #include <regex.h>
+#include <cairo/cairo.h>
 
 /* claude.md #41: log() */
 void festina_log_int(int64_t v);
@@ -127,5 +128,74 @@ char *festina_str_replace(const char *text, const char *search,
                            const char *replacement, int8_t replace_all);
 char *festina_regex_replace(void *compiled, const char *text,
                              const char *replacement, int8_t replace_all);
+
+/*
+ * claude.md #37, #39, #40: img, graphics functions, click/mouse events.
+ *
+ * "Graphics are backed by Cairo" (claude.md #39) and "No GUI import is
+ * required" -- read together with #40's click/mouse events firing
+ * against "the canvas", this means an actual on-screen window, not a
+ * file written to disk. Built on Xlib + Cairo's Xlib surface backend
+ * rather than a toolkit like GTK/SDL/Qt: both are already installed
+ * everywhere this runtime already needs Cairo (verified in this
+ * project's own dev environment), so this adds one new dependency
+ * (libX11) rather than a whole GUI toolkit, per claude.md #59. The
+ * window is undecorated (Motif WM hints -- a widely honored
+ * convention, though not part of the core X11 protocol, so a given
+ * window manager could still ignore it) so it shows only the canvas,
+ * nothing else -- no title bar, menu, or other chrome drawn by this
+ * runtime.
+ *
+ * Canvas size is a fixed 800x600 (FESTINA_CANVAS_WIDTH/HEIGHT in
+ * festina_runtime.c) -- claude.md has no syntax for declaring a canvas
+ * size, so this is an implementation-defined default, not derived from
+ * anything in the spec.
+ *
+ * Drawing model: every draw call paints onto an in-memory Cairo image
+ * surface (the "backing store") and immediately blits it to the visible
+ * window -- immediate feedback, matching how claude.md's own examples
+ * read (call drawRect(), expect to see it), and the backing store is
+ * also what repaints the window on an Expose event (e.g. after another
+ * window overlapped and moved away), which a bare Cairo Xlib surface
+ * can't do on its own since it has no memory of what was drawn before.
+ * All shapes/text draw in solid black -- claude.md #39's own examples
+ * (drawRect/drawCircle/drawText) take no color argument, so there is
+ * nothing to make configurable yet.
+ *
+ * festina_graphics_init creates the window; festina_graphics_run is the
+ * blocking event loop (Expose -> repaint from the backing store,
+ * ButtonPress -> the registered click handler if any, MotionNotify ->
+ * the registered mouse handler if any, the window's close button ->
+ * return). Both are only ever called by generated code when the
+ * program actually uses a graphics function or declares an `on
+ * click`/`on mouse` handler (see CodeGen.uses_graphics in
+ * festina/codegen.py) -- a program that doesn't never opens a window,
+ * exactly like festina_db_open() only ever runs for a program that
+ * declares a `table`.
+ *
+ * festina_load_image supports PNG only, via Cairo's own built-in
+ * decoder -- claude.md #37: "Supported image formats are determined by
+ * the runtime," and PNG is the one format Cairo can decode without
+ * pulling in another image-format library.
+ *
+ * festina_register_click_handler/_mouse_handler take a fixed
+ * `void (*)(int64_t, int64_t)` signature because claude.md #40's own
+ * examples always declare `on click(x:int, y:int)` / `on
+ * mouse(x:int, y:int)` with exactly those two int parameters --
+ * festina/semantic.py enforces that any `on click`/`on mouse` handler
+ * actually declared this way before codegen ever emits a call here.
+ */
+#define FESTINA_CANVAS_WIDTH 800
+#define FESTINA_CANVAS_HEIGHT 600
+
+void festina_graphics_init(void);
+void festina_graphics_run(void);
+void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h);
+void festina_draw_circle(int64_t x, int64_t y, int64_t r);
+void festina_draw_text(const char *text, int64_t x, int64_t y);
+void *festina_load_image(const char *path);
+void festina_draw_image(void *img, int64_t x, int64_t y);
+void festina_register_click_handler(void (*handler)(int64_t, int64_t));
+void festina_register_mouse_handler(void (*handler)(int64_t, int64_t));
 
 #endif

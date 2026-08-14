@@ -107,6 +107,22 @@ _INSTALL_HINTS = {
     "cc": "install a C compiler (clang or gcc) -- see README.md's Setup section",
 }
 
+# claude.md #59's fourth point applies just as much to a pkg-config
+# *package* pkg-config itself can't find as to a missing tool -- without
+# this, _pkg_config used to silently return an empty flag list (pkg-config
+# writes its "package not found" message to stderr and exits nonzero,
+# neither of which _pkg_config previously checked), so a missing dev
+# package surfaced many steps later as a raw compiler error (e.g.
+# "cairo/cairo.h: No such file or directory") instead of naming the
+# actual missing dependency.
+_PKG_INSTALL_HINTS = {
+    "sqlite3": "install its development package, e.g. `apt install libsqlite3-dev` "
+               "on Debian/Ubuntu or `brew install sqlite` on macOS",
+    "cairo-xlib": "install Cairo's and X11's development packages, e.g. "
+                  "`apt install libcairo2-dev libx11-dev` on Debian/Ubuntu -- "
+                  "needed for claude.md #37/#39's img/graphics functions",
+}
+
 
 def _run_tool(cmd, **kwargs):
     """subprocess.run, but a missing executable becomes a clear
@@ -123,6 +139,12 @@ def _run_tool(cmd, **kwargs):
 
 def _pkg_config(*args):
     result = _run_tool(["pkg-config", *args], check=False)
+    if result.returncode != 0:
+        package = args[-1]
+        hint = _PKG_INSTALL_HINTS.get(
+            package, "install its development package and make sure pkg-config can find it")
+        raise CompileError(f"'{package}' was not found by pkg-config -- {hint}",
+                            category="missing dependency")
     return result.stdout.split()
 
 
@@ -182,7 +204,12 @@ def _ensure_runtime_object(cc):
     if os.path.exists(obj_path) and os.path.getmtime(obj_path) >= os.path.getmtime(_RUNTIME_C):
         return obj_path
 
-    cflags = _pkg_config("--cflags", "sqlite3")
+    # claude.md #37/#39: festina_runtime.c always includes cairo/cairo.h
+    # and X11/Xlib.h (graphics functions), regardless of whether a given
+    # Festina program actually calls any of them -- it's one object file
+    # with everything in it, same as sqlite3's headers being needed to
+    # compile it even for a program with no `table` declarations.
+    cflags = _pkg_config("--cflags", "sqlite3") + _pkg_config("--cflags", "cairo-xlib")
     cmd = [cc, "-O2", "-c", _RUNTIME_C, *cflags, "-o", obj_path]
     result = _run_tool(cmd)
     if result.returncode != 0:
@@ -206,9 +233,14 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
     output_path = output_path or _default_output_name(entry_path)
     # -lm: claude.md #56's Math.floor/ceil/round/trunc lower to LLVM
     # intrinsics that call into libm (round() in particular isn't inlined
-    # by clang/gcc the way floor/ceil/trunc often are).
+    # by clang/gcc the way floor/ceil/trunc often are). cairo-xlib's libs
+    # (Cairo + X11): festina_runtime.o always references cairo_*/X*
+    # symbols (claude.md #37/#39 img/graphics), whether or not this
+    # particular program calls any of them -- same reasoning as
+    # _ensure_runtime_object's cflags above.
     sqlite_link_flags, _ = _sqlite_link_flags(cc)
-    link_libs = [*sqlite_link_flags, "-lm"]
+    cairo_link_flags = _pkg_config("--libs", "cairo-xlib")
+    link_libs = [*sqlite_link_flags, *cairo_link_flags, "-lm"]
 
     if llvm_backend.available():
         _compile_via_libllvm(ir, entry_path, output_path, cc, link_libs)

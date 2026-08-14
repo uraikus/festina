@@ -2,11 +2,12 @@
 the runtime-facing halves of #5/#6 (multi-file compilation -- see
 CodeGen.filename's note in generate()), #7/#8 (entry point + startup),
 #26 (arrays), #29-31 (automatic SQLite schema sync), #32-34 (sqlite()
-queries, parameterized queries, query result types), #41/#42
-(log/fail), #45 (string interpolation), #55-57 (int.toFloat(),
-Math.floor/ceil/round/trunc, division/modulo by zero), #60/#61
-(for/while loops), #63 (array .length), #66 (postfix ++/--), #67-68
-(regex(), .test(), .match(), .replace()/.replaceAll() -- see
+queries, parameterized queries, query result types), #37, #39, #40
+(img, graphics functions, click/mouse events -- see the "Graphics"
+note below), #41/#42 (log/fail), #45 (string interpolation), #55-57
+(int.toFloat(), Math.floor/ceil/round/trunc, division/modulo by zero),
+#60/#61 (for/while loops), #63 (array .length), #66 (postfix ++/--),
+#67-68 (regex(), .test(), .match(), .replace()/.replaceAll() -- see
 _emit_regex_call and the Member-call handling in _emit_call).
 
 Scope: primitives (int/float/bool/text), global and local variables and
@@ -18,14 +19,41 @@ nesting, `.length` -- see the FESTINA_ARRAY_LLVM_TYPE note below),
 automatic table schema sync against festina.sqlite via the
 festina_runtime C helpers, sqlite() queries (SELECT into arr[Table],
 parameterized INSERT/UPDATE/DELETE -- see the "Query rows" note
-below), and regex()/.test()/.match()/.replace()/.replaceAll() (POSIX
+below), regex()/.test()/.match()/.replace()/.replaceAll() (POSIX
 extended regular expressions via the festina_runtime C helpers -- no
-bundled regex engine, see festina_runtime.h's doc comment on why).
+bundled regex engine, see festina_runtime.h's doc comment on why), and
+img/drawRect/drawCircle/drawText/drawImage/`on click`/`on mouse` (a
+real X11 window rendered via Cairo -- see the "Graphics" note below).
 
-NOT implemented yet (raises CodegenError with a clear message):
-graphics (img/drawRect/...), audio (aud/loadAudio/...), and
-`on eventName` event handlers. See README.md for the up-to-date status
-list.
+NOT implemented yet (raises CodegenError with a clear message): audio
+(aud/loadAudio/...). See README.md for the up-to-date status list.
+
+Graphics (claude.md #37, #39, #40): a real on-screen window (Xlib +
+Cairo's Xlib surface backend), not a file written to disk -- "Graphics
+are backed by Cairo" plus #40's click/mouse events firing against "the
+canvas" only make sense together as an actual window. Opened lazily
+(CodeGen.uses_graphics, set by any draw* call or an `on click`/`on
+mouse` handler, but deliberately NOT by loadImage() alone -- decoding a
+PNG needs no window; see _emit_graphics_call's own note) in main()
+before __festina_main() runs, exactly
+the same "only pay for what you use" pattern uses_sqlite already
+follows for festina_db_open(); a program that never touches graphics
+never opens a window. After __festina_main() returns, if graphics were
+used, main() blocks in festina_graphics_run() (Expose/click/mouse/
+window-close) until the window is closed. Canvas size is a fixed
+800x600 and every shape/text draws in solid black -- claude.md has no
+syntax for declaring a size or a color, so both are implementation-
+defined defaults, not derived from the spec. `on click`/`on mouse`
+compile to a real function (_emit_event_handler) registered with the
+runtime as a `void (*)(int64_t, int64_t)` function pointer -- the only
+signature claude.md's own examples for those two ever show; any other
+declared event name still compiles (so its body is still checked) but
+is simply never called, since there's no event source this runtime
+generates for it. Full rationale (window decorations, the backing-store
+redraw strategy, why Xlib instead of a GUI toolkit) is in
+festina_runtime.h's doc comment, verified against an actual rendered
+window (not just reasoned about) via a virtual X server -- see
+tests/test_codegen.py's TestGraphics.
 
 Query rows (claude.md #32-34): sqlite()'s result, when assigned to a
 declared arr[Table], is built by festina_runtime's
@@ -174,7 +202,9 @@ def _llvm_type(t):
         # TableType branch), never an inline aggregate.
         return "ptr"
     if isinstance(t, types_mod.ImageType):
-        raise CodegenError("img / graphics are not implemented yet")
+        # claude.md #37: a loaded image is an opaque Cairo surface
+        # pointer -- see _emit_call's loadImage/drawImage handling.
+        return "ptr"
     if isinstance(t, types_mod.AudioType):
         raise CodegenError("aud / audio are not implemented yet")
     if isinstance(t, types_mod.RegexType):
@@ -226,6 +256,11 @@ class CodeGen:
                                                 # schema sync and query codegen can both ask for the
                                                 # same table's column-name/type globals, and emitting
                                                 # them twice would redefine the same LLVM global names
+        self.uses_graphics = False             # any draw* call or an `on click`/`on mouse` handler
+                                                # anywhere -- NOT loadImage() alone; see
+                                                # _emit_graphics_call and _emit_main_and_entry
+        self.event_handlers = {}               # "click"/"mouse" -> @__festina_on_<name> -- see
+                                                # _emit_event_handler and _emit_main_and_entry
 
     # ---- naming ----
     def tmp(self):
@@ -355,6 +390,16 @@ class CodeGen:
             "declare ptr @festina_regex_match(ptr, ptr)",
             "declare ptr @festina_str_replace(ptr, ptr, ptr, i1)",
             "declare ptr @festina_regex_replace(ptr, ptr, ptr, i1)",
+            # claude.md #37, #39, #40: img, graphics functions, click/mouse events.
+            "declare void @festina_graphics_init()",
+            "declare void @festina_graphics_run()",
+            "declare void @festina_draw_rect(i64, i64, i64, i64)",
+            "declare void @festina_draw_circle(i64, i64, i64)",
+            "declare void @festina_draw_text(ptr, i64, i64)",
+            "declare ptr @festina_load_image(ptr)",
+            "declare void @festina_draw_image(ptr, i64, i64)",
+            "declare void @festina_register_click_handler(ptr)",
+            "declare void @festina_register_mouse_handler(ptr)",
             "declare ptr @malloc(i64)",
             "declare ptr @calloc(i64, i64)",
             # claude.md #56: Math.floor/ceil/round/trunc, via LLVM's
@@ -427,8 +472,8 @@ class CodeGen:
             self._emit_func(stmt)
             return
         if isinstance(stmt, ast.EventHandler):
-            raise CodegenError("`on` event handlers are not implemented yet",
-                                file=self.filename, line=stmt.line, column=stmt.column)
+            self._emit_event_handler(stmt)
+            return
         if isinstance(stmt, ast.VarDecl):
             type_ = self._resolve(stmt.type_expr, stmt)
             ref = f"@{stmt.name}"
@@ -475,6 +520,47 @@ class CodeGen:
         func.append("}")
         self.func_defs.extend(func)
         self.func_defs.append("")
+
+    def _emit_event_handler(self, decl):
+        """claude.md #40: `on eventName(...) { }`. Compiles to a real
+        void function (@__festina_on_<name>, not registered as an
+        ordinary callable -- an event handler is a listener, not
+        something Festina code calls by name) exactly like _emit_func,
+        minus a return type (event handlers never return a value).
+        "click"/"mouse" additionally get registered with the runtime as
+        a function pointer (see festina_runtime.h's doc comment on
+        festina_register_click_handler/_mouse_handler) -- the only two
+        event sources this runtime actually generates (claude.md #40's
+        own examples). Any other declared name still compiles (so a
+        typo/bug in its body is still caught) but is simply dead code:
+        nothing ever calls it."""
+        symbol = f"@__festina_on_{decl.name}"
+        param_types = [self._resolve(p.type_expr, decl) for p in decl.params]
+        params_ir = ", ".join(f"{_llvm_type(t)} %arg.{p.name}" for t, p in zip(param_types, decl.params))
+
+        body_env = Env(self.global_env)
+        body_lines = []
+        entry_label = self.label("entry")
+        self._start_block(entry_label, body_lines)
+        for t, p in zip(param_types, decl.params):
+            slot = f"%{p.name}"
+            body_lines.append(f"  {slot} = alloca {_llvm_type(t)}")
+            body_lines.append(f"  store {_llvm_type(t)} %arg.{p.name}, ptr {slot}")
+            body_env.define(p.name, slot, t)
+
+        block = self._emit_block(decl.body, body_env, None, body_lines)
+        if not block["terminated"]:
+            block["lines"].append("  ret void")
+
+        func = [f"define void {symbol}({params_ir}) {{"]
+        func.extend(block["lines"])
+        func.append("}")
+        self.func_defs.extend(func)
+        self.func_defs.append("")
+
+        if decl.name in ("click", "mouse"):
+            self.uses_graphics = True
+            self.event_handlers[decl.name] = symbol
 
     # ---- statements ----
     def _emit_block(self, block, parent_env, return_type, lines):
@@ -1113,9 +1199,10 @@ class CodeGen:
                 return self._emit_sqlite_call(expr, env, lines, expected_type)
             if name == "regex":
                 return self._emit_regex_call(expr, env, lines)
-            if name in ("drawRect", "drawCircle", "drawText", "drawImage",
-                        "loadImage", "loadAudio"):
-                raise CodegenError(f"'{name}' (graphics/audio) is not implemented yet",
+            if name in ("drawRect", "drawCircle", "drawText", "drawImage", "loadImage"):
+                return self._emit_graphics_call(name, expr, env, lines)
+            if name == "loadAudio":
+                raise CodegenError("'loadAudio' (audio) is not implemented yet",
                                     file=self.filename, line=callee.line)
             if name in self.func_decls:
                 decl = self.func_decls[name]
@@ -1231,6 +1318,48 @@ class CodeGen:
         out = self.tmp()
         lines.append(f"  {out} = call ptr @festina_regex_compile(ptr {pattern_val}, ptr {flags_val})")
         return out, REGEX
+
+    # ---- graphics: drawRect/drawCircle/drawText/drawImage/loadImage (claude.md #37, #39) ----
+    def _emit_graphics_call(self, name, expr, env, lines):
+        """Draws onto (or loads an image for) the graphics canvas.
+        Sets self.uses_graphics so main() knows to open the canvas
+        window before __festina_main() runs, and enter the event loop
+        after it returns (see _emit_main_and_entry) -- exactly the same
+        "only pay for what you use" pattern self.uses_sqlite already
+        follows for festina_db_open(). semantic.py has already checked
+        each function's argument count/types against claude.md's own
+        worked examples (claude.md #37, #39), so this just emits the
+        call; there's no color argument to pass because none of those
+        examples ever take one (see festina_runtime.h's doc comment).
+
+        loadImage() deliberately does NOT set self.uses_graphics:
+        decoding a PNG (Cairo's own in-memory decoder -- see
+        festina_load_image) needs no X server at all, unlike every
+        other function here, which draws onto a window. claude.md #37's
+        own example always pairs loadImage() with a later drawImage()
+        anyway, which sets the flag itself -- so this only matters for
+        the edge case of loading an image without ever drawing it,
+        where requiring a window/display would be an artificial
+        restriction claude.md never asks for."""
+        args = [self._emit_expr(a, env, lines)[0] for a in expr.args]
+        if name == "loadImage":
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_load_image(ptr {args[0]})")
+            return out, types_mod.ImageType()
+        self.uses_graphics = True
+        if name == "drawRect":
+            x, y, w, h = args
+            lines.append(f"  call void @festina_draw_rect(i64 {x}, i64 {y}, i64 {w}, i64 {h})")
+        elif name == "drawCircle":
+            x, y, r = args
+            lines.append(f"  call void @festina_draw_circle(i64 {x}, i64 {y}, i64 {r})")
+        elif name == "drawText":
+            text, x, y = args
+            lines.append(f"  call void @festina_draw_text(ptr {text}, i64 {x}, i64 {y})")
+        elif name == "drawImage":
+            img, x, y = args
+            lines.append(f"  call void @festina_draw_image(ptr {img}, i64 {x}, i64 {y})")
+        return "0", None
 
     # ---- sqlite() queries (claude.md #32-34) ----
     def _emit_sqlite_call(self, expr, env, lines, expected_type):
@@ -1359,10 +1488,11 @@ class CodeGen:
         entry_func.append("}")
 
         main_lines = ["define i32 @main() {", "entry:"]
-        # self.uses_sqlite is only reliably set by this point because every
-        # function body (self.func_defs) and every entry statement (the
-        # loop above) has already been emitted -- see the module
-        # docstring's ordering note, or generate()'s call order.
+        # self.uses_sqlite/self.uses_graphics are only reliably set by
+        # this point because every function body (self.func_defs) and
+        # every entry statement (the loop above) has already been
+        # emitted -- see the module docstring's ordering note, or
+        # generate()'s call order.
         if self.tables or self.uses_sqlite:
             main_lines.append("  %db = call ptr @festina_db_open()")
             main_lines.append("  store ptr %db, ptr @__festina_db")
@@ -1372,7 +1502,24 @@ class CodeGen:
                     f"  call void @festina_sync_table(ptr %db, ptr {self.string_const(tname)}, "
                     f"ptr {names_global}, ptr {types_global}, i32 {ncols})"
                 )
+        if self.uses_graphics:
+            main_lines.append("  call void @festina_graphics_init()")
+            register_fn = {"click": "festina_register_click_handler",
+                            "mouse": "festina_register_mouse_handler"}
+            for event_name, symbol in self.event_handlers.items():
+                main_lines.append(f"  call void @{register_fn[event_name]}(ptr {symbol})")
         main_lines.append("  call void @__festina_main()")
+        if self.uses_graphics:
+            # claude.md #40's "canvas" only means something while a
+            # window is actually open -- block here, after the entry
+            # function's own top-level statements have run (so anything
+            # drawn there is already visible), handling Expose/click/
+            # mouse/close until the window is closed (see
+            # festina_graphics_run's own doc comment in
+            # festina_runtime.h). A program that never uses graphics
+            # skips this entirely and exits immediately after
+            # __festina_main(), exactly as it always has.
+            main_lines.append("  call void @festina_graphics_run()")
         main_lines.append("  ret i32 0")
         main_lines.append("}")
 
