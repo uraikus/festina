@@ -8,9 +8,8 @@ Pipeline (claude.md #47): source -> parse -> semantic analysis -> LLVM IR
 -> object file -> link -> native executable. The resulting executable
 does not need Python or the festina package to run (claude.md #47).
 
-"Real compilation, minimal setup" (claude.md #59; see README.md's
-"Deployment"/"Setup" sections for the full staged plan and the current
-dependency list):
+"Real compilation, minimal setup" (claude.md #59; see setup.md for the
+full staged plan and the current dependency list):
 
 - stage 1: sqlite3 is statically linked into the compiled program when a
   static archive is available (_sqlite_link_flags), so a program built
@@ -78,6 +77,18 @@ def _data_root():
 
 _RUNTIME_DIR = os.path.join(_data_root(), "runtime")
 _RUNTIME_C = os.path.join(_RUNTIME_DIR, "festina_runtime.c")
+_RUNTIME_GRAPHICS_C = os.path.join(_RUNTIME_DIR, "festina_runtime_graphics.c")
+_RUNTIME_AUDIO_C = os.path.join(_RUNTIME_DIR, "festina_runtime_audio.c")
+# Both headers are #included by more than one of the .c files above (see
+# festina_runtime_internal.h's own doc comment) -- included in every
+# object file's cache-freshness check below (_ensure_runtime_object)
+# alongside that file's own source, so editing a shared header during
+# development invalidates every cached object, not just the one whose
+# .c changed.
+_RUNTIME_HEADERS = [
+    os.path.join(_RUNTIME_DIR, "festina_runtime.h"),
+    os.path.join(_RUNTIME_DIR, "festina_runtime_internal.h"),
+]
 
 _sqlite_link_cache = {}
 
@@ -102,9 +113,9 @@ _INSTALL_HINTS = {
     "pkg-config": "install it, e.g. `apt install pkg-config` on Debian/Ubuntu "
                   "or `brew install pkg-config` on macOS -- used to locate sqlite3's compiler flags",
     "clang": "install a C compiler, e.g. `apt install clang` on Debian/Ubuntu "
-             "or `brew install llvm` on macOS -- see README.md's Setup section",
-    "gcc": "install a C compiler, e.g. `apt install gcc` on Debian/Ubuntu -- see README.md's Setup section",
-    "cc": "install a C compiler (clang or gcc) -- see README.md's Setup section",
+             "or `brew install llvm` on macOS -- see setup.md",
+    "gcc": "install a C compiler, e.g. `apt install gcc` on Debian/Ubuntu -- see setup.md",
+    "cc": "install a C compiler (clang or gcc) -- see setup.md",
 }
 
 # claude.md #59's fourth point applies just as much to a pkg-config
@@ -191,36 +202,96 @@ def _sqlite_link_flags(cc):
     return flags
 
 
-def _ensure_runtime_object(cc):
-    """Compile festina_runtime.c to an object file once and reuse it
-    (cached in the system temp dir, keyed by mtime and by which `cc`
-    compiled it) instead of recompiling the same unchanging file on
-    every `festina compile` invocation. The temp dir (rather than
-    alongside the source in runtime/) sidesteps a read-only package
-    install being unable to cache anything there."""
+# Per-feature runtime translation unit metadata -- claude.md #59's "if a
+# canvas isn't used, keep the binary slim": festina_runtime.c used to be
+# ONE object file with graphics (Cairo/X11) and audio (ALSA) code always
+# present in it, so cc's -lcairo/-lX11/-lasound were always on the link
+# line -- confirmed empirically that --gc-sections/--as-needed alone
+# doesn't fix this (the linker decides a shared library is NEEDED against
+# the whole translation unit any live symbol pulls in, before dead-code
+# elimination has pruned anything from it, so an unused Cairo/X11/ALSA
+# *function* being eliminated doesn't stop the *library* from being
+# linked). Splitting into core/graphics/audio translation units (see each
+# .c file's own top comment) means the graphics/audio object files --
+# and therefore their pkg-config cflags/libs -- are only ever handed to
+# `cc` at all for a program that actually uses that feature (see
+# compile_file below, driven by CodeGen.uses_graphics/uses_audio from
+# festina/codegen.py). "core" has no entry here since it's unconditional
+# for every program (see _ensure_runtime_object's cc_source parameter).
+_RUNTIME_FEATURES = {
+    "graphics": {
+        "source": _RUNTIME_GRAPHICS_C,
+        "pkg": "cairo-xlib",
+        "extra_link_flags": [],
+    },
+    "audio": {
+        "source": _RUNTIME_AUDIO_C,
+        "pkg": "alsa",
+        # claude.md #38's audio playback runs on a background thread
+        # (see festina_runtime.h's doc comment on festina_audio_play) --
+        # -pthread is only ever needed for that, so (unlike before the
+        # split) it's no longer unconditionally on every link line.
+        "extra_link_flags": ["-pthread"],
+    },
+}
+
+
+def _ensure_runtime_object(cc, name, source, pkg_config_package):
+    """Compile one runtime translation unit (core/graphics/audio) to an
+    object file once and reuse it (cached in the system temp dir, keyed
+    by mtime and by which `cc` compiled it) instead of recompiling the
+    same unchanging file on every `festina compile` invocation. The temp
+    dir (rather than alongside the source in runtime/) sidesteps a
+    read-only package install being unable to cache anything there.
+
+    Each translation unit gets ONLY the pkg-config cflags it actually
+    needs (None for core, which needs nothing beyond sqlite3 -- see the
+    caller) -- see _RUNTIME_FEATURES' module docstring note for why this
+    matters for the *linked* binary, not just compile-time cflags."""
     cache_dir = os.path.join(tempfile.gettempdir(), "festina-runtime-cache")
     os.makedirs(cache_dir, exist_ok=True)
     cc_key = hashlib.sha1(cc.encode()).hexdigest()[:8]
-    obj_path = os.path.join(cache_dir, f"festina_runtime.{cc_key}.o")
+    obj_path = os.path.join(cache_dir, f"festina_runtime_{name}.{cc_key}.o")
 
-    if os.path.exists(obj_path) and os.path.getmtime(obj_path) >= os.path.getmtime(_RUNTIME_C):
+    freshness_sources = [source, *_RUNTIME_HEADERS]
+    if (os.path.exists(obj_path)
+            and os.path.getmtime(obj_path) >= max(os.path.getmtime(s) for s in freshness_sources)):
         return obj_path
 
-    # claude.md #37/#39/#38: festina_runtime.c always includes
-    # cairo/cairo.h, X11/Xlib.h (graphics functions), and
-    # alsa/asoundlib.h (audio), regardless of whether a given Festina
-    # program actually calls any of them -- it's one object file with
-    # everything in it, same as sqlite3's headers being needed to
-    # compile it even for a program with no `table` declarations.
-    # -pthread: claude.md #38's audio playback runs on a background
-    # thread (see festina_runtime.h's doc comment on festina_audio_play).
-    cflags = (_pkg_config("--cflags", "sqlite3") + _pkg_config("--cflags", "cairo-xlib")
-              + _pkg_config("--cflags", "alsa") + ["-pthread"])
-    cmd = [cc, "-O2", "-c", _RUNTIME_C, *cflags, "-o", obj_path]
+    cflags = _pkg_config("--cflags", "sqlite3")
+    if pkg_config_package:
+        cflags += _pkg_config("--cflags", pkg_config_package)
+    cmd = [cc, "-O2", "-c", source, *cflags, "-o", obj_path]
     result = _run_tool(cmd)
     if result.returncode != 0:
-        raise CompileError(f"failed to compile the Festina runtime:\n{result.stderr}", category="link error")
+        raise CompileError(f"failed to compile the Festina runtime ({name}):\n{result.stderr}",
+                            category="link error")
     return obj_path
+
+
+def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio):
+    """Every program links core (log/fail/sqlite/regex/timers -- see
+    festina_runtime.c's top comment) plus -lm (claude.md #56's
+    Math.floor/ceil/round/trunc lower to libm intrinsics -- round() in
+    particular isn't inlined by clang/gcc the way floor/ceil/trunc often
+    are). graphics/audio's object files -- and only their own
+    pkg-config libs -- are added on top exactly when the compiled
+    program actually uses that feature, so a program that uses neither
+    never gets -lcairo/-lX11/-lasound on cc's command line at all."""
+    # core needs no pkg-config package of its own beyond sqlite3 (always
+    # included by _ensure_runtime_object itself).
+    objects = [_ensure_runtime_object(cc, "core", _RUNTIME_C, None)]
+    sqlite_link_flags, _ = _sqlite_link_flags(cc)
+    link_libs = [*sqlite_link_flags, "-lm"]
+
+    for name, wants in (("graphics", uses_graphics), ("audio", uses_audio)):
+        if not wants:
+            continue
+        feature = _RUNTIME_FEATURES[name]
+        objects.append(_ensure_runtime_object(cc, name, feature["source"], feature["pkg"]))
+        link_libs += _pkg_config("--libs", feature["pkg"]) + feature["extra_link_flags"]
+
+    return objects, link_libs
 
 
 def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
@@ -231,38 +302,41 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
     # came from so errors below still name the right file.
     program = imports_mod.build_program(entry_path)
     analyzed = semantic_mod.analyze(program, filename=entry_path)
-    ir = codegen_mod.generate_ir(program, analyzed, filename=entry_path)
+    # Built directly (rather than via the generate_ir() wrapper still
+    # used by callers that only want the IR text, e.g. tests) so this
+    # function can read gen.uses_graphics/uses_audio after generation --
+    # claude.md #59's "if a canvas isn't used, keep the binary slim"
+    # needs to know which optional runtime object files this specific
+    # program actually needs (see _runtime_objects_and_link_libs).
+    gen = codegen_mod.CodeGen(analyzed, filename=entry_path)
+    ir = gen.generate(program)
 
     if emit_llvm:
         return ir
 
     output_path = output_path or _default_output_name(entry_path)
-    # -lm: claude.md #56's Math.floor/ceil/round/trunc lower to LLVM
-    # intrinsics that call into libm (round() in particular isn't inlined
-    # by clang/gcc the way floor/ceil/trunc often are). cairo-xlib's libs
-    # (Cairo + X11): festina_runtime.o always references cairo_*/X*
-    # symbols (claude.md #37/#39 img/graphics), whether or not this
-    # particular program calls any of them -- same reasoning as
-    # _ensure_runtime_object's cflags above. -lasound/-pthread: claude.md
-    # #38's audio, same "always linked in, always referenced by
-    # festina_runtime.o regardless of use" story.
-    sqlite_link_flags, _ = _sqlite_link_flags(cc)
-    cairo_link_flags = _pkg_config("--libs", "cairo-xlib")
-    alsa_link_flags = _pkg_config("--libs", "alsa")
-    link_libs = [*sqlite_link_flags, *cairo_link_flags, *alsa_link_flags, "-lm", "-pthread"]
+    # gen.uses_graphics alone isn't quite enough here: loadImage() alone
+    # deliberately does NOT set it (see _emit_graphics_call's doc comment
+    # -- decoding a PNG needs no window), but festina_load_image() still
+    # lives in the graphics object file, so a program that only ever
+    # calls loadImage() still needs it linked even though it never opens
+    # a canvas. gen.uses_graphics_code is the superset that also covers
+    # that case.
+    needs_graphics = gen.uses_graphics or gen.uses_graphics_code
+    runtime_objects, link_libs = _runtime_objects_and_link_libs(cc, needs_graphics, gen.uses_audio)
 
     if llvm_backend.available():
-        _compile_via_libllvm(ir, entry_path, output_path, cc, link_libs)
+        _compile_via_libllvm(ir, entry_path, output_path, cc, runtime_objects, link_libs)
     else:
-        _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, link_libs)
+        _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio, link_libs)
     return output_path
 
 
-def _compile_via_libllvm(ir, entry_path, output_path, cc, link_libs):
+def _compile_via_libllvm(ir, entry_path, output_path, cc, runtime_objects, link_libs):
     """Stage 3: compile IR to an object file ourselves via libLLVM. The
-    only work left for `cc` is compiling festina_runtime.c (cached) and
-    linking plain object files -- no longer requires clang specifically,
-    since it never sees LLVM IR text at all."""
+    only work left for `cc` is compiling the runtime translation units
+    (cached) and linking plain object files -- no longer requires clang
+    specifically, since it never sees LLVM IR text at all."""
     with tempfile.TemporaryDirectory() as d:
         obj_path = os.path.join(d, "program.o")
         try:
@@ -270,25 +344,42 @@ def _compile_via_libllvm(ir, entry_path, output_path, cc, link_libs):
         except llvm_backend.LLVMBackendError as e:
             raise CompileError(f"LLVM object emission failed:\n{e}",
                                 file=entry_path, category="codegen error")
-        runtime_obj = _ensure_runtime_object(cc)
-        cmd = [cc, obj_path, runtime_obj, *link_libs, "-o", output_path]
+        cmd = [cc, obj_path, *runtime_objects, *link_libs, "-o", output_path]
         result = _run_tool(cmd)
         if result.returncode != 0:
             raise CompileError(f"native linking failed:\n{result.stderr}",
                                 file=entry_path, category="link error")
 
 
-def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, link_libs):
+def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, needs_audio, link_libs):
     """Fallback used only when libLLVM couldn't be loaded in this process
     -- the original pipeline, handing the .ll file straight to `cc`
     (which then must actually be clang, or another compiler with an LLVM
     IR frontend -- unlike the libLLVM path above, this one does require
-    that specifically)."""
+    that specifically). Compiles the runtime .c sources directly rather
+    than through the cached-object-file path above, same as this
+    fallback always has -- still only the sources the program actually
+    needs (needs_graphics/needs_audio, from compile_file), for the same
+    binary-slimming reason."""
+    runtime_sources = [_RUNTIME_C]
+    pkg_configs = ["sqlite3"]
+    extra_link_flags = []
+    if needs_graphics:
+        runtime_sources.append(_RUNTIME_GRAPHICS_C)
+        pkg_configs.append("cairo-xlib")
+    if needs_audio:
+        runtime_sources.append(_RUNTIME_AUDIO_C)
+        pkg_configs.append("alsa")
+        extra_link_flags.append("-pthread")
+    cflags = []
+    for pkg in pkg_configs:
+        cflags += _pkg_config("--cflags", pkg)
+
     with tempfile.NamedTemporaryFile(suffix=".ll", mode="w", delete=False) as tmp:
         tmp.write(ir)
         ir_path = tmp.name
     try:
-        cmd = [cc, "-O2", ir_path, _RUNTIME_C, *link_libs, "-o", output_path]
+        cmd = [cc, "-O2", ir_path, *runtime_sources, *cflags, *link_libs, *extra_link_flags, "-o", output_path]
         result = _run_tool(cmd)
         if result.returncode != 0:
             raise CompileError(f"native linking failed:\n{result.stderr}",

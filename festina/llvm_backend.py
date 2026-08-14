@@ -2,16 +2,17 @@
 generated LLVM IR into an object file, in-process -- no `clang`/`llc`
 subprocess involved for this step.
 
-"Real compilation, minimal setup" stage 3 (claude.md #59; see README.md's
-"Deployment" section for the full staged plan). Historically
+"Real compilation, minimal setup" stage 3 (claude.md #59; see setup.md
+for the full staged plan). Historically
 `festina/cli.py` handed the whole `.ll` file to `clang`, which
 understands LLVM IR text as one
 of its accepted input formats. That's a *clang-specific* frontend
 feature -- plain `cc`/`gcc` doesn't recognize `.ll` at all (verified:
 gcc hands it to `ld`, which treats it as a broken linker script and
 fails). Compiling the IR ourselves means the only thing left for an
-external C compiler to do is compile festina_runtime.c and link plain
-object files together -- work gcc can do exactly as well as clang,
+external C compiler to do is compile the runtime translation units
+(festina_runtime.c/_graphics.c/_audio.c) and link plain object files
+together -- work gcc can do exactly as well as clang,
 which is the actual point: it's no longer clang *specifically* that
 using Festina depends on, just "some C compiler," a meaningfully
 smaller ask.

@@ -1,26 +1,48 @@
 /*
- * Festina native runtime -- claude.md #41 (log), #42 (fail), #45 (string
- * interpolation), #29-31 (automatic SQLite database + schema sync),
- * #67-68 (regex, string match/replace), #37/#39/#40 (img, graphics,
- * click/mouse/key/resize/close events), #69 (setTimeout/setInterval),
- * #38 (aud, loadAudio(), .play()/.stop()/.isPlaying()).
+ * Festina native runtime -- core translation unit: claude.md #41 (log),
+ * #42 (fail), #45 (string interpolation), #29-31 (automatic SQLite
+ * database + schema sync), #32-34 (sqlite() queries), #67-68 (regex,
+ * string match/replace), #69 (setTimeout/setInterval, minus the
+ * graphics-aware half of the blocking loop -- see below).
  *
  * This is a from-scratch runtime for the statically typed Festina
  * language.
+ *
+ * Split into three translation units -- this file (core), plus
+ * festina_runtime_graphics.c (Cairo/X11) and festina_runtime_audio.c
+ * (ALSA) -- so a compiled program that never uses graphics or audio
+ * never needs those object files (and therefore never needs -lcairo/
+ * -lX11/-lasound on cc's command line at all) to build or run. See
+ * festina_runtime.h's top-of-file note for why this was necessary: a
+ * single object file with everything in it defeats even
+ * --gc-sections/--as-needed at eliminating an unused shared-library
+ * dependency, because the linker's "is -lfoo needed" decision is made
+ * against the whole translation unit any live symbol pulls in, before
+ * dead-code elimination has pruned anything from it -- verified
+ * empirically (readelf -d kept showing libcairo/libX11/libasound as
+ * NEEDED even once readelf --dyn-syms showed zero actual undefined
+ * references to any of their symbols). Splitting so graphics/audio code
+ * lives in object files that are only ever *passed to the linker* when
+ * a program actually uses them sidesteps the problem entirely -- see
+ * cli.py's per-feature object file selection, driven by
+ * CodeGen.uses_graphics/uses_timers/uses_audio in festina/codegen.py.
+ *
+ * This core file has no dependency beyond libc, sqlite3, and POSIX
+ * <regex.h>/<time.h> -- every program links it, since log()/fail()/
+ * string interpolation and the database are always potentially in use
+ * (same as festina_db_open() only actually being *called* for a program
+ * with a `table` declaration, even though the core object file itself is
+ * always linked in).
  */
 #include <errno.h>
+#include <regex.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>       /* clock_gettime/nanosleep -- setTimeout/setInterval */
-#include <sys/select.h> /* select() -- multiplexes X11 events with timers */
-#include <pthread.h>    /* background audio playback -- claude.md #38 */
-#include <alsa/asoundlib.h> /* audio playback -- claude.md #38 */
-#include <X11/Xlib.h>
-#include <X11/Xutil.h> /* XLookupString/XKeysymToString -- `on key` */
-#include <cairo/cairo-xlib.h>
 #include "festina_runtime.h"
+#include "festina_runtime_internal.h"
 
 /* ---- log() / fail() -- claude.md #41, #42 ---- */
 
@@ -114,6 +136,39 @@ static const char *festina_sql_type(const char *festina_type) {
     return "TEXT";
 }
 
+/* festina_sync_table below builds several SQL statements incrementally
+ * across a loop over the declared columns, in the form
+ * `pos += snprintf(buf + pos, sizeof(buf) - pos, ...)`. That pattern
+ * looks bounds-safe (it's the textbook idiom for it) but genuinely
+ * isn't: snprintf's return value is how many bytes *would* have been
+ * written if the buffer were big enough, not how many actually fit --
+ * so once accumulated output exceeds the buffer, `pos` exceeds
+ * `sizeof(buf)`, and the *next* iteration's `sizeof(buf) - pos` is
+ * computed as unsigned arithmetic between a smaller and a larger value,
+ * silently underflowing to a huge number close to SIZE_MAX. snprintf is
+ * then told it has ~18 exabytes of buffer to write into and gladly
+ * writes straight past the real (2048-or-so-byte) stack array --
+ * verified directly: a table with enough columns (or long enough
+ * column/table names) that the generated SQL exceeds one of these
+ * buffers reliably stack-smashes and crashes under AddressSanitizer.
+ * Called at the top of every loop iteration that accumulates into one
+ * of these buffers (and once more after the loop, before any final
+ * fixed-text append), so `sizeof(buf) - pos` is never computed once
+ * `pos` has already reached or passed `buf_size` -- turning what would
+ * be undetected memory corruption into a clear, actionable
+ * festina_fail() instead (a table with columns that simply can't fit
+ * in a fixed-size buffer is a real, if unusual, condition to handle,
+ * not something to grow the buffers arbitrarily large to rule out). */
+static void festina_check_sql_buffer(int pos, size_t buf_size, const char *what) {
+    if (pos < 0 || (size_t)pos >= buf_size) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "festina_sync_table: %s is too long for this compiler's fixed-size "
+                 "buffer (too many columns, or column/table names too long)", what);
+        festina_fail(msg);
+    }
+}
+
 #define FESTINA_MAX_COLS 64
 
 void festina_sync_table(sqlite3 *db, const char *table_name,
@@ -149,10 +204,12 @@ void festina_sync_table(sqlite3 *db, const char *table_name,
         char sql[2048];
         int pos = snprintf(sql, sizeof(sql), "CREATE TABLE IF NOT EXISTS %s (", table_name);
         for (int i = 0; i < ncols; i++) {
-            pos += snprintf(sql + pos, sizeof(sql) - pos, "%s%s %s", i ? ", " : "",
+            festina_check_sql_buffer(pos, sizeof(sql), "CREATE TABLE statement");
+            pos += snprintf(sql + pos, sizeof(sql) - (size_t)pos, "%s%s %s", i ? ", " : "",
                              col_names[i], festina_sql_type(col_types[i]));
         }
-        snprintf(sql + pos, sizeof(sql) - pos, ");");
+        festina_check_sql_buffer(pos, sizeof(sql), "CREATE TABLE statement");
+        snprintf(sql + pos, sizeof(sql) - (size_t)pos, ");");
         festina_exec(db, sql);
         return;
     }
@@ -204,10 +261,12 @@ void festina_sync_table(sqlite3 *db, const char *table_name,
     char create_sql[2048];
     int pos = snprintf(create_sql, sizeof(create_sql), "CREATE TABLE %s (", new_table);
     for (int i = 0; i < ncols; i++) {
-        pos += snprintf(create_sql + pos, sizeof(create_sql) - pos, "%s%s %s", i ? ", " : "",
+        festina_check_sql_buffer(pos, sizeof(create_sql), "CREATE TABLE statement");
+        pos += snprintf(create_sql + pos, sizeof(create_sql) - (size_t)pos, "%s%s %s", i ? ", " : "",
                          col_names[i], festina_sql_type(col_types[i]));
     }
-    snprintf(create_sql + pos, sizeof(create_sql) - pos, ");");
+    festina_check_sql_buffer(pos, sizeof(create_sql), "CREATE TABLE statement");
+    snprintf(create_sql + pos, sizeof(create_sql) - (size_t)pos, ");");
     festina_exec(db, create_sql);
 
     char dest_cols[1024] = "";
@@ -217,12 +276,14 @@ void festina_sync_table(sqlite3 *db, const char *table_name,
     for (int j = 0; j < ncols; j++) {
         for (int i = 0; i < n_existing; i++) {
             if (strcmp(existing_names[i], col_names[j]) == 0) {
-                dpos += snprintf(dest_cols + dpos, sizeof(dest_cols) - dpos, "%s%s", first ? "" : ", ", col_names[j]);
+                festina_check_sql_buffer(dpos, sizeof(dest_cols), "column list");
+                dpos += snprintf(dest_cols + dpos, sizeof(dest_cols) - (size_t)dpos, "%s%s", first ? "" : ", ", col_names[j]);
+                festina_check_sql_buffer(spos, sizeof(src_cols), "column list");
                 if (strcmp(existing_types[i], festina_sql_type(col_types[j])) != 0) {
-                    spos += snprintf(src_cols + spos, sizeof(src_cols) - spos, "%sCAST(%s AS %s)",
+                    spos += snprintf(src_cols + spos, sizeof(src_cols) - (size_t)spos, "%sCAST(%s AS %s)",
                                       first ? "" : ", ", col_names[j], festina_sql_type(col_types[j]));
                 } else {
-                    spos += snprintf(src_cols + spos, sizeof(src_cols) - spos, "%s%s", first ? "" : ", ", col_names[j]);
+                    spos += snprintf(src_cols + spos, sizeof(src_cols) - (size_t)spos, "%s%s", first ? "" : ", ", col_names[j]);
                 }
                 first = 0;
                 break;
@@ -545,275 +606,17 @@ char *festina_regex_replace(void *compiled, const char *text,
     return out;
 }
 
-/* ---- graphics -- claude.md #37, #39, #40 (see festina_runtime.h's doc comment) ---- */
-
-/* Motif WM hints -- the widely-honored (if not core-protocol) X11
- * convention for requesting a window with no title bar/border/menu. */
-typedef struct {
-    unsigned long flags, functions, decorations;
-    long input_mode;
-    unsigned long status;
-} FestinaMotifWmHints;
-
-static Display *g_display = NULL;
-static Window g_window;
-static Atom g_wm_delete_atom;
-static cairo_surface_t *g_window_surface = NULL;
-static cairo_surface_t *g_backing_surface = NULL;
-static void (*g_click_handler)(int64_t, int64_t) = NULL;
-static void (*g_mouse_handler)(int64_t, int64_t) = NULL;
-static void (*g_key_handler)(const char *) = NULL;
-static void (*g_resize_handler)(void) = NULL;
-static void (*g_close_handler)(void) = NULL;
-/* The canvas's *current* size -- starts at FESTINA_CANVAS_WIDTH/HEIGHT
- * but tracks the window's real size after an `on resize`-triggering
- * ConfigureNotify (see festina_handle_graphics_event);
- * festina_client_width/_height read these, not the compile-time
- * constants. */
-static int64_t g_canvas_width = FESTINA_CANVAS_WIDTH;
-static int64_t g_canvas_height = FESTINA_CANVAS_HEIGHT;
-
-static void festina_graphics_require_init(void) {
-    if (!g_display) {
-        festina_fail("a graphics function was called but the canvas window "
-                      "was never created (internal compiler error)");
-    }
-}
-
-void festina_graphics_init(void) {
-    g_display = XOpenDisplay(NULL);
-    if (!g_display) {
-        festina_fail("could not open the X display -- claude.md #39's graphics "
-                      "functions need a running X server (is $DISPLAY set?)");
-    }
-
-    int screen = DefaultScreen(g_display);
-    g_window = XCreateSimpleWindow(g_display, RootWindow(g_display, screen), 0, 0,
-                                    FESTINA_CANVAS_WIDTH, FESTINA_CANVAS_HEIGHT, 0,
-                                    BlackPixel(g_display, screen), WhitePixel(g_display, screen));
-
-    Atom mwm_hints_atom = XInternAtom(g_display, "_MOTIF_WM_HINTS", False);
-    FestinaMotifWmHints hints;
-    memset(&hints, 0, sizeof(hints));
-    hints.flags = 2; /* MWM_HINTS_DECORATIONS */
-    hints.decorations = 0;
-    XChangeProperty(g_display, g_window, mwm_hints_atom, mwm_hints_atom, 32,
-                     PropModeReplace, (unsigned char *)&hints,
-                     sizeof(hints) / sizeof(long));
-
-    XStoreName(g_display, g_window, "Festina");
-    XSelectInput(g_display, g_window,
-                 ExposureMask | ButtonPressMask | PointerMotionMask |
-                 KeyPressMask | StructureNotifyMask);
-    g_wm_delete_atom = XInternAtom(g_display, "WM_DELETE_WINDOW", False);
-    XSetWMProtocols(g_display, g_window, &g_wm_delete_atom, 1);
-
-    XMapWindow(g_display, g_window);
-    XSync(g_display, False); /* the map must reach the server before ... */
-    /* ... this: with no window manager to hand focus over (as under a
-     * bare Xvfb instance -- see tests/test_codegen.py's TestGraphics),
-     * nothing else would ever give this window keyboard focus, and `on
-     * key` would never fire. A real desktop's WM normally does this on
-     * click/map; asking directly is harmless either way. */
-    XSetInputFocus(g_display, g_window, RevertToParent, CurrentTime);
-    XFlush(g_display);
-
-    g_canvas_width = FESTINA_CANVAS_WIDTH;
-    g_canvas_height = FESTINA_CANVAS_HEIGHT;
-    g_window_surface = cairo_xlib_surface_create(g_display, g_window, DefaultVisual(g_display, screen),
-                                                  FESTINA_CANVAS_WIDTH, FESTINA_CANVAS_HEIGHT);
-    g_backing_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
-                                                     FESTINA_CANVAS_WIDTH, FESTINA_CANVAS_HEIGHT);
-    cairo_t *cr = cairo_create(g_backing_surface);
-    cairo_set_source_rgb(cr, 1, 1, 1); /* white canvas background */
-    cairo_paint(cr);
-    cairo_destroy(cr);
-}
-
-/* Blits the backing store (source of truth for what's been drawn) onto
- * the visible window -- called after every draw call for immediate
- * feedback, and on every Expose event to repaint correctly. */
-static void festina_graphics_present(void) {
-    cairo_t *cr = cairo_create(g_window_surface);
-    cairo_set_source_surface(cr, g_backing_surface, 0, 0);
-    cairo_paint(cr);
-    cairo_destroy(cr);
-    cairo_surface_flush(g_window_surface);
-    XFlush(g_display);
-}
-
-void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
-    festina_graphics_require_init();
-    cairo_t *cr = cairo_create(g_backing_surface);
-    cairo_set_source_rgb(cr, 0, 0, 0);
-    cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
-    cairo_fill(cr);
-    cairo_destroy(cr);
-    festina_graphics_present();
-}
-
-void festina_draw_circle(int64_t x, int64_t y, int64_t r) {
-    festina_graphics_require_init();
-    cairo_t *cr = cairo_create(g_backing_surface);
-    cairo_set_source_rgb(cr, 0, 0, 0);
-    cairo_arc(cr, (double)x, (double)y, (double)r, 0.0, 2.0 * 3.14159265358979323846);
-    cairo_fill(cr);
-    cairo_destroy(cr);
-    festina_graphics_present();
-}
-
-void festina_draw_text(const char *text, int64_t x, int64_t y) {
-    festina_graphics_require_init();
-    if (!text) text = "";
-    cairo_t *cr = cairo_create(g_backing_surface);
-    cairo_set_source_rgb(cr, 0, 0, 0);
-    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 16);
-    cairo_move_to(cr, (double)x, (double)y);
-    cairo_show_text(cr, text);
-    cairo_destroy(cr);
-    festina_graphics_present();
-}
-
-void *festina_load_image(const char *path) {
-    if (!path) path = "";
-    /* claude.md #37: "Supported image formats are determined by the
-     * runtime" -- PNG only, via Cairo's own built-in decoder. */
-    cairo_surface_t *img = cairo_image_surface_create_from_png(path);
-    cairo_status_t status = cairo_surface_status(img);
-    if (status != CAIRO_STATUS_SUCCESS) {
-        char msg[512];
-        snprintf(msg, sizeof(msg), "could not load image '%s': %s (only PNG images are supported)",
-                 path, cairo_status_to_string(status));
-        cairo_surface_destroy(img);
-        festina_fail(msg);
-    }
-    return img;
-}
-
-void festina_draw_image(void *img, int64_t x, int64_t y) {
-    festina_graphics_require_init();
-    if (!img) return;
-    cairo_t *cr = cairo_create(g_backing_surface);
-    cairo_set_source_surface(cr, (cairo_surface_t *)img, (double)x, (double)y);
-    cairo_paint(cr);
-    cairo_destroy(cr);
-    festina_graphics_present();
-}
-
-void festina_register_click_handler(void (*handler)(int64_t, int64_t)) {
-    g_click_handler = handler;
-}
-
-void festina_register_mouse_handler(void (*handler)(int64_t, int64_t)) {
-    g_mouse_handler = handler;
-}
-
-void festina_register_key_handler(void (*handler)(const char *)) {
-    g_key_handler = handler;
-}
-
-void festina_register_resize_handler(void (*handler)(void)) {
-    g_resize_handler = handler;
-}
-
-void festina_register_close_handler(void (*handler)(void)) {
-    g_close_handler = handler;
-}
-
-int64_t festina_client_width(void) {
-    festina_graphics_require_init();
-    return g_canvas_width;
-}
-
-int64_t festina_client_height(void) {
-    festina_graphics_require_init();
-    return g_canvas_height;
-}
-
-/* Handles one already-read X11 event. Returns 0 if this was the
- * window-close request (the caller should stop looping and tear down),
- * 1 otherwise. Factored out of what used to be festina_graphics_run's
- * own while(1) loop body so festina_run_event_loop (below) can drive
- * it either as-is or interleaved with timer processing. */
-static int festina_handle_graphics_event(XEvent *ev) {
-    if (ev->type == Expose) {
-        festina_graphics_present();
-    } else if (ev->type == ButtonPress) {
-        if (g_click_handler) g_click_handler(ev->xbutton.x, ev->xbutton.y);
-    } else if (ev->type == MotionNotify) {
-        if (g_mouse_handler) g_mouse_handler(ev->xmotion.x, ev->xmotion.y);
-    } else if (ev->type == KeyPress) {
-        if (g_key_handler) {
-            /* A key that types an ordinary printable character
-             * (letters, digits, punctuation, space) comes back as
-             * that character through the buffer XLookupString fills
-             * in. Anything else -- Enter/Escape/Backspace/arrow
-             * keys/... -- either comes back empty or as an
-             * unprintable control character (e.g. 0x1B for Escape,
-             * 0x0D for Return), neither of which is a useful `text`
-             * value, so those fall back to XKeysymToString's X11 key
-             * name instead (e.g. "Return", "Escape", "Left") --
-             * there's no claude.md-defined naming scheme for these,
-             * so this is simply X11's own. */
-            char buf[32];
-            KeySym keysym;
-            int len = XLookupString(&ev->xkey, buf, sizeof(buf) - 1, &keysym, NULL);
-            if (len > 0 && (unsigned char)buf[0] >= 0x20 && (unsigned char)buf[0] != 0x7F) {
-                buf[len] = '\0';
-                g_key_handler(buf);
-            } else {
-                const char *name = XKeysymToString(keysym);
-                g_key_handler(name ? name : "");
-            }
-        }
-    } else if (ev->type == ConfigureNotify) {
-        /* ConfigureNotify fires on more than just a resize (e.g. a
-         * move), so only treat it as `on resize` when the size
-         * genuinely changed. */
-        int64_t new_w = ev->xconfigure.width;
-        int64_t new_h = ev->xconfigure.height;
-        if (new_w != g_canvas_width || new_h != g_canvas_height) {
-            g_canvas_width = new_w;
-            g_canvas_height = new_h;
-            cairo_xlib_surface_set_size(g_window_surface, new_w, new_h);
-            /* claude.md #39's own examples never draw relative to a
-             * canvas size (there's no syntax for one), so there's no
-             * spec-defined way to preserve old content sanely across
-             * a resize -- clear back to white at the new size, the
-             * same behavior resizing a browser's <canvas> element
-             * has, which clientWidth/clientHeight are named after. */
-            cairo_surface_destroy(g_backing_surface);
-            g_backing_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, new_w, new_h);
-            cairo_t *cr = cairo_create(g_backing_surface);
-            cairo_set_source_rgb(cr, 1, 1, 1);
-            cairo_paint(cr);
-            cairo_destroy(cr);
-            festina_graphics_present();
-            if (g_resize_handler) g_resize_handler();
-        }
-    } else if (ev->type == ClientMessage) {
-        if ((Atom)ev->xclient.data.l[0] == g_wm_delete_atom) {
-            if (g_close_handler) g_close_handler();
-            return 0;
-        }
-    }
-    return 1;
-}
-
-static void festina_graphics_teardown(void) {
-    cairo_surface_destroy(g_backing_surface);
-    cairo_surface_destroy(g_window_surface);
-    XDestroyWindow(g_display, g_window);
-    XCloseDisplay(g_display);
-}
-
 /* ---- setTimeout/setInterval -- claude.md #69. Added because Festina
  * otherwise has no way to schedule work after the fact. See
  * festina_runtime.h's doc comment for the full design (why the
  * callback is a bare function name, how this combines with the
  * graphics event loop, when a program with pending timers actually
- * exits). ---- */
+ * exits). Pure POSIX (<time.h> only) -- no X11 dependency, so this
+ * lives in core regardless of whether a given program also uses
+ * graphics; festina_runtime_graphics.c's festina_run_event_loop calls
+ * back into festina_next_timer_deadline()/festina_fire_expired_timers()
+ * (festina_runtime_internal.h) to stay in sync with this state when
+ * both graphics and timers are in use. ---- */
 
 typedef struct {
     int64_t id;
@@ -829,7 +632,7 @@ static int64_t g_timer_count = 0;
 static int64_t g_timer_capacity = 0;
 static int64_t g_next_timer_id = 1;
 
-static double festina_now_seconds(void) {
+double festina_now_seconds(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
@@ -887,13 +690,28 @@ static void festina_clear_timer_id(int64_t id) {
 void festina_clear_timeout(int64_t id) { festina_clear_timer_id(id); }
 void festina_clear_interval(int64_t id) { festina_clear_timer_id(id); }
 
+/* The earliest next_fire_time among all active timers, or -1.0 if none
+ * are active -- festina_run_event_loop (festina_runtime_graphics.c)
+ * uses this to bound its select() timeout; festina_run_timer_loop below
+ * uses it directly. */
+double festina_next_timer_deadline(void) {
+    double earliest = -1.0;
+    for (int64_t i = 0; i < g_timer_count; i++) {
+        if (!g_timers[i].active) continue;
+        if (earliest < 0.0 || g_timers[i].next_fire_time < earliest) {
+            earliest = g_timers[i].next_fire_time;
+        }
+    }
+    return earliest;
+}
+
 /* Fires every timer whose next_fire_time has passed. Indexes into
  * g_timers fresh on every access (never caches a pointer across a
  * callback() call) since a callback is ordinary Festina code and can
  * itself call setTimeout/setInterval (growing/reallocating g_timers)
  * or clearTimeout/clearInterval (deactivating an entry, including its
  * own) -- both need to be safe to do from inside a firing callback. */
-static void festina_fire_expired_timers(void) {
+void festina_fire_expired_timers(void) {
     double now = festina_now_seconds();
     for (int64_t i = 0; i < g_timer_count; i++) {
         if (!g_timers[i].active || g_timers[i].next_fire_time > now) continue;
@@ -912,300 +730,29 @@ static void festina_fire_expired_timers(void) {
     }
 }
 
-/* The unified blocking loop main() enters (via festina_run_event_loop)
- * whenever a program uses graphics, timers, or both -- see
- * CodeGen.uses_graphics/uses_timers in festina/codegen.py. With
- * graphics: multiplexes X11 events and timer deadlines on the same
- * select() call (via ConnectionNumber(g_display)) rather than picking
- * one or the other, so `on click`/timers both stay responsive at once;
- * exits when the window closes (timers, if any, are simply abandoned --
- * matching a browser tab unloading). Without graphics: sleeps until the
- * next timer deadline and fires it, forever, until there's truly
- * nothing left to wait for (no active timers) -- matching Node's empty
- * event loop exiting the process. An uncleared setInterval therefore
- * keeps a graphics-free program running forever, exactly like in a real
- * JS runtime; it needs to be stopped externally (or via
- * clearInterval()) the same way. */
-void festina_run_event_loop(void) {
+/* The blocking loop main() enters (via festina_run_timer_loop, see
+ * festina/codegen.py's _emit_main_and_entry) for a program that uses
+ * setTimeout/setInterval but never opens a graphics window --
+ * festina_run_event_loop (festina_runtime_graphics.c) is the graphics-
+ * aware equivalent, sharing this same timer state through
+ * festina_next_timer_deadline()/festina_fire_expired_timers() above.
+ * Sleeps until the next timer deadline and fires it, forever, until
+ * there's truly nothing left to wait for (no active timers) -- matching
+ * Node's empty event loop exiting the process. An uncleared
+ * setInterval() therefore keeps a graphics-free program running
+ * forever, exactly like in a real JS runtime; it needs to be stopped
+ * externally (or via clearInterval()) the same way. */
+void festina_run_timer_loop(void) {
     while (1) {
-        double earliest = -1.0;
-        for (int64_t i = 0; i < g_timer_count; i++) {
-            if (!g_timers[i].active) continue;
-            if (earliest < 0.0 || g_timers[i].next_fire_time < earliest) {
-                earliest = g_timers[i].next_fire_time;
-            }
+        double earliest = festina_next_timer_deadline();
+        if (earliest < 0.0) return; /* nothing left to wait for */
+        double remaining = earliest - festina_now_seconds();
+        if (remaining > 0.0) {
+            struct timespec ts;
+            ts.tv_sec = (time_t)remaining;
+            ts.tv_nsec = (long)((remaining - (double)ts.tv_sec) * 1e9);
+            nanosleep(&ts, NULL);
         }
-
-        if (g_display) {
-            if (!XPending(g_display)) {
-                int xfd = ConnectionNumber(g_display);
-                fd_set fds;
-                FD_ZERO(&fds);
-                FD_SET(xfd, &fds);
-                struct timeval tv;
-                struct timeval *tvp = NULL;
-                if (earliest >= 0.0) {
-                    double remaining = earliest - festina_now_seconds();
-                    if (remaining < 0.0) remaining = 0.0;
-                    tv.tv_sec = (long)remaining;
-                    tv.tv_usec = (long)((remaining - (double)tv.tv_sec) * 1e6);
-                    tvp = &tv;
-                }
-                select(xfd + 1, &fds, NULL, NULL, tvp);
-            }
-            int keep_going = 1;
-            while (XPending(g_display)) {
-                XEvent ev;
-                XNextEvent(g_display, &ev);
-                if (!festina_handle_graphics_event(&ev)) {
-                    keep_going = 0;
-                    break; /* stop on window-close, same as the old loop did */
-                }
-            }
-            festina_fire_expired_timers();
-            if (!keep_going) {
-                festina_graphics_teardown();
-                return;
-            }
-        } else {
-            if (earliest < 0.0) return; /* nothing left to wait for */
-            double remaining = earliest - festina_now_seconds();
-            if (remaining > 0.0) {
-                struct timespec ts;
-                ts.tv_sec = (time_t)remaining;
-                ts.tv_nsec = (long)((remaining - (double)ts.tv_sec) * 1e9);
-                nanosleep(&ts, NULL);
-            }
-            festina_fire_expired_timers();
-        }
+        festina_fire_expired_timers();
     }
-}
-
-/* ---- audio -- claude.md #38 (see festina_runtime.h's doc comment) ---- */
-
-typedef struct {
-    int16_t *samples;    /* interleaved PCM, 16-bit signed, little-endian */
-    size_t frame_count;  /* frames (per channel), not raw samples */
-    int channels;
-    unsigned int sample_rate;
-
-    pthread_mutex_t lock;    /* guards everything below */
-    pthread_t thread;        /* only meaningful while thread_running */
-    snd_pcm_t *pcm;          /* only meaningful while thread_running */
-    int thread_running;      /* a playback thread is spawned and not yet joined */
-    int playing;             /* what isPlaying() reports */
-    int stop_requested;      /* set by stop()/a restarting play(), read by the thread */
-} FestinaAudio;
-
-/* The playback thread's whole job: stream already-decoded PCM to ALSA
- * in small chunks, checking stop_requested between each one so stop()
- * gets a prompt response rather than waiting for the entire clip to
- * finish. The PCM device itself was already opened+configured by
- * festina_audio_play (synchronously, before this thread was even
- * spawned -- see its own comment for why), so this thread's only jobs
- * are writing frames and, on the way out (however it ends: finished,
- * stopped, or an unrecoverable ALSA error), closing the device and
- * resetting state so isPlaying() reflects reality again. */
-static void *festina_audio_thread_main(void *arg) {
-    FestinaAudio *a = (FestinaAudio *)arg;
-    const snd_pcm_uframes_t chunk_frames = 4096;
-    size_t frame = 0;
-
-    while (frame < a->frame_count) {
-        pthread_mutex_lock(&a->lock);
-        int stop = a->stop_requested;
-        pthread_mutex_unlock(&a->lock);
-        if (stop) break;
-
-        size_t remaining = a->frame_count - frame;
-        snd_pcm_uframes_t this_chunk =
-            remaining < chunk_frames ? (snd_pcm_uframes_t)remaining : chunk_frames;
-        snd_pcm_sframes_t written = snd_pcm_writei(
-            a->pcm, a->samples + frame * (size_t)a->channels, this_chunk);
-        if (written < 0) {
-            /* snd_pcm_recover handles the common recoverable cases
-             * (buffer underrun, a suspended device); anything it can't
-             * fix, just stop -- there's no Festina-level way to report
-             * a mid-playback error after play() has already returned
-             * successfully. */
-            written = snd_pcm_recover(a->pcm, (int)written, 0);
-            if (written < 0) break;
-            continue;
-        }
-        frame += (size_t)written;
-    }
-
-    pthread_mutex_lock(&a->lock);
-    snd_pcm_close(a->pcm);
-    a->pcm = NULL;
-    a->playing = 0;
-    a->thread_running = 0;
-    pthread_mutex_unlock(&a->lock);
-    return NULL;
-}
-
-void *festina_load_audio(const char *path) {
-    if (!path) path = "";
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        char msg[512];
-        snprintf(msg, sizeof(msg), "could not open audio file '%s': %s", path, strerror(errno));
-        festina_fail(msg);
-    }
-
-    unsigned char riff_hdr[12];
-    if (fread(riff_hdr, 1, 12, f) != 12 ||
-            memcmp(riff_hdr, "RIFF", 4) != 0 || memcmp(riff_hdr + 8, "WAVE", 4) != 0) {
-        fclose(f);
-        char msg[512];
-        snprintf(msg, sizeof(msg),
-                 "could not load audio '%s': not a WAV file (only 16-bit PCM WAV audio is supported)",
-                 path);
-        festina_fail(msg);
-    }
-
-    int have_fmt = 0, have_data = 0, is_pcm = 0;
-    int16_t channels = 0, bits_per_sample = 0;
-    uint32_t sample_rate = 0;
-    unsigned char *data = NULL;
-    uint32_t data_size = 0;
-
-    unsigned char chunk_hdr[8];
-    while (fread(chunk_hdr, 1, 8, f) == 8) {
-        uint32_t chunk_size = (uint32_t)chunk_hdr[4] | ((uint32_t)chunk_hdr[5] << 8) |
-                               ((uint32_t)chunk_hdr[6] << 16) | ((uint32_t)chunk_hdr[7] << 24);
-        if (memcmp(chunk_hdr, "fmt ", 4) == 0 && chunk_size >= 16) {
-            unsigned char fmt[16];
-            if (fread(fmt, 1, 16, f) != 16) break;
-            int16_t audio_format = (int16_t)(fmt[0] | (fmt[1] << 8));
-            channels = (int16_t)(fmt[2] | (fmt[3] << 8));
-            sample_rate = (uint32_t)fmt[4] | ((uint32_t)fmt[5] << 8) |
-                          ((uint32_t)fmt[6] << 16) | ((uint32_t)fmt[7] << 24);
-            bits_per_sample = (int16_t)(fmt[14] | (fmt[15] << 8));
-            is_pcm = (audio_format == 1);
-            have_fmt = 1;
-            if (chunk_size > 16 && fseek(f, (long)(chunk_size - 16), SEEK_CUR) != 0) break;
-        } else if (memcmp(chunk_hdr, "data", 4) == 0) {
-            data = malloc(chunk_size ? chunk_size : 1);
-            if (!data || fread(data, 1, chunk_size, f) != chunk_size) {
-                free(data);
-                data = NULL;
-                break;
-            }
-            data_size = chunk_size;
-            have_data = 1;
-            if (have_fmt) break; /* ignore any chunks after data -- metadata etc. */
-        } else {
-            /* skip an unrecognized chunk -- chunks are padded to an even
-             * length, so an odd-sized chunk has one extra byte to skip. */
-            if (fseek(f, (long)chunk_size + (long)(chunk_size % 2), SEEK_CUR) != 0) break;
-        }
-    }
-    fclose(f);
-
-    if (!have_fmt || !is_pcm || !have_data || bits_per_sample != 16 || channels < 1) {
-        free(data);
-        char msg[512];
-        snprintf(msg, sizeof(msg),
-                 "could not load audio '%s': only 16-bit PCM WAV audio is supported", path);
-        festina_fail(msg);
-    }
-
-    FestinaAudio *a = calloc(1, sizeof(FestinaAudio));
-    if (!a) festina_fail("out of memory loading audio");
-    /* WAV's PCM data is little-endian; every target this compiler
-     * generates code for (x86/x86_64, ARM in its default mode) is too,
-     * so the bytes malloc'd above are already exactly int16_t samples
-     * with no conversion needed -- the same little-endian assumption
-     * this runtime already makes for int/float elsewhere. */
-    a->samples = (int16_t *)data;
-    a->frame_count = data_size / (size_t)(channels * 2);
-    a->channels = channels;
-    a->sample_rate = sample_rate;
-    pthread_mutex_init(&a->lock, NULL);
-    return a;
-}
-
-void festina_audio_play(void *audio) {
-    FestinaAudio *a = (FestinaAudio *)audio;
-    if (!a) return;
-
-    pthread_mutex_lock(&a->lock);
-    if (a->thread_running) {
-        /* claude.md #38 doesn't say what play() does while already
-         * playing -- restarting from the beginning is the least
-         * surprising choice (matching an <audio> element's own
-         * .play() called again mid-playback), so stop the current
-         * playback thread first. */
-        a->stop_requested = 1;
-        pthread_mutex_unlock(&a->lock);
-        pthread_join(a->thread, NULL);
-        pthread_mutex_lock(&a->lock);
-    }
-
-    /* Opened here, synchronously, rather than inside the background
-     * thread -- so a missing/unusable audio device fails loudly and
-     * immediately at the play() call site (festina_fail(), same as
-     * "could not open the X display" for graphics), not silently on a
-     * background thread with no way to report it back. */
-    snd_pcm_t *pcm = NULL;
-    int rc = snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
-    if (rc >= 0) {
-        rc = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
-                                 (unsigned int)a->channels, a->sample_rate, 1, 500000);
-    }
-    if (rc < 0) {
-        pthread_mutex_unlock(&a->lock);
-        char msg[256];
-        snprintf(msg, sizeof(msg),
-                 "could not open an audio output device: %s (is any audio device available?)",
-                 snd_strerror(rc));
-        festina_fail(msg);
-        return; /* unreachable -- festina_fail() calls exit() */
-    }
-
-    a->pcm = pcm;
-    a->stop_requested = 0;
-    a->playing = 1; /* set synchronously, before spawning, so isPlaying()
-                        is deterministic immediately after play() returns */
-    a->thread_running = 1;
-    rc = pthread_create(&a->thread, NULL, festina_audio_thread_main, a);
-    if (rc != 0) {
-        snd_pcm_close(pcm);
-        a->pcm = NULL;
-        a->playing = 0;
-        a->thread_running = 0;
-        pthread_mutex_unlock(&a->lock);
-        festina_fail("could not start an audio playback thread");
-        return;
-    }
-    pthread_mutex_unlock(&a->lock);
-}
-
-void festina_audio_stop(void *audio) {
-    FestinaAudio *a = (FestinaAudio *)audio;
-    if (!a) return;
-
-    pthread_mutex_lock(&a->lock);
-    if (!a->thread_running) {
-        pthread_mutex_unlock(&a->lock);
-        return; /* nothing playing -- a safe no-op, matching a real
-                    media player's stop() on an already-stopped clip */
-    }
-    a->stop_requested = 1;
-    pthread_mutex_unlock(&a->lock);
-    /* Joins (not just signals) before returning, so isPlaying() is
-     * guaranteed false the instant stop() returns -- not just "false
-     * soon". The thread sets playing/thread_running itself right
-     * before it exits (see festina_audio_thread_main). */
-    pthread_join(a->thread, NULL);
-}
-
-int8_t festina_audio_is_playing(void *audio) {
-    FestinaAudio *a = (FestinaAudio *)audio;
-    if (!a) return 0;
-    pthread_mutex_lock(&a->lock);
-    int8_t playing = (int8_t)a->playing;
-    pthread_mutex_unlock(&a->lock);
-    return playing;
 }

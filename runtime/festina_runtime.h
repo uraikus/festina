@@ -3,8 +3,20 @@
 
 #include <stdint.h>
 #include <sqlite3.h>
-#include <regex.h>
-#include <cairo/cairo.h>
+
+/* Note on what does NOT appear in this header: no Cairo, X11, ALSA, or
+ * <regex.h> type ever crosses a public function's signature -- every
+ * such value is opaqued to `void *` (regex_t* from festina_regex_compile,
+ * cairo_surface_t* from festina_load_image, ...). That's what makes it
+ * possible to split the implementation (festina_runtime.c/_graphics.c/
+ * _audio.c -- see each file's own top comment) into separate translation
+ * units with zero header-level coupling to graphics/audio: a program
+ * that never calls a graphics/audio function never needs those object
+ * files linked in at all, so `cc` never even sees -lcairo/-lX11/-lasound
+ * on its command line for it -- see cli.py's per-feature object file
+ * selection, driven by CodeGen.uses_graphics/uses_audio. sqlite3 is the
+ * one exception (sqlite3* and sqlite3_stmt* appear directly below) since
+ * it's a permanent, always-linked core dependency, never an optional one. */
 
 /* claude.md #41: log() */
 void festina_log_int(int64_t v);
@@ -218,12 +230,17 @@ char *festina_regex_replace(void *compiled, const char *text,
  * the BUILTIN_FUNCTIONS/_BUILTIN_SIGNATURES machinery the draw
  * functions and loadImage use, which all assume a Call).
  *
- * festina_run_event_loop is what main() actually blocks in after
- * __festina_main() returns, whenever a program uses graphics, timers
- * (see setTimeout/setInterval below), or both (CodeGen.uses_graphics
- * or CodeGen.uses_timers in festina/codegen.py) -- it used to be named
- * festina_graphics_run, back when graphics was the only thing that
- * could ever block here.
+ * festina_run_event_loop is what main() calls after __festina_main()
+ * returns, whenever a program uses graphics (CodeGen.uses_graphics in
+ * festina/codegen.py) -- it used to be named festina_graphics_run, back
+ * when graphics was the only thing that could ever block here; it now
+ * also fires any pending setTimeout/setInterval callbacks (see the
+ * "Timers" note below) on every pass through its select()-driven X11
+ * wait, so `on click` and a setInterval callback both stay responsive
+ * together. It lives in festina_runtime_graphics.c, not this file's .c
+ * -- a program that never uses graphics calls festina_run_timer_loop
+ * instead (declared alongside setTimeout/setInterval below), the same
+ * timer-firing behavior with no X11 dependency at all.
  */
 #define FESTINA_CANVAS_WIDTH 800
 #define FESTINA_CANVAS_HEIGHT 600
@@ -268,25 +285,38 @@ int64_t festina_client_height(void);
  *
  * Scheduling is cooperative and single-threaded, like JS's own event
  * loop -- a Festina program is never preempted mid-statement to run a
- * timer callback. Instead, timers only ever fire from inside
- * festina_run_event_loop: with graphics in use, on every pass through
- * its select()-driven X11/timer multiplexing (so `on click` and a
- * `setInterval` callback both stay responsive together); without
- * graphics, in a loop that sleeps until the next deadline and fires it,
- * for as long as there's still an active timer to wait for. A program
+ * timer callback. Instead, timers only ever fire from inside a blocking
+ * loop in main() (see festina/codegen.py's _emit_main_and_entry): with
+ * graphics in use, festina_run_event_loop (festina_runtime_graphics.c)
+ * fires them on every pass through its select()-driven X11/timer
+ * multiplexing (so `on click` and a `setInterval` callback both stay
+ * responsive together); without graphics, festina_run_timer_loop (this
+ * file's .c) sleeps until the next deadline and fires it, for as long as
+ * there's still an active timer to wait for -- both share the same
+ * timer bookkeeping and firing logic (festina_fire_expired_timers,
+ * private to this runtime, not part of this public header). A program
  * that only ever calls setTimeout() exits once every one-shot timeout
  * has fired; one that calls setInterval() and never clears it runs
  * forever, exactly like an uncleared setInterval() would in a real JS
  * runtime -- it has to be stopped externally (or via clearInterval())
- * the same way. See festina_run_event_loop's own doc comment in
- * festina_runtime.c for the full loop design, including why an
- * interval callback is rescheduled from "now" rather than from its
- * missed deadline (avoids a burst of catch-up calls after a stall).
+ * the same way. See festina_run_timer_loop/festina_run_event_loop's own
+ * doc comments in festina_runtime.c/_graphics.c for the full loop
+ * design, including why an interval callback is rescheduled from "now"
+ * rather than from its missed deadline (avoids a burst of catch-up
+ * calls after a stall).
  */
 int64_t festina_set_timeout(void (*callback)(void), int64_t delay_ms);
 int64_t festina_set_interval(void (*callback)(void), int64_t delay_ms);
 void festina_clear_timeout(int64_t id);
 void festina_clear_interval(int64_t id);
+/* The no-graphics counterpart to festina_run_event_loop above -- see
+ * this section's own doc comment. Always declared (like every function
+ * in this header) even though only one of the two loop functions is
+ * ever actually *called* by a given compiled program's main() -- a bare
+ * `declare` in the generated LLVM IR never forces linking anything (see
+ * festina/codegen.py's _runtime_declares), only an actual `call` does,
+ * and codegen only ever emits a call to whichever one the program needs. */
+void festina_run_timer_loop(void);
 
 /*
  * claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying().

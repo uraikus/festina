@@ -1,5 +1,6 @@
-// A tour of what festina/ actually implements today -- see README.md's
-// "Implementation Status" section. Build and run with:
+// A tour of what festina/ actually implements today -- see api.md for
+// the full language reference and tests/CONTRACT.md for exactly what's
+// implemented vs. not. Build and run with:
 //
 //   ./bin/festina examples/hello.f -o hello
 //   ./hello
