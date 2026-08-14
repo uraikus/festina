@@ -57,6 +57,16 @@ class AudioType:
         return "AudioType()"
 
 
+@dataclass(frozen=True)
+class RegexType:
+    """claude.md #67 -- created only via the regex() builtin, never a
+    dedicated literal syntax, so (unlike StructType/TableType) there's
+    only ever one shape of this type; no fields to distinguish."""
+
+    def __repr__(self):
+        return "RegexType()"
+
+
 def type_name(t):
     """Readable name for error messages, e.g. `arr[int]`, `User`, `int`."""
     if t is None:
@@ -73,4 +83,6 @@ def type_name(t):
         return "img"
     if isinstance(t, AudioType):
         return "aud"
+    if isinstance(t, RegexType):
+        return "regex"
     return str(t)

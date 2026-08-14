@@ -5,7 +5,9 @@ CodeGen.filename's note in generate()), #7/#8 (entry point + startup),
 queries, parameterized queries, query result types), #41/#42
 (log/fail), #45 (string interpolation), #55-57 (int.toFloat(),
 Math.floor/ceil/round/trunc, division/modulo by zero), #60/#61
-(for/while loops), #63 (array .length), #66 (postfix ++/--).
+(for/while loops), #63 (array .length), #66 (postfix ++/--), #67-68
+(regex(), .test(), .match(), .replace()/.replaceAll() -- see
+_emit_regex_call and the Member-call handling in _emit_call).
 
 Scope: primitives (int/float/bool/text), global and local variables and
 constants, functions, if/else, for/while loops, return, the full
@@ -14,9 +16,11 @@ strings/postfix ++/--), structs (GEP field access; see the
 heap-allocation note below), arrays (arr[T] literals, indexed get/set,
 nesting, `.length` -- see the FESTINA_ARRAY_LLVM_TYPE note below),
 automatic table schema sync against festina.sqlite via the
-festina_runtime C helpers, and sqlite() queries (SELECT into
-arr[Table], parameterized INSERT/UPDATE/DELETE -- see the "Query rows"
-note below).
+festina_runtime C helpers, sqlite() queries (SELECT into arr[Table],
+parameterized INSERT/UPDATE/DELETE -- see the "Query rows" note
+below), and regex()/.test()/.match()/.replace()/.replaceAll() (POSIX
+extended regular expressions via the festina_runtime C helpers -- no
+bundled regex engine, see festina_runtime.h's doc comment on why).
 
 NOT implemented yet (raises CodegenError with a clear message):
 graphics (img/drawRect/...), audio (aud/loadAudio/...), and
@@ -133,6 +137,7 @@ BOOL = types_mod.PrimitiveType("bool")
 INT = types_mod.PrimitiveType("int")
 FLOAT = types_mod.PrimitiveType("float")
 TEXT = types_mod.PrimitiveType("text")
+REGEX = types_mod.RegexType()
 
 FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
 
@@ -172,6 +177,10 @@ def _llvm_type(t):
         raise CodegenError("img / graphics are not implemented yet")
     if isinstance(t, types_mod.AudioType):
         raise CodegenError("aud / audio are not implemented yet")
+    if isinstance(t, types_mod.RegexType):
+        # claude.md #67: a compiled regex_t*, opaque to codegen -- see
+        # _emit_regex_call.
+        return "ptr"
     raise CodegenError(f"cannot generate code for type {t!r}")
 
 
@@ -340,6 +349,12 @@ class CodeGen:
             "declare void @festina_sqlite_bind_null(ptr, i32)",
             "declare void @festina_sqlite_exec(ptr)",
             "declare void @festina_sqlite_collect_rows(ptr, i32, ptr, ptr, ptr)",
+            # claude.md #67-68: regex(), .test(), .match(), .replace()/.replaceAll().
+            "declare ptr @festina_regex_compile(ptr, ptr)",
+            "declare i1 @festina_regex_test(ptr, ptr)",
+            "declare ptr @festina_regex_match(ptr, ptr)",
+            "declare ptr @festina_str_replace(ptr, ptr, ptr, i1)",
+            "declare ptr @festina_regex_replace(ptr, ptr, ptr, i1)",
             "declare ptr @malloc(i64)",
             "declare ptr @calloc(i64, i64)",
             # claude.md #56: Math.floor/ceil/round/trunc, via LLVM's
@@ -1096,6 +1111,8 @@ class CodeGen:
                 return "0", None
             if name == "sqlite":
                 return self._emit_sqlite_call(expr, env, lines, expected_type)
+            if name == "regex":
+                return self._emit_regex_call(expr, env, lines)
             if name in ("drawRect", "drawCircle", "drawText", "drawImage",
                         "loadImage", "loadAudio"):
                 raise CodegenError(f"'{name}' (graphics/audio) is not implemented yet",
@@ -1138,8 +1155,82 @@ class CodeGen:
                     out = self.tmp()
                     lines.append(f"  {out} = sitofp i64 {val} to double")
                     return out, FLOAT
+            # claude.md #67: pattern.test(value:text) -> bool
+            if callee.prop == "test":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if obj_type == REGEX:
+                    arg_val, _ = self._emit_expr(expr.args[0], env, lines)
+                    out = self.tmp()
+                    lines.append(f"  {out} = call i1 @festina_regex_test(ptr {obj_val}, ptr {arg_val})")
+                    return out, BOOL
+            # claude.md #68: value.match(pattern:regex) -> text (or null)
+            if callee.prop == "match":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if obj_type == TEXT:
+                    arg_val, _ = self._emit_expr(expr.args[0], env, lines)
+                    out = self.tmp()
+                    lines.append(f"  {out} = call ptr @festina_regex_match(ptr {arg_val}, ptr {obj_val})")
+                    return out, TEXT
+            # claude.md #68: value.replace(search, replacement:text) -> text
+            #                value.replaceAll(search, replacement:text) -> text
+            if callee.prop in ("replace", "replaceAll"):
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if obj_type == TEXT:
+                    search_val, search_type = self._emit_expr(expr.args[0], env, lines)
+                    replacement_val, _ = self._emit_expr(expr.args[1], env, lines)
+                    replace_all = "1" if callee.prop == "replaceAll" else "0"
+                    out = self.tmp()
+                    if search_type == REGEX:
+                        lines.append(
+                            f"  {out} = call ptr @festina_regex_replace(ptr {search_val}, ptr {obj_val}, "
+                            f"ptr {replacement_val}, i1 {replace_all})"
+                        )
+                    else:
+                        # search_type is TEXT, or None from a bare `null`
+                        # literal (festina_str_replace treats a NULL
+                        # search pointer defensively -- see the runtime).
+                        lines.append(
+                            f"  {out} = call ptr @festina_str_replace(ptr {obj_val}, ptr {search_val}, "
+                            f"ptr {replacement_val}, i1 {replace_all})"
+                        )
+                    return out, TEXT
         raise CodegenError("only calls to named functions are implemented",
                             file=self.filename, line=getattr(expr, "line", 0))
+
+    # ---- regex() / .test() / .match() / .replace() / .replaceAll() (claude.md #67-68) ----
+    def _emit_regex_call(self, expr, env, lines):
+        """claude.md #67: regex(pattern:text) / regex(pattern:text,
+        flags:text) -> regex. Compiles the pattern via POSIX regcomp()
+        at the call site, every time it's evaluated -- no caching across
+        calls, the same tradeoff already accepted for sqlite()'s
+        prepared statements (see _emit_sqlite_call), so a regex() call
+        inside a hot loop recompiles every iteration; documented as a
+        known gap rather than solved here (claude.md #54's ambiguity
+        rule -- correctness over micro-optimizing something #67 doesn't
+        ask for). An invalid pattern fails at runtime (festina_fail(),
+        via the C runtime's regcomp() error handling), not at compile
+        time -- the Python compiler doesn't itself validate regex
+        syntax (claude.md #67's own words)."""
+        callee = expr.callee
+        if not expr.args:
+            raise CodegenError("regex() requires at least a pattern argument",
+                                file=self.filename, line=callee.line)
+        pattern_val, pattern_type = self._emit_expr(expr.args[0], env, lines)
+        if pattern_type != TEXT:
+            raise CodegenError(
+                f"regex()'s pattern argument must be text, found {types_mod.type_name(pattern_type)}",
+                file=self.filename, line=callee.line)
+        if len(expr.args) > 1:
+            flags_val, flags_type = self._emit_expr(expr.args[1], env, lines)
+            if flags_type != TEXT:
+                raise CodegenError(
+                    f"regex()'s flags argument must be text, found {types_mod.type_name(flags_type)}",
+                    file=self.filename, line=callee.line)
+        else:
+            flags_val = self.string_const("")
+        out = self.tmp()
+        lines.append(f"  {out} = call ptr @festina_regex_compile(ptr {pattern_val}, ptr {flags_val})")
+        return out, REGEX
 
     # ---- sqlite() queries (claude.md #32-34) ----
     def _emit_sqlite_call(self, expr, env, lines, expected_type):

@@ -29,10 +29,10 @@ Festina is under active development. Everything else in this README
 describes the full target language from `claude.md`; this section is
 the ground truth for what actually runs today.
 
-**Test suite:** 273 tests, 0 failed (`pytest tests/`) — 271 passed/2
+**Test suite:** 307 tests, 0 failed (`pytest tests/`) — 305 passed/2
 skipped by default (the 2 need `pyinstaller`, an opt-in build-time-only
 dependency for the packaged-binary tests; see [Setup](#setup)), or all
-273 passed/0 skipped with it installed.
+307 passed/0 skipped with it installed.
 See [`tests/`](tests/) and [`tests/CONTRACT.md`](tests/CONTRACT.md) for
 the spec-driven suite this is measured against — every test cites the
 `claude.md` section it checks.
@@ -56,6 +56,7 @@ runtime, and *runs* as a standalone executable (no Python or the
 | **Postfix `++`/`--` (`claude.md #66`)** | ✅ mutable `int` variables only, compile-time-checked |
 | String interpolation | ✅ `` `Hello ${name}` `` |
 | `log()` / `fail()` | ✅ |
+| **Regex, string match/replace (`claude.md #67/#68`)** | ✅ `regex()`, `.test()`, `.match()`, `.replace()`/`.replaceAll()` (search may be text or regex) — POSIX extended regular expressions (no bundled/external regex engine — see [Setup](#setup)); no capture groups, backreferences, or non-greedy quantifiers (POSIX ERE's own limits, not something worked around here) |
 | Structs | ✅ declaration, field read/write, passed to and returned from functions |
 | **Arrays (`arr[T]`)** | ✅ literals, indexed read/write by any index expression, nesting, `.length` (`claude.md #63`), as function params/return values, as struct-array elements — see the caveats below and in `festina/codegen.py`'s module docstring |
 | **Numeric conversion (`claude.md #55/#56`)** | ✅ int and float never mix implicitly, in any operator (arithmetic *or* comparison) — `int.toFloat()` and `Math.floor/ceil/round/trunc(x)` are the only conversions, both compile-time-checked and runtime-tested |
@@ -131,12 +132,14 @@ scoped out rather than silently missing:
   same-named user struct unlikely — but Festina's identifier grammar
   still technically permits a user to write `struct _FestinaArray`, so
   this lowers the odds without eliminating the possibility.
-- `drawRect`/`drawCircle`/`drawText`/`drawImage`/`loadImage`/`loadAudio`
-  aren't reserved words (unlike `log`/`fail`/`sqlite`, which are lexer
-  keywords) — declaring a function with one of those names silently
-  shadows the builtin at every call site rather than erroring. Left as
-  is since none of them are implemented yet anyway; worth reserving
-  properly once they are.
+- `drawRect`/`drawCircle`/`drawText`/`drawImage`/`loadImage`/`loadAudio`/
+  `regex` aren't reserved words (unlike `log`/`fail`/`sqlite`, which are
+  lexer keywords) — declaring a function with one of those names
+  silently shadows the builtin at every call site rather than erroring.
+  Left as is for the graphics/audio functions since none of them are
+  implemented yet anyway; `regex` follows the same convention
+  deliberately, matching how `loadImage`/`loadAudio` are already
+  builtin *functions*, not dedicated keywords or literal syntax.
 - `sqlite()`'s optional second argument (bound parameters) must be a
   literal array expression (e.g. `sqlite(sql, [1, 'Patrick'])`), not an
   arbitrary `arr[T]`-typed variable or expression — claude.md #33's own
@@ -148,6 +151,15 @@ scoped out rather than silently missing:
   runtime one. Query result columns map onto a declared table's fields
   *by position*, not by name, matching claude.md #34's own `SELECT *`
   example.
+- `regex(pattern)` compiles the pattern (via POSIX `regcomp()`) fresh at
+  every call site — there's no caching by pattern text, so a `regex()`
+  call inside a loop recompiles every iteration. Same tradeoff already
+  accepted for `sqlite()`'s prepared statements (also re-prepared per
+  call, not cached); worth revisiting if it matters for a real program,
+  but not solved here. An invalid pattern is a runtime error (`fail()`,
+  with the underlying `regcomp()` error message), not a compile-time
+  one — claude.md #67 says so explicitly, since the Python compiler
+  doesn't parse regex syntax itself.
 
 ### Not implemented yet
 
@@ -175,6 +187,11 @@ fresh system:
 
 Missing any of these fails with a specific, actionable error (claude.md
 #59) rather than a raw traceback — naming the tool and how to get it.
+Notably absent: anything for `regex()`/`.test()`/`.match()`/`.replace()`
+(claude.md #67/#68) — they're built on POSIX extended regular
+expressions (`<regex.h>`), already part of libc everywhere this list's
+C compiler already requires libc, so regex support adds zero new
+dependencies.
 
 Debian/Ubuntu:
 
@@ -215,7 +232,7 @@ sure.
 
 ```bash
 pip install -r requirements-dev.txt   # pytest, for the test suite
-pytest tests/                         # 271 passed, 2 skipped (see Test suite above)
+pytest tests/                         # 305 passed, 2 skipped (see Test suite above)
 
 ./bin/festina examples/hello.f -o hello
 ./hello
@@ -521,6 +538,54 @@ int i = 0
 i++
 i--
 ```
+
+## Regex and String Matching
+
+> **Status:** implemented — `regex()`, `.test()`, `.match()`,
+> `.replace()`/`.replaceAll()`, backed by POSIX extended regular
+> expressions (no bundled or external regex engine — see
+> [Setup](#setup)). No capture groups, backreferences, or non-greedy
+> quantifiers (POSIX ERE's own limits). See
+> [Implementation Status](#implementation-status).
+
+A regex value is created with the global `regex()` function — there's
+no `/pattern/` literal syntax, `regex()` is a global function like
+`sqlite()` and `loadImage()`:
+
+```festina
+regex digits = regex('[0-9]+')
+```
+
+An optional second argument supplies flags as text; the only supported
+flag is `i` (case-insensitive):
+
+```festina
+regex greeting = regex('^hello$', 'i')
+```
+
+Test whether a pattern matches anywhere in a value:
+
+```festina
+log(digits.test('room 42'))
+```
+
+Get the first matching substring, or `null` if there's no match:
+
+```festina
+text found = 'room 42'.match(digits)
+```
+
+Replace the first match, or every match, with a new value — `search`
+may be either text (a literal substring match) or a `regex`:
+
+```festina
+text a = 'room 42'.replace('room', 'suite')
+text b = 'a1b2c3'.replaceAll(regex('[0-9]'), '-')
+```
+
+`replace()`/`replaceAll()` return a new value; the original is
+unchanged. If there's no match, they return the original value
+unchanged too.
 
 ## Graphics
 

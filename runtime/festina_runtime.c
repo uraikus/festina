@@ -1,11 +1,10 @@
 /*
  * Festina native runtime -- claude.md #41 (log), #42 (fail), #45 (string
- * interpolation), #29-31 (automatic SQLite database + schema sync).
+ * interpolation), #29-31 (automatic SQLite database + schema sync),
+ * #67-68 (regex, string match/replace).
  *
  * This is a from-scratch runtime for the statically typed Festina
- * language, kept deliberately separate from runtime/runtime.c (the
- * dynamically typed JSValue runtime that backs the older, unrelated
- * compiler/jsc.py JS-subset prototype).
+ * language.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -353,4 +352,184 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
 
     *out_length = count;
     *out_data = rows;
+}
+
+/* ---- regex(), .test(), .match(), .replace()/.replaceAll() -- claude.md #67-68 ---- */
+
+void *festina_regex_compile(const char *pattern, const char *flags) {
+    if (!pattern) pattern = "";
+    if (!flags) flags = "";
+    regex_t *compiled = malloc(sizeof(regex_t));
+    if (!compiled) festina_fail("out of memory in festina_regex_compile");
+
+    int cflags = REG_EXTENDED;
+    if (strchr(flags, 'i')) cflags |= REG_ICASE;
+
+    int rc = regcomp(compiled, pattern, cflags);
+    if (rc != 0) {
+        char errbuf[256];
+        regerror(rc, compiled, errbuf, sizeof(errbuf));
+        char msg[512];
+        snprintf(msg, sizeof(msg), "invalid regex pattern '%s': %s", pattern, errbuf);
+        free(compiled);
+        festina_fail(msg);
+    }
+    return compiled;
+}
+
+int8_t festina_regex_test(void *compiled, const char *text) {
+    if (!compiled) return 0;
+    if (!text) text = "";
+    return regexec((regex_t *)compiled, text, 0, NULL, 0) == 0;
+}
+
+char *festina_regex_match(void *compiled, const char *text) {
+    if (!compiled || !text) return NULL;
+    regmatch_t m;
+    if (regexec((regex_t *)compiled, text, 1, &m, 0) != 0) return NULL;
+    regoff_t len = m.rm_eo - m.rm_so;
+    char *out = malloc((size_t)len + 1);
+    if (!out) festina_fail("out of memory in festina_regex_match");
+    memcpy(out, text + m.rm_so, (size_t)len);
+    out[len] = '\0';
+    return out;
+}
+
+char *festina_str_replace(const char *text, const char *search,
+                           const char *replacement, int8_t replace_all) {
+    if (!text) text = "";
+    if (!replacement) replacement = "";
+    if (!search || !*search) {
+        /* claude.md #68: no match -> return the original value unchanged. */
+        return strdup(text);
+    }
+
+    size_t search_len = strlen(search);
+    size_t replacement_len = strlen(replacement);
+    size_t capacity = strlen(text) + replacement_len + 1;
+    char *out = malloc(capacity);
+    if (!out) festina_fail("out of memory in festina_str_replace");
+    size_t out_len = 0;
+    const char *cursor = text;
+    int did_replace = 0;
+
+    while (1) {
+        /* Once a single (non-"All") replacement has happened, treat
+         * every further position as "no match" so the rest of `cursor`
+         * gets copied through unchanged below. */
+        const char *found = (did_replace && !replace_all) ? NULL : strstr(cursor, search);
+        if (!found) break;
+
+        size_t prefix_len = (size_t)(found - cursor);
+        size_t needed = out_len + prefix_len + replacement_len + 1;
+        if (needed > capacity) {
+            while (capacity < needed) capacity *= 2;
+            char *grown = realloc(out, capacity);
+            if (!grown) festina_fail("out of memory in festina_str_replace");
+            out = grown;
+        }
+        memcpy(out + out_len, cursor, prefix_len);
+        out_len += prefix_len;
+        memcpy(out + out_len, replacement, replacement_len);
+        out_len += replacement_len;
+
+        cursor = found + search_len;
+        did_replace = 1;
+    }
+
+    size_t rest_len = strlen(cursor);
+    size_t needed = out_len + rest_len + 1;
+    if (needed > capacity) {
+        capacity = needed;
+        char *grown = realloc(out, capacity);
+        if (!grown) festina_fail("out of memory in festina_str_replace");
+        out = grown;
+    }
+    memcpy(out + out_len, cursor, rest_len + 1);
+
+    return out;
+}
+
+char *festina_regex_replace(void *compiled, const char *text,
+                             const char *replacement, int8_t replace_all) {
+    if (!text) text = "";
+    if (!replacement) replacement = "";
+    if (!compiled) return strdup(text);
+    regex_t *re = (regex_t *)compiled;
+
+    size_t replacement_len = strlen(replacement);
+    size_t capacity = strlen(text) + replacement_len + 1;
+    char *out = malloc(capacity);
+    if (!out) festina_fail("out of memory in festina_regex_replace");
+    size_t out_len = 0;
+    const char *cursor = text;
+    int did_replace = 0;
+
+    while (1) {
+        regmatch_t m;
+        int no_match;
+        if (did_replace && !replace_all) {
+            no_match = 1;
+        } else {
+            /* REG_NOTBOL once we're past the true start of the string --
+             * otherwise a `^`-anchored pattern would incorrectly match
+             * again at the start of *this* remaining substring on every
+             * later iteration of replaceAll. */
+            int eflags = (cursor == text) ? 0 : REG_NOTBOL;
+            no_match = regexec(re, cursor, 1, &m, eflags) != 0;
+        }
+        if (no_match) break;
+
+        size_t prefix_len = (size_t)m.rm_so;
+        size_t match_len = (size_t)(m.rm_eo - m.rm_so);
+        size_t needed = out_len + prefix_len + replacement_len + 1;
+        if (needed > capacity) {
+            while (capacity < needed) capacity *= 2;
+            char *grown = realloc(out, capacity);
+            if (!grown) festina_fail("out of memory in festina_regex_replace");
+            out = grown;
+        }
+        memcpy(out + out_len, cursor, prefix_len);
+        out_len += prefix_len;
+        memcpy(out + out_len, replacement, replacement_len);
+        out_len += replacement_len;
+
+        const char *match_end = cursor + m.rm_eo;
+        did_replace = 1;
+        if (match_len > 0) {
+            cursor = match_end;
+            continue;
+        }
+        /* Zero-length match (e.g. pattern "x*" matching where there's no
+         * 'x') -- without advancing past it, the next regexec call would
+         * find the exact same empty match at the exact same position
+         * forever. Copy the one byte at match_end through untouched and
+         * advance past it, same approach JS/Python's regex replace use
+         * for this case. */
+        if (*match_end == '\0') {
+            cursor = match_end;
+            break;
+        }
+        size_t needed2 = out_len + 2;
+        if (needed2 > capacity) {
+            capacity = needed2;
+            char *grown = realloc(out, capacity);
+            if (!grown) festina_fail("out of memory in festina_regex_replace");
+            out = grown;
+        }
+        out[out_len++] = *match_end;
+        cursor = match_end + 1;
+    }
+
+    size_t rest_len = strlen(cursor);
+    size_t needed = out_len + rest_len + 1;
+    if (needed > capacity) {
+        capacity = needed;
+        char *grown = realloc(out, capacity);
+        if (!grown) festina_fail("out of memory in festina_regex_replace");
+        out = grown;
+    }
+    memcpy(out + out_len, cursor, rest_len + 1);
+
+    return out;
 }

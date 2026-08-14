@@ -33,7 +33,14 @@ doesn't define either). Multi-file compilation (claude.md #5-6) is
 implemented too: `festina.imports.build_program` resolves the full
 import graph and merges every file into one compilation unit, and
 `bin/festina`/`festina.cli.compile_file` actually call it now (they
-used to only ever compile the single entry file).
+used to only ever compile the single entry file). So is claude.md
+#67/#68 (regex, string match/replace): `regex()` is a builtin function
+(like `sqlite()`/`loadImage()`, not a dedicated `/pattern/` literal),
+`.test()`, `.match()`, and `.replace()`/`.replaceAll()` are recognized
+Call-on-Member patterns the same way `Math.floor`/`int.toFloat()`
+already are, and the whole feature is built on POSIX extended regular
+expressions (`<regex.h>`, already part of libc) rather than a bundled
+or external regex engine, per claude.md #59.
 
 "Real compilation, minimal setup" stages 1, 2, and 3 -- claude.md #59,
 added alongside these stages to make the requirement explicit rather
@@ -52,8 +59,8 @@ working end to end). Per #59's fourth point, `festina/cli.py`'s
 `_run_tool` also turns a genuinely missing dependency (pkg-config, or
 any C compiler) into a specific, actionable error naming it and how to
 install it, rather than a raw exception -- verified directly by hiding
-each tool from PATH in turn. All 273 tests in this directory pass
-against it: 271 given a working C compiler, plus 2 more
+each tool from PATH in turn. All 307 tests in this directory pass
+against it: 305 given a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too -- both skip
 cleanly, independently, without either dependency (see below).
 
@@ -174,6 +181,22 @@ import graph actually compiling once rather than emitting duplicate
 LLVM globals for a table declared in the commonly-imported file, and
 schema sync still firing for a table declared in an imported file.
 
+`tests/test_regex.py` covers claude.md #67/#68 (regex, string
+match/replace) at the parser/semantic level, same split as
+`test_loops.py`/`test_numeric_conversion.py` -- argument-count and
+argument-type checking for `.test()`/`.match()`/`.replace()`/
+`.replaceAll()`, and that calling any of them on the wrong receiver
+type (e.g. `.match()` on `int`) is rejected the same way an undefined
+struct field access already is. `test_codegen.py`'s `TestRegex` covers
+the same feature end to end, including two cases that are easy to get
+subtly wrong in the runtime rather than the compiler: a pattern that
+can match zero-width (`x*` against text with no `x`) must not hang --
+verified by actually letting `compile_and_run`'s subprocess timeout be
+the judge, not just eyeballing the output -- and an invalid pattern
+must fail at *runtime* with a clear message (claude.md #67 says so
+explicitly), not at compile time, since nothing in this pipeline
+parses regex syntax itself before handing it to `regcomp()`.
+
 ## Public API implemented
 
 ```
@@ -205,8 +228,11 @@ festina/
 
     types.py
         PrimitiveType(name) / StructType(name) / TableType(name) /
-        ArrayType(element) / ImageType() / AudioType()   -- frozen
-        dataclasses, so equality/hashing work out of the box.
+        ArrayType(element) / ImageType() / AudioType() / RegexType()
+        -- frozen dataclasses, so equality/hashing work out of the box.
+        RegexType() has no fields (claude.md #67: created only via the
+        regex() builtin, never a dedicated literal, so there's only one
+        shape of it -- unlike StructType/TableType).
         type_name(t) -> str   # for error messages, e.g. "arr[int]"
 
     parser.py
@@ -257,7 +283,14 @@ festina/
         # assigning to it is rejected before the generic Assign
         # type-check runs (that check alone can't tell a read from a
         # write target). claude.md #66: PostfixOp requires its operand be
-        # an Identifier resolving to a non-constant int.
+        # an Identifier resolving to a non-constant int. claude.md #67/
+        # #68: regex() is a BUILTIN_FUNCTIONS entry (like sqlite()/
+        # loadImage(), returning RegexType()); pattern.test(text)/
+        # value.match(regex)/value.replace(text-or-regex, text)/
+        # .replaceAll(...) are recognized Call-on-Member patterns, same
+        # family as Math.floor/int.toFloat() above -- checked by name
+        # against the receiver's inferred type, not a real method table
+        # (Festina has no general concept of methods on primitives).
 
     sqlite_schema.py
         TYPE_MAP: dict[str, str]                        # claude.md #30
@@ -302,11 +335,17 @@ festina/
         # round/trunc (LLVM intrinsics) and int.toFloat() (sitofp),
         # division/modulo by zero returning a reserved null sentinel
         # (INT_NULL_CONST / FLOAT_NULL_CONST) via real control flow rather
-        # than a trapping instruction. Raises CodegenError (a CompileError
-        # subclass, category="not implemented") for graphics, audio, and
-        # event handlers -- and also (category="not implemented" but a
-        # genuine compile-time restriction, not a missing feature) when
-        # sqlite()'s second argument isn't a literal array expression.
+        # than a trapping instruction, and regex()/.test()/.match()/
+        # .replace()/.replaceAll() (_emit_regex_call plus the same
+        # Member-call dispatch Math.floor/int.toFloat() use -- a regex
+        # value is `ptr` to an opaque, POSIX regex_t compiled fresh at
+        # every regex() call site via the festina_runtime C helpers; no
+        # IR-level machinery of its own, it's all in the runtime). Raises
+        # CodegenError (a CompileError subclass, category="not
+        # implemented") for graphics, audio, and event handlers -- and
+        # also (category="not implemented" but a genuine compile-time
+        # restriction, not a missing feature) when sqlite()'s second
+        # argument isn't a literal array expression.
 
     llvm_backend.py
         def available() -> bool           # libLLVM found+loaded in this process?
@@ -370,12 +409,25 @@ slots, exactly the layout codegen's flat `field_index * 8` byte GEP
 reads back, so no struct-alignment rule needs to be kept in sync between
 the two languages; see festina_runtime.h's doc comment on
 `festina_sqlite_collect_rows` and codegen.py's module docstring's "Query
-rows" note, which describe the same design from each side).
+rows" note, which describe the same design from each side), and
+`festina_regex_compile`/`_test`/`_match`, `festina_str_replace`,
+`festina_regex_replace` (#67/#68: regex, string match/replace -- POSIX
+`<regex.h>`, no bundled or external regex engine; see
+festina_runtime.h's doc comment for why, and for how "no match" is
+represented -- a plain NULL `char*`, since that's already exactly how
+Festina represents a null `text` value, no separate sentinel needed
+the way int/float require one). `_str_replace`/`_regex_replace` both
+guard against a zero-length match looping forever (a pattern like
+`x*` can match zero-width at every position) by forcing progress one
+byte at a time when that happens -- verified directly in
+`tests/test_codegen.py::TestRegex::test_replace_all_zero_width_match_does_not_hang`,
+which would time out (not just assert wrong output) if this were ever
+broken again.
 
 ## Running
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 271 passed, 2 skipped (needs a C compiler; the
+pytest tests/                          # 305 passed, 2 skipped (needs a C compiler; the
                                         # 2 skips need `pip install pyinstaller` too)
 ```

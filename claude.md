@@ -1490,3 +1490,72 @@ These operators are valid only on mutable integer variables.
 The operand must be int.
 
 Using increment or decrement on any other type is a compile-time error.
+
+
+67. REGULAR EXPRESSIONS
+
+The regex type is:
+
+regex
+
+A regex value is created with the global regex() function.
+
+Example:
+
+regex pattern = regex('^[a-z]+$')
+
+An optional second argument supplies flags as text. The only supported flag is:
+
+i -- case-insensitive matching
+
+Example:
+
+regex pattern = regex('^[a-z]+$', 'i')
+
+No regex literal syntax (for example /pattern/) is used -- regex() is a global function like sqlite() and loadImage(), not a dedicated grammar construct.
+
+A regex value supports:
+
+pattern.test(value:text)
+
+test() returns bool: true if the pattern matches anywhere in value, false otherwise.
+
+Example:
+
+regex digits = regex('[0-9]+')
+log(digits.test('room 42'))
+
+An invalid pattern is a runtime error (fail()), not a compile-time error -- the compiler does not itself validate regex syntax.
+
+
+68. STRING MATCH AND REPLACE
+
+Every text value supports:
+
+value.match(pattern:regex)
+
+match() returns the first substring of value that pattern matches, or null if there is no match. The return type is text.
+
+Example:
+
+regex digits = regex('[0-9]+')
+text found = 'room 42'.match(digits)
+log(found)
+
+Every text value also supports:
+
+value.replace(search, replacement:text)
+value.replaceAll(search, replacement:text)
+
+search may be either text or regex.
+
+replace() replaces the first match with replacement. replaceAll() replaces every match with replacement. Both return a new text value; the original value is unchanged.
+
+Examples:
+
+text a = 'room 42'.replace('room', 'suite')
+text b = 'a1b2c3'.replaceAll(regex('[0-9]'), '-')
+
+If search is text, matching is a literal substring match, not a pattern match.
+
+If there is no match, replace() and replaceAll() return the original value unchanged.
