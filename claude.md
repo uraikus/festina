@@ -1523,21 +1523,31 @@ The regex type is:
 
 regex
 
-A regex value is created with the global regex() function.
+A regex value is created with a JavaScript-style literal:
+
+/pattern/flags
 
 Example:
 
-regex pattern = regex('^[a-z]+$')
+regex pattern = /^[a-z]+$/
 
-An optional second argument supplies flags as text. The only supported flag is:
+flags is optional and, if present, immediately follows the closing `/` with no space. The supported flags are:
 
 i -- case-insensitive matching
+g -- accepted for familiarity with JavaScript, but has no additional effect: replace()/replaceAll() below already say "first match" vs. "every match" explicitly, the same distinction JavaScript's g flag controls implicitly elsewhere.
 
 Example:
 
-regex pattern = regex('^[a-z]+$', 'i')
+regex pattern = /^[a-z]+$/i
 
-No regex literal syntax (for example /pattern/) is used -- regex() is a global function like sqlite() and loadImage(), not a dedicated grammar construct.
+Any flag letter other than i or g is a compile-time error.
+
+A pattern/flags known only at runtime (built from a variable, a template, ...) cannot use the literal syntax -- for that case, the global regex() function is still available, taking the same two arguments as text:
+
+regex pattern = regex(userSuppliedPattern)
+regex pattern = regex(userSuppliedPattern, userSuppliedFlags)
+
+An invalid pattern (either form) is a runtime error (fail()), not a compile-time error -- the compiler does not itself validate regex syntax, for a literal any more than for regex().
 
 A regex value supports:
 
@@ -1547,10 +1557,8 @@ test() returns bool: true if the pattern matches anywhere in value, false otherw
 
 Example:
 
-regex digits = regex('[0-9]+')
+regex digits = /[0-9]+/
 log(digits.test('room 42'))
-
-An invalid pattern is a runtime error (fail()), not a compile-time error -- the compiler does not itself validate regex syntax.
 
 
 68. STRING MATCH AND REPLACE
@@ -1563,7 +1571,7 @@ match() returns the first substring of value that pattern matches, or null if th
 
 Example:
 
-regex digits = regex('[0-9]+')
+regex digits = /[0-9]+/
 text found = 'room 42'.match(digits)
 log(found)
 
@@ -1579,7 +1587,7 @@ replace() replaces the first match with replacement. replaceAll() replaces every
 Examples:
 
 text a = 'room 42'.replace('room', 'suite')
-text b = 'a1b2c3'.replaceAll(regex('[0-9]'), '-')
+text b = 'a1b2c3'.replaceAll(/[0-9]/, '-')
 
 If search is text, matching is a literal substring match, not a pattern match.
 

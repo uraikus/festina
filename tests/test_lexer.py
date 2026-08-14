@@ -94,6 +94,86 @@ class TestPostfixOperators:
         assert [t.value for t in tokens] == ["i", "+", "+", 1]
 
 
+class TestRegexLiterals:
+    """claude.md #67: /pattern/flags -- the classic JS lexical ambiguity
+    with the division operator, resolved by treating a leading '/' as a
+    regex literal everywhere EXCEPT immediately after something that
+    could itself end an expression (an identifier, a literal, `)`/`]`,
+    postfix ++/--) -- see lexer.py's _regex_literal_may_start_here."""
+
+    def test_regex_literal_is_a_single_token(self, lexer):
+        tokens = [t for t in lexer.tokenize("/foo/") if t.type != "EOF"]
+        assert [t.type for t in tokens] == ["REGEX"]
+        assert tokens[0].value == ("foo", "")
+
+    def test_regex_literal_captures_its_flags(self, lexer):
+        tokens = lexer.tokenize(r"/\w+/gi")
+        regex_tok = next(t for t in tokens if t.type == "REGEX")
+        assert regex_tok.value == (r"\w+", "gi")
+
+    def test_escaped_slash_in_pattern_is_unescaped(self, lexer):
+        # \/ is JS's own delimiter-escape -- POSIX regcomp() never wants
+        # '/' escaped at all, so this becomes a literal '/' in the
+        # pattern text, not the two characters "\/".
+        tokens = lexer.tokenize(r"/a\/b/")
+        regex_tok = next(t for t in tokens if t.type == "REGEX")
+        assert regex_tok.value == ("a/b", "")
+
+    def test_other_backslash_sequences_pass_through_untouched(self, lexer):
+        tokens = lexer.tokenize(r"/\d\s\./")
+        regex_tok = next(t for t in tokens if t.type == "REGEX")
+        assert regex_tok.value == (r"\d\s\.", "")
+
+    @pytest.mark.parametrize("prefix, expected_types", [
+        ("(", ["LPAREN", "REGEX"]),
+        ("[", ["LBRACK", "REGEX"]),
+        ("=", ["OP", "REGEX"]),
+        ("==", ["OP", "REGEX"]),
+        ("&&", ["OP", "REGEX"]),
+        (",", ["OP", "REGEX"]),
+        ("return ", ["return", "REGEX"]),
+    ])
+    def test_regex_literal_starts_after_an_expression_boundary(self, lexer, prefix, expected_types):
+        tokens = [t for t in lexer.tokenize(f"{prefix}/x/") if t.type != "EOF"]
+        assert [t.type for t in tokens] == expected_types
+
+    @pytest.mark.parametrize("source, expected_types", [
+        ("a / b", ["IDENT", "OP", "IDENT"]),
+        ("5 / b", ["NUMBER", "OP", "IDENT"]),
+        ("'x' / b", ["STRING", "OP", "IDENT"]),
+        ("(a) / b", ["LPAREN", "IDENT", "RPAREN", "OP", "IDENT"]),
+        ("a[0] / b", ["IDENT", "LBRACK", "NUMBER", "RBRACK", "OP", "IDENT"]),
+        ("a++ / b", ["IDENT", "OP", "OP", "IDENT"]),
+        ("true / b", ["true", "OP", "IDENT"]),
+        ("a / b / c", ["IDENT", "OP", "IDENT", "OP", "IDENT"]),
+    ])
+    def test_a_slash_after_an_expression_boundary_is_division(self, lexer, source, expected_types):
+        tokens = [t for t in lexer.tokenize(source) if t.type != "EOF"]
+        assert [t.type for t in tokens] == expected_types
+
+    def test_line_comment_still_wins_over_a_regex_literal(self, lexer):
+        # '//' must never be mistaken for an (impossible, empty-pattern)
+        # regex literal -- it's always a comment, same as real JS.
+        tokens = [t for t in lexer.tokenize("x = // not a regex\n1") if t.type != "EOF"]
+        assert [t.type for t in tokens] == ["IDENT", "OP", "NUMBER"]
+
+    def test_block_comment_still_wins_over_a_regex_literal(self, lexer):
+        tokens = [t for t in lexer.tokenize("x = /* not a regex */ 1") if t.type != "EOF"]
+        assert [t.type for t in tokens] == ["IDENT", "OP", "NUMBER"]
+
+    def test_unterminated_regex_falls_back_to_division(self, lexer):
+        # '/' right after '=' is exactly where a regex literal is
+        # normally allowed to start -- but with no closing '/' before
+        # the newline, this isn't a valid one, so it must fall back to
+        # lexing '/' as plain division instead of raising or misparsing.
+        tokens = [t for t in lexer.tokenize("x = /foo\nbar") if t.type != "EOF"]
+        assert [t.type for t in tokens] == ["IDENT", "OP", "OP", "IDENT", "IDENT"]
+
+    def test_regex_literal_inside_template_interpolation(self, lexer):
+        tokens = lexer.tokenize("`${/a+/.test(x)}`")
+        assert any(t.type == "REGEX" and t.value == ("a+", "") for t in tokens)
+
+
 class TestSourceFileConvention:
     """claude.md #4: Festina source files use the .f extension."""
 

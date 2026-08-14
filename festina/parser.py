@@ -12,6 +12,21 @@ TYPE_KEYWORDS = lexer_mod.PRIMITIVE_TYPE_KEYWORDS | {"img", "aud"}
 
 _IMPORT_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+\.f$")
 
+# claude.md #67: /pattern/flags literal flags. Unlike regex()'s flags
+# *argument* (an arbitrary runtime text expression the compiler can't
+# inspect), a literal's flags are plain text known at parse time, so
+# they can -- and should -- be validated right here, the same way any
+# other syntax error is. 'i' is meaningful (case-insensitive matching,
+# same as regex()'s own 'i' flag); 'g' is accepted for familiarity (real
+# JS code reaches for it out of habit) but does nothing extra here --
+# .replace() vs .replaceAll() (claude.md #68) already say "first match"
+# vs "every match" explicitly, the same distinction JS's 'g' flag
+# controls implicitly, so there's no separate behavior left for 'g' to
+# turn on. Anything else (m/s/u/y/d, JS's own further flags) isn't
+# supported by the POSIX-regex-backed runtime this compiles down to, so
+# it's a clear compile error rather than a silently-ignored letter.
+_SUPPORTED_REGEX_FLAGS = frozenset("gi")
+
 
 class _ParseError(Exception):
     def __init__(self, tok, message):
@@ -454,6 +469,22 @@ class Parser:
             return ast.StringLit(t.value)
         if t.type == "TSTRING_START":
             return self.parse_template()
+        if t.type == "REGEX":
+            self.eat()
+            pattern, flags = t.value
+            seen = set()
+            for f in flags:
+                if f not in _SUPPORTED_REGEX_FLAGS:
+                    raise self.err(
+                        t, "invalid syntax",
+                        f"unsupported regex flag '{f}' -- only 'i' (case-insensitive) "
+                        f"and 'g' (accepted for familiarity, but has no additional effect: "
+                        f"claude.md #68's replace()/replaceAll() already say first-match vs. "
+                        f"every-match explicitly) are supported")
+                if f in seen:
+                    raise self.err(t, "invalid syntax", f"duplicate regex flag '{f}'")
+                seen.add(f)
+            return ast.RegexLit(pattern, flags, t.line, t.column)
         if t.type == "true":
             self.eat()
             return ast.BoolLit(True)
