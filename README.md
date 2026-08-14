@@ -7,7 +7,7 @@ overhead, and the boilerplate. Festina compiles through LLVM to a real,
 standalone executable — with SQLite, graphics, audio, and JS-style
 timers built directly into the language, not bolted on as libraries.
 
-[![Tests](https://img.shields.io/badge/tests-589%20passing-brightgreen)](tests/CONTRACT.md)
+[![Tests](https://img.shields.io/badge/tests-610%20passing-brightgreen)](tests/CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ```festina
@@ -29,7 +29,7 @@ whole `festina` runtime is one native binary, and it needs nothing
 Python or JIT-shaped to execute.
 
 ```bash
-bin/festina examples/greet.f -o greet && ./greet
+bin/festina compile examples/greet.f -o greet && ./greet
 ```
 
 ## Why Festina
@@ -60,9 +60,19 @@ bin/festina examples/greet.f -o greet && ./greet
 
 ```bash
 sudo apt install clang libsqlite3-dev libcairo2-dev libx11-dev libasound2-dev pkg-config
-bin/festina examples/hello.f -o hello
+bin/festina compile examples/hello.f -o hello
 ./hello
 ```
+
+Or skip the intermediate binary and just run it:
+
+```bash
+bin/festina run examples/hello.f
+```
+
+Not sure your machine has everything Festina needs? `bin/festina doctor`
+checks every dependency above and tells you exactly what's missing and
+how to install it — including whether `festina` itself is on `PATH` yet.
 
 That's the whole loop — see [setup.md](setup.md) for the full dependency
 breakdown (what's required vs. only-if-you-use-it), packaged-binary
@@ -135,7 +145,7 @@ cell, alternating X/O, real win detection) built entirely in Festina
 with nothing but `drawRect`/`drawText`/`on click`:
 
 ```bash
-bin/festina examples/tic_tac_toe.f -o tic_tac_toe && ./tic_tac_toe
+bin/festina compile examples/tic_tac_toe.f -o tic_tac_toe && ./tic_tac_toe
 ```
 
 | Example | What it shows |
@@ -174,7 +184,7 @@ needs.
 
 Festina is under active development, but not vaporware — the compiler
 frontend, LLVM codegen backend, and native C runtime are real and
-tested: **589 tests, 0 failures.** Every `claude.md` language construct
+tested: **610 tests, 0 failures.** Every `claude.md` language construct
 this project has committed to is implemented end to end, not just
 parsed. See [`tests/CONTRACT.md`](tests/CONTRACT.md) for exactly what's
 covered and how, and [todo.md](todo.md) for what's next (macOS, Windows,

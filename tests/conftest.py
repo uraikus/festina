@@ -255,6 +255,30 @@ def x_display():
 
 
 @pytest.fixture
+def path_without(tmp_path, monkeypatch):
+    """A PATH containing everything currently on PATH except the named
+    tool(s), by symlinking every other resolvable tool into an empty
+    dir and pointing PATH at just that dir. Shared between
+    test_codegen.py's TestMissingDependencyErrors (a real compile with a
+    tool hidden fails with a clear, actionable CompileError -- claude.md
+    #59) and test_cli.py's TestDoctor (festina doctor reports the exact
+    same tool as missing, with the exact same install hint, checked
+    proactively rather than only on a real compile failure)."""
+    def _make(*hidden_tools):
+        bin_dir = tmp_path / "bin_without_tool"
+        bin_dir.mkdir()
+        needed = {"python3", "bash", "sh", "env", "dirname", "basename",
+                  "pkg-config", "clang", "gcc", "cc", "ld", "as"}
+        for name in needed - set(hidden_tools):
+            found = shutil.which(name)
+            if found:
+                (bin_dir / name).symlink_to(found)
+        monkeypatch.setenv("PATH", str(bin_dir))
+        return str(bin_dir)
+    return _make
+
+
+@pytest.fixture
 def run_graphics_program(tmp_path, codegen, cli_mod, x_display):
     """Compile a Festina source string that opens the graphics canvas
     and run it (line-buffered, so log() output is visible without

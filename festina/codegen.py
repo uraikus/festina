@@ -393,6 +393,13 @@ class CodeGen:
                                                 # (festina.imports.build_program already extracted and
                                                 # validated its *position*; see _emit_main_and_entry
                                                 # for where this actually gets evaluated)
+        self._regex_lit_cache = {}             # id(ast.RegexLit node) -> its private cache global's
+                                                # name -- see _emit_cached_regex_lit; keyed by node
+                                                # identity (not pattern text) so two textually
+                                                # identical /pattern/flags literals at different
+                                                # source locations still each get their own slot,
+                                                # simpler than deduplicating by text and just as
+                                                # correct (each still only ever compiles once)
 
     # ---- naming ----
     def tmp(self):
@@ -954,17 +961,13 @@ class CodeGen:
             # this path uniformly assigned/coerced (see _emit_value_for).
             return "null", None
         if isinstance(expr, ast.RegexLit):
-            # claude.md #67: /pattern/flags -- compiles to exactly the
-            # same festina_regex_compile() call _emit_regex_call emits
-            # for regex(pattern, flags), just with both arguments already
-            # known string constants instead of arbitrary sub-expressions
-            # (a literal's pattern/flags are fixed at parse time, so
-            # there's no need to route through the general call-argument
-            # machinery _emit_regex_call uses for the dynamic case).
-            pattern_val = self._const_string(expr.pattern, lines)
-            flags_val = self._const_string(expr.flags, lines)
-            out = self.tmp()
-            lines.append(f"  {out} = call ptr @festina_regex_compile(ptr {pattern_val}, ptr {flags_val})")
+            # claude.md #67: /pattern/flags. Both arguments are known
+            # string constants (fixed at parse time, unlike regex()'s
+            # general call-argument case -- see _emit_regex_call), so
+            # unlike a dynamic regex() call this literal's compiled
+            # result never needs recomputing after the first time this
+            # exact node is reached; see _emit_cached_regex_lit.
+            out = self._emit_cached_regex_lit(expr, lines)
             return out, REGEX
         if isinstance(expr, ast.TemplateLit):
             return self._emit_template(expr, env, lines), TEXT
@@ -1850,20 +1853,84 @@ class CodeGen:
         self.func_defs.append("")
         return trampoline_name
 
+    # ---- regex literal caching (claude.md #67) ----
+    def _emit_cached_regex_lit(self, expr, lines):
+        """A /pattern/flags literal's pattern and flags are fixed at
+        parse time -- the same ast.RegexLit node always compiles to the
+        identical regcomp() result every single time it's reached, so
+        recompiling it on every execution (the previous behavior) was
+        pure wasted runtime work for something entirely knowable ahead
+        of time. This does NOT extend to the dynamic regex(pattern,
+        flags) builtin (_emit_regex_call below) -- there pattern is an
+        arbitrary runtime expression, so the same call site can
+        legitimately see a different pattern on each call (e.g.
+        regex(userPattern) inside a loop), and caching by AST node there
+        would silently keep reusing the FIRST pattern ever seen forever
+        -- a real correctness bug, not just a missed optimization -- so
+        that path intentionally stays uncached.
+
+        Caches per-AST-node (via self._regex_lit_cache) behind a private
+        global `ptr` initialized to null, using the standard lazy-init
+        null-check + phi shape _emit_ternary/_emit_logical already use
+        for conditional control flow: check the cache, branch to compile
+        only if it's still null, store the result, merge. This still
+        only compiles the pattern the first time *this* literal is
+        actually reached at runtime (a literal inside a branch that's
+        never taken, or a function that's never called, still costs
+        nothing -- unlike unconditionally precomputing every literal in
+        main()'s prologue, which would force eager evaluation regardless
+        of whether that code path ever runs), and every later reach of
+        the same literal (e.g. inside a loop) is just a load.
+        """
+        key = id(expr)
+        cache_global = self._regex_lit_cache.get(key)
+        if cache_global is None:
+            cache_global = f"@.regex.cache.{len(self._regex_lit_cache)}"
+            self._regex_lit_cache[key] = cache_global
+            self.extra_globals.append(f"{cache_global} = private global ptr null")
+
+        loaded = self.tmp()
+        lines.append(f"  {loaded} = load ptr, ptr {cache_global}")
+        is_null = self.tmp()
+        lines.append(f"  {is_null} = icmp eq ptr {loaded}, null")
+        compile_label = self.label("regex.compile")
+        done_label = self.label("regex.done")
+        lines.append(f"  br i1 {is_null}, label %{compile_label}, label %{done_label}")
+        load_pred = self.cur_block
+
+        self._start_block(compile_label, lines)
+        pattern_val = self._const_string(expr.pattern, lines)
+        flags_val = self._const_string(expr.flags, lines)
+        compiled = self.tmp()
+        lines.append(f"  {compiled} = call ptr @festina_regex_compile(ptr {pattern_val}, ptr {flags_val})")
+        lines.append(f"  store ptr {compiled}, ptr {cache_global}")
+        compile_pred = self.cur_block
+        lines.append(f"  br label %{done_label}")
+
+        self._start_block(done_label, lines)
+        out = self.tmp()
+        lines.append(f"  {out} = phi ptr [ {loaded}, %{load_pred} ], [ {compiled}, %{compile_pred} ]")
+        return out
+
     # ---- regex() / .test() / .match() / .replace() / .replaceAll() (claude.md #67-68) ----
     def _emit_regex_call(self, expr, env, lines):
         """claude.md #67: regex(pattern:text) / regex(pattern:text,
         flags:text) -> regex. Compiles the pattern via POSIX regcomp()
         at the call site, every time it's evaluated -- no caching across
         calls, the same tradeoff already accepted for sqlite()'s
-        prepared statements (see _emit_sqlite_call), so a regex() call
-        inside a hot loop recompiles every iteration; documented as a
-        known gap rather than solved here (claude.md #54's ambiguity
-        rule -- correctness over micro-optimizing something #67 doesn't
-        ask for). An invalid pattern fails at runtime (festina_fail(),
-        via the C runtime's regcomp() error handling), not at compile
-        time -- the Python compiler doesn't itself validate regex
-        syntax (claude.md #67's own words)."""
+        prepared statements (see _emit_sqlite_call). Unlike a /pattern/
+        flags literal (see _emit_cached_regex_lit above), pattern here
+        is an arbitrary runtime expression, so the same call site can
+        legitimately see a different pattern on different calls (e.g.
+        regex(userPattern) inside a loop) -- caching by call site would
+        be a correctness bug, not just a missed optimization, so a
+        regex() call inside a hot loop still recompiles every iteration;
+        documented as a known gap rather than solved here (claude.md
+        #54's ambiguity rule -- correctness over micro-optimizing
+        something #67 doesn't ask for). An invalid pattern fails at
+        runtime (festina_fail(), via the C runtime's regcomp() error
+        handling), not at compile time -- the Python compiler doesn't
+        itself validate regex syntax (claude.md #67's own words)."""
         callee = expr.callee
         if not expr.args:
             raise CodegenError("regex() requires at least a pattern argument",

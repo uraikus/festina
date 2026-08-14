@@ -110,4 +110,11 @@ listed here only so they aren't lost:
   structs (`claude.md #43` promises this; not implemented).
 - `bool x = null` still doesn't compile (unlike `int`/`float`, which
   were fixed — see [security.md](security.md)).
-- `regex()` recompiles its pattern on every call (no caching).
+- `regex(pattern, flags)` -- the dynamic builtin call, not a
+  `/pattern/flags` literal (those are now cached, compiled once per
+  source location on first reach -- see tests/CONTRACT.md) -- still
+  recompiles its pattern on every call. Inherent to it: pattern is a
+  general runtime expression, so the same call site can legitimately see
+  a different pattern on different calls (e.g. `regex(userPattern)`
+  inside a loop), and caching by call site the way the literal case does
+  would be a correctness bug, not a caching gap to close.
