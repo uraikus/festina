@@ -1,8 +1,22 @@
 """The `festina` compiler CLI -- claude.md #1, #47, #59.
 
-    festina main.f              # -> ./main (native executable)
-    festina main.f -o app       # -> ./app
-    festina main.f --emit-llvm  # -> prints LLVM IR to stdout, no linking
+    festina compile main.f              # -> ./main (native executable)
+    festina compile main.f -o app       # -> ./app
+    festina compile main.f --emit-llvm  # -> prints LLVM IR to stdout, no linking
+    festina run main.f                  # -> compiles to a throwaway temp
+                                         #    binary and runs it immediately,
+                                         #    forwarding its exit code
+    festina doctor                      # -> checks whether the C compiler/
+                                         #    pkg-config/sqlite3/etc this
+                                         #    module needs are installed, and
+                                         #    whether `festina` itself is on
+                                         #    PATH
+    festina help                        # -> this usage message
+
+Subcommands, not a single bare `festina file.f` -- deliberately: it keeps
+`festina run` (which executes the compiled result) unambiguous from
+`festina compile` (which never does), rather than inferring intent from
+flags the way e.g. `-o` present/absent would have to.
 
 Pipeline (claude.md #47): source -> parse -> semantic analysis -> LLVM IR
 -> object file -> link -> native executable. The resulting executable
@@ -332,6 +346,29 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
     return output_path
 
 
+def run_program(entry_path, cc="clang"):
+    """`festina run` -- compile entry_path to a throwaway temp executable
+    and run it immediately, the same way `go run`/`cargo run` do: no
+    lasting output file, stdin/stdout/stderr inherited directly from this
+    process (not captured) so an interactive program -- graphics, audio,
+    timers -- behaves exactly like it would if compiled with `festina
+    compile` and then run by hand. The temp binary is always cleaned up
+    afterward, compile failure or not.
+
+    A CompileError from compile_file (bad source, missing dependency,
+    ...) propagates to the caller unchanged, same as compile_file's own
+    contract -- main() below is what turns that into a clean stderr
+    message and a nonzero exit code, exactly like it already does for
+    `festina compile`. Returns the *compiled program's own* exit code on
+    success, so `festina run x.f && ...` composes the same way a real
+    compile-then-execute pair would."""
+    with tempfile.TemporaryDirectory(prefix="festina-run-") as d:
+        out_path = os.path.join(d, "program")
+        compile_file(entry_path, out_path, cc=cc)
+        result = subprocess.run([out_path])
+        return result.returncode
+
+
 def _compile_via_libllvm(ir, entry_path, output_path, cc, runtime_objects, link_libs):
     """Stage 3: compile IR to an object file ourselves via libLLVM. The
     only work left for `cc` is compiling the runtime translation units
@@ -388,16 +425,196 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
         os.unlink(ir_path)
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(prog="festina", description="Compile a Festina program to a native executable.")
-    ap.add_argument("input", help="entry .f file")
-    ap.add_argument("-o", "--output", help="output executable path (default: input filename without .f)")
-    ap.add_argument("--emit-llvm", action="store_true", help="print LLVM IR to stdout instead of linking")
+# ---- festina doctor -- claude.md #59's "fail loudly and clearly" applied
+# proactively, before a compile is even attempted, rather than only
+# reactively (that's what _run_tool/_pkg_config above already do). Reuses
+# the exact same install hints (_INSTALL_HINTS/_PKG_INSTALL_HINTS) so a
+# `doctor` report and a real compile failure always say the same thing
+# about the same missing tool. ----
+
+def _which_any(*names):
+    """The first of these tool names found on PATH, as (name, full path),
+    or (None, None) if none of them are -- mirrors compile_file's own
+    clang/gcc/cc fallback order (see main()'s default_cc), just without
+    committing to any one of them the way an actual compile has to."""
+    for name in names:
+        path = shutil.which(name)
+        if path:
+            return name, path
+    return None, None
+
+
+def _pkg_config_has(package):
+    """True if pkg-config can find this package's .pc file. Unlike
+    _pkg_config above (which raises a CompileError -- correct for an
+    actual compile, which cannot proceed without it), doctor's checks are
+    all non-fatal by design: one missing optional dependency shouldn't
+    stop the rest of the report from running. Always False if pkg-config
+    itself isn't even on PATH (checked separately, its own doctor line)."""
+    if shutil.which("pkg-config") is None:
+        return False
+    result = subprocess.run(["pkg-config", "--exists", package], capture_output=True)
+    return result.returncode == 0
+
+
+def _doctor_report():
+    """Builds `festina doctor`'s report as a list of plain-text lines,
+    plus whether every REQUIRED dependency is present. graphics/audio are
+    deliberately NOT required -- claude.md #59/security.md's binary-
+    slimming split means a compiler that can't build a graphics program
+    is still a fully working compiler for everything else; a program
+    that never uses graphics/audio never even asks for cairo-xlib/alsa's
+    flags (see _RUNTIME_FEATURES above). Returns (lines, all_required_ok)
+    so main() can turn the second value into an exit code without
+    re-parsing the printed text."""
+    lines = []
+    all_ok = True
+
+    def check(ok, required, label, hint=None):
+        nonlocal all_ok
+        if ok:
+            status = "OK"
+        elif required:
+            status = "MISSING"
+            all_ok = False
+        else:
+            status = "missing, optional"
+        lines.append(f"  [{status:^17}] {label}")
+        if not ok and hint:
+            lines.append(f"  {'':19} -> {hint}")
+
+    lines.append("Festina compiler dependencies")
+    lines.append("==============================")
+
+    cc_name, cc_path = _which_any("clang", "gcc", "cc")
+    check(cc_name is not None, True,
+          f"C compiler ({cc_name} at {cc_path})" if cc_name else "C compiler (clang, gcc, or cc)",
+          "install one, e.g. `apt install clang` on Debian/Ubuntu, or `brew install llvm` on macOS -- see setup.md")
+
+    pkgconf_path = shutil.which("pkg-config")
+    check(pkgconf_path is not None, True,
+          f"pkg-config (at {pkgconf_path})" if pkgconf_path else "pkg-config",
+          _INSTALL_HINTS["pkg-config"])
+
+    check(_pkg_config_has("sqlite3"), True,
+          "sqlite3 dev headers (required -- every Festina program has SQLite built in, claude.md #10/#28-31)",
+          _PKG_INSTALL_HINTS["sqlite3"])
+
+    check(_pkg_config_has("cairo-xlib"), False,
+          "cairo-xlib dev headers (optional -- only used by graphics: drawRect, on click, img, ...)",
+          _PKG_INSTALL_HINTS["cairo-xlib"])
+
+    check(_pkg_config_has("alsa"), False,
+          "alsa dev headers (optional -- only used by audio: loadAudio(), .play(), ...)",
+          _PKG_INSTALL_HINTS["alsa"])
+
+    llvm_ok = llvm_backend.available()
+    has_clang = shutil.which("clang") is not None
+    if llvm_ok:
+        check(True, False, "libLLVM (fast path -- in-process object emission, works with any C compiler above)")
+    else:
+        # Not required on its own (the clang-IR-frontend fallback covers
+        # it), UNLESS that fallback's own specific requirement -- clang,
+        # not just any C compiler -- also isn't met; then neither
+        # pipeline can actually finish a compile, which *is* required.
+        check(False, not has_clang,
+              "libLLVM (not found -- falls back to handing LLVM IR text to clang directly)",
+              None if has_clang else
+              "clang was not found either, and only clang can parse the raw IR text that fallback "
+              "needs -- install `llvm` (e.g. `apt install llvm` on Debian/Ubuntu) or clang itself")
+
+    lines.append("")
+    lines.append("festina on PATH")
+    lines.append("================")
+    festina_path = shutil.which("festina")
+    if festina_path:
+        lines.append(f"  [{'OK':^17}] 'festina' resolves to {festina_path}")
+    else:
+        lines.append(f"  [{'not on PATH':^17}] 'festina' -- you're running it another way right "
+                      f"now (bin/festina, python3 -m festina.cli, or a packaged binary by its own path)")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            # Running the packaged binary itself (PyInstaller --onefile);
+            # sys.executable is that binary's own real path, so this can
+            # give a concrete, copy-pasteable command rather than generic
+            # advice.
+            lines.append(f"  {'':19} this is the packaged binary -- put it on PATH directly, e.g.:")
+            lines.append(f"  {'':19}   sudo ln -s {sys.executable} /usr/local/bin/festina")
+        else:
+            bin_dir = os.path.join(_data_root(), "bin")
+            lines.append(f"  {'':19} add this checkout's bin/ directory to PATH:")
+            lines.append(f"  {'':19}   export PATH=\"$PATH:{bin_dir}\"")
+            lines.append(f"  {'':19} add that line to ~/.bashrc / ~/.zshrc (or your shell's equivalent "
+                          f"startup file) to keep it, then restart your shell -- or run "
+                          f"scripts/package_compiler.sh and put the resulting standalone binary "
+                          f"somewhere already on PATH instead (see setup.md)")
+    return lines, all_ok
+
+
+def _run_doctor():
+    lines, all_ok = _doctor_report()
+    print("\n".join(lines))
+    print()
+    if all_ok:
+        print("All required dependencies are installed. The optional ones (graphics/audio) "
+              "only matter for a program that actually uses drawRect/on click/img/loadAudio/etc.")
+        return 0
+    print("One or more REQUIRED dependencies are missing -- see the MISSING lines above.")
+    return 1
+
+
+def _build_arg_parser():
     default_cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc") or "clang"
-    ap.add_argument("--cc", default=default_cc,
-                     help="C compiler/linker to invoke (default: clang, gcc, or cc, whichever is found first)")
+    cc_help = "C compiler/linker to invoke (default: clang, gcc, or cc, whichever is found first)"
+
+    ap = argparse.ArgumentParser(prog="festina", description="Compile and run Festina programs.")
+    # dest="command", not required=True: an unrecognized/missing
+    # subcommand falls through to main()'s own help-and-exit-1 handling
+    # below, rather than argparse's own less friendly "the following
+    # arguments are required" message.
+    sub = ap.add_subparsers(dest="command", metavar="command")
+
+    compile_p = sub.add_parser("compile", help="compile a Festina program to a native executable")
+    compile_p.add_argument("input", help="entry .f file")
+    compile_p.add_argument("-o", "--output", help="output executable path (default: input filename without .f)")
+    compile_p.add_argument("--emit-llvm", action="store_true", help="print LLVM IR to stdout instead of linking")
+    compile_p.add_argument("--cc", default=default_cc, help=cc_help)
+
+    run_p = sub.add_parser("run", help="compile a Festina program and immediately run it")
+    run_p.add_argument("input", help="entry .f file")
+    run_p.add_argument("--cc", default=default_cc, help=cc_help)
+
+    sub.add_parser("doctor", help="check whether the compiler's own dependencies are installed")
+    sub.add_parser("help", help="show this help message")
+    return ap
+
+
+def main(argv=None):
+    ap = _build_arg_parser()
     args = ap.parse_args(argv)
 
+    if args.command in (None, "help"):
+        ap.print_help()
+        # A bare `festina` with no subcommand at all is a usage mistake
+        # (exit 1); `festina help` is a deliberate, successful request
+        # for the same text (exit 0) -- same distinction `git`/`cargo`
+        # draw between "no command" and "explicitly asked for help".
+        return 0 if args.command == "help" else 1
+
+    if args.command == "doctor":
+        return _run_doctor()
+
+    if args.command == "run":
+        try:
+            return run_program(args.input, cc=args.cc)
+        except CompileError as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        except OSError as e:
+            print(f"festina: {e}", file=sys.stderr)
+            return 1
+
+    # args.command == "compile"
     try:
         result = compile_file(args.input, args.output, emit_llvm=args.emit_llvm, cc=args.cc)
     except CompileError as e:

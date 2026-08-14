@@ -5,7 +5,7 @@
 The `festina/` package at the repository root implements the front end
 of the spec in `claude.md` (lexing, parsing, type resolution, semantic
 analysis) **and** now a real LLVM codegen backend + native C runtime:
-`bin/festina program.f -o program` produces a standalone executable that
+`bin/festina compile program.f -o program` produces a standalone executable that
 needs neither Python nor `festina/` to run. Automatic SQLite table
 creation and schema synchronization (claude.md #28-31) is implemented
 for real against `festina.sqlite`, including the temp-table rebuild path
@@ -359,7 +359,7 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 591 tests in this directory pass against it: 581 given a working C
+All 610 tests in this directory pass against it: 600 given a working C
 compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
 too, plus 8 more given `Xvfb`+`xdotool` too
 (`tests/test_codegen.py::TestGraphics`'s interactive click/mouse/key/
@@ -1204,6 +1204,62 @@ into a single binary at `dist/festina` by default. Not part of
 category as `bin/festina` (which remains the normal dev-from-source
 entry point, unchanged).
 
+`festina/cli.py`'s `main()` is now four subcommands
+(`festina compile|run|doctor|help`), not a single bare `festina file.f`
+-- deliberate, not incidental: a bare-file form would leave `run`
+(executes the compiled result) and `compile` (never does) distinguished
+only by which flags happen to be present, which is exactly the kind of
+implicit-intent-from-flags design this project avoids elsewhere too. An
+unrecognized/missing subcommand falls through to argparse's own usage
+error or `main()`'s help-and-exit-1 handling, matching `git`/`cargo`'s
+own "no command" vs. "explicitly asked for help" (`festina help`, exit
+0) distinction.
+
+- `festina run entry.f` (`run_program`) is `compile_file` into a
+  `tempfile.TemporaryDirectory` executable, executed with `subprocess.run`
+  and no `capture_output` -- stdin/stdout/stderr inherited directly from
+  this process, so an interactive program (graphics/audio/timers) behaves
+  identically to one compiled with `festina compile` and run by hand. The
+  temp binary is always cleaned up (the `TemporaryDirectory` context
+  manager), compile failure or not. Returns the *compiled program's own*
+  exit code, not festina's -- `festina run x.f && y` composes the same
+  way a real compile-then-execute pair would, matching `go run`/`cargo
+  run`.
+- `festina doctor` (`_doctor_report`) reuses the exact same
+  `_INSTALL_HINTS`/`_PKG_INSTALL_HINTS` dictionaries `_run_tool`/
+  `_pkg_config` already raise `CompileError` with on an actual compile
+  failure, so a `doctor` report and a real failure always name the same
+  fix for the same missing tool -- checked proactively (via
+  `shutil.which`/`pkg-config --exists`, non-fatal) rather than only
+  reactively. graphics (`cairo-xlib`)/audio (`alsa`) are reported as
+  MISSING but NOT required -- claude.md #59/security.md's binary-slimming
+  split means a compiler that can't build a graphics program is still a
+  fully working compiler for everything else (a program that never uses
+  graphics/audio never even asks pkg-config for those flags -- see
+  `_RUNTIME_FEATURES` above). `libLLVM` missing is also non-fatal on its
+  own (the clang-IR-frontend fallback covers it) UNLESS `clang` itself is
+  *also* missing, in which case neither pipeline can finish a compile at
+  all -- that combination genuinely is required, and is reported as such.
+  Also checks whether `festina` itself resolves on `PATH`
+  (`shutil.which("festina")`) -- if not, prints a concrete fix: the
+  checkout's `bin/` directory to add to `PATH` (with a copy-pasteable
+  `export PATH=...` line) when running from source, or (detected via
+  `sys._MEIPASS`, the same signal `_data_root()` uses) a `ln -s` command
+  pointing at the packaged binary's own real path when running the
+  PyInstaller-packaged `festina` directly. This check never affects the
+  exit code either way -- it's a convenience note, not something that
+  stops the compiler from working (you can always invoke it via
+  `bin/festina`/`python3 -m festina.cli` instead).
+
+See `tests/test_cli.py` -- `TestRun` (including exit-code propagation and
+that a compile error still produces a clean `CompileError`, not a raw
+`OSError`, for a nonexistent temp binary), `TestDoctor` (every check,
+in both the OK and MISSING states, including the two-tool-hidden-at-once
+case for the `libLLVM`-and-no-`clang` combination, reusing
+`TestMissingDependencyErrors`'s own `path_without` fixture pattern from
+`test_codegen.py`), and `TestHelpAndNoCommand` for the bare-invocation/
+`help` exit-code distinction.
+
 Runtime ABI: `runtime/festina_runtime.h`/`.c` implement the C side
 codegen's `declare`s call into -- `festina_log_*`/`festina_fail` (#41,
 #42), `festina_str_*` (string interpolation, #9/#45),
@@ -1339,7 +1395,7 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 581 passed, 10 skipped (needs a C compiler; 2 of
+pytest tests/                          # 600 passed, 10 skipped (needs a C compiler; 2 of
                                         # the skips need `pip install pyinstaller` too,
                                         # the other 8 need Xvfb + xdotool installed)
 ```

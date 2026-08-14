@@ -2138,25 +2138,8 @@ class TestMissingDependencyErrors:
     raw exception. Verified directly: subprocess.run(..., check=False)
     does *not* catch "the executable doesn't exist at all" the way it
     catches a nonzero exit code, so this needs its own handling
-    (festina/cli.py's _run_tool)."""
-
-    @pytest.fixture
-    def path_without(self, tmp_path, monkeypatch):
-        """A PATH containing everything currently on PATH except the
-        named tool(s), by symlinking every other resolvable tool into an
-        empty dir and pointing PATH at just that dir."""
-        def _make(*hidden_tools):
-            bin_dir = tmp_path / "bin_without_tool"
-            bin_dir.mkdir()
-            needed = {"python3", "bash", "sh", "env", "dirname", "basename",
-                      "pkg-config", "clang", "gcc", "cc", "ld", "as"}
-            for name in needed - set(hidden_tools):
-                found = shutil.which(name)
-                if found:
-                    (bin_dir / name).symlink_to(found)
-            monkeypatch.setenv("PATH", str(bin_dir))
-            return str(bin_dir)
-        return _make
+    (festina/cli.py's _run_tool). path_without is a shared conftest.py
+    fixture -- test_cli.py's TestDoctor reuses it too."""
 
     def test_missing_pkg_config_gives_actionable_error(self, parser, semantic, codegen, cli_mod, errors, tmp_path, path_without, monkeypatch):
         path_without("pkg-config")

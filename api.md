@@ -6,6 +6,33 @@ for exactly what's implemented vs. not (and known caveats), see
 [`tests/CONTRACT.md`](tests/CONTRACT.md); for the full target-language
 spec this compiler is built against, see [`claude.md`](claude.md).
 
+## CLI
+
+Four subcommands (`festina/cli.py`), not a single bare `festina file.f`
+— that would leave `festina run` (which executes the compiled result)
+ambiguous with `festina compile` (which never does) without inventing a
+flag to distinguish them:
+
+| Command | What it does |
+|---|---|
+| `festina compile entry.f -o out` | Compile to a native executable at `out` (default: `entry`'s own filename without `.f`). `--emit-llvm` prints LLVM IR to stdout instead of linking. `--cc` picks the C compiler/linker (default: whichever of `clang`/`gcc`/`cc` is found first). |
+| `festina run entry.f` | Compile to a throwaway temp executable and run it immediately — stdin/stdout/stderr inherited directly (not captured), so an interactive program (graphics/audio/timers) behaves exactly like a normal compile-then-run. Exits with the *compiled program's own* exit code, so `festina run x.f && ...` composes the same way `go run`/`cargo run` do. The temp binary is always cleaned up afterward. |
+| `festina doctor` | Checks every dependency the compiler itself needs (a C compiler, `pkg-config`, sqlite3/cairo-xlib/alsa dev headers, `libLLVM`) and reports what's missing and how to install it — the same install hints a real compile failure would give (`claude.md #59`), just checked proactively instead of only on failure. Also reports whether `festina` itself is resolvable on `PATH`, and if not, exactly how to add it (the checkout's `bin/` directory, or a packaged binary — see [setup.md](setup.md)). Exits 0 if every *required* dependency is present — graphics/audio are optional, since a compiler that can't build a graphics program is still a fully working compiler for everything else (see [security.md](security.md#binary-slimming)). |
+| `festina help` | Prints this same command list. |
+
+```bash
+bin/festina compile program.f -o program   # compile
+bin/festina compile program.f --emit-llvm  # print LLVM IR instead of linking
+./program                                  # the result needs neither
+                                            # Python nor festina/ to run
+bin/festina run program.f                  # or just run it directly
+bin/festina doctor                         # check dependencies
+```
+
+A program needs no `main()` — top-level statements in the entry file run
+in order, after every import is resolved and every declared table's
+schema is synced.
+
 ## Compilation pipeline
 
 ```
@@ -19,17 +46,6 @@ Festina source (.f)
       conditionally, _graphics.c/_audio.c -- see "Binary size" below)
    -> Native executable
 ```
-
-```bash
-bin/festina program.f -o program   # compile
-bin/festina program.f --emit-llvm  # print LLVM IR instead of linking
-./program                          # the result needs neither Python
-                                    # nor festina/ to run
-```
-
-A program needs no `main()` — top-level statements in the entry file run
-in order, after every import is resolved and every declared table's
-schema is synced.
 
 ### Binary size
 
@@ -399,4 +415,4 @@ See `tests/test_semantic_errors.py` for the full set of categories.
 [`examples/`](examples/) has a full set of small, runnable programs
 exercising everything above, including a real playable game
 (`tic_tac_toe.f`) — see the README's "See it in action" section for the
-index, or just `bin/festina examples/<name>.f -o out && ./out`.
+index, or just `bin/festina run examples/<name>.f`.
