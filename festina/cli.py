@@ -121,6 +121,8 @@ _PKG_INSTALL_HINTS = {
     "cairo-xlib": "install Cairo's and X11's development packages, e.g. "
                   "`apt install libcairo2-dev libx11-dev` on Debian/Ubuntu -- "
                   "needed for claude.md #37/#39's img/graphics functions",
+    "alsa": "install ALSA's development package, e.g. `apt install libasound2-dev` "
+            "on Debian/Ubuntu -- needed for claude.md #38's aud/loadAudio()",
 }
 
 
@@ -204,12 +206,16 @@ def _ensure_runtime_object(cc):
     if os.path.exists(obj_path) and os.path.getmtime(obj_path) >= os.path.getmtime(_RUNTIME_C):
         return obj_path
 
-    # claude.md #37/#39: festina_runtime.c always includes cairo/cairo.h
-    # and X11/Xlib.h (graphics functions), regardless of whether a given
-    # Festina program actually calls any of them -- it's one object file
-    # with everything in it, same as sqlite3's headers being needed to
+    # claude.md #37/#39/#38: festina_runtime.c always includes
+    # cairo/cairo.h, X11/Xlib.h (graphics functions), and
+    # alsa/asoundlib.h (audio), regardless of whether a given Festina
+    # program actually calls any of them -- it's one object file with
+    # everything in it, same as sqlite3's headers being needed to
     # compile it even for a program with no `table` declarations.
-    cflags = _pkg_config("--cflags", "sqlite3") + _pkg_config("--cflags", "cairo-xlib")
+    # -pthread: claude.md #38's audio playback runs on a background
+    # thread (see festina_runtime.h's doc comment on festina_audio_play).
+    cflags = (_pkg_config("--cflags", "sqlite3") + _pkg_config("--cflags", "cairo-xlib")
+              + _pkg_config("--cflags", "alsa") + ["-pthread"])
     cmd = [cc, "-O2", "-c", _RUNTIME_C, *cflags, "-o", obj_path]
     result = _run_tool(cmd)
     if result.returncode != 0:
@@ -237,10 +243,13 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
     # (Cairo + X11): festina_runtime.o always references cairo_*/X*
     # symbols (claude.md #37/#39 img/graphics), whether or not this
     # particular program calls any of them -- same reasoning as
-    # _ensure_runtime_object's cflags above.
+    # _ensure_runtime_object's cflags above. -lasound/-pthread: claude.md
+    # #38's audio, same "always linked in, always referenced by
+    # festina_runtime.o regardless of use" story.
     sqlite_link_flags, _ = _sqlite_link_flags(cc)
     cairo_link_flags = _pkg_config("--libs", "cairo-xlib")
-    link_libs = [*sqlite_link_flags, *cairo_link_flags, "-lm"]
+    alsa_link_flags = _pkg_config("--libs", "alsa")
+    link_libs = [*sqlite_link_flags, *cairo_link_flags, *alsa_link_flags, "-lm", "-pthread"]
 
     if llvm_backend.available():
         _compile_via_libllvm(ir, entry_path, output_path, cc, link_libs)
