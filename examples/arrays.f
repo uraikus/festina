@@ -1,4 +1,6 @@
-// Arrays -- see README.md's "Arrays" section for current status/caveats.
+// Arrays -- see api.md's Arrays section for the full reference and
+// caveats (not bounds-checked, no growth -- claude.md doesn't specify
+// either).
 
 int func sum3(nums:arr[int]) {
     return nums[0] + nums[1] + nums[2]

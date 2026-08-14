@@ -292,3 +292,10 @@ main.f:12:5: error: condition must be bool, found text
 ```
 
 See `tests/test_semantic_errors.py` for the full set of categories.
+
+## Examples
+
+[`examples/`](examples/) has a full set of small, runnable programs
+exercising everything above, including a real playable game
+(`tic_tac_toe.f`) — see the README's "See it in action" section for the
+index, or just `bin/festina examples/<name>.f -o out && ./out`.
