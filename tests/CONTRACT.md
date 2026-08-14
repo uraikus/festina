@@ -359,7 +359,7 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 589 tests in this directory pass against it: 579 given a working C
+All 591 tests in this directory pass against it: 581 given a working C
 compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
 too, plus 8 more given `Xvfb`+`xdotool` too
 (`tests/test_codegen.py::TestGraphics`'s interactive click/mouse/key/
@@ -550,6 +550,85 @@ Three more directly-requested features, all new claude.md territory
   non-addressable-assignment edge cases), and
   `tests/test_numeric_conversion.py::TestToText` /
   `tests/test_codegen.py::TestNumericConversion`'s `toText` tests.
+
+A follow-up sanity-check pass over the claude.md #70-72 work above found
+one more genuine, verifiable bug plus three smaller improvements, all in
+the same "catch it at compile time / don't do wasted runtime work"
+spirit as the rest of this file:
+
+- **`arr[T]` literals with mismatched element types reached codegen
+  instead of failing cleanly.** `ArrayLit`'s type inference walked every
+  element but only ever kept the *last* one's type (see the `map[T]`
+  paragraph above, which deliberately does NOT have this weakness for
+  keys) -- so `arr[bool] a = [1, 'x', true]` passed semantic analysis
+  and failed at LLVM object emission with a raw, confusing "floating
+  point constant invalid" / "global variable reference must have
+  pointer type"-shaped error instead of a `CompileError`, the exact
+  class of gap security.md's original audit fixed for comparisons/array
+  indices/`const` reassignment/etc. but happened to miss for array
+  literals themselves. Fixed by checking every element's type against
+  the first concrete (non-`null`) one seen, raising immediately on a
+  mismatch -- deliberately *not* changing what the overall inferred type
+  ends up being (still the last element's type, since a couple of
+  existing `null`-element corner cases, e.g. `arr[int] a = [5, null]`
+  failing against a declared `arr[int]`, already depend on that exact
+  value and weren't in scope to also fix here). One genuine, spec-
+  mandated exception: `sqlite()`'s parameter-list argument (claude.md
+  #33's own worked example is `[1, 'Patrick']`, deliberately mixed
+  int/text) is NOT a real `arr[T]` value at all -- it's a heterogeneous
+  bound-parameter list, one independently-typed value per `?`
+  placeholder -- so `_infer_call` infers each of its elements
+  individually when the argument is a literal written directly at the
+  `sqlite(...)` call site, bypassing the new homogeneity check rather
+  than wrongly rejecting the one construct claude.md itself requires to
+  mix types in an array literal.
+- **`/pattern/flags` regex literals now compile once, not on every
+  execution.** The pattern and flags of an `ast.RegexLit` are fixed at
+  parse time, so the exact same literal always produces the exact same
+  `regcomp()` result -- recompiling it on every reach (the previous
+  behavior, and still todo.md's documented gap for the *dynamic*
+  `regex(pattern, flags)` builtin, where pattern is a general runtime
+  expression and caching by call site would be a correctness bug, not
+  an optimization) was pure wasted work for something entirely knowable
+  ahead of time. Cached per-AST-node behind a private `ptr` global
+  initialized to `null` and the standard lazy-init null-check + `phi`
+  shape `_emit_ternary`/`_emit_logical` already use for conditional
+  control flow (`_emit_cached_regex_lit`) -- still only compiles on the
+  first runtime reach of *that* literal (a literal inside an untaken
+  branch, or a function never called, still costs nothing), with every
+  later reach just a load. Verified directly against the emitted IR: a
+  `/pattern/` literal inside a 5-iteration loop now emits exactly one
+  `call ptr @festina_regex_compile` site, guarded by the null check,
+  versus one `call` per textually distinct literal in the source, not
+  per execution.
+- **A map literal with two *literal* string keys that collide is now a
+  compile error instead of silent "last value wins."** claude.md #72's
+  own "last value wins" rule still holds -- and still has to, since
+  there's no way to know at compile time whether two arbitrary text
+  *expressions* produce the same string -- but when both keys in a pair
+  are plain `ast.StringLit`s (not a variable, template, or other
+  expression), the collision is knowable for free, right now, and is
+  essentially always a typo rather than something intentional. Same
+  "catch it before it runs" instinct as `const` reassignment or a
+  `void` function returning a value. Tracked by literal string value
+  within one `MapLit`, first occurrence only, so the error points at
+  the *second*, redundant entry.
+- **`environment`'s reserved-name collision now gets a specific
+  message.** Previously `int environment = 5` reported the same generic
+  `'environment' is already declared` every ordinary duplicate
+  declaration gets -- misleading here, since (unlike a real duplicate)
+  there's no earlier `environment` declaration in the program to point
+  a user back to. `Scope.define` now special-cases this one reserved
+  name the same way `analyze_func`'s builtin-function-name collision
+  already gets its own specific, explanatory message.
+
+See `tests/test_maps.py` (the two new `TestMapLiteral` cases),
+`tests/test_codegen.py::TestMaps`'s updated
+`test_duplicate_key_in_a_literal_last_one_wins` (now exercises the
+still-legal runtime-only collision via a variable key, since the
+literal-literal case it used to use is the newly-rejected one), and
+`tests/test_environment.py::TestEnvironmentIsReserved`'s updated
+message assertions.
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -1260,7 +1339,7 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 579 passed, 10 skipped (needs a C compiler; 2 of
+pytest tests/                          # 581 passed, 10 skipped (needs a C compiler; 2 of
                                         # the skips need `pip install pyinstaller` too,
                                         # the other 8 need Xvfb + xdotool installed)
 ```

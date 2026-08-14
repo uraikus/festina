@@ -1694,6 +1694,8 @@ An empty map literal is written {}.
 
 If the same key appears more than once in a literal, the last value for that key wins.
 
+If both of the colliding keys are plain string literals (e.g. { 'a': 1, 'a': 2 }), the collision is a compile error instead -- it is always knowable ahead of time in that case, and is essentially always a mistake. This only applies when both keys are literal text; a key that is a variable or other expression is not compared at compile time, since its value is not known until the program runs.
+
 A map value is read by indexing with a text key:
 
 npcHealths['npc1']

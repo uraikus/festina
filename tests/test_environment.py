@@ -59,11 +59,16 @@ class TestEnvironmentIsReadOnly:
 
 class TestEnvironmentIsReserved:
     def test_declaring_a_variable_named_environment_is_a_compile_error(self, parser, semantic, errors):
+        # A specific, named message (Scope.define) rather than the
+        # generic "already declared" every other duplicate declaration
+        # gets -- there's no earlier `environment` declaration in this
+        # program to point a user back to, so the generic message alone
+        # wouldn't explain why.
         program = parser.parse("int environment = 5")
-        with pytest.raises(errors.CompileError, match="already declared"):
+        with pytest.raises(errors.CompileError, match="reserved for reading environment variables"):
             semantic.analyze(program)
 
     def test_declaring_a_function_named_environment_is_a_compile_error(self, parser, semantic, errors):
         program = parser.parse("void func environment() {\n    log(1)\n}")
-        with pytest.raises(errors.CompileError, match="already declared"):
+        with pytest.raises(errors.CompileError, match="reserved for reading environment variables"):
             semantic.analyze(program)

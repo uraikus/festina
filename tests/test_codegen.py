@@ -423,7 +423,14 @@ class TestMaps:
         assert result.returncode == 0
 
     def test_duplicate_key_in_a_literal_last_one_wins(self, compile_and_run):
-        result = compile_and_run("map[int] m = {'a': 1, 'a': 2}\nlog(m['a'])")
+        # Two *literal* string keys colliding (`{'a': 1, 'a': 2}`) is now
+        # a compile-time error instead (see tests/test_maps.py's
+        # TestMapLiteral -- knowable for free, almost always a typo).
+        # "last value wins" for a genuine runtime collision still holds
+        # and is still exercised here, via a variable key that happens
+        # to equal an earlier literal key only at runtime.
+        source = "text k = 'a'\nmap[int] m = {'a': 1, k: 2}\nlog(m['a'])"
+        result = compile_and_run(source)
         assert result.stdout.strip() == "2"
 
     def test_write_adds_a_new_key(self, compile_and_run):

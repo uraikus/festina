@@ -75,6 +75,25 @@ class TestMapLiteral:
         with pytest.raises(errors.CompileError, match="map key must be text"):
             semantic.analyze(program)
 
+    def test_duplicate_string_literal_key_is_a_compile_error(self, parser, semantic, errors):
+        # Both keys are plain string literals here -- the duplicate is
+        # knowable right now, at zero runtime cost, so it's a compile
+        # error rather than silent "last value wins" (see
+        # test_codegen.py's TestMaps for the still-legal runtime-only
+        # case, where one of the two colliding keys is a variable).
+        program = parser.parse("map[int] m = {'a': 1, 'b': 2, 'a': 3}")
+        with pytest.raises(errors.CompileError, match="duplicate map key 'a'"):
+            semantic.analyze(program)
+
+    def test_a_literal_key_and_a_variable_key_are_not_flagged_as_duplicates(self, parser, semantic):
+        # The variable's text value isn't known at compile time, so this
+        # can't be (and isn't) rejected here -- claude.md #72's own
+        # example relies on exactly this shape (npc2Id might or might
+        # not collide with 'npc1' at runtime).
+        source = "text npc2Id = 'npc1'\nmap[int] m = {'npc1': 10, npc2Id: 15}"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
 
 class TestMapIndexing:
     """claude.md #72: npcHealths['npc1'] / npcHealths[key] -- read and
