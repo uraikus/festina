@@ -149,6 +149,23 @@ class Scope:
 
     def define(self, name, symbol, err_node, filename):
         if name in self.vars:
+            if name == _ENVIRONMENT_NAME:
+                # claude.md #71: environment is pre-registered into
+                # global_scope purely so this collision is caught at all
+                # (see analyze()) -- give it the same specific, named
+                # treatment as a builtin-function-name collision
+                # (analyze_func below) instead of the generic message,
+                # since "already declared" alone doesn't explain *why*
+                # (there's no earlier `environment` declaration in this
+                # program to point a user back to).
+                raise CompileError(
+                    f"'{_ENVIRONMENT_NAME}' is reserved for reading environment "
+                    f"variables ({_ENVIRONMENT_NAME}.NAME) and cannot be "
+                    f"declared as a variable, constant, function, struct, or table",
+                    file=filename, line=getattr(err_node, "line", 0),
+                    column=getattr(err_node, "column", 0),
+                    category="duplicate declaration",
+                )
             raise CompileError(
                 f"'{name}' is already declared",
                 file=filename, line=getattr(err_node, "line", 0),
@@ -288,8 +305,34 @@ def analyze(program, filename="<string>"):
             return types_mod.PrimitiveType("text")
         if isinstance(expr, ast.ArrayLit):
             elem_type = None
+            # concrete_type tracks the first non-null element's type, purely
+            # to catch a genuine mismatch between two concrete element types
+            # (e.g. [1, 'x', true]) -- before this check existed, a mixed
+            # literal like that reached codegen and failed as a raw,
+            # confusing "LLVM object emission failed" error instead of a
+            # normal CompileError, the same class of gap the security.md
+            # audit fixed for comparisons/array indices/etc. but missed
+            # here. elem_type itself is left tracking the *last* element's
+            # type, same as before this check -- that's what feeds the
+            # returned ArrayType below, and several existing null-element
+            # corner cases (e.g. `[5, null]` failing against a declared
+            # arr[int]) already depend on that exact "last wins" value;
+            # this fix only adds a mismatch check, it doesn't change what
+            # gets returned.
+            concrete_type = None
             for e in expr.elements:
                 elem_type = infer(e, scope)
+                if elem_type is not None and elem_type is not NULL:
+                    if concrete_type is None:
+                        concrete_type = elem_type
+                    elif elem_type != concrete_type:
+                        raise CompileError(
+                            f"array literal elements must all be the same type, "
+                            f"found {types_mod.type_name(concrete_type)} and "
+                            f"{types_mod.type_name(elem_type)}",
+                            file=filename, line=getattr(e, "line", 0), column=getattr(e, "column", 0),
+                            category="invalid operand type",
+                        )
             return types_mod.ArrayType(elem_type) if elem_type is not None else None
         if isinstance(expr, ast.MapLit):
             # claude.md #72: { key: value, ... } -- every key must be
@@ -302,6 +345,20 @@ def analyze(program, filename="<string>"):
             # type for context, e.g. an empty `{}`) if there's nothing
             # to infer it from.
             value_type = None
+            # Duplicate-literal-key detection: "last value wins" for a
+            # repeated key (claude.md #72) is fine as a runtime rule when
+            # the key is a general text expression -- there's no way to
+            # know at compile time whether two different expressions
+            # produce the same string. But when BOTH keys in a pair are
+            # plain string literals (ast.StringLit, not a variable/
+            # template/other expression), the duplicate is knowable right
+            # now, at zero runtime cost, and it's essentially always a
+            # typo rather than something intentional -- the same
+            # "catch it before it runs" instinct as the const-reassignment
+            # and void-return checks (security.md's audit). Tracked by
+            # literal string value, first-occurrence node only (so the
+            # error always points at the *second*, redundant one).
+            seen_literal_keys = {}
             for key_expr, val_expr in expr.entries:
                 key_type = infer(key_expr, scope)
                 if key_type is not None and key_type is not NULL and key_type != _TEXT:
@@ -310,6 +367,15 @@ def analyze(program, filename="<string>"):
                         file=filename, line=getattr(key_expr, "line", 0), column=getattr(key_expr, "column", 0),
                         category="invalid operand type",
                     )
+                if isinstance(key_expr, ast.StringLit):
+                    if key_expr.value in seen_literal_keys:
+                        raise CompileError(
+                            f"duplicate map key '{key_expr.value}' in this literal "
+                            f"(the earlier entry for this key would never be seen)",
+                            file=filename, line=getattr(key_expr, "line", 0), column=getattr(key_expr, "column", 0),
+                            category="invalid operand type",
+                        )
+                    seen_literal_keys[key_expr.value] = key_expr
                 value_type = infer(val_expr, scope)
             return types_mod.MapType(value_type) if value_type is not None else None
         if isinstance(expr, ast.Identifier):
@@ -696,7 +762,25 @@ def analyze(program, filename="<string>"):
                 sig = _BUILTIN_SIGNATURES.get(name)
                 if sig is None:
                     for a in expr.args:
-                        infer(a, scope)
+                        if name == "sqlite" and isinstance(a, ast.ArrayLit):
+                            # claude.md #33: sqlite()'s parameter list is
+                            # passed as an array literal, but -- unlike
+                            # every real arr[T] value in the language --
+                            # it's explicitly allowed (and, per #33's own
+                            # worked example, [1, 'Patrick'], expected) to
+                            # mix types: one bound value per '?'
+                            # placeholder, each independently int/float/
+                            # text/bool/null. Infer each element on its
+                            # own (still catching a genuinely broken
+                            # sub-expression) instead of delegating to the
+                            # ArrayLit branch above, whose same-element-
+                            # type check exists for real arr[T] values and
+                            # would otherwise wrongly reject this one,
+                            # spec-mandated exception.
+                            for e in a.elements:
+                                infer(e, scope)
+                        else:
+                            infer(a, scope)
                 else:
                     if len(expr.args) != len(sig):
                         raise CompileError(

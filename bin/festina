@@ -5,7 +5,10 @@
 # and a directory can't share one name on the same filesystem path.) This
 # wrapper just execs the Python implementation in festina/cli.py.
 #
-# Usage: bin/festina main.f [-o output] [--emit-llvm]
+# Usage: bin/festina compile main.f [-o output] [--emit-llvm]
+#        bin/festina run main.f
+#        bin/festina doctor
+#        bin/festina help
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"

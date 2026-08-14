@@ -8,7 +8,11 @@ the runtime dependency list below is now conditional per program).
 
 ## To *use* the compiler from a checkout
 
-`bin/festina program.f` on a fresh system:
+`bin/festina compile program.f` on a fresh system (or `bin/festina run
+program.f` to skip the intermediate binary and just run it -- see
+[api.md](api.md#cli) for the full command list, including `festina
+doctor`, which checks every dependency below for you and tells you
+exactly what's missing):
 
 | Dependency | Why | Required? |
 |---|---|---|
@@ -64,7 +68,7 @@ something the resulting binary or `festina/` itself needs:
 ```bash
 pip install -r requirements-build.txt  # pyinstaller
 ./scripts/package_compiler.sh          # -> ./dist/festina
-./dist/festina examples/hello.f -o hello
+./dist/festina compile examples/hello.f -o hello
 ```
 
 ## To *run* a program someone already compiled with Festina
@@ -116,7 +120,7 @@ technique they use (see `conftest.py`'s `audio_null_env`) needs no extra
 tool install, only the same C compiler everything else here requires.
 
 ```bash
-bin/festina examples/hello.f -o hello
+bin/festina compile examples/hello.f -o hello
 ./hello
 ```
 

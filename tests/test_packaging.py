@@ -73,7 +73,7 @@ class TestPackagedCompilerBinary:
 
         env = {"PATH": f"{fake_bin}:/usr/bin:/bin"}
         result = subprocess.run(
-            [packaged_binary, str(src), "-o", str(out)],
+            [packaged_binary, "compile", str(src), "-o", str(out)],
             cwd=tmp_path, capture_output=True, text=True, env=env, timeout=60,
         )
         assert result.returncode == 0, f"compile failed:\n{result.stderr}"
@@ -90,7 +90,7 @@ class TestPackagedCompilerBinary:
         src = tmp_path / "hello.f"
         src.write_text("log('hi')")
         result = subprocess.run(
-            [packaged_binary, str(src), "--emit-llvm"],
+            [packaged_binary, "compile", str(src), "--emit-llvm"],
             cwd=tmp_path, capture_output=True, text=True, timeout=30,
         )
         assert result.returncode == 0, result.stderr
