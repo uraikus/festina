@@ -857,16 +857,23 @@ class CodeGen:
                     lines.append(f"  {loaded} = load ptr, ptr {ref}")
                     lines.append(f"  call void @free(ptr {loaded})")
                 elif isinstance(type_, types_mod.ArrayType):
-                    loaded = self.tmp()
-                    lines.append(f"  {loaded} = load {FESTINA_ARRAY_LLVM_TYPE}, ptr {ref}")
+                    # Direct GEP-to-field-1 + load, matching how every
+                    # other array/map data-pointer read in this file
+                    # gets there (see e.g. _emit_array_length/
+                    # _try_addressable) -- leaner pre-optimization IR
+                    # than loading the whole {i64, ptr} header just to
+                    # extractvalue field 1 back out of it, and consistent
+                    # with the rest of the codebase's own convention.
+                    field_ptr = self.tmp()
+                    lines.append(f"  {field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {ref}, i32 0, i32 1")
                     data_ptr = self.tmp()
-                    lines.append(f"  {data_ptr} = extractvalue {FESTINA_ARRAY_LLVM_TYPE} {loaded}, 1")
+                    lines.append(f"  {data_ptr} = load ptr, ptr {field_ptr}")
                     lines.append(f"  call void @free(ptr {data_ptr})")
                 elif isinstance(type_, types_mod.MapType):
-                    loaded = self.tmp()
-                    lines.append(f"  {loaded} = load {FESTINA_MAP_LLVM_TYPE}, ptr {ref}")
+                    field_ptr = self.tmp()
+                    lines.append(f"  {field_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {ref}, i32 0, i32 1")
                     entries_ptr = self.tmp()
-                    lines.append(f"  {entries_ptr} = extractvalue {FESTINA_MAP_LLVM_TYPE} {loaded}, 1")
+                    lines.append(f"  {entries_ptr} = load ptr, ptr {field_ptr}")
                     lines.append(f"  call void @free(ptr {entries_ptr})")
 
     def _emit_analyzed_func_body(self, decl, body_env, return_type, body_lines):

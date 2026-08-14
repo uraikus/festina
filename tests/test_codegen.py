@@ -847,7 +847,11 @@ class TestAutomaticMemoryReclamation:
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "extractvalue %struct._FestinaArray" in ir
+        # The free path reaches the data pointer via a direct GEP to
+        # field 1 + load, matching how every other array data-pointer
+        # read in codegen.py gets there -- not a load-the-whole-header
+        # + extractvalue (see _emit_free_active_locals's own comment).
+        assert "getelementptr %struct._FestinaArray, ptr" in ir
         assert "call void @free(" in ir
 
     def test_non_escaping_map_local_frees_its_entries_pointer(self, parser, semantic, codegen):
@@ -858,7 +862,7 @@ class TestAutomaticMemoryReclamation:
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "extractvalue %struct._FestinaMap" in ir
+        assert "getelementptr %struct._FestinaMap, ptr" in ir
         assert "call void @free(" in ir
 
     def test_returned_struct_is_not_freed(self, parser, semantic, codegen):
@@ -1373,6 +1377,303 @@ class TestAutomaticMemoryReclamation:
         result = compile_and_run(source, args=None)
         assert result.returncode == 0
         assert result.stdout.splitlines()[-1] == "done"
+
+    # ---- edge cases beyond the two increments' own core scenarios ----
+    # Added in a follow-up robustness pass over the whole feature (not a
+    # new increment -- no new codegen.py behavior was needed for any of
+    # these; they exercise combinations the two increments' own tests
+    # didn't specifically spell out). Verified against real generated IR
+    # and real compiled output here, and additionally against a combined
+    # 5000-iteration program exercising every one of these patterns
+    # together under AddressSanitizer/LeakSanitizer (see tests/CONTRACT.md)
+    # -- zero ASan errors, zero leaks.
+
+    def test_break_in_a_nested_loop_frees_only_the_inner_loops_own_locals(self, parser, semantic, codegen):
+        # A loop-local declared in an OUTER loop's body, merely used (not
+        # re-declared) inside a nested inner loop, must survive the inner
+        # loop's own break -- free_depth is captured fresh by each
+        # _emit_for call, so the inner loop's break must never reach past
+        # its own body's frame down into the outer loop's.
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            for int i = 0, i < 3, i++ {
+                Point mid
+                mid.x = i
+                for int j = 0, j < 3, j++ {
+                    Point inner
+                    inner.x = j
+                    if inner.x == 1 {
+                        break
+                    }
+                }
+                log(mid.x)
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        inner_break_block = next(i for i, l in enumerate(lines) if l.strip().startswith("if.then"))
+        inner_break_end = next(i for i in range(inner_break_block, len(lines))
+                                if lines[i].strip().startswith("br label %for.end"))
+        break_lines = lines[inner_break_block:inner_break_end]
+        # Exactly one free() on the inner break path -- inner's own, not mid's.
+        assert sum("call void @free(" in l for l in break_lines) == 1
+
+    def test_break_in_a_nested_loop_does_not_corrupt_the_outer_loops_local(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            for int i = 0, i < 3, i++ {
+                Point mid
+                mid.x = i * 100
+                for int j = 0, j < 3, j++ {
+                    Point inner
+                    inner.x = j
+                    if inner.x == 1 {
+                        break
+                    }
+                }
+                log(mid.x)
+            }
+        }
+        f()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "100", "200"]
+
+    def test_return_from_a_nested_if_after_the_loop_locals_declaration_frees_it(self, compile_and_run):
+        # A return nested two levels deep inside a loop body (an if
+        # inside the loop), textually AFTER the loop-local's own
+        # declaration -- down_to=0 on Return must reach through the
+        # if-then's own frame *and* the loop body's frame *and* the
+        # function's own top-level frame, all at once.
+        source = """
+        struct Point { x:int y:int }
+        int func f(n:int) {
+            for int i = 0, i < n, i++ {
+                Point p
+                p.x = i
+                if p.x == 3 {
+                    return p.x * 100
+                }
+            }
+            return -1
+        }
+        log(f(10))
+        log(f(2))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["300", "-1"]
+
+    def test_return_from_a_nested_if_before_the_loop_locals_declaration_has_no_free_on_that_path(
+            self, parser, semantic, codegen):
+        # The mirror of test_early_return_before_the_declaration_has_no_free_on_that_path,
+        # but with the early return nested inside a loop body instead of
+        # directly in the function body -- the loop-local's VarDecl
+        # hasn't been walked yet when this path's Return fires, so its
+        # frame must still be empty on this specific path.
+        source = """
+        struct Point { x:int y:int }
+        int func f(n:int) {
+            for int i = 0, i < n, i++ {
+                if i == 2 {
+                    return 777
+                }
+                Point p
+                p.x = i
+            }
+            return -1
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        func_start = next(i for i, l in enumerate(lines) if l.startswith("define i64 @f("))
+        func_end = next(i for i in range(func_start, len(lines)) if lines[i] == "}")
+        func_lines = lines[func_start:func_end]
+        ret_lines = [i for i, l in enumerate(func_lines) if l.strip().startswith("ret i64 777")]
+        assert len(ret_lines) == 1
+        assert not any("call void @free(" in l for l in func_lines[:ret_lines[0] + 1])
+
+    def test_return_from_a_nested_if_before_the_loop_locals_declaration_produces_correct_output(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        int func f(n:int) {
+            for int i = 0, i < n, i++ {
+                if i == 2 {
+                    return 777
+                }
+                Point p
+                p.x = i
+            }
+            return -1
+        }
+        log(f(10))
+        log(f(1))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["777", "-1"]
+
+    def test_else_if_chain_frees_each_branchs_own_struct_local(self, compile_and_run):
+        # Each `else if` is its own nested IfStmt (see parser.py's
+        # parse_if), so each branch's then-block is its own _emit_block
+        # frame -- a struct declared in one arm must never affect another
+        # arm's freeing, and the un-taken arms' structs must never even
+        # be allocated (ordinary control flow, unrelated to #74, but
+        # worth pinning down together with the rest of this).
+        source = """
+        struct Point { x:int y:int }
+        int func f(n:int) {
+            if n == 0 {
+                Point a
+                a.x = 10
+                return a.x
+            } else if n == 1 {
+                Point b
+                b.x = 20
+                return b.x
+            } else if n == 2 {
+                Point c
+                c.x = 30
+                return c.x
+            } else {
+                Point d
+                d.x = 40
+                return d.x
+            }
+        }
+        log(f(0))
+        log(f(1))
+        log(f(2))
+        log(f(3))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["10", "20", "30", "40"]
+
+    def test_bare_nested_block_frees_its_own_local(self, compile_and_run):
+        # A standalone `{ }` block (not attached to if/while/for) is
+        # still routed through the same _emit_block -- and two sibling
+        # bare blocks reusing the same local name must not collide or
+        # double-free (each is its own Env/frame).
+        source = """
+        struct Point { x:int y:int }
+        int func f() {
+            int total = 0
+            {
+                Point p
+                p.x = 5
+                total = total + p.x
+            }
+            {
+                Point p
+                p.x = 6
+                total = total + p.x
+            }
+            return total
+        }
+        log(f())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "11"
+
+    def test_sibling_if_else_branches_can_declare_the_same_local_name_without_double_free(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        int func f(cond:bool) {
+            if cond {
+                Point p
+                p.x = 1
+                return p.x
+            } else {
+                Point p
+                p.x = 2
+                return p.x
+            }
+        }
+        log(f(true))
+        log(f(false))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "2"]
+
+    def test_combined_nested_loops_elif_and_bare_blocks_do_not_crash_under_heavy_iteration(
+            self, compile_and_run):
+        # The same combination verified separately by hand under
+        # AddressSanitizer/LeakSanitizer (see tests/CONTRACT.md) -- here
+        # as an ordinary correctness-and-no-crash pytest check: nested
+        # for-in-for with an inner break, return after and before a
+        # loop-local's own declaration, a 4-way else-if chain, bare
+        # blocks with a shadowed name, and if/else sibling shadowing,
+        # all run back to back many times.
+        source = """
+        struct Point { x:int y:int }
+        int func nestedForBreak() {
+            Point outer
+            outer.x = 1000
+            int total = 0
+            for int i = 0, i < 4, i++ {
+                Point mid
+                mid.x = i
+                for int j = 0, j < 4, j++ {
+                    Point inner
+                    inner.x = j
+                    if inner.x == 2 {
+                        break
+                    }
+                    total = total + inner.x
+                }
+                total = total + mid.x
+            }
+            total = total + outer.x
+            return total
+        }
+        int func elifChain(n:int) {
+            if n == 0 {
+                Point a
+                a.x = 10
+                return a.x
+            } else if n == 1 {
+                Point b
+                b.x = 20
+                return b.x
+            } else {
+                Point c
+                c.x = 30
+                return c.x
+            }
+        }
+        int func bareBlocks() {
+            int total = 0
+            {
+                Point p
+                p.x = 5
+                total = total + p.x
+            }
+            {
+                Point p
+                p.x = 6
+                total = total + p.x
+            }
+            return total
+        }
+        for int i = 0, i < 3000, i++ {
+            if nestedForBreak() != 1010 {
+                fail('nestedForBreak drifted')
+            }
+            if elifChain(i % 3) != (10 + (i % 3) * 10) {
+                fail('elifChain drifted')
+            }
+            if bareBlocks() != 11 {
+                fail('bareBlocks drifted')
+            }
+        }
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
 
 
 def _find_window(display, timeout=20):

@@ -359,9 +359,16 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 704 tests in this directory pass against it: 694 given a working C
-compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
-too, plus 8 more given `Xvfb`+`xdotool` too
+All 713 tests in this directory pass against it: 487 need no external
+tool at all (parser/semantic/IR-level tests, no compile-and-run step),
+216 more need a working C compiler, plus 2 more
+(`tests/test_packaging.py`) given `pyinstaller` too, plus 8 more given
+`Xvfb`+`xdotool` too (487 + 216 + 2 + 8 = 713 -- re-verified directly
+by hiding each tool from PATH in turn, not just derived by counting
+`compile_and_run` call sites, since the true number had drifted well
+past a much older, since-inaccurate count of "694 given a working C
+compiler" left over from before this suite's `compile_and_run`-based
+end-to-end tests grew to their current share of it)
 (`tests/test_codegen.py::TestGraphics`'s interactive click/mouse/key/
 resize tests, the one confirming the initial `clientWidth`/
 `clientHeight` values, `TestTimers`'s combined graphics-and-timers test,
@@ -952,6 +959,64 @@ more bug while doing so, and deliberately did NOT attempt a third
   including exactly what's still ahead (interprocedural analysis,
   nested struct/array/map fields, map per-entry keys) and what
   reference counting for genuinely-escaping values would still require.
+
+- **Memory management stage 1, follow-up robustness pass (same
+  session, no new codegen.py behavior).** After the nested-block
+  extension above shipped, a dedicated pass specifically hunted for
+  combinations its own tests didn't already spell out: `break` inside a
+  loop nested inside another loop (must free only the inner loop's own
+  frame, never reach down into the outer loop's -- free_depth is
+  captured fresh by each `_emit_for`/`_emit_while` call, so this was
+  already correct by construction, now pinned down by a test); `return`
+  from a nested `if` inside a loop, both *after* the loop-local's own
+  declaration (must free it, since returning exits the loop and
+  function together) and *before* it (must not, since that VarDecl's
+  frame entry is only appended once program-order actually reaches it);
+  an `else if` chain (each arm is its own nested `IfStmt`, `parser.py`'s
+  `parse_if`, so each arm's own struct local needed confirming it's
+  freed independently of its siblings); a bare, standalone `{ }` block
+  (routed through the same `_emit_block` as everything else, per its
+  own docstring, but never previously exercised on its own); and two
+  sibling blocks (an `if`'s then/else arms, or two bare blocks in a
+  row) declaring a local with the *same name* -- each is its own `Env`/
+  frame with its own uniquely-suffixed storage ref, so this was already
+  safe, now confirmed rather than assumed. All nine new tests found
+  zero bugs -- every case was already correct by the original design
+  (frame-per-block, `down_to`-scoped freeing, per-frame program-order
+  tracking) -- see the block of tests after
+  `test_many_loop_iterations_with_nested_if_and_break_continue_does_not_crash`
+  in `tests/test_codegen.py::TestAutomaticMemoryReclamation`, plus a
+  combined 5000-iteration program exercising all of the above together
+  (nested for-in-for with an inner `break`, both return-vs-declaration
+  orderings, a 4-way `else if` chain, bare blocks with a shadowed name,
+  and `if`/`else` sibling shadowing) run under a fresh AddressSanitizer/
+  LeakSanitizer pass -- zero ASan errors, zero leaks with the loop's own
+  intentional-leak line removed, confirming (not just reasoning) that
+  the new combinations don't interact badly with each other.
+
+  One real, if minor, finding *did* come out of this pass, in
+  `_emit_free_active_locals` itself rather than in a missing test: the
+  `arr[T]`/`map[T]` free path was loading the whole `{i64, ptr}` header
+  value and then `extractvalue`-ing field 1 back out of it, instead of
+  a direct `getelementptr` to field 1 + `load` the way every other
+  array/map data-pointer read in `codegen.py` already gets there (see
+  e.g. `_emit_array_length`, `_try_addressable`) -- harmless once
+  through clang/gcc's own `-O2` (this compiler already leans on that
+  pass for exactly this kind of cleanup, per the module docstring's own
+  "always still followed by a real `calloc` + `free`" note), but
+  needlessly larger pre-optimization IR and the one place in the file
+  not matching the rest of its own convention. Switched to match; see
+  `test_non_escaping_array_local_frees_its_data_pointer` and
+  `test_non_escaping_map_local_frees_its_entries_pointer`, updated to
+  assert the `getelementptr` shape directly instead of the old
+  `extractvalue`-anywhere-in-the-IR check (which had stopped actually
+  testing the free path specifically, since array/map *construction*
+  emits its own unrelated `extractvalue` elsewhere in the same
+  function).
+
+  Also used this pass to re-verify (not re-derive) this file's own
+  "Running" example and the tool-dependency breakdown just above --
+  see that paragraph's own note on the stale count it replaces.
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -1723,7 +1788,8 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 694 passed, 10 skipped (needs a C compiler; 2 of
-                                        # the skips need `pip install pyinstaller` too,
-                                        # the other 8 need Xvfb + xdotool installed)
+pytest tests/                          # 487 passed, 226 skipped (needs a C compiler; 2 of
+                                        # those skips need `pip install pyinstaller` too,
+                                        # 8 need Xvfb + xdotool installed too) given a
+                                        # working C compiler, all 713 pass
 ```
