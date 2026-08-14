@@ -1089,7 +1089,7 @@ def analyze(program, filename="<string>"):
             handler_scope.define(p.name, Symbol(p.name, resolve(p.type_expr, decl), "parameter"), decl, filename)
         analyze_block(decl.body, handler_scope, return_type=None)
 
-    def analyze_statement(stmt, scope, return_type):
+    def analyze_statement(stmt, scope, return_type, loop_depth=0):
         if isinstance(stmt, ast.ImportDecl):
             imports.append(stmt.path)
         elif isinstance(stmt, ast.StructDecl):
@@ -1105,19 +1105,26 @@ def analyze(program, filename="<string>"):
         elif isinstance(stmt, ast.IfStmt):
             cond_type = infer(stmt.test, scope)
             check_condition_bool(cond_type, stmt)
-            analyze_block(stmt.then, scope, return_type)
+            # loop_depth passes through an if/else unchanged (not reset
+            # to 0) -- claude.md #73's break/continue target the nearest
+            # enclosing *loop*, and an if inside a loop body is still
+            # inside that loop, not a boundary of its own the way a
+            # function body is (see analyze_func, which never threads
+            # loop_depth through at all -- a fresh call always starts at
+            # the default 0).
+            analyze_block(stmt.then, scope, return_type, loop_depth)
             if stmt.orelse is not None:
                 if isinstance(stmt.orelse, ast.IfStmt):
-                    analyze_statement(stmt.orelse, scope, return_type)
+                    analyze_statement(stmt.orelse, scope, return_type, loop_depth)
                 else:
-                    analyze_block(stmt.orelse, scope, return_type)
+                    analyze_block(stmt.orelse, scope, return_type, loop_depth)
         elif isinstance(stmt, ast.WhileStmt):
             # claude.md #61: condition must be bool, no truthy/falsy
             # conversion -- same rule check_condition_bool already
             # enforces for if/ternary.
             cond_type = infer(stmt.test, scope)
             check_condition_bool(cond_type, stmt)
-            analyze_block(stmt.body, scope, return_type)
+            analyze_block(stmt.body, scope, return_type, loop_depth + 1)
         elif isinstance(stmt, ast.ForStmt):
             # claude.md #60: "the initialization variable is scoped to
             # the loop body" -- a fresh scope holds just the loop
@@ -1129,7 +1136,21 @@ def analyze(program, filename="<string>"):
             cond_type = infer(stmt.test, loop_scope)
             check_condition_bool(cond_type, stmt)
             infer(stmt.update, loop_scope)
-            analyze_block(stmt.body, loop_scope, return_type)
+            analyze_block(stmt.body, loop_scope, return_type, loop_depth + 1)
+        elif isinstance(stmt, ast.BreakStmt):
+            if loop_depth == 0:
+                raise CompileError(
+                    "'break' can only be used inside a for/while loop",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="invalid statement",
+                )
+        elif isinstance(stmt, ast.ContinueStmt):
+            if loop_depth == 0:
+                raise CompileError(
+                    "'continue' can only be used inside a for/while loop",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="invalid statement",
+                )
         elif isinstance(stmt, ast.Return):
             # claude.md #23: "A function that does not return a value
             # uses void" implies the converse too -- a void function
@@ -1158,15 +1179,15 @@ def analyze(program, filename="<string>"):
                     category="invalid return type",
                 )
         elif isinstance(stmt, ast.Block):
-            analyze_block(stmt, scope, return_type)
+            analyze_block(stmt, scope, return_type, loop_depth)
         elif isinstance(stmt, ast.ExprStmt):
             infer(stmt.expr, scope)
         # unrecognized statement kinds are ignored (no-op)
 
-    def analyze_block(block, parent_scope, return_type):
+    def analyze_block(block, parent_scope, return_type, loop_depth=0):
         scope = Scope(parent_scope)
         for stmt in block.body:
-            analyze_statement(stmt, scope, return_type)
+            analyze_statement(stmt, scope, return_type, loop_depth)
 
     for stmt in program.body:
         # claude.md #6: a multi-file program (festina.imports.build_program)

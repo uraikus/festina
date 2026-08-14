@@ -359,7 +359,7 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 610 tests in this directory pass against it: 600 given a working C
+All 704 tests in this directory pass against it: 694 given a working C
 compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
 too, plus 8 more given `Xvfb`+`xdotool` too
 (`tests/test_codegen.py::TestGraphics`'s interactive click/mouse/key/
@@ -630,6 +630,329 @@ literal-literal case it used to use is the newly-rejected one), and
 `tests/test_environment.py::TestEnvironmentIsReserved`'s updated
 message assertions.
 
+A follow-up pass revisited todo.md's own "smaller, not yet tracked"
+list and closed two of its four items outright, found and fixed one
+more bug while doing so, and deliberately did NOT attempt a third
+(memory management) despite being asked -- explained below.
+
+- **`break`/`continue` (claude.md #73, new).** claude.md never defined
+  either before this, so (per #54's ambiguity rule) they didn't exist --
+  `return` from the enclosing function was the only documented way out
+  of a loop body early. Added as a genuine spec addition (a new
+  section, not just an implementation gap being closed), because the
+  semantics are unambiguous and standard for a JS-inspired language --
+  `break` exits the nearest enclosing loop immediately; `continue`
+  skips to the next iteration, still running a `for` loop's update
+  expression first (same as a normal iteration would). Both are a
+  compile error outside any loop (`semantic.py` threads a `loop_depth`
+  counter through statement analysis, incremented entering a
+  while/for's body, reset to 0 -- not inherited -- entering a nested
+  function's own body, since a function is its own boundary regardless
+  of where it happens to be lexically declared; an `if`/plain `{ }`
+  block does NOT reset it, since those aren't loop boundaries).
+  Codegen (`CodeGen._loop_targets`, a stack of `(continue_label,
+  break_label)` pairs pushed/popped around each loop body's own
+  emission in `_emit_while`/`_emit_for`) needed no new control-flow
+  machinery beyond what if/while/for already use -- `break`/`continue`
+  just emit an unconditional `br` to the nearest loop's targets and set
+  `ctx["terminated"] = True`, the exact same "nothing after this in the
+  block gets emitted" mechanism `return` already uses. Reaches through
+  arbitrarily nested if/block statements to the nearest *loop*
+  specifically because `_loop_targets` is a plain instance-level stack,
+  not threaded through `ctx` the way `terminated` is. See
+  `tests/test_loops.py::TestBreakAndContinue` (parser/semantic) and
+  `tests/test_codegen.py::TestBreakAndContinue` (real compile-and-run,
+  including claude.md #73's own worked example verbatim, nested loops,
+  and dead-code-after-break not being emitted).
+
+- **`bool x = null` (claude.md #10/#25/#57, closing a documented gap).**
+  Same root cause as `int x = null`/`float x = null`'s own original fix
+  (`null` is only valid LLVM IR for a pointer type -- storing it into a
+  non-pointer slot is a link error) but needed one extra step those
+  didn't: i64/double have plenty of spare bit patterns to reserve as a
+  sentinel, but bool's natural representation, i1, has exactly two
+  possible values, both already meaningful (0=false, 1=true) -- no room
+  for a third. Fixed by widening `_llvm_type(BOOL)` from `i1` to `i8`
+  (`BOOL_NULL_CONST = 2`), while keeping every place LLVM itself
+  requires a genuine i1 (branch conditions, `icmp`/`fcmp`/`xor`) working
+  through a new `_bool_cond` helper (`icmp ne i8 ..., 0`) and immediate
+  `zext`s at the point a comparison/logical-op's i1 result becomes a
+  "BOOL value" the rest of codegen deals with -- `_emit_if`/`_emit_while`/
+  `_emit_for`/`_emit_ternary`'s conditions, `_emit_logical`'s short-
+  circuit test (its phi itself stays over the actual i8 operand values,
+  same JS-style "returns whichever operand won" semantics as before,
+  just at the new width), and `_emit_unary`'s `!` (narrow, xor, widen
+  back). An already-null bool used as a condition, or as an operand to
+  `!`/`&&`/`||`, is unresolved -- `_bool_cond` treats it as truthy
+  (nonzero), a documented, consistent choice, not a claim it's
+  meaningful, same allowance claude.md #57 already gives int/float's own
+  null sentinels in further arithmetic. This widening is uniform
+  everywhere a bool value is stored or passed (variables, struct/table
+  fields, array/map elements, function params/returns, sqlite binding,
+  `map[bool]`'s missing-key default) since it all flows through the one
+  `_llvm_type` source of truth -- verified directly for every one of
+  those, not just plain variables. Bonus find while doing this: the five
+  runtime functions that take/return a Festina bool
+  (`festina_log_bool`, `festina_str_from_bool`, `festina_str_eq`,
+  `festina_regex_test`, `festina_audio_is_playing`) already declared
+  their C-side signature as `int8_t`, not `_Bool`/`int` -- their LLVM
+  `declare`s said `i1` anyway, a latent (if mostly harmless, since only
+  0/1 were ever produced) ABI mismatch predating this fix entirely;
+  moving those five declares to `i8` alongside the null work corrects
+  that too.
+
+- **`x == null` for a concretely-typed int/float/bool `x` (bug, found
+  while testing the bool-null fix above, not itself new scope).**
+  `_emit_binop` used to emit both operands via plain `_emit_expr`,
+  which -- for a bare `null` literal on either side -- always produces
+  the generic LLVM `null` keyword (correct for text/struct/array, the
+  only context `_emit_expr`'s own `NullLit` branch has to work with, no
+  declared-type context available). For an int/float/bool operand this
+  produced literally invalid IR (`icmp eq i64 %x, null` -- verified as a
+  pre-existing bug, independent of bool-null entirely: `int a = 1 / 0
+  \n log(a == null)` already failed identically before any of this
+  session's bool work). Fixed by having `_emit_binop` route a `NullLit`
+  operand through `_emit_value_for` with the *other* (already-emitted)
+  operand's type as context -- the same "does this position have a
+  declared type to pick a null encoding from" pattern `_emit_value_for`
+  already exists for (var decls, params, returns), a binary comparison
+  is just one more such position. Deliberately does NOT handle `null ==
+  null` (neither side has any type context to infer a representation
+  from) -- confirmed that already failed identically before this fix
+  too, an exceedingly rare, not obviously meaningful expression to
+  write in the first place (claude.md #54's ambiguity rule, same as
+  this file's other deliberately-left corner cases, e.g. `arr[int] a =
+  [5, null]`'s trailing-null quirk). One more wrinkle specific to float:
+  comparing a null float against `null` is `false`, not `true` --
+  `FLOAT_NULL_CONST` is a real quiet NaN, and IEEE-754's *ordered*
+  compares (`oeq`/`one`, what claude.md's `==`/`!=` already lower to)
+  are false for any comparison involving NaN, including a NaN against
+  itself. Not something this fix changes or could reasonably fix as a
+  side effect -- float null-checking via `==` structurally can't be as
+  reliable as int/bool's without changing what `==`/`!=` mean for every
+  float comparison, a separate, unrelated design decision -- documented
+  directly in the regression test rather than quietly asserted around.
+
+  See `tests/test_codegen.py::TestNumericConversion`'s new
+  `test_null_bool_assignment` and its neighbors (function-call round
+  trip, struct field, ordinary non-null bool logic unaffected by the
+  width change) and the four new `test_comparing_a_null_*_against_the_
+  null_literal`/`test_comparing_a_non_null_*` cases.
+
+- **Memory management (claude.md #43), stage 1: automatic reclamation
+  of provably non-escaping locals (claude.md #74, new).** A dedicated
+  `claude.md` addition preceded this (the project's own established
+  pattern, followed deliberately here -- an earlier pass declined to
+  implement any of this without one, given the risk of getting it
+  wrong: unlike a type error or a missing null representation, a wrong
+  answer here doesn't fail loudly, it silently corrupts memory or
+  frees something still reachable at some later, disconnected point in
+  the program). A local struct/`arr[T]`/`map[T]` declared directly in a
+  function or event handler's own top-level body (not yet nested inside
+  an `if`/`while`/`for` -- see the stated stage-1 limitations below) is
+  now freed automatically at every `return` the function/handler
+  reaches, when `festina/escape_analysis.py`'s `find_escaping_names` can
+  prove -- from the syntax of that function/handler alone -- that the
+  variable's name never appears anywhere except as the immediate `.obj`
+  of a `Member` access (`v.field`, `v.field = x`, `v[i]`, `v[i] = x`,
+  `v.someMethod(...)`). That one rule turns out to correctly exclude
+  every way a value's address can escape in Festina today: a bare
+  `return v`, a call argument (`foo(v)`), the value or target of a
+  plain assignment (`x = v`, `v = other` -- the latter matters because
+  `v`'s *old* value may still be aliased elsewhere, and freeing
+  whatever `v` holds at the end of the function would free the wrong
+  thing), an array/map literal element, an operand of any operator --
+  in every one of those, the bare `Identifier` node sits somewhere
+  other than immediately under a `Member.obj`. The rule is deliberately
+  name-based, not a real scope-resolving analysis: an inner block's own,
+  unrelated local shadowing the outer candidate's name can only ever
+  make the candidate look *more* escaping than it really is (a missed
+  optimization opportunity), never less (never an unsafe free) -- see
+  `escape_analysis.py`'s own module docstring for the full reasoning,
+  including why it raises on any expression node type it doesn't
+  recognize rather than silently treating an unrecognized future AST
+  addition as non-escaping.
+
+  Wiring this into codegen needed one genuinely new piece of state
+  beyond the escaping-name set itself: `CodeGen._active_free_locals`, a
+  stack of "frames" (one per currently-being-emitted function/handler
+  body, mirroring `_loop_targets`' own "instance-level stack, not
+  threaded through `ctx`" shape for the same reason -- it has to keep
+  working through arbitrary `if`/block nesting inside the tracked body)
+  where each frame accumulates `(storage ref, Type)` for every
+  non-escaping candidate *as its own declaration is actually reached* in
+  program order (`_emit_func_body`, replacing the plain `_emit_block`
+  call `_emit_func`/`_emit_event_handler` used to make for their own
+  top-level body only -- nested `if`/`while`/`for` bodies still go
+  through the unmodified `_emit_block`). This is what makes an early
+  return -- nested inside an `if` that appears *before* a later
+  candidate's declaration in the same function -- correctly never try to
+  free something that was never allocated on that path: the candidate
+  is only added to the active frame once the top-level walk actually
+  finishes emitting its own `VarDecl`, so a `Return` reached earlier
+  simply never sees it. Verified directly, not just reasoned about
+  (`test_early_return_before_the_declaration_has_no_free_on_that_path`
+  inspects the generated IR to confirm the first `ret` has no `free()`
+  before it and the second does). `_emit_free_active_locals` (called
+  from `_emit_stmt`'s `Return` handling, after the return value if any
+  has already been computed -- so anything it reads through one of
+  those locals' own fields, itself a safe use, still sees live memory --
+  and once more from `_emit_func_body` itself for a function/handler
+  that falls off its own end) frees each active candidate according to
+  its actual representation: a struct local is `alloca ptr` pointing at
+  its own calloc'd backing storage, so freeing it means loading that
+  pointer and freeing it directly; an `arr[T]`/`map[T]` local is the
+  `{i64, ptr}` header itself, stack-allocated inline (never separately
+  heap-allocated on its own -- see `FESTINA_ARRAY_LLVM_TYPE`'s own
+  module docstring note), so freeing one means loading the header value,
+  `extractvalue`-ing its second field (the data/entries pointer), and
+  freeing *that*, not the local itself.
+
+  Verified three separate ways, deliberately more rigorously than most
+  fixes in this file given the stakes: (1) `tests/test_escape_analysis.py`
+  (36 tests) exercises `find_escaping_names` directly and exhaustively
+  -- every safe pattern (field/element read and write, a deep member
+  chain, use only inside a nested `if`/`while`/`for`, a method call on
+  the variable itself) and every escaping pattern (return, call
+  argument at any nesting depth, assignment value/target, array/map
+  literal element, ternary/logical/binary/unary/postfix operand, a
+  computed index expression) -- entirely at the parser level, no C
+  compiler needed. (2) `tests/test_codegen.py::TestAutomaticMemoryReclamation`
+  (19 tests) checks both the generated IR directly (a `free()` call
+  lands exactly where and only where expected, including the early-
+  return-ordering case above, and an event handler's own locals are
+  covered too) and real compiled-and-run programs, including the exact
+  "return a struct by value" pattern that broke the earlier naive
+  stack-allocation attempt this project already tried once and reverted
+  (see `festina/codegen.py`'s module docstring) -- every escaping case
+  (returned, passed as a call argument, assigned into a global,
+  reassigned) is confirmed to still produce the *correct value*
+  afterward, not just "no crash." (3) A real AddressSanitizer/
+  LeakSanitizer run (`gcc -fsanitize=address`, since this environment's
+  clang lacks the static ASan runtime archives but gcc's dynamic one
+  works) against a combined program exercising every escaping/non-
+  escaping pattern together across 1000+ calls: zero ASan errors (no
+  use-after-free, no double-free, no invalid free), and running the same
+  binary with leak detection enabled found *exactly* the expected
+  leaks and nothing more -- 1000 objects from the one still-escaping
+  (call-argument) pattern, plus two small, separately-explained leaks
+  from `festina_map_set`'s own per-entry `strdup`'d keys (not something
+  freeing a map's `entries` buffer touches -- a genuine, distinct,
+  now-documented stage-1 limitation of its own, found via this exact
+  ASan run, not anticipated in advance). Global variables holding
+  otherwise-unfreed struct pointers (`globalStash`, top-level `Point
+  q1/q2` receiving a `makePoint()` return) were correctly NOT reported
+  as leaks by LeakSanitizer, since they remain reachable at program
+  exit -- exactly the expected, standard leak-detector distinction
+  between "never explicitly freed" and "genuinely unreachable."
+
+  (At the time of the paragraph above, before the nested-block/loop
+  widening described next, this stage still did NOT cover a value
+  declared inside a nested `if`/`while`/`for` block or a loop body at
+  all -- both closed by the follow-up increment below, in the same
+  session.) Still explicitly NOT covered (claude.md #74 itself states
+  each of these, so a later stage's own test suite has a clear
+  before/after line): whether a value passed as a call argument is
+  actually retained by the callee (treated as escaping unconditionally
+  -- no interprocedural analysis yet); struct/array/map *fields* within
+  an otherwise-freed struct; and a freed map's own per-entry keys. None
+  of these are safety gaps -- each one only means less memory is
+  reclaimed automatically than a more complete implementation would
+  reclaim.
+
+- **Memory management stage 1, widened: nested `if`/`while`/`for`
+  bodies and per-iteration loop freeing (claude.md #74, extended in the
+  same session).** The immediate follow-up to the paragraph above,
+  closing exactly the two limitations it called out. The meaningful
+  half of this isn't "nested blocks are now covered" in the abstract --
+  it's that a value declared inside a `for`/`while` loop's body is now
+  freed at the end of *every iteration that reaches the end of that
+  body*, not deferred until the loop finishes or the enclosing function
+  eventually returns. Without this, a loop-local struct/array/map would
+  leak once per iteration, unboundedly, regardless of how tightly the
+  function-level version of this same idea was scoped -- exactly the
+  highest-value gap flagged when stage 1 first shipped.
+
+  `escape_analysis.py` itself needed zero changes: `find_escaping_names`
+  was always whole-function-scoped (it already walked into nested `if`/
+  `while`/`for` bodies looking for escaping *uses*, regardless of where
+  a candidate happens to be *declared*), so the exact same analysis
+  result already answered "is this name safe" correctly no matter which
+  block declares it. Everything new is in `codegen.py`: `_emit_block`
+  (previously only used for a nested body, with `_emit_func_body` as a
+  separate top-level-only variant) now IS the one mechanism used
+  everywhere -- a function/handler's own top-level body included, via
+  the new small wrapper `_emit_analyzed_func_body` that computes
+  `find_escaping_names` once and exposes it through `self.
+  _current_escaping_names` for every `_emit_block` call reached while
+  that one function/handler is being emitted. `_emit_block` pushes its
+  own frame onto `self._active_free_locals` (now genuinely a stack of
+  per-block frames, not one frame per function) and frees just that
+  frame at its own natural, non-terminated exit.
+
+  The real new mechanism is `_emit_free_active_locals`'s `down_to`
+  parameter, and what calls it with which value: a `Return` frees
+  `down_to=0` -- every open frame at once, since returning exits every
+  nested scope simultaneously (a value declared at the top level *and*
+  one declared in a currently-open `if` both need freeing on the same
+  `ret`). A `Break`/`Continue` frees only down to the frame index
+  recorded in `self._loop_targets` (extended from `(continue_label,
+  break_label)` pairs to `(continue_label, break_label, free_depth)`
+  triples -- `free_depth` is `len(self._active_free_locals)` recorded
+  right before `_emit_while`/`_emit_for` push the loop body's own
+  frame) -- freeing the loop body's own frame and anything nested
+  deeper inside it (e.g. an `if` inside the loop containing the actual
+  `break`), but never anything below that index: a struct declared
+  *outside* the loop and merely read/written through its own fields
+  *inside* it (always safe under claude.md #74's own rule, regardless
+  of where the struct itself was declared) is correctly left alone by
+  that loop's own `break`/`continue`. Verified directly, not just
+  reasoned about
+  (`test_break_frees_the_loop_local_but_not_an_outer_scope_local`,
+  `test_outer_scope_struct_survives_break_and_continue_from_a_nested_loop`).
+  No double-free risk between a `Break`'s explicit free and
+  `_emit_block`'s own trailing natural-exit free either: the latter is
+  gated on `not ctx["terminated"]`, and `Break`/`Continue`/`Return` all
+  set `ctx["terminated"] = True` on their own path before returning, so
+  whichever one actually fires on a given execution is the only one
+  that ever runs -- different control-flow paths through the generated
+  IR, never both on the same path.
+
+  Verified the same three ways stage 1's own initial shipment was,
+  including a fresh AddressSanitizer/LeakSanitizer pass specifically
+  because the new machinery (multi-frame stack, `break`/`continue`
+  interaction) genuinely warranted re-verification, not just reusing
+  the earlier confidence: a combined program mixing loop-local structs,
+  `if`-nested-inside-loop locals, and both `break` and `continue` firing
+  repeatedly across many outer iterations -- zero ASAN errors, and (with
+  leak detection on) a genuine 499-object leak was found and traced
+  precisely to a *different*, already-understood, pre-existing leak
+  class entirely unrelated to this increment: a global reassigned
+  inside a loop (`globalStash = q`, `q` correctly treated as escaping
+  and never freed by this feature either way) orphans its *previous*
+  value on every reassignment but the last -- confirmed by removing
+  that one line and re-running to exactly zero leaks, zero errors, not
+  waved away as "probably fine."
+
+  See `tests/test_codegen.py::TestAutomaticMemoryReclamation`'s
+  `test_a_loop_local_struct_is_freed_inside_the_loop_body` (exactly one
+  `free()` call, and it's inside the loop body's own block, not just
+  once after the loop as a whole),
+  `test_break_frees_the_loop_local_but_not_an_outer_scope_local`,
+  `test_continue_frees_locals_declared_since_the_loop_body_began`,
+  `test_nested_if_inside_a_loop_frees_correctly_on_both_the_break_and_fallthrough_paths`,
+  and the matching compile-and-run correctness tests immediately after
+  them in the same class (including
+  `test_many_loop_iterations_with_nested_if_and_break_continue_does_not_crash`,
+  a heavier robustness check than stage 1's own equivalent, specifically
+  exercising the new per-iteration free + nested-if + break/continue
+  combination together, not just repeated function calls).
+
+  See `todo.md`'s "Memory management" section for the full picture,
+  including exactly what's still ahead (interprocedural analysis,
+  nested struct/array/map fields, map per-entry keys) and what
+  reference counting for genuinely-escaping values would still require.
+
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
 by value handed the caller a pointer into an already-popped stack frame
@@ -713,13 +1036,14 @@ there for the three bugs #55-58 were written in response to (see
 "Status" above): a struct returned by value, and `null`/scientific-notation
 float literals compiling and linking successfully.
 
-`tests/test_loops.py` covers claude.md #60/#61/#63/#66 (for/while
-loops, `.length`, postfix `++`/--) at the parser/semantic level, same
-split as `test_numeric_conversion.py`; the matching end-to-end runtime
-behavior (a compiled loop actually iterating the right number of times,
-loop-variable scoping surviving a real function frame, an iterative
-Fibonacci) lives in `test_codegen.py`'s `TestLoops` and
-`TestArrayLength`.
+`tests/test_loops.py` covers claude.md #60/#61/#63/#66/#73 (for/while
+loops, `.length`, postfix `++`/--, `break`/`continue`) at the parser/
+semantic level, same split as `test_numeric_conversion.py`; the matching
+end-to-end runtime behavior (a compiled loop actually iterating the
+right number of times, loop-variable scoping surviving a real function
+frame, an iterative Fibonacci, `break`/`continue` actually altering
+control flow at runtime) lives in `test_codegen.py`'s `TestLoops`,
+`TestArrayLength`, and `TestBreakAndContinue`.
 
 `tests/test_packaging.py` covers stage 2 (claude.md #59) -- it actually
 runs `scripts/package_compiler.sh`, a real PyInstaller build (tens of
@@ -935,9 +1259,13 @@ festina/
     ast.py
         Program, ImportDecl, VarDecl, Param, FieldDecl, FuncDecl,
         StructDecl, TableDecl, EventHandler, Block, IfStmt, WhileStmt,
-        ForStmt, Return, ExprStmt, Identifier, NumberLit, StringLit,
-        BoolLit, NullLit, TemplateLit, ArrayLit, Assign, Ternary,
-        LogicalOp, BinOp, UnaryOp, PostfixOp, Member, Call, ArrayTypeExpr
+        ForStmt, BreakStmt, ContinueStmt, Return, ExprStmt, Identifier,
+        NumberLit, StringLit, BoolLit, NullLit, TemplateLit, ArrayLit,
+        Assign, Ternary, LogicalOp, BinOp, UnaryOp, PostfixOp, Member,
+        Call, ArrayTypeExpr
+        # (this snapshot predates MapLit/MapTypeExpr/RegexLit too --
+        # kept here as a rough orientation sketch, not re-derived from
+        # ast.py on every change; ast.py itself is the source of truth)
 
     types.py
         PrimitiveType(name) / StructType(name) / TableType(name) /
@@ -1395,7 +1723,7 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 600 passed, 10 skipped (needs a C compiler; 2 of
+pytest tests/                          # 694 passed, 10 skipped (needs a C compiler; 2 of
                                         # the skips need `pip install pyinstaller` too,
                                         # the other 8 need Xvfb + xdotool installed)
 ```

@@ -619,9 +619,10 @@ class TestLoops:
         assert result.stdout.strip() == "after"
 
     def test_while_true_exits_via_return_inside_the_loop(self, compile_and_run):
-        # claude.md has no `break`/`continue` -- the only documented way
-        # out of an infinite loop's body is `return` from the enclosing
-        # function (see festina/codegen.py's module docstring).
+        # `return` from the enclosing function still works as a way out
+        # of an infinite loop's body too, same as before claude.md #73
+        # added break/continue -- this isn't the only way out anymore
+        # (see TestBreakAndContinue below), just still a valid one.
         source = """
         void func run() {
             int count = 0
@@ -677,6 +678,701 @@ class TestLoops:
         """
         result = compile_and_run(source)
         assert result.stdout.splitlines() == ["55", "6765"]
+
+
+class TestBreakAndContinue:
+    """claude.md #73."""
+
+    def test_break_stops_the_loop_immediately(self, compile_and_run):
+        source = """
+        for int i = 0, i < 10, i++ {
+            if i == 5 {
+                break
+            }
+            log(i)
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "1", "2", "3", "4"]
+
+    def test_continue_skips_the_rest_of_that_iteration(self, compile_and_run):
+        source = """
+        for int i = 0, i < 5, i++ {
+            if i % 2 == 0 {
+                continue
+            }
+            log(i)
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "3"]
+
+    def test_claude_mds_own_worked_example(self, compile_and_run):
+        # claude.md #73's own example: "This logs 1, 3."
+        source = """
+        for int i = 0, i < 10, i++ {
+            if i == 5 {
+                break
+            }
+            if i % 2 == 0 {
+                continue
+            }
+            log(i)
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "3"]
+
+    def test_continue_in_a_for_loop_still_runs_the_update_expression(self, compile_and_run):
+        # claude.md #73: "the update expression still runs before the
+        # condition is checked again" -- if continue skipped straight to
+        # the condition instead, i would never advance and this would
+        # loop forever (or time out); it doesn't.
+        source = """
+        for int i = 0, i < 5, i++ {
+            continue
+        }
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "done"
+
+    def test_break_in_a_while_loop(self, compile_and_run):
+        source = """
+        int i = 0
+        while true {
+            if i >= 3 {
+                break
+            }
+            log(i)
+            i++
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "1", "2"]
+
+    def test_continue_in_a_while_loop(self, compile_and_run):
+        source = """
+        int i = 0
+        while i < 5 {
+            i++
+            if i % 2 == 0 {
+                continue
+            }
+            log(i)
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "3", "5"]
+
+    def test_break_only_exits_the_innermost_loop(self, compile_and_run):
+        source = """
+        for int i = 0, i < 3, i++ {
+            for int j = 0, j < 3, j++ {
+                if j == 1 {
+                    break
+                }
+                log(`${i},${j}`)
+            }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0,0", "1,0", "2,0"]
+
+    def test_continue_only_affects_the_innermost_loop(self, compile_and_run):
+        source = """
+        for int i = 0, i < 2, i++ {
+            for int j = 0, j < 3, j++ {
+                if j == 1 {
+                    continue
+                }
+                log(`${i},${j}`)
+            }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0,0", "0,2", "1,0", "1,2"]
+
+    def test_statements_after_break_in_the_same_block_are_not_run(self, compile_and_run):
+        source = """
+        for int i = 0, i < 3, i++ {
+            if i == 1 {
+                break
+                log('unreachable')
+            }
+            log(i)
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0"]
+
+
+class TestAutomaticMemoryReclamation:
+    """claude.md #74, stage 1: a local struct/arr[T]/map[T] declared
+    directly in a function/event handler's own top-level body is freed
+    automatically at every return, when tests/test_escape_analysis.py's
+    find_escaping_names proves it never escapes. That module is tested
+    exhaustively on its own (every syntactic escaping/non-escaping
+    pattern, no C compiler needed) -- this class checks the other half:
+    that the analysis's result actually gets wired into real generated
+    IR (free() calls landing in exactly the right place) and, more
+    importantly, that real compiled programs still produce correct
+    output in both the freed and (still-leaking, unchanged) escaping
+    cases."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    # ---- IR-level: no C compiler needed ----
+
+    def test_non_escaping_struct_local_is_freed(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            Point p
+            p.x = 1
+            log(p.x)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" in ir
+
+    def test_non_escaping_array_local_frees_its_data_pointer(self, parser, semantic, codegen):
+        source = """
+        void func f() {
+            arr[int] a = [1, 2, 3]
+            log(a[0])
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "extractvalue %struct._FestinaArray" in ir
+        assert "call void @free(" in ir
+
+    def test_non_escaping_map_local_frees_its_entries_pointer(self, parser, semantic, codegen):
+        source = """
+        void func f() {
+            map[int] m = {'a': 1}
+            log(m['a'])
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "extractvalue %struct._FestinaMap" in ir
+        assert "call void @free(" in ir
+
+    def test_returned_struct_is_not_freed(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point func makePoint() {
+            Point p
+            p.x = 1
+            return p
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" not in ir
+
+    def test_struct_passed_as_a_call_argument_is_not_freed(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func takesPoint(p:Point) {
+            log(p.x)
+        }
+        void func f() {
+            Point p
+            takesPoint(p)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" not in ir
+
+    def test_struct_assigned_into_a_global_is_not_freed(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            Point p
+            g = p
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" not in ir
+
+    def test_reassigned_struct_is_not_freed(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            Point p
+            Point q
+            p = q
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" not in ir
+
+    def test_a_loop_local_struct_is_freed_inside_the_loop_body(self, parser, semantic, codegen):
+        # claude.md #74's nested-block extension: a loop-body-declared
+        # non-escaping local is now freed at the end of *every*
+        # iteration -- exactly one free() call, and it must be inside
+        # the loop body's own block (part of the runtime back-edge
+        # cycle), not just once after the loop as a whole exits.
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            for int i = 0, i < 3, i++ {
+                Point p
+                p.x = i
+                log(p.x)
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        body_start = next(i for i, l in enumerate(lines) if l.strip() == "for.body3:")
+        body_end = next(i for i in range(body_start, len(lines)) if lines[i].strip().startswith("br label %for.update"))
+        body_lines = lines[body_start:body_end]
+        assert sum("call void @free(" in l for l in body_lines) == 1
+        assert ir.count("call void @free(") == 1
+
+    def test_a_nested_if_declared_struct_is_freed_at_the_ifs_own_end(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f(cond:bool) {
+            if cond {
+                Point p
+                p.x = 1
+                log(p.x)
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" in ir
+
+    def test_break_frees_the_loop_local_but_not_an_outer_scope_local(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            Point outer
+            outer.x = 100
+            for int i = 0, i < 5, i++ {
+                Point inner
+                inner.x = i
+                if inner.x == 2 {
+                    break
+                }
+                log(inner.x)
+            }
+            log(outer.x)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        break_block = next(i for i, l in enumerate(lines) if l.strip().startswith("if.then"))
+        break_block_end = next(i for i in range(break_block, len(lines)) if lines[i].strip().startswith("br label %for.end"))
+        break_lines = lines[break_block:break_block_end]
+        # Exactly one free() on the break path -- inner's, not outer's
+        # (outer is declared outside the loop, merely used inside it).
+        assert sum("call void @free(" in l for l in break_lines) == 1
+        # outer is still freed exactly once overall, at the function's
+        # own end (after the loop, whichever way it was exited).
+        assert ir.count("call void @free(") == 3  # inner (break path) + inner (fall-through path) + outer
+
+    def test_continue_frees_locals_declared_since_the_loop_body_began(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            for int i = 0, i < 5, i++ {
+                Point p
+                p.x = i
+                if p.x % 2 == 0 {
+                    continue
+                }
+                log(p.x)
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        continue_block = next(i for i, l in enumerate(lines) if l.strip().startswith("if.then"))
+        continue_block_end = next(i for i in range(continue_block, len(lines)) if lines[i].strip().startswith("br label %for.update"))
+        continue_lines = lines[continue_block:continue_block_end]
+        assert sum("call void @free(" in l for l in continue_lines) == 1
+
+    def test_nested_if_inside_a_loop_frees_correctly_on_both_the_break_and_fallthrough_paths(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            for int i = 0, i < 5, i++ {
+                Point p
+                p.x = i
+                if p.x == 3 {
+                    break
+                }
+                log(p.x)
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        # One free() on the break path (p, via break's own free-before-
+        # branch), one on the normal fall-through-to-next-iteration path
+        # (p, via the loop body's own natural end) -- two total, both p,
+        # never both taken on the same iteration.
+        assert ir.count("call void @free(") == 2
+
+    def test_early_return_before_the_declaration_has_no_free_on_that_path(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f(cond:bool) {
+            if cond {
+                return
+            }
+            Point p
+            p.x = 1
+            log(p.x)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        func_start = next(i for i, l in enumerate(lines) if l.startswith("define void @f("))
+        func_end = next(i for i in range(func_start, len(lines)) if lines[i] == "}")
+        func_lines = lines[func_start:func_end]
+        # The very first `ret void` (the early-return path, before p is
+        # declared) must not be preceded by a free() call anywhere
+        # earlier in the function; the second (the fall-through path,
+        # after p is declared) must be.
+        ret_indices = [i for i, l in enumerate(func_lines) if l.strip() == "ret void"]
+        assert len(ret_indices) == 2
+        assert not any("call void @free(" in l for l in func_lines[:ret_indices[0] + 1])
+        assert any("call void @free(" in l for l in func_lines[ret_indices[0] + 1:ret_indices[1] + 1])
+
+    def test_event_handler_locals_are_analyzed_too(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        on click(x:int, y:int) {
+            Point p
+            p.x = x
+            log(p.x)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" in ir
+
+    # ---- end-to-end: real compiled programs, real output ----
+
+    def test_non_escaping_struct_local_still_produces_correct_output(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            Point p
+            p.x = 5
+            p.y = 10
+            log(p.x + p.y)
+        }
+        f()
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["15", "done"]
+
+    def test_returning_a_struct_still_works_correctly(self, compile_and_run):
+        # The exact shape of bug this stage must never reintroduce --
+        # see security.md's original "returning a struct by value"
+        # fix, and this session's own live demonstration of what
+        # freeing an escaping local does to it.
+        source = """
+        struct Point { x:int y:int }
+        Point func makePoint(a:int, b:int) {
+            Point p
+            p.x = a
+            p.y = b
+            return p
+        }
+        Point q1 = makePoint(10, 20)
+        Point q2 = makePoint(999, 888)
+        log(q1.x)
+        log(q1.y)
+        log(q2.x)
+        log(q2.y)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["10", "20", "999", "888"]
+
+    def test_struct_assigned_into_a_global_keeps_its_value(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            Point p
+            p.x = 7
+            g = p
+        }
+        f()
+        log(g.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "7"
+
+    def test_struct_passed_to_another_function_keeps_its_value(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func takesPoint(p:Point) {
+            log(p.x)
+        }
+        void func f() {
+            Point p
+            p.x = 3
+            takesPoint(p)
+            log(p.x)
+        }
+        f()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["3", "3"]
+
+    def test_reassignment_keeps_the_new_values_valid(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            Point p
+            p.x = 1
+            Point q
+            q.x = 2
+            p = q
+            log(p.x)
+        }
+        f()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "2"
+
+    def test_early_return_before_declaration_runs_correctly_on_both_paths(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f(cond:bool) {
+            if cond {
+                log('early')
+                return
+            }
+            Point p
+            p.x = 42
+            log(p.x)
+        }
+        f(true)
+        f(false)
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["early", "42", "done"]
+
+    def test_non_escaping_array_and_map_locals_still_produce_correct_output(self, compile_and_run):
+        source = """
+        void func useArray() {
+            arr[int] a = [1, 2, 3]
+            log(a[0] + a[1] + a[2])
+        }
+        void func useMap() {
+            map[int] m = {'a': 1, 'b': 2}
+            log(m['a'] + m['b'])
+        }
+        useArray()
+        useMap()
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["6", "3", "done"]
+
+    def test_calling_a_freeing_function_many_times_does_not_crash(self, compile_and_run):
+        # Not a memory-bound proof (see tests/CONTRACT.md for why an
+        # RSS-based measurement isn't reliable against this compiler's
+        # own O2 pipeline, which can eliminate an unobserved allocation
+        # entirely) -- a basic robustness check that repeated alloc/free
+        # of the same struct across many calls doesn't corrupt anything
+        # an allocator would notice (a bad free()/double free is exactly
+        # the kind of thing that tends to crash loudly under real
+        # allocator bookkeeping, especially across enough iterations to
+        # exercise its free-list reuse).
+        source = """
+        struct Point { x:int y:int }
+        void func useLocal(n:int) {
+            Point p
+            p.x = n
+            p.y = n * 2
+        }
+        int total = 0
+        for int i = 0, i < 50000, i++ {
+            useLocal(i)
+            total = total + 1
+        }
+        log(total)
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "50000"
+
+    def test_nested_if_declared_struct_produces_correct_output(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f(cond:bool) {
+            if cond {
+                Point p
+                p.x = 5
+                log(p.x)
+            }
+            log('after')
+        }
+        f(true)
+        f(false)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["5", "after", "after"]
+
+    def test_loop_local_struct_produces_correct_output_every_iteration(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            for int i = 0, i < 5, i++ {
+                Point p
+                p.x = i * i
+                log(p.x)
+            }
+        }
+        f()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "1", "4", "9", "16"]
+
+    def test_break_and_continue_with_loop_local_structs_produce_correct_output(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func withBreak() {
+            for int i = 0, i < 5, i++ {
+                Point p
+                p.x = i
+                if p.x == 2 {
+                    break
+                }
+                log(p.x)
+            }
+            log('after break loop')
+        }
+        void func withContinue() {
+            for int i = 0, i < 5, i++ {
+                Point p
+                p.x = i
+                if p.x % 2 == 0 {
+                    continue
+                }
+                log(p.x)
+            }
+        }
+        withBreak()
+        withContinue()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "1", "after break loop", "1", "3"]
+
+    def test_outer_scope_struct_survives_break_and_continue_from_a_nested_loop(self, compile_and_run):
+        # The critical case: a struct declared OUTSIDE a loop and merely
+        # used (not declared) inside it must keep its correct value --
+        # break/continue only free locals declared since the loop's own
+        # body began, never anything from an outer scope.
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            Point outer
+            outer.x = 100
+            for int i = 0, i < 3, i++ {
+                Point inner
+                inner.x = i
+                if inner.x == 1 {
+                    break
+                }
+                log(inner.x + outer.x)
+            }
+            log(outer.x)
+        }
+        f()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["100", "100"]
+
+    def test_while_loop_local_struct_produces_correct_output(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            int i = 0
+            while i < 4 {
+                Point p
+                p.x = i
+                if p.x % 3 == 0 {
+                    Point r
+                    r.x = p.x * 100
+                    log(r.x)
+                }
+                i = i + 1
+            }
+        }
+        f()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "300"]
+
+    def test_struct_escaping_a_loop_into_a_global_still_works_correctly(self, compile_and_run):
+        # A value that genuinely escapes (assigned into a global) from
+        # inside a loop must never be freed, on any path, including
+        # break/continue -- it's excluded from every frame entirely,
+        # the same escape_analysis.find_escaping_names result as ever.
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            for int i = 0, i < 3, i++ {
+                Point p
+                p.x = i
+                g = p
+            }
+        }
+        f()
+        log(g.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "2"
+
+    def test_many_loop_iterations_with_nested_if_and_break_continue_does_not_crash(self, compile_and_run):
+        # A heavier robustness check than the stage-1 version above --
+        # this one exercises the actual new machinery: a loop-local
+        # struct freed every iteration, an if nested inside the loop
+        # body with its own struct local, and break/continue both firing
+        # repeatedly across many iterations, all in the same loop.
+        source = """
+        struct Point { x:int y:int }
+        void func run(n:int) {
+            Point outer
+            outer.x = 0
+            for int i = 0, i < n, i++ {
+                Point p
+                p.x = i
+                if p.x % 7 == 0 {
+                    continue
+                }
+                if p.x % 13 == 0 {
+                    break
+                }
+                Point q
+                q.x = p.x * 2
+                outer.x = outer.x + q.x
+            }
+            log(outer.x)
+        }
+        for int i = 0, i < 20000, i++ {
+            run(50)
+        }
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.splitlines()[-1] == "done"
 
 
 def _find_window(display, timeout=20):
@@ -1526,6 +2222,89 @@ class TestNumericConversion:
         result = compile_and_run("int a = null\nfloat b = null\nlog('assigned fine')")
         assert result.returncode == 0
         assert result.stdout.strip() == "assigned fine"
+
+    def test_null_bool_assignment(self, compile_and_run):
+        # Regression test: same "null is only valid IR for a pointer
+        # type" link failure as int/float, but bool needed one extra
+        # step to fix -- see festina/codegen.py's module docstring's
+        # "Null for bool" note (bool widened from i1 to i8 to make room
+        # for a third, reserved value).
+        result = compile_and_run("bool a = null\nlog('assigned fine')")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "assigned fine"
+
+    def test_comparing_a_null_int_against_the_null_literal(self, compile_and_run):
+        # Regression test, found alongside the bool-null fix: `x == null`
+        # for a concretely-typed int/float/bool operand used to reach
+        # codegen as `icmp eq i64 %x, null` -- also invalid IR (null is
+        # only valid for a pointer type), independent of bool at all.
+        result = compile_and_run("int a = 1 / 0\nlog(a == null)")
+        assert result.stdout.strip() == "true"
+
+    def test_comparing_a_non_null_int_against_the_null_literal(self, compile_and_run):
+        result = compile_and_run("int a = 5\nlog(a == null)")
+        assert result.stdout.strip() == "false"
+
+    def test_comparing_a_null_float_against_the_null_literal(self, compile_and_run):
+        # Unlike int/bool, this is "false", not "true" -- FLOAT_NULL_CONST
+        # is a real NaN, and IEEE-754's `oeq`/`one` ("ordered" compares,
+        # which is what claude.md's == / != already lower to -- see
+        # _emit_binop's fcmp dict) are false for *any* comparison
+        # involving NaN, including a NaN compared with itself. This test
+        # exists to confirm the fix at least compiles/runs cleanly now
+        # (it used to be an LLVM IR parse error -- see the int case
+        # above) -- not to claim float null-checking via == is reliable
+        # the way it is for int/bool, which it structurally can't be
+        # without changing every == / != to unordered compares, a
+        # separate, unrelated design decision this fix doesn't make.
+        result = compile_and_run("float a = 1.0 / 0.0\nlog(a == null)")
+        assert result.stdout.strip() == "false"
+
+    def test_comparing_a_null_bool_against_the_null_literal(self, compile_and_run):
+        result = compile_and_run("bool a = null\nlog(a == null)")
+        assert result.stdout.strip() == "true"
+
+    def test_comparing_a_non_null_bool_against_the_null_literal(self, compile_and_run):
+        result = compile_and_run("bool a = true\nlog(a == null)")
+        assert result.stdout.strip() == "false"
+
+    def test_null_bool_survives_a_function_call_round_trip(self, compile_and_run):
+        source = """
+        bool func identity(b:bool) {
+            return b
+        }
+        log(identity(null) == null)
+        log(identity(false) == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_null_bool_struct_field(self, compile_and_run):
+        source = """
+        struct Flag { value:bool }
+        Flag f
+        f.value = null
+        log(f.value == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+
+    def test_ordinary_bool_logic_is_unaffected_by_the_widened_representation(self, compile_and_run):
+        # claude.md #21/#22-ish sanity check: none of &&/||/!/==/!= on
+        # ordinary (non-null) bool values should have changed behavior
+        # just because the underlying storage widened from i1 to i8.
+        source = """
+        bool a = true
+        bool b = false
+        log(a && b)
+        log(a || b)
+        log(!a)
+        log(!b)
+        log(a == b)
+        log(a != b)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["false", "true", "false", "true", "false", "true"]
 
     def test_float_literal_needing_scientific_notation(self, compile_and_run):
         # Regression test: _format_double used repr(), which switches to

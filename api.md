@@ -77,6 +77,13 @@ aud       -- an audio clip loaded via loadAudio() (opaque handle)
 regex     -- a compiled pattern from a /pattern/flags literal or regex() (opaque handle)
 ```
 
+Every type may hold `null` (`bool x = null` included — see "Division and
+modulo by zero" below for how `int`/`float`/`bool` each represent it
+internally; comparing a null `int`/`bool` against the `null` literal
+with `==`/`!=` works as expected, but a null `float` never compares
+equal to `null` via `==`, even to itself — it's a real NaN under the
+hood, and IEEE-754 NaN comparisons are always false).
+
 `int`/`float` never mix implicitly, in arithmetic or comparisons:
 
 ```festina
@@ -144,6 +151,8 @@ bool both = a && b                        // short-circuit
 bool either = a || b                      // short-circuit
 
 for int i = 0, i < 10, i++ {
+    if i == 5 { break }
+    if i % 2 == 0 { continue }
     log(i)
 }
 
@@ -153,9 +162,12 @@ while condition {
 ```
 
 Conditions must be `bool` — no implicit truthiness from `int`/`text`/etc.
-No `break`/`continue` (undefined by the spec); `return` from the
-enclosing function is the only documented way out of a loop early.
-Postfix `++`/`--` work on any mutable `int` variable.
+`break` exits the nearest enclosing `for`/`while` loop immediately;
+`continue` skips to that loop's next iteration (a `for` loop's update
+expression still runs first). Both are a compile error outside any loop,
+and both only ever affect the *nearest* enclosing loop — no labeled
+break/continue targeting an outer one. Postfix `++`/`--` work on any
+mutable `int` variable.
 
 ## Strings
 
@@ -183,6 +195,19 @@ user.name = 'Patrick'
 
 Structs are native in-memory records — declaration, field read/write,
 and passing to/returning from functions by value.
+
+Memory for structs, arrays, and maps is managed automatically — no
+manual allocation or freeing. A local struct/`arr[T]`/`map[T]`
+declared in a function, event handler, `if` branch, `while` body, or
+`for` body, and never returned, stored anywhere longer-lived, or passed
+to another function, is reclaimed automatically as soon as control
+leaves the block it was declared in — for a value declared inside a
+loop body, that means every iteration, not deferred until the function
+eventually returns; `break`/`continue` reclaim it too, the same as
+reaching the end of that iteration normally would. A value that does
+escape (returned, stored somewhere longer-lived, passed to another
+function) is reclaimed by a later stage not yet implemented — see
+[todo.md](todo.md#memory-management).
 
 ## Arrays
 
