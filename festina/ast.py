@@ -179,6 +179,25 @@ class ArrayLit(Node):
         self.elements = elements
 
 
+class RegexLit(Node):
+    """claude.md #67: a JS-style /pattern/flags literal -- `pattern` and
+    `flags` are both plain, already-unescaped text (never a runtime
+    expression, unlike the regex() function's arguments below), fixed
+    at compile time. Semantically and at codegen time this produces the
+    exact same regex value the equivalent regex(pattern, flags) call
+    would (see semantic.py's infer() and codegen.py's _emit_expr) --
+    regex() itself is kept as the escape hatch for a pattern/flags value
+    that genuinely isn't known until runtime (built from a variable, a
+    template, ...), the same split JS itself has between a /pattern/
+    literal and `new RegExp(str, flags)`."""
+
+    def __init__(self, pattern, flags, line=0, column=0):
+        self.pattern = pattern
+        self.flags = flags
+        self.line = line
+        self.column = column
+
+
 class Assign(Node):
     def __init__(self, target, op, value, line=0, column=0):
         self.target = target

@@ -7,7 +7,7 @@ overhead, and the boilerplate. Festina compiles through LLVM to a real,
 standalone executable — with SQLite, graphics, audio, and JS-style
 timers built directly into the language, not bolted on as libraries.
 
-[![Tests](https://img.shields.io/badge/tests-457%20passing-brightgreen)](tests/CONTRACT.md)
+[![Tests](https://img.shields.io/badge/tests-503%20passing-brightgreen)](tests/CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ```festina
@@ -112,8 +112,8 @@ music.play()
 setTimeout(showMessage, 1000)
 setInterval(tick, 500)
 
-// Regex
-'room 42'.replace(regex('[0-9]+'), 'N')
+// Regex -- JS-style literal syntax
+'room 42'.replace(/[0-9]+/, 'N')
 ```
 
 Full reference for every one of these — signatures, caveats, what's
@@ -138,7 +138,7 @@ bin/festina examples/tic_tac_toe.f -o tic_tac_toe && ./tic_tac_toe
 | [`arrays.f`](examples/arrays.f) | Array literals, indexing, `.length` |
 | [`basic.f`](examples/basic.f) / [`hello.f`](examples/hello.f) | Tables, SQLite queries, structs, functions |
 | [`multifile.f`](examples/multifile.f) + [`geometry.f`](examples/geometry.f) | `import` across files |
-| [`regex.f`](examples/regex.f) | `regex()`, `.test()`, `.match()`, `.replace()`/`.replaceAll()` |
+| [`regex.f`](examples/regex.f) | `/pattern/flags` literals, `.test()`, `.match()`, `.replace()`/`.replaceAll()` |
 | [`timers.f`](examples/timers.f) | `setTimeout`/`setInterval`/`clearInterval` |
 | [`graphics.f`](examples/graphics.f) | A drawn canvas, plus all five `on click`/`mouse`/`key`/`resize`/`close` handlers |
 | [`audio.f`](examples/audio.f) | `loadAudio()`/`.play()`/`.stop()`/`.isPlaying()`, with a tiny bundled WAV |
@@ -165,7 +165,7 @@ needs.
 
 Festina is under active development, but not vaporware — the compiler
 frontend, LLVM codegen backend, and native C runtime are real and
-tested: **457 tests, 0 failures.** Every `claude.md` language construct
+tested: **503 tests, 0 failures.** Every `claude.md` language construct
 this project has committed to is implemented end to end, not just
 parsed. See [`tests/CONTRACT.md`](tests/CONTRACT.md) for exactly what's
 covered and how, and [todo.md](todo.md) for what's next (macOS, Windows,

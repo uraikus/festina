@@ -7,8 +7,11 @@ import pytest
 
 
 class TestRegexConstruction:
-    """claude.md #67: regex() is a global function (like sqlite(),
-    loadImage()), not a dedicated /pattern/ literal syntax."""
+    """claude.md #67: a regex value can be built either way -- the
+    JS-style /pattern/flags literal (TestRegexLiteral below) for a
+    pattern known at compile time, or the regex() function (here) for
+    one that isn't (built from a variable, a template, ...), mirroring
+    JS's own split between a /pattern/ literal and `new RegExp(...)`."""
 
     def test_regex_call_parses(self, parser):
         parser.parse("regex pattern = regex('^[a-z]+$')")
@@ -24,6 +27,83 @@ class TestRegexConstruction:
         source = "void func check(p:regex) {\n    log(p.test('x'))\n}\ncheck(regex('a'))"
         program = parser.parse(source)
         semantic.analyze(program)
+
+    def test_regex_call_still_works_for_a_dynamic_pattern(self, parser, semantic):
+        # The one thing a literal genuinely can't express: a pattern
+        # that isn't known until runtime.
+        source = "text userPattern = '[0-9]+'\nregex p = regex(userPattern)"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+
+class TestRegexLiteral:
+    """claude.md #67: /pattern/flags -- a dedicated grammar construct
+    (unlike the pre-existing regex() function), resolved from ordinary
+    division via the same lexical rule real JS lexers use: a regex
+    literal can only start where an expression is expected, never right
+    after something that could itself end one (an identifier, a
+    literal, `)`/`]`, postfix ++/--). See festina/lexer.py's
+    _regex_literal_may_start_here for the exact rule and
+    tests/test_lexer.py for lower-level tokenization coverage of the
+    disambiguation itself."""
+
+    def test_regex_literal_parses(self, parser):
+        parser.parse("regex pattern = /^[a-z]+$/")
+
+    def test_regex_literal_with_i_flag_parses(self, parser):
+        parser.parse("regex pattern = /^[a-z]+$/i")
+
+    def test_regex_literal_with_g_flag_parses(self, parser):
+        # 'g' is accepted (real JS habit) even though it has no
+        # additional effect here -- see the parser's own comment on
+        # _SUPPORTED_REGEX_FLAGS.
+        parser.parse("regex pattern = /[a-z]+/g")
+
+    def test_regex_literal_with_combined_flags_parses(self, parser):
+        parser.parse(r"regex pattern = /\w+/gi")
+
+    def test_regex_literal_infers_regex_type(self, parser, semantic):
+        program = parser.parse("regex pattern = /a/")
+        semantic.analyze(program)
+
+    def test_regex_literal_used_directly_as_a_call_argument(self, parser, semantic):
+        source = "void func check(p:regex) {\n    log(p.test('x'))\n}\ncheck(/a/)"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_regex_literal_test_method_works(self, parser, semantic):
+        source = "bool matched = /[0-9]+/.test('room 42')"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_regex_literal_as_replace_search_argument(self, parser, semantic):
+        source = "text result = 'a1b2'.replaceAll(/[0-9]/, '-')"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_unsupported_flag_is_a_compile_error(self, parser, errors):
+        # 'x' isn't one of JS's own regex flags either -- picked simply
+        # as an unambiguous "not g or i" letter.
+        with pytest.raises(errors.CompileError, match="unsupported regex flag"):
+            parser.parse("regex pattern = /a/x")
+
+    def test_duplicate_flag_is_a_compile_error(self, parser, errors):
+        with pytest.raises(errors.CompileError, match="duplicate regex flag"):
+            parser.parse("regex pattern = /a/ii")
+
+    def test_a_slash_after_an_identifier_is_still_division(self, parser):
+        # The core disambiguation claim, exercised through the full
+        # parser (not just the lexer -- see test_lexer.py for that):
+        # this must produce a BinOp('/', ...), not attempt to parse a
+        # regex literal starting at the second '/' and fail confusingly.
+        program = parser.parse("int result = a / b / c")
+        # Reaching here at all (no exception) is the assertion -- a
+        # regex-literal misparse would raise well before this returns.
+        assert program is not None
+
+    def test_a_slash_after_a_call_result_is_still_division(self, parser):
+        program = parser.parse("int result = f() / 2")
+        assert program is not None
 
 
 class TestRegexTest:

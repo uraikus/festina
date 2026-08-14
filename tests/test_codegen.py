@@ -1186,6 +1186,81 @@ class TestRegex:
         assert "unreachable" not in result.stdout
 
 
+class TestRegexLiteral:
+    """claude.md #67: /pattern/flags -- same end-to-end behavior as
+    TestRegex above (a literal compiles down to exactly the same
+    festina_regex_compile() call), just via the new literal syntax."""
+
+    def test_test_matches_and_does_not_match(self, compile_and_run):
+        source = """
+        regex digits = /[0-9]+/
+        log(digits.test('room 42'))
+        log(digits.test('no numbers'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_i_flag_matches_case_insensitively(self, compile_and_run):
+        source = """
+        regex greeting = /^hello$/i
+        log(greeting.test('HELLO'))
+        log(greeting.test('goodbye'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_g_flag_is_accepted_and_still_only_case_sensitive_by_default(self, compile_and_run):
+        # 'g' alone has no additional effect (see the parser's own
+        # comment on _SUPPORTED_REGEX_FLAGS) -- this just confirms
+        # accepting it doesn't silently turn on case-insensitivity too.
+        source = """
+        regex digits = /[a-z]+/g
+        log(digits.test('room'))
+        log(digits.test('ROOM'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_word_shorthand_class_matches_via_glibcs_gnu_extension(self, compile_and_run):
+        # \w -- not official POSIX ERE syntax, but glibc's regcomp()
+        # supports it as a GNU extension even in REG_EXTENDED mode
+        # (verified directly against this runtime's own libc) -- this is
+        # exactly the case that makes the JS-familiar shorthand classes
+        # work in practice, not just the narrower official POSIX escapes.
+        result = compile_and_run(r"log(/\w+/.test('hello world'))")
+        assert result.stdout.strip() == "true"
+
+    def test_combined_flags_from_the_readme_example(self, compile_and_run):
+        result = compile_and_run(r"log(/\w+/gi.test('Hello'))")
+        assert result.stdout.strip() == "true"
+
+    def test_match_returns_first_match(self, compile_and_run):
+        result = compile_and_run("log('room 42, building 7'.match(/[0-9]+/))")
+        assert result.stdout.strip() == "42"
+
+    def test_replace_all_with_regex_literal_search(self, compile_and_run):
+        result = compile_and_run("log('a1b2c3'.replaceAll(/[0-9]/, '-'))")
+        assert result.stdout.strip() == "a-b-c-"
+
+    def test_escaped_slash_in_a_literal_pattern_matches_a_literal_slash(self, compile_and_run):
+        result = compile_and_run(r"log(/a\/b/.test('a/b'))")
+        assert result.stdout.strip() == "true"
+
+    def test_used_directly_without_a_named_variable(self, compile_and_run):
+        # No `regex x = ...` in between -- the literal is itself a
+        # complete expression, usable anywhere a regex value is.
+        result = compile_and_run("log(/[0-9]+/.test('42'))")
+        assert result.stdout.strip() == "true"
+
+    def test_a_real_division_right_after_this_feature_still_works(self, compile_and_run):
+        # End-to-end confirmation that adding regex literals didn't
+        # break ordinary division anywhere a human could plausibly
+        # confuse the two -- see test_lexer.py::TestRegexLiterals for
+        # the exhaustive disambiguation matrix at the tokenizer level.
+        result = compile_and_run("int a = 10\nint b = 2\nlog(a / b)")
+        assert result.stdout.strip() == "5"
+
+
 class TestNumericConversion:
     """claude.md #55 (no implicit int/float conversion), #56 (Math),
     #57 (division/modulo by zero returns null). See

@@ -56,7 +56,7 @@ struct    -- user-declared record type
 table     -- a struct that's also backed by a SQLite table
 img       -- an image loaded via loadImage() (opaque handle)
 aud       -- an audio clip loaded via loadAudio() (opaque handle)
-regex     -- a compiled pattern from regex() (opaque handle)
+regex     -- a compiled pattern from a /pattern/flags literal or regex() (opaque handle)
 ```
 
 `int`/`float` never mix implicitly, in arithmetic or comparisons:
@@ -135,9 +135,9 @@ Postfix `++`/`--` work on any mutable `int` variable.
 ```festina
 text greeting = `Hello, ${name}!`     // template literals
 text a = 'room 42'.replace('room', 'suite')
-text b = 'a1b2c3'.replaceAll(regex('[0-9]'), '-')
-bool matched = regex('[0-9]+').test('room 42')
-text found = 'room 42'.match(regex('[0-9]+'))   // null if no match
+text b = 'a1b2c3'.replaceAll(/[0-9]/, '-')
+bool matched = /[0-9]+/.test('room 42')
+text found = 'room 42'.match(/[0-9]+/)   // null if no match
 ```
 
 ## Structs
@@ -191,17 +191,37 @@ columns map onto a declared table's fields by position, not by name.
 ## Regex
 
 ```festina
-regex digits = regex('[0-9]+')            // POSIX extended regex
-regex ci = regex('^hello$', 'i')          // 'i' = case-insensitive, the only flag
+regex digits = /[0-9]+/                    // JS-style literal, POSIX extended regex underneath
+regex ci = /^hello$/i                      // 'i' = case-insensitive; 'g' is also accepted (see below)
 digits.test('room 42')                     // -> bool
 'room 42'.match(digits)                    // -> text or null
 'a1b2'.replace(digits, 'x')                // first match only
 'a1b2'.replaceAll(digits, 'x')             // every match
 ```
 
-No capture groups, backreferences, or non-greedy quantifiers (POSIX
-ERE's own limits). Compiled fresh at every `regex()` call site — no
-caching by pattern text.
+`flags` immediately follows the closing `/`, no space (`/pattern/flags`).
+Only `i` (case-insensitive) and `g` are accepted — `g` is recognized
+for familiarity with JavaScript but has no additional effect, since
+`.replace()`/`.replaceAll()` already say "first match" vs. "every
+match" explicitly, the same distinction `g` controls implicitly in JS.
+Any other flag letter is a compile-time error. `\w`/`\d`/`\s`/`\b` work
+as expected (glibc's `regcomp()` supports them as GNU extensions), but
+there are no capture groups, backreferences, or non-greedy quantifiers
+(POSIX ERE's own limits).
+
+A pattern/flags that aren't known until runtime (built from a variable
+or a template) can't use the literal syntax — the global `regex(pattern,
+flags)` function is still available for that case, the same split
+JavaScript itself has between a `/pattern/` literal and `new
+RegExp(...)`:
+
+```festina
+text userPattern = someInput()
+regex dynamic = regex(userPattern)
+```
+
+Compiled fresh every time it's evaluated (both forms) — no caching by
+pattern text.
 
 ## Graphics
 
