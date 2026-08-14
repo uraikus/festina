@@ -350,7 +350,7 @@
 <header class="hero">
   <div class="wrap">
     <div class="badges">
-      <span class="badge">434 tests passing</span>
+      <span class="badge">589 tests passing</span>
       <span class="badge">MIT license</span>
       <span class="badge">Linux</span>
     </div>
@@ -479,7 +479,14 @@ setTimeout(showMessage, 1000)
 setInterval(tick, 500)
 
 <span class="cm">// Regex, JS-style literals</span>
-<span class="str">'room 42'</span>.replace(<span class="re">/[0-9]+/</span>, <span class="str">'N'</span>)</pre>
+<span class="str">'room 42'</span>.replace(<span class="re">/[0-9]+/</span>, <span class="str">'N'</span>)
+
+<span class="cm">// Maps -- text-keyed, JS-object-literal-flavored</span>
+<span class="kw">map[int]</span> npcHealths = { <span class="str">'npc1'</span>: 10, <span class="str">'npc2'</span>: 15 }
+npcHealths[<span class="str">'npc1'</span>] = 30
+
+<span class="cm">// Config straight from the environment, no extra library</span>
+<span class="kw">text</span> apiKey = environment.API_KEY</pre>
   </div>
 </section>
 
@@ -548,7 +555,7 @@ setInterval(tick, 500)
     <h2>Project status</h2>
     <div class="status-line">
       <span class="dot"></span>
-      <span><strong>434 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
+      <span><strong>589 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
     </div>
     <p class="section-intro">
       The compiler frontend, LLVM codegen backend, and native C runtime are
