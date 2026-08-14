@@ -1,0 +1,913 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API Reference — Festina</title>
+<meta name="description" content="The Festina language and standard library reference: types, control flow, maps, SQLite, environment variables, regex, graphics, audio, and timers.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23e8823a'/%3E%3Ctext x='50' y='68' font-size='60' font-family='monospace' font-weight='700' text-anchor='middle' fill='%231a1712'%3Ef%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #fbf9f6;
+    --bg-raised: #ffffff;
+    --bg-sunken: #f1ede6;
+    --text: #211c14;
+    --text-muted: #6b6252;
+    --border: #e4ddd0;
+    --accent: #c15f1e;
+    --accent-strong: #a84f16;
+    --accent-soft: #fbe6d3;
+    --code-bg: #221d16;
+    --code-text: #f2ead9;
+    --code-muted: #9a8f78;
+    --code-string: #d99a5b;
+    --code-keyword: #e8823a;
+    --code-comment: #7d745f;
+    --shadow: 0 1px 2px rgba(35, 25, 10, 0.06), 0 8px 24px rgba(35, 25, 10, 0.05);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #17140f;
+      --bg-raised: #1f1b14;
+      --bg-sunken: #14110c;
+      --text: #f2ead9;
+      --text-muted: #a89c84;
+      --border: #332c20;
+      --accent: #f0904f;
+      --accent-strong: #f7a86b;
+      --accent-soft: #3a2814;
+      --code-bg: #0f0d09;
+      --code-text: #f2ead9;
+      --code-muted: #8a7f68;
+      --code-string: #e8b47c;
+      --code-keyword: #f0904f;
+      --code-comment: #6b6250;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #17140f;
+    --bg-raised: #1f1b14;
+    --bg-sunken: #14110c;
+    --text: #f2ead9;
+    --text-muted: #a89c84;
+    --border: #332c20;
+    --accent: #f0904f;
+    --accent-strong: #f7a86b;
+    --accent-soft: #3a2814;
+    --code-bg: #0f0d09;
+    --code-text: #f2ead9;
+    --code-muted: #8a7f68;
+    --code-string: #e8b47c;
+    --code-keyword: #f0904f;
+    --code-comment: #6b6250;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent-strong); }
+  code, pre, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+
+  code:not(pre code) {
+    background: var(--bg-sunken);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.1em 0.35em;
+    font-size: 0.87em;
+  }
+
+  /* Top bar */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 56px;
+    padding: 0 16px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    font-size: 1.02rem;
+    color: var(--text);
+    text-decoration: none;
+  }
+  .brand .mark {
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    background: var(--accent);
+    color: #1a1508;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: monospace;
+    font-weight: 800;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+  }
+  .brand .sep { color: var(--text-muted); font-weight: 400; }
+  .topbar-links {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    font-size: 0.88rem;
+  }
+  .topbar-links a { color: var(--text-muted); text-decoration: none; }
+  .topbar-links a:hover { color: var(--text); }
+  .menu-btn {
+    display: none;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+
+  /* Layout */
+  .layout {
+    display: grid;
+    grid-template-columns: 260px minmax(0, 1fr);
+    max-width: 1280px;
+    margin: 0 auto;
+  }
+
+  /* Sidebar */
+  aside.sidebar {
+    position: sticky;
+    top: 56px;
+    align-self: start;
+    height: calc(100vh - 56px);
+    overflow-y: auto;
+    padding: 24px 16px 40px;
+    border-right: 1px solid var(--border);
+  }
+  .search-box {
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg-raised);
+    color: var(--text);
+    font-size: 0.85rem;
+    margin-bottom: 16px;
+  }
+  .search-box:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .nav-group { margin-bottom: 4px; }
+  .nav-group-title {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin: 18px 0 6px;
+    padding: 0 10px;
+  }
+  .nav-group:first-of-type .nav-group-title { margin-top: 0; }
+  nav.toc a {
+    display: block;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 0.87rem;
+    color: var(--text-muted);
+    text-decoration: none;
+    line-height: 1.35;
+  }
+  nav.toc a:hover { background: var(--bg-sunken); color: var(--text); }
+  nav.toc a.active {
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-weight: 600;
+  }
+  nav.toc a.sub {
+    padding-left: 22px;
+    font-size: 0.83rem;
+  }
+  nav.toc a[data-hidden="true"] { display: none; }
+
+  /* Main content */
+  main {
+    min-width: 0;
+    padding: 40px 32px 100px;
+  }
+  .content-wrap { max-width: 720px; }
+
+  .page-kicker {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--accent-strong);
+    font-weight: 700;
+    margin: 0 0 8px;
+  }
+  h1.page-title {
+    font-size: 2rem;
+    margin: 0 0 12px;
+    letter-spacing: -0.02em;
+  }
+  .lede {
+    color: var(--text-muted);
+    font-size: 1.02rem;
+    max-width: 640px;
+    margin: 0 0 8px;
+  }
+
+  section.doc-section {
+    padding-top: 40px;
+    margin-top: 24px;
+    border-top: 1px solid var(--border);
+    scroll-margin-top: 72px;
+  }
+  section.doc-section:first-of-type { border-top: none; }
+  h2 {
+    font-size: 1.4rem;
+    margin: 0 0 12px;
+    letter-spacing: -0.01em;
+    scroll-margin-top: 72px;
+  }
+  h3 {
+    font-size: 1.05rem;
+    margin: 28px 0 10px;
+    scroll-margin-top: 72px;
+  }
+  h2 .anchor, h3 .anchor {
+    opacity: 0;
+    text-decoration: none;
+    color: var(--text-muted);
+    font-size: 0.85em;
+    margin-left: 6px;
+  }
+  h2:hover .anchor, h3:hover .anchor { opacity: 1; }
+
+  p { margin: 0 0 14px; color: var(--text); }
+  p.muted { color: var(--text-muted); }
+
+  pre.code {
+    background: var(--code-bg);
+    color: var(--code-text);
+    border-radius: 10px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    line-height: 1.6;
+    box-shadow: var(--shadow);
+    margin: 0 0 16px;
+  }
+  pre.code .kw { color: var(--code-keyword); }
+  pre.code .str { color: var(--code-string); }
+  pre.code .re { color: var(--code-string); opacity: 0.85; }
+  pre.code .cm { color: var(--code-comment); font-style: italic; }
+  pre.code .mut { color: var(--code-muted); }
+
+  .callout {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 0.92rem;
+    color: var(--text-muted);
+    margin: 0 0 16px;
+  }
+  .callout strong { color: var(--text); }
+
+  .sig-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    margin: 0 0 16px;
+  }
+  .sig-table td {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .sig-table td:first-child {
+    white-space: nowrap;
+    font-family: monospace;
+    color: var(--accent-strong);
+  }
+
+  .prevnext {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+  }
+  .prevnext a {
+    flex: 1;
+    text-decoration: none;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    color: var(--text);
+  }
+  .prevnext a:hover { border-color: var(--accent); }
+  .prevnext .label { display: block; font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+  .prevnext .next { text-align: right; }
+
+  @media (max-width: 880px) {
+    .layout { grid-template-columns: 1fr; }
+    .menu-btn { display: inline-block; }
+    aside.sidebar {
+      position: fixed;
+      top: 56px;
+      left: 0;
+      width: 280px;
+      max-width: 85vw;
+      background: var(--bg);
+      z-index: 30;
+      transform: translateX(-100%);
+      transition: transform 0.18s ease;
+      box-shadow: var(--shadow);
+    }
+    aside.sidebar.open { transform: translateX(0); }
+    .sidebar-backdrop {
+      display: none;
+      position: fixed;
+      inset: 56px 0 0 0;
+      background: rgba(0,0,0,0.35);
+      z-index: 25;
+    }
+    .sidebar-backdrop.open { display: block; }
+    main { padding: 32px 20px 80px; }
+    .topbar-links a.hide-narrow { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex; align-items:center; gap:8px;">
+    <button class="menu-btn" id="menuBtn" aria-label="Toggle navigation">☰ Menu</button>
+    <a class="brand" href="index.html"><span class="mark">f</span> Festina <span class="sep">/ Docs</span></a>
+  </div>
+  <div class="topbar-links">
+    <a class="hide-narrow" href="index.html#docs">All docs</a>
+    <a href="https://github.com/uraikus/festina">GitHub</a>
+  </div>
+</div>
+
+<div class="sidebar-backdrop" id="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…">
+    <nav class="toc" id="toc">
+      <div class="nav-group">
+        <a href="#compilation-pipeline">Compilation pipeline</a>
+        <a class="sub" href="#binary-size">Binary size</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Language</div>
+        <a href="#types">Types</a>
+        <a href="#variables-constants-functions">Variables, constants, functions</a>
+        <a href="#control-flow">Control flow</a>
+        <a href="#strings">Strings</a>
+        <a href="#structs">Structs</a>
+        <a href="#arrays">Arrays</a>
+        <a href="#maps">Maps</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Standard library</div>
+        <a href="#built-in-sqlite">Built-in SQLite</a>
+        <a class="sub" href="#database-configuration">Database configuration</a>
+        <a href="#environment-variables">Environment variables</a>
+        <a href="#regex">Regex</a>
+        <a href="#graphics">Graphics</a>
+        <a href="#timers">Timers</a>
+        <a href="#audio">Audio</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Reference</div>
+        <a href="#imports">Imports</a>
+        <a href="#log-fail">log() / fail()</a>
+        <a href="#error-format">Error format</a>
+        <a href="#examples">Examples</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="content-wrap">
+      <p class="page-kicker">API Reference</p>
+      <h1 class="page-title">The Festina language & standard library</h1>
+      <p class="lede">
+        As implemented today. For exactly what's implemented vs. not (and
+        known caveats), see
+        <a href="https://github.com/uraikus/festina/blob/main/tests/CONTRACT.md">tests/CONTRACT.md</a>;
+        for the full target-language spec this compiler is built against,
+        see <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md</a>.
+      </p>
+
+      <section class="doc-section" id="compilation-pipeline">
+        <h2>Compilation pipeline <a class="anchor" href="#compilation-pipeline">#</a></h2>
+        <pre class="code">Festina source (.f)
+   -&gt; AST (festina.parser)
+   -&gt; Semantic analysis (festina.semantic)
+   -&gt; LLVM IR (festina.codegen)
+   -&gt; Object file (festina.llvm_backend, via libLLVM -- or clang's IR
+      frontend as a fallback)
+   -&gt; Link against the runtime (runtime/festina_runtime.c and,
+      conditionally, _graphics.c/_audio.c -- see "Binary size" below)
+   -&gt; Native executable</pre>
+        <pre class="code"><span class="mut">$</span> bin/festina program.f -o program   <span class="cm"># compile</span>
+<span class="mut">$</span> bin/festina program.f --emit-llvm  <span class="cm"># print LLVM IR instead of linking</span>
+<span class="mut">$</span> ./program                          <span class="cm"># the result needs neither Python</span>
+                                    <span class="cm"># nor festina/ to run</span></pre>
+        <p>
+          A program needs no <code>main()</code> — top-level statements in
+          the entry file run in order, after every import is resolved and
+          every declared table's schema is synced.
+        </p>
+
+        <h3 id="binary-size">Binary size <a class="anchor" href="#binary-size">#</a></h3>
+        <p>
+          A compiled program only links what it actually uses: the
+          graphics (Cairo/X11) and audio (ALSA) runtime object files are
+          only passed to the linker when the program calls something from
+          them (see
+          <a href="https://github.com/uraikus/festina/blob/main/security.md#binary-slimming">security.md</a>).
+          <code>libsqlite3</code> is always available (statically linked
+          when possible), since automatic database support (<code>table</code>,
+          <code>sqlite()</code>) is always on.
+        </p>
+      </section>
+
+      <section class="doc-section" id="types">
+        <h2>Types <a class="anchor" href="#types">#</a></h2>
+        <pre class="code"><span class="kw">int</span>       -- 64-bit signed integer
+<span class="kw">float</span>     -- 64-bit floating point (IEEE 754 double)
+<span class="kw">bool</span>      -- true / false, no truthy/falsy coercion from anything else
+<span class="kw">text</span>      -- UTF-8 string
+<span class="kw">blob</span>      -- binary data (shares text's representation; text -&gt; blob
+             assignment is allowed, the reverse is not)
+<span class="kw">arr[T]</span>    -- homogeneous array of any of the above, a struct, or a
+             declared table's row type
+<span class="kw">map[T]</span>    -- text-keyed map of any of the above except arr[T]/map[T]
+             itself (see the Maps section below)
+<span class="kw">struct</span>    -- user-declared record type
+<span class="kw">table</span>     -- a struct that's also backed by a SQLite table
+<span class="kw">img</span>       -- an image loaded via loadImage() (opaque handle)
+<span class="kw">aud</span>       -- an audio clip loaded via loadAudio() (opaque handle)
+<span class="kw">regex</span>     -- a compiled pattern from a /pattern/flags literal or regex() (opaque handle)</pre>
+
+        <p><code>int</code>/<code>float</code> never mix implicitly, in arithmetic or comparisons:</p>
+        <pre class="code"><span class="kw">int</span> a = 5
+<span class="kw">float</span> b = 2.5
+<span class="kw">float</span> c = a.toFloat() + b        <span class="cm">// int.toFloat() is the only int-&gt;float conversion</span></pre>
+
+        <table class="sig-table">
+          <tr><td>Math.floor(x:float)</td><td>-&gt; int</td></tr>
+          <tr><td>Math.ceil(x:float)</td><td>-&gt; int</td></tr>
+          <tr><td>Math.round(x:float)</td><td>-&gt; int</td></tr>
+          <tr><td>Math.trunc(x:float)</td><td>-&gt; int</td></tr>
+        </table>
+
+        <p>Division/modulo by zero return <code>null</code> (for both <code>int</code> and <code>float</code>) rather than crashing:</p>
+        <pre class="code"><span class="kw">int</span> result = 10 / 0   <span class="cm">// null</span></pre>
+
+        <p>
+          <code>int</code>/<code>float</code>/<code>bool</code> also each
+          have <code>.toText()</code>, returning the same text template
+          interpolation already produces for that value implicitly —
+          useful when that text is needed outside of a template:
+        </p>
+        <pre class="code"><span class="kw">int</span> count = 5
+log(count.toText())   <span class="cm">// "5" -- identical to log(`${count}`)</span></pre>
+      </section>
+
+      <section class="doc-section" id="variables-constants-functions">
+        <h2>Variables, constants, functions <a class="anchor" href="#variables-constants-functions">#</a></h2>
+        <pre class="code"><span class="kw">int</span> count = 10
+<span class="kw">const int</span> max = 100      <span class="cm">// reassigning a const is a compile error</span>
+<span class="kw">text</span> message = <span class="str">'Hello'</span>
+
+<span class="kw">int func</span> add(a:<span class="kw">int</span>, b:<span class="kw">int</span>) {
+    <span class="kw">return</span> a + b
+}
+
+<span class="kw">void func</span> log_it() {
+    log(<span class="str">'called'</span>)
+}</pre>
+        <p>
+          No <code>var</code>/<code>let</code> — every declaration states
+          its type. Functions are not first-class values (no closures, no
+          passing a function as a value) — this is why
+          <code>setTimeout</code>/<code>setInterval</code>'s callback
+          argument must be the bare name of an already-declared,
+          zero-parameter, <code>void</code>-returning function, not an
+          arbitrary expression.
+        </p>
+      </section>
+
+      <section class="doc-section" id="control-flow">
+        <h2>Control flow <a class="anchor" href="#control-flow">#</a></h2>
+        <pre class="code"><span class="kw">if</span> condition {
+    ...
+} <span class="kw">else</span> {
+    ...
+}
+
+<span class="kw">bool</span> result = condition ? <span class="str">'yes'</span> : <span class="str">'no'</span>   <span class="cm">// ternary</span>
+<span class="kw">bool</span> both = a &amp;&amp; b                        <span class="cm">// short-circuit</span>
+<span class="kw">bool</span> either = a || b                      <span class="cm">// short-circuit</span>
+
+<span class="kw">for int</span> i = 0, i &lt; 10, i++ {
+    log(i)
+}
+
+<span class="kw">while</span> condition {
+    ...
+}</pre>
+        <p>
+          Conditions must be <code>bool</code> — no implicit truthiness
+          from <code>int</code>/<code>text</code>/etc. No
+          <code>break</code>/<code>continue</code> (undefined by the
+          spec); <code>return</code> from the enclosing function is the
+          only documented way out of a loop early. Postfix
+          <code>++</code>/<code>--</code> work on any mutable
+          <code>int</code> variable.
+        </p>
+      </section>
+
+      <section class="doc-section" id="strings">
+        <h2>Strings <a class="anchor" href="#strings">#</a></h2>
+        <pre class="code"><span class="kw">text</span> greeting = <span class="str">`Hello, ${name}!`</span>     <span class="cm">// template literals</span>
+<span class="kw">text</span> a = <span class="str">'room 42'</span>.replace(<span class="str">'room'</span>, <span class="str">'suite'</span>)
+<span class="kw">text</span> b = <span class="str">'a1b2c3'</span>.replaceAll(<span class="re">/[0-9]/</span>, <span class="str">'-'</span>)
+<span class="kw">bool</span> matched = <span class="re">/[0-9]+/</span>.test(<span class="str">'room 42'</span>)
+<span class="kw">text</span> found = <span class="str">'room 42'</span>.match(<span class="re">/[0-9]+/</span>)   <span class="cm">// null if no match</span></pre>
+      </section>
+
+      <section class="doc-section" id="structs">
+        <h2>Structs <a class="anchor" href="#structs">#</a></h2>
+        <pre class="code"><span class="kw">struct</span> User {
+    id:<span class="kw">int</span>
+    name:<span class="kw">text</span>
+    active:<span class="kw">bool</span>
+}
+
+<span class="kw">User</span> user
+user.id = 1
+user.name = <span class="str">'Patrick'</span></pre>
+        <p>
+          Structs are native in-memory records — declaration, field
+          read/write, and passing to/returning from functions by value.
+        </p>
+      </section>
+
+      <section class="doc-section" id="arrays">
+        <h2>Arrays <a class="anchor" href="#arrays">#</a></h2>
+        <pre class="code"><span class="kw">arr[int]</span> numbers = [1, 2, 3]
+<span class="kw">arr[arr[int]]</span> matrix
+log(numbers.length)
+numbers[0] = 10</pre>
+        <p>Not bounds-checked; data is never freed (no GC yet — see <a href="https://github.com/uraikus/festina/blob/main/todo.md">todo.md</a>).</p>
+      </section>
+
+      <section class="doc-section" id="maps">
+        <h2>Maps <a class="anchor" href="#maps">#</a></h2>
+        <pre class="code"><span class="kw">text</span> npc2Id = <span class="str">'npc2'</span>
+<span class="kw">map[int]</span> npcHealths = {<span class="str">'npc1'</span>: 10, npc2Id: 15}   <span class="cm">// keys are always text</span>
+<span class="kw">map[text]</span> npcNames = {<span class="str">'npc1'</span>: <span class="str">'jim'</span>, npc2Id: <span class="str">'john'</span>}
+
+npcHealths[<span class="str">'npc1'</span>]          <span class="cm">// -&gt; 10</span>
+npcHealths[npc2Id]          <span class="cm">// -&gt; 15 -- a key can be any text expression</span>
+npcHealths[<span class="str">'missing'</span>]       <span class="cm">// -&gt; null -- a missing key, not an error</span>
+
+npcHealths[<span class="str">'npc1'</span>] = 30     <span class="cm">// updates an existing key</span>
+npcHealths[<span class="str">'npc3'</span>] = 5      <span class="cm">// adds a new one</span>
+
+<span class="kw">void func</span> logHealth(h:<span class="kw">int</span>, key:<span class="kw">text</span>) {
+    log(<span class="str">`${key} ${h.toText()}`</span>)
+}
+npcHealths.forEach(logHealth)   <span class="cm">// (value, key) -- visit order is unspecified</span></pre>
+        <p class="muted">
+          An unquoted identifier key (<code>npc2Id</code> above) is a
+          reference to that variable's own text value, not
+          bareword-as-string-name shorthand the way a plain JS object
+          literal has. <code>map[T]</code>'s <code>T</code> may be any
+          type except <code>arr[...]</code>/<code>map[...]</code> itself
+          (a map value is stored in one fixed-size slot, which those two
+          don't fit in). <code>.forEach()</code>'s callback must be an
+          already-declared function taking exactly
+          <code>(value, key:text)</code> and returning nothing, the same
+          "bare name of a declared function" restriction
+          <code>setTimeout</code>'s callback has. Not a hash table
+          internally — lookup/insert are O(n) over the entry count, a
+          deliberate simplicity tradeoff for what's meant to be a small,
+          config/game-state-shaped collection, not a large-scale data
+          structure.
+        </p>
+      </section>
+
+      <section class="doc-section" id="built-in-sqlite">
+        <h2>Built-in SQLite <a class="anchor" href="#built-in-sqlite">#</a></h2>
+        <pre class="code"><span class="kw">table</span> People {
+    id:<span class="kw">int</span>
+    name:<span class="kw">text</span>
+}
+
+<span class="kw">arr[People]</span> people = sqlite(<span class="str">'SELECT * FROM People'</span>)
+sqlite(<span class="str">'INSERT INTO People (id, name) VALUES (?, ?)'</span>, [1, <span class="str">'Patrick'</span>])</pre>
+        <p>
+          Every <code>table</code> declaration is synced against
+          <code>festina.sqlite</code> at startup — created if missing,
+          columns added/dropped/retyped (existing data preserved via a
+          temp-table rebuild) to match the declaration exactly.
+          <code>sqlite()</code>'s optional second argument (bound
+          parameters) must be a literal array expression, not an
+          arbitrary <code>arr[T]</code> value. Query result columns map
+          onto a declared table's fields by position, not by name.
+        </p>
+
+        <h3 id="database-configuration">Database configuration <a class="anchor" href="#database-configuration">#</a></h3>
+        <p>
+          <code>festina.sqlite</code> is the default, but the entry
+          file's very first line (before any other code and before any
+          <code>import</code>) may override it:
+        </p>
+        <pre class="code">DatabaseURL = <span class="str">'game_saves.sqlite'</span></pre>
+        <p>
+          <code>path</code> may be any text expression, including
+          <code>environment.NAME</code> (see
+          <a href="#environment-variables">Environment variables</a>
+          below) — useful for picking the database path per-deployment
+          without recompiling:
+        </p>
+        <pre class="code">DatabaseURL = environment.DATABASE_URL</pre>
+        <div class="callout">
+          <strong>Note:</strong> <code>DatabaseURL</code> appearing
+          anywhere other than the entry file's first statement is a
+          compile-time error; it has no effect at all in an imported file
+          (only the file actually passed to the compiler is checked).
+        </div>
+      </section>
+
+      <section class="doc-section" id="environment-variables">
+        <h2>Environment variables <a class="anchor" href="#environment-variables">#</a></h2>
+        <pre class="code"><span class="kw">text</span> apiKey = environment.API_KEY
+<span class="kw">text</span> home = environment[<span class="str">'HOME'</span>]       <span class="cm">// computed key -- must be text</span>
+
+<span class="kw">if</span> apiKey == null {
+    fail(<span class="str">'API_KEY is not set'</span>)
+}</pre>
+        <p>
+          Returns the named environment variable as <code>text</code>, or
+          <code>null</code> if it isn't set. Read-only (assigning to
+          <code>environment.NAME</code> is a compile-time error) and
+          can't be used by itself without a
+          <code>.NAME</code>/<code>[keyExpr]</code> — both are also
+          compile-time errors, not runtime ones.
+        </p>
+      </section>
+
+      <section class="doc-section" id="regex">
+        <h2>Regex <a class="anchor" href="#regex">#</a></h2>
+        <pre class="code"><span class="kw">regex</span> digits = <span class="re">/[0-9]+/</span>                    <span class="cm">// JS-style literal, POSIX extended regex underneath</span>
+<span class="kw">regex</span> ci = <span class="re">/^hello$/i</span>                      <span class="cm">// 'i' = case-insensitive; 'g' is also accepted (see below)</span>
+digits.test(<span class="str">'room 42'</span>)                     <span class="cm">// -&gt; bool</span>
+<span class="str">'room 42'</span>.match(digits)                     <span class="cm">// -&gt; text or null</span>
+<span class="str">'a1b2'</span>.replace(digits, <span class="str">'x'</span>)                <span class="cm">// first match only</span>
+<span class="str">'a1b2'</span>.replaceAll(digits, <span class="str">'x'</span>)             <span class="cm">// every match</span></pre>
+        <p>
+          <code>flags</code> immediately follows the closing
+          <code>/</code>, no space (<code>/pattern/flags</code>). Only
+          <code>i</code> (case-insensitive) and <code>g</code> are
+          accepted — <code>g</code> is recognized for familiarity with
+          JavaScript but has no additional effect, since
+          <code>.replace()</code>/<code>.replaceAll()</code> already say
+          "first match" vs. "every match" explicitly, the same
+          distinction <code>g</code> controls implicitly in JS. Any other
+          flag letter is a compile-time error.
+          <code>\w</code>/<code>\d</code>/<code>\s</code>/<code>\b</code>
+          work as expected (glibc's <code>regcomp()</code> supports them
+          as GNU extensions), but there are no capture groups,
+          backreferences, or non-greedy quantifiers (POSIX ERE's own
+          limits).
+        </p>
+        <p>
+          A pattern/flags that aren't known until runtime (built from a
+          variable or a template) can't use the literal syntax — the
+          global <code>regex(pattern, flags)</code> function is still
+          available for that case, the same split JavaScript itself has
+          between a <code>/pattern/</code> literal and
+          <code>new RegExp(...)</code>:
+        </p>
+        <pre class="code"><span class="kw">text</span> userPattern = someInput()
+<span class="kw">regex</span> dynamic = regex(userPattern)</pre>
+        <p class="muted">Compiled fresh every time it's evaluated (both forms) — no caching by pattern text.</p>
+      </section>
+
+      <section class="doc-section" id="graphics">
+        <h2>Graphics <a class="anchor" href="#graphics">#</a></h2>
+        <pre class="code">drawRect(0, 0, 100, 100)
+drawCircle(50, 50, 25)
+drawText(<span class="str">'Hello'</span>, 20, 20)
+
+<span class="kw">img</span> profile = loadImage(<span class="str">'profile.png'</span>)    <span class="cm">// PNG only</span>
+drawImage(profile, 0, 0)
+
+log(<span class="str">`canvas is ${clientWidth}x${clientHeight}`</span>)
+
+<span class="kw">on</span> click(x:<span class="kw">int</span>, y:<span class="kw">int</span>)  { ... }
+<span class="kw">on</span> mouse(x:<span class="kw">int</span>, y:<span class="kw">int</span>)  { ... }
+<span class="kw">on</span> key(key:<span class="kw">text</span>)        { ... }
+<span class="kw">on</span> resize()             { ... }
+<span class="kw">on</span> close()              { ... }</pre>
+        <p>
+          A real on-screen X11 window (via Cairo's Xlib backend), opened
+          automatically the first time a program draws something, reads
+          <code>clientWidth</code>/<code>clientHeight</code>, or declares
+          one of the five event handlers above — <code>loadImage()</code>
+          alone does <em>not</em> open a window (decoding a PNG needs no
+          display). Undecorated, starts at 800×600, everything draws in
+          solid black (no color argument in any of claude.md's own
+          examples). After the entry file's top-level code finishes, if a
+          window was opened, the process blocks handling redraws/input
+          until the window closes.
+        </p>
+      </section>
+
+      <section class="doc-section" id="timers">
+        <h2>Timers <a class="anchor" href="#timers">#</a></h2>
+        <pre class="code"><span class="kw">void func</span> tick() {
+    log(<span class="str">'tick'</span>)
+}
+
+<span class="kw">int</span> id = setInterval(tick, 500)
+setTimeout(tick, 1000)
+clearInterval(id)          <span class="cm">// clearTimeout()/clearInterval() are interchangeable</span></pre>
+        <p>
+          JS-style scheduling. The program keeps running as long as a
+          <code>setTimeout</code> is pending or a <code>setInterval</code>
+          is uncleared — exactly like an uncleared JS interval keeping a
+          process alive. Combines with graphics: if a program uses both,
+          one event loop multiplexes X11 events and timer deadlines
+          together so neither blocks the other.
+        </p>
+      </section>
+
+      <section class="doc-section" id="audio">
+        <h2>Audio <a class="anchor" href="#audio">#</a></h2>
+        <pre class="code"><span class="kw">aud</span> music = loadAudio(<span class="str">'music.wav'</span>)   <span class="cm">// WAV, 16-bit PCM only</span>
+music.play()
+music.stop()
+music.isPlaying()                     <span class="cm">// true the instant play() returns,</span>
+                                       <span class="cm">// false the instant stop() returns</span></pre>
+        <p>
+          Plays through a real ALSA output device on a background thread,
+          so playback doesn't block the rest of the program. Calling
+          <code>play()</code> again while already playing restarts from
+          the beginning.
+        </p>
+      </section>
+
+      <section class="doc-section" id="imports">
+        <h2>Imports <a class="anchor" href="#imports">#</a></h2>
+        <pre class="code"><span class="kw">import</span> database.f
+<span class="kw">import</span> graphics.f</pre>
+        <p>
+          Resolved recursively before compilation into one merged
+          compilation unit; a file is never imported more than once even
+          if multiple files depend on it; errors still point at the file
+          a statement actually came from.
+        </p>
+      </section>
+
+      <section class="doc-section" id="log-fail">
+        <h2><code>log()</code> / <code>fail()</code> <a class="anchor" href="#log-fail">#</a></h2>
+        <pre class="code">log(value)       <span class="cm">// prints any primitive to stdout, newline-terminated</span>
+fail(<span class="str">'message'</span>)  <span class="cm">// prints to stderr, exits(1)</span></pre>
+      </section>
+
+      <section class="doc-section" id="error-format">
+        <h2>Error format <a class="anchor" href="#error-format">#</a></h2>
+        <p>Compile errors are <code>file:line:column: error: message</code>, e.g.:</p>
+        <pre class="code">main.f:12:5: error: condition must be bool, found text</pre>
+        <p class="muted">See <code>tests/test_semantic_errors.py</code> for the full set of categories.</p>
+      </section>
+
+      <section class="doc-section" id="examples">
+        <h2>Examples <a class="anchor" href="#examples">#</a></h2>
+        <p>
+          <a href="https://github.com/uraikus/festina/tree/main/examples">examples/</a>
+          has a full set of small, runnable programs exercising
+          everything above, including a real playable game
+          (<code>tic_tac_toe.f</code>) — see the README's
+          <a href="https://github.com/uraikus/festina#see-it-in-action">"See it in action"</a>
+          section for the index, or just:
+        </p>
+        <pre class="code"><span class="mut">$</span> bin/festina examples/&lt;name&gt;.f -o out &amp;&amp; ./out</pre>
+      </section>
+
+      <div class="prevnext">
+        <a class="prev" href="index.html">
+          <span class="label">← Back to</span>
+          Festina home
+        </a>
+        <a class="next" href="https://github.com/uraikus/festina/blob/main/setup.md">
+          <span class="label">Next →</span>
+          Setup & dependencies
+        </a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+  // Mobile sidebar toggle
+  const sidebar = document.getElementById('sidebar');
+  const backdrop = document.getElementById('backdrop');
+  const menuBtn = document.getElementById('menuBtn');
+  function closeSidebar() {
+    sidebar.classList.remove('open');
+    backdrop.classList.remove('open');
+  }
+  menuBtn.addEventListener('click', () => {
+    sidebar.classList.toggle('open');
+    backdrop.classList.toggle('open');
+  });
+  backdrop.addEventListener('click', closeSidebar);
+  document.getElementById('toc').addEventListener('click', (e) => {
+    if (e.target.tagName === 'A') closeSidebar();
+  });
+
+  // Sidebar filter
+  const filterBox = document.getElementById('navFilter');
+  filterBox.addEventListener('input', () => {
+    const q = filterBox.value.trim().toLowerCase();
+    document.querySelectorAll('#toc a').forEach(a => {
+      const match = !q || a.textContent.toLowerCase().includes(q);
+      a.dataset.hidden = match ? 'false' : 'true';
+    });
+    document.querySelectorAll('.nav-group').forEach(g => {
+      const anyVisible = [...g.querySelectorAll('a')].some(a => a.dataset.hidden !== 'true');
+      g.style.display = anyVisible ? '' : 'none';
+    });
+  });
+
+  // Scrollspy: highlight the section currently at the top of the
+  // viewport. Deliberately a single scroll-driven calculation (not an
+  // IntersectionObserver) so there's exactly one source of truth -- no
+  // risk of two independent observers racing each other for a short
+  // final section that a fixed rootMargin band might otherwise miss.
+  const anchors = [...document.querySelectorAll('#toc a')];
+  const byId = Object.fromEntries(anchors.map(a => [a.getAttribute('href').slice(1), a]));
+  const targets = [...document.querySelectorAll('main [id]')]
+    .filter(t => byId[t.id])
+    .map(t => ({ id: t.id, el: t }));
+
+  let ticking = false;
+  function updateActive() {
+    ticking = false;
+    const offset = 80; // matches scroll-margin-top on headings
+    const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2;
+    let currentId = targets.length ? targets[0].id : null;
+    if (atBottom) {
+      currentId = targets[targets.length - 1].id;
+    } else {
+      for (const t of targets) {
+        if (t.el.getBoundingClientRect().top <= offset) currentId = t.id;
+        else break;
+      }
+    }
+    anchors.forEach(a => a.classList.remove('active'));
+    if (currentId && byId[currentId]) byId[currentId].classList.add('active');
+  }
+  function onScroll() {
+    if (!ticking) {
+      ticking = true;
+      requestAnimationFrame(updateActive);
+    }
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll);
+  updateActive();
+</script>
+
+</body>
+</html>
