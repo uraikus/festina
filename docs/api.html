@@ -494,6 +494,17 @@
 <span class="kw">aud</span>       -- an audio clip loaded via loadAudio() (opaque handle)
 <span class="kw">regex</span>     -- a compiled pattern from a /pattern/flags literal or regex() (opaque handle)</pre>
 
+        <p class="muted">
+          Every type may hold <code>null</code>
+          (<code>bool x = null</code> included). Comparing a null
+          <code>int</code>/<code>bool</code> against the <code>null</code>
+          literal with <code>==</code>/<code>!=</code> works as expected,
+          but a null <code>float</code> never compares equal to
+          <code>null</code> via <code>==</code>, even to itself — it's a
+          real NaN under the hood, and IEEE-754 NaN comparisons are
+          always false.
+        </p>
+
         <p><code>int</code>/<code>float</code> never mix implicitly, in arithmetic or comparisons:</p>
         <pre class="code"><span class="kw">int</span> a = 5
 <span class="kw">float</span> b = 2.5
@@ -556,6 +567,8 @@ log(count.toText())   <span class="cm">// "5" -- identical to log(`${count}`)</s
 <span class="kw">bool</span> either = a || b                      <span class="cm">// short-circuit</span>
 
 <span class="kw">for int</span> i = 0, i &lt; 10, i++ {
+    <span class="kw">if</span> i == 5 { <span class="kw">break</span> }
+    <span class="kw">if</span> i % 2 == 0 { <span class="kw">continue</span> }
     log(i)
 }
 
@@ -564,10 +577,14 @@ log(count.toText())   <span class="cm">// "5" -- identical to log(`${count}`)</s
 }</pre>
         <p>
           Conditions must be <code>bool</code> — no implicit truthiness
-          from <code>int</code>/<code>text</code>/etc. No
-          <code>break</code>/<code>continue</code> (undefined by the
-          spec); <code>return</code> from the enclosing function is the
-          only documented way out of a loop early. Postfix
+          from <code>int</code>/<code>text</code>/etc.
+          <code>break</code> exits the nearest enclosing
+          <code>for</code>/<code>while</code> loop immediately;
+          <code>continue</code> skips to that loop's next iteration (a
+          <code>for</code> loop's update expression still runs first).
+          Both are a compile error outside any loop, and both only ever
+          affect the <em>nearest</em> enclosing loop — no labeled
+          break/continue targeting an outer one. Postfix
           <code>++</code>/<code>--</code> work on any mutable
           <code>int</code> variable.
         </p>
@@ -597,6 +614,24 @@ user.name = <span class="str">'Patrick'</span></pre>
           Structs are native in-memory records — declaration, field
           read/write, and passing to/returning from functions by value.
         </p>
+        <div class="callout">
+          <strong>Automatic memory reclamation (stage 1):</strong>
+          memory for structs, arrays, and maps is managed automatically
+          — no manual allocation or freeing. A local
+          <code>struct</code>/<code>arr[T]</code>/<code>map[T]</code>
+          declared in a function, event handler, <code>if</code> branch,
+          <code>while</code> body, or <code>for</code> body, and never
+          returned, stored anywhere longer-lived, or passed to another
+          function, is reclaimed automatically as soon as control leaves
+          the block it was declared in — for a value declared inside a
+          loop body, that means every iteration, not deferred until the
+          function eventually returns; <code>break</code>/<code>continue</code>
+          reclaim it too, the same as reaching the end of that iteration
+          normally would. A value that does escape (returned, stored
+          somewhere longer-lived, passed to another function) is
+          reclaimed by a later stage not yet implemented — see
+          <a href="https://github.com/uraikus/festina/blob/main/todo.md#memory-management">todo.md</a>.
+        </div>
       </section>
 
       <section class="doc-section" id="arrays">
