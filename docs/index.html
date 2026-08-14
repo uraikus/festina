@@ -351,7 +351,7 @@
 <header class="hero">
   <div class="wrap">
     <div class="badges">
-      <span class="badge">589 tests passing</span>
+      <span class="badge">610 tests passing</span>
       <span class="badge">MIT license</span>
       <span class="badge">Linux</span>
     </div>
@@ -379,7 +379,7 @@
 log(greet(<span class="str">'Festina'</span>))</pre>
 
     <div class="code-label">shell</div>
-    <pre class="code"><span class="mut">$</span> bin/festina examples/greet.f -o greet &amp;&amp; ./greet
+    <pre class="code"><span class="mut">$</span> bin/festina compile examples/greet.f -o greet &amp;&amp; ./greet
 Hello, Festina!</pre>
     <p class="section-intro" style="margin-top:8px;">
       No imports. No config. No <code>main()</code>. Run this today —
@@ -427,10 +427,23 @@ Hello, Festina!</pre>
 <section id="get-started">
   <div class="wrap">
     <h2>Get started</h2>
-    <p class="section-intro">That's the whole loop — see <a href="https://github.com/uraikus/festina/blob/main/setup.md">setup.md</a> for the full dependency breakdown, packaged-binary installs, and running the test suite.</p>
     <pre class="code"><span class="mut">$</span> sudo apt install clang libsqlite3-dev libcairo2-dev libx11-dev libasound2-dev pkg-config
-<span class="mut">$</span> bin/festina examples/hello.f -o hello
+<span class="mut">$</span> bin/festina compile examples/hello.f -o hello
 <span class="mut">$</span> ./hello</pre>
+    <p class="section-intro">Or skip the intermediate binary and just run it:</p>
+    <pre class="code"><span class="mut">$</span> bin/festina run examples/hello.f</pre>
+    <p class="section-intro">
+      Not sure your machine has everything Festina needs?
+      <code>bin/festina doctor</code> checks every dependency above and
+      tells you exactly what's missing and how to install it — including
+      whether <code>festina</code> itself is on <code>PATH</code> yet.
+    </p>
+    <p class="section-intro">
+      That's the whole loop — see
+      <a href="https://github.com/uraikus/festina/blob/main/setup.md">setup.md</a>
+      for the full dependency breakdown, packaged-binary installs, and
+      running the test suite.
+    </p>
   </div>
 </section>
 
@@ -555,7 +568,7 @@ npcHealths[<span class="str">'npc1'</span>] = 30
     <h2>Project status</h2>
     <div class="status-line">
       <span class="dot"></span>
-      <span><strong>589 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
+      <span><strong>610 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
     </div>
     <p class="section-intro">
       The compiler frontend, LLVM codegen backend, and native C runtime are

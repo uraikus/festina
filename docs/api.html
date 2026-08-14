@@ -377,6 +377,7 @@
     <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…">
     <nav class="toc" id="toc">
       <div class="nav-group">
+        <a href="#cli">CLI</a>
         <a href="#compilation-pipeline">Compilation pipeline</a>
         <a class="sub" href="#binary-size">Binary size</a>
       </div>
@@ -422,6 +423,29 @@
         see <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md</a>.
       </p>
 
+      <section class="doc-section" id="cli">
+        <h2>CLI <a class="anchor" href="#cli">#</a></h2>
+        <p>
+          Four subcommands (<code>festina/cli.py</code>), not a single
+          bare <code>festina file.f</code> — that would leave
+          <code>festina run</code> (which executes the compiled result)
+          ambiguous with <code>festina compile</code> (which never does)
+          without inventing a flag to distinguish them.
+        </p>
+        <table class="sig-table">
+          <tr><td>festina compile entry.f -o out</td><td>Compile to a native executable at <code>out</code> (default: <code>entry</code>'s own filename without <code>.f</code>). <code>--emit-llvm</code> prints LLVM IR to stdout instead of linking. <code>--cc</code> picks the C compiler/linker (default: whichever of <code>clang</code>/<code>gcc</code>/<code>cc</code> is found first).</td></tr>
+          <tr><td>festina run entry.f</td><td>Compile to a throwaway temp executable and run it immediately — stdin/stdout/stderr inherited directly (not captured), so an interactive program (graphics/audio/timers) behaves exactly like a normal compile-then-run. Exits with the <em>compiled program's own</em> exit code, so <code>festina run x.f &amp;&amp; ...</code> composes the same way <code>go run</code>/<code>cargo run</code> do. The temp binary is always cleaned up afterward.</td></tr>
+          <tr><td>festina doctor</td><td>Checks every dependency the compiler itself needs (a C compiler, <code>pkg-config</code>, sqlite3/cairo-xlib/alsa dev headers, <code>libLLVM</code>) and reports what's missing and how to install it — the same install hints a real compile failure would give, just checked proactively instead of only on failure. Also reports whether <code>festina</code> itself is resolvable on <code>PATH</code>. Exits 0 if every <em>required</em> dependency is present — graphics/audio are optional.</td></tr>
+          <tr><td>festina help</td><td>Prints this same command list.</td></tr>
+        </table>
+        <pre class="code"><span class="mut">$</span> bin/festina compile program.f -o program   <span class="cm"># compile</span>
+<span class="mut">$</span> bin/festina compile program.f --emit-llvm  <span class="cm"># print LLVM IR instead of linking</span>
+<span class="mut">$</span> ./program                                  <span class="cm"># the result needs neither</span>
+                                              <span class="cm"># Python nor festina/ to run</span>
+<span class="mut">$</span> bin/festina run program.f                  <span class="cm"># or just run it directly</span>
+<span class="mut">$</span> bin/festina doctor                         <span class="cm"># check dependencies</span></pre>
+      </section>
+
       <section class="doc-section" id="compilation-pipeline">
         <h2>Compilation pipeline <a class="anchor" href="#compilation-pipeline">#</a></h2>
         <pre class="code">Festina source (.f)
@@ -433,10 +457,6 @@
    -&gt; Link against the runtime (runtime/festina_runtime.c and,
       conditionally, _graphics.c/_audio.c -- see "Binary size" below)
    -&gt; Native executable</pre>
-        <pre class="code"><span class="mut">$</span> bin/festina program.f -o program   <span class="cm"># compile</span>
-<span class="mut">$</span> bin/festina program.f --emit-llvm  <span class="cm"># print LLVM IR instead of linking</span>
-<span class="mut">$</span> ./program                          <span class="cm"># the result needs neither Python</span>
-                                    <span class="cm"># nor festina/ to run</span></pre>
         <p>
           A program needs no <code>main()</code> — top-level statements in
           the entry file run in order, after every import is resolved and
@@ -821,7 +841,7 @@ fail(<span class="str">'message'</span>)  <span class="cm">// prints to stderr, 
           <a href="https://github.com/uraikus/festina#see-it-in-action">"See it in action"</a>
           section for the index, or just:
         </p>
-        <pre class="code"><span class="mut">$</span> bin/festina examples/&lt;name&gt;.f -o out &amp;&amp; ./out</pre>
+        <pre class="code"><span class="mut">$</span> bin/festina run examples/&lt;name&gt;.f</pre>
       </section>
 
       <div class="prevnext">
