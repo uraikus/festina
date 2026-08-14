@@ -807,6 +807,334 @@ class TestBreakAndContinue:
         assert result.stdout.splitlines() == ["0"]
 
 
+class TestAutomaticMemoryReclamation:
+    """claude.md #74, stage 1: a local struct/arr[T]/map[T] declared
+    directly in a function/event handler's own top-level body is freed
+    automatically at every return, when tests/test_escape_analysis.py's
+    find_escaping_names proves it never escapes. That module is tested
+    exhaustively on its own (every syntactic escaping/non-escaping
+    pattern, no C compiler needed) -- this class checks the other half:
+    that the analysis's result actually gets wired into real generated
+    IR (free() calls landing in exactly the right place) and, more
+    importantly, that real compiled programs still produce correct
+    output in both the freed and (still-leaking, unchanged) escaping
+    cases."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    # ---- IR-level: no C compiler needed ----
+
+    def test_non_escaping_struct_local_is_freed(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            Point p
+            p.x = 1
+            log(p.x)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" in ir
+
+    def test_non_escaping_array_local_frees_its_data_pointer(self, parser, semantic, codegen):
+        source = """
+        void func f() {
+            arr[int] a = [1, 2, 3]
+            log(a[0])
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "extractvalue %struct._FestinaArray" in ir
+        assert "call void @free(" in ir
+
+    def test_non_escaping_map_local_frees_its_entries_pointer(self, parser, semantic, codegen):
+        source = """
+        void func f() {
+            map[int] m = {'a': 1}
+            log(m['a'])
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "extractvalue %struct._FestinaMap" in ir
+        assert "call void @free(" in ir
+
+    def test_returned_struct_is_not_freed(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point func makePoint() {
+            Point p
+            p.x = 1
+            return p
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" not in ir
+
+    def test_struct_passed_as_a_call_argument_is_not_freed(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func takesPoint(p:Point) {
+            log(p.x)
+        }
+        void func f() {
+            Point p
+            takesPoint(p)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" not in ir
+
+    def test_struct_assigned_into_a_global_is_not_freed(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            Point p
+            g = p
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" not in ir
+
+    def test_reassigned_struct_is_not_freed(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            Point p
+            Point q
+            p = q
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" not in ir
+
+    def test_a_loop_local_struct_is_not_yet_analyzed(self, parser, semantic, codegen):
+        # claude.md #74's own stated stage-1 limitation: only top-level
+        # function-body declarations are covered so far, not ones nested
+        # inside a for/while body -- this must still leak, unchanged,
+        # not be (incorrectly or correctly) touched by this stage yet.
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            for int i = 0, i < 3, i++ {
+                Point p
+                p.x = i
+                log(p.x)
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" not in ir
+
+    def test_a_nested_if_declared_struct_is_not_yet_analyzed(self, parser, semantic, codegen):
+        # Same stage-1 limitation, for a nested if instead of a loop.
+        source = """
+        struct Point { x:int y:int }
+        void func f(cond:bool) {
+            if cond {
+                Point p
+                p.x = 1
+                log(p.x)
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" not in ir
+
+    def test_early_return_before_the_declaration_has_no_free_on_that_path(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f(cond:bool) {
+            if cond {
+                return
+            }
+            Point p
+            p.x = 1
+            log(p.x)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        func_start = next(i for i, l in enumerate(lines) if l.startswith("define void @f("))
+        func_end = next(i for i in range(func_start, len(lines)) if lines[i] == "}")
+        func_lines = lines[func_start:func_end]
+        # The very first `ret void` (the early-return path, before p is
+        # declared) must not be preceded by a free() call anywhere
+        # earlier in the function; the second (the fall-through path,
+        # after p is declared) must be.
+        ret_indices = [i for i, l in enumerate(func_lines) if l.strip() == "ret void"]
+        assert len(ret_indices) == 2
+        assert not any("call void @free(" in l for l in func_lines[:ret_indices[0] + 1])
+        assert any("call void @free(" in l for l in func_lines[ret_indices[0] + 1:ret_indices[1] + 1])
+
+    def test_event_handler_locals_are_analyzed_too(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        on click(x:int, y:int) {
+            Point p
+            p.x = x
+            log(p.x)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" in ir
+
+    # ---- end-to-end: real compiled programs, real output ----
+
+    def test_non_escaping_struct_local_still_produces_correct_output(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            Point p
+            p.x = 5
+            p.y = 10
+            log(p.x + p.y)
+        }
+        f()
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["15", "done"]
+
+    def test_returning_a_struct_still_works_correctly(self, compile_and_run):
+        # The exact shape of bug this stage must never reintroduce --
+        # see security.md's original "returning a struct by value"
+        # fix, and this session's own live demonstration of what
+        # freeing an escaping local does to it.
+        source = """
+        struct Point { x:int y:int }
+        Point func makePoint(a:int, b:int) {
+            Point p
+            p.x = a
+            p.y = b
+            return p
+        }
+        Point q1 = makePoint(10, 20)
+        Point q2 = makePoint(999, 888)
+        log(q1.x)
+        log(q1.y)
+        log(q2.x)
+        log(q2.y)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["10", "20", "999", "888"]
+
+    def test_struct_assigned_into_a_global_keeps_its_value(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            Point p
+            p.x = 7
+            g = p
+        }
+        f()
+        log(g.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "7"
+
+    def test_struct_passed_to_another_function_keeps_its_value(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func takesPoint(p:Point) {
+            log(p.x)
+        }
+        void func f() {
+            Point p
+            p.x = 3
+            takesPoint(p)
+            log(p.x)
+        }
+        f()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["3", "3"]
+
+    def test_reassignment_keeps_the_new_values_valid(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            Point p
+            p.x = 1
+            Point q
+            q.x = 2
+            p = q
+            log(p.x)
+        }
+        f()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "2"
+
+    def test_early_return_before_declaration_runs_correctly_on_both_paths(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f(cond:bool) {
+            if cond {
+                log('early')
+                return
+            }
+            Point p
+            p.x = 42
+            log(p.x)
+        }
+        f(true)
+        f(false)
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["early", "42", "done"]
+
+    def test_non_escaping_array_and_map_locals_still_produce_correct_output(self, compile_and_run):
+        source = """
+        void func useArray() {
+            arr[int] a = [1, 2, 3]
+            log(a[0] + a[1] + a[2])
+        }
+        void func useMap() {
+            map[int] m = {'a': 1, 'b': 2}
+            log(m['a'] + m['b'])
+        }
+        useArray()
+        useMap()
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["6", "3", "done"]
+
+    def test_calling_a_freeing_function_many_times_does_not_crash(self, compile_and_run):
+        # Not a memory-bound proof (see tests/CONTRACT.md for why an
+        # RSS-based measurement isn't reliable against this compiler's
+        # own O2 pipeline, which can eliminate an unobserved allocation
+        # entirely) -- a basic robustness check that repeated alloc/free
+        # of the same struct across many calls doesn't corrupt anything
+        # an allocator would notice (a bad free()/double free is exactly
+        # the kind of thing that tends to crash loudly under real
+        # allocator bookkeeping, especially across enough iterations to
+        # exercise its free-list reuse).
+        source = """
+        struct Point { x:int y:int }
+        void func useLocal(n:int) {
+            Point p
+            p.x = n
+            p.y = n * 2
+        }
+        int total = 0
+        for int i = 0, i < 50000, i++ {
+            useLocal(i)
+            total = total + 1
+        }
+        log(total)
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "50000"
+
+
 def _find_window(display, timeout=20):
     # 20s, not the 10s an isolated run needs comfortably -- TestGraphics
     # compiles a fresh binary (a real gcc invocation) and spawns a fresh

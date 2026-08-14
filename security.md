@@ -206,18 +206,31 @@ for the full design writeup.
 - **No unsafe deserialization.** `sqlite()` query results are read
   through SQLite's own typed column API (`sqlite3_column_*`), not parsed
   from an untrusted byte stream by hand.
-- **Known, accepted memory-management gap (not a vulnerability):**
-  arrays and struct storage are heap-allocated and never freed —
-  `claude.md #43` promises automatic memory management this compiler
-  doesn't implement yet (no GC, no refcounting). This is a resource leak
-  in a long-running process, not a safety issue (no use-after-free, no
-  double-free, since nothing is ever freed at all) — tracked as a known
-  limitation, not something this document treats as a finding.
-  Deliberately not attempted casually: both realistic fixes (escape-
-  analysis-based stack allocation, or real reference counting) trade
-  this safe-but-leaky state for one where a wrong answer *is* a genuine
-  memory-safety regression (a stray use-after-free or double-free)
-  instead of a resource leak — see [todo.md](todo.md#memory-management)
-  for the full writeup, including a naive version of the stack-
-  allocation approach that was already tried and verified to corrupt
-  memory.
+- **Known, accepted memory-management gap, partially closed
+  (not a vulnerability):** arrays and struct storage are heap-allocated;
+  `claude.md #43` promises automatic memory management this compiler is
+  implementing in stages, not all at once — the exact opposite of the
+  "wrong answer here is a genuine memory-safety regression" risk this
+  document already flags below applies just as much to shipping the
+  whole thing in one uncareful pass as it does to shipping nothing.
+  `claude.md #74` (stage 1) now frees a local struct/`arr[T]`/`map[T]`
+  automatically whenever `festina/escape_analysis.py` can prove, from
+  the syntax of its declaring function/handler alone, that its address
+  never left it. Everything that stage's own scope doesn't cover yet
+  (values declared inside a nested block or a loop body, anything
+  passed as a call argument, nested struct/array/map fields within an
+  otherwise-freed value) still leaks exactly as before — a resource
+  leak in a long-running process, not a safety issue on its own, no
+  different in kind from the gap this note already accepted. What
+  changed is that stage 1's own fix was verified with the same rigor
+  the rest of this document's findings were: exhaustive unit tests of
+  the analysis itself, end-to-end compile-and-run tests including the
+  exact "return a struct by value" pattern the earlier naive stack-
+  allocation attempt below got wrong, and a real AddressSanitizer/
+  LeakSanitizer run (zero ASAN errors; LeakSanitizer's reported leaks
+  matched the hand-derived expected count exactly, not more) — see
+  [todo.md](todo.md#memory-management) for the full writeup, including
+  the naive stack-allocation attempt that was tried before stage 1
+  existed and reverted after being verified to corrupt memory, and
+  exactly what widening stage 1's coverage and adding reference counting
+  for the values it can't reach would each still require.

@@ -15,7 +15,11 @@ clearInterval -- see the "Timers" note below), #70 (DatabaseURL -- see
 _emit_main_and_entry), #71 (environment.NAME/environment[keyExpr] --
 see _emit_environment_get), #72 (map[T] -- literals, indexed get/set,
 .forEach() -- see _emit_map_lit/_emit_map_get/_emit_map_set/
-_emit_map_foreach_trampoline).
+_emit_map_foreach_trampoline), #73 (break/continue -- see
+self._loop_targets and _emit_stmt's BreakStmt/ContinueStmt handling),
+#74 (automatic reclamation of provably non-escaping struct/arr[T]/
+map[T] locals, stage 1 -- see escape_analysis.py, _emit_func_body, and
+_emit_free_active_locals).
 #37, #39, #40 also cover `on key`/`on resize`/`on close` and the
 clientWidth/clientHeight globals (see the "Graphics" note below).
 
@@ -162,19 +166,35 @@ Struct storage is always heap-allocated (calloc), never a stack alloca,
 even for a struct declared local to a function. claude.md #43 prefers
 stack allocation "when the value's lifetime permits it," which would be
 true for a struct that provably never leaves its declaring function --
-but this codegen doesn't do escape analysis, and a struct's address
-genuinely can outlive its function (returned, stored in an array or
-another struct's field, ...). Stack-allocating unconditionally silently
-corrupted every one of those cases (verified: returning a local struct
-by value produced garbage at the call site). calloc'ing every struct is
-the simple, uniformly-correct choice per #54's ambiguity rule ("prefer
-the simplest implementation" / "prefer performance" only when it doesn't
-also mean "prefer incorrect") -- at the cost of leaking, same tradeoff
-arrays already make (see below) and for the same underlying reason: no
-GC/refcounting runtime exists yet to free either one (claude.md #43).
+but a struct's address genuinely can outlive its function (returned,
+stored in an array or another struct's field, ...), and stack-
+allocating unconditionally, without proving which case applies first,
+silently corrupted every one of those cases (verified: returning a
+local struct by value produced garbage at the call site). calloc'ing
+every struct is the simple, uniformly-correct choice per #54's
+ambiguity rule ("prefer the simplest implementation" / "prefer
+performance" only when it doesn't also mean "prefer incorrect").
 calloc (not malloc) so uninitialized fields read as zero, matching a
 global struct's `zeroinitializer` -- local and global structs now start
 identically rather than one being zeroed and the other garbage.
+
+This still always heap-allocates rather than ever choosing a stack
+alloca -- claude.md #74 (stage 1 of #43's automatic memory management
+promise) takes a different, narrower path to the same underlying goal:
+rather than proving a value never escapes and skipping the heap
+allocation entirely (which is what "prefer stack allocation" actually
+asks for, and remains unimplemented -- the exact same escape-proving
+problem, just attempted at allocation time instead of at scope-exit
+time, with the exact same risk if done unsoundly), #74 always still
+calloc's, then *frees* that same allocation automatically at scope exit
+when escape_analysis.py proves the value's address never left its
+declaring function/handler. Slower than true stack allocation would be
+(a real calloc + a real free, not a zero-cost stack pointer bump) but
+implementable as a genuinely separable, individually-verifiable first
+step -- see escape_analysis.py's own module docstring and
+CodeGen._emit_func_body/_emit_free_active_locals for the actual
+mechanism, and claude.md #74 for exactly what is and isn't covered by
+this first stage.
 
 Array representation: claude.md #26 specifies arr[T]'s type-resolution
 rules but not its runtime representation or push/pop-style operations
@@ -208,9 +228,13 @@ possibility; a Festina identifier can never collide with an LLVM name
 containing a `.` in the middle the way `struct_llvm_name` produces
 (`%struct.Name`), so a scheme that didn't reuse that "%struct." prefix
 at all would close the gap completely if it's ever worth the churn. The
-data pointer is malloc'd and never freed -- claude.md #43 promises
-automatic memory management this compiler doesn't implement yet (no GC,
-no refcounting runtime), so for now arrays leak; see todo.md.
+data pointer is malloc'd, and (as of claude.md #74) freed automatically
+at scope exit when escape_analysis.py proves a local arr[T]/map[T]
+never escapes its declaring function/handler -- otherwise (or for a
+global, or a value declared inside a nested if/while/for body, or
+inside a loop at all -- see #74's own stated stage-1 limitations) it
+still leaks exactly as before; see todo.md's "Memory management"
+section for the full picture of what's covered and what's still ahead.
 
 Null for int/float (claude.md #10, #25, #57): i64/double have no spare
 bit pattern for "null" the way a pointer has NULL, and LLVM's `null`
@@ -263,6 +287,7 @@ import struct
 from . import ast
 from . import types as types_mod
 from . import semantic as semantic_mod
+from . import escape_analysis
 from .errors import CompileError
 
 BOOL = types_mod.PrimitiveType("bool")
@@ -442,6 +467,24 @@ class CodeGen:
                                                 # outside any loop by the time codegen runs, so this
                                                 # being empty here would only ever fire on a compiler bug
                                                 # -- see _emit_stmt's own defensive check.
+        self._active_free_locals = []          # claude.md #74: stack of "frames," one per currently-
+                                                # being-emitted function/event handler body (see
+                                                # _emit_func_body) -- each frame is a list of (storage
+                                                # ref, Type) for every non-escaping struct/arr[T]/map[T]
+                                                # local declared so far, on every path that's reached
+                                                # this point in program order. Appended to as
+                                                # _emit_func_body's own top-level statement loop reaches
+                                                # each qualifying VarDecl; consulted by
+                                                # _emit_free_active_locals at every Return (however
+                                                # deeply nested inside if/while/for) and at a function's
+                                                # own implicit fall-off-the-end exit. Empty outside any
+                                                # tracked function/handler body (e.g. __festina_main's
+                                                # own top-level statements, which claude.md #74 doesn't
+                                                # analyze at all) -- _emit_free_active_locals is a no-op
+                                                # then. Same "instance-level stack, not threaded through
+                                                # ctx" shape as _loop_targets above, for the same reason:
+                                                # it needs to keep working through arbitrary if/block
+                                                # nesting inside the tracked body.
         self._regex_lit_cache = {}             # id(ast.RegexLit node) -> its private cache global's
                                                 # name -- see _emit_cached_regex_lit; keyed by node
                                                 # identity (not pattern text) so two textually
@@ -624,6 +667,10 @@ class CodeGen:
             "declare i8 @festina_audio_is_playing(ptr)",
             "declare ptr @malloc(i64)",
             "declare ptr @calloc(i64, i64)",
+            # claude.md #74: automatic reclamation of provably non-
+            # escaping struct/arr[T]/map[T] locals -- see
+            # _emit_free_active_locals.
+            "declare void @free(ptr)",
             # claude.md #71: environment.NAME / environment[keyExpr].
             "declare ptr @festina_getenv(ptr)",
             # claude.md #72: map[T] -- count_ptr/entries_ptr (the two
@@ -732,6 +779,90 @@ class CodeGen:
             type_expr, self.structs, self.tables, self.filename, node)
 
     # ---- functions ----
+
+    def _emit_func_body(self, block, parent_env, return_type, lines):
+        """Like _emit_block, but ONLY for a function/event handler's own
+        top-level body -- never for a nested if/while/for body, which
+        still goes through the ordinary _emit_block unchanged (claude.md
+        #74 doesn't analyze those yet; see that section's own stated
+        limitations).
+
+        Runs escape_analysis.find_escaping_names once for this body,
+        then walks its own top-level statements in program order,
+        maintaining self._active_free_locals so any Return anywhere in
+        the rest of this body -- however deeply nested inside if/while/
+        for -- frees exactly the non-escaping locals active at that
+        point, and never one declared later on a different path: a
+        candidate only gets added to the active set once this loop
+        actually reaches and finishes emitting its own VarDecl, so a
+        Return that textually precedes a later candidate's declaration
+        (necessarily nested inside an earlier if/while/for, since a
+        *top-level* Return before it would make the declaration dead
+        code -- unreachable, and never emitted at all) correctly never
+        tries to free something that was never allocated on that path.
+        """
+        scope = Env(parent_env)
+        escaping = escape_analysis.find_escaping_names(block)
+        ctx = {"lines": lines, "terminated": False}
+        self._active_free_locals.append([])
+        try:
+            for stmt in block.body:
+                if ctx["terminated"]:
+                    break
+                self._emit_stmt(stmt, scope, return_type, ctx)
+                if isinstance(stmt, ast.VarDecl) and stmt.name not in escaping:
+                    found = scope.lookup(stmt.name)
+                    if found is not None:
+                        ref, type_ = found
+                        if isinstance(type_, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+                            self._active_free_locals[-1].append((ref, type_))
+            if not ctx["terminated"]:
+                self._emit_free_active_locals(lines)
+        finally:
+            self._active_free_locals.pop()
+        return ctx
+
+    def _emit_free_active_locals(self, lines):
+        """claude.md #74: frees every currently-active non-escaping
+        local (self._active_free_locals[-1]) -- called from _emit_stmt's
+        Return handling (after the return value, if any, has already
+        been computed -- see that call site's own comment on why the
+        order matters) and once more from _emit_func_body itself for a
+        function/handler that falls off its own end without an explicit
+        return. A no-op outside any tracked function/handler body
+        (self._active_free_locals empty -- e.g. __festina_main's own
+        top-level statements, which claude.md #74 doesn't analyze at
+        all).
+
+        What "free" means differs by type, since only structs are
+        represented as a pointer to their own backing storage -- arr[T]/
+        map[T] locals are the {i64, ptr} header itself, stack-allocated
+        inline (never heap-allocated on their own), with only their
+        data/entries *field* separately heap-allocated (see
+        FESTINA_ARRAY_LLVM_TYPE/FESTINA_MAP_LLVM_TYPE's own module
+        docstring notes) -- so freeing one of those means loading the
+        header value and freeing its second field, not the local itself.
+        """
+        if not self._active_free_locals:
+            return
+        for ref, type_ in self._active_free_locals[-1]:
+            if isinstance(type_, types_mod.StructType):
+                loaded = self.tmp()
+                lines.append(f"  {loaded} = load ptr, ptr {ref}")
+                lines.append(f"  call void @free(ptr {loaded})")
+            elif isinstance(type_, types_mod.ArrayType):
+                loaded = self.tmp()
+                lines.append(f"  {loaded} = load {FESTINA_ARRAY_LLVM_TYPE}, ptr {ref}")
+                data_ptr = self.tmp()
+                lines.append(f"  {data_ptr} = extractvalue {FESTINA_ARRAY_LLVM_TYPE} {loaded}, 1")
+                lines.append(f"  call void @free(ptr {data_ptr})")
+            elif isinstance(type_, types_mod.MapType):
+                loaded = self.tmp()
+                lines.append(f"  {loaded} = load {FESTINA_MAP_LLVM_TYPE}, ptr {ref}")
+                entries_ptr = self.tmp()
+                lines.append(f"  {entries_ptr} = extractvalue {FESTINA_MAP_LLVM_TYPE} {loaded}, 1")
+                lines.append(f"  call void @free(ptr {entries_ptr})")
+
     def _emit_func(self, decl):
         return_type = None if decl.return_type == "void" else self._resolve(decl.return_type, decl)
         self.func_decls[decl.name] = decl
@@ -751,7 +882,7 @@ class CodeGen:
             body_lines.append(f"  store {_llvm_type(t)} %arg.{p.name}, ptr {slot}")
             body_env.define(p.name, slot, t)
 
-        block = self._emit_block(decl.body, body_env, return_type, body_lines)
+        block = self._emit_func_body(decl.body, body_env, return_type, body_lines)
         if not block["terminated"]:
             # claude.md never says whether a non-void function must
             # return a value on every code path (unlike the
@@ -806,7 +937,7 @@ class CodeGen:
             body_lines.append(f"  store {_llvm_type(t)} %arg.{p.name}, ptr {slot}")
             body_env.define(p.name, slot, t)
 
-        block = self._emit_block(decl.body, body_env, None, body_lines)
+        block = self._emit_func_body(decl.body, body_env, None, body_lines)
         if not block["terminated"]:
             block["lines"].append("  ret void")
 
@@ -869,13 +1000,23 @@ class CodeGen:
             self._emit_expr(stmt.expr, env, lines)
             return
         if isinstance(stmt, ast.Return):
+            # claude.md #74: free every currently-active non-escaping
+            # local -- AFTER the return value (if any) has already been
+            # computed, so anything that value's evaluation reads
+            # through one of those locals' own fields (safe under
+            # claude.md #74's own rule, since that's not an escaping use)
+            # sees it while it's still alive, and BEFORE the `ret`
+            # itself, so nothing after this point in the function can
+            # observe the now-freed memory.
             if stmt.value is None or return_type is None:
                 if stmt.value is not None:
                     self._emit_expr(stmt.value, env, lines)  # side effects only
+                self._emit_free_active_locals(lines)
                 lines.append("  ret void")
             else:
                 val, vtype = self._emit_value_for(stmt.value, env, lines, return_type)
                 val = self._coerce(val, vtype, return_type, lines)
+                self._emit_free_active_locals(lines)
                 lines.append(f"  ret {_llvm_type(return_type)} {val}")
             ctx["terminated"] = True
             return

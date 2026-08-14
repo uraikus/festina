@@ -359,7 +359,7 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 639 tests in this directory pass against it: 629 given a working C
+All 694 tests in this directory pass against it: 684 given a working C
 compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
 too, plus 8 more given `Xvfb`+`xdotool` too
 (`tests/test_codegen.py::TestGraphics`'s interactive click/mouse/key/
@@ -739,27 +739,130 @@ more bug while doing so, and deliberately did NOT attempt a third
   width change) and the four new `test_comparing_a_null_*_against_the_
   null_literal`/`test_comparing_a_non_null_*` cases.
 
-- **Memory management (claude.md #43) -- deliberately NOT attempted,
-  despite being asked.** Arrays and struct storage still leak (heap-
-  allocated, never freed) -- this remains true after this pass. The two
-  ways to actually close this (escape-analysis-based stack allocation
-  for values that provably never leave their declaring function; real
-  reference counting) are both substantially larger and, critically,
-  *riskier* than every other fix in this file: a wrong answer doesn't
-  fail loudly the way a type error or a missing null representation
-  does, it silently corrupts memory or frees something still reachable
-  at some later, disconnected point in the program. This isn't
-  theoretical -- an earlier pass already tried the naive version of the
-  first approach (stack-allocate every local struct unconditionally)
-  and verified it corrupts memory (see `festina/codegen.py`'s "Struct
-  storage is always heap-allocated" note). Getting this right needs a
-  dedicated design pass of its own (and, per this project's own
-  established pattern, almost certainly a `claude.md` addition first,
-  same as `break`/`continue` got one here) rather than being folded into
-  a batch of otherwise well-scoped, individually-testable fixes as a
-  side effect. See todo.md's own "Memory management" section for the
-  full writeup of both approaches and exactly why each is risky, not
-  just "not done yet."
+- **Memory management (claude.md #43), stage 1: automatic reclamation
+  of provably non-escaping locals (claude.md #74, new).** A dedicated
+  `claude.md` addition preceded this (the project's own established
+  pattern, followed deliberately here -- an earlier pass declined to
+  implement any of this without one, given the risk of getting it
+  wrong: unlike a type error or a missing null representation, a wrong
+  answer here doesn't fail loudly, it silently corrupts memory or
+  frees something still reachable at some later, disconnected point in
+  the program). A local struct/`arr[T]`/`map[T]` declared directly in a
+  function or event handler's own top-level body (not yet nested inside
+  an `if`/`while`/`for` -- see the stated stage-1 limitations below) is
+  now freed automatically at every `return` the function/handler
+  reaches, when `festina/escape_analysis.py`'s `find_escaping_names` can
+  prove -- from the syntax of that function/handler alone -- that the
+  variable's name never appears anywhere except as the immediate `.obj`
+  of a `Member` access (`v.field`, `v.field = x`, `v[i]`, `v[i] = x`,
+  `v.someMethod(...)`). That one rule turns out to correctly exclude
+  every way a value's address can escape in Festina today: a bare
+  `return v`, a call argument (`foo(v)`), the value or target of a
+  plain assignment (`x = v`, `v = other` -- the latter matters because
+  `v`'s *old* value may still be aliased elsewhere, and freeing
+  whatever `v` holds at the end of the function would free the wrong
+  thing), an array/map literal element, an operand of any operator --
+  in every one of those, the bare `Identifier` node sits somewhere
+  other than immediately under a `Member.obj`. The rule is deliberately
+  name-based, not a real scope-resolving analysis: an inner block's own,
+  unrelated local shadowing the outer candidate's name can only ever
+  make the candidate look *more* escaping than it really is (a missed
+  optimization opportunity), never less (never an unsafe free) -- see
+  `escape_analysis.py`'s own module docstring for the full reasoning,
+  including why it raises on any expression node type it doesn't
+  recognize rather than silently treating an unrecognized future AST
+  addition as non-escaping.
+
+  Wiring this into codegen needed one genuinely new piece of state
+  beyond the escaping-name set itself: `CodeGen._active_free_locals`, a
+  stack of "frames" (one per currently-being-emitted function/handler
+  body, mirroring `_loop_targets`' own "instance-level stack, not
+  threaded through `ctx`" shape for the same reason -- it has to keep
+  working through arbitrary `if`/block nesting inside the tracked body)
+  where each frame accumulates `(storage ref, Type)` for every
+  non-escaping candidate *as its own declaration is actually reached* in
+  program order (`_emit_func_body`, replacing the plain `_emit_block`
+  call `_emit_func`/`_emit_event_handler` used to make for their own
+  top-level body only -- nested `if`/`while`/`for` bodies still go
+  through the unmodified `_emit_block`). This is what makes an early
+  return -- nested inside an `if` that appears *before* a later
+  candidate's declaration in the same function -- correctly never try to
+  free something that was never allocated on that path: the candidate
+  is only added to the active frame once the top-level walk actually
+  finishes emitting its own `VarDecl`, so a `Return` reached earlier
+  simply never sees it. Verified directly, not just reasoned about
+  (`test_early_return_before_the_declaration_has_no_free_on_that_path`
+  inspects the generated IR to confirm the first `ret` has no `free()`
+  before it and the second does). `_emit_free_active_locals` (called
+  from `_emit_stmt`'s `Return` handling, after the return value if any
+  has already been computed -- so anything it reads through one of
+  those locals' own fields, itself a safe use, still sees live memory --
+  and once more from `_emit_func_body` itself for a function/handler
+  that falls off its own end) frees each active candidate according to
+  its actual representation: a struct local is `alloca ptr` pointing at
+  its own calloc'd backing storage, so freeing it means loading that
+  pointer and freeing it directly; an `arr[T]`/`map[T]` local is the
+  `{i64, ptr}` header itself, stack-allocated inline (never separately
+  heap-allocated on its own -- see `FESTINA_ARRAY_LLVM_TYPE`'s own
+  module docstring note), so freeing one means loading the header value,
+  `extractvalue`-ing its second field (the data/entries pointer), and
+  freeing *that*, not the local itself.
+
+  Verified three separate ways, deliberately more rigorously than most
+  fixes in this file given the stakes: (1) `tests/test_escape_analysis.py`
+  (36 tests) exercises `find_escaping_names` directly and exhaustively
+  -- every safe pattern (field/element read and write, a deep member
+  chain, use only inside a nested `if`/`while`/`for`, a method call on
+  the variable itself) and every escaping pattern (return, call
+  argument at any nesting depth, assignment value/target, array/map
+  literal element, ternary/logical/binary/unary/postfix operand, a
+  computed index expression) -- entirely at the parser level, no C
+  compiler needed. (2) `tests/test_codegen.py::TestAutomaticMemoryReclamation`
+  (19 tests) checks both the generated IR directly (a `free()` call
+  lands exactly where and only where expected, including the early-
+  return-ordering case above, and an event handler's own locals are
+  covered too) and real compiled-and-run programs, including the exact
+  "return a struct by value" pattern that broke the earlier naive
+  stack-allocation attempt this project already tried once and reverted
+  (see `festina/codegen.py`'s module docstring) -- every escaping case
+  (returned, passed as a call argument, assigned into a global,
+  reassigned) is confirmed to still produce the *correct value*
+  afterward, not just "no crash." (3) A real AddressSanitizer/
+  LeakSanitizer run (`gcc -fsanitize=address`, since this environment's
+  clang lacks the static ASan runtime archives but gcc's dynamic one
+  works) against a combined program exercising every escaping/non-
+  escaping pattern together across 1000+ calls: zero ASan errors (no
+  use-after-free, no double-free, no invalid free), and running the same
+  binary with leak detection enabled found *exactly* the expected
+  leaks and nothing more -- 1000 objects from the one still-escaping
+  (call-argument) pattern, plus two small, separately-explained leaks
+  from `festina_map_set`'s own per-entry `strdup`'d keys (not something
+  freeing a map's `entries` buffer touches -- a genuine, distinct,
+  now-documented stage-1 limitation of its own, found via this exact
+  ASan run, not anticipated in advance). Global variables holding
+  otherwise-unfreed struct pointers (`globalStash`, top-level `Point
+  q1/q2` receiving a `makePoint()` return) were correctly NOT reported
+  as leaks by LeakSanitizer, since they remain reachable at program
+  exit -- exactly the expected, standard leak-detector distinction
+  between "never explicitly freed" and "genuinely unreachable."
+
+  Explicitly NOT covered by this stage (claude.md #74 itself states
+  each of these, so a later stage's own test suite has a clear
+  before/after line): a value declared inside a nested `if`/`while`/
+  `for` block; a value declared inside a loop body at all (still leaks
+  on every iteration, unchanged); whether a value passed as a call
+  argument is actually retained by the callee (treated as escaping
+  unconditionally -- no interprocedural analysis yet); struct/array/map
+  *fields* within an otherwise-freed struct; and a freed map's own
+  per-entry keys. None of these are safety gaps -- each one only means
+  less memory is reclaimed automatically than a more complete
+  implementation would reclaim.
+
+  See `todo.md`'s "Memory management" section for the full picture,
+  including what widening this stage's coverage (nested blocks, loops,
+  interprocedural reasoning) versus adding reference counting for
+  genuinely-escaping values would each still require, and why neither
+  is attempted yet.
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -1531,7 +1634,7 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 629 passed, 10 skipped (needs a C compiler; 2 of
+pytest tests/                          # 684 passed, 10 skipped (needs a C compiler; 2 of
                                         # the skips need `pip install pyinstaller` too,
                                         # the other 8 need Xvfb + xdotool installed)
 ```
