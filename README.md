@@ -7,7 +7,7 @@ overhead, and the boilerplate. Festina compiles through LLVM to a real,
 standalone executable — with SQLite, graphics, audio, and JS-style
 timers built directly into the language, not bolted on as libraries.
 
-[![Tests](https://img.shields.io/badge/tests-434%20passing-brightgreen)](tests/CONTRACT.md)
+[![Tests](https://img.shields.io/badge/tests-457%20passing-brightgreen)](tests/CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ```festina
@@ -119,6 +119,36 @@ setInterval(tick, 500)
 Full reference for every one of these — signatures, caveats, what's
 implementation-defined vs. spec-mandated — is in [api.md](api.md).
 
+## See it in action
+
+[`examples/`](examples/) has a dozen small, runnable programs — from a
+one-liner to a real, playable two-player **tic-tac-toe game**
+([`tic_tac_toe.f`](examples/tic_tac_toe.f), click a cell, alternating
+X/O, real win detection) built entirely in Festina with nothing but
+`drawRect`/`drawText`/`on click`:
+
+```bash
+bin/festina examples/tic_tac_toe.f -o tic_tac_toe && ./tic_tac_toe
+```
+
+| Example | What it shows |
+|---|---|
+| [`greet.f`](examples/greet.f) | The README's own hero example |
+| [`fizzbuzz.f`](examples/fizzbuzz.f) | Loops, modulo, control flow — no dependencies |
+| [`arrays.f`](examples/arrays.f) | Array literals, indexing, `.length` |
+| [`basic.f`](examples/basic.f) / [`hello.f`](examples/hello.f) | Tables, SQLite queries, structs, functions |
+| [`multifile.f`](examples/multifile.f) + [`geometry.f`](examples/geometry.f) | `import` across files |
+| [`regex.f`](examples/regex.f) | `regex()`, `.test()`, `.match()`, `.replace()`/`.replaceAll()` |
+| [`timers.f`](examples/timers.f) | `setTimeout`/`setInterval`/`clearInterval` |
+| [`graphics.f`](examples/graphics.f) | A drawn canvas, plus all five `on click`/`mouse`/`key`/`resize`/`close` handlers |
+| [`audio.f`](examples/audio.f) | `loadAudio()`/`.play()`/`.stop()`/`.isPlaying()`, with a tiny bundled WAV |
+| [`tic_tac_toe.f`](examples/tic_tac_toe.f) | The game above — graphics, global game state, and win-checking logic together |
+
+Every one of these is compiled and checked by the test suite on every
+change (`tests/test_examples.py` and, for the two needing a display,
+`tests/test_codegen.py::TestExampleGraphicsAndGame`) — they're not just
+snippets that happened to work once.
+
 ## How it compares
 
 Festina, Rust, Go, and Bun, on the same small equivalent-logic
@@ -135,7 +165,7 @@ needs.
 
 Festina is under active development, but not vaporware — the compiler
 frontend, LLVM codegen backend, and native C runtime are real and
-tested: **434 tests, 0 failures.** Every `claude.md` language construct
+tested: **457 tests, 0 failures.** Every `claude.md` language construct
 this project has committed to is implemented end to end, not just
 parsed. See [`tests/CONTRACT.md`](tests/CONTRACT.md) for exactly what's
 covered and how, and [todo.md](todo.md) for what's next (macOS, Windows,

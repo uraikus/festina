@@ -357,17 +357,37 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 434 tests in this directory pass against it: 426 given a working C
+All 457 tests in this directory pass against it: 447 given a working C
 compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
-too, plus 6 more (`tests/test_codegen.py::TestGraphics`'s interactive
-click/mouse/key/resize tests, the one confirming the initial
-`clientWidth`/`clientHeight` values, and `TestTimers`'s combined
-graphics-and-timers test) given `Xvfb`+`xdotool` too -- all skip
-cleanly, independently, without any of those three (see below).
-`tests/test_audio.py`/`TestAudio` need none of the three either --
-the null-device technique they use (see conftest.py's
+too, plus 8 more given `Xvfb`+`xdotool` too
+(`tests/test_codegen.py::TestGraphics`'s interactive click/mouse/key/
+resize tests, the one confirming the initial `clientWidth`/
+`clientHeight` values, `TestTimers`'s combined graphics-and-timers test,
+and `TestExampleGraphicsAndGame`'s two example-driven tests below) --
+all skip cleanly, independently, without any of those three (see
+below). `tests/test_audio.py`/`TestAudio` need none of the three
+either -- the null-device technique they use (see conftest.py's
 `audio_null_env`) needs no extra tool install, only the C compiler
 `compile_and_run` already requires.
+
+`examples/` grew beyond the original hello/basic/arrays/geometry/
+multifile/regex set: `timers.f` (setTimeout/setInterval), `graphics.f`
+(drawing + all five event handlers), `audio.f` (loadAudio/play/stop/
+isPlaying, with a small generated `beep.wav` fixture), `fizzbuzz.f` (a
+dependency-free loops/modulo tour), and `tic_tac_toe.f` -- a real,
+playable two-player game (click a cell, alternating X/O, win detection
+across all eight lines) built entirely around this runtime's actual
+drawing model: every draw call paints in solid black and there's no
+"clear"/erase function (see festina_runtime.h's Graphics doc comment),
+so the game deliberately never needs to undraw anything, marks just
+accumulate the way a real pen-and-paper game would. Verified against a
+real (virtual) X server, including the win-detection path (three clicks
+completing a line), not just reasoned about. `tests/test_examples.py`
+compiles every file in `examples/` and checks the deterministic ones'
+exact stdout; `graphics.f`/`tic_tac_toe.f` (the two needing a display)
+get their own interactive coverage in
+`tests/test_codegen.py::TestExampleGraphicsAndGame` instead, next to
+`TestGraphics`'s own Xvfb helpers.
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -1073,7 +1093,7 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 426 passed, 8 skipped (needs a C compiler; 2 of
+pytest tests/                          # 447 passed, 10 skipped (needs a C compiler; 2 of
                                         # the skips need `pip install pyinstaller` too,
-                                        # the other 6 need Xvfb + xdotool installed)
+                                        # the other 8 need Xvfb + xdotool installed)
 ```
