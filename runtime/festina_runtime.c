@@ -782,6 +782,88 @@ void festina_run_timer_loop(void) {
     }
 }
 
+/* ---- reference counting -- claude.md #77 ---- */
+
+/* claude.md #74/#75/#76 (festina/escape_analysis.py) prove, from
+ * syntax alone, that some struct/arr[T]/map[T] values never outlive
+ * their declaring function -- those get freed outright (or, for a
+ * struct specifically, stack-allocated and never freed at all -- see
+ * codegen.py's own module docstring). A value proven to genuinely
+ * escape (stored into a global, returned, ...) has nothing for that
+ * kind of analysis to do; it's safe by construction to prove it MUST
+ * be freed, never to prove it's safe TO free, since something else
+ * might still be using it. Reference counting is the answer for that
+ * remainder: track how many live Festina-visible bindings currently
+ * reference a value, and only actually free it when that count reaches
+ * zero.
+ *
+ * This works completely for Festina specifically because reference
+ * cycles are not just rare here, they are structurally impossible:
+ * a struct field's type, and an arr[T]/map[T]'s own element type T,
+ * must always be a type declared *before* the struct/array/map
+ * containing it (the same "no forward references" rule semantics.py
+ * already enforces for functions -- verified directly: `struct Node {
+ * next:Node }`, and even two mutually-referencing structs declared in
+ * either order, both fail to compile with "unknown type"). So the set
+ * of types any given value could ever transitively reference, through
+ * its own fields/elements, is always a strict subset of the types
+ * declared earlier in the same program -- a DAG by construction, never
+ * a cycle -- meaning plain reference counting, with no cycle detector
+ * or tracing collector, is a *complete* answer here, not the usual
+ * "handles everything except cycles" partial one.
+ *
+ * Layout: every refcounted value's allocation has a single int64_t
+ * refcount immediately before the pointer Festina code actually sees
+ * (`payload` below) -- a fixed 8-byte offset regardless of the value's
+ * own type, since every Festina field type (int/float/bool/text/blob/
+ * struct/table/image/audio/regex all lower to i64/double/i8/ptr -- see
+ * codegen.py's _llvm_type) has natural alignment no greater than 8
+ * bytes, so placing an 8-byte header immediately before a value's own
+ * fields never needs extra padding. See codegen.py's own VarDecl/
+ * StructType handling (a local) and _global_var_defs (a global) for
+ * where this header actually gets allocated/initialized.
+ *
+ * A NEGATIVE refcount is a sentinel for "immortal, retain/release are
+ * always a no-op" -- used for a struct-typed global's own untouched
+ * static initial storage (see _global_var_defs), which was never
+ * heap-allocated in the first place and must never reach free(). This
+ * means codegen never needs to special-case a global's first-ever
+ * reassignment (from that static storage to a real heap value): both
+ * functions are always safe to call unconditionally, whatever the
+ * pointer they're given currently points to. */
+void festina_retain(void *payload) {
+    if (!payload) return;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return;
+    (*header)++;
+}
+
+/* claude.md #78: the decrement-and-check half of festina_release,
+ * split out so codegen can cascade into releasing a struct's own
+ * struct-typed field(s) BEFORE actually freeing its storage, something
+ * only the compiler (not this generic, type-blind runtime) knows how
+ * to do -- see festina/codegen.py's _release_fn_for_struct. Returns 1
+ * (the caller should now free `payload`, after releasing whatever it
+ * itself needs to release first) or 0 (nothing further to do: null,
+ * immortal, or still referenced elsewhere), the same three outcomes
+ * festina_release's own null/sentinel/nonzero-refcount checks already
+ * distinguish -- this only defers the actual free() call to the
+ * caller instead of performing it here. */
+int8_t festina_release_check(void *payload) {
+    if (!payload) return 0;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return 0;
+    (*header)--;
+    return *header == 0;
+}
+
+void festina_release(void *payload) {
+    if (!payload) return;
+    if (festina_release_check(payload)) {
+        free((char *)payload - sizeof(int64_t));
+    }
+}
+
 /* ---- maps -- claude.md #72 ---- */
 
 /* One key/value pair -- `value` is a raw 8-byte payload meaning
@@ -889,4 +971,76 @@ void festina_map_for_each(int64_t count, void *entries, void (*callback)(int64_t
     for (int64_t i = 0; i < count; i++) {
         callback(arr[i].value, arr[i].key);
     }
+}
+
+/* claude.md #74/#75: see this function's own declaration in
+ * festina_runtime.h. Frees what festina_map_set's own comment already
+ * establishes is exclusively owned by each entry -- a strdup'd copy of
+ * the key, never aliased with any other Festina-visible value -- before
+ * freeing the entries buffer itself. This is the one piece of stage
+ * 1/2's own remaining coverage gap (claude.md #74's "This stage does
+ * not yet analyze" list) that's actually safe to close without any new
+ * aliasing reasoning: unlike a struct/array/map VALUE stored into
+ * another value's field (which may still be reachable through the
+ * variable it came from -- see codegen.py's own note on why THAT case
+ * is deliberately not attempted yet), a map entry's key was never a
+ * Festina value at all -- just a private byte-for-byte copy this
+ * runtime made for its own internal bookkeeping the moment the entry
+ * was created. */
+void festina_map_free_entries(int64_t count, void *entries) {
+    FestinaMapEntry *arr = (FestinaMapEntry *)entries;
+    for (int64_t i = 0; i < count; i++) {
+        free(arr[i].key);
+    }
+    free(entries);
+}
+
+/* ---- reference counting for arr[T]/map[T] -- claude.md #79 ---- */
+
+/* claude.md #79: an arr[T]/map[T] value is now, like a struct value
+ * (claude.md #77), a single `ptr` to a heap-allocated header carrying
+ * its own i64 refcount immediately before the payload -- the same
+ * layout and the same festina_retain/festina_release_check this file's
+ * own "reference counting" section already established, reused
+ * unchanged (retaining an array/map needs no type-specific logic at
+ * all: `festina_retain` just increments a refcount, regardless of what
+ * the payload past it actually is). Only RELEASING needs an
+ * array/map-specific function, since -- unlike festina_release, which
+ * assumes there's nothing further to free once the refcount hits zero
+ * -- an arr[T]/map[T]'s own payload holds a *second* allocation (its
+ * data/entries buffer) that also needs freeing at that point.
+ *
+ * Unlike a struct (whose own field layout varies per Festina struct
+ * type, needing the compiler's own per-type knowledge -- see
+ * codegen.py's _release_fn_for_struct), every arr[T]/map[T]'s header
+ * has the identical two-field shape regardless of T (FESTINA_ARRAY_LLVM_TYPE/
+ * FESTINA_MAP_LLVM_TYPE's own `{i64, ptr}`), so a single generic
+ * function handles every arr[T] and a single generic function handles
+ * every map[T] -- no per-type codegen-generated wrapper needed here at
+ * all, unlike the struct case. */
+void festina_release_array(void *payload) {
+    if (!festina_release_check(payload)) return;
+    /* payload is {i64 length, ptr data} -- skip past the i64 to reach
+     * the data pointer, the one thing actually worth freeing here (the
+     * length is just a plain number, nothing to release). Elements
+     * that are themselves refcounted values (a struct-typed element,
+     * say) are not individually released here -- see todo.md on why
+     * that's still a separate, open gap this section doesn't close. */
+    void *data = *(void **)((char *)payload + sizeof(int64_t));
+    free(data);
+    free((char *)payload - sizeof(int64_t));
+}
+
+void festina_release_map(void *payload) {
+    if (!festina_release_check(payload)) return;
+    /* payload is {i64 count, ptr entries} -- festina_map_free_entries
+     * already does exactly the right thing for the data half (each
+     * entry's own strdup'd key, then the entries buffer itself -- see
+     * its own comment just above), so this only adds the new header
+     * free on top. Same "map values aren't individually released"
+     * scope limitation as festina_release_array above. */
+    int64_t count = *(int64_t *)payload;
+    void *entries = *(void **)((char *)payload + sizeof(int64_t));
+    festina_map_free_entries(count, entries);
+    free((char *)payload - sizeof(int64_t));
 }
