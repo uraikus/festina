@@ -430,6 +430,26 @@ class Env:
         return None
 
 
+class _StackStructFieldsOnly:
+    """claude.md #78: wraps a StructType to mark, in CodeGen.
+    _active_free_locals, a STACK-allocated struct local (see claude.md
+    #74/#76 -- provably non-escaping, so its own storage is never
+    heap-allocated/refcounted at all) that still has at least one
+    struct-typed field of its own. Such a local needs a scope-exit
+    action _emit_free_active_locals's existing StructType branch can't
+    give it (releasing the struct ITSELF, via its own refcount header,
+    which this local was never given in the first place -- see
+    _emit_stmt's own VarDecl handling) and the plain "nothing at all"
+    every other stack-allocated struct correctly gets: only its own
+    struct-typed field(s) need releasing, the same "the container stays
+    stack-allocated, but what it points to still needs explicit
+    freeing" pattern arr[T]/map[T] locals already follow for their own
+    data/entries buffer. See _emit_release_nested_fields_only."""
+
+    def __init__(self, struct_type):
+        self.struct_type = struct_type
+
+
 class CodeGen:
     def __init__(self, analyzed, filename="main.f"):
         self.analyzed = analyzed
@@ -443,6 +463,13 @@ class CodeGen:
         self.label_counter = 0
         self.global_env = Env()
         self.func_defs = []                    # emitted `define` blocks (text)
+        self._struct_release_fns = {}          # claude.md #78: struct name -> LLVM function name of
+                                                # its own lazily-generated, per-type release wrapper --
+                                                # see _release_fn_for_struct's own comment. Only ever
+                                                # populated for a struct that has at least one struct-
+                                                # typed field of its own; every other struct's values
+                                                # keep using the plain, generic @festina_release
+                                                # directly, unchanged from claude.md #77.
         self.extra_globals = []                # globals discovered while emitting main() (e.g. table column arrays)
         self.entry_stmts = []                  # top-level statements for __festina_main
         self.func_decls = {}                   # name -> ast.FuncDecl (for signatures)
@@ -754,6 +781,13 @@ class CodeGen:
             # _emit_free_active_locals's own StructType branch.
             "declare void @festina_retain(ptr)",
             "declare void @festina_release(ptr)",
+            # claude.md #78: the decrement-and-check half of
+            # festina_release, split out so a struct with its own
+            # struct-typed field(s) can cascade into releasing those
+            # fields BEFORE actually freeing its own storage -- see
+            # _release_fn_for_struct and festina_release_check's own
+            # comment in runtime/festina_runtime.c.
+            "declare i8 @festina_release_check(ptr)",
             # claude.md #71: environment.NAME / environment[keyExpr].
             "declare ptr @festina_getenv(ptr)",
             # claude.md #72: map[T] -- count_ptr/entries_ptr (the two
@@ -939,17 +973,29 @@ class CodeGen:
                 # escaping-ness -- a dynamically-growing buffer isn't
                 # safe to give a fixed-size alloca) always reach one of
                 # the other two.
-                if isinstance(type_, types_mod.StructType):
+                if isinstance(type_, _StackStructFieldsOnly):
+                    # claude.md #78: a stack-allocated struct local
+                    # (see _emit_block's own tracking comment) whose own
+                    # storage is never released here -- only whatever
+                    # its own struct-typed field(s) currently point to,
+                    # since a field write (_emit_assign) may have
+                    # retained a reference nothing else will ever
+                    # release otherwise.
+                    self._emit_release_nested_fields_only(ref, type_.struct_type, lines)
+                elif isinstance(type_, types_mod.StructType):
                     # claude.md #77: release (not free) -- this struct
                     # is refcounted (see _emit_stmt's own VarDecl
                     # handling), so its own reference simply needs
                     # dropping; festina_release only actually frees it
-                    # once nothing else references it. Never touches
-                    # this struct's own nested fields (still leak,
-                    # unchanged -- see todo.md).
+                    # once nothing else references it. claude.md #78:
+                    # goes through _release_fn_for_struct rather than
+                    # the plain @festina_release directly, so a struct
+                    # with its own struct-typed field(s) cascades into
+                    # releasing those too, once this was its last
+                    # reference.
                     loaded = self.tmp()
                     lines.append(f"  {loaded} = load ptr, ptr {ref}")
-                    lines.append(f"  call void @festina_release(ptr {loaded})")
+                    lines.append(f"  call void {self._release_fn_for_struct(type_)}(ptr {loaded})")
                 elif isinstance(type_, types_mod.ArrayType):
                     # Direct GEP-to-field-1 + load, matching how every
                     # other array/map data-pointer read in this file
@@ -1211,6 +1257,19 @@ class CodeGen:
                                                    and stmt.name not in self._current_escaping_names)
                             if not is_stack_allocated:
                                 self._active_free_locals[-1].append((ref, type_))
+                            elif self._struct_has_own_struct_field(type_.name):
+                                # claude.md #78: this local's own
+                                # storage is stack-allocated and never
+                                # itself released -- but writing into
+                                # one of its struct-typed fields
+                                # (_emit_assign) still retains whatever
+                                # value that field points to, and
+                                # nothing else will ever release that
+                                # extra reference unless this scope-exit
+                                # does. See _StackStructFieldsOnly's own
+                                # comment.
+                                self._active_free_locals[-1].append(
+                                    (ref, _StackStructFieldsOnly(type_)))
             if tracking and not ctx["terminated"]:
                 self._emit_free_active_locals(lines, down_to=len(self._active_free_locals) - 1)
         finally:
@@ -1392,7 +1451,12 @@ class CodeGen:
             # Identifier, a Member read, ...) never allocates anything of
             # its own to begin with, so there is nothing to release.
             if isinstance(vtype, types_mod.StructType) and isinstance(stmt.expr, ast.Call):
-                lines.append(f"  call void @festina_release(ptr {val})")
+                # claude.md #78: through _release_fn_for_struct, same as
+                # every other release site -- a discarded struct-typed
+                # call result can have its own nested struct-typed
+                # field(s), and this being its last reference means
+                # those need releasing too.
+                lines.append(f"  call void {self._release_fn_for_struct(vtype)}(ptr {val})")
             return
         if isinstance(stmt, ast.Return):
             # claude.md #74: free every currently-active non-escaping
@@ -2148,18 +2212,17 @@ class CodeGen:
         aliased anywhere else) is deliberately over-conservative rather
         than precise -- it can only ever delay a free that a sharper
         analysis could have done sooner, never cause one to happen too
-        early -- see todo.md on why that same precision isn't
-        implemented for LOCAL struct assignments/declarations at all
-        yet (unlike this global-only, always-paired case, a local's own
-        retain would need to avoid double-counting against a SEPARATE
-        local's own scope-exit release of the same underlying value,
-        which needs real aliasing analysis this stage doesn't have)."""
+        early. Releases through _release_fn_for_struct rather than the
+        plain @festina_release directly (claude.md #78) -- a global of
+        a struct type with its own struct-typed field(s) needs its
+        release to cascade into those fields too, the same as any other
+        release site for that struct type."""
         if not isinstance(ttype, types_mod.StructType) or not ref.startswith("@"):
             return
         old = self.tmp()
         lines.append(f"  {old} = load ptr, ptr {ref}")
         lines.append(f"  call void @festina_retain(ptr {val})")
-        lines.append(f"  call void @festina_release(ptr {old})")
+        lines.append(f"  call void {self._release_fn_for_struct(ttype)}(ptr {old})")
 
     def _is_owning_struct_source(self, expr):
         """claude.md #77 (widened): a source expression is "owning" --
@@ -2194,7 +2257,7 @@ class CodeGen:
         block) never allows in the first place."""
         return isinstance(expr, ast.Call)
 
-    def _emit_local_struct_retain_release(self, ref, val, source_expr, lines):
+    def _emit_local_struct_retain_release(self, ref, val, source_expr, ttype, lines):
         """claude.md #77 (widened): the local-variable counterpart to
         _emit_global_struct_retain_release, called from _emit_assign's
         Identifier branch when the target is a LOCAL (not a global) --
@@ -2226,7 +2289,126 @@ class CodeGen:
         lines.append(f"  {old} = load ptr, ptr {ref}")
         if not self._is_owning_struct_source(source_expr):
             lines.append(f"  call void @festina_retain(ptr {val})")
-        lines.append(f"  call void @festina_release(ptr {old})")
+        lines.append(f"  call void {self._release_fn_for_struct(ttype)}(ptr {old})")
+
+    def _struct_has_own_struct_field(self, name):
+        """claude.md #78: True when the struct declared `name` has at
+        least one field of its own that is itself a StructType --
+        never transitively (see _release_fn_for_struct's own comment on
+        why only the direct case needs checking here)."""
+        return any(isinstance(t, types_mod.StructType) for _, t in self.struct_fields(name))
+
+    def _release_fn_for_struct(self, type_):
+        """claude.md #78: returns the LLVM function name to call to
+        release a value of struct type `type_` -- the plain, generic
+        `@festina_release` (unchanged from claude.md #77) for a struct
+        with no struct-typed field of its own, since there is nothing
+        for a release to cascade into; a dedicated, lazily-generated,
+        per-struct-type wrapper (`@__festina_release_struct_<Name>`,
+        cached in self._struct_release_fns so repeat callers -- and
+        there are many, every release site in this file included --
+        never regenerate it) for one that has at least one.
+
+        That wrapper does exactly what the plain runtime function can't,
+        since the runtime is entirely type-blind (every value it ever
+        touches is just a `void *payload`, see festina_release_check's
+        own comment): decrement the refcount via festina_release_check,
+        and -- only if that was the value's last reference -- release
+        each of the struct's own struct-typed fields (via THAT field
+        type's own release function, found by calling this same method
+        recursively) before actually freeing this struct's own storage.
+        Every other field (int/float/bool/text/blob/arr[T]/map[T]/...)
+        is left untouched, exactly as before this section -- text/blob
+        are never refcounted at all (see claude.md #43's own note on
+        string ownership), and arr[T]/map[T] fields need that stage's
+        own foundational work (reference counting for escaping array/
+        map values) before a struct holding one could be covered here
+        too; see todo.md.
+
+        The recursion here always terminates and can never produce a
+        duplicate/infinite chain of wrapper functions, for the same
+        reason claude.md #77 already gives for why reference cycles are
+        structurally impossible in Festina: a struct field's type must
+        always be declared *before* the struct containing it (claude.md
+        #48's "declared before used" rule, the same one that already
+        governs function forward references), so the graph of "which
+        struct types reference which other struct types through their
+        own fields" is a DAG by construction, never a cycle -- a
+        struct's own release wrapper can transitively call another
+        struct's, but never, even indirectly, its own."""
+        if not self._struct_has_own_struct_field(type_.name):
+            return "@festina_release"
+        if type_.name in self._struct_release_fns:
+            return self._struct_release_fns[type_.name]
+        fn_name = f"@__festina_release_struct_{type_.name}"
+        # Registered before the field loop below (which may recurse
+        # back into this same method for a DIFFERENT struct type) so a
+        # second, unrelated caller reaching this struct type again
+        # while this one's own body is still being built -- e.g. two
+        # sibling fields of some other struct both being this same
+        # type -- gets the cached name immediately rather than
+        # triggering a second, redundant generation.
+        self._struct_release_fns[type_.name] = fn_name
+        struct_ty = self.struct_llvm_name(type_.name)
+        body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
+        should_free = self.tmp()
+        body.append(f"  {should_free} = call i8 @festina_release_check(ptr %payload)")
+        cond = self.tmp()
+        body.append(f"  {cond} = icmp ne i8 {should_free}, 0")
+        free_label = self.label("relstruct.free")
+        done_label = self.label("relstruct.done")
+        body.append(f"  br i1 {cond}, label %{free_label}, label %{done_label}")
+        body.append(f"{free_label}:")
+        self._emit_release_struct_field_refs("%payload", type_, body)
+        header = self.tmp()
+        body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
+        body.append(f"  call void @free(ptr {header})")
+        body.append(f"  br label %{done_label}")
+        body.append(f"{done_label}:")
+        body.append("  ret void")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _emit_release_struct_field_refs(self, obj_ptr, type_, lines):
+        """claude.md #78: releases every struct-typed field of `type_`
+        directly reachable from `obj_ptr` (already-emitted IR for a
+        `ptr` to that struct's own storage) -- the shared field-walking
+        core both _release_fn_for_struct (a heap-allocated struct
+        that's about to be freed) and _emit_release_nested_fields_only
+        (a stack-allocated struct whose own storage is never freed, but
+        whose field references still need dropping) build on. Never
+        touches `type_`'s own storage or refcount header -- entirely
+        the caller's own responsibility, since the two callers need
+        different things done with it (free it outright, or nothing at
+        all)."""
+        struct_ty = self.struct_llvm_name(type_.name)
+        for i, (_, ftype) in enumerate(self.struct_fields(type_.name)):
+            if isinstance(ftype, types_mod.StructType):
+                field_release_fn = self._release_fn_for_struct(ftype)
+                fptr = self.tmp()
+                lines.append(f"  {fptr} = getelementptr {struct_ty}, ptr {obj_ptr}, i32 0, i32 {i}")
+                fval = self.tmp()
+                lines.append(f"  {fval} = load ptr, ptr {fptr}")
+                lines.append(f"  call void {field_release_fn}(ptr {fval})")
+
+    def _emit_release_nested_fields_only(self, ref, struct_type, lines):
+        """claude.md #78: the stack-allocated counterpart to
+        _release_fn_for_struct's own generated wrapper -- called from
+        _emit_free_active_locals for a struct local _emit_block marked
+        with _StackStructFieldsOnly. `ref` is the local's own `alloca
+        ptr` slot (see _emit_stmt's VarDecl handling -- even a stack-
+        allocated struct is addressed through one, so Identifier lookup
+        never needs to special-case where a struct's storage actually
+        lives); loading it gives a perfectly valid pointer into that
+        stack storage, usable for a GEP into its own fields exactly
+        like a heap pointer would be -- it must simply never reach
+        festina_release/@free, since it has no refcount header and
+        isn't heap memory at all."""
+        obj = self.tmp()
+        lines.append(f"  {obj} = load ptr, ptr {ref}")
+        self._emit_release_struct_field_refs(obj, struct_type, lines)
 
     def _emit_assign(self, expr, env, lines):
         # The target's declared type is resolved *before* the value, so an
@@ -2244,7 +2426,7 @@ class CodeGen:
                 if ref.startswith("@"):
                     self._emit_global_struct_retain_release(ref, val, ttype, lines)
                 else:
-                    self._emit_local_struct_retain_release(ref, val, expr.value, lines)
+                    self._emit_local_struct_retain_release(ref, val, expr.value, ttype, lines)
             lines.append(f"  store {_llvm_type(ttype)} {val}, ptr {ref}")
             return val, ttype
         if isinstance(expr.target, ast.Member):
@@ -2280,6 +2462,28 @@ class CodeGen:
                 ptr, ftype = self._member_ptr(expr.target, env, lines)
             val, vtype = self._emit_value_for(expr.value, env, lines, ftype)
             val = self._coerce(val, vtype, ftype, lines)
+            if not expr.target.computed and isinstance(ftype, types_mod.StructType):
+                # claude.md #78: `outer.field = value` -- the ONLY way a
+                # struct-typed field is ever populated (there's no
+                # struct-literal initializer syntax) -- gets the exact
+                # same owning/aliasing retain rule as a plain local
+                # reassignment, and releases whatever the field
+                # previously held (always safe: a struct's own fields
+                # start out null, per its zeroinitializer/calloc'd
+                # storage, and both festina_retain/festina_release
+                # already null-check). Deliberately NOT applied to a
+                # computed target (arr[i] = v / map[key] = v) even when
+                # the array/map's own element type happens to be a
+                # struct -- arr[T]/map[T] values aren't refcounted
+                # containers at all yet (a separate, still-open item --
+                # see todo.md), so there is no scope-exit release this
+                # retain could ever be paired with; only a genuine
+                # struct FIELD, on a genuine struct, is covered here.
+                old = self.tmp()
+                lines.append(f"  {old} = load ptr, ptr {ptr}")
+                if not self._is_owning_struct_source(expr.value):
+                    lines.append(f"  call void @festina_retain(ptr {val})")
+                lines.append(f"  call void {self._release_fn_for_struct(ftype)}(ptr {old})")
             lines.append(f"  store {_llvm_type(ftype)} {val}, ptr {ptr}")
             return val, ftype
         raise CodegenError("unsupported assignment target", file=self.filename)

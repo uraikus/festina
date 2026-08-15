@@ -2864,6 +2864,261 @@ class TestAutomaticMemoryReclamation:
         assert result.returncode == 0
         assert result.stdout.strip() == "2000"
 
+    # -- reference counting for a struct's own struct-typed fields
+    # (claude.md #78, new section): the nested-field gap sections 74-77
+    # deliberately left open. See tests/CONTRACT.md for the full
+    # writeup.
+
+    def test_struct_field_write_from_an_identifier_retains(self, parser, semantic, codegen):
+        source = """
+        struct Inner { v:int }
+        struct Outer { inner:Inner }
+        void func f() {
+            Inner i
+            Outer o
+            o.inner = i
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" in f_body
+
+    def test_struct_field_write_from_a_call_result_does_not_retain(self, parser, semantic, codegen):
+        source = """
+        struct Inner { v:int }
+        struct Outer { inner:Inner }
+        Inner func make() {
+            Inner i
+            return i
+        }
+        void func f() {
+            Outer o
+            o.inner = make()
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        f_start = next(i for i, l in enumerate(lines) if l.startswith("define void @f("))
+        f_end = next(i for i in range(f_start, len(lines)) if lines[i].strip() == "}")
+        f_body = "\n".join(lines[f_start:f_end])
+        assert "call void @festina_retain(" not in f_body
+
+    def test_struct_with_no_struct_fields_still_uses_the_generic_release(
+            self, parser, semantic, codegen):
+        # The common case (the overwhelming majority of structs have no
+        # struct-typed field of their own) must stay exactly as cheap as
+        # claude.md #77 already made it -- no per-type wrapper function
+        # generated, no extra indirection, when there's nothing for a
+        # release to cascade into.
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            Point p
+            g = p
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "@__festina_release_struct_" not in ir
+        assert "call void @festina_release(" in ir
+
+    def test_struct_with_a_nested_struct_field_gets_a_dedicated_release_function(
+            self, parser, semantic, codegen):
+        source = """
+        struct Inner { v:int }
+        struct Outer { inner:Inner }
+        Outer g
+        void func f() {
+            Outer o
+            g = o
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "define void @__festina_release_struct_Outer(ptr %payload)" in ir
+        # The wrapper itself must release the nested field via the
+        # plain generic release (Inner has no struct-typed field of its
+        # own) before freeing Outer's own storage.
+        wrapper_start = ir.index("define void @__festina_release_struct_Outer(")
+        wrapper_end = ir.index("\n}\n", wrapper_start)
+        wrapper_body = ir[wrapper_start:wrapper_end]
+        assert "call i8 @festina_release_check(" in wrapper_body
+        assert "call void @festina_release(" in wrapper_body
+        assert "call void @free(" in wrapper_body
+        # And every release site for an Outer value (here, g's own
+        # reassignment and o's own scope-exit) must call the wrapper,
+        # not the plain generic release, directly.
+        assert ir.count("call void @__festina_release_struct_Outer(") >= 2
+
+    def test_deeply_nested_struct_fields_cascade_through_every_level(
+            self, parser, semantic, codegen):
+        # A -> B -> C, three levels deep -- confirms the recursive
+        # wrapper-generation handles more than one level, not just the
+        # immediate-child case every test above exercises.
+        source = """
+        struct C { v:int }
+        struct B { c:C }
+        struct A { b:B }
+        A g
+        void func f() {
+            A a
+            g = a
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "define void @__festina_release_struct_A(" in ir
+        assert "define void @__festina_release_struct_B(" in ir
+        # C has no struct-typed field of its own -- no wrapper needed.
+        assert "define void @__festina_release_struct_C(" not in ir
+        a_start = ir.index("define void @__festina_release_struct_A(")
+        a_end = ir.index("\n}\n", a_start)
+        a_body = ir[a_start:a_end]
+        assert "call void @__festina_release_struct_B(" in a_body
+        b_start = ir.index("define void @__festina_release_struct_B(")
+        b_end = ir.index("\n}\n", b_start)
+        b_body = ir[b_start:b_end]
+        assert "call void @festina_release(" in b_body
+
+    def test_nested_struct_field_reads_and_writes_correctly(self, compile_and_run):
+        source = """
+        struct Inner { v:int }
+        struct Outer { inner:Inner }
+        Outer g
+        void func f(n:int) {
+            Inner i
+            i.v = n
+            Outer o
+            o.inner = i
+            g = o
+        }
+        f(42)
+        log(g.inner.v)
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "42"
+
+    def test_original_local_stays_correct_after_being_written_into_a_field(
+            self, compile_and_run):
+        # The exact aliasing hazard todo.md documented as the reason
+        # this was deliberately deferred: `outer.field = someLocal`
+        # aliases someLocal's own storage, not a copy. Without
+        # retaining that reference on the way in, someLocal's own
+        # later scope-exit release could free memory outer.field still
+        # points to. Reading BOTH someLocal and outer.field.v, well
+        # after someLocal's own scope would ordinarily have released
+        # it, is the actual check -- 2000 iterations so a real
+        # use-after-free (not just a lucky read of not-yet-reused
+        # memory) would reliably surface as wrong output.
+        source = """
+        struct Inner { v:int }
+        struct Outer { inner:Inner }
+        void func f(n:int) {
+            Inner i
+            i.v = n
+            Outer o
+            o.inner = i
+            if i.v != n || o.inner.v != n {
+                fail('field aliasing drifted before scope exit')
+            }
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                f(i)
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_reassigning_a_struct_field_releases_the_old_value_correctly(
+            self, compile_and_run):
+        source = """
+        struct Inner { v:int }
+        struct Outer { inner:Inner }
+        void func f(n:int) {
+            Inner a
+            a.v = n
+            Inner b
+            b.v = n * 2
+            Outer o
+            o.inner = a
+            o.inner = b
+            if o.inner.v != n * 2 {
+                fail('field reassignment drifted')
+            }
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                f(i)
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_self_assignment_of_a_struct_field_does_not_crash(self, compile_and_run):
+        source = """
+        struct Inner { v:int }
+        struct Outer { inner:Inner }
+        void func f(n:int) {
+            Inner i
+            i.v = n
+            Outer o
+            o.inner = i
+            o.inner = o.inner
+            o.inner = o.inner
+            if o.inner.v != n {
+                fail('self-assignment corrupted')
+            }
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                f(i)
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_freeing_an_outer_struct_frees_its_nested_field_too(self, compile_and_run):
+        # A correctness/no-crash check that the OUTER struct being
+        # freed doesn't corrupt anything -- the actual leak-vs-freed
+        # verification is done with a real AddressSanitizer/
+        # LeakSanitizer run (see tests/CONTRACT.md); pytest itself
+        # doesn't drive ASan builds.
+        source = """
+        struct Inner { v:int }
+        struct Outer { inner:Inner }
+        Outer g
+        void func f(n:int) {
+            Inner i
+            i.v = n
+            Outer o
+            o.inner = i
+            g = o
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                f(i)
+            }
+        }
+        run(2000)
+        log(g.inner.v)
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "1999"
+
 
 def _find_window(display, timeout=20):
     # 20s, not the 10s an isolated run needs comfortably -- TestGraphics

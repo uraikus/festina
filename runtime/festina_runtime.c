@@ -838,12 +838,30 @@ void festina_retain(void *payload) {
     (*header)++;
 }
 
+/* claude.md #78: the decrement-and-check half of festina_release,
+ * split out so codegen can cascade into releasing a struct's own
+ * struct-typed field(s) BEFORE actually freeing its storage, something
+ * only the compiler (not this generic, type-blind runtime) knows how
+ * to do -- see festina/codegen.py's _release_fn_for_struct. Returns 1
+ * (the caller should now free `payload`, after releasing whatever it
+ * itself needs to release first) or 0 (nothing further to do: null,
+ * immortal, or still referenced elsewhere), the same three outcomes
+ * festina_release's own null/sentinel/nonzero-refcount checks already
+ * distinguish -- this only defers the actual free() call to the
+ * caller instead of performing it here. */
+int8_t festina_release_check(void *payload) {
+    if (!payload) return 0;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return 0;
+    (*header)--;
+    return *header == 0;
+}
+
 void festina_release(void *payload) {
     if (!payload) return;
-    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
-    if (*header < 0) return;
-    (*header)--;
-    if (*header == 0) free(header);
+    if (festina_release_check(payload)) {
+        free((char *)payload - sizeof(int64_t));
+    }
 }
 
 /* ---- maps -- claude.md #72 ---- */

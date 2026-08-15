@@ -359,11 +359,11 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 766 tests in this directory pass against it: 519 need no external
+All 776 tests in this directory pass against it: 524 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-237 more need a working C compiler, plus 2 more
+242 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 8 more given
-`Xvfb`+`xdotool` too (519 + 237 + 2 + 8 = 766 -- re-verified directly
+`Xvfb`+`xdotool` too (524 + 242 + 2 + 8 = 776 -- re-verified directly
 by hiding each tool from PATH in turn, not just derived by counting
 `compile_and_run` call sites, since the true number had drifted well
 past a much older, since-inaccurate count of "694 given a working C
@@ -1670,8 +1670,102 @@ more bug while doing so, and deliberately did NOT attempt a third
   now fully, correctly reference counted. See `todo.md`'s "Memory
   management" section, "Releasing a discarded return value", for the
   full writeup, and "What's still ahead" for the gaps sections 74-77
-  never claimed to cover: a struct's own nested struct/array/map-typed
-  fields, and `arr[T]`/`map[T]` values that themselves escape.
+  never claimed to cover: a struct's own struct-typed fields (closed
+  next, below), and `arr[T]`/`map[T]` values that themselves escape.
+
+- **Memory management stage 5: reference counting for a struct's own
+  struct-typed fields (claude.md #78, new section, same session).**
+  Closes the last struct-related gap: `outer.field = value` (the only
+  way a struct-typed field is ever populated -- there's no struct-
+  literal initializer syntax) stores `value`'s own pointer into the
+  field, an alias, not a copy. Until this section, that write was never
+  itself counted as a reference -- a real latent hazard, not just an
+  incompleteness: `value`'s own ordinary scope-exit release could free
+  memory `outer.field` still pointed to (use-after-free on the next
+  read through it), and a struct freed by stage 4 never released
+  whatever its own struct-typed fields still pointed to (a leak).
+
+  **Design, two parts:** (1) *Retain on field write* --
+  `_emit_assign`'s Member-target branch now retains a struct-typed
+  field's new value first (skipped only when the source is a plain
+  function call, `_is_owning_struct_source` again) and releases
+  whatever the field previously held (always safe: a struct's own
+  fields start null). Gated on `not expr.target.computed`, so `arr[i] =
+  v`/`map[key] = v` are deliberately untouched even when the element
+  type is a struct -- `arr[T]`/`map[T]` values aren't refcounted
+  containers at all yet, so there's no scope-exit release site to pair
+  a retain there with. (2) *Cascade on release* -- a new
+  `CodeGen._release_fn_for_struct(type_)` returns the plain, unchanged
+  `@festina_release` for a struct with no struct-typed field of its own
+  (the overwhelming majority -- zero new IR, zero extra indirection),
+  or a lazily-generated, cached `@__festina_release_struct_<Name>`
+  wrapper for one that has at least one. That wrapper decrements the
+  refcount via a new runtime function, `festina_release_check` (split
+  out from `festina_release` specifically so codegen can interpose a
+  field cascade between the decrement and the actual `free()` call),
+  and only if it just reached zero, releases each struct-typed field
+  (via *that* field's own release function, recursively) before freeing
+  its own storage -- recursion that always terminates for the identical
+  DAG reason claude.md #77 already gives for why cycles are
+  structurally impossible. Every existing release call site now
+  dispatches through this instead of calling the plain
+  `@festina_release` directly.
+
+  **A real bug found and fixed during this stage's own verification,
+  before shipping:** a struct local proven safe to live on the *stack*
+  can still have a struct-typed field written into it, and part (1)'s
+  retain fires regardless of whether the *container* is stack- or
+  heap-allocated. A heap-allocated container's own release (part 2)
+  already covered that reference; a stack-allocated one's never did --
+  its own storage is simply reused/discarded at scope-exit, with no
+  release call of any kind. This produced a genuine new leak (not
+  corruption -- an over-retained reference only ever delays a free, it
+  can never trigger one too early), confirmed directly: a combined
+  stress program leaked exactly 2000 objects per affected function,
+  matching a stack-allocated container's written-but-never-released
+  field one-for-one, before the fix. Closed with a new
+  `_StackStructFieldsOnly` marker (wrapping the struct's type) that
+  tells `_emit_free_active_locals` to release *only* the struct's own
+  field references at scope-exit, never a (nonexistent, since stack-
+  allocated) refcount header -- `_emit_block` schedules a stack-
+  allocated struct local for this whenever it has at least one
+  struct-typed field, mirroring exactly how an `arr[T]`/`map[T]`
+  local's own data/entries buffer is scheduled for freeing today
+  despite its header being stack-allocated too.
+
+  Verified the same three ways as every stage before it: new IR-level
+  tests (retain present for an aliasing field-write source, absent for
+  an owning one; a struct with no struct-typed field keeps using the
+  plain generic release with no wrapper generated; a struct with a
+  nested field gets a dedicated wrapper that itself calls the generic
+  release for its own field; three levels of nesting produce exactly
+  two wrapper functions, not three, since the innermost type has no
+  struct-typed field of its own), new compile-and-run tests (nested
+  field reads/writes, reassigning a field releases the old value,
+  self-assignment of a field doesn't crash, freeing an outer struct
+  correctly reaches its nested field) --
+  `tests/test_codegen.py::TestAutomaticMemoryReclamation` grew from 83
+  to 93 -- and a real, properly-instrumented AddressSanitizer/
+  LeakSanitizer run against a combined stress program (the exact
+  aliasing hazard this stage exists to close: writing a local into a
+  field, then reading both the local and the field well past where the
+  local's own scope-exit release would have fired under the old code;
+  deep three-level nesting escaping through a global; field
+  reassignment; self-assignment of a field; two independently-tracked
+  globals each holding their own nested structure; 2000 iterations) --
+  zero ASan errors, and zero leaks after the stack-allocated-container
+  fix above (before it: three functions each leaking exactly 2000
+  objects, one per call, confirming the bug's exact mechanism). Every
+  earlier stage's own combined verification program was re-run through
+  the same corrected pipeline to confirm no regression -- all came back
+  clean.
+
+  See `todo.md`'s "Memory management" section, "Stage 5", for the full
+  writeup, and "What's still ahead" for the two narrower gaps this
+  stage itself left open (a struct-typed field of an arr[T]/map[T]
+  element, and an arr[T]/map[T]-typed field of a struct) and why both
+  need arr[T]/map[T] values themselves to be refcounted containers
+  first.
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -2443,8 +2537,8 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 519 passed, 247 skipped (needs a C compiler; 2 of
+pytest tests/                          # 524 passed, 252 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
                                         # 8 need Xvfb + xdotool installed too) given a
-                                        # working C compiler, all 766 pass
+                                        # working C compiler, all 776 pass
 ```

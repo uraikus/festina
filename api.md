@@ -236,10 +236,15 @@ used as a bare statement), is reclaimed too — released immediately at
 the point it's discarded, since a function's own return value is
 always freshly produced and nothing else can be referencing it yet.
 Every struct value is now correctly reclaimed once nothing references
-it anymore, whichever of these shapes produced it. An escaping
-`arr[T]`/`map[T]` value, and a struct's own nested struct/array/
-map-typed fields, are reclaimed by a later stage not yet implemented —
-see [todo.md](todo.md#memory-management).
+it anymore, whichever of these shapes produced it. This includes a
+struct's own struct-typed *fields*: `outer.field = value` retains
+`value` the same way any other binding does, and freeing `outer`
+recursively frees whatever its own struct-typed fields still hold too,
+however many levels deep a program actually nests structs. An escaping
+`arr[T]`/`map[T]` value, a struct-typed field of an arr[T]/map[T]
+element, and an arr[T]/map[T]-typed field of a struct, are reclaimed by
+a later stage not yet implemented — see
+[todo.md](todo.md#memory-management).
 
 ## Arrays
 

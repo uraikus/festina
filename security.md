@@ -337,25 +337,58 @@ for the full design writeup.
   program -- previously leaking 2000 objects for the identical reason
   -- is now fully leak-free too.
 
-  One nested case was investigated during stage 3 and *deliberately not
-  attempted* after finding a real soundness hazard, not simply left
-  alone: freeing a struct/array/map-typed **field** of an
+  A nested case was investigated during stage 3 and *deliberately not
+  attempted* at the time, after finding a real soundness hazard, not
+  simply left alone: freeing a struct-typed **field** of an
   otherwise-freed struct. The only way to populate such a field is
   assigning an existing local's value into it (`outer.field =
   someLocal` — there's no struct-literal initializer syntax), and that
   assignment stores `someLocal`'s own pointer into the field — an
   alias, not a copy (confirmed directly in generated IR, not assumed).
-  `someLocal` is already correctly marked escaping by the existing
+  `someLocal` was already correctly marked escaping by the existing
   assignment-value rule, so it was never at risk of being double-freed
-  under its own name — but freeing `outer.field`'s value when `outer`
-  goes out of scope would free that *same* memory reachable through a
-  different, still-live name, and a later read through `someLocal`
-  (still entirely legal Festina code) would be a genuine
-  use-after-free. This needs real aliasing/ownership analysis to close
-  soundly, not a small extension of the existing syntactic rule — see
-  [todo.md](todo.md#memory-management) for the full trace and why it's
-  effectively the same open problem stage 4's own narrow scope
-  sidesteps rather than answers.
+  under its own name — but without retaining that field's own
+  reference, `someLocal`'s own ordinary scope-exit release could free
+  memory `outer.field` still pointed to, and a later read through
+  `outer.field` (still entirely legal Festina code) would be a genuine
+  use-after-free.
+
+  `claude.md #78` (stage 5, later in the same session) closes this,
+  treating a struct-typed field exactly like any other binding stage 4
+  already retains and releases for: `outer.field = value` now retains
+  the new value first (skipped only for a fresh call result, the
+  identical rule stage 4 already applies everywhere else) and releases
+  whatever the field previously held (always safe -- a struct's own
+  fields start out null). Symmetrically, when a struct's own refcount
+  reaches zero, each of its own struct-typed fields is now released
+  too, *before* its own storage is freed -- recursively, through a new
+  per-struct-type release function generated at compile time (the
+  runtime itself is entirely type-blind, so cascading into a struct's
+  own fields needs the compiler's own knowledge of that struct's
+  layout, not a small runtime addition), with the plain, unchanged
+  generic release kept for the overwhelming majority of structs that
+  have no struct-typed field of their own -- no new function, no extra
+  indirection, for those. Sound for the identical reason stage 4's own
+  reference-cycle argument already established: a struct field's type
+  must always be declared before the struct containing it, so this
+  recursion always terminates.
+
+  Building this surfaced one real bug, found and fixed before shipping
+  as part of this stage's own verification, not after: a struct local
+  provably safe to live on the *stack* (never heap-allocated,
+  never itself refcounted) can still have a struct-typed field written
+  into it, and the retain above fires regardless of whether the
+  *container* is stack- or heap-allocated. For a heap-allocated
+  container, releasing the container itself (stage 4) already released
+  that reference too. For a stack-allocated one, nothing did --
+  producing a genuine new leak (not a corruption bug: an
+  over-retained reference can only delay a free indefinitely, never
+  free something too early), confirmed directly via a real
+  AddressSanitizer/LeakSanitizer run before being fixed. Closed the
+  same way an `arr[T]`/`map[T]` local's own data/entries buffer is
+  already handled despite its header being stack-allocated: release
+  *only* the struct's own field references at scope-exit, never
+  its own (nonexistent) refcount header.
 
   Stage 4's own build process found two real bugs, both fixed and
   covered by regression tests before shipping — worth naming precisely
@@ -389,8 +422,9 @@ for the full design writeup.
   now fixed. See [todo.md](todo.md#memory-management) for the complete
   writeup and reproduction.
 
-  Everything not covered by any stage (the nested-field case, an
-  escaping `arr[T]`/`map[T]` value, and whether a value stored into a
+  Everything not covered by any stage (an escaping `arr[T]`/`map[T]`
+  value, a struct-typed field of an arr[T]/map[T] element, an arr[T]/
+  map[T]-typed field of a struct, and whether a value stored into a
   field of a call argument is itself retained) still leaks exactly as
   before — a
   resource leak in a long-running process, not a safety issue on its

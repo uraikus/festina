@@ -105,16 +105,18 @@ longer reachable." Arrays and struct storage were originally always
 heap-allocated (`malloc`/`calloc`) and never freed — a real resource
 leak in any long-running program, though never a memory-safety issue on
 its own (see [security.md](security.md)'s note: no use-after-free, no
-double-free, since nothing was ever freed). Four stages below have
+double-free, since nothing was ever freed). Five stages below have
 since narrowed that: a provably-safe struct is now stack-allocated
 outright (stage 3), a provably-safe `arr[T]`/`map[T]`'s data is still
-heap-allocated but now freed (stages 1/2), and a struct-typed global
+heap-allocated but now freed (stages 1/2), a struct-typed global
 (always) or escaping local (stage 4) is reference counted and freed
 once nothing references it anymore, including a value handed back
-through `return` itself, or discarded outright at its own call site —
-anything not covered by any stage is still heap-allocated (structs) or
-still leaks (arrays/maps, and a struct's own nested struct/array/
-map-typed fields — see below), exactly as originally described here.
+through `return` itself, or discarded outright at its own call site,
+and a struct's own struct-typed fields are reference counted the same
+way (stage 5) — anything not covered by any stage still leaks
+(arrays/maps, and a struct-typed field of an arr[T]/map[T] element, or
+an arr[T]/map[T]-typed field of a struct — see below), exactly as
+originally described here.
 
 ### Stage 1: non-escaping locals (done — claude.md #74)
 
@@ -637,44 +639,158 @@ With this, every struct value stage 4 set out to cover (globals, and
 every shape a local or a call's own return value can take) is now
 fully, correctly reference counted — the only remaining struct-related
 gaps are the ones sections 74-77 never claimed to cover in the first
-place: a struct's own nested struct/array/map-typed fields, and
-`arr[T]`/`map[T]` values that themselves escape (see below).
+place: a struct's own struct-typed fields (closed next, see "Stage 5"
+below), and `arr[T]`/`map[T]` values that themselves escape (see "What's
+still ahead").
+
+### Stage 5: reference counting for a struct's own struct-typed fields (done — claude.md #78)
+
+Explored as part of stage 3 and *deliberately not attempted* at the
+time, after finding a real soundness hazard, not merely left alone by
+inertia: the only way to populate a struct-typed field is `outer.field
+= someExistingLocal` (there's no struct-literal initializer syntax),
+which stores that local's own pointer into the field — an alias, not a
+copy (confirmed directly by inspecting the generated IR: `store ptr
+%t11, ptr %t10`, the same pointer value, not a fresh allocation).
+`someExistingLocal` was already correctly marked escaping by stages
+1/2's own existing rule (an assignment *value* always escapes), so it
+was never at risk of being double-freed under its own name — but
+without this stage, nothing ever retained the field's own reference to
+it either, which cuts both ways: `someExistingLocal`'s own ordinary
+scope-exit release could free memory `outer.field` still pointed to (a
+genuine use-after-free the moment it was read again — still entirely
+legal Festina code, a live variable in its own scope until *it* goes
+out of scope), and a struct freed by stage 4 never released whatever
+its own struct-typed fields still pointed to (a leak, since nothing
+else was ever going to). Retaining on every local assignment, and on
+every function's own return value (stage 4's own widenings), never
+answered this: both only ever retain a *binding* (a local variable's
+own slot, or the value handed back through `return`) when it starts
+referencing a value — neither touches a struct's own *field*, a
+different storage location with no binding of its own to retain into.
+This stage is that missing piece.
+
+**Design, in two parts, matching claude.md #78's own two paragraphs:**
+
+1. *Retain on field write.* Every `outer.field = value` assignment,
+   where `field` is struct-typed, now retains the new value first
+   (skipped only when `value`'s own source is a plain function call --
+   the identical `_is_owning_struct_source` check stage 4's own local-
+   scope widening already uses) and releases whatever the field
+   previously held -- always safe, since a struct's own fields start
+   out null (its zero-initialized storage, never populated any other
+   way) and both `festina_retain`/`festina_release` already null-check.
+   Implemented in `_emit_assign`'s Member-target branch, gated on
+   `not expr.target.computed` so it never fires for `arr[i] = v` /
+   `map[key] = v` even when the array/map's own element type happens to
+   be a struct -- `arr[T]`/`map[T]` values aren't refcounted containers
+   at all yet (a separate, still-open item, see "What's still ahead"),
+   so there would be no scope-exit release site to pair a retain there
+   with.
+2. *Cascade on release.* When a struct value is released and its
+   refcount reaches zero, each of its own struct-typed fields is now
+   released too, *before* its own storage is freed -- recursively, so a
+   field's own struct-typed field is released the same way. Since the
+   C runtime is entirely type-blind (every value it ever touches is
+   just a `void *`), this needed a real per-struct-type function
+   generated at compile time, not a small addition to the existing
+   generic `festina_release`: a new `CodeGen._release_fn_for_struct(type_)`
+   returns the plain, unchanged `@festina_release` for a struct with no
+   struct-typed field of its own (the overwhelming majority -- no new
+   function, no extra indirection, exactly as cheap as before this
+   stage), or a lazily-generated, cached
+   `@__festina_release_struct_<Name>` wrapper for one that has at least
+   one. That wrapper decrements the refcount via a new runtime function,
+   `festina_release_check` (the same decrement-and-check `festina_release`
+   itself now delegates to, split out specifically so codegen can
+   interpose the field-cascade between the decrement and the actual
+   `free()` call), and only if it just reached zero, releases each
+   struct-typed field (via *that* field's own release function, found
+   by calling `_release_fn_for_struct` again -- recursion handles
+   arbitrary nesting depth for free) before freeing its own storage.
+   This recursion always terminates and can never produce a cycle of
+   wrapper functions, for the identical reason claude.md #77 already
+   gives for why reference cycles are structurally impossible in
+   Festina: a struct field's type must always be declared *before* the
+   struct containing it, so the graph of "which struct types reference
+   which others through their own fields" is a DAG by construction.
+   Every existing release call site (`_emit_free_active_locals`,
+   `_emit_global_struct_retain_release`, `_emit_local_struct_retain_release`,
+   `return`'s own release-on-exit, the discarded-call-result release)
+   now goes through this dispatch instead of calling the plain
+   `@festina_release` directly.
+
+**A real bug found and fixed while verifying this, worth recording in
+full:** a struct local proven safe by stages 1/3 to live on the *stack*
+(never heap-allocated, never itself refcounted at all) can still have a
+struct-typed field written into it -- and part 1 above retains that
+field's own reference regardless of whether the *container* is stack-
+or heap-allocated, since the field write itself doesn't know or care.
+For a heap-allocated container, that retained reference gets released
+when the container itself is (part 2, above). For a *stack*-allocated
+container, nothing was releasing it at all -- the container's own
+storage is simply reused/discarded at scope-exit, with no release call
+of any kind, heap or otherwise. This produced a genuine new leak
+(confirmed via a real AddressSanitizer/LeakSanitizer run: three
+different functions in a combined stress program each leaked exactly
+2000 objects, one per call, matching a stack-allocated outer struct
+with a written-but-never-released field one-for-one) -- not a
+correctness/corruption bug (the extra, never-released reference only
+ever holds a value's refcount *too high*, so it can only delay a free
+indefinitely, never trigger one too early), but still a real regression
+from this stage's own stated goal. Fixed the same way an `arr[T]`/
+`map[T]` local's own data/entries buffer is already handled despite its
+header being stack-allocated: a new `_StackStructFieldsOnly` marker
+(wrapping the struct's type) tells `_emit_free_active_locals` to
+release *only* the struct's own struct-typed field references at
+scope-exit, never the struct's own (nonexistent, since stack-allocated)
+refcount header -- `_emit_block` now schedules a stack-allocated struct
+local for this treatment whenever `_struct_has_own_struct_field` says
+its own type has at least one struct-typed field, mirroring exactly how
+an array/map local is scheduled today. Found and fixed *before*
+shipping, as part of this stage's own verification, not after.
+
+Verified the same three ways as every stage before it: new IR-level
+tests (retain present for an aliasing field-write source, absent for an
+owning one; a struct with no struct-typed fields keeps using the plain
+generic release with no wrapper generated at all; a struct with a
+nested field gets a dedicated wrapper that itself calls the generic
+release for its own field; three levels of nesting (A → B → C) produce
+two wrapper functions, not three, since C has no struct-typed field of
+its own), new compile-and-run tests (nested field reads/writes,
+reassigning a field releases the old value, self-assignment of a field
+doesn't crash, freeing an outer struct correctly reaches its nested
+field) --
+`tests/test_codegen.py::TestAutomaticMemoryReclamation` grew from 83 to
+93 -- and real, properly-instrumented AddressSanitizer/LeakSanitizer
+runs against a combined stress program (the exact aliasing hazard this
+stage exists to close: writing a local into a field, then reading both
+the local and the field well past where the local's own scope-exit
+release would have fired under the old code; deep three-level nesting
+escaping through a global; field reassignment; self-assignment of a
+field; two independently-tracked globals each holding their own nested
+structure; 2000 iterations) -- zero ASan errors, and (after the
+stack-allocated-container fix above) zero leaks. Every earlier stage's
+own combined verification program was re-run through the same corrected
+pipeline to confirm no regression -- all came back clean.
 
 ### What's still ahead
 
-- **Nested struct/array/map fields within a freed struct.** Explored
-  as part of stage 3 and *deliberately not attempted* after finding a
-  real soundness hazard, not merely left alone by inertia: the only way
-  to populate a struct-typed field is `outer.field = someExistingLocal`
-  (there's no struct-literal initializer syntax), which stores that
-  local's own pointer into the field — an alias, not a copy (confirmed
-  directly by inspecting the generated IR: `store ptr %t11, ptr %t10`,
-  the same pointer value, not a fresh allocation). `someExistingLocal`
-  is already correctly marked escaping by stages 1/2's own existing
-  rule (an assignment *value* always escapes), so it was never going to
-  be double-freed under its own name — but freeing `outer.field`'s
-  value when `outer` itself goes out of scope would free that *same*
-  memory through a different name, and if `someExistingLocal` is read
-  again anywhere after that point (still entirely legal Festina code —
-  it's a live variable in its own scope until *it* goes out of scope),
-  that read would be a genuine use-after-free. This is a structurally
-  different, harder problem than stages 1/2's own syntactic "does this
-  name appear outside a safe position" question — real aliasing/
-  ownership analysis (does anything else still reference this field's
-  value when the struct holding it stops existing). Retaining on every
-  local assignment, and on every function's own return value (both done
-  now, see above), turned out not to answer this one: both widenings
-  only ever retain a *binding* (a local variable's own slot, or the
-  value handed back through `return`) when it starts referencing a
-  value — neither touches a struct's own *field*, which is a different
-  storage location with no binding of its own to retain into. Still
-  needs its own design pass, same bar as every stage here.
 - **Reference counting for `arr[T]`/`map[T]` values that escape** —
-  stage 4 covers structs only. An escaping array/map still leaks
-  exactly as before this stage; extending reference counting to
-  arrays/maps needs their own allocation sites (literal construction,
-  `festina_map_set`'s own realloc) to also carry the same header, a
-  larger surface than the struct-only allocation sites stage 4 touched.
+  stage 4/5 cover structs (including their own struct-typed fields)
+  only. An escaping array/map still leaks exactly as before these
+  stages; extending reference counting to arrays/maps needs their own
+  allocation sites (literal construction, `festina_map_set`'s own
+  realloc) to also carry the same header, a larger surface than the
+  struct-only allocation sites stages 4/5 touched. This is also a
+  prerequisite for two narrower gaps stage 5 itself left open: a
+  struct-typed field of an arr[T]/map[T] *element*, and an arr[T]/
+  map[T]-typed field of a struct -- neither can be soundly retained/
+  released until arr[T]/map[T] values themselves are refcounted
+  containers with a scope-exit release site to pair a retain with, the
+  same reason stage 5's own field-write logic deliberately excludes a
+  computed assignment target (`arr[i] = v`) even when the array's own
+  element type happens to be a struct.
 - **A real tracing GC** was never seriously considered as an
   alternative to reference counting here, given section 77's own
   finding that reference cycles are structurally impossible in
