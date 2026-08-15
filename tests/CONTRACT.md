@@ -359,11 +359,11 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 763 tests in this directory pass against it: 517 need no external
+All 766 tests in this directory pass against it: 519 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-236 more need a working C compiler, plus 2 more
+237 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 8 more given
-`Xvfb`+`xdotool` too (517 + 236 + 2 + 8 = 763 -- re-verified directly
+`Xvfb`+`xdotool` too (519 + 237 + 2 + 8 = 766 -- re-verified directly
 by hiding each tool from PATH in turn, not just derived by counting
 `compile_and_run` call sites, since the true number had drifted well
 past a much older, since-inaccurate count of "694 given a working C
@@ -1629,6 +1629,50 @@ more bug while doing so, and deliberately did NOT attempt a third
   the one struct-return leak now remaining: a return value discarded
   outright at its own call site, never bound to anything.
 
+- **Memory management: releasing a discarded return value (claude.md
+  #77, same stage, same session).** Closes that one remaining leak.
+  `_emit_stmt`'s `ast.ExprStmt` handling now checks whether the
+  statement's own expression is a bare `ast.Call` whose return type is
+  a struct, and if so, releases the value immediately, right after
+  evaluating it. Provably correct rather than merely conservative,
+  unlike most of this stage's other decisions: a function call's own
+  return value is always the "owning" kind this stage already treats
+  specially (fresh, nothing else referencing it yet), so a call site
+  that never binds the result to anything is *by construction* that
+  value's only reference -- no aliasing analysis needed to justify
+  releasing it there, since no other binding could possibly also hold
+  it. The call itself still runs in full either way; only the struct
+  value it happens to return is released once its own statement is
+  done with it.
+
+  Verified the same three ways as every increment in this stage: a new
+  IR-level test confirming the release call appears right after a
+  discarded struct-returning call, a negative IR-level test confirming
+  a discarded *void* call (where `_emit_call` returns `("0", None)`)
+  emits no extra release, a compile-and-run test confirming a global
+  counter incremented inside the discarded call still increments
+  exactly once per call regardless of the return value being thrown
+  away, and real AddressSanitizer/LeakSanitizer runs --
+  `tests/test_codegen.py::TestAutomaticMemoryReclamation` grew from 80
+  to 83. `discard_check.f`, the exact program that leaked 2000 objects
+  when the local-scope widening first documented this gap, now reports
+  **zero** leaks; `return_widen1.f`, the retain-on-Return fix's own
+  combined verification program (which leaked 2000 objects for the
+  identical reason), is now fully leak-free too. Every earlier
+  verification program across all of stage 4 (`widen1.f`,
+  `field_source.f`, stages 1-3's own `chaos2.f`/`interproc2.f`/
+  `stackalloc1.f`/`mapkeys1.f`/`recur_stack.f`, and stage 4's own
+  `rc_loop.f`/`rc_debug3.f`/`rc_debug4.f`/`rc_combined.f`) was re-run
+  through the same corrected pipeline -- all came back clean.
+
+  With this, every struct value stage 4 set out to cover -- globals,
+  and every shape a local or a call's own return value can take -- is
+  now fully, correctly reference counted. See `todo.md`'s "Memory
+  management" section, "Releasing a discarded return value", for the
+  full writeup, and "What's still ahead" for the gaps sections 74-77
+  never claimed to cover: a struct's own nested struct/array/map-typed
+  fields, and `arr[T]`/`map[T]` values that themselves escape.
+
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
 by value handed the caller a pointer into an already-popped stack frame
@@ -2399,8 +2443,8 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 517 passed, 246 skipped (needs a C compiler; 2 of
+pytest tests/                          # 519 passed, 247 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
                                         # 8 need Xvfb + xdotool installed too) given a
-                                        # working C compiler, all 763 pass
+                                        # working C compiler, all 766 pass
 ```

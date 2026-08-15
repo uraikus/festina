@@ -2796,6 +2796,74 @@ class TestAutomaticMemoryReclamation:
         assert result.returncode == 0
         assert result.stdout.strip() == "done"
 
+    # -- releasing a discarded return value (claude.md #77, same stage):
+    # the one struct-return leak left standing after the retain-on-Return
+    # fix above -- a call result never bound to anything at all. See
+    # tests/CONTRACT.md for the full writeup.
+
+    def test_discarded_struct_returning_call_result_is_released(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point func make(n:int) {
+            Point p
+            p.x = n
+            return p
+        }
+        void func f() {
+            make(5)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_release(" in f_body
+
+    def test_discarded_void_call_result_is_not_released(self, parser, semantic, codegen):
+        # A negative check alongside the positive one above: a void
+        # call has nothing to release (_emit_call returns ("0", None)
+        # for it), and this fix only ever fires for a StructType result
+        # -- confirms it doesn't misfire on the overwhelmingly more
+        # common "call something for its side effects" case.
+        source = """
+        void func sideEffect() {
+            log(1)
+        }
+        void func f() {
+            sideEffect()
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_release(" not in f_body
+
+    def test_discarded_struct_return_used_only_for_side_effects_still_crashes_safely(
+            self, compile_and_run):
+        # The struct value itself is thrown away, but the call still
+        # runs and its side effect (the global write) still must happen
+        # -- releasing the return value doesn't mean skipping the call.
+        source = """
+        struct Point { x:int y:int }
+        int counter
+        Point func makeAndCount(n:int) {
+            counter = counter + 1
+            Point p
+            p.x = n
+            return p
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                makeAndCount(i)
+            }
+        }
+        run(2000)
+        log(counter)
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "2000"
+
 
 def _find_window(display, timeout=20):
     # 20s, not the 10s an isolated run needs comfortably -- TestGraphics

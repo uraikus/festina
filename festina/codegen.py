@@ -1372,7 +1372,27 @@ class CodeGen:
                 lines.append(f"  store {llvm_ty} {val}, ptr {slot}")
             return
         if isinstance(stmt, ast.ExprStmt):
-            self._emit_expr(stmt.expr, env, lines)
+            val, vtype = self._emit_expr(stmt.expr, env, lines)
+            # claude.md #77: the one struct-return leak the retain-on-
+            # Return fix above doesn't touch -- a call result that's
+            # discarded outright, never bound to anything at all (`f();`
+            # as a bare statement). Nothing else in this stage's
+            # tracking would ever reach this value: it's not a local
+            # (no VarDecl), not a global (no assignment), and Return's
+            # own retain only protects a value being handed BACK to a
+            # caller, not one a caller is about to throw away. Since a
+            # Call's own return value is always "owning" (see
+            # _is_owning_struct_source) -- fresh, nothing else
+            # referencing it yet -- this ExprStmt is provably the value's
+            # ONLY reference, so releasing it immediately (freeing it,
+            # since nothing else can possibly still hold it) is always
+            # correct, not just conservative. Only fires for a bare Call
+            # used as a statement, matching exactly the "owning" source
+            # shape -- an ExprStmt wrapping anything else (a bare
+            # Identifier, a Member read, ...) never allocates anything of
+            # its own to begin with, so there is nothing to release.
+            if isinstance(vtype, types_mod.StructType) and isinstance(stmt.expr, ast.Call):
+                lines.append(f"  call void @festina_release(ptr {val})")
             return
         if isinstance(stmt, ast.Return):
             # claude.md #74: free every currently-active non-escaping

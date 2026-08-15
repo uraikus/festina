@@ -319,6 +319,24 @@ for the full design writeup.
   exactly the number of deliberately-*discarded* return values in it,
   one-for-one -- confirming every other case is now correctly freed.
 
+  Still in the same stage, that one remaining leak (a discarded return
+  value) was closed next: `_emit_stmt`'s handling of a bare-expression
+  statement now checks whether it's a struct-returning `Call` with its
+  result never bound to anything, and if so, releases the value right
+  there. This needed no new analysis to justify, unlike most of this
+  stage's other decisions -- a function call's own return value is
+  always the "owning," freshly-produced kind this stage already treats
+  specially, so a call site that never binds it to anything is *by
+  construction* that value's only reference; releasing it there can
+  never free something another binding still needs, because no other
+  binding could possibly exist. Verified the same way as everything
+  above: a real AddressSanitizer/LeakSanitizer run against the exact
+  program that previously leaked 2000 objects (one per discarded call,
+  documented when the local-scope widening first shipped) now reports
+  zero leaks, and the retain-on-Return fix's own combined verification
+  program -- previously leaking 2000 objects for the identical reason
+  -- is now fully leak-free too.
+
   One nested case was investigated during stage 3 and *deliberately not
   attempted* after finding a real soundness hazard, not simply left
   alone: freeing a struct/array/map-typed **field** of an
@@ -371,10 +389,10 @@ for the full design writeup.
   now fixed. See [todo.md](todo.md#memory-management) for the complete
   writeup and reproduction.
 
-  Everything not covered by any stage (the nested-field case, a returned
-  value discarded outright at its own call site, an escaping `arr[T]`/
-  `map[T]` value, and whether a value stored into a field of a call
-  argument is itself retained) still leaks exactly as before — a
+  Everything not covered by any stage (the nested-field case, an
+  escaping `arr[T]`/`map[T]` value, and whether a value stored into a
+  field of a call argument is itself retained) still leaks exactly as
+  before — a
   resource leak in a long-running process, not a safety issue on its
   own, no different in kind from the gap this note already accepted.
   What changed across all four stages is that each one's own fix, at

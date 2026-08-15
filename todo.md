@@ -111,11 +111,10 @@ outright (stage 3), a provably-safe `arr[T]`/`map[T]`'s data is still
 heap-allocated but now freed (stages 1/2), and a struct-typed global
 (always) or escaping local (stage 4) is reference counted and freed
 once nothing references it anymore, including a value handed back
-through `return` itself — anything not covered by any stage is still
-heap-allocated (structs) or still leaks (arrays/maps, a struct's own
-nested struct/array/map-typed fields, and a returned value that's
-discarded outright at its own call site — see below),
-exactly as originally described here.
+through `return` itself, or discarded outright at its own call site —
+anything not covered by any stage is still heap-allocated (structs) or
+still leaks (arrays/maps, and a struct's own nested struct/array/
+map-typed fields — see below), exactly as originally described here.
 
 ### Stage 1: non-escaping locals (done — claude.md #74)
 
@@ -585,6 +584,62 @@ and stage 4's own `rc_loop.f`/`rc_debug3.f`/`rc_debug4.f`/`rc_combined.f`)
 was re-run through the same corrected pipeline — all came back clean,
 confirming no regression.
 
+### Releasing a discarded return value (done — claude.md #77, same stage)
+
+The last struct-return leak left standing after the retain-on-Return
+fix above: a call result never bound to anything at all (`make(n)`
+used as a bare statement, not `Point r = make(n)`). Nothing in this
+stage's tracking would otherwise ever reach this value — it's not a
+local (no `VarDecl` binds it), not a global (no assignment references
+it), and `Return`'s own retain only protects a value being handed
+*back* to a caller, not one a caller is about to throw away entirely.
+
+Closed with no new analysis needed, just one more application of a
+fact this stage already relies on everywhere else: a function call's
+own return value is always "owning" — freshly produced, nothing else
+referencing it yet, the instant it comes back. `_emit_stmt`'s
+`ast.ExprStmt` handling now checks whether the statement's own
+expression is a bare `ast.Call` whose return type is a struct, and if
+so, releases the value immediately, right after evaluating it. This is
+provably correct, not merely conservative, in a way most of this
+stage's other decisions aren't: since the value is "owning" and this
+`ExprStmt` is the only place it's ever referenced, this call site is
+*by construction* that value's sole reference — no other binding could
+possibly also hold it, so releasing it here can never free something
+still needed elsewhere the way an imprecise heuristic might. Discarding
+the value doesn't skip the call itself, of course — any side effects
+inside the called function (writing a global, incrementing a counter,
+...) still run exactly as before; only the struct value the call
+happens to return is released once its own statement has finished with
+it.
+
+Verified the same three ways as every increment in this stage: a new
+IR-level test confirming the release call appears right after a
+discarded struct-returning call, a negative IR-level test confirming a
+discarded *void* call emits no extra release (this only ever fires for
+a `StructType` result), a compile-and-run test confirming the call's
+own side effect (a global counter increment) still happens exactly
+`iterations` times even though its return value is thrown away every
+time, and real AddressSanitizer/LeakSanitizer runs: the exact
+`discard_check.f` program that previously leaked 2000 objects (one per
+discarded call, confirmed and documented when the local-scope widening
+above first shipped) now reports **zero** leaks, and the combined
+`return_widen1.f` program from the retain-on-Return fix above — which
+previously leaked exactly 2000 objects, one per its own deliberately-
+discarded `make(i)` call — is now also fully leak-free. Every earlier
+verification program across all of stage 4 (`widen1.f`, `field_source.f`,
+stages 1-3's own `chaos2.f`/`interproc2.f`/`stackalloc1.f`/`mapkeys1.f`/
+`recur_stack.f`, and stage 4's own `rc_loop.f`/`rc_debug3.f`/
+`rc_debug4.f`/`rc_combined.f`) was re-run through the same corrected
+pipeline to confirm no regression — all came back clean.
+
+With this, every struct value stage 4 set out to cover (globals, and
+every shape a local or a call's own return value can take) is now
+fully, correctly reference counted — the only remaining struct-related
+gaps are the ones sections 74-77 never claimed to cover in the first
+place: a struct's own nested struct/array/map-typed fields, and
+`arr[T]`/`map[T]` values that themselves escape (see below).
+
 ### What's still ahead
 
 - **Nested struct/array/map fields within a freed struct.** Explored
@@ -614,20 +669,6 @@ confirming no regression.
   value — neither touches a struct's own *field*, which is a different
   storage location with no binding of its own to retain into. Still
   needs its own design pass, same bar as every stage here.
-- **Releasing a return value that's discarded outright at its own call
-  site** (`make(n);` used as a bare statement, the result never bound
-  to any variable). Now the only remaining struct-return leak, since
-  "Retaining a function's own return value" above closed every case
-  where the result is bound to *something* (a local, a global, another
-  return). Nothing at a discarding call site currently retains or
-  releases the value at all — it's simply never referenced by anything
-  tracked, so it's never freed. Needs a decision this stage
-  deliberately hasn't made yet: whose responsibility releasing an
-  unused return value would be (the callee never knows at the point it
-  returns whether its result will be discarded; the caller would need
-  to recognize a Call used as a bare ExprStmt with a struct return type
-  specifically, and release the value right there instead of retaining
-  it into any binding).
 - **Reference counting for `arr[T]`/`map[T]` values that escape** —
   stage 4 covers structs only. An escaping array/map still leaks
   exactly as before this stage; extending reference counting to
