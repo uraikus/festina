@@ -221,29 +221,51 @@ for the full design writeup.
   `while`/`for` body), not deferred until the function eventually
   returns: a loop-body-declared value is freed every iteration, and
   `break`/`continue` free everything declared since that loop's own
-  body began before actually leaving. Everything that stage's own scope
-  doesn't cover yet (whether a value passed as a call argument is
-  actually retained by the callee, nested struct/array/map fields
-  within an otherwise-freed value, a freed map's own per-entry keys)
+  body began before actually leaving. `claude.md #75` (stage 2) closes
+  stage 1's own stated call-argument limitation for calls between
+  functions declared in the same program: a value passed as a call
+  argument is no longer *unconditionally* treated as escaping —
+  each function's own parameters are analyzed the same way locals
+  always were, once, in declaration order (Festina requires a function
+  be declared before it's called, so every possible callee is already
+  fully analyzed by the time a caller needs to consult it; a
+  self-recursive call is the one exception, and falls back to the
+  original conservative rule automatically, with no special-casing
+  needed), and a caller's argument is only exempted from the default
+  rule at a call site whose corresponding parameter position that
+  callee's own analysis already proved safe — composing transitively
+  across any number of calls for free. A call to a builtin, or through
+  a field/element access rather than a plain function name, is
+  unaffected and stays exactly as conservative as before. Everything
+  neither stage covers yet (nested struct/array/map fields within an
+  otherwise-freed value, a freed map's own per-entry keys, and whether
+  a value stored into a field of a call argument is itself retained)
   still leaks exactly as before — a resource leak in a long-running
   process, not a safety issue on its own, no different in kind from the
-  gap this note already accepted. What changed is that stage 1's own
-  fix, at every step of building it out, was verified with the same
-  rigor the rest of this document's findings were: exhaustive unit
+  gap this note already accepted. What changed is that both stages'
+  own fix, at every step of building them out, was verified with the
+  same rigor the rest of this document's findings were: exhaustive unit
   tests of the analysis itself, end-to-end compile-and-run tests
   including the exact "return a struct by value" pattern the earlier
   naive stack-allocation attempt below got wrong and the critical
   "a value merely used inside a loop, not declared inside it, survives
   that loop's own break/continue" case, and real AddressSanitizer/
   LeakSanitizer runs (zero ASAN errors each time; LeakSanitizer's
-  reported leaks matched the hand-derived expected count exactly every
-  time, including one run where the "extra" leak turned out to be a
-  real, separately-explained, structurally different gap -- a global
-  repeatedly reassigned orphaning its previous value -- confirmed by
-  removing that one line and re-running to zero leaks, not waved away)
+  reported leaks matched the hand-derived expected count almost exactly
+  every time it was checked, including one run where the "extra" leak
+  turned out to be a real, separately-explained, structurally different
+  gap -- a global repeatedly reassigned orphaning its previous value --
+  confirmed by removing that one line and re-running to zero leaks, not
+  waved away; stage 2's own combined verification program specifically
+  ran with leak detection off for its correctness check, since
+  AddressSanitizer's own leak-report exit path can skip flushing
+  already-buffered stdout -- unrelated to this feature -- and separately
+  with leak detection on to confirm only the values genuinely proven to
+  escape were the ones that leaked)
   — see [todo.md](todo.md#memory-management) for the full writeup,
   including the naive stack-allocation attempt that was tried before
   stage 1 existed and reverted after being verified to corrupt memory,
-  and exactly what widening stage 1's remaining coverage and adding
-  reference counting for the values it can't reach would each still
-  require.
+  and exactly what swapping calloc+free for real stack allocation now
+  that stage 2's proof is wide enough to justify it, and adding
+  reference counting for the values escape analysis can't reach at
+  all, would each still require.

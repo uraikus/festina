@@ -877,7 +877,16 @@ class TestAutomaticMemoryReclamation:
         ir = self._ir(parser, semantic, codegen, source)
         assert "call void @free(" not in ir
 
-    def test_struct_passed_as_a_call_argument_is_not_freed(self, parser, semantic, codegen):
+    def test_struct_passed_to_a_non_retaining_function_is_now_freed(self, parser, semantic, codegen):
+        # claude.md #74 stage 2 (interprocedural): takesPoint only reads
+        # p.x (a Member.obj-safe use, same rule as any local's own
+        # fields) -- its own parameter never escapes within its own
+        # body, so escaping_params[takesPoint] = {} and f()'s own `p`,
+        # passed there and never used any other way, is now provably
+        # safe too. This is the exact case stage 1's own module
+        # docstring called out as its stated limitation ("even if the
+        # called function provably doesn't retain it") -- this is that
+        # stage.
         source = """
         struct Point { x:int y:int }
         void func takesPoint(p:Point) {
@@ -886,6 +895,27 @@ class TestAutomaticMemoryReclamation:
         void func f() {
             Point p
             takesPoint(p)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" in ir
+
+    def test_struct_passed_to_a_retaining_function_is_still_not_freed(self, parser, semantic, codegen):
+        # The mirror case: retains actually stores its own parameter
+        # into a global (an unconditional hard escape, same rule as
+        # ever) -- escaping_params[retains] = {0}, so f()'s own `p`,
+        # passed at that same position, still correctly escapes too.
+        # Interprocedural analysis only ever widens what's PROVEN safe;
+        # it must never widen what's proven unsafe.
+        source = """
+        struct Point { x:int y:int }
+        Point stash
+        void func retains(p:Point) {
+            stash = p
+        }
+        void func f() {
+            Point p
+            retains(p)
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
@@ -1118,6 +1148,12 @@ class TestAutomaticMemoryReclamation:
         assert result.stdout.strip() == "7"
 
     def test_struct_passed_to_another_function_keeps_its_value(self, compile_and_run):
+        # Since claude.md #74 stage 2, takesPoint's own read-only use of
+        # its parameter (see test_struct_passed_to_a_non_retaining_function_is_now_freed)
+        # means p is now provably safe throughout f() too -- p ends up
+        # freed at the end of f(), but only *after* both reads (inside
+        # takesPoint and f()'s own trailing log(p.x)) have already
+        # happened, so the values here must still come out correct.
         source = """
         struct Point { x:int y:int }
         void func takesPoint(p:Point) {
@@ -1674,6 +1710,245 @@ class TestAutomaticMemoryReclamation:
         result = compile_and_run(source, args=None)
         assert result.returncode == 0
         assert result.stdout.strip() == "done"
+
+    # ---- interprocedural (claude.md #74 stage 2) ----
+    # See festina/escape_analysis.py's own module docstring and
+    # tests/test_escape_analysis.py::TestInterproceduralEscapingParams
+    # for the analysis in isolation (no C compiler, no codegen at all).
+    # These check the other half: that CodeGen actually builds a
+    # correct escaping_params table one function at a time, in program
+    # order, and wires it into real generated IR and real compiled
+    # output -- including the two cases the analysis-only tests can't
+    # reach on their own (a real multi-function program, and a real
+    # self-recursive function).
+
+    def test_transitive_chain_of_non_retaining_calls_frees_the_original_local(
+            self, parser, semantic, codegen):
+        # a() -> b() -> c(), and c only reads its own parameter -- the
+        # "safe" result has to propagate through b's own analysis (b's
+        # parameter is only ever used as a pass-through argument to c)
+        # before a's own local can be proven safe. Requires
+        # escaping_params[c] to already exist by the time b is
+        # analyzed, and escaping_params[b] to already exist by the time
+        # a is analyzed -- exactly the program-order guarantee
+        # CodeGen.escaping_params's own comment describes.
+        source = """
+        struct Point { x:int y:int }
+        void func c(q:Point) {
+            log(q.x)
+        }
+        void func b(r:Point) {
+            c(r)
+        }
+        void func a() {
+            Point p
+            b(p)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" in ir
+
+    def test_transitive_chain_stops_freeing_at_the_first_retaining_link(
+            self, parser, semantic, codegen):
+        # Same shape, but c now retains its own parameter (stores it
+        # into a global) -- the escaping-ness must propagate all the
+        # way back UP the chain: b's own argument to c escapes, so b's
+        # own parameter escapes, so a's own local passed to b escapes
+        # too. Nothing anywhere in this chain should be freed.
+        source = """
+        struct Point { x:int y:int }
+        Point stash
+        void func c(q:Point) {
+            stash = q
+        }
+        void func b(r:Point) {
+            c(r)
+        }
+        void func a() {
+            Point p
+            b(p)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" not in ir
+
+    def test_self_recursive_function_passing_its_own_param_stays_conservative(
+            self, parser, semantic, codegen):
+        # f calls itself, passing its own struct parameter straight
+        # through. self.escaping_params has no entry for 'f' yet at the
+        # point f's own body is being walked (f isn't registered until
+        # AFTER its own analysis completes), so this recursive call
+        # site falls back to the original unconditional "any call
+        # argument escapes" default, exactly like a call to an unknown
+        # builtin would -- p is marked escaping via that one use, even
+        # though every OTHER use of p in f is a safe field read. A
+        # caller of f() must see that same conservative result: it must
+        # not free its own local either, even though nothing in this
+        # program actually corrupts anything either way.
+        source = """
+        struct Point { x:int y:int }
+        void func f(p:Point, n:int) {
+            log(p.x)
+            if n > 0 {
+                f(p, n - 1)
+            }
+        }
+        void func g() {
+            Point p
+            f(p, 3)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" not in ir
+
+    def test_only_the_provably_safe_parameter_position_is_exempted(
+            self, parser, semantic, codegen):
+        # mixed(a, b): a is only ever read (safe), b is stored into a
+        # global (escapes) -- escaping_params[mixed] must end up
+        # {1}, not {0, 1} or {} -- and f()'s own call must free exactly
+        # the argument at the safe position (p, position 0) and leave
+        # the other (q, position 1) alone.
+        source = """
+        struct Point { x:int y:int }
+        Point stash
+        void func mixed(a:Point, b:Point) {
+            log(a.x)
+            stash = b
+        }
+        void func f() {
+            Point p
+            Point q
+            mixed(p, q)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert ir.count("call void @free(") == 1
+
+    def test_transitive_chain_produces_correct_output(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        int func c(q:Point) {
+            return q.x * 10
+        }
+        int func b(r:Point) {
+            return c(r) + 1
+        }
+        int func a(n:int) {
+            Point p
+            p.x = n
+            return b(p)
+        }
+        log(a(5))
+        log(a(7))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["51", "71"]
+
+    def test_multi_param_mixed_escaping_produces_correct_output(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        Point stash
+        void func mixed(a:Point, b:Point) {
+            log(a.x)
+            stash = b
+        }
+        void func f() {
+            Point p
+            p.x = 1
+            Point q
+            q.x = 2
+            mixed(p, q)
+        }
+        f()
+        log(stash.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "2"]
+
+    def test_self_recursive_function_produces_correct_output_and_does_not_crash(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f(p:Point, n:int) {
+            log(p.x)
+            if n > 0 {
+                f(p, n - 1)
+            }
+        }
+        void func g() {
+            Point p
+            p.x = 42
+            f(p, 3)
+        }
+        g()
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["42", "42", "42", "42", "done"]
+
+    def test_interprocedural_combination_does_not_crash_under_heavy_iteration(
+            self, compile_and_run):
+        # The same combination verified separately by hand under
+        # AddressSanitizer/LeakSanitizer (see tests/CONTRACT.md): a
+        # transitive non-retaining chain, a transitive retaining chain,
+        # a self-recursive function, and a multi-parameter
+        # mixed-escaping function, all called many times in a loop.
+        source = """
+        struct Point { x:int y:int }
+        Point stash
+        int func readOnly(q:Point) {
+            return q.x
+        }
+        int func passThrough(r:Point) {
+            return readOnly(r)
+        }
+        int func nonRetainingChain(n:int) {
+            Point p
+            p.x = n
+            return passThrough(p)
+        }
+        void func retains(q:Point) {
+            stash = q
+        }
+        void func retainingChain(r:Point) {
+            retains(r)
+        }
+        void func mixed(a:Point, b:Point) {
+            log(a.x)
+            stash = b
+        }
+        void func recur(p:Point, n:int) {
+            if n > 0 {
+                recur(p, n - 1)
+            }
+        }
+        for int i = 0, i < 3000, i++ {
+            if nonRetainingChain(i) != i {
+                fail('nonRetainingChain drifted')
+            }
+            Point retainMe
+            retainMe.x = i
+            retainingChain(retainMe)
+            if stash.x != i {
+                fail('retainingChain drifted')
+            }
+            Point a
+            a.x = i
+            Point b
+            b.x = i * 2
+            mixed(a, b)
+            if stash.x != i * 2 {
+                fail('mixed drifted')
+            }
+            Point r
+            r.x = i
+            recur(r, 5)
+        }
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.splitlines()[-1] == "done"
 
 
 def _find_window(display, timeout=20):

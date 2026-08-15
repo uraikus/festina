@@ -359,11 +359,11 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 713 tests in this directory pass against it: 487 need no external
+All 730 tests in this directory pass against it: 500 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-216 more need a working C compiler, plus 2 more
+220 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 8 more given
-`Xvfb`+`xdotool` too (487 + 216 + 2 + 8 = 713 -- re-verified directly
+`Xvfb`+`xdotool` too (500 + 220 + 2 + 8 = 730 -- re-verified directly
 by hiding each tool from PATH in turn, not just derived by counting
 `compile_and_run` call sites, since the true number had drifted well
 past a much older, since-inaccurate count of "694 given a working C
@@ -1017,6 +1017,155 @@ more bug while doing so, and deliberately did NOT attempt a third
   Also used this pass to re-verify (not re-derive) this file's own
   "Running" example and the tool-dependency breakdown just above --
   see that paragraph's own note on the stale count it replaces.
+
+- **Memory management stage 2: interprocedural call-argument analysis
+  (claude.md #75, same session).** Stage 1's own stated limitation: a
+  value passed as a call argument was *always* treated as escaping,
+  even when the called function provably never retains it -- explicitly
+  named, in stage 1's own module docstring, as "interprocedural
+  analysis, a later stage." This is that stage, for calls to any
+  function declared in the same program (a call to a builtin, or
+  through a field/element access rather than a plain function name,
+  is unaffected and stays exactly as conservative as before).
+
+  The core mechanism: `escape_analysis.find_escaping_names` gained one
+  new optional parameter, `escaping_params` -- a `{func_name: set[int]}`
+  map. Its `Call`-handling branch now looks up the callee's name in
+  that map (only when the callee is a plain `ast.Identifier`, never for
+  a Member-based method call); if found, only the argument positions
+  listed in that function's own set are still treated as escaping via
+  *this specific call site* -- every other position is exempted from
+  the default rule there (the argument may still end up escaping some
+  other, unrelated way elsewhere in the same function; this only stops
+  this one call site from being the *reason* it does). A callee not in
+  the map -- because it's a builtin, or because it hasn't been analyzed
+  yet -- leaves the lookup returning `None`, which falls back to the
+  exact original unconditional behavior with no special-casing needed
+  (the `is not None` guard around the whole exemption makes a missing
+  entry behave identically to `escaping_params` never being passed at
+  all, which is also exactly what every one of stage 1's own 36
+  existing unit tests still exercises unchanged, proving this is
+  strictly additive, not a rewrite of the base rule).
+
+  Building the map itself turned out to need no fixpoint, no
+  topological sort, and no separate whole-program pre-pass -- the
+  single most important design insight of this stage, and the reason
+  it stayed a same-session increment rather than becoming its own
+  multi-session design effort. Festina already rejects a call to a
+  function before its own declaration (semantic.py's "unknown
+  function" error, claude.md #48) -- verified directly, not assumed,
+  by writing exactly that program and confirming the compile error
+  before designing around it. That guarantee means: (1) the only way a
+  function can call itself is directly, by its own name, and (2) every
+  *other* possible callee of any function F is necessarily declared,
+  and therefore necessarily already fully analyzed, before F is. Since
+  `CodeGen` already emits every function body in one single pass, in
+  source order (`generate()` -> `_toplevel` -> `_emit_func`), stage 2
+  needed only: compute `escaping_params[F]` immediately after F's own
+  body is walked (`_emit_analyzed_func_body`, right before returning),
+  and pass the whole `self.escaping_params` dict (built up
+  incrementally, one function at a time, never cleared) into
+  `find_escaping_names` for *every* function's analysis, including its
+  own. A self-recursive call inside F's own body looks up F's own name
+  in a dict that doesn't have F's entry yet -- an ordinary miss, not a
+  special case -- so it automatically gets the same conservative
+  fallback a call to an unanalyzed builtin gets. No graph, no
+  worklist, no cycle detection: the language's own forward-reference
+  rule makes the call graph (excluding self-recursion) a DAG that
+  happens to already be topologically sorted by source order, for
+  free.
+
+  Verified the same three ways as every stage before it, with the
+  leak-count check given deliberately more weight here than stage 1's
+  own got: a bug in stage 1's reasoning could only ever *under-free*
+  (leak a bit more than a perfect analysis would); a bug in stage 2's
+  reasoning is the first one in this whole feature that could plausibly
+  *over-free* -- mark something safe that a real caller elsewhere still
+  needed -- which is a correctness regression, not just a missed
+  optimization, exactly the distinction claude.md #74's own docstring
+  draws between "leaks but is memory-safe" and an early free. A
+  combined program exercising a 3-function non-retaining chain (A calls
+  B calls C, C only reads its own parameter -- A's own local must end
+  up freed), a 3-function retaining chain (C stores its parameter into
+  a global -- nothing anywhere in the chain should be freed), a
+  self-recursive function passed a struct parameter (must stay
+  conservative), and a two-parameter function where only one position
+  actually escapes (must free exactly the safe one, never both, never
+  neither), all wrapped inside its own function -- deliberately, so its
+  own locals are subject to analysis at all, rather than accidentally
+  exercising the separate, pre-existing "`__festina_main`'s own
+  top-level statements are never analyzed" limitation instead of this
+  one -- run for hundreds of iterations with each iteration's own
+  hand-computed expected values checked via `fail(...)` inside the
+  program itself: **zero** AddressSanitizer errors (no use-after-free,
+  no double-free, no heap-buffer-overflow) and not one `fail()` fired,
+  across every combination, every iteration.
+
+  One methodology wrinkle surfaced and resolved during this
+  verification, worth recording since it very nearly looked like a
+  real bug: the first run (leak detection on) came back with *empty*
+  stdout despite the program clearly having executed correctly (no
+  `fail()`, clean-looking leak report). Traced to AddressSanitizer's
+  own leak-report exit path calling `_exit()` directly when leaks are
+  found, which -- unlike a normal `exit()`/`return` from `main` --
+  skips flushing libc's stdio buffers; since this program's real stdout
+  was redirected to a file (fully buffered, not line-buffered the way a
+  terminal would be) and produced meaningfully more leaked bytes than
+  the earlier nested-block increment's own equivalent check happened
+  to, the entire buffered-but-unflushed output was lost. Confirmed by
+  re-running the identical binary with leak detection off
+  (`ASAN_OPTIONS=detect_leaks=0`, which disables only the leak *report*
+  step -- every other AddressSanitizer check, including everything
+  this verification actually needed, stays fully active): full, correct
+  401-line output, exit code 0. This is a property of AddressSanitizer
+  itself, unrelated to anything this feature or Festina's runtime does
+  -- documented here rather than left as a confusing footnote, since it
+  also retroactively explains why the earlier nested-block increment's
+  own leaky-case ASAN run (tests/CONTRACT.md's own note on it, above)
+  never actually showed its own trailing "done" line either, without
+  that having been a problem at the time (only the leak *count* was
+  being checked there, not the full output).
+
+  With leak detection back on for a *separate*, count-only run: 1198
+  leaked allocations, against a hand-derived expectation of 1199 (400
+  iterations each contributing one struct passed into the retaining
+  chain, one passed into the mixed function's own retaining parameter
+  position minus the very last iteration's since it's still reachable
+  through the global at exit, and one passed into the self-recursive
+  function) -- matching to within LeakSanitizer's own known
+  conservative-stack-scanning under-count of a small few (the same
+  under-by-one-ish behavior already independently observed and
+  explained in this file's own nested-block-increment entry above),
+  and critically, *not* anywhere near what it would have been had the
+  two provably-safe values in the same program (the pass-through chain
+  and the read-only argument position of the two-parameter function)
+  also been leaking -- which is exactly the comparison that would have
+  caught a bug marking something safe that wasn't, had there been one.
+
+  See `tests/test_escape_analysis.py::TestInterproceduralEscapingParams`
+  for the analysis in isolation (no C compiler, no codegen -- a
+  hand-built `escaping_params` table exercising every documented rule:
+  exemption, non-exemption, unknown callee, position-specific exemption
+  in a multi-argument call, a Member-callee method call never
+  consulting the table at all, a non-Identifier argument at an exempted
+  position still walked normally, and a name still ending up escaping
+  through some *other*, unrelated use despite one exempted call site)
+  and the new "interprocedural" section of
+  `tests/test_codegen.py::TestAutomaticMemoryReclamation` for the same
+  properties against real generated IR and real compiled output,
+  including the two existing stage-1 tests whose own assertions
+  deliberately flipped as a direct, expected consequence of this stage
+  (a struct passed to a function that only reads it is now freed; the
+  matching "still not freed when the callee actually retains it" case
+  was added as its own explicit companion test rather than only
+  relying on the flipped one's absence of freeing to imply it).
+
+  See `todo.md`'s "Memory management" section for the full picture,
+  including exactly what's still ahead (swapping calloc+free for real
+  stack allocation now that this stage's proof is wide enough to
+  justify it, nested struct/array/map fields, map per-entry keys, and
+  reference counting for the values escape analysis can't reach at
+  all).
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -1788,8 +1937,8 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 487 passed, 226 skipped (needs a C compiler; 2 of
+pytest tests/                          # 500 passed, 230 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
                                         # 8 need Xvfb + xdotool installed too) given a
-                                        # working C compiler, all 713 pass
+                                        # working C compiler, all 730 pass
 ```

@@ -158,23 +158,92 @@ increments — first function-top-level-only, then widened to nested
 blocks and per-iteration loop freeing — rather than attempting the
 whole thing in one pass, exactly as originally planned.
 
+### Stage 2: interprocedural call-argument analysis (done — claude.md #75)
+
+Stage 1's own stated limitation: a value passed as a call argument was
+*always* treated as escaping, even when the called function provably
+never retains it. This stage closes that gap for calls to any function
+declared in the same program (calls to builtins, and calls through a
+field/element access rather than a plain name, are unaffected and stay
+exactly as conservative as before).
+
+For each function, in declaration order, `festina/escape_analysis.py`'s
+same walker now also determines which of *that function's own
+parameters* ever escape within its own body — the identical rule
+stage 1 already applies to locals, applied to parameters instead. That
+result is recorded (`CodeGen.escaping_params`, a plain `{func_name:
+set[int]}` dict) once the function's body is fully analyzed, so any
+*later* function's own analysis can use it: a call argument at a
+position some earlier function's own analysis already proved safe is
+exempted from the default call-argument rule at that one call site —
+it may still escape some other way, through some other use, which is
+judged entirely independently. This composes transitively for free: if
+A calls B, and B passes its own parameter straight through to C, A's
+own argument is only as safe as C's own analysis of the position it
+ultimately reaches, with no explicit chaining logic needed anywhere —
+by the time B's own body is analyzed, C's result already exists to
+consult, and by the time A's is, B's does too.
+
+The one subtlety this needed: Festina requires a function be declared
+before it's called (semantic.py rejects forward references — see
+claude.md #48's "unknown function" error), which means the only way a
+function can call itself is directly, by its own name, *before* its
+own analysis has completed. This turns out to need no special-casing
+at all: a self-recursive call's lookup against `escaping_params` is
+just an ordinary dict miss (that function's own entry hasn't been
+written yet), which already falls back to the same conservative "any
+call argument escapes" default a call to an unanalyzed builtin gets —
+correctly safe, if more conservative than a fixpoint analysis over the
+recursive call itself could in principle prove. Also crucially: because
+forward references are rejected, every *other* possible callee is
+guaranteed to already be a fully-resolved key in `escaping_params` by
+the time it's consulted — no whole-program pre-pass or graph fixpoint
+was needed, just building the table incrementally, one function at a
+time, in the same single pass `CodeGen` already emits every function
+body in.
+
+Verified the same three ways as stage 1, with the leak-count match
+given extra weight here specifically because a bug in this stage's
+reasoning is the first one in this whole feature that could plausibly
+free a value still in use elsewhere (stage 1's own worst-case bug was
+always just "leaks a bit more than provable," never corruption, since
+it never widened *what* gets freed based on another function's
+behavior) — not something to wave through on "the design sounds
+right" alone. A combined program (a 3-function non-retaining chain, a
+3-function retaining chain, a self-recursive function passed a struct
+parameter, and a two-parameter function where only one position
+escapes, all exercised together for hundreds of iterations, wrapped in
+its own function so its own locals are subject to analysis rather than
+accidentally exercising the separate, pre-existing "`__festina_main`'s
+own top-level statements are never analyzed at all" limitation)
+produced **zero** AddressSanitizer errors (no use-after-free, no
+double-free, no heap-buffer-overflow) and never tripped any of its own
+embedded correctness checks (`fail(...)` on any value drifting from
+its hand-computed expectation) across hundreds of iterations, run with
+leak detection off specifically to get trustworthy full program output
+for that check (AddressSanitizer's own leak-report exit path can skip
+flushing already-buffered stdout, unrelated to anything this feature
+does — verified by re-running with leak detection on for a *separate*
+leak-count check, matching the hand-derived expected count of "exactly
+the values proven to genuinely escape (an argument passed to a
+retaining chain, and the self-recursive one, both by design still
+leak, unchanged from before this stage) to within LeakSanitizer's own
+known conservative-stack-scanning under-count of a small few" almost
+exactly).
+
 ### What's still ahead
 
 - **Escape analysis is *always still followed by a real `calloc` +
   `free`***, not true stack allocation — a real speed cost (allocator
-  traffic) that a genuine stack alloca would avoid entirely. Widening
-  stage 1's proof to also cover interprocedural reasoning (does a value
-  passed as a call argument actually get retained by the callee, or is
-  it provably only read/used transiently?) is what would let it safely
-  swap in a stack alloca instead of calloc+free for the values that
-  qualify — the nested-block and per-iteration-loop coverage stage 1
-  already has is not itself the blocker for this anymore, since a
-  stack alloca inside a loop body is exactly as sound as one inside a
-  plain function body (both are popped/reused the same way on the next
-  iteration/call); it's specifically the still-conservative "any call
-  argument escapes unconditionally" rule that would need real
-  interprocedural analysis before this could be considered. Still
-  governed by claude.md #74 (or a new stage within it), not a new
+  traffic) that a genuine stack alloca would avoid entirely. Stage 2
+  above closes the specific gap previously named here as the blocker
+  (interprocedural call-argument reasoning), but swapping the
+  allocation strategy itself hasn't been attempted yet — it's a
+  separate change on top of stage 2's proof, not automatically implied
+  by it, and still needs its own dedicated verification pass (the same
+  "provably safe" bar every stage here has needed, not assumed to
+  transfer just because the escaping-ness proof got wider). Still
+  governed by claude.md #74/#75 (or a new stage within them), not a new
   design.
 
   A naive, unconditional version of stack allocation was tried once,
@@ -184,15 +253,16 @@ whole thing in one pass, exactly as originally planned.
   and a stack allocation doesn't survive that; see
   `festina/codegen.py`'s module docstring). Stage 1's own escape
   analysis is the proof mechanism that naive attempt was missing --
-  widening it is the difference between "provably safe, narrow" (stage
-  1 today) and "provably safe, wide enough to also justify stack
-  allocation instead of calloc+free."
+  stage 2 widens it further; swapping calloc+free for a real stack
+  alloca everywhere that wider proof now covers is the next step this
+  bullet describes, not yet done.
 - **Reference counting** (or a real tracing GC) for the values escape
   analysis can't (or structurally never could) clear — genuinely shared
   values, or ones stored somewhere long-lived on purpose (globals,
-  caches). This is the complete answer for the remainder stage 1's
-  approach can never reach on its own (a value that provably *does*
-  escape has nothing for escape analysis to do), but touches nearly
+  caches). This is the complete answer for the remainder escape
+  analysis (stages 1 or 2) can never reach on its own (a value that
+  provably *does* escape has nothing for escape analysis to do), but
+  touches nearly
   every place a value is assigned, passed, stored, or a scope exits — a
   large surface area to get right, and an incorrect refcount (an early
   free, or a missed increment) *is* a real memory-safety bug, a genuine

@@ -1764,8 +1764,21 @@ The compiler proves this the same way regardless of which block the variable is 
 
 This stage does not yet analyze:
 
-- Whether a value passed as an argument to another function is retained by that function. Any use as a call argument is treated as escaping, unconditionally, even if the called function does not actually retain it.
 - Fields within a freed struct that are themselves struct, arr[T], or map[T] values. Freeing the outer struct does not free those nested allocations; they continue to leak independently until a later stage addresses them.
 - A freed map[T]'s own individual entries. Freeing a map frees its entries buffer as a whole, but each entry's key is its own separate allocation (independent of the map's declared value type, and independent of whether that value type is itself covered by this stage or not); those per-entry key allocations are not freed and continue to leak until a later stage addresses them.
 
 None of these are safety gaps -- each one simply means less memory is reclaimed automatically than a more complete implementation would reclaim, not that anything is freed incorrectly. Extending coverage to these cases is expected in later stages, each documented as its own addition to this section or a new one, following the same rule: memory is only freed automatically where the compiler can prove it is safe.
+
+75. AUTOMATIC MEMORY RECLAMATION (STAGE 2: INTERPROCEDURAL CALL-ARGUMENT ANALYSIS)
+
+This section extends section 74's stage 1. Stage 1 treated a value passed as an argument to any function call as escaping, unconditionally, even when the called function did not actually retain it. This stage removes that limitation for calls to functions declared in the same program.
+
+For each function, in the order it is declared, the compiler determines which of that function's own parameters ever escape within that function's own body, using exactly the same rule section 74 already applies to locals: a parameter is safe if every use of its name is either the immediate object of a field or element access, or an argument to another function call at a position that function's own analysis has already proven safe; any other use marks it escaping. This result is recorded against the function's name once its body has been fully analyzed.
+
+When a later function calls an earlier one, passing a local, arr[T], or map[T] value directly as an argument, that argument is now escaping only if the called function's own analysis marked the corresponding parameter position as escaping. If the called function's analysis proved that parameter safe, the argument is exempted from the default call-argument rule at that call site -- it may still escape some other way, through some other use elsewhere in the calling function, which is judged entirely independently. This proof composes across any number of calls: if function A calls B, and B passes its own parameter straight through to C, then A's own argument is only as safe as C's own analysis of the position it ultimately reaches.
+
+A call to a function not declared in the program -- a builtin, or a call through a field or element access rather than a plain name -- is unaffected by this stage and continues to be treated as escaping, unconditionally, exactly as in stage 1.
+
+A function that calls itself, directly or indirectly, is handled conservatively: since a function's own declaration must precede its use (see section 48's "unknown function" error), the only way a function can call itself is directly, by its own name, before its own analysis has completed. Any argument passed to such a call is treated as escaping, unconditionally, the same as a call to an unanalyzed function -- this may mark a value escaping that a more thorough analysis could have proven safe, but it never marks anything safe that is not.
+
+This stage does not yet analyze whether a value stored into a field of another value that is itself passed as a call argument continues to be retained beyond that call, or extend any further than section 74's own stated remaining limitations (nested fields within a freed struct, and a freed map's own per-entry keys). Extending coverage further is expected in later stages, following the same rule both stages before it already follow: memory is only freed automatically where the compiler can prove it is safe.

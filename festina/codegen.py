@@ -490,6 +490,32 @@ class CodeGen:
                                                 # a stack: Festina has no nested function declarations
                                                 # reaching codegen (see _toplevel), so only ever one
                                                 # function/handler's body is being emitted at a time.
+        self.escaping_params = {}              # claude.md #74 stage 2 (interprocedural): {func_name:
+                                                # set[int]} -- for each FuncDecl already fully emitted,
+                                                # which of ITS OWN parameter positions escape_analysis
+                                                # proved escape somewhere in its own body. Built up
+                                                # incrementally, one entry per function, immediately
+                                                # after that function's own _emit_analyzed_func_body call
+                                                # returns (see that method) -- never all at once in a
+                                                # separate pass, because it doesn't need to be: semantic.py
+                                                # already rejects a call to a function before its own
+                                                # declaration (no forward references), so by the time any
+                                                # function F's body is being walked, every function F could
+                                                # possibly call (other than F itself, mid-recursion) is
+                                                # necessarily already a key in this dict. A self-recursive
+                                                # call inside F's own body looks up F's own name here
+                                                # *before* F's own entry has been added -- a plain,
+                                                # ordinary dict miss, correctly falling back to
+                                                # escape_analysis.py's original conservative "any call
+                                                # argument escapes" default, exactly like a call to an
+                                                # unanalyzed builtin does. Never cleared, never popped:
+                                                # unlike _current_escaping_names (one function at a time)
+                                                # this accumulates across the whole program, since a
+                                                # function emitted early may be called by many functions
+                                                # emitted later. Passed to every
+                                                # escape_analysis.find_escaping_names call this session
+                                                # makes (see _emit_analyzed_func_body) -- see that
+                                                # module's own docstring for the full contract.
         self._active_free_locals = []          # claude.md #74: stack of "frames," one per currently-
                                                 # open block within the function/handler body being
                                                 # emitted -- not just its own top-level body anymore, but
@@ -890,12 +916,32 @@ class CodeGen:
         ever exists at a whole program's top level -- see _toplevel), so
         this never needs to be a stack the way _active_free_locals and
         _loop_targets are, just a single value cleared between one
-        function/handler's emission and the next."""
-        self._current_escaping_names = escape_analysis.find_escaping_names(decl.body)
+        function/handler's emission and the next.
+
+        claude.md #74 stage 2 (interprocedural): passes self.
+        escaping_params into find_escaping_names so a Call argument
+        position already proven safe by some EARLIER function's own
+        analysis is exempted from the default "any call argument
+        escapes" rule (see escape_analysis.py's own docstring for the
+        full contract). After decl's own body is fully walked, a real
+        ast.FuncDecl (not an EventHandler -- nothing ever calls a
+        handler by name, so it never needs an entry here) registers its
+        own result into self.escaping_params, keyed by name, so any
+        LATER function's own analysis can use it in turn -- see that
+        field's own comment on why this incremental,
+        one-function-at-a-time approach is already sound with no
+        separate whole-program pre-pass or fixpoint needed."""
+        escaping = escape_analysis.find_escaping_names(decl.body, escaping_params=self.escaping_params)
+        self._current_escaping_names = escaping
         try:
-            return self._emit_block(decl.body, body_env, return_type, body_lines)
+            block = self._emit_block(decl.body, body_env, return_type, body_lines)
         finally:
             self._current_escaping_names = None
+        if isinstance(decl, ast.FuncDecl):
+            self.escaping_params[decl.name] = {
+                i for i, p in enumerate(decl.params) if p.name in escaping
+            }
+        return block
 
     def _emit_func(self, decl):
         return_type = None if decl.return_type == "void" else self._resolve(decl.return_type, decl)

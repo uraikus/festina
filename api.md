@@ -199,14 +199,19 @@ and passing to/returning from functions by value.
 Memory for structs, arrays, and maps is managed automatically — no
 manual allocation or freeing. A local struct/`arr[T]`/`map[T]`
 declared in a function, event handler, `if` branch, `while` body, or
-`for` body, and never returned, stored anywhere longer-lived, or passed
-to another function, is reclaimed automatically as soon as control
-leaves the block it was declared in — for a value declared inside a
-loop body, that means every iteration, not deferred until the function
-eventually returns; `break`/`continue` reclaim it too, the same as
-reaching the end of that iteration normally would. A value that does
-escape (returned, stored somewhere longer-lived, passed to another
-function) is reclaimed by a later stage not yet implemented — see
+`for` body, and never returned or stored anywhere longer-lived, is
+reclaimed automatically as soon as control leaves the block it was
+declared in — for a value declared inside a loop body, that means
+every iteration, not deferred until the function eventually returns;
+`break`/`continue` reclaim it too, the same as reaching the end of that
+iteration normally would. Passing a value to another function no
+longer unconditionally prevents this: if that function's own body
+never itself lets the value outlive the call (only reads/writes
+through its own fields, or passes it on to some other function that
+in turn doesn't retain it either), the original value is still
+reclaimed exactly the same way. A value that does escape (returned,
+stored somewhere longer-lived, or genuinely retained by a function it
+was passed to) is reclaimed by a later stage not yet implemented — see
 [todo.md](todo.md#memory-management).
 
 ## Arrays
