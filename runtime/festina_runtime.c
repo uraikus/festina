@@ -890,3 +890,25 @@ void festina_map_for_each(int64_t count, void *entries, void (*callback)(int64_t
         callback(arr[i].value, arr[i].key);
     }
 }
+
+/* claude.md #74/#75: see this function's own declaration in
+ * festina_runtime.h. Frees what festina_map_set's own comment already
+ * establishes is exclusively owned by each entry -- a strdup'd copy of
+ * the key, never aliased with any other Festina-visible value -- before
+ * freeing the entries buffer itself. This is the one piece of stage
+ * 1/2's own remaining coverage gap (claude.md #74's "This stage does
+ * not yet analyze" list) that's actually safe to close without any new
+ * aliasing reasoning: unlike a struct/array/map VALUE stored into
+ * another value's field (which may still be reachable through the
+ * variable it came from -- see codegen.py's own note on why THAT case
+ * is deliberately not attempted yet), a map entry's key was never a
+ * Festina value at all -- just a private byte-for-byte copy this
+ * runtime made for its own internal bookkeeping the moment the entry
+ * was created. */
+void festina_map_free_entries(int64_t count, void *entries) {
+    FestinaMapEntry *arr = (FestinaMapEntry *)entries;
+    for (int64_t i = 0; i < count; i++) {
+        free(arr[i].key);
+    }
+    free(entries);
+}

@@ -101,12 +101,16 @@ a benchmarks addition once real (server) benchmarks are possible.
 
 `claude.md #43` promises "automatic memory management" — the compiler
 should "automatically release or reclaim memory when values are no
-longer reachable." Arrays and struct storage are heap-allocated
-(`malloc`/`calloc`); until `claude.md #74` (stage 1, below) landed,
-none of it was ever freed — a real resource leak in any long-running
-program, though never a memory-safety issue on its own (see
-[security.md](security.md)'s note: no use-after-free, no double-free,
-since nothing was ever freed).
+longer reachable." Arrays and struct storage were originally always
+heap-allocated (`malloc`/`calloc`) and never freed — a real resource
+leak in any long-running program, though never a memory-safety issue on
+its own (see [security.md](security.md)'s note: no use-after-free, no
+double-free, since nothing was ever freed). Three stages below have
+since narrowed that: a provably-safe struct is now stack-allocated
+outright (stage 3), and a provably-safe `arr[T]`/`map[T]`'s data is
+still heap-allocated but now freed (stages 1/2) — anything not provably
+safe under any stage is still heap-allocated (structs) or still leaks
+(arrays/maps), exactly as originally described here.
 
 ### Stage 1: non-escaping locals (done — claude.md #74)
 
@@ -231,36 +235,104 @@ leak, unchanged from before this stage) to within LeakSanitizer's own
 known conservative-stack-scanning under-count of a small few" almost
 exactly).
 
+### Stage 3: stack allocation and map entry keys (done — claude.md #76)
+
+Two closures of previously-named gaps, shipped together since neither
+widens what stages 1/2 prove safe — both only change what happens once
+something already is proven safe, or close an incomplete
+implementation of a promise stage 1 already made.
+
+**Stack allocation.** A struct local proven safe by stage 1 or 2 is now
+a real stack `alloca` (explicitly zeroed with `store %struct.T
+zeroinitializer`, matching `calloc`'s own zero-init behavior — the two
+allocation strategies have to stay indistinguishable to any Festina
+program, not just individually correct) instead of a `calloc`+`free`
+pair. This is sound for exactly the reason freeing early was sound: an
+address that never escapes needs nothing beyond its own function's
+stack frame, and a stack alloca's own lifetime already matches exactly
+the points the old `free()` call would have fired at (block exit,
+every loop iteration, `break`/`continue`) — LLVM's `alloca` reserves
+one fixed address for the whole enclosing function regardless of which
+basic block contains it, so a loop-body-declared one is simply reused,
+address and all, on the next iteration, and a recursive call still
+gets its own genuinely distinct address (ordinary calling-convention
+behavior, unrelated to this choice — verified directly with a
+hand-traced recursive-accumulator test, not just reasoned about: see
+`tests/test_codegen.py`'s
+`test_recursive_function_with_a_non_escaping_struct_local_keeps_each_calls_own_value`).
+`arr[T]`/`map[T]` locals are deliberately unaffected — their data/
+entries buffer can grow after declaration (`.push()`, a map literal
+past its initial size), so its size isn't known at declaration time,
+and a stack allocation needs a size known in advance; these still
+`calloc`+free their buffer exactly as stage 1 shipped.
+
+**Map entry keys.** `festina_map_free_entries` (new, in
+`runtime/festina_runtime.c`) frees each entry's own `strdup`'d key
+before freeing the entries buffer itself, closing stage 1's own
+originally-stated "a freed map's own per-entry keys" gap. This needed
+no new soundness reasoning at all, unlike the struct/array/map-*value*
+cases below: a map entry's key was never a Festina-visible value to
+begin with, just a private byte-for-byte copy this runtime made for
+its own bookkeeping the instant the entry was created (see
+`festina_map_set`'s own comment) — nothing else could ever be aliased
+to it.
+
+Verified the same way as every stage before it: new unit/IR/
+compile-and-run tests (`tests/test_codegen.py::TestAutomaticMemoryReclamation`
+grew from 47 to 51, several existing IR-shape assertions rewritten from
+"a `free()` call appears" to "an `alloca`+`zeroinitializer` pair
+appears, no `calloc`/`free` at all" — the correctness-only
+compile-and-run tests needed **zero** changes, confirming the swap is
+exactly as semantically transparent as intended), and real
+AddressSanitizer/LeakSanitizer runs across four different combined
+programs: a recursion-focused stress test (deep and wide recursive
+struct locals, loop-local structs reused thousands of times, nested-if
+struct locals) and a map-key-focused one (thousands of map creations
+with several keys each, some escaping loop iterations via `break`/
+`continue`) written fresh for this stage, plus re-running both
+combined programs from stages 1/2's own verification unchanged, to
+confirm the swap didn't regress anything already proven — zero ASan
+errors and zero leaks across all four (the two chains/loop-heavy
+programs from stages 1/2 had already-understood, unrelated leaks from
+their own intentionally-escaping values; those counts stayed the same
+give or take LeakSanitizer's own already-documented conservative
+under-count, confirming the escaping/leaking *set* is unchanged by
+this stage, only the mechanism for the non-escaping set is).
+
 ### What's still ahead
 
-- **Escape analysis is *always still followed by a real `calloc` +
-  `free`***, not true stack allocation — a real speed cost (allocator
-  traffic) that a genuine stack alloca would avoid entirely. Stage 2
-  above closes the specific gap previously named here as the blocker
-  (interprocedural call-argument reasoning), but swapping the
-  allocation strategy itself hasn't been attempted yet — it's a
-  separate change on top of stage 2's proof, not automatically implied
-  by it, and still needs its own dedicated verification pass (the same
-  "provably safe" bar every stage here has needed, not assumed to
-  transfer just because the escaping-ness proof got wider). Still
-  governed by claude.md #74/#75 (or a new stage within them), not a new
-  design.
-
-  A naive, unconditional version of stack allocation was tried once,
-  before stage 1 existed, and reverted after it was verified to
-  silently corrupt memory (a struct's address can genuinely outlive its
-  function -- returned, stored in an array or another struct's field --
-  and a stack allocation doesn't survive that; see
-  `festina/codegen.py`'s module docstring). Stage 1's own escape
-  analysis is the proof mechanism that naive attempt was missing --
-  stage 2 widens it further; swapping calloc+free for a real stack
-  alloca everywhere that wider proof now covers is the next step this
-  bullet describes, not yet done.
+- **Nested struct/array/map fields within a freed struct.** Explored
+  as part of stage 3 above and *deliberately not attempted* after
+  finding a real soundness hazard, not merely left alone by inertia:
+  the only way to populate a struct-typed field is `outer.field =
+  someExistingLocal` (there's no struct-literal initializer syntax),
+  which stores that local's own pointer into the field — an alias, not
+  a copy (confirmed directly by inspecting the generated IR: `store
+  ptr %t11, ptr %t10`, the same pointer value, not a fresh allocation).
+  `someExistingLocal` is already correctly marked escaping by stages
+  1/2's own existing rule (an assignment *value* always escapes), so it
+  was never going to be double-freed under its own name — but freeing
+  `outer.field`'s value when `outer` itself goes out of scope would
+  free that *same* memory through a different name, and if
+  `someExistingLocal` is read again anywhere after that point (still
+  entirely legal Festina code — it's a live variable in its own scope
+  until *it* goes out of scope), that read would be a genuine
+  use-after-free. Confirmed concretely, not just reasoned about: wrote
+  exactly that program, inspected its IR, and traced the aliasing by
+  hand before concluding this needs real aliasing/ownership analysis
+  (does anything else still reference this field's value when the
+  struct holding it stops existing) rather than the syntactic "does
+  this name appear outside a safe position" question stages 1/2 both
+  answer. That's a structurally different, harder problem — arguably
+  the same problem as reference counting below, just asked from the
+  freeing side instead of the retaining side — not a small extension
+  of the existing rule, and not attempted here for exactly that reason.
+  Needs its own design pass, same bar as every stage here.
 - **Reference counting** (or a real tracing GC) for the values escape
   analysis can't (or structurally never could) clear — genuinely shared
   values, or ones stored somewhere long-lived on purpose (globals,
   caches). This is the complete answer for the remainder escape
-  analysis (stages 1 or 2) can never reach on its own (a value that
+  analysis (stages 1-3) can never reach on its own (a value that
   provably *does* escape has nothing for escape analysis to do), but
   touches nearly
   every place a value is assigned, passed, stored, or a scope exits — a
@@ -269,9 +341,14 @@ exactly).
   regression from "leaks but is memory-safe," not a wash. Cycles are
   also a real question to resolve one way or another (rare in Festina's
   language model, given no closures/first-class functions, but not
-  provably impossible without checking). Needs its own `claude.md`
-  addition and dedicated design pass before implementation, same as
-  every stage here — not attempted yet, not overlooked.
+  provably impossible without checking). A real design for this would
+  also need to settle the nested-field aliasing question just above,
+  since a struct field holding a refcounted value is exactly the kind
+  of "does something else still reference this" question refcounting
+  exists to answer generally — the two bullets here are likely one
+  design effort, not two. Needs its own `claude.md` addition and
+  dedicated design pass before implementation, same as every stage
+  here — not attempted yet, not overlooked.
 
 ## Smaller, not yet tracked elsewhere
 

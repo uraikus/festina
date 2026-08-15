@@ -359,11 +359,11 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 730 tests in this directory pass against it: 500 need no external
+All 734 tests in this directory pass against it: 503 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-220 more need a working C compiler, plus 2 more
+221 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 8 more given
-`Xvfb`+`xdotool` too (500 + 220 + 2 + 8 = 730 -- re-verified directly
+`Xvfb`+`xdotool` too (503 + 221 + 2 + 8 = 734 -- re-verified directly
 by hiding each tool from PATH in turn, not just derived by counting
 `compile_and_run` call sites, since the true number had drifted well
 past a much older, since-inaccurate count of "694 given a working C
@@ -1161,11 +1161,125 @@ more bug while doing so, and deliberately did NOT attempt a third
   relying on the flipped one's absence of freeing to imply it).
 
   See `todo.md`'s "Memory management" section for the full picture,
-  including exactly what's still ahead (swapping calloc+free for real
-  stack allocation now that this stage's proof is wide enough to
-  justify it, nested struct/array/map fields, map per-entry keys, and
-  reference counting for the values escape analysis can't reach at
+  including exactly what's still ahead (nested struct/array/map fields
+  and reference counting for the values escape analysis can't reach at
   all).
+
+- **Memory management stage 3: stack allocation and map entry keys
+  (claude.md #76, same session).** Two closures shipped together, since
+  neither widens what stages 1/2 prove safe -- both only change what
+  happens once something already is, or close an incomplete
+  implementation of a promise stage 1 already made.
+
+  **Stack allocation:** a struct local proven safe by stage 1 or 2 now
+  gets `alloca %struct.T` + `store %struct.T zeroinitializer` (the
+  explicit zero-init matches `calloc`'s own behavior -- the two
+  allocation strategies must stay indistinguishable to any Festina
+  program) instead of `calloc(1, sizeof)` + a scheduled `free()`.
+  `_emit_stmt`'s own VarDecl handling makes this choice using the exact
+  same `self._current_escaping_names` set `_emit_block` already
+  consults for freeing -- literally the same boolean condition, reused
+  for a different purpose, not a new analysis. `_emit_block`'s own
+  per-VarDecl tracking (which builds `_active_free_locals`, the list
+  `_emit_free_active_locals` later walks) simply stopped adding
+  `StructType` to that list at all -- there's nothing left to free for
+  one, so `_emit_free_active_locals`'s own former `StructType` branch
+  became dead code and was removed rather than left unreachable.
+  `arr[T]`/`map[T]` locals are untouched: their data/entries buffer can
+  grow after declaration (`.push()`, a map literal past its initial
+  size), so a fixed-size `alloca` isn't safe for it regardless of
+  escaping-ness -- they still always `calloc`+free their buffer.
+
+  Soundness argument (not just "it compiles and runs"): a stack
+  alloca's own lifetime already matches exactly the points
+  `_emit_free_active_locals` would otherwise have freed it at -- LLVM's
+  `alloca` reserves one fixed address for the whole enclosing function
+  regardless of which basic block textually contains it, so a
+  loop-body-declared one is simply reused, address and all, on the next
+  iteration (zero allocator traffic, not just leak-free sooner), and a
+  recursive call still gets its own genuinely distinct address (a
+  stack frame is per call, ordinary calling-convention behavior
+  unrelated to this choice). That last claim was verified directly, not
+  just assumed correct because it's "how C works": a hand-traced
+  recursive accumulator
+  (`test_recursive_function_with_a_non_escaping_struct_local_keeps_each_calls_own_value`
+  -- `recur(n)` builds `n*100 + recur(n-1)` by reading its own `p.x`
+  *after* its own recursive call returns, which would read a corrupted
+  value if calls shared one slot) produces the exact hand-derived
+  values (`recur(3)` = 600, `recur(5)` = 1500) -- the single most
+  important correctness question this change raises, answered with a
+  program specifically designed to fail loudly if the assumption were
+  wrong, not just one that happens to pass.
+
+  **Map entry keys:** `festina_map_free_entries` (new, in
+  `runtime/festina_runtime.c` and declared in `festina_runtime.h`)
+  frees each entry's own `strdup`'d key before freeing the entries
+  buffer itself, replacing a plain `free(entries)` that leaked every
+  key. No new soundness question here at all -- unlike a struct/array/
+  map *value* stored into another value's field (see the "nested
+  fields" gap below, deliberately not attempted), a map entry's key was
+  never a Festina-visible value; `festina_map_set`'s own comment already
+  established it as a private copy this runtime made for its own
+  internal bookkeeping, never aliased with anything else.
+
+  Rewiring existing IR-shape tests, not just adding new ones: every
+  test in `TestAutomaticMemoryReclamation` that asserted `"call void
+  @free(" in ir` for a *struct* local no longer has anything true to
+  assert -- rewritten to assert the `alloca`/`zeroinitializer` shape
+  instead (`test_non_escaping_struct_local_is_stack_allocated`, and
+  others), or, where the test's real purpose was exercising the
+  loop/break/continue *scheduling* machinery rather than structs
+  specifically, rewritten to use `arr[int]` instead (which still goes
+  through that exact machinery unchanged) so the same control-flow
+  shape stays meaningfully tested
+  (`test_a_loop_local_array_is_freed_inside_the_loop_body` and its
+  siblings). Every *compile-and-run* (correctness-only) test in the
+  same class needed **zero** changes and passed unmodified on the first
+  try -- direct, automatic confirmation that the swap is exactly as
+  semantically transparent as the design intended, not something
+  inferred after the fact.
+
+  Verified under AddressSanitizer/LeakSanitizer across four combined
+  programs: two written fresh for this stage (a recursion-focused one
+  -- deep and wide recursive struct locals, thousands of loop-local
+  structs reused across iterations with `break`/`continue` mixed in,
+  nested-if struct locals, each with its own embedded `fail()`
+  correctness check -- and a map-key-focused one, thousands of map
+  creations with several keys each, some escaping loop iterations) and
+  two re-run unchanged from stages 1/2's own earlier verification (to
+  confirm this stage didn't regress anything already proven). Zero
+  ASan errors across all four. Leak-detection-on runs: zero leaks for
+  both fresh programs (nothing in either one escapes, so there's
+  nothing left to leak once structs stop going through calloc at all);
+  the two stage-1/2 programs' own leak counts stayed the same, give or
+  take LeakSanitizer's own already-documented conservative
+  under-count (1198 -> 1197 on one, matching the expectation that the
+  escaping/leaking *set* is unchanged by this stage -- only the
+  mechanism for the *non*-escaping set is).
+
+  **Investigated and deliberately not attempted**, worth recording as
+  its own finding rather than a silent omission: freeing a struct/
+  array/map-typed *field* of an otherwise-freed struct. The only way to
+  populate such a field is `outer.field = someLocal` (no struct-literal
+  initializer syntax exists), and inspecting the generated IR for
+  exactly that program confirms this stores `someLocal`'s own pointer
+  into the field (`store ptr %t11, ptr %t10`) -- an alias, not a copy.
+  `someLocal` is already correctly marked escaping by the existing
+  assignment-value rule (never freed under its own name), but freeing
+  `outer.field`'s value when `outer` itself goes out of scope would
+  free that *same* memory reachable through `someLocal`'s still-live
+  name, and a later read through `someLocal` -- entirely legal Festina
+  code -- would be a genuine use-after-free. This needs real
+  aliasing/ownership analysis (does anything else still reference this
+  field's value when the struct holding it stops existing), not a small
+  syntactic extension of the existing "does this name appear outside a
+  safe position" rule -- see todo.md's own note on why this is likely
+  the same open design problem as reference counting, from the other
+  direction.
+
+  See `todo.md`'s "Memory management" section for the full picture,
+  including that nested-field finding in full and reference counting
+  for the values escape analysis can't reach at all.
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -1937,8 +2051,8 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 500 passed, 230 skipped (needs a C compiler; 2 of
+pytest tests/                          # 503 passed, 231 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
                                         # 8 need Xvfb + xdotool installed too) given a
-                                        # working C compiler, all 730 pass
+                                        # working C compiler, all 734 pass
 ```

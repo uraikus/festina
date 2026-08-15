@@ -827,7 +827,12 @@ class TestAutomaticMemoryReclamation:
 
     # ---- IR-level: no C compiler needed ----
 
-    def test_non_escaping_struct_local_is_freed(self, parser, semantic, codegen):
+    def test_non_escaping_struct_local_is_stack_allocated(self, parser, semantic, codegen):
+        # claude.md #43/#74/#75: a struct local proven never to escape
+        # its declaring function is now a real stack alloca, not a
+        # calloc+free pair -- see _emit_stmt's own VarDecl comment for
+        # why reusing the exact same escape-analysis proof is sound for
+        # allocation, not just for freeing.
         source = """
         struct Point { x:int y:int }
         void func f() {
@@ -837,7 +842,11 @@ class TestAutomaticMemoryReclamation:
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @free(" in ir
+        assert "%p.storage" in ir
+        assert "alloca %struct.Point" in ir
+        assert "store %struct.Point zeroinitializer" in ir
+        assert "call ptr @calloc(" not in ir
+        assert "call void @free(" not in ir
 
     def test_non_escaping_array_local_frees_its_data_pointer(self, parser, semantic, codegen):
         source = """
@@ -855,6 +864,12 @@ class TestAutomaticMemoryReclamation:
         assert "call void @free(" in ir
 
     def test_non_escaping_map_local_frees_its_entries_pointer(self, parser, semantic, codegen):
+        # claude.md #74/#75: a map's entries buffer has its own nested
+        # per-entry key allocation (see festina_map_set's own comment),
+        # so freeing it goes through festina_map_free_entries -- which
+        # frees each entry's key too -- not a plain @free(entries) that
+        # would leak them (see _emit_free_active_locals's MapType
+        # branch).
         source = """
         void func f() {
             map[int] m = {'a': 1}
@@ -863,7 +878,7 @@ class TestAutomaticMemoryReclamation:
         """
         ir = self._ir(parser, semantic, codegen, source)
         assert "getelementptr %struct._FestinaMap, ptr" in ir
-        assert "call void @free(" in ir
+        assert "call void @festina_map_free_entries(" in ir
 
     def test_returned_struct_is_not_freed(self, parser, semantic, codegen):
         source = """
@@ -877,7 +892,8 @@ class TestAutomaticMemoryReclamation:
         ir = self._ir(parser, semantic, codegen, source)
         assert "call void @free(" not in ir
 
-    def test_struct_passed_to_a_non_retaining_function_is_now_freed(self, parser, semantic, codegen):
+    def test_struct_passed_to_a_non_retaining_function_is_now_stack_allocated(
+            self, parser, semantic, codegen):
         # claude.md #74 stage 2 (interprocedural): takesPoint only reads
         # p.x (a Member.obj-safe use, same rule as any local's own
         # fields) -- its own parameter never escapes within its own
@@ -885,8 +901,9 @@ class TestAutomaticMemoryReclamation:
         # passed there and never used any other way, is now provably
         # safe too. This is the exact case stage 1's own module
         # docstring called out as its stated limitation ("even if the
-        # called function provably doesn't retain it") -- this is that
-        # stage.
+        # called function provably doesn't retain it") -- combined with
+        # the stack-allocation swap (claude.md #43/#74/#75), f()'s own
+        # `p` is now a stack alloca, not a calloc'd allocation at all.
         source = """
         struct Point { x:int y:int }
         void func takesPoint(p:Point) {
@@ -898,7 +915,59 @@ class TestAutomaticMemoryReclamation:
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @free(" in ir
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "alloca %struct.Point" in f_body
+        assert "call ptr @calloc(" not in f_body
+
+    def test_loop_local_struct_is_stack_allocated_and_reused_across_iterations(
+            self, parser, semantic, codegen):
+        # claude.md #43/#74/#75: the loop-body/break/continue-scoped
+        # freeing machinery still applies to *when* a struct local's
+        # storage is considered dead, even though "dead" no longer
+        # means "call free() here" for a struct -- it means the very
+        # next textual reach of the same VarDecl (the next iteration)
+        # re-zeros the *same* stack address rather than allocating a
+        # fresh one, since LLVM's alloca reserves one fixed slot for
+        # the whole enclosing function regardless of which basic block
+        # contains it. The alloca and its zeroinitializer store must
+        # both be inside the loop body (so re-zeroing genuinely
+        # happens every iteration, not just once before the loop), and
+        # there must be no calloc/free anywhere in the function at all.
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            for int i = 0, i < 3, i++ {
+                Point p
+                p.x = i
+                log(p.x)
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        body_start = next(i for i, l in enumerate(lines) if l.strip().startswith("for.body"))
+        body_end = next(i for i in range(body_start, len(lines)) if lines[i].strip().startswith("br label %for.update"))
+        body_lines = lines[body_start:body_end]
+        assert any("alloca %struct.Point" in l for l in body_lines)
+        assert any("store %struct.Point zeroinitializer" in l for l in body_lines)
+        assert "call ptr @calloc(" not in ir
+        assert "call void @free(" not in ir
+
+    def test_nested_if_declared_struct_is_stack_allocated(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f(cond:bool) {
+            if cond {
+                Point p
+                p.x = 1
+                log(p.x)
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "alloca %struct.Point" in ir
+        assert "call ptr @calloc(" not in ir
 
     def test_struct_passed_to_a_retaining_function_is_still_not_freed(self, parser, semantic, codegen):
         # The mirror case: retains actually stores its own parameter
@@ -945,38 +1014,43 @@ class TestAutomaticMemoryReclamation:
         ir = self._ir(parser, semantic, codegen, source)
         assert "call void @free(" not in ir
 
-    def test_a_loop_local_struct_is_freed_inside_the_loop_body(self, parser, semantic, codegen):
+    def test_a_loop_local_array_is_freed_inside_the_loop_body(self, parser, semantic, codegen):
         # claude.md #74's nested-block extension: a loop-body-declared
         # non-escaping local is now freed at the end of *every*
         # iteration -- exactly one free() call, and it must be inside
         # the loop body's own block (part of the runtime back-edge
-        # cycle), not just once after the loop as a whole exits.
+        # cycle), not just once after the loop as a whole exits. Uses
+        # arr[int], not a struct -- since the stack-allocation swap
+        # (claude.md #43/#74/#75), a non-escaping struct local no
+        # longer goes through this free-scheduling machinery at all
+        # (see test_a_loop_local_struct_is_reused_across_iterations_via_the_same_alloca
+        # for the struct/stack-allocation equivalent of this same
+        # shape); arr[T]'s data buffer still always calloc's/frees
+        # regardless of escaping-ness (a dynamically-growing buffer
+        # isn't safe to give a fixed-size alloca), so this is still the
+        # right type to exercise the free-scheduling logic itself with.
         source = """
-        struct Point { x:int y:int }
         void func f() {
             for int i = 0, i < 3, i++ {
-                Point p
-                p.x = i
-                log(p.x)
+                arr[int] p = [i]
+                log(p[0])
             }
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
         lines = ir.splitlines()
-        body_start = next(i for i, l in enumerate(lines) if l.strip() == "for.body3:")
+        body_start = next(i for i, l in enumerate(lines) if l.strip().startswith("for.body"))
         body_end = next(i for i in range(body_start, len(lines)) if lines[i].strip().startswith("br label %for.update"))
         body_lines = lines[body_start:body_end]
         assert sum("call void @free(" in l for l in body_lines) == 1
         assert ir.count("call void @free(") == 1
 
-    def test_a_nested_if_declared_struct_is_freed_at_the_ifs_own_end(self, parser, semantic, codegen):
+    def test_a_nested_if_declared_array_is_freed_at_the_ifs_own_end(self, parser, semantic, codegen):
         source = """
-        struct Point { x:int y:int }
         void func f(cond:bool) {
             if cond {
-                Point p
-                p.x = 1
-                log(p.x)
+                arr[int] p = [1]
+                log(p[0])
             }
         }
         """
@@ -985,19 +1059,16 @@ class TestAutomaticMemoryReclamation:
 
     def test_break_frees_the_loop_local_but_not_an_outer_scope_local(self, parser, semantic, codegen):
         source = """
-        struct Point { x:int y:int }
         void func f() {
-            Point outer
-            outer.x = 100
+            arr[int] outer = [100]
             for int i = 0, i < 5, i++ {
-                Point inner
-                inner.x = i
-                if inner.x == 2 {
+                arr[int] inner = [i]
+                if inner[0] == 2 {
                     break
                 }
-                log(inner.x)
+                log(inner[0])
             }
-            log(outer.x)
+            log(outer[0])
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
@@ -1014,15 +1085,13 @@ class TestAutomaticMemoryReclamation:
 
     def test_continue_frees_locals_declared_since_the_loop_body_began(self, parser, semantic, codegen):
         source = """
-        struct Point { x:int y:int }
         void func f() {
             for int i = 0, i < 5, i++ {
-                Point p
-                p.x = i
-                if p.x % 2 == 0 {
+                arr[int] p = [i]
+                if p[0] % 2 == 0 {
                     continue
                 }
-                log(p.x)
+                log(p[0])
             }
         }
         """
@@ -1035,15 +1104,13 @@ class TestAutomaticMemoryReclamation:
 
     def test_nested_if_inside_a_loop_frees_correctly_on_both_the_break_and_fallthrough_paths(self, parser, semantic, codegen):
         source = """
-        struct Point { x:int y:int }
         void func f() {
             for int i = 0, i < 5, i++ {
-                Point p
-                p.x = i
-                if p.x == 3 {
+                arr[int] p = [i]
+                if p[0] == 3 {
                     break
                 }
-                log(p.x)
+                log(p[0])
             }
         }
         """
@@ -1056,14 +1123,12 @@ class TestAutomaticMemoryReclamation:
 
     def test_early_return_before_the_declaration_has_no_free_on_that_path(self, parser, semantic, codegen):
         source = """
-        struct Point { x:int y:int }
         void func f(cond:bool) {
             if cond {
                 return
             }
-            Point p
-            p.x = 1
-            log(p.x)
+            arr[int] p = [1]
+            log(p[0])
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
@@ -1082,6 +1147,16 @@ class TestAutomaticMemoryReclamation:
 
     def test_event_handler_locals_are_analyzed_too(self, parser, semantic, codegen):
         source = """
+        on click(x:int, y:int) {
+            arr[int] p = [x]
+            log(p[0])
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" in ir
+
+    def test_event_handler_struct_local_is_stack_allocated_too(self, parser, semantic, codegen):
+        source = """
         struct Point { x:int y:int }
         on click(x:int, y:int) {
             Point p
@@ -1090,7 +1165,8 @@ class TestAutomaticMemoryReclamation:
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @free(" in ir
+        assert "alloca %struct.Point" in ir
+        assert "call ptr @calloc(" not in ir
 
     # ---- end-to-end: real compiled programs, real output ----
 
@@ -1131,6 +1207,37 @@ class TestAutomaticMemoryReclamation:
         """
         result = compile_and_run(source)
         assert result.stdout.splitlines() == ["10", "20", "999", "888"]
+
+    def test_recursive_function_with_a_non_escaping_struct_local_keeps_each_calls_own_value(
+            self, compile_and_run):
+        # The single most important correctness question the stack-
+        # allocation swap (claude.md #43/#74/#75) raises: does each
+        # recursive call really get its own, distinct stack slot for
+        # p, or could a wrong assumption about LLVM's calling
+        # convention let a deeper call's own p.x overwrite an
+        # outstanding shallower call's? recur(n)'s own p.x must still
+        # read back correctly *after* its own recursive call to
+        # recur(n-1) returns -- if calls shared one slot, this would
+        # read n-1's (or some other call's) value instead of n's own.
+        source = """
+        struct Point { x:int y:int }
+        int func recur(n:int) {
+            Point p
+            p.x = n
+            if n == 0 {
+                return p.x
+            }
+            int inner = recur(n - 1)
+            return p.x * 100 + inner
+        }
+        log(recur(3))
+        log(recur(5))
+        """
+        result = compile_and_run(source)
+        # recur(0)=0, recur(1)=100, recur(2)=300, recur(3)=600,
+        # recur(4)=1000, recur(5)=1500 -- hand-derived, each building on
+        # the previous: recur(n) = n*100 + recur(n-1).
+        assert result.stdout.splitlines() == ["600", "1500"]
 
     def test_struct_assigned_into_a_global_keeps_its_value(self, compile_and_run):
         source = """
@@ -1429,21 +1536,21 @@ class TestAutomaticMemoryReclamation:
         # re-declared) inside a nested inner loop, must survive the inner
         # loop's own break -- free_depth is captured fresh by each
         # _emit_for call, so the inner loop's break must never reach past
-        # its own body's frame down into the outer loop's.
+        # its own body's frame down into the outer loop's. arr[T], not a
+        # struct -- see test_a_loop_local_array_is_freed_inside_the_loop_body's
+        # own note on why arr[T] is what still exercises this machinery
+        # since the stack-allocation swap.
         source = """
-        struct Point { x:int y:int }
         void func f() {
             for int i = 0, i < 3, i++ {
-                Point mid
-                mid.x = i
+                arr[int] mid = [i]
                 for int j = 0, j < 3, j++ {
-                    Point inner
-                    inner.x = j
-                    if inner.x == 1 {
+                    arr[int] inner = [j]
+                    if inner[0] == 1 {
                         break
                     }
                 }
-                log(mid.x)
+                log(mid[0])
             }
         }
         """
@@ -1722,7 +1829,7 @@ class TestAutomaticMemoryReclamation:
     # reach on their own (a real multi-function program, and a real
     # self-recursive function).
 
-    def test_transitive_chain_of_non_retaining_calls_frees_the_original_local(
+    def test_transitive_chain_of_non_retaining_calls_stack_allocates_the_original_local(
             self, parser, semantic, codegen):
         # a() -> b() -> c(), and c only reads its own parameter -- the
         # "safe" result has to propagate through b's own analysis (b's
@@ -1731,7 +1838,10 @@ class TestAutomaticMemoryReclamation:
         # escaping_params[c] to already exist by the time b is
         # analyzed, and escaping_params[b] to already exist by the time
         # a is analyzed -- exactly the program-order guarantee
-        # CodeGen.escaping_params's own comment describes.
+        # CodeGen.escaping_params's own comment describes. Checks for a
+        # stack alloca, not a free() -- since the stack-allocation swap
+        # (claude.md #43/#74/#75), a struct proven safe this way never
+        # goes through calloc+free at all.
         source = """
         struct Point { x:int y:int }
         void func c(q:Point) {
@@ -1746,7 +1856,10 @@ class TestAutomaticMemoryReclamation:
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @free(" in ir
+        a_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @a("))
+        a_body = "\n".join(ir.splitlines()[a_start:])
+        assert "alloca %struct.Point" in a_body
+        assert "call ptr @calloc(" not in a_body
 
     def test_transitive_chain_stops_freeing_at_the_first_retaining_link(
             self, parser, semantic, codegen):
@@ -1805,9 +1918,10 @@ class TestAutomaticMemoryReclamation:
             self, parser, semantic, codegen):
         # mixed(a, b): a is only ever read (safe), b is stored into a
         # global (escapes) -- escaping_params[mixed] must end up
-        # {1}, not {0, 1} or {} -- and f()'s own call must free exactly
-        # the argument at the safe position (p, position 0) and leave
-        # the other (q, position 1) alone.
+        # {1}, not {0, 1} or {} -- and f()'s own call must stack-
+        # allocate exactly the argument at the safe position (p,
+        # position 0) and leave the other (q, position 1) calloc'd,
+        # exactly as it always was.
         source = """
         struct Point { x:int y:int }
         Point stash
@@ -1822,7 +1936,12 @@ class TestAutomaticMemoryReclamation:
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert ir.count("call void @free(") == 1
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        p_line = next(l for l in f_body.splitlines() if l.strip().startswith("%p.storage."))
+        q_line = next(l for l in f_body.splitlines() if l.strip().startswith("%q.storage."))
+        assert "alloca %struct.Point" in p_line
+        assert "call ptr @calloc(" in q_line
 
     def test_transitive_chain_produces_correct_output(self, compile_and_run):
         source = """

@@ -207,13 +207,14 @@ for the full design writeup.
   through SQLite's own typed column API (`sqlite3_column_*`), not parsed
   from an untrusted byte stream by hand.
 - **Known, accepted memory-management gap, partially closed
-  (not a vulnerability):** arrays and struct storage are heap-allocated;
-  `claude.md #43` promises automatic memory management this compiler is
-  implementing in stages, not all at once — the exact opposite of the
-  "wrong answer here is a genuine memory-safety regression" risk this
-  document already flags below applies just as much to shipping the
-  whole thing in one uncareful pass as it does to shipping nothing.
-  `claude.md #74` (stage 1) now frees a local struct/`arr[T]`/`map[T]`
+  (not a vulnerability):** arrays and struct storage were originally
+  always heap-allocated and never freed; `claude.md #43` promises
+  automatic memory management this compiler is implementing in stages,
+  not all at once — the exact opposite of the "wrong answer here is a
+  genuine memory-safety regression" risk this document already flags
+  below applies just as much to shipping the whole thing in one
+  uncareful pass as it does to shipping nothing.
+  `claude.md #74` (stage 1) frees a local struct/`arr[T]`/`map[T]`
   automatically whenever `festina/escape_analysis.py` can prove, from
   the syntax of its declaring function/handler alone, that its address
   never left it — as soon as control leaves the block it was declared
@@ -236,36 +237,78 @@ for the full design writeup.
   callee's own analysis already proved safe — composing transitively
   across any number of calls for free. A call to a builtin, or through
   a field/element access rather than a plain function name, is
-  unaffected and stays exactly as conservative as before. Everything
-  neither stage covers yet (nested struct/array/map fields within an
-  otherwise-freed value, a freed map's own per-entry keys, and whether
-  a value stored into a field of a call argument is itself retained)
-  still leaks exactly as before — a resource leak in a long-running
-  process, not a safety issue on its own, no different in kind from the
-  gap this note already accepted. What changed is that both stages'
-  own fix, at every step of building them out, was verified with the
-  same rigor the rest of this document's findings were: exhaustive unit
-  tests of the analysis itself, end-to-end compile-and-run tests
-  including the exact "return a struct by value" pattern the earlier
-  naive stack-allocation attempt below got wrong and the critical
-  "a value merely used inside a loop, not declared inside it, survives
-  that loop's own break/continue" case, and real AddressSanitizer/
-  LeakSanitizer runs (zero ASAN errors each time; LeakSanitizer's
-  reported leaks matched the hand-derived expected count almost exactly
-  every time it was checked, including one run where the "extra" leak
-  turned out to be a real, separately-explained, structurally different
-  gap -- a global repeatedly reassigned orphaning its previous value --
-  confirmed by removing that one line and re-running to zero leaks, not
-  waved away; stage 2's own combined verification program specifically
-  ran with leak detection off for its correctness check, since
+  unaffected and stays exactly as conservative as before.
+  `claude.md #76` (stage 3) changes *how* a value already proven safe
+  by stage 1 or 2 is handled, not what counts as proven safe: a struct
+  is now a real stack allocation instead of a `calloc`+`free` pair
+  (sound for the identical reason freeing early was sound — an address
+  that never escapes needs nothing beyond its own function's stack
+  frame, and a stack alloca's own lifetime already matches exactly the
+  points the old `free()` would have fired at, including a fresh
+  address per recursive call — verified directly with a hand-traced
+  recursive-accumulator program, not just reasoned about), and a freed
+  `map[T]`'s own per-entry keys are now freed alongside its entries
+  buffer (previously only the buffer itself was, leaking each entry's
+  own `strdup`'d key — closing stage 1's own originally-stated gap on
+  this, not a new capability; a map entry's key was never a
+  Festina-visible value to begin with, just a private copy this
+  runtime made for its own bookkeeping, so this needed no new
+  aliasing reasoning the way the item below did). `arr[T]`/`map[T]`
+  locals are deliberately unaffected by the stack-allocation half of
+  this — their data/entries buffer can grow after declaration, so its
+  size isn't known in advance, and a stack allocation needs a size
+  that is.
+
+  One nested case was investigated during stage 3 and *deliberately not
+  attempted* after finding a real soundness hazard, not simply left
+  alone: freeing a struct/array/map-typed **field** of an
+  otherwise-freed struct. The only way to populate such a field is
+  assigning an existing local's value into it (`outer.field =
+  someLocal` — there's no struct-literal initializer syntax), and that
+  assignment stores `someLocal`'s own pointer into the field — an
+  alias, not a copy (confirmed directly in generated IR, not assumed).
+  `someLocal` is already correctly marked escaping by the existing
+  assignment-value rule, so it was never at risk of being double-freed
+  under its own name — but freeing `outer.field`'s value when `outer`
+  goes out of scope would free that *same* memory reachable through a
+  different, still-live name, and a later read through `someLocal`
+  (still entirely legal Festina code) would be a genuine
+  use-after-free. This needs real aliasing/ownership analysis to close
+  soundly, not a small extension of the existing syntactic rule — see
+  [todo.md](todo.md#memory-management) for the full trace and why it's
+  effectively the same open problem as reference counting, approached
+  from the other direction.
+
+  Everything not covered by any stage (that one nested-field case, and
+  whether a value stored into a field of a call argument is itself
+  retained) still leaks exactly as before — a resource leak in a
+  long-running process, not a safety issue on its own, no different in
+  kind from the gap this note already accepted. What changed across all
+  three stages is that each one's own fix, at every step of building it
+  out, was verified with the same rigor the rest of this document's
+  findings were: exhaustive unit tests of the analysis itself,
+  end-to-end compile-and-run tests including the exact "return a struct
+  by value" pattern the earlier naive stack-allocation attempt below
+  got wrong and the critical "a value merely used inside a loop, not
+  declared inside it, survives that loop's own break/continue" case,
+  and real AddressSanitizer/LeakSanitizer runs (zero ASAN errors every
+  time, across four different combined stress programs for stage 3
+  alone — a recursion-focused one and a map-key-focused one written
+  fresh, plus stage 1/2's own combined programs re-run unchanged to
+  confirm no regression; LeakSanitizer's reported leaks matched the
+  hand-derived expected count almost exactly every time it was checked,
+  including one run where the "extra" leak turned out to be a real,
+  separately-explained, structurally different gap -- a global
+  repeatedly reassigned orphaning its previous value -- confirmed by
+  removing that one line and re-running to zero leaks, not waved away;
+  stage 2 and stage 3's own combined verification programs specifically
+  ran with leak detection off for their correctness check, since
   AddressSanitizer's own leak-report exit path can skip flushing
-  already-buffered stdout -- unrelated to this feature -- and separately
-  with leak detection on to confirm only the values genuinely proven to
-  escape were the ones that leaked)
+  already-buffered stdout -- unrelated to this feature -- and
+  separately with leak detection on to confirm only the values
+  genuinely proven to escape were the ones that leaked)
   — see [todo.md](todo.md#memory-management) for the full writeup,
   including the naive stack-allocation attempt that was tried before
   stage 1 existed and reverted after being verified to corrupt memory,
-  and exactly what swapping calloc+free for real stack allocation now
-  that stage 2's proof is wide enough to justify it, and adding
-  reference counting for the values escape analysis can't reach at
-  all, would each still require.
+  and exactly what the nested-field case and reference counting for the
+  values escape analysis can't reach at all would each still require.

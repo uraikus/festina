@@ -442,4 +442,15 @@ void festina_map_set(int64_t *count, void **entries, const char *key, int64_t va
 int64_t festina_map_get(int64_t count, void *entries, const char *key, int64_t default_value);
 void festina_map_for_each(int64_t count, void *entries, void (*callback)(int64_t, const char *));
 
+/* claude.md #74/#75: called by generated code when a map[T] local,
+ * proven never to escape its declaring function, goes out of scope.
+ * Frees each entry's own strdup'd key (see festina_map_set's own
+ * comment -- always a private copy, never aliased with anything
+ * Festina-visible, so this is always safe regardless of anything
+ * escape analysis does or doesn't know) and then the entries buffer
+ * itself. A no-op for a map that was declared but never grown
+ * (entries is NULL, count is 0 -- the loop below simply doesn't run,
+ * and free(NULL) is a defined no-op). */
+void festina_map_free_entries(int64_t count, void *entries);
+
 #endif

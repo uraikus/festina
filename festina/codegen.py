@@ -17,10 +17,13 @@ see _emit_environment_get), #72 (map[T] -- literals, indexed get/set,
 .forEach() -- see _emit_map_lit/_emit_map_get/_emit_map_set/
 _emit_map_foreach_trampoline), #73 (break/continue -- see
 self._loop_targets and _emit_stmt's BreakStmt/ContinueStmt handling),
-#74 (automatic reclamation of provably non-escaping struct/arr[T]/
-map[T] locals, stage 1, now covering nested if/while/for bodies and
-per-iteration loop-local freeing too -- see escape_analysis.py,
-_emit_analyzed_func_body, _emit_block, and _emit_free_active_locals).
+#74/#75 (automatic reclamation of provably non-escaping struct/arr[T]/
+map[T] locals -- stage 1 covering nested if/while/for bodies and
+per-iteration loop-local freeing, stage 2 covering interprocedural
+call-argument analysis, and a struct proven non-escaping this way now
+gets a real stack alloca instead of a calloc+free pair -- see
+escape_analysis.py, _emit_analyzed_func_body, _emit_block,
+_emit_free_active_locals, and _emit_stmt's own VarDecl handling).
 #37, #39, #40 also cover `on key`/`on resize`/`on close` and the
 clientWidth/clientHeight globals (see the "Graphics" note below).
 
@@ -163,44 +166,62 @@ elsewhere.
 Uses LLVM's opaque-pointer IR (`ptr` everywhere) to match clang 15+'s
 default, so no manual bitcasting between pointer "flavors" is needed.
 
-Struct storage is always heap-allocated (calloc), never a stack alloca,
-even for a struct declared local to a function. claude.md #43 prefers
-stack allocation "when the value's lifetime permits it," which would be
-true for a struct that provably never leaves its declaring function --
-but a struct's address genuinely can outlive its function (returned,
-stored in an array or another struct's field, ...), and stack-
-allocating unconditionally, without proving which case applies first,
-silently corrupted every one of those cases (verified: returning a
-local struct by value produced garbage at the call site). calloc'ing
-every struct is the simple, uniformly-correct choice per #54's
-ambiguity rule ("prefer the simplest implementation" / "prefer
-performance" only when it doesn't also mean "prefer incorrect").
-calloc (not malloc) so uninitialized fields read as zero, matching a
-global struct's `zeroinitializer` -- local and global structs now start
-identically rather than one being zeroed and the other garbage.
+Struct storage is heap-allocated (calloc) by default, even for a struct
+declared local to a function -- a struct's address genuinely can
+outlive its function (returned, stored in an array or another struct's
+field, ...), and stack-allocating unconditionally, without proving
+which case applies first, silently corrupted every one of those cases
+(verified: returning a local struct by value produced garbage at the
+call site). calloc'ing every struct was the simple, uniformly-correct
+starting choice per #54's ambiguity rule ("prefer the simplest
+implementation" / "prefer performance" only when it doesn't also mean
+"prefer incorrect"). calloc (not malloc) so uninitialized fields read
+as zero, matching a global struct's `zeroinitializer` -- local and
+global structs start identically rather than one being zeroed and the
+other garbage.
 
-This still always heap-allocates rather than ever choosing a stack
-alloca -- claude.md #74 (stage 1 of #43's automatic memory management
-promise) takes a different, narrower path to the same underlying goal:
-rather than proving a value never escapes and skipping the heap
-allocation entirely (which is what "prefer stack allocation" actually
-asks for, and remains unimplemented -- the exact same escape-proving
-problem, just attempted at allocation time instead of at scope-exit
-time, with the exact same risk if done unsoundly), #74 always still
-calloc's, then *frees* that same allocation automatically at scope exit
-when escape_analysis.py proves the value's address never left its
-declaring function/handler. Slower than true stack allocation would be
-(a real calloc + a real free, not a zero-cost stack pointer bump) but
-implementable as a genuinely separable, individually-verifiable first
-step -- see escape_analysis.py's own module docstring and
+claude.md #43 prefers stack allocation "when the value's lifetime
+permits it" -- claude.md #74/#75 (automatic memory management's
+staged rollout) is the proof mechanism that makes it possible to know
+which structs that actually is: #74 first proves a struct's address
+never left its declaring function/handler at all (stage 1), then #75
+extends that same proof through calls to other functions in the same
+program too (stage 2, interprocedural). A struct provably safe under
+either stage now gets a genuine stack alloca (_emit_stmt's own VarDecl
+handling), explicitly zeroed with `store %struct.T zeroinitializer`
+immediately after (matching calloc's own zero-init behavior -- the two
+allocation strategies must stay indistinguishable to any Festina
+program, not just individually correct), instead of calloc+free --
+zero allocator traffic, not just leak-free. This is sound for exactly
+the same reason the earlier calloc+free-at-scope-exit approach was: an
+address that never escapes needs nothing beyond its own function's
+stack frame to remain valid, and a stack alloca's own lifetime already
+matches exactly the points _emit_free_active_locals would otherwise
+have freed it at (block exit, every loop iteration, break/continue) --
+LLVM's alloca reserves one fixed address for the whole enclosing
+function regardless of which basic block textually contains it, so a
+loop-body-declared one is simply reused, address and all, on the next
+iteration, and each recursive call still gets its own genuinely
+distinct address (ordinary calling-convention behavior, unrelated to
+this choice) -- verified directly, not just reasoned about (see
+tests/test_codegen.py::TestAutomaticMemoryReclamation's
+test_recursive_function_with_a_non_escaping_struct_local_keeps_each_calls_own_value).
+A struct that isn't provably safe under either stage still calloc's
+and still leaks, exactly as before -- this changes *how* a proven-safe
+struct is allocated, not what counts as proven safe; see
+escape_analysis.py's own module docstring and
 CodeGen._emit_analyzed_func_body/_emit_block/_emit_free_active_locals
-for the actual mechanism, and claude.md #74 for exactly what is and
-isn't covered by this first stage. Freeing happens as soon as control
-actually leaves the declaring block -- a loop-body-declared value is
-freed every iteration, not deferred until the enclosing function
-eventually returns -- not just at the end of the function, so this
-already meaningfully bounds a long-running loop's memory even without
-ever choosing a stack alloca.
+for the analysis and freeing machinery, and claude.md #74/#75 for
+exactly what is and isn't covered.
+
+arr[T]/map[T] locals are unaffected by any of this: their data/entries
+buffer is a genuinely dynamically-growing allocation (`.push()`, a map
+literal growing past its initial size, ...) with no compile-time-known
+fixed size, so it isn't safe to give a fixed-size alloca regardless of
+escaping-ness -- they still always calloc their data/entries buffer and
+still free it (map[T] additionally freeing each entry's own strdup'd
+key -- see festina_map_free_entries in runtime/festina_runtime.c) when
+proven non-escaping, exactly as stage 1 originally shipped.
 
 Array representation: claude.md #26 specifies arr[T]'s type-resolution
 rules but not its runtime representation or push/pop-style operations
@@ -739,6 +760,12 @@ class CodeGen:
             "declare void @festina_map_set(ptr, ptr, ptr, i64)",
             "declare i64 @festina_map_get(i64, ptr, ptr, i64)",
             "declare void @festina_map_for_each(i64, ptr, ptr)",
+            # claude.md #74/#75: frees each entry's own strdup'd key
+            # (never a plain free()-the-buffer-alone away from leaking
+            # them -- see festina_map_free_entries's own doc comment)
+            # before freeing the entries buffer itself -- see
+            # _emit_free_active_locals's MapType branch.
+            "declare void @festina_map_free_entries(i64, ptr)",
             # claude.md #56: Math.floor/ceil/round/trunc, via LLVM's
             # built-in intrinsics rather than a runtime C function.
             "declare double @llvm.floor.f64(double)",
@@ -878,11 +905,16 @@ class CodeGen:
             return
         for frame in reversed(self._active_free_locals[down_to:]):
             for ref, type_ in frame:
-                if isinstance(type_, types_mod.StructType):
-                    loaded = self.tmp()
-                    lines.append(f"  {loaded} = load ptr, ptr {ref}")
-                    lines.append(f"  call void @free(ptr {loaded})")
-                elif isinstance(type_, types_mod.ArrayType):
+                # StructType never reaches here -- a non-escaping struct
+                # local is stack-allocated at declaration time instead
+                # (see _emit_stmt's VarDecl handling and _emit_block's
+                # own tracking comment), so there's nothing for this
+                # method to free for one; only arr[T]/map[T] locals
+                # (whose data/entries buffer is always still calloc'd
+                # regardless of escaping-ness -- a dynamically-growing
+                # buffer isn't safe to give a fixed-size alloca) ever
+                # get appended to a frame at all.
+                if isinstance(type_, types_mod.ArrayType):
                     # Direct GEP-to-field-1 + load, matching how every
                     # other array/map data-pointer read in this file
                     # gets there (see e.g. _emit_array_length/
@@ -896,11 +928,27 @@ class CodeGen:
                     lines.append(f"  {data_ptr} = load ptr, ptr {field_ptr}")
                     lines.append(f"  call void @free(ptr {data_ptr})")
                 elif isinstance(type_, types_mod.MapType):
+                    # claude.md #74/#75: unlike an array's plain data
+                    # buffer, a map's entries buffer has its own nested
+                    # allocation per entry (each key is its own
+                    # strdup'd copy -- see festina_map_set's own
+                    # comment) that a plain free() of the entries
+                    # pointer alone would leak. festina_map_free_entries
+                    # frees each entry's key first, then the entries
+                    # buffer itself -- see its own doc comment in
+                    # festina_runtime.h for why this is always safe with
+                    # no new aliasing reasoning needed, unlike a
+                    # struct/array/map *value* stored into another
+                    # value's field.
+                    count_ptr = self.tmp()
+                    lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {ref}, i32 0, i32 0")
+                    count_val = self.tmp()
+                    lines.append(f"  {count_val} = load i64, ptr {count_ptr}")
                     field_ptr = self.tmp()
                     lines.append(f"  {field_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {ref}, i32 0, i32 1")
                     entries_ptr = self.tmp()
                     lines.append(f"  {entries_ptr} = load ptr, ptr {field_ptr}")
-                    lines.append(f"  call void @free(ptr {entries_ptr})")
+                    lines.append(f"  call void @festina_map_free_entries(i64 {count_val}, ptr {entries_ptr})")
 
     def _emit_analyzed_func_body(self, decl, body_env, return_type, body_lines):
         """claude.md #74: runs escape_analysis.find_escaping_names once
@@ -1075,7 +1123,18 @@ class CodeGen:
                     found = env.lookup(stmt.name)
                     if found is not None:
                         ref, type_ = found
-                        if isinstance(type_, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+                        # StructType is deliberately absent here: a
+                        # non-escaping struct local is stack-allocated
+                        # (see _emit_stmt's VarDecl handling), not
+                        # calloc'd, so there is nothing left to free --
+                        # its storage is simply reused/reclaimed the
+                        # same way any other stack-local's is. arr[T]/
+                        # map[T] still always calloc their data/entries
+                        # pointer regardless of escaping-ness (a
+                        # genuinely dynamic-size buffer isn't safe to
+                        # give a fixed-size alloca -- see this method's
+                        # own docstring), so those are unaffected.
+                        if isinstance(type_, (types_mod.ArrayType, types_mod.MapType)):
                             self._active_free_locals[-1].append((ref, type_))
             if tracking and not ctx["terminated"]:
                 self._emit_free_active_locals(lines, down_to=len(self._active_free_locals) - 1)
@@ -1091,19 +1150,82 @@ class CodeGen:
             if isinstance(type_, types_mod.StructType):
                 # `slot` holds a *pointer* to the struct's own storage,
                 # kept uniform with every other type so Identifier lookup
-                # never needs a struct special-case. That storage is
-                # calloc'd, not a stack alloca -- see the module
-                # docstring's "Struct storage is always heap-allocated"
-                # note for why (a stack-allocated struct's address can
-                # outlive its function: returned, put in an array, stored
-                # in another struct's field -- verified to silently
-                # corrupt memory when it does).
+                # never needs a struct special-case, whichever way that
+                # storage itself was obtained below.
+                #
+                # claude.md #43: "prefer stack allocation when the
+                # value's lifetime permits it." A struct whose address
+                # can outlive its function (returned, put in an array,
+                # stored in another struct's field, ...) genuinely can't
+                # -- unconditional stack allocation was tried once,
+                # before claude.md #74 existed, and reverted after being
+                # verified to silently corrupt memory (see this module's
+                # own docstring's "Struct storage is always heap-
+                # allocated" note, and escape_analysis.py's docstring)
+                # -- but claude.md #74/#75's escape analysis now proves
+                # exactly the cases where it DOES permit it: whenever
+                # this exact name is also what _emit_block would
+                # otherwise have freed at scope exit (see that method's
+                # own tracking logic, which now skips StructType
+                # precisely because there's nothing left for it to
+                # free). Reusing that same proof for allocation instead
+                # of only for freeing is sound for the identical reason
+                # it was sound for freeing: an address that never
+                # escapes its declaring function needs nothing beyond
+                # that function's own stack frame to remain valid, and a
+                # stack alloca's own lifetime already matches exactly
+                # the same points (block exit, every loop iteration,
+                # break/continue) _emit_free_active_locals would
+                # otherwise have freed it at -- LLVM's alloca reserves a
+                # single fixed address for the whole enclosing function
+                # regardless of which basic block textually contains it,
+                # so a loop-body-declared one is simply reused, address
+                # and all, on the next iteration, with zero allocator
+                # traffic either way (faster than the calloc+free stage
+                # 1/2 alone would have produced, not just leak-free
+                # sooner). Recursion needs no special handling either:
+                # each call gets its own stack frame regardless of this
+                # choice (ordinary calling-convention behavior), so each
+                # recursive invocation's own alloca is a genuinely
+                # distinct address.
+                #
+                # Scoped to *this* local's own storage only, not
+                # anything reachable through it -- a struct-typed FIELD
+                # of this struct, if ever assigned an existing local's
+                # value (the only way one can be populated; there is no
+                # struct-literal initializer syntax), still always
+                # aliases that other value's own storage exactly as
+                # before, unconditionally heap-allocated, unconditionally
+                # never freed via this local's own cleanup -- proving
+                # that's *also* safe to change needs real aliasing
+                # analysis (does anything else still reference that
+                # field's value when this struct's own lifetime ends),
+                # a genuinely different and harder question than "does
+                # this local's own name ever appear outside a safe
+                # position," and not attempted here; see todo.md.
                 uid = self._unique()
                 struct_ty = self.struct_llvm_name(type_.name)
-                size_val = self._sizeof(struct_ty, lines)
                 backing = f"%{stmt.name}.storage.{uid}"
                 slot = f"%{stmt.name}.{uid}"
-                lines.append(f"  {backing} = call ptr @calloc(i64 1, i64 {size_val})")
+                non_escaping = (self._current_escaping_names is not None
+                                and stmt.name not in self._current_escaping_names)
+                if non_escaping:
+                    lines.append(f"  {backing} = alloca {struct_ty}")
+                    # calloc zero-initializes; alloca doesn't -- claude.md
+                    # #74's own module docstring note ("uninitialized
+                    # fields read as zero, matching a global struct's
+                    # zeroinitializer") still has to hold here, so this
+                    # explicitly zeros the same way a global's own
+                    # `zeroinitializer` storage already does (see
+                    # _struct_type_defs / _global_var_defs) -- the two
+                    # allocation strategies below must remain
+                    # indistinguishable to any Festina program, or this
+                    # wouldn't be "prefer stack allocation when it's
+                    # safe," it would be a visible behavior change.
+                    lines.append(f"  store {struct_ty} zeroinitializer, ptr {backing}")
+                else:
+                    size_val = self._sizeof(struct_ty, lines)
+                    lines.append(f"  {backing} = call ptr @calloc(i64 1, i64 {size_val})")
                 lines.append(f"  {slot} = alloca ptr")
                 lines.append(f"  store ptr {backing}, ptr {slot}")
                 env.define(stmt.name, slot, type_)

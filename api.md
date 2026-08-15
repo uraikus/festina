@@ -209,9 +209,15 @@ longer unconditionally prevents this: if that function's own body
 never itself lets the value outlive the call (only reads/writes
 through its own fields, or passes it on to some other function that
 in turn doesn't retain it either), the original value is still
-reclaimed exactly the same way. A value that does escape (returned,
-stored somewhere longer-lived, or genuinely retained by a function it
-was passed to) is reclaimed by a later stage not yet implemented — see
+reclaimed exactly the same way. A struct reclaimed this way is a real
+stack allocation, not a heap allocation freed afterward — faster, not
+just eventually cleaned up, and with each recursive call still getting
+its own independent copy the same way any other stack-local value
+would. A `map[T]` reclaimed this way frees each of its own entries
+completely, keys included, not just the entries themselves. A value
+that does escape (returned, stored somewhere longer-lived, or
+genuinely retained by a function it was passed to) is reclaimed by a
+later stage not yet implemented — see
 [todo.md](todo.md#memory-management).
 
 ## Arrays

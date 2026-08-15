@@ -1765,9 +1765,8 @@ The compiler proves this the same way regardless of which block the variable is 
 This stage does not yet analyze:
 
 - Fields within a freed struct that are themselves struct, arr[T], or map[T] values. Freeing the outer struct does not free those nested allocations; they continue to leak independently until a later stage addresses them.
-- A freed map[T]'s own individual entries. Freeing a map frees its entries buffer as a whole, but each entry's key is its own separate allocation (independent of the map's declared value type, and independent of whether that value type is itself covered by this stage or not); those per-entry key allocations are not freed and continue to leak until a later stage addresses them.
 
-None of these are safety gaps -- each one simply means less memory is reclaimed automatically than a more complete implementation would reclaim, not that anything is freed incorrectly. Extending coverage to these cases is expected in later stages, each documented as its own addition to this section or a new one, following the same rule: memory is only freed automatically where the compiler can prove it is safe.
+This is not a safety gap -- it simply means less memory is reclaimed automatically than a more complete implementation would reclaim, not that anything is freed incorrectly. A freed map[T]'s own per-entry keys were also once an unaddressed part of this same list; that gap is closed (see section 76). Extending coverage to the remaining case is expected in a later stage, documented as its own addition to this section or a new one, following the same rule: memory is only freed automatically where the compiler can prove it is safe.
 
 75. AUTOMATIC MEMORY RECLAMATION (STAGE 2: INTERPROCEDURAL CALL-ARGUMENT ANALYSIS)
 
@@ -1781,4 +1780,14 @@ A call to a function not declared in the program -- a builtin, or a call through
 
 A function that calls itself, directly or indirectly, is handled conservatively: since a function's own declaration must precede its use (see section 48's "unknown function" error), the only way a function can call itself is directly, by its own name, before its own analysis has completed. Any argument passed to such a call is treated as escaping, unconditionally, the same as a call to an unanalyzed function -- this may mark a value escaping that a more thorough analysis could have proven safe, but it never marks anything safe that is not.
 
-This stage does not yet analyze whether a value stored into a field of another value that is itself passed as a call argument continues to be retained beyond that call, or extend any further than section 74's own stated remaining limitations (nested fields within a freed struct, and a freed map's own per-entry keys). Extending coverage further is expected in later stages, following the same rule both stages before it already follow: memory is only freed automatically where the compiler can prove it is safe.
+This stage does not yet analyze whether a value stored into a field of another value that is itself passed as a call argument continues to be retained beyond that call, or extend any further than section 74's own stated remaining limitation on nested fields within a freed struct. Extending coverage further is expected in later stages, following the same rule both stages before it already follow: memory is only freed automatically where the compiler can prove it is safe.
+
+76. AUTOMATIC MEMORY RECLAMATION (STAGE 3: STACK ALLOCATION AND MAP ENTRY KEYS)
+
+This section does not widen what sections 74 and 75 together prove safe -- it changes what happens once something already is.
+
+A struct local proven safe by section 74 or 75 is now allocated on the stack instead of on the heap, and is not freed at all -- its storage is simply reused (for a value declared inside a loop body, on the next iteration; for a value declared in a recursive function, each call still gets its own, since a stack frame is per call regardless) or reclaimed automatically when its declaring function's own stack frame is. This satisfies section 43's preference for stack allocation "when the value's lifetime permits it": sections 74 and 75 are exactly the proof that a given struct's lifetime does permit it. A struct not proven safe by either stage is still heap-allocated and still leaks, exactly as before -- this section only changes how a proven-safe struct's storage is obtained, not which structs count as proven safe.
+
+arr[T] and map[T] locals are not affected by this: their data (or entries) buffer can grow after declaration (an element pushed, a key added to a map), so its size is not known at declaration time, and a stack allocation requires a size known in advance. These continue to be heap-allocated and freed exactly as sections 74 and 75 already describe.
+
+Separately: a freed map[T]'s own entries are now fully reclaimed, including each entry's own key, not just the entries buffer as a whole. This was section 74's own stated remaining limitation on maps specifically, not a new capability -- freeing entries without freeing what each entry's key itself points to was always an incomplete implementation of freeing a map, not a deliberately narrower one.
