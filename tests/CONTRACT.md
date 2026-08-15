@@ -359,16 +359,18 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 812 tests in this directory pass against it: 542 need no external
+All 829 tests in this directory pass against it: 552 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-259 more need a working C compiler, plus 2 more
+266 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 9 more given
-`Xvfb`+`xdotool` too (542 + 259 + 2 + 9 = 812 -- re-verified directly
-by hiding each tool from PATH in turn, not just derived by counting
-`compile_and_run` call sites, since the true number had drifted well
-past a much older, since-inaccurate count of "694 given a working C
-compiler" left over from before this suite's `compile_and_run`-based
-end-to-end tests grew to their current share of it)
+`Xvfb`+`xdotool` too (552 + 266 + 2 + 9 = 829 -- re-verified directly
+by running the whole suite with a PATH containing nothing but Python,
+not just derived by counting `compile_and_run` call sites, since the
+true number had drifted well past a much older, since-inaccurate count
+of "694 given a working C compiler" left over from before this suite's
+`compile_and_run`-based end-to-end tests grew to their current share of
+it; that re-measurement also corrected the previous split by one, which
+had put 542/259 where a direct count gives 541/260)
 (`tests/test_codegen.py::TestGraphics`'s interactive click/mouse/key/
 resize tests, the one confirming the initial `clientWidth`/
 `clientHeight` values, `TestTimers`'s combined graphics-and-timers test,
@@ -2053,6 +2055,37 @@ underlying O(n²) naive-concatenation algorithm at all.
 `tests/test_codegen.py::TestStrings` grew from 2 to 11 tests covering
 both the correctness (unaffected) and the actual call-count reduction.
 
+**claude.md #83**: `text` values are now genuinely owned and genuinely
+freed. Before this, a text value was never freed anywhere in generated
+code, at any binding site, under any circumstance -- stages 1-8 of the
+memory-management effort covered `struct`/`arr[T]`/`map[T]` and left
+text out of all of it. Found by profiling rather than auditing:
+`string_concat` was leaking every intermediate buffer it built, so its
+heap grew quadratically and the program spent essentially all its
+runtime in `brk()` (816 calls, against 3 for equivalent leak-free C),
+which took the benchmark from ~77ms to **3.6ms** once fixed -- with the
+O(n²) naive-copy algorithm itself unchanged. Text deliberately keeps
+its plain `char*` representation rather than taking the refcount header
+stages 4-7 use (sqlite, the regex engine, and `festina_log_text` all
+consume `char*` directly), getting exclusivity by *copying* instead:
+every text binding always holds either NULL or a buffer it owns
+exclusively, via one new runtime helper (`festina_text_own`, a
+NULL-safe `strdup`). That invariant is what lets text be freed with no
+escape analysis at all. **claude.md #84**: a real, pre-existing
+use-after-free -- a callee that reassigns its own `struct`/`arr[T]`/
+`map[T]` parameter was releasing a refcount it never incremented,
+freeing the caller's live value out from under it -- closed by giving
+a reassigned parameter its own reference at binding time.
+`tests/test_codegen.py::TestTextReferenceManagement` (13 new tests) and
+`::TestParameterReassignmentOwnership` (4 new tests) cover both, at the
+IR level and end-to-end, alongside AddressSanitizer/LeakSanitizer runs
+over locals, globals, uninitialized locals, reassignment, nested call
+temporaries, struct fields, array elements, map values, regex/text
+methods on temporaries, loop accumulation and parameter reassignment.
+Two text leaks stay deliberately open and tracked in todo.md rather
+than claimed closed: text arguments to the graphics/sqlite/timer
+builtins, and text globals at process exit.
+
 See api.md for the current language/standard library reference and this
 file's own "Status" section above for the implemented-vs-not matrix; the
 short version: nothing is left
@@ -2808,9 +2841,9 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 542 passed, 270 skipped (needs a C compiler; 2 of
+pytest tests/                          # 552 passed, 277 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
                                         # 9 need Xvfb + xdotool installed too, 1 of those
                                         # also needs `openbox`) given a working C compiler,
-                                        # all 812 pass
+                                        # all 829 pass
 ```

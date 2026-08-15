@@ -52,46 +52,46 @@ _Last run: 2026-08-15 on this machine -- see benchmark.md's "Methodology" sectio
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 1.4 ms | 714.7 ms | 1.44 MB |
-| Rust | 1.7 ms | 90.4 ms | 3.77 MB |
-| Go | 1.4 ms | 204.9 ms | 2.11 MB |
-| Bun | 12.0 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 1.4 ms | 475.1 ms | 1.44 MB |
+| Rust | 1.5 ms | 72.2 ms | 3.77 MB |
+| Go | 1.2 ms | 151.1 ms | 2.11 MB |
+| Bun | 9.7 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `fib`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 9.4 ms | 102.7 ms | 1.44 MB |
-| Rust | 9.6 ms | 97.4 ms | 3.77 MB |
-| Go | 13.6 ms | 192.9 ms | 2.11 MB |
-| Bun | 35.8 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 7.7 ms | 63.6 ms | 1.44 MB |
+| Rust | 7.7 ms | 73.4 ms | 3.77 MB |
+| Go | 13.5 ms | 147.9 ms | 2.11 MB |
+| Bun | 28.4 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `loop_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 526.8 ms | 90.4 ms | 1.44 MB |
-| Rust | 498.1 ms | 98.3 ms | 3.77 MB |
-| Go | 458.7 ms | 169.1 ms | 2.11 MB |
-| Bun | 9245.6 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 519.0 ms | 69.1 ms | 1.44 MB |
+| Rust | 523.5 ms | 74.8 ms | 3.77 MB |
+| Go | 458.5 ms | 156.5 ms | 2.11 MB |
+| Bun | 8963.5 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `array_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 86.0 ms | 102.3 ms | 1.44 MB |
-| Rust | 86.1 ms | 112.1 ms | 3.77 MB |
-| Go | 88.6 ms | 181.7 ms | 2.11 MB |
-| Bun | 2645.5 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 91.9 ms | 83.1 ms | 1.44 MB |
+| Rust | 89.6 ms | 93.9 ms | 3.77 MB |
+| Go | 87.0 ms | 142.5 ms | 2.11 MB |
+| Bun | 2272.7 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `string_concat`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 71.6 ms | 117.5 ms | 1.44 MB |
-| Rust | 1.6 ms | 114.5 ms | 3.77 MB |
-| Go | 49.5 ms | 197.9 ms | 2.11 MB |
-| Bun | 12.4 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 3.6 ms | 69.3 ms | 1.44 MB |
+| Rust | 1.5 ms | 95.1 ms | 3.77 MB |
+| Go | 33.0 ms | 146.7 ms | 2.11 MB |
+| Bun | 10.9 ms | n/a (JIT, no separate build step) | n/a |
 
 <!-- BENCHMARK_RESULTS_END -->
 
@@ -129,25 +129,34 @@ _Last run: 2026-08-15 on this machine -- see benchmark.md's "Methodology" sectio
   here, not behind them — the remaining, much smaller gap is ordinary
   codegen-maturity noise, not an allocation-strategy gap anymore.
 - **`string_concat`** used to be the sharpest divergence in the whole
-  suite (140ms vs. Rust's 1.7ms) for two compounding reasons: Rust's
-  `String` `+` operator reuses the left operand's own spare capacity in
-  place when it has room (amortized growth, the same idea a `Vec`
-  already uses) -- a genuine algorithmic advantage Festina doesn't
-  have and isn't attempting to close here -- but Festina's own template-
-  literal codegen was *also* doing double the necessary work: `` `${s}x` ``
-  was compiled as `("" + s) + "x"`, concatenating with an empty string
-  literal before appending the real one. claude.md #81 fixes that too
-  (skipping a `festina_str_concat` call entirely for every empty
-  literal piece a template has), roughly halving Festina's own time
-  here (140ms → ~77ms) without touching the underlying O(n²)
-  naive-concatenation algorithm at all -- Go's own `+` on immutable
-  strings is close to Festina's *new* naive-copy time for the same
-  structural reason (no spare capacity to grow into either); Bun's V8
+  suite (140ms vs. Rust's 1.7ms), and closing it took three separate
+  fixes across two rounds. The first was pure wasted work in template
+  codegen: `` `${s}x` `` compiled as `("" + s) + "x"`, concatenating
+  with an empty string literal before appending the real one, which
+  claude.md #82 removed for roughly half the time (140ms → ~77ms).
+  What remained was far larger and wasn't an algorithmic gap at all —
+  Festina never freed a `text` value *anywhere* in generated code, at
+  any binding site, under any circumstance. This benchmark abandons
+  every intermediate buffer it builds, so its heap grew quadratically
+  and the program spent essentially all its time asking the kernel for
+  more: **816 `brk()` calls, against 3 for equivalent leak-free C.**
+  claude.md #83 makes text genuinely owned and genuinely freed, taking
+  this benchmark from ~77ms to **3.6ms** — and the underlying O(n²)
+  naive-copy algorithm is *unchanged*; that entire gap was allocator
+  pressure from the leak, not copying.
+- Festina now sits second in `string_concat`, ahead of both Go (~9x)
+  and Bun (~3x) and within about 2.4x of Rust. The remaining Rust gap
+  is genuinely algorithmic and not something Festina is attempting to
+  close here: Rust's `String` `+` reuses the left operand's own spare
+  capacity in place when it has room (amortized growth, the same idea
+  `Vec` uses), so it isn't doing the full O(n²) copy at all. Go's `+`
+  on immutable strings has no spare capacity to grow into either, which
+  is why it lands on the same side of the divide as Festina; Bun's V8
   backend uses rope/cons-string representations internally, deferring
-  the copy until the string is actually read, which is why it doesn't
-  show the same quadratic blowup here despite being naive-looking
-  source. None of this is a bug in any of the four — it's exactly the
-  kind of language/runtime difference this benchmark exists to surface.
+  the copy until the string is actually read, which is why it avoids
+  the quadratic blowup despite naive-looking source. None of this is a
+  bug in any of the four — it's exactly the kind of language/runtime
+  difference this benchmark exists to surface.
 - These are intentionally small, fast benchmarks so they can be re-run
   on every change worth checking, not a comprehensive suite (no I/O, no
   concurrency, no realistic mixed workload) — see [todo.md](todo.md)

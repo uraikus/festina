@@ -258,6 +258,22 @@ the same rule a struct's own field write already follows, and freeing
 an array or map recursively releases each of its own elements/values
 too, however many levels deep a program nests `arr[T]`/`map[T]`.
 
+`text` is reclaimed too, by a different mechanism, and the difference
+is visible in one place worth knowing about. Rather than being
+reference counted, every text-typed binding — local, global, struct
+field, array element, map value, parameter — always holds its *own*
+private copy of the string, made automatically wherever one is needed.
+So unlike `arr[T]`/`map[T]`, two text variables never come to share one
+underlying buffer: `text b = a` gives `b` its own copy, and text
+values are immutable in Festina anyway, so nothing can observe the
+difference except that each binding can be freed independently. That's
+what lets a text value be freed on every reassignment and at every
+scope exit unconditionally, with no escape analysis involved — a loop
+that rebuilds a string each iteration (`` s = `${s}x` ``) frees the
+previous buffer every time instead of accumulating them. Two cases are
+not yet reclaimed: text passed to the graphics, sqlite, and timer
+builtins, and text globals at process exit.
+
 ## Arrays
 
 ```festina

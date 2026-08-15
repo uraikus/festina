@@ -5477,3 +5477,373 @@ class TestMissingDependencyErrors:
         src.write_text("log('hi')")
         with pytest.raises(errors.CompileError, match="clang.*install"):
             cli_mod.compile_file(str(src), str(tmp_path / "out"), cc="clang")
+
+
+class TestTextReferenceManagement:
+    """claude.md #83: every text-typed binding (local, global, struct
+    field, array element, map value, parameter) always holds either NULL
+    or a heap buffer it owns EXCLUSIVELY -- never a bare alias of a
+    `.str.N` literal constant or of another binding's buffer. Unlike
+    struct/arr[T]/map[T] (claude.md #77/#79, a refcount header in front
+    of the payload), text keeps its plain `char*` representation
+    everywhere -- sqlite, regex, log, and every other existing `char*`
+    consumer are untouched -- and gets its exclusivity by COPYING at
+    each binding site (festina_text_own, a NULL-safe strdup) whenever
+    the value's source isn't already a fresh buffer. That invariant is
+    what makes freeing unconditional: a text local is always safe to
+    free on reassignment and at scope exit, with no escape analysis
+    needed, because no other binding can ever be sharing its buffer.
+
+    Before this section text was never freed anywhere at all, which is
+    why benchmarks/string_concat.f spent its whole runtime growing the
+    heap (816 brk() calls, now 3)."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    # ---- IR-level: no C compiler needed ----
+
+    def test_text_local_from_a_literal_is_copied_not_aliased(self, parser, semantic, codegen):
+        # A StringLit is a pointer to a `.str.N` global CONSTANT -- if a
+        # local aliased it directly, the scope-exit free below would be
+        # handing free() a pointer into the binary's own static data.
+        source = """
+        void func f() {
+            text a = 'lit'
+            log(a)
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call ptr @festina_text_own(ptr @.str." in ir
+
+    def test_text_local_from_a_call_takes_ownership_with_no_copy(self, parser, semantic, codegen):
+        # A Call already returns a fresh, exclusively-held buffer
+        # (_is_owning_text_source), so copying it would be pure waste --
+        # the returned pointer is stored directly.
+        source = """
+        text func make() { return `x` }
+        void func f() {
+            text b = make()
+            log(b)
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        assert "call ptr @make()" in body
+        # the call's result is stored straight into b's slot, uncopied
+        assert "@festina_text_own" not in body
+
+    def test_uninitialized_text_local_is_null_initialized(self, parser, semantic, codegen):
+        # Prerequisite for freeing text at all: before this section a
+        # `text s` with no initializer got an alloca and no store
+        # whatsoever, so its slot held genuine uninitialized garbage --
+        # freeing that at scope exit would be freeing a wild pointer.
+        source = """
+        void func f() {
+            text u
+            log(u)
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        assert "store ptr null" in body
+
+    def test_text_local_reassignment_frees_the_old_buffer(self, parser, semantic, codegen):
+        source = """
+        text func make() { return `x` }
+        void func f() {
+            text a = 'lit'
+            a = make()
+            log(a)
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        assert "call void @free(" in body
+
+    def test_bare_interpolation_template_copies_its_only_piece(self, parser, semantic, codegen):
+        # `` `${s}` `` performs no concatenation at all (claude.md #82
+        # skips the two empty literal pieces), so without an explicit
+        # copy it would hand back s's OWN buffer -- and since every
+        # TemplateLit counts as owning, the caller would then free a
+        # buffer s still points at.
+        source = """
+        void func f(s:text) { log(`${s}`) }
+        f('x')
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f(ptr %arg.s)")[1].split("\n}")[0]
+        assert "@festina_text_own" in body
+        assert "@festina_str_concat" not in body
+
+    def test_interpolation_followed_by_a_literal_piece_skips_the_copy(self, parser, semantic, codegen):
+        # `` `${s}!` `` DOES concatenate, and festina_str_concat already
+        # mallocs a fresh buffer from its two operands -- copying s
+        # first would allocate a second buffer that nothing ever frees
+        # (festina_str_concat never frees what it is handed). This was a
+        # real leak, caught by LeakSanitizer while building this section.
+        source = """
+        void func f(s:text) { log(`${s}!`) }
+        f('x')
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f(ptr %arg.s)")[1].split("\n}")[0]
+        assert "@festina_str_concat" in body
+        # the only festina_text_own left is the parameter's own binding
+        # copy (claude.md #84), never one feeding the concat
+        assert body.count("@festina_text_own") == 1
+
+    def test_chained_template_frees_every_intermediate_concat(self, parser, semantic, codegen):
+        # Each festina_str_concat copies both operands into a brand new
+        # buffer and leaves them untouched, so a template chaining four
+        # of them leaks three intermediates unless each is freed the
+        # moment the next concat has finished copying out of it.
+        source = """
+        void func f(s:text) { log(`a${s}b${s}c`) }
+        f('x')
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f(ptr %arg.s)")[1].split("\n}")[0]
+        concats = body.count("@festina_str_concat")
+        assert concats == 4
+        # 3 intermediates + the final result (freed after log) + the
+        # parameter's own scope-exit free
+        assert body.count("call void @free(") == concats + 1
+
+    def test_text_temporary_passed_as_an_argument_is_freed_after_the_call(
+            self, parser, semantic, codegen):
+        # Callees never take ownership of a text argument -- one they
+        # reassign is copied at binding (claude.md #84), one they only
+        # read is borrowed for the call's duration -- so the caller
+        # still owns what it passed and must free it, or it leaks with
+        # no binding anywhere left to free it later.
+        source = """
+        text func make() { return `x` }
+        void func f() {
+            log(make())
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        assert "@festina_log_text" in body
+        assert "call void @free(" in body
+
+    def test_borrowed_text_argument_is_not_freed_by_the_caller(self, parser, semantic, codegen):
+        # A bare Identifier argument is the variable's own buffer, not a
+        # temporary -- freeing it here would leave the variable dangling.
+        source = """
+        void func f() {
+            text a = 'lit'
+            log(a)
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        # exactly one free: a's own scope-exit free, none after the log
+        assert body.count("call void @free(") == 1
+
+    # ---- behavioural: real compiled programs ----
+
+    def test_text_locals_globals_and_reassignment_stay_correct(self, compile_and_run):
+        source = """
+        text g = 'initial'
+        text func wrap(s:text) { return `<${s}>` }
+        void func run() {
+            text a = 'hello'
+            text b = wrap(a)
+            text c = `${a} ${b}`
+            a = wrap(b)
+            log(a)
+            log(b)
+            log(c)
+            g = wrap('global')
+            log(g)
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == (
+            "<<hello>>\n"
+            "<hello>\n"
+            "hello <hello>\n"
+            "<global>\n"
+        )
+
+    def test_text_in_struct_fields_arrays_and_maps_stays_correct(self, compile_and_run):
+        source = """
+        struct Person { name:text }
+        text func wrap(s:text) { return `<${s}>` }
+        void func run() {
+            Person p
+            p.name = 'field'
+            log(p.name)
+            p.name = wrap('field2')
+            log(p.name)
+            p.name = `tmpl ${p.name}`
+            log(p.name)
+
+            arr[text] names = ['one', wrap('two')]
+            names[0] = wrap('changed')
+            log(names[0])
+            log(names[1])
+
+            map[text] m = {'k1': 'v1'}
+            m['k1'] = wrap('v1b')
+            m['k2'] = `tmpl-${m['k1']}`
+            log(m['k1'])
+            log(m['k2'])
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == (
+            "field\n"
+            "<field2>\n"
+            "tmpl <field2>\n"
+            "<changed>\n"
+            "<two>\n"
+            "<v1b>\n"
+            "tmpl-<v1b>\n"
+        )
+
+    def test_repeated_concatenation_in_a_loop_builds_the_right_string(self, compile_and_run):
+        # benchmarks/string_concat.f's own shape: `s` is freed and
+        # replaced every iteration, so the heap stays flat instead of
+        # growing by one leaked buffer per iteration.
+        source = """
+        void func run() {
+            text s = ''
+            for int i = 0, i < 200, i++ {
+                s = `${s}x`
+            }
+            log(s)
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "x" * 200 + "\n"
+
+    def test_text_methods_on_temporaries_stay_correct(self, compile_and_run):
+        source = """
+        text func wrap(s:text) { return `<${s}>` }
+        void func run() {
+            log('room 42'.replace(/[0-9]+/, 'N'))
+            log(wrap('abc').replace('b', 'Z'))
+            log(`${'hello'}`.replaceAll('l', 'L'))
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "room N\n<aZc>\nheLLo\n"
+
+
+class TestParameterReassignmentOwnership:
+    """claude.md #84: a struct/arr[T]/map[T] parameter is passed as the
+    caller's own raw pointer, unretained -- a deliberately "borrowed"
+    convention, since a callee that only reads its parameter has no
+    reason to touch the refcount. But a callee that REASSIGNS its own
+    parameter (`p = somethingElse`) runs the ordinary local-reassignment
+    path, which releases whatever the binding currently holds -- and for
+    a borrowed parameter that is the CALLER's live value, dropping its
+    refcount to zero and freeing it out from under the caller.
+
+    That was a real, pre-existing use-after-free (confirmed under
+    AddressSanitizer with a heap-allocated local passed to a
+    parameter-reassigning callee), not something introduced by the text
+    work -- it was found while designing text's own parameter handling,
+    which has exactly the same shape. The fix: any parameter escape
+    analysis shows the callee assigns to is given its own reference at
+    binding time (festina_retain for struct/arr[T]/map[T], a
+    festina_text_own copy for text) and released at the callee's own
+    scope exit, so the callee is never mutating a binding it doesn't own.
+
+    Note the retain/copy is keyed on the whole `escaping` set rather
+    than on reassignment alone. Every reassigned name is necessarily in
+    that set (escape_analysis._walk_assign_target adds every bare
+    Identifier assignment target), so this is safe but conservative --
+    it also copies a text parameter that merely gets interpolated or
+    passed along. See todo.md."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_reassigned_struct_parameter_is_retained_at_binding(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int }
+        void func mutate(p:Point) {
+            Point fresh
+            fresh.x = 999
+            p = fresh
+        }
+        Point func make() { Point o o.x = 1 return o }
+        void func run() {
+            Point original = make()
+            mutate(original)
+            log(original.x)
+        }
+        run()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @mutate(ptr %arg.p)")[1].split("\n}")[0]
+        assert "call void @festina_retain(ptr %arg.p)" in body
+
+    def test_reassigned_text_parameter_is_copied_at_binding(self, parser, semantic, codegen):
+        source = """
+        void func mutate(s:text) { s = `${s}!` }
+        mutate('x')
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @mutate(ptr %arg.s)")[1].split("\n}")[0]
+        assert "call ptr @festina_text_own(ptr %arg.s)" in body
+
+    def test_callers_struct_survives_a_callee_reassigning_its_parameter(self, compile_and_run):
+        # The regression this section exists for: before the fix,
+        # `original` was freed by mutate()'s own reassignment and
+        # original.x read freed memory.
+        source = """
+        struct Point { x:int }
+        void func mutate(p:Point) {
+            Point fresh
+            fresh.x = 999
+            p = fresh
+        }
+        Point func make() { Point o o.x = 1 return o }
+        void func run() {
+            Point original = make()
+            mutate(original)
+            log(original.x)
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "1\n"
+
+    def test_callers_text_survives_a_callee_reassigning_its_parameter(self, compile_and_run):
+        source = """
+        void func mutate(s:text) { s = `${s}!` }
+        text func make() { return `hello` }
+        void func run() {
+            text original = make()
+            mutate(original)
+            log(original)
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "hello\n"

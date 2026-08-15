@@ -104,6 +104,30 @@ char *festina_str_concat(const char *a, const char *b) {
     return out;
 }
 
+/* claude.md #83: text values are reference-managed by copying, not
+ * counting -- every text-typed binding (local, global, struct field,
+ * array element, map value) always holds either NULL or a fresh,
+ * EXCLUSIVELY-owned heap buffer, never a raw alias into a string
+ * literal constant or another binding's own buffer. codegen calls this
+ * whenever a text-typed binding's own new value comes from a source
+ * that might already be referenced elsewhere (an existing identifier,
+ * a field/element read, a ternary, ...) -- the same "aliasing, needs
+ * its own copy" classification claude.md #77 already established for
+ * struct/arr[T]/map[T], just implemented with `strdup` instead of a
+ * refcount increment, since text has no shared/refcounted
+ * representation to increment in the first place. A source that's
+ * already known-fresh (a call result, a template literal's own
+ * concatenation) skips this and is taken directly -- see
+ * _is_owning_text_source's own comment. NULL-safe, matching every
+ * other NULL-tolerant helper in this file (a text value's zero value
+ * is a plain NULL pointer, the same as struct/arr[T]/map[T]'s own). */
+char *festina_text_own(const char *s) {
+    if (!s) return NULL;
+    char *out = strdup(s);
+    if (!out) festina_fail("out of memory in festina_text_own");
+    return out;
+}
+
 int8_t festina_str_eq(const char *a, const char *b) {
     if (!a) a = "";
     if (!b) b = "";
