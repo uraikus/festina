@@ -593,12 +593,36 @@ for the full design writeup.
   parameter the callee assigns to its own reference at binding time,
   released at the callee's own scope exit.
 
-  Two text-related resource leaks remain deliberately open and are
-  tracked rather than claimed closed: text arguments to the graphics,
-  sqlite, and timer builtins are not yet freed (temporaries at
-  `log()`, user function calls, and the text/regex methods are), and
-  text globals are not freed at process exit — matching how every other
-  global already behaves. See [todo.md](todo.md#memory-management).
+  `claude.md #85` (stage 11) closes two further pre-existing leak
+  classes that the text work surfaced but did not cause, both unbounded
+  rather than one-off. A sqlite result row is built by
+  `festina_sqlite_collect_rows` as a plain `malloc` with its text
+  columns strdup'd in and **no refcount header**, and `TableType` is a
+  separate type class from `StructType`, so every
+  `isinstance(t, (StructType, ArrayType, MapType))` check in codegen
+  missed it and nothing ever freed a row or its text columns — meaning
+  `arr[People] rows = sqlite(...)`, this language's most central idiom,
+  leaked its entire row set on every query. The container itself was
+  always freed correctly; only the rows hanging off it were not.
+  Because a row has no header it cannot go through `festina_release`,
+  and because the array owns its rows outright a `People p = rows[0]`
+  local is only borrowing one — so the per-row free is reached solely
+  from the array's own element cascade and deliberately not exposed
+  through `_release_fn_for`, which would otherwise let an arbitrary
+  TableType binding free a row the array still owns. Separately, every
+  runtime `regex(...)` call compiled a `regex_t` nothing ever freed, so
+  a `regex(...)` inside a loop leaked a full automaton per iteration;
+  those are now released via `festina_regex_free`, while a `/pattern/`
+  literal — compiled once into a process-lifetime cache — is
+  deliberately left alone, since freeing one would leave every later
+  evaluation running against a dangling `regex_t`.
+
+  Two resource leaks remain deliberately open and are tracked rather
+  than claimed closed: a regex bound to a variable (bounded by the
+  number of such declarations, not by how often they run — regex has no
+  binding-level ownership story the way text now does), and text
+  globals at process exit, matching how every other global already
+  behaves. See [todo.md](todo.md#memory-management).
 
   What changed across all seven stages is that each one's own fix, at
   every step of building it out, was verified with the same rigor the

@@ -498,6 +498,19 @@ void *festina_regex_compile(const char *pattern, const char *flags) {
     return compiled;
 }
 
+/* claude.md #85: releases a regex_t compiled by festina_regex_compile.
+ * Only ever called for a regex produced by a runtime `regex(...)` call
+ * and consumed as a temporary in the same expression -- a /pattern/
+ * literal is compiled once and cached for the life of the process (see
+ * _emit_cached_regex_lit), so it is deliberately never freed. regfree()
+ * releases what regcomp() allocated INSIDE the regex_t; the regex_t
+ * itself was a separate malloc and needs its own free(). */
+void festina_regex_free(void *compiled) {
+    if (!compiled) return;
+    regfree((regex_t *)compiled);
+    free(compiled);
+}
+
 int8_t festina_regex_test(void *compiled, const char *text) {
     if (!compiled) return 0;
     if (!text) text = "";

@@ -5847,3 +5847,131 @@ class TestParameterReassignmentOwnership:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "hello\n"
+
+
+class TestQueryRowAndRegexReclamation:
+    """claude.md #85: two leak classes the text work (claude.md #83)
+    surfaced but did not itself cause, both pre-existing and both
+    unbounded rather than one-off.
+
+    A sqlite result row is deliberately not shaped like any other
+    Festina value: `festina_sqlite_collect_rows` builds each one as a
+    plain `malloc(col_count * sizeof(int64_t))` with each text/blob
+    column strdup'd into its slot, and no refcount header in front of
+    it. Every `isinstance(t, (StructType, ArrayType, MapType))` check in
+    codegen misses `TableType` entirely, so nothing ever freed a row or
+    its text columns -- and `arr[People] rows = sqlite(...)` is the
+    language's most central idiom, so every query leaked its whole row
+    set. The array header and its pointer buffer WERE already freed
+    (an arr[T] is an arr[T] whatever its element type); only the rows
+    hanging off it were not.
+
+    Because a row has no refcount header, this cannot reuse
+    `festina_release`, and -- more importantly -- the array owns its
+    rows outright: a `People p = rows[0]` local is only ever borrowing
+    one. So the per-row free is reached solely from
+    `_release_fn_for_array`'s own cascade, never from
+    `_release_fn_for`, which would otherwise let an arbitrary
+    TableType-typed binding double-free a row the array still owns.
+
+    Separately, a regex compiled by a runtime `regex(...)` call was
+    never freed either, so a `regex(...)` inside a loop leaked a full
+    compiled automaton (several KB) per iteration. A /pattern/ literal
+    is compiled once into a process-lifetime cache and must NOT be
+    freed, which is exactly what separates the two: only `regex(...)`
+    is an ast.Call."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_array_of_query_rows_gets_a_per_row_release_cascade(self, parser, semantic, codegen):
+        source = """
+        table People { id:int  name:text }
+        void func run() {
+            arr[People] rows = sqlite('SELECT * FROM People')
+            log(rows.length)
+        }
+        run()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "@__festina_release_row_People" in ir
+        # the generated row release frees the text column and the row
+        row_fn = ir.split("define void @__festina_release_row_People")[1].split("\n}")[0]
+        assert row_fn.count("call void @free(") == 2
+
+    def test_row_release_only_frees_text_and_blob_columns(self, parser, semantic, codegen):
+        # int/float/bool columns are plain i64 slots, never heap
+        # pointers -- freeing one would be freeing an integer.
+        source = """
+        table Mixed { id:int  score:float  ok:bool  name:text  data:blob }
+        void func run() {
+            arr[Mixed] rows = sqlite('SELECT * FROM Mixed')
+            log(rows.length)
+        }
+        run()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        row_fn = ir.split("define void @__festina_release_row_Mixed")[1].split("\n}")[0]
+        # 2 heap columns (name, data) + the row buffer itself
+        assert row_fn.count("call void @free(") == 3
+
+    def test_runtime_regex_temporary_is_freed(self, parser, semantic, codegen):
+        source = """
+        void func run() {
+            log(regex('[0-9]+').test('abc 42'))
+        }
+        run()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_regex_free(" in ir
+
+    def test_cached_regex_literal_is_never_freed(self, parser, semantic, codegen):
+        # A /pattern/ literal is compiled once and reused for the life
+        # of the process -- freeing it would leave the cache holding a
+        # dangling regex_t for every later evaluation.
+        source = """
+        void func run() {
+            log(/[0-9]+/.test('abc 42'))
+        }
+        run()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_regex_free(" not in ir
+
+    def test_query_rows_and_borrowed_row_stay_correct(self, compile_and_run, tmp_path):
+        source = """
+        table People { id:int  name:text }
+        void func run() {
+            sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'alice'])
+            sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [2, 'bob'])
+            arr[People] rows = sqlite('SELECT * FROM People ORDER BY id')
+            log(rows.length)
+            People first = rows[0]
+            log(first.name)
+            text copied = rows[1].name
+            log(copied)
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\nalice\nbob\n"
+
+    def test_runtime_and_literal_regexes_stay_correct_together(self, compile_and_run):
+        source = """
+        void func run() {
+            for int i = 0, i < 3, i++ {
+                log(regex('[0-9]+').test('abc 42'))
+                log('room 42'.replace(regex('[0-9]+'), 'N'))
+                log('room 42'.match(regex('[0-9]+')))
+                log(/[0-9]+/.test('abc 42'))
+                log('room 42'.replace(/[0-9]+/, 'N'))
+            }
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\nroom N\n42\ntrue\nroom N\n" * 3

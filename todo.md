@@ -1157,17 +1157,19 @@ accumulation and parameter reassignment — all clean, with byte-identical
 output. `string_concat` went from ~77ms to **3.6ms** with the O(n²)
 naive-copy algorithm completely unchanged.
 
-Two follow-ups are deliberately left open rather than quietly claimed:
+One follow-up is deliberately left open rather than quietly claimed:
 
-- **Text arguments to the graphics, sqlite, and timer builtins are not
-  yet freed.** Temporaries are freed at `log()`, user function calls,
-  and the text/regex methods; those three builtin families leak a
-  bounded amount per call. Same mechanism (`_free_text_temp`), just not
-  yet threaded through their own emitters.
 - **Nothing frees a text global at process exit.** Deliberate, matching
   how every other global already behaves — the process is ending — but
   it does mean LeakSanitizer sees them as still-reachable rather than
   freed.
+
+(An earlier version of this note also listed text arguments to the
+graphics, sqlite, and timer builtins as unfreed. Stage 11 closed the
+graphics and sqlite cases, along with `regex()` and `loadAudio()`; the
+timer entry was simply wrong — `setTimeout`/`setInterval` take a
+function name and an int delay, and `clearTimeout`/`clearInterval` take
+an int id, so no text ever reaches them.)
 
 ### Stage 10: a reassigned parameter owns its own reference (done — claude.md #84)
 
@@ -1211,6 +1213,76 @@ borrows the parameter or does its own retain/copy at the storing site)
 and wants a `find_reassigned_names` alongside `find_escaping_names`;
 left undone here only to avoid threading a second collector through
 eight functions of a heavily-tested module late in an unrelated change.
+
+### Stage 11: query rows and runtime-compiled regexes are reclaimed (done — claude.md #85)
+
+Two leak classes stage 9 *surfaced* but did not cause — both
+pre-existing, and both unbounded rather than one-off: they grew with the
+number of queries run or regexes compiled, not with program size. Found
+by running the stage 9 verification programs against a workload that
+actually used sqlite and `regex()` together, rather than by audit.
+
+**Query rows.** A sqlite result row is deliberately not shaped like any
+other value in this language: `festina_sqlite_collect_rows` builds each
+one as a plain `malloc(col_count * sizeof(int64_t))` with each text/blob
+column strdup'd into its slot, and — unlike every struct/`arr[T]`/
+`map[T]` value since stage 4 — **no refcount header**. `TableType` is
+also a separate type class from `StructType`, so every
+`isinstance(t, (StructType, ArrayType, MapType))` test in codegen missed
+it entirely and nothing ever freed a row or any of its text columns.
+Since `arr[People] rows = sqlite(...)` is this language's single most
+central idiom, every query leaked its whole row set. What was already
+correct is the container: an `arr[T]` is an `arr[T]` whatever its
+element type, so the array header and its pointer buffer were always
+freed — only the rows those pointers point *at* were not.
+
+The fix respects two constraints at once. A row has no header, so
+`festina_release` (which reads the eight bytes before the payload) could
+never be pointed at one. And the array owns its rows outright, so a
+`People p = rows[0]` local — or a row passed to a function — is only
+borrowing one. The per-row free is therefore a bespoke, per-table
+generated function reached **solely** from `_release_fn_for_array`'s own
+element cascade, and deliberately *not* exposed through
+`_release_fn_for`, which would otherwise let an arbitrary
+TableType-typed binding free a row out from under the array holding it.
+Which columns need freeing uses the identical rule the runtime used when
+building the row (`text`/`blob` → strdup, everything else → a plain
+i64), with `free(NULL)` covering a column that was SQL NULL.
+
+**Runtime regexes.** Every `regex(pattern)` call compiles a fresh
+`regex_t` — several KB once regcomp's automaton is built — that nothing
+ever freed, so a `regex(...)` inside a loop leaked one per iteration. A
+regex used as a temporary in the expression that compiled it
+(`regex(p).test(s)`, the ordinary shape) is now released through a new
+`festina_regex_free` (`regfree` for what regcomp allocated inside the
+struct, then `free` for the struct), reusing stage 9's own
+free-immediately-after-the-consuming-call approach. The owning test
+separates the two ways a regex is produced, and getting it wrong either
+way is a real bug rather than a missed optimization: only `regex(...)`
+is an `ast.Call`, while a `/pattern/` literal is an `ast.RegexLit`
+compiled once into a process-lifetime cache that must never be freed —
+freeing one would leave every later evaluation running against a
+dangling `regex_t`.
+
+Verified with 6 new tests
+(`tests/test_codegen.py::TestQueryRowAndRegexReclamation`) covering both
+the generated IR and end-to-end behaviour, plus ASan/LeakSanitizer runs
+over a sqlite workload (multiple queries, a borrowed row, a text column
+copied out) and a regex loop mixing runtime and literal patterns — all
+clean. Full suite 829 → 835.
+
+Two leaks stay deliberately open:
+
+- **A regex bound to a variable** (`regex r = regex('x')`) is never
+  freed. Bounded by the number of such declarations rather than by how
+  often they run, since regex has no binding-level ownership story the
+  way text now does. Closing it means giving `RegexType` the same
+  copy-or-own decision text got — except a cached literal and a
+  runtime-compiled regex would need to stay distinguishable at every
+  binding site, which is the part that needs designing rather than
+  just wiring.
+- **Text globals at process exit**, unchanged from stage 9 and for the
+  same reason.
 
 ### What's still ahead
 

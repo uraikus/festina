@@ -124,9 +124,15 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
  *
  * festina_regex_compile compiles `pattern` once per call (REG_EXTENDED,
  * plus REG_ICASE if `flags` contains 'i') and returns the resulting
- * regex_t*, heap-allocated and never freed -- same "no GC yet, things
- * leak" tradeoff every other heap allocation in this runtime already
- * makes (see festina/codegen.py's module docstring). An invalid
+ * regex_t*, heap-allocated. claude.md #85: a regex produced by a
+ * runtime `regex(...)` call and consumed as a temporary in the same
+ * expression (`regex(p).test(s)`) is freed via festina_regex_free once
+ * that expression is done with it -- previously such a regex leaked on
+ * every evaluation, which a `regex(...)` inside a loop turned into an
+ * unbounded leak. A /pattern/ literal is compiled once and cached for
+ * the life of the process (see _emit_cached_regex_lit) and so is
+ * deliberately never freed, as is a regex bound to a variable. An
+ * invalid
  * pattern calls festina_fail() with regerror()'s message -- claude.md
  * #67: pattern validity is a runtime concern, the Python compiler
  * doesn't parse regex syntax itself.
@@ -141,6 +147,7 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
  * unchanged (not NULL) when there's no match, per claude.md #68.
  */
 void *festina_regex_compile(const char *pattern, const char *flags);
+void festina_regex_free(void *compiled);  /* claude.md #85: regfree + free */
 int8_t festina_regex_test(void *compiled, const char *text);
 char *festina_regex_match(void *compiled, const char *text);
 char *festina_str_replace(const char *text, const char *search,

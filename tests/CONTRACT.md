@@ -359,11 +359,11 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 829 tests in this directory pass against it: 552 need no external
+All 835 tests in this directory pass against it: 556 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-266 more need a working C compiler, plus 2 more
+268 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 9 more given
-`Xvfb`+`xdotool` too (552 + 266 + 2 + 9 = 829 -- re-verified directly
+`Xvfb`+`xdotool` too (556 + 268 + 2 + 9 = 835 -- re-verified directly
 by running the whole suite with a PATH containing nothing but Python,
 not just derived by counting `compile_and_run` call sites, since the
 true number had drifted well past a much older, since-inaccurate count
@@ -2082,9 +2082,21 @@ IR level and end-to-end, alongside AddressSanitizer/LeakSanitizer runs
 over locals, globals, uninitialized locals, reassignment, nested call
 temporaries, struct fields, array elements, map values, regex/text
 methods on temporaries, loop accumulation and parameter reassignment.
-Two text leaks stay deliberately open and tracked in todo.md rather
-than claimed closed: text arguments to the graphics/sqlite/timer
-builtins, and text globals at process exit.
+**claude.md #85**: two further pre-existing, unbounded leak classes
+the text work surfaced but did not cause. Nothing ever freed a sqlite
+result row or its text columns (a row is a plain `malloc` with no
+refcount header, and `TableType` is a separate type class that every
+`isinstance(t, (StructType, ArrayType, MapType))` check in codegen
+missed), so `arr[People] rows = sqlite(...)` leaked its whole row set
+on every query; and every runtime `regex(...)` call leaked a compiled
+automaton, several KB per loop iteration. Both closed --
+the per-row free deliberately reachable only from the array's own
+element cascade, so a borrowed `People p = rows[0]` can't double-free a
+row the array still owns, and `/pattern/` literals deliberately left
+uncached-freed since they live for the process.
+`tests/test_codegen.py::TestQueryRowAndRegexReclamation` (6 new tests)
+covers both. Two leaks stay deliberately open and tracked in todo.md:
+a regex bound to a variable, and text globals at process exit.
 
 See api.md for the current language/standard library reference and this
 file's own "Status" section above for the implemented-vs-not matrix; the
@@ -2841,9 +2853,9 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 552 passed, 277 skipped (needs a C compiler; 2 of
+pytest tests/                          # 556 passed, 279 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
                                         # 9 need Xvfb + xdotool installed too, 1 of those
                                         # also needs `openbox`) given a working C compiler,
-                                        # all 829 pass
+                                        # all 835 pass
 ```
