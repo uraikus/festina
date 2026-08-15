@@ -1108,6 +1108,110 @@ bug in generated code.) Directly re-benchmarked afterward:
 Go's own equivalent rather than behind them, with byte-identical output
 before and after.
 
+### Stage 9: text values are owned and freed (done — claude.md #83)
+
+The largest single gap in this whole effort, and the one nobody had
+looked at: stages 1-8 gave `struct`/`arr[T]`/`map[T]` a complete
+ownership story, and `text` was left out of *all* of it. A text value
+was never freed anywhere in generated code, at any binding site, under
+any circumstance — every reassignment abandoned the previous buffer,
+every scope exit abandoned every text local. Found by profiling rather
+than by audit: `string_concat`'s 15,000 iterations of `` s = `${s}x` ``
+leaked every intermediate it built, so the heap grew quadratically and
+the program spent essentially all its runtime in `brk()` — **816 calls,
+against 3 for equivalent leak-free C**, which is where ~650ms of a
+~655ms benchmark was going.
+
+Closed *without* the refcount-header representation stages 4-7 use.
+That representation puts a counter in front of the payload, which every
+consumer must know about — and text's payload is a plain `char*` that
+sqlite, the regex engine, `festina_log_text`, and every comparison
+already take directly, so changing it would touch all of them. Text
+gets exclusivity by **copying** instead: every text binding always
+holds either NULL or a buffer it owns exclusively, never a bare alias
+of a `.str.N` constant or of another binding's buffer, with one new
+runtime helper (`festina_text_own`, a NULL-safe `strdup`) and plain
+`@free` for release. The payoff is that freeing needs **no escape
+analysis at all** — copying happens at each consuming site rather than
+by draining the source, so no number of other readers can make freeing
+a text local unsafe, and it is freed unconditionally on reassignment
+and at scope exit.
+
+Three things had to be fixed alongside it. An uninitialized `text s`
+local previously got an alloca and *no store at all*, leaving genuine
+garbage in the slot — harmless while text was never freed, an immediate
+wild-pointer `free()` afterward. Stage 8's sibling optimization
+(claude.md #82) had to be revised: a template that concatenates nothing
+(`` `${name}` ``) would otherwise hand back `name`'s own buffer to a
+caller that believes it owns what a template returns. And templates had
+to start freeing their own intermediates — `festina_str_concat` leaves
+both operands untouched, so a four-concatenation template leaks three
+buffers unless each is freed as the next one finishes copying out of it.
+
+Verified the same way every stage before it was: 13 new tests
+(`tests/test_codegen.py::TestTextReferenceManagement`) plus real
+AddressSanitizer/LeakSanitizer runs over locals, globals, uninitialized
+locals, reassignment, nested call temporaries, struct fields, array
+elements, map values, regex/text methods on temporaries, loop
+accumulation and parameter reassignment — all clean, with byte-identical
+output. `string_concat` went from ~77ms to **3.6ms** with the O(n²)
+naive-copy algorithm completely unchanged.
+
+Two follow-ups are deliberately left open rather than quietly claimed:
+
+- **Text arguments to the graphics, sqlite, and timer builtins are not
+  yet freed.** Temporaries are freed at `log()`, user function calls,
+  and the text/regex methods; those three builtin families leak a
+  bounded amount per call. Same mechanism (`_free_text_temp`), just not
+  yet threaded through their own emitters.
+- **Nothing frees a text global at process exit.** Deliberate, matching
+  how every other global already behaves — the process is ending — but
+  it does mean LeakSanitizer sees them as still-reachable rather than
+  freed.
+
+### Stage 10: a reassigned parameter owns its own reference (done — claude.md #84)
+
+A **real, pre-existing use-after-free**, not introduced by stage 9 —
+found while designing text's own parameter handling, which has the same
+shape. A `struct`/`arr[T]`/`map[T]` parameter is passed as the caller's
+raw pointer, unretained; that borrowed convention is deliberate and
+worth keeping. But a callee that *reassigns* its own parameter
+(`p = somethingElse`) runs stage 4's ordinary local-reassignment path,
+which releases whatever the binding currently holds — and for a
+borrowed parameter that is the caller's live value, dropping a refcount
+the callee never incremented and freeing it out from under the caller.
+
+Confirming it took some care, because the two most obvious reproductions
+both hide it, which is worth recording so a future audit doesn't
+conclude the bug isn't there. A global that has never been assigned
+still carries the immortal negative-refcount sentinel static storage
+starts with, on which retain and release are both no-ops. A global that
+*has* been assigned got an unconditional retain on that assignment,
+leaving its count at 2, so the erroneous release only brings it to 1 and
+the symptom is a leak rather than a crash. Only a heap-allocated
+**local** passed to a parameter-reassigning callee exposes it — and
+under ASan that is an unambiguous heap-use-after-free with both the
+freeing and allocating stacks recorded.
+
+Closed by giving any parameter the callee assigns to its own reference
+at binding time (`festina_retain` for struct/arr[T]/map[T], a
+`festina_text_own` copy for text), released at the callee's own scope
+exit. This required computing escape analysis *before* parameters are
+bound rather than after, and giving parameters their own scope-exit
+frame outside the body's.
+
+One follow-up left open: **the retain/copy is keyed on the whole
+`escaping` set rather than on reassignment alone.** Every reassigned
+name is necessarily in that set (escape analysis adds every bare
+Identifier assignment target), which is what makes this safe — but the
+set is broader, so a text parameter that is merely interpolated or
+passed along takes a `strdup` it doesn't need, on every call. Narrowing
+it to genuine reassignment is safe (every other escaping use either
+borrows the parameter or does its own retain/copy at the storing site)
+and wants a `find_reassigned_names` alongside `find_escaping_names`;
+left undone here only to avoid threading a second collector through
+eight functions of a heavily-tested module late in an unrelated change.
+
 ### What's still ahead
 
 - **A real tracing GC** was never seriously considered as an

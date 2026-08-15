@@ -548,6 +548,58 @@ for the full design writeup.
   effort ever found and confirmed (as opposed to a mere resource leak)
   is closed.
 
+  `claude.md #83` (stage 9) closes the largest remaining *resource*
+  leak, and the one no audit had looked at: stages 1-7 covered
+  `struct`/`arr[T]`/`map[T]` and left `text` out of all of it, never
+  freeing a text value anywhere in generated code, at any binding site,
+  under any circumstance. Found by profiling rather than auditing —
+  `benchmark.md`'s own `string_concat` was spending essentially its
+  whole runtime growing the heap (816 `brk()` calls against 3 for
+  equivalent leak-free C). Text deliberately does *not* get the
+  refcount-header representation stages 4-7 use, since its payload is a
+  plain `char*` that sqlite, the regex engine, and `festina_log_text`
+  all take directly; it gets exclusivity by copying instead
+  (`festina_text_own`, a NULL-safe `strdup`), so that every text
+  binding always holds either NULL or a buffer it owns exclusively.
+  That invariant is what lets text be freed with *no* escape analysis:
+  copying happens at each consuming site rather than by draining the
+  source, so no number of other readers can make freeing a text local
+  unsafe. Two safety-relevant prerequisites came out of it — an
+  uninitialized `text s` local previously got an alloca and no store at
+  all, which was harmless only while text was never freed and an
+  immediate wild-pointer `free()` afterward, and `claude.md #82`'s
+  empty-piece template optimization had to be revised so that a
+  template concatenating nothing (`` `${name}` ``) no longer hands back
+  an interpolated variable's own buffer to a caller that believes it
+  owns it.
+
+  `claude.md #84` (stage 10) closes a **real, pre-existing
+  use-after-free** that this effort had not previously found — not
+  introduced by stage 9, but discovered while designing text's own
+  parameter handling, which has the identical shape. A
+  `struct`/`arr[T]`/`map[T]` parameter is passed as the caller's raw,
+  unretained pointer (a deliberate borrowed convention), but a callee
+  that *reassigns* its own parameter runs stage 4's ordinary
+  local-reassignment path, releasing a refcount it never incremented
+  and freeing the caller's live value out from under it. Worth
+  recording for any future audit: the two most obvious reproductions
+  both hide the bug — an unassigned global still carries the immortal
+  negative-refcount sentinel on which retain/release are no-ops, and an
+  assigned global's own unconditional retain leaves the count at 2 so
+  the symptom degrades to a leak. Only a heap-allocated **local**
+  passed to a parameter-reassigning callee exposes it, and under
+  AddressSanitizer it is an unambiguous heap-use-after-free with both
+  the freeing and allocating stacks recorded. Closed by giving any
+  parameter the callee assigns to its own reference at binding time,
+  released at the callee's own scope exit.
+
+  Two text-related resource leaks remain deliberately open and are
+  tracked rather than claimed closed: text arguments to the graphics,
+  sqlite, and timer builtins are not yet freed (temporaries at
+  `log()`, user function calls, and the text/regex methods are), and
+  text globals are not freed at process exit — matching how every other
+  global already behaves. See [todo.md](todo.md#memory-management).
+
   What changed across all seven stages is that each one's own fix, at
   every step of building it out, was verified with the same rigor the
   rest of this document's findings were: exhaustive unit tests of the

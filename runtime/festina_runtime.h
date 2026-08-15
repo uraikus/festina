@@ -32,6 +32,7 @@ char *festina_str_from_int(int64_t v);
 char *festina_str_from_float(double v);
 char *festina_str_from_bool(int8_t v);
 char *festina_str_concat(const char *a, const char *b);
+char *festina_text_own(const char *s);  /* claude.md #83: NULL-safe strdup */
 int8_t festina_str_eq(const char *a, const char *b);
 
 /*

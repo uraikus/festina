@@ -766,6 +766,12 @@ class CodeGen:
             "declare ptr @festina_str_from_float(double)",
             "declare ptr @festina_str_from_bool(i8)",
             "declare ptr @festina_str_concat(ptr, ptr)",
+            # claude.md #83: text values are copy-managed, not
+            # refcounted -- this is the "make my own exclusive copy"
+            # primitive every aliasing text binding site calls (a
+            # NULL-safe strdup); freeing uses plain @free directly
+            # (also NULL-safe), no dedicated release function needed.
+            "declare ptr @festina_text_own(ptr)",
             "declare i8 @festina_str_eq(ptr, ptr)",
             # claude.md #70: DatabaseURL -- path is festina.sqlite's
             # location, NULL/empty meaning "use the default" (a plain
@@ -1074,9 +1080,11 @@ class CodeGen:
                         lines.append(f"  {field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
                         data_ptr = self.tmp()
                         lines.append(f"  {data_ptr} = load ptr, ptr {field_ptr}")
-                        if isinstance(elem_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
-                            # claude.md #80: this array's own elements
-                            # are themselves refcounted -- release each
+                        if (isinstance(elem_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+                                or elem_type == TEXT):
+                            # claude.md #80 (widened by #83 to text):
+                            # this array's own elements are themselves
+                            # refcounted/copy-managed -- release each
                             # one before freeing the data buffer they
                             # live in, the same element-release loop
                             # _release_fn_for_array's own generated
@@ -1103,28 +1111,38 @@ class CodeGen:
                         lines.append(f"  {field_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
                         entries_ptr = self.tmp()
                         lines.append(f"  {entries_ptr} = load ptr, ptr {field_ptr}")
-                        if isinstance(value_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
-                            # claude.md #80: same as the array case just
-                            # above, but through festina_map_for_each
-                            # and a release trampoline, since a map's
-                            # own entries layout stays opaque to codegen
-                            # -- see _release_fn_for_map's own comment.
+                        if (isinstance(value_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+                                or value_type == TEXT):
+                            # claude.md #80 (widened by #83 to text):
+                            # same as the array case just above, but
+                            # through festina_map_for_each and a
+                            # release trampoline, since a map's own
+                            # entries layout stays opaque to codegen --
+                            # see _release_fn_for_map's own comment.
                             trampoline_name = self._emit_map_value_release_trampoline(value_type)
                             lines.append(
                                 f"  call void @festina_map_for_each(i64 {count_val}, ptr {entries_ptr}, ptr {trampoline_name})")
                         lines.append(f"  call void @festina_map_free_entries(i64 {count_val}, ptr {entries_ptr})")
-                elif isinstance(type_, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+                elif isinstance(type_, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)) or type_ == TEXT:
                     # claude.md #77/#79: release (not free) -- this
                     # value is refcounted (see _emit_stmt's own VarDecl
                     # handling), so its own reference simply needs
                     # dropping; whichever function _release_fn_for
                     # dispatches to only actually frees it once nothing
-                    # else references it.
+                    # else references it. claude.md #83: for text,
+                    # _release_fn_for dispatches straight to a plain,
+                    # NULL-safe @free -- there's no refcount to check,
+                    # so freeing IS the whole job here (correct because
+                    # every text local is scheduled for this regardless
+                    # of escaping-ness -- see _emit_block's own tracking
+                    # comment -- so this always sees its own exclusively
+                    # owned copy, never a value some other binding still
+                    # needs).
                     loaded = self.tmp()
                     lines.append(f"  {loaded} = load ptr, ptr {ref}")
                     lines.append(f"  call void {self._release_fn_for(type_)}(ptr {loaded})")
 
-    def _emit_analyzed_func_body(self, decl, body_env, return_type, body_lines):
+    def _emit_analyzed_func_body(self, decl, body_env, return_type, body_lines, escaping):
         """claude.md #74: runs escape_analysis.find_escaping_names once
         for decl's whole body and makes it available (self.
         _current_escaping_names) to every _emit_block call this body's
@@ -1160,8 +1178,13 @@ class CodeGen:
         Return's own handling now retains the value being returned
         whenever it might be aliased, the same treatment every other
         struct-producing site in this stage already gets, so no extra
-        per-function state is needed here for it at all."""
-        escaping = escape_analysis.find_escaping_names(decl.body, escaping_params=self.escaping_params)
+        per-function state is needed here for it at all.
+
+        claude.md #84: `escaping` is computed by the CALLER now (once,
+        before its own parameter-binding loop runs -- see
+        _emit_param_bindings' own comment for why binding needs it
+        before this method would otherwise compute it), not
+        recomputed here -- this method just applies it."""
         self._current_escaping_names = escaping
         try:
             block = self._emit_block(decl.body, body_env, return_type, body_lines)
@@ -1172,6 +1195,71 @@ class CodeGen:
                 i for i, p in enumerate(decl.params) if p.name in escaping
             }
         return block
+
+    def _emit_param_bindings(self, decl, param_types, body_env, body_lines):
+        """claude.md #84: binds every one of decl's own parameters into
+        body_env (a fresh `alloca` + `store` per parameter, exactly as
+        before this section), and returns the escaping-names set
+        (escape_analysis.find_escaping_names, computed here -- BEFORE
+        binding, not after -- so a struct/arr[T]/map[T]/text parameter
+        that turns out to be escaping can be retained/copied right at
+        its own binding point, not left to alias the caller's own
+        argument pointer unretained) for the caller (_emit_func/
+        _emit_event_handler) to pass through to
+        _emit_analyzed_func_body afterward.
+
+        Fixes a real, confirmed pre-existing bug (found while designing
+        claude.md #83's own text parameter handling, but never
+        specific to text at all): a struct/arr[T]/map[T] parameter is
+        passed as the caller's own raw pointer, on purpose, never
+        retained at the call site (the same "borrowed, not owned"
+        convention every call argument already uses) -- but if the
+        callee's own body ever REASSIGNS that parameter
+        (`void func f(p:Point) { p = other }`), _emit_local_retain_
+        release's own reassignment logic unconditionally releases
+        whatever `p` currently holds, which, for a parameter that was
+        never independently retained, IS the caller's own value --
+        confirmed directly with AddressSanitizer as a genuine heap-
+        use-after-free, the caller's own binding silently corrupted
+        the moment the callee returns. A parameter that's merely
+        *read* (never itself reassigned, returned, or otherwise made
+        to escape) needs no fix: nothing releases an untracked
+        binding's borrowed reference, so the caller's own reference is
+        never touched.
+
+        The fix mirrors an ordinary WITH-INITIALIZER local declared
+        from an aliasing source exactly: retain (struct/arr[T]/map[T])
+        or copy via festina_text_own (text) any parameter whose own
+        name is in `escaping` -- deliberately not narrowed to "only
+        when actually reassigned," the same over-conservative-rather-
+        than-precise bias every other retain-or-not decision in this
+        whole effort already takes, since a parameter that merely gets
+        returned or passed onward (not reassigned) already works
+        correctly without this and retaining it anyway costs nothing
+        but a balanced extra retain/release pair -- then schedules it
+        in _active_free_locals (a new, OUTERMOST frame the caller
+        pushes before this call and pops/frees after
+        _emit_analyzed_func_body returns) for release at the
+        function's own scope-exit, the identical bookkeeping an
+        ordinary escaping local already gets from _emit_block's own
+        tracking."""
+        escaping = escape_analysis.find_escaping_names(decl.body, escaping_params=self.escaping_params)
+        for t, p in zip(param_types, decl.params):
+            slot = f"%{p.name}"
+            body_lines.append(f"  {slot} = alloca {_llvm_type(t)}")
+            arg_ref = f"%arg.{p.name}"
+            if p.name in escaping and isinstance(
+                    t, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+                body_lines.append(f"  call void @festina_retain(ptr {arg_ref})")
+                self._active_free_locals[-1].append((slot, t))
+            elif p.name in escaping and t == TEXT:
+                owned = self.tmp()
+                body_lines.append(f"  {owned} = call ptr @festina_text_own(ptr {arg_ref})")
+                arg_ref = owned
+                self._active_free_locals[-1].append((slot, t))
+            body_lines.append(f"  store {_llvm_type(t)} {arg_ref}, ptr {slot}")
+            body_env.define(p.name, slot, t)
+        return escaping
 
     def _emit_func(self, decl):
         return_type = None if decl.return_type == "void" else self._resolve(decl.return_type, decl)
@@ -1186,13 +1274,20 @@ class CodeGen:
         body_lines = []
         entry_label = self.label("entry")
         self._start_block(entry_label, body_lines)
-        for t, p in zip(param_types, decl.params):
-            slot = f"%{p.name}"
-            body_lines.append(f"  {slot} = alloca {_llvm_type(t)}")
-            body_lines.append(f"  store {_llvm_type(t)} %arg.{p.name}, ptr {slot}")
-            body_env.define(p.name, slot, t)
+        # claude.md #84: an OUTERMOST frame for this function's own
+        # parameters -- pushed before binding them (so
+        # _emit_param_bindings can schedule any escaping struct/
+        # arr[T]/map[T]/text one it retains/copies), popped and freed
+        # after decl's own body is fully emitted, one level below the
+        # body's own frame(s) (_emit_block pushes/pops its own,
+        # separately) so a Return anywhere inside frees both via the
+        # same _emit_free_active_locals(down_to=0) call it already
+        # makes -- see _emit_param_bindings' own comment for why this
+        # exists at all.
+        self._active_free_locals.append([])
+        escaping = self._emit_param_bindings(decl, param_types, body_env, body_lines)
 
-        block = self._emit_analyzed_func_body(decl, body_env, return_type, body_lines)
+        block = self._emit_analyzed_func_body(decl, body_env, return_type, body_lines, escaping)
         if not block["terminated"]:
             # claude.md never says whether a non-void function must
             # return a value on every code path (unlike the
@@ -1206,10 +1301,16 @@ class CodeGen:
             # (_zero_value below) rather than being a compile error --
             # deterministic and never crashes, the same "prefer the
             # simplest implementation" reasoning #54 itself asks for.
+            # claude.md #84: also frees this function's own parameter
+            # frame first -- _emit_block's own fall-through-exit only
+            # ever frees its OWN (body-level) frame, never a caller-
+            # pushed outer one.
+            self._emit_free_active_locals(block["lines"], down_to=len(self._active_free_locals) - 1)
             if return_type is None:
                 block["lines"].append("  ret void")
             else:
                 block["lines"].append(f"  ret {_llvm_type(return_type)} {self._zero_value(return_type)}")
+        self._active_free_locals.pop()
 
         func = [f"define {llvm_ret} @{decl.name}({params_ir}) {{"]
         func.extend(block["lines"])
@@ -1241,15 +1342,17 @@ class CodeGen:
         body_lines = []
         entry_label = self.label("entry")
         self._start_block(entry_label, body_lines)
-        for t, p in zip(param_types, decl.params):
-            slot = f"%{p.name}"
-            body_lines.append(f"  {slot} = alloca {_llvm_type(t)}")
-            body_lines.append(f"  store {_llvm_type(t)} %arg.{p.name}, ptr {slot}")
-            body_env.define(p.name, slot, t)
+        # claude.md #84: see _emit_func's own comment on this same
+        # pattern -- an event handler's own parameters (e.g. `on
+        # key(key:text)`) need the identical outer parameter frame.
+        self._active_free_locals.append([])
+        escaping = self._emit_param_bindings(decl, param_types, body_env, body_lines)
 
-        block = self._emit_analyzed_func_body(decl, body_env, None, body_lines)
+        block = self._emit_analyzed_func_body(decl, body_env, None, body_lines, escaping)
         if not block["terminated"]:
+            self._emit_free_active_locals(block["lines"], down_to=len(self._active_free_locals) - 1)
             block["lines"].append("  ret void")
+        self._active_free_locals.pop()
 
         func = [f"define void {symbol}({params_ir}) {{"]
         func.extend(block["lines"])
@@ -1386,6 +1489,27 @@ class CodeGen:
                                 # comment.
                                 self._active_free_locals[-1].append(
                                     (ref, _StackStructFieldsOnly(type_)))
+                        elif type_ == TEXT:
+                            # claude.md #83: unlike the other three
+                            # types, a text local is ALWAYS scheduled
+                            # for scope-exit freeing here, regardless of
+                            # whether it has an initializer or whether
+                            # escape_analysis proves it escapes -- there
+                            # is no stack-allocation option for a text
+                            # local's own buffer to begin with (a
+                            # dynamically-sized string was never a
+                            # fixed-size alloca candidate), and, unlike
+                            # struct/arr[T]/map[T]'s own shared,
+                            # refcounted representation, a text local
+                            # ALWAYS holds its own exclusively-owned
+                            # copy no matter how many other bindings
+                            # have READ it elsewhere (see
+                            # _is_owning_text_source's own comment:
+                            # copying happens at every consuming site,
+                            # not by draining the source) -- so freeing
+                            # it here can never affect any other
+                            # binding, "escaping" or not.
+                            self._active_free_locals[-1].append((ref, type_))
             if tracking and not ctx["terminated"]:
                 self._emit_free_active_locals(lines, down_to=len(self._active_free_locals) - 1)
         finally:
@@ -1601,6 +1725,36 @@ class CodeGen:
                 # stmt.init is None here -- handled by the early-return
                 # branches above.
                 return
+            if type_ == TEXT:
+                # claude.md #83: text is copy-managed, not refcounted --
+                # every declaration (with or without an initializer)
+                # gets its own slot explicitly initialized (a bare
+                # `store ptr null` for the no-init case, matching
+                # struct/arr[T]/map[T]'s own zeroinitializer convention
+                # just above -- this local's own value is scheduled for
+                # unconditional freeing at scope-exit below, via
+                # _active_free_locals, and freeing genuinely
+                # uninitialized garbage would be a real, silent crash
+                # risk the OTHER three types never had, since their own
+                # no-init case was ALREADY always explicitly zeroed).
+                # With an initializer, copies via festina_text_own only
+                # when the source isn't itself owning -- the identical
+                # rule every other with-initializer declaration in this
+                # whole effort already follows.
+                slot = f"%{stmt.name}.{self._unique()}"
+                lines.append(f"  {slot} = alloca ptr")
+                if stmt.init is not None:
+                    val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
+                    val = self._coerce(val, vtype, type_, lines)
+                    if not self._is_owning_text_source(stmt.init):
+                        owned = self.tmp()
+                        lines.append(f"  {owned} = call ptr @festina_text_own(ptr {val})")
+                        val = owned
+                    lines.append(f"  store ptr {val}, ptr {slot}")
+                else:
+                    lines.append(f"  store ptr null, ptr {slot}")
+                env.define(stmt.name, slot, type_)
+                return
             llvm_ty = _llvm_type(type_)
             slot = f"%{stmt.name}.{self._unique()}"
             lines.append(f"  {slot} = alloca {llvm_ty}")
@@ -1643,6 +1797,14 @@ class CodeGen:
                 # "owning" a source as a Call is, and just as
                 # unambiguously this statement's own sole reference.
                 lines.append(f"  call void {self._release_fn_for(vtype)}(ptr {val})")
+            elif vtype == TEXT and isinstance(stmt.expr, (ast.Call, ast.TemplateLit)):
+                # claude.md #83: the text counterpart just above -- a
+                # discarded text-returning call/template result is,
+                # by the identical "owning" reasoning, provably this
+                # statement's own sole reference, freed immediately via
+                # a plain @free (never festina_release -- text has no
+                # refcount header to check).
+                lines.append(f"  call void @free(ptr {val})")
             return
         if isinstance(stmt, ast.Return):
             # claude.md #74: free every currently-active non-escaping
@@ -1687,6 +1849,18 @@ class CodeGen:
                 if (isinstance(return_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
                         and not self._is_owning_refcounted_source(stmt.value)):
                     lines.append(f"  call void @festina_retain(ptr {val})")
+                elif return_type == TEXT and not self._is_owning_text_source(stmt.value):
+                    # claude.md #83: the text counterpart just above --
+                    # copies (festina_text_own) rather than retains, for
+                    # the identical reason: without it, a bare `return
+                    # s` (aliasing a local) would hand the caller `s`'s
+                    # own buffer, which _emit_free_active_locals is
+                    # about to free right along with every other active
+                    # local below, leaving the caller with a dangling
+                    # pointer the instant this function returns.
+                    owned = self.tmp()
+                    lines.append(f"  {owned} = call ptr @festina_text_own(ptr {val})")
+                    val = owned
                 self._emit_free_active_locals(lines)
                 lines.append(f"  ret {_llvm_type(return_type)} {val}")
             ctx["terminated"] = True
@@ -2037,29 +2211,56 @@ class CodeGen:
         # a TemplateLit once at least one `${...}` has been parsed -- a
         # template with none is a plain ast.StringLit instead), so the
         # loop below always runs at least once and `result` is
-        # guaranteed non-None by the time it's returned. When the
-        # interpolated value's own text is used as `result` directly
-        # (skipped leading piece, or no piece follows it either) this
-        # aliases that value's existing pointer instead of copying it --
-        # always safe, since `text` is never freed/released anywhere in
-        # generated code (no refcounting, no scope-exit free -- see
-        # _emit_free_active_locals's own comment enumerating exactly
-        # which types it tracks, text isn't among them).
+        # guaranteed non-None by the time it's returned.
+        #
+        # claude.md #83: every @festina_str_concat call mallocs a fresh
+        # buffer and copies both operands into it, leaving the operands
+        # themselves untouched -- so a template that chains several of
+        # them leaks every intermediate unless each one is freed the
+        # moment the next concat has finished copying out of it.
+        # `result_owned`/`piece_owned` track exactly that: whether the
+        # pointer in hand is a buffer THIS template allocated (free it
+        # once consumed) or someone else's storage -- a `.str.N` literal
+        # constant, or another binding's own buffer -- which must never
+        # be freed here. A non-TEXT piece is always owned, because
+        # _to_text's int/float/bool conversions all allocate.
+        #
+        # The template's own RESULT must in turn always be a fresh,
+        # exclusively-owned buffer, since _is_owning_text_source treats
+        # every TemplateLit as owning. Every concat output already
+        # satisfies that; the one shape that doesn't is a template that
+        # never concatenates at all -- a bare `` `${name}` ``, which
+        # would otherwise hand back `name`'s own current buffer,
+        # indistinguishable from it, so that freeing either one would
+        # leave the other dangling. That case, and only that case, takes
+        # a festina_text_own copy on the way out.
         result = self._const_string(expr.parts[0], lines) if expr.parts[0] else None
+        result_owned = False
         for part_expr, next_part in zip(expr.exprs, expr.parts[1:]):
             val, vtype = self._emit_expr(part_expr, env, lines)
             piece = self._to_text(val, vtype, lines)
+            piece_owned = vtype != TEXT or self._is_owning_text_source(part_expr)
             if result is None:
-                result = piece
+                result, result_owned = piece, piece_owned
             else:
                 out = self.tmp()
                 lines.append(f"  {out} = call ptr @festina_str_concat(ptr {result}, ptr {piece})")
-                result = out
+                if result_owned:
+                    lines.append(f"  call void @free(ptr {result})")
+                if piece_owned:
+                    lines.append(f"  call void @free(ptr {piece})")
+                result, result_owned = out, True
             if next_part:
                 part_str = self._const_string(next_part, lines)
                 out2 = self.tmp()
                 lines.append(f"  {out2} = call ptr @festina_str_concat(ptr {result}, ptr {part_str})")
-                result = out2
+                if result_owned:
+                    lines.append(f"  call void @free(ptr {result})")
+                result, result_owned = out2, True
+        if not result_owned:
+            owned = self.tmp()
+            lines.append(f"  {owned} = call ptr @festina_text_own(ptr {result})")
+            result = owned
         return result
 
     def _to_text(self, val, type_, lines):
@@ -2210,7 +2411,10 @@ class CodeGen:
             # already-built array): this data buffer is fresh malloc'd
             # memory, never zero-initialized, so every index is written
             # exactly once, right here, before anything could ever read
-            # a stale/garbage "old" value through it.
+            # a stale/garbage "old" value through it. claude.md #83:
+            # a text element gets the identical treatment, copying
+            # (festina_text_own) instead of retaining, for the same
+            # "no release-old needed, fresh malloc'd memory" reason.
             elem_is_refcounted = isinstance(
                 elem_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
             for i, val in enumerate(values):
@@ -2218,6 +2422,10 @@ class CodeGen:
                 lines.append(f"  {elem_ptr} = getelementptr {elem_llvm_ty}, ptr {data_ptr}, i64 {i}")
                 if elem_is_refcounted and not self._is_owning_refcounted_source(sources[i]):
                     lines.append(f"  call void @festina_retain(ptr {val})")
+                elif elem_type == TEXT and not self._is_owning_text_source(sources[i]):
+                    owned = self.tmp()
+                    lines.append(f"  {owned} = call ptr @festina_text_own(ptr {val})")
+                    val = owned
                 lines.append(f"  store {elem_llvm_ty} {val}, ptr {elem_ptr}")
 
         data_field_ptr = self.tmp()
@@ -2404,6 +2612,26 @@ class CodeGen:
             if not self._is_owning_refcounted_source(value_source_expr):
                 lines.append(f"  call void @festina_retain(ptr {value_val})")
             lines.append(f"  call void {self._release_fn_for(value_type)}(ptr {old_ptr})")
+        elif value_type == TEXT:
+            # claude.md #83: the text counterpart just above -- same
+            # "look up whatever value the key currently maps to (if
+            # any) via festina_map_get with a null default, since there
+            # is no fixed address to load an old value from directly"
+            # shape, copying (festina_text_own) instead of retaining
+            # and freeing (a plain @free) instead of releasing.
+            count_val = self.tmp()
+            lines.append(f"  {count_val} = load i64, ptr {count_ptr}")
+            entries_val = self.tmp()
+            lines.append(f"  {entries_val} = load ptr, ptr {entries_ptr}")
+            old_raw = self.tmp()
+            lines.append(f"  {old_raw} = call i64 @festina_map_get(i64 {count_val}, ptr {entries_val}, ptr {key_val}, i64 0)")
+            old_ptr = self.tmp()
+            lines.append(f"  {old_ptr} = inttoptr i64 {old_raw} to ptr")
+            if not self._is_owning_text_source(value_source_expr):
+                owned = self.tmp()
+                lines.append(f"  {owned} = call ptr @festina_text_own(ptr {value_val})")
+                value_val = owned
+            lines.append(f"  call void @free(ptr {old_ptr})")
         raw_val = self._map_value_to_i64(value_val, value_type, lines)
         lines.append(f"  call void @festina_map_set(ptr {count_ptr}, ptr {entries_ptr}, ptr {key_val}, i64 {raw_val})")
 
@@ -2478,14 +2706,21 @@ class CodeGen:
         lines.append(f"  {out} = getelementptr {struct_ty}, ptr {obj_val}, i32 0, i32 {idx}")
         return out, ftype
 
-    def _emit_global_retain_release(self, ref, val, ttype, lines):
+    def _emit_global_retain_release(self, ref, val, ttype, lines, source_expr=None):
         """claude.md #77 (widened by claude.md #79 to arr[T]/map[T]
-        globals too): called immediately before storing `val` (a
-        struct/array/map-typed value) into a GLOBAL's own slot `ref`,
-        whether that's an ordinary reassignment (_emit_assign) or a
-        global's own declaration-with-initializer (_emit_toplevel_stmt)
-        -- both sites need the identical treatment, factored out here
-        so they can't drift apart. Retains the new value (this global's
+        globals, claude.md #83 to text globals): called immediately
+        before storing `val` into a GLOBAL's own slot `ref`, whether
+        that's an ordinary reassignment (_emit_assign) or a global's
+        own declaration-with-initializer (_emit_toplevel_stmt) -- both
+        sites need the identical treatment, factored out here so they
+        can't drift apart. Returns the value the caller should actually
+        store -- `val` unchanged for struct/arr[T]/map[T] (retaining
+        never changes which pointer is stored, only its own refcount),
+        but possibly a *different*, freshly copied pointer for text
+        (see below) -- callers must always store whatever this returns,
+        not `val` itself.
+
+        For struct/arr[T]/map[T]: retains the new value (this global's
         own slot is now one more binding referencing it) and releases
         whatever it previously held (one fewer binding referencing
         that), freeing it if that was the last one. Retain happens
@@ -2508,14 +2743,37 @@ class CodeGen:
         type's release function directly (claude.md #78) -- a global of
         a struct type with its own struct-typed field(s) needs its
         release to cascade into those fields too, the same as any other
-        release site for that struct type."""
-        if (not isinstance(ttype, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
-                or not ref.startswith("@")):
-            return
+        release site for that struct type.
+
+        For text: unlike struct/arr[T]/map[T], over-copying is NOT
+        cheap the way over-retaining is (a real strdup, not a refcount
+        increment/decrement pair), so this DOES check
+        _is_owning_text_source rather than unconditionally copying --
+        `source_expr` (the new value's own AST source, needed only for
+        this check) is required whenever `ttype` is TEXT. The old value
+        is freed unconditionally via a plain `@free` (never
+        festina_release -- text has no refcount header at all, see
+        festina_text_own's own comment), safe even the very first time
+        a global's value is ever set: its zero value is a plain LLVM
+        `null`, and `free(NULL)` is always a defined no-op."""
+        if not ref.startswith("@"):
+            return val
+        if ttype == TEXT:
+            old = self.tmp()
+            lines.append(f"  {old} = load ptr, ptr {ref}")
+            if not self._is_owning_text_source(source_expr):
+                owned = self.tmp()
+                lines.append(f"  {owned} = call ptr @festina_text_own(ptr {val})")
+                val = owned
+            lines.append(f"  call void @free(ptr {old})")
+            return val
+        if not isinstance(ttype, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+            return val
         old = self.tmp()
         lines.append(f"  {old} = load ptr, ptr {ref}")
         lines.append(f"  call void @festina_retain(ptr {val})")
         lines.append(f"  call void {self._release_fn_for(ttype)}(ptr {old})")
+        return val
 
     def _is_owning_refcounted_source(self, expr):
         """claude.md #77 (widened): a source expression is "owning" --
@@ -2557,6 +2815,75 @@ class CodeGen:
         "fresh, uniquely-owned" comment), nothing else referencing it
         the instant it's produced."""
         return isinstance(expr, (ast.Call, ast.ArrayLit, ast.MapLit))
+
+    def _is_owning_text_source(self, expr):
+        """claude.md #83: the text counterpart to
+        _is_owning_refcounted_source -- "owning" here means "already a
+        fresh, exclusively-held heap buffer, safe to take directly
+        with no extra copy," not "safe to alias without retaining"
+        (text has no shared representation to retain in the first
+        place; the non-owning case calls festina_text_own -- a copy --
+        instead of festina_retain -- an increment).
+
+        A Call is owning for the identical reason it already is for
+        struct/arr[T]/map[T]: every text-returning runtime function
+        this language ever calls through one -- festina_str_concat
+        (via a user function that returns text), festina_str_from_int/
+        _float/_bool, festina_getenv, festina_regex_match,
+        festina_str_replace/festina_regex_replace, sqlite text column
+        reads -- always mallocs a fresh buffer nothing else references
+        yet, whether reached directly or through a user-defined
+        function's own `return` (which, by this same rule applied
+        recursively, only ever hands back something IT already knows
+        is fresh). A method call (`text.replace(...)`, `regex.test()`,
+        ...) is syntactically a Call too (a Member callee, not a bare
+        name) -- no separate case needed.
+
+        A TemplateLit is owning because _emit_template itself
+        guarantees every value it returns is a fresh buffer, never a
+        bare alias of one of its own interpolated pieces -- see its
+        own comment for exactly how (claude.md #82's own "skip the
+        empty-piece concat" optimization had to be revised alongside
+        this section to preserve that guarantee once text started
+        being freed for real).
+
+        Everything else -- a bare Identifier (a local, a global, a
+        parameter -- all just aliasing whatever they already point
+        to), a Member/field read, a Ternary, and critically a
+        StringLit itself (a pointer to a `.str.N` global CONSTANT,
+        never allocated at all -- freeing one would corrupt the
+        binary's own static data) -- is "aliasing": conservatively
+        copied via festina_text_own before being stored into a new
+        binding, the same directional bias every prior stage in this
+        whole effort defaults to whenever a choice isn't fully provable
+        either way."""
+        return isinstance(expr, (ast.Call, ast.TemplateLit))
+
+    def _free_text_temp(self, source_expr, val, vtype, lines):
+        """claude.md #83: frees a text value that the expression being
+        emitted allocated itself and that nothing took ownership of --
+        a call result or template literal used as an argument or a
+        method receiver and then discarded, e.g. the `f()` in
+        `log(f())` or the `` `${x}` `` in `g(`${x}`)`.
+
+        Callees never take ownership of a text argument: a parameter the
+        callee reassigns is copied at binding time (claude.md #84), and
+        one it only reads is borrowed for the duration of the call, so
+        the caller always still owns what it passed once the call
+        returns. Freeing is therefore the caller's job at every one of
+        these sites, and skipping it leaks the buffer outright -- there
+        is no binding anywhere that would ever free it later.
+
+        Every call site below evaluates its operands and consumes them
+        within the SAME basic block, so emitting the free immediately
+        after the consuming call always dominates correctly with no
+        cleanup slot needed, and -- unlike a statement-level cleanup
+        list -- frees once per loop iteration rather than once per loop.
+        A borrowed value (an identifier's own buffer, a `.str.N`
+        literal constant) is never freed here, exactly per
+        _is_owning_text_source's own split."""
+        if vtype == TEXT and self._is_owning_text_source(source_expr):
+            lines.append(f"  call void @free(ptr {val})")
 
     def _is_stack_allocatable_array_or_map_decl(self, stmt, type_):
         """claude.md #79 (extended by #81): whether an arr[T]/map[T]-
@@ -2642,6 +2969,39 @@ class CodeGen:
             lines.append(f"  call void @festina_retain(ptr {val})")
         lines.append(f"  call void {self._release_fn_for(ttype)}(ptr {old})")
 
+    def _emit_local_text_own_release(self, ref, val, source_expr, lines):
+        """claude.md #83: the text counterpart to
+        _emit_local_retain_release -- called from _emit_assign's
+        Identifier branch for an ordinary `s = expr` reassignment of an
+        already-declared LOCAL text variable (never the target's own
+        first-ever declaration; _emit_stmt's VarDecl handling covers
+        that separately, since it never has an "old value" to free).
+        No escaping check needed here at all, unlike the struct/
+        arr[T]/map[T] version: a text local's own buffer is always
+        heap-allocated regardless of whether the local itself escapes
+        (a dynamically-sized string was never a stack-allocation
+        candidate to begin with -- see _emit_stmt's own VarDecl
+        comment), so there's no "was this ever stack-allocated"
+        question to rule out the way there is for the other three
+        types. Copies the new value via festina_text_own only when
+        _is_owning_text_source says it needs it (a fresh call/template
+        result already owns its own +1 outright, no copy needed --
+        copying it anyway would just leak that original allocation once
+        nothing else ever references it either); always frees the old
+        value unconditionally via a plain @free (text has no refcount
+        header, never festina_release). Returns the value the caller
+        should actually store, mirroring _emit_global_retain_release's
+        own return-a-value contract -- `val` itself when owning, the
+        freshly copied pointer otherwise."""
+        old = self.tmp()
+        lines.append(f"  {old} = load ptr, ptr {ref}")
+        if not self._is_owning_text_source(source_expr):
+            owned = self.tmp()
+            lines.append(f"  {owned} = call ptr @festina_text_own(ptr {val})")
+            val = owned
+        lines.append(f"  call void @free(ptr {old})")
+        return val
+
     def _release_fn_for(self, type_):
         """claude.md #79 (widened by claude.md #80): the single dispatch
         point every release call site in this file goes through
@@ -2662,6 +3022,16 @@ class CodeGen:
             return self._release_fn_for_array(type_)
         if isinstance(type_, types_mod.MapType):
             return self._release_fn_for_map(type_)
+        if type_ == TEXT:
+            # claude.md #83: text has no refcount header to dispatch
+            # through -- "releasing" one is always just a plain,
+            # NULL-safe @free (used here so an array/map's own
+            # element-type cascade -- _release_fn_for_array/_map,
+            # _emit_release_array_elements, _emit_map_value_release_
+            # trampoline -- can call _release_fn_for(elem_type) exactly
+            # the same way regardless of whether elem_type is text or
+            # one of the other three refcounted types).
+            return "@free"
         raise CodegenError(f"cannot release a value of type {types_mod.type_name(type_)}")
 
     def _struct_has_own_refcounted_field(self, name):
@@ -2769,6 +3139,17 @@ class CodeGen:
                 fval = self.tmp()
                 lines.append(f"  {fval} = load ptr, ptr {fptr}")
                 lines.append(f"  call void {field_release_fn}(ptr {fval})")
+            elif ftype == TEXT:
+                # claude.md #83: a text-typed field is copy-managed, not
+                # refcounted -- freed with a plain @free (NULL-safe),
+                # never through _release_fn_for's own struct/arr[T]/
+                # map[T] dispatch, since there's no refcount header to
+                # decrement here at all.
+                fptr = self.tmp()
+                lines.append(f"  {fptr} = getelementptr {struct_ty}, ptr {obj_ptr}, i32 0, i32 {i}")
+                fval = self.tmp()
+                lines.append(f"  {fval} = load ptr, ptr {fptr}")
+                lines.append(f"  call void @free(ptr {fval})")
 
     def _emit_release_nested_fields_only(self, ref, struct_type, lines):
         """claude.md #78: the stack-allocated counterpart to
@@ -2817,7 +3198,8 @@ class CodeGen:
         used" rule forbids it -- there is no way to even *write* a
         self-referential arr[T] type in Festina's own grammar."""
         elem_type = type_.element
-        if not isinstance(elem_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+        if not (isinstance(elem_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+                or elem_type == TEXT):
             return "@festina_release_array"
         key = types_mod.type_name(type_)
         if key in self._array_release_fns:
@@ -2915,7 +3297,8 @@ class CodeGen:
         festina_release_map's own C implementation already does) and
         frees the header."""
         value_type = type_.value
-        if not isinstance(value_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+        if not (isinstance(value_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+                or value_type == TEXT):
             return "@festina_release_map"
         key = types_mod.type_name(type_)
         if key in self._map_release_fns:
@@ -2994,9 +3377,14 @@ class CodeGen:
             val = self._coerce(val, vtype, ttype, lines)
             if isinstance(ttype, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
                 if ref.startswith("@"):
-                    self._emit_global_retain_release(ref, val, ttype, lines)
+                    val = self._emit_global_retain_release(ref, val, ttype, lines)
                 else:
                     self._emit_local_retain_release(ref, val, expr.value, ttype, lines)
+            elif ttype == TEXT:
+                if ref.startswith("@"):
+                    val = self._emit_global_retain_release(ref, val, ttype, lines, expr.value)
+                else:
+                    val = self._emit_local_text_own_release(ref, val, expr.value, lines)
             lines.append(f"  store {_llvm_type(ttype)} {val}, ptr {ref}")
             return val, ttype
         if isinstance(expr.target, ast.Member):
@@ -3075,6 +3463,27 @@ class CodeGen:
                 if not self._is_owning_refcounted_source(expr.value):
                     lines.append(f"  call void @festina_retain(ptr {val})")
                 lines.append(f"  call void {self._release_fn_for(ftype)}(ptr {old})")
+            elif ftype == TEXT:
+                # claude.md #83: the text counterpart to the block just
+                # above -- copies (via festina_text_own) rather than
+                # retains, frees (via a plain @free) rather than
+                # releases, but otherwise the identical "overwrite one
+                # binding's worth of a fixed-address slot" shape a
+                # struct field write and array element write already
+                # share. A field starts out null (zeroinitializer/
+                # calloc'd storage); an array element always holds a
+                # real value by the time this runs (_emit_array_lit's
+                # own construction already wrote every index once) --
+                # either way @free is always safe (NULL-safe, and every
+                # non-null value here is, by claude.md #83's own
+                # invariant, always an exclusively-owned heap buffer).
+                old = self.tmp()
+                lines.append(f"  {old} = load ptr, ptr {ptr}")
+                if not self._is_owning_text_source(expr.value):
+                    owned = self.tmp()
+                    lines.append(f"  {owned} = call ptr @festina_text_own(ptr {val})")
+                    val = owned
+                lines.append(f"  call void @free(ptr {old})")
             lines.append(f"  store {_llvm_type(ftype)} {val}, ptr {ptr}")
             return val, ftype
         raise CodegenError("unsupported assignment target", file=self.filename)
@@ -3326,6 +3735,7 @@ class CodeGen:
                       "blob": "festina_log_text"}[vtype.name]
                 ty = _llvm_type(vtype)
                 lines.append(f"  call void @{fn}({ty} {val})")
+                self._free_text_temp(expr.args[0], val, vtype, lines)
                 return "0", None
             if name == "fail":
                 val, vtype = self._emit_expr(expr.args[0], env, lines)
@@ -3349,18 +3759,25 @@ class CodeGen:
             if name in self.func_decls:
                 decl = self.func_decls[name]
                 arg_vals = []
+                text_temps = []
                 for arg_expr, param in zip(expr.args, decl.params):
                     ptype = self._resolve(param.type_expr, decl)
                     val, vtype = self._emit_value_for(arg_expr, env, lines, ptype)
                     val = self._coerce(val, vtype, ptype, lines)
                     arg_vals.append(f"{_llvm_type(ptype)} {val}")
+                    text_temps.append((arg_expr, val, vtype))
                 ret_ref, ret_type = env.lookup(name)
                 args_ir = ", ".join(arg_vals)
                 if ret_type is None:
                     lines.append(f"  call void @{name}({args_ir})")
-                    return "0", None
-                out = self.tmp()
-                lines.append(f"  {out} = call {_llvm_type(ret_type)} @{name}({args_ir})")
+                    out = "0"
+                else:
+                    out = self.tmp()
+                    lines.append(f"  {out} = call {_llvm_type(ret_type)} @{name}({args_ir})")
+                # claude.md #83: after the call, not before -- the callee
+                # borrows every text argument for the duration of the call.
+                for arg_expr, val, vtype in text_temps:
+                    self._free_text_temp(arg_expr, val, vtype, lines)
                 return out, ret_type
             raise CodegenError(f"unknown function '{name}'", file=self.filename, line=callee.line)
         if isinstance(callee, ast.Member) and not callee.computed:
@@ -3398,9 +3815,10 @@ class CodeGen:
             if callee.prop == "test":
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if obj_type == REGEX:
-                    arg_val, _ = self._emit_expr(expr.args[0], env, lines)
+                    arg_val, arg_type = self._emit_expr(expr.args[0], env, lines)
                     out = self.tmp()
                     lines.append(f"  {out} = call i8 @festina_regex_test(ptr {obj_val}, ptr {arg_val})")
+                    self._free_text_temp(expr.args[0], arg_val, arg_type, lines)
                     return out, BOOL
             # claude.md #68: value.match(pattern:regex) -> text (or null)
             if callee.prop == "match":
@@ -3409,6 +3827,7 @@ class CodeGen:
                     arg_val, _ = self._emit_expr(expr.args[0], env, lines)
                     out = self.tmp()
                     lines.append(f"  {out} = call ptr @festina_regex_match(ptr {arg_val}, ptr {obj_val})")
+                    self._free_text_temp(callee.obj, obj_val, obj_type, lines)
                     return out, TEXT
             # claude.md #68: value.replace(search, replacement:text) -> text
             #                value.replaceAll(search, replacement:text) -> text
@@ -3416,7 +3835,7 @@ class CodeGen:
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if obj_type == TEXT:
                     search_val, search_type = self._emit_expr(expr.args[0], env, lines)
-                    replacement_val, _ = self._emit_expr(expr.args[1], env, lines)
+                    replacement_val, replacement_type = self._emit_expr(expr.args[1], env, lines)
                     replace_all = "1" if callee.prop == "replaceAll" else "0"
                     out = self.tmp()
                     if search_type == REGEX:
@@ -3432,6 +3851,9 @@ class CodeGen:
                             f"  {out} = call ptr @festina_str_replace(ptr {obj_val}, ptr {search_val}, "
                             f"ptr {replacement_val}, i8 {replace_all})"
                         )
+                    self._free_text_temp(callee.obj, obj_val, obj_type, lines)
+                    self._free_text_temp(expr.args[0], search_val, search_type, lines)
+                    self._free_text_temp(expr.args[1], replacement_val, replacement_type, lines)
                     return out, TEXT
             # claude.md #38: music.play() / music.stop() / music.isPlaying()
             if callee.prop == "play":
@@ -3911,13 +4333,15 @@ class CodeGen:
             if stmt.init is not None:
                 val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
                 val = self._coerce(val, vtype, type_, lines)
-                # claude.md #77: a global's own declaration-with-
-                # initializer is just another point its value changes
-                # -- see _emit_global_retain_release's own
+                # claude.md #77 (widened by #83 to text): a global's own
+                # declaration-with-initializer is just another point its
+                # value changes -- see _emit_global_retain_release's own
                 # comment for why this needs the exact same retain/
-                # release treatment an ordinary `g = expr` reassignment
-                # gets (_emit_assign), not a plain store.
-                self._emit_global_retain_release(ref, val, type_, lines)
+                # release (or, for text, copy/free) treatment an
+                # ordinary `g = expr` reassignment gets (_emit_assign),
+                # not a plain store. Its own return value is what must
+                # actually be stored -- see that method's own comment.
+                val = self._emit_global_retain_release(ref, val, type_, lines, stmt.init)
                 lines.append(f"  store {_llvm_type(type_)} {val}, ptr {ref}")
             return
         self._emit_stmt(stmt, env, None, ctx)
