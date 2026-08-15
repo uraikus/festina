@@ -3792,6 +3792,15 @@ class TestGraphics:
     festina_runtime.c's festina_handle_graphics_event for the actual
     dispatch, right alongside the click/mouse/key/resize dispatch this
     class does verify.
+
+    One test in this class runs against a *fourth*, separate tier: a
+    real window manager (`openbox`, via the `x_display_with_wm` fixture)
+    rather than the bare, WM-less Xvfb every other test here uses --
+    needed because a whole class of window-manager-reparenting race
+    exists only under a real WM, and a bare Xvfb instance can never
+    reproduce it no matter how many times a graphics program is run
+    against it. Skips cleanly if `openbox` isn't installed, same as the
+    rest of this tier skips cleanly without Xvfb/xdotool.
     """
 
     def test_compiles_and_links_successfully(self, cli_mod, tmp_path):
@@ -3929,6 +3938,34 @@ class TestGraphics:
             subprocess.run(["xdotool", "windowsize", wid, "640", "480"], env=env, check=True)
             text = _wait_for_output(stdout_path, lambda t: "resize 640 480" in t)
             assert "resize 640 480" in text
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_graphics_init_does_not_crash_under_a_real_window_manager(
+            self, run_graphics_program, x_display_with_wm):
+        # A confirmed, reproduced regression, not a hypothetical: this
+        # exact source, against this exact fixture, crashed with "X
+        # Error of failed request: BadMatch ... X_SetInputFocus" before
+        # the fix -- reproduced directly against `openbox`, not assumed
+        # from reading the X11 spec. `x_display` (every other test in
+        # this class) is a bare Xvfb instance with no window manager at
+        # all to race with, so it can never reproduce this on its own:
+        # festina_graphics_init's own best-effort XSetInputFocus call
+        # always just succeeds there, no matter how many times it's run.
+        # See festina_ignore_focus_error's own comment in
+        # festina_runtime_graphics.c for the fix this guards.
+        source = "log(`${clientWidth}x${clientHeight}`)"
+        proc, stdout_path = run_graphics_program(source, display=x_display_with_wm)
+        try:
+            _find_window(x_display_with_wm)  # the window actually opened and is mapped
+            text = _wait_for_output(stdout_path, lambda t: t.strip() != "")
+            assert text.strip() == "800x600"
+            assert proc.poll() is None, (
+                "graphics program exited unexpectedly under a real window manager "
+                f"(the XSetInputFocus BadMatch regression?) -- stdout:\n"
+                f"{stdout_path.read_text()}"
+            )
         finally:
             proc.terminate()
             proc.wait(timeout=5)

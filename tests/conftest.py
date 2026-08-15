@@ -289,20 +289,26 @@ def run_graphics_program(tmp_path, codegen, cli_mod, x_display):
     reads stdout_path, then must terminate the process itself (a
     graphics program blocks in its event loop until the window closes,
     so there's no "wait for it to exit" the way compile_and_run has).
+
+    `display` defaults to the injected `x_display` (a bare Xvfb
+    instance) but can be overridden per-call -- `x_display_with_wm`'s
+    own regression test passes its WM-backed display explicitly, to run
+    the exact same compile-and-launch path against a real window
+    manager instead.
     """
     cc = _require_c_compiler()
     if not shutil.which("xdotool"):
         pytest.skip("xdotool isn't installed -- needed to simulate clicks/mouse "
                      "movement against the graphics canvas window")
 
-    def _run(source, filename="main.f"):
+    def _run(source, filename="main.f", display=None):
         src_path = tmp_path / filename
         src_path.write_text(source)
         out_path = tmp_path / "program"
         cli_mod.compile_file(str(src_path), str(out_path), cc=cc)
 
         stdout_path = tmp_path / "stdout.log"
-        env = dict(os.environ, DISPLAY=x_display)
+        env = dict(os.environ, DISPLAY=display or x_display)
         proc = subprocess.Popen(
             ["stdbuf", "-oL", str(out_path)],
             cwd=tmp_path, stdout=open(stdout_path, "w"), stderr=subprocess.STDOUT,
@@ -311,3 +317,76 @@ def run_graphics_program(tmp_path, codegen, cli_mod, x_display):
         return proc, stdout_path
 
     return _run
+
+
+@pytest.fixture
+def x_display_with_wm(x_display):
+    """Wraps x_display with a real window manager running against it --
+    `openbox`, a real, actively-used, EWMH-compliant one, not a
+    minimal/legacy stand-in -- so a graphics test can run against
+    exactly the class of window manager this fixture exists for:
+    `x_display`'s own bare Xvfb instance has no window manager at all,
+    so it can never reproduce a WM-reparenting race no matter how many
+    times a graphics program is run against it (confirmed directly:
+    `festina_graphics_init`'s own best-effort XSetInputFocus call,
+    harmless under a WM-less Xvfb, reproducibly crashed the whole
+    program with a BadMatch under a real WM before the fix this
+    fixture's own regression test exists to guard -- reproduced under
+    both `openbox` and, initially, `twm`; `twm` was dropped for this
+    fixture after it turned out to have its own separate, unrelated
+    hang deep inside `cairo_xlib_surface_create`, apparently a quirk of
+    that particular 1990s-era WM's own grab handling -- confirmed
+    absent under `openbox`, which is what any real user is actually
+    likely to be running). Skips cleanly if `openbox` isn't installed --
+    same opt-in tier as `x_display`'s own Xvfb skip; `openbox` isn't one
+    of setup.md's documented dependencies, only this one regression
+    test's own.
+
+    Waits for a real readiness signal, not a fixed sleep, the same way
+    `x_display` itself polls Xvfb via `xdotool getdisplaygeometry`:
+    unlike `twm`, `openbox` is EWMH-compliant and sets
+    `_NET_SUPPORTING_WM_CHECK` on the root window as soon as it's ready
+    to manage windows, which `xprop` (part of the same `x11-utils`
+    package tier as `xdotool`) can poll for directly.
+    """
+    openbox = shutil.which("openbox")
+    if not openbox:
+        pytest.skip("openbox isn't installed -- needed to test graphics init against "
+                     "a real window manager, not just a bare Xvfb instance")
+    proc = subprocess.Popen([openbox], env=dict(os.environ, DISPLAY=x_display),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.time() + 10
+    ready = False
+    xprop = shutil.which("xprop")
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            pytest.fail(f"openbox on {x_display} exited immediately (see its exit code: {proc.returncode})")
+        if xprop:
+            probe = subprocess.run(
+                [xprop, "-root", "_NET_SUPPORTING_WM_CHECK"],
+                env=dict(os.environ, DISPLAY=x_display),
+                capture_output=True, text=True,
+            )
+            if probe.returncode == 0 and "_NET_SUPPORTING_WM_CHECK" in probe.stdout:
+                ready = True
+                break
+        else:
+            # xprop isn't installed -- fall back to a fixed, generous
+            # sleep instead of a real readiness poll (openbox itself
+            # isn't a documented setup.md dependency at all, so xprop's
+            # own absence shouldn't hard-fail this fixture too).
+            time.sleep(1)
+            ready = True
+            break
+        time.sleep(0.1)
+    if not ready:
+        proc.terminate()
+        pytest.fail(f"openbox on {x_display} never became ready to manage windows")
+    try:
+        yield x_display
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()

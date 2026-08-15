@@ -359,11 +359,11 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 801 tests in this directory pass against it: 536 need no external
+All 802 tests in this directory pass against it: 536 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
 255 more need a working C compiler, plus 2 more
-(`tests/test_packaging.py`) given `pyinstaller` too, plus 8 more given
-`Xvfb`+`xdotool` too (536 + 255 + 2 + 8 = 801 -- re-verified directly
+(`tests/test_packaging.py`) given `pyinstaller` too, plus 9 more given
+`Xvfb`+`xdotool` too (536 + 255 + 2 + 9 = 802 -- re-verified directly
 by hiding each tool from PATH in turn, not just derived by counting
 `compile_and_run` call sites, since the true number had drifted well
 past a much older, since-inaccurate count of "694 given a working C
@@ -372,12 +372,15 @@ end-to-end tests grew to their current share of it)
 (`tests/test_codegen.py::TestGraphics`'s interactive click/mouse/key/
 resize tests, the one confirming the initial `clientWidth`/
 `clientHeight` values, `TestTimers`'s combined graphics-and-timers test,
-and `TestExampleGraphicsAndGame`'s two example-driven tests below) --
-all skip cleanly, independently, without any of those three (see
-below). `tests/test_audio.py`/`TestAudio` need none of the three
-either -- the null-device technique they use (see conftest.py's
-`audio_null_env`) needs no extra tool install, only the C compiler
-`compile_and_run` already requires.
+`TestExampleGraphicsAndGame`'s two example-driven tests below, and the
+real-window-manager crash regression test -- see security.md) -- all
+skip cleanly, independently, without any of those three (see below).
+One of those nine (the real-window-manager regression test) needs a
+fourth tool on top, `openbox`, and skips cleanly without it too even
+when the other three are present. `tests/test_audio.py`/`TestAudio`
+need none of the above -- the null-device technique they use (see
+conftest.py's `audio_null_env`) needs no extra tool install, only the C
+compiler `compile_and_run` already requires.
 
 `examples/` grew beyond the original hello/basic/arrays/geometry/
 multifile/regex set: `timers.f` (setTimeout/setInterval), `graphics.f`
@@ -2011,6 +2014,19 @@ making the stricter behavior the rule everywhere, with `Math`/`.toFloat()`
 as the escape hatch, rather than picking a side ad hoc in code with no
 spec backing either way.
 
+A user-reported bug, not one this suite's own testing surfaced first: a
+compiled graphics program (`tic_tac_toe.f` among them) crashed with a
+real X11 protocol error, `BadMatch` on `X_SetInputFocus`, the moment its
+window opened on a real desktop -- never reproducible against this
+suite's own Xvfb-based `TestGraphics` tier, since a bare Xvfb instance
+runs no window manager to race against at all. Root-caused, fixed, and
+given its own dedicated regression test (a new `x_display_with_wm`
+fixture layering a real `openbox` instance on top of the existing
+Xvfb-based `x_display` fixture) -- full writeup, including a separate,
+unrelated `twm`-specific hang found and ruled out while narrowing this
+down, in
+[security.md](security.md#graphics-a-real-window-manager-crash-badmatch-on-xsetinputfocus).
+
 See api.md for the current language/standard library reference and this
 file's own "Status" section above for the implemented-vs-not matrix; the
 short version: nothing is left
@@ -2766,8 +2782,9 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 536 passed, 265 skipped (needs a C compiler; 2 of
+pytest tests/                          # 536 passed, 266 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
-                                        # 8 need Xvfb + xdotool installed too) given a
-                                        # working C compiler, all 801 pass
+                                        # 9 need Xvfb + xdotool installed too, 1 of those
+                                        # also needs `openbox`) given a working C compiler,
+                                        # all 802 pass
 ```
