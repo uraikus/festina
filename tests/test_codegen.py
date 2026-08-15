@@ -122,6 +122,11 @@ class TestArithmeticAndControlFlow:
 class TestStrings:
     """claude.md #9, #45: template string interpolation."""
 
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
     def test_template_interpolation(self, compile_and_run):
         source = """
         text func greet(name:text) {
@@ -140,6 +145,126 @@ class TestStrings:
         """
         result = compile_and_run(source)
         assert result.stdout.strip() == "(3, 4)"
+
+    # -- claude.md #82: a template literal skips concatenating with an
+    # empty literal piece entirely (starts/ends with an interpolation,
+    # or has two interpolations back to back) instead of emitting a
+    # wasted `festina_str_concat("", ...)`/`festina_str_concat(..., "")`
+    # call for it -- correctness (output is identical either way) and
+    # the actual call-count reduction are both worth locking in
+    # separately, so the optimization can't silently regress back to
+    # the old always-two-calls-per-interpolation shape.
+
+    def test_interpolation_at_the_start_produces_correct_output(self, compile_and_run):
+        source = """
+        text name = 'World'
+        log(`${name}!`)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "World!"
+
+    def test_interpolation_at_the_end_produces_correct_output(self, compile_and_run):
+        source = """
+        text name = 'World'
+        log(`Hello, ${name}`)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "Hello, World"
+
+    def test_bare_interpolation_with_no_surrounding_text_produces_correct_output(
+            self, compile_and_run):
+        source = """
+        text name = 'World'
+        log(`${name}`)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "World"
+
+    def test_adjacent_interpolations_with_no_text_between_them_produce_correct_output(
+            self, compile_and_run):
+        source = """
+        int x = 3
+        int y = 4
+        log(`${x}${y}`)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "34"
+
+    def test_a_leading_empty_piece_emits_no_concat_for_it(self, parser, semantic, codegen):
+        # `${name}!` has parts = ["", "!"] -- the leading "" is never
+        # concatenated at all; only ONE festina_str_concat call remains
+        # (appending "!"), not two.
+        source = """
+        void func f(name:text) {
+            log(`${name}!`)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert f_body.count("call ptr @festina_str_concat(") == 1
+
+    def test_a_trailing_empty_piece_emits_no_concat_for_it(self, parser, semantic, codegen):
+        # `Hello, ${name}` has parts = ["Hello, ", ""] -- the trailing ""
+        # is never concatenated; only ONE call remains (prepending
+        # "Hello, ").
+        source = """
+        void func f(name:text) {
+            log(`Hello, ${name}`)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert f_body.count("call ptr @festina_str_concat(") == 1
+
+    def test_a_bare_interpolation_emits_no_concat_call_at_all(self, parser, semantic, codegen):
+        # `${name}` has parts = ["", ""] -- both empty, so the
+        # interpolated value's own text is used directly, with zero
+        # festina_str_concat calls (the old codegen emitted two: `"" +
+        # name`, then `+ ""`).
+        source = """
+        void func f(name:text) {
+            log(`${name}`)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert f_body.count("call ptr @festina_str_concat(") == 0
+
+    def test_adjacent_interpolations_emit_exactly_one_concat_for_the_empty_piece_between_them(
+            self, parser, semantic, codegen):
+        # `${x}${y}` has parts = ["", "", ""] -- the leading and
+        # trailing pieces are both skipped (same as the bare-
+        # interpolation case), but the piece BETWEEN x and y is also
+        # "" and must still result in exactly one concat joining x's
+        # and y's own text together (there's no way to skip joining two
+        # genuinely different runtime values into one string).
+        source = """
+        void func f(x:int, y:int) {
+            log(`${x}${y}`)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert f_body.count("call ptr @festina_str_concat(") == 1
+
+    def test_a_template_with_no_empty_pieces_is_unaffected(self, parser, semantic, codegen):
+        # `(${x}, ${y})` has parts = ["(", ", ", ")"] -- none empty, so
+        # every concat call this template always needed is still there:
+        # 4 total (join x in, join ", " in, join y in, join ")" in),
+        # unchanged from before claude.md #82.
+        source = """
+        void func f(x:int, y:int) {
+            log(`(${x}, ${y})`)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert f_body.count("call ptr @festina_str_concat(") == 4
 
 
 class TestBlob:
@@ -848,14 +973,22 @@ class TestAutomaticMemoryReclamation:
         assert "call ptr @calloc(" not in ir
         assert "call void @free(" not in ir
 
-    def test_array_local_declared_with_an_initializer_is_refcounted(self, parser, semantic, codegen):
-        # claude.md #79: a with-initializer arr[T]/map[T] local never
-        # stack-allocates at all (mirroring claude.md #77's own struct
-        # rule) -- it's always refcounted, released through
-        # festina_release_array/_map rather than a bare @free(), which
-        # only ever fires for a genuinely stack-allocated (no-init,
-        # non-escaping) local's own data buffer now -- see
-        # test_no_init_non_escaping_array_local_frees_its_data_pointer_directly.
+    def test_non_escaping_array_local_declared_with_a_literal_initializer_is_stack_allocated(
+            self, parser, semantic, codegen):
+        # claude.md #81: a with-initializer arr[T]/map[T] local used to
+        # never stack-allocate at all (mirroring claude.md #77's own
+        # original struct rule) -- always refcounted, released through
+        # festina_release_array/_map. Now, when the initializer is a
+        # literal written directly here AND the local never escapes
+        # (both true in this exact source), the header itself is
+        # stack-allocated instead, exactly like a no-init non-escaping
+        # local already was (see
+        # test_no_init_non_escaping_array_local_frees_its_data_pointer_directly,
+        # just below) -- only the data buffer this literal still
+        # malloc's needs freeing at scope-exit, through a bare @free(),
+        # never festina_release_array. The ESCAPING with-init case is
+        # unaffected and still fully refcounted -- see
+        # test_with_init_array_local_is_refcounted_via_a_shared_header.
         source = """
         void func f() {
             arr[int] a = [1, 2, 3]
@@ -864,7 +997,9 @@ class TestAutomaticMemoryReclamation:
         """
         ir = self._ir(parser, semantic, codegen, source)
         assert "getelementptr %struct._FestinaArray, ptr" in ir
-        assert "call void @festina_release_array(" in ir
+        assert "alloca %struct._FestinaArray" in ir
+        assert "call void @free(" in ir
+        assert "call void @festina_release_array(" not in ir
 
     def test_no_init_non_escaping_array_local_frees_its_data_pointer_directly(
             self, parser, semantic, codegen):
@@ -883,18 +1018,41 @@ class TestAutomaticMemoryReclamation:
         assert "call void @free(" in ir
         assert "call void @festina_release_array(" not in ir
 
-    def test_map_local_declared_with_an_initializer_is_refcounted(self, parser, semantic, codegen):
-        # claude.md #79: same as the array case above -- a with-
-        # initializer map[T] local is always refcounted, released
-        # through festina_release_map (which itself calls
-        # festina_map_free_entries internally, in C -- no longer
-        # directly visible in the generated IR, see
-        # test_no_init_non_escaping_map_local_frees_its_entries_pointer_directly
-        # for where that call still appears in the IR).
+    def test_non_escaping_map_local_declared_with_a_literal_initializer_is_stack_allocated(
+            self, parser, semantic, codegen):
+        # claude.md #81: same as the array case above -- a with-
+        # initializer map[T] local used to always be refcounted,
+        # released through festina_release_map (which itself calls
+        # festina_map_free_entries internally, in C). Now, non-escaping
+        # with a literal initializer written directly here, its header
+        # is stack-allocated instead, so festina_map_free_entries is
+        # called directly in this function's own IR (not hidden inside
+        # festina_release_map anymore) to free just the entries buffer.
         source = """
         void func f() {
             map[int] m = {'a': 1}
             log(m['a'])
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "getelementptr %struct._FestinaMap, ptr" in ir
+        assert "alloca %struct._FestinaMap" in ir
+        assert "call void @festina_map_free_entries(" in ir
+        assert "call void @festina_release_map(" not in ir
+
+    def test_escaping_map_local_declared_with_an_initializer_is_refcounted(
+            self, parser, semantic, codegen):
+        # The escaping counterpart to the non-escaping test just above
+        # (mirroring test_with_init_array_local_is_refcounted_via_a_shared_header):
+        # `m` here is assigned into a global, so it can't be stack-
+        # allocated at all -- still always refcounted, released through
+        # festina_release_map, exactly as every with-init map local was
+        # before claude.md #81.
+        source = """
+        map[int] g
+        void func f() {
+            map[int] m = {'a': 1}
+            g = m
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
@@ -1059,8 +1217,8 @@ class TestAutomaticMemoryReclamation:
 
     def test_a_loop_local_array_is_freed_inside_the_loop_body(self, parser, semantic, codegen):
         # claude.md #74's nested-block extension: a loop-body-declared
-        # local is released at the end of *every* iteration -- exactly
-        # one release call, and it must be inside the loop body's own
+        # local is freed at the end of *every* iteration -- exactly
+        # one free call, and it must be inside the loop body's own
         # block (part of the runtime back-edge cycle), not just once
         # after the loop as a whole exits. Uses arr[int], not a
         # struct -- since the stack-allocation swap (claude.md #43/#74/
@@ -1068,10 +1226,12 @@ class TestAutomaticMemoryReclamation:
         # free-scheduling machinery at all (see
         # test_a_loop_local_struct_is_reused_across_iterations_via_the_same_alloca
         # for the struct/stack-allocation equivalent of this same
-        # shape); a with-initializer arr[T] local (claude.md #79) is
-        # always refcounted, released the same way a struct with an
-        # initializer already is, so this is still the right type to
-        # exercise the free-scheduling logic itself with.
+        # shape). `p` here is non-escaping with a literal initializer,
+        # so its own HEADER is stack-allocated (claude.md #81) and only
+        # its data buffer needs freeing at scope-exit (a plain @free(),
+        # not festina_release_array) -- still exactly the right type to
+        # exercise the free-scheduling logic itself with, just through
+        # a different runtime call than before #81.
         source = """
         void func f() {
             for int i = 0, i < 3, i++ {
@@ -1085,8 +1245,8 @@ class TestAutomaticMemoryReclamation:
         body_start = next(i for i, l in enumerate(lines) if l.strip().startswith("for.body"))
         body_end = next(i for i in range(body_start, len(lines)) if lines[i].strip().startswith("br label %for.update"))
         body_lines = lines[body_start:body_end]
-        assert sum("call void @festina_release_array(" in l for l in body_lines) == 1
-        assert ir.count("call void @festina_release_array(") == 1
+        assert sum("call void @free(" in l for l in body_lines) == 1
+        assert ir.count("call void @free(") == 1
 
     def test_a_nested_if_declared_array_is_freed_at_the_ifs_own_end(self, parser, semantic, codegen):
         source = """
@@ -1098,7 +1258,7 @@ class TestAutomaticMemoryReclamation:
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @festina_release_array(" in ir
+        assert "call void @free(" in ir
 
     def test_break_frees_the_loop_local_but_not_an_outer_scope_local(self, parser, semantic, codegen):
         source = """
@@ -1119,12 +1279,12 @@ class TestAutomaticMemoryReclamation:
         break_block = next(i for i, l in enumerate(lines) if l.strip().startswith("if.then"))
         break_block_end = next(i for i in range(break_block, len(lines)) if lines[i].strip().startswith("br label %for.end"))
         break_lines = lines[break_block:break_block_end]
-        # Exactly one release on the break path -- inner's, not outer's
+        # Exactly one free on the break path -- inner's, not outer's
         # (outer is declared outside the loop, merely used inside it).
-        assert sum("call void @festina_release_array(" in l for l in break_lines) == 1
-        # outer is still released exactly once overall, at the function's
+        assert sum("call void @free(" in l for l in break_lines) == 1
+        # outer is still freed exactly once overall, at the function's
         # own end (after the loop, whichever way it was exited).
-        assert ir.count("call void @festina_release_array(") == 3  # inner (break path) + inner (fall-through path) + outer
+        assert ir.count("call void @free(") == 3  # inner (break path) + inner (fall-through path) + outer
 
     def test_continue_frees_locals_declared_since_the_loop_body_began(self, parser, semantic, codegen):
         source = """
@@ -1143,7 +1303,7 @@ class TestAutomaticMemoryReclamation:
         continue_block = next(i for i, l in enumerate(lines) if l.strip().startswith("if.then"))
         continue_block_end = next(i for i in range(continue_block, len(lines)) if lines[i].strip().startswith("br label %for.update"))
         continue_lines = lines[continue_block:continue_block_end]
-        assert sum("call void @festina_release_array(" in l for l in continue_lines) == 1
+        assert sum("call void @free(" in l for l in continue_lines) == 1
 
     def test_nested_if_inside_a_loop_frees_correctly_on_both_the_break_and_fallthrough_paths(self, parser, semantic, codegen):
         source = """
@@ -1158,11 +1318,11 @@ class TestAutomaticMemoryReclamation:
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        # One release on the break path (p, via break's own release-
-        # before-branch), one on the normal fall-through-to-next-
-        # iteration path (p, via the loop body's own natural end) --
-        # two total, both p, never both taken on the same iteration.
-        assert ir.count("call void @festina_release_array(") == 2
+        # One free on the break path (p, via break's own free-before-
+        # branch), one on the normal fall-through-to-next-iteration path
+        # (p, via the loop body's own natural end) -- two total, both p,
+        # never both taken on the same iteration.
+        assert ir.count("call void @free(") == 2
 
     def test_early_return_before_the_declaration_has_no_free_on_that_path(self, parser, semantic, codegen):
         source = """
@@ -1180,13 +1340,13 @@ class TestAutomaticMemoryReclamation:
         func_end = next(i for i in range(func_start, len(lines)) if lines[i] == "}")
         func_lines = lines[func_start:func_end]
         # The very first `ret void` (the early-return path, before p is
-        # declared) must not be preceded by a release call anywhere
-        # earlier in the function; the second (the fall-through path,
-        # after p is declared) must be.
+        # declared) must not be preceded by a free call anywhere earlier
+        # in the function; the second (the fall-through path, after p is
+        # declared) must be.
         ret_indices = [i for i, l in enumerate(func_lines) if l.strip() == "ret void"]
         assert len(ret_indices) == 2
-        assert not any("call void @festina_release_array(" in l for l in func_lines[:ret_indices[0] + 1])
-        assert any("call void @festina_release_array(" in l for l in func_lines[ret_indices[0] + 1:ret_indices[1] + 1])
+        assert not any("call void @free(" in l for l in func_lines[:ret_indices[0] + 1])
+        assert any("call void @free(" in l for l in func_lines[ret_indices[0] + 1:ret_indices[1] + 1])
 
     def test_event_handler_locals_are_analyzed_too(self, parser, semantic, codegen):
         source = """
@@ -1196,7 +1356,7 @@ class TestAutomaticMemoryReclamation:
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @festina_release_array(" in ir
+        assert "call void @free(" in ir
 
     def test_event_handler_struct_local_is_stack_allocated_too(self, parser, semantic, codegen):
         source = """
@@ -1603,8 +1763,8 @@ class TestAutomaticMemoryReclamation:
         inner_break_end = next(i for i in range(inner_break_block, len(lines))
                                 if lines[i].strip().startswith("br label %for.end"))
         break_lines = lines[inner_break_block:inner_break_end]
-        # Exactly one release on the inner break path -- inner's own, not mid's.
-        assert sum("call void @festina_release_array(" in l for l in break_lines) == 1
+        # Exactly one free on the inner break path -- inner's own, not mid's.
+        assert sum("call void @free(" in l for l in break_lines) == 1
 
     def test_break_in_a_nested_loop_does_not_corrupt_the_outer_loops_local(self, compile_and_run):
         source = """
