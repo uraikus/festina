@@ -219,3 +219,98 @@ class TestEscapingUses:
     def test_postfix_op_operand(self, parser, escape_analysis_mod):
         names = _escaping_names(parser, escape_analysis_mod, "int i = 0\ni++")
         assert "i" in names
+
+
+class TestInterproceduralEscapingParams:
+    """claude.md #74 stage 2: find_escaping_names's optional
+    escaping_params argument. Unit-level, on find_escaping_names
+    directly with a hand-built {func_name: set[int]} table -- the
+    question of how codegen.py actually BUILDS that table (one function
+    at a time, in program order, using each earlier function's own
+    already-computed result) is covered separately in
+    tests/test_codegen.py::TestAutomaticMemoryReclamation, against real
+    generated IR and real compiled output. This class only checks the
+    consuming half: given a table, does a Call argument position get
+    exempted (or not) exactly as documented in escape_analysis.py's own
+    module docstring."""
+
+    def test_position_proven_safe_is_exempted(self, parser, escape_analysis_mod):
+        program = parser.parse("void func f() {\n    Point p\n    g(p)\n}")
+        names = escape_analysis_mod.find_escaping_names(
+            program.body[0].body, escaping_params={"g": set()})
+        assert "p" not in names
+
+    def test_position_proven_escaping_still_escapes(self, parser, escape_analysis_mod):
+        program = parser.parse("void func f() {\n    Point p\n    g(p)\n}")
+        names = escape_analysis_mod.find_escaping_names(
+            program.body[0].body, escaping_params={"g": {0}})
+        assert "p" in names
+
+    def test_unknown_callee_defaults_to_escaping(self, parser, escape_analysis_mod):
+        # g simply isn't a key in the table at all (a builtin, a method,
+        # or -- from codegen.py's own use of this -- a function this
+        # program never got around to registering, e.g. it's still
+        # being analyzed itself, mid-self-recursion) -- falls back to
+        # the original unconditional rule, exactly as if escaping_params
+        # were never passed.
+        program = parser.parse("void func f() {\n    Point p\n    g(p)\n}")
+        names = escape_analysis_mod.find_escaping_names(
+            program.body[0].body, escaping_params={})
+        assert "p" in names
+
+    def test_escaping_params_omitted_matches_original_unconditional_behavior(
+            self, parser, escape_analysis_mod):
+        program = parser.parse("void func f() {\n    Point p\n    g(p)\n}")
+        names = escape_analysis_mod.find_escaping_names(program.body[0].body)
+        assert "p" in names
+
+    def test_only_the_matching_argument_position_is_exempted(self, parser, escape_analysis_mod):
+        # g's own analysis proved position 1 escapes but position 0
+        # doesn't -- p (position 0) must be exempted, q (position 1)
+        # must not, in the exact same call.
+        program = parser.parse(
+            "void func f() {\n    Point p\n    Point q\n    g(p, q)\n}")
+        names = escape_analysis_mod.find_escaping_names(
+            program.body[0].body, escaping_params={"g": {1}})
+        assert "p" not in names
+        assert "q" in names
+
+    def test_method_call_never_consults_escaping_params(self, parser, escape_analysis_mod):
+        # m.forEach(cb) -- the callee is a Member (m.forEach), not a
+        # plain Identifier, so it can never match a key in the table no
+        # matter what that table contains; cb still escapes via the
+        # original unconditional rule. A table entry deliberately keyed
+        # "forEach" (matching the method NAME, not a real function) is
+        # included to prove the lookup genuinely never even considers
+        # Member callees, not just that this particular table happens
+        # not to have a matching key.
+        program = parser.parse(
+            "void func f() {\n    map[int] m = {}\n    Point cb\n    m.forEach(cb)\n}")
+        names = escape_analysis_mod.find_escaping_names(
+            program.body[0].body, escaping_params={"forEach": set()})
+        assert "cb" in names
+
+    def test_non_identifier_argument_at_an_exempted_position_is_still_walked_safely(
+            self, parser, escape_analysis_mod):
+        # g(p.x) at a proven-safe position -- p.x isn't a bare
+        # Identifier, so the exemption's own isinstance guard doesn't
+        # apply to it, but it's still just p's own Member.obj-safe field
+        # read either way (see TestSafeUses.test_field_read) -- exists
+        # to confirm this doesn't crash or behave differently than the
+        # no-escaping_params case for a non-Identifier argument.
+        program = parser.parse("void func f() {\n    Point p\n    g(p.x)\n}")
+        names = escape_analysis_mod.find_escaping_names(
+            program.body[0].body, escaping_params={"g": set()})
+        assert "p" not in names
+
+    def test_still_escapes_via_an_unrelated_use_despite_the_exempted_call(
+            self, parser, escape_analysis_mod):
+        # p is exempted at the g(p) call site specifically, but also
+        # returned two lines later -- the exemption only stops THAT one
+        # call site from being the reason p escapes; it must not paper
+        # over p's own, entirely separate, genuinely escaping use.
+        program = parser.parse(
+            "Point func f() {\n    Point p\n    g(p)\n    return p\n}")
+        names = escape_analysis_mod.find_escaping_names(
+            program.body[0].body, escaping_params={"g": set()})
+        assert "p" in names

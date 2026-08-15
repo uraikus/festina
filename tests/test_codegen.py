@@ -827,7 +827,12 @@ class TestAutomaticMemoryReclamation:
 
     # ---- IR-level: no C compiler needed ----
 
-    def test_non_escaping_struct_local_is_freed(self, parser, semantic, codegen):
+    def test_non_escaping_struct_local_is_stack_allocated(self, parser, semantic, codegen):
+        # claude.md #43/#74/#75: a struct local proven never to escape
+        # its declaring function is now a real stack alloca, not a
+        # calloc+free pair -- see _emit_stmt's own VarDecl comment for
+        # why reusing the exact same escape-analysis proof is sound for
+        # allocation, not just for freeing.
         source = """
         struct Point { x:int y:int }
         void func f() {
@@ -837,9 +842,20 @@ class TestAutomaticMemoryReclamation:
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @free(" in ir
+        assert "%p.storage" in ir
+        assert "alloca %struct.Point" in ir
+        assert "store %struct.Point zeroinitializer" in ir
+        assert "call ptr @calloc(" not in ir
+        assert "call void @free(" not in ir
 
-    def test_non_escaping_array_local_frees_its_data_pointer(self, parser, semantic, codegen):
+    def test_array_local_declared_with_an_initializer_is_refcounted(self, parser, semantic, codegen):
+        # claude.md #79: a with-initializer arr[T]/map[T] local never
+        # stack-allocates at all (mirroring claude.md #77's own struct
+        # rule) -- it's always refcounted, released through
+        # festina_release_array/_map rather than a bare @free(), which
+        # only ever fires for a genuinely stack-allocated (no-init,
+        # non-escaping) local's own data buffer now -- see
+        # test_no_init_non_escaping_array_local_frees_its_data_pointer_directly.
         source = """
         void func f() {
             arr[int] a = [1, 2, 3]
@@ -847,10 +863,34 @@ class TestAutomaticMemoryReclamation:
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "extractvalue %struct._FestinaArray" in ir
-        assert "call void @free(" in ir
+        assert "getelementptr %struct._FestinaArray, ptr" in ir
+        assert "call void @festina_release_array(" in ir
 
-    def test_non_escaping_map_local_frees_its_entries_pointer(self, parser, semantic, codegen):
+    def test_no_init_non_escaping_array_local_frees_its_data_pointer_directly(
+            self, parser, semantic, codegen):
+        # A no-init arr[T] local that never escapes still stack-
+        # allocates its own header (claude.md #74, unchanged) -- only
+        # its data buffer needs freeing at scope-exit, through a bare
+        # @free(), never festina_release_array (the header itself was
+        # never heap-allocated/refcounted at all).
+        source = """
+        void func f() {
+            arr[int] a
+            log(a.length)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" in ir
+        assert "call void @festina_release_array(" not in ir
+
+    def test_map_local_declared_with_an_initializer_is_refcounted(self, parser, semantic, codegen):
+        # claude.md #79: same as the array case above -- a with-
+        # initializer map[T] local is always refcounted, released
+        # through festina_release_map (which itself calls
+        # festina_map_free_entries internally, in C -- no longer
+        # directly visible in the generated IR, see
+        # test_no_init_non_escaping_map_local_frees_its_entries_pointer_directly
+        # for where that call still appears in the IR).
         source = """
         void func f() {
             map[int] m = {'a': 1}
@@ -858,8 +898,30 @@ class TestAutomaticMemoryReclamation:
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "extractvalue %struct._FestinaMap" in ir
-        assert "call void @free(" in ir
+        assert "getelementptr %struct._FestinaMap, ptr" in ir
+        assert "call void @festina_release_map(" in ir
+        assert "call void @festina_map_free_entries(" not in ir
+
+    def test_no_init_non_escaping_map_local_frees_its_entries_pointer_directly(
+            self, parser, semantic, codegen):
+        # claude.md #74/#75: a map's entries buffer has its own nested
+        # per-entry key allocation (see festina_map_set's own comment),
+        # so freeing it goes through festina_map_free_entries -- which
+        # frees each entry's key too -- not a plain @free(entries) that
+        # would leak them. A no-init map that never escapes still
+        # stack-allocates its own header (claude.md #74, unchanged), so
+        # this call is still emitted directly in the IR, unlike the
+        # with-initializer case above.
+        source = """
+        void func f() {
+            map[int] m
+            m['a'] = 1
+            log(m['a'])
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_map_free_entries(" in ir
+        assert "call void @festina_release_map(" not in ir
 
     def test_returned_struct_is_not_freed(self, parser, semantic, codegen):
         source = """
@@ -873,7 +935,18 @@ class TestAutomaticMemoryReclamation:
         ir = self._ir(parser, semantic, codegen, source)
         assert "call void @free(" not in ir
 
-    def test_struct_passed_as_a_call_argument_is_not_freed(self, parser, semantic, codegen):
+    def test_struct_passed_to_a_non_retaining_function_is_now_stack_allocated(
+            self, parser, semantic, codegen):
+        # claude.md #74 stage 2 (interprocedural): takesPoint only reads
+        # p.x (a Member.obj-safe use, same rule as any local's own
+        # fields) -- its own parameter never escapes within its own
+        # body, so escaping_params[takesPoint] = {} and f()'s own `p`,
+        # passed there and never used any other way, is now provably
+        # safe too. This is the exact case stage 1's own module
+        # docstring called out as its stated limitation ("even if the
+        # called function provably doesn't retain it") -- combined with
+        # the stack-allocation swap (claude.md #43/#74/#75), f()'s own
+        # `p` is now a stack alloca, not a calloc'd allocation at all.
         source = """
         struct Point { x:int y:int }
         void func takesPoint(p:Point) {
@@ -882,6 +955,79 @@ class TestAutomaticMemoryReclamation:
         void func f() {
             Point p
             takesPoint(p)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "alloca %struct.Point" in f_body
+        assert "call ptr @calloc(" not in f_body
+
+    def test_loop_local_struct_is_stack_allocated_and_reused_across_iterations(
+            self, parser, semantic, codegen):
+        # claude.md #43/#74/#75: the loop-body/break/continue-scoped
+        # freeing machinery still applies to *when* a struct local's
+        # storage is considered dead, even though "dead" no longer
+        # means "call free() here" for a struct -- it means the very
+        # next textual reach of the same VarDecl (the next iteration)
+        # re-zeros the *same* stack address rather than allocating a
+        # fresh one, since LLVM's alloca reserves one fixed slot for
+        # the whole enclosing function regardless of which basic block
+        # contains it. The alloca and its zeroinitializer store must
+        # both be inside the loop body (so re-zeroing genuinely
+        # happens every iteration, not just once before the loop), and
+        # there must be no calloc/free anywhere in the function at all.
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            for int i = 0, i < 3, i++ {
+                Point p
+                p.x = i
+                log(p.x)
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        body_start = next(i for i, l in enumerate(lines) if l.strip().startswith("for.body"))
+        body_end = next(i for i in range(body_start, len(lines)) if lines[i].strip().startswith("br label %for.update"))
+        body_lines = lines[body_start:body_end]
+        assert any("alloca %struct.Point" in l for l in body_lines)
+        assert any("store %struct.Point zeroinitializer" in l for l in body_lines)
+        assert "call ptr @calloc(" not in ir
+        assert "call void @free(" not in ir
+
+    def test_nested_if_declared_struct_is_stack_allocated(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f(cond:bool) {
+            if cond {
+                Point p
+                p.x = 1
+                log(p.x)
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "alloca %struct.Point" in ir
+        assert "call ptr @calloc(" not in ir
+
+    def test_struct_passed_to_a_retaining_function_is_still_not_freed(self, parser, semantic, codegen):
+        # The mirror case: retains actually stores its own parameter
+        # into a global (an unconditional hard escape, same rule as
+        # ever) -- escaping_params[retains] = {0}, so f()'s own `p`,
+        # passed at that same position, still correctly escapes too.
+        # Interprocedural analysis only ever widens what's PROVEN safe;
+        # it must never widen what's proven unsafe.
+        source = """
+        struct Point { x:int y:int }
+        Point stash
+        void func retains(p:Point) {
+            stash = p
+        }
+        void func f() {
+            Point p
+            retains(p)
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
@@ -911,59 +1057,61 @@ class TestAutomaticMemoryReclamation:
         ir = self._ir(parser, semantic, codegen, source)
         assert "call void @free(" not in ir
 
-    def test_a_loop_local_struct_is_freed_inside_the_loop_body(self, parser, semantic, codegen):
+    def test_a_loop_local_array_is_freed_inside_the_loop_body(self, parser, semantic, codegen):
         # claude.md #74's nested-block extension: a loop-body-declared
-        # non-escaping local is now freed at the end of *every*
-        # iteration -- exactly one free() call, and it must be inside
-        # the loop body's own block (part of the runtime back-edge
-        # cycle), not just once after the loop as a whole exits.
+        # local is released at the end of *every* iteration -- exactly
+        # one release call, and it must be inside the loop body's own
+        # block (part of the runtime back-edge cycle), not just once
+        # after the loop as a whole exits. Uses arr[int], not a
+        # struct -- since the stack-allocation swap (claude.md #43/#74/
+        # #75), a non-escaping struct local no longer goes through this
+        # free-scheduling machinery at all (see
+        # test_a_loop_local_struct_is_reused_across_iterations_via_the_same_alloca
+        # for the struct/stack-allocation equivalent of this same
+        # shape); a with-initializer arr[T] local (claude.md #79) is
+        # always refcounted, released the same way a struct with an
+        # initializer already is, so this is still the right type to
+        # exercise the free-scheduling logic itself with.
         source = """
-        struct Point { x:int y:int }
         void func f() {
             for int i = 0, i < 3, i++ {
-                Point p
-                p.x = i
-                log(p.x)
+                arr[int] p = [i]
+                log(p[0])
             }
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
         lines = ir.splitlines()
-        body_start = next(i for i, l in enumerate(lines) if l.strip() == "for.body3:")
+        body_start = next(i for i, l in enumerate(lines) if l.strip().startswith("for.body"))
         body_end = next(i for i in range(body_start, len(lines)) if lines[i].strip().startswith("br label %for.update"))
         body_lines = lines[body_start:body_end]
-        assert sum("call void @free(" in l for l in body_lines) == 1
-        assert ir.count("call void @free(") == 1
+        assert sum("call void @festina_release_array(" in l for l in body_lines) == 1
+        assert ir.count("call void @festina_release_array(") == 1
 
-    def test_a_nested_if_declared_struct_is_freed_at_the_ifs_own_end(self, parser, semantic, codegen):
+    def test_a_nested_if_declared_array_is_freed_at_the_ifs_own_end(self, parser, semantic, codegen):
         source = """
-        struct Point { x:int y:int }
         void func f(cond:bool) {
             if cond {
-                Point p
-                p.x = 1
-                log(p.x)
+                arr[int] p = [1]
+                log(p[0])
             }
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @free(" in ir
+        assert "call void @festina_release_array(" in ir
 
     def test_break_frees_the_loop_local_but_not_an_outer_scope_local(self, parser, semantic, codegen):
         source = """
-        struct Point { x:int y:int }
         void func f() {
-            Point outer
-            outer.x = 100
+            arr[int] outer = [100]
             for int i = 0, i < 5, i++ {
-                Point inner
-                inner.x = i
-                if inner.x == 2 {
+                arr[int] inner = [i]
+                if inner[0] == 2 {
                     break
                 }
-                log(inner.x)
+                log(inner[0])
             }
-            log(outer.x)
+            log(outer[0])
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
@@ -971,24 +1119,22 @@ class TestAutomaticMemoryReclamation:
         break_block = next(i for i, l in enumerate(lines) if l.strip().startswith("if.then"))
         break_block_end = next(i for i in range(break_block, len(lines)) if lines[i].strip().startswith("br label %for.end"))
         break_lines = lines[break_block:break_block_end]
-        # Exactly one free() on the break path -- inner's, not outer's
+        # Exactly one release on the break path -- inner's, not outer's
         # (outer is declared outside the loop, merely used inside it).
-        assert sum("call void @free(" in l for l in break_lines) == 1
-        # outer is still freed exactly once overall, at the function's
+        assert sum("call void @festina_release_array(" in l for l in break_lines) == 1
+        # outer is still released exactly once overall, at the function's
         # own end (after the loop, whichever way it was exited).
-        assert ir.count("call void @free(") == 3  # inner (break path) + inner (fall-through path) + outer
+        assert ir.count("call void @festina_release_array(") == 3  # inner (break path) + inner (fall-through path) + outer
 
     def test_continue_frees_locals_declared_since_the_loop_body_began(self, parser, semantic, codegen):
         source = """
-        struct Point { x:int y:int }
         void func f() {
             for int i = 0, i < 5, i++ {
-                Point p
-                p.x = i
-                if p.x % 2 == 0 {
+                arr[int] p = [i]
+                if p[0] % 2 == 0 {
                     continue
                 }
-                log(p.x)
+                log(p[0])
             }
         }
         """
@@ -997,39 +1143,35 @@ class TestAutomaticMemoryReclamation:
         continue_block = next(i for i, l in enumerate(lines) if l.strip().startswith("if.then"))
         continue_block_end = next(i for i in range(continue_block, len(lines)) if lines[i].strip().startswith("br label %for.update"))
         continue_lines = lines[continue_block:continue_block_end]
-        assert sum("call void @free(" in l for l in continue_lines) == 1
+        assert sum("call void @festina_release_array(" in l for l in continue_lines) == 1
 
     def test_nested_if_inside_a_loop_frees_correctly_on_both_the_break_and_fallthrough_paths(self, parser, semantic, codegen):
         source = """
-        struct Point { x:int y:int }
         void func f() {
             for int i = 0, i < 5, i++ {
-                Point p
-                p.x = i
-                if p.x == 3 {
+                arr[int] p = [i]
+                if p[0] == 3 {
                     break
                 }
-                log(p.x)
+                log(p[0])
             }
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        # One free() on the break path (p, via break's own free-before-
-        # branch), one on the normal fall-through-to-next-iteration path
-        # (p, via the loop body's own natural end) -- two total, both p,
-        # never both taken on the same iteration.
-        assert ir.count("call void @free(") == 2
+        # One release on the break path (p, via break's own release-
+        # before-branch), one on the normal fall-through-to-next-
+        # iteration path (p, via the loop body's own natural end) --
+        # two total, both p, never both taken on the same iteration.
+        assert ir.count("call void @festina_release_array(") == 2
 
     def test_early_return_before_the_declaration_has_no_free_on_that_path(self, parser, semantic, codegen):
         source = """
-        struct Point { x:int y:int }
         void func f(cond:bool) {
             if cond {
                 return
             }
-            Point p
-            p.x = 1
-            log(p.x)
+            arr[int] p = [1]
+            log(p[0])
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
@@ -1038,15 +1180,25 @@ class TestAutomaticMemoryReclamation:
         func_end = next(i for i in range(func_start, len(lines)) if lines[i] == "}")
         func_lines = lines[func_start:func_end]
         # The very first `ret void` (the early-return path, before p is
-        # declared) must not be preceded by a free() call anywhere
+        # declared) must not be preceded by a release call anywhere
         # earlier in the function; the second (the fall-through path,
         # after p is declared) must be.
         ret_indices = [i for i, l in enumerate(func_lines) if l.strip() == "ret void"]
         assert len(ret_indices) == 2
-        assert not any("call void @free(" in l for l in func_lines[:ret_indices[0] + 1])
-        assert any("call void @free(" in l for l in func_lines[ret_indices[0] + 1:ret_indices[1] + 1])
+        assert not any("call void @festina_release_array(" in l for l in func_lines[:ret_indices[0] + 1])
+        assert any("call void @festina_release_array(" in l for l in func_lines[ret_indices[0] + 1:ret_indices[1] + 1])
 
     def test_event_handler_locals_are_analyzed_too(self, parser, semantic, codegen):
+        source = """
+        on click(x:int, y:int) {
+            arr[int] p = [x]
+            log(p[0])
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_release_array(" in ir
+
+    def test_event_handler_struct_local_is_stack_allocated_too(self, parser, semantic, codegen):
         source = """
         struct Point { x:int y:int }
         on click(x:int, y:int) {
@@ -1056,7 +1208,8 @@ class TestAutomaticMemoryReclamation:
         }
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @free(" in ir
+        assert "alloca %struct.Point" in ir
+        assert "call ptr @calloc(" not in ir
 
     # ---- end-to-end: real compiled programs, real output ----
 
@@ -1098,6 +1251,37 @@ class TestAutomaticMemoryReclamation:
         result = compile_and_run(source)
         assert result.stdout.splitlines() == ["10", "20", "999", "888"]
 
+    def test_recursive_function_with_a_non_escaping_struct_local_keeps_each_calls_own_value(
+            self, compile_and_run):
+        # The single most important correctness question the stack-
+        # allocation swap (claude.md #43/#74/#75) raises: does each
+        # recursive call really get its own, distinct stack slot for
+        # p, or could a wrong assumption about LLVM's calling
+        # convention let a deeper call's own p.x overwrite an
+        # outstanding shallower call's? recur(n)'s own p.x must still
+        # read back correctly *after* its own recursive call to
+        # recur(n-1) returns -- if calls shared one slot, this would
+        # read n-1's (or some other call's) value instead of n's own.
+        source = """
+        struct Point { x:int y:int }
+        int func recur(n:int) {
+            Point p
+            p.x = n
+            if n == 0 {
+                return p.x
+            }
+            int inner = recur(n - 1)
+            return p.x * 100 + inner
+        }
+        log(recur(3))
+        log(recur(5))
+        """
+        result = compile_and_run(source)
+        # recur(0)=0, recur(1)=100, recur(2)=300, recur(3)=600,
+        # recur(4)=1000, recur(5)=1500 -- hand-derived, each building on
+        # the previous: recur(n) = n*100 + recur(n-1).
+        assert result.stdout.splitlines() == ["600", "1500"]
+
     def test_struct_assigned_into_a_global_keeps_its_value(self, compile_and_run):
         source = """
         struct Point { x:int y:int }
@@ -1114,6 +1298,12 @@ class TestAutomaticMemoryReclamation:
         assert result.stdout.strip() == "7"
 
     def test_struct_passed_to_another_function_keeps_its_value(self, compile_and_run):
+        # Since claude.md #74 stage 2, takesPoint's own read-only use of
+        # its parameter (see test_struct_passed_to_a_non_retaining_function_is_now_freed)
+        # means p is now provably safe throughout f() too -- p ends up
+        # freed at the end of f(), but only *after* both reads (inside
+        # takesPoint and f()'s own trailing log(p.x)) have already
+        # happened, so the values here must still come out correct.
         source = """
         struct Point { x:int y:int }
         void func takesPoint(p:Point) {
@@ -1373,6 +1563,2153 @@ class TestAutomaticMemoryReclamation:
         result = compile_and_run(source, args=None)
         assert result.returncode == 0
         assert result.stdout.splitlines()[-1] == "done"
+
+    # ---- edge cases beyond the two increments' own core scenarios ----
+    # Added in a follow-up robustness pass over the whole feature (not a
+    # new increment -- no new codegen.py behavior was needed for any of
+    # these; they exercise combinations the two increments' own tests
+    # didn't specifically spell out). Verified against real generated IR
+    # and real compiled output here, and additionally against a combined
+    # 5000-iteration program exercising every one of these patterns
+    # together under AddressSanitizer/LeakSanitizer (see tests/CONTRACT.md)
+    # -- zero ASan errors, zero leaks.
+
+    def test_break_in_a_nested_loop_frees_only_the_inner_loops_own_locals(self, parser, semantic, codegen):
+        # A loop-local declared in an OUTER loop's body, merely used (not
+        # re-declared) inside a nested inner loop, must survive the inner
+        # loop's own break -- free_depth is captured fresh by each
+        # _emit_for call, so the inner loop's break must never reach past
+        # its own body's frame down into the outer loop's. arr[T], not a
+        # struct -- see test_a_loop_local_array_is_freed_inside_the_loop_body's
+        # own note on why arr[T] is what still exercises this machinery
+        # since the stack-allocation swap.
+        source = """
+        void func f() {
+            for int i = 0, i < 3, i++ {
+                arr[int] mid = [i]
+                for int j = 0, j < 3, j++ {
+                    arr[int] inner = [j]
+                    if inner[0] == 1 {
+                        break
+                    }
+                }
+                log(mid[0])
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        inner_break_block = next(i for i, l in enumerate(lines) if l.strip().startswith("if.then"))
+        inner_break_end = next(i for i in range(inner_break_block, len(lines))
+                                if lines[i].strip().startswith("br label %for.end"))
+        break_lines = lines[inner_break_block:inner_break_end]
+        # Exactly one release on the inner break path -- inner's own, not mid's.
+        assert sum("call void @festina_release_array(" in l for l in break_lines) == 1
+
+    def test_break_in_a_nested_loop_does_not_corrupt_the_outer_loops_local(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            for int i = 0, i < 3, i++ {
+                Point mid
+                mid.x = i * 100
+                for int j = 0, j < 3, j++ {
+                    Point inner
+                    inner.x = j
+                    if inner.x == 1 {
+                        break
+                    }
+                }
+                log(mid.x)
+            }
+        }
+        f()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "100", "200"]
+
+    def test_return_from_a_nested_if_after_the_loop_locals_declaration_frees_it(self, compile_and_run):
+        # A return nested two levels deep inside a loop body (an if
+        # inside the loop), textually AFTER the loop-local's own
+        # declaration -- down_to=0 on Return must reach through the
+        # if-then's own frame *and* the loop body's frame *and* the
+        # function's own top-level frame, all at once.
+        source = """
+        struct Point { x:int y:int }
+        int func f(n:int) {
+            for int i = 0, i < n, i++ {
+                Point p
+                p.x = i
+                if p.x == 3 {
+                    return p.x * 100
+                }
+            }
+            return -1
+        }
+        log(f(10))
+        log(f(2))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["300", "-1"]
+
+    def test_return_from_a_nested_if_before_the_loop_locals_declaration_has_no_free_on_that_path(
+            self, parser, semantic, codegen):
+        # The mirror of test_early_return_before_the_declaration_has_no_free_on_that_path,
+        # but with the early return nested inside a loop body instead of
+        # directly in the function body -- the loop-local's VarDecl
+        # hasn't been walked yet when this path's Return fires, so its
+        # frame must still be empty on this specific path.
+        source = """
+        struct Point { x:int y:int }
+        int func f(n:int) {
+            for int i = 0, i < n, i++ {
+                if i == 2 {
+                    return 777
+                }
+                Point p
+                p.x = i
+            }
+            return -1
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        func_start = next(i for i, l in enumerate(lines) if l.startswith("define i64 @f("))
+        func_end = next(i for i in range(func_start, len(lines)) if lines[i] == "}")
+        func_lines = lines[func_start:func_end]
+        ret_lines = [i for i, l in enumerate(func_lines) if l.strip().startswith("ret i64 777")]
+        assert len(ret_lines) == 1
+        assert not any("call void @free(" in l for l in func_lines[:ret_lines[0] + 1])
+
+    def test_return_from_a_nested_if_before_the_loop_locals_declaration_produces_correct_output(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        int func f(n:int) {
+            for int i = 0, i < n, i++ {
+                if i == 2 {
+                    return 777
+                }
+                Point p
+                p.x = i
+            }
+            return -1
+        }
+        log(f(10))
+        log(f(1))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["777", "-1"]
+
+    def test_else_if_chain_frees_each_branchs_own_struct_local(self, compile_and_run):
+        # Each `else if` is its own nested IfStmt (see parser.py's
+        # parse_if), so each branch's then-block is its own _emit_block
+        # frame -- a struct declared in one arm must never affect another
+        # arm's freeing, and the un-taken arms' structs must never even
+        # be allocated (ordinary control flow, unrelated to #74, but
+        # worth pinning down together with the rest of this).
+        source = """
+        struct Point { x:int y:int }
+        int func f(n:int) {
+            if n == 0 {
+                Point a
+                a.x = 10
+                return a.x
+            } else if n == 1 {
+                Point b
+                b.x = 20
+                return b.x
+            } else if n == 2 {
+                Point c
+                c.x = 30
+                return c.x
+            } else {
+                Point d
+                d.x = 40
+                return d.x
+            }
+        }
+        log(f(0))
+        log(f(1))
+        log(f(2))
+        log(f(3))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["10", "20", "30", "40"]
+
+    def test_bare_nested_block_frees_its_own_local(self, compile_and_run):
+        # A standalone `{ }` block (not attached to if/while/for) is
+        # still routed through the same _emit_block -- and two sibling
+        # bare blocks reusing the same local name must not collide or
+        # double-free (each is its own Env/frame).
+        source = """
+        struct Point { x:int y:int }
+        int func f() {
+            int total = 0
+            {
+                Point p
+                p.x = 5
+                total = total + p.x
+            }
+            {
+                Point p
+                p.x = 6
+                total = total + p.x
+            }
+            return total
+        }
+        log(f())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "11"
+
+    def test_sibling_if_else_branches_can_declare_the_same_local_name_without_double_free(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        int func f(cond:bool) {
+            if cond {
+                Point p
+                p.x = 1
+                return p.x
+            } else {
+                Point p
+                p.x = 2
+                return p.x
+            }
+        }
+        log(f(true))
+        log(f(false))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "2"]
+
+    def test_combined_nested_loops_elif_and_bare_blocks_do_not_crash_under_heavy_iteration(
+            self, compile_and_run):
+        # The same combination verified separately by hand under
+        # AddressSanitizer/LeakSanitizer (see tests/CONTRACT.md) -- here
+        # as an ordinary correctness-and-no-crash pytest check: nested
+        # for-in-for with an inner break, return after and before a
+        # loop-local's own declaration, a 4-way else-if chain, bare
+        # blocks with a shadowed name, and if/else sibling shadowing,
+        # all run back to back many times.
+        source = """
+        struct Point { x:int y:int }
+        int func nestedForBreak() {
+            Point outer
+            outer.x = 1000
+            int total = 0
+            for int i = 0, i < 4, i++ {
+                Point mid
+                mid.x = i
+                for int j = 0, j < 4, j++ {
+                    Point inner
+                    inner.x = j
+                    if inner.x == 2 {
+                        break
+                    }
+                    total = total + inner.x
+                }
+                total = total + mid.x
+            }
+            total = total + outer.x
+            return total
+        }
+        int func elifChain(n:int) {
+            if n == 0 {
+                Point a
+                a.x = 10
+                return a.x
+            } else if n == 1 {
+                Point b
+                b.x = 20
+                return b.x
+            } else {
+                Point c
+                c.x = 30
+                return c.x
+            }
+        }
+        int func bareBlocks() {
+            int total = 0
+            {
+                Point p
+                p.x = 5
+                total = total + p.x
+            }
+            {
+                Point p
+                p.x = 6
+                total = total + p.x
+            }
+            return total
+        }
+        for int i = 0, i < 3000, i++ {
+            if nestedForBreak() != 1010 {
+                fail('nestedForBreak drifted')
+            }
+            if elifChain(i % 3) != (10 + (i % 3) * 10) {
+                fail('elifChain drifted')
+            }
+            if bareBlocks() != 11 {
+                fail('bareBlocks drifted')
+            }
+        }
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    # ---- interprocedural (claude.md #74 stage 2) ----
+    # See festina/escape_analysis.py's own module docstring and
+    # tests/test_escape_analysis.py::TestInterproceduralEscapingParams
+    # for the analysis in isolation (no C compiler, no codegen at all).
+    # These check the other half: that CodeGen actually builds a
+    # correct escaping_params table one function at a time, in program
+    # order, and wires it into real generated IR and real compiled
+    # output -- including the two cases the analysis-only tests can't
+    # reach on their own (a real multi-function program, and a real
+    # self-recursive function).
+
+    def test_transitive_chain_of_non_retaining_calls_stack_allocates_the_original_local(
+            self, parser, semantic, codegen):
+        # a() -> b() -> c(), and c only reads its own parameter -- the
+        # "safe" result has to propagate through b's own analysis (b's
+        # parameter is only ever used as a pass-through argument to c)
+        # before a's own local can be proven safe. Requires
+        # escaping_params[c] to already exist by the time b is
+        # analyzed, and escaping_params[b] to already exist by the time
+        # a is analyzed -- exactly the program-order guarantee
+        # CodeGen.escaping_params's own comment describes. Checks for a
+        # stack alloca, not a free() -- since the stack-allocation swap
+        # (claude.md #43/#74/#75), a struct proven safe this way never
+        # goes through calloc+free at all.
+        source = """
+        struct Point { x:int y:int }
+        void func c(q:Point) {
+            log(q.x)
+        }
+        void func b(r:Point) {
+            c(r)
+        }
+        void func a() {
+            Point p
+            b(p)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        a_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @a("))
+        a_body = "\n".join(ir.splitlines()[a_start:])
+        assert "alloca %struct.Point" in a_body
+        assert "call ptr @calloc(" not in a_body
+
+    def test_transitive_chain_stops_freeing_at_the_first_retaining_link(
+            self, parser, semantic, codegen):
+        # Same shape, but c now retains its own parameter (stores it
+        # into a global) -- the escaping-ness must propagate all the
+        # way back UP the chain: b's own argument to c escapes, so b's
+        # own parameter escapes, so a's own local passed to b escapes
+        # too. Nothing anywhere in this chain should be freed.
+        source = """
+        struct Point { x:int y:int }
+        Point stash
+        void func c(q:Point) {
+            stash = q
+        }
+        void func b(r:Point) {
+            c(r)
+        }
+        void func a() {
+            Point p
+            b(p)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" not in ir
+
+    def test_self_recursive_function_passing_its_own_param_stays_conservative(
+            self, parser, semantic, codegen):
+        # f calls itself, passing its own struct parameter straight
+        # through. self.escaping_params has no entry for 'f' yet at the
+        # point f's own body is being walked (f isn't registered until
+        # AFTER its own analysis completes), so this recursive call
+        # site falls back to the original unconditional "any call
+        # argument escapes" default, exactly like a call to an unknown
+        # builtin would -- p is marked escaping via that one use, even
+        # though every OTHER use of p in f is a safe field read. A
+        # caller of f() must see that same conservative result: it must
+        # not free its own local either, even though nothing in this
+        # program actually corrupts anything either way.
+        source = """
+        struct Point { x:int y:int }
+        void func f(p:Point, n:int) {
+            log(p.x)
+            if n > 0 {
+                f(p, n - 1)
+            }
+        }
+        void func g() {
+            Point p
+            f(p, 3)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @free(" not in ir
+
+    def test_only_the_provably_safe_parameter_position_is_exempted(
+            self, parser, semantic, codegen):
+        # mixed(a, b): a is only ever read (safe), b is stored into a
+        # global (escapes) -- escaping_params[mixed] must end up
+        # {1}, not {0, 1} or {} -- and f()'s own call must stack-
+        # allocate exactly the argument at the safe position (p,
+        # position 0) and leave the other (q, position 1) heap-
+        # allocated with a refcount header (claude.md #77 -- q is
+        # escaping AND never returned, so it's also scheduled for
+        # release, not just left leaking calloc'd), exactly the same
+        # non-stack-allocated treatment escaping structs always got.
+        source = """
+        struct Point { x:int y:int }
+        Point stash
+        void func mixed(a:Point, b:Point) {
+            log(a.x)
+            stash = b
+        }
+        void func f() {
+            Point p
+            Point q
+            mixed(p, q)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        p_storage_line = next(l for l in f_body.splitlines() if l.strip().startswith("%p.storage."))
+        q_raw_line = next(l for l in f_body.splitlines() if l.strip().startswith("%q.raw."))
+        assert "alloca %struct.Point" in p_storage_line
+        assert "call ptr @calloc(" in q_raw_line
+        assert "%p.raw." not in f_body
+        assert "call void @festina_release(" in f_body
+
+    def test_transitive_chain_produces_correct_output(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        int func c(q:Point) {
+            return q.x * 10
+        }
+        int func b(r:Point) {
+            return c(r) + 1
+        }
+        int func a(n:int) {
+            Point p
+            p.x = n
+            return b(p)
+        }
+        log(a(5))
+        log(a(7))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["51", "71"]
+
+    def test_multi_param_mixed_escaping_produces_correct_output(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        Point stash
+        void func mixed(a:Point, b:Point) {
+            log(a.x)
+            stash = b
+        }
+        void func f() {
+            Point p
+            p.x = 1
+            Point q
+            q.x = 2
+            mixed(p, q)
+        }
+        f()
+        log(stash.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "2"]
+
+    def test_self_recursive_function_produces_correct_output_and_does_not_crash(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f(p:Point, n:int) {
+            log(p.x)
+            if n > 0 {
+                f(p, n - 1)
+            }
+        }
+        void func g() {
+            Point p
+            p.x = 42
+            f(p, 3)
+        }
+        g()
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["42", "42", "42", "42", "done"]
+
+    def test_interprocedural_combination_does_not_crash_under_heavy_iteration(
+            self, compile_and_run):
+        # The same combination verified separately by hand under
+        # AddressSanitizer/LeakSanitizer (see tests/CONTRACT.md): a
+        # transitive non-retaining chain, a transitive retaining chain,
+        # a self-recursive function, and a multi-parameter
+        # mixed-escaping function, all called many times in a loop.
+        source = """
+        struct Point { x:int y:int }
+        Point stash
+        int func readOnly(q:Point) {
+            return q.x
+        }
+        int func passThrough(r:Point) {
+            return readOnly(r)
+        }
+        int func nonRetainingChain(n:int) {
+            Point p
+            p.x = n
+            return passThrough(p)
+        }
+        void func retains(q:Point) {
+            stash = q
+        }
+        void func retainingChain(r:Point) {
+            retains(r)
+        }
+        void func mixed(a:Point, b:Point) {
+            log(a.x)
+            stash = b
+        }
+        void func recur(p:Point, n:int) {
+            if n > 0 {
+                recur(p, n - 1)
+            }
+        }
+        for int i = 0, i < 3000, i++ {
+            if nonRetainingChain(i) != i {
+                fail('nonRetainingChain drifted')
+            }
+            Point retainMe
+            retainMe.x = i
+            retainingChain(retainMe)
+            if stash.x != i {
+                fail('retainingChain drifted')
+            }
+            Point a
+            a.x = i
+            Point b
+            b.x = i * 2
+            mixed(a, b)
+            if stash.x != i * 2 {
+                fail('mixed drifted')
+            }
+            Point r
+            r.x = i
+            recur(r, 5)
+        }
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.splitlines()[-1] == "done"
+
+    # ---- reference counting (claude.md #77) ----
+    # Scope for this stage: struct-typed GLOBALS (retain new/release old
+    # on every reassignment) and escaping struct LOCALS that are never
+    # themselves returned anywhere in their own function (released at
+    # the same scope-exit points stages 1/2 already track). Struct
+    # fields, arr[T]/map[T] values, and a value returned from a
+    # function are all explicitly out of scope -- see todo.md.
+
+    def test_global_struct_uses_a_sentinel_header_for_static_storage(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "@g.header = global {i64, %struct.Point} {i64 -1, %struct.Point zeroinitializer}" in ir
+        assert "@g = global ptr getelementptr({i64, %struct.Point}, ptr @g.header, i32 0, i32 1)" in ir
+
+    def test_global_struct_reassignment_retains_new_and_releases_old(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            Point p
+            g = p
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        # retain happens before release -- see _emit_assign's own
+        # comment on why the order matters for self-assignment safety.
+        retain_idx = f_body.index("call void @festina_retain(")
+        release_idx = f_body.index("call void @festina_release(")
+        assert retain_idx < release_idx
+
+    def test_escaping_local_never_returned_is_released_at_scope_exit(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            Point p
+            g = p
+            log(p.x)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        # One release from the global assignment itself (releasing the
+        # OLD global value, not p), one more from p's own scope-exit --
+        # two total.
+        assert f_body.count("call void @festina_release(") == 2
+
+    def test_escaping_local_that_is_sometimes_returned_is_now_released_at_scope_exit(
+            self, parser, semantic, codegen):
+        # p is returned on ONE path (cond true) but not the other (cond
+        # false, falls through to the end) -- textually identical
+        # `return p` on both paths here, but that's just this source's
+        # own shape, not something the retain-on-Return logic cares
+        # about: every Return of a struct-typed value retains it first
+        # (since a bare Identifier is an "aliasing" source, not an
+        # owning one) and then _emit_free_active_locals releases every
+        # active local, p included, on every path -- retain-then-
+        # release-everything nets out to exactly one surviving
+        # reference, the one just handed to the caller, on whichever
+        # path actually runs. Three releases total: the global
+        # assignment's own release of ITS previous value, plus one from
+        # each of the two Return statements' own _emit_free_active_locals
+        # call (only one of which runs on any given call, but both
+        # appear in the IR).
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        Point func f(cond:bool) {
+            Point p
+            g = p
+            if cond {
+                return p
+            }
+            return p
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define ptr @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert f_body.count("call void @festina_release(") == 3
+        # And a matching retain for each of the two Return statements,
+        # on top of the one from `g = p` itself -- three total.
+        assert f_body.count("call void @festina_retain(") == 3
+
+    def test_loop_local_escaping_struct_is_released_every_iteration(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            for int i = 0, i < 3, i++ {
+                Point p
+                p.x = i
+                g = p
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        body_start = next(i for i, l in enumerate(lines) if l.strip().startswith("for.body"))
+        body_end = next(i for i in range(body_start, len(lines)) if lines[i].strip().startswith("br label %for.update"))
+        body_lines = lines[body_start:body_end]
+        # One release for the OLD global value, one for p's own
+        # per-iteration scope-exit -- both inside the loop body, every
+        # iteration, not just once after the loop as a whole exits.
+        assert sum("call void @festina_release(" in l for l in body_lines) == 2
+
+    def test_break_releases_the_escaping_loop_local(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            for int i = 0, i < 5, i++ {
+                Point p
+                p.x = i
+                g = p
+                if p.x == 2 {
+                    break
+                }
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        break_block = next(i for i, l in enumerate(lines) if l.strip().startswith("if.then"))
+        break_block_end = next(i for i in range(break_block, len(lines)) if lines[i].strip().startswith("br label %for.end"))
+        break_lines = lines[break_block:break_block_end]
+        assert any("call void @festina_release(" in l for l in break_lines)
+
+    def test_global_reassignment_in_a_loop_produces_correct_final_value(
+            self, compile_and_run):
+        # claude.md #77's own motivating case, found and documented
+        # earlier in this same effort: a global repeatedly reassigned
+        # inside a loop used to orphan every value but the last one,
+        # leaking each -- now they're actually freed, and the reachable
+        # (last) one must still read back correctly.
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func run() {
+            for int i = 0, i < 500, i++ {
+                Point p
+                p.x = i
+                g = p
+            }
+        }
+        run()
+        log(g.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "499"
+
+    def test_intermediate_global_values_stay_correct_across_reassignments(
+            self, compile_and_run):
+        # Not just the FINAL value -- every value read back immediately
+        # after its own assignment (before the next iteration's release
+        # could possibly touch it) must be correct too.
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func run() {
+            for int i = 0, i < 5, i++ {
+                Point p
+                p.x = i * i
+                g = p
+                log(g.x)
+            }
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "1", "4", "9", "16"]
+
+    def test_self_assignment_of_a_global_struct_does_not_crash(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            Point p
+            p.x = 7
+            g = p
+            g = g
+            g = g
+        }
+        f()
+        log(g.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "7"
+
+    def test_escaping_and_sometimes_returned_local_still_produces_correct_output(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        Point func f(cond:bool) {
+            Point p
+            p.x = 3
+            g = p
+            if cond {
+                return p
+            }
+            return p
+        }
+        Point q1 = f(true)
+        Point q2 = f(false)
+        log(q1.x)
+        log(q2.x)
+        log(g.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["3", "3", "3"]
+
+    def test_two_different_global_structs_are_tracked_independently(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        Point g1
+        Point g2
+        void func f() {
+            Point p
+            p.x = 1
+            g1 = p
+            Point q
+            q.x = 2
+            g2 = q
+        }
+        f()
+        log(g1.x)
+        log(g2.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "2"]
+
+    def test_local_struct_declared_with_a_call_result_initializer_keeps_the_value(
+            self, compile_and_run):
+        # A real, pre-existing (not introduced by claude.md #77) bug
+        # found while testing this stage: `Point r = make(5)` for a
+        # LOCAL r (inside a function -- a top-level/global one already
+        # worked, via a completely different code path,
+        # _emit_toplevel_stmt) silently discarded the initializer and
+        # left r's fields at their stack-allocated zero value instead,
+        # since _emit_stmt's own StructType VarDecl branch never
+        # actually looked at stmt.init at all. Traced by hand-tracing
+        # the generated IR (`%r.storage = alloca %struct.Point; store
+        # ... zeroinitializer` with the make(5) call's own return value
+        # never referenced again) before fixing it, not just from the
+        # symptom.
+        source = """
+        struct Point { x:int y:int }
+        Point func make(n:int) {
+            Point p
+            p.x = n
+            return p
+        }
+        void func f() {
+            Point r = make(5)
+            log(r.x)
+        }
+        f()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "5"
+
+    def test_reassigning_a_local_struct_to_alias_another_does_not_double_release(
+            self, compile_and_run):
+        # A real bug found while first building claude.md #77's own
+        # narrower initial scope: `Point q; q = p;` (q reassigned, after
+        # its own declaration, to alias p's storage) then BOTH p and q
+        # separately escaping (to two different globals) meant both
+        # were scheduled for release at their own, independent scope-
+        # exits -- with no retain anywhere to account for q's
+        # reassignment creating a second reference, the second release
+        # would decrement an already-zero (and, one more reassignment
+        # later, already-freed) refcount. That narrower scope's own fix
+        # was to exclude any reassigned struct local from release
+        # tracking entirely (it leaked instead); this stage's own
+        # widening replaces that exclusion with the actual missing
+        # piece -- _emit_local_struct_retain_release now retains
+        # whatever a reassignment's source aliases, which is what makes
+        # it safe to schedule q for release too, not just avoid double-
+        # releasing it. Confirmed via a real AddressSanitizer build with
+        # the generated code itself properly instrumented
+        # (`sanitize_address` added to every `define` -- see
+        # tests/CONTRACT.md's own note on why
+        # `clang -fsanitize=address -c file.ll` alone does not
+        # instrument raw LLVM IR the way it does C source), not just
+        # from this test's own passing assertion.
+        source = """
+        struct Point { x:int y:int }
+        Point g1
+        Point g2
+        Point g3
+        void func f() {
+            Point p
+            p.x = 5
+            Point q
+            q = p
+            g1 = p
+            g2 = q
+        }
+        f()
+        Point other
+        other.x = 999
+        g1 = other
+        log(g2.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "5"
+
+    def test_struct_declared_with_an_initializer_is_now_included_in_release_tracking(
+            self, parser, semantic, codegen):
+        # claude.md #77 widened: r's own initializer is a Call (make's
+        # return value), an "owning" source per _is_owning_struct_source
+        # -- no retain needed there, r's alias just carries make()'s own
+        # +1 forward. `g = r` retains it (2). Two releases total: r's
+        # own scope-exit (2 -> 1, correctly still alive via g) and the
+        # global assignment's own release of g's previous value
+        # (static, a no-op, but the call still happens).
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        Point func make(n:int) {
+            Point p
+            p.x = n
+            return p
+        }
+        void func f() {
+            Point r = make(5)
+            g = r
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert f_body.count("call void @festina_release(") == 2
+
+    def test_reassigned_struct_is_now_included_in_release_tracking(
+            self, parser, semantic, codegen):
+        # claude.md #77 widened: q's own reassignment (`q = p`, p a bare
+        # Identifier -- an "aliasing" source) now retains p's value and
+        # releases q's OWN original allocation (freed immediately,
+        # nothing else ever referenced it) -- this is exactly what makes
+        # it safe to now ALSO schedule q for release at its own scope-
+        # exit, unlike before this widening. Five releases total: q's
+        # own reassignment releasing its original allocation, the two
+        # global assignments' own release of their previous (static,
+        # no-op) values, and p's and q's own scope-exit releases. Final
+        # refcount ends at 2 (g1 and g2, the two true live references),
+        # matching reality -- see this test's own compile-and-run
+        # sibling
+        # (test_reassigning_a_local_struct_to_alias_another_does_not_double_release)
+        # for the correctness confirmation, not just the IR shape.
+        source = """
+        struct Point { x:int y:int }
+        Point g1
+        Point g2
+        void func f() {
+            Point p
+            Point q
+            q = p
+            g1 = p
+            g2 = q
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert f_body.count("call void @festina_release(") == 5
+
+    # ---- widening local retain/release (claude.md #77, same stage) ----
+
+    def test_local_reassignment_from_an_existing_identifier_retains(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            Point p
+            Point q
+            q = p
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" in f_body
+
+    def test_local_reassignment_from_a_call_result_does_not_retain(
+            self, parser, semantic, codegen):
+        # make()'s own return value is a fresh, uniquely-owned value --
+        # aliasing it into q needs no retain (see
+        # _is_owning_struct_source's own comment).
+        source = """
+        struct Point { x:int y:int }
+        Point func make(n:int) {
+            Point p
+            p.x = n
+            return p
+        }
+        void func f() {
+            Point q
+            q = make(5)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" not in f_body
+        # Still releases q's own original allocation on the way out.
+        assert "call void @festina_release(" in f_body
+
+    def test_vardecl_init_from_an_existing_identifier_retains(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            Point p
+            Point q = p
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" in f_body
+
+    def test_vardecl_init_from_a_call_result_does_not_retain(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point func make(n:int) {
+            Point p
+            p.x = n
+            return p
+        }
+        void func f() {
+            Point r = make(5)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" not in f_body
+        assert "call void @festina_release(" in f_body
+
+    def test_with_init_local_that_never_further_escapes_is_freed_correctly(
+            self, compile_and_run):
+        # The gap stage 4's own initial, narrower scope explicitly left
+        # open: a local declared with an initializer and never
+        # otherwise escaping used to leak permanently, since it was
+        # excluded from release tracking entirely. Now included --
+        # correctness confirmed here; the actual freeing (not just "no
+        # crash") is confirmed under AddressSanitizer/LeakSanitizer
+        # (see tests/CONTRACT.md).
+        source = """
+        struct Point { x:int y:int }
+        Point func make(n:int) {
+            Point p
+            p.x = n
+            return p
+        }
+        void func f(n:int) {
+            Point r = make(n)
+            log(r.x)
+        }
+        for int i = 0, i < 5, i++ {
+            f(i * i)
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "1", "4", "9", "16"]
+
+    def test_reassignment_chain_through_two_globals_keeps_correct_values(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        Point g1
+        Point g2
+        void func f(n:int) {
+            Point p
+            p.x = n
+            Point q
+            q = p
+            g1 = p
+            g2 = q
+        }
+        for int i = 0, i < 500, i++ {
+            f(i)
+        }
+        log(g1.x)
+        log(g2.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["499", "499"]
+
+    def test_struct_field_read_used_as_a_reassignment_source_retains_correctly(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        struct Outer { inner:Point label:text }
+        Point g
+        void func f(n:int) {
+            Point p
+            p.x = n
+            Outer o
+            o.inner = p
+            Point q
+            q = o.inner
+            g = q
+        }
+        for int i = 0, i < 500, i++ {
+            f(i)
+        }
+        log(g.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "499"
+
+    def test_self_reassignment_of_a_local_struct_does_not_crash(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f(n:int) {
+            Point p
+            p.x = n
+            p = p
+            p = p
+            log(p.x)
+        }
+        f(7)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "7"
+
+    def test_widened_local_retain_release_combination_does_not_crash(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        Point g1
+        Point g2
+        Point func make(n:int) {
+            Point p
+            p.x = n
+            return p
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                Point r = make(i)
+                if r.x != i {
+                    fail('with-init local drifted')
+                }
+                Point p
+                p.x = i
+                Point q
+                q = p
+                g1 = p
+                g2 = q
+                if g1.x != i || g2.x != i {
+                    fail('reassignment chain drifted')
+                }
+                Point acc
+                acc = r
+                acc = q
+                if acc.x != i {
+                    fail('multi-reassignment drifted')
+                }
+            }
+        }
+        run(3000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_many_global_reassignments_with_break_and_continue_does_not_crash(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func run(n:int) {
+            for int i = 0, i < n, i++ {
+                Point p
+                p.x = i
+                g = p
+                if p.x % 7 == 0 {
+                    continue
+                }
+                if p.x % 97 == 0 {
+                    break
+                }
+            }
+        }
+        for int i = 0, i < 3000, i++ {
+            run(50)
+        }
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    # -- retaining a function's own Return value (claude.md #77, widened
+    # further): the last of the three conditions the original stage-4
+    # scope excluded a struct local for is now handled too. See
+    # tests/CONTRACT.md for the full writeup.
+
+    def test_return_of_a_bare_identifier_retains(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point func f() {
+            Point p
+            return p
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define ptr @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" in f_body
+        assert "call void @festina_release(" in f_body
+
+    def test_return_of_a_call_result_does_not_retain(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point func make() {
+            Point p
+            return p
+        }
+        Point func f() {
+            return make()
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        f_start = next(i for i, l in enumerate(lines) if l.startswith("define ptr @f("))
+        f_end = next(i for i in range(f_start, len(lines)) if lines[i].strip() == "}")
+        f_body = "\n".join(lines[f_start:f_end])
+        # f() itself has nothing to retain -- its own Return value is a
+        # fresh, uniquely-owned call result, the same "no retain needed"
+        # case a VarDecl-with-initializer or plain reassignment already
+        # gets from a Call source. (make()'s own Return of its bare
+        # local p is a separate, unrelated retain -- deliberately
+        # excluded by only looking at f()'s own body.)
+        assert "call void @festina_retain(" not in f_body
+        assert "call void @festina_release(" not in f_body
+
+    def test_returning_a_parameter_directly_keeps_the_callers_copy_correct(
+            self, compile_and_run):
+        # The soundness case this widening exists for, not just a leak
+        # count: identity(x) hands x's own storage straight back out.
+        # Without retaining it there, y (the caller's own copy of the
+        # return value) would alias x's storage with no reference of
+        # its own -- x's later scope-exit release would free memory y
+        # still points to, and reading y afterward would be a genuine
+        # use-after-free. Reading x AND y, well after x's own local
+        # would ordinarily have been released, is the actual check.
+        source = """
+        struct Point { x:int y:int }
+        Point func identity(p:Point) {
+            return p
+        }
+        void func run() {
+            for int i = 0, i < 2000, i++ {
+                Point x
+                x.x = i
+                Point y = identity(x)
+                if x.x != i || y.x != i {
+                    fail('identity aliasing drifted')
+                }
+            }
+        }
+        run()
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_returning_a_ternary_between_two_locals_frees_the_untaken_branch(
+            self, compile_and_run):
+        # Neither branch of `cond ? a : b` is a bare Identifier Return
+        # value in the old, narrower sense (the Return's own value
+        # expression is the Ternary itself) -- this only works soundly
+        # because the retain applies to whatever the Ternary evaluates
+        # to at runtime, and _emit_free_active_locals still releases
+        # BOTH a and b unconditionally afterward: the branch that was
+        # actually returned nets out to one surviving reference (the
+        # retain cancels its own release), and the untaken branch is
+        # simply released and freed, same as if it had never been
+        # returned at all.
+        source = """
+        struct Point { x:int y:int }
+        Point func pick(cond:bool, n:int) {
+            Point a
+            a.x = n
+            Point b
+            b.x = n * 2
+            return cond ? a : b
+        }
+        void func run() {
+            for int i = 0, i < 2000, i++ {
+                Point p = pick(i % 2 == 0, i)
+                int expected = (i % 2 == 0) ? i : i * 2
+                if p.x != expected {
+                    fail('ternary return drifted')
+                }
+            }
+        }
+        run()
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    # -- releasing a discarded return value (claude.md #77, same stage):
+    # the one struct-return leak left standing after the retain-on-Return
+    # fix above -- a call result never bound to anything at all. See
+    # tests/CONTRACT.md for the full writeup.
+
+    def test_discarded_struct_returning_call_result_is_released(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point func make(n:int) {
+            Point p
+            p.x = n
+            return p
+        }
+        void func f() {
+            make(5)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_release(" in f_body
+
+    def test_discarded_void_call_result_is_not_released(self, parser, semantic, codegen):
+        # A negative check alongside the positive one above: a void
+        # call has nothing to release (_emit_call returns ("0", None)
+        # for it), and this fix only ever fires for a StructType result
+        # -- confirms it doesn't misfire on the overwhelmingly more
+        # common "call something for its side effects" case.
+        source = """
+        void func sideEffect() {
+            log(1)
+        }
+        void func f() {
+            sideEffect()
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_release(" not in f_body
+
+    def test_discarded_struct_return_used_only_for_side_effects_still_crashes_safely(
+            self, compile_and_run):
+        # The struct value itself is thrown away, but the call still
+        # runs and its side effect (the global write) still must happen
+        # -- releasing the return value doesn't mean skipping the call.
+        source = """
+        struct Point { x:int y:int }
+        int counter
+        Point func makeAndCount(n:int) {
+            counter = counter + 1
+            Point p
+            p.x = n
+            return p
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                makeAndCount(i)
+            }
+        }
+        run(2000)
+        log(counter)
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "2000"
+
+    # -- reference counting for a struct's own struct-typed fields
+    # (claude.md #78, new section): the nested-field gap sections 74-77
+    # deliberately left open. See tests/CONTRACT.md for the full
+    # writeup.
+
+    def test_struct_field_write_from_an_identifier_retains(self, parser, semantic, codegen):
+        source = """
+        struct Inner { v:int }
+        struct Outer { inner:Inner }
+        void func f() {
+            Inner i
+            Outer o
+            o.inner = i
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" in f_body
+
+    def test_struct_field_write_from_a_call_result_does_not_retain(self, parser, semantic, codegen):
+        source = """
+        struct Inner { v:int }
+        struct Outer { inner:Inner }
+        Inner func make() {
+            Inner i
+            return i
+        }
+        void func f() {
+            Outer o
+            o.inner = make()
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        f_start = next(i for i, l in enumerate(lines) if l.startswith("define void @f("))
+        f_end = next(i for i in range(f_start, len(lines)) if lines[i].strip() == "}")
+        f_body = "\n".join(lines[f_start:f_end])
+        assert "call void @festina_retain(" not in f_body
+
+    def test_struct_with_no_struct_fields_still_uses_the_generic_release(
+            self, parser, semantic, codegen):
+        # The common case (the overwhelming majority of structs have no
+        # struct-typed field of their own) must stay exactly as cheap as
+        # claude.md #77 already made it -- no per-type wrapper function
+        # generated, no extra indirection, when there's nothing for a
+        # release to cascade into.
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            Point p
+            g = p
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "@__festina_release_struct_" not in ir
+        assert "call void @festina_release(" in ir
+
+    def test_struct_with_a_nested_struct_field_gets_a_dedicated_release_function(
+            self, parser, semantic, codegen):
+        source = """
+        struct Inner { v:int }
+        struct Outer { inner:Inner }
+        Outer g
+        void func f() {
+            Outer o
+            g = o
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "define void @__festina_release_struct_Outer(ptr %payload)" in ir
+        # The wrapper itself must release the nested field via the
+        # plain generic release (Inner has no struct-typed field of its
+        # own) before freeing Outer's own storage.
+        wrapper_start = ir.index("define void @__festina_release_struct_Outer(")
+        wrapper_end = ir.index("\n}\n", wrapper_start)
+        wrapper_body = ir[wrapper_start:wrapper_end]
+        assert "call i8 @festina_release_check(" in wrapper_body
+        assert "call void @festina_release(" in wrapper_body
+        assert "call void @free(" in wrapper_body
+        # And every release site for an Outer value (here, g's own
+        # reassignment and o's own scope-exit) must call the wrapper,
+        # not the plain generic release, directly.
+        assert ir.count("call void @__festina_release_struct_Outer(") >= 2
+
+    def test_deeply_nested_struct_fields_cascade_through_every_level(
+            self, parser, semantic, codegen):
+        # A -> B -> C, three levels deep -- confirms the recursive
+        # wrapper-generation handles more than one level, not just the
+        # immediate-child case every test above exercises.
+        source = """
+        struct C { v:int }
+        struct B { c:C }
+        struct A { b:B }
+        A g
+        void func f() {
+            A a
+            g = a
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "define void @__festina_release_struct_A(" in ir
+        assert "define void @__festina_release_struct_B(" in ir
+        # C has no struct-typed field of its own -- no wrapper needed.
+        assert "define void @__festina_release_struct_C(" not in ir
+        a_start = ir.index("define void @__festina_release_struct_A(")
+        a_end = ir.index("\n}\n", a_start)
+        a_body = ir[a_start:a_end]
+        assert "call void @__festina_release_struct_B(" in a_body
+        b_start = ir.index("define void @__festina_release_struct_B(")
+        b_end = ir.index("\n}\n", b_start)
+        b_body = ir[b_start:b_end]
+        assert "call void @festina_release(" in b_body
+
+    def test_nested_struct_field_reads_and_writes_correctly(self, compile_and_run):
+        source = """
+        struct Inner { v:int }
+        struct Outer { inner:Inner }
+        Outer g
+        void func f(n:int) {
+            Inner i
+            i.v = n
+            Outer o
+            o.inner = i
+            g = o
+        }
+        f(42)
+        log(g.inner.v)
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "42"
+
+    def test_original_local_stays_correct_after_being_written_into_a_field(
+            self, compile_and_run):
+        # The exact aliasing hazard todo.md documented as the reason
+        # this was deliberately deferred: `outer.field = someLocal`
+        # aliases someLocal's own storage, not a copy. Without
+        # retaining that reference on the way in, someLocal's own
+        # later scope-exit release could free memory outer.field still
+        # points to. Reading BOTH someLocal and outer.field.v, well
+        # after someLocal's own scope would ordinarily have released
+        # it, is the actual check -- 2000 iterations so a real
+        # use-after-free (not just a lucky read of not-yet-reused
+        # memory) would reliably surface as wrong output.
+        source = """
+        struct Inner { v:int }
+        struct Outer { inner:Inner }
+        void func f(n:int) {
+            Inner i
+            i.v = n
+            Outer o
+            o.inner = i
+            if i.v != n || o.inner.v != n {
+                fail('field aliasing drifted before scope exit')
+            }
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                f(i)
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_reassigning_a_struct_field_releases_the_old_value_correctly(
+            self, compile_and_run):
+        source = """
+        struct Inner { v:int }
+        struct Outer { inner:Inner }
+        void func f(n:int) {
+            Inner a
+            a.v = n
+            Inner b
+            b.v = n * 2
+            Outer o
+            o.inner = a
+            o.inner = b
+            if o.inner.v != n * 2 {
+                fail('field reassignment drifted')
+            }
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                f(i)
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_self_assignment_of_a_struct_field_does_not_crash(self, compile_and_run):
+        source = """
+        struct Inner { v:int }
+        struct Outer { inner:Inner }
+        void func f(n:int) {
+            Inner i
+            i.v = n
+            Outer o
+            o.inner = i
+            o.inner = o.inner
+            o.inner = o.inner
+            if o.inner.v != n {
+                fail('self-assignment corrupted')
+            }
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                f(i)
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_freeing_an_outer_struct_frees_its_nested_field_too(self, compile_and_run):
+        # A correctness/no-crash check that the OUTER struct being
+        # freed doesn't corrupt anything -- the actual leak-vs-freed
+        # verification is done with a real AddressSanitizer/
+        # LeakSanitizer run (see tests/CONTRACT.md); pytest itself
+        # doesn't drive ASan builds.
+        source = """
+        struct Inner { v:int }
+        struct Outer { inner:Inner }
+        Outer g
+        void func f(n:int) {
+            Inner i
+            i.v = n
+            Outer o
+            o.inner = i
+            g = o
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                f(i)
+            }
+        }
+        run(2000)
+        log(g.inner.v)
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "1999"
+
+    # -- reference counting for arr[T]/map[T] values that escape
+    # (claude.md #79, new section): arr[T]/map[T] is now a `ptr` to a
+    # heap-allocated header, the same indirect, shared-identity
+    # representation a struct value already has -- closing both the
+    # escaping-array/map leak this whole roadmap item names, and a
+    # separate, pre-existing memory-safety bug this representation
+    # change fixes as a side effect (growing a map through one alias
+    # left any other alias holding a dangling pointer). See
+    # tests/CONTRACT.md for the full writeup.
+
+    def test_with_init_array_local_is_refcounted_via_a_shared_header(
+            self, parser, semantic, codegen):
+        source = """
+        arr[int] g
+        void func f() {
+            arr[int] a = [1, 2, 3]
+            g = a
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        # A literal source is "owning" -- no retain for a's own
+        # declaration -- but g's own reassignment always retains.
+        assert f_body.count("call void @festina_retain(") == 1
+        assert "call void @festina_release_array(" in f_body
+
+    def test_array_field_write_from_an_identifier_retains(self, parser, semantic, codegen):
+        source = """
+        struct Bag { items:arr[int] }
+        void func f() {
+            arr[int] a
+            Bag b
+            b.items = a
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" in f_body
+
+    def test_array_field_write_from_a_literal_does_not_retain(self, parser, semantic, codegen):
+        source = """
+        struct Bag { items:arr[int] }
+        void func f() {
+            Bag b
+            b.items = [1, 2, 3]
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" not in f_body
+
+    def test_struct_with_an_array_field_gets_a_dedicated_release_function(
+            self, parser, semantic, codegen):
+        source = """
+        struct Bag { items:arr[int] }
+        Bag g
+        void func f() {
+            Bag b
+            g = b
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "define void @__festina_release_struct_Bag(ptr %payload)" in ir
+        wrapper_start = ir.index("define void @__festina_release_struct_Bag(")
+        wrapper_end = ir.index("\n}\n", wrapper_start)
+        wrapper_body = ir[wrapper_start:wrapper_end]
+        assert "call void @festina_release_array(" in wrapper_body
+
+    def test_no_struct_or_array_type_uses_extractvalue_anymore(self, parser, semantic, codegen):
+        # claude.md #79: arr[T]/map[T] moved from a plain aggregate
+        # VALUE to a `ptr`, the same representation change structs
+        # already went through -- extractvalue on a FESTINA_ARRAY_LLVM_TYPE/
+        # FESTINA_MAP_LLVM_TYPE value should never appear anywhere in
+        # generated IR anymore (every read now goes through a GEP+load
+        # on the pointer instead).
+        source = """
+        void func printer(v:int, k:text) {
+            log(v)
+        }
+        arr[int] a = [1, 2, 3]
+        map[int] m = {'x': 1}
+        log(a.length)
+        log(a[0])
+        log(m['x'])
+        m.forEach(printer)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "extractvalue" not in ir
+
+    def test_map_growth_through_one_alias_is_visible_through_another(self, compile_and_run):
+        # The exact pre-existing (unrelated to refcounting) bug this
+        # representation change fixes as a side effect: growing a map
+        # via one alias used to leave any OTHER alias holding a stale
+        # pointer into memory festina_map_set's own realloc had already
+        # moved or freed -- confirmed directly, a real segfault, before
+        # this section existed. Both aliases now share one identical
+        # heap header, so festina_map_set's own mutation is visible to
+        # both immediately, correctly, every time.
+        source = """
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                map[int] a = {'x': i}
+                map[int] b = a
+                b['y'] = i + 1
+                if a['y'] != i + 1 {
+                    fail('map growth not visible through original alias')
+                }
+                b['x'] = i + 100
+                if a['x'] != i + 100 {
+                    fail('map mutation not visible through original alias')
+                }
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_array_and_map_function_parameters_alias_the_callers_own_value(
+            self, compile_and_run):
+        source = """
+        void func mutateFirst(a:arr[int], v:int) {
+            a[0] = v
+        }
+        void func addEntry(m:map[int], k:text, v:int) {
+            m[k] = v
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                arr[int] a = [i]
+                mutateFirst(a, i + 1)
+                if a[0] != i + 1 {
+                    fail('array param mutation not visible to caller')
+                }
+                map[int] m = {'a': i}
+                addEntry(m, 'b', i + 1)
+                if m['b'] != i + 1 {
+                    fail('map param mutation not visible to caller')
+                }
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_returning_an_array_or_map_keeps_the_correct_value(self, compile_and_run):
+        source = """
+        arr[int] func makeArr(n:int) {
+            arr[int] a = [n, n * 2, n * 3]
+            return a
+        }
+        map[int] func makeMap(n:int) {
+            map[int] m = {'a': n}
+            return m
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                arr[int] r = makeArr(i)
+                if r[0] != i || r[1] != i * 2 || r[2] != i * 3 {
+                    fail('returned array drifted')
+                }
+                map[int] mr = makeMap(i)
+                if mr['a'] != i {
+                    fail('returned map drifted')
+                }
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_discarded_array_and_map_call_results_do_not_crash(self, compile_and_run):
+        source = """
+        arr[int] func makeArr(n:int) {
+            arr[int] a = [n]
+            return a
+        }
+        map[int] func makeMap(n:int) {
+            map[int] m = {'a': n}
+            return m
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                makeArr(i)
+                makeMap(i)
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_recursive_function_over_an_array_parameter_works_correctly(self, compile_and_run):
+        source = """
+        int func sumRecursive(a:arr[int], idx:int) {
+            if idx >= a.length {
+                return 0
+            }
+            return a[idx] + sumRecursive(a, idx + 1)
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                arr[int] nums = [i, i + 1, i + 2, i + 3]
+                if sumRecursive(nums, 0) != i + (i + 1) + (i + 2) + (i + 3) {
+                    fail('sumRecursive drifted')
+                }
+            }
+        }
+        run(1000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_struct_field_of_array_and_map_type_reads_and_writes_correctly(
+            self, compile_and_run):
+        source = """
+        struct Bag { items:arr[int] counts:map[int] }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                arr[int] items = [i, i + 1, i + 2]
+                map[int] counts = {'total': i}
+                Bag bag
+                bag.items = items
+                bag.counts = counts
+                if bag.items[0] != i || bag.counts['total'] != i {
+                    fail('struct arr/map field drifted')
+                }
+                bag.items = [i + 10]
+                if bag.items[0] != i + 10 {
+                    fail('struct arr field reassignment drifted')
+                }
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_global_array_reassigned_in_a_loop_produces_correct_final_value(
+            self, compile_and_run):
+        # claude.md #79's own motivating case, the same as claude.md
+        # #77's original one for structs: a global repeatedly
+        # reassigned inside a loop used to leak every value but the
+        # last (arrays weren't refcounted at all before this section);
+        # now each iteration's own value is correctly released, and the
+        # final (reachable) one still reads back correctly.
+        source = """
+        arr[int] g
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                arr[int] a = [i]
+                g = a
+            }
+        }
+        run(2000)
+        log(g[0])
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "1999"
+
+    # -- reference counting for individual elements/values stored
+    # *inside* an arr[T]/map[T] (claude.md #80, new section): claude.md
+    # #79 made the array/map's own header a refcounted, shared-identity
+    # value, but never touched what happens to a struct/arr/map ELEMENT
+    # once it's copied into the array's data buffer or a map's entry --
+    # that element was never retained on the way in, and never released
+    # on the way out, leaving a struct-typed array element readable
+    # after its original binding's own scope had already released it
+    # (a confirmed, reproduced heap-use-after-free). See tests/CONTRACT.md
+    # for the full writeup.
+
+    def test_struct_element_of_an_escaping_array_survives_its_source_scope(
+            self, compile_and_run):
+        # The exact use-after-free claude.md #79 left open and #80
+        # closes: a struct built fresh inside f(), stored as an
+        # array's sole element, the array escaping through a global
+        # while the struct's own local scope ends when f() returns.
+        source = """
+        struct Point { x:int y:int }
+        arr[Point] g
+
+        void func f(n:int) {
+            Point p
+            p.x = n
+            arr[Point] pts = [p]
+            g = pts
+        }
+
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                f(i)
+                if g[0].x != i {
+                    fail('array element of struct type did not survive its source scope')
+                }
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_struct_value_of_an_escaping_map_survives_its_source_scope(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        map[Point] g
+
+        void func f(n:int) {
+            Point p
+            p.x = n
+            map[Point] pts = {'a': p}
+            g = pts
+        }
+
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                f(i)
+                if g['a'].x != i {
+                    fail('map value of struct type did not survive its source scope')
+                }
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_array_of_arrays_element_survives_its_source_scope(self, compile_and_run):
+        source = """
+        arr[arr[int]] g
+
+        void func f(n:int) {
+            arr[int] inner = [n, n + 1]
+            arr[arr[int]] outer = [inner]
+            g = outer
+        }
+
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                f(i)
+                if g[0][0] != i || g[0][1] != i + 1 {
+                    fail('array-of-arrays element did not survive its source scope')
+                }
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_reassigning_an_array_element_releases_the_old_value_correctly(
+            self, compile_and_run):
+        # arr[i]=v now shares the exact retain-new/release-old path
+        # struct-field writes already use -- the old element (still
+        # reachable nowhere else) must be released, and the new one
+        # (an aliased identifier, not a fresh literal) must be retained,
+        # without either double-freeing or leaking.
+        source = """
+        struct Box { v:int }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                Box b0
+                Box b1
+                arr[Box] boxes = [b0, b1]
+                Box replacement
+                replacement.v = i
+                boxes[0] = replacement
+                if boxes[0].v != i {
+                    fail('array element reassignment drifted')
+                }
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_reassigning_a_map_value_releases_the_old_value_correctly(
+            self, compile_and_run):
+        source = """
+        struct Box { v:int }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                Box b0
+                map[Box] boxes = {'a': b0}
+                Box replacement
+                replacement.v = i
+                boxes['a'] = replacement
+                if boxes['a'].v != i {
+                    fail('map value reassignment drifted')
+                }
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_non_escaping_array_of_structs_frees_its_elements_too(
+            self, compile_and_run):
+        # A purely local, never-escaping arr[Box] still stack-allocates
+        # its own header (claude.md #76) but its Box elements are
+        # heap-allocated (structs always are) -- the _StackArrayOrMap
+        # scope-exit path must release each element before freeing the
+        # data buffer, not just free the buffer itself.
+        source = """
+        struct Box { v:int }
+        void func f(n:int) {
+            Box b0
+            Box b1
+            arr[Box] boxes = [b0, b1]
+            boxes[0].v = n
+            boxes[1].v = n + 1
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                f(i)
+            }
+        }
+        run(20000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_array_literal_element_from_an_identifier_retains(self, parser, semantic, codegen):
+        source = """
+        struct Box { v:int }
+        void func f() {
+            Box b
+            arr[Box] boxes = [b]
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" in f_body
+
+    def test_array_literal_element_from_a_call_does_not_retain(self, parser, semantic, codegen):
+        source = """
+        struct Box { v:int }
+        Box func makeBox() {
+            Box b
+            return b
+        }
+        void func f() {
+            arr[Box] boxes = [makeBox()]
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" not in f_body
+
+    def test_array_of_structs_release_wrapper_cascades_into_each_element(
+            self, parser, semantic, codegen):
+        source = """
+        struct Box { v:int }
+        arr[arr[Box]] g
+        void func f() {
+            Box b
+            arr[Box] boxes = [b]
+            arr[arr[Box]] outer = [boxes]
+            g = outer
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        # A dedicated per-element-type release wrapper is generated for
+        # arr[Box] (Box is refcounted), and outer's own wrapper (for
+        # arr[arr[Box]]) must call into it rather than the generic,
+        # element-blind @festina_release_array.
+        assert "define void @__festina_release_array_" in ir
+        wrapper_names = [
+            l.split("define void @")[1].split("(")[0]
+            for l in ir.splitlines() if l.startswith("define void @__festina_release_array_")
+        ]
+        assert len(wrapper_names) == 2
+        outer_wrapper_body = None
+        for name in wrapper_names:
+            start = ir.index(f"define void @{name}(")
+            end = ir.index("\n}\n", start)
+            body = ir[start:end]
+            if any(other in body for other in wrapper_names if other != name):
+                outer_wrapper_body = body
+        assert outer_wrapper_body is not None
+
+    def test_map_of_structs_release_wrapper_uses_map_for_each(
+            self, parser, semantic, codegen):
+        source = """
+        struct Box { v:int }
+        map[Box] g
+        void func f() {
+            Box b
+            map[Box] boxes = {'a': b}
+            g = boxes
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "define void @__festina_release_map_" in ir
+        wrapper_start = ir.index("define void @__festina_release_map_")
+        wrapper_end = ir.index("\n}\n", wrapper_start)
+        wrapper_body = ir[wrapper_start:wrapper_end]
+        assert "call void @festina_map_for_each(" in wrapper_body
+
+    def test_map_of_ints_still_uses_the_generic_release_function(
+            self, parser, semantic, codegen):
+        # An int-valued map has nothing to cascade into -- it must keep
+        # using the plain, generic @festina_release_map from claude.md
+        # #79 rather than generating a needless per-type wrapper.
+        source = """
+        map[int] g
+        void func f() {
+            map[int] m = {'a': 1}
+            g = m
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "define void @__festina_release_map_" not in ir
+        assert "call void @festina_release_map(" in ir
 
 
 def _find_window(display, timeout=20):

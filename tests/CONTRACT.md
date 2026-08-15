@@ -359,9 +359,16 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 704 tests in this directory pass against it: 694 given a working C
-compiler, plus 2 more (`tests/test_packaging.py`) given `pyinstaller`
-too, plus 8 more given `Xvfb`+`xdotool` too
+All 801 tests in this directory pass against it: 536 need no external
+tool at all (parser/semantic/IR-level tests, no compile-and-run step),
+255 more need a working C compiler, plus 2 more
+(`tests/test_packaging.py`) given `pyinstaller` too, plus 8 more given
+`Xvfb`+`xdotool` too (536 + 255 + 2 + 8 = 801 -- re-verified directly
+by hiding each tool from PATH in turn, not just derived by counting
+`compile_and_run` call sites, since the true number had drifted well
+past a much older, since-inaccurate count of "694 given a working C
+compiler" left over from before this suite's `compile_and_run`-based
+end-to-end tests grew to their current share of it)
 (`tests/test_codegen.py::TestGraphics`'s interactive click/mouse/key/
 resize tests, the one confirming the initial `clientWidth`/
 `clientHeight` values, `TestTimers`'s combined graphics-and-timers test,
@@ -952,6 +959,1042 @@ more bug while doing so, and deliberately did NOT attempt a third
   including exactly what's still ahead (interprocedural analysis,
   nested struct/array/map fields, map per-entry keys) and what
   reference counting for genuinely-escaping values would still require.
+
+- **Memory management stage 1, follow-up robustness pass (same
+  session, no new codegen.py behavior).** After the nested-block
+  extension above shipped, a dedicated pass specifically hunted for
+  combinations its own tests didn't already spell out: `break` inside a
+  loop nested inside another loop (must free only the inner loop's own
+  frame, never reach down into the outer loop's -- free_depth is
+  captured fresh by each `_emit_for`/`_emit_while` call, so this was
+  already correct by construction, now pinned down by a test); `return`
+  from a nested `if` inside a loop, both *after* the loop-local's own
+  declaration (must free it, since returning exits the loop and
+  function together) and *before* it (must not, since that VarDecl's
+  frame entry is only appended once program-order actually reaches it);
+  an `else if` chain (each arm is its own nested `IfStmt`, `parser.py`'s
+  `parse_if`, so each arm's own struct local needed confirming it's
+  freed independently of its siblings); a bare, standalone `{ }` block
+  (routed through the same `_emit_block` as everything else, per its
+  own docstring, but never previously exercised on its own); and two
+  sibling blocks (an `if`'s then/else arms, or two bare blocks in a
+  row) declaring a local with the *same name* -- each is its own `Env`/
+  frame with its own uniquely-suffixed storage ref, so this was already
+  safe, now confirmed rather than assumed. All nine new tests found
+  zero bugs -- every case was already correct by the original design
+  (frame-per-block, `down_to`-scoped freeing, per-frame program-order
+  tracking) -- see the block of tests after
+  `test_many_loop_iterations_with_nested_if_and_break_continue_does_not_crash`
+  in `tests/test_codegen.py::TestAutomaticMemoryReclamation`, plus a
+  combined 5000-iteration program exercising all of the above together
+  (nested for-in-for with an inner `break`, both return-vs-declaration
+  orderings, a 4-way `else if` chain, bare blocks with a shadowed name,
+  and `if`/`else` sibling shadowing) run under a fresh AddressSanitizer/
+  LeakSanitizer pass -- zero ASan errors, zero leaks with the loop's own
+  intentional-leak line removed, confirming (not just reasoning) that
+  the new combinations don't interact badly with each other.
+
+  One real, if minor, finding *did* come out of this pass, in
+  `_emit_free_active_locals` itself rather than in a missing test: the
+  `arr[T]`/`map[T]` free path was loading the whole `{i64, ptr}` header
+  value and then `extractvalue`-ing field 1 back out of it, instead of
+  a direct `getelementptr` to field 1 + `load` the way every other
+  array/map data-pointer read in `codegen.py` already gets there (see
+  e.g. `_emit_array_length`, `_try_addressable`) -- harmless once
+  through clang/gcc's own `-O2` (this compiler already leans on that
+  pass for exactly this kind of cleanup, per the module docstring's own
+  "always still followed by a real `calloc` + `free`" note), but
+  needlessly larger pre-optimization IR and the one place in the file
+  not matching the rest of its own convention. Switched to match; see
+  `test_non_escaping_array_local_frees_its_data_pointer` and
+  `test_non_escaping_map_local_frees_its_entries_pointer`, updated to
+  assert the `getelementptr` shape directly instead of the old
+  `extractvalue`-anywhere-in-the-IR check (which had stopped actually
+  testing the free path specifically, since array/map *construction*
+  emits its own unrelated `extractvalue` elsewhere in the same
+  function).
+
+  Also used this pass to re-verify (not re-derive) this file's own
+  "Running" example and the tool-dependency breakdown just above --
+  see that paragraph's own note on the stale count it replaces.
+
+- **Memory management stage 2: interprocedural call-argument analysis
+  (claude.md #75, same session).** Stage 1's own stated limitation: a
+  value passed as a call argument was *always* treated as escaping,
+  even when the called function provably never retains it -- explicitly
+  named, in stage 1's own module docstring, as "interprocedural
+  analysis, a later stage." This is that stage, for calls to any
+  function declared in the same program (a call to a builtin, or
+  through a field/element access rather than a plain function name,
+  is unaffected and stays exactly as conservative as before).
+
+  The core mechanism: `escape_analysis.find_escaping_names` gained one
+  new optional parameter, `escaping_params` -- a `{func_name: set[int]}`
+  map. Its `Call`-handling branch now looks up the callee's name in
+  that map (only when the callee is a plain `ast.Identifier`, never for
+  a Member-based method call); if found, only the argument positions
+  listed in that function's own set are still treated as escaping via
+  *this specific call site* -- every other position is exempted from
+  the default rule there (the argument may still end up escaping some
+  other, unrelated way elsewhere in the same function; this only stops
+  this one call site from being the *reason* it does). A callee not in
+  the map -- because it's a builtin, or because it hasn't been analyzed
+  yet -- leaves the lookup returning `None`, which falls back to the
+  exact original unconditional behavior with no special-casing needed
+  (the `is not None` guard around the whole exemption makes a missing
+  entry behave identically to `escaping_params` never being passed at
+  all, which is also exactly what every one of stage 1's own 36
+  existing unit tests still exercises unchanged, proving this is
+  strictly additive, not a rewrite of the base rule).
+
+  Building the map itself turned out to need no fixpoint, no
+  topological sort, and no separate whole-program pre-pass -- the
+  single most important design insight of this stage, and the reason
+  it stayed a same-session increment rather than becoming its own
+  multi-session design effort. Festina already rejects a call to a
+  function before its own declaration (semantic.py's "unknown
+  function" error, claude.md #48) -- verified directly, not assumed,
+  by writing exactly that program and confirming the compile error
+  before designing around it. That guarantee means: (1) the only way a
+  function can call itself is directly, by its own name, and (2) every
+  *other* possible callee of any function F is necessarily declared,
+  and therefore necessarily already fully analyzed, before F is. Since
+  `CodeGen` already emits every function body in one single pass, in
+  source order (`generate()` -> `_toplevel` -> `_emit_func`), stage 2
+  needed only: compute `escaping_params[F]` immediately after F's own
+  body is walked (`_emit_analyzed_func_body`, right before returning),
+  and pass the whole `self.escaping_params` dict (built up
+  incrementally, one function at a time, never cleared) into
+  `find_escaping_names` for *every* function's analysis, including its
+  own. A self-recursive call inside F's own body looks up F's own name
+  in a dict that doesn't have F's entry yet -- an ordinary miss, not a
+  special case -- so it automatically gets the same conservative
+  fallback a call to an unanalyzed builtin gets. No graph, no
+  worklist, no cycle detection: the language's own forward-reference
+  rule makes the call graph (excluding self-recursion) a DAG that
+  happens to already be topologically sorted by source order, for
+  free.
+
+  Verified the same three ways as every stage before it, with the
+  leak-count check given deliberately more weight here than stage 1's
+  own got: a bug in stage 1's reasoning could only ever *under-free*
+  (leak a bit more than a perfect analysis would); a bug in stage 2's
+  reasoning is the first one in this whole feature that could plausibly
+  *over-free* -- mark something safe that a real caller elsewhere still
+  needed -- which is a correctness regression, not just a missed
+  optimization, exactly the distinction claude.md #74's own docstring
+  draws between "leaks but is memory-safe" and an early free. A
+  combined program exercising a 3-function non-retaining chain (A calls
+  B calls C, C only reads its own parameter -- A's own local must end
+  up freed), a 3-function retaining chain (C stores its parameter into
+  a global -- nothing anywhere in the chain should be freed), a
+  self-recursive function passed a struct parameter (must stay
+  conservative), and a two-parameter function where only one position
+  actually escapes (must free exactly the safe one, never both, never
+  neither), all wrapped inside its own function -- deliberately, so its
+  own locals are subject to analysis at all, rather than accidentally
+  exercising the separate, pre-existing "`__festina_main`'s own
+  top-level statements are never analyzed" limitation instead of this
+  one -- run for hundreds of iterations with each iteration's own
+  hand-computed expected values checked via `fail(...)` inside the
+  program itself: **zero** AddressSanitizer errors (no use-after-free,
+  no double-free, no heap-buffer-overflow) and not one `fail()` fired,
+  across every combination, every iteration.
+
+  One methodology wrinkle surfaced and resolved during this
+  verification, worth recording since it very nearly looked like a
+  real bug: the first run (leak detection on) came back with *empty*
+  stdout despite the program clearly having executed correctly (no
+  `fail()`, clean-looking leak report). Traced to AddressSanitizer's
+  own leak-report exit path calling `_exit()` directly when leaks are
+  found, which -- unlike a normal `exit()`/`return` from `main` --
+  skips flushing libc's stdio buffers; since this program's real stdout
+  was redirected to a file (fully buffered, not line-buffered the way a
+  terminal would be) and produced meaningfully more leaked bytes than
+  the earlier nested-block increment's own equivalent check happened
+  to, the entire buffered-but-unflushed output was lost. Confirmed by
+  re-running the identical binary with leak detection off
+  (`ASAN_OPTIONS=detect_leaks=0`, which disables only the leak *report*
+  step -- every other AddressSanitizer check, including everything
+  this verification actually needed, stays fully active): full, correct
+  401-line output, exit code 0. This is a property of AddressSanitizer
+  itself, unrelated to anything this feature or Festina's runtime does
+  -- documented here rather than left as a confusing footnote, since it
+  also retroactively explains why the earlier nested-block increment's
+  own leaky-case ASAN run (tests/CONTRACT.md's own note on it, above)
+  never actually showed its own trailing "done" line either, without
+  that having been a problem at the time (only the leak *count* was
+  being checked there, not the full output).
+
+  With leak detection back on for a *separate*, count-only run: 1198
+  leaked allocations, against a hand-derived expectation of 1199 (400
+  iterations each contributing one struct passed into the retaining
+  chain, one passed into the mixed function's own retaining parameter
+  position minus the very last iteration's since it's still reachable
+  through the global at exit, and one passed into the self-recursive
+  function) -- matching to within LeakSanitizer's own known
+  conservative-stack-scanning under-count of a small few (the same
+  under-by-one-ish behavior already independently observed and
+  explained in this file's own nested-block-increment entry above),
+  and critically, *not* anywhere near what it would have been had the
+  two provably-safe values in the same program (the pass-through chain
+  and the read-only argument position of the two-parameter function)
+  also been leaking -- which is exactly the comparison that would have
+  caught a bug marking something safe that wasn't, had there been one.
+
+  See `tests/test_escape_analysis.py::TestInterproceduralEscapingParams`
+  for the analysis in isolation (no C compiler, no codegen -- a
+  hand-built `escaping_params` table exercising every documented rule:
+  exemption, non-exemption, unknown callee, position-specific exemption
+  in a multi-argument call, a Member-callee method call never
+  consulting the table at all, a non-Identifier argument at an exempted
+  position still walked normally, and a name still ending up escaping
+  through some *other*, unrelated use despite one exempted call site)
+  and the new "interprocedural" section of
+  `tests/test_codegen.py::TestAutomaticMemoryReclamation` for the same
+  properties against real generated IR and real compiled output,
+  including the two existing stage-1 tests whose own assertions
+  deliberately flipped as a direct, expected consequence of this stage
+  (a struct passed to a function that only reads it is now freed; the
+  matching "still not freed when the callee actually retains it" case
+  was added as its own explicit companion test rather than only
+  relying on the flipped one's absence of freeing to imply it).
+
+  See `todo.md`'s "Memory management" section for the full picture,
+  including exactly what's still ahead (nested struct/array/map fields
+  and reference counting for the values escape analysis can't reach at
+  all).
+
+- **Memory management stage 3: stack allocation and map entry keys
+  (claude.md #76, same session).** Two closures shipped together, since
+  neither widens what stages 1/2 prove safe -- both only change what
+  happens once something already is, or close an incomplete
+  implementation of a promise stage 1 already made.
+
+  **Stack allocation:** a struct local proven safe by stage 1 or 2 now
+  gets `alloca %struct.T` + `store %struct.T zeroinitializer` (the
+  explicit zero-init matches `calloc`'s own behavior -- the two
+  allocation strategies must stay indistinguishable to any Festina
+  program) instead of `calloc(1, sizeof)` + a scheduled `free()`.
+  `_emit_stmt`'s own VarDecl handling makes this choice using the exact
+  same `self._current_escaping_names` set `_emit_block` already
+  consults for freeing -- literally the same boolean condition, reused
+  for a different purpose, not a new analysis. `_emit_block`'s own
+  per-VarDecl tracking (which builds `_active_free_locals`, the list
+  `_emit_free_active_locals` later walks) simply stopped adding
+  `StructType` to that list at all -- there's nothing left to free for
+  one, so `_emit_free_active_locals`'s own former `StructType` branch
+  became dead code and was removed rather than left unreachable.
+  `arr[T]`/`map[T]` locals are untouched: their data/entries buffer can
+  grow after declaration (`.push()`, a map literal past its initial
+  size), so a fixed-size `alloca` isn't safe for it regardless of
+  escaping-ness -- they still always `calloc`+free their buffer.
+
+  Soundness argument (not just "it compiles and runs"): a stack
+  alloca's own lifetime already matches exactly the points
+  `_emit_free_active_locals` would otherwise have freed it at -- LLVM's
+  `alloca` reserves one fixed address for the whole enclosing function
+  regardless of which basic block textually contains it, so a
+  loop-body-declared one is simply reused, address and all, on the next
+  iteration (zero allocator traffic, not just leak-free sooner), and a
+  recursive call still gets its own genuinely distinct address (a
+  stack frame is per call, ordinary calling-convention behavior
+  unrelated to this choice). That last claim was verified directly, not
+  just assumed correct because it's "how C works": a hand-traced
+  recursive accumulator
+  (`test_recursive_function_with_a_non_escaping_struct_local_keeps_each_calls_own_value`
+  -- `recur(n)` builds `n*100 + recur(n-1)` by reading its own `p.x`
+  *after* its own recursive call returns, which would read a corrupted
+  value if calls shared one slot) produces the exact hand-derived
+  values (`recur(3)` = 600, `recur(5)` = 1500) -- the single most
+  important correctness question this change raises, answered with a
+  program specifically designed to fail loudly if the assumption were
+  wrong, not just one that happens to pass.
+
+  **Map entry keys:** `festina_map_free_entries` (new, in
+  `runtime/festina_runtime.c` and declared in `festina_runtime.h`)
+  frees each entry's own `strdup`'d key before freeing the entries
+  buffer itself, replacing a plain `free(entries)` that leaked every
+  key. No new soundness question here at all -- unlike a struct/array/
+  map *value* stored into another value's field (see the "nested
+  fields" gap below, deliberately not attempted), a map entry's key was
+  never a Festina-visible value; `festina_map_set`'s own comment already
+  established it as a private copy this runtime made for its own
+  internal bookkeeping, never aliased with anything else.
+
+  Rewiring existing IR-shape tests, not just adding new ones: every
+  test in `TestAutomaticMemoryReclamation` that asserted `"call void
+  @free(" in ir` for a *struct* local no longer has anything true to
+  assert -- rewritten to assert the `alloca`/`zeroinitializer` shape
+  instead (`test_non_escaping_struct_local_is_stack_allocated`, and
+  others), or, where the test's real purpose was exercising the
+  loop/break/continue *scheduling* machinery rather than structs
+  specifically, rewritten to use `arr[int]` instead (which still goes
+  through that exact machinery unchanged) so the same control-flow
+  shape stays meaningfully tested
+  (`test_a_loop_local_array_is_freed_inside_the_loop_body` and its
+  siblings). Every *compile-and-run* (correctness-only) test in the
+  same class needed **zero** changes and passed unmodified on the first
+  try -- direct, automatic confirmation that the swap is exactly as
+  semantically transparent as the design intended, not something
+  inferred after the fact.
+
+  Verified under AddressSanitizer/LeakSanitizer across four combined
+  programs: two written fresh for this stage (a recursion-focused one
+  -- deep and wide recursive struct locals, thousands of loop-local
+  structs reused across iterations with `break`/`continue` mixed in,
+  nested-if struct locals, each with its own embedded `fail()`
+  correctness check -- and a map-key-focused one, thousands of map
+  creations with several keys each, some escaping loop iterations) and
+  two re-run unchanged from stages 1/2's own earlier verification (to
+  confirm this stage didn't regress anything already proven). Zero
+  ASan errors across all four. Leak-detection-on runs: zero leaks for
+  both fresh programs (nothing in either one escapes, so there's
+  nothing left to leak once structs stop going through calloc at all);
+  the two stage-1/2 programs' own leak counts stayed the same, give or
+  take LeakSanitizer's own already-documented conservative
+  under-count (1198 -> 1197 on one, matching the expectation that the
+  escaping/leaking *set* is unchanged by this stage -- only the
+  mechanism for the *non*-escaping set is).
+
+  **Investigated and deliberately not attempted**, worth recording as
+  its own finding rather than a silent omission: freeing a struct/
+  array/map-typed *field* of an otherwise-freed struct. The only way to
+  populate such a field is `outer.field = someLocal` (no struct-literal
+  initializer syntax exists), and inspecting the generated IR for
+  exactly that program confirms this stores `someLocal`'s own pointer
+  into the field (`store ptr %t11, ptr %t10`) -- an alias, not a copy.
+  `someLocal` is already correctly marked escaping by the existing
+  assignment-value rule (never freed under its own name), but freeing
+  `outer.field`'s value when `outer` itself goes out of scope would
+  free that *same* memory reachable through `someLocal`'s still-live
+  name, and a later read through `someLocal` -- entirely legal Festina
+  code -- would be a genuine use-after-free. This needs real
+  aliasing/ownership analysis (does anything else still reference this
+  field's value when the struct holding it stops existing), not a small
+  syntactic extension of the existing "does this name appear outside a
+  safe position" rule -- see todo.md's own note on why this is likely
+  the same open design problem as reference counting, from the other
+  direction.
+
+  See `todo.md`'s "Memory management" section for the full picture,
+  including that nested-field finding in full and reference counting
+  for the values escape analysis can't reach at all.
+
+- **Memory management stage 4: reference counting for escaping struct
+  globals and locals (claude.md #77, same session).** The remainder
+  stages 1-3 can never reach on their own: a value proven to genuinely
+  escape has nothing for pure escape analysis to do, since something
+  else might still need it when its own declaring scope ends. This
+  stage tracks reference counts for struct values specifically and
+  frees a value once its count reaches zero.
+
+  **Why this is complete, not the usual "everything but cycles"
+  answer:** Festina's type system makes reference cycles structurally
+  impossible -- a struct field's type must always be declared *before*
+  the struct containing it, the identical rule that already governs
+  function forward references. Verified directly, not assumed: `struct
+  Node { next:Node }` fails to compile ("unknown type 'Node'"), and so
+  does either declaration order of two mutually-referencing structs.
+  So the set of types any value could ever transitively reference is
+  always a strict subset of what's declared earlier in the same
+  program -- a DAG by construction. No cycle detector, no tracing
+  collector, needed at all.
+
+  **Representation:** every refcounted struct allocation has a single
+  `i64` refcount immediately before the pointer Festina code itself
+  sees -- a fixed 8-byte offset regardless of the struct's own field
+  layout, since every Festina field type (int/float/bool/text/blob/
+  struct/table/image/audio/regex, all lowering to i64/double/i8/ptr)
+  has natural alignment no greater than 8 bytes, so no extra padding is
+  ever needed between the header and a struct's own fields. A NEGATIVE
+  refcount is a sentinel for "immortal, retain/release always a
+  no-op" -- used for a struct-typed global's own untouched static
+  initial storage (`@Name.header = global {i64, %struct.Point} {i64 -1,
+  %struct.Point zeroinitializer}`, `@Name = global ptr
+  getelementptr({i64, %struct.Point}, ptr @Name.header, i32 0, i32
+  1)`), which was never heap-allocated and must never reach `free()`.
+  This means a global's very first-ever assignment needs zero special-
+  casing anywhere in codegen: `festina_retain`/`festina_release` are
+  always safe to call unconditionally, whatever a global currently
+  points to.
+
+  **Scope, deliberately the narrowest slice that's actually sound, not
+  the full design originally sketched:** a struct-typed GLOBAL's value
+  is always fully reference counted -- `_emit_global_struct_retain_release`
+  (one shared helper, used by both `_emit_assign`'s Identifier branch
+  for ordinary reassignment and `_emit_toplevel_stmt`'s VarDecl-with-
+  initializer branch for a global's own declaration, so the two sites
+  can't drift apart) retains the new value and releases the old one on
+  every single change. A struct-typed LOCAL is only scheduled for
+  release at its own scope-exit (the exact frame/`down_to` machinery
+  stages 1-3 already built, completely unchanged) when THREE conditions
+  all hold: declared without an initializer, never itself returned
+  (`escape_analysis.find_returned_names`, unchanged from when it was
+  added for this exact purpose), and never itself the target of a
+  plain reassignment (`escape_analysis.find_reassigned_names`, new this
+  stage). A local failing any of the three simply keeps leaking,
+  exactly as before this stage -- the same "leaks but is memory-safe"
+  fallback every not-yet-covered case in this whole effort already
+  gets, chosen deliberately over guessing. (All three of these
+  conditions were later widened away, in the same stage, same session
+  -- see the two entries below.)
+
+  **Two real bugs found and fixed while building this, both traced to
+  their exact mechanism before fixing, not patched blind from a
+  symptom:**
+
+  1. *Pre-existing, not introduced by this stage*: `Point r =
+     someFunc()` for a LOCAL `r` silently discarded the call's return
+     value, leaving `r` at its stack-allocated zero value --
+     `_emit_stmt`'s own struct VarDecl handling never checked
+     `stmt.init` at all (comment literally claimed "no struct-literal
+     initializer syntax exists yet, so stmt.init is always None here" --
+     true for *literal* syntax, false for a call-result initializer, a
+     distinction the comment's author -- this same session -- had
+     conflated). A top-level `Point r = someFunc()` already worked
+     correctly, through a completely different code path
+     (`_emit_toplevel_stmt`) untouched by the bug -- which is exactly
+     why this had never been noticed: every existing test exercising
+     this pattern happened to use a global. Found while writing this
+     stage's own combined verification program and noticing an
+     embedded `fail()` fire that had no business firing; confirmed by
+     reading the generated IR directly (`%r.storage = alloca
+     %struct.Point; store %struct.Point zeroinitializer, ...` with the
+     call's own return value computed and then never referenced again)
+     before writing the fix. Fixed by making a struct VarDecl-with-
+     initializer alias whatever its initializer evaluates to -- no
+     allocation of its own at all, the same as a plain `r = expr`
+     assignment already does.
+  2. *Introduced by this stage's own first pass*: `Point q; q = p;`
+     (`q` reassigned, after its own declaration, to alias `p`'s
+     storage), with `p` and `q` later assigned to two *different*
+     globals, scheduled BOTH for release at their own independent
+     scope-exits -- with nothing retaining the extra reference `q = p`
+     itself created, the second release decremented a refcount the
+     first had already brought to its true value, undercounting by
+     one; one more reassignment of either global later, this actually
+     freed memory the OTHER global still pointed to, and reading
+     through it produced garbage in a plain (non-ASan) build. Found
+     the same way -- written into the verification program, then
+     hand-traced with a debug build of the runtime that printed every
+     retain/release/free call, confirming the exact refcount sequence
+     (1 -> 2 -> 3 -> 2 -> 1 -> 0, freed, while a second global still
+     held the same pointer) before writing the fix, not just re-running
+     until the symptom went away. Fixed by excluding any struct local
+     ever found in `find_reassigned_names` from scope-exit release
+     scheduling entirely -- the third of the three local-scope
+     conditions above. (This exclusion-based fix was itself superseded
+     later in the same stage -- see the widening entry below -- by
+     retaining on every local reassignment instead of excluding the
+     ones that needed it.)
+
+  **A significant methodology finding, independent of either bug,
+  surfaced while chasing bug 2:** the very first attempt to reproduce
+  bug 2 under AddressSanitizer produced *zero errors* despite the
+  plain build unambiguously printing garbage -- a real red flag, not
+  something to shrug off as "ASan just didn't catch this one." Isolated
+  with a minimal, hand-written 11-line `.ll` file doing an unambiguous
+  calloc+free+read-after-free: `clang -fsanitize=address -c file.ll`
+  produced a binary with **zero** `sanitize_address`/`__asan_report*`
+  symbols anywhere in it (verified by grepping the `-S -emit-llvm`
+  output of that exact compile step) and did not catch the bug; the
+  byte-for-byte-equivalent pattern written as `.c` source produced 28
+  such symbols and caught it immediately, with a full, correct
+  use-after-free report. Root cause: ASan's per-function opt-in (the
+  `sanitize_address` LLVM function attribute) is normally added by
+  clang's own C frontend during Sema/CodeGen -- a step that's bypassed
+  entirely when the input handed to `clang -c` is already `.ll` text,
+  so `-fsanitize=address` at the driver level has nothing to attach
+  instrumentation to. The fix, once found: add `sanitize_address` to
+  every `define` line in the generated `.ll` file before compiling
+  (`sed -E 's/^(define [^{]+) \{/\1 sanitize_address {/'` against the
+  file, verified afterward by re-checking the instrumentation-symbol
+  count went from 0 to a real number) -- confirmed to both catch the
+  known bug 2 reproduction reliably and to change nothing about
+  already-passing programs' behavior otherwise.
+
+  This means every AddressSanitizer claim made earlier in this same
+  session, for stages 1 through 3 and interprocedural analysis, was
+  only ever checking two things correctly: linking success, and
+  LeakSanitizer's own allocation-tracking (which intercepts the
+  allocator's own calls directly and is unaffected by instrumentation
+  -- this is *why* every leak-count claim from those earlier stages
+  remained trustworthy even though the corruption-detection half never
+  actually ran against the generated program's own code). It was never
+  actually exercising ASan's heap-buffer-overflow/use-after-free/
+  double-free detection against anything except the hand-written
+  runtime `.c` file linked alongside each test binary. Rather than
+  letting that stand as an open question, every earlier stage's own
+  combined verification program (stage 1/2's nested-block and
+  interprocedural stress tests, stage 3's recursion-focused and
+  map-key-focused stress tests) was re-run through the corrected,
+  properly-instrumented pipeline specifically to check for anything the
+  flawed methodology might have silently missed -- all came back clean,
+  zero ASan errors, confirming those stages' own underlying *design*
+  reasoning was sound all along; the two bugs above (both found through
+  this same corrected pipeline) were the only real findings from the
+  entire retrospective check, and both are specific to this stage's own
+  new retain/release logic, not inherited from anything earlier.
+
+  Final verification, with the corrected pipeline from the start: new
+  unit tests (`tests/test_escape_analysis.py::TestFindReturnedNames`,
+  plus `find_reassigned_names` covered the same way), new IR-level and
+  compile-and-run tests in
+  `tests/test_codegen.py::TestAutomaticMemoryReclamation` (51 -> 67,
+  including one dedicated regression test per bug above, each
+  reproducing the exact scenario that found it), and a properly-
+  instrumented AddressSanitizer/LeakSanitizer run against a combined
+  program exercising: the original global-reassignment-in-a-loop leak
+  scenario from when stage 1 first shipped (now correctly freed, not
+  leaked -- the concrete payoff this whole stage exists to deliver), a
+  sometimes-returned local (correctly still leaks, matching this
+  stage's own stated scope), a reassigned local aliasing another
+  tracked local (correctly no longer double-released), self-assignment
+  of a global struct, and two independently-tracked globals, all run
+  for hundreds of iterations with embedded `fail()` correctness checks
+  -- zero ASan errors, and LeakSanitizer's only reported leak matches
+  exactly the one value this stage's own documented scope says should
+  still leak, not a byte more or less.
+
+  See `todo.md`'s "Memory management" section for the full picture,
+  including the nested-field nesting problem stage 4's own scope
+  deliberately sidesteps, and exactly what widening this stage's own
+  scope (retaining on every local assignment, not just a global's)
+  would still require.
+
+- **Memory management: widening stage 4's own local scope (claude.md
+  #77, same stage, same session).** Closes the gap the "Scope" entry
+  above documents: retaining on every LOCAL assignment/declaration, not
+  just a global's, the same way a global's own reassignment already
+  did. A new `CodeGen._is_owning_struct_source(expr)` classifies a
+  source expression as "owning" (a fresh, uniquely-owned value, no
+  retain needed -- its own +1 transfers cleanly into the new binding)
+  only when it is a plain `ast.Call`; every other shape -- reading an
+  existing identifier, a struct field, a ternary, ... -- is
+  conservatively classified "aliasing" and retained before the old
+  value is released, since something else might already reference the
+  same value. Two call sites apply this: a new
+  `_emit_local_struct_retain_release` (the local counterpart to the
+  existing `_emit_global_struct_retain_release`, called from
+  `_emit_assign`'s Identifier branch for a plain local reassignment) and
+  an equivalent inline check in `_emit_stmt`'s VarDecl-with-initializer
+  handling. With retaining now correct in both positions,
+  `_emit_block`'s own scope-exit scheduling drops two of the original
+  three exclusion conditions: a with-init local is now always eligible
+  for release tracking (it never stack-allocates -- claude.md #76 -- so
+  scheduling it is never wrong), and a no-init local is eligible exactly
+  when escape analysis says it escapes, unchanged. Only "never itself
+  returned" remains as an exclusion -- `Return` still doesn't retain.
+  The now-unnecessary exclusion machinery
+  (`escape_analysis.find_reassigned_names`,
+  `_walk_stmts_for_reassignments`, `_walk_stmt_for_reassignments`,
+  `_walk_expr_for_reassignments`, and `CodeGen._reassigned_names`) was
+  deleted outright rather than left dead once nothing referenced it.
+
+  Unlike stage 4's own first pass, this widening's build turned up no
+  new bugs -- attributed to three things done differently this time:
+  reusing the already-fixed, already-ASan-verified
+  `_emit_global_struct_retain_release` pattern as a direct template
+  instead of writing new retain/release logic from scratch; applying
+  the owning/aliasing classification conservatively (retain whenever
+  unprovable) from the very first line written, rather than arriving at
+  that bias only after a bug forced it; and using the corrected,
+  `sanitize_address`-attributed ASan pipeline from the first
+  verification run, rather than discovering the instrumentation gap
+  mid-verification the way stage 4's first pass did.
+
+  Verified the same three ways as every stage before it:
+  `tests/test_codegen.py::TestAutomaticMemoryReclamation` grew from 67
+  to 76, split across IR-level assertions (retain present for an
+  aliasing source, absent for an owning one, checked separately for the
+  VarDecl-with-initializer and plain-reassignment positions),
+  compile-and-run tests (a with-init local that never further escapes
+  freed correctly; a reassignment chain propagating through two
+  independently-tracked globals; a struct-field read used as a
+  reassignment source; self-reassignment of a local not crashing), and a
+  combined stress test (3000 iterations, embedded `fail()` correctness
+  checks, asserting clean exit). Real, properly-instrumented
+  AddressSanitizer/LeakSanitizer runs against a fresh combined program
+  (`makeAndDiscard`, a reassignment chain into two globals, reassignment
+  from a call result, multiple reassignments of one local, a
+  loop-reassigned local interacting with `break`/`continue`, and
+  self-reassignment stress, 500 iterations) came back with zero ASan
+  errors and zero leaks; a second, narrowly targeted program confirmed a
+  return value discarded outright (a bare `make(n)` statement, never
+  bound to any variable) still leaks exactly as before -- that gap is
+  unrelated to this widening and stays open. Every earlier stage's own
+  combined stress-test program (stage 1/2's nested-block and
+  interprocedural stress tests, stage 3's recursion-focused and
+  map-key-focused stress tests, plus stage 4's own bug-2 reproduction)
+  was re-run through the same corrected pipeline to confirm this
+  widening regresses nothing already proven -- all came back clean.
+
+  One unplanned side effect, worth recording precisely rather than
+  over- or under-claiming: stage 4's own combined verification program
+  went from 9999 leaked objects to zero under this widening, because
+  the caller's own `Point r = sometimesReturned(...)` -- a with-init
+  local -- is now correctly tracked and released at its own scope-exit.
+  This closes much of the "returned value leaks" gap for the common
+  case where a caller captures a call's result directly into a local --
+  but `Return`'s own retain/release logic was never touched, so a
+  return value that is discarded outright at its call site (never bound
+  to anything) still leaks unconditionally, confirmed by the dedicated
+  discard-only reproduction above.
+
+  See `todo.md`'s "Memory management" section, "Widening this stage's
+  own local scope", for the full writeup, and "What's still ahead" for
+  exactly what retaining every function's own return value would still
+  need to close the last gap.
+
+- **Memory management: retaining a function's own return value
+  (claude.md #77, same stage, same session).** Closes the one condition
+  the widening entry above left standing: a struct local excluded from
+  scope-exit release because it was ever itself returned somewhere in
+  its own function. `_emit_stmt`'s Return handling now applies the
+  identical `_is_owning_struct_source` check every other struct-
+  producing site in this stage already uses -- retain the value being
+  returned first, unless its source is a plain function call -- and
+  then calls `_emit_free_active_locals` exactly as before, with no
+  special-casing left for a name that happens to be one of the locals
+  it's about to release. Retain-then-release-everything nets out
+  correctly on every path: whichever binding actually produced the
+  returned value gets a retain that exactly cancels its own release,
+  while every other active local is simply released as normal, freed if
+  nothing else references it. With this in place,
+  `escape_analysis.find_returned_names` and its own walker helpers, and
+  `CodeGen._returned_names`, were deleted outright -- nothing needs the
+  old "is this name ever a bare Return value" approximation anymore,
+  since the new logic is keyed off the Return statement's own source
+  expression instead of a whole-function, name-based guess at it.
+
+  This is a real correctness fix, not merely a leak-closing one, and
+  the two cases that prove it were deliberately the ones the OLD
+  name-based exclusion could never have reached at all, not just
+  ones it happened to handle conservatively:
+
+  1. *A struct-typed parameter returned directly*
+     (`Point func identity(p:Point) { return p }`) aliases the
+     *caller's own* storage, not a fresh value. Without retaining it on
+     the way out, the caller's own local would remain the sole holder
+     of a reference count that never accounted for the call's own
+     return-value binding also now pointing at the same storage -- the
+     caller's own local going out of scope first would free memory a
+     still-live return-value binding pointed to, and reading through
+     that binding afterward would be a genuine use-after-free. Verified
+     directly, not just reasoned about: a dedicated test calls
+     `identity(x)` 2000 times in a loop, storing the result in `y` and
+     then reading *both* `x.x` and `y.x` well past where `x`'s own
+     scope-exit release would already have fired under the old code --
+     confirming both remain correct, not just that nothing crashes.
+  2. *A Ternary between two locals* (`return cond ? a : b`) was
+     invisible to the old exclusion by construction -- it only ever
+     recognized a bare Identifier Return value, and neither `a` nor `b`
+     is one, so *neither* was ever excluded from scope-exit release
+     under the old code. Whichever branch actually executed on a given
+     call could have been released -- and, if nothing else referenced
+     it, freed -- on its way out to the caller, before this fix: a
+     latent soundness hole the name-based design could never have
+     closed without abandoning the name-based approach entirely (which
+     is exactly what this fix does). Verified with a dedicated test
+     alternating both branches across 2000 calls, each one's own
+     `fail()` check confirming the correct value came back.
+
+  Verified the same three ways as every increment in this stage: new
+  IR-level tests (retain present in a bare-identifier Return, absent in
+  a call-result Return, checked on two separate functions so a callee's
+  own Return doesn't get credited to its caller's), the two
+  compile-and-run regression tests above, and a combined stress program
+  (`make`/`identity`/`pick`/`sometimesReturned`/`chainReturn`, 2000
+  iterations, folding this together with the earlier local-scope
+  widening) --
+  `tests/test_codegen.py::TestAutomaticMemoryReclamation` grew from 76
+  to 80. A real, properly-instrumented AddressSanitizer/LeakSanitizer
+  run against that combined program came back with zero ASan errors and
+  a leak count of exactly 2000 objects -- 24 bytes each, matching the
+  16-byte `Point` plus its 8-byte refcount header -- one for each of the
+  2000 deliberately-*discarded* `make(i)` calls also folded into the
+  same program, and nothing more: every other case (captured-by-a-
+  local, parameter-passthrough, ternary, sometimes-returned-and-also-
+  global) is now correctly freed. Every earlier verification program
+  from this stage (`widen1.f`, `discard_check.f`, `field_source.f`,
+  plus stages 1-3's own `chaos2.f`/`interproc2.f`/`stackalloc1.f`/
+  `mapkeys1.f`/`recur_stack.f`, and stage 4's own `rc_loop.f`/
+  `rc_debug3.f`/`rc_debug4.f`/`rc_combined.f`) was re-run through the
+  same corrected pipeline to confirm no regression -- all came back
+  clean.
+
+  See `todo.md`'s "Memory management" section, "Retaining a function's
+  own return value", for the full writeup, and "What's still ahead" for
+  the one struct-return leak now remaining: a return value discarded
+  outright at its own call site, never bound to anything.
+
+- **Memory management: releasing a discarded return value (claude.md
+  #77, same stage, same session).** Closes that one remaining leak.
+  `_emit_stmt`'s `ast.ExprStmt` handling now checks whether the
+  statement's own expression is a bare `ast.Call` whose return type is
+  a struct, and if so, releases the value immediately, right after
+  evaluating it. Provably correct rather than merely conservative,
+  unlike most of this stage's other decisions: a function call's own
+  return value is always the "owning" kind this stage already treats
+  specially (fresh, nothing else referencing it yet), so a call site
+  that never binds the result to anything is *by construction* that
+  value's only reference -- no aliasing analysis needed to justify
+  releasing it there, since no other binding could possibly also hold
+  it. The call itself still runs in full either way; only the struct
+  value it happens to return is released once its own statement is
+  done with it.
+
+  Verified the same three ways as every increment in this stage: a new
+  IR-level test confirming the release call appears right after a
+  discarded struct-returning call, a negative IR-level test confirming
+  a discarded *void* call (where `_emit_call` returns `("0", None)`)
+  emits no extra release, a compile-and-run test confirming a global
+  counter incremented inside the discarded call still increments
+  exactly once per call regardless of the return value being thrown
+  away, and real AddressSanitizer/LeakSanitizer runs --
+  `tests/test_codegen.py::TestAutomaticMemoryReclamation` grew from 80
+  to 83. `discard_check.f`, the exact program that leaked 2000 objects
+  when the local-scope widening first documented this gap, now reports
+  **zero** leaks; `return_widen1.f`, the retain-on-Return fix's own
+  combined verification program (which leaked 2000 objects for the
+  identical reason), is now fully leak-free too. Every earlier
+  verification program across all of stage 4 (`widen1.f`,
+  `field_source.f`, stages 1-3's own `chaos2.f`/`interproc2.f`/
+  `stackalloc1.f`/`mapkeys1.f`/`recur_stack.f`, and stage 4's own
+  `rc_loop.f`/`rc_debug3.f`/`rc_debug4.f`/`rc_combined.f`) was re-run
+  through the same corrected pipeline -- all came back clean.
+
+  With this, every struct value stage 4 set out to cover -- globals,
+  and every shape a local or a call's own return value can take -- is
+  now fully, correctly reference counted. See `todo.md`'s "Memory
+  management" section, "Releasing a discarded return value", for the
+  full writeup, and "What's still ahead" for the gaps sections 74-77
+  never claimed to cover: a struct's own struct-typed fields (closed
+  next, below), and `arr[T]`/`map[T]` values that themselves escape.
+
+- **Memory management stage 5: reference counting for a struct's own
+  struct-typed fields (claude.md #78, new section, same session).**
+  Closes the last struct-related gap: `outer.field = value` (the only
+  way a struct-typed field is ever populated -- there's no struct-
+  literal initializer syntax) stores `value`'s own pointer into the
+  field, an alias, not a copy. Until this section, that write was never
+  itself counted as a reference -- a real latent hazard, not just an
+  incompleteness: `value`'s own ordinary scope-exit release could free
+  memory `outer.field` still pointed to (use-after-free on the next
+  read through it), and a struct freed by stage 4 never released
+  whatever its own struct-typed fields still pointed to (a leak).
+
+  **Design, two parts:** (1) *Retain on field write* --
+  `_emit_assign`'s Member-target branch now retains a struct-typed
+  field's new value first (skipped only when the source is a plain
+  function call, `_is_owning_struct_source` again) and releases
+  whatever the field previously held (always safe: a struct's own
+  fields start null). Gated on `not expr.target.computed`, so `arr[i] =
+  v`/`map[key] = v` are deliberately untouched even when the element
+  type is a struct -- `arr[T]`/`map[T]` values aren't refcounted
+  containers at all yet, so there's no scope-exit release site to pair
+  a retain there with. (2) *Cascade on release* -- a new
+  `CodeGen._release_fn_for_struct(type_)` returns the plain, unchanged
+  `@festina_release` for a struct with no struct-typed field of its own
+  (the overwhelming majority -- zero new IR, zero extra indirection),
+  or a lazily-generated, cached `@__festina_release_struct_<Name>`
+  wrapper for one that has at least one. That wrapper decrements the
+  refcount via a new runtime function, `festina_release_check` (split
+  out from `festina_release` specifically so codegen can interpose a
+  field cascade between the decrement and the actual `free()` call),
+  and only if it just reached zero, releases each struct-typed field
+  (via *that* field's own release function, recursively) before freeing
+  its own storage -- recursion that always terminates for the identical
+  DAG reason claude.md #77 already gives for why cycles are
+  structurally impossible. Every existing release call site now
+  dispatches through this instead of calling the plain
+  `@festina_release` directly.
+
+  **A real bug found and fixed during this stage's own verification,
+  before shipping:** a struct local proven safe to live on the *stack*
+  can still have a struct-typed field written into it, and part (1)'s
+  retain fires regardless of whether the *container* is stack- or
+  heap-allocated. A heap-allocated container's own release (part 2)
+  already covered that reference; a stack-allocated one's never did --
+  its own storage is simply reused/discarded at scope-exit, with no
+  release call of any kind. This produced a genuine new leak (not
+  corruption -- an over-retained reference only ever delays a free, it
+  can never trigger one too early), confirmed directly: a combined
+  stress program leaked exactly 2000 objects per affected function,
+  matching a stack-allocated container's written-but-never-released
+  field one-for-one, before the fix. Closed with a new
+  `_StackStructFieldsOnly` marker (wrapping the struct's type) that
+  tells `_emit_free_active_locals` to release *only* the struct's own
+  field references at scope-exit, never a (nonexistent, since stack-
+  allocated) refcount header -- `_emit_block` schedules a stack-
+  allocated struct local for this whenever it has at least one
+  struct-typed field, mirroring exactly how an `arr[T]`/`map[T]`
+  local's own data/entries buffer is scheduled for freeing today
+  despite its header being stack-allocated too.
+
+  Verified the same three ways as every stage before it: new IR-level
+  tests (retain present for an aliasing field-write source, absent for
+  an owning one; a struct with no struct-typed field keeps using the
+  plain generic release with no wrapper generated; a struct with a
+  nested field gets a dedicated wrapper that itself calls the generic
+  release for its own field; three levels of nesting produce exactly
+  two wrapper functions, not three, since the innermost type has no
+  struct-typed field of its own), new compile-and-run tests (nested
+  field reads/writes, reassigning a field releases the old value,
+  self-assignment of a field doesn't crash, freeing an outer struct
+  correctly reaches its nested field) --
+  `tests/test_codegen.py::TestAutomaticMemoryReclamation` grew from 83
+  to 93 -- and a real, properly-instrumented AddressSanitizer/
+  LeakSanitizer run against a combined stress program (the exact
+  aliasing hazard this stage exists to close: writing a local into a
+  field, then reading both the local and the field well past where the
+  local's own scope-exit release would have fired under the old code;
+  deep three-level nesting escaping through a global; field
+  reassignment; self-assignment of a field; two independently-tracked
+  globals each holding their own nested structure; 2000 iterations) --
+  zero ASan errors, and zero leaks after the stack-allocated-container
+  fix above (before it: three functions each leaking exactly 2000
+  objects, one per call, confirming the bug's exact mechanism). Every
+  earlier stage's own combined verification program was re-run through
+  the same corrected pipeline to confirm no regression -- all came back
+  clean.
+
+  See `todo.md`'s "Memory management" section, "Stage 5", for the full
+  writeup, and "Stage 6" below for how this stage's own remaining gap
+  (a struct-typed field of an arr[T]/map[T] element -- an arr[T]/
+  map[T]-typed field of a struct is closed by stage 6 itself) needs
+  arr[T]/map[T] values to be refcounted containers first.
+
+- **Memory management stage 6: reference counting for escaping
+  `arr[T]`/`map[T]` values (claude.md #79, new section, same
+  session).** Closes the last of the three remaining struct-related
+  gaps -- but needed a real representation change first, not just a new
+  tracking rule, because arr[T]/map[T] never had a struct's own
+  single-pointer identity to begin with.
+
+  **The problem, found while designing this stage, not assumed:** an
+  arr[T]/map[T] value used to *be* the `{length, data}`/`{count,
+  entries}` pair itself -- `_llvm_type` returned
+  `FESTINA_ARRAY_LLVM_TYPE`/`FESTINA_MAP_LLVM_TYPE` directly, a plain
+  two-word aggregate *value*, copied by value on every assignment. Two
+  bindings made to alias each other each got their own independent
+  copy, sharing the same data/entries pointer only until one of them
+  changed. Merely imprecise for arr[T] (arrays never grow after
+  construction -- no `.push`, fixed size from their own literal), but a
+  **real, exploitable memory-safety bug** for map[T] specifically:
+  growing a map through one alias (`b['newkey'] = v`, reallocating the
+  entries buffer via `festina_map_set`) only ever updated *that one
+  binding's* own copy of `entries` -- every other binding ever made to
+  alias it kept a now-stale pointer into memory `realloc` may have
+  already moved or freed. Reproduced directly:
+  ```festina
+  map[int] a = {'x': 1}
+  map[int] b = a
+  b['y'] = 2      // grows b's own entries buffer via realloc
+  log(a['y'])     // reads through a's now-stale, possibly-freed pointer
+  ```
+  **segfaults** on the code as it stood before this stage -- confirmed
+  unrelated to anything else in this session's own work (never touches
+  map assignment, `_emit_map_set`, `_try_addressable`, or either
+  type's own construction), a pre-existing bug that had simply never
+  been exercised by any existing test.
+
+  **The fix:** arr[T]/map[T] is now a single `ptr` to its own
+  heap-allocated storage -- `_llvm_type(ArrayType)`/`_llvm_type(MapType)`
+  both return `"ptr"`, the identical representation and `{i64
+  refcount, payload...}` header layout a struct value already has
+  (`_emit_fresh_heap_header`, shared with an escaping struct local's
+  own allocation). Two bindings made to alias each other now share the
+  *exact same* header, so a growth through either is correctly,
+  immediately visible through both -- verified directly by re-running
+  the exact reproduction above and getting `2`, not a crash. Every
+  array/map-specific codegen site that used to GEP/extractvalue a
+  *value* now does the same one level of indirection further in (load
+  the `ptr`, then GEP off that): `.length`, `arr[i]`/`map[key]` reads,
+  `.forEach()`, `_emit_map_set`/`_emit_map_get`, sqlite row collection.
+  `_try_addressable` -- previously needed to tell an "addressable" map
+  target (whose own storage slot a grown entries pointer could be
+  written back into) apart from a merely "valuable" one -- was deleted
+  outright: every arr[T]/map[T] expression's own *value* is now the
+  header's address itself, exactly what `festina_map_set` needs, no
+  separate addressability concept left to maintain.
+
+  **Retain/release, identical to stages 4/5's own rule:** every
+  binding site (a local's own declaration, a plain reassignment, a
+  global, a struct field -- widening claude.md #78's own field-write
+  logic, which generalized cleanly once `_release_fn_for` existed -- a
+  `return` value, a discarded call result) retains the new value unless
+  its source is "owning," releases whatever it previously held.
+  "Owning" gains one new case beyond a plain function call: an array or
+  map *literal* -- structs have no literal syntax at all, so this case
+  never arose for them, but `[1,2,3]`/`{...}` allocate a fresh header
+  exactly like a call's own return value does. Release needed no
+  per-type codegen-generated wrapper the way a struct's own cascade
+  does -- every arr[T]'s header has the identical shape regardless of
+  T (same for map[T]), so two fixed runtime functions
+  (`festina_release_array`/`festina_release_map`, built on the same
+  `festina_release_check` split claude.md #78 introduced) cover every
+  case, both reached through the same `_release_fn_for` dispatch that
+  also routes to a struct's own per-type release function. A
+  non-escaping local's own stack-allocated header (stages 1-3) is
+  unaffected -- still a plain `alloca`, never refcounted; only its
+  data/entries buffer (always heap-allocated regardless) still needs
+  freeing at scope-exit, via a new `_StackArrayOrMap` marker mirroring
+  `_StackStructFieldsOnly`'s own shape from stage 5.
+
+  **A significant test-suite consequence, not a bug:** ten existing
+  IR-level tests asserted a bare `call void @free(` for a
+  with-initializer arr[T] local's own data buffer -- now correctly
+  `call void @festina_release_array(` instead, since a with-initializer
+  local is always refcounted (mirroring struct precedent, never stack-
+  allocated). Updated in place, plus two new tests added specifically
+  for the no-init, non-escaping case (which still uses the original
+  bare `@free`/`@festina_map_free_entries` path, unchanged).
+
+  Verified the same three ways as every stage before it: new IR-level
+  tests (a with-initializer array/map local is refcounted, not stack-
+  allocated; array-typed struct field writes retain/don't retain
+  correctly; a struct with an array field gets a dedicated cascade
+  wrapper calling `festina_release_array`; no `extractvalue` on either
+  payload type anywhere in generated IR), new compile-and-run tests
+  (**the map-growth-through-alias bug above, now a dedicated regression
+  test**; array/map function parameters alias the caller's own value;
+  returning an array/map keeps the correct value; discarded array/map
+  call results don't crash; a recursive function summing an array
+  parameter; struct fields of array/map type; a global array repeatedly
+  reassigned in a loop, the identical motivating case claude.md #77
+  originally had for structs) --
+  `tests/test_codegen.py::TestAutomaticMemoryReclamation` grew from 93
+  to 107 -- and a real, properly-instrumented AddressSanitizer/
+  LeakSanitizer run against a combined stress program (every case
+  above, plus two independently-tracked globals, a loop-scoped
+  stack-allocated array/map, 1500-2000 iterations each) -- zero ASan
+  errors, zero leaks including for every discarded call result. Every
+  earlier stage's own combined verification program (14 in total,
+  spanning stages 1 through 5) was re-run through the same pipeline --
+  all came back clean. Full suite before this stage: 778 tests; after:
+  790 (531 no external tool, 249 needing a C compiler, 2 needing
+  pyinstaller, 8 needing Xvfb+xdotool).
+
+  **One more real bug found and precisely characterized, deliberately
+  left open:** a struct-typed value stored as an array *element* (not
+  a struct *field* -- stage 5 already closed that case) can still be
+  read after the local it came from has gone out of scope and been
+  released. Confirmed directly: a dedicated reproduction (a fresh
+  struct stored as an array's sole element, the array escaping through
+  a global while the struct's own local function returns) produces a
+  genuine **heap-use-after-free**, caught by AddressSanitizer. This
+  stage only ever refcounts an arr[T]/map[T]'s own *header*, never what
+  it stores *inside*, so this hazard is exactly as open after this
+  stage as before -- a dynamically-sized, runtime-indexed collection
+  needs a materially different fix than stage 5's own fixed-field-list
+  cascade, not attempted here.
+
+  See `todo.md`'s "Memory management" section, "Stage 6", for the full
+  writeup and reproduction, and "What's still ahead" for exactly what
+  retaining/releasing individual arr[T]/map[T] elements/values would
+  still require.
+
+- **Memory management stage 7: reference counting for an `arr[T]`/
+  `map[T]`'s own elements/values (claude.md #80, new section, same
+  session).** Closes the exact gap stage 6 left open: an array element
+  or map value whose own type is itself refcounted (struct, arr[T], or
+  map[T]) is now retained when stored and released when overwritten or
+  when the container holding it is freed. Confirmed directly by
+  re-running stage 6's own reproduction (a struct built fresh inside a
+  function, stored as an array's sole element, the array assigned to a
+  global before that function returns) -- it now prints the correct
+  value on every iteration of a 2000-iteration run instead of crashing,
+  and a fresh AddressSanitizer/LeakSanitizer build reports zero errors
+  and zero leaks.
+
+  **Sound for the same structural reason stages 4-6 already lean on,
+  one level down:** Festina's grammar gives every arr[T]/map[T] type a
+  syntactically fresh, finite type expression at each nesting level --
+  no way to write a self-referential array or map type, the same
+  guarantee stage 4's own argument already gives structs -- so
+  releasing an arr[arr[T]]'s own elements (each itself an arr[T], which
+  may have its own elements to release in turn) always terminates, on a
+  nesting depth fixed at compile time.
+
+  **Array elements and struct fields now share the identical
+  retain-new/release-old code path** for `arr[i] = value`, exactly as
+  `outer.field = value` already used for struct writes -- the
+  `not expr.target.computed` restriction that used to separate the two
+  cases was removed, since by the time that shared code is reached with
+  a computed target it's provably the array-element case (the
+  `map[key] = value` case returns earlier, from its own branch). The
+  one-time element store during array-literal construction retains each
+  refcounted element the same way stage 6 already retains an aliased
+  whole-array/whole-map value, skipped for the same "owning" source
+  shapes stage 6 already exempts (a function call, or -- new here,
+  since it applies one level down too -- an array/map literal used as
+  an element's own source); no release-old is needed there, since a
+  freshly malloc'd buffer never previously held a valid pointer at any
+  of its slots.
+
+  **map[T] needed a different mechanism for both directions**, since a
+  `FestinaMapEntry`'s own layout is deliberately opaque outside the C
+  runtime (the same boundary `festina_map_find`'s own comment already
+  documents, kept intact rather than punched through for this stage).
+  `map[key] = value` -- both in a map literal's own construction and a
+  later assignment -- retains the new value and releases whatever the
+  key previously held by looking up any existing value first
+  (`_emit_map_set` now calls the existing `festina_map_get`, with a
+  null default -- always safe, since releasing null is always a no-op)
+  before the set proceeds. Releasing every value in a map being freed
+  reuses the existing `festina_map_for_each` iteration `.forEach()`
+  already relies on, passing a freshly generated release-flavored
+  trampoline instead of a user callback -- no new C-side structure
+  access was added for this stage at all, by design.
+
+  **Two lazily-generated, per-element-type release wrappers**
+  (`_release_fn_for_array`/`_release_fn_for_map`, cached the same way
+  `_release_fn_for_struct`'s own per-struct-type wrappers already are)
+  are generated only for an arr[T]/map[T] whose own element/value type
+  is itself refcounted -- every other arr[T]/map[T] keeps using the
+  plain, generic, element-blind `festina_release_array`/
+  `festina_release_map` stage 6 already introduced, unchanged.
+  `_release_fn_for` now delegates ArrayType/MapType to these two new
+  methods instead of returning a fixed string directly. A non-escaping
+  local's own stack-allocation optimization is unaffected in how its
+  own header is allocated -- still a plain `alloca`, never itself
+  refcounted -- but the `_StackArrayOrMap` scope-exit path now also
+  releases each element/value, when refcounted, before freeing the
+  data/entries buffer itself.
+
+  Verified the same three ways as every stage before it: new IR-level
+  tests (an array-literal element from an identifier retains, from a
+  call doesn't; an arr[arr[Box]]'s own release wrapper cascades into
+  arr[Box]'s own dedicated wrapper rather than the generic one; a
+  map[Box]'s own release wrapper uses `festina_map_for_each`; a
+  map[int] keeps using the plain generic function, no wrapper generated
+  needlessly), new compile-and-run tests (**the exact use-after-free
+  reproduction above, now a dedicated regression test, for both an
+  escaping array and an escaping map**; a nested arr[arr[int]] element
+  survives its own source scope; reassigning an array element or map
+  value releases the old one correctly; a non-escaping, stack-headered
+  array/map of structs still frees its own elements) --
+  `tests/test_codegen.py::TestAutomaticMemoryReclamation` grew from 107
+  to 118 -- and real, properly-instrumented AddressSanitizer/
+  LeakSanitizer runs against both the exact original reproduction and a
+  new combined stress program (escaping arrays/maps of structs, nested
+  arr[arr[int]], element/value reassignment, and non-escaping
+  stack-headered arrays/maps of structs, 500 iterations each) -- zero
+  ASan errors, zero leaks. Every earlier stage's own stress/reproduction
+  program (15 in total, spanning stages 1 through 6) was re-run through
+  the same pipeline -- all came back clean. Full suite before this
+  stage: 790 tests; after: 801 (536 no external tool, 255 needing a C
+  compiler, 2 needing pyinstaller, 8 needing Xvfb+xdotool -- re-verified
+  directly by hiding the C compiler from PATH, not just derived by
+  counting `compile_and_run` call sites, the same cross-check stage 6's
+  own count used).
+
+  With this stage, every memory-safety gap claude.md #43's "automatic
+  memory management" promise was ever found to have is closed. See
+  `todo.md`'s "Memory management" section, "Stage 7", for the full
+  writeup and reproduction.
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -1723,7 +2766,8 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 694 passed, 10 skipped (needs a C compiler; 2 of
-                                        # the skips need `pip install pyinstaller` too,
-                                        # the other 8 need Xvfb + xdotool installed)
+pytest tests/                          # 536 passed, 265 skipped (needs a C compiler; 2 of
+                                        # those skips need `pip install pyinstaller` too,
+                                        # 8 need Xvfb + xdotool installed too) given a
+                                        # working C compiler, all 801 pass
 ```

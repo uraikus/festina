@@ -394,6 +394,30 @@ int8_t festina_audio_is_playing(void *audio);
 char *festina_getenv(const char *name);
 
 /*
+ * claude.md #77: reference counting for struct/arr[T]/map[T] values
+ * escape analysis (claude.md #74/#75/#76) proves DO escape their
+ * declaring function -- the remainder that pure escape analysis can
+ * never reach on its own. Complete (not just "handles everything but
+ * cycles") for Festina specifically: a struct field's type, and an
+ * arr[T]/map[T]'s own element type, must always be declared *before*
+ * the struct/array/map containing it (verified directly -- even
+ * `struct Node { next:Node }` fails to compile), so no value can ever
+ * transitively reference itself. See festina_retain/festina_release's
+ * own doc comment in festina_runtime.c for the full design (the
+ * refcount header layout, the negative-refcount immortal sentinel used
+ * for a global's own untouched static initial storage, and why no
+ * cycle-breaking machinery is needed at all).
+ *
+ * `payload` is the pointer Festina code itself sees (past the hidden
+ * header) -- both functions are always safe to call on any struct
+ * value, including a null one (a struct-typed field or global that was
+ * never assigned) and including a global's own immortal static
+ * storage.
+ */
+void festina_retain(void *payload);
+void festina_release(void *payload);
+
+/*
  * claude.md #72: map[T] -- { key: value, ... } literals,
  * npcHealths[key] read/write, npcHealths.forEach(callback).
  *
@@ -441,5 +465,25 @@ char *festina_getenv(const char *name);
 void festina_map_set(int64_t *count, void **entries, const char *key, int64_t value);
 int64_t festina_map_get(int64_t count, void *entries, const char *key, int64_t default_value);
 void festina_map_for_each(int64_t count, void *entries, void (*callback)(int64_t, const char *));
+
+/* claude.md #74/#75: called by generated code when a map[T] local,
+ * proven never to escape its declaring function, goes out of scope.
+ * Frees each entry's own strdup'd key (see festina_map_set's own
+ * comment -- always a private copy, never aliased with anything
+ * Festina-visible, so this is always safe regardless of anything
+ * escape analysis does or doesn't know) and then the entries buffer
+ * itself. A no-op for a map that was declared but never grown
+ * (entries is NULL, count is 0 -- the loop below simply doesn't run,
+ * and free(NULL) is a defined no-op). */
+void festina_map_free_entries(int64_t count, void *entries);
+
+/*
+ * claude.md #79: releases an arr[T]/map[T] value -- see each
+ * function's own doc comment in festina_runtime.c. Like
+ * festina_retain/festina_release, always safe to call on any arr[T]/
+ * map[T] value, including a null one.
+ */
+void festina_release_array(void *payload);
+void festina_release_map(void *payload);
 
 #endif

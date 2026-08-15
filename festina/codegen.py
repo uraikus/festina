@@ -17,10 +17,13 @@ see _emit_environment_get), #72 (map[T] -- literals, indexed get/set,
 .forEach() -- see _emit_map_lit/_emit_map_get/_emit_map_set/
 _emit_map_foreach_trampoline), #73 (break/continue -- see
 self._loop_targets and _emit_stmt's BreakStmt/ContinueStmt handling),
-#74 (automatic reclamation of provably non-escaping struct/arr[T]/
-map[T] locals, stage 1, now covering nested if/while/for bodies and
-per-iteration loop-local freeing too -- see escape_analysis.py,
-_emit_analyzed_func_body, _emit_block, and _emit_free_active_locals).
+#74/#75 (automatic reclamation of provably non-escaping struct/arr[T]/
+map[T] locals -- stage 1 covering nested if/while/for bodies and
+per-iteration loop-local freeing, stage 2 covering interprocedural
+call-argument analysis, and a struct proven non-escaping this way now
+gets a real stack alloca instead of a calloc+free pair -- see
+escape_analysis.py, _emit_analyzed_func_body, _emit_block,
+_emit_free_active_locals, and _emit_stmt's own VarDecl handling).
 #37, #39, #40 also cover `on key`/`on resize`/`on close` and the
 clientWidth/clientHeight globals (see the "Graphics" note below).
 
@@ -163,44 +166,62 @@ elsewhere.
 Uses LLVM's opaque-pointer IR (`ptr` everywhere) to match clang 15+'s
 default, so no manual bitcasting between pointer "flavors" is needed.
 
-Struct storage is always heap-allocated (calloc), never a stack alloca,
-even for a struct declared local to a function. claude.md #43 prefers
-stack allocation "when the value's lifetime permits it," which would be
-true for a struct that provably never leaves its declaring function --
-but a struct's address genuinely can outlive its function (returned,
-stored in an array or another struct's field, ...), and stack-
-allocating unconditionally, without proving which case applies first,
-silently corrupted every one of those cases (verified: returning a
-local struct by value produced garbage at the call site). calloc'ing
-every struct is the simple, uniformly-correct choice per #54's
-ambiguity rule ("prefer the simplest implementation" / "prefer
-performance" only when it doesn't also mean "prefer incorrect").
-calloc (not malloc) so uninitialized fields read as zero, matching a
-global struct's `zeroinitializer` -- local and global structs now start
-identically rather than one being zeroed and the other garbage.
+Struct storage is heap-allocated (calloc) by default, even for a struct
+declared local to a function -- a struct's address genuinely can
+outlive its function (returned, stored in an array or another struct's
+field, ...), and stack-allocating unconditionally, without proving
+which case applies first, silently corrupted every one of those cases
+(verified: returning a local struct by value produced garbage at the
+call site). calloc'ing every struct was the simple, uniformly-correct
+starting choice per #54's ambiguity rule ("prefer the simplest
+implementation" / "prefer performance" only when it doesn't also mean
+"prefer incorrect"). calloc (not malloc) so uninitialized fields read
+as zero, matching a global struct's `zeroinitializer` -- local and
+global structs start identically rather than one being zeroed and the
+other garbage.
 
-This still always heap-allocates rather than ever choosing a stack
-alloca -- claude.md #74 (stage 1 of #43's automatic memory management
-promise) takes a different, narrower path to the same underlying goal:
-rather than proving a value never escapes and skipping the heap
-allocation entirely (which is what "prefer stack allocation" actually
-asks for, and remains unimplemented -- the exact same escape-proving
-problem, just attempted at allocation time instead of at scope-exit
-time, with the exact same risk if done unsoundly), #74 always still
-calloc's, then *frees* that same allocation automatically at scope exit
-when escape_analysis.py proves the value's address never left its
-declaring function/handler. Slower than true stack allocation would be
-(a real calloc + a real free, not a zero-cost stack pointer bump) but
-implementable as a genuinely separable, individually-verifiable first
-step -- see escape_analysis.py's own module docstring and
+claude.md #43 prefers stack allocation "when the value's lifetime
+permits it" -- claude.md #74/#75 (automatic memory management's
+staged rollout) is the proof mechanism that makes it possible to know
+which structs that actually is: #74 first proves a struct's address
+never left its declaring function/handler at all (stage 1), then #75
+extends that same proof through calls to other functions in the same
+program too (stage 2, interprocedural). A struct provably safe under
+either stage now gets a genuine stack alloca (_emit_stmt's own VarDecl
+handling), explicitly zeroed with `store %struct.T zeroinitializer`
+immediately after (matching calloc's own zero-init behavior -- the two
+allocation strategies must stay indistinguishable to any Festina
+program, not just individually correct), instead of calloc+free --
+zero allocator traffic, not just leak-free. This is sound for exactly
+the same reason the earlier calloc+free-at-scope-exit approach was: an
+address that never escapes needs nothing beyond its own function's
+stack frame to remain valid, and a stack alloca's own lifetime already
+matches exactly the points _emit_free_active_locals would otherwise
+have freed it at (block exit, every loop iteration, break/continue) --
+LLVM's alloca reserves one fixed address for the whole enclosing
+function regardless of which basic block textually contains it, so a
+loop-body-declared one is simply reused, address and all, on the next
+iteration, and each recursive call still gets its own genuinely
+distinct address (ordinary calling-convention behavior, unrelated to
+this choice) -- verified directly, not just reasoned about (see
+tests/test_codegen.py::TestAutomaticMemoryReclamation's
+test_recursive_function_with_a_non_escaping_struct_local_keeps_each_calls_own_value).
+A struct that isn't provably safe under either stage still calloc's
+and still leaks, exactly as before -- this changes *how* a proven-safe
+struct is allocated, not what counts as proven safe; see
+escape_analysis.py's own module docstring and
 CodeGen._emit_analyzed_func_body/_emit_block/_emit_free_active_locals
-for the actual mechanism, and claude.md #74 for exactly what is and
-isn't covered by this first stage. Freeing happens as soon as control
-actually leaves the declaring block -- a loop-body-declared value is
-freed every iteration, not deferred until the enclosing function
-eventually returns -- not just at the end of the function, so this
-already meaningfully bounds a long-running loop's memory even without
-ever choosing a stack alloca.
+for the analysis and freeing machinery, and claude.md #74/#75 for
+exactly what is and isn't covered.
+
+arr[T]/map[T] locals are unaffected by any of this: their data/entries
+buffer is a genuinely dynamically-growing allocation (`.push()`, a map
+literal growing past its initial size, ...) with no compile-time-known
+fixed size, so it isn't safe to give a fixed-size alloca regardless of
+escaping-ness -- they still always calloc their data/entries buffer and
+still free it (map[T] additionally freeing each entry's own strdup'd
+key -- see festina_map_free_entries in runtime/festina_runtime.c) when
+proven non-escaping, exactly as stage 1 originally shipped.
 
 Array representation: claude.md #26 specifies arr[T]'s type-resolution
 rules but not its runtime representation or push/pop-style operations
@@ -220,27 +241,33 @@ in the absence of a spec requirement either way). `break`/`continue`
 self._loop_targets' own comment for why that's a plain stack rather than
 something threaded through ctx the way `terminated` is.
 
-Every arr[T], regardless of T, lowers to the same fixed-size aggregate
-FESTINA_ARRAY_LLVM_TYPE = `%struct._FestinaArray = type { i64, ptr }`
-(length, data pointer) -- Festina's own type system (not the generated
-IR) is what keeps different arr[T] values from mixing, exactly like
-festina.types keeps PrimitiveType/StructType/etc. distinct without a
-runtime tag (claude.md #11). Named `_FestinaArray` (leading underscore)
-rather than a plainer name specifically to make an accidental collision
-with a user-declared `struct _FestinaArray { ... }` less likely --
-Festina's identifier grammar still technically allows a user to write
-that exact name, so this lowers the odds without eliminating the
-possibility; a Festina identifier can never collide with an LLVM name
-containing a `.` in the middle the way `struct_llvm_name` produces
-(`%struct.Name`), so a scheme that didn't reuse that "%struct." prefix
-at all would close the gap completely if it's ever worth the churn. The
-data pointer is malloc'd, and (as of claude.md #74) freed automatically
-at scope exit when escape_analysis.py proves a local arr[T]/map[T]
-never escapes its declaring function/handler -- otherwise (or for a
-global, or a value declared inside a nested if/while/for body, or
-inside a loop at all -- see #74's own stated stage-1 limitations) it
-still leaks exactly as before; see todo.md's "Memory management"
-section for the full picture of what's covered and what's still ahead.
+Every arr[T], regardless of T, has the same fixed-size aggregate
+*payload* shape, FESTINA_ARRAY_LLVM_TYPE = `%struct._FestinaArray =
+type { i64, ptr }` (length, data pointer) -- Festina's own type system
+(not the generated IR) is what keeps different arr[T] values from
+mixing, exactly like festina.types keeps PrimitiveType/StructType/etc.
+distinct without a runtime tag (claude.md #11). Named `_FestinaArray`
+(leading underscore) rather than a plainer name specifically to make an
+accidental collision with a user-declared `struct _FestinaArray { ...
+}` less likely -- Festina's identifier grammar still technically
+allows a user to write that exact name, so this lowers the odds
+without eliminating the possibility; a Festina identifier can never
+collide with an LLVM name containing a `.` in the middle the way
+`struct_llvm_name` produces (`%struct.Name`), so a scheme that didn't
+reuse that "%struct." prefix at all would close the gap completely if
+it's ever worth the churn. claude.md #79: an arr[T]/map[T] *value*
+(what `_llvm_type` returns, what a variable/field/param/return actually
+holds) is a `ptr` to that payload's own storage, not the payload
+itself -- the same indirect representation a struct value already has
+(see `_emit_fresh_heap_header`), needed for two aliased bindings to
+share one genuine identity rather than independently-mutable copies.
+The data pointer is malloc'd, and (as of claude.md #74) freed
+automatically at scope exit when escape_analysis.py proves a local
+arr[T]/map[T] never escapes its declaring function/handler; an
+ESCAPING one (claude.md #79) is reference counted instead, the same
+treatment claude.md #77 already gives an escaping struct -- see
+todo.md's "Memory management" section for the full picture of what's
+covered and what's still ahead.
 
 Null for int/float (claude.md #10, #25, #57): i64/double have no spare
 bit pattern for "null" the way a pointer has NULL, and LLVM's `null`
@@ -363,7 +390,23 @@ def _llvm_type(t):
     if isinstance(t, types_mod.StructType):
         return "ptr"
     if isinstance(t, types_mod.ArrayType):
-        return FESTINA_ARRAY_LLVM_TYPE
+        # claude.md #79: like StructType, always a `ptr` to the value's
+        # own storage -- never FESTINA_ARRAY_LLVM_TYPE's `{i64, ptr}`
+        # shape directly (that shape still describes the storage this
+        # points AT, unchanged; see that constant's own comment and
+        # _emit_array_lit). This is what gives two arr[T] bindings a
+        # genuine shared identity on assignment (`b = a` -- both now
+        # hold the exact same header pointer, not independent copies
+        # that merely started out agreeing), the same "aliasing means
+        # sharing one address" semantics a struct-typed value already
+        # has -- previously, arr[T] was the `{i64,ptr}` value itself,
+        # copied by value on every assignment (a genuine, pre-existing,
+        # unrelated-to-refcounting bug for map[T] specifically: growing
+        # one alias via a key add can realloc its own entries buffer,
+        # which only that ONE copy's own header ever finds out about --
+        # confirmed directly, a real segfault, fixed as a side effect of
+        # this same representation change).
+        return "ptr"
     if isinstance(t, types_mod.TableType):
         # claude.md #32-34: a table-typed value is one row from a query
         # result -- like StructType, it's always a pointer to the row's
@@ -385,7 +428,10 @@ def _llvm_type(t):
         # _emit_regex_call.
         return "ptr"
     if isinstance(t, types_mod.MapType):
-        return FESTINA_MAP_LLVM_TYPE
+        # claude.md #79: see the ArrayType branch above -- identical
+        # reasoning, FESTINA_MAP_LLVM_TYPE's own `{i64, ptr}` shape
+        # still describes the storage this points at.
+        return "ptr"
     raise CodegenError(f"cannot generate code for type {t!r}")
 
 
@@ -409,6 +455,43 @@ class Env:
         return None
 
 
+class _StackStructFieldsOnly:
+    """claude.md #78: wraps a StructType to mark, in CodeGen.
+    _active_free_locals, a STACK-allocated struct local (see claude.md
+    #74/#76 -- provably non-escaping, so its own storage is never
+    heap-allocated/refcounted at all) that still has at least one
+    struct-typed field of its own. Such a local needs a scope-exit
+    action _emit_free_active_locals's existing StructType branch can't
+    give it (releasing the struct ITSELF, via its own refcount header,
+    which this local was never given in the first place -- see
+    _emit_stmt's own VarDecl handling) and the plain "nothing at all"
+    every other stack-allocated struct correctly gets: only its own
+    struct-typed field(s) need releasing, the same "the container stays
+    stack-allocated, but what it points to still needs explicit
+    freeing" pattern arr[T]/map[T] locals already follow for their own
+    data/entries buffer. See _emit_release_nested_fields_only."""
+
+    def __init__(self, struct_type):
+        self.struct_type = struct_type
+
+
+class _StackArrayOrMap:
+    """claude.md #79: wraps an ArrayType/MapType to mark, in CodeGen.
+    _active_free_locals, a STACK-allocated arr[T]/map[T] local (see
+    claude.md #74 -- provably non-escaping, so its own header is never
+    heap-allocated/refcounted at all, unchanged from before this
+    section). Its data/entries buffer is still always heap-allocated
+    regardless of the header's own escaping-ness -- a dynamically-sized
+    buffer was never safe to give a fixed-size alloca, before or after
+    this section -- so it still needs freeing at scope-exit, through
+    the header's own now-indirect `ptr` slot, and never through
+    festina_release_array/_map (which would try to release/free the
+    header itself, memory this local's storage never had)."""
+
+    def __init__(self, type_):
+        self.type_ = type_
+
+
 class CodeGen:
     def __init__(self, analyzed, filename="main.f"):
         self.analyzed = analyzed
@@ -422,6 +505,24 @@ class CodeGen:
         self.label_counter = 0
         self.global_env = Env()
         self.func_defs = []                    # emitted `define` blocks (text)
+        self._struct_release_fns = {}          # claude.md #78: struct name -> LLVM function name of
+                                                # its own lazily-generated, per-type release wrapper --
+                                                # see _release_fn_for_struct's own comment. Only ever
+                                                # populated for a struct that has at least one struct-
+                                                # typed field of its own; every other struct's values
+                                                # keep using the plain, generic @festina_release
+                                                # directly, unchanged from claude.md #77.
+        self._array_release_fns = {}           # claude.md #80: types_mod.type_name(ArrayType) -> LLVM
+                                                # function name of its own lazily-generated, per-
+                                                # element-type release wrapper -- see
+                                                # _release_fn_for_array's own comment. Only ever
+                                                # populated for an arr[T] whose own T is itself
+                                                # refcounted (struct/arr/map); every other arr[T]
+                                                # keeps using the plain, generic @festina_release_array
+                                                # directly, unchanged from claude.md #79.
+        self._map_release_fns = {}             # claude.md #80: the map[T] counterpart to
+                                                # self._array_release_fns -- see
+                                                # _release_fn_for_map's own comment.
         self.extra_globals = []                # globals discovered while emitting main() (e.g. table column arrays)
         self.entry_stmts = []                  # top-level statements for __festina_main
         self.func_decls = {}                   # name -> ast.FuncDecl (for signatures)
@@ -490,6 +591,32 @@ class CodeGen:
                                                 # a stack: Festina has no nested function declarations
                                                 # reaching codegen (see _toplevel), so only ever one
                                                 # function/handler's body is being emitted at a time.
+        self.escaping_params = {}              # claude.md #74 stage 2 (interprocedural): {func_name:
+                                                # set[int]} -- for each FuncDecl already fully emitted,
+                                                # which of ITS OWN parameter positions escape_analysis
+                                                # proved escape somewhere in its own body. Built up
+                                                # incrementally, one entry per function, immediately
+                                                # after that function's own _emit_analyzed_func_body call
+                                                # returns (see that method) -- never all at once in a
+                                                # separate pass, because it doesn't need to be: semantic.py
+                                                # already rejects a call to a function before its own
+                                                # declaration (no forward references), so by the time any
+                                                # function F's body is being walked, every function F could
+                                                # possibly call (other than F itself, mid-recursion) is
+                                                # necessarily already a key in this dict. A self-recursive
+                                                # call inside F's own body looks up F's own name here
+                                                # *before* F's own entry has been added -- a plain,
+                                                # ordinary dict miss, correctly falling back to
+                                                # escape_analysis.py's original conservative "any call
+                                                # argument escapes" default, exactly like a call to an
+                                                # unanalyzed builtin does. Never cleared, never popped:
+                                                # unlike _current_escaping_names (one function at a time)
+                                                # this accumulates across the whole program, since a
+                                                # function emitted early may be called by many functions
+                                                # emitted later. Passed to every
+                                                # escape_analysis.find_escaping_names call this session
+                                                # makes (see _emit_analyzed_func_body) -- see that
+                                                # module's own docstring for the full contract.
         self._active_free_locals = []          # claude.md #74: stack of "frames," one per currently-
                                                 # open block within the function/handler body being
                                                 # emitted -- not just its own top-level body anymore, but
@@ -699,6 +826,26 @@ class CodeGen:
             # escaping struct/arr[T]/map[T] locals -- see
             # _emit_free_active_locals.
             "declare void @free(ptr)",
+            # claude.md #77: reference counting for struct values escape
+            # analysis proves DO escape (global structs, and escaping
+            # local structs that are never themselves returned) -- see
+            # both functions' own doc comment in
+            # runtime/festina_runtime.c, _global_var_defs, and
+            # _emit_free_active_locals's own StructType branch.
+            "declare void @festina_retain(ptr)",
+            "declare void @festina_release(ptr)",
+            # claude.md #78: the decrement-and-check half of
+            # festina_release, split out so a struct with its own
+            # struct-typed field(s) can cascade into releasing those
+            # fields BEFORE actually freeing its own storage -- see
+            # _release_fn_for_struct and festina_release_check's own
+            # comment in runtime/festina_runtime.c.
+            "declare i8 @festina_release_check(ptr)",
+            # claude.md #79: reference counting for arr[T]/map[T]
+            # values that escape -- see _release_fn_for and each
+            # function's own doc comment in runtime/festina_runtime.c.
+            "declare void @festina_release_array(ptr)",
+            "declare void @festina_release_map(ptr)",
             # claude.md #71: environment.NAME / environment[keyExpr].
             "declare ptr @festina_getenv(ptr)",
             # claude.md #72: map[T] -- count_ptr/entries_ptr (the two
@@ -713,6 +860,12 @@ class CodeGen:
             "declare void @festina_map_set(ptr, ptr, ptr, i64)",
             "declare i64 @festina_map_get(i64, ptr, ptr, i64)",
             "declare void @festina_map_for_each(i64, ptr, ptr)",
+            # claude.md #74/#75: frees each entry's own strdup'd key
+            # (never a plain free()-the-buffer-alone away from leaking
+            # them -- see festina_map_free_entries's own doc comment)
+            # before freeing the entries buffer itself -- see
+            # _emit_free_active_locals's MapType branch.
+            "declare void @festina_map_free_entries(i64, ptr)",
             # claude.md #56: Math.floor/ceil/round/trunc, via LLVM's
             # built-in intrinsics rather than a runtime C function.
             "declare double @llvm.floor.f64(double)",
@@ -748,9 +901,38 @@ class CodeGen:
                 # storage, exactly like a local struct var's alloca slot
                 # (see _emit_stmt) -- kept uniform so Identifier lookup
                 # never needs to special-case structs.
-                backing = f"{ref}.storage"
-                lines.append(f"{backing} = global {self.struct_llvm_name(type_.name)} zeroinitializer")
-                lines.append(f"{ref} = global ptr {backing}")
+                #
+                # claude.md #77: this initial storage is never freed --
+                # it's static/global memory, not a heap allocation, and
+                # passing it to free() would be undefined behavior. It
+                # still gets the same i64-refcount-header layout every
+                # other struct value does (see festina_retain/
+                # festina_release's own comment in
+                # runtime/festina_runtime.c), but with the header
+                # initialized to -1, a sentinel both functions treat as
+                # "immortal, always a no-op" -- so a global's first-ever
+                # reassignment (from this untouched storage to a real
+                # heap value) needs no special-casing at the assignment
+                # site at all; retaining/releasing whatever this global
+                # currently points to is always safe, whatever that is.
+                struct_ty = self.struct_llvm_name(type_.name)
+                header = f"{ref}.header"
+                lines.append(f"{header} = global {{i64, {struct_ty}}} {{i64 -1, {struct_ty} zeroinitializer}}")
+                lines.append(f"{ref} = global ptr getelementptr({{i64, {struct_ty}}}, ptr {header}, i32 0, i32 1)")
+                continue
+            if isinstance(type_, (types_mod.ArrayType, types_mod.MapType)):
+                # claude.md #79: identical treatment to the StructType
+                # branch just above -- see its own comment for the full
+                # reasoning (immortal sentinel refcount, no special-
+                # casing needed at a global's first-ever reassignment).
+                # Only the payload shape differs (FESTINA_ARRAY_LLVM_TYPE/
+                # FESTINA_MAP_LLVM_TYPE's `{i64, ptr}` in place of a
+                # user struct's own field list).
+                payload_ty = (FESTINA_ARRAY_LLVM_TYPE if isinstance(type_, types_mod.ArrayType)
+                              else FESTINA_MAP_LLVM_TYPE)
+                header = f"{ref}.header"
+                lines.append(f"{header} = global {{i64, {payload_ty}}} {{i64 -1, {payload_ty} zeroinitializer}}")
+                lines.append(f"{ref} = global ptr getelementptr({{i64, {payload_ty}}}, ptr {header}, i32 0, i32 1)")
                 continue
             llvm_ty = _llvm_type(type_)
             zero = self._zero_value(type_)
@@ -758,17 +940,21 @@ class CodeGen:
         return lines
 
     def _zero_value(self, type_):
+        # claude.md #79: every "%struct."-shaped LLVM type (arr[T]/
+        # map[T]'s own FESTINA_ARRAY_LLVM_TYPE/FESTINA_MAP_LLVM_TYPE
+        # payload) is now only ever reached *indirectly*, through a
+        # `ptr` -- struct/array/map-typed globals all get their own
+        # dedicated, refcount-sentinel-carrying storage in
+        # _global_var_defs instead of ever reaching this function, so
+        # there is no remaining case that needs a "zeroinitializer"
+        # aggregate value here; "null" (the final fallback below) is
+        # correct for all three now, the same as it already was for
+        # StructType.
         llvm_ty = _llvm_type(type_)
         if llvm_ty in ("i64", "i1", "i8"):
             return "0"
         if llvm_ty == "double":
             return "0.0"
-        if llvm_ty.startswith("%struct."):
-            # Named aggregate types (currently just FESTINA_ARRAY_LLVM_TYPE
-            # reaches this branch -- struct-typed globals are handled
-            # separately in _global_var_defs) can't use "null"; a plain
-            # "ptr null" only works for actual pointer types.
-            return "zeroinitializer"
         return "null"
 
     def _string_const_defs(self):
@@ -835,39 +1021,108 @@ class CodeGen:
         (nothing to free -- e.g. a block that never actually opened its
         own frame because it isn't inside a tracked body).
 
-        What "free" means differs by type, since only structs are
-        represented as a pointer to their own backing storage -- arr[T]/
-        map[T] locals are the {i64, ptr} header itself, stack-allocated
-        inline (never heap-allocated on their own), with only their
-        data/entries *field* separately heap-allocated (see
-        FESTINA_ARRAY_LLVM_TYPE/FESTINA_MAP_LLVM_TYPE's own module
-        docstring notes) -- so freeing one of those means loading the
-        header value and freeing its second field, not the local itself.
-        Frames are freed innermost-first purely for readability of the
-        emitted IR -- each free() call is an independent allocation with
-        no interdependency, so the actual order never affects
-        correctness.
+        What "free"/"release" means differs by exactly what
+        _active_free_locals' own entry marks a name as (see
+        _emit_block's own tracking comment for how each is chosen):
+        a plain StructType/ArrayType/MapType entry means this local's
+        own header is heap-allocated and refcounted (claude.md #77/
+        #79), so it's RELEASED, via whichever function _release_fn_for
+        dispatches to for that type, only actually freed once nothing
+        else references it; a _StackStructFieldsOnly/_StackArrayOrMap
+        entry means the header itself is stack-allocated (never
+        released), but something reachable through it still needs
+        explicit freeing (a struct's own struct-typed field(s), an
+        array's data buffer, a map's entries buffer). Frames are freed
+        innermost-first purely for readability of the emitted IR --
+        each release/free call is independent, so the actual order
+        never affects correctness.
         """
         if down_to >= len(self._active_free_locals):
             return
         for frame in reversed(self._active_free_locals[down_to:]):
             for ref, type_ in frame:
-                if isinstance(type_, types_mod.StructType):
+                if isinstance(type_, _StackStructFieldsOnly):
+                    # claude.md #78: a stack-allocated struct local
+                    # (see _emit_block's own tracking comment) whose own
+                    # storage is never released here -- only whatever
+                    # its own struct-typed field(s) currently point to,
+                    # since a field write (_emit_assign) may have
+                    # retained a reference nothing else will ever
+                    # release otherwise.
+                    self._emit_release_nested_fields_only(ref, type_.struct_type, lines)
+                elif isinstance(type_, _StackArrayOrMap):
+                    # claude.md #79: a stack-allocated arr[T]/map[T]
+                    # local (see _emit_block's own tracking comment) --
+                    # `ref` is the local's own `alloca ptr` slot, so
+                    # this needs one load to reach the header's own
+                    # (stack) storage before GEPing into its own
+                    # data/entries field, the same pattern claude.md #78
+                    # already established for a stack-allocated struct's
+                    # own field access. Only that buffer is freed here,
+                    # never the header itself -- it has no refcount
+                    # header and isn't heap memory at all, so it must
+                    # never reach festina_release_array/_map.
+                    header = self.tmp()
+                    lines.append(f"  {header} = load ptr, ptr {ref}")
+                    if isinstance(type_.type_, types_mod.ArrayType):
+                        elem_type = type_.type_.element
+                        len_ptr = self.tmp()
+                        lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
+                        len_val = self.tmp()
+                        lines.append(f"  {len_val} = load i64, ptr {len_ptr}")
+                        field_ptr = self.tmp()
+                        lines.append(f"  {field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
+                        data_ptr = self.tmp()
+                        lines.append(f"  {data_ptr} = load ptr, ptr {field_ptr}")
+                        if isinstance(elem_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+                            # claude.md #80: this array's own elements
+                            # are themselves refcounted -- release each
+                            # one before freeing the data buffer they
+                            # live in, the same element-release loop
+                            # _release_fn_for_array's own generated
+                            # wrapper uses for the heap-allocated case.
+                            self._emit_release_array_elements(
+                                data_ptr, len_val, self._release_fn_for(elem_type),
+                                _llvm_type(elem_type), lines)
+                        lines.append(f"  call void @free(ptr {data_ptr})")
+                    else:
+                        # claude.md #74/#75: unlike an array's plain
+                        # data buffer, a map's entries buffer has its
+                        # own nested allocation per entry (each key is
+                        # its own strdup'd copy -- see festina_map_set's
+                        # own comment) that a plain free() of the
+                        # entries pointer alone would leak.
+                        # festina_map_free_entries frees each entry's
+                        # key first, then the entries buffer itself.
+                        value_type = type_.type_.value
+                        count_ptr = self.tmp()
+                        lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
+                        count_val = self.tmp()
+                        lines.append(f"  {count_val} = load i64, ptr {count_ptr}")
+                        field_ptr = self.tmp()
+                        lines.append(f"  {field_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
+                        entries_ptr = self.tmp()
+                        lines.append(f"  {entries_ptr} = load ptr, ptr {field_ptr}")
+                        if isinstance(value_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+                            # claude.md #80: same as the array case just
+                            # above, but through festina_map_for_each
+                            # and a release trampoline, since a map's
+                            # own entries layout stays opaque to codegen
+                            # -- see _release_fn_for_map's own comment.
+                            trampoline_name = self._emit_map_value_release_trampoline(value_type)
+                            lines.append(
+                                f"  call void @festina_map_for_each(i64 {count_val}, ptr {entries_ptr}, ptr {trampoline_name})")
+                        lines.append(f"  call void @festina_map_free_entries(i64 {count_val}, ptr {entries_ptr})")
+                elif isinstance(type_, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+                    # claude.md #77/#79: release (not free) -- this
+                    # value is refcounted (see _emit_stmt's own VarDecl
+                    # handling), so its own reference simply needs
+                    # dropping; whichever function _release_fn_for
+                    # dispatches to only actually frees it once nothing
+                    # else references it.
                     loaded = self.tmp()
                     lines.append(f"  {loaded} = load ptr, ptr {ref}")
-                    lines.append(f"  call void @free(ptr {loaded})")
-                elif isinstance(type_, types_mod.ArrayType):
-                    loaded = self.tmp()
-                    lines.append(f"  {loaded} = load {FESTINA_ARRAY_LLVM_TYPE}, ptr {ref}")
-                    data_ptr = self.tmp()
-                    lines.append(f"  {data_ptr} = extractvalue {FESTINA_ARRAY_LLVM_TYPE} {loaded}, 1")
-                    lines.append(f"  call void @free(ptr {data_ptr})")
-                elif isinstance(type_, types_mod.MapType):
-                    loaded = self.tmp()
-                    lines.append(f"  {loaded} = load {FESTINA_MAP_LLVM_TYPE}, ptr {ref}")
-                    entries_ptr = self.tmp()
-                    lines.append(f"  {entries_ptr} = extractvalue {FESTINA_MAP_LLVM_TYPE} {loaded}, 1")
-                    lines.append(f"  call void @free(ptr {entries_ptr})")
+                    lines.append(f"  call void {self._release_fn_for(type_)}(ptr {loaded})")
 
     def _emit_analyzed_func_body(self, decl, body_env, return_type, body_lines):
         """claude.md #74: runs escape_analysis.find_escaping_names once
@@ -883,12 +1138,40 @@ class CodeGen:
         ever exists at a whole program's top level -- see _toplevel), so
         this never needs to be a stack the way _active_free_locals and
         _loop_targets are, just a single value cleared between one
-        function/handler's emission and the next."""
-        self._current_escaping_names = escape_analysis.find_escaping_names(decl.body)
+        function/handler's emission and the next.
+
+        claude.md #74 stage 2 (interprocedural): passes self.
+        escaping_params into find_escaping_names so a Call argument
+        position already proven safe by some EARLIER function's own
+        analysis is exempted from the default "any call argument
+        escapes" rule (see escape_analysis.py's own docstring for the
+        full contract). After decl's own body is fully walked, a real
+        ast.FuncDecl (not an EventHandler -- nothing ever calls a
+        handler by name, so it never needs an entry here) registers its
+        own result into self.escaping_params, keyed by name, so any
+        LATER function's own analysis can use it in turn -- see that
+        field's own comment on why this incremental,
+        one-function-at-a-time approach is already sound with no
+        separate whole-program pre-pass or fixpoint needed.
+
+        claude.md #77 (widened): a struct value returned through
+        Return no longer needs its own separate name-based tracking
+        the way it once did (self._returned_names, since removed) --
+        Return's own handling now retains the value being returned
+        whenever it might be aliased, the same treatment every other
+        struct-producing site in this stage already gets, so no extra
+        per-function state is needed here for it at all."""
+        escaping = escape_analysis.find_escaping_names(decl.body, escaping_params=self.escaping_params)
+        self._current_escaping_names = escaping
         try:
-            return self._emit_block(decl.body, body_env, return_type, body_lines)
+            block = self._emit_block(decl.body, body_env, return_type, body_lines)
         finally:
             self._current_escaping_names = None
+        if isinstance(decl, ast.FuncDecl):
+            self.escaping_params[decl.name] = {
+                i for i, p in enumerate(decl.params) if p.name in escaping
+            }
+        return block
 
     def _emit_func(self, decl):
         return_type = None if decl.return_type == "void" else self._resolve(decl.return_type, decl)
@@ -1017,13 +1300,89 @@ class CodeGen:
                 if ctx["terminated"]:
                     break
                 self._emit_stmt(stmt, env, return_type, ctx)
-                if (tracking and isinstance(stmt, ast.VarDecl)
-                        and stmt.name not in self._current_escaping_names):
+                if tracking and isinstance(stmt, ast.VarDecl):
                     found = env.lookup(stmt.name)
                     if found is not None:
                         ref, type_ = found
-                        if isinstance(type_, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
-                            self._active_free_locals[-1].append((ref, type_))
+                        if isinstance(type_, (types_mod.ArrayType, types_mod.MapType)):
+                            # claude.md #79 (mirroring claude.md #77's
+                            # own struct widening below): a with-init
+                            # local never stack-allocates at all (see
+                            # _emit_stmt's own VarDecl handling -- it
+                            # always aliases its initializer's value),
+                            # so it's always refcounted and always safe
+                            # to schedule for release, regardless of its
+                            # own escaping-ness. A no-init local is only
+                            # refcounted (not stack-allocated) when
+                            # escape_analysis actually proves it
+                            # escapes -- exactly mirroring _emit_stmt's
+                            # own stack-vs-heap decision. Either way, a
+                            # name that's ever itself returned is not
+                            # excluded here either -- Return's own
+                            # handling retains first, same as for
+                            # structs.
+                            is_stack_allocated = (stmt.init is None
+                                                   and stmt.name not in self._current_escaping_names)
+                            if not is_stack_allocated:
+                                self._active_free_locals[-1].append((ref, type_))
+                            else:
+                                # arr[T]/map[T] still always calloc/
+                                # malloc their data/entries buffer
+                                # regardless of the HEADER's own
+                                # escaping-ness (a genuinely dynamic-size
+                                # buffer isn't safe to give a fixed-size
+                                # alloca -- see this method's own
+                                # docstring) -- so a stack-allocated
+                                # header still needs THAT buffer freed at
+                                # scope-exit; see _StackArrayOrMap's own
+                                # comment.
+                                self._active_free_locals[-1].append(
+                                    (ref, _StackArrayOrMap(type_)))
+                        elif isinstance(type_, types_mod.StructType):
+                            # claude.md #77 (widened): a struct local
+                            # declared WITH an initializer never goes
+                            # through stack allocation at all (see
+                            # _emit_stmt's own VarDecl handling -- it
+                            # always aliases its initializer's value,
+                            # retained there whenever that source isn't
+                            # a fresh call result), so it's always
+                            # refcounted and always safe to schedule for
+                            # release, regardless of its own escaping-
+                            # ness. A struct local declared WITHOUT one
+                            # is only refcounted (not stack-allocated)
+                            # when escape_analysis actually proves it
+                            # escapes -- exactly mirroring _emit_stmt's
+                            # own stack-vs-heap decision, since
+                            # scheduling anything else for release would
+                            # try to release a stack address that was
+                            # never calloc'd with a header in the first
+                            # place. A name that's ever itself returned
+                            # is no longer excluded here either (unlike
+                            # this stage's earlier passes): Return's own
+                            # handling now retains the value first
+                            # whenever it might be aliased (see
+                            # _emit_stmt's Return branch), so releasing
+                            # this binding too, right alongside every
+                            # other active local, nets out to exactly
+                            # one reference surviving -- the one handed
+                            # to the caller -- rather than leaking it.
+                            is_stack_allocated = (stmt.init is None
+                                                   and stmt.name not in self._current_escaping_names)
+                            if not is_stack_allocated:
+                                self._active_free_locals[-1].append((ref, type_))
+                            elif self._struct_has_own_refcounted_field(type_.name):
+                                # claude.md #78: this local's own
+                                # storage is stack-allocated and never
+                                # itself released -- but writing into
+                                # one of its struct-typed fields
+                                # (_emit_assign) still retains whatever
+                                # value that field points to, and
+                                # nothing else will ever release that
+                                # extra reference unless this scope-exit
+                                # does. See _StackStructFieldsOnly's own
+                                # comment.
+                                self._active_free_locals[-1].append(
+                                    (ref, _StackStructFieldsOnly(type_)))
             if tracking and not ctx["terminated"]:
                 self._emit_free_active_locals(lines, down_to=len(self._active_free_locals) - 1)
         finally:
@@ -1038,24 +1397,179 @@ class CodeGen:
             if isinstance(type_, types_mod.StructType):
                 # `slot` holds a *pointer* to the struct's own storage,
                 # kept uniform with every other type so Identifier lookup
-                # never needs a struct special-case. That storage is
-                # calloc'd, not a stack alloca -- see the module
-                # docstring's "Struct storage is always heap-allocated"
-                # note for why (a stack-allocated struct's address can
-                # outlive its function: returned, put in an array, stored
-                # in another struct's field -- verified to silently
-                # corrupt memory when it does).
+                # never needs a struct special-case, whichever way that
+                # storage itself was obtained below.
+                #
+                # claude.md #43: "prefer stack allocation when the
+                # value's lifetime permits it." A struct whose address
+                # can outlive its function (returned, put in an array,
+                # stored in another struct's field, ...) genuinely can't
+                # -- unconditional stack allocation was tried once,
+                # before claude.md #74 existed, and reverted after being
+                # verified to silently corrupt memory (see this module's
+                # own docstring's "Struct storage is always heap-
+                # allocated" note, and escape_analysis.py's docstring)
+                # -- but claude.md #74/#75's escape analysis now proves
+                # exactly the cases where it DOES permit it: whenever
+                # this exact name is also what _emit_block would
+                # otherwise have freed at scope exit (see that method's
+                # own tracking logic, which now skips StructType
+                # precisely because there's nothing left for it to
+                # free). Reusing that same proof for allocation instead
+                # of only for freeing is sound for the identical reason
+                # it was sound for freeing: an address that never
+                # escapes its declaring function needs nothing beyond
+                # that function's own stack frame to remain valid, and a
+                # stack alloca's own lifetime already matches exactly
+                # the same points (block exit, every loop iteration,
+                # break/continue) _emit_free_active_locals would
+                # otherwise have freed it at -- LLVM's alloca reserves a
+                # single fixed address for the whole enclosing function
+                # regardless of which basic block textually contains it,
+                # so a loop-body-declared one is simply reused, address
+                # and all, on the next iteration, with zero allocator
+                # traffic either way (faster than the calloc+free stage
+                # 1/2 alone would have produced, not just leak-free
+                # sooner). Recursion needs no special handling either:
+                # each call gets its own stack frame regardless of this
+                # choice (ordinary calling-convention behavior), so each
+                # recursive invocation's own alloca is a genuinely
+                # distinct address.
+                #
+                # Scoped to *this* local's own storage only, not
+                # anything reachable through it -- a struct-typed FIELD
+                # of this struct, if ever assigned an existing local's
+                # value (the only way one can be populated; there is no
+                # struct-literal initializer syntax), still always
+                # aliases that other value's own storage exactly as
+                # before, unconditionally heap-allocated, unconditionally
+                # never retained/released via this local's own cleanup
+                # (claude.md #77's own release, below, only ever touches
+                # a struct's own top-level allocation, never walks into
+                # its fields) -- proving that's *also* safe to change
+                # needs real aliasing analysis (does anything else still
+                # reference that field's value when this struct's own
+                # lifetime ends), a genuinely different and harder
+                # question than "does this local's own name ever appear
+                # outside a safe position," and not attempted here; see
+                # todo.md.
                 uid = self._unique()
                 struct_ty = self.struct_llvm_name(type_.name)
-                size_val = self._sizeof(struct_ty, lines)
                 backing = f"%{stmt.name}.storage.{uid}"
                 slot = f"%{stmt.name}.{uid}"
-                lines.append(f"  {backing} = call ptr @calloc(i64 1, i64 {size_val})")
+                if stmt.init is not None:
+                    # `Point r = someExpr` -- most commonly a function
+                    # call returning a struct by value (claude.md #55's
+                    # own "returning a struct by value" fix is exactly
+                    # what makes this safe: the callee's own return
+                    # value is never a stack allocation the callee's
+                    # frame owns). This local simply aliases whatever
+                    # storage the initializer's own value already
+                    # points to, the same as a plain `r = expr`
+                    # assignment would -- no fresh allocation of its
+                    # own at all, since structs are always reference
+                    # types at the Festina level (see this method's own
+                    # "kept uniform" note above).
+                    #
+                    # claude.md #77: retained here (mirroring
+                    # _emit_local_retain_release's own logic,
+                    # which this can't just call -- there is no OLD
+                    # value to release for a name's own first-ever
+                    # declaration) whenever the initializer isn't a
+                    # plain function call -- see
+                    # _is_owning_refcounted_source's own comment for why a
+                    # call result needs no retain (it already owns a
+                    # fresh +1 nothing else references yet) while
+                    # anything else (an existing local/parameter/global
+                    # read, a field read, ...) does (something else
+                    # already references it too). This is what makes it
+                    # safe for _emit_block to schedule r for release at
+                    # its own scope-exit regardless of whether it has an
+                    # initializer -- r's own reference is now always
+                    # correctly counted, whichever way it came to exist.
+                    val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
+                    val = self._coerce(val, vtype, type_, lines)
+                    if not self._is_owning_refcounted_source(stmt.init):
+                        lines.append(f"  call void @festina_retain(ptr {val})")
+                    lines.append(f"  {slot} = alloca ptr")
+                    lines.append(f"  store ptr {val}, ptr {slot}")
+                    env.define(stmt.name, slot, type_)
+                    return
+                non_escaping = (self._current_escaping_names is not None
+                                and stmt.name not in self._current_escaping_names)
+                if non_escaping:
+                    lines.append(f"  {backing} = alloca {struct_ty}")
+                    # calloc zero-initializes; alloca doesn't -- claude.md
+                    # #74's own module docstring note ("uninitialized
+                    # fields read as zero, matching a global struct's
+                    # zeroinitializer") still has to hold here, so this
+                    # explicitly zeros the same way a global's own
+                    # `zeroinitializer` storage already does (see
+                    # _struct_type_defs / _global_var_defs) -- the two
+                    # allocation strategies below must remain
+                    # indistinguishable to any Festina program, or this
+                    # wouldn't be "prefer stack allocation when it's
+                    # safe," it would be a visible behavior change.
+                    lines.append(f"  store {struct_ty} zeroinitializer, ptr {backing}")
+                else:
+                    # claude.md #77: an escaping struct local is
+                    # refcounted like any other escaping struct value
+                    # (see festina_retain/festina_release's own comment
+                    # in runtime/festina_runtime.c for the header
+                    # layout) -- allocate 8 extra bytes for the i64
+                    # refcount header, initialize it to 1 (this
+                    # binding's own reference), and offset the visible
+                    # `backing` pointer past it so every existing GEP-
+                    # based field access downstream is unaffected.
+                    size_val = self._sizeof(struct_ty, lines)
+                    total_size = self.tmp()
+                    lines.append(f"  {total_size} = add i64 {size_val}, 8")
+                    raw = f"%{stmt.name}.raw.{uid}"
+                    lines.append(f"  {raw} = call ptr @calloc(i64 1, i64 {total_size})")
+                    lines.append(f"  store i64 1, ptr {raw}")
+                    lines.append(f"  {backing} = getelementptr i8, ptr {raw}, i64 8")
                 lines.append(f"  {slot} = alloca ptr")
                 lines.append(f"  store ptr {backing}, ptr {slot}")
                 env.define(stmt.name, slot, type_)
-                # No struct-literal initializer syntax exists yet, so
-                # stmt.init is always None here.
+                # stmt.init is None here -- handled by the early-return
+                # branch above.
+                return
+            if isinstance(type_, (types_mod.ArrayType, types_mod.MapType)):
+                # claude.md #79: identical treatment to the StructType
+                # branch just above -- see its own comment for the full
+                # reasoning (this is what gives an arr[T]/map[T] local a
+                # real stack-allocation option when non-escaping, the
+                # same "prefer stack allocation when the value's
+                # lifetime permits it" claude.md #43 already promises
+                # structs, plus the identical retain-on-alias treatment
+                # for a with-initializer declaration). Only the payload
+                # shape differs.
+                payload_ty = (FESTINA_ARRAY_LLVM_TYPE if isinstance(type_, types_mod.ArrayType)
+                              else FESTINA_MAP_LLVM_TYPE)
+                uid = self._unique()
+                backing = f"%{stmt.name}.storage.{uid}"
+                slot = f"%{stmt.name}.{uid}"
+                if stmt.init is not None:
+                    val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
+                    val = self._coerce(val, vtype, type_, lines)
+                    if not self._is_owning_refcounted_source(stmt.init):
+                        lines.append(f"  call void @festina_retain(ptr {val})")
+                    lines.append(f"  {slot} = alloca ptr")
+                    lines.append(f"  store ptr {val}, ptr {slot}")
+                    env.define(stmt.name, slot, type_)
+                    return
+                non_escaping = (self._current_escaping_names is not None
+                                and stmt.name not in self._current_escaping_names)
+                if non_escaping:
+                    lines.append(f"  {backing} = alloca {payload_ty}")
+                    lines.append(f"  store {payload_ty} zeroinitializer, ptr {backing}")
+                else:
+                    backing = self._emit_fresh_heap_header(payload_ty, lines)
+                lines.append(f"  {slot} = alloca ptr")
+                lines.append(f"  store ptr {backing}, ptr {slot}")
+                env.define(stmt.name, slot, type_)
+                # stmt.init is None here -- handled by the early-return
+                # branch above.
                 return
             llvm_ty = _llvm_type(type_)
             slot = f"%{stmt.name}.{self._unique()}"
@@ -1067,7 +1581,38 @@ class CodeGen:
                 lines.append(f"  store {llvm_ty} {val}, ptr {slot}")
             return
         if isinstance(stmt, ast.ExprStmt):
-            self._emit_expr(stmt.expr, env, lines)
+            val, vtype = self._emit_expr(stmt.expr, env, lines)
+            # claude.md #77: the one struct-return leak the retain-on-
+            # Return fix above doesn't touch -- a call result that's
+            # discarded outright, never bound to anything at all (`f();`
+            # as a bare statement). Nothing else in this stage's
+            # tracking would ever reach this value: it's not a local
+            # (no VarDecl), not a global (no assignment), and Return's
+            # own retain only protects a value being handed BACK to a
+            # caller, not one a caller is about to throw away. Since a
+            # Call's own return value is always "owning" (see
+            # _is_owning_refcounted_source) -- fresh, nothing else
+            # referencing it yet -- this ExprStmt is provably the value's
+            # ONLY reference, so releasing it immediately (freeing it,
+            # since nothing else can possibly still hold it) is always
+            # correct, not just conservative. Only fires for a bare Call
+            # used as a statement, matching exactly the "owning" source
+            # shape -- an ExprStmt wrapping anything else (a bare
+            # Identifier, a Member read, ...) never allocates anything of
+            # its own to begin with, so there is nothing to release.
+            if (isinstance(vtype, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+                    and isinstance(stmt.expr, (ast.Call, ast.ArrayLit, ast.MapLit))):
+                # claude.md #78/#79: through _release_fn_for (which
+                # dispatches to _release_fn_for_struct for a struct, so
+                # a discarded struct-typed call result with its own
+                # nested struct-typed field(s) still cascades correctly)
+                # rather than any one type's release function directly.
+                # claude.md #79 widens this beyond a discarded Call: a
+                # bare array/map literal statement (`[1,2,3];`,
+                # degenerate but syntactically valid) is just as
+                # "owning" a source as a Call is, and just as
+                # unambiguously this statement's own sole reference.
+                lines.append(f"  call void {self._release_fn_for(vtype)}(ptr {val})")
             return
         if isinstance(stmt, ast.Return):
             # claude.md #74: free every currently-active non-escaping
@@ -1086,6 +1631,32 @@ class CodeGen:
             else:
                 val, vtype = self._emit_value_for(stmt.value, env, lines, return_type)
                 val = self._coerce(val, vtype, return_type, lines)
+                # claude.md #77 (widened further): a struct being handed
+                # back to the caller gets the exact same owning/aliasing
+                # treatment _emit_local_retain_release already
+                # gives a plain local assignment -- retain it here,
+                # BEFORE _emit_free_active_locals below releases every
+                # active local (which, since a returned name is no
+                # longer excluded from that list -- see _emit_block's
+                # own comment -- may include the very binding this value
+                # came from). Skipped only when the source is a fresh,
+                # uniquely-owned call result (_is_owning_refcounted_source),
+                # the same "no retain needed, the +1 just transfers"
+                # case every other call site in this stage already
+                # relies on. This is what makes it safe to stop
+                # excluding a returned local from scope-exit release at
+                # all: retain-then-release-everything nets out to
+                # exactly one reference surviving per binding, on every
+                # path, including a Ternary/parameter/field read this
+                # source could be -- not just the bare-Identifier case a
+                # name-based exclusion could ever recognize.
+                # claude.md #79: widened to arr[T]/map[T] return values
+                # too, the identical rule -- retain always being the
+                # same generic @festina_retain regardless of type is
+                # exactly what makes this one check cover all three.
+                if (isinstance(return_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+                        and not self._is_owning_refcounted_source(stmt.value)):
+                    lines.append(f"  call void @festina_retain(ptr {val})")
                 self._emit_free_active_locals(lines)
                 lines.append(f"  ret {_llvm_type(return_type)} {val}")
             ctx["terminated"] = True
@@ -1353,19 +1924,23 @@ class CodeGen:
             if isinstance(expr.obj, ast.Identifier) and expr.obj.name == "environment":
                 return self._emit_environment_get(expr, env, lines)
             if not expr.computed and expr.prop == "length":
-                # claude.md #63: unlike struct/table field access,
-                # .length isn't addressable via a GEP -- an arr[T] value
-                # is a plain {i64, ptr} aggregate *value* (not a pointer
-                # to one; see the module docstring), and not every
-                # array-typed expression is even an lvalue (e.g. a
-                # function call's return value). extractvalue on the
-                # object's value works uniformly regardless, and .length
-                # is read-only anyway (see semantic.py), so there's never
-                # a need to go through _member_ptr for it.
+                # claude.md #79: an arr[T] value is a `ptr` to its own
+                # {i64, ptr} storage now, so .length is a GEP+load of
+                # field 0 off that pointer -- not extractvalue on a
+                # value anymore (that only ever worked because arr[T]
+                # used to BE the {i64,ptr} value itself; see the module
+                # docstring). Still not going through _member_ptr for it
+                # (see claude.md #63): not every array-typed expression
+                # is addressable at the SOURCE-LANGUAGE level (e.g. a
+                # function call's own return value), even though every
+                # one of them is now a `ptr` at the LLVM level -- and
+                # .length is read-only anyway (see semantic.py).
                 obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
                 if isinstance(obj_type, types_mod.ArrayType):
+                    len_ptr = self.tmp()
+                    lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 0")
                     out = self.tmp()
-                    lines.append(f"  {out} = extractvalue {FESTINA_ARRAY_LLVM_TYPE} {obj_val}, 0")
+                    lines.append(f"  {out} = load i64, ptr {len_ptr}")
                     return out, INT
             if expr.computed:
                 # claude.md #26/#72: arr[i] / map[key] -- expr.obj is
@@ -1488,6 +2063,30 @@ class CodeGen:
         lines.append(f"  {size_val} = ptrtoint ptr {ptr_val} to i64")
         return size_val
 
+    def _emit_fresh_heap_header(self, payload_llvm_ty, lines):
+        """claude.md #79: allocates a fresh, uniquely-owned (refcount=1)
+        heap block for a refcounted value's own header -- an escaping
+        struct local's own calloc (_emit_stmt's VarDecl handling) and
+        every array/map literal (_emit_array_lit/_emit_map_lit/
+        _emit_sqlite_collect) all now share this one implementation --
+        and returns a `ptr` to the PAYLOAD portion, past the 8-byte i64
+        refcount prefix every refcounted value shares (see
+        festina_retain/festina_release's own comment in
+        runtime/festina_runtime.c). calloc zero-initializes the whole
+        block, so the payload's own fields all start at their zero
+        value (0/null) exactly like a global's own `zeroinitializer`
+        storage does -- the caller only needs to fill in whichever
+        fields it actually has a value for."""
+        size_val = self._sizeof(payload_llvm_ty, lines)
+        total_size = self.tmp()
+        lines.append(f"  {total_size} = add i64 {size_val}, 8")
+        raw = self.tmp()
+        lines.append(f"  {raw} = call ptr @calloc(i64 1, i64 {total_size})")
+        lines.append(f"  store i64 1, ptr {raw}")
+        payload = self.tmp()
+        lines.append(f"  {payload} = getelementptr i8, ptr {raw}, i64 8")
+        return payload
+
     def _emit_array_lit(self, expr, env, lines, expected_type=None):
         # claude.md #26: "Arrays may contain supported primitive types,
         # structs, tables, and other array types" -- table elements are
@@ -1496,6 +2095,7 @@ class CodeGen:
         expected_elem = expected_type.element if isinstance(expected_type, types_mod.ArrayType) else None
 
         values = []
+        sources = []
         elem_type = expected_elem
         for e in expr.elements:
             if isinstance(e, ast.ArrayLit) and isinstance(expected_elem, types_mod.ArrayType):
@@ -1506,6 +2106,7 @@ class CodeGen:
                 val = self._coerce(val, vtype, expected_elem, lines)
                 vtype = expected_elem
             values.append(val)
+            sources.append(e)
             elem_type = elem_type or vtype
 
         if elem_type is None:
@@ -1516,8 +2117,16 @@ class CodeGen:
         elem_llvm_ty = _llvm_type(elem_type)
         n = len(values)
 
-        header = f"%arr.hdr.{self._unique()}"
-        lines.append(f"  {header} = alloca {FESTINA_ARRAY_LLVM_TYPE}")
+        # claude.md #79: a fresh, uniquely-owned (refcount=1) heap
+        # header -- the same "owning" source _is_owning_refcounted_source
+        # already treats an array/map literal as, so binding it into a
+        # new slot needs no separate retain. Unconditionally heap-
+        # allocated, the same as an escaping struct local's own
+        # storage; a *non-escaping* local's own stack-allocated
+        # optimization (claude.md #74) is a property of the LOCAL
+        # BINDING this literal happens to initialize, decided in
+        # _emit_stmt, not of the literal's own construction here.
+        header = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, lines)
         len_ptr = self.tmp()
         lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
         lines.append(f"  store i64 {n}, ptr {len_ptr}")
@@ -1530,18 +2139,28 @@ class CodeGen:
             total_size = self.tmp()
             lines.append(f"  {total_size} = mul i64 {elem_size}, {n}")
             lines.append(f"  {data_ptr} = call ptr @malloc(i64 {total_size})")
+            # claude.md #80: retain a struct/arr/map-typed element
+            # whenever its own source isn't "owning" -- the identical
+            # rule every other binding site in this stage uses. No
+            # release-old logic needed here (unlike arr[i] = v on an
+            # already-built array): this data buffer is fresh malloc'd
+            # memory, never zero-initialized, so every index is written
+            # exactly once, right here, before anything could ever read
+            # a stale/garbage "old" value through it.
+            elem_is_refcounted = isinstance(
+                elem_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
             for i, val in enumerate(values):
                 elem_ptr = self.tmp()
                 lines.append(f"  {elem_ptr} = getelementptr {elem_llvm_ty}, ptr {data_ptr}, i64 {i}")
+                if elem_is_refcounted and not self._is_owning_refcounted_source(sources[i]):
+                    lines.append(f"  call void @festina_retain(ptr {val})")
                 lines.append(f"  store {elem_llvm_ty} {val}, ptr {elem_ptr}")
 
         data_field_ptr = self.tmp()
         lines.append(f"  {data_field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
         lines.append(f"  store ptr {data_ptr}, ptr {data_field_ptr}")
 
-        out = self.tmp()
-        lines.append(f"  {out} = load {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}")
-        return out, types_mod.ArrayType(elem_type)
+        return header, types_mod.ArrayType(elem_type)
 
     def _emit_map_lit(self, expr, env, lines, expected_type=None):
         """claude.md #72: { key: value, ... } -- built the same way
@@ -1556,14 +2175,13 @@ class CodeGen:
         final value once" shape _emit_array_lit already uses."""
         expected_value = expected_type.value if isinstance(expected_type, types_mod.MapType) else None
 
-        header = f"%map.hdr.{self._unique()}"
-        lines.append(f"  {header} = alloca {FESTINA_MAP_LLVM_TYPE}")
-        count_ptr = self.tmp()
-        lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
-        lines.append(f"  store i64 0, ptr {count_ptr}")
-        entries_field_ptr = self.tmp()
-        lines.append(f"  {entries_field_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
-        lines.append(f"  store ptr null, ptr {entries_field_ptr}")
+        # claude.md #79: a fresh, uniquely-owned heap header -- see
+        # _emit_array_lit's own comment just above for why this is
+        # always heap-allocated regardless of where this literal ends
+        # up bound. calloc already zero-initializes count/entries (0,
+        # null), so no separate stores are needed for them the way the
+        # pre-#79 stack-alloca'd scratch header needed.
+        header = self._emit_fresh_heap_header(FESTINA_MAP_LLVM_TYPE, lines)
 
         value_type = expected_value
         for key_expr, val_expr in expr.entries:
@@ -1579,7 +2197,7 @@ class CodeGen:
                 val_val = self._coerce(val_val, vtype, expected_value, lines)
                 vtype = expected_value
             value_type = value_type or vtype
-            self._emit_map_set(header, value_type, key_val, val_val, lines)
+            self._emit_map_set(header, value_type, key_val, val_val, val_expr, lines)
 
         if value_type is None:
             raise CodegenError(
@@ -1587,9 +2205,7 @@ class CodeGen:
                 file=self.filename, line=getattr(expr, "line", 0),
             )
 
-        out = self.tmp()
-        lines.append(f"  {out} = load {FESTINA_MAP_LLVM_TYPE}, ptr {header}")
-        return out, types_mod.MapType(value_type)
+        return header, types_mod.MapType(value_type)
 
     def _map_value_to_i64(self, val, value_type, lines):
         """Reinterprets an already-emitted value of the given map value
@@ -1650,35 +2266,79 @@ class CodeGen:
         return "0"
 
     def _emit_map_get(self, obj_val, value_type, key_val, lines):
-        """claude.md #72: npcHealths['npc1'] -- count/entries are pulled
-        directly out of the already-emitted map VALUE (extractvalue,
-        exactly like array indexing's own data-pointer field -- no
-        addressability needed for a read, unlike a write; see
-        _emit_map_set)."""
+        """claude.md #72: npcHealths['npc1'] -- count/entries are read
+        straight out of the already-emitted map's own storage
+        (claude.md #79: `obj_val` is now a `ptr` to that storage, not
+        the {count,entries} value itself, so this needs a GEP+load per
+        field, the same two-step pattern struct field reads already
+        use -- not addressable via extractvalue anymore). No
+        addressability needed for a READ regardless, unlike a write;
+        see _emit_map_set."""
+        count_ptr = self.tmp()
+        lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 0")
         count = self.tmp()
-        lines.append(f"  {count} = extractvalue {FESTINA_MAP_LLVM_TYPE} {obj_val}, 0")
+        lines.append(f"  {count} = load i64, ptr {count_ptr}")
+        entries_ptr = self.tmp()
+        lines.append(f"  {entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 1")
         entries = self.tmp()
-        lines.append(f"  {entries} = extractvalue {FESTINA_MAP_LLVM_TYPE} {obj_val}, 1")
+        lines.append(f"  {entries} = load ptr, ptr {entries_ptr}")
         default = self._map_missing_default(value_type)
         raw = self.tmp()
         lines.append(f"  {raw} = call i64 @festina_map_get(i64 {count}, ptr {entries}, ptr {key_val}, i64 {default})")
         return self._i64_to_map_value(raw, value_type, lines), value_type
 
-    def _emit_map_set(self, map_ptr, value_type, key_val, value_val, lines):
+    def _emit_map_set(self, map_ptr, value_type, key_val, value_val, value_source_expr, lines):
         """claude.md #72: npcHealths['npc1'] = 30 (and the equivalent
         per-entry calls a map literal builds itself out of -- see
-        _emit_map_lit). Unlike a read, this needs the map's own
-        ADDRESS (`map_ptr`, a `ptr` to its {count, entries} storage
-        slot -- from a variable's own alloca/global, a struct field's
-        GEP, or (during literal construction) the literal's own scratch
-        header alloca), not just its value, since festina_map_set can
-        grow the backing entries array and has to write the new
-        count/entries back into that same slot for the change to
-        actually stick."""
+        _emit_map_lit). Unlike a read, this needs the map's own actual
+        header ADDRESS (`map_ptr`, a `ptr` to its {count, entries}
+        storage), not just its value, since festina_map_set can grow
+        the backing entries array and has to write the new
+        count/entries back into that same storage for the change to
+        actually stick. claude.md #79: since every arr[T]/map[T] value
+        is now itself a `ptr` to that storage (not the storage inline),
+        `map_ptr` here is always already that pointer -- the LOADED
+        value of a variable's own slot/global, a struct field's own
+        loaded value, or (during literal construction) the literal's
+        own fresh heap header -- never a slot or field's own ADDRESS a
+        further load would still be needed for; see _try_addressable's
+        own comment for where that load actually happens.
+
+        claude.md #80: when `value_type` is itself refcounted, retains
+        `value_val` (unless `value_source_expr` is "owning") and
+        releases whatever value the key previously mapped to, if any --
+        the identical rule an array-element or struct-field write
+        already follows. Unlike those, there's no fixed address to
+        `load` an "old" value from first (a map key may or may not
+        already be present, and festina_map_set itself doesn't say
+        which) -- `festina_map_get` with a `0` (null) default finds it
+        instead, the same lookup a genuine read already uses, safe to
+        call unconditionally: `0` can never be a real heap pointer, so
+        it only ever means "nothing to release," whether the key was
+        truly absent or (i.e. `m[k] = null`) present with an
+        already-null value -- releasing null is always a no-op either
+        way, so the two cases need no distinguishing here. This is what
+        makes overwriting a key -- including a repeated key within the
+        very literal building this map, which is exactly a `map[key] =
+        v` re-set applied to a key this same construction already
+        set -- correctly release the value it replaces, not just skip
+        it."""
         count_ptr = self.tmp()
         lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 0")
         entries_ptr = self.tmp()
         lines.append(f"  {entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 1")
+        if isinstance(value_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+            count_val = self.tmp()
+            lines.append(f"  {count_val} = load i64, ptr {count_ptr}")
+            entries_val = self.tmp()
+            lines.append(f"  {entries_val} = load ptr, ptr {entries_ptr}")
+            old_raw = self.tmp()
+            lines.append(f"  {old_raw} = call i64 @festina_map_get(i64 {count_val}, ptr {entries_val}, ptr {key_val}, i64 0)")
+            old_ptr = self.tmp()
+            lines.append(f"  {old_ptr} = inttoptr i64 {old_raw} to ptr")
+            if not self._is_owning_refcounted_source(value_source_expr):
+                lines.append(f"  call void @festina_retain(ptr {value_val})")
+            lines.append(f"  call void {self._release_fn_for(value_type)}(ptr {old_ptr})")
         raw_val = self._map_value_to_i64(value_val, value_type, lines)
         lines.append(f"  call void @festina_map_set(ptr {count_ptr}, ptr {entries_ptr}, ptr {key_val}, i64 {raw_val})")
 
@@ -1704,50 +2364,25 @@ class CodeGen:
         return out, ftype
 
     def _array_elem_ptr(self, obj_val, obj_type, idx_val, lines):
-        """Given an already-emitted arr[T] value, its ArrayType, and an
-        already-emitted int index value, returns (ptr, element_type) --
-        a pointer to that element's storage slot. Shared by _emit_expr's
-        computed-Member read dispatch and _emit_assign's write dispatch
-        so obj_val/idx_val are each the caller's own single emission,
-        never re-emitted here -- see _emit_expr's own comment on why an
+        """Given an already-emitted arr[T] value (claude.md #79: a
+        `ptr` to its own {length, data} storage, not the value itself
+        -- a GEP+load per field is needed to reach the data pointer,
+        not extractvalue), its ArrayType, and an already-emitted int
+        index value, returns (ptr, element_type) -- a pointer to that
+        element's storage slot. Shared by _emit_expr's computed-Member
+        read dispatch and _emit_assign's write dispatch so obj_val/
+        idx_val are each the caller's own single emission, never
+        re-emitted here -- see _emit_expr's own comment on why an
         object expression might not be safe to emit twice."""
+        data_field_ptr = self.tmp()
+        lines.append(f"  {data_field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 1")
         data_ptr = self.tmp()
-        lines.append(f"  {data_ptr} = extractvalue {FESTINA_ARRAY_LLVM_TYPE} {obj_val}, 1")
+        lines.append(f"  {data_ptr} = load ptr, ptr {data_field_ptr}")
         elem_type = obj_type.element
         elem_llvm_ty = _llvm_type(elem_type)
         out = self.tmp()
         lines.append(f"  {out} = getelementptr {elem_llvm_ty}, ptr {data_ptr}, i64 {idx_val}")
         return out, elem_type
-
-    def _try_addressable(self, expr, env, lines):
-        """Resolves `expr` to (address, value, type) for _emit_assign's
-        computed-Member target dispatch (map[key] = v / arr[i] = v),
-        which needs an actual ADDRESS for a map target (festina_map_set
-        mutates count/entries in place -- see _emit_map_set) but only
-        ever needs a VALUE for an array target (indexing works directly
-        off the {length, data} value via extractvalue, the data pointer
-        it holds is already its own independent heap allocation -- see
-        _array_elem_ptr). Exactly one of address/value is non-None:
-        address, for the same two forms _member_ptr's struct/table field
-        access already knows how to address (a plain variable, or a
-        non-computed field of one); value, for anything else (a
-        function call, another computed index, ...) -- which also means
-        a map[key] = v target on anything other than a plain variable or
-        field is a compile error (see _emit_assign), since there's no
-        way to mutate a map value that doesn't live anywhere addressable.
-        `expr` is emitted at most once regardless of which case applies."""
-        if isinstance(expr, ast.Identifier):
-            found = env.lookup(expr.name)
-            if found is None:
-                raise CodegenError(f"unknown variable '{expr.name}'",
-                                    file=self.filename, line=getattr(expr, "line", 0))
-            ref, ttype = found
-            return ref, None, ttype
-        if isinstance(expr, ast.Member) and not expr.computed:
-            ptr, ftype = self._member_ptr(expr, env, lines)
-            return ptr, None, ftype
-        val, vtype = self._emit_expr(expr, env, lines)
-        return None, val, vtype
 
     def _member_ptr(self, expr, env, lines):
         # Struct/table field access only -- computed (array/map
@@ -1778,6 +2413,460 @@ class CodeGen:
         lines.append(f"  {out} = getelementptr {struct_ty}, ptr {obj_val}, i32 0, i32 {idx}")
         return out, ftype
 
+    def _emit_global_retain_release(self, ref, val, ttype, lines):
+        """claude.md #77 (widened by claude.md #79 to arr[T]/map[T]
+        globals too): called immediately before storing `val` (a
+        struct/array/map-typed value) into a GLOBAL's own slot `ref`,
+        whether that's an ordinary reassignment (_emit_assign) or a
+        global's own declaration-with-initializer (_emit_toplevel_stmt)
+        -- both sites need the identical treatment, factored out here
+        so they can't drift apart. Retains the new value (this global's
+        own slot is now one more binding referencing it) and releases
+        whatever it previously held (one fewer binding referencing
+        that), freeing it if that was the last one. Retain happens
+        BEFORE release so a self-assignment (`g = g`, or aliasing
+        through another name that already equals g's own current
+        value) can never see refcount hit zero and free something still
+        about to be stored. Always safe to call unconditionally,
+        including the very first time a global's value is ever set
+        (from its own untouched static initial storage): both functions
+        treat a negative refcount as an immortal no-op (see
+        _global_var_defs and festina_retain/festina_release's own
+        comment in runtime/festina_runtime.c), so there's nothing to
+        special-case here regardless of what `ref` currently holds.
+        Retaining the new value even when it's a fresh, uniquely-owned
+        value (a function call's own return value, never aliased
+        anywhere else) is deliberately over-conservative rather than
+        precise -- it can only ever delay a free that a sharper
+        analysis could have done sooner, never cause one to happen too
+        early. Releases through _release_fn_for rather than any one
+        type's release function directly (claude.md #78) -- a global of
+        a struct type with its own struct-typed field(s) needs its
+        release to cascade into those fields too, the same as any other
+        release site for that struct type."""
+        if (not isinstance(ttype, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+                or not ref.startswith("@")):
+            return
+        old = self.tmp()
+        lines.append(f"  {old} = load ptr, ptr {ref}")
+        lines.append(f"  call void @festina_retain(ptr {val})")
+        lines.append(f"  call void {self._release_fn_for(ttype)}(ptr {old})")
+
+    def _is_owning_refcounted_source(self, expr):
+        """claude.md #77 (widened): a source expression is "owning" --
+        a fresh value with no other binding referencing it yet, so
+        aliasing it into a new slot needs no retain, the same "moves,
+        doesn't copy" reasoning a Return statement already relies on --
+        only when it's a plain function Call. Every other expression
+        shape (a bare Identifier reading an existing local/parameter/
+        global, a Member/field read, a Ternary between two such reads,
+        ...) is conservatively treated as "aliasing": something ELSE
+        already references this exact value (or could), so a NEW
+        binding referencing it too needs its own retain. This can only
+        ever retain when it turns out not to have been strictly
+        necessary (over-conservative, never under), never skip a retain
+        a real alias actually needed -- the same directional bias every
+        other stage in this whole effort has taken when a choice wasn't
+        fully provable either way.
+
+        Deliberately simple and conservative rather than a full points-
+        to analysis: a function call's own return value is "owning"
+        regardless of what that function's OWN body actually returns
+        (a fresh local it created, or -- in principle -- one of its own
+        parameters passed straight through) -- verified sound for
+        Festina specifically, not merely assumed, because nothing this
+        stage does lets a value's lifetime outlive its own true owner's
+        scope: a caller's local bound from a call result is itself
+        subject to this exact same tracking (retained wherever it's
+        THEN aliased further), so an under-counted "owning" call result
+        can only ever matter if something reads it after its own
+        binding's scope has already ended, which Festina's own lexical
+        scoping (no closures, no way to keep a name alive past its own
+        block) never allows in the first place.
+
+        claude.md #79: an ast.ArrayLit/ast.MapLit is "owning" for the
+        identical reason a Call is -- structs have no literal syntax at
+        all, so this case never arose for them, but `[1,2,3]`/`{...}`
+        allocate a fresh, uniquely-owned header exactly like a Call's
+        own return value does (see _emit_array_lit/_emit_map_lit's own
+        "fresh, uniquely-owned" comment), nothing else referencing it
+        the instant it's produced."""
+        return isinstance(expr, (ast.Call, ast.ArrayLit, ast.MapLit))
+
+    def _emit_local_retain_release(self, ref, val, source_expr, ttype, lines):
+        """claude.md #77 (widened; claude.md #79 widens it again to
+        arr[T]/map[T] locals): the local-variable counterpart to
+        _emit_global_retain_release, called from _emit_assign's
+        Identifier branch when the target is a LOCAL (not a global) --
+        never called for the target's own FIRST-EVER declaration
+        (VarDecl-with-initializer handles that separately, in
+        _emit_stmt, since it never has an "old value" to release), only
+        for an ordinary `q = expr` reassignment of an already-declared
+        local. Unlike the global version, there is no sentinel/immortal
+        case to skip here: a local of any of these three types that's
+        ever the target of ANY assignment is unconditionally marked
+        escaping by escape_analysis's own existing rule (an assignment
+        target always escapes, regardless of what type it is), so it
+        can never have been stack-allocated (see _emit_stmt's own
+        VarDecl handling) -- its current value, at the point of any
+        reassignment, is always either its own original heap+header
+        allocation or some other value it was previously made to
+        alias, either way a real, releasable pointer. Retains the new
+        value only when _is_owning_refcounted_source says it needs it
+        (a fresh call/literal result's own +1 already correctly
+        transfers by just aliasing it, no retain needed -- retaining it
+        too would permanently over-count, the one case where matching
+        the global-side function's always-retain choice would have
+        cost real, permanent leaks this stage specifically exists to
+        close); always releases the old value unconditionally, freeing
+        it if this reassignment was its last reference. Retain (when it
+        happens) still happens before release, for the identical
+        self-assignment-safety reason the global version's own comment
+        explains."""
+        old = self.tmp()
+        lines.append(f"  {old} = load ptr, ptr {ref}")
+        if not self._is_owning_refcounted_source(source_expr):
+            lines.append(f"  call void @festina_retain(ptr {val})")
+        lines.append(f"  call void {self._release_fn_for(ttype)}(ptr {old})")
+
+    def _release_fn_for(self, type_):
+        """claude.md #79 (widened by claude.md #80): the single dispatch
+        point every release call site in this file goes through
+        (mirroring claude.md #78's own _release_fn_for_struct, now one
+        case among three rather than the only one) -- returns the LLVM
+        function name to call to release a refcounted value of `type_`.
+        A struct gets _release_fn_for_struct's own per-type dispatch
+        (the plain generic release, or a lazily-generated per-struct-
+        type cascade wrapper, depending on whether it has its own
+        struct-typed field). An arr[T] gets _release_fn_for_array's own
+        analogous dispatch (the plain generic release, or a lazily-
+        generated per-element-type cascade wrapper, depending on
+        whether T is itself refcounted); map[T] gets
+        _release_fn_for_map's own."""
+        if isinstance(type_, types_mod.StructType):
+            return self._release_fn_for_struct(type_)
+        if isinstance(type_, types_mod.ArrayType):
+            return self._release_fn_for_array(type_)
+        if isinstance(type_, types_mod.MapType):
+            return self._release_fn_for_map(type_)
+        raise CodegenError(f"cannot release a value of type {types_mod.type_name(type_)}")
+
+    def _struct_has_own_refcounted_field(self, name):
+        """claude.md #78 (widened by claude.md #79 to arr[T]/map[T]
+        fields too): True when the struct declared `name` has at least
+        one field of its own that is itself a struct/array/map-typed
+        value -- never transitively (see _release_fn_for_struct's own
+        comment on why only the direct case needs checking here)."""
+        return any(isinstance(t, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+                   for _, t in self.struct_fields(name))
+
+    def _release_fn_for_struct(self, type_):
+        """claude.md #78 (widened by claude.md #79): returns the LLVM
+        function name to call to release a value of struct type
+        `type_` -- the plain, generic `@festina_release` (unchanged
+        from claude.md #77) for a struct with no struct/array/map-typed
+        field of its own, since there is nothing for a release to
+        cascade into; a dedicated, lazily-generated, per-struct-type
+        wrapper (`@__festina_release_struct_<Name>`, cached in
+        self._struct_release_fns so repeat callers -- and there are
+        many, every release site in this file included -- never
+        regenerate it) for one that has at least one.
+
+        That wrapper does exactly what the plain runtime function can't,
+        since the runtime is entirely type-blind (every value it ever
+        touches is just a `void *payload`, see festina_release_check's
+        own comment): decrement the refcount via festina_release_check,
+        and -- only if that was the value's last reference -- release
+        each of the struct's own struct/array/map-typed fields (via
+        THAT field's own release function, found via _release_fn_for,
+        recursing back into this same method for another struct-typed
+        field) before actually freeing this struct's own storage. Every
+        other field (int/float/bool/text/blob/...) is left untouched --
+        text/blob are never refcounted at all (see claude.md #43's own
+        note on string ownership). A struct-typed ELEMENT of an arr[T]/
+        map[T]-typed field is still not individually released here --
+        only the field's own container (its header) is; see todo.md for
+        why that's a separate, still-open gap.
+
+        The recursion here always terminates and can never produce a
+        duplicate/infinite chain of wrapper functions, for the same
+        reason claude.md #77 already gives for why reference cycles are
+        structurally impossible in Festina: a struct field's type must
+        always be declared *before* the struct containing it (claude.md
+        #48's "declared before used" rule, the same one that already
+        governs function forward references), so the graph of "which
+        struct types reference which other struct types through their
+        own fields" is a DAG by construction, never a cycle -- a
+        struct's own release wrapper can transitively call another
+        struct's, but never, even indirectly, its own."""
+        if not self._struct_has_own_refcounted_field(type_.name):
+            return "@festina_release"
+        if type_.name in self._struct_release_fns:
+            return self._struct_release_fns[type_.name]
+        fn_name = f"@__festina_release_struct_{type_.name}"
+        # Registered before the field loop below (which may recurse
+        # back into this same method for a DIFFERENT struct type) so a
+        # second, unrelated caller reaching this struct type again
+        # while this one's own body is still being built -- e.g. two
+        # sibling fields of some other struct both being this same
+        # type -- gets the cached name immediately rather than
+        # triggering a second, redundant generation.
+        self._struct_release_fns[type_.name] = fn_name
+        struct_ty = self.struct_llvm_name(type_.name)
+        body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
+        should_free = self.tmp()
+        body.append(f"  {should_free} = call i8 @festina_release_check(ptr %payload)")
+        cond = self.tmp()
+        body.append(f"  {cond} = icmp ne i8 {should_free}, 0")
+        free_label = self.label("relstruct.free")
+        done_label = self.label("relstruct.done")
+        body.append(f"  br i1 {cond}, label %{free_label}, label %{done_label}")
+        body.append(f"{free_label}:")
+        self._emit_release_struct_field_refs("%payload", type_, body)
+        header = self.tmp()
+        body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
+        body.append(f"  call void @free(ptr {header})")
+        body.append(f"  br label %{done_label}")
+        body.append(f"{done_label}:")
+        body.append("  ret void")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _emit_release_struct_field_refs(self, obj_ptr, type_, lines):
+        """claude.md #78 (widened by claude.md #79 to arr[T]/map[T]
+        fields too): releases every struct/array/map-typed field of
+        `type_` directly reachable from `obj_ptr` (already-emitted IR
+        for a `ptr` to that struct's own storage) -- the shared field-
+        walking core both _release_fn_for_struct (a heap-allocated
+        struct that's about to be freed) and
+        _emit_release_nested_fields_only (a stack-allocated struct
+        whose own storage is never freed, but whose field references
+        still need dropping) build on. Never touches `type_`'s own
+        storage or refcount header -- entirely the caller's own
+        responsibility, since the two callers need different things
+        done with it (free it outright, or nothing at all)."""
+        struct_ty = self.struct_llvm_name(type_.name)
+        for i, (_, ftype) in enumerate(self.struct_fields(type_.name)):
+            if isinstance(ftype, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+                field_release_fn = self._release_fn_for(ftype)
+                fptr = self.tmp()
+                lines.append(f"  {fptr} = getelementptr {struct_ty}, ptr {obj_ptr}, i32 0, i32 {i}")
+                fval = self.tmp()
+                lines.append(f"  {fval} = load ptr, ptr {fptr}")
+                lines.append(f"  call void {field_release_fn}(ptr {fval})")
+
+    def _emit_release_nested_fields_only(self, ref, struct_type, lines):
+        """claude.md #78: the stack-allocated counterpart to
+        _release_fn_for_struct's own generated wrapper -- called from
+        _emit_free_active_locals for a struct local _emit_block marked
+        with _StackStructFieldsOnly. `ref` is the local's own `alloca
+        ptr` slot (see _emit_stmt's VarDecl handling -- even a stack-
+        allocated struct is addressed through one, so Identifier lookup
+        never needs to special-case where a struct's storage actually
+        lives); loading it gives a perfectly valid pointer into that
+        stack storage, usable for a GEP into its own fields exactly
+        like a heap pointer would be -- it must simply never reach
+        festina_release/@free, since it has no refcount header and
+        isn't heap memory at all."""
+        obj = self.tmp()
+        lines.append(f"  {obj} = load ptr, ptr {ref}")
+        self._emit_release_struct_field_refs(obj, struct_type, lines)
+
+    def _release_fn_for_array(self, type_):
+        """claude.md #80: the arr[T] counterpart to
+        _release_fn_for_struct -- returns the plain, generic
+        `@festina_release_array` (unchanged from claude.md #79) when
+        T is not itself refcounted, since there's nothing for a
+        release to cascade into; a dedicated, lazily-generated, cached
+        (by `types_mod.type_name(type_)`, since arr[T] has no name of
+        its own the way a struct does) per-element-type wrapper when
+        T is a struct/arr/map.
+
+        That wrapper decrements the refcount via festina_release_check,
+        and -- only if this was the array's last reference -- releases
+        each of its own elements (via T's own release function, found
+        by calling _release_fn_for again -- recursing back into this
+        same method for a nested arr[T] of arr[U]) in a plain runtime
+        loop over the array's own length, before freeing the data
+        buffer and the header itself (duplicating
+        festina_release_array's own free logic -- the two can't simply
+        call each other, since the element loop has to run strictly
+        between the refcount check and the actual free).
+
+        This recursion always terminates, for an even stronger reason
+        than claude.md #77's own struct field DAG argument: arr[T]'s
+        own element type is always a fresh syntactic type expression
+        written out in the source (`arr[arr[int]]`, ...), never a name
+        that could refer back to itself the way a struct declaration
+        technically could before claude.md #48's "declared before
+        used" rule forbids it -- there is no way to even *write* a
+        self-referential arr[T] type in Festina's own grammar."""
+        elem_type = type_.element
+        if not isinstance(elem_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+            return "@festina_release_array"
+        key = types_mod.type_name(type_)
+        if key in self._array_release_fns:
+            return self._array_release_fns[key]
+        fn_name = f"@__festina_release_array_{self._unique()}"
+        self._array_release_fns[key] = fn_name
+        elem_release_fn = self._release_fn_for(elem_type)
+        elem_llvm_ty = _llvm_type(elem_type)
+        body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
+        should_free = self.tmp()
+        body.append(f"  {should_free} = call i8 @festina_release_check(ptr %payload)")
+        cond = self.tmp()
+        body.append(f"  {cond} = icmp ne i8 {should_free}, 0")
+        free_label = self.label("relarr.free")
+        done_label = self.label("relarr.done")
+        body.append(f"  br i1 {cond}, label %{free_label}, label %{done_label}")
+        body.append(f"{free_label}:")
+        len_ptr = self.tmp()
+        body.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr %payload, i32 0, i32 0")
+        len_val = self.tmp()
+        body.append(f"  {len_val} = load i64, ptr {len_ptr}")
+        data_field_ptr = self.tmp()
+        body.append(f"  {data_field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr %payload, i32 0, i32 1")
+        data_ptr = self.tmp()
+        body.append(f"  {data_ptr} = load ptr, ptr {data_field_ptr}")
+        self._emit_release_array_elements(data_ptr, len_val, elem_release_fn, elem_llvm_ty, body)
+        body.append(f"  call void @free(ptr {data_ptr})")
+        header = self.tmp()
+        body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
+        body.append(f"  call void @free(ptr {header})")
+        body.append(f"  br label %{done_label}")
+        body.append(f"{done_label}:")
+        body.append("  ret void")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _emit_release_array_elements(self, data_ptr, len_val, elem_release_fn, elem_llvm_ty, lines):
+        """claude.md #80: the shared element-release loop both
+        _release_fn_for_array's own generated wrapper (a heap-allocated
+        array about to be freed) and _emit_free_active_locals (a
+        stack-allocated array whose own header is never freed, but
+        whose elements' own references still need dropping) build on
+        -- a plain counted loop from 0 to `len_val`, releasing the
+        element at each index via `elem_release_fn`. Never touches
+        `data_ptr` itself or frees anything -- entirely the caller's
+        own responsibility, since the two callers need different
+        things done with it afterward."""
+        idx_slot = self.tmp()
+        lines.append(f"  {idx_slot} = alloca i64")
+        lines.append(f"  store i64 0, ptr {idx_slot}")
+        loop_cond = self.label("relarr.loopcond")
+        loop_body = self.label("relarr.loopbody")
+        loop_end = self.label("relarr.loopend")
+        lines.append(f"  br label %{loop_cond}")
+        lines.append(f"{loop_cond}:")
+        idx_val = self.tmp()
+        lines.append(f"  {idx_val} = load i64, ptr {idx_slot}")
+        keep_going = self.tmp()
+        lines.append(f"  {keep_going} = icmp slt i64 {idx_val}, {len_val}")
+        lines.append(f"  br i1 {keep_going}, label %{loop_body}, label %{loop_end}")
+        lines.append(f"{loop_body}:")
+        elem_ptr = self.tmp()
+        lines.append(f"  {elem_ptr} = getelementptr {elem_llvm_ty}, ptr {data_ptr}, i64 {idx_val}")
+        elem_val = self.tmp()
+        lines.append(f"  {elem_val} = load {elem_llvm_ty}, ptr {elem_ptr}")
+        lines.append(f"  call void {elem_release_fn}(ptr {elem_val})")
+        next_idx = self.tmp()
+        lines.append(f"  {next_idx} = add i64 {idx_val}, 1")
+        lines.append(f"  store i64 {next_idx}, ptr {idx_slot}")
+        lines.append(f"  br label %{loop_cond}")
+        lines.append(f"{loop_end}:")
+
+    def _release_fn_for_map(self, type_):
+        """claude.md #80: the map[T] counterpart to
+        _release_fn_for_array -- returns the plain, generic
+        `@festina_release_map` when T is not itself refcounted, or a
+        dedicated, lazily-generated, cached per-value-type wrapper when
+        it is.
+
+        Unlike an array's own elements (a flat buffer codegen already
+        knows the exact layout of), a map's own entries are opaque to
+        codegen -- FestinaMapEntry's own C struct layout is only ever
+        touched from festina_runtime.c, deliberately (see
+        festina_map_find's own comment) -- so this can't just emit a
+        raw GEP loop the way _release_fn_for_array does. Instead it
+        reuses festina_map_for_each's own existing iteration (the exact
+        mechanism .forEach() itself already uses), passing a small
+        release-flavored trampoline (_emit_map_value_release_trampoline)
+        that converts each entry's raw i64 value back to a `ptr` and
+        releases it, in place of a user callback -- then, once every
+        value is released, defers to festina_map_free_entries for the
+        keys/entries buffer itself (identical to what
+        festina_release_map's own C implementation already does) and
+        frees the header."""
+        value_type = type_.value
+        if not isinstance(value_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+            return "@festina_release_map"
+        key = types_mod.type_name(type_)
+        if key in self._map_release_fns:
+            return self._map_release_fns[key]
+        fn_name = f"@__festina_release_map_{self._unique()}"
+        self._map_release_fns[key] = fn_name
+        trampoline_name = self._emit_map_value_release_trampoline(value_type)
+        body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
+        should_free = self.tmp()
+        body.append(f"  {should_free} = call i8 @festina_release_check(ptr %payload)")
+        cond = self.tmp()
+        body.append(f"  {cond} = icmp ne i8 {should_free}, 0")
+        free_label = self.label("relmap.free")
+        done_label = self.label("relmap.done")
+        body.append(f"  br i1 {cond}, label %{free_label}, label %{done_label}")
+        body.append(f"{free_label}:")
+        count_ptr = self.tmp()
+        body.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr %payload, i32 0, i32 0")
+        count_val = self.tmp()
+        body.append(f"  {count_val} = load i64, ptr {count_ptr}")
+        entries_field_ptr = self.tmp()
+        body.append(f"  {entries_field_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr %payload, i32 0, i32 1")
+        entries_ptr = self.tmp()
+        body.append(f"  {entries_ptr} = load ptr, ptr {entries_field_ptr}")
+        body.append(f"  call void @festina_map_for_each(i64 {count_val}, ptr {entries_ptr}, ptr {trampoline_name})")
+        body.append(f"  call void @festina_map_free_entries(i64 {count_val}, ptr {entries_ptr})")
+        header = self.tmp()
+        body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
+        body.append(f"  call void @free(ptr {header})")
+        body.append(f"  br label %{done_label}")
+        body.append(f"{done_label}:")
+        body.append("  ret void")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _emit_map_value_release_trampoline(self, value_type):
+        """claude.md #80: generates a small function matching
+        festina_map_for_each's own fixed callback signature
+        (`void(i64, ptr)` -- see _emit_map_foreach_trampoline's own
+        comment on why a real, correctly-typed function is needed
+        rather than relying on ABI coincidence, though here both sides
+        of the mismatch this guards against for .forEach() don't apply
+        -- this trampoline's OWN signature already matches exactly,
+        it's just discarding the key and reinterpreting the raw i64
+        value), releasing it via `value_type`'s own release function.
+        Never cached/reused across value types the way
+        _release_fn_for_array/_map's own wrappers are -- always freshly
+        generated per call, since it's only ever needed once, at the
+        one call site inside _release_fn_for_map that generates it."""
+        uid = self._unique()
+        trampoline_name = f"@__festina_maprelease_{uid}"
+        release_fn = self._release_fn_for(value_type)
+        body = [f"define void {trampoline_name}(i64 %raw, ptr %key) {{", "entry:"]
+        ptr_val = self.tmp()
+        body.append(f"  {ptr_val} = inttoptr i64 %raw to ptr")
+        body.append(f"  call void {release_fn}(ptr {ptr_val})")
+        body.append("  ret void")
+        body.append("}")
+        self.func_defs.extend(body)
+        self.func_defs.append("")
+        return trampoline_name
+
     def _emit_assign(self, expr, env, lines):
         # The target's declared type is resolved *before* the value, so an
         # array-literal RHS (e.g. `nums = [4, 5, 6]`) can pick its element
@@ -1790,14 +2879,43 @@ class CodeGen:
             ref, ttype = found
             val, vtype = self._emit_value_for(expr.value, env, lines, ttype)
             val = self._coerce(val, vtype, ttype, lines)
+            if isinstance(ttype, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+                if ref.startswith("@"):
+                    self._emit_global_retain_release(ref, val, ttype, lines)
+                else:
+                    self._emit_local_retain_release(ref, val, expr.value, ttype, lines)
             lines.append(f"  store {_llvm_type(ttype)} {val}, ptr {ref}")
             return val, ttype
         if isinstance(expr.target, ast.Member):
             if expr.target.computed:
                 # claude.md #72: npcHealths['npc1'] = 30 / npcHealths[key] = 30
-                addr, val_of_obj, obj_type = self._try_addressable(expr.target.obj, env, lines)
+                # claude.md #79: expr.target.obj is emitted exactly
+                # once, giving obj_val -- now always the array/map's own
+                # header pointer (see the module docstring's arr[T]/
+                # map[T] note), the same value _emit_expr's own
+                # computed-Member READ dispatch would produce for it.
+                # Previously this went through _try_addressable
+                # (removed), which needed to tell an "addressable" arr/
+                # map (a plain variable or field, whose own STORAGE
+                # SLOT could be written back through if a map grew) apart
+                # from a merely "valuable" one (anything else, e.g. a
+                # function call) -- ptr-to-shared-header values from
+                # #79 no longer need that distinction at all: a map's
+                # own festina_map_set mutates the header EVERY alias
+                # already shares, not a slot private to this one
+                # expression, so there's nothing left to "write back"
+                # into that obj_val doesn't already give directly.
+                obj_val, obj_type = self._emit_expr(expr.target.obj, env, lines)
                 if isinstance(obj_type, types_mod.MapType):
-                    if addr is None:
+                    # Still restricted to a plain variable or a non-
+                    # computed field target -- unchanged from before
+                    # this section (not a restriction the representation
+                    # change above actually still requires, but not this
+                    # section's place to relax it either; claude.md #54).
+                    obj = expr.target.obj
+                    addressable = isinstance(obj, ast.Identifier) or (
+                        isinstance(obj, ast.Member) and not obj.computed)
+                    if not addressable:
                         raise CodegenError(
                             "a map assignment target must be a plain variable or field, "
                             "not an arbitrary expression",
@@ -1805,26 +2923,45 @@ class CodeGen:
                     key_val, _ = self._emit_expr(expr.target.prop, env, lines)
                     val, vtype = self._emit_value_for(expr.value, env, lines, obj_type.value)
                     val = self._coerce(val, vtype, obj_type.value, lines)
-                    self._emit_map_set(addr, obj_type.value, key_val, val, lines)
+                    self._emit_map_set(obj_val, obj_type.value, key_val, val, expr.value, lines)
                     return val, obj_type.value
-                # claude.md #26: arr[i] = v -- unlike a map target, an
-                # array only ever needs its VALUE (see _try_addressable's
-                # own comment), so this works whether expr.target.obj was
-                # addressable or not.
                 if not isinstance(obj_type, types_mod.ArrayType):
                     raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",
                                         file=self.filename, line=getattr(expr.target, "line", 0))
-                if addr is not None:
-                    obj_val = self.tmp()
-                    lines.append(f"  {obj_val} = load {FESTINA_ARRAY_LLVM_TYPE}, ptr {addr}")
-                else:
-                    obj_val = val_of_obj
                 idx_val, _ = self._emit_expr(expr.target.prop, env, lines)
                 ptr, ftype = self._array_elem_ptr(obj_val, obj_type, idx_val, lines)
             else:
                 ptr, ftype = self._member_ptr(expr.target, env, lines)
             val, vtype = self._emit_value_for(expr.value, env, lines, ftype)
             val = self._coerce(val, vtype, ftype, lines)
+            if isinstance(ftype, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+                # claude.md #78 (widened by claude.md #79 to arr[T]/
+                # map[T]-typed fields, and claude.md #80 to arr[T]
+                # ELEMENTS too): `outer.field = value` / `arr[i] = value`
+                # -- the ONLY way a struct/array/map-typed field or
+                # array element is ever populated (there's no struct/
+                # array/map-literal-as-field/element-initializer syntax)
+                # -- gets the exact same owning/aliasing retain rule as
+                # a plain local reassignment, and releases whatever the
+                # field/element previously held (always safe: a field
+                # starts out null, per its zeroinitializer/calloc'd
+                # storage; an array element always holds a real,
+                # previously-retained value by the time this runs --
+                # every index was already written once, in
+                # _emit_array_lit's own construction, before any later
+                # `arr[i] = v` could ever reach it -- and every release
+                # function already null-checks regardless). `map[key] =
+                # v` is handled separately, inside _emit_map_set, since
+                # it needs a key-based lookup (not a fixed address) to
+                # find whatever value it's overwriting, if any -- by the
+                # time computed-Member reaches this shared code with
+                # `ftype` set, it's already provably the array-element
+                # case (the map one returns earlier, above).
+                old = self.tmp()
+                lines.append(f"  {old} = load ptr, ptr {ptr}")
+                if not self._is_owning_refcounted_source(expr.value):
+                    lines.append(f"  call void @festina_retain(ptr {val})")
+                lines.append(f"  call void {self._release_fn_for(ftype)}(ptr {old})")
             lines.append(f"  store {_llvm_type(ftype)} {val}, ptr {ptr}")
             return val, ftype
         raise CodegenError("unsupported assignment target", file=self.filename)
@@ -2211,10 +3348,17 @@ class CodeGen:
                     # user-function reference in this file already uses.
                     callback_name = f"@{expr.args[0].name}"
                     trampoline_name = self._emit_map_foreach_trampoline(obj_type.value, callback_name)
+                    # claude.md #79: obj_val is now a `ptr` to the map's
+                    # own storage, not the {count,entries} value itself
+                    # -- GEP+load per field, same as _emit_map_get.
+                    count_ptr = self.tmp()
+                    lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 0")
                     count = self.tmp()
-                    lines.append(f"  {count} = extractvalue {FESTINA_MAP_LLVM_TYPE} {obj_val}, 0")
+                    lines.append(f"  {count} = load i64, ptr {count_ptr}")
+                    entries_ptr = self.tmp()
+                    lines.append(f"  {entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 1")
                     entries = self.tmp()
-                    lines.append(f"  {entries} = extractvalue {FESTINA_MAP_LLVM_TYPE} {obj_val}, 1")
+                    lines.append(f"  {entries} = load ptr, ptr {entries_ptr}")
                     lines.append(
                         f"  call void @festina_map_for_each(i64 {count}, ptr {entries}, ptr {trampoline_name})")
                     return "0", None
@@ -2526,18 +3670,19 @@ class CodeGen:
         # festina_sqlite_collect_rows's out_data is already an array of
         # row pointers (one 8-byte pointer per row), exactly the layout
         # an arr[T] data pointer expects when _llvm_type(T) is "ptr"
-        # (true for TableType, same as StructType) -- no repacking needed.
-        header = f"%arr.hdr.{self._unique()}"
-        lines.append(f"  {header} = alloca {FESTINA_ARRAY_LLVM_TYPE}")
+        # (true for TableType, same as StructType) -- no repacking
+        # needed. claude.md #79: a fresh, uniquely-owned heap header,
+        # same as _emit_array_lit's own -- a sqlite() query result is
+        # exactly as "owning" a source as an array literal is (nothing
+        # else references it yet).
+        header = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, lines)
         len_ptr = self.tmp()
         lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
         lines.append(f"  store i64 {n_val}, ptr {len_ptr}")
         data_field_ptr = self.tmp()
         lines.append(f"  {data_field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
         lines.append(f"  store ptr {data_val}, ptr {data_field_ptr}")
-        out = self.tmp()
-        lines.append(f"  {out} = load {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}")
-        return out
+        return header
 
     # ---- entry function / main ----
     def _emit_main_and_entry(self):
@@ -2653,6 +3798,13 @@ class CodeGen:
             if stmt.init is not None:
                 val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
                 val = self._coerce(val, vtype, type_, lines)
+                # claude.md #77: a global's own declaration-with-
+                # initializer is just another point its value changes
+                # -- see _emit_global_retain_release's own
+                # comment for why this needs the exact same retain/
+                # release treatment an ordinary `g = expr` reassignment
+                # gets (_emit_assign), not a plain store.
+                self._emit_global_retain_release(ref, val, type_, lines)
                 lines.append(f"  store {_llvm_type(type_)} {val}, ptr {ref}")
             return
         self._emit_stmt(stmt, env, None, ctx)

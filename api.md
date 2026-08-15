@@ -199,15 +199,64 @@ and passing to/returning from functions by value.
 Memory for structs, arrays, and maps is managed automatically — no
 manual allocation or freeing. A local struct/`arr[T]`/`map[T]`
 declared in a function, event handler, `if` branch, `while` body, or
-`for` body, and never returned, stored anywhere longer-lived, or passed
-to another function, is reclaimed automatically as soon as control
-leaves the block it was declared in — for a value declared inside a
-loop body, that means every iteration, not deferred until the function
-eventually returns; `break`/`continue` reclaim it too, the same as
-reaching the end of that iteration normally would. A value that does
-escape (returned, stored somewhere longer-lived, passed to another
-function) is reclaimed by a later stage not yet implemented — see
-[todo.md](todo.md#memory-management).
+`for` body, and never returned or stored anywhere longer-lived, is
+reclaimed automatically as soon as control leaves the block it was
+declared in — for a value declared inside a loop body, that means
+every iteration, not deferred until the function eventually returns;
+`break`/`continue` reclaim it too, the same as reaching the end of that
+iteration normally would. Passing a value to another function no
+longer unconditionally prevents this: if that function's own body
+never itself lets the value outlive the call (only reads/writes
+through its own fields, or passes it on to some other function that
+in turn doesn't retain it either), the original value is still
+reclaimed exactly the same way. A struct reclaimed this way is a real
+stack allocation, not a heap allocation freed afterward — faster, not
+just eventually cleaned up, and with each recursive call still getting
+its own independent copy the same way any other stack-local value
+would. A `map[T]` reclaimed this way frees each of its own entries
+completely, keys included, not just the entries themselves. A value
+that does escape a function entirely isn't necessarily lost, either: a
+struct-typed global variable's value is reference counted and freed
+once nothing references it anymore, on every reassignment (including
+its own initial declaration) — a global repeatedly reassigned in a
+loop no longer leaks every value but the last. A struct-typed local
+that escapes gets the same treatment at its own scope-exit — declared
+with an initializer, or reassigned after declaration, no longer exclude
+it either, since every new value a local ever comes to hold (through an
+initializer or a plain reassignment) is now retained first whenever
+that value might already be referenced elsewhere. Being returned no
+longer excludes a local either — a function's own `return` retains the
+value it hands back under the same rule, so a struct local that's ever
+returned, a struct-typed parameter returned straight through, and a
+`cond ? a : b` between two locals are all now correctly reclaimed
+(whichever value wasn't actually returned is freed; the one that was
+survives with exactly the right reference count). A call result
+discarded outright, never bound to any variable at all (`someFunc();`
+used as a bare statement), is reclaimed too — released immediately at
+the point it's discarded, since a function's own return value is
+always freshly produced and nothing else can be referencing it yet.
+Every struct value is now correctly reclaimed once nothing references
+it anymore, whichever of these shapes produced it. This includes a
+struct's own struct-typed *fields*: `outer.field = value` retains
+`value` the same way any other binding does, and freeing `outer`
+recursively frees whatever its own struct-typed fields still hold too,
+however many levels deep a program actually nests structs.
+
+An escaping `arr[T]`/`map[T]` value is reclaimed the same way: two
+variables made to alias each other (`map[T] b = a`) now share one
+underlying value, not independent copies — so growing `b` (adding a
+new key) is correctly visible through `a` too, not just the data each
+started out with. Assigning `[1, 2, 3]`/`{...}` into a fresh binding,
+returning an array/map, passing one to another function, storing one
+in a struct field — every one of these is reclaimed once nothing
+references it anymore, the identical rule struct values already
+follow. This includes an `arr[T]`/`map[T]`'s own elements/values, when
+their own type is itself reclaimed this way (a struct, `arr[T]`, or
+`map[T]`): `boxes[0] = replacement`/`boxes['key'] = replacement`
+retains the new value and releases whatever that slot previously held,
+the same rule a struct's own field write already follows, and freeing
+an array or map recursively releases each of its own elements/values
+too, however many levels deep a program nests `arr[T]`/`map[T]`.
 
 ## Arrays
 
@@ -218,8 +267,9 @@ log(numbers.length)
 numbers[0] = 10
 ```
 
-Not bounds-checked; data is never freed (no GC yet — see
-[todo.md](todo.md)).
+Not bounds-checked. Memory is reclaimed automatically — see "Structs"
+above for the full picture (non-escaping locals reclaimed at scope-exit,
+escaping values reference counted).
 
 ## Maps
 
