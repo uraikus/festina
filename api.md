@@ -224,16 +224,18 @@ that escapes gets the same treatment at its own scope-exit — declared
 with an initializer, or reassigned after declaration, no longer exclude
 it either, since every new value a local ever comes to hold (through an
 initializer or a plain reassignment) is now retained first whenever
-that value might already be referenced elsewhere. The one thing that
-still excludes a local from this: being returned anywhere in the
-function — a function's own `return` doesn't yet retain the value it
-hands back, so a local that's ever returned still leaks, and so does a
-returned value discarded outright at its call site (never bound to a
-variable). Capturing a call's result directly into a local (`Point r =
-someFunc()`) is unaffected by that gap, though — that local is tracked
-and freed correctly once its own scope ends. An escaping `arr[T]`/
-`map[T]` value, and a struct's own nested struct/array/map-typed
-fields, are reclaimed by a later stage not yet implemented — see
+that value might already be referenced elsewhere. Being returned no
+longer excludes a local either — a function's own `return` retains the
+value it hands back under the same rule, so a struct local that's ever
+returned, a struct-typed parameter returned straight through, and a
+`cond ? a : b` between two locals are all now correctly reclaimed
+(whichever value wasn't actually returned is freed; the one that was
+survives with exactly the right reference count). The only struct value
+that still leaks unconditionally is one discarded outright at its own
+call site — a call result never bound to any variable at all
+(`someFunc();` used as a bare statement). An escaping `arr[T]`/`map[T]`
+value, and a struct's own nested struct/array/map-typed fields, are
+reclaimed by a later stage not yet implemented — see
 [todo.md](todo.md#memory-management).
 
 ## Arrays

@@ -537,20 +537,6 @@ class CodeGen:
                                                 # escape_analysis.find_escaping_names call this session
                                                 # makes (see _emit_analyzed_func_body) -- see that
                                                 # module's own docstring for the full contract.
-        self._returned_names = None            # claude.md #77: set (by _emit_analyzed_func_body, mirroring
-                                                # _current_escaping_names) to escape_analysis.
-                                                # find_returned_names's result for the function/handler
-                                                # body currently being emitted -- every name that's ever
-                                                # used as a bare Return value anywhere in it. An escaping
-                                                # struct local in this set is conservatively excluded from
-                                                # _emit_block's own release-at-scope-exit tracking entirely
-                                                # (see that method's own comment) -- this stage doesn't yet
-                                                # implement transferring ownership to a caller at Return, so
-                                                # a name that's ever returned keeps leaking exactly as
-                                                # before, function-wide, rather than risk releasing (and
-                                                # possibly freeing) a value on its way out through Return.
-                                                # None outside any tracked function/handler body, same as
-                                                # _current_escaping_names.
         self._active_free_locals = []          # claude.md #74: stack of "frames," one per currently-
                                                 # open block within the function/handler body being
                                                 # emitted -- not just its own top-level body anymore, but
@@ -1030,17 +1016,19 @@ class CodeGen:
         one-function-at-a-time approach is already sound with no
         separate whole-program pre-pass or fixpoint needed.
 
-        claude.md #77: also computes self._returned_names (see that
-        field's own comment) the same way -- once per function/handler,
-        available for the whole of its own emission, reset afterward."""
+        claude.md #77 (widened): a struct value returned through
+        Return no longer needs its own separate name-based tracking
+        the way it once did (self._returned_names, since removed) --
+        Return's own handling now retains the value being returned
+        whenever it might be aliased, the same treatment every other
+        struct-producing site in this stage already gets, so no extra
+        per-function state is needed here for it at all."""
         escaping = escape_analysis.find_escaping_names(decl.body, escaping_params=self.escaping_params)
         self._current_escaping_names = escaping
-        self._returned_names = escape_analysis.find_returned_names(decl.body)
         try:
             block = self._emit_block(decl.body, body_env, return_type, body_lines)
         finally:
             self._current_escaping_names = None
-            self._returned_names = None
         if isinstance(decl, ast.FuncDecl):
             self.escaping_params[decl.name] = {
                 i for i, p in enumerate(decl.params) if p.name in escaping
@@ -1209,15 +1197,19 @@ class CodeGen:
                             # scheduling anything else for release would
                             # try to release a stack address that was
                             # never calloc'd with a header in the first
-                            # place. Either way, a name that's ever
-                            # itself returned is still excluded
-                            # entirely, function-wide -- see
-                            # self._returned_names's own comment for
-                            # why (Return's own retain/release handling
-                            # isn't implemented yet).
+                            # place. A name that's ever itself returned
+                            # is no longer excluded here either (unlike
+                            # this stage's earlier passes): Return's own
+                            # handling now retains the value first
+                            # whenever it might be aliased (see
+                            # _emit_stmt's Return branch), so releasing
+                            # this binding too, right alongside every
+                            # other active local, nets out to exactly
+                            # one reference surviving -- the one handed
+                            # to the caller -- rather than leaking it.
                             is_stack_allocated = (stmt.init is None
                                                    and stmt.name not in self._current_escaping_names)
-                            if not is_stack_allocated and stmt.name not in self._returned_names:
+                            if not is_stack_allocated:
                                 self._active_free_locals[-1].append((ref, type_))
             if tracking and not ctx["terminated"]:
                 self._emit_free_active_locals(lines, down_to=len(self._active_free_locals) - 1)
@@ -1399,6 +1391,27 @@ class CodeGen:
             else:
                 val, vtype = self._emit_value_for(stmt.value, env, lines, return_type)
                 val = self._coerce(val, vtype, return_type, lines)
+                # claude.md #77 (widened further): a struct being handed
+                # back to the caller gets the exact same owning/aliasing
+                # treatment _emit_local_struct_retain_release already
+                # gives a plain local assignment -- retain it here,
+                # BEFORE _emit_free_active_locals below releases every
+                # active local (which, since a returned name is no
+                # longer excluded from that list -- see _emit_block's
+                # own comment -- may include the very binding this value
+                # came from). Skipped only when the source is a fresh,
+                # uniquely-owned call result (_is_owning_struct_source),
+                # the same "no retain needed, the +1 just transfers"
+                # case every other call site in this stage already
+                # relies on. This is what makes it safe to stop
+                # excluding a returned local from scope-exit release at
+                # all: retain-then-release-everything nets out to
+                # exactly one reference surviving per binding, on every
+                # path, including a Ternary/parameter/field read this
+                # source could be -- not just the bare-Identifier case a
+                # name-based exclusion could ever recognize.
+                if isinstance(return_type, types_mod.StructType) and not self._is_owning_struct_source(stmt.value):
+                    lines.append(f"  call void @festina_retain(ptr {val})")
                 self._emit_free_active_locals(lines)
                 lines.append(f"  ret {_llvm_type(return_type)} {val}")
             ctx["terminated"] = True

@@ -359,11 +359,11 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 770 tests in this directory pass against it: 526 need no external
+All 763 tests in this directory pass against it: 517 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-234 more need a working C compiler, plus 2 more
+236 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 8 more given
-`Xvfb`+`xdotool` too (526 + 234 + 2 + 8 = 770 -- re-verified directly
+`Xvfb`+`xdotool` too (517 + 236 + 2 + 8 = 763 -- re-verified directly
 by hiding each tool from PATH in turn, not just derived by counting
 `compile_and_run` call sites, since the true number had drifted well
 past a much older, since-inaccurate count of "694 given a working C
@@ -1336,7 +1336,9 @@ more bug while doing so, and deliberately did NOT attempt a third
   stage). A local failing any of the three simply keeps leaking,
   exactly as before this stage -- the same "leaks but is memory-safe"
   fallback every not-yet-covered case in this whole effort already
-  gets, chosen deliberately over guessing.
+  gets, chosen deliberately over guessing. (All three of these
+  conditions were later widened away, in the same stage, same session
+  -- see the two entries below.)
 
   **Two real bugs found and fixed while building this, both traced to
   their exact mechanism before fixing, not patched blind from a
@@ -1544,6 +1546,88 @@ more bug while doing so, and deliberately did NOT attempt a third
   own local scope", for the full writeup, and "What's still ahead" for
   exactly what retaining every function's own return value would still
   need to close the last gap.
+
+- **Memory management: retaining a function's own return value
+  (claude.md #77, same stage, same session).** Closes the one condition
+  the widening entry above left standing: a struct local excluded from
+  scope-exit release because it was ever itself returned somewhere in
+  its own function. `_emit_stmt`'s Return handling now applies the
+  identical `_is_owning_struct_source` check every other struct-
+  producing site in this stage already uses -- retain the value being
+  returned first, unless its source is a plain function call -- and
+  then calls `_emit_free_active_locals` exactly as before, with no
+  special-casing left for a name that happens to be one of the locals
+  it's about to release. Retain-then-release-everything nets out
+  correctly on every path: whichever binding actually produced the
+  returned value gets a retain that exactly cancels its own release,
+  while every other active local is simply released as normal, freed if
+  nothing else references it. With this in place,
+  `escape_analysis.find_returned_names` and its own walker helpers, and
+  `CodeGen._returned_names`, were deleted outright -- nothing needs the
+  old "is this name ever a bare Return value" approximation anymore,
+  since the new logic is keyed off the Return statement's own source
+  expression instead of a whole-function, name-based guess at it.
+
+  This is a real correctness fix, not merely a leak-closing one, and
+  the two cases that prove it were deliberately the ones the OLD
+  name-based exclusion could never have reached at all, not just
+  ones it happened to handle conservatively:
+
+  1. *A struct-typed parameter returned directly*
+     (`Point func identity(p:Point) { return p }`) aliases the
+     *caller's own* storage, not a fresh value. Without retaining it on
+     the way out, the caller's own local would remain the sole holder
+     of a reference count that never accounted for the call's own
+     return-value binding also now pointing at the same storage -- the
+     caller's own local going out of scope first would free memory a
+     still-live return-value binding pointed to, and reading through
+     that binding afterward would be a genuine use-after-free. Verified
+     directly, not just reasoned about: a dedicated test calls
+     `identity(x)` 2000 times in a loop, storing the result in `y` and
+     then reading *both* `x.x` and `y.x` well past where `x`'s own
+     scope-exit release would already have fired under the old code --
+     confirming both remain correct, not just that nothing crashes.
+  2. *A Ternary between two locals* (`return cond ? a : b`) was
+     invisible to the old exclusion by construction -- it only ever
+     recognized a bare Identifier Return value, and neither `a` nor `b`
+     is one, so *neither* was ever excluded from scope-exit release
+     under the old code. Whichever branch actually executed on a given
+     call could have been released -- and, if nothing else referenced
+     it, freed -- on its way out to the caller, before this fix: a
+     latent soundness hole the name-based design could never have
+     closed without abandoning the name-based approach entirely (which
+     is exactly what this fix does). Verified with a dedicated test
+     alternating both branches across 2000 calls, each one's own
+     `fail()` check confirming the correct value came back.
+
+  Verified the same three ways as every increment in this stage: new
+  IR-level tests (retain present in a bare-identifier Return, absent in
+  a call-result Return, checked on two separate functions so a callee's
+  own Return doesn't get credited to its caller's), the two
+  compile-and-run regression tests above, and a combined stress program
+  (`make`/`identity`/`pick`/`sometimesReturned`/`chainReturn`, 2000
+  iterations, folding this together with the earlier local-scope
+  widening) --
+  `tests/test_codegen.py::TestAutomaticMemoryReclamation` grew from 76
+  to 80. A real, properly-instrumented AddressSanitizer/LeakSanitizer
+  run against that combined program came back with zero ASan errors and
+  a leak count of exactly 2000 objects -- 24 bytes each, matching the
+  16-byte `Point` plus its 8-byte refcount header -- one for each of the
+  2000 deliberately-*discarded* `make(i)` calls also folded into the
+  same program, and nothing more: every other case (captured-by-a-
+  local, parameter-passthrough, ternary, sometimes-returned-and-also-
+  global) is now correctly freed. Every earlier verification program
+  from this stage (`widen1.f`, `discard_check.f`, `field_source.f`,
+  plus stages 1-3's own `chaos2.f`/`interproc2.f`/`stackalloc1.f`/
+  `mapkeys1.f`/`recur_stack.f`, and stage 4's own `rc_loop.f`/
+  `rc_debug3.f`/`rc_debug4.f`/`rc_combined.f`) was re-run through the
+  same corrected pipeline to confirm no regression -- all came back
+  clean.
+
+  See `todo.md`'s "Memory management" section, "Retaining a function's
+  own return value", for the full writeup, and "What's still ahead" for
+  the one struct-return leak now remaining: a return value discarded
+  outright at its own call site, never bound to anything.
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -2315,8 +2399,8 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 526 passed, 244 skipped (needs a C compiler; 2 of
+pytest tests/                          # 517 passed, 246 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
                                         # 8 need Xvfb + xdotool installed too) given a
-                                        # working C compiler, all 770 pass
+                                        # working C compiler, all 763 pass
 ```

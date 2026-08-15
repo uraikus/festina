@@ -2130,14 +2130,23 @@ class TestAutomaticMemoryReclamation:
         # two total.
         assert f_body.count("call void @festina_release(") == 2
 
-    def test_escaping_local_that_is_sometimes_returned_is_never_released_at_scope_exit(
+    def test_escaping_local_that_is_sometimes_returned_is_now_released_at_scope_exit(
             self, parser, semantic, codegen):
         # p is returned on ONE path (cond true) but not the other (cond
-        # false, falls through to the end) -- claude.md #77 doesn't yet
-        # implement transferring ownership through Return, so p is
-        # conservatively excluded from scope-exit release on BOTH
-        # paths, function-wide, not just the one that actually returns
-        # it (see escape_analysis.find_returned_names's own docstring).
+        # false, falls through to the end) -- textually identical
+        # `return p` on both paths here, but that's just this source's
+        # own shape, not something the retain-on-Return logic cares
+        # about: every Return of a struct-typed value retains it first
+        # (since a bare Identifier is an "aliasing" source, not an
+        # owning one) and then _emit_free_active_locals releases every
+        # active local, p included, on every path -- retain-then-
+        # release-everything nets out to exactly one surviving
+        # reference, the one just handed to the caller, on whichever
+        # path actually runs. Three releases total: the global
+        # assignment's own release of ITS previous value, plus one from
+        # each of the two Return statements' own _emit_free_active_locals
+        # call (only one of which runs on any given call, but both
+        # appear in the IR).
         source = """
         struct Point { x:int y:int }
         Point g
@@ -2153,9 +2162,10 @@ class TestAutomaticMemoryReclamation:
         ir = self._ir(parser, semantic, codegen, source)
         f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define ptr @f("))
         f_body = "\n".join(ir.splitlines()[f_start:])
-        # Exactly one release -- the global assignment's own release of
-        # its PREVIOUS value -- and none for p itself on either path.
-        assert f_body.count("call void @festina_release(") == 1
+        assert f_body.count("call void @festina_release(") == 3
+        # And a matching retain for each of the two Return statements,
+        # on top of the one from `g = p` itself -- three total.
+        assert f_body.count("call void @festina_retain(") == 3
 
     def test_loop_local_escaping_struct_is_released_every_iteration(
             self, parser, semantic, codegen):
@@ -2667,6 +2677,119 @@ class TestAutomaticMemoryReclamation:
         for int i = 0, i < 3000, i++ {
             run(50)
         }
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    # -- retaining a function's own Return value (claude.md #77, widened
+    # further): the last of the three conditions the original stage-4
+    # scope excluded a struct local for is now handled too. See
+    # tests/CONTRACT.md for the full writeup.
+
+    def test_return_of_a_bare_identifier_retains(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point func f() {
+            Point p
+            return p
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define ptr @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" in f_body
+        assert "call void @festina_release(" in f_body
+
+    def test_return_of_a_call_result_does_not_retain(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point func make() {
+            Point p
+            return p
+        }
+        Point func f() {
+            return make()
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        f_start = next(i for i, l in enumerate(lines) if l.startswith("define ptr @f("))
+        f_end = next(i for i in range(f_start, len(lines)) if lines[i].strip() == "}")
+        f_body = "\n".join(lines[f_start:f_end])
+        # f() itself has nothing to retain -- its own Return value is a
+        # fresh, uniquely-owned call result, the same "no retain needed"
+        # case a VarDecl-with-initializer or plain reassignment already
+        # gets from a Call source. (make()'s own Return of its bare
+        # local p is a separate, unrelated retain -- deliberately
+        # excluded by only looking at f()'s own body.)
+        assert "call void @festina_retain(" not in f_body
+        assert "call void @festina_release(" not in f_body
+
+    def test_returning_a_parameter_directly_keeps_the_callers_copy_correct(
+            self, compile_and_run):
+        # The soundness case this widening exists for, not just a leak
+        # count: identity(x) hands x's own storage straight back out.
+        # Without retaining it there, y (the caller's own copy of the
+        # return value) would alias x's storage with no reference of
+        # its own -- x's later scope-exit release would free memory y
+        # still points to, and reading y afterward would be a genuine
+        # use-after-free. Reading x AND y, well after x's own local
+        # would ordinarily have been released, is the actual check.
+        source = """
+        struct Point { x:int y:int }
+        Point func identity(p:Point) {
+            return p
+        }
+        void func run() {
+            for int i = 0, i < 2000, i++ {
+                Point x
+                x.x = i
+                Point y = identity(x)
+                if x.x != i || y.x != i {
+                    fail('identity aliasing drifted')
+                }
+            }
+        }
+        run()
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_returning_a_ternary_between_two_locals_frees_the_untaken_branch(
+            self, compile_and_run):
+        # Neither branch of `cond ? a : b` is a bare Identifier Return
+        # value in the old, narrower sense (the Return's own value
+        # expression is the Ternary itself) -- this only works soundly
+        # because the retain applies to whatever the Ternary evaluates
+        # to at runtime, and _emit_free_active_locals still releases
+        # BOTH a and b unconditionally afterward: the branch that was
+        # actually returned nets out to one surviving reference (the
+        # retain cancels its own release), and the untaken branch is
+        # simply released and freed, same as if it had never been
+        # returned at all.
+        source = """
+        struct Point { x:int y:int }
+        Point func pick(cond:bool, n:int) {
+            Point a
+            a.x = n
+            Point b
+            b.x = n * 2
+            return cond ? a : b
+        }
+        void func run() {
+            for int i = 0, i < 2000, i++ {
+                Point p = pick(i % 2 == 0, i)
+                int expected = (i % 2 == 0) ? i : i * 2
+                if p.x != expected {
+                    fail('ternary return drifted')
+                }
+            }
+        }
+        run()
         log('done')
         """
         result = compile_and_run(source, args=None)

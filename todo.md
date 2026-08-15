@@ -110,10 +110,11 @@ since narrowed that: a provably-safe struct is now stack-allocated
 outright (stage 3), a provably-safe `arr[T]`/`map[T]`'s data is still
 heap-allocated but now freed (stages 1/2), and a struct-typed global
 (always) or escaping local (stage 4) is reference counted and freed
-once nothing references it anymore — anything not covered by any stage
-is still heap-allocated (structs) or still leaks (arrays/maps, and a
-struct-typed local that is ever itself returned, the one gap stage 4's
-own later widening did not close — see below),
+once nothing references it anymore, including a value handed back
+through `return` itself — anything not covered by any stage is still
+heap-allocated (structs) or still leaks (arrays/maps, a struct's own
+nested struct/array/map-typed fields, and a returned value that's
+discarded outright at its own call site — see below),
 exactly as originally described here.
 
 ### Stage 1: non-escaping locals (done — claude.md #74)
@@ -516,6 +517,74 @@ discarded outright, never bound to anything, still leaks unconditionally
 every value a function returns, closing that last gap, is still open —
 see "what's still ahead" below.
 
+### Retaining a function's own return value (done — claude.md #77, same stage)
+
+The one condition still excluding a struct local from this stage's
+scope-exit release tracking after the widening above: `Return` itself
+never retained the value it handed back to its caller, so a local
+that's ever returned still leaked, regardless of the caller-side
+widening. This closes that gap by applying the identical owning/
+aliasing treatment `_emit_local_struct_retain_release` already gives a
+plain assignment to `Return`'s own value: retain it first whenever its
+source isn't a plain function call, then let `_emit_free_active_locals`
+release every active local exactly as it already does on every other
+function exit — no separate exclusion needed anymore for a name that's
+ever returned, since retain-then-release-everything nets out to
+exactly one surviving reference on whichever path actually executes.
+
+This is a genuine correctness fix, not just a leak-closing one: a
+struct-typed *parameter* returned directly (`Point func identity(p:
+Point) { return p }`) is aliasing the *caller's* own storage, not a
+fresh value — without a retain there, the caller's own local would be
+left as the sole holder of a reference count that never accounted for
+the second binding (the call's own return value) now also pointing at
+it, so the caller's own local going out of scope first would free
+memory a still-live return-value binding pointed to, a genuine
+use-after-free once read. Traced through by hand before implementing,
+not just reasoned about afterward: `identity(x)`'s own caller keeps
+reading both `x` and the value it got back, well past where `x`'s own
+release would ordinarily have fired, specifically to catch this.
+
+With the name-based exclusion gone, `escape_analysis.find_returned_names`
+and its own walker helpers, and `CodeGen._returned_names`, were removed
+entirely — nothing needs the "is this name ever a bare Return value"
+question anymore, since the new logic is keyed off the Return
+statement's own source expression, not a whole-function, name-based
+approximation of it. This is also strictly more precise than the old
+name-based exclusion ever was: the old approach only ever recognized a
+*bare* Return value (`return p`), so `return p.x` (not itself a
+soundness issue, `p.x` isn't a tracked binding) and `return cond ? a :
+b` (a genuine gap — neither `a` nor `b` is a bare Identifier, so
+neither was ever excluded, meaning whichever branch actually ran could
+have been released out from under the caller on the way out, before
+this fix) were invisible to it. The Ternary case in particular was a
+latent soundness gap the old exclusion-based design could never have
+closed without abandoning the name-based approach entirely — retain-
+on-Return closes it as a natural consequence of no longer needing to
+ask "which *name* is this" at all.
+
+Verified the same three ways as every increment in this stage: new
+IR-level tests (retain present for a bare-identifier Return, absent for
+a call-result Return), and new compile-and-run tests for the parameter-
+aliasing soundness case above, a Ternary return between two locals
+(confirming the untaken branch is freed and the taken one survives
+correctly), and a combined stress program folding all of this
+together with the earlier local-scope widening (2000 iterations,
+`make`/`identity`/`pick`/`sometimesReturned`/`chainReturn` all
+exercised together, `tests/test_codegen.py::TestAutomaticMemoryReclamation`,
+76 → 80). Real, properly-instrumented AddressSanitizer/LeakSanitizer
+runs against that same combined program came back with zero ASan
+errors and a leak count of exactly 2000 objects — matching the 2000
+deliberately-discarded `make(i)` calls in the same program one-for-one,
+confirming every OTHER case (captured-by-a-local, parameter-passthrough,
+ternary, sometimes-returned-and-also-global) is now correctly freed and
+nothing else is. Every earlier verification program from this stage
+(`widen1.f`, `discard_check.f`, `field_source.f`, plus stages 1-3's own
+`chaos2.f`/`interproc2.f`/`stackalloc1.f`/`mapkeys1.f`/`recur_stack.f`,
+and stage 4's own `rc_loop.f`/`rc_debug3.f`/`rc_debug4.f`/`rc_combined.f`)
+was re-run through the same corrected pipeline — all came back clean,
+confirming no regression.
+
 ### What's still ahead
 
 - **Nested struct/array/map fields within a freed struct.** Explored
@@ -538,26 +607,27 @@ see "what's still ahead" below.
   name appear outside a safe position" question — real aliasing/
   ownership analysis (does anything else still reference this field's
   value when the struct holding it stops existing). Retaining on every
-  local assignment (below, now done) turned out not to answer this one:
-  that widening only ever retains a *binding* (a local variable's own
-  slot) when it starts referencing a value — it never touches a
-  struct's own *field*, which is a different storage location with no
-  binding of its own to retain into. Still needs its own design pass,
-  same bar as every stage here.
-- **Retaining every value a function returns.** The one condition still
-  excluding a local from this stage's own scope-exit release tracking
-  (see "Widening this stage's own local scope" above): `Return` does
-  not yet retain the value it hands back to its caller, so a local
-  that's ever returned still leaks unconditionally, and a returned
-  value that's discarded outright (never bound to any variable at the
-  call site) leaks regardless of what this bullet would fix. Implementing
-  this is expected to need the same owning/aliasing source
-  classification the local-scope widening above already introduced,
-  applied to what a `return` statement's own expression evaluates to,
-  plus a decision about whose responsibility releasing an *unused*
-  return value would be (the callee never knows if its result will be
-  discarded; the caller doesn't retain what it never binds) — not yet
-  designed.
+  local assignment, and on every function's own return value (both done
+  now, see above), turned out not to answer this one: both widenings
+  only ever retain a *binding* (a local variable's own slot, or the
+  value handed back through `return`) when it starts referencing a
+  value — neither touches a struct's own *field*, which is a different
+  storage location with no binding of its own to retain into. Still
+  needs its own design pass, same bar as every stage here.
+- **Releasing a return value that's discarded outright at its own call
+  site** (`make(n);` used as a bare statement, the result never bound
+  to any variable). Now the only remaining struct-return leak, since
+  "Retaining a function's own return value" above closed every case
+  where the result is bound to *something* (a local, a global, another
+  return). Nothing at a discarding call site currently retains or
+  releases the value at all — it's simply never referenced by anything
+  tracked, so it's never freed. Needs a decision this stage
+  deliberately hasn't made yet: whose responsibility releasing an
+  unused return value would be (the callee never knows at the point it
+  returns whether its result will be discarded; the caller would need
+  to recognize a Call used as a bare ExprStmt with a struct return type
+  specifically, and release the value right there instead of retaining
+  it into any binding).
 - **Reference counting for `arr[T]`/`map[T]` values that escape** —
   stage 4 covers structs only. An escaping array/map still leaks
   exactly as before this stage; extending reference counting to

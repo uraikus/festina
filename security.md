@@ -262,9 +262,10 @@ for the full design writeup.
   `claude.md #77` (stage 4) covers the remainder stages 1-3 can never
   reach on their own: a struct value proven to genuinely escape now has
   its own reference count (a struct-typed global, always; a struct-
-  typed local at its own scope-exit, unless it's ever itself
-  returned — see claude.md #77's own text for exactly why that one
-  condition remains), freed once nothing references it anymore. This is
+  typed local at its own scope-exit, including one that's returned --
+  `return` itself now retains the value first whenever its source might
+  be aliased, the same treatment every other struct-producing site in
+  this stage gets), freed once nothing references it anymore. This is
   sound specifically because Festina's type system makes reference
   cycles structurally impossible — a struct field's type must always be
   declared *before* the struct containing it, verified directly by
@@ -287,6 +288,36 @@ for the full design writeup.
   verification (unit, IR-level, compile-and-run, and real
   AddressSanitizer/LeakSanitizer runs, properly instrumented from the
   start) found no new bugs.
+
+  Still in the same stage, `return` itself got the identical treatment
+  next: retain the value being returned first, whenever its source
+  isn't a plain function call, then release every active local exactly
+  as every other function exit already does -- no more excluding a
+  name that's ever returned from that release entirely. This is a real
+  correctness fix, not just a leak-closing one, caught by deliberately
+  testing the case the old name-based exclusion could never reach: a
+  struct-typed *parameter* returned directly aliases the *caller's own*
+  storage, not a fresh value, so without retaining it there, the
+  caller's own local would be left as the sole holder of a refcount
+  that never accounted for the return value's own new binding also
+  pointing at it -- the caller's own local going out of scope first
+  would free memory the return-value binding still pointed to, a
+  genuine use-after-free on the next read through it. A second gap the
+  old exclusion could never have closed either: it only recognized a
+  *bare* Return value (`return p`), so `return cond ? a : b` -- neither
+  branch a bare Identifier -- was invisible to it, meaning whichever
+  branch actually ran on a given call could have been released out from
+  under the caller before this fix, a genuine soundness hole, not
+  merely an over-conservative one. Verified with dedicated tests for
+  both: the parameter-aliasing case (reading the caller's own local and
+  the return value well past where the old code would have released the
+  caller's copy) and the Ternary case (confirming the untaken branch is
+  freed and the taken one survives correctly), plus a combined stress
+  program folding this together with the earlier local-scope widening.
+  A real AddressSanitizer/LeakSanitizer run against that combined
+  program came back with zero ASan errors and a leak count matching
+  exactly the number of deliberately-*discarded* return values in it,
+  one-for-one -- confirming every other case is now correctly freed.
 
   One nested case was investigated during stage 3 and *deliberately not
   attempted* after finding a real soundness hazard, not simply left
@@ -340,11 +371,10 @@ for the full design writeup.
   now fixed. See [todo.md](todo.md#memory-management) for the complete
   writeup and reproduction.
 
-  Everything not covered by any stage (the nested-field case, a struct
-  local that's ever itself returned, a returned value discarded outright
-  at its call site, an escaping `arr[T]`/`map[T]` value, and whether a
-  value stored into a field of a call argument is itself retained)
-  still leaks exactly as before — a
+  Everything not covered by any stage (the nested-field case, a returned
+  value discarded outright at its own call site, an escaping `arr[T]`/
+  `map[T]` value, and whether a value stored into a field of a call
+  argument is itself retained) still leaks exactly as before — a
   resource leak in a long-running process, not a safety issue on its
   own, no different in kind from the gap this note already accepted.
   What changed across all four stages is that each one's own fix, at
