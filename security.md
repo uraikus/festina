@@ -422,10 +422,58 @@ for the full design writeup.
   now fixed. See [todo.md](todo.md#memory-management) for the complete
   writeup and reproduction.
 
-  Everything not covered by any stage (an escaping `arr[T]`/`map[T]`
-  value, a struct-typed field of an arr[T]/map[T] element, an arr[T]/
-  map[T]-typed field of a struct, and whether a value stored into a
-  field of a call argument is itself retained) still leaks exactly as
+  `claude.md #79` (stage 6) closes the last of the three remaining
+  gaps: an escaping `arr[T]`/`map[T]` value now gets the identical
+  reference-counting treatment stage 4 gave structs. This needed a real
+  representation change first, not just a new tracking rule --
+  `arr[T]`/`map[T]` used to be a plain `{length, data}`/`{count,
+  entries}` *value*, copied by value on every assignment, so two
+  bindings made to alias each other each got their own independent
+  copy, sharing the same data/entries pointer only until one of them
+  changed. This was merely imprecise for `arr[T]` (arrays never grow
+  after construction), but a **real, pre-existing memory-safety bug**
+  for `map[T]` specifically, found and confirmed directly while
+  designing this stage, not assumed: growing a map through one alias
+  (`b['newkey'] = v`, reallocating the entries buffer) never updated
+  any *other* alias's own independent copy of the entries pointer,
+  leaving it stale -- a dedicated reproduction (`map[int] b = a;
+  b['y'] = 2; log(a['y'])`) **segfaults** on the code as it stood before
+  this stage, unrelated to anything else in this stage's own work (it
+  never touches map assignment or `festina_map_set` at all). Making
+  `arr[T]`/`map[T]` a single `ptr` to its own heap-allocated header --
+  the identical representation a struct value already has, needed
+  anyway for refcounting to mean anything precise -- fixes this as a
+  direct consequence: two aliased bindings now share the exact same
+  header, so a growth through either is correctly visible through both,
+  confirmed by re-running the exact reproduction above and getting `2`,
+  not a crash. Release itself needed no per-type generated wrapper the
+  way a struct's own field cascade does -- every `arr[T]`'s header has
+  the identical shape regardless of T (same for `map[T]`), so two fixed
+  runtime functions (`festina_release_array`/`festina_release_map`)
+  cover every case, dispatched through the same `_release_fn_for` that
+  also routes to a struct's own per-type release function.
+
+  Stage 6's own verification surfaced one more real, precisely
+  characterized use-after-free, deliberately left open rather than
+  patched blind: a struct-typed value stored as an array *element*
+  (not a struct *field*, which stage 5 already closed) can still be
+  read after the local it came from has gone out of scope and been
+  released -- confirmed directly with a dedicated reproduction (a fresh
+  struct stored as an array's sole element, the array escaping through
+  a global while the struct's own local function returns), caught by
+  AddressSanitizer as a genuine heap-use-after-free. This stage only
+  ever refcounts an arr[T]/map[T]'s own *header*, never what's stored
+  *inside* it, so this hazard is exactly as open after this stage as
+  before it -- a dynamically-sized, runtime-indexed collection needs a
+  materially different fix than the fixed-field-list walk stage 5's own
+  cascade already does, not attempted here; see
+  [todo.md](todo.md#memory-management) for the full reproduction and
+  why it's a separate design problem.
+
+  Everything not covered by any stage (a struct-typed element of an
+  arr[T]/map[T] value, an arr[T]/map[T]-typed element of another arr[T]/
+  map[T] value, and whether a value stored into a field of a call
+  argument is itself retained) still leaks exactly as
   before — a
   resource leak in a long-running process, not a safety issue on its
   own, no different in kind from the gap this note already accepted.

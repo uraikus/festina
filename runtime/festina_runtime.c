@@ -994,3 +994,53 @@ void festina_map_free_entries(int64_t count, void *entries) {
     }
     free(entries);
 }
+
+/* ---- reference counting for arr[T]/map[T] -- claude.md #79 ---- */
+
+/* claude.md #79: an arr[T]/map[T] value is now, like a struct value
+ * (claude.md #77), a single `ptr` to a heap-allocated header carrying
+ * its own i64 refcount immediately before the payload -- the same
+ * layout and the same festina_retain/festina_release_check this file's
+ * own "reference counting" section already established, reused
+ * unchanged (retaining an array/map needs no type-specific logic at
+ * all: `festina_retain` just increments a refcount, regardless of what
+ * the payload past it actually is). Only RELEASING needs an
+ * array/map-specific function, since -- unlike festina_release, which
+ * assumes there's nothing further to free once the refcount hits zero
+ * -- an arr[T]/map[T]'s own payload holds a *second* allocation (its
+ * data/entries buffer) that also needs freeing at that point.
+ *
+ * Unlike a struct (whose own field layout varies per Festina struct
+ * type, needing the compiler's own per-type knowledge -- see
+ * codegen.py's _release_fn_for_struct), every arr[T]/map[T]'s header
+ * has the identical two-field shape regardless of T (FESTINA_ARRAY_LLVM_TYPE/
+ * FESTINA_MAP_LLVM_TYPE's own `{i64, ptr}`), so a single generic
+ * function handles every arr[T] and a single generic function handles
+ * every map[T] -- no per-type codegen-generated wrapper needed here at
+ * all, unlike the struct case. */
+void festina_release_array(void *payload) {
+    if (!festina_release_check(payload)) return;
+    /* payload is {i64 length, ptr data} -- skip past the i64 to reach
+     * the data pointer, the one thing actually worth freeing here (the
+     * length is just a plain number, nothing to release). Elements
+     * that are themselves refcounted values (a struct-typed element,
+     * say) are not individually released here -- see todo.md on why
+     * that's still a separate, open gap this section doesn't close. */
+    void *data = *(void **)((char *)payload + sizeof(int64_t));
+    free(data);
+    free((char *)payload - sizeof(int64_t));
+}
+
+void festina_release_map(void *payload) {
+    if (!festina_release_check(payload)) return;
+    /* payload is {i64 count, ptr entries} -- festina_map_free_entries
+     * already does exactly the right thing for the data half (each
+     * entry's own strdup'd key, then the entries buffer itself -- see
+     * its own comment just above), so this only adds the new header
+     * free on top. Same "map values aren't individually released"
+     * scope limitation as festina_release_array above. */
+    int64_t count = *(int64_t *)payload;
+    void *entries = *(void **)((char *)payload + sizeof(int64_t));
+    festina_map_free_entries(count, entries);
+    free((char *)payload - sizeof(int64_t));
+}

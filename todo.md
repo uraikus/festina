@@ -105,18 +105,20 @@ longer reachable." Arrays and struct storage were originally always
 heap-allocated (`malloc`/`calloc`) and never freed — a real resource
 leak in any long-running program, though never a memory-safety issue on
 its own (see [security.md](security.md)'s note: no use-after-free, no
-double-free, since nothing was ever freed). Five stages below have
+double-free, since nothing was ever freed). Six stages below have
 since narrowed that: a provably-safe struct is now stack-allocated
 outright (stage 3), a provably-safe `arr[T]`/`map[T]`'s data is still
 heap-allocated but now freed (stages 1/2), a struct-typed global
 (always) or escaping local (stage 4) is reference counted and freed
 once nothing references it anymore, including a value handed back
 through `return` itself, or discarded outright at its own call site,
-and a struct's own struct-typed fields are reference counted the same
-way (stage 5) — anything not covered by any stage still leaks
-(arrays/maps, and a struct-typed field of an arr[T]/map[T] element, or
-an arr[T]/map[T]-typed field of a struct — see below), exactly as
-originally described here.
+a struct's own struct-typed fields are reference counted the same way
+(stage 5), and an escaping `arr[T]`/`map[T]` value is now reference
+counted too, the identical treatment, plus a real pre-existing memory-
+safety bug fixed as a side effect (stage 6) — anything not covered by
+any stage still leaks (a struct-typed element of an arr[T]/map[T]
+value, or an arr[T]/map[T]-typed element of another arr[T]/map[T]
+value — see below), exactly as originally described here.
 
 ### Stage 1: non-escaping locals (done — claude.md #74)
 
@@ -774,23 +776,177 @@ stack-allocated-container fix above) zero leaks. Every earlier stage's
 own combined verification program was re-run through the same corrected
 pipeline to confirm no regression -- all came back clean.
 
+### Stage 6: reference counting for escaping `arr[T]`/`map[T]` values (done — claude.md #79)
+
+The last of the three remaining struct-related gaps closed, this stage
+does for arrays/maps what stage 4 did for structs — but needed a real
+representation change first, not just a new tracking rule, because
+`arr[T]`/`map[T]` never had a struct's own single-pointer identity to
+begin with.
+
+**The problem the old representation had, found while designing this
+stage, not assumed:** an `arr[T]`/`map[T]` value used to *be* the
+`{length, data}` (or `{count, entries}`) pair itself — `_llvm_type`
+returned `FESTINA_ARRAY_LLVM_TYPE`/`FESTINA_MAP_LLVM_TYPE` directly, a
+plain two-word aggregate *value*, copied by value on every assignment.
+Two bindings made to alias each other (`map[int] b = a`) each got
+their *own* independent copy of that pair, sharing the same
+data/entries pointer only until one of them changed. This was merely
+imprecise for `arr[T]` — arrays never grow after construction (no
+`.push`, fixed size from their own literal), so two aliased array
+copies could never actually diverge. It was a **real, exploitable
+memory-safety bug** for `map[T]` specifically, confirmed directly, not
+assumed: `map[T]` *does* grow (`npcHealths[key] = v` can add a new
+key, reallocating the entries buffer via `festina_map_set`), and that
+realloc only ever wrote the new `count`/`entries` back into the
+*mutating* binding's own copy — every *other* binding that had ever
+been made to alias it kept its own, now-stale copy of `entries`,
+pointing at memory `realloc` may have already moved or freed.
+
+```festina
+map[int] a = {'x': 1}
+map[int] b = a
+b['y'] = 2      // grows b's own entries buffer via realloc
+log(a['y'])     // reads through a's now-stale, possibly-freed pointer
+```
+
+Reproduced directly: this exact program **segfaults** on `main`,
+unrelated to this stage's own work in any way (never touches
+`_emit_map_set`, `_try_addressable`, or either type's own assignment
+path) — a pre-existing bug that had simply never been exercised by any
+existing test, since nothing in the suite grew a map through one alias
+and read it back through another.
+
+**The fix, and why it closes both problems at once:** `arr[T]`/
+`map[T]` is now a single `ptr` to its own heap-allocated storage —
+`_llvm_type(ArrayType)`/`_llvm_type(MapType)` both return `"ptr"` now,
+the identical representation a struct value already has, with the
+identical `{i64 refcount, payload...}` header layout
+(`_emit_fresh_heap_header`, shared with an escaping struct local's own
+allocation). Two bindings made to alias each other now share the
+*exact same* header, not independent copies that merely started out
+agreeing — `festina_map_set`'s own realloc updates the one canonical
+header everyone points at, so a growth through either binding is
+correctly, immediately visible through the other, every time.
+Verified directly: the exact reproduction above now prints `2`, not a
+segfault. This is a genuine consequence of the representation change
+this stage needed anyway for refcounting to make sense at all, not a
+separately-motivated bug fix bolted on alongside it — refcounting a
+value that could still silently diverge into two independently-mutable
+copies would have been refcounting the wrong thing.
+
+**What actually changed, mechanically:** every array/map-specific
+codegen site that used to GEP/extractvalue a *value* now does the same
+thing one level of indirection further in (load the `ptr`, then GEP
+off *that*) — `.length`, `arr[i]`/`map[key]` reads, `.forEach()`,
+`_emit_map_set`/`_emit_map_get`, sqlite row collection. Construction
+(`_emit_array_lit`/`_emit_map_lit`) now heap-allocates via the same
+`_emit_fresh_heap_header` helper an escaping struct uses, rather than
+a scratch stack alloca. `_try_addressable` — previously needed to tell
+an "addressable" map target (whose own storage slot a grown entries
+pointer could be written back into) apart from a merely "valuable" one
+— was deleted outright: every arr[T]/map[T] expression's own *value*
+is now the header's address itself, exactly what `festina_map_set`
+needs to mutate directly, no separate addressability concept left to
+maintain. `_global_var_defs`/`_zero_value` give array/map globals the
+identical immortal-sentinel treatment a struct global already gets.
+
+**Retain/release rule, identical to stages 4/5's own:** every binding
+site — a local's own declaration, a plain reassignment, a global, a
+struct field (widening claude.md #78's own field-write logic, which
+already generalized cleanly once `_release_fn_for` existed), a `return`
+value, a discarded call result — retains the new value unless its
+source is "owning," and releases whatever the binding previously held.
+"Owning" gains one new case beyond a plain function call: an array or
+map *literal* (`[1, 2, 3]`, `{...}`) — structs have no literal syntax
+at all, so this case never arose for them, but a literal allocates a
+fresh header exactly like a call's own return value does, nothing else
+referencing it the instant it's produced.
+
+**Release itself needed no per-type codegen-generated wrapper the way
+a struct's own cascade does** (`_release_fn_for_struct`'s lazily-built
+`@__festina_release_struct_<Name>` functions) — unlike a struct, whose
+own field layout varies by Festina type and needs the compiler's own
+per-type knowledge, *every* `arr[T]`'s header has the identical
+`{i64,ptr}` shape regardless of T (same for `map[T]`), so two fixed
+runtime functions, `festina_release_array`/`festina_release_map`
+(built on the same `festina_release_check` decrement-and-check split
+claude.md #78 introduced), handle every array and every map
+respectively. `_release_fn_for` is the one dispatch point every
+release call site in codegen.py now goes through, choosing between
+these two fixed functions and `_release_fn_for_struct`'s own per-type
+dispatch.
+
+**A non-escaping local's own stack-allocation optimization (stages
+1-3) is unaffected in how its *header* is allocated** — still a plain
+stack `alloca`, never heap/refcounted, exactly as before this stage.
+Its data/entries buffer is still always heap-allocated regardless (a
+dynamically-sized buffer was never safe to give a fixed-size alloca)
+and still needs freeing at that local's own scope-exit — this stage
+only adds a *second*, different scope-exit action (releasing the whole
+header) for the case where the header itself escapes, via a new
+`_StackArrayOrMap` marker mirroring `_StackStructFieldsOnly`'s own
+shape from stage 5.
+
+**Verified the same three ways as every stage before it:** new
+IR-level tests (a with-initializer array/map local is refcounted, not
+stack-allocated; array-typed struct field writes retain/don't retain
+correctly; a struct with an array field gets a dedicated cascade
+wrapper that calls `festina_release_array`; no `extractvalue` on
+either payload type appears anywhere in generated IR anymore), new
+compile-and-run tests (**the map-aliasing-through-growth bug above,
+now a dedicated regression test**; array/map function parameters alias
+the caller's own value; returning an array/map keeps the correct
+value; discarded array/map call results don't crash; a recursive
+function summing an array parameter; struct fields of array/map type
+read/write correctly; a global array repeatedly reassigned in a loop,
+the identical motivating case claude.md #77 originally had for
+structs) — `tests/test_codegen.py::TestAutomaticMemoryReclamation`
+grew from 93 to 107 — and real, properly-instrumented
+AddressSanitizer/LeakSanitizer runs against a combined stress program
+(every case above, plus two independently-tracked globals, a
+loop-scoped stack-allocated array/map, 1500-2000 iterations each) —
+zero ASan errors, zero leaks, including for every discarded call
+result. Every earlier stage's own combined verification program (14 in
+total, spanning stages 1 through 5) was re-run through the same
+pipeline to confirm no regression — all came back clean. Full suite
+before this stage: 778 tests; after: 790.
+
+**One more real bug found and precisely characterized while verifying
+this stage, deliberately not fixed here — see "what's still ahead"
+below:** a struct-typed value stored as an array *element* (not a
+struct *field* — that case is claude.md #78's own, already closed) can
+still be read after the local it originally came from has gone out of
+scope and been released, exactly the same shape of hazard claude.md
+#78 closed for fields, still open for elements. Confirmed directly,
+not assumed: a dedicated reproduction (a struct built fresh, stored as
+an array's sole element, the array escaping through a global while the
+original struct local's own function returns) produces a genuine
+**heap-use-after-free**, caught by AddressSanitizer. Because this
+stage never touches individual element/value storage at all — only an
+arr[T]/map[T]'s own *header* is refcounted, never what's stored
+*inside* it — this hazard is exactly as open after this stage as it
+was before; this stage neither creates it nor closes it, and the
+distinction (a fixed field list a struct's own declaration already
+enumerates, vs. a dynamically-sized, runtime-indexed collection) is
+precisely why it needs its own separate design pass, the same
+reasoning claude.md #79's own boundary paragraph gives.
+
 ### What's still ahead
 
-- **Reference counting for `arr[T]`/`map[T]` values that escape** —
-  stage 4/5 cover structs (including their own struct-typed fields)
-  only. An escaping array/map still leaks exactly as before these
-  stages; extending reference counting to arrays/maps needs their own
-  allocation sites (literal construction, `festina_map_set`'s own
-  realloc) to also carry the same header, a larger surface than the
-  struct-only allocation sites stages 4/5 touched. This is also a
-  prerequisite for two narrower gaps stage 5 itself left open: a
-  struct-typed field of an arr[T]/map[T] *element*, and an arr[T]/
-  map[T]-typed field of a struct -- neither can be soundly retained/
-  released until arr[T]/map[T] values themselves are refcounted
-  containers with a scope-exit release site to pair a retain with, the
-  same reason stage 5's own field-write logic deliberately excludes a
-  computed assignment target (`arr[i] = v`) even when the array's own
-  element type happens to be a struct.
+- **A struct-typed element of an `arr[T]`/`map[T]` value, and an
+  `arr[T]`/`map[T]`-typed element of another `arr[T]`/`map[T]` value.**
+  The one gap stage 6 confirmed still open, not merely left alone by
+  inertia -- see its own writeup above for the exact
+  AddressSanitizer-caught use-after-free reproduction. An arr[T]/
+  map[T]'s own elements/values are a dynamically-sized, runtime-indexed
+  collection, not a fixed field list a struct's own declaration already
+  enumerates the way claude.md #78's own struct-field cascade walks --
+  retaining/releasing them individually needs iterating the collection
+  at every point a value is stored into it *and* at every point the
+  whole container is freed, a materially different, harder problem
+  than the fixed-shape field walk claude.md #78 and #79 both already
+  do. Needs its own design pass, same bar as every stage here.
 - **A real tracing GC** was never seriously considered as an
   alternative to reference counting here, given section 77's own
   finding that reference cycles are structurally impossible in

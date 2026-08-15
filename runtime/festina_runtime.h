@@ -477,4 +477,13 @@ void festina_map_for_each(int64_t count, void *entries, void (*callback)(int64_t
  * and free(NULL) is a defined no-op). */
 void festina_map_free_entries(int64_t count, void *entries);
 
+/*
+ * claude.md #79: releases an arr[T]/map[T] value -- see each
+ * function's own doc comment in festina_runtime.c. Like
+ * festina_retain/festina_release, always safe to call on any arr[T]/
+ * map[T] value, including a null one.
+ */
+void festina_release_array(void *payload);
+void festina_release_map(void *payload);
+
 #endif

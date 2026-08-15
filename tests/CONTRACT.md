@@ -359,11 +359,11 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 776 tests in this directory pass against it: 524 need no external
+All 790 tests in this directory pass against it: 531 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-242 more need a working C compiler, plus 2 more
+249 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 8 more given
-`Xvfb`+`xdotool` too (524 + 242 + 2 + 8 = 776 -- re-verified directly
+`Xvfb`+`xdotool` too (531 + 249 + 2 + 8 = 790 -- re-verified directly
 by hiding each tool from PATH in turn, not just derived by counting
 `compile_and_run` call sites, since the true number had drifted well
 past a much older, since-inaccurate count of "694 given a working C
@@ -1761,11 +1761,140 @@ more bug while doing so, and deliberately did NOT attempt a third
   clean.
 
   See `todo.md`'s "Memory management" section, "Stage 5", for the full
-  writeup, and "What's still ahead" for the two narrower gaps this
-  stage itself left open (a struct-typed field of an arr[T]/map[T]
-  element, and an arr[T]/map[T]-typed field of a struct) and why both
-  need arr[T]/map[T] values themselves to be refcounted containers
-  first.
+  writeup, and "Stage 6" below for how this stage's own remaining gap
+  (a struct-typed field of an arr[T]/map[T] element -- an arr[T]/
+  map[T]-typed field of a struct is closed by stage 6 itself) needs
+  arr[T]/map[T] values to be refcounted containers first.
+
+- **Memory management stage 6: reference counting for escaping
+  `arr[T]`/`map[T]` values (claude.md #79, new section, same
+  session).** Closes the last of the three remaining struct-related
+  gaps -- but needed a real representation change first, not just a new
+  tracking rule, because arr[T]/map[T] never had a struct's own
+  single-pointer identity to begin with.
+
+  **The problem, found while designing this stage, not assumed:** an
+  arr[T]/map[T] value used to *be* the `{length, data}`/`{count,
+  entries}` pair itself -- `_llvm_type` returned
+  `FESTINA_ARRAY_LLVM_TYPE`/`FESTINA_MAP_LLVM_TYPE` directly, a plain
+  two-word aggregate *value*, copied by value on every assignment. Two
+  bindings made to alias each other each got their own independent
+  copy, sharing the same data/entries pointer only until one of them
+  changed. Merely imprecise for arr[T] (arrays never grow after
+  construction -- no `.push`, fixed size from their own literal), but a
+  **real, exploitable memory-safety bug** for map[T] specifically:
+  growing a map through one alias (`b['newkey'] = v`, reallocating the
+  entries buffer via `festina_map_set`) only ever updated *that one
+  binding's* own copy of `entries` -- every other binding ever made to
+  alias it kept a now-stale pointer into memory `realloc` may have
+  already moved or freed. Reproduced directly:
+  ```festina
+  map[int] a = {'x': 1}
+  map[int] b = a
+  b['y'] = 2      // grows b's own entries buffer via realloc
+  log(a['y'])     // reads through a's now-stale, possibly-freed pointer
+  ```
+  **segfaults** on the code as it stood before this stage -- confirmed
+  unrelated to anything else in this session's own work (never touches
+  map assignment, `_emit_map_set`, `_try_addressable`, or either
+  type's own construction), a pre-existing bug that had simply never
+  been exercised by any existing test.
+
+  **The fix:** arr[T]/map[T] is now a single `ptr` to its own
+  heap-allocated storage -- `_llvm_type(ArrayType)`/`_llvm_type(MapType)`
+  both return `"ptr"`, the identical representation and `{i64
+  refcount, payload...}` header layout a struct value already has
+  (`_emit_fresh_heap_header`, shared with an escaping struct local's
+  own allocation). Two bindings made to alias each other now share the
+  *exact same* header, so a growth through either is correctly,
+  immediately visible through both -- verified directly by re-running
+  the exact reproduction above and getting `2`, not a crash. Every
+  array/map-specific codegen site that used to GEP/extractvalue a
+  *value* now does the same one level of indirection further in (load
+  the `ptr`, then GEP off that): `.length`, `arr[i]`/`map[key]` reads,
+  `.forEach()`, `_emit_map_set`/`_emit_map_get`, sqlite row collection.
+  `_try_addressable` -- previously needed to tell an "addressable" map
+  target (whose own storage slot a grown entries pointer could be
+  written back into) apart from a merely "valuable" one -- was deleted
+  outright: every arr[T]/map[T] expression's own *value* is now the
+  header's address itself, exactly what `festina_map_set` needs, no
+  separate addressability concept left to maintain.
+
+  **Retain/release, identical to stages 4/5's own rule:** every
+  binding site (a local's own declaration, a plain reassignment, a
+  global, a struct field -- widening claude.md #78's own field-write
+  logic, which generalized cleanly once `_release_fn_for` existed -- a
+  `return` value, a discarded call result) retains the new value unless
+  its source is "owning," releases whatever it previously held.
+  "Owning" gains one new case beyond a plain function call: an array or
+  map *literal* -- structs have no literal syntax at all, so this case
+  never arose for them, but `[1,2,3]`/`{...}` allocate a fresh header
+  exactly like a call's own return value does. Release needed no
+  per-type codegen-generated wrapper the way a struct's own cascade
+  does -- every arr[T]'s header has the identical shape regardless of
+  T (same for map[T]), so two fixed runtime functions
+  (`festina_release_array`/`festina_release_map`, built on the same
+  `festina_release_check` split claude.md #78 introduced) cover every
+  case, both reached through the same `_release_fn_for` dispatch that
+  also routes to a struct's own per-type release function. A
+  non-escaping local's own stack-allocated header (stages 1-3) is
+  unaffected -- still a plain `alloca`, never refcounted; only its
+  data/entries buffer (always heap-allocated regardless) still needs
+  freeing at scope-exit, via a new `_StackArrayOrMap` marker mirroring
+  `_StackStructFieldsOnly`'s own shape from stage 5.
+
+  **A significant test-suite consequence, not a bug:** ten existing
+  IR-level tests asserted a bare `call void @free(` for a
+  with-initializer arr[T] local's own data buffer -- now correctly
+  `call void @festina_release_array(` instead, since a with-initializer
+  local is always refcounted (mirroring struct precedent, never stack-
+  allocated). Updated in place, plus two new tests added specifically
+  for the no-init, non-escaping case (which still uses the original
+  bare `@free`/`@festina_map_free_entries` path, unchanged).
+
+  Verified the same three ways as every stage before it: new IR-level
+  tests (a with-initializer array/map local is refcounted, not stack-
+  allocated; array-typed struct field writes retain/don't retain
+  correctly; a struct with an array field gets a dedicated cascade
+  wrapper calling `festina_release_array`; no `extractvalue` on either
+  payload type anywhere in generated IR), new compile-and-run tests
+  (**the map-growth-through-alias bug above, now a dedicated regression
+  test**; array/map function parameters alias the caller's own value;
+  returning an array/map keeps the correct value; discarded array/map
+  call results don't crash; a recursive function summing an array
+  parameter; struct fields of array/map type; a global array repeatedly
+  reassigned in a loop, the identical motivating case claude.md #77
+  originally had for structs) --
+  `tests/test_codegen.py::TestAutomaticMemoryReclamation` grew from 93
+  to 107 -- and a real, properly-instrumented AddressSanitizer/
+  LeakSanitizer run against a combined stress program (every case
+  above, plus two independently-tracked globals, a loop-scoped
+  stack-allocated array/map, 1500-2000 iterations each) -- zero ASan
+  errors, zero leaks including for every discarded call result. Every
+  earlier stage's own combined verification program (14 in total,
+  spanning stages 1 through 5) was re-run through the same pipeline --
+  all came back clean. Full suite before this stage: 778 tests; after:
+  790 (531 no external tool, 249 needing a C compiler, 2 needing
+  pyinstaller, 8 needing Xvfb+xdotool).
+
+  **One more real bug found and precisely characterized, deliberately
+  left open:** a struct-typed value stored as an array *element* (not
+  a struct *field* -- stage 5 already closed that case) can still be
+  read after the local it came from has gone out of scope and been
+  released. Confirmed directly: a dedicated reproduction (a fresh
+  struct stored as an array's sole element, the array escaping through
+  a global while the struct's own local function returns) produces a
+  genuine **heap-use-after-free**, caught by AddressSanitizer. This
+  stage only ever refcounts an arr[T]/map[T]'s own *header*, never what
+  it stores *inside*, so this hazard is exactly as open after this
+  stage as before -- a dynamically-sized, runtime-indexed collection
+  needs a materially different fix than stage 5's own fixed-field-list
+  cascade, not attempted here.
+
+  See `todo.md`'s "Memory management" section, "Stage 6", for the full
+  writeup and reproduction, and "What's still ahead" for exactly what
+  retaining/releasing individual arr[T]/map[T] elements/values would
+  still require.
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -2537,8 +2666,8 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 524 passed, 252 skipped (needs a C compiler; 2 of
+pytest tests/                          # 531 passed, 259 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
                                         # 8 need Xvfb + xdotool installed too) given a
-                                        # working C compiler, all 776 pass
+                                        # working C compiler, all 790 pass
 ```

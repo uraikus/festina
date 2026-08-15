@@ -240,11 +240,21 @@ it anymore, whichever of these shapes produced it. This includes a
 struct's own struct-typed *fields*: `outer.field = value` retains
 `value` the same way any other binding does, and freeing `outer`
 recursively frees whatever its own struct-typed fields still hold too,
-however many levels deep a program actually nests structs. An escaping
-`arr[T]`/`map[T]` value, a struct-typed field of an arr[T]/map[T]
-element, and an arr[T]/map[T]-typed field of a struct, are reclaimed by
-a later stage not yet implemented — see
-[todo.md](todo.md#memory-management).
+however many levels deep a program actually nests structs.
+
+An escaping `arr[T]`/`map[T]` value is reclaimed the same way: two
+variables made to alias each other (`map[T] b = a`) now share one
+underlying value, not independent copies — so growing `b` (adding a
+new key) is correctly visible through `a` too, not just the data each
+started out with. Assigning `[1, 2, 3]`/`{...}` into a fresh binding,
+returning an array/map, passing one to another function, storing one
+in a struct field — every one of these is reclaimed once nothing
+references it anymore, the identical rule struct values already
+follow. What isn't yet covered: a struct value stored as an
+`arr[T]`/`map[T]` *element* (as opposed to a struct *field*, which is
+covered) can still be read after the binding it came from goes out of
+scope — see [todo.md](todo.md#memory-management) for exactly what
+extending this to individual elements/values would still require.
 
 ## Arrays
 
@@ -255,8 +265,9 @@ log(numbers.length)
 numbers[0] = 10
 ```
 
-Not bounds-checked; data is never freed (no GC yet — see
-[todo.md](todo.md)).
+Not bounds-checked. Memory is reclaimed automatically — see "Structs"
+above for the full picture (non-escaping locals reclaimed at scope-exit,
+escaping values reference counted).
 
 ## Maps
 
