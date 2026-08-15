@@ -262,10 +262,9 @@ for the full design writeup.
   `claude.md #77` (stage 4) covers the remainder stages 1-3 can never
   reach on their own: a struct value proven to genuinely escape now has
   its own reference count (a struct-typed global, always; a struct-
-  typed local only when it was declared without an initializer, is
-  never itself returned, and is never itself the target of a plain
-  reassignment — see claude.md #77's own text for exactly why those
-  three conditions), freed once nothing references it anymore. This is
+  typed local at its own scope-exit, unless it's ever itself
+  returned — see claude.md #77's own text for exactly why that one
+  condition remains), freed once nothing references it anymore. This is
   sound specifically because Festina's type system makes reference
   cycles structurally impossible — a struct field's type must always be
   declared *before* the struct containing it, verified directly by
@@ -273,6 +272,21 @@ for the full design writeup.
   structs in either declaration order) fail to compile — so plain
   reference counting is a *complete* answer here, not the usual
   "handles everything but cycles" partial one.
+
+  Stage 4 initially shipped with a narrower local-scope carve-out (also
+  excluding a local declared with an initializer, or ever itself
+  reassigned) before widening to the scope above in the same stage: a
+  new `_is_owning_struct_source` classification retains a local's new
+  value whenever its source expression isn't a plain function call
+  (reading an existing identifier, a struct field, a ternary, ...,
+  since any of those might alias a value some other tracked binding
+  already references) and skips the retain only when the source is a
+  fresh call result nothing else yet references — the same
+  conservative "unprovable means retain" bias used everywhere else in
+  this feature. Unlike stage 4's first pass, this widening's own
+  verification (unit, IR-level, compile-and-run, and real
+  AddressSanitizer/LeakSanitizer runs, properly instrumented from the
+  start) found no new bugs.
 
   One nested case was investigated during stage 3 and *deliberately not
   attempted* after finding a real soundness hazard, not simply left
@@ -327,9 +341,10 @@ for the full design writeup.
   writeup and reproduction.
 
   Everything not covered by any stage (the nested-field case, a struct
-  local outside stage 4's own narrow scope, an escaping `arr[T]`/
-  `map[T]` value, and whether a value stored into a field of a call
-  argument is itself retained) still leaks exactly as before — a
+  local that's ever itself returned, a returned value discarded outright
+  at its call site, an escaping `arr[T]`/`map[T]` value, and whether a
+  value stored into a field of a call argument is itself retained)
+  still leaks exactly as before — a
   resource leak in a long-running process, not a safety issue on its
   own, no different in kind from the gap this note already accepted.
   What changed across all four stages is that each one's own fix, at

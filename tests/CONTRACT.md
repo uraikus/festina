@@ -359,11 +359,11 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 761 tests in this directory pass against it: 522 need no external
+All 770 tests in this directory pass against it: 526 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-229 more need a working C compiler, plus 2 more
+234 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 8 more given
-`Xvfb`+`xdotool` too (522 + 229 + 2 + 8 = 761 -- re-verified directly
+`Xvfb`+`xdotool` too (526 + 234 + 2 + 8 = 770 -- re-verified directly
 by hiding each tool from PATH in turn, not just derived by counting
 `compile_and_run` call sites, since the true number had drifted well
 past a much older, since-inaccurate count of "694 given a working C
@@ -1382,7 +1382,10 @@ more bug while doing so, and deliberately did NOT attempt a third
      until the symptom went away. Fixed by excluding any struct local
      ever found in `find_reassigned_names` from scope-exit release
      scheduling entirely -- the third of the three local-scope
-     conditions above.
+     conditions above. (This exclusion-based fix was itself superseded
+     later in the same stage -- see the widening entry below -- by
+     retaining on every local reassignment instead of excluding the
+     ones that needed it.)
 
   **A significant methodology finding, independent of either bug,
   surfaced while chasing bug 2:** the very first attempt to reproduce
@@ -1457,6 +1460,90 @@ more bug while doing so, and deliberately did NOT attempt a third
   deliberately sidesteps, and exactly what widening this stage's own
   scope (retaining on every local assignment, not just a global's)
   would still require.
+
+- **Memory management: widening stage 4's own local scope (claude.md
+  #77, same stage, same session).** Closes the gap the "Scope" entry
+  above documents: retaining on every LOCAL assignment/declaration, not
+  just a global's, the same way a global's own reassignment already
+  did. A new `CodeGen._is_owning_struct_source(expr)` classifies a
+  source expression as "owning" (a fresh, uniquely-owned value, no
+  retain needed -- its own +1 transfers cleanly into the new binding)
+  only when it is a plain `ast.Call`; every other shape -- reading an
+  existing identifier, a struct field, a ternary, ... -- is
+  conservatively classified "aliasing" and retained before the old
+  value is released, since something else might already reference the
+  same value. Two call sites apply this: a new
+  `_emit_local_struct_retain_release` (the local counterpart to the
+  existing `_emit_global_struct_retain_release`, called from
+  `_emit_assign`'s Identifier branch for a plain local reassignment) and
+  an equivalent inline check in `_emit_stmt`'s VarDecl-with-initializer
+  handling. With retaining now correct in both positions,
+  `_emit_block`'s own scope-exit scheduling drops two of the original
+  three exclusion conditions: a with-init local is now always eligible
+  for release tracking (it never stack-allocates -- claude.md #76 -- so
+  scheduling it is never wrong), and a no-init local is eligible exactly
+  when escape analysis says it escapes, unchanged. Only "never itself
+  returned" remains as an exclusion -- `Return` still doesn't retain.
+  The now-unnecessary exclusion machinery
+  (`escape_analysis.find_reassigned_names`,
+  `_walk_stmts_for_reassignments`, `_walk_stmt_for_reassignments`,
+  `_walk_expr_for_reassignments`, and `CodeGen._reassigned_names`) was
+  deleted outright rather than left dead once nothing referenced it.
+
+  Unlike stage 4's own first pass, this widening's build turned up no
+  new bugs -- attributed to three things done differently this time:
+  reusing the already-fixed, already-ASan-verified
+  `_emit_global_struct_retain_release` pattern as a direct template
+  instead of writing new retain/release logic from scratch; applying
+  the owning/aliasing classification conservatively (retain whenever
+  unprovable) from the very first line written, rather than arriving at
+  that bias only after a bug forced it; and using the corrected,
+  `sanitize_address`-attributed ASan pipeline from the first
+  verification run, rather than discovering the instrumentation gap
+  mid-verification the way stage 4's first pass did.
+
+  Verified the same three ways as every stage before it:
+  `tests/test_codegen.py::TestAutomaticMemoryReclamation` grew from 67
+  to 76, split across IR-level assertions (retain present for an
+  aliasing source, absent for an owning one, checked separately for the
+  VarDecl-with-initializer and plain-reassignment positions),
+  compile-and-run tests (a with-init local that never further escapes
+  freed correctly; a reassignment chain propagating through two
+  independently-tracked globals; a struct-field read used as a
+  reassignment source; self-reassignment of a local not crashing), and a
+  combined stress test (3000 iterations, embedded `fail()` correctness
+  checks, asserting clean exit). Real, properly-instrumented
+  AddressSanitizer/LeakSanitizer runs against a fresh combined program
+  (`makeAndDiscard`, a reassignment chain into two globals, reassignment
+  from a call result, multiple reassignments of one local, a
+  loop-reassigned local interacting with `break`/`continue`, and
+  self-reassignment stress, 500 iterations) came back with zero ASan
+  errors and zero leaks; a second, narrowly targeted program confirmed a
+  return value discarded outright (a bare `make(n)` statement, never
+  bound to any variable) still leaks exactly as before -- that gap is
+  unrelated to this widening and stays open. Every earlier stage's own
+  combined stress-test program (stage 1/2's nested-block and
+  interprocedural stress tests, stage 3's recursion-focused and
+  map-key-focused stress tests, plus stage 4's own bug-2 reproduction)
+  was re-run through the same corrected pipeline to confirm this
+  widening regresses nothing already proven -- all came back clean.
+
+  One unplanned side effect, worth recording precisely rather than
+  over- or under-claiming: stage 4's own combined verification program
+  went from 9999 leaked objects to zero under this widening, because
+  the caller's own `Point r = sometimesReturned(...)` -- a with-init
+  local -- is now correctly tracked and released at its own scope-exit.
+  This closes much of the "returned value leaks" gap for the common
+  case where a caller captures a call's result directly into a local --
+  but `Return`'s own retain/release logic was never touched, so a
+  return value that is discarded outright at its call site (never bound
+  to anything) still leaks unconditionally, confirmed by the dedicated
+  discard-only reproduction above.
+
+  See `todo.md`'s "Memory management" section, "Widening this stage's
+  own local scope", for the full writeup, and "What's still ahead" for
+  exactly what retaining every function's own return value would still
+  need to close the last gap.
 
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
@@ -2228,8 +2315,8 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 522 passed, 239 skipped (needs a C compiler; 2 of
+pytest tests/                          # 526 passed, 244 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
                                         # 8 need Xvfb + xdotool installed too) given a
-                                        # working C compiler, all 761 pass
+                                        # working C compiler, all 770 pass
 ```

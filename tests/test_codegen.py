@@ -2339,23 +2339,25 @@ class TestAutomaticMemoryReclamation:
 
     def test_reassigning_a_local_struct_to_alias_another_does_not_double_release(
             self, compile_and_run):
-        # A second real bug found while testing this stage, this one
-        # actually introduced by claude.md #77's own first pass: `Point
-        # q; q = p;` (q reassigned, after its own declaration, to alias
-        # p's storage) then BOTH p and q separately escaping (to two
-        # different globals) meant both were scheduled for release at
-        # their own, independent scope-exits -- with no retain anywhere
-        # to account for q's reassignment creating a second reference,
-        # the second release would decrement an already-zero (and, one
-        # more reassignment later, already-freed) refcount. Fixed by
-        # excluding any struct local that's ever reassigned
-        # (escape_analysis.find_reassigned_names) from scope-exit
-        # release scheduling entirely -- it leaks instead, the same
-        # "leaks but is memory-safe" fallback every other not-yet-
-        # covered case already gets. Confirmed via a real
-        # AddressSanitizer build with the generated code itself
-        # properly instrumented (`sanitize_address` added to every
-        # `define` -- see tests/CONTRACT.md's own note on why
+        # A real bug found while first building claude.md #77's own
+        # narrower initial scope: `Point q; q = p;` (q reassigned, after
+        # its own declaration, to alias p's storage) then BOTH p and q
+        # separately escaping (to two different globals) meant both
+        # were scheduled for release at their own, independent scope-
+        # exits -- with no retain anywhere to account for q's
+        # reassignment creating a second reference, the second release
+        # would decrement an already-zero (and, one more reassignment
+        # later, already-freed) refcount. That narrower scope's own fix
+        # was to exclude any reassigned struct local from release
+        # tracking entirely (it leaked instead); this stage's own
+        # widening replaces that exclusion with the actual missing
+        # piece -- _emit_local_struct_retain_release now retains
+        # whatever a reassignment's source aliases, which is what makes
+        # it safe to schedule q for release too, not just avoid double-
+        # releasing it. Confirmed via a real AddressSanitizer build with
+        # the generated code itself properly instrumented
+        # (`sanitize_address` added to every `define` -- see
+        # tests/CONTRACT.md's own note on why
         # `clang -fsanitize=address -c file.ll` alone does not
         # instrument raw LLVM IR the way it does C source), not just
         # from this test's own passing assertion.
@@ -2381,8 +2383,15 @@ class TestAutomaticMemoryReclamation:
         result = compile_and_run(source)
         assert result.stdout.strip() == "5"
 
-    def test_struct_declared_with_an_initializer_is_excluded_from_release_tracking(
+    def test_struct_declared_with_an_initializer_is_now_included_in_release_tracking(
             self, parser, semantic, codegen):
+        # claude.md #77 widened: r's own initializer is a Call (make's
+        # return value), an "owning" source per _is_owning_struct_source
+        # -- no retain needed there, r's alias just carries make()'s own
+        # +1 forward. `g = r` retains it (2). Two releases total: r's
+        # own scope-exit (2 -> 1, correctly still alive via g) and the
+        # global assignment's own release of g's previous value
+        # (static, a no-op, but the call still happens).
         source = """
         struct Point { x:int y:int }
         Point g
@@ -2399,28 +2408,24 @@ class TestAutomaticMemoryReclamation:
         ir = self._ir(parser, semantic, codegen, source)
         f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
         f_body = "\n".join(ir.splitlines()[f_start:])
-        # Only one release in f() -- the global assignment's own release
-        # of g's previous value. r itself is never scheduled for
-        # release (it was declared with an initializer).
-        assert f_body.count("call void @festina_release(") == 1
+        assert f_body.count("call void @festina_release(") == 2
 
-    def test_reassigned_struct_is_excluded_from_release_tracking(
+    def test_reassigned_struct_is_now_included_in_release_tracking(
             self, parser, semantic, codegen):
-        # q (the REASSIGNMENT TARGET) is excluded from its own scope-
-        # exit release -- only q's name is ever a bare-Identifier Assign
-        # target here, so only q is in find_reassigned_names's result.
-        # p itself was never reassigned (only ever a SOURCE, in `q = p`
-        # and `g1 = p`), so p is NOT excluded -- p correctly still gets
-        # its own scope-exit release, and that's exactly what keeps the
-        # refcount correct: p ends at 2 (retained once via `g1 = p`,
-        # once more via `g2 = q` since q aliases p, released back down
-        # by one via p's own scope-exit) -- 2 live references (g1 and
-        # g2), refcount 2, matching reality. Three releases total: one
-        # per global assignment's own previous value, plus p's own
-        # scope-exit -- q gets none, which is what actually prevents
-        # the double-release this test's own compile-and-run sibling
+        # claude.md #77 widened: q's own reassignment (`q = p`, p a bare
+        # Identifier -- an "aliasing" source) now retains p's value and
+        # releases q's OWN original allocation (freed immediately,
+        # nothing else ever referenced it) -- this is exactly what makes
+        # it safe to now ALSO schedule q for release at its own scope-
+        # exit, unlike before this widening. Five releases total: q's
+        # own reassignment releasing its original allocation, the two
+        # global assignments' own release of their previous (static,
+        # no-op) values, and p's and q's own scope-exit releases. Final
+        # refcount ends at 2 (g1 and g2, the two true live references),
+        # matching reality -- see this test's own compile-and-run
+        # sibling
         # (test_reassigning_a_local_struct_to_alias_another_does_not_double_release)
-        # confirms doesn't happen.
+        # for the correctness confirmation, not just the IR shape.
         source = """
         struct Point { x:int y:int }
         Point g1
@@ -2436,7 +2441,210 @@ class TestAutomaticMemoryReclamation:
         ir = self._ir(parser, semantic, codegen, source)
         f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
         f_body = "\n".join(ir.splitlines()[f_start:])
-        assert f_body.count("call void @festina_release(") == 3
+        assert f_body.count("call void @festina_release(") == 5
+
+    # ---- widening local retain/release (claude.md #77, same stage) ----
+
+    def test_local_reassignment_from_an_existing_identifier_retains(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            Point p
+            Point q
+            q = p
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" in f_body
+
+    def test_local_reassignment_from_a_call_result_does_not_retain(
+            self, parser, semantic, codegen):
+        # make()'s own return value is a fresh, uniquely-owned value --
+        # aliasing it into q needs no retain (see
+        # _is_owning_struct_source's own comment).
+        source = """
+        struct Point { x:int y:int }
+        Point func make(n:int) {
+            Point p
+            p.x = n
+            return p
+        }
+        void func f() {
+            Point q
+            q = make(5)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" not in f_body
+        # Still releases q's own original allocation on the way out.
+        assert "call void @festina_release(" in f_body
+
+    def test_vardecl_init_from_an_existing_identifier_retains(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        void func f() {
+            Point p
+            Point q = p
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" in f_body
+
+    def test_vardecl_init_from_a_call_result_does_not_retain(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point func make(n:int) {
+            Point p
+            p.x = n
+            return p
+        }
+        void func f() {
+            Point r = make(5)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" not in f_body
+        assert "call void @festina_release(" in f_body
+
+    def test_with_init_local_that_never_further_escapes_is_freed_correctly(
+            self, compile_and_run):
+        # The gap stage 4's own initial, narrower scope explicitly left
+        # open: a local declared with an initializer and never
+        # otherwise escaping used to leak permanently, since it was
+        # excluded from release tracking entirely. Now included --
+        # correctness confirmed here; the actual freeing (not just "no
+        # crash") is confirmed under AddressSanitizer/LeakSanitizer
+        # (see tests/CONTRACT.md).
+        source = """
+        struct Point { x:int y:int }
+        Point func make(n:int) {
+            Point p
+            p.x = n
+            return p
+        }
+        void func f(n:int) {
+            Point r = make(n)
+            log(r.x)
+        }
+        for int i = 0, i < 5, i++ {
+            f(i * i)
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "1", "4", "9", "16"]
+
+    def test_reassignment_chain_through_two_globals_keeps_correct_values(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        Point g1
+        Point g2
+        void func f(n:int) {
+            Point p
+            p.x = n
+            Point q
+            q = p
+            g1 = p
+            g2 = q
+        }
+        for int i = 0, i < 500, i++ {
+            f(i)
+        }
+        log(g1.x)
+        log(g2.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["499", "499"]
+
+    def test_struct_field_read_used_as_a_reassignment_source_retains_correctly(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        struct Outer { inner:Point label:text }
+        Point g
+        void func f(n:int) {
+            Point p
+            p.x = n
+            Outer o
+            o.inner = p
+            Point q
+            q = o.inner
+            g = q
+        }
+        for int i = 0, i < 500, i++ {
+            f(i)
+        }
+        log(g.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "499"
+
+    def test_self_reassignment_of_a_local_struct_does_not_crash(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        void func f(n:int) {
+            Point p
+            p.x = n
+            p = p
+            p = p
+            log(p.x)
+        }
+        f(7)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "7"
+
+    def test_widened_local_retain_release_combination_does_not_crash(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        Point g1
+        Point g2
+        Point func make(n:int) {
+            Point p
+            p.x = n
+            return p
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                Point r = make(i)
+                if r.x != i {
+                    fail('with-init local drifted')
+                }
+                Point p
+                p.x = i
+                Point q
+                q = p
+                g1 = p
+                g2 = q
+                if g1.x != i || g2.x != i {
+                    fail('reassignment chain drifted')
+                }
+                Point acc
+                acc = r
+                acc = q
+                if acc.x != i {
+                    fail('multi-reassignment drifted')
+                }
+            }
+        }
+        run(3000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
 
     def test_many_global_reassignments_with_break_and_continue_does_not_crash(
             self, compile_and_run):

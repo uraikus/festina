@@ -220,12 +220,21 @@ struct-typed global variable's value is reference counted and freed
 once nothing references it anymore, on every reassignment (including
 its own initial declaration) — a global repeatedly reassigned in a
 loop no longer leaks every value but the last. A struct-typed local
-that escapes gets the same treatment at its own scope-exit, but only
-when it was declared without an initializer, never itself returned,
-and never itself reassigned — a local outside that narrow scope, an
-escaping `arr[T]`/`map[T]` value, and a struct's own nested struct/
-array/map-typed fields are all reclaimed by a later stage not yet
-implemented — see [todo.md](todo.md#memory-management).
+that escapes gets the same treatment at its own scope-exit — declared
+with an initializer, or reassigned after declaration, no longer exclude
+it either, since every new value a local ever comes to hold (through an
+initializer or a plain reassignment) is now retained first whenever
+that value might already be referenced elsewhere. The one thing that
+still excludes a local from this: being returned anywhere in the
+function — a function's own `return` doesn't yet retain the value it
+hands back, so a local that's ever returned still leaks, and so does a
+returned value discarded outright at its call site (never bound to a
+variable). Capturing a call's result directly into a local (`Point r =
+someFunc()`) is unaffected by that gap, though — that local is tracked
+and freed correctly once its own scope ends. An escaping `arr[T]`/
+`map[T]` value, and a struct's own nested struct/array/map-typed
+fields, are reclaimed by a later stage not yet implemented — see
+[todo.md](todo.md#memory-management).
 
 ## Arrays
 

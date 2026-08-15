@@ -109,10 +109,11 @@ double-free, since nothing was ever freed). Four stages below have
 since narrowed that: a provably-safe struct is now stack-allocated
 outright (stage 3), a provably-safe `arr[T]`/`map[T]`'s data is still
 heap-allocated but now freed (stages 1/2), and a struct-typed global
-(always) or narrowly-scoped escaping local (stage 4) is reference
-counted and freed once nothing references it anymore — anything not
-covered by any stage is still heap-allocated (structs) or still leaks
-(arrays/maps, and any struct outside stage 4's own narrow scope),
+(always) or escaping local (stage 4) is reference counted and freed
+once nothing references it anymore — anything not covered by any stage
+is still heap-allocated (structs) or still leaks (arrays/maps, and a
+struct-typed local that is ever itself returned, the one gap stage 4's
+own later widening did not close — see below),
 exactly as originally described here.
 
 ### Stage 1: non-escaping locals (done — claude.md #74)
@@ -320,7 +321,8 @@ structs referencing each other in either declaration order. Reference
 cycles are not just rare in Festina — they are structurally impossible.
 
 **Scope, deliberately narrower than the full design originally
-sketched:** a struct-typed *global*'s value is fully reference counted
+sketched (at first — widened in the same stage shortly after, see
+below):** a struct-typed *global*'s value is fully reference counted
 — every reassignment (including its own declaration, if that
 declaration has an initializer) retains the new value and releases the
 old one, freeing it if nothing else references it anymore; the very
@@ -328,16 +330,18 @@ first assignment is never a special case, since a global's own
 untouched initial value carries a sentinel refcount both `festina_retain`/
 `festina_release` treat as an unconditional no-op (it was never
 heap-allocated, so it must never reach `free()`). A struct-typed
-*local* is only released at its own scope-exit (the same points
-stages 1-3 already track) when it was declared **without** an
-initializer, is **never** itself returned, and is **never** itself the
-target of a plain reassignment anywhere in its own function — a local
-failing any of these three conditions leaks exactly as it did before
-this stage. This is not the complete answer stages 1-3 themselves
-eventually reached for non-escaping locals (interprocedural analysis,
-every nesting shape) — it's the narrowest slice that's actually sound,
-because retaining on every local assignment (needed to widen this
-safely) isn't implemented yet — see "what's still ahead" below.
+*local* was, in this stage's first pass, only released at its own
+scope-exit (the same points stages 1-3 already track) when it was
+declared **without** an initializer, was **never** itself returned, and
+was **never** itself the target of a plain reassignment anywhere in its
+own function — a local failing any of these three conditions leaked
+exactly as it did before this stage. This was not the complete answer
+stages 1-3 themselves eventually reached for non-escaping locals
+(interprocedural analysis, every nesting shape) — it was the narrowest
+slice that was actually sound at the time, because retaining on every
+local assignment (needed to widen this safely) wasn't implemented yet.
+That narrowing was closed shortly after, in the same stage — see
+"Widening this stage's own local scope" below.
 
 **Two real bugs found and fixed while building this, both worth
 recording in full rather than glossed over as routine debugging:**
@@ -372,7 +376,11 @@ recording in full rather than glossed over as routine debugging:**
    any struct local that's ever the target of a plain reassignment
    (`escape_analysis.find_reassigned_names`, new) from scope-exit
    release scheduling entirely — the third of the three conditions
-   above.
+   above. (This exclusion-based fix was itself superseded, later in
+   this same stage, by retaining on every local reassignment instead of
+   sidestepping the ones that needed it — see "Widening this stage's
+   own local scope" below; `find_reassigned_names` was removed once
+   nothing depended on it anymore.)
 
 **A significant methodology finding, independent of either bug above,
 surfaced while chasing the second one:** `clang -fsanitize=address -c
@@ -428,6 +436,86 @@ zero ASan errors, and the only leak reported matches exactly the one
 value this stage's own documented scope says should still leak (a
 returned local), not a byte more.
 
+### Widening this stage's own local scope (done — claude.md #77, same stage)
+
+The narrow scope above excluded a struct local from scope-exit release
+tracking the moment it was declared with an initializer or was ever
+the target of a plain reassignment, because retaining a value only
+when something *else* might already reference it wasn't implemented
+for locals yet — only for globals. This widening implements exactly
+that: a new `CodeGen._is_owning_struct_source(expr)` classifies a
+source expression as "owning" (a fresh, uniquely-owned value, no
+retain needed — its own +1 transfers cleanly into the new binding)
+only when it's a plain `ast.Call`; every other shape (reading an
+existing identifier, a struct field, a ternary, ...) is conservatively
+treated as "aliasing" — retain needed, since something else might
+already reference the same value. This mirrors the project's
+established "when unprovable, be conservative in the safe direction"
+rule the same way every prior stage has. Two new codegen methods apply
+this: `_emit_local_struct_retain_release` (the local-variable
+counterpart to the existing `_emit_global_struct_retain_release`,
+called from `_emit_assign`'s Identifier branch for a plain local
+reassignment) and an equivalent inline check in `_emit_stmt`'s
+VarDecl-with-initializer handling. With retaining now correct for both
+cases, `_emit_block`'s own scope-exit scheduling no longer needs to
+exclude them: a with-init local is now always eligible for release
+tracking (it never stack-allocates — see `claude.md #76` — so it's
+never wrong to schedule it), and a no-init local is eligible exactly
+when escape analysis already says it escapes, same as before. The
+now-unnecessary exclusion machinery (`escape_analysis.find_reassigned_names`
+and `CodeGen._reassigned_names`) was removed entirely rather than left
+dead. The one condition that still excludes a local from this
+section's coverage — being returned anywhere in the function — is
+untouched by this widening: `Return` still doesn't retain, so a
+locally-declared struct that's ever returned still leaks, exactly as
+stage 4's first pass already documented.
+
+Unlike stage 4's first pass, this widening found no new bugs during
+verification — attributed to reusing the already-fixed, already-ASan-
+verified `_emit_global_struct_retain_release` pattern as a template,
+applying the owning/aliasing classification conservatively from the
+start, and using the corrected (`sanitize_address`-attributed) ASan
+methodology from the very first test rather than discovering the
+instrumentation gap mid-verification as stage 4's first pass did.
+Verified the same three ways as every stage before it: new IR-level
+tests asserting retain is present for an aliasing source and absent
+for an owning one, in both the VarDecl-with-initializer and plain-
+reassignment positions; new compile-and-run tests for a with-init
+local that never further escapes, a reassignment chain through two
+globals, a struct-field read used as a reassignment source, and
+self-reassignment, plus a combined stress test (3000 iterations,
+`tests/test_codegen.py::TestAutomaticMemoryReclamation`, 67 → 76); and
+real, properly-instrumented AddressSanitizer/LeakSanitizer runs against
+a fresh combined stress program (`makeAndDiscard`, a reassignment
+chain into two globals, reassignment from a call result, multiple
+reassignments of one local, a loop-local reassigned every iteration
+with `break`/`continue` interaction, and self-reassignment stress, 500
+iterations) — zero ASan errors and zero leaks — plus a second, narrowly
+targeted program confirming a *discarded* return value (`make(n)` used
+as a bare statement, never bound to any variable) still leaks exactly
+as before, since it never reaches any retain/release-aware codepath;
+that gap is unrelated to this widening and remains open, tracked below.
+Every earlier stage's own combined stress-test program
+(`chaos2.f`, `interproc2.f`, `stackalloc1.f`, `mapkeys1.f`,
+`recur_stack.f`, `rc_loop.f`, plus the debug-build traces from stage
+4's own bug hunts) was re-run through the same corrected pipeline to
+confirm this widening doesn't regress anything already proven — all
+came back clean.
+
+One notable, unplanned side effect worth recording precisely rather
+than overclaiming or underclaiming: the combined verification program
+from stage 4's first pass (`rc_combined.f`) went from 9999 leaked
+objects to **zero**, because the caller's own `Point r =
+sometimesReturned(...)` — a with-init local — is now correctly tracked
+and released once its own scope ends. This closes much of the
+"returned value leaks" gap for the common case where a caller captures
+a call's result in a local, but *not* because `Return`'s own
+retain/release logic was touched — it wasn't. A return value that's
+discarded outright, never bound to anything, still leaks unconditionally
+(confirmed by the dedicated `discard_check.f` program above). Retaining
+every value a function returns, closing that last gap, is still open —
+see "what's still ahead" below.
+
 ### What's still ahead
 
 - **Nested struct/array/map fields within a freed struct.** Explored
@@ -449,22 +537,27 @@ returned local), not a byte more.
   different, harder problem than stages 1/2's own syntactic "does this
   name appear outside a safe position" question — real aliasing/
   ownership analysis (does anything else still reference this field's
-  value when the struct holding it stops existing), the same kind of
-  question stage 4's own scope-narrowing (excluding reassigned/
-  initializer-declared locals) sidesteps rather than answers. Needs its
-  own design pass, same bar as every stage here.
-- **Widening stage 4's own scope**: retaining on every LOCAL
-  assignment/declaration (not just a global's), and on every value
-  returned from a function, the same way a global's reassignment
-  already is — this is what would let a struct declared with an
-  initializer, or ever reassigned, be safely included in scope-exit
-  release tracking too, closing most of what stage 4 currently leaves
-  leaking. Requires the same "is this source expression a fresh,
-  uniquely-owned value (no retain needed) or an alias of something
-  still independently live (retain needed)" distinction the nested-
-  field problem above needs too — likely the same design effort as
-  that bullet, and the field-aliasing problem, rather than three
-  separate ones.
+  value when the struct holding it stops existing). Retaining on every
+  local assignment (below, now done) turned out not to answer this one:
+  that widening only ever retains a *binding* (a local variable's own
+  slot) when it starts referencing a value — it never touches a
+  struct's own *field*, which is a different storage location with no
+  binding of its own to retain into. Still needs its own design pass,
+  same bar as every stage here.
+- **Retaining every value a function returns.** The one condition still
+  excluding a local from this stage's own scope-exit release tracking
+  (see "Widening this stage's own local scope" above): `Return` does
+  not yet retain the value it hands back to its caller, so a local
+  that's ever returned still leaks unconditionally, and a returned
+  value that's discarded outright (never bound to any variable at the
+  call site) leaks regardless of what this bullet would fix. Implementing
+  this is expected to need the same owning/aliasing source
+  classification the local-scope widening above already introduced,
+  applied to what a `return` statement's own expression evaluates to,
+  plus a decision about whose responsibility releasing an *unused*
+  return value would be (the callee never knows if its result will be
+  discarded; the caller doesn't retain what it never binds) — not yet
+  designed.
 - **Reference counting for `arr[T]`/`map[T]` values that escape** —
   stage 4 covers structs only. An escaping array/map still leaks
   exactly as before this stage; extending reference counting to

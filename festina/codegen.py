@@ -551,23 +551,6 @@ class CodeGen:
                                                 # possibly freeing) a value on its way out through Return.
                                                 # None outside any tracked function/handler body, same as
                                                 # _current_escaping_names.
-        self._reassigned_names = None          # claude.md #77: set (by _emit_analyzed_func_body, same
-                                                # shape as _returned_names) to escape_analysis.
-                                                # find_reassigned_names's result -- every name that's ever
-                                                # the TARGET of a plain `name = expr` reassignment anywhere
-                                                # in the function/handler body currently being emitted. An
-                                                # escaping struct local in this set is ALSO excluded from
-                                                # _emit_block's own release-at-scope-exit tracking, for a
-                                                # different reason than _returned_names: after such a
-                                                # reassignment, this name might alias whatever ANOTHER
-                                                # tracked local's own name already pointed to (`q = p`),
-                                                # and this stage does not retain on a plain local-to-local
-                                                # assignment (unlike a global's own reassignment -- see
-                                                # _emit_global_struct_retain_release) -- without that
-                                                # retain, releasing BOTH q and p independently at their own
-                                                # scope-exits would release the same underlying value twice.
-                                                # None outside any tracked function/handler body, same as
-                                                # _current_escaping_names.
         self._active_free_locals = []          # claude.md #74: stack of "frames," one per currently-
                                                 # open block within the function/handler body being
                                                 # emitted -- not just its own top-level body anymore, but
@@ -1047,20 +1030,17 @@ class CodeGen:
         one-function-at-a-time approach is already sound with no
         separate whole-program pre-pass or fixpoint needed.
 
-        claude.md #77: also computes self._returned_names and self.
-        _reassigned_names (see each field's own comment) the same way
-        -- once per function/handler, available for the whole of its
-        own emission, reset afterward."""
+        claude.md #77: also computes self._returned_names (see that
+        field's own comment) the same way -- once per function/handler,
+        available for the whole of its own emission, reset afterward."""
         escaping = escape_analysis.find_escaping_names(decl.body, escaping_params=self.escaping_params)
         self._current_escaping_names = escaping
         self._returned_names = escape_analysis.find_returned_names(decl.body)
-        self._reassigned_names = escape_analysis.find_reassigned_names(decl.body)
         try:
             block = self._emit_block(decl.body, body_env, return_type, body_lines)
         finally:
             self._current_escaping_names = None
             self._returned_names = None
-            self._reassigned_names = None
         if isinstance(decl, ast.FuncDecl):
             self.escaping_params[decl.name] = {
                 i for i, p in enumerate(decl.params) if p.name in escaping
@@ -1198,46 +1178,47 @@ class CodeGen:
                     found = env.lookup(stmt.name)
                     if found is not None:
                         ref, type_ = found
-                        if stmt.name not in self._current_escaping_names:
-                            # StructType is deliberately absent here: a
-                            # non-escaping struct local is stack-
-                            # allocated (see _emit_stmt's VarDecl
-                            # handling), not calloc'd, so there is
-                            # nothing left to free -- its storage is
-                            # simply reused/reclaimed the same way any
-                            # other stack-local's is. arr[T]/map[T]
-                            # still always calloc their data/entries
-                            # pointer regardless of escaping-ness (a
-                            # genuinely dynamic-size buffer isn't safe
-                            # to give a fixed-size alloca -- see this
-                            # method's own docstring), so those are
-                            # unaffected.
-                            if isinstance(type_, (types_mod.ArrayType, types_mod.MapType)):
+                        if isinstance(type_, (types_mod.ArrayType, types_mod.MapType)):
+                            # arr[T]/map[T] still always calloc their
+                            # data/entries pointer regardless of
+                            # escaping-ness (a genuinely dynamic-size
+                            # buffer isn't safe to give a fixed-size
+                            # alloca -- see this method's own
+                            # docstring) -- only tracked (for freeing,
+                            # not refcounted release -- see
+                            # _emit_free_active_locals) when proven
+                            # non-escaping, unaffected by anything
+                            # claude.md #77 does.
+                            if stmt.name not in self._current_escaping_names:
                                 self._active_free_locals[-1].append((ref, type_))
-                        elif (isinstance(type_, types_mod.StructType)
-                              and stmt.init is None
-                              and stmt.name not in self._returned_names
-                              and stmt.name not in self._reassigned_names):
-                            # claude.md #77: an escaping struct local
-                            # that's never itself returned, never
-                            # reassigned after its own declaration, and
-                            # declared fresh (no initializer -- see
-                            # _emit_stmt's own VarDecl handling for why
-                            # an initializer means this name might
-                            # alias something else's storage instead of
-                            # owning a fresh allocation of its own) is
-                            # refcounted -- release (not free) its own
-                            # reference when this scope ends, via the
-                            # exact same frame/down_to machinery as the
-                            # non-escaping case above, just a different
-                            # reclaim method (see
-                            # _emit_free_active_locals). A name that's
-                            # sometimes returned, ever reassigned, or
-                            # declared with an initializer is left out
-                            # of every frame entirely, function-wide --
-                            # see self._returned_names's and self.
-                            # _reassigned_names's own comments for why.
-                            self._active_free_locals[-1].append((ref, type_))
+                        elif isinstance(type_, types_mod.StructType):
+                            # claude.md #77 (widened): a struct local
+                            # declared WITH an initializer never goes
+                            # through stack allocation at all (see
+                            # _emit_stmt's own VarDecl handling -- it
+                            # always aliases its initializer's value,
+                            # retained there whenever that source isn't
+                            # a fresh call result), so it's always
+                            # refcounted and always safe to schedule for
+                            # release, regardless of its own escaping-
+                            # ness. A struct local declared WITHOUT one
+                            # is only refcounted (not stack-allocated)
+                            # when escape_analysis actually proves it
+                            # escapes -- exactly mirroring _emit_stmt's
+                            # own stack-vs-heap decision, since
+                            # scheduling anything else for release would
+                            # try to release a stack address that was
+                            # never calloc'd with a header in the first
+                            # place. Either way, a name that's ever
+                            # itself returned is still excluded
+                            # entirely, function-wide -- see
+                            # self._returned_names's own comment for
+                            # why (Return's own retain/release handling
+                            # isn't implemented yet).
+                            is_stack_allocated = (stmt.init is None
+                                                   and stmt.name not in self._current_escaping_names)
+                            if not is_stack_allocated and stmt.name not in self._returned_names:
+                                self._active_free_locals[-1].append((ref, type_))
             if tracking and not ctx["terminated"]:
                 self._emit_free_active_locals(lines, down_to=len(self._active_free_locals) - 1)
         finally:
@@ -1324,17 +1305,28 @@ class CodeGen:
                     # assignment would -- no fresh allocation of its
                     # own at all, since structs are always reference
                     # types at the Festina level (see this method's own
-                    # "kept uniform" note above). claude.md #77's own
-                    # release-scheduling deliberately excludes any
-                    # struct local declared with an initializer (see
-                    # _emit_block's own tracking condition) -- aliasing
-                    # an existing binding this way, without a matching
-                    # retain (not yet implemented for locals -- see
-                    # todo.md), would otherwise risk two different
-                    # tracked locals releasing the same underlying
-                    # value.
+                    # "kept uniform" note above).
+                    #
+                    # claude.md #77: retained here (mirroring
+                    # _emit_local_struct_retain_release's own logic,
+                    # which this can't just call -- there is no OLD
+                    # value to release for a name's own first-ever
+                    # declaration) whenever the initializer isn't a
+                    # plain function call -- see
+                    # _is_owning_struct_source's own comment for why a
+                    # call result needs no retain (it already owns a
+                    # fresh +1 nothing else references yet) while
+                    # anything else (an existing local/parameter/global
+                    # read, a field read, ...) does (something else
+                    # already references it too). This is what makes it
+                    # safe for _emit_block to schedule r for release at
+                    # its own scope-exit regardless of whether it has an
+                    # initializer -- r's own reference is now always
+                    # correctly counted, whichever way it came to exist.
                     val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
                     val = self._coerce(val, vtype, type_, lines)
+                    if not self._is_owning_struct_source(stmt.init):
+                        lines.append(f"  call void @festina_retain(ptr {val})")
                     lines.append(f"  {slot} = alloca ptr")
                     lines.append(f"  store ptr {val}, ptr {slot}")
                     env.define(stmt.name, slot, type_)
@@ -2136,6 +2128,73 @@ class CodeGen:
         lines.append(f"  call void @festina_retain(ptr {val})")
         lines.append(f"  call void @festina_release(ptr {old})")
 
+    def _is_owning_struct_source(self, expr):
+        """claude.md #77 (widened): a source expression is "owning" --
+        a fresh value with no other binding referencing it yet, so
+        aliasing it into a new slot needs no retain, the same "moves,
+        doesn't copy" reasoning a Return statement already relies on --
+        only when it's a plain function Call. Every other expression
+        shape (a bare Identifier reading an existing local/parameter/
+        global, a Member/field read, a Ternary between two such reads,
+        ...) is conservatively treated as "aliasing": something ELSE
+        already references this exact value (or could), so a NEW
+        binding referencing it too needs its own retain. This can only
+        ever retain when it turns out not to have been strictly
+        necessary (over-conservative, never under), never skip a retain
+        a real alias actually needed -- the same directional bias every
+        other stage in this whole effort has taken when a choice wasn't
+        fully provable either way.
+
+        Deliberately simple and conservative rather than a full points-
+        to analysis: a function call's own return value is "owning"
+        regardless of what that function's OWN body actually returns
+        (a fresh local it created, or -- in principle -- one of its own
+        parameters passed straight through) -- verified sound for
+        Festina specifically, not merely assumed, because nothing this
+        stage does lets a value's lifetime outlive its own true owner's
+        scope: a caller's local bound from a call result is itself
+        subject to this exact same tracking (retained wherever it's
+        THEN aliased further), so an under-counted "owning" call result
+        can only ever matter if something reads it after its own
+        binding's scope has already ended, which Festina's own lexical
+        scoping (no closures, no way to keep a name alive past its own
+        block) never allows in the first place."""
+        return isinstance(expr, ast.Call)
+
+    def _emit_local_struct_retain_release(self, ref, val, source_expr, lines):
+        """claude.md #77 (widened): the local-variable counterpart to
+        _emit_global_struct_retain_release, called from _emit_assign's
+        Identifier branch when the target is a LOCAL (not a global) --
+        never called for the target's own FIRST-EVER declaration
+        (VarDecl-with-initializer handles that separately, in
+        _emit_stmt, since it never has an "old value" to release), only
+        for an ordinary `q = expr` reassignment of an already-declared
+        local. Unlike the global version, there is no sentinel/immortal
+        case to skip here: a struct-typed local that's ever the target
+        of ANY assignment is unconditionally marked escaping by
+        escape_analysis's own existing rule (an assignment target
+        always escapes), so it can never have been stack-allocated (see
+        _emit_stmt's own VarDecl handling) -- its current value, at the
+        point of any reassignment, is always either its own original
+        heap+header allocation or some other value it was previously
+        made to alias, either way a real, releasable pointer. Retains
+        the new value only when _is_owning_struct_source says it needs
+        it (a fresh call result's own +1 already correctly transfers by
+        just aliasing it, no retain needed -- retaining it too would
+        permanently over-count, the one case where matching the
+        global-side function's always-retain choice would have cost
+        real, permanent leaks this stage specifically exists to close);
+        always releases the old value unconditionally, freeing it if
+        this reassignment was its last reference. Retain (when it
+        happens) still happens before release, for the identical
+        self-assignment-safety reason the global version's own comment
+        explains."""
+        old = self.tmp()
+        lines.append(f"  {old} = load ptr, ptr {ref}")
+        if not self._is_owning_struct_source(source_expr):
+            lines.append(f"  call void @festina_retain(ptr {val})")
+        lines.append(f"  call void @festina_release(ptr {old})")
+
     def _emit_assign(self, expr, env, lines):
         # The target's declared type is resolved *before* the value, so an
         # array-literal RHS (e.g. `nums = [4, 5, 6]`) can pick its element
@@ -2148,7 +2207,11 @@ class CodeGen:
             ref, ttype = found
             val, vtype = self._emit_value_for(expr.value, env, lines, ttype)
             val = self._coerce(val, vtype, ttype, lines)
-            self._emit_global_struct_retain_release(ref, val, ttype, lines)
+            if isinstance(ttype, types_mod.StructType):
+                if ref.startswith("@"):
+                    self._emit_global_struct_retain_release(ref, val, ttype, lines)
+                else:
+                    self._emit_local_struct_retain_release(ref, val, expr.value, lines)
             lines.append(f"  store {_llvm_type(ttype)} {val}, ptr {ref}")
             return val, ttype
         if isinstance(expr.target, ast.Member):
