@@ -142,6 +142,55 @@ Worth recording so they aren't re-litigated by a future audit pass:
   passes that text as a `%s` *argument*, never as the format string
   itself.
 
+## Graphics: a real window-manager crash (BadMatch on XSetInputFocus)
+
+**Severity: low (crash, not corruption or exploitable)**, but a real,
+user-reported bug affecting any graphics program (`claude.md #39`) run
+under an actual desktop window manager, not just the Xvfb-based test
+setup this project's own test suite runs against.
+
+`festina_graphics_init` (`runtime/festina_runtime_graphics.c`) asks for
+keyboard focus directly right after mapping its window
+(`XSetInputFocus`) — necessary since a bare Xvfb instance runs no window
+manager to hand focus over on its own, and without it `on key` would
+never fire under test. Under a *real* window manager, though, this is a
+genuine race: the WM can still be reparenting the just-mapped window at
+the exact moment this request reaches the server, so the window is
+transiently not yet "viewable" — a real, reproducible `BadMatch` (major
+opcode 42, `X_SetInputFocus`), and Xlib's *default* error handler prints
+that and then `exit()`s the whole program, crashing any graphics program
+(including the `tic_tac_toe.f` example) the instant it opened its
+window, on a real desktop.
+
+**Confirmed directly, not assumed from reading the X11 spec**: reproduced
+reliably by running a compiled Festina graphics program against Xvfb
+with a real window manager attached (`openbox`) instead of the bare,
+WM-less Xvfb the test suite otherwise uses — the exact
+`X Error of failed request: BadMatch ... X_SetInputFocus` the reporting
+user saw. A separate, unrelated hang was found and ruled out while
+narrowing this down: an early attempt to reproduce this under `twm` (a
+much older, rarely-used WM) surfaced its own, apparently
+grab-related deadlock deep inside `cairo_xlib_surface_create` that
+has nothing to do with this bug (confirmed by testing under `openbox`,
+where it doesn't occur at all) — not chased further, since `twm` isn't
+a WM any real user is likely running.
+
+**Fix:** the one `XSetInputFocus` call is now wrapped in a narrowly
+scoped, temporary error handler (`festina_ignore_focus_error`) that
+tolerates exactly this failure — installed immediately before the call,
+restored immediately after an explicit `XSync` forces any pending error
+to be delivered first. Every other X11 error the program might hit
+still goes through Xlib's own default (fatal) handler, unchanged — this
+only silences the one call already documented as "harmless either way"
+if it fails.
+
+Regression test:
+`tests/test_codegen.py::TestGraphics::test_graphics_init_does_not_crash_under_a_real_window_manager`,
+via a new `x_display_with_wm` fixture (`tests/conftest.py`) that layers
+a real `openbox` instance on top of the existing Xvfb-based `x_display`
+fixture — confirmed to both reproduce the original crash (fails cleanly
+without the fix, the window never appears) and pass cleanly with it.
+
 ## Binary slimming
 
 Not a vulnerability fix, but a real reduction in attack surface / supply
