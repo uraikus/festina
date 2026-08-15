@@ -105,12 +105,15 @@ longer reachable." Arrays and struct storage were originally always
 heap-allocated (`malloc`/`calloc`) and never freed — a real resource
 leak in any long-running program, though never a memory-safety issue on
 its own (see [security.md](security.md)'s note: no use-after-free, no
-double-free, since nothing was ever freed). Three stages below have
+double-free, since nothing was ever freed). Four stages below have
 since narrowed that: a provably-safe struct is now stack-allocated
-outright (stage 3), and a provably-safe `arr[T]`/`map[T]`'s data is
-still heap-allocated but now freed (stages 1/2) — anything not provably
-safe under any stage is still heap-allocated (structs) or still leaks
-(arrays/maps), exactly as originally described here.
+outright (stage 3), a provably-safe `arr[T]`/`map[T]`'s data is still
+heap-allocated but now freed (stages 1/2), and a struct-typed global
+(always) or narrowly-scoped escaping local (stage 4) is reference
+counted and freed once nothing references it anymore — anything not
+covered by any stage is still heap-allocated (structs) or still leaks
+(arrays/maps, and any struct outside stage 4's own narrow scope),
+exactly as originally described here.
 
 ### Stage 1: non-escaping locals (done — claude.md #74)
 
@@ -299,56 +302,185 @@ give or take LeakSanitizer's own already-documented conservative
 under-count, confirming the escaping/leaking *set* is unchanged by
 this stage, only the mechanism for the non-escaping set is).
 
+### Stage 4: reference counting for escaping struct globals and locals (done — claude.md #77)
+
+The remainder stages 1-3 can never reach on their own: a value proven
+to genuinely escape has nothing for pure escape analysis to do, since
+something else might still need it when its own declaring scope ends.
+This stage tracks how many bindings reference a struct value and frees
+it only once that count reaches zero — reference counting, not a
+tracing GC, and *complete* for Festina specifically, not the usual
+"handles everything but cycles" partial answer: a struct field's type
+must always be declared *before* the struct containing it (the same
+rule that already governs function forward references), so no struct
+can ever reference itself, directly or through any chain of fields —
+verified directly, not assumed, by writing `struct Node { next:Node }`
+and confirming it fails to compile, then confirming the same for two
+structs referencing each other in either declaration order. Reference
+cycles are not just rare in Festina — they are structurally impossible.
+
+**Scope, deliberately narrower than the full design originally
+sketched:** a struct-typed *global*'s value is fully reference counted
+— every reassignment (including its own declaration, if that
+declaration has an initializer) retains the new value and releases the
+old one, freeing it if nothing else references it anymore; the very
+first assignment is never a special case, since a global's own
+untouched initial value carries a sentinel refcount both `festina_retain`/
+`festina_release` treat as an unconditional no-op (it was never
+heap-allocated, so it must never reach `free()`). A struct-typed
+*local* is only released at its own scope-exit (the same points
+stages 1-3 already track) when it was declared **without** an
+initializer, is **never** itself returned, and is **never** itself the
+target of a plain reassignment anywhere in its own function — a local
+failing any of these three conditions leaks exactly as it did before
+this stage. This is not the complete answer stages 1-3 themselves
+eventually reached for non-escaping locals (interprocedural analysis,
+every nesting shape) — it's the narrowest slice that's actually sound,
+because retaining on every local assignment (needed to widen this
+safely) isn't implemented yet — see "what's still ahead" below.
+
+**Two real bugs found and fixed while building this, both worth
+recording in full rather than glossed over as routine debugging:**
+
+1. A *pre-existing* bug, not introduced by this stage: `Point r =
+   someFunc()` for a **local** `r` silently discarded the call's
+   return value and left `r` at its stack-allocated zero value instead
+   — `_emit_stmt`'s own struct VarDecl handling never looked at
+   `stmt.init` at all (a top-level/global `Point r = someFunc()`
+   already worked, but through a completely different code path,
+   `_emit_toplevel_stmt`, untouched by the bug). Found by writing
+   exactly this pattern as part of this stage's own verification
+   program and noticing a `fail()` fire that shouldn't have; traced to
+   the generated IR (`alloca %struct.Point` + `store ...
+   zeroinitializer`, the call's own return value never referenced
+   again) before fixing it, not patched blind from the symptom. Fixed
+   by making a struct VarDecl-with-initializer simply alias whatever
+   its initializer evaluates to, the same as an ordinary `r = expr`
+   assignment would, with no allocation of its own.
+2. A bug this stage's *own first pass* introduced: `Point q; q = p;`
+   (`q` reassigned, after its own declaration, to alias `p`'s storage)
+   with both `p` and `q` later assigned to two *different* globals
+   meant both were scheduled for release at their own, independent
+   scope-exits — with nothing retaining the extra reference `q = p`
+   created, the second release decremented a refcount the first
+   release had already brought to its true value, and one more
+   reassignment later, actually freed memory a still-live global still
+   pointed to. Found the same way: written as part of the verification
+   program, traced by hand (a debug build of the runtime printing every
+   retain/release call) to confirm the exact mechanism before fixing
+   it, not just accepting "the test now passes." Fixed by excluding
+   any struct local that's ever the target of a plain reassignment
+   (`escape_analysis.find_reassigned_names`, new) from scope-exit
+   release scheduling entirely — the third of the three conditions
+   above.
+
+**A significant methodology finding, independent of either bug above,
+surfaced while chasing the second one:** `clang -fsanitize=address -c
+file.ll` does **not** instrument raw LLVM IR text the way it
+instruments C source. ASan's per-function opt-in (the
+`sanitize_address` attribute) is normally added by clang's own C
+frontend during compilation, which is bypassed entirely when the input
+is already `.ll` — verified directly by compiling a hand-written
+`.ll` file containing an unambiguous calloc+free+read-after-free
+through this exact pipeline and finding it produced zero
+`sanitize_address`/`__asan_report*` symbols and did not catch the bug,
+while the byte-for-byte-equivalent pattern written as `.c` source
+produced 28 such symbols and caught it immediately. This means every
+prior AddressSanitizer verification claim in this document and
+`security.md`/`tests/CONTRACT.md`, for stages 1 through 3 and
+interprocedural analysis, checked LeakSanitizer's allocation-tracking
+correctly (that tracks the allocator's own calls directly, unaffected
+by instrumentation) but never actually exercised ASan's
+corruption-detection (heap-buffer-overflow, use-after-free,
+double-free) against the *generated program's own* memory accesses —
+only against the hand-written runtime `.c` file linked alongside it.
+The fix is straightforward once identified: add the `sanitize_address`
+attribute to every `define` in the generated `.ll` file before
+compiling. Re-ran the earlier stages' own combined verification
+programs (stage 1/2's nested-block and interprocedural-analysis
+stress tests, stage 3's recursion and map-key stress tests) through
+the corrected pipeline specifically to check for anything the flawed
+methodology might have missed silently — all came back clean, zero
+ASan errors, with this stage's own two bugs (both found via the exact
+same corrected pipeline) being the only real findings from this whole
+retrospective check. Their own underlying *design* reasoning holds up;
+only this stage's own new retain/release logic was ever actually
+unverified for corruption, and both bugs it had are now fixed and
+covered by regression tests. See tests/CONTRACT.md for the full
+methodology writeup and reproduction.
+
+Verified the same way as every stage before it, this time with the
+corrected instrumentation from the start once it was found: new unit
+tests (`tests/test_escape_analysis.py::TestFindReturnedNames` plus a
+`find_reassigned_names` walker, mirroring `find_returned_names`'s own
+shape), new IR-level and compile-and-run tests in
+`tests/test_codegen.py::TestAutomaticMemoryReclamation` (51 → 67,
+including a dedicated regression test for each of the two bugs above),
+and real AddressSanitizer/LeakSanitizer runs (properly instrumented)
+against a combined program exercising global reassignment in a loop
+(the exact scenario originally found and documented as a leak, back
+when stage 1 first shipped — now correctly freed, not leaked), a
+sometimes-returned local (correctly still leaks, by this stage's own
+stated scope), a reassigned local aliasing another tracked local
+(correctly no longer double-released), self-assignment, and two
+independently-tracked globals, all run for hundreds of iterations —
+zero ASan errors, and the only leak reported matches exactly the one
+value this stage's own documented scope says should still leak (a
+returned local), not a byte more.
+
 ### What's still ahead
 
 - **Nested struct/array/map fields within a freed struct.** Explored
-  as part of stage 3 above and *deliberately not attempted* after
-  finding a real soundness hazard, not merely left alone by inertia:
-  the only way to populate a struct-typed field is `outer.field =
-  someExistingLocal` (there's no struct-literal initializer syntax),
-  which stores that local's own pointer into the field — an alias, not
-  a copy (confirmed directly by inspecting the generated IR: `store
-  ptr %t11, ptr %t10`, the same pointer value, not a fresh allocation).
-  `someExistingLocal` is already correctly marked escaping by stages
-  1/2's own existing rule (an assignment *value* always escapes), so it
-  was never going to be double-freed under its own name — but freeing
-  `outer.field`'s value when `outer` itself goes out of scope would
-  free that *same* memory through a different name, and if
-  `someExistingLocal` is read again anywhere after that point (still
-  entirely legal Festina code — it's a live variable in its own scope
-  until *it* goes out of scope), that read would be a genuine
-  use-after-free. Confirmed concretely, not just reasoned about: wrote
-  exactly that program, inspected its IR, and traced the aliasing by
-  hand before concluding this needs real aliasing/ownership analysis
-  (does anything else still reference this field's value when the
-  struct holding it stops existing) rather than the syntactic "does
-  this name appear outside a safe position" question stages 1/2 both
-  answer. That's a structurally different, harder problem — arguably
-  the same problem as reference counting below, just asked from the
-  freeing side instead of the retaining side — not a small extension
-  of the existing rule, and not attempted here for exactly that reason.
-  Needs its own design pass, same bar as every stage here.
-- **Reference counting** (or a real tracing GC) for the values escape
-  analysis can't (or structurally never could) clear — genuinely shared
-  values, or ones stored somewhere long-lived on purpose (globals,
-  caches). This is the complete answer for the remainder escape
-  analysis (stages 1-3) can never reach on its own (a value that
-  provably *does* escape has nothing for escape analysis to do), but
-  touches nearly
-  every place a value is assigned, passed, stored, or a scope exits — a
-  large surface area to get right, and an incorrect refcount (an early
-  free, or a missed increment) *is* a real memory-safety bug, a genuine
-  regression from "leaks but is memory-safe," not a wash. Cycles are
-  also a real question to resolve one way or another (rare in Festina's
-  language model, given no closures/first-class functions, but not
-  provably impossible without checking). A real design for this would
-  also need to settle the nested-field aliasing question just above,
-  since a struct field holding a refcounted value is exactly the kind
-  of "does something else still reference this" question refcounting
-  exists to answer generally — the two bullets here are likely one
-  design effort, not two. Needs its own `claude.md` addition and
-  dedicated design pass before implementation, same as every stage
-  here — not attempted yet, not overlooked.
+  as part of stage 3 and *deliberately not attempted* after finding a
+  real soundness hazard, not merely left alone by inertia: the only way
+  to populate a struct-typed field is `outer.field = someExistingLocal`
+  (there's no struct-literal initializer syntax), which stores that
+  local's own pointer into the field — an alias, not a copy (confirmed
+  directly by inspecting the generated IR: `store ptr %t11, ptr %t10`,
+  the same pointer value, not a fresh allocation). `someExistingLocal`
+  is already correctly marked escaping by stages 1/2's own existing
+  rule (an assignment *value* always escapes), so it was never going to
+  be double-freed under its own name — but freeing `outer.field`'s
+  value when `outer` itself goes out of scope would free that *same*
+  memory through a different name, and if `someExistingLocal` is read
+  again anywhere after that point (still entirely legal Festina code —
+  it's a live variable in its own scope until *it* goes out of scope),
+  that read would be a genuine use-after-free. This is a structurally
+  different, harder problem than stages 1/2's own syntactic "does this
+  name appear outside a safe position" question — real aliasing/
+  ownership analysis (does anything else still reference this field's
+  value when the struct holding it stops existing), the same kind of
+  question stage 4's own scope-narrowing (excluding reassigned/
+  initializer-declared locals) sidesteps rather than answers. Needs its
+  own design pass, same bar as every stage here.
+- **Widening stage 4's own scope**: retaining on every LOCAL
+  assignment/declaration (not just a global's), and on every value
+  returned from a function, the same way a global's reassignment
+  already is — this is what would let a struct declared with an
+  initializer, or ever reassigned, be safely included in scope-exit
+  release tracking too, closing most of what stage 4 currently leaves
+  leaking. Requires the same "is this source expression a fresh,
+  uniquely-owned value (no retain needed) or an alias of something
+  still independently live (retain needed)" distinction the nested-
+  field problem above needs too — likely the same design effort as
+  that bullet, and the field-aliasing problem, rather than three
+  separate ones.
+- **Reference counting for `arr[T]`/`map[T]` values that escape** —
+  stage 4 covers structs only. An escaping array/map still leaks
+  exactly as before this stage; extending reference counting to
+  arrays/maps needs their own allocation sites (literal construction,
+  `festina_map_set`'s own realloc) to also carry the same header, a
+  larger surface than the struct-only allocation sites stage 4 touched.
+- **A real tracing GC** was never seriously considered as an
+  alternative to reference counting here, given section 77's own
+  finding that reference cycles are structurally impossible in
+  Festina's current type system (no self-referential or
+  forward-referencing struct/array/map element types) — a tracing
+  collector's main advantage over refcounting is handling cycles
+  refcounting can't, which isn't a problem this language can currently
+  produce. Worth revisiting only if a future language change
+  (closures, first-class functions, or forward-referencing types)
+  reintroduces the possibility.
 
 ## Smaller, not yet tracked elsewhere
 

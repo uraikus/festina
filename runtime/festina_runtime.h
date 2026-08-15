@@ -394,6 +394,30 @@ int8_t festina_audio_is_playing(void *audio);
 char *festina_getenv(const char *name);
 
 /*
+ * claude.md #77: reference counting for struct/arr[T]/map[T] values
+ * escape analysis (claude.md #74/#75/#76) proves DO escape their
+ * declaring function -- the remainder that pure escape analysis can
+ * never reach on its own. Complete (not just "handles everything but
+ * cycles") for Festina specifically: a struct field's type, and an
+ * arr[T]/map[T]'s own element type, must always be declared *before*
+ * the struct/array/map containing it (verified directly -- even
+ * `struct Node { next:Node }` fails to compile), so no value can ever
+ * transitively reference itself. See festina_retain/festina_release's
+ * own doc comment in festina_runtime.c for the full design (the
+ * refcount header layout, the negative-refcount immortal sentinel used
+ * for a global's own untouched static initial storage, and why no
+ * cycle-breaking machinery is needed at all).
+ *
+ * `payload` is the pointer Festina code itself sees (past the hidden
+ * header) -- both functions are always safe to call on any struct
+ * value, including a null one (a struct-typed field or global that was
+ * never assigned) and including a global's own immortal static
+ * storage.
+ */
+void festina_retain(void *payload);
+void festina_release(void *payload);
+
+/*
  * claude.md #72: map[T] -- { key: value, ... } literals,
  * npcHealths[key] read/write, npcHealths.forEach(callback).
  *

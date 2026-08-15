@@ -259,6 +259,21 @@ for the full design writeup.
   size isn't known in advance, and a stack allocation needs a size
   that is.
 
+  `claude.md #77` (stage 4) covers the remainder stages 1-3 can never
+  reach on their own: a struct value proven to genuinely escape now has
+  its own reference count (a struct-typed global, always; a struct-
+  typed local only when it was declared without an initializer, is
+  never itself returned, and is never itself the target of a plain
+  reassignment — see claude.md #77's own text for exactly why those
+  three conditions), freed once nothing references it anymore. This is
+  sound specifically because Festina's type system makes reference
+  cycles structurally impossible — a struct field's type must always be
+  declared *before* the struct containing it, verified directly by
+  confirming `struct Node { next:Node }` (and two mutually-referencing
+  structs in either declaration order) fail to compile — so plain
+  reference counting is a *complete* answer here, not the usual
+  "handles everything but cycles" partial one.
+
   One nested case was investigated during stage 3 and *deliberately not
   attempted* after finding a real soundness hazard, not simply left
   alone: freeing a struct/array/map-typed **field** of an
@@ -276,39 +291,72 @@ for the full design writeup.
   use-after-free. This needs real aliasing/ownership analysis to close
   soundly, not a small extension of the existing syntactic rule — see
   [todo.md](todo.md#memory-management) for the full trace and why it's
-  effectively the same open problem as reference counting, approached
-  from the other direction.
+  effectively the same open problem stage 4's own narrow scope
+  sidesteps rather than answers.
 
-  Everything not covered by any stage (that one nested-field case, and
-  whether a value stored into a field of a call argument is itself
-  retained) still leaks exactly as before — a resource leak in a
-  long-running process, not a safety issue on its own, no different in
-  kind from the gap this note already accepted. What changed across all
-  three stages is that each one's own fix, at every step of building it
-  out, was verified with the same rigor the rest of this document's
-  findings were: exhaustive unit tests of the analysis itself,
-  end-to-end compile-and-run tests including the exact "return a struct
-  by value" pattern the earlier naive stack-allocation attempt below
-  got wrong and the critical "a value merely used inside a loop, not
-  declared inside it, survives that loop's own break/continue" case,
-  and real AddressSanitizer/LeakSanitizer runs (zero ASAN errors every
-  time, across four different combined stress programs for stage 3
-  alone — a recursion-focused one and a map-key-focused one written
-  fresh, plus stage 1/2's own combined programs re-run unchanged to
-  confirm no regression; LeakSanitizer's reported leaks matched the
-  hand-derived expected count almost exactly every time it was checked,
-  including one run where the "extra" leak turned out to be a real,
-  separately-explained, structurally different gap -- a global
-  repeatedly reassigned orphaning its previous value -- confirmed by
-  removing that one line and re-running to zero leaks, not waved away;
-  stage 2 and stage 3's own combined verification programs specifically
-  ran with leak detection off for their correctness check, since
-  AddressSanitizer's own leak-report exit path can skip flushing
-  already-buffered stdout -- unrelated to this feature -- and
-  separately with leak detection on to confirm only the values
-  genuinely proven to escape were the ones that leaked)
+  Stage 4's own build process found two real bugs, both fixed and
+  covered by regression tests before shipping — worth naming precisely
+  here, not just "bugs were fixed": (1) a *pre-existing* bug, unrelated
+  to reference counting itself, where a local `Point r = someFunc()`
+  silently discarded the call's return value and left `r` zeroed,
+  because the struct VarDecl codegen path never looked at its own
+  initializer expression at all; and (2) a bug stage 4's own first pass
+  introduced, where reassigning a local struct to alias another
+  (`Point q; q = p;`) followed by both ending up independently tracked
+  for release meant the same underlying value could be released twice
+  — fixed by excluding any struct local that's ever reassigned from
+  release tracking entirely (the third of the three local-scope
+  conditions above). Finding bug (2) also surfaced a significant,
+  independent methodology finding: `clang -fsanitize=address -c
+  file.ll` does not actually instrument raw LLVM IR text the way it
+  instruments C source (verified directly — a hand-written
+  calloc+free+read-after-free `.ll` file compiled this way produced
+  zero ASan instrumentation symbols and didn't catch the bug; the
+  identical pattern as `.c` source did). This means every earlier
+  AddressSanitizer claim in this document, for stages 1 through 3 and
+  interprocedural analysis, only ever exercised LeakSanitizer's
+  allocation tracking (unaffected by instrumentation) and the
+  hand-written runtime's own `.c` code, never the *generated program's*
+  own memory accesses for corruption. Re-running those earlier stages'
+  own combined verification programs through the corrected pipeline
+  (adding the `sanitize_address` attribute to every generated function
+  before compiling) found nothing else wrong — their own design
+  reasoning holds up; only stage 4's own new logic had never actually
+  been checked for corruption before, and both bugs it turned up are
+  now fixed. See [todo.md](todo.md#memory-management) for the complete
+  writeup and reproduction.
+
+  Everything not covered by any stage (the nested-field case, a struct
+  local outside stage 4's own narrow scope, an escaping `arr[T]`/
+  `map[T]` value, and whether a value stored into a field of a call
+  argument is itself retained) still leaks exactly as before — a
+  resource leak in a long-running process, not a safety issue on its
+  own, no different in kind from the gap this note already accepted.
+  What changed across all four stages is that each one's own fix, at
+  every step of building it out, was verified with the same rigor the
+  rest of this document's findings were: exhaustive unit tests of the
+  analysis itself, end-to-end compile-and-run tests including the exact
+  "return a struct by value" pattern the earlier naive stack-allocation
+  attempt below got wrong and the critical "a value merely used inside
+  a loop, not declared inside it, survives that loop's own break/
+  continue" case, and real AddressSanitizer/LeakSanitizer runs (zero
+  ASAN errors every time, with stage 4's own verification specifically
+  using the corrected, properly-instrumented pipeline described above;
+  LeakSanitizer's reported leaks matched the hand-derived expected
+  count almost exactly every time it was checked, including one run
+  where the "extra" leak turned out to be a real, separately-explained,
+  structurally different gap -- a global repeatedly reassigned
+  orphaning its previous value -- confirmed by removing that one line
+  and re-running to zero leaks, not waved away, and stage 4 itself
+  closing that exact original leak scenario for good; several stages'
+  own combined verification programs specifically ran with leak
+  detection off for their correctness check, since AddressSanitizer's
+  own leak-report exit path can skip flushing already-buffered stdout
+  -- unrelated to this feature -- and separately with leak detection on
+  to confirm only the values genuinely proven to escape were the ones
+  that leaked)
   — see [todo.md](todo.md#memory-management) for the full writeup,
   including the naive stack-allocation attempt that was tried before
   stage 1 existed and reverted after being verified to corrupt memory,
-  and exactly what the nested-field case and reference counting for the
-  values escape analysis can't reach at all would each still require.
+  and exactly what the nested-field case and widening stage 4's own
+  scope would each still require.

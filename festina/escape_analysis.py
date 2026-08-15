@@ -255,3 +255,168 @@ def _walk_assign_target(target, escaping, escaping_params):
     raise AssertionError(
         f"escape_analysis: unhandled assignment target {type(target).__name__}"
     )
+
+
+def find_returned_names(block):
+    """claude.md #77: every name that appears as a *bare* Return value
+    (`return p`, not `return p.x` or `return f(p)`) anywhere in `block`,
+    at any nesting depth -- a much narrower question than
+    find_escaping_names's own "does this name appear outside a safe
+    position anywhere," and answered independently of it: this exists
+    purely to tell CodeGen._emit_block which escaping struct locals are
+    safe to schedule for release at an ordinary scope-exit point (block
+    exit, loop iteration, break/continue) versus which ones might be
+    handed off to a caller through Return instead, a transfer this
+    stage does not yet implement (see claude.md #77's own stated
+    scope). A name found here is excluded from that scope-exit release
+    path entirely, function-wide -- not just on the specific paths that
+    actually return it -- the same conservative, name-based (not
+    flow-sensitive) stance find_escaping_names itself already takes:
+    this can only ever make a name look MORE likely to be returned than
+    it really is on any single path, never less, so it can only cost a
+    missed optimization (leaking a little longer than a fully
+    path-sensitive analysis could), never risk releasing a value still
+    on its way out through Return.
+
+    Deliberately much simpler than find_escaping_names's own walker:
+    only Return statements matter here, so this doesn't need to walk
+    into expressions at all (a Return's value is either a bare
+    Identifier, which is all this cares about, or something else,
+    which isn't), and doesn't need find_escaping_names's own "raise on
+    an unrecognized expression kind" discipline, since it never
+    inspects expression *kinds* beyond that one isinstance check."""
+    returned = set()
+    _walk_stmts_for_returns(block.body, returned)
+    return returned
+
+
+def _walk_stmts_for_returns(stmts, returned):
+    for stmt in stmts:
+        _walk_stmt_for_returns(stmt, returned)
+
+
+def _walk_stmt_for_returns(stmt, returned):
+    if isinstance(stmt, ast.Return):
+        if isinstance(stmt.value, ast.Identifier):
+            returned.add(stmt.value.name)
+    elif isinstance(stmt, ast.IfStmt):
+        _walk_stmts_for_returns(stmt.then.body, returned)
+        if stmt.orelse is not None:
+            if isinstance(stmt.orelse, ast.IfStmt):
+                _walk_stmt_for_returns(stmt.orelse, returned)
+            else:
+                _walk_stmts_for_returns(stmt.orelse.body, returned)
+    elif isinstance(stmt, ast.WhileStmt):
+        _walk_stmts_for_returns(stmt.body.body, returned)
+    elif isinstance(stmt, ast.ForStmt):
+        _walk_stmts_for_returns(stmt.body.body, returned)
+    elif isinstance(stmt, ast.Block):
+        _walk_stmts_for_returns(stmt.body, returned)
+    # BreakStmt/ContinueStmt/VarDecl/ExprStmt: no Return can appear
+    # directly inside one of these, nothing to walk. Everything else
+    # (see find_escaping_names's own module docstring's last
+    # paragraph): silent no-op, same convention.
+
+
+def find_reassigned_names(block):
+    """claude.md #77: every name that is ever the TARGET of a plain
+    reassignment (`name = expr` -- a bare Identifier target, not
+    `name.field = expr` or `name[i] = expr`) anywhere in `block`, at
+    any nesting depth. Used alongside find_returned_names to decide
+    which escaping struct locals CodeGen._emit_block schedules for
+    release at scope-exit: a name that's ever reassigned might, after
+    that reassignment, alias whatever ANOTHER tracked local's own name
+    already pointed to (`q = p`, both q and p locals) -- if both q and
+    p were independently scheduled for release, both would release the
+    SAME underlying value at their own separate scope-exits, with
+    nothing to account for the second reference `q = p` created (this
+    stage does not retain on a plain local-to-local assignment the way
+    it does for a global's own reassignment -- see
+    _emit_global_struct_retain_release's own comment on why that
+    precision isn't implemented for locals yet). A name found here is
+    excluded from scope-exit release entirely, the same conservative,
+    name-based, function-wide (not flow-sensitive) stance
+    find_returned_names already takes -- this can only ever cost a
+    missed optimization (a value that could safely have been released
+    keeps leaking instead), never risk releasing a value another
+    binding still needs.
+
+    Deliberately narrower than find_escaping_names's own "target of any
+    Assign" rule (which also has to account for the OLD value
+    potentially being aliased elsewhere, unrelated to this question):
+    this only cares about bare-Identifier Assign TARGETS, walked with
+    the same simple, Return-statement-only-shaped recursion
+    find_returned_names uses, since (like that function) it never needs
+    to inspect an expression's own internal shape beyond one isinstance
+    check."""
+    reassigned = set()
+    _walk_stmts_for_reassignments(block.body, reassigned)
+    return reassigned
+
+
+def _walk_stmts_for_reassignments(stmts, reassigned):
+    for stmt in stmts:
+        _walk_stmt_for_reassignments(stmt, reassigned)
+
+
+def _walk_stmt_for_reassignments(stmt, reassigned):
+    if isinstance(stmt, ast.ExprStmt):
+        _walk_expr_for_reassignments(stmt.expr, reassigned)
+    elif isinstance(stmt, ast.VarDecl):
+        if stmt.init is not None:
+            _walk_expr_for_reassignments(stmt.init, reassigned)
+    elif isinstance(stmt, ast.Return):
+        if stmt.value is not None:
+            _walk_expr_for_reassignments(stmt.value, reassigned)
+    elif isinstance(stmt, ast.IfStmt):
+        _walk_expr_for_reassignments(stmt.test, reassigned)
+        _walk_stmts_for_reassignments(stmt.then.body, reassigned)
+        if stmt.orelse is not None:
+            if isinstance(stmt.orelse, ast.IfStmt):
+                _walk_stmt_for_reassignments(stmt.orelse, reassigned)
+            else:
+                _walk_stmts_for_reassignments(stmt.orelse.body, reassigned)
+    elif isinstance(stmt, ast.WhileStmt):
+        _walk_expr_for_reassignments(stmt.test, reassigned)
+        _walk_stmts_for_reassignments(stmt.body.body, reassigned)
+    elif isinstance(stmt, ast.ForStmt):
+        _walk_stmt_for_reassignments(stmt.init, reassigned)
+        _walk_expr_for_reassignments(stmt.test, reassigned)
+        _walk_expr_for_reassignments(stmt.update, reassigned)
+        _walk_stmts_for_reassignments(stmt.body.body, reassigned)
+    elif isinstance(stmt, ast.Block):
+        _walk_stmts_for_reassignments(stmt.body, reassigned)
+    # BreakStmt/ContinueStmt: nothing to walk. Everything else (see
+    # find_escaping_names's own module docstring's last paragraph):
+    # silent no-op, same convention.
+
+
+def _walk_expr_for_reassignments(expr, reassigned):
+    """Only ever needs to find Assign nodes and recurse enough to reach
+    every one of them, however deeply an assignment might be nested
+    inside a larger expression (`x = (cond ? (y = p) : q)` -- unusual
+    for Festina code in practice, but not something the grammar
+    forbids) -- unlike find_escaping_names, this never needs to
+    classify what happens to any OTHER name it encounters along the
+    way, so it doesn't need find_escaping_names's own "raise on an
+    unrecognized expression kind" discipline; anything that isn't one
+    of the compound shapes explicitly listed below simply has no Assign
+    nested inside it for this to find."""
+    if expr is None:
+        return
+    if isinstance(expr, ast.Assign):
+        if isinstance(expr.target, ast.Identifier):
+            reassigned.add(expr.target.name)
+        _walk_expr_for_reassignments(expr.value, reassigned)
+        return
+    if isinstance(expr, ast.Ternary):
+        _walk_expr_for_reassignments(expr.cons, reassigned)
+        _walk_expr_for_reassignments(expr.alt, reassigned)
+        return
+    if isinstance(expr, ast.LogicalOp):
+        _walk_expr_for_reassignments(expr.left, reassigned)
+        _walk_expr_for_reassignments(expr.right, reassigned)
+        return
+    if isinstance(expr, ast.Call):
+        for a in expr.args:
+            _walk_expr_for_reassignments(a, reassigned)

@@ -215,10 +215,17 @@ just eventually cleaned up, and with each recursive call still getting
 its own independent copy the same way any other stack-local value
 would. A `map[T]` reclaimed this way frees each of its own entries
 completely, keys included, not just the entries themselves. A value
-that does escape (returned, stored somewhere longer-lived, or
-genuinely retained by a function it was passed to) is reclaimed by a
-later stage not yet implemented — see
-[todo.md](todo.md#memory-management).
+that does escape a function entirely isn't necessarily lost, either: a
+struct-typed global variable's value is reference counted and freed
+once nothing references it anymore, on every reassignment (including
+its own initial declaration) — a global repeatedly reassigned in a
+loop no longer leaks every value but the last. A struct-typed local
+that escapes gets the same treatment at its own scope-exit, but only
+when it was declared without an initializer, never itself returned,
+and never itself reassigned — a local outside that narrow scope, an
+escaping `arr[T]`/`map[T]` value, and a struct's own nested struct/
+array/map-typed fields are all reclaimed by a later stage not yet
+implemented — see [todo.md](todo.md#memory-management).
 
 ## Arrays
 

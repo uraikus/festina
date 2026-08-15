@@ -782,6 +782,70 @@ void festina_run_timer_loop(void) {
     }
 }
 
+/* ---- reference counting -- claude.md #77 ---- */
+
+/* claude.md #74/#75/#76 (festina/escape_analysis.py) prove, from
+ * syntax alone, that some struct/arr[T]/map[T] values never outlive
+ * their declaring function -- those get freed outright (or, for a
+ * struct specifically, stack-allocated and never freed at all -- see
+ * codegen.py's own module docstring). A value proven to genuinely
+ * escape (stored into a global, returned, ...) has nothing for that
+ * kind of analysis to do; it's safe by construction to prove it MUST
+ * be freed, never to prove it's safe TO free, since something else
+ * might still be using it. Reference counting is the answer for that
+ * remainder: track how many live Festina-visible bindings currently
+ * reference a value, and only actually free it when that count reaches
+ * zero.
+ *
+ * This works completely for Festina specifically because reference
+ * cycles are not just rare here, they are structurally impossible:
+ * a struct field's type, and an arr[T]/map[T]'s own element type T,
+ * must always be a type declared *before* the struct/array/map
+ * containing it (the same "no forward references" rule semantics.py
+ * already enforces for functions -- verified directly: `struct Node {
+ * next:Node }`, and even two mutually-referencing structs declared in
+ * either order, both fail to compile with "unknown type"). So the set
+ * of types any given value could ever transitively reference, through
+ * its own fields/elements, is always a strict subset of the types
+ * declared earlier in the same program -- a DAG by construction, never
+ * a cycle -- meaning plain reference counting, with no cycle detector
+ * or tracing collector, is a *complete* answer here, not the usual
+ * "handles everything except cycles" partial one.
+ *
+ * Layout: every refcounted value's allocation has a single int64_t
+ * refcount immediately before the pointer Festina code actually sees
+ * (`payload` below) -- a fixed 8-byte offset regardless of the value's
+ * own type, since every Festina field type (int/float/bool/text/blob/
+ * struct/table/image/audio/regex all lower to i64/double/i8/ptr -- see
+ * codegen.py's _llvm_type) has natural alignment no greater than 8
+ * bytes, so placing an 8-byte header immediately before a value's own
+ * fields never needs extra padding. See codegen.py's own VarDecl/
+ * StructType handling (a local) and _global_var_defs (a global) for
+ * where this header actually gets allocated/initialized.
+ *
+ * A NEGATIVE refcount is a sentinel for "immortal, retain/release are
+ * always a no-op" -- used for a struct-typed global's own untouched
+ * static initial storage (see _global_var_defs), which was never
+ * heap-allocated in the first place and must never reach free(). This
+ * means codegen never needs to special-case a global's first-ever
+ * reassignment (from that static storage to a real heap value): both
+ * functions are always safe to call unconditionally, whatever the
+ * pointer they're given currently points to. */
+void festina_retain(void *payload) {
+    if (!payload) return;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return;
+    (*header)++;
+}
+
+void festina_release(void *payload) {
+    if (!payload) return;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return;
+    (*header)--;
+    if (*header == 0) free(header);
+}
+
 /* ---- maps -- claude.md #72 ---- */
 
 /* One key/value pair -- `value` is a raw 8-byte payload meaning

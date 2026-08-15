@@ -1920,8 +1920,11 @@ class TestAutomaticMemoryReclamation:
         # global (escapes) -- escaping_params[mixed] must end up
         # {1}, not {0, 1} or {} -- and f()'s own call must stack-
         # allocate exactly the argument at the safe position (p,
-        # position 0) and leave the other (q, position 1) calloc'd,
-        # exactly as it always was.
+        # position 0) and leave the other (q, position 1) heap-
+        # allocated with a refcount header (claude.md #77 -- q is
+        # escaping AND never returned, so it's also scheduled for
+        # release, not just left leaking calloc'd), exactly the same
+        # non-stack-allocated treatment escaping structs always got.
         source = """
         struct Point { x:int y:int }
         Point stash
@@ -1938,10 +1941,12 @@ class TestAutomaticMemoryReclamation:
         ir = self._ir(parser, semantic, codegen, source)
         f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
         f_body = "\n".join(ir.splitlines()[f_start:])
-        p_line = next(l for l in f_body.splitlines() if l.strip().startswith("%p.storage."))
-        q_line = next(l for l in f_body.splitlines() if l.strip().startswith("%q.storage."))
-        assert "alloca %struct.Point" in p_line
-        assert "call ptr @calloc(" in q_line
+        p_storage_line = next(l for l in f_body.splitlines() if l.strip().startswith("%p.storage."))
+        q_raw_line = next(l for l in f_body.splitlines() if l.strip().startswith("%q.raw."))
+        assert "alloca %struct.Point" in p_storage_line
+        assert "call ptr @calloc(" in q_raw_line
+        assert "%p.raw." not in f_body
+        assert "call void @festina_release(" in f_body
 
     def test_transitive_chain_produces_correct_output(self, compile_and_run):
         source = """
@@ -2068,6 +2073,397 @@ class TestAutomaticMemoryReclamation:
         result = compile_and_run(source, args=None)
         assert result.returncode == 0
         assert result.stdout.splitlines()[-1] == "done"
+
+    # ---- reference counting (claude.md #77) ----
+    # Scope for this stage: struct-typed GLOBALS (retain new/release old
+    # on every reassignment) and escaping struct LOCALS that are never
+    # themselves returned anywhere in their own function (released at
+    # the same scope-exit points stages 1/2 already track). Struct
+    # fields, arr[T]/map[T] values, and a value returned from a
+    # function are all explicitly out of scope -- see todo.md.
+
+    def test_global_struct_uses_a_sentinel_header_for_static_storage(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "@g.header = global {i64, %struct.Point} {i64 -1, %struct.Point zeroinitializer}" in ir
+        assert "@g = global ptr getelementptr({i64, %struct.Point}, ptr @g.header, i32 0, i32 1)" in ir
+
+    def test_global_struct_reassignment_retains_new_and_releases_old(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            Point p
+            g = p
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        # retain happens before release -- see _emit_assign's own
+        # comment on why the order matters for self-assignment safety.
+        retain_idx = f_body.index("call void @festina_retain(")
+        release_idx = f_body.index("call void @festina_release(")
+        assert retain_idx < release_idx
+
+    def test_escaping_local_never_returned_is_released_at_scope_exit(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            Point p
+            g = p
+            log(p.x)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        # One release from the global assignment itself (releasing the
+        # OLD global value, not p), one more from p's own scope-exit --
+        # two total.
+        assert f_body.count("call void @festina_release(") == 2
+
+    def test_escaping_local_that_is_sometimes_returned_is_never_released_at_scope_exit(
+            self, parser, semantic, codegen):
+        # p is returned on ONE path (cond true) but not the other (cond
+        # false, falls through to the end) -- claude.md #77 doesn't yet
+        # implement transferring ownership through Return, so p is
+        # conservatively excluded from scope-exit release on BOTH
+        # paths, function-wide, not just the one that actually returns
+        # it (see escape_analysis.find_returned_names's own docstring).
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        Point func f(cond:bool) {
+            Point p
+            g = p
+            if cond {
+                return p
+            }
+            return p
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define ptr @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        # Exactly one release -- the global assignment's own release of
+        # its PREVIOUS value -- and none for p itself on either path.
+        assert f_body.count("call void @festina_release(") == 1
+
+    def test_loop_local_escaping_struct_is_released_every_iteration(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            for int i = 0, i < 3, i++ {
+                Point p
+                p.x = i
+                g = p
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        body_start = next(i for i, l in enumerate(lines) if l.strip().startswith("for.body"))
+        body_end = next(i for i in range(body_start, len(lines)) if lines[i].strip().startswith("br label %for.update"))
+        body_lines = lines[body_start:body_end]
+        # One release for the OLD global value, one for p's own
+        # per-iteration scope-exit -- both inside the loop body, every
+        # iteration, not just once after the loop as a whole exits.
+        assert sum("call void @festina_release(" in l for l in body_lines) == 2
+
+    def test_break_releases_the_escaping_loop_local(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            for int i = 0, i < 5, i++ {
+                Point p
+                p.x = i
+                g = p
+                if p.x == 2 {
+                    break
+                }
+            }
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        lines = ir.splitlines()
+        break_block = next(i for i, l in enumerate(lines) if l.strip().startswith("if.then"))
+        break_block_end = next(i for i in range(break_block, len(lines)) if lines[i].strip().startswith("br label %for.end"))
+        break_lines = lines[break_block:break_block_end]
+        assert any("call void @festina_release(" in l for l in break_lines)
+
+    def test_global_reassignment_in_a_loop_produces_correct_final_value(
+            self, compile_and_run):
+        # claude.md #77's own motivating case, found and documented
+        # earlier in this same effort: a global repeatedly reassigned
+        # inside a loop used to orphan every value but the last one,
+        # leaking each -- now they're actually freed, and the reachable
+        # (last) one must still read back correctly.
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func run() {
+            for int i = 0, i < 500, i++ {
+                Point p
+                p.x = i
+                g = p
+            }
+        }
+        run()
+        log(g.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "499"
+
+    def test_intermediate_global_values_stay_correct_across_reassignments(
+            self, compile_and_run):
+        # Not just the FINAL value -- every value read back immediately
+        # after its own assignment (before the next iteration's release
+        # could possibly touch it) must be correct too.
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func run() {
+            for int i = 0, i < 5, i++ {
+                Point p
+                p.x = i * i
+                g = p
+                log(g.x)
+            }
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "1", "4", "9", "16"]
+
+    def test_self_assignment_of_a_global_struct_does_not_crash(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func f() {
+            Point p
+            p.x = 7
+            g = p
+            g = g
+            g = g
+        }
+        f()
+        log(g.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "7"
+
+    def test_escaping_and_sometimes_returned_local_still_produces_correct_output(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        Point func f(cond:bool) {
+            Point p
+            p.x = 3
+            g = p
+            if cond {
+                return p
+            }
+            return p
+        }
+        Point q1 = f(true)
+        Point q2 = f(false)
+        log(q1.x)
+        log(q2.x)
+        log(g.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["3", "3", "3"]
+
+    def test_two_different_global_structs_are_tracked_independently(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        Point g1
+        Point g2
+        void func f() {
+            Point p
+            p.x = 1
+            g1 = p
+            Point q
+            q.x = 2
+            g2 = q
+        }
+        f()
+        log(g1.x)
+        log(g2.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "2"]
+
+    def test_local_struct_declared_with_a_call_result_initializer_keeps_the_value(
+            self, compile_and_run):
+        # A real, pre-existing (not introduced by claude.md #77) bug
+        # found while testing this stage: `Point r = make(5)` for a
+        # LOCAL r (inside a function -- a top-level/global one already
+        # worked, via a completely different code path,
+        # _emit_toplevel_stmt) silently discarded the initializer and
+        # left r's fields at their stack-allocated zero value instead,
+        # since _emit_stmt's own StructType VarDecl branch never
+        # actually looked at stmt.init at all. Traced by hand-tracing
+        # the generated IR (`%r.storage = alloca %struct.Point; store
+        # ... zeroinitializer` with the make(5) call's own return value
+        # never referenced again) before fixing it, not just from the
+        # symptom.
+        source = """
+        struct Point { x:int y:int }
+        Point func make(n:int) {
+            Point p
+            p.x = n
+            return p
+        }
+        void func f() {
+            Point r = make(5)
+            log(r.x)
+        }
+        f()
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "5"
+
+    def test_reassigning_a_local_struct_to_alias_another_does_not_double_release(
+            self, compile_and_run):
+        # A second real bug found while testing this stage, this one
+        # actually introduced by claude.md #77's own first pass: `Point
+        # q; q = p;` (q reassigned, after its own declaration, to alias
+        # p's storage) then BOTH p and q separately escaping (to two
+        # different globals) meant both were scheduled for release at
+        # their own, independent scope-exits -- with no retain anywhere
+        # to account for q's reassignment creating a second reference,
+        # the second release would decrement an already-zero (and, one
+        # more reassignment later, already-freed) refcount. Fixed by
+        # excluding any struct local that's ever reassigned
+        # (escape_analysis.find_reassigned_names) from scope-exit
+        # release scheduling entirely -- it leaks instead, the same
+        # "leaks but is memory-safe" fallback every other not-yet-
+        # covered case already gets. Confirmed via a real
+        # AddressSanitizer build with the generated code itself
+        # properly instrumented (`sanitize_address` added to every
+        # `define` -- see tests/CONTRACT.md's own note on why
+        # `clang -fsanitize=address -c file.ll` alone does not
+        # instrument raw LLVM IR the way it does C source), not just
+        # from this test's own passing assertion.
+        source = """
+        struct Point { x:int y:int }
+        Point g1
+        Point g2
+        Point g3
+        void func f() {
+            Point p
+            p.x = 5
+            Point q
+            q = p
+            g1 = p
+            g2 = q
+        }
+        f()
+        Point other
+        other.x = 999
+        g1 = other
+        log(g2.x)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "5"
+
+    def test_struct_declared_with_an_initializer_is_excluded_from_release_tracking(
+            self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        Point func make(n:int) {
+            Point p
+            p.x = n
+            return p
+        }
+        void func f() {
+            Point r = make(5)
+            g = r
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        # Only one release in f() -- the global assignment's own release
+        # of g's previous value. r itself is never scheduled for
+        # release (it was declared with an initializer).
+        assert f_body.count("call void @festina_release(") == 1
+
+    def test_reassigned_struct_is_excluded_from_release_tracking(
+            self, parser, semantic, codegen):
+        # q (the REASSIGNMENT TARGET) is excluded from its own scope-
+        # exit release -- only q's name is ever a bare-Identifier Assign
+        # target here, so only q is in find_reassigned_names's result.
+        # p itself was never reassigned (only ever a SOURCE, in `q = p`
+        # and `g1 = p`), so p is NOT excluded -- p correctly still gets
+        # its own scope-exit release, and that's exactly what keeps the
+        # refcount correct: p ends at 2 (retained once via `g1 = p`,
+        # once more via `g2 = q` since q aliases p, released back down
+        # by one via p's own scope-exit) -- 2 live references (g1 and
+        # g2), refcount 2, matching reality. Three releases total: one
+        # per global assignment's own previous value, plus p's own
+        # scope-exit -- q gets none, which is what actually prevents
+        # the double-release this test's own compile-and-run sibling
+        # (test_reassigning_a_local_struct_to_alias_another_does_not_double_release)
+        # confirms doesn't happen.
+        source = """
+        struct Point { x:int y:int }
+        Point g1
+        Point g2
+        void func f() {
+            Point p
+            Point q
+            q = p
+            g1 = p
+            g2 = q
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert f_body.count("call void @festina_release(") == 3
+
+    def test_many_global_reassignments_with_break_and_continue_does_not_crash(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        Point g
+        void func run(n:int) {
+            for int i = 0, i < n, i++ {
+                Point p
+                p.x = i
+                g = p
+                if p.x % 7 == 0 {
+                    continue
+                }
+                if p.x % 97 == 0 {
+                    break
+                }
+            }
+        }
+        for int i = 0, i < 3000, i++ {
+            run(50)
+        }
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
 
 
 def _find_window(display, timeout=20):

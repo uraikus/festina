@@ -359,11 +359,11 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 734 tests in this directory pass against it: 503 need no external
+All 761 tests in this directory pass against it: 522 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-221 more need a working C compiler, plus 2 more
+229 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 8 more given
-`Xvfb`+`xdotool` too (503 + 221 + 2 + 8 = 734 -- re-verified directly
+`Xvfb`+`xdotool` too (522 + 229 + 2 + 8 = 761 -- re-verified directly
 by hiding each tool from PATH in turn, not just derived by counting
 `compile_and_run` call sites, since the true number had drifted well
 past a much older, since-inaccurate count of "694 given a working C
@@ -1281,6 +1281,183 @@ more bug while doing so, and deliberately did NOT attempt a third
   including that nested-field finding in full and reference counting
   for the values escape analysis can't reach at all.
 
+- **Memory management stage 4: reference counting for escaping struct
+  globals and locals (claude.md #77, same session).** The remainder
+  stages 1-3 can never reach on their own: a value proven to genuinely
+  escape has nothing for pure escape analysis to do, since something
+  else might still need it when its own declaring scope ends. This
+  stage tracks reference counts for struct values specifically and
+  frees a value once its count reaches zero.
+
+  **Why this is complete, not the usual "everything but cycles"
+  answer:** Festina's type system makes reference cycles structurally
+  impossible -- a struct field's type must always be declared *before*
+  the struct containing it, the identical rule that already governs
+  function forward references. Verified directly, not assumed: `struct
+  Node { next:Node }` fails to compile ("unknown type 'Node'"), and so
+  does either declaration order of two mutually-referencing structs.
+  So the set of types any value could ever transitively reference is
+  always a strict subset of what's declared earlier in the same
+  program -- a DAG by construction. No cycle detector, no tracing
+  collector, needed at all.
+
+  **Representation:** every refcounted struct allocation has a single
+  `i64` refcount immediately before the pointer Festina code itself
+  sees -- a fixed 8-byte offset regardless of the struct's own field
+  layout, since every Festina field type (int/float/bool/text/blob/
+  struct/table/image/audio/regex, all lowering to i64/double/i8/ptr)
+  has natural alignment no greater than 8 bytes, so no extra padding is
+  ever needed between the header and a struct's own fields. A NEGATIVE
+  refcount is a sentinel for "immortal, retain/release always a
+  no-op" -- used for a struct-typed global's own untouched static
+  initial storage (`@Name.header = global {i64, %struct.Point} {i64 -1,
+  %struct.Point zeroinitializer}`, `@Name = global ptr
+  getelementptr({i64, %struct.Point}, ptr @Name.header, i32 0, i32
+  1)`), which was never heap-allocated and must never reach `free()`.
+  This means a global's very first-ever assignment needs zero special-
+  casing anywhere in codegen: `festina_retain`/`festina_release` are
+  always safe to call unconditionally, whatever a global currently
+  points to.
+
+  **Scope, deliberately the narrowest slice that's actually sound, not
+  the full design originally sketched:** a struct-typed GLOBAL's value
+  is always fully reference counted -- `_emit_global_struct_retain_release`
+  (one shared helper, used by both `_emit_assign`'s Identifier branch
+  for ordinary reassignment and `_emit_toplevel_stmt`'s VarDecl-with-
+  initializer branch for a global's own declaration, so the two sites
+  can't drift apart) retains the new value and releases the old one on
+  every single change. A struct-typed LOCAL is only scheduled for
+  release at its own scope-exit (the exact frame/`down_to` machinery
+  stages 1-3 already built, completely unchanged) when THREE conditions
+  all hold: declared without an initializer, never itself returned
+  (`escape_analysis.find_returned_names`, unchanged from when it was
+  added for this exact purpose), and never itself the target of a
+  plain reassignment (`escape_analysis.find_reassigned_names`, new this
+  stage). A local failing any of the three simply keeps leaking,
+  exactly as before this stage -- the same "leaks but is memory-safe"
+  fallback every not-yet-covered case in this whole effort already
+  gets, chosen deliberately over guessing.
+
+  **Two real bugs found and fixed while building this, both traced to
+  their exact mechanism before fixing, not patched blind from a
+  symptom:**
+
+  1. *Pre-existing, not introduced by this stage*: `Point r =
+     someFunc()` for a LOCAL `r` silently discarded the call's return
+     value, leaving `r` at its stack-allocated zero value --
+     `_emit_stmt`'s own struct VarDecl handling never checked
+     `stmt.init` at all (comment literally claimed "no struct-literal
+     initializer syntax exists yet, so stmt.init is always None here" --
+     true for *literal* syntax, false for a call-result initializer, a
+     distinction the comment's author -- this same session -- had
+     conflated). A top-level `Point r = someFunc()` already worked
+     correctly, through a completely different code path
+     (`_emit_toplevel_stmt`) untouched by the bug -- which is exactly
+     why this had never been noticed: every existing test exercising
+     this pattern happened to use a global. Found while writing this
+     stage's own combined verification program and noticing an
+     embedded `fail()` fire that had no business firing; confirmed by
+     reading the generated IR directly (`%r.storage = alloca
+     %struct.Point; store %struct.Point zeroinitializer, ...` with the
+     call's own return value computed and then never referenced again)
+     before writing the fix. Fixed by making a struct VarDecl-with-
+     initializer alias whatever its initializer evaluates to -- no
+     allocation of its own at all, the same as a plain `r = expr`
+     assignment already does.
+  2. *Introduced by this stage's own first pass*: `Point q; q = p;`
+     (`q` reassigned, after its own declaration, to alias `p`'s
+     storage), with `p` and `q` later assigned to two *different*
+     globals, scheduled BOTH for release at their own independent
+     scope-exits -- with nothing retaining the extra reference `q = p`
+     itself created, the second release decremented a refcount the
+     first had already brought to its true value, undercounting by
+     one; one more reassignment of either global later, this actually
+     freed memory the OTHER global still pointed to, and reading
+     through it produced garbage in a plain (non-ASan) build. Found
+     the same way -- written into the verification program, then
+     hand-traced with a debug build of the runtime that printed every
+     retain/release/free call, confirming the exact refcount sequence
+     (1 -> 2 -> 3 -> 2 -> 1 -> 0, freed, while a second global still
+     held the same pointer) before writing the fix, not just re-running
+     until the symptom went away. Fixed by excluding any struct local
+     ever found in `find_reassigned_names` from scope-exit release
+     scheduling entirely -- the third of the three local-scope
+     conditions above.
+
+  **A significant methodology finding, independent of either bug,
+  surfaced while chasing bug 2:** the very first attempt to reproduce
+  bug 2 under AddressSanitizer produced *zero errors* despite the
+  plain build unambiguously printing garbage -- a real red flag, not
+  something to shrug off as "ASan just didn't catch this one." Isolated
+  with a minimal, hand-written 11-line `.ll` file doing an unambiguous
+  calloc+free+read-after-free: `clang -fsanitize=address -c file.ll`
+  produced a binary with **zero** `sanitize_address`/`__asan_report*`
+  symbols anywhere in it (verified by grepping the `-S -emit-llvm`
+  output of that exact compile step) and did not catch the bug; the
+  byte-for-byte-equivalent pattern written as `.c` source produced 28
+  such symbols and caught it immediately, with a full, correct
+  use-after-free report. Root cause: ASan's per-function opt-in (the
+  `sanitize_address` LLVM function attribute) is normally added by
+  clang's own C frontend during Sema/CodeGen -- a step that's bypassed
+  entirely when the input handed to `clang -c` is already `.ll` text,
+  so `-fsanitize=address` at the driver level has nothing to attach
+  instrumentation to. The fix, once found: add `sanitize_address` to
+  every `define` line in the generated `.ll` file before compiling
+  (`sed -E 's/^(define [^{]+) \{/\1 sanitize_address {/'` against the
+  file, verified afterward by re-checking the instrumentation-symbol
+  count went from 0 to a real number) -- confirmed to both catch the
+  known bug 2 reproduction reliably and to change nothing about
+  already-passing programs' behavior otherwise.
+
+  This means every AddressSanitizer claim made earlier in this same
+  session, for stages 1 through 3 and interprocedural analysis, was
+  only ever checking two things correctly: linking success, and
+  LeakSanitizer's own allocation-tracking (which intercepts the
+  allocator's own calls directly and is unaffected by instrumentation
+  -- this is *why* every leak-count claim from those earlier stages
+  remained trustworthy even though the corruption-detection half never
+  actually ran against the generated program's own code). It was never
+  actually exercising ASan's heap-buffer-overflow/use-after-free/
+  double-free detection against anything except the hand-written
+  runtime `.c` file linked alongside each test binary. Rather than
+  letting that stand as an open question, every earlier stage's own
+  combined verification program (stage 1/2's nested-block and
+  interprocedural stress tests, stage 3's recursion-focused and
+  map-key-focused stress tests) was re-run through the corrected,
+  properly-instrumented pipeline specifically to check for anything the
+  flawed methodology might have silently missed -- all came back clean,
+  zero ASan errors, confirming those stages' own underlying *design*
+  reasoning was sound all along; the two bugs above (both found through
+  this same corrected pipeline) were the only real findings from the
+  entire retrospective check, and both are specific to this stage's own
+  new retain/release logic, not inherited from anything earlier.
+
+  Final verification, with the corrected pipeline from the start: new
+  unit tests (`tests/test_escape_analysis.py::TestFindReturnedNames`,
+  plus `find_reassigned_names` covered the same way), new IR-level and
+  compile-and-run tests in
+  `tests/test_codegen.py::TestAutomaticMemoryReclamation` (51 -> 67,
+  including one dedicated regression test per bug above, each
+  reproducing the exact scenario that found it), and a properly-
+  instrumented AddressSanitizer/LeakSanitizer run against a combined
+  program exercising: the original global-reassignment-in-a-loop leak
+  scenario from when stage 1 first shipped (now correctly freed, not
+  leaked -- the concrete payoff this whole stage exists to deliver), a
+  sometimes-returned local (correctly still leaks, matching this
+  stage's own stated scope), a reassigned local aliasing another
+  tracked local (correctly no longer double-released), self-assignment
+  of a global struct, and two independently-tracked globals, all run
+  for hundreds of iterations with embedded `fail()` correctness checks
+  -- zero ASan errors, and LeakSanitizer's only reported leak matches
+  exactly the one value this stage's own documented scope says should
+  still leak, not a byte more or less.
+
+  See `todo.md`'s "Memory management" section for the full picture,
+  including the nested-field nesting problem stage 4's own scope
+  deliberately sidesteps, and exactly what widening this stage's own
+  scope (retaining on every local assignment, not just a global's)
+  would still require.
+
 claude.md #55-58 exist because of bugs a design review found by actually
 running compiled programs, not just reading the code: returning a struct
 by value handed the caller a pointer into an already-popped stack frame
@@ -2051,8 +2228,8 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 503 passed, 231 skipped (needs a C compiler; 2 of
+pytest tests/                          # 522 passed, 239 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
                                         # 8 need Xvfb + xdotool installed too) given a
-                                        # working C compiler, all 734 pass
+                                        # working C compiler, all 761 pass
 ```

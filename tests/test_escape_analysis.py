@@ -314,3 +314,123 @@ class TestInterproceduralEscapingParams:
         names = escape_analysis_mod.find_escaping_names(
             program.body[0].body, escaping_params={"g": set()})
         assert "p" in names
+
+
+class TestFindReturnedNames:
+    """claude.md #77: escape_analysis.find_returned_names -- a much
+    narrower question than find_escaping_names ("is this name ever a
+    bare Return value"), used by CodeGen._emit_block to decide which
+    escaping struct locals are safe to release at an ordinary scope-
+    exit point versus which might be handed off to a caller through
+    Return instead (not yet implemented -- see claude.md #77's own
+    stated scope)."""
+
+    def test_bare_return_of_a_name(self, parser, escape_analysis_mod):
+        program = parser.parse("Point func f() {\n    Point p\n    return p\n}")
+        names = escape_analysis_mod.find_returned_names(program.body[0].body)
+        assert "p" in names
+
+    def test_returning_a_field_does_not_count(self, parser, escape_analysis_mod):
+        # return p.x -- the Return's own value is a Member, not a bare
+        # Identifier, so p itself was never handed to a caller here.
+        program = parser.parse("int func f() {\n    Point p\n    return p.x\n}")
+        names = escape_analysis_mod.find_returned_names(program.body[0].body)
+        assert "p" not in names
+
+    def test_returning_a_call_result_does_not_count(self, parser, escape_analysis_mod):
+        program = parser.parse("int func f() {\n    return g()\n}")
+        names = escape_analysis_mod.find_returned_names(program.body[0].body)
+        assert names == set()
+
+    def test_a_name_never_returned_is_absent(self, parser, escape_analysis_mod):
+        program = parser.parse("void func f() {\n    Point p\n    log(p.x)\n}")
+        names = escape_analysis_mod.find_returned_names(program.body[0].body)
+        assert "p" not in names
+
+    def test_return_nested_in_an_if(self, parser, escape_analysis_mod):
+        program = parser.parse(
+            "Point func f(cond:bool) {\n"
+            "    Point p\n"
+            "    if cond {\n"
+            "        return p\n"
+            "    }\n"
+            "    return p\n"
+            "}"
+        )
+        names = escape_analysis_mod.find_returned_names(program.body[0].body)
+        assert "p" in names
+
+    def test_return_nested_in_an_else_if_chain(self, parser, escape_analysis_mod):
+        program = parser.parse(
+            "Point func f(n:int) {\n"
+            "    Point p\n"
+            "    Point q\n"
+            "    if n == 0 {\n"
+            "        return p\n"
+            "    } else if n == 1 {\n"
+            "        return q\n"
+            "    } else {\n"
+            "        return p\n"
+            "    }\n"
+            "}"
+        )
+        names = escape_analysis_mod.find_returned_names(program.body[0].body)
+        assert "p" in names
+        assert "q" in names
+
+    def test_return_nested_in_a_while_loop(self, parser, escape_analysis_mod):
+        program = parser.parse(
+            "Point func f() {\n"
+            "    Point p\n"
+            "    while true {\n"
+            "        return p\n"
+            "    }\n"
+            "}"
+        )
+        names = escape_analysis_mod.find_returned_names(program.body[0].body)
+        assert "p" in names
+
+    def test_return_nested_in_a_for_loop(self, parser, escape_analysis_mod):
+        program = parser.parse(
+            "Point func f() {\n"
+            "    Point p\n"
+            "    for int i = 0, i < 3, i++ {\n"
+            "        return p\n"
+            "    }\n"
+            "}"
+        )
+        names = escape_analysis_mod.find_returned_names(program.body[0].body)
+        assert "p" in names
+
+    def test_return_nested_in_a_bare_block(self, parser, escape_analysis_mod):
+        program = parser.parse(
+            "Point func f() {\n"
+            "    Point p\n"
+            "    {\n"
+            "        return p\n"
+            "    }\n"
+            "}"
+        )
+        names = escape_analysis_mod.find_returned_names(program.body[0].body)
+        assert "p" in names
+
+    def test_a_different_name_returned_elsewhere_does_not_mark_this_one(
+            self, parser, escape_analysis_mod):
+        program = parser.parse(
+            "Point func f(cond:bool) {\n"
+            "    Point p\n"
+            "    Point q\n"
+            "    if cond {\n"
+            "        return p\n"
+            "    }\n"
+            "    log(q.x)\n"
+            "}"
+        )
+        names = escape_analysis_mod.find_returned_names(program.body[0].body)
+        assert "p" in names
+        assert "q" not in names
+
+    def test_bare_return_with_no_value(self, parser, escape_analysis_mod):
+        program = parser.parse("void func f() {\n    return\n}")
+        names = escape_analysis_mod.find_returned_names(program.body[0].body)
+        assert names == set()
