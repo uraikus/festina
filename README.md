@@ -172,9 +172,10 @@ snippets that happened to work once.
 
 Festina, Rust, Go, and Bun, on the same small equivalent-logic
 benchmarks (recursive function calls, tight-loop arithmetic, process
-startup) — see [benchmark.md](benchmark.md) for the methodology and the
-full, regularly-refreshed results table. Short version: Festina holds
-its own against Rust and Go on compute-bound native code, and comfortably
+startup, array allocation, string concatenation) — see
+[benchmark.md](benchmark.md) for the methodology and the full,
+regularly-refreshed results table. Short version: Festina holds its own
+against Rust and Go on compute-bound native code, and comfortably
 outruns a JIT on cold single-shot execution — unsurprising for a young
 optimizer against two of the most mature compiled-language backends
 around, and exactly the kind of regression tracking a young compiler

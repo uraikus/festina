@@ -3,13 +3,13 @@
 writes, with --update-doc) a Markdown results table for benchmark.md.
 
 Deliberately cheap to run "frequently" (the whole suite is a handful of
-seconds, not minutes): three small equivalent-logic programs per
-language (hello/fib/loop_sum -- see each file's own comments for what
-each measures and why), each language's own native/JIT toolchain doing
-the actual compiling, timed with repeated runs and the *minimum* wall
-time kept (the standard way to reduce OS scheduling noise without
-needing a dedicated benchmarking harness like hyperfine, which isn't a
-project dependency).
+seconds, not minutes): five small equivalent-logic programs per
+language (hello/fib/loop_sum/array_sum/string_concat -- see each file's
+own comments for what each measures and why), each language's own
+native/JIT toolchain doing the actual compiling, timed with repeated
+runs and the *minimum* wall time kept (the standard way to reduce OS
+scheduling noise without needing a dedicated benchmarking harness like
+hyperfine, which isn't a project dependency).
 
 Usage:
     python3 benchmarks/run_benchmarks.py                 # print results
@@ -37,7 +37,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 BENCHMARK_MD = os.path.join(REPO_ROOT, "benchmark.md")
 
-BENCHMARKS = ["hello", "fib", "loop_sum"]
+BENCHMARKS = ["hello", "fib", "loop_sum", "array_sum", "string_concat"]
 RUNS_PER_BENCHMARK = 7  # minimum of this many timed runs, after 1 untimed warmup
 
 
