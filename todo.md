@@ -105,7 +105,7 @@ longer reachable." Arrays and struct storage were originally always
 heap-allocated (`malloc`/`calloc`) and never freed — a real resource
 leak in any long-running program, though never a memory-safety issue on
 its own (see [security.md](security.md)'s note: no use-after-free, no
-double-free, since nothing was ever freed). Six stages below have
+double-free, since nothing was ever freed). Seven stages below have
 since narrowed that: a provably-safe struct is now stack-allocated
 outright (stage 3), a provably-safe `arr[T]`/`map[T]`'s data is still
 heap-allocated but now freed (stages 1/2), a struct-typed global
@@ -113,12 +113,14 @@ heap-allocated but now freed (stages 1/2), a struct-typed global
 once nothing references it anymore, including a value handed back
 through `return` itself, or discarded outright at its own call site,
 a struct's own struct-typed fields are reference counted the same way
-(stage 5), and an escaping `arr[T]`/`map[T]` value is now reference
+(stage 5), an escaping `arr[T]`/`map[T]` value is now reference
 counted too, the identical treatment, plus a real pre-existing memory-
-safety bug fixed as a side effect (stage 6) — anything not covered by
-any stage still leaks (a struct-typed element of an arr[T]/map[T]
-value, or an arr[T]/map[T]-typed element of another arr[T]/map[T]
-value — see below), exactly as originally described here.
+safety bug fixed as a side effect (stage 6), and an `arr[T]`/`map[T]`'s
+own individual elements/values are now reference counted too, once
+their own type is itself refcounted, closing the last remaining
+memory-safety gap this whole effort had found and precisely
+characterized along the way (stage 7) — every gap this section
+originally described is now closed.
 
 ### Stage 1: non-escaping locals (done — claude.md #74)
 
@@ -932,21 +934,113 @@ enumerates, vs. a dynamically-sized, runtime-indexed collection) is
 precisely why it needs its own separate design pass, the same
 reasoning claude.md #79's own boundary paragraph gives.
 
+### Stage 7: reference counting for an `arr[T]`/`map[T]`'s own elements/values (done — claude.md #80)
+
+The exact gap stage 6 confirmed still open, closed: an array element or
+map value whose own type is itself refcounted (struct, `arr[T]`, or
+`map[T]`) is now retained when stored and released when overwritten or
+when the container holding it is freed — the same AddressSanitizer-
+caught heap-use-after-free stage 6's own writeup describes (a struct
+built fresh inside a function, stored as an array's sole element, the
+array assigned to a global before that function returns; reading the
+global's element afterward reads through a pointer its own original
+binding already released) no longer reproduces, confirmed directly by
+re-running the identical reproduction program: it now prints the
+correct value on every one of 2000 iterations instead of crashing, and
+a fresh AddressSanitizer/LeakSanitizer build of it reports zero errors
+and zero leaks.
+
+**Sound for the same structural reason stages 4-6 already lean on, one
+level down:** Festina's grammar gives every `arr[T]`/`map[T]` type a
+syntactically fresh, finite type expression at each nesting level —
+there is no way to write a self-referential array or map type the way
+stage 4's own argument already rules out for structs — so releasing an
+`arr[arr[T]]`'s own elements (each one itself an `arr[T]`, which may in
+turn have its own elements to release, and so on) always terminates, on
+a nesting depth fixed at compile time by the program's own source text.
+
+**Array elements and struct fields now share the identical retain-new/
+release-old code path for `arr[i] = value`**, exactly as
+`outer.field = value` already used for struct field writes (the
+`not expr.target.computed` restriction that used to separate the two
+cases was removed — by the time that shared code is reached with a
+computed target, it's provably the array-element case, since the
+`map[key] = value` case returns earlier from its own dedicated branch).
+The one-time element store during array-literal construction
+(`[a, b, c]`) retains each refcounted element the same way stage 6
+already retains an aliased whole-array/whole-map value, skipped for the
+same "owning" source shapes stage 6 already exempts (a function call,
+or — new here, since it applies one level down too — an array/map
+literal used as an element's own source expression); no release-old is
+needed there, since a freshly `malloc`'d buffer was never previously
+holding a valid pointer at any of its slots.
+
+**`map[T]` needed a different mechanism for both directions**, since a
+`FestinaMapEntry`'s own layout is deliberately opaque outside the C
+runtime (the same boundary `festina_map_find`'s own comment already
+documents, kept intact rather than punched through for this stage).
+`map[key] = value`, in both a map literal's own construction and a
+later assignment, retains the new value and releases whatever the key
+previously held by looking up any existing value first (`_emit_map_set`
+now calls the existing `festina_map_get`, with a null default — always
+safe, since releasing null is always a no-op, whether the key was
+genuinely absent or present but itself null) before the set proceeds.
+Releasing every value in a map being freed reuses the existing
+`festina_map_for_each` iteration `.forEach()` already relies on,
+passing a freshly generated release-flavored trampoline function
+instead of a user callback — no new C-side structure access was added
+for this stage at all, by design.
+
+**Two lazily-generated, per-element-type release wrappers**
+(`_release_fn_for_array`/`_release_fn_for_map`, cached the same way
+`_release_fn_for_struct`'s own per-struct-type wrappers already are)
+are now generated only for an `arr[T]`/`map[T]` whose own element/value
+type is itself refcounted — every other `arr[T]`/`map[T]` keeps using
+the plain, generic, element-blind `festina_release_array`/
+`festina_release_map` stage 6 already introduced, unchanged.
+`_release_fn_for` — the one dispatch point every release call site in
+codegen.py already goes through — now delegates `ArrayType`/`MapType`
+to these two new methods instead of returning a fixed string directly.
+**A non-escaping local's own stack-allocation optimization is
+unaffected in how its own header is allocated** — still a plain stack
+`alloca`, never itself refcounted, exactly as stages 1-6 already
+established — but the `_StackArrayOrMap` scope-exit path now also
+releases each element/value, when refcounted, before freeing the
+data/entries buffer itself, the identical "the header's own storage was
+never heap-allocated, but what it points to still needs freeing"
+distinction stage 6 already drew for that buffer.
+
+**Verified the same three ways as every stage before it:** new
+IR-level tests (an array-literal element from an identifier retains,
+from a call doesn't; an `arr[arr[Box]]`'s own release wrapper cascades
+into `arr[Box]`'s own dedicated wrapper rather than the generic one; a
+`map[Box]`'s own release wrapper uses `festina_map_for_each`; a
+`map[int]` keeps using the plain generic function, no wrapper
+generated needlessly), new compile-and-run tests (**the exact use-
+after-free reproduction above, now a dedicated regression test, for
+both an escaping array and an escaping map**; a nested `arr[arr[int]]`
+element survives its own source scope; reassigning an array element or
+map value releases the old one correctly; a non-escaping, stack-headered
+array/map of structs still frees its own elements) —
+`tests/test_codegen.py::TestAutomaticMemoryReclamation` grew from 107
+to 118 — and real, properly-instrumented AddressSanitizer/
+LeakSanitizer runs against both the exact original reproduction and a
+new combined stress program (escaping arrays/maps of structs, nested
+`arr[arr[int]]`, element/value reassignment, and non-escaping
+stack-headered arrays/maps of structs, 500 iterations each) — zero ASan
+errors, zero leaks. Every earlier stage's own stress/reproduction
+program (15 in total, spanning stages 1 through 6) was re-run through
+the same pipeline to confirm no regression — all came back clean. Full
+suite before this stage: 790 tests; after: 801.
+
+With this stage, every memory-safety gap `claude.md #43`'s "automatic
+memory management" promise was ever found to have — leaked reclamation,
+a struct's own escaping value, a struct's own struct-typed fields, an
+escaping `arr[T]`/`map[T]` value, and now an `arr[T]`/`map[T]`'s own
+elements/values — is closed.
+
 ### What's still ahead
 
-- **A struct-typed element of an `arr[T]`/`map[T]` value, and an
-  `arr[T]`/`map[T]`-typed element of another `arr[T]`/`map[T]` value.**
-  The one gap stage 6 confirmed still open, not merely left alone by
-  inertia -- see its own writeup above for the exact
-  AddressSanitizer-caught use-after-free reproduction. An arr[T]/
-  map[T]'s own elements/values are a dynamically-sized, runtime-indexed
-  collection, not a fixed field list a struct's own declaration already
-  enumerates the way claude.md #78's own struct-field cascade walks --
-  retaining/releasing them individually needs iterating the collection
-  at every point a value is stored into it *and* at every point the
-  whole container is freed, a materially different, harder problem
-  than the fixed-shape field walk claude.md #78 and #79 both already
-  do. Needs its own design pass, same bar as every stage here.
 - **A real tracing GC** was never seriously considered as an
   alternative to reference counting here, given section 77's own
   finding that reference cycles are structurally impossible in

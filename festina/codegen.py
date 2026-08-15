@@ -512,6 +512,17 @@ class CodeGen:
                                                 # typed field of its own; every other struct's values
                                                 # keep using the plain, generic @festina_release
                                                 # directly, unchanged from claude.md #77.
+        self._array_release_fns = {}           # claude.md #80: types_mod.type_name(ArrayType) -> LLVM
+                                                # function name of its own lazily-generated, per-
+                                                # element-type release wrapper -- see
+                                                # _release_fn_for_array's own comment. Only ever
+                                                # populated for an arr[T] whose own T is itself
+                                                # refcounted (struct/arr/map); every other arr[T]
+                                                # keeps using the plain, generic @festina_release_array
+                                                # directly, unchanged from claude.md #79.
+        self._map_release_fns = {}             # claude.md #80: the map[T] counterpart to
+                                                # self._array_release_fns -- see
+                                                # _release_fn_for_map's own comment.
         self.extra_globals = []                # globals discovered while emitting main() (e.g. table column arrays)
         self.entry_stmts = []                  # top-level statements for __festina_main
         self.func_decls = {}                   # name -> ast.FuncDecl (for signatures)
@@ -1054,10 +1065,25 @@ class CodeGen:
                     header = self.tmp()
                     lines.append(f"  {header} = load ptr, ptr {ref}")
                     if isinstance(type_.type_, types_mod.ArrayType):
+                        elem_type = type_.type_.element
+                        len_ptr = self.tmp()
+                        lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
+                        len_val = self.tmp()
+                        lines.append(f"  {len_val} = load i64, ptr {len_ptr}")
                         field_ptr = self.tmp()
                         lines.append(f"  {field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
                         data_ptr = self.tmp()
                         lines.append(f"  {data_ptr} = load ptr, ptr {field_ptr}")
+                        if isinstance(elem_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+                            # claude.md #80: this array's own elements
+                            # are themselves refcounted -- release each
+                            # one before freeing the data buffer they
+                            # live in, the same element-release loop
+                            # _release_fn_for_array's own generated
+                            # wrapper uses for the heap-allocated case.
+                            self._emit_release_array_elements(
+                                data_ptr, len_val, self._release_fn_for(elem_type),
+                                _llvm_type(elem_type), lines)
                         lines.append(f"  call void @free(ptr {data_ptr})")
                     else:
                         # claude.md #74/#75: unlike an array's plain
@@ -1068,6 +1094,7 @@ class CodeGen:
                         # entries pointer alone would leak.
                         # festina_map_free_entries frees each entry's
                         # key first, then the entries buffer itself.
+                        value_type = type_.type_.value
                         count_ptr = self.tmp()
                         lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
                         count_val = self.tmp()
@@ -1076,6 +1103,15 @@ class CodeGen:
                         lines.append(f"  {field_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
                         entries_ptr = self.tmp()
                         lines.append(f"  {entries_ptr} = load ptr, ptr {field_ptr}")
+                        if isinstance(value_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+                            # claude.md #80: same as the array case just
+                            # above, but through festina_map_for_each
+                            # and a release trampoline, since a map's
+                            # own entries layout stays opaque to codegen
+                            # -- see _release_fn_for_map's own comment.
+                            trampoline_name = self._emit_map_value_release_trampoline(value_type)
+                            lines.append(
+                                f"  call void @festina_map_for_each(i64 {count_val}, ptr {entries_ptr}, ptr {trampoline_name})")
                         lines.append(f"  call void @festina_map_free_entries(i64 {count_val}, ptr {entries_ptr})")
                 elif isinstance(type_, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
                     # claude.md #77/#79: release (not free) -- this
@@ -2059,6 +2095,7 @@ class CodeGen:
         expected_elem = expected_type.element if isinstance(expected_type, types_mod.ArrayType) else None
 
         values = []
+        sources = []
         elem_type = expected_elem
         for e in expr.elements:
             if isinstance(e, ast.ArrayLit) and isinstance(expected_elem, types_mod.ArrayType):
@@ -2069,6 +2106,7 @@ class CodeGen:
                 val = self._coerce(val, vtype, expected_elem, lines)
                 vtype = expected_elem
             values.append(val)
+            sources.append(e)
             elem_type = elem_type or vtype
 
         if elem_type is None:
@@ -2101,9 +2139,21 @@ class CodeGen:
             total_size = self.tmp()
             lines.append(f"  {total_size} = mul i64 {elem_size}, {n}")
             lines.append(f"  {data_ptr} = call ptr @malloc(i64 {total_size})")
+            # claude.md #80: retain a struct/arr/map-typed element
+            # whenever its own source isn't "owning" -- the identical
+            # rule every other binding site in this stage uses. No
+            # release-old logic needed here (unlike arr[i] = v on an
+            # already-built array): this data buffer is fresh malloc'd
+            # memory, never zero-initialized, so every index is written
+            # exactly once, right here, before anything could ever read
+            # a stale/garbage "old" value through it.
+            elem_is_refcounted = isinstance(
+                elem_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
             for i, val in enumerate(values):
                 elem_ptr = self.tmp()
                 lines.append(f"  {elem_ptr} = getelementptr {elem_llvm_ty}, ptr {data_ptr}, i64 {i}")
+                if elem_is_refcounted and not self._is_owning_refcounted_source(sources[i]):
+                    lines.append(f"  call void @festina_retain(ptr {val})")
                 lines.append(f"  store {elem_llvm_ty} {val}, ptr {elem_ptr}")
 
         data_field_ptr = self.tmp()
@@ -2147,7 +2197,7 @@ class CodeGen:
                 val_val = self._coerce(val_val, vtype, expected_value, lines)
                 vtype = expected_value
             value_type = value_type or vtype
-            self._emit_map_set(header, value_type, key_val, val_val, lines)
+            self._emit_map_set(header, value_type, key_val, val_val, val_expr, lines)
 
         if value_type is None:
             raise CodegenError(
@@ -2237,7 +2287,7 @@ class CodeGen:
         lines.append(f"  {raw} = call i64 @festina_map_get(i64 {count}, ptr {entries}, ptr {key_val}, i64 {default})")
         return self._i64_to_map_value(raw, value_type, lines), value_type
 
-    def _emit_map_set(self, map_ptr, value_type, key_val, value_val, lines):
+    def _emit_map_set(self, map_ptr, value_type, key_val, value_val, value_source_expr, lines):
         """claude.md #72: npcHealths['npc1'] = 30 (and the equivalent
         per-entry calls a map literal builds itself out of -- see
         _emit_map_lit). Unlike a read, this needs the map's own actual
@@ -2252,11 +2302,43 @@ class CodeGen:
         loaded value, or (during literal construction) the literal's
         own fresh heap header -- never a slot or field's own ADDRESS a
         further load would still be needed for; see _try_addressable's
-        own comment for where that load actually happens."""
+        own comment for where that load actually happens.
+
+        claude.md #80: when `value_type` is itself refcounted, retains
+        `value_val` (unless `value_source_expr` is "owning") and
+        releases whatever value the key previously mapped to, if any --
+        the identical rule an array-element or struct-field write
+        already follows. Unlike those, there's no fixed address to
+        `load` an "old" value from first (a map key may or may not
+        already be present, and festina_map_set itself doesn't say
+        which) -- `festina_map_get` with a `0` (null) default finds it
+        instead, the same lookup a genuine read already uses, safe to
+        call unconditionally: `0` can never be a real heap pointer, so
+        it only ever means "nothing to release," whether the key was
+        truly absent or (i.e. `m[k] = null`) present with an
+        already-null value -- releasing null is always a no-op either
+        way, so the two cases need no distinguishing here. This is what
+        makes overwriting a key -- including a repeated key within the
+        very literal building this map, which is exactly a `map[key] =
+        v` re-set applied to a key this same construction already
+        set -- correctly release the value it replaces, not just skip
+        it."""
         count_ptr = self.tmp()
         lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 0")
         entries_ptr = self.tmp()
         lines.append(f"  {entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 1")
+        if isinstance(value_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+            count_val = self.tmp()
+            lines.append(f"  {count_val} = load i64, ptr {count_ptr}")
+            entries_val = self.tmp()
+            lines.append(f"  {entries_val} = load ptr, ptr {entries_ptr}")
+            old_raw = self.tmp()
+            lines.append(f"  {old_raw} = call i64 @festina_map_get(i64 {count_val}, ptr {entries_val}, ptr {key_val}, i64 0)")
+            old_ptr = self.tmp()
+            lines.append(f"  {old_ptr} = inttoptr i64 {old_raw} to ptr")
+            if not self._is_owning_refcounted_source(value_source_expr):
+                lines.append(f"  call void @festina_retain(ptr {value_val})")
+            lines.append(f"  call void {self._release_fn_for(value_type)}(ptr {old_ptr})")
         raw_val = self._map_value_to_i64(value_val, value_type, lines)
         lines.append(f"  call void @festina_map_set(ptr {count_ptr}, ptr {entries_ptr}, ptr {key_val}, i64 {raw_val})")
 
@@ -2448,27 +2530,25 @@ class CodeGen:
         lines.append(f"  call void {self._release_fn_for(ttype)}(ptr {old})")
 
     def _release_fn_for(self, type_):
-        """claude.md #79: the single dispatch point every release call
-        site in this file goes through (mirroring claude.md #78's own
-        _release_fn_for_struct, now one case among three rather than
-        the only one) -- returns the LLVM function name to call to
-        release a refcounted value of `type_`. A struct gets
-        _release_fn_for_struct's own per-type dispatch (the plain
-        generic release, or a lazily-generated per-struct-type cascade
-        wrapper, depending on whether it has its own struct-typed
-        field). An arr[T]/map[T] needs no such per-type dispatch at
-        all: unlike a struct, whose own field layout varies by Festina
-        type, EVERY arr[T]'s header has the identical `{i64,ptr}` shape
-        regardless of T (same for map[T]), so a single fixed runtime
-        function (festina_release_array / festina_release_map -- see
-        their own doc comments in runtime/festina_runtime.c) already
-        handles every one, with no codegen-generated wrapper needed."""
+        """claude.md #79 (widened by claude.md #80): the single dispatch
+        point every release call site in this file goes through
+        (mirroring claude.md #78's own _release_fn_for_struct, now one
+        case among three rather than the only one) -- returns the LLVM
+        function name to call to release a refcounted value of `type_`.
+        A struct gets _release_fn_for_struct's own per-type dispatch
+        (the plain generic release, or a lazily-generated per-struct-
+        type cascade wrapper, depending on whether it has its own
+        struct-typed field). An arr[T] gets _release_fn_for_array's own
+        analogous dispatch (the plain generic release, or a lazily-
+        generated per-element-type cascade wrapper, depending on
+        whether T is itself refcounted); map[T] gets
+        _release_fn_for_map's own."""
         if isinstance(type_, types_mod.StructType):
             return self._release_fn_for_struct(type_)
         if isinstance(type_, types_mod.ArrayType):
-            return "@festina_release_array"
+            return self._release_fn_for_array(type_)
         if isinstance(type_, types_mod.MapType):
-            return "@festina_release_map"
+            return self._release_fn_for_map(type_)
         raise CodegenError(f"cannot release a value of type {types_mod.type_name(type_)}")
 
     def _struct_has_own_refcounted_field(self, name):
@@ -2594,6 +2674,199 @@ class CodeGen:
         lines.append(f"  {obj} = load ptr, ptr {ref}")
         self._emit_release_struct_field_refs(obj, struct_type, lines)
 
+    def _release_fn_for_array(self, type_):
+        """claude.md #80: the arr[T] counterpart to
+        _release_fn_for_struct -- returns the plain, generic
+        `@festina_release_array` (unchanged from claude.md #79) when
+        T is not itself refcounted, since there's nothing for a
+        release to cascade into; a dedicated, lazily-generated, cached
+        (by `types_mod.type_name(type_)`, since arr[T] has no name of
+        its own the way a struct does) per-element-type wrapper when
+        T is a struct/arr/map.
+
+        That wrapper decrements the refcount via festina_release_check,
+        and -- only if this was the array's last reference -- releases
+        each of its own elements (via T's own release function, found
+        by calling _release_fn_for again -- recursing back into this
+        same method for a nested arr[T] of arr[U]) in a plain runtime
+        loop over the array's own length, before freeing the data
+        buffer and the header itself (duplicating
+        festina_release_array's own free logic -- the two can't simply
+        call each other, since the element loop has to run strictly
+        between the refcount check and the actual free).
+
+        This recursion always terminates, for an even stronger reason
+        than claude.md #77's own struct field DAG argument: arr[T]'s
+        own element type is always a fresh syntactic type expression
+        written out in the source (`arr[arr[int]]`, ...), never a name
+        that could refer back to itself the way a struct declaration
+        technically could before claude.md #48's "declared before
+        used" rule forbids it -- there is no way to even *write* a
+        self-referential arr[T] type in Festina's own grammar."""
+        elem_type = type_.element
+        if not isinstance(elem_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+            return "@festina_release_array"
+        key = types_mod.type_name(type_)
+        if key in self._array_release_fns:
+            return self._array_release_fns[key]
+        fn_name = f"@__festina_release_array_{self._unique()}"
+        self._array_release_fns[key] = fn_name
+        elem_release_fn = self._release_fn_for(elem_type)
+        elem_llvm_ty = _llvm_type(elem_type)
+        body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
+        should_free = self.tmp()
+        body.append(f"  {should_free} = call i8 @festina_release_check(ptr %payload)")
+        cond = self.tmp()
+        body.append(f"  {cond} = icmp ne i8 {should_free}, 0")
+        free_label = self.label("relarr.free")
+        done_label = self.label("relarr.done")
+        body.append(f"  br i1 {cond}, label %{free_label}, label %{done_label}")
+        body.append(f"{free_label}:")
+        len_ptr = self.tmp()
+        body.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr %payload, i32 0, i32 0")
+        len_val = self.tmp()
+        body.append(f"  {len_val} = load i64, ptr {len_ptr}")
+        data_field_ptr = self.tmp()
+        body.append(f"  {data_field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr %payload, i32 0, i32 1")
+        data_ptr = self.tmp()
+        body.append(f"  {data_ptr} = load ptr, ptr {data_field_ptr}")
+        self._emit_release_array_elements(data_ptr, len_val, elem_release_fn, elem_llvm_ty, body)
+        body.append(f"  call void @free(ptr {data_ptr})")
+        header = self.tmp()
+        body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
+        body.append(f"  call void @free(ptr {header})")
+        body.append(f"  br label %{done_label}")
+        body.append(f"{done_label}:")
+        body.append("  ret void")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _emit_release_array_elements(self, data_ptr, len_val, elem_release_fn, elem_llvm_ty, lines):
+        """claude.md #80: the shared element-release loop both
+        _release_fn_for_array's own generated wrapper (a heap-allocated
+        array about to be freed) and _emit_free_active_locals (a
+        stack-allocated array whose own header is never freed, but
+        whose elements' own references still need dropping) build on
+        -- a plain counted loop from 0 to `len_val`, releasing the
+        element at each index via `elem_release_fn`. Never touches
+        `data_ptr` itself or frees anything -- entirely the caller's
+        own responsibility, since the two callers need different
+        things done with it afterward."""
+        idx_slot = self.tmp()
+        lines.append(f"  {idx_slot} = alloca i64")
+        lines.append(f"  store i64 0, ptr {idx_slot}")
+        loop_cond = self.label("relarr.loopcond")
+        loop_body = self.label("relarr.loopbody")
+        loop_end = self.label("relarr.loopend")
+        lines.append(f"  br label %{loop_cond}")
+        lines.append(f"{loop_cond}:")
+        idx_val = self.tmp()
+        lines.append(f"  {idx_val} = load i64, ptr {idx_slot}")
+        keep_going = self.tmp()
+        lines.append(f"  {keep_going} = icmp slt i64 {idx_val}, {len_val}")
+        lines.append(f"  br i1 {keep_going}, label %{loop_body}, label %{loop_end}")
+        lines.append(f"{loop_body}:")
+        elem_ptr = self.tmp()
+        lines.append(f"  {elem_ptr} = getelementptr {elem_llvm_ty}, ptr {data_ptr}, i64 {idx_val}")
+        elem_val = self.tmp()
+        lines.append(f"  {elem_val} = load {elem_llvm_ty}, ptr {elem_ptr}")
+        lines.append(f"  call void {elem_release_fn}(ptr {elem_val})")
+        next_idx = self.tmp()
+        lines.append(f"  {next_idx} = add i64 {idx_val}, 1")
+        lines.append(f"  store i64 {next_idx}, ptr {idx_slot}")
+        lines.append(f"  br label %{loop_cond}")
+        lines.append(f"{loop_end}:")
+
+    def _release_fn_for_map(self, type_):
+        """claude.md #80: the map[T] counterpart to
+        _release_fn_for_array -- returns the plain, generic
+        `@festina_release_map` when T is not itself refcounted, or a
+        dedicated, lazily-generated, cached per-value-type wrapper when
+        it is.
+
+        Unlike an array's own elements (a flat buffer codegen already
+        knows the exact layout of), a map's own entries are opaque to
+        codegen -- FestinaMapEntry's own C struct layout is only ever
+        touched from festina_runtime.c, deliberately (see
+        festina_map_find's own comment) -- so this can't just emit a
+        raw GEP loop the way _release_fn_for_array does. Instead it
+        reuses festina_map_for_each's own existing iteration (the exact
+        mechanism .forEach() itself already uses), passing a small
+        release-flavored trampoline (_emit_map_value_release_trampoline)
+        that converts each entry's raw i64 value back to a `ptr` and
+        releases it, in place of a user callback -- then, once every
+        value is released, defers to festina_map_free_entries for the
+        keys/entries buffer itself (identical to what
+        festina_release_map's own C implementation already does) and
+        frees the header."""
+        value_type = type_.value
+        if not isinstance(value_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+            return "@festina_release_map"
+        key = types_mod.type_name(type_)
+        if key in self._map_release_fns:
+            return self._map_release_fns[key]
+        fn_name = f"@__festina_release_map_{self._unique()}"
+        self._map_release_fns[key] = fn_name
+        trampoline_name = self._emit_map_value_release_trampoline(value_type)
+        body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
+        should_free = self.tmp()
+        body.append(f"  {should_free} = call i8 @festina_release_check(ptr %payload)")
+        cond = self.tmp()
+        body.append(f"  {cond} = icmp ne i8 {should_free}, 0")
+        free_label = self.label("relmap.free")
+        done_label = self.label("relmap.done")
+        body.append(f"  br i1 {cond}, label %{free_label}, label %{done_label}")
+        body.append(f"{free_label}:")
+        count_ptr = self.tmp()
+        body.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr %payload, i32 0, i32 0")
+        count_val = self.tmp()
+        body.append(f"  {count_val} = load i64, ptr {count_ptr}")
+        entries_field_ptr = self.tmp()
+        body.append(f"  {entries_field_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr %payload, i32 0, i32 1")
+        entries_ptr = self.tmp()
+        body.append(f"  {entries_ptr} = load ptr, ptr {entries_field_ptr}")
+        body.append(f"  call void @festina_map_for_each(i64 {count_val}, ptr {entries_ptr}, ptr {trampoline_name})")
+        body.append(f"  call void @festina_map_free_entries(i64 {count_val}, ptr {entries_ptr})")
+        header = self.tmp()
+        body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
+        body.append(f"  call void @free(ptr {header})")
+        body.append(f"  br label %{done_label}")
+        body.append(f"{done_label}:")
+        body.append("  ret void")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _emit_map_value_release_trampoline(self, value_type):
+        """claude.md #80: generates a small function matching
+        festina_map_for_each's own fixed callback signature
+        (`void(i64, ptr)` -- see _emit_map_foreach_trampoline's own
+        comment on why a real, correctly-typed function is needed
+        rather than relying on ABI coincidence, though here both sides
+        of the mismatch this guards against for .forEach() don't apply
+        -- this trampoline's OWN signature already matches exactly,
+        it's just discarding the key and reinterpreting the raw i64
+        value), releasing it via `value_type`'s own release function.
+        Never cached/reused across value types the way
+        _release_fn_for_array/_map's own wrappers are -- always freshly
+        generated per call, since it's only ever needed once, at the
+        one call site inside _release_fn_for_map that generates it."""
+        uid = self._unique()
+        trampoline_name = f"@__festina_maprelease_{uid}"
+        release_fn = self._release_fn_for(value_type)
+        body = [f"define void {trampoline_name}(i64 %raw, ptr %key) {{", "entry:"]
+        ptr_val = self.tmp()
+        body.append(f"  {ptr_val} = inttoptr i64 %raw to ptr")
+        body.append(f"  call void {release_fn}(ptr {ptr_val})")
+        body.append("  ret void")
+        body.append("}")
+        self.func_defs.extend(body)
+        self.func_defs.append("")
+        return trampoline_name
+
     def _emit_assign(self, expr, env, lines):
         # The target's declared type is resolved *before* the value, so an
         # array-literal RHS (e.g. `nums = [4, 5, 6]`) can pick its element
@@ -2650,7 +2923,7 @@ class CodeGen:
                     key_val, _ = self._emit_expr(expr.target.prop, env, lines)
                     val, vtype = self._emit_value_for(expr.value, env, lines, obj_type.value)
                     val = self._coerce(val, vtype, obj_type.value, lines)
-                    self._emit_map_set(obj_val, obj_type.value, key_val, val, lines)
+                    self._emit_map_set(obj_val, obj_type.value, key_val, val, expr.value, lines)
                     return val, obj_type.value
                 if not isinstance(obj_type, types_mod.ArrayType):
                     raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",
@@ -2661,28 +2934,29 @@ class CodeGen:
                 ptr, ftype = self._member_ptr(expr.target, env, lines)
             val, vtype = self._emit_value_for(expr.value, env, lines, ftype)
             val = self._coerce(val, vtype, ftype, lines)
-            if not expr.target.computed and isinstance(
-                    ftype, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+            if isinstance(ftype, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
                 # claude.md #78 (widened by claude.md #79 to arr[T]/
-                # map[T]-typed fields too): `outer.field = value` -- the
-                # ONLY way a struct/array/map-typed field is ever
-                # populated (there's no struct/array/map-literal-as-
-                # field-initializer syntax) -- gets the exact same
-                # owning/aliasing retain rule as a plain local
-                # reassignment, and releases whatever the field
-                # previously held (always safe: a field of any of these
-                # three types starts out null, per its zeroinitializer/
-                # calloc'd storage, and every release function already
-                # null-checks). Deliberately NOT applied to a computed
-                # target (arr[i] = v / map[key] = v) even when the
-                # array/map's own ELEMENT type happens to be one of
-                # these three -- that's a different, still-open gap
-                # (see todo.md): arr[T]/map[T] values are refcounted
-                # CONTAINERS as of this section, but their own individual
-                # elements/values are not yet individually tracked, so
-                # there is no scope-exit release an element-level retain
-                # here could ever be paired with; only a genuine FIELD,
-                # on a genuine struct, is covered here.
+                # map[T]-typed fields, and claude.md #80 to arr[T]
+                # ELEMENTS too): `outer.field = value` / `arr[i] = value`
+                # -- the ONLY way a struct/array/map-typed field or
+                # array element is ever populated (there's no struct/
+                # array/map-literal-as-field/element-initializer syntax)
+                # -- gets the exact same owning/aliasing retain rule as
+                # a plain local reassignment, and releases whatever the
+                # field/element previously held (always safe: a field
+                # starts out null, per its zeroinitializer/calloc'd
+                # storage; an array element always holds a real,
+                # previously-retained value by the time this runs --
+                # every index was already written once, in
+                # _emit_array_lit's own construction, before any later
+                # `arr[i] = v` could ever reach it -- and every release
+                # function already null-checks regardless). `map[key] =
+                # v` is handled separately, inside _emit_map_set, since
+                # it needs a key-based lookup (not a fixed address) to
+                # find whatever value it's overwriting, if any -- by the
+                # time computed-Member reaches this shared code with
+                # `ftype` set, it's already provably the array-element
+                # case (the map one returns earlier, above).
                 old = self.tmp()
                 lines.append(f"  {old} = load ptr, ptr {ptr}")
                 if not self._is_owning_refcounted_source(expr.value):

@@ -250,11 +250,13 @@ started out with. Assigning `[1, 2, 3]`/`{...}` into a fresh binding,
 returning an array/map, passing one to another function, storing one
 in a struct field — every one of these is reclaimed once nothing
 references it anymore, the identical rule struct values already
-follow. What isn't yet covered: a struct value stored as an
-`arr[T]`/`map[T]` *element* (as opposed to a struct *field*, which is
-covered) can still be read after the binding it came from goes out of
-scope — see [todo.md](todo.md#memory-management) for exactly what
-extending this to individual elements/values would still require.
+follow. This includes an `arr[T]`/`map[T]`'s own elements/values, when
+their own type is itself reclaimed this way (a struct, `arr[T]`, or
+`map[T]`): `boxes[0] = replacement`/`boxes['key'] = replacement`
+retains the new value and releases whatever that slot previously held,
+the same rule a struct's own field write already follows, and freeing
+an array or map recursively releases each of its own elements/values
+too, however many levels deep a program nests `arr[T]`/`map[T]`.
 
 ## Arrays
 

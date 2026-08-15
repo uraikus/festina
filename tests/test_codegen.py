@@ -3440,6 +3440,277 @@ class TestAutomaticMemoryReclamation:
         assert result.returncode == 0
         assert result.stdout.strip() == "1999"
 
+    # -- reference counting for individual elements/values stored
+    # *inside* an arr[T]/map[T] (claude.md #80, new section): claude.md
+    # #79 made the array/map's own header a refcounted, shared-identity
+    # value, but never touched what happens to a struct/arr/map ELEMENT
+    # once it's copied into the array's data buffer or a map's entry --
+    # that element was never retained on the way in, and never released
+    # on the way out, leaving a struct-typed array element readable
+    # after its original binding's own scope had already released it
+    # (a confirmed, reproduced heap-use-after-free). See tests/CONTRACT.md
+    # for the full writeup.
+
+    def test_struct_element_of_an_escaping_array_survives_its_source_scope(
+            self, compile_and_run):
+        # The exact use-after-free claude.md #79 left open and #80
+        # closes: a struct built fresh inside f(), stored as an
+        # array's sole element, the array escaping through a global
+        # while the struct's own local scope ends when f() returns.
+        source = """
+        struct Point { x:int y:int }
+        arr[Point] g
+
+        void func f(n:int) {
+            Point p
+            p.x = n
+            arr[Point] pts = [p]
+            g = pts
+        }
+
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                f(i)
+                if g[0].x != i {
+                    fail('array element of struct type did not survive its source scope')
+                }
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_struct_value_of_an_escaping_map_survives_its_source_scope(
+            self, compile_and_run):
+        source = """
+        struct Point { x:int y:int }
+        map[Point] g
+
+        void func f(n:int) {
+            Point p
+            p.x = n
+            map[Point] pts = {'a': p}
+            g = pts
+        }
+
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                f(i)
+                if g['a'].x != i {
+                    fail('map value of struct type did not survive its source scope')
+                }
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_array_of_arrays_element_survives_its_source_scope(self, compile_and_run):
+        source = """
+        arr[arr[int]] g
+
+        void func f(n:int) {
+            arr[int] inner = [n, n + 1]
+            arr[arr[int]] outer = [inner]
+            g = outer
+        }
+
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                f(i)
+                if g[0][0] != i || g[0][1] != i + 1 {
+                    fail('array-of-arrays element did not survive its source scope')
+                }
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_reassigning_an_array_element_releases_the_old_value_correctly(
+            self, compile_and_run):
+        # arr[i]=v now shares the exact retain-new/release-old path
+        # struct-field writes already use -- the old element (still
+        # reachable nowhere else) must be released, and the new one
+        # (an aliased identifier, not a fresh literal) must be retained,
+        # without either double-freeing or leaking.
+        source = """
+        struct Box { v:int }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                Box b0
+                Box b1
+                arr[Box] boxes = [b0, b1]
+                Box replacement
+                replacement.v = i
+                boxes[0] = replacement
+                if boxes[0].v != i {
+                    fail('array element reassignment drifted')
+                }
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_reassigning_a_map_value_releases_the_old_value_correctly(
+            self, compile_and_run):
+        source = """
+        struct Box { v:int }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                Box b0
+                map[Box] boxes = {'a': b0}
+                Box replacement
+                replacement.v = i
+                boxes['a'] = replacement
+                if boxes['a'].v != i {
+                    fail('map value reassignment drifted')
+                }
+            }
+        }
+        run(2000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_non_escaping_array_of_structs_frees_its_elements_too(
+            self, compile_and_run):
+        # A purely local, never-escaping arr[Box] still stack-allocates
+        # its own header (claude.md #76) but its Box elements are
+        # heap-allocated (structs always are) -- the _StackArrayOrMap
+        # scope-exit path must release each element before freeing the
+        # data buffer, not just free the buffer itself.
+        source = """
+        struct Box { v:int }
+        void func f(n:int) {
+            Box b0
+            Box b1
+            arr[Box] boxes = [b0, b1]
+            boxes[0].v = n
+            boxes[1].v = n + 1
+        }
+        void func run(iterations:int) {
+            for int i = 0, i < iterations, i++ {
+                f(i)
+            }
+        }
+        run(20000)
+        log('done')
+        """
+        result = compile_and_run(source, args=None)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_array_literal_element_from_an_identifier_retains(self, parser, semantic, codegen):
+        source = """
+        struct Box { v:int }
+        void func f() {
+            Box b
+            arr[Box] boxes = [b]
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" in f_body
+
+    def test_array_literal_element_from_a_call_does_not_retain(self, parser, semantic, codegen):
+        source = """
+        struct Box { v:int }
+        Box func makeBox() {
+            Box b
+            return b
+        }
+        void func f() {
+            arr[Box] boxes = [makeBox()]
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
+        f_body = "\n".join(ir.splitlines()[f_start:])
+        assert "call void @festina_retain(" not in f_body
+
+    def test_array_of_structs_release_wrapper_cascades_into_each_element(
+            self, parser, semantic, codegen):
+        source = """
+        struct Box { v:int }
+        arr[arr[Box]] g
+        void func f() {
+            Box b
+            arr[Box] boxes = [b]
+            arr[arr[Box]] outer = [boxes]
+            g = outer
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        # A dedicated per-element-type release wrapper is generated for
+        # arr[Box] (Box is refcounted), and outer's own wrapper (for
+        # arr[arr[Box]]) must call into it rather than the generic,
+        # element-blind @festina_release_array.
+        assert "define void @__festina_release_array_" in ir
+        wrapper_names = [
+            l.split("define void @")[1].split("(")[0]
+            for l in ir.splitlines() if l.startswith("define void @__festina_release_array_")
+        ]
+        assert len(wrapper_names) == 2
+        outer_wrapper_body = None
+        for name in wrapper_names:
+            start = ir.index(f"define void @{name}(")
+            end = ir.index("\n}\n", start)
+            body = ir[start:end]
+            if any(other in body for other in wrapper_names if other != name):
+                outer_wrapper_body = body
+        assert outer_wrapper_body is not None
+
+    def test_map_of_structs_release_wrapper_uses_map_for_each(
+            self, parser, semantic, codegen):
+        source = """
+        struct Box { v:int }
+        map[Box] g
+        void func f() {
+            Box b
+            map[Box] boxes = {'a': b}
+            g = boxes
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "define void @__festina_release_map_" in ir
+        wrapper_start = ir.index("define void @__festina_release_map_")
+        wrapper_end = ir.index("\n}\n", wrapper_start)
+        wrapper_body = ir[wrapper_start:wrapper_end]
+        assert "call void @festina_map_for_each(" in wrapper_body
+
+    def test_map_of_ints_still_uses_the_generic_release_function(
+            self, parser, semantic, codegen):
+        # An int-valued map has nothing to cascade into -- it must keep
+        # using the plain, generic @festina_release_map from claude.md
+        # #79 rather than generating a needless per-type wrapper.
+        source = """
+        map[int] g
+        void func f() {
+            map[int] m = {'a': 1}
+            g = m
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "define void @__festina_release_map_" not in ir
+        assert "call void @festina_release_map(" in ir
+
 
 def _find_window(display, timeout=20):
     # 20s, not the 10s an isolated run needs comfortably -- TestGraphics

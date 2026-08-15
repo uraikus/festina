@@ -470,14 +470,36 @@ for the full design writeup.
   [todo.md](todo.md#memory-management) for the full reproduction and
   why it's a separate design problem.
 
-  Everything not covered by any stage (a struct-typed element of an
-  arr[T]/map[T] value, an arr[T]/map[T]-typed element of another arr[T]/
-  map[T] value, and whether a value stored into a field of a call
-  argument is itself retained) still leaks exactly as
-  before — a
-  resource leak in a long-running process, not a safety issue on its
-  own, no different in kind from the gap this note already accepted.
-  What changed across all four stages is that each one's own fix, at
+  `claude.md #80` (stage 7) closes exactly that gap: an array element
+  or map value whose own type is itself refcounted (struct, `arr[T]`,
+  or `map[T]`) is now retained when stored and released when
+  overwritten or when the container holding it is freed. Confirmed
+  directly by re-running stage 6's own reproduction above -- it now
+  prints the correct value on every iteration of a 2000-iteration run
+  instead of crashing a genuine heap-use-after-free, and a fresh
+  AddressSanitizer/LeakSanitizer build of it reports zero errors and
+  zero leaks. Sound for the same structural reason stage 4's own
+  reference-cycle argument already gives, one level down: Festina's
+  grammar gives every `arr[T]`/`map[T]` type a syntactically fresh,
+  finite type expression at each nesting level, so releasing a nested
+  `arr[arr[T]]`'s own elements always terminates. `map[T]` needed a
+  different mechanism from `arr[T]` for both directions, since a
+  `FestinaMapEntry`'s own layout is deliberately opaque outside the C
+  runtime: releasing every value in a map being freed reuses the
+  existing `festina_map_for_each` iteration `.forEach()` already relies
+  on, passing a release-flavored callback instead of a user one, rather
+  than exposing any new C-side structure access. See
+  [todo.md](todo.md#memory-management) for the full writeup.
+
+  Everything not covered by any stage (whether a value stored into a
+  field of a call argument is itself retained) still leaks exactly as
+  before — a resource leak in a long-running process, not a safety
+  issue on its own, no different in kind from the gap this note already
+  accepted. With stage 7, every genuine memory-*safety* gap this whole
+  effort ever found and confirmed (as opposed to a mere resource leak)
+  is closed.
+
+  What changed across all seven stages is that each one's own fix, at
   every step of building it out, was verified with the same rigor the
   rest of this document's findings were: exhaustive unit tests of the
   analysis itself, end-to-end compile-and-run tests including the exact
