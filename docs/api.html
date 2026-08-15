@@ -614,24 +614,45 @@ user.name = <span class="str">'Patrick'</span></pre>
           Structs are native in-memory records — declaration, field
           read/write, and passing to/returning from functions by value.
         </p>
+        <p class="muted">
+          Memory for structs, arrays, and maps is managed automatically
+          — no manual allocation or freeing, anywhere:
+        </p>
         <div class="callout">
-          <strong>Automatic memory reclamation (stage 1):</strong>
-          memory for structs, arrays, and maps is managed automatically
-          — no manual allocation or freeing. A local
-          <code>struct</code>/<code>arr[T]</code>/<code>map[T]</code>
+          <strong>Non-escaping locals, stack-allocated.</strong>
+          A local <code>struct</code>/<code>arr[T]</code>/<code>map[T]</code>
           declared in a function, event handler, <code>if</code> branch,
           <code>while</code> body, or <code>for</code> body, and never
-          returned, stored anywhere longer-lived, or passed to another
-          function, is reclaimed automatically as soon as control leaves
-          the block it was declared in — for a value declared inside a
-          loop body, that means every iteration, not deferred until the
-          function eventually returns; <code>break</code>/<code>continue</code>
-          reclaim it too, the same as reaching the end of that iteration
-          normally would. A value that does escape (returned, stored
-          somewhere longer-lived, passed to another function) is
-          reclaimed by a later stage not yet implemented — see
-          <a href="https://github.com/uraikus/festina/blob/main/todo.md#memory-management">todo.md</a>.
+          returned or stored anywhere longer-lived, is reclaimed
+          automatically as soon as control leaves the block it was
+          declared in — for a value declared inside a loop body, that
+          means every iteration; <code>break</code>/<code>continue</code>
+          reclaim it too. A non-escaping struct is a real stack
+          allocation, not a heap allocation freed afterward. Passing one
+          to another function no longer forces it to escape either — if
+          that function's own body never lets the value outlive the
+          call, the original is still reclaimed the same way.
         </div>
+        <div class="callout">
+          <strong>Escaping values, reference counted.</strong>
+          Anything that does escape — returned, stored in a global or a
+          struct field/array element, passed on and actually retained
+          — is reference counted instead: freed once nothing
+          references it anymore. This covers a struct-typed global on
+          every reassignment, an escaping local, a value handed back
+          through <code>return</code>, a call result discarded outright,
+          a struct's own struct-typed fields, and an
+          <code>arr[T]</code>/<code>map[T]</code>'s own elements/values
+          — however many levels deep a program nests them. Two
+          variables made to alias each other
+          (<code>map[T] b = a</code>) now correctly share one underlying
+          value rather than silently diverging.
+        </div>
+        <p class="muted">
+          Every gap this used to leave open is now closed — see
+          <a href="https://github.com/uraikus/festina/blob/main/todo.md#memory-management">todo.md</a>
+          for the full seven-stage history.
+        </p>
       </section>
 
       <section class="doc-section" id="arrays">
@@ -640,7 +661,7 @@ user.name = <span class="str">'Patrick'</span></pre>
 <span class="kw">arr[arr[int]]</span> matrix
 log(numbers.length)
 numbers[0] = 10</pre>
-        <p>Not bounds-checked; data is never freed (no GC yet — see <a href="https://github.com/uraikus/festina/blob/main/todo.md">todo.md</a>).</p>
+        <p>Not bounds-checked. Memory is reclaimed automatically — see <a href="#structs">Structs</a> above for the full picture (non-escaping locals reclaimed at scope-exit, escaping values reference counted).</p>
       </section>
 
       <section class="doc-section" id="maps">
