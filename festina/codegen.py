@@ -1306,23 +1306,26 @@ class CodeGen:
                         ref, type_ = found
                         if isinstance(type_, (types_mod.ArrayType, types_mod.MapType)):
                             # claude.md #79 (mirroring claude.md #77's
-                            # own struct widening below): a with-init
-                            # local never stack-allocates at all (see
-                            # _emit_stmt's own VarDecl handling -- it
-                            # always aliases its initializer's value),
-                            # so it's always refcounted and always safe
-                            # to schedule for release, regardless of its
-                            # own escaping-ness. A no-init local is only
-                            # refcounted (not stack-allocated) when
-                            # escape_analysis actually proves it
-                            # escapes -- exactly mirroring _emit_stmt's
-                            # own stack-vs-heap decision. Either way, a
+                            # own struct widening below), extended by
+                            # claude.md #81: a with-init local stack-
+                            # allocates only when its initializer is a
+                            # literal written directly here (see
+                            # _is_stack_allocatable_array_or_map_decl's
+                            # own comment, shared with _emit_stmt so this
+                            # can never disagree with what it actually
+                            # built) -- any other with-init shape (an
+                            # existing identifier, a field read, a call
+                            # result, ...) still always aliases its
+                            # initializer's value and is always
+                            # refcounted, regardless of its own escaping-
+                            # ness. A no-init local is only refcounted
+                            # (not stack-allocated) when escape_analysis
+                            # actually proves it escapes. Either way, a
                             # name that's ever itself returned is not
                             # excluded here either -- Return's own
                             # handling retains first, same as for
                             # structs.
-                            is_stack_allocated = (stmt.init is None
-                                                   and stmt.name not in self._current_escaping_names)
+                            is_stack_allocated = self._is_stack_allocatable_array_or_map_decl(stmt, type_)
                             if not is_stack_allocated:
                                 self._active_free_locals[-1].append((ref, type_))
                             else:
@@ -1549,6 +1552,35 @@ class CodeGen:
                 uid = self._unique()
                 backing = f"%{stmt.name}.storage.{uid}"
                 slot = f"%{stmt.name}.{uid}"
+                stack_allocatable = self._is_stack_allocatable_array_or_map_decl(stmt, type_)
+                if stmt.init is not None and stack_allocatable:
+                    # claude.md #81: a non-escaping local declared
+                    # directly from an array/map literal -- see
+                    # _is_stack_allocatable_array_or_map_decl's own
+                    # comment for why this is safe. Builds the header
+                    # straight into a stack slot (zero-initialized
+                    # first, the same as the no-init case below, since
+                    # _emit_array_lit/_emit_map_lit only ever WRITE
+                    # fields they have a real value for -- an empty
+                    # array literal's own data field, for one, still
+                    # needs to start null) and hands it to
+                    # _emit_array_lit/_emit_map_lit as `header` to build
+                    # directly into, instead of routing through
+                    # _emit_value_for's general (always-heap) path. No
+                    # retain needed: a literal is always an "owning"
+                    # source (_is_owning_refcounted_source), the same
+                    # reason the general with-initializer path below
+                    # already skips retaining one.
+                    lines.append(f"  {backing} = alloca {payload_ty}")
+                    lines.append(f"  store {payload_ty} zeroinitializer, ptr {backing}")
+                    if isinstance(type_, types_mod.ArrayType):
+                        self._emit_array_lit(stmt.init, env, lines, type_, header=backing)
+                    else:
+                        self._emit_map_lit(stmt.init, env, lines, type_, header=backing)
+                    lines.append(f"  {slot} = alloca ptr")
+                    lines.append(f"  store ptr {backing}, ptr {slot}")
+                    env.define(stmt.name, slot, type_)
+                    return
                 if stmt.init is not None:
                     val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
                     val = self._coerce(val, vtype, type_, lines)
@@ -1558,9 +1590,7 @@ class CodeGen:
                     lines.append(f"  store ptr {val}, ptr {slot}")
                     env.define(stmt.name, slot, type_)
                     return
-                non_escaping = (self._current_escaping_names is not None
-                                and stmt.name not in self._current_escaping_names)
-                if non_escaping:
+                if stack_allocatable:
                     lines.append(f"  {backing} = alloca {payload_ty}")
                     lines.append(f"  store {payload_ty} zeroinitializer, ptr {backing}")
                 else:
@@ -1569,7 +1599,7 @@ class CodeGen:
                 lines.append(f"  store ptr {backing}, ptr {slot}")
                 env.define(stmt.name, slot, type_)
                 # stmt.init is None here -- handled by the early-return
-                # branch above.
+                # branches above.
                 return
             llvm_ty = _llvm_type(type_)
             slot = f"%{stmt.name}.{self._unique()}"
@@ -1996,17 +2026,40 @@ class CodeGen:
         return name
 
     def _emit_template(self, expr, env, lines):
-        result = self._const_string(expr.parts[0], lines)
+        # Skips a @festina_str_concat call entirely for every EMPTY
+        # literal piece (`` `${x}` ``'s own leading/trailing parts are
+        # both "", and adjacent interpolations like `` `${a}${b}` `` have
+        # an empty piece between them too) -- concatenating with "" is
+        # always a no-op, so emitting the call at all was pure wasted
+        # allocation+copy work, doubling the concat count for the
+        # extremely common "starts or ends with an interpolation"
+        # shape. `expr.exprs` is never empty (parse_template only builds
+        # a TemplateLit once at least one `${...}` has been parsed -- a
+        # template with none is a plain ast.StringLit instead), so the
+        # loop below always runs at least once and `result` is
+        # guaranteed non-None by the time it's returned. When the
+        # interpolated value's own text is used as `result` directly
+        # (skipped leading piece, or no piece follows it either) this
+        # aliases that value's existing pointer instead of copying it --
+        # always safe, since `text` is never freed/released anywhere in
+        # generated code (no refcounting, no scope-exit free -- see
+        # _emit_free_active_locals's own comment enumerating exactly
+        # which types it tracks, text isn't among them).
+        result = self._const_string(expr.parts[0], lines) if expr.parts[0] else None
         for part_expr, next_part in zip(expr.exprs, expr.parts[1:]):
             val, vtype = self._emit_expr(part_expr, env, lines)
             piece = self._to_text(val, vtype, lines)
-            out = self.tmp()
-            lines.append(f"  {out} = call ptr @festina_str_concat(ptr {result}, ptr {piece})")
-            result = out
-            part_str = self._const_string(next_part, lines)
-            out2 = self.tmp()
-            lines.append(f"  {out2} = call ptr @festina_str_concat(ptr {result}, ptr {part_str})")
-            result = out2
+            if result is None:
+                result = piece
+            else:
+                out = self.tmp()
+                lines.append(f"  {out} = call ptr @festina_str_concat(ptr {result}, ptr {piece})")
+                result = out
+            if next_part:
+                part_str = self._const_string(next_part, lines)
+                out2 = self.tmp()
+                lines.append(f"  {out2} = call ptr @festina_str_concat(ptr {result}, ptr {part_str})")
+                result = out2
         return result
 
     def _to_text(self, val, type_, lines):
@@ -2087,7 +2140,15 @@ class CodeGen:
         lines.append(f"  {payload} = getelementptr i8, ptr {raw}, i64 8")
         return payload
 
-    def _emit_array_lit(self, expr, env, lines, expected_type=None):
+    def _emit_array_lit(self, expr, env, lines, expected_type=None, header=None):
+        # `header`, when given, is an already-allocated (and, for a
+        # `ptr` field, zero-initialized) FESTINA_ARRAY_LLVM_TYPE slot to
+        # build directly into instead of allocating a fresh heap header
+        # -- see this method's own header-allocation comment below, and
+        # _emit_stmt's VarDecl handling, the only caller that ever
+        # passes one (a non-escaping local declared directly from an
+        # array literal -- claude.md #81).
+        #
         # claude.md #26: "Arrays may contain supported primitive types,
         # structs, tables, and other array types" -- table elements are
         # rejected by _llvm_type(TableType) below, since there's no way
@@ -2118,15 +2179,18 @@ class CodeGen:
         n = len(values)
 
         # claude.md #79: a fresh, uniquely-owned (refcount=1) heap
-        # header -- the same "owning" source _is_owning_refcounted_source
-        # already treats an array/map literal as, so binding it into a
-        # new slot needs no separate retain. Unconditionally heap-
-        # allocated, the same as an escaping struct local's own
-        # storage; a *non-escaping* local's own stack-allocated
-        # optimization (claude.md #74) is a property of the LOCAL
-        # BINDING this literal happens to initialize, decided in
-        # _emit_stmt, not of the literal's own construction here.
-        header = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, lines)
+        # header when `header` wasn't already supplied by the caller --
+        # the same "owning" source _is_owning_refcounted_source already
+        # treats an array/map literal as, so binding it into a new slot
+        # needs no separate retain either way. Whether THIS literal's
+        # own header is heap or stack is a property of the LOCAL BINDING
+        # it happens to initialize (decided in _emit_stmt, not here) --
+        # heap by default (matching an escaping struct local's own
+        # storage), stack only for the one case claude.md #81 adds: a
+        # non-escaping local declared directly from a literal, which
+        # passes its own pre-allocated stack slot in as `header`.
+        if header is None:
+            header = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, lines)
         len_ptr = self.tmp()
         lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
         lines.append(f"  store i64 {n}, ptr {len_ptr}")
@@ -2162,26 +2226,27 @@ class CodeGen:
 
         return header, types_mod.ArrayType(elem_type)
 
-    def _emit_map_lit(self, expr, env, lines, expected_type=None):
+    def _emit_map_lit(self, expr, env, lines, expected_type=None, header=None):
         """claude.md #72: { key: value, ... } -- built the same way
-        _emit_array_lit builds an array literal: a temporary header
-        alloca (needed here, unlike a fixed-size array, because
-        festina_map_set has to mutate count/entries in place as each
-        entry is added -- see _emit_map_set), one festina_map_set call
-        per entry in source order (so a repeated key naturally ends up
-        "last one wins", with no separate dedup pass needed), then a
-        single `load` of the finished {count, entries} value out of that
-        header at the end -- same "build in a scratch slot, load the
-        final value once" shape _emit_array_lit already uses."""
+        _emit_array_lit builds an array literal: a header (fresh heap by
+        default, or the caller's own pre-allocated `header` -- see
+        _emit_array_lit's own comment on that parameter, claude.md #81)
+        that festina_map_set mutates count/entries on in place as each
+        entry is added (see _emit_map_set), one festina_map_set call per
+        entry in source order (so a repeated key naturally ends up "last
+        one wins", with no separate dedup pass needed).
+
+        `header`, when given, must already be zero-initialized (its own
+        count/entries fields both starting at 0/null) -- true of both a
+        fresh calloc'd heap header and a `store {ty} zeroinitializer`
+        stack one, so this method itself never needs to care which."""
         expected_value = expected_type.value if isinstance(expected_type, types_mod.MapType) else None
 
-        # claude.md #79: a fresh, uniquely-owned heap header -- see
-        # _emit_array_lit's own comment just above for why this is
-        # always heap-allocated regardless of where this literal ends
-        # up bound. calloc already zero-initializes count/entries (0,
-        # null), so no separate stores are needed for them the way the
-        # pre-#79 stack-alloca'd scratch header needed.
-        header = self._emit_fresh_heap_header(FESTINA_MAP_LLVM_TYPE, lines)
+        # claude.md #79: a fresh, uniquely-owned heap header when
+        # `header` wasn't already supplied -- see _emit_array_lit's own
+        # comment just above for the full reasoning, identical here.
+        if header is None:
+            header = self._emit_fresh_heap_header(FESTINA_MAP_LLVM_TYPE, lines)
 
         value_type = expected_value
         for key_expr, val_expr in expr.entries:
@@ -2492,6 +2557,54 @@ class CodeGen:
         "fresh, uniquely-owned" comment), nothing else referencing it
         the instant it's produced."""
         return isinstance(expr, (ast.Call, ast.ArrayLit, ast.MapLit))
+
+    def _is_stack_allocatable_array_or_map_decl(self, stmt, type_):
+        """claude.md #79 (extended by #81): whether an arr[T]/map[T]-
+        typed VarDecl can keep its own HEADER on the stack instead of
+        allocating a fresh, refcounted heap one -- true for a non-
+        escaping local with either no initializer at all (claude.md
+        #79's own original case), or one initialized directly from an
+        array/map literal (claude.md #81: a literal's own element/entry
+        count is always known right at the declaration site, so its
+        data/entries buffer's own size is too -- see
+        _emit_array_lit/_emit_map_lit's own `header` parameter, which is
+        what actually builds into a stack slot this method says is
+        eligible for one).
+
+        Deliberately conservative the same direction
+        _is_owning_refcounted_source already is: an initializer that's
+        merely an IDENTIFIER bound to some OTHER array/map literal
+        (`arr[int] a = [1,2,3]` then, elsewhere, `arr[int] b = a`) is
+        NOT covered here -- only a literal written directly at this
+        declaration's own initializer position is, since only then is
+        the buffer size provably known without chasing another
+        binding's own history.
+
+        Shared by _emit_stmt (which actually emits the stack allocation
+        this says is safe) and _emit_block (which decides how to
+        schedule it for scope-exit cleanup -- a plain heap-refcounted
+        RELEASE for anything this returns False for, a _StackArrayOrMap
+        entry, freeing only the still-heap data/entries buffer, for
+        anything it returns True for) so the two decisions can never
+        drift apart into disagreeing about the same local.
+
+        Sound for the identical reason claude.md #79's own no-init case
+        already is, not a new argument: "non-escaping" here means
+        escape_analysis's own existing whole-function analysis already
+        proved this name is never returned, never stored anywhere
+        longer-lived, and -- critically -- never itself the target of a
+        LATER reassignment either (an assignment target always escapes,
+        by escape_analysis's own existing rule -- see
+        _emit_local_retain_release's own comment), so a stack-header
+        local built here can never later be pointed at a *different*,
+        possibly-heap value the way `_emit_assign`'s general retain/
+        release machinery would otherwise need to account for."""
+        if self._current_escaping_names is None or stmt.name in self._current_escaping_names:
+            return False
+        if stmt.init is None:
+            return True
+        literal_cls = ast.ArrayLit if isinstance(type_, types_mod.ArrayType) else ast.MapLit
+        return isinstance(stmt.init, literal_cls)
 
     def _emit_local_retain_release(self, ref, val, source_expr, ttype, lines):
         """claude.md #77 (widened; claude.md #79 widens it again to

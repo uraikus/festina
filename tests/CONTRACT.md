@@ -359,11 +359,11 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 801 tests in this directory pass against it: 536 need no external
+All 812 tests in this directory pass against it: 542 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-255 more need a working C compiler, plus 2 more
-(`tests/test_packaging.py`) given `pyinstaller` too, plus 8 more given
-`Xvfb`+`xdotool` too (536 + 255 + 2 + 8 = 801 -- re-verified directly
+259 more need a working C compiler, plus 2 more
+(`tests/test_packaging.py`) given `pyinstaller` too, plus 9 more given
+`Xvfb`+`xdotool` too (542 + 259 + 2 + 9 = 812 -- re-verified directly
 by hiding each tool from PATH in turn, not just derived by counting
 `compile_and_run` call sites, since the true number had drifted well
 past a much older, since-inaccurate count of "694 given a working C
@@ -372,12 +372,15 @@ end-to-end tests grew to their current share of it)
 (`tests/test_codegen.py::TestGraphics`'s interactive click/mouse/key/
 resize tests, the one confirming the initial `clientWidth`/
 `clientHeight` values, `TestTimers`'s combined graphics-and-timers test,
-and `TestExampleGraphicsAndGame`'s two example-driven tests below) --
-all skip cleanly, independently, without any of those three (see
-below). `tests/test_audio.py`/`TestAudio` need none of the three
-either -- the null-device technique they use (see conftest.py's
-`audio_null_env`) needs no extra tool install, only the C compiler
-`compile_and_run` already requires.
+`TestExampleGraphicsAndGame`'s two example-driven tests below, and the
+real-window-manager crash regression test -- see security.md) -- all
+skip cleanly, independently, without any of those three (see below).
+One of those nine (the real-window-manager regression test) needs a
+fourth tool on top, `openbox`, and skips cleanly without it too even
+when the other three are present. `tests/test_audio.py`/`TestAudio`
+need none of the above -- the null-device technique they use (see
+conftest.py's `audio_null_env`) needs no extra tool install, only the C
+compiler `compile_and_run` already requires.
 
 `examples/` grew beyond the original hello/basic/arrays/geometry/
 multifile/regex set: `timers.f` (setTimeout/setInterval), `graphics.f`
@@ -2011,6 +2014,45 @@ making the stricter behavior the rule everywhere, with `Math`/`.toFloat()`
 as the escape hatch, rather than picking a side ad hoc in code with no
 spec backing either way.
 
+A user-reported bug, not one this suite's own testing surfaced first: a
+compiled graphics program (`tic_tac_toe.f` among them) crashed with a
+real X11 protocol error, `BadMatch` on `X_SetInputFocus`, the moment its
+window opened on a real desktop -- never reproducible against this
+suite's own Xvfb-based `TestGraphics` tier, since a bare Xvfb instance
+runs no window manager to race against at all. Root-caused, fixed, and
+given its own dedicated regression test (a new `x_display_with_wm`
+fixture layering a real `openbox` instance on top of the existing
+Xvfb-based `x_display` fixture) -- full writeup, including a separate,
+unrelated `twm`-specific hang found and ruled out while narrowing this
+down, in
+[security.md](security.md#graphics-a-real-window-manager-crash-badmatch-on-xsetinputfocus).
+
+Two performance findings, prompted directly by benchmarking
+([benchmark.md](benchmark.md)) rather than an audit -- correctness-
+neutral in both cases, closing real, honest gaps against Rust/Go rather
+than fixing bugs. **claude.md #81**: a non-escaping local declared
+directly from an array/map literal now stack-allocates its own header
+(`_emit_array_lit`/`_emit_map_lit` accept a caller-supplied header slot
+to build into) instead of always heap-allocating one the way stage 6's
+own with-initializer path unconditionally did -- `array_sum`'s own
+2,000,000-iteration benchmark went from 209ms (a real 2.4x behind
+Rust/Go) to 86ms (parity with both), purely from one allocation
+eliminated per iteration. See todo.md's "Memory management" section,
+"Stage 8", for the full writeup, including a genuinely unrelated
+AddressSanitizer-at-scale finding (an ordinary, pre-existing struct-in-
+a-loop pattern also stack-overflows under ASan's own heavier
+instrumentation past ~65,000 iterations -- confirmed unrelated to this
+stage, not a regression it introduced). **claude.md #82**: a template
+literal (`` `${x}` ``) used to always emit two `festina_str_concat`
+calls per interpolation regardless of content, even when concatenating
+with an empty literal piece (a no-op for any template that starts or
+ends with an interpolation, or has two adjacent) -- now skipped
+entirely. `string_concat`'s own 15,000-iteration benchmark went from
+140ms to roughly 77ms, close to halving it, without touching the
+underlying O(n²) naive-concatenation algorithm at all.
+`tests/test_codegen.py::TestStrings` grew from 2 to 11 tests covering
+both the correctness (unaffected) and the actual call-count reduction.
+
 See api.md for the current language/standard library reference and this
 file's own "Status" section above for the implemented-vs-not matrix; the
 short version: nothing is left
@@ -2766,8 +2808,9 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 536 passed, 265 skipped (needs a C compiler; 2 of
+pytest tests/                          # 542 passed, 270 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
-                                        # 8 need Xvfb + xdotool installed too) given a
-                                        # working C compiler, all 801 pass
+                                        # 9 need Xvfb + xdotool installed too, 1 of those
+                                        # also needs `openbox`) given a working C compiler,
+                                        # all 812 pass
 ```

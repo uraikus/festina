@@ -58,6 +58,27 @@ static void festina_graphics_require_init(void) {
     }
 }
 
+/* Swallows exactly the failure mode festina_graphics_init's own
+ * best-effort XSetInputFocus call can trigger: under a *real* window
+ * manager (unlike the bare Xvfb instance tests/test_codegen.py's
+ * TestGraphics runs against, which has no WM to race with at all), the
+ * WM can still be reparenting/managing the just-mapped window at the
+ * moment this call reaches the server, so the window is transiently not
+ * yet "viewable" -- a real, reproduced BadMatch (X_SetInputFocus, opcode
+ * 42), confirmed directly by running a compiled Festina graphics program
+ * under `twm`, not a hypothetical race. Xlib's *default* error handler
+ * prints this and then calls exit(), which would otherwise take the
+ * whole program down over a focus request that was already documented
+ * as harmless-if-it-fails. Installed only around that one call (see its
+ * own call site) -- every other X11 error the program might hit still
+ * goes through Xlib's default handler and is treated as fatal, exactly
+ * as before this existed. */
+static int festina_ignore_focus_error(Display *display, XErrorEvent *error) {
+    (void)display;
+    (void)error;
+    return 0;
+}
+
 void festina_graphics_init(void) {
     g_display = XOpenDisplay(NULL);
     if (!g_display) {
@@ -92,8 +113,16 @@ void festina_graphics_init(void) {
      * bare Xvfb instance -- see tests/test_codegen.py's TestGraphics),
      * nothing else would ever give this window keyboard focus, and `on
      * key` would never fire. A real desktop's WM normally does this on
-     * click/map; asking directly is harmless either way. */
+     * click/map; asking directly is harmless either way -- and, under a
+     * real WM, can genuinely fail (BadMatch, if the WM is still
+     * reparenting the window at this exact moment), so this one call is
+     * wrapped in a lenient handler that tolerates it rather than letting
+     * Xlib's own default handler exit() the whole program over it; see
+     * festina_ignore_focus_error's own comment. */
+    int (*prev_error_handler)(Display *, XErrorEvent *) = XSetErrorHandler(festina_ignore_focus_error);
     XSetInputFocus(g_display, g_window, RevertToParent, CurrentTime);
+    XSync(g_display, False); /* force any BadMatch to arrive before the handler is restored */
+    XSetErrorHandler(prev_error_handler);
     XFlush(g_display);
 
     g_canvas_width = FESTINA_CANVAS_WIDTH;

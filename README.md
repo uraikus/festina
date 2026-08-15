@@ -7,7 +7,7 @@ overhead, and the boilerplate. Festina compiles through LLVM to a real,
 standalone executable — with SQLite, graphics, audio, and JS-style
 timers built directly into the language, not bolted on as libraries.
 
-[![Tests](https://img.shields.io/badge/tests-801%20passing-brightgreen)](tests/CONTRACT.md)
+[![Tests](https://img.shields.io/badge/tests-812%20passing-brightgreen)](tests/CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ```festina
@@ -172,9 +172,10 @@ snippets that happened to work once.
 
 Festina, Rust, Go, and Bun, on the same small equivalent-logic
 benchmarks (recursive function calls, tight-loop arithmetic, process
-startup) — see [benchmark.md](benchmark.md) for the methodology and the
-full, regularly-refreshed results table. Short version: Festina holds
-its own against Rust and Go on compute-bound native code, and comfortably
+startup, array allocation, string concatenation) — see
+[benchmark.md](benchmark.md) for the methodology and the full,
+regularly-refreshed results table. Short version: Festina holds its own
+against Rust and Go on compute-bound native code, and comfortably
 outruns a JIT on cold single-shot execution — unsurprising for a young
 optimizer against two of the most mature compiled-language backends
 around, and exactly the kind of regression tracking a young compiler
@@ -184,7 +185,7 @@ needs.
 
 Festina is under active development, but not vaporware — the compiler
 frontend, LLVM codegen backend, and native C runtime are real and
-tested: **801 tests, 0 failures.** Every `claude.md` language construct
+tested: **812 tests, 0 failures.** Every `claude.md` language construct
 this project has committed to is implemented end to end, not just
 parsed. See [`tests/CONTRACT.md`](tests/CONTRACT.md) for exactly what's
 covered and how, and [todo.md](todo.md) for what's next (macOS, Windows,

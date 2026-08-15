@@ -1039,6 +1039,75 @@ a struct's own escaping value, a struct's own struct-typed fields, an
 escaping `arr[T]`/`map[T]` value, and now an `arr[T]`/`map[T]`'s own
 elements/values — is closed.
 
+### Stage 8: stack allocation for a literal-initialized non-escaping arr[T]/map[T] local (done — claude.md #81)
+
+A correctness-neutral follow-up, not a new safety gap: prompted directly
+by benchmarking (see [benchmark.md](benchmark.md)'s own `array_sum`),
+not found by an audit. Stage 3 already gives a non-escaping struct
+local, and a non-escaping *no-initializer* `arr[T]`/`map[T]` local, a
+real stack-allocation option instead of a heap/refcounted one — a
+*with-initializer* `arr[T]`/`map[T]` local never got this option at
+all, even when non-escaping, always routing through the general
+array/map-literal construction (stage 6's own), which always
+heap-allocates its own header regardless of where the literal ends up
+bound. Correct (a literal used as a nested subexpression might
+genuinely need that header to outlive its own construction) but
+needlessly conservative for the ordinary case of a local declared
+directly from a literal and never used anywhere else — confirmed a real
+cost, not just a theoretical one, once benchmarked: `array_sum`'s own
+2,000,000-iteration loop, building a fresh 8-element `arr[int]` every
+iteration, ran a real, honest 2.4x behind Rust/Go's own equivalent
+(209ms vs. ~87ms) purely from this one avoidable heap allocation.
+
+Closed for exactly the one case it's provably safe to: a local whose
+initializer is an array/map literal written *directly* at the
+declaration itself (not merely an expression that happens to evaluate
+to one — an identifier bound to some other literal elsewhere doesn't
+give this anything provable about its own size), and which escape
+analysis already proves non-escaping — sound for the identical reason
+stage 1's own no-initializer case already is: "non-escaping" already
+rules out this local ever later being the target of a plain
+reassignment too (an assignment target always escapes, by
+escape_analysis's own existing rule), so there's no risk of a stack-
+header local later being pointed at a genuinely different, possibly-
+heap value. `_emit_array_lit`/`_emit_map_lit` (stage 6's own
+construction logic) now accept a caller-supplied header slot to build
+directly into, instead of always allocating their own — the literal's
+own data/entries buffer is unchanged, still always heap-allocated (a
+dynamically-sized buffer was never safe to give a fixed-size `alloca`),
+so this closes only one of the two heap allocations a with-initializer
+local used to need, not both.
+
+Verified the same three ways as every stage before it: 10 existing
+IR-level tests updated in place (they used a with-initializer
+`arr[int]` local specifically *because* it used to always be
+refcounted, to exercise loop/break/continue/if free-scheduling timing —
+now correctly asserting a bare `@free(` call instead of
+`festina_release_array(`, the identical timing, just a different
+runtime function since the header itself is no longer refcounted), 2
+renamed/rewritten to cover the new non-escaping-stack-allocated shape
+directly, 1 new test added to keep the escaping with-initializer case
+(still fully refcounted, unaffected) independently covered for maps the
+way it already was for arrays — `tests/test_codegen.py::TestAutomaticMemoryReclamation`
+grew from 118 to 119 — and real AddressSanitizer/LeakSanitizer runs
+against every earlier stage's own stress/reproduction program (16 in
+total) plus a dedicated new one at this stage's own established safe
+scale, all clean. (A genuinely unrelated finding surfaced while pushing
+verification scale higher, worth recording so it isn't mistaken for a
+regression later: an *ordinary*, long-established, already-shipped
+stack-allocated-struct-in-a-loop pattern — nothing to do with this
+stage's own change — reliably trips a stack-overflow under
+AddressSanitizer's own heavier per-frame instrumentation somewhere
+between 10,000 and 100,000 loop iterations, confirmed by reproducing
+the identical failure with a plain struct local completely unrelated to
+this stage. The plain, non-instrumented binary runs the real
+benchmark's full 2,000,000 iterations correctly and quickly either way
+— an ASan-at-that-scale testing-methodology ceiling, not a correctness
+bug in generated code.) Directly re-benchmarked afterward:
+`array_sum` dropped from 209ms to 86ms, landing at parity with Rust and
+Go's own equivalent rather than behind them, with byte-identical output
+before and after.
+
 ### What's still ahead
 
 - **A real tracing GC** was never seriously considered as an
