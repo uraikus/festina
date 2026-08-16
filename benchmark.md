@@ -1,7 +1,8 @@
 # Benchmarks
 
 How Festina compares to Rust, Go, and Bun on a handful of small,
-equivalent-logic programs, and to a browser's `<canvas>` on 2D drawing. Not a claim that Festina is faster than any
+equivalent-logic programs, and to a browser's `<canvas>` and MonoGame on
+2D drawing. Not a claim that Festina is faster than any
 of these languages in general — a compiled language's real-world
 performance depends heavily on what's actually being written and how
 mature its optimizer/runtime is, and Festina's is young. This exists to
@@ -13,8 +14,8 @@ few workloads on every change that plausibly affects performance
 
 Five programs, each implemented equivalently in Festina, Rust, Go, and
 Bun (source in [`benchmarks/`](benchmarks/)), plus a sixth comparing
-Festina's canvas against a browser's — see
-[Canvas](#canvas-festina-vs-an-html-canvas) at the end:
+Festina's canvas against a browser's and MonoGame's — see
+[Canvas](#canvas-festina-vs-an-html-canvas-vs-monogame) at the end:
 
 | Benchmark | What it measures |
 |---|---|
@@ -50,6 +51,10 @@ python3 benchmarks/run_benchmarks.py --update-doc   # regenerate this file's tab
 
 python3 benchmarks/canvas/run_canvas_benchmark.py             # the canvas comparison
 python3 benchmarks/canvas/run_canvas_benchmark.py --update-doc
+
+# The MonoGame side needs a .NET SDK and, on first run, network access
+# to restore its NuGet package; without either it is skipped with a note
+# rather than failing the run.
 ```
 
 The runner skips any language toolchain not installed rather than
@@ -180,13 +185,21 @@ _Last run: 2026-08-16 on this machine -- see benchmark.md's "Methodology" sectio
   result from 1.4x behind to 2.1x ahead. Festina also wins startup by
   more than an order of magnitude and wins on variance, which for a
   frame budget is not a footnote.
+- **MonoGame** joins the canvas comparison as a third side, and its
+  number is the one on this page most likely to be quoted out of
+  context. It is a GPU framework running here with no GPU, on Mesa's
+  software rasterizer; on real hardware it would batch these 40,000
+  sprites into a couple of draw calls and beat everything else on this
+  page by orders of magnitude. The row is worth having because headless
+  rendering with no GPU is a real situation — CI, a build server, a
+  container — and it is worth reading only with that sentence attached.
 - These are intentionally small, fast benchmarks so they can be re-run
   on every change worth checking, not a comprehensive suite (no I/O, no
   concurrency, no realistic mixed workload) — see [todo.md](todo.md)
   for what's still missing from Festina itself that would make a
   broader comparison meaningful (HTTP, for one).
 
-## Canvas: Festina vs an HTML `<canvas>`
+## Canvas: Festina vs an HTML `<canvas>` vs MonoGame
 
 <!-- CANVAS_RESULTS_START -->
 _Last run: 2026-08-16 on this machine. Chromium 141.0.7390.37._
@@ -201,10 +214,31 @@ which documents what each one cost when it was measured the other way.
 
 | | Frame (min) | Frame (median) | First frame |
 |---|---|---|---|
-| Festina (Cairo) | 31 ms | 32 ms | 17 ms (process start + PNG encode) |
-| HTML `<canvas>` (Chromium/Skia) | 64 ms | 83 ms | 224 ms (browser launch) |
+| Festina (Cairo) | 31 ms | 32 ms | 16 ms (process start + PNG encode) |
+| HTML `<canvas>` (Chromium/Skia) | 60 ms | 62 ms | 240 ms (browser launch) |
+| MonoGame (SpriteBatch, **software** GL) | 181 ms | 410 ms | 166 ms (.NET runtime + GL context) |
 
-On this workload **Festina draws it 2.1x faster**.
+> **The MonoGame row needs its caveat read before its number.**
+> MonoGame is a GPU framework, and this machine has no GPU — its GL
+> context is Mesa's `llvmpipe`, a software implementation of the whole
+> graphics pipeline. It is therefore paying in software for vertex
+> transform, rasterization setup and per-pixel texture sampling that
+> real hardware does for free. On an actual GPU these 40,000 sprites
+> batch into a couple of draw calls and finish in well under a
+> millisecond — which no CPU rasterizer on this page can approach.
+> What this row measures is the headless, no-GPU case (CI, a build
+> server, a container), and nothing else.
+>
+> It is also by far the noisiest row: `llvmpipe` is multithreaded and
+> so is far more exposed to whatever else the machine is doing than
+> single-threaded Cairo. Consecutive runs of the same binary measured
+> 173, 180, 193, 285 and 498 ms. The runner launches the process five
+> times and keeps the best, which lands near the floor most of the
+> time — but treat this number as "a few hundred milliseconds",
+> not as a figure precise to the millisecond the way the other two
+> rows are.
+
+On this workload **Festina draws it 1.9x faster**.
 
 That took one change, and finding it took measuring rather than
 guessing. The first version of this benchmark had Festina 1.4x SLOWER,
@@ -220,7 +254,7 @@ frame from 90 ms to 31 ms (claude.md #104). The remaining split is
 20,000 times is too cheap to measure.
 
 Two things are worth reading alongside the headline. The browser's frame
-time is far noisier -- 64 ms at best against a 83 ms median here, and
+time is far noisier -- 60 ms at best against a 62 ms median here, and
 the median moves by 20+ ms between runs of this same script, while
 Festina's two numbers (31 and 32 ms) sit on top of each other. For a
 frame budget, predictability is not a footnote. And getting to the

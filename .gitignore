@@ -166,3 +166,9 @@ benchmarks/loop_sum
 /dist/
 /build/
 *.spec
+
+# claude.md #105: the MonoGame benchmark's build output. The project
+# file and Program.cs are checked in; bin/ and obj/ are restored and
+# rebuilt by benchmarks/canvas/run_canvas_benchmark.py on first run.
+benchmarks/canvas/monogame/bin/
+benchmarks/canvas/monogame/obj/
