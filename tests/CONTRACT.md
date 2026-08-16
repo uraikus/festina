@@ -2514,6 +2514,38 @@ same reasons the pool tests are), 4 end-to-end tests in `TestAudio`
 alternation), and 8 in `tests/test_audio.py` for the signatures. Clean
 under ThreadSanitizer and AddressSanitizer.
 
+**claude.md #105**: MonoGame added to the canvas benchmark.
+
+The same 20,000 rectangles and 20,000 circles through SpriteBatch into
+an offscreen RenderTarget2D. Festina 31 ms, Chromium's canvas ~60 ms,
+MonoGame ~177 ms -- and that last number is close to meaningless without
+its caveat, so the caveat is printed with it: **MonoGame is a GPU
+framework and this machine has no GPU**, so its GL context is Mesa's
+`llvmpipe`, paying in software for the whole graphics pipeline. On real
+hardware these 40,000 sprites batch into a couple of draw calls and
+finish in well under a millisecond. The row measures the headless,
+no-GPU case only.
+
+The MonoGame side is written idiomatically -- 1x1 tinted texture for
+rects, pre-rendered circle texture, one deferred SpriteBatch so the
+framework batches as designed. Defeating that would have produced a
+bigger number and a worthless one.
+
+Trustworthy timing took three attempts: the one-pixel readback that
+syncs the browser syncs only *sometimes* here (min 193, median 519, max
+553 within one run), and no readback at all is worse still (516/526/538,
+because frames queue and a timed region holds another frame's backlog).
+Reading the whole target forces a real finish and costs 0.4 ms on an
+untouched target. llvmpipe is also multithreaded and far more exposed to
+machine noise than single-threaded Cairo (176/182/513 ms across three
+invocations), so the runner launches the process several times and keeps
+the best.
+
+MonoGame's frame matches Festina's with a worst per-channel difference
+of **0.0** -- better than the browser's 0.2 -- because the circle
+texture is built with the same coverage-based antialiasing Cairo
+applies. Skips with a note when there is no .NET SDK or no network.
+
 **claude.md #104**: filled circles are stamped, not tessellated.
 
 claude.md #103 measured Festina's canvas at 1.4x *slower* than a

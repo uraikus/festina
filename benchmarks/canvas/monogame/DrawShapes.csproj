@@ -1,0 +1,28 @@
+<!-- claude.md #105: the MonoGame half of the canvas benchmark.
+
+     DesktopGL rather than the DirectX backend, since this is Linux. The
+     project is restored from nuget.org on first run, which is why the
+     runner treats a missing network or a missing dotnet SDK as a skip
+     rather than a failure. -->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>FestinaBench</RootNamespace>
+    <AssemblyName>DrawShapes</AssemblyName>
+    <!-- Release, and with the tiered JIT allowed to reach its top tier:
+         the benchmark runs the frame many times inside one process, so
+         quoting a cold-JIT number would understate MonoGame for reasons
+         that have nothing to do with drawing. -->
+    <Optimize>true</Optimize>
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="MonoGame.Framework.DesktopGL" Version="3.8.*" />
+  </ItemGroup>
+
+</Project>

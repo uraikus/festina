@@ -2221,3 +2221,26 @@ The verification is the part worth keeping. A frame exercising every one of thos
 One test expectation had to be corrected rather than the code: a radius-1 circle does not fully cover even its own centre pixel, so Cairo antialiases it to grey. Asserting solid black there would have been testing Cairo's coverage arithmetic rather than this cache, and the fallback produces the identical grey.
 
 What remains is 11 ms of rectangles and 20 ms of circles. Rectangles at 0.5 microseconds each are not obviously improvable without leaving Cairo, and the context-per-call overhead that started this investigation is still there, still worth 4 ms, and still not worth the state-leak risk of a shared long-lived context. The honest summary is that this workload is now bounded by Cairo's span filling rather than by anything Festina is doing to it.
+
+
+105. MONOGAME, AND A NUMBER THAT NEEDS ITS CAVEAT READ FIRST
+
+The canvas benchmark gained a third side: MonoGame, drawing the same 20,000 rectangles and 20,000 circles through SpriteBatch into an offscreen RenderTarget2D. Festina draws the frame in 31 ms, Chromium's canvas in about 60 ms, and MonoGame in about 177 ms.
+
+That last number is close to meaningless without what follows it, so it is printed with the caveat attached in both the benchmark output and the document. MonoGame is a GPU framework. This machine has no GPU, so its GL context is Mesa's `llvmpipe` -- a software implementation of the entire graphics pipeline -- and it is therefore paying in software for vertex transform, rasterization setup and per-pixel texture sampling that real hardware does for free. On an actual GPU these 40,000 sprites batch into a couple of draw calls and finish in well under a millisecond, which no CPU rasterizer in this comparison can approach. What the MonoGame row measures is the headless, no-GPU case -- CI, a build server, a container -- and nothing else. Reporting "Festina is 5.7x faster than MonoGame" without that sentence would be a lie by omission, and a particularly cheap one.
+
+The MonoGame side is written the way MonoGame is meant to be written, which matters more than it sounds. A filled rectangle is a 1x1 white texture stretched and tinted; a circle is a pre-rendered circle texture tinted the same way; both go through one deferred SpriteBatch so the framework batches 40,000 draws into a couple of calls. Defeating that batching would have produced a bigger number and a worthless one. Worth noticing in passing: a MonoGame circle is a pre-rendered texture stamped per instance, which is exactly what claude.md #104 made Festina's own drawCircle do internally -- the two arrived at the same trick from opposite directions.
+
+Getting a trustworthy measurement out of it took three attempts, and the failure mode is the same one the browser side had, only worse. GL is asynchronous, so timing the submission measures how fast a command buffer fills. Three sync strategies, measured:
+
+    no readback     min 516  median 526  max 538 ms
+    one pixel       min 193  median 519  max 553 ms
+    whole target    min 188  median 195  max 272 ms
+
+The one-pixel readback that works for the browser syncs only SOMETIMES here, which is why its numbers swing threefold inside a single run. No readback at all is worse than either, because frames queue and a timed region ends up holding some other frame's backlog. Reading the whole target forces a real finish, and costs 0.4 ms on an untouched target -- measured, so it is not what is being timed.
+
+Even with that settled, llvmpipe is multithreaded and far more exposed to whatever else the machine is doing than single-threaded Cairo: three consecutive invocations measured 176 ms, 182 ms and 513 ms. The runner therefore launches the process several times and keeps the best, which is the same min-of-runs the rest of benchmark.md already uses, applied one level up.
+
+The output comparison earns its place again. MonoGame's frame matches Festina's with a worst per-channel difference of 0.0 over the 16x16 grid -- better than the browser's 0.2 -- which is only possible because the circle texture is built with the same coverage-based antialiasing Cairo applies rather than a hard-edged disc. Two rasterizers agreeing to the byte at that granularity is what makes the timing comparison mean anything at all.
+
+The benchmark degrades rather than fails where it cannot run: no .NET SDK, or no network to restore the NuGet package from, skips that side with a note. The project file and source are checked in; bin/ and obj/ are not.
