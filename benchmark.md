@@ -171,13 +171,15 @@ _Last run: 2026-08-16 on this machine -- see benchmark.md's "Methodology" sectio
   difference this benchmark exists to surface.
 - **The canvas comparison** (below) is the one benchmark here that
   isn't against another *language*. It's against the thing a 2D game
-  would otherwise most likely be written on: an HTML `<canvas>`. Festina
-  loses the frame-drawing half by about 1.4x, which is worth stating
-  plainly rather than burying — Skia has had years of SIMD-level
-  investment aimed squarely at this loop and Cairo has not, and Festina
-  does not get to claim otherwise by picking a friendlier workload. It
-  wins the startup half by more than an order of magnitude, and it wins
-  on variance, which for a frame budget is not a footnote.
+  would otherwise most likely be written on: an HTML `<canvas>`. It
+  started out with Festina 1.4x **slower**, and that got written down in
+  bold before anything was done about it — which is what made the fix
+  findable. Splitting the frame by shape type showed circles were 90% of
+  it, because Cairo tessellates every arc afresh; caching one alpha mask
+  per radius (claude.md #104) took the frame from 90 ms to 31 ms and the
+  result from 1.4x behind to 2.1x ahead. Festina also wins startup by
+  more than an order of magnitude and wins on variance, which for a
+  frame budget is not a footnote.
 - These are intentionally small, fast benchmarks so they can be re-run
   on every change worth checking, not a comprehensive suite (no I/O, no
   concurrency, no realistic mixed workload) — see [todo.md](todo.md)
@@ -199,19 +201,32 @@ which documents what each one cost when it was measured the other way.
 
 | | Frame (min) | Frame (median) | First frame |
 |---|---|---|---|
-| Festina (Cairo) | 90 ms | 94 ms | 17 ms (process start + PNG encode) |
-| HTML `<canvas>` (Chromium/Skia) | 60 ms | 66 ms | 223 ms (browser launch) |
+| Festina (Cairo) | 31 ms | 32 ms | 17 ms (process start + PNG encode) |
+| HTML `<canvas>` (Chromium/Skia) | 64 ms | 83 ms | 224 ms (browser launch) |
 
-On this workload **the browser draws it 1.5x faster**. That is the honest result
-and not a surprising one: Skia is a mature, heavily SIMD-optimized
-rasterizer with years of investment behind exactly this loop, and Cairo
-is neither. Two things are worth reading alongside it. The browser's frame time is
-far noisier -- 60 ms at best against a 66 ms median here, and the
-median moves by 20+ ms between runs of this same script, while Festina's
-two numbers (90 and 94 ms) sit on top of each other. For a frame
-budget, predictability is not a footnote. And getting to the *first*
-frame differs by more than an order of magnitude in the other direction,
-because one side starts a browser and the other starts a process.
+On this workload **Festina draws it 2.1x faster**.
+
+That took one change, and finding it took measuring rather than
+guessing. The first version of this benchmark had Festina 1.4x SLOWER,
+and the obvious culprit -- a fresh Cairo context per draw call -- turned
+out to account for 4 ms of 90. Splitting the frame by shape type found
+the real one immediately: 20,000 rectangles cost 10 ms and 20,000
+circles cost 76 ms, because `cairo_arc` + `cairo_fill` tessellates the
+curve into Beziers and scan-converts a general polygon every single
+time. Rasterizing each radius once into an alpha mask and stamping it
+thereafter -- what a glyph cache does -- took circles to 20 ms and the
+frame from 90 ms to 31 ms (claude.md #104). The remaining split is
+11 ms of rectangles, 20 ms of circles, and setting the fill colour
+20,000 times is too cheap to measure.
+
+Two things are worth reading alongside the headline. The browser's frame
+time is far noisier -- 64 ms at best against a 83 ms median here, and
+the median moves by 20+ ms between runs of this same script, while
+Festina's two numbers (31 and 32 ms) sit on top of each other. For a
+frame budget, predictability is not a footnote. And getting to the
+*first* frame differs by more than an order of magnitude in the same
+direction, because one side starts a process and the other starts a
+browser.
 
 Both outputs were compared cell-by-cell over a 16x16 grid to confirm
 they drew the same scene -- worst per-channel difference 0.2 out of 255.

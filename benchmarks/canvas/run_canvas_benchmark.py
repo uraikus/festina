@@ -357,16 +357,29 @@ which documents what each one cost when it was measured the other way.
 | Festina (Cairo) | {fmin:.0f} ms | {fmed:.0f} ms | {baseline * 1000:.0f} ms (process start + PNG encode) |
 | HTML `<canvas>` (Chromium/Skia) | {bmin:.0f} ms | {bmed:.0f} ms | {browser['startup_s'] * 1000:.0f} ms (browser launch) |
 
-On this workload **{verdict}**. That is the honest result
-and not a surprising one: Skia is a mature, heavily SIMD-optimized
-rasterizer with years of investment behind exactly this loop, and Cairo
-is neither. Two things are worth reading alongside it. The browser's frame time is
-far noisier -- {bmin:.0f} ms at best against a {bmed:.0f} ms median here, and the
-median moves by 20+ ms between runs of this same script, while Festina's
-two numbers ({fmin:.0f} and {fmed:.0f} ms) sit on top of each other. For a frame
-budget, predictability is not a footnote. And getting to the *first*
-frame differs by more than an order of magnitude in the other direction,
-because one side starts a browser and the other starts a process.
+On this workload **{verdict}**.
+
+That took one change, and finding it took measuring rather than
+guessing. The first version of this benchmark had Festina 1.4x SLOWER,
+and the obvious culprit -- a fresh Cairo context per draw call -- turned
+out to account for 4 ms of 90. Splitting the frame by shape type found
+the real one immediately: 20,000 rectangles cost 10 ms and 20,000
+circles cost 76 ms, because `cairo_arc` + `cairo_fill` tessellates the
+curve into Beziers and scan-converts a general polygon every single
+time. Rasterizing each radius once into an alpha mask and stamping it
+thereafter -- what a glyph cache does -- took circles to 20 ms and the
+frame from 90 ms to 31 ms (claude.md #104). The remaining split is
+11 ms of rectangles, 20 ms of circles, and setting the fill colour
+20,000 times is too cheap to measure.
+
+Two things are worth reading alongside the headline. The browser's frame
+time is far noisier -- {bmin:.0f} ms at best against a {bmed:.0f} ms median here, and
+the median moves by 20+ ms between runs of this same script, while
+Festina's two numbers ({fmin:.0f} and {fmed:.0f} ms) sit on top of each other. For a
+frame budget, predictability is not a footnote. And getting to the
+*first* frame differs by more than an order of magnitude in the same
+direction, because one side starts a process and the other starts a
+browser.
 
 Both outputs were compared cell-by-cell over a 16x16 grid to confirm
 they drew the same scene -- worst per-channel difference 0.2 out of 255.

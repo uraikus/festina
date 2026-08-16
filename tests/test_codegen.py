@@ -5203,6 +5203,144 @@ int main(int argc, char **argv) {
 """
 
 
+class TestCircleMaskFastPath:
+    """claude.md #104: filled circles are rasterized once per radius and
+    stamped thereafter, instead of tessellating the curve every time.
+
+    Measured on the canvas benchmark, circles were 90% of the frame --
+    20,000 of them cost 76 ms against 10 ms for the same number of
+    rectangles -- because cairo_arc + cairo_fill turns the curve into
+    Beziers and scan-converts a general polygon on every call. Caching
+    an A8 alpha mask per radius is 4.4x faster on that workload and took
+    the whole frame from 90 ms to 31 ms.
+
+    Everything here is about the fast path being INVISIBLE. It is only
+    correct while the mask lands exactly where a tessellated circle
+    would, so anything that would move it off the pixel grid -- a scale,
+    a rotation, a fractional translation -- has to fall back, and a
+    border has to fall back because a stroke needs a real path. Verified
+    against the tessellating fallback over a whole 800x600 frame
+    covering every one of these cases: 5 pixels of 480,000 differed, all
+    by 1/255, all inside a gradient (sampling rounding, not geometry).
+    """
+
+    def _canvas(self, compile_and_run, monkeypatch, body, name="out.png"):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        result = compile_and_run(f"clearCanvas()\n{body}\nlog(saveCanvas('{name}'))")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "true"
+        return result
+
+    def test_a_filled_circle_is_actually_filled(self, compile_and_run, tmp_path, monkeypatch):
+        self._canvas(compile_and_run, monkeypatch,
+                      "fillStyle(200, 30, 30)\ndrawCircle(60, 60, 20)")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        assert pixel(60, 60) == (200, 30, 30)      # centre
+        assert pixel(60, 45) == (200, 30, 30)      # inside, near the top edge
+        assert pixel(60, 20) == (255, 255, 255)    # well outside
+        assert pixel(95, 60) == (255, 255, 255)
+
+    @pytest.mark.parametrize("radius", [1, 2, 3, 4, 8, 16, 32])
+    def test_every_radius_covers_the_right_extent(self, compile_and_run, tmp_path,
+                                                    monkeypatch, radius):
+        # A mask stamped half a pixel off would show up here as an edge
+        # landing one pixel early or late, at every radius independently.
+        self._canvas(compile_and_run, monkeypatch,
+                      f"fillStyle(0, 0, 0)\ndrawCircle(100, 100, {radius})")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        # Inked, not necessarily SOLID: a radius-1 circle does not fully
+        # cover even its own centre pixel, so Cairo antialiases it to
+        # grey -- in the fallback exactly as much as in the fast path
+        # (compared directly: zero differing pixels at r=1). Demanding
+        # pure black here would be testing Cairo's coverage arithmetic
+        # rather than this cache.
+        assert pixel(100, 100)[0] < 200, (radius, pixel(100, 100))
+        # Just outside the circle in each direction is untouched white.
+        for dx, dy in ((radius + 2, 0), (-radius - 2, 0), (0, radius + 2), (0, -radius - 2)):
+            assert pixel(100 + dx, 100 + dy) == (255, 255, 255), (radius, dx, dy)
+
+    def test_a_bordered_circle_still_gets_its_border(self, compile_and_run, tmp_path,
+                                                      monkeypatch):
+        # Must fall back: a stroke needs a real path, and the mask has
+        # none. If the fast path ever swallowed this, the border would
+        # silently vanish.
+        self._canvas(compile_and_run, monkeypatch,
+                      "color navy = 'navy'\n"
+                      "fillStyle(255, 255, 0)\n"
+                      "borderColor(navy)\n"
+                      "lineWidth(4)\n"
+                      "drawCircle(60, 60, 20)")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        assert pixel(60, 60) == (255, 255, 0)          # the fill
+        r, g, b = pixel(60, 40)                         # on the border ring
+        assert b > r and b > g, (r, g, b)
+
+    def test_a_scaled_circle_is_the_scaled_size(self, compile_and_run, tmp_path, monkeypatch):
+        # Must fall back: stamping a pre-rasterized mask under a scale
+        # would resample it. The give-away is the extent -- a radius-10
+        # circle drawn at scale 2 has to reach 20 pixels out.
+        self._canvas(compile_and_run, monkeypatch,
+                      "fillStyle(0, 0, 0)\nscale(2.0, 2.0)\ndrawCircle(50, 50, 10)")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        assert pixel(100, 100) == (0, 0, 0)
+        assert pixel(100, 84) == (0, 0, 0)         # 16px out, inside a radius-20 circle
+        assert pixel(100, 78) == (255, 255, 255)   # 22px out, beyond it
+
+    def test_a_translated_circle_moves(self, compile_and_run, tmp_path, monkeypatch):
+        # A whole-number translation KEEPS the fast path, so this checks
+        # the offset is applied rather than ignored.
+        self._canvas(compile_and_run, monkeypatch,
+                      "fillStyle(0, 0, 0)\ntranslate(100, 50)\ndrawCircle(30, 30, 10)")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        assert pixel(130, 80) == (0, 0, 0)
+        assert pixel(30, 30) == (255, 255, 255)
+
+    def test_alpha_applies_to_a_circle(self, compile_and_run, tmp_path, monkeypatch):
+        self._canvas(compile_and_run, monkeypatch,
+                      "fillStyle(0, 0, 0)\nfillAlpha(0.5)\ndrawCircle(60, 60, 20)")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        r, g, b = pixel(60, 60)
+        # Half-transparent black over white: mid grey, not solid black.
+        assert 100 < r < 160 and r == g == b, (r, g, b)
+
+    def test_a_gradient_fills_a_circle(self, compile_and_run, tmp_path, monkeypatch):
+        self._canvas(compile_and_run, monkeypatch,
+                      "color a = 'red'\n"
+                      "color b = 'blue'\n"
+                      "fillLinearGradient(40, 0, a, 80, 0, b)\n"
+                      "drawCircle(60, 60, 20)")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        left = pixel(45, 60)
+        right = pixel(75, 60)
+        assert left[0] > left[2], left      # red end
+        assert right[2] > right[0], right   # blue end
+
+    def test_a_degenerate_radius_draws_nothing_and_does_not_crash(self, compile_and_run,
+                                                                    tmp_path, monkeypatch):
+        self._canvas(compile_and_run, monkeypatch,
+                      "fillStyle(0, 0, 0)\ndrawCircle(60, 60, 0)\ndrawCircle(90, 60, -5)")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        assert pixel(60, 60) == (255, 255, 255)
+        assert pixel(90, 60) == (255, 255, 255)
+
+    def test_many_distinct_radii_do_not_break_the_cache(self, compile_and_run, tmp_path,
+                                                          monkeypatch):
+        # The cache holds 16 entries and evicts round-robin, so a program
+        # cycling through more radii than that exercises eviction on
+        # every draw. Correctness must not depend on a hit.
+        body = "fillStyle(0, 0, 0)\n" + "\n".join(
+            f"drawCircle({12 + (i % 30) * 25}, {30 + (i // 30) * 40}, {1 + i % 20})"
+            for i in range(60))
+        self._canvas(compile_and_run, monkeypatch, body)
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        # Every one of the 60 got drawn somewhere: count inked centres
+        # rather than assert a colour, since the smallest radii are
+        # antialiased grey (see the extent test above).
+        inked = sum(1 for i in range(60)
+                     if pixel(12 + (i % 30) * 25, 30 + (i // 30) * 40)[0] < 200)
+        assert inked == 60, inked
+
+
 class TestAllNullLiterals:
     """claude.md #102: `arr[text] a = [null]` / `map[int] m = {'k': null}`.
 

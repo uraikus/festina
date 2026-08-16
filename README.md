@@ -7,7 +7,7 @@ overhead, and the boilerplate. Festina compiles through LLVM to a real,
 standalone executable — with SQLite, graphics, audio, and JS-style
 timers built directly into the language, not bolted on as libraries.
 
-[![Tests](https://img.shields.io/badge/tests-1046%20passing-brightgreen)](tests/CONTRACT.md)
+[![Tests](https://img.shields.io/badge/tests-1061%20passing-brightgreen)](tests/CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ```festina
@@ -190,7 +190,7 @@ needs.
 
 Festina is under active development, but not vaporware — the compiler
 frontend, LLVM codegen backend, and native C runtime are real and
-tested: **1046 tests, 0 failures.** Every `claude.md` language construct
+tested: **1061 tests, 0 failures.** Every `claude.md` language construct
 this project has committed to is implemented end to end, not just
 parsed. That includes a leak stress suite —
 [`scripts/leak_stress.sh`](scripts/leak_stress.sh) runs five programs
