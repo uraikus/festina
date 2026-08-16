@@ -123,6 +123,16 @@ void festina_sqlite_bind_null(sqlite3_stmt *stmt, int32_t idx);
  * captured into an arr[Table]). */
 void festina_sqlite_exec(sqlite3_stmt *stmt);
 
+/* claude.md #94: single-value queries -- the first column of the first
+ * row, then finalize. Receiving a result used to require declaring a
+ * `table`, which CREATES one (claude.md #28-31's schema sync), so a
+ * `count(*)` left a throwaway table in the database; these need no
+ * schema at all. No rows, or a SQL NULL, answers with Festina's own
+ * null for that type rather than failing. */
+int64_t festina_sqlite_scalar_int(sqlite3_stmt *stmt);
+double festina_sqlite_scalar_float(sqlite3_stmt *stmt);
+char *festina_sqlite_scalar_text(sqlite3_stmt *stmt);
+
 /* Steps a prepared statement to completion, collecting each row per the
  * layout above, then finalizes it. col_types has col_count entries,
  * one per declared table field in order ("int"/"float"/"bool"/"text"). */
@@ -299,6 +309,49 @@ void *festina_load_image(const char *path);
 /* claude.md #93: saves the backing canvas as a PNG via Cairo's own
  * writer, already compiled in alongside the reader loadImage uses. */
 int8_t festina_save_canvas(const char *path);
+
+/* claude.md #94: paths, transforms, gradients and alpha.
+ *
+ * Every drawing function builds its own short-lived Cairo context, so a
+ * transform has to live outside any one of them and be applied to each
+ * -- that is what makes translate()/rotate()/scale() affect everything
+ * drawn afterwards. saveState()/restoreState() save the whole drawing
+ * state (transform, colours, alpha, line width, font), matching the
+ * canvas save()/restore() they mirror; restoring a transform while
+ * leaving a colour changed is the kind of half-measure that produces
+ * baffling bugs.
+ *
+ * A path is built across separate calls, so one context stays open from
+ * beginPath() until fillPath()/strokePath() consumes it -- as in the
+ * canvas model, where fill()/stroke() end the current path. Using any
+ * of the path builders with no path open is a clean failure naming the
+ * missing beginPath().
+ *
+ * Gradients take exactly two stops. That covers essentially every
+ * gradient a program actually draws and needs no new value type, where
+ * an n-stop version would need a whole gradient object; a gradient
+ * replaces the flat fill until the next fillStyle(). Rotation is in
+ * DEGREES -- this language has no angle type to make the unit
+ * self-documenting, and Math.PI is there for anyone wanting radians. */
+void festina_set_alpha(double alpha);
+void festina_fill_linear_gradient(int64_t x0, int64_t y0, int64_t c0,
+                                   int64_t x1, int64_t y1, int64_t c1);
+void festina_fill_radial_gradient(int64_t x, int64_t y, int64_t radius,
+                                   int64_t inner, int64_t outer);
+void festina_translate(int64_t x, int64_t y);
+void festina_rotate(double degrees);
+void festina_scale(double sx, double sy);
+void festina_reset_transform(void);
+void festina_save_state(void);
+void festina_restore_state(void);
+void festina_begin_path(void);
+void festina_move_to(int64_t x, int64_t y);
+void festina_line_to(int64_t x, int64_t y);
+void festina_curve_to(int64_t cx1, int64_t cy1, int64_t cx2, int64_t cy2,
+                       int64_t x, int64_t y);
+void festina_close_path(void);
+void festina_fill_path(void);
+void festina_stroke_path(void);
 int64_t festina_image_width(void *img);
 int64_t festina_image_height(void *img);
 void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h);

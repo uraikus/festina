@@ -7058,3 +7058,266 @@ class TestSaveCanvas:
             assert "false" in text
         finally:
             proc.terminate()
+
+
+class TestScalarQueries:
+    """claude.md #94: sqliteInt/sqliteFloat/sqliteText take one value out
+    of a query without a `table` declaration to hold it.
+
+    That declaration isn't free: a `table` CREATES a real table
+    (claude.md #28-31's automatic schema sync), so before this, asking
+    for a `count(*)` or a single `json_extract` meant leaving a
+    throwaway table behind in the database forever. These share the
+    prepare-and-bind path `sqlite()` already uses; only the stepping
+    differs.
+
+    A query matching no rows, or whose value is SQL NULL, answers with
+    Festina's own null for that type -- an ordinary result to test for,
+    the same treatment claude.md #57 gives division by zero."""
+
+    def test_scalars_read_values_without_a_result_table(self, compile_and_run):
+        source = """
+        table Post { id:int  title:text  score:float }
+        sqlite(`DELETE FROM Post`)
+        sqlite(`INSERT INTO Post (id, title, score) VALUES (?, ?, ?)`, [1, 'alpha', 1.5])
+        sqlite(`INSERT INTO Post (id, title, score) VALUES (?, ?, ?)`, [2, 'beta', 2.5])
+        log(sqliteInt(`SELECT count(*) FROM Post`))
+        log(sqliteText(`SELECT title FROM Post WHERE id = ?`, [2]))
+        log(sqliteFloat(`SELECT sum(score) FROM Post`))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\nbeta\n4\n"
+
+    def test_no_matching_row_is_null(self, compile_and_run):
+        source = """
+        table Post { id:int  title:text }
+        sqlite(`DELETE FROM Post`)
+        log(sqliteText(`SELECT title FROM Post WHERE id = ?`, [99]) == null)
+        log(sqliteInt(`SELECT id FROM Post WHERE id = ?`, [99]) == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\n"
+
+    def test_a_scalar_query_creates_no_extra_table(self, compile_and_run, tmp_path):
+        # The gap this exists to close: the only table in the database
+        # afterwards should be the one actually declared.
+        source = """
+        table Post { id:int }
+        sqlite(`DELETE FROM Post`)
+        sqlite(`INSERT INTO Post (id) VALUES (?)`, [1])
+        log(sqliteInt(`SELECT count(*) FROM Post`))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "1\n"
+        import sqlite3
+        db = sqlite3.connect(str(tmp_path / "festina.sqlite"))
+        names = sorted(r[0] for r in db.execute(
+            "select name from sqlite_master where type='table' "
+            "and name not like 'sqlite_%'"))
+        db.close()
+        assert names == ["Post"]
+
+    def test_json1_works_through_scalar_queries(self, compile_and_run):
+        # SQLite's JSON1 needs no compiler feature at all -- it is
+        # ordinary SQL. This locks in that it stays reachable.
+        source = """
+        log(sqliteInt(`SELECT json_extract('{"n":42}','$.n')`))
+        log(sqliteText(`SELECT json_extract('{"name":"ada"}','$.name')`))
+        log(sqliteInt(`SELECT json_array_length('[1,2,3]')`))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "42\nada\n3\n"
+
+    def test_fts5_full_text_search_works_end_to_end(self, compile_and_run):
+        # Likewise FTS5: a virtual table, an index rebuild and a ranked
+        # MATCH query, all through SQL the language already passes
+        # through untouched.
+        source = """
+        table Post { id:int  title:text  body:text }
+        sqlite(`DELETE FROM Post`)
+        sqlite(`INSERT INTO Post (id, title, body) VALUES (?, ?, ?)`,
+               [1, 'Compilers', 'a compiler turns source into machine code'])
+        sqlite(`INSERT INTO Post (id, title, body) VALUES (?, ?, ?)`,
+               [2, 'Gardening', 'planting tomatoes in spring soil'])
+        sqlite(`INSERT INTO Post (id, title, body) VALUES (?, ?, ?)`,
+               [3, 'Machines', 'machine learning and machine code differ'])
+        sqlite(`DROP TABLE IF EXISTS PostSearch`)
+        sqlite(`CREATE VIRTUAL TABLE PostSearch USING fts5(title, body, content='Post', content_rowid='id')`)
+        sqlite(`INSERT INTO PostSearch(PostSearch) VALUES('rebuild')`)
+        log(sqliteInt(`SELECT count(*) FROM PostSearch WHERE PostSearch MATCH ?`, ['machine']))
+        log(sqliteText(`SELECT title FROM PostSearch WHERE PostSearch MATCH ? ORDER BY rank`, ['tomatoes']))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\nGardening\n"
+
+
+class TestCanvasPathsTransformsAndGradients:
+    """claude.md #94: the canvas gains arbitrary shapes.
+
+    Before this it could draw exactly three things -- a rectangle, a
+    circle and a line of text -- with no way to express a triangle, a
+    polygon, a curve, a rotated anything, a gradient or transparency.
+
+    Every drawing call builds its own short-lived Cairo context, so the
+    transform lives outside all of them and is applied to each; that is
+    what makes `translate(100, 0)` affect the NEXT drawRect rather than
+    nothing. `saveState`/`restoreState` save the whole drawing state,
+    matching the canvas `save()`/`restore()` they mirror."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_path_and_transform_calls_are_emitted(self, parser, semantic, codegen):
+        source = """
+        beginPath()
+        moveTo(0, 0)
+        lineTo(10, 10)
+        curveTo(1, 2, 3, 4, 5, 6)
+        closePath()
+        fillPath()
+        strokePath()
+        translate(5, 5)
+        rotate(45.0)
+        scale(2.0, 2.0)
+        resetTransform()
+        saveState()
+        restoreState()
+        fillAlpha(0.5)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        for fn in ["begin_path", "move_to", "line_to", "curve_to", "close_path",
+                   "fill_path", "stroke_path", "translate", "rotate", "scale",
+                   "reset_transform", "save_state", "restore_state", "set_alpha"]:
+            assert f"@festina_{fn}(" in ir, f"festina_{fn} not emitted"
+
+    def test_gradients_take_color_values(self, parser, semantic, codegen):
+        source = """
+        color a = 'red'
+        color b = 'blue'
+        fillLinearGradient(0, 0, a, 100, 0, b)
+        fillRadialGradient(50, 50, 40, a, b)
+        drawRect(0, 0, 10, 10)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "@festina_fill_linear_gradient(" in ir
+        assert "@festina_fill_radial_gradient(" in ir
+
+    def test_a_gradient_rejects_a_non_color(self, parser, semantic, errors):
+        program = parser.parse(
+            "fillLinearGradient(0, 0, 'red', 100, 0, 'blue')", filename="main.f")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program, filename="main.f")
+
+    def test_path_calls_open_a_canvas(self, parser, semantic, codegen):
+        # beginPath builds its context against the surface, so it needs
+        # one to exist.
+        ir = self._ir(parser, semantic, codegen, "beginPath()\nmoveTo(0,0)\nfillPath()")
+        assert "call void @festina_graphics_init()" in ir
+
+    def test_transforms_and_state_open_nothing(self, parser, semantic, codegen):
+        # Pure state, exactly like claude.md #89's own style setters --
+        # a program that only sets a transform shouldn't get a window.
+        source = """
+        saveState()
+        translate(5, 5)
+        rotate(45.0)
+        scale(2.0, 2.0)
+        fillAlpha(0.5)
+        restoreState()
+        resetTransform()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_graphics_init()" not in ir
+
+    def test_building_a_path_with_none_open_fails_clearly(self, compile_and_run):
+        result = compile_and_run("moveTo(10, 10)")
+        assert result.returncode != 0
+        assert "beginPath" in result.stdout + result.stderr
+
+    def test_restoring_more_than_was_saved_fails_clearly(self, compile_and_run):
+        # No drawing, so no display needed -- restoreState is pure state.
+        result = compile_and_run("restoreState()")
+        assert result.returncode != 0
+        assert "restoreState" in result.stdout + result.stderr
+
+
+class TestCanvasPathsRenderRealPixels:
+    """claude.md #94, the tier the IR tests can't reach: that a path is
+    a real shape rather than its bounding box, that a transform actually
+    moves what is drawn next, that a gradient interpolates, and that
+    alpha blends. Needs a display plus `xdotool`/`xwd`."""
+
+    def test_paths_transforms_gradients_and_alpha_render(
+            self, run_graphics_program, x_display):
+        if not shutil.which("xwd"):
+            pytest.skip("xwd isn't installed -- needed to read real canvas pixels")
+        source = """
+        color red = 'red'
+        color blue = 'blue'
+        color black = 'black'
+        color none = 'none'
+
+        fillStyle(red)
+        beginPath()
+        moveTo(50, 50)
+        lineTo(150, 50)
+        lineTo(100, 140)
+        closePath()
+        fillPath()
+
+        fillStyle(none)
+        borderColor(black)
+        lineWidth(6)
+        beginPath()
+        moveTo(200, 50)
+        lineTo(300, 140)
+        strokePath()
+
+        saveState()
+        translate(400, 40)
+        fillStyle(blue)
+        drawRect(0, 0, 60, 60)
+        restoreState()
+        fillStyle(blue)
+        drawRect(400, 200, 20, 20)
+
+        fillLinearGradient(50, 300, red, 250, 300, blue)
+        drawRect(50, 280, 200, 60)
+
+        fillStyle(red)
+        fillAlpha(0.5)
+        drawRect(500, 280, 80, 60)
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            got = _xwd_pixels(x_display, wid, [
+                (100, 80),   # inside the triangle
+                (55, 130),   # inside its bounding box but OUTSIDE the shape
+                (250, 95),   # on the stroked diagonal
+                (430, 70),   # the translated square
+                (405, 205),  # drawn after restoreState -- untransformed
+                (55, 300),   # gradient, red end
+                (245, 300),  # gradient, blue end
+                (540, 300),  # 50% red over white
+            ])
+            assert got[0] == (255, 0, 0), "the triangle did not fill"
+            assert got[1] == (255, 255, 255), (
+                "a corner outside the triangle was filled -- the path was "
+                "treated as its bounding box")
+            assert got[2] == (0, 0, 0), "the stroked path is missing"
+            assert got[3] == (0, 0, 255), "translate() did not move drawRect"
+            assert got[4] == (0, 0, 255), "restoreState() did not undo translate()"
+            assert got[5][0] > 200 and got[5][2] < 60, "gradient start is not red"
+            assert got[6][2] > 200 and got[6][0] < 60, "gradient end is not blue"
+            assert got[7] == (255, 127, 127), "50% red over white should blend"
+        finally:
+            proc.terminate()

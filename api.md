@@ -665,6 +665,73 @@ once -- write `color name = '...'` and use `name`, or, to choose one at
 runtime, use fillStyle(red, green, blue) with each component 0-255
 ```
 
+### Paths
+
+```festina
+fillStyle(red)
+beginPath()
+moveTo(50, 50)
+lineTo(150, 50)
+lineTo(100, 140)
+closePath()
+fillPath()        // a filled triangle
+```
+
+| | |
+|---|---|
+| `beginPath()` | Starts a new path. |
+| `moveTo(x, y)` / `lineTo(x, y)` | Move the pen / draw a straight segment. |
+| `curveTo(cx1, cy1, cx2, cy2, x, y)` | A cubic bezier to `(x, y)`. |
+| `closePath()` | Closes back to the start. |
+| `fillPath()` / `strokePath()` | Paints the path with the current fill / border colour, and **ends** it. |
+
+`fillPath` uses `fillStyle`; `strokePath` uses `borderColor` and
+`lineWidth`. Both consume the path, as `fill()`/`stroke()` do on a
+canvas — call `beginPath()` again for the next shape. Using `moveTo` and
+friends with no path open is a clean error naming the missing
+`beginPath()`.
+
+### Transforms
+
+```festina
+saveState()
+translate(400, 40)
+rotate(30.0)          // degrees
+scale(2.0, 2.0)
+drawRect(0, 0, 60, 60)
+restoreState()        // transform (and style) back as it was
+```
+
+A transform applies to everything drawn *after* it, until changed.
+`resetTransform()` returns to the identity.
+
+`saveState`/`restoreState` save the whole drawing state — transform,
+colors, alpha, line width and font — matching the canvas `save()`/
+`restore()` they mirror. A `restoreState()` with nothing saved is an
+error rather than a silent no-op.
+
+Rotation is in **degrees**. `Math.PI` is there if you'd rather work in
+radians.
+
+### Gradients and transparency
+
+```festina
+color a = 'red'
+color b = 'blue'
+
+fillLinearGradient(50, 300, a, 250, 300, b)   // start point, colour -> end point, colour
+drawRect(50, 280, 200, 60)
+
+fillRadialGradient(400, 300, 60, a, b)        // centre, radius, inner, outer
+drawCircle(400, 300, 60)
+
+fillAlpha(0.5)                                 // 0.0 transparent .. 1.0 opaque
+```
+
+A gradient replaces the flat fill until the next `fillStyle()`. Two
+stops rather than an arbitrary list — that covers essentially every
+gradient a program draws, and needs no separate gradient type.
+
 ### Text metrics
 
 ```festina
@@ -724,6 +791,35 @@ subtraction:
 int started = now()
 doTheWork()
 log(`took ${now() - started}ms`)
+```
+
+### Single-value queries
+
+```festina
+int total  = sqliteInt(`SELECT count(*) FROM Post`)
+text name  = sqliteText(`SELECT title FROM Post WHERE id = ?`, [2])
+float mean = sqliteFloat(`SELECT avg(score) FROM Post`)
+```
+
+The first column of the first row. Use these instead of declaring a
+`table` just to receive a scalar — a `table` declaration *creates* a
+real table, so a throwaway one for a `count(*)` would sit in your
+database permanently.
+
+A query matching no rows (or whose value is SQL NULL) returns `null`,
+so it's something to test for rather than something that stops you.
+
+### JSON and full-text search
+
+Both are ordinary SQL, and `sqlite()` passes SQL through untouched — so
+SQLite's JSON1 and FTS5 work today with no extra language feature:
+
+```festina
+log(sqliteText(`SELECT json_extract(data, '$.name') FROM Doc WHERE id = ?`, [1]))
+
+sqlite(`CREATE VIRTUAL TABLE PostSearch USING fts5(title, body, content='Post', content_rowid='id')`)
+sqlite(`INSERT INTO PostSearch(PostSearch) VALUES('rebuild')`)
+log(sqliteInt(`SELECT count(*) FROM PostSearch WHERE PostSearch MATCH ?`, ['machine']))
 ```
 
 ## Timers

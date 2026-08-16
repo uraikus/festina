@@ -892,6 +892,10 @@ class CodeGen:
             "declare void @festina_sqlite_bind_text(ptr, i32, ptr)",
             "declare void @festina_sqlite_bind_null(ptr, i32)",
             "declare void @festina_sqlite_exec(ptr)",
+            # claude.md #94: single-value queries
+            "declare i64 @festina_sqlite_scalar_int(ptr)",
+            "declare double @festina_sqlite_scalar_float(ptr)",
+            "declare ptr @festina_sqlite_scalar_text(ptr)",
             "declare void @festina_sqlite_collect_rows(ptr, i32, ptr, ptr, ptr)",
             # claude.md #67-68: regex(), .test(), .match(), .replace()/.replaceAll().
             "declare ptr @festina_regex_compile(ptr, ptr)",
@@ -922,6 +926,23 @@ class CodeGen:
             "declare i64 @festina_measure_text_height(ptr)",
             "declare ptr @festina_load_image(ptr)",
             "declare i8 @festina_save_canvas(ptr)",  # claude.md #93
+            # claude.md #94: paths, transforms, gradients, alpha
+            "declare void @festina_set_alpha(double)",
+            "declare void @festina_fill_linear_gradient(i64, i64, i64, i64, i64, i64)",
+            "declare void @festina_fill_radial_gradient(i64, i64, i64, i64, i64)",
+            "declare void @festina_translate(i64, i64)",
+            "declare void @festina_rotate(double)",
+            "declare void @festina_scale(double, double)",
+            "declare void @festina_reset_transform()",
+            "declare void @festina_save_state()",
+            "declare void @festina_restore_state()",
+            "declare void @festina_begin_path()",
+            "declare void @festina_move_to(i64, i64)",
+            "declare void @festina_line_to(i64, i64)",
+            "declare void @festina_curve_to(i64, i64, i64, i64, i64, i64)",
+            "declare void @festina_close_path()",
+            "declare void @festina_fill_path()",
+            "declare void @festina_stroke_path()",
             # claude.md #92: img methods/properties
             "declare i64 @festina_image_width(ptr)",
             "declare i64 @festina_image_height(ptr)",
@@ -4085,6 +4106,50 @@ class CodeGen:
                 "formatTime": ("festina_format_time", "ptr", TEXT),
                 "saveCanvas": ("festina_save_canvas", "i8", BOOL),
             }
+            # claude.md #94: paths, transforms, gradients and alpha.
+            # All draw onto (or configure) the canvas, so all of them
+            # open one -- unlike the style setters of claude.md #89,
+            # which only record state.
+            _CANVAS_OPS = {
+                "beginPath": ("festina_begin_path", []),
+                "moveTo": ("festina_move_to", ["i64", "i64"]),
+                "lineTo": ("festina_line_to", ["i64", "i64"]),
+                "curveTo": ("festina_curve_to", ["i64"] * 6),
+                "closePath": ("festina_close_path", []),
+                "fillPath": ("festina_fill_path", []),
+                "strokePath": ("festina_stroke_path", []),
+                "translate": ("festina_translate", ["i64", "i64"]),
+                "rotate": ("festina_rotate", ["double"]),
+                "scale": ("festina_scale", ["double", "double"]),
+                "resetTransform": ("festina_reset_transform", []),
+                "saveState": ("festina_save_state", []),
+                "restoreState": ("festina_restore_state", []),
+                "fillAlpha": ("festina_set_alpha", ["double"]),
+                "fillLinearGradient": ("festina_fill_linear_gradient", ["i64"] * 6),
+                "fillRadialGradient": ("festina_fill_radial_gradient", ["i64"] * 5),
+            }
+            if name in _CANVAS_OPS:
+                fn, arg_irs = _CANVAS_OPS[name]
+                self.uses_graphics_code = True
+                # Only the three that genuinely touch the surface open a
+                # canvas -- beginPath builds its context against it, and
+                # fill/strokePath paint and present. Transforms, saved
+                # state, alpha and gradients are pure state and open
+                # nothing, exactly as claude.md #89's own style setters
+                # don't (and so `restoreState()` with nothing saved
+                # reports THAT, rather than a missing display).
+                if name in ("beginPath", "fillPath", "strokePath"):
+                    self.uses_graphics = True
+                # A gradient's colour arguments are `color`-typed
+                # (semantic enforces it), so they arrive as the packed
+                # integers claude.md #91 already made them -- nothing
+                # here needs the expected-type path.
+                vals = [self._emit_expr(a, env, lines)[0] for a in expr.args]
+                sig = ", ".join(f"{ty} {v}" for ty, v in zip(arg_irs, vals))
+                lines.append(f"  call void @{fn}({sig})")
+                return "0", None
+            if name in ("sqliteInt", "sqliteFloat", "sqliteText"):
+                return self._emit_sqlite_scalar(name, expr, env, lines)
             if name == "now":
                 out = self.tmp()
                 lines.append(f"  {out} = call i64 @festina_now_ms()")
@@ -4721,6 +4786,44 @@ class CodeGen:
                     "sqlite() parameters must be int/float/bool/text/null, "
                     f"found {types_mod.type_name(vtype)}",
                     file=self.filename, line=getattr(elem, "line", 0))
+
+    def _emit_sqlite_scalar(self, name, expr, env, lines):
+        """claude.md #94: sqliteInt/sqliteFloat/sqliteText -- one value
+        out of a query, with no `table` declaration to hold it.
+
+        Shares _emit_sqlite_call's own prepare-and-bind path exactly;
+        only the stepping differs, taking the first column of the first
+        row instead of collecting rows into an array. That matters
+        because a `table` declaration CREATES a table (claude.md
+        #28-31), so before this, asking for a `count(*)` meant leaving a
+        throwaway table behind in the database."""
+        self.uses_sqlite = True
+        callee = expr.callee
+        if not expr.args:
+            raise CodegenError(f"{name}() requires a SQL string argument",
+                                file=self.filename, line=callee.line)
+        sql_val, sql_type = self._emit_expr(expr.args[0], env, lines)
+        if sql_type != TEXT:
+            raise CodegenError(
+                f"{name}()'s first argument must be text, found "
+                f"{types_mod.type_name(sql_type)}",
+                file=self.filename, line=callee.line)
+        db_val = self.tmp()
+        lines.append(f"  {db_val} = load ptr, ptr @__festina_db")
+        stmt_val = self.tmp()
+        lines.append(
+            f"  {stmt_val} = call ptr @festina_sqlite_prepare(ptr {db_val}, ptr {sql_val})")
+        self._free_text_temp(expr.args[0], sql_val, sql_type, lines)
+        if len(expr.args) > 1:
+            self._emit_sqlite_bind_params(expr.args[1], stmt_val, env, lines)
+        fn, ret_ir, ret_type = {
+            "sqliteInt": ("festina_sqlite_scalar_int", "i64", INT),
+            "sqliteFloat": ("festina_sqlite_scalar_float", "double", FLOAT),
+            "sqliteText": ("festina_sqlite_scalar_text", "ptr", TEXT),
+        }[name]
+        out = self.tmp()
+        lines.append(f"  {out} = call {ret_ir} @{fn}(ptr {stmt_val})")
+        return out, ret_type
 
     def _emit_sqlite_collect(self, stmt_val, table_type, lines):
         table_name = table_type.name

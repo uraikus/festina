@@ -359,13 +359,13 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 897 tests in this directory pass against it: 596 need no external
+All 910 tests in this directory pass against it: 601 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-284 more need a working C compiler, plus 2 more
-(`tests/test_packaging.py`) given `pyinstaller` too, plus 15 more given
-`Xvfb`+`xdotool` too (4 of those also need `xwd`, from the same
+291 more need a working C compiler, plus 2 more
+(`tests/test_packaging.py`) given `pyinstaller` too, plus 16 more given
+`Xvfb`+`xdotool` too (5 of those also need `xwd`, from the same
 x11-apps/x11-utils tier, to read real canvas pixels back --
-claude.md #89/#92) (596 + 284 + 2 + 15 = 897 -- re-verified directly
+claude.md #89/#92/#94) (601 + 291 + 2 + 16 = 910 -- re-verified directly
 by running the whole suite with a PATH containing nothing but Python,
 not just derived by counting `compile_and_run` call sites, since the
 true number had drifted well past a much older, since-inaccurate count
@@ -2267,6 +2267,46 @@ PNG and finds the drawn rectangles in it, since "the call returned true"
 proves the plumbing but not that a canvas rather than a blank surface
 was captured.
 
+**claude.md #94**: two gaps found by asking what the already-linked
+dependencies could do that the language couldn't reach.
+
+The canvas could draw exactly three things -- a rectangle, a circle and
+a line of text -- with no way to express a triangle, a polygon, a curve,
+a rotated anything, a gradient or transparency, all of which Cairo could
+always do on the library already linked for `drawRect`. Added: paths
+(`beginPath`/`moveTo`/`lineTo`/`curveTo`/`closePath`/`fillPath`/
+`strokePath`), transforms (`translate`/`rotate`/`scale`/
+`resetTransform`/`saveState`/`restoreState`), two-stop gradients and
+`fillAlpha`. Every drawing call builds its own short-lived Cairo
+context, so the transform lives outside all of them and is applied to
+each -- that is what makes `translate` affect the *next* `drawRect`.
+`saveState`/`restoreState` save the whole state (transform, colours,
+alpha, line width, font), since restoring a transform while leaving a
+colour changed is the kind of half-measure that produces baffling bugs.
+Only `beginPath`/`fillPath`/`strokePath` open a canvas; transforms,
+state, alpha and gradients are pure state and open nothing, exactly as
+#89's setters don't -- which is also why `restoreState()` with nothing
+saved reports *that* rather than a missing display.
+
+The database gap was narrower than expected, and worth recording because
+the obvious guess was wrong: **JSON1 and FTS5 need no compiler feature
+at all**. Both are ordinary SQL and `sqlite()` has always passed SQL
+through untouched, so `json_extract` queries and full FTS5 virtual
+tables with ranked `MATCH` already worked -- there are now tests locking
+that in. What made them unpleasant was that receiving *any* result
+required declaring a `table` to hold the row shape, and a `table`
+declaration CREATES a real table (#28-31's schema sync), so a
+`count(*)` left a throwaway table in the database forever.
+`sqliteInt`/`sqliteFloat`/`sqliteText` close that with no schema at all,
+sharing `sqlite()`'s own prepare-and-bind path and differing only in the
+stepping; no rows (or a SQL NULL) answers with null rather than failing.
+`tests/test_codegen.py::TestScalarQueries` (5 tests, one asserting the
+database ends up with only the declared table in it),
+`::TestCanvasPathsTransformsAndGradients` (7) and
+`::TestCanvasPathsRenderRealPixels` (1, which checks a point inside the
+triangle's bounding box but outside the triangle stays unpainted --
+proving a path is a real shape and not its bounds).
+
 See api.md for the current language/standard library reference and this
 file's own "Status" section above for the implemented-vs-not matrix; the
 short version: nothing is left
@@ -3022,10 +3062,10 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 596 passed, 301 skipped (needs a C compiler; 2 of
+pytest tests/                          # 601 passed, 309 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
-                                        # 15 need Xvfb + xdotool installed too, 1 of those
-                                        # also needs `openbox` and 4 need `xwd`) given a
+                                        # 16 need Xvfb + xdotool installed too, 1 of those
+                                        # also needs `openbox` and 5 need `xwd`) given a
                                         # working C compiler,
-                                        # all 897 pass
+                                        # all 910 pass
 ```

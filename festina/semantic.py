@@ -52,6 +52,15 @@ BUILTIN_FUNCTIONS = {
     # libc or by Cairo's own PNG writer, both already linked.
     "readFile", "writeFile", "appendFile", "fileExists", "deleteFile",
     "now", "formatTime", "saveCanvas",
+    # claude.md #94: paths, transforms, gradients, alpha
+    "beginPath", "moveTo", "lineTo", "curveTo", "closePath",
+    "fillPath", "strokePath",
+    "translate", "rotate", "scale", "resetTransform",
+    "saveState", "restoreState",
+    "fillAlpha", "fillLinearGradient", "fillRadialGradient",
+    # claude.md #94: single-value queries, so a scalar result needs no
+    # throwaway `table` declaration (which would create a real table).
+    "sqliteInt", "sqliteFloat", "sqliteText",
 }
 
 _BUILTIN_RETURN_TYPES = {
@@ -70,6 +79,10 @@ _BUILTIN_RETURN_TYPES = {
     "now": types_mod.PrimitiveType("int"),
     "formatTime": types_mod.PrimitiveType("text"),
     "saveCanvas": types_mod.PrimitiveType("bool"),
+    # claude.md #94
+    "sqliteInt": types_mod.PrimitiveType("int"),
+    "sqliteFloat": types_mod.PrimitiveType("float"),
+    "sqliteText": types_mod.PrimitiveType("text"),
 }
 
 # claude.md #55: int and float never mix directly in a binary operator.
@@ -108,6 +121,23 @@ _BUILTIN_SIGNATURES = {
     "now": (),
     "formatTime": (_INT, _TEXT),
     "saveCanvas": (_TEXT,),
+    # claude.md #94
+    "beginPath": (),
+    "moveTo": (_INT, _INT),
+    "lineTo": (_INT, _INT),
+    "curveTo": (_INT, _INT, _INT, _INT, _INT, _INT),
+    "closePath": (),
+    "fillPath": (),
+    "strokePath": (),
+    "translate": (_INT, _INT),
+    "rotate": (_FLOAT,),
+    "scale": (_FLOAT, _FLOAT),
+    "resetTransform": (),
+    "saveState": (),
+    "restoreState": (),
+    "fillAlpha": (_FLOAT,),
+    "fillLinearGradient": (_INT, _INT, types_mod.ColorType(), _INT, _INT, types_mod.ColorType()),
+    "fillRadialGradient": (_INT, _INT, _INT, types_mod.ColorType(), types_mod.ColorType()),
 }
 
 # claude.md #90: three builtins accept two different shapes. The
@@ -118,6 +148,12 @@ _BUILTIN_SIGNATURES = {
 # signatures", with the arity picking which one applies.
 _COLOR = types_mod.ColorType()
 _FONT = types_mod.FontType()
+
+# claude.md #33/#94: every builtin taking (sql, [params]) -- the bound
+# parameter list is a literal array that is explicitly allowed to mix
+# types, so all of them need the same carve-out from the ordinary
+# same-element-type array rule.
+_SQLITE_BUILTINS = frozenset({"sqlite", "sqliteInt", "sqliteFloat", "sqliteText"})
 
 _BUILTIN_SIGNATURE_ALTERNATES = {
     # claude.md #91: the one-argument form takes a `color` value, not a
@@ -910,7 +946,7 @@ def analyze(program, filename="<string>"):
                         )
                 if sig is None:
                     for a in expr.args:
-                        if name == "sqlite" and isinstance(a, ast.ArrayLit):
+                        if (name in _SQLITE_BUILTINS and isinstance(a, ast.ArrayLit)):
                             # claude.md #33: sqlite()'s parameter list is
                             # passed as an array literal, but -- unlike
                             # every real arr[T] value in the language --

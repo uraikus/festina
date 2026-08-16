@@ -80,6 +80,53 @@ static double g_font_size = 16.0;
 static cairo_font_slant_t g_font_slant = CAIRO_FONT_SLANT_NORMAL;
 static cairo_font_weight_t g_font_weight = CAIRO_FONT_WEIGHT_NORMAL;
 
+/* claude.md #94: the current transform, plus the saved-state stack.
+ *
+ * Every drawing function creates its own short-lived cairo_t (see
+ * festina_draw_rect and friends), which starts with an identity matrix
+ * -- so a transform set by translate()/rotate()/scale() has to live
+ * here, outside any one of them, and be applied to each new context.
+ * That is what makes `translate(100, 0)` affect the NEXT drawRect
+ * rather than nothing at all. */
+static cairo_matrix_t g_transform;
+static int g_transform_ready = 0;
+static double g_fill_alpha = 1.0;
+/* A gradient set by fillLinearGradient/fillRadialGradient, used instead
+ * of the flat fill colour until the next plain fillStyle() call. */
+static cairo_pattern_t *g_fill_gradient = NULL;
+
+/* saveState()/restoreState() save the whole drawing state, not just the
+ * transform -- that is what the canvas save()/restore() this mirrors
+ * does, and restoring a transform while leaving a colour changed is
+ * exactly the kind of half-measure that produces baffling bugs. */
+typedef struct {
+    cairo_matrix_t transform;
+    double fill_r, fill_g, fill_b, alpha;
+    int fill_none;
+    double border_r, border_g, border_b, line_width;
+    int border_set;
+    double font_size;
+    cairo_font_slant_t font_slant;
+    cairo_font_weight_t font_weight;
+    char font_family[64];
+} FestinaCanvasState;
+
+#define FESTINA_STATE_STACK_MAX 64
+static FestinaCanvasState g_state_stack[FESTINA_STATE_STACK_MAX];
+static int g_state_depth = 0;
+
+/* The path being built by beginPath()/moveTo()/lineTo()/... A single
+ * context is kept open across those calls, since a Cairo path lives on
+ * its context and this language's drawing calls are each independent
+ * statements. */
+static cairo_t *g_path_cr = NULL;
+
+/* Forward declarations: claude.md #94's state helpers are defined
+ * alongside the transform/path code further down, but are used by the
+ * style setters above it. */
+static void festina_clear_gradient(void);
+static void festina_graphics_present(void);
+
 static void festina_graphics_require_init(void) {
     if (!g_display) {
         festina_fail("a graphics function was called but the canvas window "
@@ -100,6 +147,7 @@ static void festina_graphics_require_init(void) {
  * 'none'/'transparent'). It needs no extra argument and no second
  * function to say so, because no real channel value can be negative. */
 void festina_set_fill_rgb(int64_t r, int64_t g, int64_t b) {
+    festina_clear_gradient();  /* claude.md #94: a flat colour replaces any gradient */
     if (r < 0 || g < 0 || b < 0) {
         g_fill_none = 1;
         return;
@@ -262,10 +310,217 @@ int64_t festina_measure_text_height(const char *text) {
  * the same path on top. Shared by every filled shape so they can never
  * drift apart. Preserves the path across the fill (cairo_fill_preserve)
  * only when a border is actually going to use it. */
+/* claude.md #94: every drawing context starts from the current
+ * transform rather than the identity, which is what makes a transform
+ * set once apply to everything drawn afterwards. */
+static void festina_apply_transform(cairo_t *cr) {
+    if (!g_transform_ready) {
+        cairo_matrix_init_identity(&g_transform);
+        g_transform_ready = 1;
+    }
+    cairo_set_matrix(cr, &g_transform);
+}
+
+static cairo_t *festina_canvas_context(void) {
+    cairo_t *cr = cairo_create(g_backing_surface);
+    festina_apply_transform(cr);
+    return cr;
+}
+
+/* Sets the fill source: a gradient when one is active, otherwise the
+ * flat colour, in both cases carrying the current alpha. */
+static void festina_set_fill_source(cairo_t *cr) {
+    if (g_fill_gradient) {
+        cairo_set_source(cr, g_fill_gradient);
+        if (g_fill_alpha < 1.0) {
+            cairo_paint_with_alpha(cr, g_fill_alpha);
+        }
+        return;
+    }
+    cairo_set_source_rgba(cr, g_fill_r, g_fill_g, g_fill_b, g_fill_alpha);
+}
+
+void festina_set_alpha(double alpha) {
+    if (alpha < 0.0) alpha = 0.0;
+    if (alpha > 1.0) alpha = 1.0;
+    g_fill_alpha = alpha;
+}
+
+static void festina_clear_gradient(void) {
+    if (g_fill_gradient) {
+        cairo_pattern_destroy(g_fill_gradient);
+        g_fill_gradient = NULL;
+    }
+}
+
+static void festina_unpack_rgb(int64_t packed, double *r, double *g, double *b) {
+    *r = ((packed >> 16) & 0xFF) / 255.0;
+    *g = ((packed >> 8) & 0xFF) / 255.0;
+    *b = (packed & 0xFF) / 255.0;
+}
+
+/* claude.md #94: a two-stop gradient becomes the fill, replacing the
+ * flat colour until the next fillStyle(). Two stops rather than an
+ * arbitrary list deliberately: it covers essentially every gradient a
+ * program actually draws and needs no new value type to express, where
+ * an n-stop version would need a whole gradient object. */
+void festina_fill_linear_gradient(int64_t x0, int64_t y0, int64_t c0,
+                                   int64_t x1, int64_t y1, int64_t c1) {
+    festina_clear_gradient();
+    double r0, g0, b0, r1, g1, b1;
+    festina_unpack_rgb(c0, &r0, &g0, &b0);
+    festina_unpack_rgb(c1, &r1, &g1, &b1);
+    g_fill_gradient = cairo_pattern_create_linear((double)x0, (double)y0,
+                                                   (double)x1, (double)y1);
+    cairo_pattern_add_color_stop_rgb(g_fill_gradient, 0.0, r0, g0, b0);
+    cairo_pattern_add_color_stop_rgb(g_fill_gradient, 1.0, r1, g1, b1);
+    g_fill_none = 0;
+}
+
+void festina_fill_radial_gradient(int64_t x, int64_t y, int64_t radius,
+                                   int64_t inner, int64_t outer) {
+    festina_clear_gradient();
+    double ri, gi, bi, ro, go, bo;
+    festina_unpack_rgb(inner, &ri, &gi, &bi);
+    festina_unpack_rgb(outer, &ro, &go, &bo);
+    if (radius < 0) radius = 0;
+    g_fill_gradient = cairo_pattern_create_radial((double)x, (double)y, 0.0,
+                                                   (double)x, (double)y, (double)radius);
+    cairo_pattern_add_color_stop_rgb(g_fill_gradient, 0.0, ri, gi, bi);
+    cairo_pattern_add_color_stop_rgb(g_fill_gradient, 1.0, ro, go, bo);
+    g_fill_none = 0;
+}
+
+/* ---- claude.md #94: transforms ---- */
+
+void festina_translate(int64_t x, int64_t y) {
+    if (!g_transform_ready) { cairo_matrix_init_identity(&g_transform); g_transform_ready = 1; }
+    cairo_matrix_translate(&g_transform, (double)x, (double)y);
+}
+
+void festina_rotate(double degrees) {
+    if (!g_transform_ready) { cairo_matrix_init_identity(&g_transform); g_transform_ready = 1; }
+    /* Degrees, not radians: this language has no angle type to make the
+     * unit self-documenting, and degrees are what a program author
+     * reaches for. Math.PI is available for anyone who wants radians. */
+    cairo_matrix_rotate(&g_transform, degrees * 3.14159265358979323846 / 180.0);
+}
+
+void festina_scale(double sx, double sy) {
+    if (!g_transform_ready) { cairo_matrix_init_identity(&g_transform); g_transform_ready = 1; }
+    /* A zero scale collapses the matrix to something non-invertible,
+     * which makes every later Cairo call on it fail silently. */
+    if (sx == 0.0 || sy == 0.0) return;
+    cairo_matrix_scale(&g_transform, sx, sy);
+}
+
+void festina_reset_transform(void) {
+    cairo_matrix_init_identity(&g_transform);
+    g_transform_ready = 1;
+}
+
+void festina_save_state(void) {
+    if (g_state_depth >= FESTINA_STATE_STACK_MAX) {
+        festina_fail("saveState(): nested too deeply (limit 64) -- is a "
+                      "restoreState() missing?");
+    }
+    if (!g_transform_ready) { cairo_matrix_init_identity(&g_transform); g_transform_ready = 1; }
+    FestinaCanvasState *st = &g_state_stack[g_state_depth++];
+    st->transform = g_transform;
+    st->fill_r = g_fill_r; st->fill_g = g_fill_g; st->fill_b = g_fill_b;
+    st->alpha = g_fill_alpha; st->fill_none = g_fill_none;
+    st->border_r = g_border_r; st->border_g = g_border_g; st->border_b = g_border_b;
+    st->line_width = g_line_width; st->border_set = g_border_set;
+    st->font_size = g_font_size; st->font_slant = g_font_slant;
+    st->font_weight = g_font_weight;
+    snprintf(st->font_family, sizeof(st->font_family), "%s", g_font_family);
+}
+
+void festina_restore_state(void) {
+    if (g_state_depth <= 0) {
+        festina_fail("restoreState(): nothing was saved -- every "
+                      "restoreState() needs its own saveState() first");
+    }
+    FestinaCanvasState *st = &g_state_stack[--g_state_depth];
+    g_transform = st->transform; g_transform_ready = 1;
+    g_fill_r = st->fill_r; g_fill_g = st->fill_g; g_fill_b = st->fill_b;
+    g_fill_alpha = st->alpha; g_fill_none = st->fill_none;
+    g_border_r = st->border_r; g_border_g = st->border_g; g_border_b = st->border_b;
+    g_line_width = st->line_width; g_border_set = st->border_set;
+    g_font_size = st->font_size; g_font_slant = st->font_slant;
+    g_font_weight = st->font_weight;
+    snprintf(g_font_family, sizeof(g_font_family), "%s", st->font_family);
+}
+
+/* ---- claude.md #94: paths ---- */
+
+void festina_begin_path(void) {
+    festina_graphics_require_init();
+    if (g_path_cr) cairo_destroy(g_path_cr);
+    g_path_cr = festina_canvas_context();
+}
+
+static int festina_path_open(const char *fn) {
+    if (g_path_cr) return 1;
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "%s(): no path is open -- call beginPath() first", fn);
+    festina_fail(msg);
+    return 0;
+}
+
+void festina_move_to(int64_t x, int64_t y) {
+    if (!festina_path_open("moveTo")) return;
+    cairo_move_to(g_path_cr, (double)x, (double)y);
+}
+
+void festina_line_to(int64_t x, int64_t y) {
+    if (!festina_path_open("lineTo")) return;
+    cairo_line_to(g_path_cr, (double)x, (double)y);
+}
+
+void festina_curve_to(int64_t cx1, int64_t cy1, int64_t cx2, int64_t cy2,
+                       int64_t x, int64_t y) {
+    if (!festina_path_open("curveTo")) return;
+    cairo_curve_to(g_path_cr, (double)cx1, (double)cy1, (double)cx2, (double)cy2,
+                    (double)x, (double)y);
+}
+
+void festina_close_path(void) {
+    if (!festina_path_open("closePath")) return;
+    cairo_close_path(g_path_cr);
+}
+
+/* Both of these consume the path, matching the canvas model where
+ * fill()/stroke() end the current path -- keeping it would make a
+ * second fill silently paint the same shape twice. */
+void festina_fill_path(void) {
+    if (!festina_path_open("fillPath")) return;
+    if (!g_fill_none) {
+        festina_set_fill_source(g_path_cr);
+        cairo_fill(g_path_cr);
+    }
+    cairo_destroy(g_path_cr);
+    g_path_cr = NULL;
+    festina_graphics_present();
+}
+
+void festina_stroke_path(void) {
+    if (!festina_path_open("strokePath")) return;
+    if (g_border_set && g_line_width > 0.0) {
+        cairo_set_source_rgba(g_path_cr, g_border_r, g_border_g, g_border_b, g_fill_alpha);
+        cairo_set_line_width(g_path_cr, g_line_width);
+        cairo_stroke(g_path_cr);
+    }
+    cairo_destroy(g_path_cr);
+    g_path_cr = NULL;
+    festina_graphics_present();
+}
+
 static void festina_fill_and_border(cairo_t *cr) {
     int border = g_border_set && g_line_width > 0.0;
     if (!g_fill_none) {
-        cairo_set_source_rgb(cr, g_fill_r, g_fill_g, g_fill_b);
+        festina_set_fill_source(cr);
         if (border) {
             cairo_fill_preserve(cr);
         } else {
@@ -278,7 +533,7 @@ static void festina_fill_and_border(cairo_t *cr) {
         return;
     }
     if (border) {
-        cairo_set_source_rgb(cr, g_border_r, g_border_g, g_border_b);
+        cairo_set_source_rgba(cr, g_border_r, g_border_g, g_border_b, g_fill_alpha);
         cairo_set_line_width(cr, g_line_width);
         cairo_stroke(cr);
     }
@@ -425,7 +680,7 @@ static void festina_graphics_present(void) {
 
 void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
     festina_graphics_require_init();
-    cairo_t *cr = cairo_create(g_backing_surface);
+    cairo_t *cr = festina_canvas_context();
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     festina_fill_and_border(cr); /* claude.md #89 */
     cairo_destroy(cr);
@@ -434,7 +689,7 @@ void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
 
 void festina_draw_circle(int64_t x, int64_t y, int64_t r) {
     festina_graphics_require_init();
-    cairo_t *cr = cairo_create(g_backing_surface);
+    cairo_t *cr = festina_canvas_context();
     cairo_arc(cr, (double)x, (double)y, (double)r, 0.0, 2.0 * 3.14159265358979323846);
     festina_fill_and_border(cr); /* claude.md #89 */
     cairo_destroy(cr);
@@ -444,11 +699,11 @@ void festina_draw_circle(int64_t x, int64_t y, int64_t r) {
 void festina_draw_text(const char *text, int64_t x, int64_t y) {
     festina_graphics_require_init();
     if (!text) text = "";
-    cairo_t *cr = cairo_create(g_backing_surface);
+    cairo_t *cr = festina_canvas_context();
     /* claude.md #89: drawn in the current fill colour and font. Text is
      * filled only -- borderColor outlines shapes, not glyphs. */
     if (g_fill_none) { cairo_destroy(cr); return; }
-    cairo_set_source_rgb(cr, g_fill_r, g_fill_g, g_fill_b);
+    cairo_set_source_rgba(cr, g_fill_r, g_fill_g, g_fill_b, g_fill_alpha);
     festina_apply_font(cr);
     cairo_move_to(cr, (double)x, (double)y);
     cairo_show_text(cr, text);
@@ -570,7 +825,7 @@ void festina_image_free(void *img) {
 void festina_draw_image(void *img, int64_t x, int64_t y) {
     festina_graphics_require_init();
     if (!img) return;
-    cairo_t *cr = cairo_create(g_backing_surface);
+    cairo_t *cr = festina_canvas_context();
     cairo_set_source_surface(cr, ((FestinaImageBox *)img)->surface, (double)x, (double)y);
     cairo_paint(cr);
     cairo_destroy(cr);
