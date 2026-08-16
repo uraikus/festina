@@ -265,6 +265,21 @@ void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h);
 void festina_draw_circle(int64_t x, int64_t y, int64_t r);
 void festina_draw_text(const char *text, int64_t x, int64_t y);
 void *festina_load_image(const char *path);
+/* claude.md #92: img methods and properties. An `img` value is a
+ * pointer to a small box holding the Cairo surface, not the surface
+ * itself -- that indirection is what lets resize() change the image in
+ * place, so every binding sharing it sees the new size (a Cairo surface
+ * cannot be resized in place). clip() returns a NEW image and leaves
+ * the source untouched, so one spritesheet can be clipped repeatedly;
+ * a region reaching past the edge copies the overlap and leaves the
+ * rest transparent rather than failing. Both reject a non-positive
+ * width or height, which Cairo would otherwise accept and turn into a
+ * surface nothing can draw. */
+int64_t festina_image_width(void *img);
+int64_t festina_image_height(void *img);
+void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
+void festina_image_resize(void *img, int64_t w, int64_t h);
+void festina_image_free(void *img);
 void festina_draw_image(void *img, int64_t x, int64_t y);
 /* claude.md #89/#90: canvas drawing style -- process-global state set by
  * fillStyle()/borderColor()/lineWidth()/font() and read by every later

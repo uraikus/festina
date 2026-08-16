@@ -1989,3 +1989,23 @@ Both are written as text at the declaration, because `color brand = '#4a90d9'` r
 The consequence, and the rule this section is really about: **a colour name or a font shorthand can only ever come from a literal.** `fillStyle('red')` is no longer valid -- a name must be declared as a `color` first. A `text` value computed at runtime cannot become either type, and trying is a compile error naming the alternative. That alternative is `fillStyle(red, green, blue)` with each component 0-255, and `changeFont(px, style, family)` with a nullable style and family; both remain exactly as section 90 left them. This costs nothing, because those forms are strictly MORE capable for anything dynamic -- they take arbitrary int expressions, where a colour *name* could only ever have named one of a fixed set -- and it buys a language where no colour string and no font grammar exists at runtime at all.
 
 A `font` literal that says nothing (`font f = ''`) is rejected rather than silently producing a record that changes nothing, since it is far more likely to be a mistake than an intent.
+
+92. IMG GAINS CLIP, RESIZE, WIDTH AND HEIGHT
+
+Section 37 gave `img` exactly two operations: load one, draw it whole. That is enough for a picture and useless for a spritesheet, which is the shape most 2D graphics actually take -- one PNG holding a grid of frames, each drawn separately. This section adds `.clip(x, y, w, h)`, `.resize(w, h)`, `.width` and `.height`.
+
+```festina
+img sheet = loadImage('sheet.png')
+img grass = sheet.clip(0, 0, 64, 64)
+grass.resize(32, 32)
+```
+
+`clip` returns a NEW image and leaves the source untouched, so one sheet can be clipped as many times as a program likes. A region reaching past the source's edge is deliberately not an error: the overlapping part is copied and the rest stays transparent, which is what a canvas `drawImage` with a source rectangle does, and is ordinary at a sheet's right or bottom margin. A non-positive width or height IS an error, since Cairo would otherwise accept it and hand back a surface nothing can ever draw -- a silent no-op in place of an obvious mistake.
+
+`resize` changes the image IN PLACE. That follows from how it reads: `grass.resize(32, 32)` is a statement, not something whose result you assign, so it has to change `grass` itself. A Cairo surface cannot be resized in place, which is why an `img` value is now a pointer to a small box holding the surface rather than the surface directly. That indirection is the whole representation change, and it is what makes sharing behave consistently: two bindings naming the same image both see the new size, exactly as they both saw the old one.
+
+`.width`/`.height` are runtime calls rather than stored fields, because `resize` replaces the surface underneath them and anything cached would go stale. The `img` branch of member access was previously a permissive "anything is allowed" fallthrough, dating from when section 37 defined nothing at all on img; it is now strict, so a typo like `.widht` is an error rather than silently typeless, and naming a method without calling it says so specifically.
+
+The box also gives `img` an ownership story it never had, using the same two-part test section 86 established for regex: an `img` local whose initializer is a Call -- `loadImage(...)` or `sheet.clip(...)`, both of which hand back something freshly created that nothing else references yet -- and whose name escape analysis proves never leaves the declaring function is destroyed at scope exit. This matters more here than it did for regex, because `clip` exists to be called repeatedly: without it, extracting frames inside a loop leaks an entire Cairo surface per iteration.
+
+Making that reclamation actually reach the common case required widening escape analysis. Its stage-2 machinery (section 75) exempts a call argument when the callee is a user function whose own body proves that position safe, but a builtin has no Festina body to analyse, so every builtin call argument fell under the conservative "anything passed to a call escapes" default. That meant `drawImage(tile, x, y)` alone kept `tile` alive forever -- defeating this section's own reclamation in precisely the clip-draw-repeat shape it exists for. Builtins are now listed as non-retaining, each checked against the runtime rather than assumed: Cairo copies the glyphs and pixels it paints, sqlite binds with `SQLITE_TRANSIENT`, the measure functions only take metrics, and the style setters copy what they need into their own state. Anything not listed keeps the conservative default, and this incidentally improves reclamation for struct/arr[T]/map[T] locals passed to those same builtins.

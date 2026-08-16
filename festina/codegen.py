@@ -506,6 +506,25 @@ class _StackArrayOrMap:
         self.type_ = type_
 
 
+class _OwnedImage:
+    """claude.md #92: marks, in CodeGen._active_free_locals, an `img`
+    local this scope provably owns -- one whose initializer is a Call
+    (`loadImage(...)` or `sheet.clip(...)`, both of which hand back a
+    freshly created image nothing else references yet) and whose name
+    escape analysis proves never leaves the declaring function.
+
+    Exactly the shape claude.md #86 already uses for regex, and here for
+    a sharper reason: clip() exists to be called repeatedly -- one per
+    sprite -- so without this, extracting frames inside a loop would
+    leak a whole Cairo surface every iteration. An `img` bound from
+    anything else (another img binding, a struct field) is only
+    borrowing, and an escaping one may still be referenced after this
+    scope ends; neither is freed here."""
+
+    def __init__(self):
+        pass
+
+
 class _OwnedRegex:
     """claude.md #86: marks, in CodeGen._active_free_locals, a `regex`
     local this scope provably owns outright -- one whose initializer is
@@ -868,6 +887,12 @@ class CodeGen:
             "declare i64 @festina_measure_text_width(ptr)",
             "declare i64 @festina_measure_text_height(ptr)",
             "declare ptr @festina_load_image(ptr)",
+            # claude.md #92: img methods/properties
+            "declare i64 @festina_image_width(ptr)",
+            "declare i64 @festina_image_height(ptr)",
+            "declare ptr @festina_image_clip(ptr, i64, i64, i64, i64)",
+            "declare void @festina_image_resize(ptr, i64, i64)",
+            "declare void @festina_image_free(ptr)",
             "declare void @festina_draw_image(ptr, i64, i64)",
             "declare void @festina_register_click_handler(ptr)",
             "declare void @festina_register_mouse_handler(ptr)",
@@ -1132,6 +1157,13 @@ class CodeGen:
                     # retained a reference nothing else will ever
                     # release otherwise.
                     self._emit_release_nested_fields_only(ref, type_.struct_type, lines)
+                elif isinstance(type_, _OwnedImage):
+                    # claude.md #92: destroys the Cairo surface and the
+                    # box holding it. Never reached for a borrowed or
+                    # escaping img; see _OwnedImage's own comment.
+                    image = self.tmp()
+                    lines.append(f"  {image} = load ptr, ptr {ref}")
+                    lines.append(f"  call void @festina_image_free(ptr {image})")
                 elif isinstance(type_, _OwnedRegex):
                     # claude.md #86: a regex this scope compiled itself
                     # and provably never shared -- regfree + free, via
@@ -1574,6 +1606,14 @@ class CodeGen:
                                 # comment.
                                 self._active_free_locals[-1].append(
                                     (ref, _StackStructFieldsOnly(type_)))
+                        elif isinstance(type_, types_mod.ImageType):
+                            # claude.md #92: same two-part ownership test
+                            # #86 uses for regex -- created here (a Call:
+                            # loadImage or clip) and provably never
+                            # escaping. See _OwnedImage's own comment.
+                            if (isinstance(stmt.init, ast.Call)
+                                    and stmt.name not in self._current_escaping_names):
+                                self._active_free_locals[-1].append((ref, _OwnedImage()))
                         elif type_ == REGEX:
                             # claude.md #86: only a regex this scope
                             # compiled itself (a `regex(...)` Call, so
@@ -2227,6 +2267,28 @@ class CodeGen:
             # identifier to emit (see semantic.py's matching check).
             if isinstance(expr.obj, ast.Identifier) and expr.obj.name == "environment":
                 return self._emit_environment_get(expr, env, lines)
+            # claude.md #92: img.width / img.height -- a runtime call
+            # rather than a field read, since an `img` is a pointer to a
+            # box whose Cairo surface owns the real dimensions (and
+            # resize() replaces that surface underneath it, so caching
+            # them anywhere would go stale).
+            if not expr.computed and expr.prop in ("width", "height"):
+                obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+                if isinstance(obj_type, types_mod.ImageType):
+                    fn = ("festina_image_width" if expr.prop == "width"
+                          else "festina_image_height")
+                    out = self.tmp()
+                    lines.append(f"  {out} = call i64 @{fn}(ptr {obj_val})")
+                    return out, INT
+                # A struct/table field genuinely named "width" or
+                # "height" is perfectly legal, so it still resolves the
+                # ordinary way -- reusing the object value emitted just
+                # above rather than emitting expr.obj a second time,
+                # which would run any side effects in it twice.
+                ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
+                out = self.tmp()
+                lines.append(f"  {out} = load {_llvm_type(ftype)}, ptr {ptr}")
+                return out, ftype
             if not expr.computed and expr.prop == "length":
                 # claude.md #79: an arr[T] value is a `ptr` to its own
                 # {i64, ptr} storage now, so .length is a GEP+load of
@@ -2816,6 +2878,14 @@ class CodeGen:
         # (re-emitting expr.obj from scratch every time it's called)
         # can't guarantee.
         obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+        return self._member_ptr_from(obj_val, obj_type, expr, lines)
+
+    def _member_ptr_from(self, obj_val, obj_type, expr, lines):
+        """_member_ptr's body, split out so a caller that has ALREADY
+        emitted expr.obj can reuse that one emission instead of forcing
+        a second one -- see _emit_expr's img .width/.height handling,
+        where the object has to be emitted before its type is known and
+        expr.obj may be an arbitrary side-effecting expression."""
         if isinstance(obj_type, types_mod.TableType):
             # claude.md #32-34: a table-typed value is one query result
             # row -- flat `field_index * 8` byte offset, not a named
@@ -4074,6 +4144,24 @@ class CodeGen:
                     self._free_regex_temp(expr.args[0], search_val, search_type, lines)
                     self._free_text_temp(expr.args[1], replacement_val, replacement_type, lines)
                     return out, TEXT
+            # claude.md #92: sheet.clip(x, y, w, h) -> img (a new image,
+            # leaving the sheet untouched) and image.resize(w, h) -> void
+            # (in place, so every binding holding it sees the new size).
+            if callee.prop in ("clip", "resize"):
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.ImageType):
+                    arg_vals = [self._emit_expr(a, env, lines)[0] for a in expr.args]
+                    if callee.prop == "clip":
+                        out = self.tmp()
+                        lines.append(
+                            f"  {out} = call ptr @festina_image_clip(ptr {obj_val}, "
+                            f"i64 {arg_vals[0]}, i64 {arg_vals[1]}, "
+                            f"i64 {arg_vals[2]}, i64 {arg_vals[3]})")
+                        return out, types_mod.ImageType()
+                    lines.append(
+                        f"  call void @festina_image_resize(ptr {obj_val}, "
+                        f"i64 {arg_vals[0]}, i64 {arg_vals[1]})")
+                    return "0", None
             # claude.md #38: music.play() / music.stop() / music.isPlaying()
             if callee.prop == "play":
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)

@@ -110,6 +110,7 @@ _BUILTIN_SIGNATURE_ALTERNATES = {
 }
 _REGEX = types_mod.RegexType()
 _AUDIO = types_mod.AudioType()
+_IMAGE = types_mod.ImageType()
 
 # claude.md #56: float -> int, with an explicit rounding decision.
 MATH_FUNCTIONS = {"floor", "ceil", "round", "trunc"}
@@ -728,7 +729,26 @@ def analyze(program, filename="<string>"):
                 )
             return types_mod.PrimitiveType("int")
         if isinstance(obj_type, types_mod.ImageType):
-            return None  # permissive: claude.md #37 defines no methods on img at all
+            # claude.md #92: img has exactly two readable properties.
+            # Strict, like ArrayType's own `.length` handling just above
+            # -- this branch used to be a permissive `return None`, back
+            # when claude.md #37 defined nothing at all on img, which
+            # silently accepted every typo.
+            if expr.prop in ("width", "height"):
+                return types_mod.PrimitiveType("int")
+            if expr.prop in ("clip", "resize"):
+                raise CompileError(
+                    f"'{expr.prop}' is a method on img -- call it, "
+                    f"e.g. `sheet.{expr.prop}(...)`",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            raise CompileError(
+                f"img has no field '{expr.prop}' "
+                f"(img has .width, .height, .clip() and .resize())",
+                file=filename, line=expr.line, column=expr.column,
+                category="invalid field access",
+            )
         # claude.md #38: aud's play()/stop()/isPlaying() are only
         # recognized as Call-on-Member patterns (see _infer_call) --
         # this branch is for a bare `music.play` reference with no
@@ -995,6 +1015,29 @@ def analyze(program, filename="<string>"):
                         category="invalid function argument type",
                     )
                 return None
+            # claude.md #92: sheet.clip(x, y, w, h) -> img, and
+            # image.resize(w, h) -> void (in place). Checked here rather
+            # than left to the generic Member-call fallback so the arity
+            # and the int-ness of every argument are enforced.
+            if callee.prop in ("clip", "resize") and infer(callee.obj, scope) == _IMAGE:
+                expected = 4 if callee.prop == "clip" else 2
+                if len(expr.args) != expected:
+                    raise CompileError(
+                        f"{callee.prop}() expects {expected} argument(s), "
+                        f"got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                for i, arg in enumerate(expr.args):
+                    arg_type = infer(arg, scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != _INT:
+                        raise CompileError(
+                            f"{callee.prop}()'s argument {i + 1} expects int, "
+                            f"found {types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return types_mod.ImageType() if callee.prop == "clip" else None
             if callee.prop == "isPlaying" and infer(callee.obj, scope) == _AUDIO:
                 if expr.args:
                     raise CompileError(

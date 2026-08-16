@@ -160,6 +160,47 @@ def audio_null_env(tmp_path):
 
 
 @pytest.fixture
+def sprite_sheet_png(tmp_path):
+    """A 128x64 PNG laid out as a 4x2 grid of 32x32 solid-colour tiles,
+    written fresh into tmp_path and returned as a path.
+
+    Generated rather than committed: claude.md #92's clip()/resize()
+    tests need to assert real pixel colours at known tile coordinates,
+    which means the fixture's exact layout is part of the test, and a
+    checked-in binary would hide that. Encoded by hand (zlib + the four
+    PNG chunks) so this needs no image library -- the compiler itself
+    has none, and neither should its tests.
+    """
+    import struct
+    import zlib
+
+    width, height, tile = 128, 64, 32
+    # index = (row * 4) + column, so tile 0 is red at (0,0) and tile 5
+    # is cyan at (32,32) -- both asserted by name in the tests.
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+              (255, 0, 255), (0, 255, 255), (128, 0, 128), (0, 128, 128)]
+    rows = []
+    for y in range(height):
+        row = bytearray([0])  # PNG filter type 0 for this scanline
+        for x in range(width):
+            r, g, b = colors[(y // tile) * 4 + (x // tile)]
+            row += bytes([r, g, b, 255])
+        rows.append(bytes(row))
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(b"".join(rows)))
+           + chunk(b"IEND", b""))
+    path = tmp_path / "sheet.png"
+    path.write_bytes(png)
+    return str(path)
+
+
+@pytest.fixture
 def write_source(tmp_path):
     """Write named Festina source files under a temp dir; return their dir."""
 

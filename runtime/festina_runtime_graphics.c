@@ -18,6 +18,7 @@
  */
 #include <string.h>     /* memset -- Motif WM hints */
 #include <stdio.h>      /* snprintf -- festina_load_image's error message */
+#include <stdlib.h>     /* malloc/free -- claude.md #92's image box */
 #include <ctype.h>      /* tolower -- claude.md #90's case-insensitive style match */
 #include <sys/select.h> /* select() -- multiplexes X11 events with timers */
 #include <time.h>       /* nanosleep -- festina_graphics_init's connect retry */
@@ -439,6 +440,35 @@ void festina_draw_text(const char *text, int64_t x, int64_t y) {
     festina_graphics_present();
 }
 
+/* claude.md #92: an `img` value is a pointer to one of these, not the
+ * Cairo surface directly. The indirection is what makes resize() work
+ * the way it reads -- `grass.resize(32, 32)` is a statement, so it has
+ * to change `grass` itself, and a Cairo surface cannot be resized in
+ * place. Boxing the surface means every binding that shares an image
+ * sees the new one, exactly as they shared the old. */
+typedef struct {
+    cairo_surface_t *surface;
+} FestinaImageBox;
+
+static FestinaImageBox *festina_image_box(cairo_surface_t *surface) {
+    FestinaImageBox *box = malloc(sizeof(FestinaImageBox));
+    if (!box) festina_fail("out of memory creating an image");
+    box->surface = surface;
+    return box;
+}
+
+/* Both dimensions must be positive: Cairo would accept 0 and hand back
+ * a surface nothing can ever draw, which is a silent no-op rather than
+ * the mistake it almost certainly is. */
+static void festina_check_image_size(const char *fn, int64_t w, int64_t h) {
+    if (w > 0 && h > 0) return;
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "%s(): width and height must both be positive, got %lldx%lld",
+             fn, (long long)w, (long long)h);
+    festina_fail(msg);
+}
+
 void *festina_load_image(const char *path) {
     if (!path) path = "";
     /* claude.md #37: "Supported image formats are determined by the
@@ -452,14 +482,80 @@ void *festina_load_image(const char *path) {
         cairo_surface_destroy(img);
         festina_fail(msg);
     }
-    return img;
+    return festina_image_box(img);
+}
+
+int64_t festina_image_width(void *img) {
+    if (!img) return 0;
+    return (int64_t)cairo_image_surface_get_width(((FestinaImageBox *)img)->surface);
+}
+
+int64_t festina_image_height(void *img) {
+    if (!img) return 0;
+    return (int64_t)cairo_image_surface_get_height(((FestinaImageBox *)img)->surface);
+}
+
+/* claude.md #92: a rectangle lifted out of a larger image -- the
+ * spritesheet operation. Returns a NEW image; the source is untouched,
+ * so one sheet can be clipped as many times as a program likes.
+ *
+ * A region reaching past the source's edge is deliberately not an
+ * error: the overlapping part is copied and the rest stays transparent,
+ * which is what every canvas drawImage-with-source-rect does, and is
+ * ordinary at a sheet's right/bottom margin. */
+void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h) {
+    if (!img) return NULL;
+    festina_check_image_size("clip", w, h);
+    cairo_surface_t *src = ((FestinaImageBox *)img)->surface;
+    cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, (int)w, (int)h);
+    cairo_t *cr = cairo_create(out);
+    /* Offsetting the source by -x/-y puts the requested region at the
+     * new surface's origin. */
+    cairo_set_source_surface(cr, src, -(double)x, -(double)y);
+    cairo_paint(cr);
+    cairo_destroy(cr);
+    return festina_image_box(out);
+}
+
+/* claude.md #92: scales this image to w x h IN PLACE, so every binding
+ * holding it sees the new size. The old surface is destroyed here --
+ * safe precisely because the box, not the surface, is what any Festina
+ * binding ever holds. */
+void festina_image_resize(void *img, int64_t w, int64_t h) {
+    if (!img) return;
+    festina_check_image_size("resize", w, h);
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    int src_w = cairo_image_surface_get_width(box->surface);
+    int src_h = cairo_image_surface_get_height(box->surface);
+    if (src_w <= 0 || src_h <= 0) return;
+    cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, (int)w, (int)h);
+    cairo_t *cr = cairo_create(out);
+    cairo_scale(cr, (double)w / src_w, (double)h / src_h);
+    cairo_set_source_surface(cr, box->surface, 0, 0);
+    /* GOOD filtering matters here: the default is fine for a 1:1 blit
+     * but visibly blocky once a sprite is scaled. */
+    cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
+    cairo_paint(cr);
+    cairo_destroy(cr);
+    cairo_surface_destroy(box->surface);
+    box->surface = out;
+}
+
+/* claude.md #92: releases an image and the surface it holds. Reached
+ * only from the scope-exit path for a non-escaping `img` local whose
+ * initializer was a call -- see _OwnedImage in festina/codegen.py. */
+void festina_image_free(void *img) {
+    if (!img) return;
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    if (box->surface) cairo_surface_destroy(box->surface);
+    free(box);
 }
 
 void festina_draw_image(void *img, int64_t x, int64_t y) {
     festina_graphics_require_init();
     if (!img) return;
     cairo_t *cr = cairo_create(g_backing_surface);
-    cairo_set_source_surface(cr, (cairo_surface_t *)img, (double)x, (double)y);
+    cairo_set_source_surface(cr, ((FestinaImageBox *)img)->surface, (double)x, (double)y);
     cairo_paint(cr);
     cairo_destroy(cr);
     festina_graphics_present();

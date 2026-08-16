@@ -85,6 +85,31 @@ semantic.py's own analyze_statement already uses.
 from . import ast
 
 
+# claude.md #92: builtins none of whose arguments ever escape. The
+# stage-2 machinery below already exempts a call argument when the
+# callee is a user function whose own body proves that position safe;
+# a builtin has no Festina body to analyse, so it defaulted to the
+# conservative "every call argument escapes" rule -- which meant
+# `drawImage(tile, x, y)` alone was enough to keep `tile` alive
+# forever, defeating claude.md #92's own reclamation of a clipped
+# image in exactly the shape it exists for (clip, draw, repeat).
+#
+# Every entry here has been checked against the runtime rather than
+# assumed: each of these reads its argument during the call and keeps
+# no pointer to it afterwards -- Cairo copies the glyphs and pixels it
+# paints, sqlite binds with SQLITE_TRANSIENT, the measure functions
+# only take metrics, and the style setters copy what they need into
+# their own state. Anything not listed keeps the conservative default.
+_NON_RETAINING_BUILTINS = frozenset({
+    "log", "fail",
+    "drawRect", "drawCircle", "drawText", "drawImage",
+    "loadImage", "loadAudio",
+    "fillStyle", "borderColor", "lineWidth", "changeFont",
+    "measureTextWidth", "measureTextHeight",
+    "sqlite", "regex",
+})
+
+
 def find_escaping_names(block, escaping_params=None):
     """Every name that appears anywhere in `block` (an ast.Block -- the
     top-level body of a function or event handler) in a position other
@@ -197,8 +222,14 @@ def _walk_expr(expr, escaping, escaping_params):
         # True when escaping_positions is None, by the `is not None`
         # check that guards it).
         escaping_positions = None
-        if escaping_params is not None and isinstance(expr.callee, ast.Identifier):
-            escaping_positions = escaping_params.get(expr.callee.name)
+        if isinstance(expr.callee, ast.Identifier):
+            if expr.callee.name in _NON_RETAINING_BUILTINS:
+                # claude.md #92: no argument position escapes -- an empty
+                # set exempts every one of them, the same way a fully
+                # safe user function's own analysis would.
+                escaping_positions = frozenset()
+            elif escaping_params is not None:
+                escaping_positions = escaping_params.get(expr.callee.name)
         for i, a in enumerate(expr.args):
             if (escaping_positions is not None and i not in escaping_positions
                     and isinstance(a, ast.Identifier)):

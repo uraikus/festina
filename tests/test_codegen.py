@@ -6531,3 +6531,239 @@ class TestCanvasStyleRendersRealPixels:
                 f"{small_inked} -- changeFont() had no effect")
         finally:
             proc.terminate()
+
+
+class TestImageClipResizeAndSize:
+    """claude.md #92: `img` gains `.width`/`.height` and the two methods
+    a spritesheet actually needs.
+
+    ```festina
+    img sheet = loadImage('sheet.png')
+    img grass = sheet.clip(0, 0, 64, 64)   // a new image
+    grass.resize(32, 32)                    // in place
+    ```
+
+    `clip` returns a NEW image and leaves the source untouched, so one
+    sheet can be clipped as many times as a program likes. `resize`
+    changes the image IN PLACE -- it reads as a statement, so it has to
+    -- which is why an `img` value is a pointer to a small box holding
+    the Cairo surface rather than the surface itself: a Cairo surface
+    can't be resized in place, and boxing it means every binding
+    sharing an image sees the new one.
+
+    That box is also why img now has an ownership story (`_OwnedImage`,
+    the same shape claude.md #86 uses for regex): clip() exists to be
+    called repeatedly, so without scope-exit reclamation, extracting
+    frames in a loop would leak a whole surface per iteration."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    # ---- IR level ----
+
+    def test_width_and_height_emit_runtime_calls(self, parser, semantic, codegen):
+        source = """
+        img sheet = loadImage('s.png')
+        log(sheet.width)
+        log(sheet.height)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call i64 @festina_image_width(ptr" in ir
+        assert "call i64 @festina_image_height(ptr" in ir
+
+    def test_clip_and_resize_emit_runtime_calls(self, parser, semantic, codegen):
+        source = """
+        img sheet = loadImage('s.png')
+        img tile = sheet.clip(0, 32, 64, 64)
+        tile.resize(16, 16)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert ("call ptr @festina_image_clip(ptr %" in ir
+                and "i64 0, i64 32, i64 64, i64 64)" in ir)
+        assert "call void @festina_image_resize(ptr %" in ir
+
+    def test_a_clipped_local_is_freed_at_scope_exit(self, parser, semantic, codegen):
+        # Without this, clipping inside a loop leaks a surface per pass.
+        source = """
+        void func f(sheet:img) {
+            img tile = sheet.clip(0, 0, 8, 8)
+            drawImage(tile, 0, 0)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f(ptr %arg.sheet)")[1].split("\n}")[0]
+        assert "call void @festina_image_free(ptr" in body
+
+    def test_a_borrowed_image_is_not_freed(self, parser, semantic, codegen):
+        # `other` merely aliases an image the caller owns -- freeing it
+        # here would destroy a surface still in use.
+        source = """
+        void func f(sheet:img) {
+            img other = sheet
+            drawImage(other, 0, 0)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f(ptr %arg.sheet)")[1].split("\n}")[0]
+        assert "call void @festina_image_free(ptr" not in body
+
+    def test_an_escaping_image_is_not_freed(self, parser, semantic, codegen):
+        source = """
+        img kept
+        void func f(sheet:img) {
+            img tile = sheet.clip(0, 0, 8, 8)
+            kept = tile
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f(ptr %arg.sheet)")[1].split("\n}")[0]
+        assert "call void @festina_image_free(ptr" not in body
+
+    # ---- type checking ----
+
+    def test_wrong_arity_and_types_are_rejected(self, parser, semantic, errors):
+        for source in [
+            "img s = loadImage('a.png')\ns.clip(0, 0, 64)",
+            "img s = loadImage('a.png')\ns.resize(1, 2, 3)",
+            "img s = loadImage('a.png')\ns.clip(0, 0, 64, 'x')",
+            "img s = loadImage('a.png')\ns.resize('a', 2)",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+    def test_an_unknown_img_field_is_rejected(self, parser, semantic, errors):
+        # This branch used to be a permissive `return None`, which
+        # silently accepted every typo on an img.
+        program = parser.parse("img s = loadImage('a.png')\nlog(s.widht)",
+                                filename="main.f")
+        with pytest.raises(errors.CompileError, match="img has no field"):
+            semantic.analyze(program, filename="main.f")
+
+    def test_a_method_referenced_without_calling_says_so(self, parser, semantic, errors):
+        program = parser.parse("img s = loadImage('a.png')\nlog(s.clip)",
+                                filename="main.f")
+        with pytest.raises(errors.CompileError, match="is a method on img"):
+            semantic.analyze(program, filename="main.f")
+
+    def test_a_struct_field_named_width_still_works(self, compile_and_run):
+        # `.width` is only special on an img; a struct may still declare
+        # one, and the object must be evaluated exactly once either way.
+        source = """
+        struct Box { width:int  height:int }
+        Box func make() { Box b  b.width = 7  b.height = 9  return b }
+        log(make().width)
+        log(make().height)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "7\n9\n"
+
+    # ---- behaviour, against a real PNG ----
+
+    def test_clip_resize_and_dimensions_against_a_real_sheet(
+            self, compile_and_run, sprite_sheet_png):
+        source = f"""
+        img sheet = loadImage('{sprite_sheet_png}')
+        log(`${{sheet.width}}x${{sheet.height}}`)
+
+        img tile = sheet.clip(32, 32, 32, 32)
+        log(`${{tile.width}}x${{tile.height}}`)
+
+        // clipping leaves the source alone
+        log(`${{sheet.width}}x${{sheet.height}}`)
+
+        // resize changes the image in place
+        tile.resize(8, 4)
+        log(`${{tile.width}}x${{tile.height}}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "128x64\n32x32\n128x64\n8x4\n"
+
+    def test_resize_is_visible_through_every_binding(
+            self, compile_and_run, sprite_sheet_png):
+        # An img is a shared handle, so resizing through one name is
+        # visible through another -- that is what "in place" means.
+        source = f"""
+        img sheet = loadImage('{sprite_sheet_png}')
+        img a = sheet.clip(0, 0, 32, 32)
+        img b = a
+        a.resize(4, 4)
+        log(`${{b.width}}x${{b.height}}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "4x4\n"
+
+    def test_a_non_positive_size_fails_clearly(self, compile_and_run, sprite_sheet_png):
+        for call in ["sheet.clip(0, 0, 0, 8)", "sheet.resize(8, 0)"]:
+            source = f"""
+            img sheet = loadImage('{sprite_sheet_png}')
+            {call}
+            """
+            result = compile_and_run(source)
+            assert result.returncode != 0
+            assert "must both be positive" in result.stdout + result.stderr
+
+
+class TestImageClipRendersRealPixels:
+    """claude.md #92, the tier the rest can't reach: that clip() lifts
+    the region it was actually asked for. Asserting the runtime call was
+    emitted, or that the result reports 32x32, proves neither that the
+    right pixels came out nor that the offset was applied in the right
+    direction.
+
+    Same opt-in tier as the rest of TestGraphics: a real display plus
+    `xdotool`/`xwd`."""
+
+    def test_each_clipped_tile_carries_its_own_colour(
+            self, run_graphics_program, x_display, sprite_sheet_png):
+        if not shutil.which("xwd"):
+            pytest.skip("xwd isn't installed -- needed to read real canvas pixels")
+        # The fixture's grid: tile (col, row) -> index row*4+col.
+        # (0,0) red, (1,0) green, (1,1) cyan.
+        source = f"""
+        img sheet = loadImage('{sprite_sheet_png}')
+        img red = sheet.clip(0, 0, 32, 32)
+        img green = sheet.clip(32, 0, 32, 32)
+        img cyan = sheet.clip(32, 32, 32, 32)
+        drawImage(red, 10, 10)
+        drawImage(green, 100, 10)
+        drawImage(cyan, 200, 10)
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            got = _xwd_pixels(x_display, wid, [(25, 25), (115, 25), (215, 25)])
+            assert got[0] == (255, 0, 0), "tile (0,0) should be red"
+            assert got[1] == (0, 255, 0), "tile (1,0) should be green"
+            assert got[2] == (0, 255, 255), "tile (1,1) should be cyan"
+        finally:
+            proc.terminate()
+
+    def test_a_resized_tile_covers_its_new_size(
+            self, run_graphics_program, x_display, sprite_sheet_png):
+        if not shutil.which("xwd"):
+            pytest.skip("xwd isn't installed -- needed to read real canvas pixels")
+        source = f"""
+        img sheet = loadImage('{sprite_sheet_png}')
+        img big = sheet.clip(0, 0, 32, 32)
+        big.resize(96, 96)
+        drawImage(big, 10, 10)
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            # inside the scaled-up tile, and past where the 32x32
+            # original would have ended
+            got = _xwd_pixels(x_display, wid, [(20, 20), (90, 90), (120, 120)])
+            assert got[0] == (255, 0, 0)
+            assert got[1] == (255, 0, 0), "the tile did not scale up to 96x96"
+            assert got[2] == (255, 255, 255), "it scaled past its requested size"
+        finally:
+            proc.terminate()

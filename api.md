@@ -440,6 +440,7 @@ drawText('Hello', 20, 20)
 
 img profile = loadImage('profile.png')    // PNG only
 drawImage(profile, 0, 0)
+log(`${profile.width}x${profile.height}`)
 
 log(`canvas is ${clientWidth}x${clientHeight}`)
 
@@ -457,6 +458,54 @@ handlers above — `loadImage()` alone does *not* open a window (decoding
 a PNG needs no display). Undecorated, starts at 800×600. After the entry
 file's top-level code finishes, if a window was opened, the process
 blocks handling redraws/input until the window closes.
+
+### Images
+
+```festina
+img sheet = loadImage('spritesheet.png')
+log(`${sheet.width}x${sheet.height}`)
+
+img grass = sheet.clip(0, 0, 64, 64)     // a new 64x64 image
+grass.resize(32, 32)                      // scaled in place
+drawImage(grass, 100, 100)
+```
+
+| | |
+|---|---|
+| `img.width` / `img.height` | Current size in pixels, as `int`. |
+| `img.clip(x, y, w, h)` | A **new** `img` holding that rectangle. The source is untouched, so one sheet can be clipped as many times as you like. |
+| `img.resize(w, h)` | Scales the image **in place** — it changes the image itself, so every name for it sees the new size. |
+
+`clip` is the spritesheet operation: one PNG holding a grid of frames,
+sliced into the individual images you draw.
+
+```festina
+img sheet = loadImage('tiles.png')
+arr[img] tiles = []
+for int i = 0, i < 8, i++ {
+    tiles[i] = sheet.clip(i * 32, 0, 32, 32)
+}
+```
+
+A clip region reaching past the source's edge isn't an error — the
+overlapping part is copied and the rest stays transparent, which is
+normal at a sheet's right or bottom margin. A zero or negative width or
+height *is* an error, since it could only ever produce an image nothing
+can draw.
+
+Because `resize` changes the image itself, two names for one image stay
+in step:
+
+```festina
+img a = sheet.clip(0, 0, 32, 32)
+img b = a
+a.resize(8, 8)
+log(b.width)      // 8 -- a and b are the same image
+```
+
+An image created in a function (by `loadImage` or `clip`) and never
+stored outside it is released when that function returns, so slicing
+frames inside a loop doesn't accumulate.
 
 ### Drawing style
 
