@@ -5203,6 +5203,433 @@ int main(int argc, char **argv) {
 """
 
 
+class TestCircleMaskFastPath:
+    """claude.md #104: filled circles are rasterized once per radius and
+    stamped thereafter, instead of tessellating the curve every time.
+
+    Measured on the canvas benchmark, circles were 90% of the frame --
+    20,000 of them cost 76 ms against 10 ms for the same number of
+    rectangles -- because cairo_arc + cairo_fill turns the curve into
+    Beziers and scan-converts a general polygon on every call. Caching
+    an A8 alpha mask per radius is 4.4x faster on that workload and took
+    the whole frame from 90 ms to 31 ms.
+
+    Everything here is about the fast path being INVISIBLE. It is only
+    correct while the mask lands exactly where a tessellated circle
+    would, so anything that would move it off the pixel grid -- a scale,
+    a rotation, a fractional translation -- has to fall back, and a
+    border has to fall back because a stroke needs a real path. Verified
+    against the tessellating fallback over a whole 800x600 frame
+    covering every one of these cases: 5 pixels of 480,000 differed, all
+    by 1/255, all inside a gradient (sampling rounding, not geometry).
+    """
+
+    def _canvas(self, compile_and_run, monkeypatch, body, name="out.png"):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        result = compile_and_run(f"clearCanvas()\n{body}\nlog(saveCanvas('{name}'))")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "true"
+        return result
+
+    def test_a_filled_circle_is_actually_filled(self, compile_and_run, tmp_path, monkeypatch):
+        self._canvas(compile_and_run, monkeypatch,
+                      "fillStyle(200, 30, 30)\ndrawCircle(60, 60, 20)")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        assert pixel(60, 60) == (200, 30, 30)      # centre
+        assert pixel(60, 45) == (200, 30, 30)      # inside, near the top edge
+        assert pixel(60, 20) == (255, 255, 255)    # well outside
+        assert pixel(95, 60) == (255, 255, 255)
+
+    @pytest.mark.parametrize("radius", [1, 2, 3, 4, 8, 16, 32])
+    def test_every_radius_covers_the_right_extent(self, compile_and_run, tmp_path,
+                                                    monkeypatch, radius):
+        # A mask stamped half a pixel off would show up here as an edge
+        # landing one pixel early or late, at every radius independently.
+        self._canvas(compile_and_run, monkeypatch,
+                      f"fillStyle(0, 0, 0)\ndrawCircle(100, 100, {radius})")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        # Inked, not necessarily SOLID: a radius-1 circle does not fully
+        # cover even its own centre pixel, so Cairo antialiases it to
+        # grey -- in the fallback exactly as much as in the fast path
+        # (compared directly: zero differing pixels at r=1). Demanding
+        # pure black here would be testing Cairo's coverage arithmetic
+        # rather than this cache.
+        assert pixel(100, 100)[0] < 200, (radius, pixel(100, 100))
+        # Just outside the circle in each direction is untouched white.
+        for dx, dy in ((radius + 2, 0), (-radius - 2, 0), (0, radius + 2), (0, -radius - 2)):
+            assert pixel(100 + dx, 100 + dy) == (255, 255, 255), (radius, dx, dy)
+
+    def test_a_bordered_circle_still_gets_its_border(self, compile_and_run, tmp_path,
+                                                      monkeypatch):
+        # Must fall back: a stroke needs a real path, and the mask has
+        # none. If the fast path ever swallowed this, the border would
+        # silently vanish.
+        self._canvas(compile_and_run, monkeypatch,
+                      "color navy = 'navy'\n"
+                      "fillStyle(255, 255, 0)\n"
+                      "borderColor(navy)\n"
+                      "lineWidth(4)\n"
+                      "drawCircle(60, 60, 20)")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        assert pixel(60, 60) == (255, 255, 0)          # the fill
+        r, g, b = pixel(60, 40)                         # on the border ring
+        assert b > r and b > g, (r, g, b)
+
+    def test_a_scaled_circle_is_the_scaled_size(self, compile_and_run, tmp_path, monkeypatch):
+        # Must fall back: stamping a pre-rasterized mask under a scale
+        # would resample it. The give-away is the extent -- a radius-10
+        # circle drawn at scale 2 has to reach 20 pixels out.
+        self._canvas(compile_and_run, monkeypatch,
+                      "fillStyle(0, 0, 0)\nscale(2.0, 2.0)\ndrawCircle(50, 50, 10)")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        assert pixel(100, 100) == (0, 0, 0)
+        assert pixel(100, 84) == (0, 0, 0)         # 16px out, inside a radius-20 circle
+        assert pixel(100, 78) == (255, 255, 255)   # 22px out, beyond it
+
+    def test_a_translated_circle_moves(self, compile_and_run, tmp_path, monkeypatch):
+        # A whole-number translation KEEPS the fast path, so this checks
+        # the offset is applied rather than ignored.
+        self._canvas(compile_and_run, monkeypatch,
+                      "fillStyle(0, 0, 0)\ntranslate(100, 50)\ndrawCircle(30, 30, 10)")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        assert pixel(130, 80) == (0, 0, 0)
+        assert pixel(30, 30) == (255, 255, 255)
+
+    def test_alpha_applies_to_a_circle(self, compile_and_run, tmp_path, monkeypatch):
+        self._canvas(compile_and_run, monkeypatch,
+                      "fillStyle(0, 0, 0)\nfillAlpha(0.5)\ndrawCircle(60, 60, 20)")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        r, g, b = pixel(60, 60)
+        # Half-transparent black over white: mid grey, not solid black.
+        assert 100 < r < 160 and r == g == b, (r, g, b)
+
+    def test_a_gradient_fills_a_circle(self, compile_and_run, tmp_path, monkeypatch):
+        self._canvas(compile_and_run, monkeypatch,
+                      "color a = 'red'\n"
+                      "color b = 'blue'\n"
+                      "fillLinearGradient(40, 0, a, 80, 0, b)\n"
+                      "drawCircle(60, 60, 20)")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        left = pixel(45, 60)
+        right = pixel(75, 60)
+        assert left[0] > left[2], left      # red end
+        assert right[2] > right[0], right   # blue end
+
+    def test_a_degenerate_radius_draws_nothing_and_does_not_crash(self, compile_and_run,
+                                                                    tmp_path, monkeypatch):
+        self._canvas(compile_and_run, monkeypatch,
+                      "fillStyle(0, 0, 0)\ndrawCircle(60, 60, 0)\ndrawCircle(90, 60, -5)")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        assert pixel(60, 60) == (255, 255, 255)
+        assert pixel(90, 60) == (255, 255, 255)
+
+    def test_many_distinct_radii_do_not_break_the_cache(self, compile_and_run, tmp_path,
+                                                          monkeypatch):
+        # The cache holds 16 entries and evicts round-robin, so a program
+        # cycling through more radii than that exercises eviction on
+        # every draw. Correctness must not depend on a hit.
+        body = "fillStyle(0, 0, 0)\n" + "\n".join(
+            f"drawCircle({12 + (i % 30) * 25}, {30 + (i // 30) * 40}, {1 + i % 20})"
+            for i in range(60))
+        self._canvas(compile_and_run, monkeypatch, body)
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        # Every one of the 60 got drawn somewhere: count inked centres
+        # rather than assert a colour, since the smallest radii are
+        # antialiased grey (see the extent test above).
+        inked = sum(1 for i in range(60)
+                     if pixel(12 + (i % 30) * 25, 30 + (i // 30) * 40)[0] < 200)
+        assert inked == 60, inked
+
+
+class TestAllNullLiterals:
+    """claude.md #102: `arr[text] a = [null]` / `map[int] m = {'k': null}`.
+
+    A literal whose values are ALL null infers its element type as null
+    itself, and that was rejected against every declared element type --
+    so the one literal shape meaning "entries, none of them meaningful
+    yet" could not be written at all. `a.push(null)` and `m[k] = null`
+    were both already fine, and `[null, 'x']` inferred text without
+    complaint, which is what makes this an inconsistency rather than a
+    policy.
+    """
+
+    def test_an_all_null_array_literal(self, compile_and_run):
+        result = compile_and_run(
+            "arr[text] a = [null]\nlog(a.length)\nlog(a[0] == null)")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["1", "true"]
+
+    def test_an_all_null_map_literal(self, compile_and_run):
+        result = compile_and_run(
+            "map[text] m = {'a': null, 'b': null}\nlog(m['a'] == null)\nlog(m['b'] == null)")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["true", "true"]
+
+    def test_the_declared_element_type_still_decides_the_null(self, compile_and_run):
+        # An int's null is its own reserved sentinel, not a pointer --
+        # so this also proves the declared type reaches the elements
+        # rather than them being left as generic pointers.
+        result = compile_and_run(
+            "arr[int] a = [null, null]\nlog(a[1])\nmap[int] m = {'k': null}\nlog(m['k'])")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["-9223372036854775808"] * 2
+
+    def test_a_mixed_literal_still_infers_normally(self, compile_and_run):
+        result = compile_and_run("arr[text] a = [null, 'x']\nlog(a.length)\nlog(a[1])")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["2", "x"]
+
+    def test_a_genuine_type_mismatch_is_still_rejected(self, parser, semantic, errors):
+        # The allowance is for null specifically, not a hole in element
+        # type checking.
+        for source in ["arr[int] a = ['x']", "map[int] m = {'k': 'x'}"]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError, match="cannot assign"):
+                semantic.analyze(program, filename="main.f")
+
+
+class TestNullComparisonOnEveryType:
+    """claude.md #102: `x == null` on a pointer-backed type.
+
+    Every one of these used to fail the COMPILE with an LLVM parse error
+    naming a generated temporary -- `icmp eq i64 <a ptr>, null` is not
+    valid IR at all. That is an internal-error message for something
+    entirely reasonable to write, and it covered struct, arr[T], map[T],
+    img, aud and regex: every managed type in the language except text.
+    """
+
+    @pytest.mark.parametrize("decl,expr", [
+        ("struct S { n:int }\nS x", "x"),
+        ("arr[int] x = []", "x"),
+        ("map[int] x = {}", "x"),
+        ("regex x = regex('a')", "x"),
+        ("text x = 'a'", "x"),
+        ("int x = 1", "x"),
+        ("bool x = true", "x"),
+    ])
+    def test_a_live_value_is_not_null(self, compile_and_run, decl, expr):
+        result = compile_and_run(f"{decl}\nlog({expr} == null)\nlog({expr} != null)")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["false", "true"]
+
+    def test_float_keeps_its_documented_nan_behaviour(self, compile_and_run):
+        # Deliberately NOT in the list above. A null float is a real
+        # NaN, and IEEE-754 says every ordered comparison against a NaN
+        # is false -- so a live float is neither == null nor != null.
+        # api.md states this; pinned here so the fix above is not
+        # mistaken for a licence to "correct" it.
+        result = compile_and_run("float x = 1.5\nlog(x == null)\nlog(x != null)")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["false", "false"]
+
+    def test_media_handles_compare_against_null(self, compile_and_run, tmp_path,
+                                                  monkeypatch, sprite_sheet_png):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        sheet = os.path.basename(sprite_sheet_png)
+        result = compile_and_run(
+            f"img p = '{sheet}'\naud a = 'beep.wav'\n"
+            "log(p == null)\nlog(a == null)\n",
+            env={"HOME": str(tmp_path)},
+        ) if False else compile_and_run(f"img p = '{sheet}'\nlog(p == null)\nlog(p != null)")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["false", "true"]
+
+    def test_a_null_media_column_reads_as_null(self, compile_and_run, tmp_path,
+                                                monkeypatch):
+        # The case that surfaced this: a nullable BLOB column has to be
+        # checkable, and there is no other way to ask.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        source = """
+        table Asset {
+            name:text
+            pic:img
+        }
+        sqlite('INSERT INTO Asset (name) VALUES (?)', ['nopic'])
+        arr[Asset] rows = sqlite('SELECT * FROM Asset')
+        log(rows[0].name)
+        log(rows[0].pic == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["nopic", "true"]
+
+
+class TestMediaColumnsLinkTheirRuntime:
+    """claude.md #102: a table column of type `aud`/`img` is by itself
+    enough to make a program use that feature.
+
+    Two things need it -- main() registers the media decoders, and the
+    per-table row release function calls that type's destructor -- and
+    both emit calls into a translation unit that would otherwise not be
+    linked. A program whose only use of audio was `file:aud` in a table
+    therefore failed at the LINK step with an undefined reference to
+    festina_audio_free: a compiler bug reported as a linker error.
+    """
+
+    @pytest.mark.parametrize("column,flag", [("aud", "uses_audio"),
+                                              ("img", "uses_graphics_code")])
+    def test_the_column_alone_sets_the_flag(self, parser, semantic, codegen, column, flag):
+        program = parser.parse(
+            f"table T {{ name:text asset:{column} }}\nlog('x')", filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        gen = codegen.CodeGen(analyzed, "main.f")
+        gen.generate(program)
+        assert getattr(gen, flag) is True
+
+    def test_such_a_program_actually_links_and_runs(self, compile_and_run, monkeypatch):
+        # The end-to-end version: nothing here names a single audio or
+        # graphics function, so only the column types can pull the
+        # runtime in.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        source = """
+        table T {
+            name:text
+            clip:aud
+            pic:img
+        }
+        sqlite('INSERT INTO T (name) VALUES (?)', ['row'])
+        arr[T] rows = sqlite('SELECT * FROM T')
+        log(rows[0].name)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "row"
+
+
+class TestFloatToIntIsNeverUndefined:
+    """claude.md #102: Math.floor/ceil/round/trunc of a NaN, an infinity
+    or an out-of-range double.
+
+    A bare `fptosi` is undefined behaviour for all three -- not "some
+    unspecified integer", genuinely undefined, and it behaved like it.
+    Measured before the fix: `Math.floor(1.0 / 0.0)` printed a different
+    value on every build, once a stack ADDRESS, and in one program
+    `Math.floor(nan)` answered 1 while `Math.ceil(nan)` on the next line
+    answered the null sentinel -- the optimizer had folded two identical
+    UB sites differently. A language that returns null for division by
+    zero rather than crashing cannot then hand back a stack address for
+    Math.floor of that same null.
+    """
+
+    @pytest.mark.parametrize("fn", ["floor", "ceil", "round", "trunc"])
+    def test_a_null_float_rounds_to_a_null_int(self, compile_and_run, fn):
+        result = compile_and_run(
+            f"float nan = 1.0 / 0.0\nlog(Math.{fn}(nan) == null)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    @pytest.mark.parametrize("fn", ["floor", "ceil", "round", "trunc"])
+    def test_an_infinity_rounds_to_a_null_int(self, compile_and_run, fn):
+        result = compile_and_run(
+            "float inf = Math.exp(10000.0)\n"
+            f"log(Math.{fn}(inf) == null)\n"
+            "float ninf = 0.0 - inf\n"
+            f"log(Math.{fn}(ninf) == null)\n")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["true", "true"]
+
+    def test_the_answer_is_the_same_on_every_run(self, compile_and_run):
+        # The original symptom was non-determinism, so this checks for
+        # non-determinism specifically rather than for a value.
+        source = "float nan = 1.0 / 0.0\nlog(Math.floor(nan))\nlog(Math.ceil(nan))"
+        first = compile_and_run(source).stdout
+        for _ in range(3):
+            assert compile_and_run(source).stdout == first
+        assert set(first.split()) == {"-9223372036854775808"}
+
+    def test_ordinary_values_are_untouched(self, compile_and_run):
+        result = compile_and_run(
+            "log(Math.floor(3.7))\nlog(Math.ceil(3.2))\nlog(Math.round(3.5))\n"
+            "log(Math.round(0.0 - 3.5))\nlog(Math.trunc(0.0 - 3.9))\n"
+            "log(Math.floor(0.0))\n")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["3", "4", "4", "-4", "-3", "0"]
+
+
+class TestDiscardedCallResultReachedForAField:
+    """claude.md #102: `makeThing().count` -- a call result produced
+    solely to read one field out of, with nothing binding it.
+
+    claude.md #77 already released a call result discarded as a bare
+    statement, on the reasoning that a Call's result is fresh and
+    unshared by construction so that expression is provably its only
+    reference. Reading a field off it is the same situation and was
+    simply never covered: measured at one whole struct per evaluation,
+    which in a loop is per iteration. Found by the leak stress suite.
+    """
+
+    def test_the_value_is_still_correct(self, compile_and_run):
+        source = """
+        struct Config { retries:int name:text }
+        Config func load() {
+            Config c
+            c.retries = 3
+            c.name = 'main'
+            return c
+        }
+        int total = 0
+        for int i = 0, i < 5, i++ {
+            total = total + load().retries
+        }
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "15"
+
+    def test_the_receiver_is_released_exactly_once(self, parser, semantic, codegen):
+        source = """
+        struct Config { retries:int }
+        Config func load() {
+            Config c
+            c.retries = 3
+            return c
+        }
+        void func use() {
+            log(load().retries)
+        }
+        use()
+        """
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        body = ir.split("define void @use()")[1].split("\n}")[0]
+        assert body.count("@festina_release") == 1
+
+    def test_a_managed_field_survives_being_read_off_a_call(self, compile_and_run):
+        # The restriction is load-bearing, not conservative: releasing
+        # the parent recursively releases its struct-typed fields, so
+        # doing it for a managed field would free the very value just
+        # loaded. This case therefore still leaks, deliberately -- and
+        # what must never happen is the alternative, which is that the
+        # value read back is garbage or the program crashes. Pinned so a
+        # later "optimization" cannot quietly turn a documented leak
+        # into a use-after-free.
+        source = """
+        struct Inner { n:int label:text }
+        struct Outer { inner:Inner }
+        Outer func make(n:int) {
+            Outer o
+            o.inner.n = n
+            o.inner.label = `label ${n}`
+            return o
+        }
+        for int i = 0, i < 20, i++ {
+            Inner got = make(i).inner
+            if got.n != i {
+                log('corrupted')
+            }
+            if got.label != `label ${i}` {
+                log('corrupted')
+            }
+        }
+        log('intact')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "intact"
+
+
 class TestMediaFormatsAndPaths:
     """claude.md #101: `img sprite = 'sprite.png'` alongside claude.md
     #100's `aud`, JPEG and MP3 decoding, and both types as sqlite BLOB

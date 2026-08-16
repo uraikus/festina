@@ -1,7 +1,7 @@
 # Benchmarks
 
 How Festina compares to Rust, Go, and Bun on a handful of small,
-equivalent-logic programs. Not a claim that Festina is faster than any
+equivalent-logic programs, and to a browser's `<canvas>` on 2D drawing. Not a claim that Festina is faster than any
 of these languages in general — a compiled language's real-world
 performance depends heavily on what's actually being written and how
 mature its optimizer/runtime is, and Festina's is young. This exists to
@@ -12,7 +12,9 @@ few workloads on every change that plausibly affects performance
 ## Methodology
 
 Five programs, each implemented equivalently in Festina, Rust, Go, and
-Bun (source in [`benchmarks/`](benchmarks/)):
+Bun (source in [`benchmarks/`](benchmarks/)), plus a sixth comparing
+Festina's canvas against a browser's — see
+[Canvas](#canvas-festina-vs-an-html-canvas) at the end:
 
 | Benchmark | What it measures |
 |---|---|
@@ -33,11 +35,21 @@ linker resolution, ...) followed by 7 timed runs, keeping the *minimum*
 dedicated benchmarking tool. Binary size is the compiled executable's
 size on disk (n/a for Bun, which ships no separate binary).
 
+Build time gets one untimed throwaway build per toolchain before any
+timed one, for the same reason each program gets an untimed warmup run.
+Without it the first benchmark in the list absorbed the whole toolchain's
+cold-start cost and reported a build time several times everyone else's
+— measured at 5.1 s for Rust's `hello` against 0.1 s for the very next
+program it built, which says nothing about `hello`.
+
 Reproduce locally:
 
 ```bash
 python3 benchmarks/run_benchmarks.py               # print results
 python3 benchmarks/run_benchmarks.py --update-doc   # regenerate this file's table
+
+python3 benchmarks/canvas/run_canvas_benchmark.py             # the canvas comparison
+python3 benchmarks/canvas/run_canvas_benchmark.py --update-doc
 ```
 
 The runner skips any language toolchain not installed rather than
@@ -46,52 +58,52 @@ failing — see [setup.md](setup.md) for what each one needs.
 ## Results
 
 <!-- BENCHMARK_RESULTS_START -->
-_Last run: 2026-08-15 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
+_Last run: 2026-08-16 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
 
 ### `hello`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 1.4 ms | 475.1 ms | 1.44 MB |
-| Rust | 1.5 ms | 72.2 ms | 3.77 MB |
-| Go | 1.2 ms | 151.1 ms | 2.11 MB |
-| Bun | 9.7 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 1.2 ms | 65.3 ms | 1.45 MB |
+| Rust | 1.4 ms | 73.1 ms | 3.77 MB |
+| Go | 1.3 ms | 147.5 ms | 2.11 MB |
+| Bun | 9.3 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `fib`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 7.7 ms | 63.6 ms | 1.44 MB |
-| Rust | 7.7 ms | 73.4 ms | 3.77 MB |
-| Go | 13.5 ms | 147.9 ms | 2.11 MB |
-| Bun | 28.4 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 7.2 ms | 71.5 ms | 1.45 MB |
+| Rust | 8.8 ms | 83.3 ms | 3.77 MB |
+| Go | 13.7 ms | 131.7 ms | 2.11 MB |
+| Bun | 28.0 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `loop_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 519.0 ms | 69.1 ms | 1.44 MB |
-| Rust | 523.5 ms | 74.8 ms | 3.77 MB |
-| Go | 458.5 ms | 156.5 ms | 2.11 MB |
-| Bun | 8963.5 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 551.1 ms | 80.1 ms | 1.45 MB |
+| Rust | 582.0 ms | 85.9 ms | 3.77 MB |
+| Go | 533.2 ms | 138.3 ms | 2.11 MB |
+| Bun | 10474.8 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `array_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 91.9 ms | 83.1 ms | 1.44 MB |
-| Rust | 89.6 ms | 93.9 ms | 3.77 MB |
-| Go | 87.0 ms | 142.5 ms | 2.11 MB |
-| Bun | 2272.7 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 98.5 ms | 87.7 ms | 1.45 MB |
+| Rust | 98.7 ms | 101.5 ms | 3.77 MB |
+| Go | 98.7 ms | 134.4 ms | 2.11 MB |
+| Bun | 2455.5 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `string_concat`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 3.6 ms | 69.3 ms | 1.44 MB |
-| Rust | 1.5 ms | 95.1 ms | 3.77 MB |
-| Go | 33.0 ms | 146.7 ms | 2.11 MB |
-| Bun | 10.9 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 3.5 ms | 73.8 ms | 1.45 MB |
+| Rust | 1.3 ms | 99.4 ms | 3.77 MB |
+| Go | 28.2 ms | 129.5 ms | 2.11 MB |
+| Bun | 11.3 ms | n/a (JIT, no separate build step) | n/a |
 
 <!-- BENCHMARK_RESULTS_END -->
 
@@ -157,8 +169,70 @@ _Last run: 2026-08-15 on this machine -- see benchmark.md's "Methodology" sectio
   the quadratic blowup despite naive-looking source. None of this is a
   bug in any of the four — it's exactly the kind of language/runtime
   difference this benchmark exists to surface.
+- **The canvas comparison** (below) is the one benchmark here that
+  isn't against another *language*. It's against the thing a 2D game
+  would otherwise most likely be written on: an HTML `<canvas>`. It
+  started out with Festina 1.4x **slower**, and that got written down in
+  bold before anything was done about it — which is what made the fix
+  findable. Splitting the frame by shape type showed circles were 90% of
+  it, because Cairo tessellates every arc afresh; caching one alpha mask
+  per radius (claude.md #104) took the frame from 90 ms to 31 ms and the
+  result from 1.4x behind to 2.1x ahead. Festina also wins startup by
+  more than an order of magnitude and wins on variance, which for a
+  frame budget is not a footnote.
 - These are intentionally small, fast benchmarks so they can be re-run
   on every change worth checking, not a comprehensive suite (no I/O, no
   concurrency, no realistic mixed workload) — see [todo.md](todo.md)
   for what's still missing from Festina itself that would make a
   broader comparison meaningful (HTTP, for one).
+
+## Canvas: Festina vs an HTML `<canvas>`
+
+<!-- CANVAS_RESULTS_START -->
+_Last run: 2026-08-16 on this machine. Chromium 141.0.7390.37._
+
+20,000 filled rectangles and 20,000 filled circles, fill colour changed
+between every shape, into an 800x600 surface. Both sides draw
+**offscreen**, both time their own draw loop with their own monotonic
+clock, and the browser is forced to rasterize inside the timed region.
+All three of those matter and all three are easy to get wrong -- see
+[`run_canvas_benchmark.py`](benchmarks/canvas/run_canvas_benchmark.py),
+which documents what each one cost when it was measured the other way.
+
+| | Frame (min) | Frame (median) | First frame |
+|---|---|---|---|
+| Festina (Cairo) | 31 ms | 32 ms | 17 ms (process start + PNG encode) |
+| HTML `<canvas>` (Chromium/Skia) | 64 ms | 83 ms | 224 ms (browser launch) |
+
+On this workload **Festina draws it 2.1x faster**.
+
+That took one change, and finding it took measuring rather than
+guessing. The first version of this benchmark had Festina 1.4x SLOWER,
+and the obvious culprit -- a fresh Cairo context per draw call -- turned
+out to account for 4 ms of 90. Splitting the frame by shape type found
+the real one immediately: 20,000 rectangles cost 10 ms and 20,000
+circles cost 76 ms, because `cairo_arc` + `cairo_fill` tessellates the
+curve into Beziers and scan-converts a general polygon every single
+time. Rasterizing each radius once into an alpha mask and stamping it
+thereafter -- what a glyph cache does -- took circles to 20 ms and the
+frame from 90 ms to 31 ms (claude.md #104). The remaining split is
+11 ms of rectangles, 20 ms of circles, and setting the fill colour
+20,000 times is too cheap to measure.
+
+Two things are worth reading alongside the headline. The browser's frame
+time is far noisier -- 64 ms at best against a 83 ms median here, and
+the median moves by 20+ ms between runs of this same script, while
+Festina's two numbers (31 and 32 ms) sit on top of each other. For a
+frame budget, predictability is not a footnote. And getting to the
+*first* frame differs by more than an order of magnitude in the same
+direction, because one side starts a process and the other starts a
+browser.
+
+Both outputs were compared cell-by-cell over a 16x16 grid to confirm
+they drew the same scene -- worst per-channel difference 0.2 out of 255.
+Not byte-for-byte: Cairo and Skia disagree about antialiasing on every
+curve, and demanding identical bytes would only prove the two
+rasterizers are the same program. The check has already earned itself
+once, catching a bug in this very script that left one side comparing a
+blank canvas.
+<!-- CANVAS_RESULTS_END -->

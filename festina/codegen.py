@@ -686,6 +686,24 @@ class CodeGen:
                                                 # file needs to be linked in at all, so a program
                                                 # that never touches audio doesn't pull in
                                                 # libasound (see cli.py's _ensure_runtime_objects)
+
+        # claude.md #102: a table column of type aud/img makes the
+        # program use that feature, whether or not it ever names a
+        # graphics or audio function. Two things need it: main()
+        # registers the media decoders so a stored BLOB can become a
+        # handle again (claude.md #101), and the per-table row release
+        # function calls that type's destructor. Both emit calls into a
+        # translation unit that would otherwise not be linked at all --
+        # so without this a program whose ONLY use of audio is
+        # `file:aud` in a table failed at the LINK step with an
+        # undefined reference to festina_audio_free, which is a
+        # compiler bug reported as a linker error.
+        for _cols in self.tables.values():
+            for _col_type in _cols.values():
+                if _col_type == "aud":
+                    self.uses_audio = True
+                elif _col_type == "img":
+                    self.uses_graphics_code = True
         self.database_url_expr = None          # claude.md #70: DatabaseURL's value expression, or
                                                 # None -- set from program.database_url in generate()
                                                 # (festina.imports.build_program already extracted and
@@ -1091,6 +1109,7 @@ class CodeGen:
             "declare void @festina_map_free_entries(i64, ptr)",
             # claude.md #56: Math.floor/ceil/round/trunc, via LLVM's
             # built-in intrinsics rather than a runtime C function.
+            "declare i64 @llvm.fptosi.sat.i64.f64(double)",
             "declare double @llvm.floor.f64(double)",
             "declare double @llvm.ceil.f64(double)",
             "declare double @llvm.round.f64(double)",
@@ -3164,8 +3183,45 @@ class CodeGen:
         return out, TEXT
 
     def _emit_member_load(self, expr, env, lines):
-        ptr, ftype = self._member_ptr(expr, env, lines)
-        return self._load_field_value(ptr, ftype, lines)
+        obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+        ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
+        out, ftype = self._load_field_value(ptr, ftype, lines)
+        self._release_member_receiver_temp(expr.obj, obj_val, obj_type, ftype, lines)
+        return out, ftype
+
+    def _release_member_receiver_temp(self, obj_expr, obj_val, obj_type, field_type, lines):
+        """claude.md #102: releases a struct/arr[T]/map[T] that this
+        expression's own CALL produced purely to read one field out of,
+        with nothing else ever referencing it -- `makeOuter(i).inner.n`,
+        `rowsFor(x).length`, `config().retries`.
+
+        claude.md #77 already releases a call result discarded as a bare
+        statement (`someFunc();`), on the reasoning that a Call's result
+        is fresh and unshared by construction so this expression is
+        provably its only reference. Reading a field off it is the same
+        situation and was simply never covered: measured under
+        LeakSanitizer at one whole struct -- header, fields and all --
+        per evaluation, which in a loop is per iteration.
+
+        Restricted to a field whose own type is NOT managed, and that
+        restriction is load-bearing rather than conservative. Releasing
+        the parent recursively releases whatever its struct/arr/map
+        fields point at and frees its text fields outright, so for those
+        field types the value just loaded would be freed before the
+        caller ever saw it -- trading a leak for a use-after-free. Making
+        those cases work needs a notion of an owned temporary that
+        outlives its producing expression, which this codegen does not
+        have; they keep leaking, which is at least safe, and the far
+        commoner scalar case is fixed."""
+        if not isinstance(obj_expr, ast.Call):
+            return
+        if not isinstance(obj_type, (types_mod.StructType, types_mod.ArrayType,
+                                      types_mod.MapType)):
+            return
+        if isinstance(field_type, (types_mod.StructType, types_mod.ArrayType,
+                                    types_mod.MapType)) or field_type == TEXT:
+            return
+        lines.append(f"  call void {self._release_fn_for(obj_type)}(ptr {obj_val})")
 
     def _load_field_value(self, ptr, ftype, lines):
         """Loads one field, giving a struct/arr[T]/map[T]-typed one real
@@ -4251,6 +4307,53 @@ class CodeGen:
         lines.append(f"  {out} = phi i8 [ {left_val}, %{start_label} ], [ {right_val}, %{rhs_pred} ]")
         return out, BOOL
 
+    def _emit_float_to_int(self, val, lines):
+        """claude.md #102: the rounding four (Math.floor/ceil/round/
+        trunc) converting a double to an i64, without the undefined
+        behaviour a bare `fptosi` has.
+
+        `fptosi` is UB in LLVM for a NaN, for an infinity, and for
+        anything outside i64's range -- not "some unspecified integer",
+        genuinely undefined, and it behaves like it. Measured before
+        this: `Math.floor(1.0 / 0.0)` printed a different value on every
+        build, once a stack ADDRESS; and in one program
+        `Math.floor(nan)` answered 1 while `Math.ceil(nan)` on the very
+        next line answered the int-null sentinel, because the optimizer
+        had folded two identical UB sites differently. A language whose
+        stated position is that division by zero returns null rather
+        than crashing cannot then hand back a stack address for
+        Math.floor of that same null.
+
+        The answer is null in all three cases, which is the same claim
+        claude.md #57 already makes for division by zero: there is no
+        meaningful integer here. Saturating instead would be worse, not
+        better -- i64's minimum IS the int null sentinel, so clamping a
+        huge negative float would land on it anyway and clamping a huge
+        positive one would assert a precise answer the input never had.
+
+        llvm.fptosi.sat does the conversion itself, which is fully
+        defined (NaN -> 0, out of range -> clamped) and so leaves no
+        poison anywhere for the select below to inherit -- ordering it
+        the other way, fptosi first and select afterward, would still be
+        UB, since a select cannot launder a poisoned operand."""
+        nan = self.tmp()
+        lines.append(f"  {nan} = fcmp uno double {val}, {val}")
+        # 2^63 and -2^63 exactly, as hex doubles: the first double at or
+        # beyond i64's positive limit, and i64's exact negative limit.
+        too_big = self.tmp()
+        lines.append(f"  {too_big} = fcmp oge double {val}, 0x43E0000000000000")
+        too_small = self.tmp()
+        lines.append(f"  {too_small} = fcmp olt double {val}, 0xC3E0000000000000")
+        out_of_range = self.tmp()
+        lines.append(f"  {out_of_range} = or i1 {too_big}, {too_small}")
+        unusable = self.tmp()
+        lines.append(f"  {unusable} = or i1 {nan}, {out_of_range}")
+        converted = self.tmp()
+        lines.append(f"  {converted} = call i64 @llvm.fptosi.sat.i64.f64(double {val})")
+        out = self.tmp()
+        lines.append(f"  {out} = select i1 {unusable}, i64 {INT_NULL_CONST}, i64 {converted}")
+        return out
+
     def _emit_binop(self, expr, env, lines):
         # A bare `null` literal compared against a concretely-typed int/
         # float/bool operand (e.g. `x == null`) needs that operand's own
@@ -4323,6 +4426,33 @@ class CodeGen:
                 return out, TEXT
             raise CodegenError(f"operator '{expr.op}' is not supported on text",
                                 file=self.filename, line=expr.line)
+
+        # claude.md #102: every pointer-backed type -- struct, arr[T],
+        # map[T], a table row, img, aud, regex, blob -- compares against
+        # `null` with a plain pointer icmp. Without this the numeric path
+        # below emitted `icmp eq i64 <a ptr>, null`, which is not valid
+        # IR at all: the compile died with an LLVM PARSE ERROR naming a
+        # generated temporary, which is an internal-error message for
+        # what is an entirely reasonable thing to write. `x == null` on
+        # a struct-typed value, and `row.file == null` on a nullable
+        # media column, are both ordinary.
+        #
+        # Only ==/!= and only against a genuine null: two struct values
+        # compared with `==` stays unsupported (it would have to mean
+        # either identity or deep equality, and claude.md picks neither
+        # -- #54's ambiguity rule), and ordering operators are meaningless
+        # on a handle.
+        null_side = (isinstance(expr.right, ast.NullLit), isinstance(expr.left, ast.NullLit))
+        if expr.op in ("==", "!=") and any(null_side):
+            other = left_type if null_side[0] else right_type
+            if _llvm_type(other) == "ptr" if other is not None else False:
+                value = left_val if null_side[0] else right_val
+                cmp_out = self.tmp()
+                op = "eq" if expr.op == "==" else "ne"
+                lines.append(f"  {cmp_out} = icmp {op} ptr {value}, null")
+                out = self.tmp()
+                lines.append(f"  {out} = zext i1 {cmp_out} to i8")
+                return out, BOOL
 
         # claude.md #55: int and float never mix directly -- semantic.py
         # already rejected a genuine mismatch before codegen ever runs, so
@@ -4656,8 +4786,7 @@ class CodeGen:
                         file=self.filename, line=callee.line)
                 rounded = self.tmp()
                 lines.append(f"  {rounded} = call double @{MATH_INTRINSICS[callee.prop]}(double {val})")
-                out = self.tmp()
-                lines.append(f"  {out} = fptosi double {rounded} to i64")
+                out = self._emit_float_to_int(rounded, lines)
                 return out, INT
             # claude.md #55: int.toFloat() -> float
             if callee.prop == "toFloat" and not expr.args:
