@@ -225,6 +225,25 @@ user.name = 'Patrick'
 Structs are native in-memory records — declaration, field read/write,
 and passing to/returning from functions by value.
 
+An unassigned field reads as its zero value, and that includes a field
+whose own type is a `struct`, `arr[T]`, or `map[T]` — reaching through
+one before anything was assigned to it gives you a real, empty value
+rather than an error:
+
+```festina
+struct Inner { n:int }
+struct Bag   { inner:Inner  xs:arr[int]  m:map[int] }
+
+Bag b
+log(b.inner.n)      // 0
+log(b.xs.length)    // 0
+b.xs.push(1)        // works -- the array is created on first reach
+b.m['k'] = 9
+```
+
+The value is created once, on first reach, and stays — the read above
+and the `push` below it are talking about the same array.
+
 Memory for structs, arrays, and maps is managed automatically — no
 manual allocation or freeing. A local struct/`arr[T]`/`map[T]`
 declared in a function, event handler, `if` branch, `while` body, or
@@ -325,9 +344,43 @@ log(numbers.length)
 numbers[0] = 10
 ```
 
-Not bounds-checked. Memory is reclaimed automatically — see "Structs"
-above for the full picture (non-escaping locals reclaimed at scope-exit,
-escaping values reference counted).
+Memory is reclaimed automatically — see "Structs" above for the full
+picture (non-escaping locals reclaimed at scope-exit, escaping values
+reference counted).
+
+### Indexing is not bounds-checked
+
+**`numbers[i]` is a raw memory access, and keeping `i` in range is
+yours to guarantee.** This is the one place Festina hands you a loaded
+gun, and it is deliberate: an index is checked in the hot path of every
+loop a game writes, and the check would cost more than the language is
+willing to spend. Nothing about it is soft.
+
+- **Reading past the end** returns whatever bytes follow the array. Not
+  `null`, not a zero, not an error — arbitrary heap contents, different
+  on each run.
+- **Writing past the end** corrupts the heap. Confirmed under
+  AddressSanitizer as a genuine heap-buffer-overflow. It may crash
+  immediately, or corrupt an unrelated value and crash somewhere else
+  much later, or appear to work.
+- **A negative index** is the same, backwards.
+- **`.length` is always right**; nothing else is checked against it.
+
+So guard the index yourself:
+
+```festina
+if i >= 0 && i < xs.length {
+    log(xs[i])
+}
+```
+
+This applies only to `arr[T]` indexing. A missing `map[T]` key answers
+`null` (see [Maps](#maps)); `pop()`/`shift()` on an empty array answer
+`null` (see below); and `splice()` clamps its own range. Indexing is the
+only unchecked operation in the language.
+
+Arrays grow, and are searched, through the methods in
+[Growing arrays](#growing-arrays) below.
 
 ## Maps
 
@@ -862,9 +915,10 @@ xs.pop()            // -> last element, removed
 xs.shift()          // -> first element, removed
 xs.unshift(0)       // -> new length
 arr[int] cut = xs.splice(1, 2)   // remove 2 from index 1, return them
+xs.indexOf(3)       // -> first index holding 3, or -1
 ```
 
-All five behave as their JavaScript namesakes do, including `splice`'s
+All six behave as their JavaScript namesakes do, including `splice`'s
 clamping — a negative start counts back from the end, and an oversized
 range clamps rather than failing, so `splice(i, 1)` at a boundary is a
 no-op. (`splice`'s variadic insert has no spelling here; Festina has no
@@ -878,9 +932,30 @@ arr[int] empty = []
 log(empty.pop() == null)     // true
 ```
 
+`indexOf()` answers `-1` when the value isn't present, rather than
+`null` — an index is the kind of thing you compare or feed straight to
+`splice`, and both read naturally against `-1`:
+
+```festina
+if queue.indexOf(target) >= 0 { ... }
+queue.splice(queue.indexOf(target), 1)   // remove by value
+```
+
+What "the same value" means depends on the element type:
+
+- `int`, `float`, `bool` — **by value**.
+- `text` — **by content**, so a needle built at runtime finds a match:
+  `names.indexOf('gr' + 'ace')` is `1` for `['ada', 'grace']`. (Identity
+  would be useless here: text is copied on binding, so two equal strings
+  are almost always two different buffers.)
+- `struct`, `arr`, `map` — **by identity**. Two separately-declared
+  structs with identical fields are two different values; only the one
+  actually in the array is found.
+
 Elements are owned the same way any other binding owns them: pushing a
 `text` copies it, so the array and the variable don't share a buffer.
-Removing transfers ownership to whoever receives it.
+Removing transfers ownership to whoever receives it. `indexOf()` takes
+no ownership at all — an index isn't a reference.
 
 ## Timers
 

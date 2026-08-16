@@ -1354,31 +1354,65 @@ missed it: none of its programs happened to leave a struct alive with a
 text field in it. 3 new tests
 (`tests/test_codegen.py::TestStructTextFieldReclamation`).
 
-### Found but not fixed: nested struct fields segfault on write
+### Stage 15: unassigned struct/array/map fields auto-vivify (done — claude.md #97)
 
-Surfaced while building stage 14's test program, and **not** a memory
--management bug — a language-semantics question, which is why it is
-recorded rather than patched:
+Recorded here after stage 14 as "found but not fixed", on the reasoning
+that fixing it meant a design decision about who owns a nested field's
+allocation. This stage made that decision. Probing it first showed the
+recorded scope was too narrow in two directions — **reads** crashed just
+as writes did, and `arr[T]`/`map[T]`-typed fields crashed the same way
+struct-typed ones did:
 
 ```festina
-struct Inner { label:text }
-struct Outer { inner:Inner }
-Outer o
-o.inner.label = 'x'    // segfault
+struct Inner { n:int }
+struct Bag   { inner:Inner  xs:arr[int] }
+Bag b
+log(b.inner.n)     // exit 139
+log(b.xs.length)   // exit 139
 ```
 
-A stack-allocated struct is `zeroinitializer`d, so its struct-typed
-fields start as null pointers, and nothing allocates one on first use
-the way a top-level declaration does — so the write GEPs off null and
-dereferences it. **Confirmed long-standing**, not introduced by any of
-stages 9–14: reproduced directly on `b87948f`, the commit before this
-entire memory-management effort began.
+The decision: **lazily, on first reach**, not eagerly at the parent's
+declaration. Eager allocation needs somewhere to run an initializer, and
+a global has none — its storage is a compile-time `zeroinitializer`. Lazy
+vivification needs no such place, so one mechanism covers stack locals,
+heap locals, globals, parameters and arbitrarily deep nesting. The load
+becomes a null test, a make-and-store branch and a phi; the storage is
+created once, not per access, which is what makes `o.inner.n = 5`
+followed by a read answer 5. The ownership question stages 4–6 raised
+answers itself: the vivified value is created by the same
+`_emit_fresh_heap_header` path every other value of that type uses, and
+is owned by the field exactly as an explicitly assigned one is.
+7 new tests
+(`tests/test_codegen.py::TestUnassignedNestedFieldsAutoVivify`), plus a
+100-iteration ASan run.
 
-Fixing it means choosing between allocating a nested struct field
-eagerly at its parent's declaration or lazily on first write, and that
-choice interacts with stages 4–6's ownership rules (who owns the
-allocation, when it is released, what happens when the parent is
-reassigned). That design decision is why it isn't bolted on here.
+### Stage 16: three more leaks and one silent corruption (done — claude.md #97)
+
+Found while ASan-verifying `indexOf`, all pre-existing:
+
+- **A text `+` was not an owning source.** Stage 9 classified only a
+  call and a template literal as "already a fresh, exclusively-owned
+  buffer". A text `+` compiles to one `festina_str_concat`, which
+  mallocs unconditionally — so `text j = a + b` and `return s + '!'`
+  each copied an already-exclusive buffer and dropped the original, and
+  a chained `a + b + c` leaked its intermediate on top of that. This
+  should have been caught with stage 9's own `_emit_template` fix, which
+  is the identical bug one expression form over.
+- **Computed map keys.** `festina_map_set` strdups its key and
+  `festina_map_get` only reads one, so `m[`s${i}`] = v` leaked the key
+  it built. Both sites now free it.
+- **Top-level block scopes were never tracked.** Stage 4's scope
+  tracking only ran inside function/handler bodies, so a local declared
+  in a nested block at *top* level — `text row = a + b` inside a
+  top-level `while` — was emitted as an ordinary alloca and never
+  freed. One buffer per iteration, in exactly the shape a game loop
+  takes. The top-level statement list now gets the same whole-body
+  escape analysis every function gets.
+- **`arr[bool]` was silently corrupt** (not a leak — a wrong answer).
+  claude.md #96's array helpers move elements by a byte count passed in from
+  codegen, hardcoded to 8. Every element type is 8 bytes wide except
+  `bool`, which is `i8`, so `push` wrote byte `8*i` while `xs[i]` read
+  byte `i`. The stride now comes from the element type.
 
 ### The one remaining leak
 

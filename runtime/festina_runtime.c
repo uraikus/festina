@@ -48,7 +48,15 @@
 
 void festina_log_int(int64_t v) { printf("%lld\n", (long long)v); }
 void festina_log_float(double v) { printf("%g\n", v); }
-void festina_log_bool(int8_t v) { printf("%s\n", v ? "true" : "false"); }
+/* claude.md #97: bool's null is the reserved third bit pattern 2 (see
+ * codegen's BOOL_NULL_CONST), and printing it with a plain `v ? true :
+ * false` rendered it as "true" -- indistinguishable from a genuine
+ * true, which made claude.md #96's "popping an empty array gives you
+ * null" impossible to actually observe for an arr[bool]. Only the
+ * sentinel takes this branch, so no real boolean's output changes. */
+void festina_log_bool(int8_t v) {
+    printf("%s\n", v == 2 ? "null" : (v ? "true" : "false"));
+}
 void festina_log_text(const char *v) { printf("%s\n", v ? v : ""); }
 
 void festina_fail(const char *msg) {
@@ -90,7 +98,11 @@ char *festina_str_from_float(double v) {
 }
 
 char *festina_str_from_bool(int8_t v) {
-    return strdup(v ? "true" : "false");
+    /* claude.md #97: same three-way split festina_log_bool uses -- a
+     * bool interpolated into a template has to render its null the
+     * same way logging it does, or `${b}` and `log(b)` would disagree
+     * about the same value. */
+    return strdup(v == 2 ? "null" : (v ? "true" : "false"));
 }
 
 char *festina_str_concat(const char *a, const char *b) {
@@ -1326,6 +1338,39 @@ void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
                 (size_t)(tail * elem_size));
     }
     festina_array_resize(a, elem_size, len - count);
+}
+
+/* claude.md #97: indexOf -- the first index holding `value`, or -1.
+ *
+ * -1 rather than null because the answer is an INDEX, and every use of
+ * it is a comparison or a splice argument: `if xs.indexOf(v) >= 0` and
+ * `xs.splice(xs.indexOf(v), 1)` both read naturally, where a null index
+ * would have to be tested separately before it could be used at all.
+ * It is also what JavaScript's own indexOf answers, which is the
+ * convention this language's array methods already follow.
+ *
+ * Comparison is by the element's raw 8-byte slot, which is exactly
+ * right for int/float/bool and for identity on struct/arr[T]/map[T]
+ * (two bindings naming one value share its pointer -- claude.md #79).
+ * `text` is the one type where that is wrong, since equal strings are
+ * usually different buffers, so codegen passes is_text and this
+ * compares with strcmp instead. */
+int64_t festina_array_index_of(void *hdr, int64_t elem_size,
+                                const void *value, int8_t is_text) {
+    FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
+    if (!a || !value || a->length <= 0 || !a->data) return -1;
+    for (int64_t i = 0; i < a->length; i++) {
+        const char *slot = (const char *)a->data + i * elem_size;
+        if (is_text) {
+            const char *have = *(const char *const *)slot;
+            const char *want = *(const char *const *)value;
+            if (have == want) return i;              /* both null, or same buffer */
+            if (have && want && strcmp(have, want) == 0) return i;
+        } else if (memcmp(slot, value, (size_t)elem_size) == 0) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 void festina_release_array(void *payload) {

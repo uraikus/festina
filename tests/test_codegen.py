@@ -7612,3 +7612,479 @@ class TestArrayMethods:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "a\nb\n2: c,d\n"
+
+
+
+class TestArrayIndexOf:
+    """claude.md #97: xs.indexOf(v) -- the first index holding v, or -1.
+
+    -1 rather than null because the answer is an index and every use of
+    one is a comparison or a splice argument, both of which read
+    naturally against -1 and neither of which would against null. It is
+    also what JavaScript's own indexOf answers, and claude.md #26's
+    arrays are JS-shaped.
+
+    The comparison is by 8-byte slot for everything except text, which
+    compares by content -- two equal strings are almost always two
+    different buffers under claude.md #83's copy-on-alias rule, so
+    identity would make indexOf useless for exactly the element type
+    it's most often used with."""
+
+    def test_int_elements_found_and_missing(self, compile_and_run):
+        source = """
+        arr[int] xs = [10, 20, 30]
+        log(xs.indexOf(30))
+        log(xs.indexOf(10))
+        log(xs.indexOf(99))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\n0\n-1\n"
+
+    def test_text_elements_compare_by_content_not_identity(self, compile_and_run):
+        # Every one of these needles is a DIFFERENT buffer from the
+        # array's own element (claude.md #83 copies text on binding), so
+        # a pointer comparison would answer -1 for all three.
+        source = """
+        text func bang(s:text) {
+            return s + '!'
+        }
+        arr[text] names = ['ada!', 'grace!', 'alan!']
+        text who = 'grace'
+        log(names.indexOf('alan!'))
+        log(names.indexOf(bang(who)))
+        log(names.indexOf(`${who}!`))
+        log(names.indexOf(who + '!'))
+        log(names.indexOf('nobody'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\n1\n1\n1\n-1\n"
+
+    def test_first_match_wins_and_empty_is_minus_one(self, compile_and_run):
+        source = """
+        arr[int] dupes = [5, 5, 5]
+        log(dupes.indexOf(5))
+        arr[int] empty = []
+        log(empty.indexOf(1))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "0\n-1\n"
+
+    def test_bool_elements(self, compile_and_run):
+        # arr[bool] is the one element type whose slot is 1 byte wide,
+        # not 8 -- see _elem_size.
+        source = """
+        arr[bool] flags = [true, true, false]
+        log(flags.indexOf(false))
+        log(flags.indexOf(true))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\n0\n"
+
+    def test_float_elements(self, compile_and_run):
+        source = """
+        arr[float] fs = [1.5, 2.5]
+        log(fs.indexOf(2.5))
+        log(fs.indexOf(9.5))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "1\n-1\n"
+
+    def test_struct_elements_match_by_identity(self, compile_and_run):
+        # Two structs with identical fields are two distinct values --
+        # claude.md #79's arr[T] holds each element's own header
+        # pointer, so this is the same "aliasing means sharing one
+        # address" identity every other struct operation uses.
+        source = """
+        struct Point { x:int y:int }
+        Point a
+        a.x = 1
+        a.y = 2
+        Point b
+        b.x = 1
+        b.y = 2
+        arr[Point] ps = [a, b]
+        log(ps.indexOf(a))
+        log(ps.indexOf(b))
+        Point c
+        c.x = 1
+        c.y = 2
+        log(ps.indexOf(c))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "0\n1\n-1\n"
+
+    def test_composes_with_splice(self, compile_and_run):
+        # The reason -1 is the right answer shape: this is what removal
+        # by value looks like, and it needs no separate "was it found"
+        # dance for the found case.
+        source = """
+        arr[text] queue = ['a', 'b', 'c']
+        arr[text] gone = queue.splice(queue.indexOf('b'), 1)
+        log(gone[0])
+        log(`${queue.length}: ${queue[0]},${queue[1]}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "b\n2: a,c\n"
+
+    def test_wrong_arity_or_element_type_is_a_compile_error(self, parser, semantic, errors):
+        for source in [
+            "arr[int] xs = [1]\nlog(xs.indexOf())",
+            "arr[int] xs = [1]\nlog(xs.indexOf(1, 2))",
+            "arr[int] xs = [1]\nlog(xs.indexOf('a'))",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
+class TestBoolArrayElementStride:
+    """claude.md #97: arr[bool] is the one array whose element slot is
+    a single byte -- bool lowers to i8 (see _llvm_type's own note on
+    why it isn't i1), while int/float/text/struct/arr/map all lower to
+    something 8 bytes wide.
+
+    claude.md #96's array helpers move elements by a byte count the
+    compiler hands them, and that count was hardcoded to 8. For an
+    arr[bool] that made push() write to byte 8*i while xs[i] read byte
+    i: the value went in and a neighbouring element's byte came back
+    out. These pin every helper against the stride indexing actually
+    uses."""
+
+    def test_push_is_readable_at_its_own_index(self, compile_and_run):
+        source = """
+        arr[bool] bs = [true, false]
+        bs.push(true)
+        log(bs.length)
+        log(bs[0])
+        log(bs[1])
+        log(bs[2])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "3\ntrue\nfalse\ntrue\n"
+
+    def test_unshift_shift_and_splice(self, compile_and_run):
+        source = """
+        arr[bool] bs = [true, false, true, false]
+        bs.unshift(true)
+        log(`${bs.length} ${bs[0]} ${bs[1]}`)
+        log(bs.shift())
+        arr[bool] cut = bs.splice(1, 2)
+        log(`${cut.length} ${cut[0]} ${cut[1]}`)
+        log(`${bs.length} ${bs[0]} ${bs[1]}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == (
+            "5 true true\n"
+            "true\n"
+            "2 false true\n"
+            "2 true false\n"
+        )
+
+    def test_pop_on_an_empty_bool_array_is_null(self, compile_and_run):
+        source = """
+        arr[bool] bs = []
+        log(bs.pop())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "null\n"
+
+
+class TestUnassignedNestedFieldsAutoVivify:
+    """claude.md #97: reaching THROUGH an unassigned struct/arr/map
+    field used to segfault.
+
+    claude.md's own rule is that an uninitialized field reads as its
+    zero value, and for int/float/bool/text that already held. But a
+    struct/arr/map field starts as a null pointer (calloc, or a global's
+    zeroinitializer, gives it nothing else), so `o.inner.n` dereferenced
+    null -- a crash, not a zero. Both reads and writes crashed, and the
+    array and map cases crashed the same way the struct one did.
+
+    The fix gives such a field real storage the first time it is
+    reached, lazily. Lazily rather than eagerly at declaration because
+    one mechanism then covers stack locals, heap locals, globals (whose
+    storage is a compile-time zeroinitializer with nowhere to run an
+    initializer at all), parameters, and fields nested arbitrarily deep
+    inside other fields."""
+
+    def test_reading_through_an_unassigned_struct_field(self, compile_and_run):
+        source = """
+        struct Inner { n:int label:text }
+        struct Outer { inner:Inner }
+        Outer o
+        log(o.inner.n)
+        log(o.inner.label)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # A null text logs as an empty line -- the existing convention,
+        # unchanged here; what matters is that it does not crash.
+        assert result.stdout == "0\n\n"
+
+    def test_reading_an_unassigned_array_or_map_field(self, compile_and_run):
+        source = """
+        struct Bag { xs:arr[int] m:map[int] }
+        Bag b
+        log(b.xs.length)
+        log(b.m['nothing'])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # An absent map[int] key answers int's own null, which logs as
+        # its reserved sentinel (see codegen's INT_NULL_CONST).
+        assert result.stdout == "0\n-9223372036854775808\n"
+
+    def test_the_storage_is_created_once_not_per_access(self, compile_and_run):
+        # The identity check: if each read vivified a FRESH value, the
+        # write below would land somewhere the read never looks at.
+        source = """
+        struct Inner { n:int }
+        struct Outer { inner:Inner }
+        Outer o
+        o.inner.n = 5
+        log(o.inner.n)
+        o.inner.n = o.inner.n + 1
+        log(o.inner.n)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "5\n6\n"
+
+    def test_pushing_onto_an_unassigned_array_field(self, compile_and_run):
+        source = """
+        struct Bag { xs:arr[int] }
+        Bag b
+        b.xs.push(1)
+        b.xs.push(2)
+        log(`${b.xs.length}: ${b.xs[0]},${b.xs[1]}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2: 1,2\n"
+
+    def test_setting_a_key_on_an_unassigned_map_field(self, compile_and_run):
+        source = """
+        struct Bag { m:map[int] }
+        Bag b
+        b.m['k'] = 9
+        log(b.m['k'])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "9\n"
+
+    def test_an_explicit_assignment_still_wins(self, compile_and_run):
+        source = """
+        struct Inner { n:int }
+        struct Outer { inner:Inner }
+        Inner i
+        i.n = 7
+        Outer o
+        o.inner = i
+        log(o.inner.n)
+        i.n = 8
+        log(o.inner.n)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # Assigned by reference, so the later write to `i` is visible
+        # through `o.inner` -- claude.md #79's shared-header identity.
+        assert result.stdout == "7\n8\n"
+
+    def test_deeply_nested_unassigned_fields(self, compile_and_run):
+        source = """
+        struct C { n:int }
+        struct B { c:C }
+        struct A { b:B }
+        A a
+        log(a.b.c.n)
+        a.b.c.n = 3
+        log(a.b.c.n)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "0\n3\n"
+
+
+class TestTextConcatOwnership:
+    """claude.md #97: a `+` on text is an owning source.
+
+    claude.md #83 classified only a Call and a template literal as
+    "already a fresh, exclusively-owned buffer". A text `+` compiles to
+    exactly one festina_str_concat, which mallocs unconditionally with
+    no operand-passthrough path -- so it is just as owning, and leaving
+    it out meant every binding of a concatenation copied a buffer that
+    was already exclusively owned and dropped the original: `text j = a
+    + b` and `return s + '!'` each leaked one buffer per evaluation.
+
+    The other half is that festina_str_concat COPIES from both operands
+    and keeps neither, so a chained `a + b + c` has to free its own
+    intermediate -- the same fix _emit_template already applies to its
+    own intermediates.
+
+    These are behaviour tests; the leaks themselves were measured under
+    LeakSanitizer, which is not available here."""
+
+    def test_chained_concatenation_frees_its_intermediate(self, parser, semantic, codegen):
+        source = """
+        text a = 'aa'
+        text b = 'bb'
+        text c = 'cc'
+        void func use() {
+            text joined = a + b + c
+        }
+        use()
+        """
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        body = ir.split("define void @use()")[1].split("\n}")[0]
+        # Two concats, one free of the first one's result -- and no
+        # festina_text_own, since the outer concat is itself owning.
+        assert body.count("@festina_str_concat") == 2
+        # One free for the `a + b` intermediate, one for `joined` at
+        # scope exit -- and no festina_text_own at all, since the outer
+        # concat is itself owning and needs no copy.
+        assert body.count("call void @free(") == 2
+        assert "@festina_text_own" not in body
+
+    def test_returning_a_concatenation_does_not_copy_it(self, parser, semantic, codegen):
+        source = """
+        text func bang(s:text) {
+            return s + '!'
+        }
+        log(bang('x'))
+        """
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        body = ir.split("define ptr @bang(")[1].split("\n}")[0]
+        assert body.count("@festina_str_concat") == 1
+        # The only text_own left is the parameter binding (claude.md
+        # #84), never the returned concatenation itself.
+        assert body.count("@festina_text_own") == 1
+
+    def test_concatenation_still_produces_the_right_values(self, compile_and_run):
+        source = """
+        text func bang(s:text) {
+            return s + '!'
+        }
+        text a = 'aa'
+        text b = 'bb'
+        log(a + b + 'cc')
+        log(bang(a + b))
+        text kept = a + b
+        log(kept)
+        log(kept + kept)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "aabbcc\naabb!\naabb\naabbaabb\n"
+
+    def test_comparing_two_computed_texts(self, compile_and_run):
+        source = """
+        text a = 'aa'
+        log(a + 'b' == 'aab')
+        log(a + 'b' != 'aab')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\nfalse\n"
+
+
+class TestComputedMapKeyOwnership:
+    """claude.md #97: festina_map_set strdups the key it is given (see
+    its own comment on why it never aliases the caller's pointer) and
+    festina_map_get only reads it, so a key the CALLER allocated --
+    `m[`s${i}`] = v`, `m[a + b]` -- has no owner left once the call
+    returns. Both sites now free it."""
+
+    def test_a_computed_key_round_trips(self, compile_and_run):
+        source = """
+        map[int] scores = {}
+        for int i = 0, i < 3, i++ {
+            scores[`s${i}`] = i * 10
+        }
+        log(scores['s0'])
+        log(scores[`s${1}`])
+        log(scores['s' + '2'])
+        log(scores['missing'])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "0\n10\n20\n-9223372036854775808\n"
+
+    def test_the_map_keeps_its_own_copy_of_the_key(self, compile_and_run):
+        # The key buffer is freed at the call site now, so the map must
+        # genuinely own its copy for this lookup to still work.
+        source = """
+        map[text] m = {}
+        text k = 'na'
+        m[k + 'me'] = 'ada'
+        k = 'zzz'
+        log(m['name'])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "ada\n"
+
+
+class TestTopLevelBlockScopeTracking:
+    """claude.md #97: claude.md #74's scope tracking now covers the
+    top-level statements too.
+
+    A top-level VarDecl is a global and is unaffected. What this
+    reaches is a local declared inside a NESTED block at top level --
+    `text row = a + b` in a top-level `while` body -- which was emitted
+    as an ordinary alloca and, with tracking off, never freed: one
+    leaked buffer per iteration, in exactly the shape a game loop is
+    written in. Leak-freedom was measured under LeakSanitizer; what is
+    pinned here is that the values stay correct, since the same switch
+    also turns on claude.md #81's stack promotion for these locals."""
+
+    def test_locals_in_a_top_level_loop_stay_correct(self, compile_and_run):
+        source = """
+        struct P { x:int y:int }
+        arr[P] kept = []
+        int total = 0
+        for int i = 0, i < 5, i++ {
+            P local
+            local.x = i
+            local.y = i * 2
+            arr[int] nums = [i, i + 1]
+            text row = `${local.x},${local.y}` + '|'
+            total = total + nums[1]
+            if i % 2 == 0 {
+                kept.push(local)
+            }
+        }
+        log(total)
+        log(kept.length)
+        log(`${kept[0].x}/${kept[0].y} ${kept[2].x}/${kept[2].y}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "15\n3\n0/0 4/8\n"
+
+    def test_a_map_local_in_a_top_level_loop(self, compile_and_run):
+        source = """
+        text last = ''
+        for int i = 0, i < 3, i++ {
+            map[text] m = {'k': `v${i}`}
+            last = m['k']
+        }
+        log(last)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "v2\n"

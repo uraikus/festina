@@ -18,9 +18,13 @@ festina/codegen.py's module docstring's "Query rows" note for the row
 representation and the params-must-be-a-literal-array restriction).
 Arrays (claude.md #26) are
 implemented too -- literals, indexed get/set, nesting, function
-params/return values, and (claude.md #63) `.length` -- though claude.md
-still doesn't specify bounds checking or array growth, so neither of
-those exist (see festina/codegen.py's module docstring). claude.md
+params/return values, and (claude.md #63) `.length`. Arrays grow
+(claude.md #96/#97: `push`/`pop`/`shift`/`unshift`/`splice`/`indexOf`),
+but indexing is still not bounds-checked -- claude.md never specified it,
+and claude.md #97 makes that a documented, deliberate contract rather
+than an omission: `xs[i]` past the end is a raw memory access, and
+keeping `i` in range is the program's responsibility (see api.md's
+"Indexing is not bounds-checked"). claude.md
 #55-58 (added after a design review of the first codegen pass turned up
 real bugs -- see below) are implemented too: int/float never convert
 implicitly in any operator, `int.toFloat()`/`Math.floor/ceil/round/trunc`
@@ -359,14 +363,14 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 928 tests in this directory pass against it: 605 need no external
+All 954 tests in this directory pass against it: 608 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-306 more need a working C compiler, plus 2 more
+329 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 15 more given
 `Xvfb`+`xdotool` too (4 of those also need `xwd`, from the same
 x11-apps/x11-utils tier, to read real canvas pixels back --
 claude.md #89/#92/#94; two former `xwd` tests became display-free once
-claude.md #95 made saveCanvas headless) (605 + 306 + 2 + 15 = 928 --
+claude.md #95 made saveCanvas headless) (608 + 329 + 2 + 15 = 954 --
 re-verified directly
 by running the whole suite with a PATH containing nothing but Python,
 not just derived by counting `compile_and_run` call sites, since the
@@ -2346,6 +2350,73 @@ JavaScript's does, negative start included.
 `tests/test_codegen.py::TestArrayMethods` (10 tests), plus a 100-
 iteration ASan run driving push/pop/unshift/splice over text elements.
 
+**claude.md #97**: unchecked indexing is documented as the user's; four
+defects that were ours are fixed.
+
+*Auto-vivification.* Reaching through an unassigned struct/`arr[T]`/
+`map[T]` field segfaulted -- those fields are pointers, and `calloc` (or
+a global's `zeroinitializer`) leaves them null, contradicting claude.md's
+own "an uninitialized field reads as its zero value". The recorded scope
+was "writes to nested struct fields"; probing showed reads crashed
+identically and the array/map cases crashed the same way. The value is
+now created lazily on first reach -- lazily rather than eagerly because a
+global's storage is a compile-time constant with nowhere to run an
+initializer, so one mechanism covers locals, globals, parameters and
+arbitrarily deep nesting. Identity is preserved: the storage is created
+once, not per access.
+`tests/test_codegen.py::TestUnassignedNestedFieldsAutoVivify` (7 tests),
+plus a 100-iteration ASan run.
+
+*`arr[bool]` element stride.* #96's helpers move elements by a byte count
+passed in from codegen, hardcoded to 8. Every element type is 8 bytes
+wide except `bool`, which is `i8` -- so `push` wrote byte `8*i` while
+`xs[i]` read byte `i`, and a neighbouring element's byte came back out.
+The stride now comes from the element type.
+`tests/test_codegen.py::TestBoolArrayElementStride` (3 tests).
+
+*Text `+` is an owning source.* #83 classified only a Call and a template
+literal as owning. A text `+` is one `festina_str_concat`, which mallocs
+unconditionally -- so `text j = a + b` and `return s + '!'` each copied
+an already-exclusive buffer and leaked the original, and a chained
+`a + b + c` leaked its intermediate on top of that. Both halves fixed;
+measured under LeakSanitizer.
+`tests/test_codegen.py::TestTextConcatOwnership` (4 tests).
+
+*Computed map keys and top-level block scopes.* `festina_map_set` strdups
+its key and `festina_map_get` only reads one, so `m[`s${i}`] = v` leaked
+the key it built -- both sites now free it. Separately, #74's scope
+tracking only ran inside function/handler bodies, so a local declared in
+a nested block at TOP level (`text row = a + b` in a top-level `while`)
+was never freed: one buffer per iteration, in exactly the shape a game
+loop takes. The top-level statement list now gets the same whole-body
+escape analysis every function gets.
+`tests/test_codegen.py::TestComputedMapKeyOwnership` (2 tests),
+`tests/test_codegen.py::TestTopLevelBlockScopeTracking` (2 tests).
+
+*`indexOf`.* The first index holding a value, or `-1` -- `-1` rather than
+null because every use of an index is a comparison or a `splice`
+argument, and both read naturally against it. Comparison is by raw slot
+(value for `int`/`float`/`bool`, identity for struct/`arr`/`map` per
+#79), with `text` switching to `strcmp` since #83 copies text on binding
+and two equal strings are almost always two different buffers. Takes no
+ownership: an index is not a reference.
+`tests/test_codegen.py::TestArrayIndexOf` (8 tests).
+
+*Indexing stays unchecked.* `xs[i]` past the end is a genuine
+heap-buffer-overflow, for reads as well as writes -- confirmed under
+AddressSanitizer. A bounds check would sit in the hot path of every loop
+a game writes, so api.md now states plainly that keeping the index in
+range is the user's responsibility, what actually happens when it isn't,
+and which neighbouring operations are *not* in that category (a missing
+map key answers null, an empty `pop`/`shift` answers null, `splice`
+clamps). Indexing is the only unchecked operation in the language.
+
+*One display fix rode along.* `bool`'s null is the reserved bit pattern
+2, and both `festina_log_bool` and `festina_str_from_bool` rendered it
+via a plain `v ? "true" : "false"` -- so it printed as `true`, which made
+#96's "an empty pop answers null" impossible to observe for an
+`arr[bool]`. Both now print `null`; only the sentinel takes that branch.
+
 See api.md for the current language/standard library reference and this
 file's own "Status" section above for the implemented-vs-not matrix; the
 short version: nothing is left
@@ -3106,5 +3177,5 @@ pytest tests/                          # 605 passed, 323 skipped (needs a C comp
                                         # 15 need Xvfb + xdotool installed too, 1 of those
                                         # also needs `openbox` and 4 need `xwd`) given a
                                         # working C compiler,
-                                        # all 928 pass
+                                        # all 954 pass
 ```

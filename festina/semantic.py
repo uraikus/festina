@@ -1128,10 +1128,27 @@ def analyze(program, filename="<string>"):
             # than left to the generic Member-call fallback so the arity
             # and the int-ness of every argument are enforced.
             # claude.md #96: array methods, JS-shaped.
-            if callee.prop in ("push", "pop", "shift", "unshift", "splice"):
+            if callee.prop in ("push", "pop", "shift", "unshift", "splice",
+                               "indexOf"):
                 obj_type = infer(callee.obj, scope)
                 if isinstance(obj_type, types_mod.ArrayType):
                     elem = obj_type.element
+                    # claude.md #97: indexOf(value) -> int, -1 when absent.
+                    # The argument has to be assignable to the element type
+                    # for the same reason push()'s does: a search for a
+                    # value the array cannot hold is a mistake, not a
+                    # never-matching search.
+                    if callee.prop == "indexOf":
+                        if len(expr.args) != 1:
+                            raise CompileError(
+                                "indexOf() expects exactly 1 argument, "
+                                f"got {len(expr.args)}",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
+                        check_assignable(elem, infer(expr.args[0], scope),
+                                          callee, what="indexOf() argument")
+                        return _INT
                     if callee.prop in ("push", "unshift"):
                         if len(expr.args) != 1:
                             raise CompileError(

@@ -668,6 +668,14 @@ int8_t festina_array_pop(void *hdr, int64_t elem_size, void *out);
 int8_t festina_array_shift(void *hdr, int64_t elem_size, void *out);
 void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
                            int64_t count, void *dst_hdr);
+/* claude.md #97: the first index holding `value`, or -1 if absent.
+ * -1 rather than null because the answer is an index and every use of
+ * one is a comparison or a splice argument. Compares the raw 8-byte
+ * slot, which is right for int/float/bool and for identity on
+ * struct/arr/map; `text` sets is_text so equal strings in different
+ * buffers still match. */
+int64_t festina_array_index_of(void *hdr, int64_t elem_size,
+                                const void *value, int8_t is_text);
 void festina_release_array(void *payload);
 void festina_release_map(void *payload);
 

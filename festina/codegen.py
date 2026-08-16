@@ -405,6 +405,37 @@ class CodegenError(CompileError):
         super().__init__(message, **kw)
 
 
+class _StmtList:
+    """The one thing escape_analysis.find_escaping_names actually reads
+    off an ast.Block -- its `.body` list. Lets the top-level statement
+    list be analyzed by the same function without inventing a synthetic
+    ast.Block (which carries a source position this list has no single
+    one of). See _emit_main_and_entry."""
+
+    __slots__ = ("body",)
+
+    def __init__(self, body):
+        self.body = body
+
+
+def _elem_size(t):
+    """The byte stride of one arr[T] element slot.
+
+    This has to agree EXACTLY with the stride _array_elem_ptr's
+    `getelementptr <elem type>` walks with, because the runtime's array
+    helpers move elements with memmove over a size the compiler hands
+    them while indexing still goes through that GEP. Everything Festina
+    stores in an array is 8 bytes wide -- i64, double, and every `ptr`
+    -- except bool, which is i8 (see _llvm_type's own note on why bool
+    is not i1). Assuming 8 across the board, as this originally did,
+    made push() on an arr[bool] write to byte 8*i while the read at
+    xs[i] looked at byte i: the value went in and a neighbouring
+    element's byte came back out. Confirmed, then fixed here rather
+    than by widening bool's storage, which would change every bool
+    array's layout for one method's convenience."""
+    return 1 if t == BOOL else 8
+
+
 def _llvm_type(t):
     if isinstance(t, types_mod.PrimitiveType):
         # "bool": "i8", not "i1" -- see the module docstring's "Null for
@@ -1009,6 +1040,8 @@ class CodeGen:
             "declare i8 @festina_array_pop(ptr, i64, ptr)",
             "declare i8 @festina_array_shift(ptr, i64, ptr)",
             "declare void @festina_array_splice(ptr, i64, i64, i64, ptr)",
+            # claude.md #97
+            "declare i64 @festina_array_index_of(ptr, i64, ptr, i8)",
             "declare void @festina_release_map(ptr)",
             # claude.md #71: environment.NAME / environment[keyExpr].
             "declare ptr @festina_getenv(ptr)",
@@ -2369,9 +2402,7 @@ class CodeGen:
                 # above rather than emitting expr.obj a second time,
                 # which would run any side effects in it twice.
                 ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
-                out = self.tmp()
-                lines.append(f"  {out} = load {_llvm_type(ftype)}, ptr {ptr}")
-                return out, ftype
+                return self._load_field_value(ptr, ftype, lines)
             if not expr.computed and expr.prop == "length":
                 # claude.md #79: an arr[T] value is a `ptr` to its own
                 # {i64, ptr} storage now, so .length is a GEP+load of
@@ -2401,8 +2432,14 @@ class CodeGen:
                 # returning an array or map).
                 obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
                 if isinstance(obj_type, types_mod.MapType):
-                    key_val, _ = self._emit_expr(expr.prop, env, lines)
-                    return self._emit_map_get(obj_val, obj_type.value, key_val, lines)
+                    key_val, key_type = self._emit_expr(expr.prop, env, lines)
+                    out = self._emit_map_get(obj_val, obj_type.value, key_val, lines)
+                    # claude.md #97: festina_map_get only READS the key
+                    # (it strcmp's against each entry's own copy), so a
+                    # key this expression allocated -- `m[`k${i}`]` --
+                    # is finished the moment the lookup returns.
+                    self._free_text_temp(expr.prop, key_val, key_type, lines)
+                    return out
                 if not isinstance(obj_type, types_mod.ArrayType):
                     raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",
                                         file=self.filename, line=getattr(expr, "line", 0))
@@ -2648,7 +2685,7 @@ class CodeGen:
         transfers rather than ending."""
         elem_type = obj_type.element
         elem_ir = _llvm_type(elem_type)
-        elem_size = 8  # every element slot is 8 bytes -- see _array_elem_ptr
+        elem_size = _elem_size(elem_type)
 
         if name in ("push", "unshift"):
             val, vtype = self._emit_value_for(expr.args[0], env, lines, elem_type)
@@ -2688,6 +2725,32 @@ class CodeGen:
             out = self.tmp()
             lines.append(f"  {out} = load {elem_ir}, ptr {slot}")
             return out, elem_type
+
+        if name == "indexOf":
+            # claude.md #97. The needle is handed over BY ADDRESS so one
+            # runtime helper serves every arr[T]: it compares the raw
+            # 8-byte slot, which is right for int/float/bool and is
+            # identity for struct/arr/map (aliases share a pointer). Text
+            # is the exception the `is_text` flag exists for -- two equal
+            # strings are usually two different buffers, so the runtime
+            # switches to strcmp.
+            #
+            # No ownership work happens here in either direction: the
+            # needle is only read, and an index is not a reference. That
+            # also means the temporary is freed the ordinary way, exactly
+            # as any other text argument at a call site would be.
+            val, vtype = self._emit_value_for(expr.args[0], env, lines, elem_type)
+            val = self._coerce(val, vtype, elem_type, lines)
+            slot = self.tmp()
+            lines.append(f"  {slot} = alloca {elem_ir}")
+            lines.append(f"  store {elem_ir} {val}, ptr {slot}")
+            is_text = 1 if elem_type == TEXT else 0
+            out = self.tmp()
+            lines.append(
+                f"  {out} = call i64 @festina_array_index_of(ptr {obj_val}, "
+                f"i64 {elem_size}, ptr {slot}, i8 {is_text})")
+            self._free_text_temp(expr.args[0], val, elem_type, lines)
+            return out, INT
 
         # splice(start, count) -> arr[T] of the removed elements
         start_val, _ = self._emit_expr(expr.args[0], env, lines)
@@ -2827,7 +2890,8 @@ class CodeGen:
                 val_val = self._coerce(val_val, vtype, expected_value, lines)
                 vtype = expected_value
             value_type = value_type or vtype
-            self._emit_map_set(header, value_type, key_val, val_val, val_expr, lines)
+            self._emit_map_set(header, value_type, key_val, val_val, val_expr, lines,
+                                key_source_expr=key_expr)
 
         if value_type is None:
             raise CodegenError(
@@ -2917,7 +2981,8 @@ class CodeGen:
         lines.append(f"  {raw} = call i64 @festina_map_get(i64 {count}, ptr {entries}, ptr {key_val}, i64 {default})")
         return self._i64_to_map_value(raw, value_type, lines), value_type
 
-    def _emit_map_set(self, map_ptr, value_type, key_val, value_val, value_source_expr, lines):
+    def _emit_map_set(self, map_ptr, value_type, key_val, value_val, value_source_expr, lines,
+                       key_source_expr=None):
         """claude.md #72: npcHealths['npc1'] = 30 (and the equivalent
         per-entry calls a map literal builds itself out of -- see
         _emit_map_lit). Unlike a read, this needs the map's own actual
@@ -2991,6 +3056,15 @@ class CodeGen:
             lines.append(f"  call void @free(ptr {old_ptr})")
         raw_val = self._map_value_to_i64(value_val, value_type, lines)
         lines.append(f"  call void @festina_map_set(ptr {count_ptr}, ptr {entries_ptr}, ptr {key_val}, i64 {raw_val})")
+        # claude.md #97: the key is strdup'd by festina_map_set (see its
+        # own comment on why it never aliases the caller's pointer), so
+        # a key the caller ALLOCATED -- `m[`s${i}`] = v`, `m[a + b] = v`
+        # -- has no owner left once this returns. Freed here rather than
+        # at each call site so both the literal path and the assignment
+        # path get it from one place; `key_source_expr` is None only
+        # where the key is a compile-time constant with nothing to free.
+        if key_source_expr is not None:
+            self._free_text_temp(key_source_expr, key_val, TEXT, lines)
 
     def _emit_environment_get(self, expr, env, lines):
         """claude.md #71: environment.NAME / environment[keyExpr]. NAME
@@ -3009,8 +3083,67 @@ class CodeGen:
 
     def _emit_member_load(self, expr, env, lines):
         ptr, ftype = self._member_ptr(expr, env, lines)
+        return self._load_field_value(ptr, ftype, lines)
+
+    def _load_field_value(self, ptr, ftype, lines):
+        """Loads one field, giving a struct/arr[T]/map[T]-typed one real
+        storage the first time it is reached.
+
+        claude.md #97: a field of one of those three types starts as a
+        null pointer -- calloc/zeroinitializer gives it no value of its
+        own, unlike an int field whose zero IS 0. So reaching through an
+        unassigned one (`outer.inner.label`, `s.items.length`)
+        dereferenced null and segfaulted, on both reads and writes.
+        That contradicted the rule this language already states for
+        every other field: an uninitialized field reads as its zero
+        value (see _emit_stmt's own VarDecl comment, and #74's module
+        note). For a struct field, "zero" means a struct with every
+        field at ITS zero -- not the absence of a struct -- and for an
+        arr[T]/map[T] field it means an empty one.
+
+        So the storage is created on first use rather than eagerly at
+        the parent's declaration. Lazily, because it covers every way a
+        struct can come into being with one mechanism -- a stack local,
+        a heap local, a global's static storage, a parameter, a field of
+        a field -- where eager creation would need a separate pass for
+        globals, whose storage is a compile-time `zeroinitializer` with
+        nowhere to run an initializer. The value is stored back, so it
+        is created once and every later read sees the same one; freeing
+        the parent releases it through the field walk #78 already does.
+        """
+        if not isinstance(ftype, (types_mod.StructType, types_mod.ArrayType,
+                                   types_mod.MapType)):
+            out = self.tmp()
+            lines.append(f"  {out} = load {_llvm_type(ftype)}, ptr {ptr}")
+            return out, ftype
+
+        loaded = self.tmp()
+        lines.append(f"  {loaded} = load ptr, ptr {ptr}")
+        is_null = self.tmp()
+        lines.append(f"  {is_null} = icmp eq ptr {loaded}, null")
+        make_label = self.label("field.make")
+        done_label = self.label("field.done")
+        lines.append(f"  br i1 {is_null}, label %{make_label}, label %{done_label}")
+        load_pred = self.cur_block
+
+        self._start_block(make_label, lines)
+        if isinstance(ftype, types_mod.StructType):
+            payload_ty = self.struct_llvm_name(ftype.name)
+        elif isinstance(ftype, types_mod.ArrayType):
+            payload_ty = FESTINA_ARRAY_LLVM_TYPE
+        else:
+            payload_ty = FESTINA_MAP_LLVM_TYPE
+        # calloc'd, so every field lands on its own zero -- an empty
+        # arr[T]/map[T] is exactly {length 0, data null}.
+        made = self._emit_fresh_heap_header(payload_ty, lines)
+        lines.append(f"  store ptr {made}, ptr {ptr}")
+        make_pred = self.cur_block
+        lines.append(f"  br label %{done_label}")
+
+        self._start_block(done_label, lines)
         out = self.tmp()
-        lines.append(f"  {out} = load {_llvm_type(ftype)}, ptr {ptr}")
+        lines.append(
+            f"  {out} = phi ptr [ {loaded}, %{load_pred} ], [ {made}, %{make_pred} ]")
         return out, ftype
 
     def _array_elem_ptr(self, obj_val, obj_type, idx_val, lines):
@@ -3212,6 +3345,19 @@ class CodeGen:
         this section to preserve that guarantee once text started
         being freed for real).
 
+        A `+` BinOp is owning too (claude.md #97). In a text context
+        `+` is concatenation and _emit_binop compiles it to exactly one
+        @festina_str_concat, which mallocs unconditionally -- there is
+        no operand-passthrough path, not even for an empty operand, so
+        its result is always a fresh buffer. Leaving it out of this
+        list (as claude.md #83 originally did) meant EVERY binding of a
+        concatenation copied a buffer that was already exclusively
+        owned and then dropped the original on the floor: `text j = a +
+        b` and `return s + '!'` both leaked the concat result, once per
+        evaluation. Reading the op alone is safe because every caller
+        of this function has already established that the value's type
+        is text, so a `+` reaching here is never integer addition.
+
         Everything else -- a bare Identifier (a local, a global, a
         parameter -- all just aliasing whatever they already point
         to), a Member/field read, a Ternary, and critically a
@@ -3222,6 +3368,8 @@ class CodeGen:
         binding, the same directional bias every prior stage in this
         whole effort defaults to whenever a choice isn't fully provable
         either way."""
+        if isinstance(expr, ast.BinOp):
+            return expr.op == "+"
         return isinstance(expr, (ast.Call, ast.TemplateLit))
 
     def _free_text_temp(self, source_expr, val, vtype, lines):
@@ -3872,7 +4020,8 @@ class CodeGen:
                     key_val, _ = self._emit_expr(expr.target.prop, env, lines)
                     val, vtype = self._emit_value_for(expr.value, env, lines, obj_type.value)
                     val = self._coerce(val, vtype, obj_type.value, lines)
-                    self._emit_map_set(obj_val, obj_type.value, key_val, val, expr.value, lines)
+                    self._emit_map_set(obj_val, obj_type.value, key_val, val, expr.value, lines,
+                                        key_source_expr=expr.target.prop)
                     return val, obj_type.value
                 if not isinstance(obj_type, types_mod.ArrayType):
                     raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",
@@ -4034,11 +4183,31 @@ class CodeGen:
                     # this needs no icmp/zext round trip the way a
                     # genuine i1 source would.
                     lines.append(f"  {neg} = xor i8 {out}, 1")
-                    return neg, BOOL
-                return out, BOOL
+                    result = neg
+                else:
+                    result = out
+                # claude.md #97: an operand that allocated its own buffer
+                # is consumed here and nothing downstream can reach it --
+                # a bool is not a text reference, so this is the last
+                # chance to free it. `f() == g()` leaked both results
+                # before this.
+                self._free_text_temp(expr.left, left_val, left_type, lines)
+                self._free_text_temp(expr.right, right_val, right_type, lines)
+                return result, BOOL
             if expr.op == "+":
                 out = self.tmp()
                 lines.append(f"  {out} = call ptr @festina_str_concat(ptr {left_val}, ptr {right_val})")
+                # claude.md #97: festina_str_concat COPIES from both
+                # operands and keeps neither, so an operand that was
+                # itself freshly allocated -- the `a + b` inside
+                # `a + b + c`, a call result, a template -- is dead the
+                # moment this returns. Freeing it here rather than at
+                # the eventual binding site is what keeps a chained
+                # concatenation from leaking one buffer per `+`, the
+                # same fix _emit_template already applies to its own
+                # intermediates (claude.md #83).
+                self._free_text_temp(expr.left, left_val, left_type, lines)
+                self._free_text_temp(expr.right, right_val, right_type, lines)
                 return out, TEXT
             raise CodegenError(f"operator '{expr.op}' is not supported on text",
                                 file=self.filename, line=expr.line)
@@ -4413,7 +4582,8 @@ class CodeGen:
                     self._free_text_temp(expr.args[1], replacement_val, replacement_type, lines)
                     return out, TEXT
             # claude.md #96: array methods.
-            if callee.prop in ("push", "pop", "shift", "unshift", "splice"):
+            if callee.prop in ("push", "pop", "shift", "unshift", "splice",
+                               "indexOf"):
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if isinstance(obj_type, types_mod.ArrayType):
                     return self._emit_array_method(
@@ -4977,9 +5147,27 @@ class CodeGen:
         entry_ctx = {"lines": lines, "terminated": False}
         env = self.global_env
         self.cur_block = "entry"
-        for stmt in self.entry_stmts:
-            self.filename = getattr(stmt, "file", self.filename)  # see generate()'s note
-            self._emit_toplevel_stmt(stmt, env, entry_ctx)
+        # claude.md #97: claude.md #74's scope tracking now covers the
+        # top-level statements too, not just function/handler bodies.
+        # A top-level VarDecl is a GLOBAL (an `@name`, emitted by
+        # _emit_toplevel_stmt, which never consults this) and is
+        # unaffected -- what this reaches is a local declared inside a
+        # NESTED block at top level, `text row = a + b` in a top-level
+        # `while` body, which _emit_block emits as an ordinary alloca
+        # and, with tracking off, never freed: one leaked buffer per
+        # iteration, in exactly the shape a Festina game loop is
+        # written in. The analysis input is the same whole-body name
+        # set every function gets, computed over the top-level
+        # statement list; `escaping_params` carries over so a call
+        # argument already proven safe stays safe here too.
+        self._current_escaping_names = escape_analysis.find_escaping_names(
+            _StmtList(self.entry_stmts), escaping_params=self.escaping_params)
+        try:
+            for stmt in self.entry_stmts:
+                self.filename = getattr(stmt, "file", self.filename)  # see generate()'s note
+                self._emit_toplevel_stmt(stmt, env, entry_ctx)
+        finally:
+            self._current_escaping_names = None
         if not entry_ctx["terminated"]:
             lines.append("  ret void")
 
