@@ -286,6 +286,31 @@
   td.num, th.num { text-align: right; }
   .row-festina td:first-child { color: var(--accent-strong); font-weight: 700; }
 
+  .canvas-highlight {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    margin: 32px 0;
+  }
+  .canvas-highlight-head {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+  }
+  .canvas-stat {
+    font-size: 2.2rem;
+    font-weight: 800;
+    color: var(--accent-strong);
+    letter-spacing: -0.02em;
+  }
+  .canvas-highlight-head h3 {
+    margin: 0;
+    font-size: 1.05rem;
+  }
+
   .docs-table a { text-decoration: none; font-weight: 600; }
   .docs-table td:last-child { color: var(--text-muted); }
 
@@ -351,7 +376,7 @@
 <header class="hero">
   <div class="wrap">
     <div class="badges">
-      <span class="badge">1008 tests passing</span>
+      <span class="badge">1061 tests passing</span>
       <span class="badge">MIT license</span>
       <span class="badge">Linux</span>
     </div>
@@ -523,10 +548,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>hello</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">1.4 ms</td><td class="num">475.1 ms</td><td class="num">1.44 MB</td></tr>
-          <tr><td>Rust</td><td class="num">1.5 ms</td><td class="num">72.2 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">1.2 ms</td><td class="num">151.1 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">9.7 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">1.2 ms</td><td class="num">65.3 ms</td><td class="num">1.45 MB</td></tr>
+          <tr><td>Rust</td><td class="num">1.4 ms</td><td class="num">73.1 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">1.3 ms</td><td class="num">147.5 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">9.3 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -537,10 +562,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>fib(32)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">7.7 ms</td><td class="num">63.6 ms</td><td class="num">1.44 MB</td></tr>
-          <tr><td>Rust</td><td class="num">7.7 ms</td><td class="num">73.4 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">13.5 ms</td><td class="num">147.9 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">28.4 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">7.2 ms</td><td class="num">71.5 ms</td><td class="num">1.45 MB</td></tr>
+          <tr><td>Rust</td><td class="num">8.8 ms</td><td class="num">83.3 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">13.7 ms</td><td class="num">131.7 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">28.0 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -551,10 +576,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>loop_sum (100M)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">519.0 ms</td><td class="num">69.1 ms</td><td class="num">1.44 MB</td></tr>
-          <tr><td>Rust</td><td class="num">523.5 ms</td><td class="num">74.8 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">458.5 ms</td><td class="num">156.5 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">8963.5 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">551.1 ms</td><td class="num">80.1 ms</td><td class="num">1.45 MB</td></tr>
+          <tr><td>Rust</td><td class="num">582.0 ms</td><td class="num">85.9 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">533.2 ms</td><td class="num">138.3 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">10474.8 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -565,10 +590,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>array_sum (2M)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">91.9 ms</td><td class="num">83.1 ms</td><td class="num">1.44 MB</td></tr>
-          <tr><td>Rust</td><td class="num">89.6 ms</td><td class="num">93.9 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">87.0 ms</td><td class="num">142.5 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">2272.7 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">98.5 ms</td><td class="num">87.7 ms</td><td class="num">1.45 MB</td></tr>
+          <tr><td>Rust</td><td class="num">98.7 ms</td><td class="num">101.5 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">98.7 ms</td><td class="num">134.4 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">2455.5 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -579,13 +604,51 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>string_concat (15K)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">3.6 ms</td><td class="num">69.3 ms</td><td class="num">1.44 MB</td></tr>
-          <tr><td>Rust</td><td class="num">1.5 ms</td><td class="num">95.1 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">33.0 ms</td><td class="num">146.7 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">10.9 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">3.5 ms</td><td class="num">73.8 ms</td><td class="num">1.45 MB</td></tr>
+          <tr><td>Rust</td><td class="num">1.3 ms</td><td class="num">99.4 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">28.2 ms</td><td class="num">129.5 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">11.3 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
+
+    <div class="canvas-highlight">
+      <div class="canvas-highlight-head">
+        <span class="canvas-stat">2.1x faster</span>
+        <h3>than an HTML &lt;canvas&gt;, drawing the same scene</h3>
+      </div>
+      <p class="section-intro" style="margin:0 0 16px;">
+        The one benchmark here that isn't against another language — it's
+        against the thing a 2D game would otherwise most likely be
+        written on. 20,000 filled rectangles and 20,000 filled circles,
+        both sides drawing offscreen into an 800×600 surface.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Canvas</th><th class="num">Frame (min)</th><th class="num">Frame (median)</th><th class="num">First frame</th></tr>
+          </thead>
+          <tbody>
+            <tr class="row-festina"><td>Festina (Cairo)</td><td class="num">31 ms</td><td class="num">32 ms</td><td class="num">17 ms</td></tr>
+            <tr><td>HTML &lt;canvas&gt; (Chromium/Skia)</td><td class="num">64 ms</td><td class="num">83 ms</td><td class="num">224 ms</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="section-intro" style="margin:16px 0 0;">
+        It didn't start there — the first version of this benchmark had
+        Festina 1.4x <em>slower</em>. Splitting the frame by shape type
+        found the reason: Cairo tessellates every circle into fresh
+        Beziers on every single draw, 76 ms of the 90 ms frame. Caching
+        one alpha mask per radius and stamping it thereafter took circles
+        to 20 ms and the frame from 90 ms to 31 ms — turning a 1.4x
+        deficit into a 2.1x lead. Festina also wins startup by more than
+        an order of magnitude and wins on variance — the browser's frame
+        time swings 20+ ms between runs, Festina's two numbers sit right
+        on top of each other, and for a frame budget that's not a
+        footnote.
+      </p>
+    </div>
+
     <p class="section-intro" style="margin-top:20px;">
       Short version: Festina holds its own against Rust and Go on
       compute-bound native code and lands right at them on
@@ -606,13 +669,18 @@ npcHealths[<span class="str">'npc1'</span>] = 30
     <h2>Project status</h2>
     <div class="status-line">
       <span class="dot"></span>
-      <span><strong>1008 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
+      <span><strong>1061 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
     </div>
     <p class="section-intro">
       The compiler frontend, LLVM codegen backend, and native C runtime are
       real and tested. Every <code>claude.md</code> language construct this
       project has committed to is implemented end to end, not just parsed.
-      See
+      That includes a leak stress suite —
+      <a href="https://github.com/uraikus/festina/blob/main/scripts/leak_stress.sh">scripts/leak_stress.sh</a>
+      runs five programs under AddressSanitizer and LeakSanitizer, each
+      hammering one ownership mechanism thousands of times, because "the
+      answers are right" and "nothing accumulates while producing them"
+      are different claims. See
       <a href="https://github.com/uraikus/festina/blob/main/tests/CONTRACT.md">tests/CONTRACT.md</a>
       for exactly what's covered, and
       <a href="https://github.com/uraikus/festina/blob/main/todo.md">todo.md</a>
