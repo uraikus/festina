@@ -5203,6 +5203,295 @@ int main(int argc, char **argv) {
 """
 
 
+class TestAllNullLiterals:
+    """claude.md #102: `arr[text] a = [null]` / `map[int] m = {'k': null}`.
+
+    A literal whose values are ALL null infers its element type as null
+    itself, and that was rejected against every declared element type --
+    so the one literal shape meaning "entries, none of them meaningful
+    yet" could not be written at all. `a.push(null)` and `m[k] = null`
+    were both already fine, and `[null, 'x']` inferred text without
+    complaint, which is what makes this an inconsistency rather than a
+    policy.
+    """
+
+    def test_an_all_null_array_literal(self, compile_and_run):
+        result = compile_and_run(
+            "arr[text] a = [null]\nlog(a.length)\nlog(a[0] == null)")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["1", "true"]
+
+    def test_an_all_null_map_literal(self, compile_and_run):
+        result = compile_and_run(
+            "map[text] m = {'a': null, 'b': null}\nlog(m['a'] == null)\nlog(m['b'] == null)")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["true", "true"]
+
+    def test_the_declared_element_type_still_decides_the_null(self, compile_and_run):
+        # An int's null is its own reserved sentinel, not a pointer --
+        # so this also proves the declared type reaches the elements
+        # rather than them being left as generic pointers.
+        result = compile_and_run(
+            "arr[int] a = [null, null]\nlog(a[1])\nmap[int] m = {'k': null}\nlog(m['k'])")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["-9223372036854775808"] * 2
+
+    def test_a_mixed_literal_still_infers_normally(self, compile_and_run):
+        result = compile_and_run("arr[text] a = [null, 'x']\nlog(a.length)\nlog(a[1])")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["2", "x"]
+
+    def test_a_genuine_type_mismatch_is_still_rejected(self, parser, semantic, errors):
+        # The allowance is for null specifically, not a hole in element
+        # type checking.
+        for source in ["arr[int] a = ['x']", "map[int] m = {'k': 'x'}"]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError, match="cannot assign"):
+                semantic.analyze(program, filename="main.f")
+
+
+class TestNullComparisonOnEveryType:
+    """claude.md #102: `x == null` on a pointer-backed type.
+
+    Every one of these used to fail the COMPILE with an LLVM parse error
+    naming a generated temporary -- `icmp eq i64 <a ptr>, null` is not
+    valid IR at all. That is an internal-error message for something
+    entirely reasonable to write, and it covered struct, arr[T], map[T],
+    img, aud and regex: every managed type in the language except text.
+    """
+
+    @pytest.mark.parametrize("decl,expr", [
+        ("struct S { n:int }\nS x", "x"),
+        ("arr[int] x = []", "x"),
+        ("map[int] x = {}", "x"),
+        ("regex x = regex('a')", "x"),
+        ("text x = 'a'", "x"),
+        ("int x = 1", "x"),
+        ("bool x = true", "x"),
+    ])
+    def test_a_live_value_is_not_null(self, compile_and_run, decl, expr):
+        result = compile_and_run(f"{decl}\nlog({expr} == null)\nlog({expr} != null)")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["false", "true"]
+
+    def test_float_keeps_its_documented_nan_behaviour(self, compile_and_run):
+        # Deliberately NOT in the list above. A null float is a real
+        # NaN, and IEEE-754 says every ordered comparison against a NaN
+        # is false -- so a live float is neither == null nor != null.
+        # api.md states this; pinned here so the fix above is not
+        # mistaken for a licence to "correct" it.
+        result = compile_and_run("float x = 1.5\nlog(x == null)\nlog(x != null)")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["false", "false"]
+
+    def test_media_handles_compare_against_null(self, compile_and_run, tmp_path,
+                                                  monkeypatch, sprite_sheet_png):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        sheet = os.path.basename(sprite_sheet_png)
+        result = compile_and_run(
+            f"img p = '{sheet}'\naud a = 'beep.wav'\n"
+            "log(p == null)\nlog(a == null)\n",
+            env={"HOME": str(tmp_path)},
+        ) if False else compile_and_run(f"img p = '{sheet}'\nlog(p == null)\nlog(p != null)")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["false", "true"]
+
+    def test_a_null_media_column_reads_as_null(self, compile_and_run, tmp_path,
+                                                monkeypatch):
+        # The case that surfaced this: a nullable BLOB column has to be
+        # checkable, and there is no other way to ask.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        source = """
+        table Asset {
+            name:text
+            pic:img
+        }
+        sqlite('INSERT INTO Asset (name) VALUES (?)', ['nopic'])
+        arr[Asset] rows = sqlite('SELECT * FROM Asset')
+        log(rows[0].name)
+        log(rows[0].pic == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["nopic", "true"]
+
+
+class TestMediaColumnsLinkTheirRuntime:
+    """claude.md #102: a table column of type `aud`/`img` is by itself
+    enough to make a program use that feature.
+
+    Two things need it -- main() registers the media decoders, and the
+    per-table row release function calls that type's destructor -- and
+    both emit calls into a translation unit that would otherwise not be
+    linked. A program whose only use of audio was `file:aud` in a table
+    therefore failed at the LINK step with an undefined reference to
+    festina_audio_free: a compiler bug reported as a linker error.
+    """
+
+    @pytest.mark.parametrize("column,flag", [("aud", "uses_audio"),
+                                              ("img", "uses_graphics_code")])
+    def test_the_column_alone_sets_the_flag(self, parser, semantic, codegen, column, flag):
+        program = parser.parse(
+            f"table T {{ name:text asset:{column} }}\nlog('x')", filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        gen = codegen.CodeGen(analyzed, "main.f")
+        gen.generate(program)
+        assert getattr(gen, flag) is True
+
+    def test_such_a_program_actually_links_and_runs(self, compile_and_run, monkeypatch):
+        # The end-to-end version: nothing here names a single audio or
+        # graphics function, so only the column types can pull the
+        # runtime in.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        source = """
+        table T {
+            name:text
+            clip:aud
+            pic:img
+        }
+        sqlite('INSERT INTO T (name) VALUES (?)', ['row'])
+        arr[T] rows = sqlite('SELECT * FROM T')
+        log(rows[0].name)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "row"
+
+
+class TestFloatToIntIsNeverUndefined:
+    """claude.md #102: Math.floor/ceil/round/trunc of a NaN, an infinity
+    or an out-of-range double.
+
+    A bare `fptosi` is undefined behaviour for all three -- not "some
+    unspecified integer", genuinely undefined, and it behaved like it.
+    Measured before the fix: `Math.floor(1.0 / 0.0)` printed a different
+    value on every build, once a stack ADDRESS, and in one program
+    `Math.floor(nan)` answered 1 while `Math.ceil(nan)` on the next line
+    answered the null sentinel -- the optimizer had folded two identical
+    UB sites differently. A language that returns null for division by
+    zero rather than crashing cannot then hand back a stack address for
+    Math.floor of that same null.
+    """
+
+    @pytest.mark.parametrize("fn", ["floor", "ceil", "round", "trunc"])
+    def test_a_null_float_rounds_to_a_null_int(self, compile_and_run, fn):
+        result = compile_and_run(
+            f"float nan = 1.0 / 0.0\nlog(Math.{fn}(nan) == null)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    @pytest.mark.parametrize("fn", ["floor", "ceil", "round", "trunc"])
+    def test_an_infinity_rounds_to_a_null_int(self, compile_and_run, fn):
+        result = compile_and_run(
+            "float inf = Math.exp(10000.0)\n"
+            f"log(Math.{fn}(inf) == null)\n"
+            "float ninf = 0.0 - inf\n"
+            f"log(Math.{fn}(ninf) == null)\n")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["true", "true"]
+
+    def test_the_answer_is_the_same_on_every_run(self, compile_and_run):
+        # The original symptom was non-determinism, so this checks for
+        # non-determinism specifically rather than for a value.
+        source = "float nan = 1.0 / 0.0\nlog(Math.floor(nan))\nlog(Math.ceil(nan))"
+        first = compile_and_run(source).stdout
+        for _ in range(3):
+            assert compile_and_run(source).stdout == first
+        assert set(first.split()) == {"-9223372036854775808"}
+
+    def test_ordinary_values_are_untouched(self, compile_and_run):
+        result = compile_and_run(
+            "log(Math.floor(3.7))\nlog(Math.ceil(3.2))\nlog(Math.round(3.5))\n"
+            "log(Math.round(0.0 - 3.5))\nlog(Math.trunc(0.0 - 3.9))\n"
+            "log(Math.floor(0.0))\n")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["3", "4", "4", "-4", "-3", "0"]
+
+
+class TestDiscardedCallResultReachedForAField:
+    """claude.md #102: `makeThing().count` -- a call result produced
+    solely to read one field out of, with nothing binding it.
+
+    claude.md #77 already released a call result discarded as a bare
+    statement, on the reasoning that a Call's result is fresh and
+    unshared by construction so that expression is provably its only
+    reference. Reading a field off it is the same situation and was
+    simply never covered: measured at one whole struct per evaluation,
+    which in a loop is per iteration. Found by the leak stress suite.
+    """
+
+    def test_the_value_is_still_correct(self, compile_and_run):
+        source = """
+        struct Config { retries:int name:text }
+        Config func load() {
+            Config c
+            c.retries = 3
+            c.name = 'main'
+            return c
+        }
+        int total = 0
+        for int i = 0, i < 5, i++ {
+            total = total + load().retries
+        }
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "15"
+
+    def test_the_receiver_is_released_exactly_once(self, parser, semantic, codegen):
+        source = """
+        struct Config { retries:int }
+        Config func load() {
+            Config c
+            c.retries = 3
+            return c
+        }
+        void func use() {
+            log(load().retries)
+        }
+        use()
+        """
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        body = ir.split("define void @use()")[1].split("\n}")[0]
+        assert body.count("@festina_release") == 1
+
+    def test_a_managed_field_survives_being_read_off_a_call(self, compile_and_run):
+        # The restriction is load-bearing, not conservative: releasing
+        # the parent recursively releases its struct-typed fields, so
+        # doing it for a managed field would free the very value just
+        # loaded. This case therefore still leaks, deliberately -- and
+        # what must never happen is the alternative, which is that the
+        # value read back is garbage or the program crashes. Pinned so a
+        # later "optimization" cannot quietly turn a documented leak
+        # into a use-after-free.
+        source = """
+        struct Inner { n:int label:text }
+        struct Outer { inner:Inner }
+        Outer func make(n:int) {
+            Outer o
+            o.inner.n = n
+            o.inner.label = `label ${n}`
+            return o
+        }
+        for int i = 0, i < 20, i++ {
+            Inner got = make(i).inner
+            if got.n != i {
+                log('corrupted')
+            }
+            if got.label != `label ${i}` {
+                log('corrupted')
+            }
+        }
+        log('intact')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "intact"
+
+
 class TestMediaFormatsAndPaths:
     """claude.md #101: `img sprite = 'sprite.png'` alongside claude.md
     #100's `aud`, JPEG and MP3 decoding, and both types as sqlite BLOB

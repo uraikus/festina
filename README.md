@@ -7,7 +7,7 @@ overhead, and the boilerplate. Festina compiles through LLVM to a real,
 standalone executable — with SQLite, graphics, audio, and JS-style
 timers built directly into the language, not bolted on as libraries.
 
-[![Tests](https://img.shields.io/badge/tests-1008%20passing-brightgreen)](tests/CONTRACT.md)
+[![Tests](https://img.shields.io/badge/tests-1046%20passing-brightgreen)](tests/CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ```festina
@@ -190,11 +190,20 @@ needs.
 
 Festina is under active development, but not vaporware — the compiler
 frontend, LLVM codegen backend, and native C runtime are real and
-tested: **1008 tests, 0 failures.** Every `claude.md` language construct
+tested: **1046 tests, 0 failures.** Every `claude.md` language construct
 this project has committed to is implemented end to end, not just
-parsed. See [`tests/CONTRACT.md`](tests/CONTRACT.md) for exactly what's
-covered and how, and [todo.md](todo.md) for what's next (macOS, Windows,
-HTTP).
+parsed. That includes a leak stress suite —
+[`scripts/leak_stress.sh`](scripts/leak_stress.sh) runs five programs
+under AddressSanitizer and LeakSanitizer, each hammering one ownership
+mechanism thousands of times — because "the answers are right" and
+"nothing accumulates while producing them" are different claims. See
+[`tests/CONTRACT.md`](tests/CONTRACT.md) for exactly what's covered and
+how, and [todo.md](todo.md) for what's next (macOS, Windows, HTTP).
+
+```bash
+python3 -m pytest            # the whole suite
+scripts/leak_stress.sh       # just the sanitizer stress runs
+```
 
 | | |
 |---|---|

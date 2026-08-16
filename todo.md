@@ -1468,6 +1468,25 @@ listed here only so they aren't lost:
   global, lives for the program's lifetime. Bounded (one allocation per
   load, not per use) and the same accepted tradeoff as text globals at
   exit.
+- **A call result reached through a CHAIN for a managed field still
+  leaks.** `makeThing().count` is reclaimed (claude.md #102), but
+  `makeThing().inner.n` is not: releasing the parent there recursively
+  releases its struct/arr/map fields and frees its text fields, so the
+  value just loaded would be freed before the caller saw it. Fixing it
+  properly needs a notion of an owned temporary that outlives its
+  producing expression -- a statement-level pending-release list, most
+  likely -- which this codegen does not have. A test pins that the
+  loaded value stays intact, so the leak cannot quietly become a
+  use-after-free. Repro: `total = total + make().inner.n` in a loop,
+  under `scripts/leak_stress.sh`.
+- **A struct cannot reference its own type.** `struct Node { n:int
+  next:Node }` fails with "unknown type 'Node'", because a struct's
+  name is registered only after its own fields resolve. Nothing about
+  the representation prevents it -- a struct-typed field is a pointer,
+  so a self-reference is finite-sized, and claude.md #97's
+  auto-vivification would make a linked list work the moment the name
+  resolved. The error message is also misleading, since it reads like a
+  typo rather than an ordering rule.
 - **Only PNG/JPEG and WAV/MP3.** claude.md #101 added JPEG and MP3, and
   drew the line there deliberately: each new format is a new
   system dependency on every machine that compiles a graphics or audio
