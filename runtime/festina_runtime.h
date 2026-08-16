@@ -244,20 +244,24 @@ char *festina_regex_replace(void *compiled, const char *text,
  * pulling in another image-format library.
  *
  * festina_register_click_handler/_mouse_handler take a fixed
- * `void (*)(int64_t, int64_t)` signature, festina_register_key_handler
- * takes a fixed `void (*)(const char *)` signature, and
+ * `void (*)(int64_t, int64_t)` signature,
+ * festina_register_key_down_handler/_key_up_handler take a fixed
+ * `void (*)(const char *)` signature, and
  * festina_register_resize_handler/_close_handler take a fixed
  * `void (*)(void)` signature -- each matches the parameters claude.md
  * #40's own worked example declares for that event exactly
- * (`on click(x:int, y:int)`, `on key(key:text)`, `on resize()`, ...);
- * festina/semantic.py's _EVENT_SIGNATURES enforces that any handler for
- * one of these five names is actually declared that way before codegen
- * ever emits a call here, so a mismatch would otherwise be a silent ABI
- * mismatch rather than a caught compile error. The key handler's text
- * comes from XLookupString (a key that types a character, e.g. "a",
- * "5", " ") falling back to XKeysymToString (a named key with no text
- * of its own, e.g. "Left", "Escape", "Return") -- see
- * festina_handle_graphics_event's own comment in festina_runtime.c.
+ * (`on click(x:int, y:int)`, `on keyDown(key:text)`, `on resize()`,
+ * ...); festina/semantic.py's _EVENT_SIGNATURES enforces that any
+ * handler for one of these six names is actually declared that way
+ * before codegen ever emits a call here, so a mismatch would otherwise
+ * be a silent ABI mismatch rather than a caught compile error. Both key
+ * handlers' text comes from the same festina_key_name helper --
+ * XLookupString (a key that types a character, e.g. "a", "5", " ")
+ * falling back to XKeysymToString (a named key with no text of its own,
+ * e.g. "Left", "Escape", "Return") -- so keyUp always reports exactly
+ * what keyDown reported for the same physical key. claude.md #98:
+ * auto-repeat is filtered, so holding a key does not fire a phantom
+ * keyUp between repeats -- see festina_key_event_is_autorepeat.
  * `on resize` intentionally clears the canvas back to white at the new
  * size rather than preserving old content, matching how resizing a browser's
  * `<canvas>` element also clears it (clientWidth/clientHeight below are
@@ -424,7 +428,12 @@ int64_t festina_measure_text_width(const char *text);
 int64_t festina_measure_text_height(const char *text);
 void festina_register_click_handler(void (*handler)(int64_t, int64_t));
 void festina_register_mouse_handler(void (*handler)(int64_t, int64_t));
-void festina_register_key_handler(void (*handler)(const char *));
+/* claude.md #98: `on key` became `on keyDown` + `on keyUp`, so what
+ * was one registration is now two -- both taking the same fixed
+ * `void (*)(const char *)` signature and both fed the same key name,
+ * so a program can match a release against the press that started it. */
+void festina_register_key_down_handler(void (*handler)(const char *));
+void festina_register_key_up_handler(void (*handler)(const char *));
 void festina_register_resize_handler(void (*handler)(void));
 void festina_register_close_handler(void (*handler)(void));
 int64_t festina_client_width(void);
@@ -520,21 +529,41 @@ void festina_run_timer_loop(void);
  * clip doesn't block the rest of the program -- matching what having a
  * separate isPlaying() to poll, and a separate stop() to interrupt,
  * both imply about play() being non-blocking. Calling play() again
- * while a clip is already playing restarts it from the beginning
- * (stopping the previous playback thread first) -- claude.md #38
- * doesn't say what play()-while-playing should do; this is the least
- * surprising choice, matching a browser's own `<audio>` element.
+ * while a clip is already playing no longer cuts the first playback
+ * off (claude.md #98). Each `aud` owns a POOL of voices -- one thread
+ * and one ALSA handle per simultaneous playback, all streaming the
+ * same decoded PCM buffer read-only, so N voices cost N devices and
+ * never N copies of the audio. play() takes the first idle voice; the
+ * clip's own samples are loaded once, at loadAudio() time, and are
+ * never re-decoded per voice.
  *
- * festina_audio_stop() signals the background thread and *joins* it
- * before returning, so festina_audio_is_playing() is guaranteed false
- * the instant stop() returns, not just "false soon" -- calling stop()
- * when nothing is playing is a safe no-op. A clip that reaches its own
- * natural end (never stopped) also sets playing back to false, but its
- * thread is never explicitly joined by anything in that case -- for a
- * typical short-lived compiled Festina program this is an accepted,
- * deliberate tradeoff (the OS reclaims everything at process exit
- * regardless) rather than machinery to track and join every
- * already-finished playback thread that nothing asked to stop.
+ * The pool size is per-`aud` and defaults to 10, overridable with
+ * setMaxAudioPlayers(n) (festina_set_max_audio_players below). When
+ * every voice within the limit is busy, the OLDEST is stolen -- at the
+ * limit something has to give, and the sound that has been playing
+ * longest is closest to finishing anyway, whereas dropping the NEW
+ * play would silence a rapid-fire effect at exactly the moment it
+ * fires fastest. At a limit of 1 this reduces exactly to the old
+ * restart-from-the-beginning behaviour, which is what makes
+ * setMaxAudioPlayers(1) a real way to ask for it back.
+ *
+ * festina_audio_stop() stops EVERY voice of that clip, and
+ * festina_audio_is_playing() is true while ANY is still streaming:
+ * `sound.stop()` names the clip, not one playback of it, and there is
+ * no syntax for naming an individual voice -- inventing one would mean
+ * exposing the pool, which is exactly what this design keeps out of
+ * the language. stop() signals all voices before joining any (so N
+ * voices cost one clip's worth of latency, not N) and *joins* rather
+ * than merely signalling, so festina_audio_is_playing() is guaranteed
+ * false the instant stop() returns, not just "false soon" -- calling
+ * stop() when nothing is playing is a safe no-op.
+ *
+ * A voice that reaches its own natural end clears itself but stays
+ * *joinable*: whoever next claims that slot joins the finished thread
+ * first. That is what makes the pool genuinely reusable rather than
+ * leaking one thread per play() over a long-running game -- the
+ * previous single-voice design could get away with never joining a
+ * naturally-finished thread precisely because it only ever had one.
  *
  * Audio does not keep a program running the way an uncleared
  * setInterval does (see festina_set_interval above) -- if main()
@@ -546,6 +575,13 @@ void *festina_load_audio(const char *path);
 void festina_audio_play(void *audio);
 void festina_audio_stop(void *audio);
 int8_t festina_audio_is_playing(void *audio);
+/* claude.md #98: the per-aud voice limit. Clamped into [1, 64] rather
+ * than rejected -- this is a tuning knob, and failing a program over a
+ * number that is merely unreasonable would be a worse trade than
+ * giving it the nearest workable one. The getter exists so a program
+ * can read back what it actually got after clamping. */
+void festina_set_max_audio_players(int64_t max);
+int64_t festina_get_max_audio_players(void);
 
 /*
  * claude.md #71: environment.NAME / environment[keyExpr].

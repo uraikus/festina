@@ -23,7 +23,8 @@
 #include <sys/select.h> /* select() -- multiplexes X11 events with timers */
 #include <time.h>       /* nanosleep -- festina_graphics_init's connect retry */
 #include <X11/Xlib.h>
-#include <X11/Xutil.h> /* XLookupString/XKeysymToString -- `on key` */
+#include <X11/Xutil.h> /* XLookupString/XKeysymToString -- `on keyDown`/`on keyUp` */
+#include <X11/XKBlib.h> /* XkbSetDetectableAutoRepeat -- claude.md #98 */
 #include <cairo/cairo-xlib.h>
 #include "festina_runtime.h"
 #include "festina_runtime_internal.h"
@@ -43,7 +44,18 @@ static cairo_surface_t *g_window_surface = NULL;
 static cairo_surface_t *g_backing_surface = NULL;
 static void (*g_click_handler)(int64_t, int64_t) = NULL;
 static void (*g_mouse_handler)(int64_t, int64_t) = NULL;
-static void (*g_key_handler)(const char *) = NULL;
+/* claude.md #98: `on key` split into `on keyDown` and `on keyUp`. */
+static void (*g_key_down_handler)(const char *) = NULL;
+static void (*g_key_up_handler)(const char *) = NULL;
+/* Whether the X server could turn on detectable auto-repeat (XKB). When
+ * it can, a held key produces a single KeyPress and one KeyRelease when
+ * it is finally let go. When it cannot, X synthesizes a
+ * KeyRelease/KeyPress PAIR per repeat, and this file filters them out
+ * by hand -- see festina_key_event_is_autorepeat. Without either, a
+ * held key would fire keyUp/keyDown dozens of times a second, which is
+ * exactly the bug splitting the event apart is meant to let a program
+ * avoid. */
+static int g_detectable_autorepeat = 0;
 static void (*g_resize_handler)(void) = NULL;
 static void (*g_close_handler)(void) = NULL;
 /* The canvas's *current* size -- starts at FESTINA_CANVAS_WIDTH/HEIGHT
@@ -633,7 +645,16 @@ void festina_graphics_init(void) {
     XStoreName(g_display, g_window, "Festina");
     XSelectInput(g_display, g_window,
                  ExposureMask | ButtonPressMask | PointerMotionMask |
-                 KeyPressMask | StructureNotifyMask);
+                 KeyPressMask | KeyReleaseMask | StructureNotifyMask);
+    /* claude.md #98: ask the server to stop synthesizing a KeyRelease
+     * before every auto-repeated KeyPress, so a held key produces one
+     * keyDown and one keyUp when it is actually let go. Part of libX11
+     * itself (XKB), not a separate dependency. Not every server
+     * supports it, so the result is recorded and a hand-rolled filter
+     * covers the ones that do not -- see festina_key_event_is_autorepeat. */
+    Bool detectable = False;
+    XkbSetDetectableAutoRepeat(g_display, True, &detectable);
+    g_detectable_autorepeat = detectable ? 1 : 0;
     g_wm_delete_atom = XInternAtom(g_display, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(g_display, g_window, &g_wm_delete_atom, 1);
 
@@ -899,8 +920,12 @@ void festina_register_mouse_handler(void (*handler)(int64_t, int64_t)) {
     g_mouse_handler = handler;
 }
 
-void festina_register_key_handler(void (*handler)(const char *)) {
-    g_key_handler = handler;
+void festina_register_key_down_handler(void (*handler)(const char *)) {
+    g_key_down_handler = handler;
+}
+
+void festina_register_key_up_handler(void (*handler)(const char *)) {
+    g_key_up_handler = handler;
 }
 
 void festina_register_resize_handler(void (*handler)(void)) {
@@ -929,6 +954,60 @@ int64_t festina_client_height(void) {
  * 1 otherwise. Factored out of what used to be festina_graphics_run's
  * own while(1) loop body so festina_run_event_loop (below) can drive
  * it either as-is or interleaved with timer processing. */
+/* claude.md #40's key NAME, shared by keyDown and keyUp so the two
+ * events can never disagree about what to call the same physical key.
+ *
+ * A key that types an ordinary printable character (letters, digits,
+ * punctuation, space) comes back as that character through the buffer
+ * XLookupString fills in. Anything else -- Enter/Escape/Backspace/
+ * arrow keys/... -- either comes back empty or as an unprintable
+ * control character (e.g. 0x1B for Escape, 0x0D for Return), neither
+ * of which is a useful `text` value, so those fall back to
+ * XKeysymToString's X11 key name instead (e.g. "Return", "Escape",
+ * "Left") -- there's no claude.md-defined naming scheme for these, so
+ * this is simply X11's own.
+ *
+ * XLookupString is given the event by address rather than a copy: it
+ * takes an XKeyEvent* and reads the modifier state out of it, which is
+ * what makes a shifted "a" arrive as "A". */
+static void festina_key_name(XKeyEvent *ev, char *out, size_t out_size) {
+    char buf[32];
+    KeySym keysym;
+    int len = XLookupString(ev, buf, sizeof(buf) - 1, &keysym, NULL);
+    if (len > 0 && (unsigned char)buf[0] >= 0x20 && (unsigned char)buf[0] != 0x7F) {
+        if ((size_t)len >= out_size) len = (int)out_size - 1;
+        memcpy(out, buf, (size_t)len);
+        out[len] = '\0';
+        return;
+    }
+    const char *name = XKeysymToString(keysym);
+    if (!name) name = "";
+    snprintf(out, out_size, "%s", name);
+}
+
+/* claude.md #98: true for the KeyRelease half of an auto-repeat pair.
+ *
+ * Only needed when the server could not give us detectable auto-repeat
+ * (see g_detectable_autorepeat). Without XKB, holding a key produces a
+ * stream of KeyRelease/KeyPress pairs with IDENTICAL timestamps and
+ * keycodes -- so peeking at the next queued event and dropping the
+ * release when its partner is already sitting behind it turns the
+ * stream back into the one-down-many-repeats shape a program expects.
+ * The repeated KeyPress events are deliberately left alone: a held key
+ * legitimately repeating `keyDown` is how text entry works, and a
+ * program that only wants the first can compare against the key it
+ * last saw go up. What it must NOT see is a phantom keyUp while the
+ * key is still physically down. */
+static int festina_key_event_is_autorepeat(XEvent *ev) {
+    if (g_detectable_autorepeat || ev->type != KeyRelease) return 0;
+    if (!XPending(g_display)) return 0;
+    XEvent next;
+    XPeekEvent(g_display, &next);
+    return next.type == KeyPress &&
+           next.xkey.time == ev->xkey.time &&
+           next.xkey.keycode == ev->xkey.keycode;
+}
+
 static int festina_handle_graphics_event(XEvent *ev) {
     if (ev->type == Expose) {
         festina_graphics_present();
@@ -936,29 +1015,13 @@ static int festina_handle_graphics_event(XEvent *ev) {
         if (g_click_handler) g_click_handler(ev->xbutton.x, ev->xbutton.y);
     } else if (ev->type == MotionNotify) {
         if (g_mouse_handler) g_mouse_handler(ev->xmotion.x, ev->xmotion.y);
-    } else if (ev->type == KeyPress) {
-        if (g_key_handler) {
-            /* A key that types an ordinary printable character
-             * (letters, digits, punctuation, space) comes back as
-             * that character through the buffer XLookupString fills
-             * in. Anything else -- Enter/Escape/Backspace/arrow
-             * keys/... -- either comes back empty or as an
-             * unprintable control character (e.g. 0x1B for Escape,
-             * 0x0D for Return), neither of which is a useful `text`
-             * value, so those fall back to XKeysymToString's X11 key
-             * name instead (e.g. "Return", "Escape", "Left") --
-             * there's no claude.md-defined naming scheme for these,
-             * so this is simply X11's own. */
-            char buf[32];
-            KeySym keysym;
-            int len = XLookupString(&ev->xkey, buf, sizeof(buf) - 1, &keysym, NULL);
-            if (len > 0 && (unsigned char)buf[0] >= 0x20 && (unsigned char)buf[0] != 0x7F) {
-                buf[len] = '\0';
-                g_key_handler(buf);
-            } else {
-                const char *name = XKeysymToString(keysym);
-                g_key_handler(name ? name : "");
-            }
+    } else if (ev->type == KeyPress || ev->type == KeyRelease) {
+        void (*handler)(const char *) =
+            ev->type == KeyPress ? g_key_down_handler : g_key_up_handler;
+        if (handler && !festina_key_event_is_autorepeat(ev)) {
+            char name[32];
+            festina_key_name(&ev->xkey, name, sizeof(name));
+            handler(name);
         }
     } else if (ev->type == ConfigureNotify) {
         /* ConfigureNotify fires on more than just a resize (e.g. a

@@ -4114,13 +4114,13 @@ class TestGraphics:
             proc.terminate()
             proc.wait(timeout=5)
 
-    def test_key_dispatches_printable_and_named_keys(self, run_graphics_program, x_display):
-        # claude.md #40: `on key(key:text)`. A printable key (e.g. "a")
-        # comes back as its own character; a non-printable one (e.g.
-        # Escape, whose ASCII value is an unprintable control code) is
-        # not a useful `text` value, so it falls back to X11's own key
-        # name instead -- see festina_runtime.c's festina_handle_graphics_event.
-        source = "on key(key:text) {\n    log(`key ${key}`)\n}"
+    def test_key_down_dispatches_printable_and_named_keys(self, run_graphics_program, x_display):
+        # claude.md #40/#98: `on keyDown(key:text)`. A printable key
+        # (e.g. "a") comes back as its own character; a non-printable one
+        # (e.g. Escape, whose ASCII value is an unprintable control code)
+        # is not a useful `text` value, so it falls back to X11's own key
+        # name instead -- see festina_key_name in the graphics runtime.
+        source = "on keyDown(key:text) {\n    log(`key ${key}`)\n}"
         proc, stdout_path = run_graphics_program(source)
         try:
             wid = _find_window(x_display)
@@ -4134,6 +4134,72 @@ class TestGraphics:
             subprocess.run(["xdotool", "key", "--window", wid, "Escape"], env=env, check=True)
             text = _wait_for_output(stdout_path, lambda t: len(t.splitlines()) >= 2)
             assert text.splitlines() == ["key a", "key Escape"]
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_key_up_fires_separately_and_reports_the_same_name(self, run_graphics_program, x_display):
+        # claude.md #98: the whole point of the split -- a press and a
+        # release are now distinguishable, and both name the same key the
+        # same way (one shared festina_key_name), so a program can match
+        # a release against the press that started it.
+        source = ("on keyDown(key:text) {\n    log(`down ${key}`)\n}\n"
+                  "on keyUp(key:text) {\n    log(`up ${key}`)\n}")
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            time.sleep(0.3)
+            subprocess.run(["xdotool", "key", "--window", wid, "a"], env=env, check=True)
+            subprocess.run(["xdotool", "key", "--window", wid, "Left"], env=env, check=True)
+            text = _wait_for_output(stdout_path, lambda t: len(t.splitlines()) >= 4)
+            assert text.splitlines() == ["down a", "up a", "down Left", "up Left"]
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_only_the_declared_key_handler_fires(self, run_graphics_program, x_display):
+        # A program that declares only keyUp must not also get keyDown's
+        # events -- they are two independent registrations, not one
+        # handler called twice.
+        source = "on keyUp(key:text) {\n    log(`up ${key}`)\n}"
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            time.sleep(0.3)
+            subprocess.run(["xdotool", "key", "--window", wid, "b"], env=env, check=True)
+            text = _wait_for_output(stdout_path, lambda t: t.strip() != "")
+            time.sleep(0.3)
+            with open(stdout_path) as f:
+                assert f.read().splitlines() == ["up b"]
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_holding_a_key_does_not_fire_a_phantom_key_up(self, run_graphics_program, x_display):
+        # claude.md #98: X's own auto-repeat synthesizes a
+        # KeyRelease/KeyPress pair per repeat unless XKB's detectable
+        # auto-repeat is on. Either way a HELD key must produce exactly
+        # one keyUp -- the one where it is actually let go -- or the
+        # split would be useless for the movement keys it exists for.
+        source = ("on keyDown(key:text) {\n    log('down')\n}\n"
+                  "on keyUp(key:text) {\n    log('up')\n}")
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            time.sleep(0.3)
+            subprocess.run(["xdotool", "keydown", "--window", wid, "a"], env=env, check=True)
+            time.sleep(1.0)   # long enough for auto-repeat to kick in
+            subprocess.run(["xdotool", "keyup", "--window", wid, "a"], env=env, check=True)
+            _wait_for_output(stdout_path, lambda t: "up" in t.splitlines())
+            time.sleep(0.3)
+            with open(stdout_path) as f:
+                lines = f.read().splitlines()
+            assert lines.count("up") == 1, lines
+            assert lines[-1] == "up", lines
+            assert lines[0] == "down", lines
         finally:
             proc.terminate()
             proc.wait(timeout=5)
@@ -4544,6 +4610,72 @@ class TestAudio:
         assert result.returncode == 0
         assert result.stdout.strip() == "true"
 
+    def test_max_audio_players_is_readable_and_clamped(self, compile_and_run):
+        # claude.md #98: the limit is a tuning knob, so an unreasonable
+        # value is clamped into [1, 64] rather than failing the program.
+        # maxAudioPlayers() reads back what was actually applied.
+        source = (
+            "log(maxAudioPlayers())\n"
+            "setMaxAudioPlayers(4)\n"
+            "log(maxAudioPlayers())\n"
+            "setMaxAudioPlayers(0)\n"
+            "log(maxAudioPlayers())\n"
+            "setMaxAudioPlayers(9999)\n"
+            "log(maxAudioPlayers())\n"
+        )
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["10", "4", "1", "64"]
+
+    def test_setting_the_limit_links_the_audio_runtime(self, parser, semantic, codegen):
+        # Both builtins live in the audio translation unit, so naming
+        # either has to mark the program as using audio -- otherwise the
+        # link would fail with an undefined symbol.
+        program = parser.parse("setMaxAudioPlayers(3)", filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        gen = codegen.CodeGen(analyzed, "main.f")
+        gen.generate(program)
+        assert gen.uses_audio is True
+
+    def test_overlapping_plays_all_keep_playing(self, compile_and_run, tmp_path, audio_null_env):
+        # claude.md #98: the behaviour this replaced would have had the
+        # second play() stop the first. Festina has no way to count
+        # voices (deliberately -- the pool is not language surface), so
+        # what is observable here is that three rapid plays of a clip
+        # long enough not to have finished all report as playing and
+        # nothing crashes; TestAudioVoicePool below opens the runtime up
+        # and counts the voices directly.
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = (
+            "aud music = loadAudio('clip.wav')\n"
+            "music.play()\n"
+            "music.play()\n"
+            "music.play()\n"
+            "log(music.isPlaying())\n"
+            "music.stop()\n"
+            "log(music.isPlaying())\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_a_limit_of_one_still_restarts_rather_than_failing(
+        self, compile_and_run, tmp_path, audio_null_env
+    ):
+        # setMaxAudioPlayers(1) is the documented way to ask for the old
+        # cut-off-the-previous-sound behaviour back.
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = (
+            "setMaxAudioPlayers(1)\n"
+            "aud music = loadAudio('clip.wav')\n"
+            "music.play()\n"
+            "music.play()\n"
+            "log(music.isPlaying())\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
     def test_timers_and_audio_work_together(self, compile_and_run, tmp_path, audio_null_env):
         # A short clip finishes (isPlaying() -> false) on its own, with
         # no stop() call -- checked from a setTimeout callback, proving
@@ -4562,6 +4694,202 @@ class TestAudio:
         result = compile_and_run(source, env=audio_null_env)
         assert result.returncode == 0
         assert result.stdout.strip() == "playing after delay: false"
+
+
+_VOICE_POOL_HARNESS = r"""
+/* claude.md #98: a WHITE-BOX check of the per-aud voice pool.
+ *
+ * Two things make this a C harness rather than a Festina program.
+ *
+ * First, the pool is deliberately not language surface: a Festina
+ * program can ask whether a clip is playing, never how many copies of
+ * it are, and stop() names the clip rather than one playback of it.
+ * Adding a counter to the language purely to make this testable would
+ * be the tail wagging the dog, so this includes the translation unit
+ * directly, which gives it FestinaAudio/FestinaVoice (both file-local
+ * types) and lets it count active voices for real.
+ *
+ * Second, the ALSA device layer is REPLACED here, via the macros
+ * below, and that is not a shortcut -- it is the only way this test
+ * can exist. The null ALSA device the rest of the audio tests use
+ * consumes PCM instantly (measured: a 2-second clip finishes in 0ms),
+ * so under it every voice is finished before the next play() begins
+ * and there is no concurrency left to observe. A stub that sleeps per
+ * chunk gives playback real duration under the harness's own control,
+ * and needs no sound hardware, no ALSA config, and no device at all.
+ * Everything above the device -- the pool, the stealing, the slot
+ * reuse, the joining -- is the genuine runtime code.
+ */
+#include <alsa/asoundlib.h>
+#include <time.h>
+
+static int harness_pcm_open(snd_pcm_t **out) { *out = (snd_pcm_t *)1; return 0; }
+static long harness_pcm_writei(snd_pcm_t *pcm, const void *buf, unsigned long frames) {
+    (void)pcm; (void)buf;
+    /* ~10ms per 4096-frame chunk, so a clip of a few chunks plays for
+     * long enough that back-to-back play() calls genuinely overlap. */
+    struct timespec ts = { 0, 10L * 1000L * 1000L };
+    nanosleep(&ts, NULL);
+    return (long)frames;
+}
+
+#define snd_pcm_open(pcmp, name, stream, mode) harness_pcm_open(pcmp)
+#define snd_pcm_set_params(pcm, f, a, c, r, s, l) 0
+#define snd_pcm_writei(pcm, buf, frames) harness_pcm_writei(pcm, buf, frames)
+#define snd_pcm_recover(pcm, err, silent) (-1)
+#define snd_pcm_close(pcm) 0
+
+#include "festina_runtime_audio.c"
+
+/* The only thing the audio unit needs from the core runtime, supplied
+ * here so this harness does not have to link festina_runtime.c (and
+ * with it sqlite3) for a test that is entirely about audio. */
+void festina_fail(const char *msg) {
+    fprintf(stderr, "fail: %s\n", msg ? msg : "");
+    exit(1);
+}
+
+static int active_voices(void *audio) {
+    FestinaAudio *a = (FestinaAudio *)audio;
+    int n = 0;
+    pthread_mutex_lock(&a->lock);
+    for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+        if (a->voices[i].active) n++;
+    }
+    pthread_mutex_unlock(&a->lock);
+    return n;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    void *clip = festina_load_audio(argv[1]);
+
+    printf("default %lld\n", (long long)festina_get_max_audio_players());
+
+    /* Three overlapping plays, well inside the default limit of 10.
+     * Before claude.md #98 the second would have cut the first off and
+     * this would read 1. */
+    festina_audio_play(clip);
+    festina_audio_play(clip);
+    festina_audio_play(clip);
+    printf("three %d\n", active_voices(clip));
+    printf("isplaying %d\n", (int)festina_audio_is_playing(clip));
+
+    /* stop() means the CLIP, so every voice goes. */
+    festina_audio_stop(clip);
+    printf("stopped %d\n", active_voices(clip));
+    printf("isplaying_after_stop %d\n", (int)festina_audio_is_playing(clip));
+
+    /* At the limit, the oldest voice is stolen rather than the new play
+     * being dropped -- so the count saturates at the limit, never
+     * exceeds it, and never collapses to zero however many plays pile
+     * up. */
+    festina_set_max_audio_players(2);
+    for (int i = 0; i < 6; i++) festina_audio_play(clip);
+    printf("limit2 %d\n", active_voices(clip));
+
+    /* A limit of 1 is exactly the old behaviour: one voice, restarted. */
+    festina_audio_stop(clip);
+    festina_set_max_audio_players(1);
+    festina_audio_play(clip);
+    festina_audio_play(clip);
+    printf("limit1 %d\n", active_voices(clip));
+
+    festina_audio_stop(clip);
+    printf("final %d\n", active_voices(clip));
+
+    /* Slots are REUSED, not grown: 40 plays through a pool of 3 must
+     * never show more than 3 voices, which only holds if a finished
+     * thread is joined and its slot reclaimed (see
+     * festina_audio_reap_locked). */
+    festina_set_max_audio_players(3);
+    int peak = 0;
+    for (int i = 0; i < 40; i++) {
+        festina_audio_play(clip);
+        int n = active_voices(clip);
+        if (n > peak) peak = n;
+    }
+    printf("peak %d\n", peak);
+    festina_audio_stop(clip);
+    printf("drained %d\n", active_voices(clip));
+    return 0;
+}
+"""
+
+
+class TestAudioVoicePool:
+    """claude.md #98: `aud.play()` no longer cuts off a playback that is
+    already running -- each clip owns a pool of voices, one thread and
+    one ALSA handle per simultaneous playback, all streaming the same
+    decoded PCM read-only.
+
+    See _VOICE_POOL_HARNESS's own comment for why this is a white-box C
+    test: the pool is deliberately invisible to the language, and the
+    null ALSA device the other audio tests use consumes PCM instantly,
+    so under it there is no concurrency left to observe at all.
+    """
+
+    def _run_harness(self, tmp_path):
+        cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
+        if not cc:
+            pytest.skip("no C compiler (clang/gcc/cc) on PATH")
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa"],
+                               capture_output=True, text=True)
+        if alsa.returncode != 0:
+            pytest.skip("alsa dev headers are not installed")
+
+        runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
+        harness = tmp_path / "voice_pool_harness.c"
+        harness.write_text(_VOICE_POOL_HARNESS)
+        binary = tmp_path / "voice_pool_harness"
+        # 2 seconds at 8kHz is 16000 frames -- four 4096-frame chunks,
+        # so ~40ms of playback per voice under the harness's stub. Long
+        # enough that back-to-back plays overlap, short enough that 40
+        # of them through a pool of 3 still finish quickly.
+        wav = tmp_path / "clip.wav"
+        _write_wav(wav, duration_s=2.0)
+
+        build = subprocess.run(
+            [cc, "-I", runtime_dir, str(harness),
+             "-o", str(binary), "-pthread"] + alsa.stdout.split(),
+            capture_output=True, text=True,
+        )
+        assert build.returncode == 0, build.stderr
+        run = subprocess.run([str(binary), str(wav)], capture_output=True, text=True,
+                              timeout=180)
+        assert run.returncode == 0, run.stderr
+        return dict(line.split() for line in run.stdout.splitlines())
+
+    def test_overlapping_plays_each_get_their_own_voice(self, tmp_path):
+        out = self._run_harness(tmp_path)
+        assert out["default"] == "10"
+        # The whole point: three plays, three voices, none cut off.
+        assert out["three"] == "3"
+        assert out["isplaying"] == "1"
+
+    def test_stop_ends_every_voice_of_the_clip(self, tmp_path):
+        out = self._run_harness(tmp_path)
+        assert out["stopped"] == "0"
+        assert out["isplaying_after_stop"] == "0"
+        assert out["final"] == "0"
+        assert out["drained"] == "0"
+
+    def test_the_limit_caps_the_pool_and_steals_rather_than_dropping(self, tmp_path):
+        out = self._run_harness(tmp_path)
+        # Six plays into a limit of 2: saturated, never exceeded, and
+        # still 2 rather than 0 -- the older voices were stolen and
+        # replaced, not merely stopped, and no play() was dropped.
+        assert out["limit2"] == "2"
+        # A limit of 1 is the old cut-off-the-previous-sound behaviour.
+        assert out["limit1"] == "1"
+
+    def test_slots_are_reused_rather_than_grown(self, tmp_path):
+        # 40 plays through a pool of 3. This only holds if a finished
+        # thread is joined and its slot reclaimed -- otherwise the pool
+        # would either overflow or leak one thread per play over the
+        # life of a long-running game.
+        out = self._run_harness(tmp_path)
+        assert out["peak"] == "3"
 
 
 class TestRegex:

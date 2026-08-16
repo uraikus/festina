@@ -126,9 +126,14 @@ class TestIndividualExamples:
         lines = result.stdout.splitlines()
         assert lines[0] == "playing..."
         assert lines[1] == "isPlaying(): true"
-        assert lines[2].startswith("isPlaying() after 100ms: ")
-        assert lines[3] == "stopping early"
-        assert lines[4] == "isPlaying() after stop(): false"
+        # claude.md #98: the demo now also shows the voice pool, so two
+        # more play() calls layer on top of the first instead of
+        # restarting it.
+        assert lines[2] == "voices available per clip: 10"
+        assert lines[3].startswith("isPlaying() after 100ms: ")
+        assert lines[4] == "stopping early"
+        # stop() names the clip, so all three overlapping voices end.
+        assert lines[5] == "isPlaying() after stop(): false"
 
     def test_maps_demo_runs_correctly(self, cli_mod, tmp_path):
         result = _run_example(cli_mod, tmp_path, "maps.f")

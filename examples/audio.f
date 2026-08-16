@@ -16,6 +16,18 @@ log('playing...')
 beep.play()
 log(`isPlaying(): ${beep.isPlaying()}`)   // true immediately -- see api.md
 
+// claude.md #98: play() does NOT cut off a playback already running --
+// each clip has a pool of voices (10 by default), so these two layer on
+// top of the one above instead of restarting it. That is what makes a
+// rapid-fire sound effect work: the faster it fires, the more copies
+// overlap, rather than each one silencing the last.
+log(`voices available per clip: ${maxAudioPlayers()}`)
+beep.play()
+beep.play()
+
+// setMaxAudioPlayers(1) is how to ask for the old behaviour back: one
+// voice, restarted from the beginning on every play().
+
 // setTimeout, not a busy-loop -- playback runs on its own background
 // thread (see api.md's Audio section), so the program is free to keep
 // scheduling other work while the clip plays.
@@ -24,6 +36,7 @@ void func checkStillPlaying() {
 }
 
 void func stopEarly() {
+    // stop() names the CLIP, so all three overlapping voices end here.
     log('stopping early')
     beep.stop()
     log(`isPlaying() after stop(): ${beep.isPlaying()}`)   // false immediately

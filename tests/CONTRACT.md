@@ -48,8 +48,9 @@ claude.md #59. A regex value was originally constructible only via a
 dedicated literal syntax at all -- see this section's later "JS-style
 regex literal syntax" paragraph below for why and how that changed.
 claude.md #37/#39/#40 (`img`/`loadImage()`, `drawRect`/`drawCircle`/
-`drawText`/`drawImage`, `on click`/`on mouse`/`on key`/`on resize`/`on
-close`, `clientWidth`/`clientHeight`) are implemented too, per the
+`drawText`/`drawImage`, `on click`/`on mouse`/`on keyDown`/`on keyUp`/
+`on resize`/`on close`, `clientWidth`/`clientHeight`) are implemented
+too, per the
 user's own clarification that this means a real on-screen window --
 "not a file" -- showing only the drawing canvas ("a canvas renderer",
 not a GUI with any chrome): X11 (Xlib) + Cairo's Xlib surface backend,
@@ -363,14 +364,15 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 954 tests in this directory pass against it: 608 need no external
+All 969 tests in this directory pass against it: 613 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-329 more need a working C compiler, plus 2 more
-(`tests/test_packaging.py`) given `pyinstaller` too, plus 15 more given
+335 more need a working C compiler, plus 2 more
+(`tests/test_packaging.py`) given `pyinstaller` too, plus 19 more given
 `Xvfb`+`xdotool` too (4 of those also need `xwd`, from the same
 x11-apps/x11-utils tier, to read real canvas pixels back --
 claude.md #89/#92/#94; two former `xwd` tests became display-free once
-claude.md #95 made saveCanvas headless) (608 + 329 + 2 + 15 = 954 --
+claude.md #95 made saveCanvas headless; claude.md #98 added 4 more) (613
++ 335 + 2 + 19 = 969 --
 re-verified directly
 by running the whole suite with a PATH containing nothing but Python,
 not just derived by counting `compile_and_run` call sites, since the
@@ -394,7 +396,7 @@ compiler `compile_and_run` already requires.
 
 `examples/` grew beyond the original hello/basic/arrays/geometry/
 multifile/regex set: `timers.f` (setTimeout/setInterval), `graphics.f`
-(drawing + all five event handlers), `audio.f` (loadAudio/play/stop/
+(drawing + all six event handlers), `audio.f` (loadAudio/play/stop/
 isPlaying, with a small generated `beep.wav` fixture), `fizzbuzz.f` (a
 dependency-free loops/modulo tour), and `tic_tac_toe.f` -- a real,
 playable two-player game (click a cell, alternating X/O, win detection
@@ -2417,6 +2419,55 @@ via a plain `v ? "true" : "false"` -- so it printed as `true`, which made
 #96's "an empty pop answers null" impossible to observe for an
 `arr[bool]`. Both now print `null`; only the sentinel takes that branch.
 
+**claude.md #98**: sounds overlap, and a key press is not a key release.
+
+*Audio voice pool.* `play()` used to cut off whatever that clip was
+already playing -- one `aud`, one thread, one ALSA handle -- so a
+footstep or gunshot fired in rapid succession silenced the one before
+it, and the faster the effect fired the quieter it got. Each `aud` now
+owns a pool of voices (one thread and one device handle per
+simultaneous playback, all streaming the same decoded PCM read-only),
+defaulting to 10 and overridable with `setMaxAudioPlayers(n)` /
+readable back with `maxAudioPlayers()` -- readable back because the
+value is clamped into [1, 64] rather than rejected. At the limit the
+OLDEST voice is stolen rather than the new play being dropped: the
+longest-playing sound is closest to finishing anyway, whereas dropping
+the new play would silence a rapid-fire effect at exactly the moment it
+fires fastest. `setMaxAudioPlayers(1)` reduces exactly to the old
+behaviour. `stop()`/`isPlaying()` stay about the CLIP, not one playback
+of it. A voice that ends naturally stays *joinable* and is joined by
+whoever next claims its slot -- the single-voice design got away with
+never joining a finished thread because it only ever had one; a pool
+that never joined would leak one thread per `play()`.
+`tests/test_codegen.py::TestAudioVoicePool` (4 tests) plus 4 more in
+`TestAudio`. The pool tests are a white-box C harness for two reasons
+worth stating: a Festina program cannot count voices (deliberately --
+the pool is not language surface), and the null ALSA device the other
+audio tests use consumes PCM instantly (measured: a 2-second clip
+finishes in 0ms), so under it there is no concurrency left to observe
+at all. The harness replaces the device layer and keeps every line
+above it real; clean under both ThreadSanitizer and AddressSanitizer.
+
+*`on key` became `on keyDown` + `on keyUp`.* A key held down and a key
+tapped were the same event, so the most ordinary thing a 2D game does
+with the keyboard had no expressible form. **This is a breaking
+change**: `on key` still compiles (claude.md #40 never restricted event
+names) but is now dead code with no runtime event source, exactly like
+`on somethingElse` -- the give-away is that it no longer links the
+graphics runtime in. Both handlers take the same `(key:text)` and share
+one name function, so a release always reports what the press reported.
+Auto-repeat is what makes this usable rather than merely present: X
+synthesizes a KeyRelease before every repeated KeyPress, which would
+have fired a stream of phantom key-ups for exactly the keys the split
+exists for. XKB's detectable auto-repeat is requested at window
+creation, with a queue-peeking filter for servers that lack it; both
+paths verified against a real X server, the fallback by forcing it on.
+`keyDown` deliberately still repeats -- that is how text entry works.
+`tests/test_codegen.py::TestGraphics` (4 key tests, one of which holds a
+key for a full second and asserts exactly one keyUp),
+`tests/test_graphics.py` (5 more, including that bare `on key` no longer
+marks a program as using graphics).
+
 See api.md for the current language/standard library reference and this
 file's own "Status" section above for the implemented-vs-not matrix; the
 short version: nothing is left
@@ -3078,16 +3129,16 @@ own built-in decoder, the backing-store-plus-blit-on-Expose strategy a
 bare Cairo Xlib surface needs since it has no memory of prior drawing,
 and the fixed function-pointer signature per event -- `void
 (*)(int64_t, int64_t)` for click/mouse, `void (*)(const char *)` for
-key, `void (*)(void)` for resize/close -- that's the whole reason
-claude.md #40's five event handlers are each signature-restricted at
-the semantic.py level above). Event dispatch itself lives in a helper,
+keyDown/keyUp, `void (*)(void)` for resize/close -- that's the whole
+reason claude.md #40's six event handlers are each signature-restricted
+at the semantic.py level above). Event dispatch itself lives in a helper,
 `festina_handle_graphics_event` (one already-read `XEvent` in, `0`/`1`
 out signaling whether this was the window-close request) -- factored
 out of what used to be `festina_graphics_run`'s own `while(1)` loop body
 so `festina_run_event_loop` (below) can drive it either as-is or
 interleaved with timer processing: `Expose` -> re-blit, `ButtonPress`/
 `MotionNotify` -> call the registered click/mouse handler if any,
-`KeyPress` -> call the registered key handler if any, with the pressed
+`KeyPress`/`KeyRelease` -> call the registered keyDown/keyUp handler if any, with the pressed
 key's text from `XLookupString` for an ordinary printable character or
 `XKeysymToString`'s X11 key name otherwise (e.g. "Escape", "Return",
 "Left") for anything else, `ConfigureNotify` with a genuine size change
@@ -3177,5 +3228,5 @@ pytest tests/                          # 605 passed, 323 skipped (needs a C comp
                                         # 15 need Xvfb + xdotool installed too, 1 of those
                                         # also needs `openbox` and 4 need `xwd`) given a
                                         # working C compiler,
-                                        # all 954 pass
+                                        # all 969 pass
 ```

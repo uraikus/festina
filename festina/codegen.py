@@ -987,7 +987,9 @@ class CodeGen:
             "declare void @festina_draw_image(ptr, i64, i64)",
             "declare void @festina_register_click_handler(ptr)",
             "declare void @festina_register_mouse_handler(ptr)",
-            "declare void @festina_register_key_handler(ptr)",
+            # claude.md #98: `on key` became `on keyDown` + `on keyUp`.
+            "declare void @festina_register_key_down_handler(ptr)",
+            "declare void @festina_register_key_up_handler(ptr)",
             "declare void @festina_register_resize_handler(ptr)",
             "declare void @festina_register_close_handler(ptr)",
             "declare i64 @festina_client_width()",
@@ -1009,6 +1011,9 @@ class CodeGen:
             "declare void @festina_audio_play(ptr)",
             "declare void @festina_audio_stop(ptr)",
             "declare i8 @festina_audio_is_playing(ptr)",
+            # claude.md #98: the per-aud voice limit.
+            "declare void @festina_set_max_audio_players(i64)",
+            "declare i64 @festina_get_max_audio_players()",
             "declare ptr @malloc(i64)",
             "declare ptr @calloc(i64, i64)",
             # claude.md #74: automatic reclamation of provably non-
@@ -1576,7 +1581,7 @@ class CodeGen:
         self.func_defs.extend(func)
         self.func_defs.append("")
 
-        if decl.name in ("click", "mouse", "key", "resize", "close"):
+        if decl.name in ("click", "mouse", "keyDown", "keyUp", "resize", "close"):
             self.uses_graphics = True
             self.event_handlers[decl.name] = symbol
 
@@ -4449,6 +4454,21 @@ class CodeGen:
                 return self._emit_graphics_call(name, expr, env, lines)
             if name in ("setTimeout", "setInterval", "clearTimeout", "clearInterval"):
                 return self._emit_timer_call(name, expr, env, lines)
+            if name in ("setMaxAudioPlayers", "maxAudioPlayers"):
+                # claude.md #98. Both live in the audio translation unit,
+                # so naming either is what makes a program "use audio" --
+                # which is right: a program that tunes the voice limit is
+                # a program that plays sounds, and one that never touches
+                # audio never links these in.
+                self.uses_audio = True
+                if name == "maxAudioPlayers":
+                    out = self.tmp()
+                    lines.append(f"  {out} = call i64 @festina_get_max_audio_players()")
+                    return out, INT
+                max_val, max_type = self._emit_expr(expr.args[0], env, lines)
+                max_val = self._coerce(max_val, max_type, INT, lines)
+                lines.append(f"  call void @festina_set_max_audio_players(i64 {max_val})")
+                return "0", None
             if name == "loadAudio":
                 self.uses_audio = True
                 path_val, path_type = self._emit_expr(expr.args[0], env, lines)
@@ -5213,7 +5233,8 @@ class CodeGen:
             main_lines.append("  call void @festina_graphics_init()")
             register_fn = {"click": "festina_register_click_handler",
                             "mouse": "festina_register_mouse_handler",
-                            "key": "festina_register_key_handler",
+                            "keyDown": "festina_register_key_down_handler",
+                            "keyUp": "festina_register_key_up_handler",
                             "resize": "festina_register_resize_handler",
                             "close": "festina_register_close_handler"}
             for event_name, symbol in self.event_handlers.items():

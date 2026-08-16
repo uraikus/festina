@@ -1452,6 +1452,18 @@ listed here only so they aren't lost:
   structs (`claude.md #43` promises this; not implemented -- see
   "Memory management" below, a deliberately separate, larger writeup
   rather than a one-line bullet here).
+- **No way to name one playback of a clip.** `stop()` and `isPlaying()`
+  are about the `aud` -- since claude.md #98, that means every voice in
+  its pool. Naming an individual voice would mean handing the pool to
+  the language, which is precisely what #98 kept out of it; the two
+  knobs a program actually needs (how many may overlap, and stopping
+  the clip) are both there. Recorded because it is a real limit, not
+  because it is expected to change.
+- **A key held down still repeats `keyDown`.** Deliberate -- that is
+  how text entry works, and claude.md #98 only guarantees that a HELD
+  key fires exactly one `keyUp`, when it is really let go. A program
+  that wants edge-triggered presses tracks which keys it has seen go
+  down; the language does not do that for it.
 - `regex(pattern, flags)` -- the dynamic builtin call, not a
   `/pattern/flags` literal (those are now cached, compiled once per
   source location on first reach -- see tests/CONTRACT.md) -- still

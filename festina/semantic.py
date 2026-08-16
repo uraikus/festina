@@ -41,6 +41,8 @@ BUILTIN_FUNCTIONS = {
     "log", "fail", "sqlite",
     "drawRect", "drawCircle", "drawText", "drawImage",
     "loadImage", "loadAudio",
+    # claude.md #98: how many voices one aud may play at once.
+    "setMaxAudioPlayers", "maxAudioPlayers",
     # claude.md #89/#91: canvas drawing style + text metrics. `font` is
     # NOT here -- claude.md #91 turned it into a type name, so the
     # setter is changeFont().
@@ -67,6 +69,9 @@ BUILTIN_FUNCTIONS = {
 _BUILTIN_RETURN_TYPES = {
     "loadImage": types_mod.ImageType(),
     "loadAudio": types_mod.AudioType(),
+    # claude.md #98: reads back the limit AFTER clamping, so a program
+    # can see what it actually got rather than what it asked for.
+    "maxAudioPlayers": types_mod.PrimitiveType("int"),
     "regex": types_mod.RegexType(),
     # claude.md #89: the only two graphics builtins that return anything
     "measureTextWidth": types_mod.PrimitiveType("int"),
@@ -106,6 +111,8 @@ _BUILTIN_SIGNATURES = {
     "drawImage": (types_mod.ImageType(), _INT, _INT),
     "loadImage": (_TEXT,),
     "loadAudio": (_TEXT,),  # claude.md #38
+    "setMaxAudioPlayers": (_INT,),  # claude.md #98
+    "maxAudioPlayers": (),
     # claude.md #89: a colour is text (a name, #rgb/#rrggbb, or 'none'),
     # validated at runtime rather than compile time -- the value is an
     # arbitrary expression, so there is nothing to check here beyond its
@@ -211,7 +218,11 @@ MATH_CONSTANTS = {"PI": math.pi, "E": math.e}
 _EVENT_SIGNATURES = {
     "click": ((_INT, _INT), "(x:int, y:int)"),
     "mouse": ((_INT, _INT), "(x:int, y:int)"),
-    "key": ((_TEXT,), "(key:text)"),
+    # claude.md #98: one `on key` became two, so a program can tell a
+    # press from a release -- holding a movement key and letting it go
+    # had no expressible difference before.
+    "keyDown": ((_TEXT,), "(key:text)"),
+    "keyUp": ((_TEXT,), "(key:text)"),
     "resize": ((), "no parameters"),
     "close": ((), "no parameters"),
 }

@@ -96,8 +96,17 @@ on mouse(x:int, y:int) {
     }
 }
 
-on key(key:text) {
+// claude.md #98: a press and a release are separate events, so a
+// program can tell "the key is being held" from "the key was tapped" --
+// which is what a movement key in a game actually needs. Both report
+// the same name for the same physical key, and a held key fires one
+// keyUp (when it is really let go), not one per auto-repeat.
+on keyDown(key:text) {
     log(`key pressed: ${key}`)
+}
+
+on keyUp(key:text) {
+    log(`key released: ${key}`)
 }
 
 on resize() {

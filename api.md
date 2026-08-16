@@ -527,7 +527,8 @@ log(`canvas is ${clientWidth}x${clientHeight}`)
 
 on click(x:int, y:int)  { ... }
 on mouse(x:int, y:int)  { ... }
-on key(key:text)        { ... }
+on keyDown(key:text)    { ... }
+on keyUp(key:text)      { ... }
 on resize()             { ... }
 on close()               { ... }
 ```
@@ -537,7 +538,7 @@ on close()               { ... }
 Every drawing call paints an offscreen canvas that needs no display at
 all. `render()` is the one call that shows it, opening a real X11 window
 (via Cairo's Xlib backend) the first time it runs — undecorated, 800×600.
-Declaring one of the five event handlers opens a window too, since they
+Declaring one of the six event handlers opens a window too, since they
 can't fire without one. After the entry file's top-level code finishes,
 if a window was opened, the process blocks handling redraws/input until
 the window closes.
@@ -565,6 +566,32 @@ frame takes ~1ms.
 Nothing but `render()` and the event handlers needs a display —
 `saveCanvas`, `clientWidth`/`clientHeight` and `loadImage` all work
 headless.
+
+### Keyboard events
+
+`on keyDown` fires when a key goes down, `on keyUp` when it comes back
+up. Both report the same name for the same physical key: a key that
+types a character gives you that character (`'a'`, `'5'`, `' '`), and
+anything else gives you X11's own name for it (`'Left'`, `'Escape'`,
+`'Return'`, `'space'` is `' '`). So a release can always be matched
+against the press that started it:
+
+```festina
+map[bool] held = {}
+
+on keyDown(key:text) { held[key] = true }
+on keyUp(key:text)   { held[key] = false }
+```
+
+**Holding a key fires one `keyUp`, when you actually let go.** X's own
+auto-repeat would otherwise synthesize a release before every repeat,
+which would make the pair useless for exactly the movement keys it
+exists for; the runtime turns that off where the server supports it and
+filters it out where it doesn't.
+
+`keyDown` *does* repeat while a key is held — that is how text entry
+works, and a program that only wants the first press can check whether
+it has already seen that key go down without a matching up.
 
 ### Images
 
@@ -986,8 +1013,43 @@ music.isPlaying()                     // true the instant play() returns,
 ```
 
 Plays through a real ALSA output device on a background thread, so
-playback doesn't block the rest of the program. Calling `play()` again
-while already playing restarts from the beginning.
+playback doesn't block the rest of the program.
+
+### Overlapping sounds
+
+**`play()` while a sound is already playing does not cut it off.** Each
+`aud` owns a pool of up to 10 voices — so a footstep, a gunshot or a
+coin pickup firing in rapid succession layer instead of interrupting
+each other, which is what a game actually needs:
+
+```festina
+aud coin = loadAudio('coin.wav')
+coin.play()   // three overlapping copies, not one restarted three times
+coin.play()
+coin.play()
+```
+
+The clip's audio is decoded once, at `loadAudio()` time; a voice costs a
+thread and a device handle, never another copy of the samples.
+
+```festina
+setMaxAudioPlayers(4)          // per aud; clamped into [1, 64]
+log(maxAudioPlayers())         // -> 4, i.e. what was actually applied
+```
+
+When every voice is busy, the **oldest** is stolen. Something has to
+give at the limit, and the sound that has been playing longest is
+closest to finishing anyway — dropping the *new* play instead would
+silence a rapid-fire effect at exactly the moment it fires fastest.
+
+`setMaxAudioPlayers(1)` is the way to ask for the old behaviour back:
+one voice, restarted from the beginning on every `play()`.
+
+`stop()` and `isPlaying()` are about the **clip**, not one playback of
+it: `stop()` ends every voice of that clip, and `isPlaying()` is true
+while any is still going. There is no way to name an individual
+playback — that would mean exposing the pool, which is deliberately not
+part of the language.
 
 ## Imports
 
