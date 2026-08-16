@@ -834,6 +834,13 @@ class CodeGen:
             "declare void @festina_draw_rect(i64, i64, i64, i64)",
             "declare void @festina_draw_circle(i64, i64, i64)",
             "declare void @festina_draw_text(ptr, i64, i64)",
+            # claude.md #89: canvas drawing style + text metrics
+            "declare void @festina_set_fill_style(ptr)",
+            "declare void @festina_set_border_color(ptr)",
+            "declare void @festina_set_line_width(i64)",
+            "declare void @festina_set_font(ptr)",
+            "declare i64 @festina_measure_text_width(ptr)",
+            "declare i64 @festina_measure_text_height(ptr)",
             "declare ptr @festina_load_image(ptr)",
             "declare void @festina_draw_image(ptr, i64, i64)",
             "declare void @festina_register_click_handler(ptr)",
@@ -3887,7 +3894,9 @@ class CodeGen:
                 return self._emit_sqlite_call(expr, env, lines, expected_type)
             if name == "regex":
                 return self._emit_regex_call(expr, env, lines)
-            if name in ("drawRect", "drawCircle", "drawText", "drawImage", "loadImage"):
+            if name in ("drawRect", "drawCircle", "drawText", "drawImage", "loadImage",
+                        "fillStyle", "borderColor", "lineWidth", "font",
+                        "measureTextWidth", "measureTextHeight"):
                 return self._emit_graphics_call(name, expr, env, lines)
             if name in ("setTimeout", "setInterval", "clearTimeout", "clearInterval"):
                 return self._emit_timer_call(name, expr, env, lines)
@@ -4221,6 +4230,35 @@ class CodeGen:
             lines.append(f"  {out} = call ptr @festina_load_image(ptr {args[0]})")
             free_text_temps()
             return out, types_mod.ImageType()
+
+        # claude.md #89: style setters and text metrics deliberately do
+        # NOT set self.uses_graphics, for the same reason loadImage()
+        # doesn't (see this method's own docstring): none of them draws
+        # anything, so none of them needs a canvas window to exist. A
+        # program that only measures text, or only sets a fill colour it
+        # never draws with, should not have a window opened on it -- and
+        # measuring genuinely works with no X server at all, since text
+        # metrics depend only on the font (festina_measure_text_* run
+        # against a scratch image surface).
+        _STYLE_SETTERS = {
+            "fillStyle": ("festina_set_fill_style", "ptr"),
+            "borderColor": ("festina_set_border_color", "ptr"),
+            "font": ("festina_set_font", "ptr"),
+            "lineWidth": ("festina_set_line_width", "i64"),
+        }
+        if name in _STYLE_SETTERS:
+            fn, ty = _STYLE_SETTERS[name]
+            lines.append(f"  call void @{fn}({ty} {args[0]})")
+            free_text_temps()
+            return "0", None
+        if name in ("measureTextWidth", "measureTextHeight"):
+            fn = ("festina_measure_text_width" if name == "measureTextWidth"
+                  else "festina_measure_text_height")
+            out = self.tmp()
+            lines.append(f"  {out} = call i64 @{fn}(ptr {args[0]})")
+            free_text_temps()
+            return out, INT
+
         self.uses_graphics = True
         if name == "drawRect":
             x, y, w, h = args

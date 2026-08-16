@@ -359,11 +359,13 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 842 tests in this directory pass against it: 561 need no external
+All 855 tests in this directory pass against it: 567 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-270 more need a working C compiler, plus 2 more
-(`tests/test_packaging.py`) given `pyinstaller` too, plus 9 more given
-`Xvfb`+`xdotool` too (561 + 270 + 2 + 9 = 842 -- re-verified directly
+275 more need a working C compiler, plus 2 more
+(`tests/test_packaging.py`) given `pyinstaller` too, plus 11 more given
+`Xvfb`+`xdotool` too (2 of those also need `xwd`, from the same
+x11-apps/x11-utils tier, to read real canvas pixels back --
+claude.md #89) (567 + 275 + 2 + 11 = 855 -- re-verified directly
 by running the whole suite with a PATH containing nothing but Python,
 not just derived by counting `compile_and_run` call sites, since the
 true number had drifted well past a much older, since-inaccurate count
@@ -2123,6 +2125,29 @@ process exit, which LeakSanitizer already reports as clean (a global
 stays reachable through its own variable) and which no other systems
 language frees either.
 
+**claude.md #89**: the canvas gains drawing style and text metrics --
+`fillStyle`, `borderColor`, `lineWidth`, `font`, `measureTextWidth`,
+`measureTextHeight`. Style is process-global "set it, then draw" state,
+matching the HTML canvas 2D context, because claude.md #37/#39's own
+worked examples take geometry only (`drawRect(0, 0, 100, 100)`) and
+adding style parameters would have meant changing those signatures.
+Every default reproduces what these functions drew before (black fill,
+no border, 16px sans-serif), so no existing program's output changes.
+A colour is a name, a `#rgb`/`#rrggbb` hex value, or `none`/
+`transparent`; anything else fails at the `fillStyle()` call itself,
+naming the value, rather than deferring to the next draw or silently
+defaulting to black. `borderColor` outlines shapes, not glyphs, and the
+two measure functions deliberately open no window (text metrics depend
+only on the font -- the same rule `loadImage` already follows).
+`tests/test_codegen.py::TestCanvasStyleAndTextMetrics` (11 tests)
+covers codegen, the window-opening rule, argument typing, the
+builtin-shadowing rule these six now join, and the failure messages;
+`::TestCanvasStyleRendersRealPixels` (2 tests) captures the window with
+`xwd` and asserts the actual RGB values, since asserting the runtime
+call was emitted proves the plumbing but not that 'red' comes out red,
+that `#00f` expands to `#0000ff`, or that `fillStyle('none')` leaves an
+interior genuinely unpainted.
+
 See api.md for the current language/standard library reference and this
 file's own "Status" section above for the implemented-vs-not matrix; the
 short version: nothing is left
@@ -2878,9 +2903,10 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 561 passed, 281 skipped (needs a C compiler; 2 of
+pytest tests/                          # 567 passed, 288 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
-                                        # 9 need Xvfb + xdotool installed too, 1 of those
-                                        # also needs `openbox`) given a working C compiler,
-                                        # all 842 pass
+                                        # 11 need Xvfb + xdotool installed too, 1 of those
+                                        # also needs `openbox` and 2 need `xwd`) given a
+                                        # working C compiler,
+                                        # all 855 pass
 ```

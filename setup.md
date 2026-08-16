@@ -111,7 +111,7 @@ in any requirements file:
 | Extra tool | Needed for | Install |
 |---|---|---|
 | `pyinstaller` | `tests/test_packaging.py` (2 tests) | `pip install -r requirements-build.txt` |
-| `Xvfb` + `xdotool` | Interactive graphics tests — clicking, moving the mouse, pressing keys, resizing a real (virtual) window (`TestGraphics`, plus `TestTimers`'s combined graphics+timers case; 6 tests) | `sudo apt install xvfb xdotool` on Debian/Ubuntu — a real `$DISPLAY` works too, if one is already available |
+| `Xvfb` + `xdotool` + `xwd` | Interactive graphics tests — clicking, moving the mouse, pressing keys, resizing a real (virtual) window, and reading canvas pixels back to check `claude.md #89`'s colours and fonts actually render (`TestGraphics`, `TestCanvasStyleRendersRealPixels`, plus `TestTimers`'s combined graphics+timers case) | `sudo apt install xvfb xdotool x11-apps` on Debian/Ubuntu (`xwd` ships in `x11-apps`) — a real `$DISPLAY` works too, if one is already available |
 | `openbox` (+ optional `xprop`, from `x11-utils`) | One regression test for a real window-manager crash (see [security.md](security.md#graphics-a-real-window-manager-crash-badmatch-on-xsetinputfocus)) that a bare Xvfb instance (no WM at all) can never reproduce (`TestGraphics::test_graphics_init_does_not_crash_under_a_real_window_manager`; 1 test) | `sudo apt install openbox x11-utils` on Debian/Ubuntu — `xprop` is only used to poll for the WM's own readiness signal instead of a fixed sleep; the test still runs (with a fixed sleep instead) without it |
 
 Every one of those skips cleanly and independently when its tool isn't

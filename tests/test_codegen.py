@@ -3906,6 +3906,45 @@ def _find_window(display, timeout=20):
     raise AssertionError("the Festina canvas window never appeared")
 
 
+def _xwd_pixels(display, wid, points):
+    """Capture a window with `xwd` and return the RGB at each (x, y).
+
+    claude.md #89's colours are only really verified by looking at what
+    actually landed on the canvas -- asserting the runtime call was
+    emitted proves the plumbing, not that 'red' is red. xwd ships with
+    the same x11-apps/x11-utils tier as xdotool, which these tests
+    already require, so this needs no new dependency.
+
+    XWD is a fixed 25-word big-endian header, then the window name, then
+    the colormap, then rows of `bytes_per_line`; the r/g/b masks in the
+    header say where each channel sits inside a pixel.
+    """
+    import struct
+    dump = subprocess.run(["xwd", "-id", wid], env=dict(os.environ, DISPLAY=display),
+                          capture_output=True, check=True).stdout
+    hdr = struct.unpack(">25I", dump[:100])
+    header_size, bpp, bytes_per_line = hdr[0], hdr[11], hdr[12]
+    red_mask, green_mask, blue_mask, ncolors = hdr[14], hdr[15], hdr[16], hdr[19]
+    body = dump[header_size + ncolors * 12:]
+
+    def channel(value, mask):
+        if not mask:
+            return 0
+        shift = (mask & -mask).bit_length() - 1
+        width = bin(mask >> shift).count("1")
+        c = (value & mask) >> shift
+        return c << (8 - width) if width < 8 else c
+
+    out = []
+    nbytes = bpp // 8
+    for x, y in points:
+        base = y * bytes_per_line + x * nbytes
+        value = int.from_bytes(body[base:base + nbytes], "little")
+        out.append((channel(value, red_mask), channel(value, green_mask),
+                    channel(value, blue_mask)))
+    return out
+
+
 def _wait_for_output(stdout_path, predicate, timeout=20):
     # Polls instead of a fixed sleep-then-assert, for the same reason
     # x_display polls for Xvfb readiness instead of a fixed sleep (see
@@ -6147,3 +6186,253 @@ class TestStructTextFieldReclamation:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "[field]\n[heap]\n[global]\n"
+
+
+class TestCanvasStyleAndTextMetrics:
+    """claude.md #89: fillStyle/borderColor/lineWidth/font set canvas
+    drawing state that every later draw call reads, and
+    measureTextWidth/measureTextHeight report metrics for the current
+    font. The style model is the HTML canvas 2D one -- set it, then draw
+    -- rather than passing style arguments to each draw function, since
+    claude.md #37/#39's own worked examples take geometry only
+    (`drawRect(0, 0, 100, 100)`).
+
+    Defaults reproduce exactly what these functions drew before this
+    section: black fill, no border, 16px sans-serif, so no existing
+    program's output changes.
+
+    Two behaviours worth locking in beyond the obvious: neither the
+    style setters nor the measure functions open a canvas window (none
+    of them draws anything, and text metrics depend only on the font --
+    the same reasoning that keeps loadImage() from forcing a window
+    open), and an unrecognised colour fails loudly naming the offending
+    value rather than silently defaulting to black."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    # ---- compile-only: no display needed ----
+
+    def test_style_setters_emit_their_runtime_calls(self, parser, semantic, codegen):
+        source = """
+        fillStyle('red')
+        borderColor('#00ff00')
+        lineWidth(4)
+        font('bold 20px serif')
+        drawRect(0, 0, 10, 10)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_set_fill_style(ptr" in ir
+        assert "call void @festina_set_border_color(ptr" in ir
+        assert "call void @festina_set_line_width(i64 4)" in ir
+        assert "call void @festina_set_font(ptr" in ir
+
+    def test_measure_functions_return_int(self, parser, semantic, codegen):
+        source = """
+        int w = measureTextWidth('hello')
+        int h = measureTextHeight('hello')
+        log(w + h)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call i64 @festina_measure_text_width(ptr" in ir
+        assert "call i64 @festina_measure_text_height(ptr" in ir
+
+    def test_measuring_alone_does_not_open_a_canvas_window(self, parser, semantic, codegen):
+        # Same rule loadImage() already follows: nothing here draws, so
+        # nothing here should force a window open.
+        source = """
+        font('16px sans-serif')
+        fillStyle('red')
+        log(measureTextWidth('hello'))
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_graphics_init()" not in ir
+
+    def test_drawing_still_opens_a_canvas_window(self, parser, semantic, codegen):
+        source = """
+        fillStyle('red')
+        drawRect(0, 0, 10, 10)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_graphics_init()" in ir
+
+    def test_a_user_function_may_not_shadow_a_new_builtin(self, parser, semantic, errors):
+        # These six join the existing builtin-name collision rule --
+        # codegen's builtin dispatch always wins, so a same-named user
+        # function would be silently uncallable.
+        source = """
+        void func font() { log('mine') }
+        """
+        program = parser.parse(source, filename="main.f")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program, filename="main.f")
+
+    def test_wrong_argument_types_are_rejected(self, parser, semantic, errors):
+        for source in ["fillStyle(5)", "lineWidth('4')", "measureTextWidth(5)"]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+    # ---- behavioural: needs a C compiler, but no display ----
+
+    def test_text_metrics_scale_with_the_font(self, compile_and_run):
+        source = """
+        font('16px sans-serif')
+        int smallW = measureTextWidth('Hello')
+        int smallH = measureTextHeight('Hello')
+        font('32px sans-serif')
+        int bigW = measureTextWidth('Hello')
+        int bigH = measureTextHeight('Hello')
+        log(smallW > 0)
+        log(bigW > smallW)
+        log(bigH > smallH)
+        log(measureTextWidth(''))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\ntrue\n0\n"
+
+    def test_an_unrecognised_colour_fails_with_a_clear_message(self, compile_and_run):
+        # No drawing, and so no display needed: a colour is validated at
+        # the fillStyle() call itself rather than deferred to the next
+        # draw, which is both a better error (it points at the line that
+        # set the bad value) and what makes this testable anywhere.
+        source = "fillStyle('nosuchcolour')"
+        result = compile_and_run(source)
+        assert result.returncode != 0
+        combined = result.stdout + result.stderr
+        assert "nosuchcolour" in combined
+        assert "not a colour" in combined
+
+    def test_a_malformed_hex_colour_fails_too(self, compile_and_run):
+        source = "fillStyle('#12345')"
+        result = compile_and_run(source)
+        assert result.returncode != 0
+        assert "#12345" in result.stdout + result.stderr
+
+    def test_borderColor_validates_its_colour_too(self, compile_and_run):
+        source = "borderColor('bogus')"
+        result = compile_and_run(source)
+        assert result.returncode != 0
+        combined = result.stdout + result.stderr
+        assert "borderColor()" in combined
+        assert "bogus" in combined
+
+    def test_named_hex_and_none_colours_are_all_accepted(self, compile_and_run):
+        # Exercises every accepted colour shape without drawing: a name,
+        # both hex lengths, case-insensitivity, and the two "no colour"
+        # spellings. Reaching the end means none of them failed.
+        source = """
+        fillStyle('red')
+        fillStyle('ORANGE')
+        fillStyle('#0a0')
+        fillStyle('#00FF7F')
+        fillStyle('none')
+        borderColor('transparent')
+        borderColor('#123456')
+        lineWidth(0)
+        font('italic bold 18px monospace')
+        log('ok')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "ok\n"
+
+
+class TestCanvasStyleRendersRealPixels:
+    """claude.md #89, the tier the rest of TestCanvasStyleAndTextMetrics
+    can't reach: that the colours actually land on the canvas. Asserting
+    `festina_set_fill_style` was called proves the plumbing, not that
+    'red' comes out red, that `#00f` expands to `#0000ff`, or that
+    `fillStyle('none')` genuinely leaves the interior unpainted while
+    still drawing its border.
+
+    Same opt-in tier as the rest of TestGraphics: needs a real display
+    (Xvfb is fine) plus `xdotool`/`xwd`."""
+
+    def test_fill_border_and_none_render_the_expected_pixels(
+            self, run_graphics_program, x_display):
+        if not shutil.which("xwd"):
+            pytest.skip("xwd isn't installed -- needed to read back real canvas pixels")
+        source = """
+        fillStyle('red')
+        drawRect(10, 10, 100, 100)
+
+        fillStyle('#00ff00')
+        drawRect(150, 10, 100, 100)
+
+        fillStyle('#00f')
+        drawRect(290, 10, 100, 100)
+
+        fillStyle('yellow')
+        borderColor('black')
+        lineWidth(10)
+        drawRect(10, 150, 100, 100)
+
+        fillStyle('none')
+        borderColor('purple')
+        lineWidth(8)
+        drawRect(150, 150, 100, 100)
+
+        borderColor('none')
+        fillStyle('teal')
+        drawRect(290, 150, 100, 100)
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)  # let every draw reach the server before reading back
+            got = _xwd_pixels(x_display, wid, [
+                (60, 60),    # 'red'
+                (200, 60),   # '#00ff00'
+                (340, 60),   # '#00f' -> #0000ff
+                (60, 200),   # yellow fill, inside its black border
+                (10, 200),   # on that 10px black border (centred on the path)
+                (152, 200),  # purple border of the unfilled rect
+                (200, 200),  # its interior -- fillStyle('none'), so untouched
+                (340, 200),  # teal, after borderColor('none') turned borders off
+                (500, 400),  # untouched canvas background
+            ])
+            assert got[0] == (255, 0, 0)
+            assert got[1] == (0, 255, 0)
+            assert got[2] == (0, 0, 255)
+            assert got[3] == (255, 255, 0)
+            assert got[4] == (0, 0, 0)
+            assert got[5] == (128, 0, 128)
+            assert got[6] == (255, 255, 255)
+            assert got[7] == (0, 128, 128)
+            assert got[8] == (255, 255, 255)
+        finally:
+            proc.terminate()
+
+    def test_font_changes_what_is_drawn(self, run_graphics_program, x_display):
+        # Same string, same position, two font sizes: the larger one must
+        # ink pixels the smaller one leaves untouched.
+        if not shutil.which("xwd"):
+            pytest.skip("xwd isn't installed -- needed to read back real canvas pixels")
+        source = """
+        fillStyle('black')
+        font('10px sans-serif')
+        drawText('Hg', 20, 40)
+        font('48px sans-serif')
+        drawText('Hg', 20, 140)
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            # Count inked pixels in a band around each baseline.
+            small = [(x, y) for x in range(20, 70, 2) for y in range(20, 45, 2)]
+            big = [(x, y) for x in range(20, 70, 2) for y in range(95, 145, 2)]
+            small_px = _xwd_pixels(x_display, wid, small)
+            big_px = _xwd_pixels(x_display, wid, big)
+            small_inked = sum(1 for p in small_px if p != (255, 255, 255))
+            big_inked = sum(1 for p in big_px if p != (255, 255, 255))
+            assert small_inked > 0, "the 10px text drew nothing at all"
+            assert big_inked > small_inked, (
+                f"48px text inked {big_inked} sampled pixels, 10px inked "
+                f"{small_inked} -- font() had no effect")
+        finally:
+            proc.terminate()

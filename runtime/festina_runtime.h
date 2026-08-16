@@ -266,6 +266,20 @@ void festina_draw_circle(int64_t x, int64_t y, int64_t r);
 void festina_draw_text(const char *text, int64_t x, int64_t y);
 void *festina_load_image(const char *path);
 void festina_draw_image(void *img, int64_t x, int64_t y);
+/* claude.md #89: canvas drawing style -- process-global state set by
+ * fillStyle()/borderColor()/lineWidth()/font() and read by every later
+ * draw call, the same "set it, then draw" model the HTML canvas 2D
+ * context uses. A colour is a name (red, blue, ...), a #rgb/#rrggbb hex
+ * value, or 'none'/'transparent'; anything else calls festina_fail()
+ * naming the offending value rather than silently defaulting. The two
+ * measure functions deliberately need no canvas window -- text metrics
+ * depend only on the font, so they run against a scratch surface. */
+void festina_set_fill_style(const char *color);
+void festina_set_border_color(const char *color);
+void festina_set_line_width(int64_t width);
+void festina_set_font(const char *spec);
+int64_t festina_measure_text_width(const char *text);
+int64_t festina_measure_text_height(const char *text);
 void festina_register_click_handler(void (*handler)(int64_t, int64_t));
 void festina_register_mouse_handler(void (*handler)(int64_t, int64_t));
 void festina_register_key_handler(void (*handler)(const char *));

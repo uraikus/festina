@@ -39,6 +39,9 @@ BUILTIN_FUNCTIONS = {
     "log", "fail", "sqlite",
     "drawRect", "drawCircle", "drawText", "drawImage",
     "loadImage", "loadAudio",
+    # claude.md #89: canvas drawing style + text metrics
+    "fillStyle", "borderColor", "lineWidth", "font",
+    "measureTextWidth", "measureTextHeight",
     "regex",
     "setTimeout", "setInterval", "clearTimeout", "clearInterval",
 }
@@ -47,6 +50,9 @@ _BUILTIN_RETURN_TYPES = {
     "loadImage": types_mod.ImageType(),
     "loadAudio": types_mod.AudioType(),
     "regex": types_mod.RegexType(),
+    # claude.md #89: the only two graphics builtins that return anything
+    "measureTextWidth": types_mod.PrimitiveType("int"),
+    "measureTextHeight": types_mod.PrimitiveType("int"),
 }
 
 # claude.md #55: int and float never mix directly in a binary operator.
@@ -69,6 +75,16 @@ _BUILTIN_SIGNATURES = {
     "drawImage": (types_mod.ImageType(), _INT, _INT),
     "loadImage": (_TEXT,),
     "loadAudio": (_TEXT,),  # claude.md #38
+    # claude.md #89: a colour is text (a name, #rgb/#rrggbb, or 'none'),
+    # validated at runtime rather than compile time -- the value is an
+    # arbitrary expression, so there is nothing to check here beyond its
+    # type (the same split regex() already uses for its own pattern).
+    "fillStyle": (_TEXT,),
+    "borderColor": (_TEXT,),
+    "lineWidth": (_INT,),
+    "font": (_TEXT,),
+    "measureTextWidth": (_TEXT,),
+    "measureTextHeight": (_TEXT,),
 }
 _REGEX = types_mod.RegexType()
 _AUDIO = types_mod.AudioType()

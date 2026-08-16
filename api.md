@@ -447,11 +447,69 @@ A real on-screen X11 window (via Cairo's Xlib backend), opened
 automatically the first time a program draws something, reads
 `clientWidth`/`clientHeight`, or declares one of the five event
 handlers above — `loadImage()` alone does *not* open a window (decoding
-a PNG needs no display). Undecorated, starts at 800×600, everything
-draws in solid black (no color argument in any of claude.md's own
-examples). After the entry file's top-level code finishes, if a window
-was opened, the process blocks handling redraws/input until the window
-closes.
+a PNG needs no display). Undecorated, starts at 800×600. After the entry
+file's top-level code finishes, if a window was opened, the process
+blocks handling redraws/input until the window closes.
+
+### Drawing style
+
+```festina
+fillStyle('red')            // fills: drawRect, drawCircle, drawText
+borderColor('#333')         // outlines drawRect/drawCircle
+lineWidth(4)                // border thickness, in pixels
+font('bold 20px serif')     // used by drawText and both measure calls
+```
+
+Style is set once and applies to every later draw — the same model the
+HTML canvas uses. Defaults are black fill, no border, and 16px
+sans-serif, so a program that never calls these draws exactly what it
+did before they existed.
+
+A **color** is a name (`red`, `blue`, `black`, `orange`, `teal`,
+`purple`, …), a `#rgb` or `#rrggbb` hex value, or `none`/`transparent`.
+Names are case-insensitive and `#abc` expands to `#aabbcc`, both as in
+CSS. Anything else fails immediately, at the `fillStyle()` call rather
+than at the next draw, naming the value it didn't understand — it never
+silently falls back to black.
+
+`none` is useful on both: as a fill it leaves a shape's interior
+untouched, so `borderColor` alone gives you an outline-only shape; as a
+border color it switches borders back off.
+
+```festina
+fillStyle('none')
+borderColor('purple')
+lineWidth(8)
+drawCircle(200, 200, 60)    // a purple ring, nothing inside it
+```
+
+`borderColor` outlines shapes only, not the glyphs `drawText` draws.
+
+**`font`** takes a tolerant subset of the CSS/canvas shorthand:
+whitespace-separated words in any order, where `italic`/`oblique` set
+the slant, `bold` sets the weight, a bare number or `<n>px` sets the
+size, and the first word that is none of those is the family. All of
+`'20px serif'`, `'bold 20px'`, `'italic monospace'` and
+`'monospace bold 14px'` work.
+
+### Text metrics
+
+```festina
+int w = measureTextWidth('Hello')
+int h = measureTextHeight('Hello')
+```
+
+Both measure against the current `font` and return `int`. Neither opens
+a window — text metrics depend only on the font, so they work in a
+program that never draws, and with no X server at all.
+
+`measureTextWidth` is the advance width (how far the pen moves), which
+is what you want for laying strings out one after another — the same
+thing the canvas `measureText().width` reports. `measureTextHeight` is
+the inked height of *that string*, which is why it takes the text:
+`'x'` is shorter than `'Xg'`. For a stable line height independent of
+which letters appear, measure a string with both an ascender and a
+descender.
 
 ## Timers
 

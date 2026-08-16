@@ -18,6 +18,9 @@
  */
 #include <string.h>     /* memset -- Motif WM hints */
 #include <stdio.h>      /* snprintf -- festina_load_image's error message */
+#include <stdlib.h>     /* strtol -- claude.md #89's #rrggbb colour parsing */
+#include <ctype.h>      /* isdigit/tolower -- claude.md #89's colour/font parsing */
+#include <strings.h>    /* strcasecmp -- claude.md #89's case-insensitive colour names */
 #include <sys/select.h> /* select() -- multiplexes X11 events with timers */
 #include <time.h>       /* nanosleep -- festina_graphics_init's connect retry */
 #include <X11/Xlib.h>
@@ -52,10 +55,289 @@ static void (*g_close_handler)(void) = NULL;
 static int64_t g_canvas_width = FESTINA_CANVAS_WIDTH;
 static int64_t g_canvas_height = FESTINA_CANVAS_HEIGHT;
 
+/* claude.md #89: the canvas's current drawing style. All of it is plain
+ * process-global state set by fillStyle()/borderColor()/lineWidth()/
+ * font() and read by every later draw call -- the same "set it, then
+ * draw" model the HTML canvas 2D context uses, rather than passing a
+ * style argument to every draw function (which claude.md #37/#39's own
+ * worked examples explicitly don't do: drawRect(0, 0, 100, 100) takes
+ * geometry only). Defaults reproduce exactly what these functions drew
+ * before this section existed: solid black fill, no border, 16px
+ * sans-serif -- so adding this section changes no existing program's
+ * output. */
+static double g_fill_r = 0.0, g_fill_g = 0.0, g_fill_b = 0.0;
+static int g_fill_none = 0;
+static double g_border_r = 0.0, g_border_g = 0.0, g_border_b = 0.0;
+/* Unset, not merely "black": a border is drawn only once borderColor()
+ * has actually been called with a real colour, so a program that never
+ * mentions it keeps the plain filled shapes it always had. */
+static int g_border_set = 0;
+static double g_line_width = 1.0;
+static char g_font_family[64] = "sans-serif";
+static double g_font_size = 16.0;
+static cairo_font_slant_t g_font_slant = CAIRO_FONT_SLANT_NORMAL;
+static cairo_font_weight_t g_font_weight = CAIRO_FONT_WEIGHT_NORMAL;
+
 static void festina_graphics_require_init(void) {
     if (!g_display) {
         festina_fail("a graphics function was called but the canvas window "
                       "was never created (internal compiler error)");
+    }
+}
+
+/* claude.md #89: the named colours a fillStyle()/borderColor() string may
+ * use, on top of #rgb/#rrggbb. Deliberately a small, fixed table rather
+ * than the full ~148-entry CSS list: these are the ones a program is
+ * actually likely to reach for, and every additional name is a name a
+ * typo could silently resolve to. Anything unrecognised fails loudly
+ * (see festina_parse_color) rather than defaulting to black, matching
+ * claude.md #59's "fail clearly the moment something is actually
+ * wrong" bias. */
+typedef struct {
+    const char *name;
+    double r, g, b;
+} FestinaNamedColor;
+
+static const FestinaNamedColor FESTINA_NAMED_COLORS[] = {
+    {"black",   0.0,  0.0,  0.0},
+    {"white",   1.0,  1.0,  1.0},
+    {"red",     1.0,  0.0,  0.0},
+    {"green",   0.0,  0.5,  0.0},
+    {"lime",    0.0,  1.0,  0.0},
+    {"blue",    0.0,  0.0,  1.0},
+    {"yellow",  1.0,  1.0,  0.0},
+    {"cyan",    0.0,  1.0,  1.0},
+    {"aqua",    0.0,  1.0,  1.0},
+    {"magenta", 1.0,  0.0,  1.0},
+    {"fuchsia", 1.0,  0.0,  1.0},
+    {"silver",  0.75, 0.75, 0.75},
+    {"gray",    0.5,  0.5,  0.5},
+    {"grey",    0.5,  0.5,  0.5},
+    {"maroon",  0.5,  0.0,  0.0},
+    {"olive",   0.5,  0.5,  0.0},
+    {"purple",  0.5,  0.0,  0.5},
+    {"teal",    0.0,  0.5,  0.5},
+    {"navy",    0.0,  0.0,  0.5},
+    {"orange",  1.0,  0.65, 0.0},
+    {"pink",    1.0,  0.75, 0.8},
+    {"brown",   0.65, 0.16, 0.16},
+};
+
+static int festina_hex_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    c = (char)tolower((unsigned char)c);
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    return -1;
+}
+
+/* Parses a colour string into r/g/b in 0..1. Sets *is_none for the two
+ * spellings that mean "draw nothing at all" rather than a colour.
+ * Returns 0 on a string it doesn't understand, so the caller can fail
+ * with a message naming the offending value. */
+static int festina_parse_color(const char *s, double *r, double *g, double *b, int *is_none) {
+    *is_none = 0;
+    if (!s) return 0;
+    while (*s == ' ' || *s == '\t') s++;
+
+    if (strcasecmp(s, "none") == 0 || strcasecmp(s, "transparent") == 0) {
+        *is_none = 1;
+        *r = *g = *b = 0.0;
+        return 1;
+    }
+
+    if (*s == '#') {
+        const char *h = s + 1;
+        size_t len = strlen(h);
+        int v[6];
+        if (len != 3 && len != 6) return 0;
+        for (size_t i = 0; i < len; i++) {
+            v[i] = festina_hex_value(h[i]);
+            if (v[i] < 0) return 0;
+        }
+        if (len == 3) {
+            /* #abc is #aabbcc -- each digit doubled, same as CSS. */
+            *r = (v[0] * 17) / 255.0;
+            *g = (v[1] * 17) / 255.0;
+            *b = (v[2] * 17) / 255.0;
+        } else {
+            *r = (v[0] * 16 + v[1]) / 255.0;
+            *g = (v[2] * 16 + v[3]) / 255.0;
+            *b = (v[4] * 16 + v[5]) / 255.0;
+        }
+        return 1;
+    }
+
+    for (size_t i = 0; i < sizeof(FESTINA_NAMED_COLORS) / sizeof(FESTINA_NAMED_COLORS[0]); i++) {
+        if (strcasecmp(s, FESTINA_NAMED_COLORS[i].name) == 0) {
+            *r = FESTINA_NAMED_COLORS[i].r;
+            *g = FESTINA_NAMED_COLORS[i].g;
+            *b = FESTINA_NAMED_COLORS[i].b;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void festina_fail_bad_color(const char *fn, const char *value) {
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+             "%s(): '%s' is not a colour Festina understands -- use a name "
+             "(red, blue, black, ...), a #rgb or #rrggbb hex value, or "
+             "'none' for no colour at all",
+             fn, value ? value : "null");
+    festina_fail(msg);
+}
+
+void festina_set_fill_style(const char *color) {
+    double r, g, b;
+    int none;
+    if (!festina_parse_color(color, &r, &g, &b, &none)) {
+        festina_fail_bad_color("fillStyle", color);
+    }
+    g_fill_r = r; g_fill_g = g; g_fill_b = b;
+    g_fill_none = none;
+}
+
+void festina_set_border_color(const char *color) {
+    double r, g, b;
+    int none;
+    if (!festina_parse_color(color, &r, &g, &b, &none)) {
+        festina_fail_bad_color("borderColor", color);
+    }
+    /* 'none' turns the border back off rather than setting a colour, so
+     * a program can switch borders off again after enabling them. */
+    g_border_set = !none;
+    g_border_r = r; g_border_g = g; g_border_b = b;
+}
+
+void festina_set_line_width(int64_t width) {
+    /* A negative width is meaningless to Cairo (and would silently draw
+     * nothing); clamping to 0 keeps "no border" expressible both ways. */
+    g_line_width = width < 0 ? 0.0 : (double)width;
+}
+
+/* claude.md #89: a tolerant subset of the CSS/canvas `font` shorthand --
+ * whitespace-separated words, in any order, where `italic`/`oblique` set
+ * the slant, `bold` sets the weight, a bare number or `<n>px` sets the
+ * size, and the first thing that is none of those becomes the family.
+ * Order-independence is deliberate: the strict CSS grammar requires
+ * size and family last and in that order, which is exactly the kind of
+ * rule that turns a reasonable-looking string into a silent no-op, and
+ * nothing here needs the ambiguity that grammar exists to resolve. */
+void festina_set_font(const char *spec) {
+    if (!spec) return;
+    cairo_font_slant_t slant = CAIRO_FONT_SLANT_NORMAL;
+    cairo_font_weight_t weight = CAIRO_FONT_WEIGHT_NORMAL;
+    double size = g_font_size;
+    char family[64];
+    family[0] = '\0';
+
+    const char *p = spec;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        size_t len = (size_t)(p - start);
+        char word[64];
+        if (len >= sizeof(word)) len = sizeof(word) - 1;
+        memcpy(word, start, len);
+        word[len] = '\0';
+
+        if (strcasecmp(word, "italic") == 0 || strcasecmp(word, "oblique") == 0) {
+            slant = CAIRO_FONT_SLANT_ITALIC;
+        } else if (strcasecmp(word, "bold") == 0) {
+            weight = CAIRO_FONT_WEIGHT_BOLD;
+        } else if (strcasecmp(word, "normal") == 0) {
+            /* explicit default -- accepted and ignored, as in CSS */
+        } else if (isdigit((unsigned char)word[0])) {
+            char *end = NULL;
+            double parsed = strtod(word, &end);
+            if (parsed > 0.0) size = parsed;
+        } else if (family[0] == '\0') {
+            snprintf(family, sizeof(family), "%s", word);
+        }
+    }
+
+    g_font_slant = slant;
+    g_font_weight = weight;
+    g_font_size = size;
+    if (family[0] != '\0') {
+        snprintf(g_font_family, sizeof(g_font_family), "%s", family);
+    }
+}
+
+/* Applies the current font to a context -- shared by drawing and by the
+ * measure functions, so a measurement can never disagree with what a
+ * later draw of the same string actually produces. */
+static void festina_apply_font(cairo_t *cr) {
+    cairo_select_font_face(cr, g_font_family, g_font_slant, g_font_weight);
+    cairo_set_font_size(cr, g_font_size);
+}
+
+/* claude.md #89: measuring deliberately does NOT require the canvas
+ * window. Text metrics depend only on the font, so these run against a
+ * tiny scratch image surface and work in a program that never draws
+ * anything at all (the same reasoning that keeps loadImage() from
+ * forcing a window open -- see festina_load_image's own note). */
+static cairo_t *festina_measure_context(void) {
+    static cairo_surface_t *scratch = NULL;
+    if (!scratch) {
+        scratch = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+    }
+    cairo_t *cr = cairo_create(scratch);
+    festina_apply_font(cr);
+    return cr;
+}
+
+int64_t festina_measure_text_width(const char *text) {
+    if (!text) text = "";
+    cairo_t *cr = festina_measure_context();
+    cairo_text_extents_t ext;
+    cairo_text_extents(cr, text, &ext);
+    cairo_destroy(cr);
+    /* x_advance, not the inked width: this is how far the pen moves, so
+     * laying out one string after another actually lines up. Matches
+     * the canvas 2D measureText().width. */
+    return (int64_t)(ext.x_advance + 0.5);
+}
+
+int64_t festina_measure_text_height(const char *text) {
+    if (!text) text = "";
+    cairo_t *cr = festina_measure_context();
+    cairo_text_extents_t ext;
+    cairo_text_extents(cr, text, &ext);
+    cairo_destroy(cr);
+    /* The inked height of THIS string, which is why it takes the text
+     * rather than reading the font alone -- 'x' is shorter than 'Xg'.
+     * See api.md for when font-wide line height is the better tool. */
+    return (int64_t)(ext.height + 0.5);
+}
+
+/* Fills the path already built on `cr` with the current fill colour and,
+ * when borderColor() has set one and lineWidth() is non-zero, strokes
+ * the same path on top. Shared by every filled shape so they can never
+ * drift apart. Preserves the path across the fill (cairo_fill_preserve)
+ * only when a border is actually going to use it. */
+static void festina_fill_and_border(cairo_t *cr) {
+    int border = g_border_set && g_line_width > 0.0;
+    if (!g_fill_none) {
+        cairo_set_source_rgb(cr, g_fill_r, g_fill_g, g_fill_b);
+        if (border) {
+            cairo_fill_preserve(cr);
+        } else {
+            cairo_fill(cr);
+        }
+    } else if (!border) {
+        /* nothing to fill and nothing to stroke -- clear the path so it
+         * doesn't leak into whatever this context draws next */
+        cairo_new_path(cr);
+        return;
+    }
+    if (border) {
+        cairo_set_source_rgb(cr, g_border_r, g_border_g, g_border_b);
+        cairo_set_line_width(cr, g_line_width);
+        cairo_stroke(cr);
     }
 }
 
@@ -185,9 +467,8 @@ static void festina_graphics_present(void) {
 void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
     festina_graphics_require_init();
     cairo_t *cr = cairo_create(g_backing_surface);
-    cairo_set_source_rgb(cr, 0, 0, 0);
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
-    cairo_fill(cr);
+    festina_fill_and_border(cr); /* claude.md #89 */
     cairo_destroy(cr);
     festina_graphics_present();
 }
@@ -195,9 +476,8 @@ void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
 void festina_draw_circle(int64_t x, int64_t y, int64_t r) {
     festina_graphics_require_init();
     cairo_t *cr = cairo_create(g_backing_surface);
-    cairo_set_source_rgb(cr, 0, 0, 0);
     cairo_arc(cr, (double)x, (double)y, (double)r, 0.0, 2.0 * 3.14159265358979323846);
-    cairo_fill(cr);
+    festina_fill_and_border(cr); /* claude.md #89 */
     cairo_destroy(cr);
     festina_graphics_present();
 }
@@ -206,9 +486,11 @@ void festina_draw_text(const char *text, int64_t x, int64_t y) {
     festina_graphics_require_init();
     if (!text) text = "";
     cairo_t *cr = cairo_create(g_backing_surface);
-    cairo_set_source_rgb(cr, 0, 0, 0);
-    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 16);
+    /* claude.md #89: drawn in the current fill colour and font. Text is
+     * filled only -- borderColor outlines shapes, not glyphs. */
+    if (g_fill_none) { cairo_destroy(cr); return; }
+    cairo_set_source_rgb(cr, g_fill_r, g_fill_g, g_fill_b);
+    festina_apply_font(cr);
     cairo_move_to(cr, (double)x, (double)y);
     cairo_show_text(cr, text);
     cairo_destroy(cr);
