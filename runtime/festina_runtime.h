@@ -32,6 +32,28 @@ char *festina_str_from_int(int64_t v);
 char *festina_str_from_float(double v);
 char *festina_str_from_bool(int8_t v);
 char *festina_str_concat(const char *a, const char *b);
+char *festina_text_own(const char *s);  /* claude.md #83: NULL-safe strdup */
+
+/* claude.md #93: math, files and time -- all libc/libm, both already on
+ * every link line, so none of this costs a new dependency.
+ *
+ * festina_read_file returns NULL (Festina's null text) for anything it
+ * cannot read and festina_format_time returns NULL for a format that
+ * produces nothing, rather than failing the program: a missing file or
+ * a bad format is an ordinary condition a program should be able to
+ * test for, the same reasoning claude.md #57 applies to division by
+ * zero. The write helpers return 0/1 for the same reason, and count a
+ * failing fclose as a failed write (a full disk can fail there even
+ * when every fwrite succeeded). festina_random is plain rand() --
+ * suitable for gameplay and sampling, explicitly not for cryptography. */
+double festina_random(void);
+char *festina_read_file(const char *path);
+int8_t festina_write_file(const char *path, const char *content);
+int8_t festina_append_file(const char *path, const char *content);
+int8_t festina_file_exists(const char *path);
+int8_t festina_delete_file(const char *path);
+int64_t festina_now_ms(void);
+char *festina_format_time(int64_t ms, const char *format);
 int8_t festina_str_eq(const char *a, const char *b);
 
 /*
@@ -94,12 +116,34 @@ sqlite3_stmt *festina_sqlite_prepare(sqlite3 *db, const char *sql);
 void festina_sqlite_bind_int(sqlite3_stmt *stmt, int32_t idx, int64_t val);
 void festina_sqlite_bind_float(sqlite3_stmt *stmt, int32_t idx, double val);
 void festina_sqlite_bind_text(sqlite3_stmt *stmt, int32_t idx, const char *val);
+void festina_sqlite_bind_blob(sqlite3_stmt *stmt, int32_t idx, const void *data, int64_t len);
 void festina_sqlite_bind_null(sqlite3_stmt *stmt, int32_t idx);
+
+/* claude.md #101: an `aud`/`img` table column stores the asset's own
+ * encoded bytes as a BLOB, so reading such a row has to turn bytes back
+ * into a handle. This translation unit must not reference the graphics
+ * or audio ones by name -- that separation is what lets a program using
+ * neither link neither (see this file's top-of-file note) -- so main()
+ * registers the decoders instead, exactly when the program already
+ * links that feature. Unregistered, such a column reads as null rather
+ * than crashing. */
+void festina_set_audio_decoder(void *(*fn)(const void *, int64_t, const char *));
+void festina_set_image_decoder(void *(*fn)(const void *, int64_t, const char *));
 
 /* Runs a prepared statement to completion and finalizes it, discarding
  * any rows (INSERT/UPDATE/DELETE, or a SELECT whose result isn't
  * captured into an arr[Table]). */
 void festina_sqlite_exec(sqlite3_stmt *stmt);
+
+/* claude.md #94: single-value queries -- the first column of the first
+ * row, then finalize. Receiving a result used to require declaring a
+ * `table`, which CREATES one (claude.md #28-31's schema sync), so a
+ * `count(*)` left a throwaway table in the database; these need no
+ * schema at all. No rows, or a SQL NULL, answers with Festina's own
+ * null for that type rather than failing. */
+int64_t festina_sqlite_scalar_int(sqlite3_stmt *stmt);
+double festina_sqlite_scalar_float(sqlite3_stmt *stmt);
+char *festina_sqlite_scalar_text(sqlite3_stmt *stmt);
 
 /* Steps a prepared statement to completion, collecting each row per the
  * layout above, then finalizes it. col_types has col_count entries,
@@ -123,9 +167,15 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
  *
  * festina_regex_compile compiles `pattern` once per call (REG_EXTENDED,
  * plus REG_ICASE if `flags` contains 'i') and returns the resulting
- * regex_t*, heap-allocated and never freed -- same "no GC yet, things
- * leak" tradeoff every other heap allocation in this runtime already
- * makes (see festina/codegen.py's module docstring). An invalid
+ * regex_t*, heap-allocated. claude.md #85: a regex produced by a
+ * runtime `regex(...)` call and consumed as a temporary in the same
+ * expression (`regex(p).test(s)`) is freed via festina_regex_free once
+ * that expression is done with it -- previously such a regex leaked on
+ * every evaluation, which a `regex(...)` inside a loop turned into an
+ * unbounded leak. A /pattern/ literal is compiled once and cached for
+ * the life of the process (see _emit_cached_regex_lit) and so is
+ * deliberately never freed, as is a regex bound to a variable. An
+ * invalid
  * pattern calls festina_fail() with regerror()'s message -- claude.md
  * #67: pattern validity is a runtime concern, the Python compiler
  * doesn't parse regex syntax itself.
@@ -140,6 +190,7 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
  * unchanged (not NULL) when there's no match, per claude.md #68.
  */
 void *festina_regex_compile(const char *pattern, const char *flags);
+void festina_regex_free(void *compiled);  /* claude.md #85: regfree + free */
 int8_t festina_regex_test(void *compiled, const char *text);
 char *festina_regex_match(void *compiled, const char *text);
 char *festina_str_replace(const char *text, const char *search,
@@ -199,26 +250,34 @@ char *festina_regex_replace(void *compiled, const char *text,
  * doesn't never opens a window, exactly like festina_db_open() only
  * ever runs for a program that declares a `table`.
  *
- * festina_load_image supports PNG only, via Cairo's own built-in
- * decoder -- claude.md #37: "Supported image formats are determined by
- * the runtime," and PNG is the one format Cairo can decode without
- * pulling in another image-format library.
+ * festina_load_image supports PNG (via Cairo's own built-in decoder)
+ * and, since claude.md #101, JPEG (via libjpeg) -- claude.md #37:
+ * "Supported image formats are determined by the runtime." libjpeg
+ * rather than a heavier toolkit for the same reason Xlib was picked
+ * over a GUI toolkit: the smallest dependency that does the job.
+ * Format is sniffed from the MAGIC BYTES, not the file extension -- a
+ * blob out of a database column has no extension, and an extension was
+ * never evidence of anything anyway.
  *
  * festina_register_click_handler/_mouse_handler take a fixed
- * `void (*)(int64_t, int64_t)` signature, festina_register_key_handler
- * takes a fixed `void (*)(const char *)` signature, and
+ * `void (*)(int64_t, int64_t)` signature,
+ * festina_register_key_down_handler/_key_up_handler take a fixed
+ * `void (*)(const char *)` signature, and
  * festina_register_resize_handler/_close_handler take a fixed
  * `void (*)(void)` signature -- each matches the parameters claude.md
  * #40's own worked example declares for that event exactly
- * (`on click(x:int, y:int)`, `on key(key:text)`, `on resize()`, ...);
- * festina/semantic.py's _EVENT_SIGNATURES enforces that any handler for
- * one of these five names is actually declared that way before codegen
- * ever emits a call here, so a mismatch would otherwise be a silent ABI
- * mismatch rather than a caught compile error. The key handler's text
- * comes from XLookupString (a key that types a character, e.g. "a",
- * "5", " ") falling back to XKeysymToString (a named key with no text
- * of its own, e.g. "Left", "Escape", "Return") -- see
- * festina_handle_graphics_event's own comment in festina_runtime.c.
+ * (`on click(x:int, y:int)`, `on keyDown(key:text)`, `on resize()`,
+ * ...); festina/semantic.py's _EVENT_SIGNATURES enforces that any
+ * handler for one of these six names is actually declared that way
+ * before codegen ever emits a call here, so a mismatch would otherwise
+ * be a silent ABI mismatch rather than a caught compile error. Both key
+ * handlers' text comes from the same festina_key_name helper --
+ * XLookupString (a key that types a character, e.g. "a", "5", " ")
+ * falling back to XKeysymToString (a named key with no text of its own,
+ * e.g. "Left", "Escape", "Return") -- so keyUp always reports exactly
+ * what keyDown reported for the same physical key. claude.md #98:
+ * auto-repeat is filtered, so holding a key does not fire a phantom
+ * keyUp between repeats -- see festina_key_event_is_autorepeat.
  * `on resize` intentionally clears the canvas back to white at the new
  * size rather than preserving old content, matching how resizing a browser's
  * `<canvas>` element also clears it (clientWidth/clientHeight below are
@@ -257,10 +316,146 @@ void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h);
 void festina_draw_circle(int64_t x, int64_t y, int64_t r);
 void festina_draw_text(const char *text, int64_t x, int64_t y);
 void *festina_load_image(const char *path);
+/* claude.md #101: the image counterparts of the two audio entry points
+ * above, with one difference -- an image that never came from a file
+ * (a clip() or resize() result) has no source bytes, so
+ * festina_image_bytes encodes PNG on demand and caches it. */
+void *festina_image_from_bytes(const void *data, int64_t len, const char *label);
+const void *festina_image_bytes(void *img, int64_t *out_len);
+/* claude.md #92: img methods and properties. An `img` value is a
+ * pointer to a small box holding the Cairo surface, not the surface
+ * itself -- that indirection is what lets resize() change the image in
+ * place, so every binding sharing it sees the new size (a Cairo surface
+ * cannot be resized in place). clip() returns a NEW image and leaves
+ * the source untouched, so one spritesheet can be clipped repeatedly;
+ * a region reaching past the edge copies the overlap and leaves the
+ * rest transparent rather than failing. Both reject a non-positive
+ * width or height, which Cairo would otherwise accept and turn into a
+ * surface nothing can draw. */
+/* claude.md #93: saves the backing canvas as a PNG via Cairo's own
+ * writer, already compiled in alongside the reader loadImage uses. */
+int8_t festina_save_canvas(const char *path);
+
+/* claude.md #95: the canvas exists without a window.
+ *
+ * Drawing paints an offscreen image surface that needs no X server at
+ * all; render() is the single call that puts it on screen, opening the
+ * window the first time it runs. That split does three things: a
+ * program that draws and saves a PNG never opens a window or enters an
+ * event loop (so it runs on a build server or over ssh), "does this
+ * need a GUI?" becomes answerable by looking for render(), and a frame
+ * costs one blit instead of one per shape -- drawing used to flush the
+ * whole canvas to X on every single call.
+ *
+ * clearCanvas() deliberately ignores the current transform (a rotated
+ * "erase everything" leaving wedges behind would be a trap);
+ * clearRect() honours it, since it names a region in the same
+ * coordinates as the drawing around it. */
+void festina_render(void);
+void festina_clear_canvas(void);
+void festina_clear_rect(int64_t x, int64_t y, int64_t w, int64_t h);
+
+/* claude.md #94: paths, transforms, gradients and alpha.
+ *
+ * Every drawing function builds its own short-lived Cairo context, so a
+ * transform has to live outside any one of them and be applied to each
+ * -- that is what makes translate()/rotate()/scale() affect everything
+ * drawn afterwards. saveState()/restoreState() save the whole drawing
+ * state (transform, colours, alpha, line width, font), matching the
+ * canvas save()/restore() they mirror; restoring a transform while
+ * leaving a colour changed is the kind of half-measure that produces
+ * baffling bugs.
+ *
+ * A path is built across separate calls, so one context stays open from
+ * beginPath() until fillPath()/strokePath() consumes it -- as in the
+ * canvas model, where fill()/stroke() end the current path. Using any
+ * of the path builders with no path open is a clean failure naming the
+ * missing beginPath().
+ *
+ * Gradients take exactly two stops. That covers essentially every
+ * gradient a program actually draws and needs no new value type, where
+ * an n-stop version would need a whole gradient object; a gradient
+ * replaces the flat fill until the next fillStyle(). Rotation is in
+ * DEGREES -- this language has no angle type to make the unit
+ * self-documenting, and Math.PI is there for anyone wanting radians. */
+void festina_set_alpha(double alpha);
+void festina_fill_linear_gradient(int64_t x0, int64_t y0, int64_t c0,
+                                   int64_t x1, int64_t y1, int64_t c1);
+void festina_fill_radial_gradient(int64_t x, int64_t y, int64_t radius,
+                                   int64_t inner, int64_t outer);
+void festina_translate(int64_t x, int64_t y);
+void festina_rotate(double degrees);
+void festina_scale(double sx, double sy);
+void festina_reset_transform(void);
+void festina_save_state(void);
+void festina_restore_state(void);
+void festina_begin_path(void);
+void festina_move_to(int64_t x, int64_t y);
+void festina_line_to(int64_t x, int64_t y);
+void festina_curve_to(int64_t cx1, int64_t cy1, int64_t cx2, int64_t cy2,
+                       int64_t x, int64_t y);
+void festina_close_path(void);
+void festina_fill_path(void);
+void festina_stroke_path(void);
+int64_t festina_image_width(void *img);
+int64_t festina_image_height(void *img);
+void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
+void festina_image_resize(void *img, int64_t w, int64_t h);
+void festina_image_free(void *img);
 void festina_draw_image(void *img, int64_t x, int64_t y);
+/* claude.md #89/#90: canvas drawing style -- process-global state set by
+ * fillStyle()/borderColor()/lineWidth()/font() and read by every later
+ * draw call, the same "set it, then draw" model the HTML canvas 2D
+ * context uses.
+ *
+ * Everything arrives here already resolved. Festina source writes
+ * fillStyle('red') and font('arial 14px bold'), but the compiler turns
+ * both into the numeric forms below (festina/colors.py), so this
+ * runtime holds no colour-name table, no hex parsing and no font
+ * grammar, and does none of that work per draw call.
+ *
+ * A negative colour component means "no colour at all" -- Festina's
+ * 'none'/'transparent' -- which needs no extra argument to express,
+ * since no real channel value can be negative. For fonts, a
+ * non-positive `px` or a NULL string means "leave that aspect alone",
+ * which is what lets font('14px') change only the size.
+ *
+ * The two measure functions deliberately need no canvas window -- text
+ * metrics depend only on the font, so they run against a scratch
+ * surface. */
+/* claude.md #91: the compiled form of a Festina `font` value. Codegen
+ * emits one of these as read-only data per distinct font literal (see
+ * _emit_font_constant) and changeFont() is handed a pointer to it, so
+ * declaring a font costs no runtime work at all. Layout must stay in
+ * step with FESTINA_FONT_LLVM_TYPE in festina/codegen.py. `px <= 0`
+ * means "leave the size alone" and a NULL family means "leave the
+ * family alone", which is what lets `font small = '12px'` change only
+ * the size. */
+typedef struct {
+    int64_t px;
+    int64_t slant;   /* 0 normal, 1 italic */
+    int64_t weight;  /* 0 normal, 1 bold */
+    const char *family;
+} FestinaFont;
+
+void festina_set_fill_rgb(int64_t r, int64_t g, int64_t b);
+void festina_set_border_rgb(int64_t r, int64_t g, int64_t b);
+/* claude.md #91: a `color` value -- packed 0xRRGGBB, negative = 'none'. */
+void festina_set_fill_color(int64_t packed);
+void festina_set_border_color(int64_t packed);
+void festina_set_font_value(const FestinaFont *f);
+void festina_set_line_width(int64_t width);
+void festina_set_font(int64_t px, const char *style, const char *family);
+int64_t festina_measure_text_width(const char *text);
+int64_t festina_measure_text_height(const char *text);
 void festina_register_click_handler(void (*handler)(int64_t, int64_t));
 void festina_register_mouse_handler(void (*handler)(int64_t, int64_t));
-void festina_register_key_handler(void (*handler)(const char *));
+/* claude.md #98: `on key` became `on keyDown` + `on keyUp`, so what
+ * was one registration is now two -- both taking the same fixed
+ * `void (*)(const char *)` signature and both fed the same key name,
+ * so a program can match a release against the press that started it. */
+void festina_register_key_down_handler(void (*handler)(const char *));
+void festina_register_key_up_handler(void (*handler)(const char *));
 void festina_register_resize_handler(void (*handler)(void));
 void festina_register_close_handler(void (*handler)(void));
 int64_t festina_client_width(void);
@@ -334,18 +529,16 @@ void festina_run_timer_loop(void);
  * that does the job (claude.md #59; the same reasoning that picked
  * Xlib over a GUI toolkit for graphics).
  *
- * festina_load_audio only supports WAV (16-bit PCM) -- claude.md's own
- * example names a `.mp3`, but unlike Cairo (which decodes PNG on its
- * own, so images support PNG "for free") nothing this project already
- * depends on can decode MP3 without a real new library, so WAV -- a
- * container simple enough to parse directly in festina_runtime.c with
- * zero decoder dependencies at all -- is the implementation-defined
- * choice here, the same kind of call PNG-only images already made.
- * Anything else (a compressed WAV, 8/24/32-bit PCM, an actual MP3,
- * ...) fails at load time with a clear message, not a crash or silent
- * garbage.
+ * festina_load_audio supports WAV (16-bit PCM), parsed directly here
+ * since RIFF is simple enough to walk, and -- since claude.md #101 --
+ * MP3 via libmpg123, which claude.md's own `.mp3` example always
+ * implied. libmpg123 is the audio counterpart of libjpeg above and was
+ * chosen the same way. Format is sniffed from content, not from the
+ * file extension. Anything else (a compressed WAV, 8/24/32-bit PCM,
+ * Ogg, FLAC, ...) fails at load time with a clear message naming both
+ * supported formats, not a crash or silent garbage.
  *
- * festina_audio_play(): calling play() opens (and configures) the ALSA
+ * festina_audio_play_on(): calling play() opens (and configures) the ALSA
  * device *synchronously*, right there in the play() call itself -- not
  * on the background thread described below -- so a missing or unusable
  * audio device fails loudly and immediately at the call site
@@ -356,21 +549,62 @@ void festina_run_timer_loop(void);
  * clip doesn't block the rest of the program -- matching what having a
  * separate isPlaying() to poll, and a separate stop() to interrupt,
  * both imply about play() being non-blocking. Calling play() again
- * while a clip is already playing restarts it from the beginning
- * (stopping the previous playback thread first) -- claude.md #38
- * doesn't say what play()-while-playing should do; this is the least
- * surprising choice, matching a browser's own `<audio>` element.
+ * while a clip is already playing no longer cuts the first playback
+ * off (claude.md #98). Each `aud` owns a POOL of voices -- one thread
+ * and one ALSA handle per simultaneous playback, all streaming the
+ * same decoded PCM buffer read-only, so N voices cost N devices and
+ * never N copies of the audio. play() takes the first idle voice; the
+ * clip's own samples are loaded once, at loadAudio() time, and are
+ * never re-decoded per voice.
  *
- * festina_audio_stop() signals the background thread and *joins* it
- * before returning, so festina_audio_is_playing() is guaranteed false
- * the instant stop() returns, not just "false soon" -- calling stop()
- * when nothing is playing is a safe no-op. A clip that reaches its own
- * natural end (never stopped) also sets playing back to false, but its
- * thread is never explicitly joined by anything in that case -- for a
- * typical short-lived compiled Festina program this is an accepted,
- * deliberate tradeoff (the OS reclaims everything at process exit
- * regardless) rather than machinery to track and join every
- * already-finished playback thread that nothing asked to stop.
+ * claude.md #99 made the pool PROCESS-GLOBAL rather than per-`aud`,
+ * and named its slots CHANNELS. Two different clips have to be able to
+ * share one -- `adventureMusic.playLoop(0)` then
+ * `battleMusic.playLoop(0)` hands channel 0 over -- which cannot be
+ * expressed at all when each clip owns its own pool and "channel 0"
+ * means two different things. It is also what lets
+ * stopAudioPlayer(0) be a plain free function instead of something
+ * that would have to name a clip to find the channel.
+ *
+ * The pool defaults to 10 channels, overridable with
+ * setMaxAudioPlayers(n) (festina_set_max_audio_players below). When
+ * every unreserved channel within the limit is busy, the OLDEST is
+ * stolen -- at the limit something has to give, and the sound that has
+ * been playing longest is closest to finishing anyway, whereas
+ * dropping the NEW play would silence a rapid-fire effect at exactly
+ * the moment it fires fastest. At a limit of 1 this reduces exactly to
+ * the old restart-from-the-beginning behaviour, which is what makes
+ * setMaxAudioPlayers(1) a real way to ask for it back.
+ *
+ * playLoop() RESERVES its channel: a reserved channel is never chosen
+ * by automatic assignment and never stolen, so a looping music track
+ * cannot be evicted by an ordinary sound effect. Only an explicit
+ * play(n)/playLoop(n) on that exact channel, stopAudioPlayer(n), or
+ * that clip's own stop() releases it. An explicit play(n) both takes
+ * the channel over and hands it back to the pool, since a one-shot has
+ * nothing to reserve it for.
+ *
+ * claude.md #100 REMOVED the per-clip stop. One clip can be playing on
+ * several channels at once -- three overlapping gunshots are the
+ * ordinary case, not the exotic one -- so "stop this clip" never named
+ * one thing, and its only honest reading (stop every copy) is almost
+ * never what a program firing overlapping effects wants. Channels are
+ * how playback is addressed: festina_stop_audio_player(n) for one,
+ * festina_stop_audio_player(-1) for all. Both *join* rather than merely
+ * signalling, so a stopped channel is guaranteed idle the instant the
+ * call returns, not just "idle soon"; stopping a channel with nothing
+ * on it is a safe no-op.
+ *
+ * festina_audio_is_playing() survives, and stays clip-wide: "is this
+ * sound audible anywhere" is still a meaningful question with a single
+ * answer, unlike "stop it".
+ *
+ * A voice that reaches its own natural end clears itself but stays
+ * *joinable*: whoever next claims that slot joins the finished thread
+ * first. That is what makes the pool genuinely reusable rather than
+ * leaking one thread per play() over a long-running game -- the
+ * previous single-voice design could get away with never joining a
+ * naturally-finished thread precisely because it only ever had one.
  *
  * Audio does not keep a program running the way an uncleared
  * setInterval does (see festina_set_interval above) -- if main()
@@ -379,9 +613,41 @@ void festina_run_timer_loop(void);
  * closes), it does not wait for playback to finish.
  */
 void *festina_load_audio(const char *path);
-void festina_audio_play(void *audio);
-void festina_audio_stop(void *audio);
+/* claude.md #101: decoding from memory is the primitive; loading a path
+ * is "read the file, then decode the bytes". `label` only names the
+ * source in an error message. festina_audio_bytes hands back the bytes
+ * the clip was decoded from, for storing an `aud` in a sqlite BLOB
+ * column -- so a round trip is byte-identical and an MP3 stays an MP3
+ * rather than becoming a much larger WAV. */
+void *festina_audio_from_bytes(const void *data, int64_t len, const char *label);
+const void *festina_audio_bytes(void *audio, int64_t *out_len);
+/* claude.md #101: frees a clip codegen has proven this scope created
+ * and never shared -- the aud counterpart of festina_image_free, which
+ * `img` has had since claude.md #92. Stops any channel still playing it
+ * first, so "freed while a thread is streaming it" cannot happen. */
+void festina_audio_free(void *audio);
+/* claude.md #38/#99: `channel` names a channel and `explicit_channel`
+ * says whether the program actually named one (a bare play() passes 0
+ * and gets automatic assignment); `looping` selects playLoop() over
+ * play(). One entry point rather than four, because the four differ
+ * only in these two flags -- claiming a channel, opening a device and
+ * spawning a thread are identical for all of them. */
+void festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel,
+                            int8_t looping);
 int8_t festina_audio_is_playing(void *audio);
+/* claude.md #99: stopAudioPlayer(n) -- stop one channel and release its
+ * reservation. A negative channel means every channel, which is what a
+ * bare stopAudioPlayer() compiles to. */
+void festina_stop_audio_player(int64_t channel);
+/* claude.md #98: the channel-pool limit. Clamped into [1, 64] rather
+ * than rejected -- this is a tuning knob, and failing a program over a
+ * number that is merely unreasonable would be a worse trade than
+ * giving it the nearest workable one. The getter exists so a program
+ * can read back what it actually got after clamping. claude.md #99:
+ * this bounds AUTOMATIC assignment only; an explicitly named channel is
+ * honoured anywhere in [0, 64). */
+void festina_set_max_audio_players(int64_t max);
+int64_t festina_get_max_audio_players(void);
 
 /*
  * claude.md #71: environment.NAME / environment[keyExpr].
@@ -483,6 +749,35 @@ void festina_map_free_entries(int64_t count, void *entries);
  * festina_retain/festina_release, always safe to call on any arr[T]/
  * map[T] value, including a null one.
  */
+/* claude.md #96: array methods. The header layout is the one
+ * festina/codegen.py's FESTINA_ARRAY_LLVM_TYPE describes ({length,
+ * data}), shared here the same way the sqlite row layout already is,
+ * since these have to resize a buffer codegen allocated. Values move by
+ * BYTES with the element size passed in, so one set of functions covers
+ * every arr[T] instead of a family per element type.
+ *
+ * Ownership of a removed element TRANSFERS to whoever receives it
+ * (pop/shift hand it back, splice hands it to the returned array), so
+ * nothing here releases anything -- that would free a value the caller
+ * is about to be given. pop/shift leave *out untouched when there is
+ * nothing to remove, because codegen has already stored the element
+ * type's own null there. splice clamps exactly as JavaScript's does,
+ * negative start included, so `splice(i, 1)` at a boundary is a no-op
+ * rather than a crash. */
+void festina_array_push(void *hdr, int64_t elem_size, const void *value);
+void festina_array_unshift(void *hdr, int64_t elem_size, const void *value);
+int8_t festina_array_pop(void *hdr, int64_t elem_size, void *out);
+int8_t festina_array_shift(void *hdr, int64_t elem_size, void *out);
+void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
+                           int64_t count, void *dst_hdr);
+/* claude.md #97: the first index holding `value`, or -1 if absent.
+ * -1 rather than null because the answer is an index and every use of
+ * one is a comparison or a splice argument. Compares the raw 8-byte
+ * slot, which is right for int/float/bool and for identity on
+ * struct/arr/map; `text` sets is_text so equal strings in different
+ * buffers still match. */
+int64_t festina_array_index_of(void *hdr, int64_t elem_size,
+                                const void *value, int8_t is_text);
 void festina_release_array(void *payload);
 void festina_release_map(void *payload);
 

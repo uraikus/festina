@@ -19,16 +19,16 @@ exactly what's missing):
 | Python 3 | Runs the compiler frontend itself (`bin/festina` execs `python3 -m festina.cli`) — only if running from source; see the packaged-binary option below to avoid this entirely | Required (unless using the packaged binary) |
 | A C compiler (`clang` or `gcc`) | Compiles the runtime and links the final binary | Required (either works) |
 | `libsqlite3-dev` (headers) | The runtime's core translation unit does `#include <sqlite3.h>` — needed to compile *any* program, since `festina.sqlite` support (`claude.md #8/#28-31`) is always on | Required |
-| `libcairo2-dev` + `libx11-dev` (headers) | Only needed to compile a *program that actually uses graphics* (`claude.md #37/#39`'s `img`/`draw*`/`on click`/etc.) — the graphics runtime translation unit isn't even compiled otherwise | Required only if you'll compile graphics-using programs |
-| `libasound2-dev` (headers) | Same story, for `claude.md #38`'s `aud`/`loadAudio()` | Required only if you'll compile audio-using programs |
-| `pkg-config` | Locates sqlite3's (and, conditionally, Cairo/X11's/ALSA's) compile/link flags | Required |
+| `libcairo2-dev` + `libx11-dev` + `libjpeg-dev` (headers) | Only needed to compile a *program that actually uses graphics* (`claude.md #37/#39`'s `img`/`draw*`/`on click`/etc.) — the graphics runtime translation unit isn't even compiled otherwise. `libjpeg` is `claude.md #101`'s JPEG decoding; Cairo handles PNG on its own | Required only if you'll compile graphics-using programs |
+| `libasound2-dev` + `libmpg123-dev` (headers) | Same story, for `claude.md #38`'s `aud` — ALSA for playback, `libmpg123` for `claude.md #101`'s MP3 decoding (WAV is parsed directly, with no library at all) | Required only if you'll compile audio-using programs |
+| `pkg-config` | Locates sqlite3's (and, conditionally, Cairo/X11's/libjpeg's/ALSA's/libmpg123's) compile/link flags | Required |
 | `llvm` (provides `libLLVM`) | Lets `festina/llvm_backend.py` compile IR directly (the fast path, and the one that makes `gcc` usable at all) | Recommended — without it, the C compiler must specifically be `clang`, since only clang can parse the `.ll` IR text this compiler falls back to handing it directly (verified: `gcc` hands it to `ld`, which fails treating it as a corrupt linker script) |
 
 Missing any of these fails with a specific, actionable error (`claude.md
 #59`) rather than a raw traceback — naming the tool and how to get it.
 If you don't know ahead of time whether every program you'll ever
-compile needs graphics/audio, the simplest move is installing all five
-system packages up front (below) — a *compiled program* only ends up
+compile needs graphics/audio, the simplest move is installing all
+seven system packages up front (below) — a *compiled program* only ends up
 depending on the ones it actually uses (that's the whole point of
 [security.md](security.md#binary-slimming)'s binary-slimming split);
 it's only the *compiler's own build-time* dependency list that's
@@ -45,7 +45,8 @@ POSIX, already part of libc too.
 Debian/Ubuntu:
 
 ```bash
-sudo apt install clang libsqlite3-dev libcairo2-dev libx11-dev libasound2-dev pkg-config
+sudo apt install clang libsqlite3-dev libcairo2-dev libx11-dev libjpeg-dev \
+                 libasound2-dev libmpg123-dev pkg-config
 ```
 
 `clang` conveniently pulls in `libLLVM` as a dependency, covering both
@@ -111,7 +112,7 @@ in any requirements file:
 | Extra tool | Needed for | Install |
 |---|---|---|
 | `pyinstaller` | `tests/test_packaging.py` (2 tests) | `pip install -r requirements-build.txt` |
-| `Xvfb` + `xdotool` | Interactive graphics tests — clicking, moving the mouse, pressing keys, resizing a real (virtual) window (`TestGraphics`, plus `TestTimers`'s combined graphics+timers case; 6 tests) | `sudo apt install xvfb xdotool` on Debian/Ubuntu — a real `$DISPLAY` works too, if one is already available |
+| `Xvfb` + `xdotool` + `xwd` | Interactive graphics tests — clicking, moving the mouse, pressing keys, resizing a real (virtual) window, and reading canvas pixels back to check `claude.md #89`'s colours and fonts actually render (`TestGraphics`, `TestCanvasStyleRendersRealPixels`, plus `TestTimers`'s combined graphics+timers case) | `sudo apt install xvfb xdotool x11-apps` on Debian/Ubuntu (`xwd` ships in `x11-apps`) — a real `$DISPLAY` works too, if one is already available |
 | `openbox` (+ optional `xprop`, from `x11-utils`) | One regression test for a real window-manager crash (see [security.md](security.md#graphics-a-real-window-manager-crash-badmatch-on-xsetinputfocus)) that a bare Xvfb instance (no WM at all) can never reproduce (`TestGraphics::test_graphics_init_does_not_crash_under_a_real_window_manager`; 1 test) | `sudo apt install openbox x11-utils` on Debian/Ubuntu — `xprop` is only used to poll for the WM's own readiness signal instead of a fixed sleep; the test still runs (with a fixed sleep instead) without it |
 
 Every one of those skips cleanly and independently when its tool isn't

@@ -126,9 +126,18 @@ class TestIndividualExamples:
         lines = result.stdout.splitlines()
         assert lines[0] == "playing..."
         assert lines[1] == "isPlaying(): true"
-        assert lines[2].startswith("isPlaying() after 100ms: ")
-        assert lines[3] == "stopping early"
-        assert lines[4] == "isPlaying() after stop(): false"
+        # claude.md #98: the demo now also shows the channel pool, so
+        # two more play() calls layer on top of the first instead of
+        # restarting it.
+        assert lines[2] == "pooled channels: 10"
+        # claude.md #99: a reserved, looping channel, released by name.
+        assert lines[3] == "looping on channel 0: true"
+        assert lines[4] == "after stopAudioPlayer(0): false"
+        assert lines[5].startswith("isPlaying() after 100ms: ")
+        assert lines[6] == "stopping early"
+        # claude.md #100: playback is stopped by channel; a bare
+        # stopAudioPlayer() stops every one.
+        assert lines[7] == "isPlaying() after stopAudioPlayer(): false"
 
     def test_maps_demo_runs_correctly(self, cli_mod, tmp_path):
         result = _run_example(cli_mod, tmp_path, "maps.f")

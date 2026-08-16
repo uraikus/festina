@@ -7,7 +7,7 @@ overhead, and the boilerplate. Festina compiles through LLVM to a real,
 standalone executable — with SQLite, graphics, audio, and JS-style
 timers built directly into the language, not bolted on as libraries.
 
-[![Tests](https://img.shields.io/badge/tests-812%20passing-brightgreen)](tests/CONTRACT.md)
+[![Tests](https://img.shields.io/badge/tests-1008%20passing-brightgreen)](tests/CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ```festina
@@ -42,7 +42,8 @@ bin/festina compile examples/greet.f -o greet && ./greet
   `festina.sqlite` is created, migrated, and kept in sync automatically
   — no ORM, no migration scripts, no setup code.
 - **Graphics and audio, no dependencies to wire up yourself.** A real
-  on-screen canvas (`drawRect`, `on click`, ...) and real audio playback
+  on-screen canvas (`drawRect`, `on click`, typed `color`/`font` values,
+  ...) and real audio playback
   (`loadAudio().play()`) are just functions, backed by Cairo/X11 and
   ALSA under the hood.
 - **JavaScript syntax, none of the surprises.** Template strings,
@@ -111,6 +112,10 @@ table People { id:int  name:text }
 arr[People] people = sqlite('SELECT * FROM People')
 
 // Graphics -- a real window, opened on first use
+color brand = '#4a90d9'
+font  title = 'bold 24px sans-serif'
+fillStyle(brand)
+changeFont(title)
 drawRect(0, 0, 100, 100)
 on click(x:int, y:int) { log(`clicked ${x}, ${y}`) }
 
@@ -185,7 +190,7 @@ needs.
 
 Festina is under active development, but not vaporware — the compiler
 frontend, LLVM codegen backend, and native C runtime are real and
-tested: **812 tests, 0 failures.** Every `claude.md` language construct
+tested: **1008 tests, 0 failures.** Every `claude.md` language construct
 this project has committed to is implemented end to end, not just
 parsed. See [`tests/CONTRACT.md`](tests/CONTRACT.md) for exactly what's
 covered and how, and [todo.md](todo.md) for what's next (macOS, Windows,

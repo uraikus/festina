@@ -548,6 +548,116 @@ for the full design writeup.
   effort ever found and confirmed (as opposed to a mere resource leak)
   is closed.
 
+  `claude.md #83` (stage 9) closes the largest remaining *resource*
+  leak, and the one no audit had looked at: stages 1-7 covered
+  `struct`/`arr[T]`/`map[T]` and left `text` out of all of it, never
+  freeing a text value anywhere in generated code, at any binding site,
+  under any circumstance. Found by profiling rather than auditing —
+  `benchmark.md`'s own `string_concat` was spending essentially its
+  whole runtime growing the heap (816 `brk()` calls against 3 for
+  equivalent leak-free C). Text deliberately does *not* get the
+  refcount-header representation stages 4-7 use, since its payload is a
+  plain `char*` that sqlite, the regex engine, and `festina_log_text`
+  all take directly; it gets exclusivity by copying instead
+  (`festina_text_own`, a NULL-safe `strdup`), so that every text
+  binding always holds either NULL or a buffer it owns exclusively.
+  That invariant is what lets text be freed with *no* escape analysis:
+  copying happens at each consuming site rather than by draining the
+  source, so no number of other readers can make freeing a text local
+  unsafe. Two safety-relevant prerequisites came out of it — an
+  uninitialized `text s` local previously got an alloca and no store at
+  all, which was harmless only while text was never freed and an
+  immediate wild-pointer `free()` afterward, and `claude.md #82`'s
+  empty-piece template optimization had to be revised so that a
+  template concatenating nothing (`` `${name}` ``) no longer hands back
+  an interpolated variable's own buffer to a caller that believes it
+  owns it.
+
+  `claude.md #84` (stage 10) closes a **real, pre-existing
+  use-after-free** that this effort had not previously found — not
+  introduced by stage 9, but discovered while designing text's own
+  parameter handling, which has the identical shape. A
+  `struct`/`arr[T]`/`map[T]` parameter is passed as the caller's raw,
+  unretained pointer (a deliberate borrowed convention), but a callee
+  that *reassigns* its own parameter runs stage 4's ordinary
+  local-reassignment path, releasing a refcount it never incremented
+  and freeing the caller's live value out from under it. Worth
+  recording for any future audit: the two most obvious reproductions
+  both hide the bug — an unassigned global still carries the immortal
+  negative-refcount sentinel on which retain/release are no-ops, and an
+  assigned global's own unconditional retain leaves the count at 2 so
+  the symptom degrades to a leak. Only a heap-allocated **local**
+  passed to a parameter-reassigning callee exposes it, and under
+  AddressSanitizer it is an unambiguous heap-use-after-free with both
+  the freeing and allocating stacks recorded. Closed by giving any
+  parameter the callee assigns to its own reference at binding time,
+  released at the callee's own scope exit.
+
+  `claude.md #85` (stage 11) closes two further pre-existing leak
+  classes that the text work surfaced but did not cause, both unbounded
+  rather than one-off. A sqlite result row is built by
+  `festina_sqlite_collect_rows` as a plain `malloc` with its text
+  columns strdup'd in and **no refcount header**, and `TableType` is a
+  separate type class from `StructType`, so every
+  `isinstance(t, (StructType, ArrayType, MapType))` check in codegen
+  missed it and nothing ever freed a row or its text columns — meaning
+  `arr[People] rows = sqlite(...)`, this language's most central idiom,
+  leaked its entire row set on every query. The container itself was
+  always freed correctly; only the rows hanging off it were not.
+  Because a row has no header it cannot go through `festina_release`,
+  and because the array owns its rows outright a `People p = rows[0]`
+  local is only borrowing one — so the per-row free is reached solely
+  from the array's own element cascade and deliberately not exposed
+  through `_release_fn_for`, which would otherwise let an arbitrary
+  TableType binding free a row the array still owns. Separately, every
+  runtime `regex(...)` call compiled a `regex_t` nothing ever freed, so
+  a `regex(...)` inside a loop leaked a full automaton per iteration;
+  those are now released via `festina_regex_free`, while a `/pattern/`
+  literal — compiled once into a process-lifetime cache — is
+  deliberately left alone, since freeing one would leave every later
+  evaluation running against a dangling `regex_t`.
+
+  `claude.md #86` (stage 12) closes the regex-bound-to-a-variable leak
+  stage 11 had left open and mischaracterised as bounded: `regex r =
+  regex(p)` *inside a loop* leaks a full compiled automaton per
+  iteration, so it was unbounded. A regex local whose initializer is a
+  `regex(...)` call and which escape analysis proves never escapes is
+  now freed at scope exit. Both halves of that test are load-bearing —
+  a `/pattern/` literal initializer points into a process-lifetime
+  cache, so freeing it would leave every later evaluation running
+  `regexec` against freed memory, and an escaping regex has no
+  equivalent of text's copy-on-alias trick (a regex "copy" would mean
+  recompiling, and the pattern isn't retained to recompile from), so it
+  is deliberately left to leak rather than freed while still
+  referenced. Reached only through the scope-exit path and never
+  through `_release_fn_for`, since routing it through the generic
+  dispatcher would make an `arr[regex]` cascade free elements that may
+  themselves be cached literals.
+
+  One resource leak remains deliberately open: text globals at process
+  exit. Worth stating precisely — LeakSanitizer already reports these
+  runs clean, since a global stays reachable through its own variable;
+  it only appears if global-root scanning is explicitly disabled. At
+  most one buffer per global survives (every reassignment already frees
+  the previous value), so freeing them would be exit-time busywork for
+  no observable benefit. See [todo.md](todo.md#memory-management).
+
+- **A graphics program could die on a transient X connection failure**
+  (`claude.md #87`), which was also the sole cause of the test suite's
+  one intermittently flaky test. `festina_graphics_init` called
+  `XOpenDisplay` exactly once, and Xlib does no retrying of its own, so
+  a single refused connection under load killed the program with a
+  fatal error naming entirely the wrong cause ("is `$DISPLAY` set?").
+  Not a memory-safety issue, but a real robustness gap for anyone
+  launching a graphics program on a busy machine. Confirmed as a
+  genuine transient rather than a dead or misaddressed server: at the
+  moment of failure the X server process was alive, its socket and lock
+  file were present with the lock naming that same live server's pid,
+  and `xdotool` connected to that exact display successfully both
+  immediately before and immediately after. Now retried ten times,
+  100ms apart, so a genuinely absent server still fails with the same
+  clear message in about a second.
+
   What changed across all seven stages is that each one's own fix, at
   every step of building it out, was verified with the same rigor the
   rest of this document's findings were: exhaustive unit tests of the

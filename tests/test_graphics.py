@@ -93,8 +93,10 @@ class TestEventHandlers:
         program = parser.parse(source)
         semantic.analyze(program)
 
-    def test_key_handler_parses_and_analyzes(self, parser, semantic):
-        source = "on key(key:text) {\n    log(key)\n}"
+    @pytest.mark.parametrize("name", ["keyDown", "keyUp"])
+    def test_key_handlers_parse_and_analyze(self, parser, semantic, name):
+        # claude.md #98: `on key` split into two.
+        source = f"on {name}(key:text) {{\n    log(key)\n}}"
         program = parser.parse(source)
         semantic.analyze(program)
 
@@ -130,17 +132,33 @@ class TestEventHandlers:
         with pytest.raises(errors.CompileError, match=name):
             semantic.analyze(program)
 
-    def test_key_wrong_parameter_count_is_a_compile_error(self, parser, semantic, errors):
-        source = "on key() {\n    log('x')\n}"
+    @pytest.mark.parametrize("name", ["keyDown", "keyUp"])
+    def test_key_wrong_parameter_count_is_a_compile_error(self, parser, semantic, errors, name):
+        source = f"on {name}() {{\n    log('x')\n}}"
         program = parser.parse(source)
-        with pytest.raises(errors.CompileError, match="key"):
+        with pytest.raises(errors.CompileError, match=name):
             semantic.analyze(program)
 
-    def test_key_wrong_parameter_type_is_a_compile_error(self, parser, semantic, errors):
-        source = "on key(key:int) {\n    log(key)\n}"
+    @pytest.mark.parametrize("name", ["keyDown", "keyUp"])
+    def test_key_wrong_parameter_type_is_a_compile_error(self, parser, semantic, errors, name):
+        source = f"on {name}(key:int) {{\n    log(key)\n}}"
         program = parser.parse(source)
-        with pytest.raises(errors.CompileError, match="key"):
+        with pytest.raises(errors.CompileError, match=name):
             semantic.analyze(program)
+
+    def test_bare_on_key_is_no_longer_a_recognized_event(self, parser, semantic, codegen):
+        # claude.md #98 replaced `on key` outright rather than keeping it
+        # as an alias. It still COMPILES -- claude.md #40 never
+        # restricted event names -- but it is now ordinary dead code with
+        # no runtime event source, exactly like `on somethingElse`. The
+        # give-away is that it no longer forces the graphics runtime to
+        # be linked in.
+        source = "on key(key:text) {\n    log(key)\n}"
+        program = parser.parse(source)
+        analyzed = semantic.analyze(program)
+        gen = codegen.CodeGen(analyzed, "main.f")
+        gen.generate(program)
+        assert gen.uses_graphics is False
 
     @pytest.mark.parametrize("name", ["resize", "close"])
     def test_resize_and_close_reject_any_parameters(self, parser, semantic, errors, name):

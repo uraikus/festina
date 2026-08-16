@@ -25,6 +25,8 @@ analyzing it, so errors still name the right file (see the loop at the
 bottom of analyze()).
 """
 from . import ast
+import math
+
 from . import types as types_mod
 from .errors import CompileError
 
@@ -39,14 +41,56 @@ BUILTIN_FUNCTIONS = {
     "log", "fail", "sqlite",
     "drawRect", "drawCircle", "drawText", "drawImage",
     "loadImage", "loadAudio",
+    # claude.md #98: how many channels the pool may assign automatically.
+    "setMaxAudioPlayers", "maxAudioPlayers",
+    # claude.md #99: stop one channel (or, with no argument, all of them).
+    "stopAudioPlayer",
+    # claude.md #89/#91: canvas drawing style + text metrics. `font` is
+    # NOT here -- claude.md #91 turned it into a type name, so the
+    # setter is changeFont().
+    "fillStyle", "borderColor", "lineWidth", "changeFont",
+    "measureTextWidth", "measureTextHeight",
     "regex",
     "setTimeout", "setInterval", "clearTimeout", "clearInterval",
+    # claude.md #93: files, time, and canvas export -- all backed by
+    # libc or by Cairo's own PNG writer, both already linked.
+    "readFile", "writeFile", "appendFile", "fileExists", "deleteFile",
+    "now", "formatTime", "saveCanvas",
+    # claude.md #94: paths, transforms, gradients, alpha
+    "render", "clearCanvas", "clearRect",
+    "beginPath", "moveTo", "lineTo", "curveTo", "closePath",
+    "fillPath", "strokePath",
+    "translate", "rotate", "scale", "resetTransform",
+    "saveState", "restoreState",
+    "fillAlpha", "fillLinearGradient", "fillRadialGradient",
+    # claude.md #94: single-value queries, so a scalar result needs no
+    # throwaway `table` declaration (which would create a real table).
+    "sqliteInt", "sqliteFloat", "sqliteText",
 }
 
 _BUILTIN_RETURN_TYPES = {
     "loadImage": types_mod.ImageType(),
     "loadAudio": types_mod.AudioType(),
+    # claude.md #98: reads back the limit AFTER clamping, so a program
+    # can see what it actually got rather than what it asked for.
+    "maxAudioPlayers": types_mod.PrimitiveType("int"),
     "regex": types_mod.RegexType(),
+    # claude.md #89: the only two graphics builtins that return anything
+    "measureTextWidth": types_mod.PrimitiveType("int"),
+    "measureTextHeight": types_mod.PrimitiveType("int"),
+    # claude.md #93
+    "readFile": types_mod.PrimitiveType("text"),
+    "writeFile": types_mod.PrimitiveType("bool"),
+    "appendFile": types_mod.PrimitiveType("bool"),
+    "fileExists": types_mod.PrimitiveType("bool"),
+    "deleteFile": types_mod.PrimitiveType("bool"),
+    "now": types_mod.PrimitiveType("int"),
+    "formatTime": types_mod.PrimitiveType("text"),
+    "saveCanvas": types_mod.PrimitiveType("bool"),
+    # claude.md #94
+    "sqliteInt": types_mod.PrimitiveType("int"),
+    "sqliteFloat": types_mod.PrimitiveType("float"),
+    "sqliteText": types_mod.PrimitiveType("text"),
 }
 
 # claude.md #55: int and float never mix directly in a binary operator.
@@ -69,12 +113,100 @@ _BUILTIN_SIGNATURES = {
     "drawImage": (types_mod.ImageType(), _INT, _INT),
     "loadImage": (_TEXT,),
     "loadAudio": (_TEXT,),  # claude.md #38
+    "setMaxAudioPlayers": (_INT,),  # claude.md #98
+    "maxAudioPlayers": (),
+    # claude.md #89: a colour is text (a name, #rgb/#rrggbb, or 'none'),
+    # validated at runtime rather than compile time -- the value is an
+    # arbitrary expression, so there is nothing to check here beyond its
+    # type (the same split regex() already uses for its own pattern).
+    "lineWidth": (_INT,),
+    "measureTextWidth": (_TEXT,),
+    "measureTextHeight": (_TEXT,),
+    # claude.md #93
+    "readFile": (_TEXT,),
+    "writeFile": (_TEXT, _TEXT),
+    "appendFile": (_TEXT, _TEXT),
+    "fileExists": (_TEXT,),
+    "deleteFile": (_TEXT,),
+    "now": (),
+    "formatTime": (_INT, _TEXT),
+    "saveCanvas": (_TEXT,),
+    # claude.md #94
+    "render": (),
+    "clearCanvas": (),
+    "clearRect": (_INT, _INT, _INT, _INT),
+    "beginPath": (),
+    "moveTo": (_INT, _INT),
+    "lineTo": (_INT, _INT),
+    "curveTo": (_INT, _INT, _INT, _INT, _INT, _INT),
+    "closePath": (),
+    "fillPath": (),
+    "strokePath": (),
+    "translate": (_INT, _INT),
+    "rotate": (_FLOAT,),
+    "scale": (_FLOAT, _FLOAT),
+    "resetTransform": (),
+    "saveState": (),
+    "restoreState": (),
+    "fillAlpha": (_FLOAT,),
+    "fillLinearGradient": (_INT, _INT, types_mod.ColorType(), _INT, _INT, types_mod.ColorType()),
+    "fillRadialGradient": (_INT, _INT, _INT, types_mod.ColorType(), types_mod.ColorType()),
+}
+
+# claude.md #90: three builtins accept two different shapes. The
+# one-argument form takes a literal the compiler resolves outright
+# (fillStyle('red'), font('bold 14px arial')); the explicit form takes
+# the already-resolved parts, and is what a program uses to compute a
+# colour or font size at runtime. Checked here as "any of these
+# signatures", with the arity picking which one applies.
+_COLOR = types_mod.ColorType()
+_FONT = types_mod.FontType()
+
+# claude.md #33/#94: every builtin taking (sql, [params]) -- the bound
+# parameter list is a literal array that is explicitly allowed to mix
+# types, so all of them need the same carve-out from the ordinary
+# same-element-type array rule.
+_SQLITE_BUILTINS = frozenset({"sqlite", "sqliteInt", "sqliteFloat", "sqliteText"})
+
+_BUILTIN_SIGNATURE_ALTERNATES = {
+    # claude.md #91: the one-argument form takes a `color` value, not a
+    # text literal -- a colour name has to be declared as one
+    # (`color red = 'red'`) so that resolution happens exactly once, at
+    # that declaration. The three-int form is what a program uses to
+    # compute a colour at runtime.
+    "fillStyle": [(_COLOR,), (_INT, _INT, _INT)],
+    "borderColor": [(_COLOR,), (_INT, _INT, _INT)],
+    # claude.md #91: likewise a `font` value; the explicit form (px,
+    # style, family -- style/family nullable, px <= 0 keeps the current
+    # size) remains for a font whose size is computed at runtime.
+    "changeFont": [(_FONT,), (_INT, _TEXT, _TEXT)],
+    # claude.md #99: stopAudioPlayer(n) stops one channel;
+    # stopAudioPlayer() stops every channel.
+    "stopAudioPlayer": [(), (_INT,)],
 }
 _REGEX = types_mod.RegexType()
 _AUDIO = types_mod.AudioType()
+_IMAGE = types_mod.ImageType()
 
 # claude.md #56: float -> int, with an explicit rounding decision.
-MATH_FUNCTIONS = {"floor", "ceil", "round", "trunc"}
+MATH_ROUNDING_FUNCTIONS = {"floor", "ceil", "round", "trunc"}
+# claude.md #93: float -> float. Kept separate from the rounding four
+# above because the RETURN type differs -- rounding answers "which
+# integer", these answer "which real number" -- and conflating them
+# would make Math.sqrt(2.0) silently an int.
+MATH_FLOAT_FUNCTIONS = {"sqrt", "sin", "cos", "tan", "asin", "acos", "atan",
+                        "exp", "log", "log2", "log10", "abs"}
+# claude.md #93: (float, float) -> float.
+MATH_FLOAT2_FUNCTIONS = {"pow", "min", "max", "atan2"}
+# Every name reachable as Math.<name>(...), for the "is this a Math
+# call at all" test; the three sets above decide arity and result type.
+MATH_FUNCTIONS = (MATH_ROUNDING_FUNCTIONS | MATH_FLOAT_FUNCTIONS
+                  | MATH_FLOAT2_FUNCTIONS | {"random"})
+# claude.md #93: Math.PI / Math.E -- constants, not calls. Trigonometry
+# is unusable without at least PI, and making a program spell out
+# 3.14159... is exactly the kind of thing a standard library exists to
+# prevent.
+MATH_CONSTANTS = {"PI": math.pi, "E": math.e}
 
 # claude.md #40: these five event names are the only ones with a real
 # runtime source (an X11 event of some kind -- see festina_runtime.h's
@@ -91,7 +223,11 @@ MATH_FUNCTIONS = {"floor", "ceil", "round", "trunc"}
 _EVENT_SIGNATURES = {
     "click": ((_INT, _INT), "(x:int, y:int)"),
     "mouse": ((_INT, _INT), "(x:int, y:int)"),
-    "key": ((_TEXT,), "(key:text)"),
+    # claude.md #98: one `on key` became two, so a program can tell a
+    # press from a release -- holding a movement key and letting it go
+    # had no expressible difference before.
+    "keyDown": ((_TEXT,), "(key:text)"),
+    "keyUp": ((_TEXT,), "(key:text)"),
     "resize": ((), "no parameters"),
     "close": ((), "no parameters"),
 }
@@ -219,6 +355,10 @@ def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None
         return types_mod.AudioType()
     if name == "regex":
         return types_mod.RegexType()
+    if name == "color":
+        return types_mod.ColorType()
+    if name == "font":
+        return types_mod.FontType()
     if name in structs:
         return types_mod.StructType(name)
     if name in tables:
@@ -263,6 +403,33 @@ def analyze(program, filename="<string>"):
         # blob and text already share the identical `ptr` runtime
         # representation (see _llvm_type).
         if declared == _BLOB and actual == _TEXT:
+            return
+        # claude.md #91: `color red = 'red'` / `font body = '13px arial'`
+        # -- a colour and a font are written as text because that is what
+        # reads well, and resolved to their compiled form at the
+        # declaration. Same one-directional text -> X allowance blob
+        # already has above, and for the same reason: there is no
+        # separate literal syntax for either, and nothing else in the
+        # language could construct one. Whether the value is a genuine
+        # LITERAL (and so resolvable at all) is checked in codegen, which
+        # is where the resolution happens and where the error can name
+        # the offending text.
+        if (isinstance(declared, (types_mod.ColorType, types_mod.FontType))
+                and actual == _TEXT):
+            return
+        # claude.md #100/#101: `aud music = 'path/track.wav'` and
+        # `img sprite = 'sprite.png'` -- the same
+        # one-directional text -> X allowance, for the same reason the
+        # three above have it: a path is what reads well, and there is no
+        # other literal syntax for an audio clip. Unlike colour and font
+        # this is NOT resolved at compile time -- it becomes a real
+        # loadAudio() call wherever the conversion happens (see codegen's
+        # _coerce), so the path may be any text expression, not just a
+        # literal. claude.md #101 gave `img` the same treatment, so the
+        # two media types no longer differ for no reason. That also means it is a genuine file read at that
+        # point, which is worth knowing when the conversion is at a call
+        # site rather than a declaration.
+        if isinstance(declared, (types_mod.AudioType, types_mod.ImageType)) and actual == _TEXT:
             return
         if declared != actual:
             raise CompileError(
@@ -576,6 +743,27 @@ def analyze(program, filename="<string>"):
         return None
 
     def _infer_member(expr, scope):
+        # claude.md #93: Math.PI / Math.E -- checked here for the same
+        # reason `environment` is below: Math is a namespace, not a
+        # value, so there is nothing to infer the type of.
+        if (isinstance(expr.obj, ast.Identifier) and expr.obj.name == "Math"
+                and not expr.computed):
+            if expr.prop in MATH_CONSTANTS:
+                return _FLOAT
+            if expr.prop in MATH_FUNCTIONS:
+                raise CompileError(
+                    f"Math.{expr.prop} is a function -- call it, "
+                    f"e.g. `Math.{expr.prop}(...)`",
+                    file=filename, line=getattr(expr, "line", 0),
+                    column=getattr(expr, "column", 0),
+                    category="invalid field access",
+                )
+            raise CompileError(
+                f"Math has no member '{expr.prop}'",
+                file=filename, line=getattr(expr, "line", 0),
+                column=getattr(expr, "column", 0),
+                category="invalid field access",
+            )
         # claude.md #71: environment.NAME / environment[keyExpr] --
         # checked structurally (an Identifier literally named
         # "environment"), before the generic infer(expr.obj, scope)
@@ -673,7 +861,26 @@ def analyze(program, filename="<string>"):
                 )
             return types_mod.PrimitiveType("int")
         if isinstance(obj_type, types_mod.ImageType):
-            return None  # permissive: claude.md #37 defines no methods on img at all
+            # claude.md #92: img has exactly two readable properties.
+            # Strict, like ArrayType's own `.length` handling just above
+            # -- this branch used to be a permissive `return None`, back
+            # when claude.md #37 defined nothing at all on img, which
+            # silently accepted every typo.
+            if expr.prop in ("width", "height"):
+                return types_mod.PrimitiveType("int")
+            if expr.prop in ("clip", "resize"):
+                raise CompileError(
+                    f"'{expr.prop}' is a method on img -- call it, "
+                    f"e.g. `sheet.{expr.prop}(...)`",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            raise CompileError(
+                f"img has no field '{expr.prop}' "
+                f"(img has .width, .height, .clip() and .resize())",
+                file=filename, line=expr.line, column=expr.column,
+                category="invalid field access",
+            )
         # claude.md #38: aud's play()/stop()/isPlaying() are only
         # recognized as Call-on-Member patterns (see _infer_call) --
         # this branch is for a bare `music.play` reference with no
@@ -760,9 +967,20 @@ def analyze(program, filename="<string>"):
                 return None
             if name in BUILTIN_FUNCTIONS:
                 sig = _BUILTIN_SIGNATURES.get(name)
+                alternates = _BUILTIN_SIGNATURE_ALTERNATES.get(name)
+                if alternates is not None:
+                    sig = next((a for a in alternates if len(a) == len(expr.args)), None)
+                    if sig is None:
+                        shapes = " or ".join(str(len(a)) for a in alternates)
+                        raise CompileError(
+                            f"{name}() expects {shapes} argument(s), "
+                            f"got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
                 if sig is None:
                     for a in expr.args:
-                        if name == "sqlite" and isinstance(a, ast.ArrayLit):
+                        if (name in _SQLITE_BUILTINS and isinstance(a, ast.ArrayLit)):
                             # claude.md #33: sqlite()'s parameter list is
                             # passed as an array literal, but -- unlike
                             # every real arr[T] value in the language --
@@ -828,20 +1046,26 @@ def analyze(program, filename="<string>"):
             # claude.md #56: Math.floor/ceil/round/trunc(x:float) -> int
             if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
                     and callee.prop in MATH_FUNCTIONS):
-                if len(expr.args) != 1:
+                expected = 0 if callee.prop == "random" else (
+                    2 if callee.prop in MATH_FLOAT2_FUNCTIONS else 1)
+                if len(expr.args) != expected:
                     raise CompileError(
-                        f"Math.{callee.prop}() expects exactly 1 argument, got {len(expr.args)}",
+                        f"Math.{callee.prop}() expects exactly {expected} "
+                        f"argument(s), got {len(expr.args)}",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
-                arg_type = infer(expr.args[0], scope)
-                if arg_type is not None and arg_type is not NULL and arg_type != _FLOAT:
-                    raise CompileError(
-                        f"Math.{callee.prop}() expects a float argument, found {types_mod.type_name(arg_type)}",
-                        file=filename, line=callee.line, column=callee.column,
-                        category="invalid function argument type",
-                    )
-                return _INT
+                for arg in expr.args:
+                    arg_type = infer(arg, scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != _FLOAT:
+                        raise CompileError(
+                            f"Math.{callee.prop}() expects float argument(s), found {types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                # claude.md #56 vs #93: only the rounding four answer
+                # with an int; everything else stays in float.
+                return _INT if callee.prop in MATH_ROUNDING_FUNCTIONS else _FLOAT
             # claude.md #55: int.toFloat() -> float
             if callee.prop == "toFloat" and not expr.args and infer(callee.obj, scope) == _INT:
                 return _FLOAT
@@ -921,14 +1145,128 @@ def analyze(program, filename="<string>"):
             # generic "Member call" fallback below and fails there via
             # _infer_member's now-strict AudioType handling, the same
             # way an unknown struct field does.
-            if callee.prop in ("play", "stop") and infer(callee.obj, scope) == _AUDIO:
-                if expr.args:
+            # claude.md #99: play/playLoop take an OPTIONAL channel;
+            # stop still takes none (it names the clip, not a channel --
+            # stopAudioPlayer(n) is how a program addresses one channel).
+            if callee.prop in ("play", "playLoop") and infer(callee.obj, scope) == _AUDIO:
+                if len(expr.args) > 1:
                     raise CompileError(
-                        f"{callee.prop}() takes no arguments, got {len(expr.args)}",
+                        f"{callee.prop}() expects 0 or 1 argument (an optional "
+                        f"channel), got {len(expr.args)}",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
+                if expr.args:
+                    arg_type = infer(expr.args[0], scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != _INT:
+                        raise CompileError(
+                            f"{callee.prop}()'s channel must be int, found "
+                            f"{types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
                 return None
+            # claude.md #100: aud.stop() is GONE. One clip can be playing
+            # on several channels at once -- three overlapping gunshots
+            # are the ordinary case, not the exotic one -- so "stop this
+            # clip" never named one thing, and its only honest reading
+            # (stop every copy of it) is almost never what a program
+            # firing overlapping effects wants. Channels are how a
+            # program addresses playback now. Caught by name here rather
+            # than left to the generic unknown-method error so the
+            # message can say what to use instead.
+            if callee.prop == "stop" and infer(callee.obj, scope) == _AUDIO:
+                raise CompileError(
+                    "aud has no stop() -- one clip can be playing on several "
+                    "channels at once, so stop it by channel: "
+                    "stopAudioPlayer(channel), or stopAudioPlayer() for all",
+                    file=filename, line=callee.line, column=callee.column,
+                    category="unknown method",
+                )
+            # claude.md #92: sheet.clip(x, y, w, h) -> img, and
+            # image.resize(w, h) -> void (in place). Checked here rather
+            # than left to the generic Member-call fallback so the arity
+            # and the int-ness of every argument are enforced.
+            # claude.md #96: array methods, JS-shaped.
+            if callee.prop in ("push", "pop", "shift", "unshift", "splice",
+                               "indexOf"):
+                obj_type = infer(callee.obj, scope)
+                if isinstance(obj_type, types_mod.ArrayType):
+                    elem = obj_type.element
+                    # claude.md #97: indexOf(value) -> int, -1 when absent.
+                    # The argument has to be assignable to the element type
+                    # for the same reason push()'s does: a search for a
+                    # value the array cannot hold is a mistake, not a
+                    # never-matching search.
+                    if callee.prop == "indexOf":
+                        if len(expr.args) != 1:
+                            raise CompileError(
+                                "indexOf() expects exactly 1 argument, "
+                                f"got {len(expr.args)}",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
+                        check_assignable(elem, infer(expr.args[0], scope),
+                                          callee, what="indexOf() argument")
+                        return _INT
+                    if callee.prop in ("push", "unshift"):
+                        if len(expr.args) != 1:
+                            raise CompileError(
+                                f"{callee.prop}() expects exactly 1 argument, "
+                                f"got {len(expr.args)}",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
+                        check_assignable(elem, infer(expr.args[0], scope),
+                                          callee, what=f"{callee.prop}() argument")
+                        # The new length, as JS returns.
+                        return _INT
+                    if callee.prop in ("pop", "shift"):
+                        if expr.args:
+                            raise CompileError(
+                                f"{callee.prop}() takes no arguments, "
+                                f"got {len(expr.args)}",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
+                        return elem
+                    # splice(start, count) -> arr[T] of what was removed
+                    if len(expr.args) != 2:
+                        raise CompileError(
+                            "splice() expects 2 arguments (start, count), "
+                            f"got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    for arg in expr.args:
+                        arg_type = infer(arg, scope)
+                        if arg_type is not None and arg_type is not NULL and arg_type != _INT:
+                            raise CompileError(
+                                "splice() expects int arguments, found "
+                                f"{types_mod.type_name(arg_type)}",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
+                    return types_mod.ArrayType(elem)
+            if callee.prop in ("clip", "resize") and infer(callee.obj, scope) == _IMAGE:
+                expected = 4 if callee.prop == "clip" else 2
+                if len(expr.args) != expected:
+                    raise CompileError(
+                        f"{callee.prop}() expects {expected} argument(s), "
+                        f"got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                for i, arg in enumerate(expr.args):
+                    arg_type = infer(arg, scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != _INT:
+                        raise CompileError(
+                            f"{callee.prop}()'s argument {i + 1} expects int, "
+                            f"found {types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return types_mod.ImageType() if callee.prop == "clip" else None
             if callee.prop == "isPlaying" and infer(callee.obj, scope) == _AUDIO:
                 if expr.args:
                     raise CompileError(

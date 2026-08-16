@@ -26,6 +26,14 @@ import wave
 import pytest
 
 _EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
+# claude.md #101: real JPEG/MP3 files, committed rather than generated,
+# because nothing in this repo can encode either and a test that only
+# exercised a hand-rolled approximation would prove nothing about
+# libjpeg/libmpg123 actually being wired up. Both are tiny (a 16x16
+# gradient and a fifth of a second of a 440Hz tone).
+_FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+_JPEG_FIXTURE = os.path.join(_FIXTURES_DIR, "gradient.jpg")
+_MP3_FIXTURE = os.path.join(_FIXTURES_DIR, "tone.mp3")
 
 
 # ---- no C toolchain needed -- IR-text-only checks ----
@@ -3873,15 +3881,25 @@ class TestAutomaticMemoryReclamation:
 
 
 def _find_window(display, timeout=20):
-    # 20s, not the 10s an isolated run needs comfortably -- TestGraphics
-    # compiles a fresh binary (a real gcc invocation) and spawns a fresh
-    # Xvfb instance per interactive test, back to back; under real
-    # contention (the full suite, or just a loaded sandbox) that
-    # occasionally pushes a single window's startup past 10s even though
-    # the underlying Xvfb/window-creation code itself is reliable in
-    # isolation (verified directly, outside pytest, with no failures in
-    # 15 repeated runs). Module-level (not a method) so TestTimers's one
-    # combined graphics+timers test can reuse it too.
+    # A window actually appears in ~0.2s, measured, consistently -- this
+    # timeout is generous insurance, not a figure anything is expected
+    # to approach.
+    #
+    # It used to be 20s for a reason that turned out to be a
+    # misdiagnosis, recorded here so it isn't re-derived: TestGraphics
+    # was intermittently flaky (roughly a third of full-suite runs,
+    # essentially never in isolation), and that was attributed to
+    # contention pushing a window's startup past the old 10s, so the
+    # timeout was doubled. Raising it never helped, and could not have:
+    # the compiled program had already exited by then. The real cause
+    # was a single un-retried XOpenDisplay in festina_graphics_init --
+    # one transient connection refusal under load killed the program
+    # outright, with a fatal error naming entirely the wrong cause ("is
+    # $DISPLAY set?"). Fixed in the runtime (claude.md #87), which is
+    # what actually made these tests deterministic; see that section for
+    # the forensics proving the server was alive and reachable the whole
+    # time. Module-level (not a method) so TestTimers's one combined
+    # graphics+timers test can reuse it too.
     deadline = time.time() + timeout
     while time.time() < deadline:
         result = subprocess.run(
@@ -3894,6 +3912,45 @@ def _find_window(display, timeout=20):
             return wids[0]
         time.sleep(0.2)
     raise AssertionError("the Festina canvas window never appeared")
+
+
+def _xwd_pixels(display, wid, points):
+    """Capture a window with `xwd` and return the RGB at each (x, y).
+
+    claude.md #89's colours are only really verified by looking at what
+    actually landed on the canvas -- asserting the runtime call was
+    emitted proves the plumbing, not that 'red' is red. xwd ships with
+    the same x11-apps/x11-utils tier as xdotool, which these tests
+    already require, so this needs no new dependency.
+
+    XWD is a fixed 25-word big-endian header, then the window name, then
+    the colormap, then rows of `bytes_per_line`; the r/g/b masks in the
+    header say where each channel sits inside a pixel.
+    """
+    import struct
+    dump = subprocess.run(["xwd", "-id", wid], env=dict(os.environ, DISPLAY=display),
+                          capture_output=True, check=True).stdout
+    hdr = struct.unpack(">25I", dump[:100])
+    header_size, bpp, bytes_per_line = hdr[0], hdr[11], hdr[12]
+    red_mask, green_mask, blue_mask, ncolors = hdr[14], hdr[15], hdr[16], hdr[19]
+    body = dump[header_size + ncolors * 12:]
+
+    def channel(value, mask):
+        if not mask:
+            return 0
+        shift = (mask & -mask).bit_length() - 1
+        width = bin(mask >> shift).count("1")
+        c = (value & mask) >> shift
+        return c << (8 - width) if width < 8 else c
+
+    out = []
+    nbytes = bpp // 8
+    for x, y in points:
+        base = y * bytes_per_line + x * nbytes
+        value = int.from_bytes(body[base:base + nbytes], "little")
+        out.append((channel(value, red_mask), channel(value, green_mask),
+                    channel(value, blue_mask)))
+    return out
 
 
 def _wait_for_output(stdout_path, predicate, timeout=20):
@@ -4002,16 +4059,39 @@ class TestGraphics:
         assert out_path.exists()
 
     def test_missing_display_is_a_clear_runtime_error(self, compile_and_run, monkeypatch):
+        # claude.md #95: it is render() that needs a display now, not
+        # drawing -- drawing paints an offscreen canvas and is perfectly
+        # happy with no X server, which is what makes headless PNG
+        # output possible. So this is the call that must report it.
         monkeypatch.delenv("DISPLAY", raising=False)
-        result = compile_and_run("drawRect(0, 0, 10, 10)")
+        result = compile_and_run("drawRect(0, 0, 10, 10)\nrender()")
         assert result.returncode == 1
         assert "X display" in result.stderr
 
-    def test_invalid_image_path_is_a_clear_runtime_error(self, compile_and_run, monkeypatch):
+    def test_drawing_without_a_display_is_no_longer_an_error(
+            self, compile_and_run, monkeypatch):
         monkeypatch.delenv("DISPLAY", raising=False)
-        result = compile_and_run("img icon = loadImage('/nonexistent/path.png')\nlog('unreachable')")
+        result = compile_and_run("drawRect(0, 0, 10, 10)\nlog('drew headlessly')")
+        assert result.returncode == 0
+        assert result.stdout == "drew headlessly\n"
+
+    def test_invalid_image_path_is_a_clear_runtime_error(self, compile_and_run, monkeypatch):
+        # claude.md #101 split "cannot open the file" from "cannot
+        # decode what is in it" -- they are different mistakes and the
+        # old single message named neither precisely.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        result = compile_and_run("img icon = '/nonexistent/path.png'\nlog('unreachable')")
         assert result.returncode == 1
-        assert "could not load image" in result.stderr
+        assert "could not open image file" in result.stderr
+        assert "unreachable" not in result.stdout
+
+    def test_an_undecodable_image_names_both_supported_formats(self, compile_and_run, tmp_path,
+                                                                 monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        (tmp_path / "bad.png").write_bytes(b"this is not an image at all")
+        result = compile_and_run("img icon = 'bad.png'\nlog('unreachable')")
+        assert result.returncode == 1
+        assert "not a PNG or JPEG" in result.stderr
         assert "unreachable" not in result.stdout
 
     def test_program_without_graphics_never_opens_a_window(self, compile_and_run, monkeypatch):
@@ -4054,13 +4134,13 @@ class TestGraphics:
             proc.terminate()
             proc.wait(timeout=5)
 
-    def test_key_dispatches_printable_and_named_keys(self, run_graphics_program, x_display):
-        # claude.md #40: `on key(key:text)`. A printable key (e.g. "a")
-        # comes back as its own character; a non-printable one (e.g.
-        # Escape, whose ASCII value is an unprintable control code) is
-        # not a useful `text` value, so it falls back to X11's own key
-        # name instead -- see festina_runtime.c's festina_handle_graphics_event.
-        source = "on key(key:text) {\n    log(`key ${key}`)\n}"
+    def test_key_down_dispatches_printable_and_named_keys(self, run_graphics_program, x_display):
+        # claude.md #40/#98: `on keyDown(key:text)`. A printable key
+        # (e.g. "a") comes back as its own character; a non-printable one
+        # (e.g. Escape, whose ASCII value is an unprintable control code)
+        # is not a useful `text` value, so it falls back to X11's own key
+        # name instead -- see festina_key_name in the graphics runtime.
+        source = "on keyDown(key:text) {\n    log(`key ${key}`)\n}"
         proc, stdout_path = run_graphics_program(source)
         try:
             wid = _find_window(x_display)
@@ -4078,8 +4158,77 @@ class TestGraphics:
             proc.terminate()
             proc.wait(timeout=5)
 
+    def test_key_up_fires_separately_and_reports_the_same_name(self, run_graphics_program, x_display):
+        # claude.md #98: the whole point of the split -- a press and a
+        # release are now distinguishable, and both name the same key the
+        # same way (one shared festina_key_name), so a program can match
+        # a release against the press that started it.
+        source = ("on keyDown(key:text) {\n    log(`down ${key}`)\n}\n"
+                  "on keyUp(key:text) {\n    log(`up ${key}`)\n}")
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            time.sleep(0.3)
+            subprocess.run(["xdotool", "key", "--window", wid, "a"], env=env, check=True)
+            subprocess.run(["xdotool", "key", "--window", wid, "Left"], env=env, check=True)
+            text = _wait_for_output(stdout_path, lambda t: len(t.splitlines()) >= 4)
+            assert text.splitlines() == ["down a", "up a", "down Left", "up Left"]
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_only_the_declared_key_handler_fires(self, run_graphics_program, x_display):
+        # A program that declares only keyUp must not also get keyDown's
+        # events -- they are two independent registrations, not one
+        # handler called twice.
+        source = "on keyUp(key:text) {\n    log(`up ${key}`)\n}"
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            time.sleep(0.3)
+            subprocess.run(["xdotool", "key", "--window", wid, "b"], env=env, check=True)
+            text = _wait_for_output(stdout_path, lambda t: t.strip() != "")
+            time.sleep(0.3)
+            with open(stdout_path) as f:
+                assert f.read().splitlines() == ["up b"]
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_holding_a_key_does_not_fire_a_phantom_key_up(self, run_graphics_program, x_display):
+        # claude.md #98: X's own auto-repeat synthesizes a
+        # KeyRelease/KeyPress pair per repeat unless XKB's detectable
+        # auto-repeat is on. Either way a HELD key must produce exactly
+        # one keyUp -- the one where it is actually let go -- or the
+        # split would be useless for the movement keys it exists for.
+        source = ("on keyDown(key:text) {\n    log('down')\n}\n"
+                  "on keyUp(key:text) {\n    log('up')\n}")
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            time.sleep(0.3)
+            subprocess.run(["xdotool", "keydown", "--window", wid, "a"], env=env, check=True)
+            time.sleep(1.0)   # long enough for auto-repeat to kick in
+            subprocess.run(["xdotool", "keyup", "--window", wid, "a"], env=env, check=True)
+            _wait_for_output(stdout_path, lambda t: "up" in t.splitlines())
+            time.sleep(0.3)
+            with open(stdout_path) as f:
+                lines = f.read().splitlines()
+            assert lines.count("up") == 1, lines
+            assert lines[-1] == "up", lines
+            assert lines[0] == "down", lines
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
     def test_client_size_matches_the_initial_canvas_before_any_resize(self, run_graphics_program, x_display):
-        source = "log(`${clientWidth}x${clientHeight}`)"
+        # claude.md #95: reading the canvas size no longer opens a
+        # window -- render() is what does, so the window this asserts on
+        # comes from that call rather than from the size read.
+        source = "log(`${clientWidth}x${clientHeight}`)\nrender()"
         proc, stdout_path = run_graphics_program(source)
         try:
             _find_window(x_display)  # also proves a bare reference opens a window
@@ -4115,7 +4264,10 @@ class TestGraphics:
         # always just succeeds there, no matter how many times it's run.
         # See festina_ignore_focus_error's own comment in
         # festina_runtime_graphics.c for the fix this guards.
-        source = "log(`${clientWidth}x${clientHeight}`)"
+        # claude.md #95: reading the canvas size no longer opens a
+        # window -- render() is what does, so the window this asserts on
+        # comes from that call rather than from the size read.
+        source = "log(`${clientWidth}x${clientHeight}`)\nrender()"
         proc, stdout_path = run_graphics_program(source, display=x_display_with_wm)
         try:
             _find_window(x_display_with_wm)  # the window actually opened and is mapped
@@ -4363,7 +4515,8 @@ def _write_wav(path, duration_s=0.2, sample_rate=8000, channels=1):
 
 
 class TestAudio:
-    """claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying().
+    """claude.md #38/#99/#100: aud, `aud m = 'path'`, .play()/
+    .playLoop()/.isPlaying(), and stopAudioPlayer().
 
     Unlike TestGraphics, none of this needs an opt-in skip tier: the
     null-device trick audio_null_env uses (see conftest.py) needs no
@@ -4389,9 +4542,9 @@ class TestAudio:
         if not (shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")):
             pytest.skip("no C compiler (clang/gcc/cc) on PATH")
         source = """
-        aud music = loadAudio('nonexistent.wav')
+        aud music = 'nonexistent.wav'
         music.play()
-        music.stop()
+        stopAudioPlayer()
         log(music.isPlaying())
         """
         src_path = tmp_path / "main.f"
@@ -4421,23 +4574,25 @@ class TestAudio:
 
     def test_invalid_audio_path_is_a_clear_runtime_error(self, compile_and_run):
         result = compile_and_run(
-            "aud music = loadAudio('/nonexistent/path.wav')\nlog('unreachable')"
+            "aud music = '/nonexistent/path.wav'\nlog('unreachable')"
         )
         assert result.returncode == 1
         assert "could not open audio file" in result.stderr
         assert "unreachable" not in result.stdout
 
-    def test_non_wav_file_is_a_clear_runtime_error(self, compile_and_run, tmp_path):
+    def test_undecodable_audio_is_a_clear_runtime_error(self, compile_and_run, tmp_path):
         (tmp_path / "bad.wav").write_bytes(b"this is not a wav file at all")
-        result = compile_and_run("aud music = loadAudio('bad.wav')\nlog('unreachable')")
+        result = compile_and_run("aud music = 'bad.wav'\nlog('unreachable')")
         assert result.returncode == 1
-        assert "only 16-bit PCM WAV audio is supported" in result.stderr
+        # claude.md #101: the message names both formats this runtime
+        # decodes, since "not a WAV" stopped being the whole story.
+        assert "not 16-bit PCM WAV or MP3" in result.stderr
         assert "unreachable" not in result.stdout
 
     def test_is_playing_true_immediately_after_play(self, compile_and_run, tmp_path, audio_null_env):
         _write_wav(tmp_path / "clip.wav")
         source = (
-            "aud music = loadAudio('clip.wav')\n"
+            "aud music = 'clip.wav'\n"
             "music.play()\n"
             "log(music.isPlaying())\n"
         )
@@ -4448,9 +4603,9 @@ class TestAudio:
     def test_is_playing_false_immediately_after_stop(self, compile_and_run, tmp_path, audio_null_env):
         _write_wav(tmp_path / "clip.wav")
         source = (
-            "aud music = loadAudio('clip.wav')\n"
+            "aud music = 'clip.wav'\n"
             "music.play()\n"
-            "music.stop()\n"
+            "stopAudioPlayer()\n"
             "log(music.isPlaying())\n"
         )
         result = compile_and_run(source, env=audio_null_env)
@@ -4459,7 +4614,7 @@ class TestAudio:
 
     def test_stop_when_nothing_playing_is_a_safe_no_op(self, compile_and_run, tmp_path, audio_null_env):
         _write_wav(tmp_path / "clip.wav")
-        source = "aud music = loadAudio('clip.wav')\nmusic.stop()\nlog(music.isPlaying())\n"
+        source = "aud music = 'clip.wav'\nstopAudioPlayer()\nlog(music.isPlaying())\n"
         result = compile_and_run(source, env=audio_null_env)
         assert result.returncode == 0
         assert result.stdout.strip() == "false"
@@ -4469,7 +4624,7 @@ class TestAudio:
     ):
         _write_wav(tmp_path / "clip.wav", duration_s=1.0)
         source = (
-            "aud music = loadAudio('clip.wav')\n"
+            "aud music = 'clip.wav'\n"
             "music.play()\n"
             "music.play()\n"
             "log(music.isPlaying())\n"
@@ -4477,6 +4632,222 @@ class TestAudio:
         result = compile_and_run(source, env=audio_null_env)
         assert result.returncode == 0
         assert result.stdout.strip() == "true"
+
+    def test_max_audio_players_is_readable_and_clamped(self, compile_and_run):
+        # claude.md #98: the limit is a tuning knob, so an unreasonable
+        # value is clamped into [1, 64] rather than failing the program.
+        # maxAudioPlayers() reads back what was actually applied.
+        source = (
+            "log(maxAudioPlayers())\n"
+            "setMaxAudioPlayers(4)\n"
+            "log(maxAudioPlayers())\n"
+            "setMaxAudioPlayers(0)\n"
+            "log(maxAudioPlayers())\n"
+            "setMaxAudioPlayers(9999)\n"
+            "log(maxAudioPlayers())\n"
+        )
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["10", "4", "1", "64"]
+
+    def test_setting_the_limit_links_the_audio_runtime(self, parser, semantic, codegen):
+        # Both builtins live in the audio translation unit, so naming
+        # either has to mark the program as using audio -- otherwise the
+        # link would fail with an undefined symbol.
+        program = parser.parse("setMaxAudioPlayers(3)", filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        gen = codegen.CodeGen(analyzed, "main.f")
+        gen.generate(program)
+        assert gen.uses_audio is True
+
+    def test_overlapping_plays_all_keep_playing(self, compile_and_run, tmp_path, audio_null_env):
+        # claude.md #98: the behaviour this replaced would have had the
+        # second play() stop the first. Festina has no way to count
+        # voices (deliberately -- the pool is not language surface), so
+        # what is observable here is that three overlapping playbacks all
+        # report as playing and nothing crashes; TestAudioVoicePool below
+        # opens the runtime up and counts the voices directly.
+        #
+        # playLoop, not play, and that is not incidental: the null ALSA
+        # device this runs against consumes PCM instantly (measured -- a
+        # 2-second clip finishes in 0ms), so a one-shot can legitimately
+        # finish between the play() call and the next statement. Written
+        # with play() this test passed in isolation and failed under
+        # full-suite load, which is a race in the TEST rather than in the
+        # runtime -- "isPlaying() is true the instant play() returns" is
+        # still honoured, it just says nothing about the statement after.
+        # A loop never finishes on its own, so there is no window at all.
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = (
+            "aud music = 'clip.wav'\n"
+            "music.playLoop(0)\n"
+            "music.playLoop(1)\n"
+            "music.playLoop(2)\n"
+            "log(music.isPlaying())\n"
+            "stopAudioPlayer()\n"
+            "log(music.isPlaying())\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_a_limit_of_one_still_restarts_rather_than_failing(
+        self, compile_and_run, tmp_path, audio_null_env
+    ):
+        # setMaxAudioPlayers(1) is the documented way to ask for the old
+        # cut-off-the-previous-sound behaviour back.
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = (
+            "setMaxAudioPlayers(1)\n"
+            "aud music = 'clip.wav'\n"
+            "music.play()\n"
+            "music.play()\n"
+            "log(music.isPlaying())\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_a_path_declares_a_clip_and_really_loads_it(self, compile_and_run, tmp_path,
+                                                          audio_null_env):
+        # claude.md #100: `aud m = 'path'`. The proof that it is a real
+        # load and not just a type-check allowance is that playing it
+        # works -- and that a bad path fails exactly the way
+        # loadAudio()'s own bad path does.
+        _write_wav(tmp_path / "clip.wav", duration_s=0.5)
+        source = (
+            "aud music = 'clip.wav'\n"
+            "music.play()\n"
+            "log(music.isPlaying())\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_a_path_may_be_a_computed_text_expression(self, compile_and_run, tmp_path,
+                                                        audio_null_env):
+        # Unlike color/font (resolved at compile time, so literal-only),
+        # this becomes a real loadAudio() call, so any text works.
+        _write_wav(tmp_path / "clip.wav", duration_s=0.5)
+        source = (
+            "text name = 'clip'\n"
+            "aud music = name + '.wav'\n"
+            "music.play()\n"
+            "log(music.isPlaying())\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_a_bad_path_in_the_short_form_fails_the_same_way(self, compile_and_run):
+        result = compile_and_run("aud music = '/nonexistent/path.wav'\nlog('unreachable')")
+        assert result.returncode == 1
+        assert "could not open audio file" in result.stderr
+        assert "unreachable" not in result.stdout
+
+    def test_stop_is_gone_from_aud(self, parser, semantic, errors):
+        # claude.md #100: one clip can be playing on several channels at
+        # once, so "stop this clip" never named one thing.
+        program = parser.parse("aud music = 'x.wav'\nmusic.stop()", filename="main.f")
+        with pytest.raises(errors.CompileError, match="stopAudioPlayer"):
+            semantic.analyze(program, filename="main.f")
+
+    def test_channels_and_loops_compile_and_run(self, compile_and_run, tmp_path, audio_null_env):
+        # claude.md #99: every shape of the new surface, through the
+        # real compiler and the real runtime. What is observable from
+        # Festina is that these run and that stop/isPlaying still agree;
+        # which CHANNEL each landed on is checked white-box in
+        # TestAudioChannels, since the language deliberately cannot see
+        # it.
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = (
+            "aud music = 'clip.wav'\n"
+            "music.play()\n"
+            "music.play(3)\n"
+            "music.playLoop()\n"
+            "music.playLoop(0)\n"
+            "log(music.isPlaying())\n"
+            "stopAudioPlayer(0)\n"
+            "stopAudioPlayer(3)\n"
+            "stopAudioPlayer()\n"
+            "log(music.isPlaying())\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_a_looping_track_outlives_its_own_length(self, compile_and_run, tmp_path,
+                                                       audio_null_env):
+        # The one loop property observable from Festina: a clip that
+        # would long since have finished is still playing. 50ms of
+        # audio, checked 400ms later.
+        _write_wav(tmp_path / "clip.wav", duration_s=0.05)
+        source = (
+            "aud music = 'clip.wav'\n"
+            "void func check() {\n"
+            "    log(`still playing: ${music.isPlaying()}`)\n"
+            "    stopAudioPlayer(0)\n"
+            "    log(`after stop: ${music.isPlaying()}`)\n"
+            "}\n"
+            "music.playLoop(0)\n"
+            "setTimeout(check, 400)\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["still playing: true", "after stop: false"]
+
+    def test_a_non_looping_play_still_finishes_on_its_own(self, compile_and_run, tmp_path,
+                                                            audio_null_env):
+        # The control for the test above -- same clip, same delay,
+        # play() instead of playLoop(). Without this pair, "still
+        # playing" would not distinguish looping from a slow device.
+        _write_wav(tmp_path / "clip.wav", duration_s=0.05)
+        source = (
+            "aud music = 'clip.wav'\n"
+            "void func check() {\n"
+            "    log(`still playing: ${music.isPlaying()}`)\n"
+            "}\n"
+            "music.play(0)\n"
+            "setTimeout(check, 400)\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "still playing: false"
+
+    def test_the_music_handover_from_the_motivating_example(self, compile_and_run, tmp_path,
+                                                              audio_null_env):
+        # claude.md #99's own worked example, shortened: two tracks
+        # trading channel 0 back and forth. The point is that
+        # isPlaying() flips each time, which only works if the second
+        # playLoop(0) genuinely evicts the first.
+        _write_wav(tmp_path / "adventure.wav", duration_s=0.05)
+        _write_wav(tmp_path / "battle.wav", duration_s=0.05)
+        source = (
+            "aud adventureMusic = 'adventure.wav'\n"
+            "aud battleMusic = 'battle.wav'\n"
+            "void func changeMusic() {\n"
+            "    if adventureMusic.isPlaying() {\n"
+            "        battleMusic.playLoop(0)\n"
+            "        log('battle')\n"
+            "    } else {\n"
+            "        adventureMusic.playLoop(0)\n"
+            "        log('adventure')\n"
+            "    }\n"
+            "}\n"
+            "int id = 0\n"
+            "void func done() {\n"
+            "    stopAudioPlayer(0)\n"
+            "    clearInterval(id)\n"
+            "}\n"
+            "adventureMusic.playLoop(0)\n"
+            "id = setInterval(changeMusic, 100)\n"
+            "setTimeout(done, 450)\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        lines = result.stdout.splitlines()
+        # Strict alternation: each tick sees the other track playing.
+        assert lines[:4] == ["battle", "adventure", "battle", "adventure"]
 
     def test_timers_and_audio_work_together(self, compile_and_run, tmp_path, audio_null_env):
         # A short clip finishes (isPlaying() -> false) on its own, with
@@ -4486,7 +4857,7 @@ class TestAudio:
         # or festina_run_event_loop() on the main thread).
         _write_wav(tmp_path / "clip.wav", duration_s=0.05)
         source = (
-            "aud music = loadAudio('clip.wav')\n"
+            "aud music = 'clip.wav'\n"
             "void func check() {\n"
             "    log(`playing after delay: ${music.isPlaying()}`)\n"
             "}\n"
@@ -4496,6 +4867,802 @@ class TestAudio:
         result = compile_and_run(source, env=audio_null_env)
         assert result.returncode == 0
         assert result.stdout.strip() == "playing after delay: false"
+
+
+_VOICE_POOL_HARNESS = r"""
+/* claude.md #98: a WHITE-BOX check of the per-aud voice pool.
+ *
+ * Two things make this a C harness rather than a Festina program.
+ *
+ * First, the pool is deliberately not language surface: a Festina
+ * program can ask whether a clip is playing, never how many copies of
+ * it are, and stop() names the clip rather than one playback of it.
+ * Adding a counter to the language purely to make this testable would
+ * be the tail wagging the dog, so this includes the translation unit
+ * directly, which gives it FestinaAudio/FestinaVoice (both file-local
+ * types) and lets it count active voices for real.
+ *
+ * Second, the ALSA device layer is REPLACED here, via the macros
+ * below, and that is not a shortcut -- it is the only way this test
+ * can exist. The null ALSA device the rest of the audio tests use
+ * consumes PCM instantly (measured: a 2-second clip finishes in 0ms),
+ * so under it every voice is finished before the next play() begins
+ * and there is no concurrency left to observe. A stub that sleeps per
+ * chunk gives playback real duration under the harness's own control,
+ * and needs no sound hardware, no ALSA config, and no device at all.
+ * Everything above the device -- the pool, the stealing, the slot
+ * reuse, the joining -- is the genuine runtime code.
+ */
+#include <alsa/asoundlib.h>
+#include <time.h>
+
+static int harness_pcm_open(snd_pcm_t **out) { *out = (snd_pcm_t *)1; return 0; }
+static long harness_pcm_writei(snd_pcm_t *pcm, const void *buf, unsigned long frames) {
+    (void)pcm; (void)buf;
+    /* ~10ms per 4096-frame chunk, so a clip of a few chunks plays for
+     * long enough that back-to-back play() calls genuinely overlap. */
+    struct timespec ts = { 0, 10L * 1000L * 1000L };
+    nanosleep(&ts, NULL);
+    return (long)frames;
+}
+
+#define snd_pcm_open(pcmp, name, stream, mode) harness_pcm_open(pcmp)
+#define snd_pcm_set_params(pcm, f, a, c, r, s, l) 0
+#define snd_pcm_writei(pcm, buf, frames) harness_pcm_writei(pcm, buf, frames)
+#define snd_pcm_recover(pcm, err, silent) (-1)
+#define snd_pcm_close(pcm) 0
+
+#include "festina_runtime_audio.c"
+
+/* The only thing the audio unit needs from the core runtime, supplied
+ * here so this harness does not have to link festina_runtime.c (and
+ * with it sqlite3) for a test that is entirely about audio. */
+void festina_fail(const char *msg) {
+    fprintf(stderr, "fail: %s\n", msg ? msg : "");
+    exit(1);
+}
+
+static int active_voices(void *audio) {
+    int n = 0;
+    pthread_mutex_lock(&g_audio_lock);
+    for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+        if (g_channels[i].active && g_channels[i].clip == audio) n++;
+    }
+    pthread_mutex_unlock(&g_audio_lock);
+    return n;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    void *clip = festina_load_audio(argv[1]);
+
+    printf("default %lld\n", (long long)festina_get_max_audio_players());
+
+    /* Three overlapping plays, well inside the default limit of 10.
+     * Before claude.md #98 the second would have cut the first off and
+     * this would read 1. */
+    festina_audio_play_on(clip, 0, 0, 0);
+    festina_audio_play_on(clip, 0, 0, 0);
+    festina_audio_play_on(clip, 0, 0, 0);
+    printf("three %d\n", active_voices(clip));
+    printf("isplaying %d\n", (int)festina_audio_is_playing(clip));
+
+    /* claude.md #100: playback is stopped by CHANNEL now, and a
+     * negative channel means every channel. */
+    festina_stop_audio_player(-1);
+    printf("stopped %d\n", active_voices(clip));
+    printf("isplaying_after_stop %d\n", (int)festina_audio_is_playing(clip));
+
+    /* At the limit, the oldest voice is stolen rather than the new play
+     * being dropped -- so the count saturates at the limit, never
+     * exceeds it, and never collapses to zero however many plays pile
+     * up. */
+    festina_set_max_audio_players(2);
+    for (int i = 0; i < 6; i++) festina_audio_play_on(clip, 0, 0, 0);
+    printf("limit2 %d\n", active_voices(clip));
+
+    /* A limit of 1 is exactly the old behaviour: one voice, restarted. */
+    festina_stop_audio_player(-1);
+    festina_set_max_audio_players(1);
+    festina_audio_play_on(clip, 0, 0, 0);
+    festina_audio_play_on(clip, 0, 0, 0);
+    printf("limit1 %d\n", active_voices(clip));
+
+    festina_stop_audio_player(-1);
+    printf("final %d\n", active_voices(clip));
+
+    /* Slots are REUSED, not grown: 40 plays through a pool of 3 must
+     * never show more than 3 voices, which only holds if a finished
+     * thread is joined and its slot reclaimed (see
+     * festina_audio_reap_locked). */
+    festina_set_max_audio_players(3);
+    int peak = 0;
+    for (int i = 0; i < 40; i++) {
+        festina_audio_play_on(clip, 0, 0, 0);
+        int n = active_voices(clip);
+        if (n > peak) peak = n;
+    }
+    printf("peak %d\n", peak);
+    festina_stop_audio_player(-1);
+    printf("drained %d\n", active_voices(clip));
+    return 0;
+}
+"""
+
+
+_SINGLE_STREAM_HARNESS = r"""
+/* claude.md #98: a "default" device that does NO software mixing, so
+ * the second concurrent open fails with EBUSY -- a bare hw: device
+ * with no dmix, which is ordinary on minimal/embedded Linux and on any
+ * machine where another program holds the device exclusively.
+ *
+ * The voice pool opens one handle per voice, so this is the case where
+ * layering is not physically available. What must NOT happen is the
+ * program dying: overlapping plays have to degrade back to cutting
+ * each other off, which is exactly what they did before there was a
+ * pool at all.
+ */
+#include <alsa/asoundlib.h>
+#include <time.h>
+
+static int g_open_count = 0;
+static int lim_open(snd_pcm_t **p) {
+    if (g_open_count >= 1) return -EBUSY;
+    g_open_count++;
+    *p = (snd_pcm_t *)(long)g_open_count;
+    return 0;
+}
+static int lim_close(snd_pcm_t *p) { (void)p; g_open_count--; return 0; }
+static long lim_writei(snd_pcm_t *p, const void *b, unsigned long f) {
+    (void)p; (void)b;
+    struct timespec ts = { 0, 10L * 1000L * 1000L };
+    nanosleep(&ts, NULL);
+    return (long)f;
+}
+
+#define snd_pcm_open(pcmp, name, stream, mode) lim_open(pcmp)
+#define snd_pcm_set_params(pcm, f, a, c, r, s, l) 0
+#define snd_pcm_writei(pcm, buf, frames) lim_writei(pcm, buf, frames)
+#define snd_pcm_recover(pcm, err, silent) (-1)
+#define snd_pcm_close(pcm) lim_close(pcm)
+
+#include "festina_runtime_audio.c"
+
+void festina_fail(const char *msg) {
+    fprintf(stderr, "fail: %s\n", msg ? msg : "");
+    exit(1);
+}
+
+static int active_voices(void *audio) {
+    int n = 0;
+    pthread_mutex_lock(&g_audio_lock);
+    for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+        if (g_channels[i].active && g_channels[i].clip == audio) n++;
+    }
+    pthread_mutex_unlock(&g_audio_lock);
+    return n;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    void *clip = festina_load_audio(argv[1]);
+    for (int i = 0; i < 5; i++) festina_audio_play_on(clip, 0, 0, 0);
+    /* One stream is all the device has, so one voice is all there is --
+     * and crucially the program is still running to say so. */
+    printf("voices %d\n", active_voices(clip));
+    printf("open_handles %d\n", g_open_count);
+    printf("isplaying %d\n", (int)festina_audio_is_playing(clip));
+    festina_stop_audio_player(-1);
+    printf("after_stop %d\n", active_voices(clip));
+    printf("leaked_handles %d\n", g_open_count);
+    return 0;
+}
+"""
+
+
+_CHANNEL_HARNESS = r"""
+/* claude.md #99: named channels -- play(n)/playLoop(n)/
+ * stopAudioPlayer(n), and the reservation playLoop takes out.
+ *
+ * White-box for the same two reasons the pool harness is (see
+ * _VOICE_POOL_HARNESS): a Festina program cannot see which channel a
+ * clip landed on, and the null ALSA device consumes PCM instantly so
+ * there is no concurrency to observe under it. The device layer is
+ * stubbed; the channel table is the real one.
+ */
+#include <alsa/asoundlib.h>
+#include <time.h>
+
+static int harness_pcm_open(snd_pcm_t **out) { *out = (snd_pcm_t *)1; return 0; }
+static long harness_pcm_writei(snd_pcm_t *pcm, const void *buf, unsigned long frames) {
+    (void)pcm; (void)buf;
+    struct timespec ts = { 0, 10L * 1000L * 1000L };
+    nanosleep(&ts, NULL);
+    return (long)frames;
+}
+
+#define snd_pcm_open(pcmp, name, stream, mode) harness_pcm_open(pcmp)
+#define snd_pcm_set_params(pcm, f, a, c, r, s, l) 0
+#define snd_pcm_writei(pcm, buf, frames) harness_pcm_writei(pcm, buf, frames)
+#define snd_pcm_recover(pcm, err, silent) (-1)
+#define snd_pcm_close(pcm) 0
+
+#include "festina_runtime_audio.c"
+
+void festina_fail(const char *msg) {
+    fprintf(stderr, "fail: %s\n", msg ? msg : "");
+    exit(1);
+}
+
+/* Which channel index a clip is playing on, or -1. */
+static int channel_of(void *clip) {
+    int found = -1;
+    pthread_mutex_lock(&g_audio_lock);
+    for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+        if (g_channels[i].active && g_channels[i].clip == clip) { found = i; break; }
+    }
+    pthread_mutex_unlock(&g_audio_lock);
+    return found;
+}
+
+static int locked_at(int i) {
+    pthread_mutex_lock(&g_audio_lock);
+    int v = g_channels[i].locked;
+    pthread_mutex_unlock(&g_audio_lock);
+    return v;
+}
+
+static int active_at(int i) {
+    pthread_mutex_lock(&g_audio_lock);
+    int v = g_channels[i].active;
+    pthread_mutex_unlock(&g_audio_lock);
+    return v;
+}
+
+static int active_total(void) {
+    int n = 0;
+    pthread_mutex_lock(&g_audio_lock);
+    for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) if (g_channels[i].active) n++;
+    pthread_mutex_unlock(&g_audio_lock);
+    return n;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 3) return 2;
+    void *adventure = festina_load_audio(argv[1]);
+    void *battle = festina_load_audio(argv[2]);
+
+    /* An explicit channel is honoured exactly. */
+    festina_audio_play_on(adventure, 5, 1, 0);
+    printf("explicit %d\n", channel_of(adventure));
+    festina_stop_audio_player(5);
+
+    /* playLoop reserves the channel it uses. */
+    festina_audio_play_on(adventure, 0, 1, 1);
+    printf("loop_channel %d\n", channel_of(adventure));
+    printf("loop_locked %d\n", locked_at(0));
+
+    /* A reserved channel is never taken by automatic assignment, even
+     * under pressure: 30 pooled plays with a limit of 3 must never land
+     * on channel 0 or evict what is looping there. */
+    festina_set_max_audio_players(3);
+    int stole_channel_0 = 0;
+    for (int i = 0; i < 30; i++) {
+        festina_audio_play_on(battle, 0, 0, 0);
+        pthread_mutex_lock(&g_audio_lock);
+        if (g_channels[0].clip != adventure) stole_channel_0 = 1;
+        pthread_mutex_unlock(&g_audio_lock);
+    }
+    printf("stole_reserved %d\n", stole_channel_0);
+
+    /* The looping clip is STILL playing after all that -- it has run
+     * far past its own length, which only a real loop does. */
+    printf("still_looping %d\n", (int)festina_audio_is_playing(adventure));
+
+    /* The handover from the user's own example: a different clip named
+     * on the same channel takes it over. */
+    festina_audio_play_on(battle, 0, 1, 1);
+    printf("handover_battle %d\n", channel_of(battle));
+    printf("handover_adventure_playing %d\n", (int)festina_audio_is_playing(adventure));
+    printf("handover_still_locked %d\n", locked_at(0));
+
+    /* An explicit one-shot play() on a reserved channel takes it over
+     * AND releases the reservation. */
+    festina_audio_play_on(adventure, 0, 1, 0);
+    printf("oneshot_released %d\n", locked_at(0));
+
+    /* stopAudioPlayer(n) stops that channel and releases it. Asserted
+     * per CHANNEL, not per clip: isPlaying() is deliberately clip-wide
+     * (claude.md #98), so with the same clip also running on channel 0
+     * from the block above it would stay true regardless of what
+     * channel 2 does -- which would make this assert nothing. */
+    festina_audio_play_on(adventure, 2, 1, 1);
+    printf("before_stop_locked %d\n", locked_at(2));
+    printf("before_stop_active %d\n", active_at(2));
+    festina_stop_audio_player(2);
+    printf("after_stop_locked %d\n", locked_at(2));
+    printf("after_stop_active %d\n", active_at(2));
+
+    /* A bare stopAudioPlayer() stops everything. */
+    festina_audio_play_on(adventure, 1, 1, 1);
+    festina_audio_play_on(battle, 4, 1, 1);
+    festina_audio_play_on(battle, 0, 0, 0);
+    printf("before_stop_all %d\n", active_total() > 0);
+    festina_stop_audio_player(-1);
+    printf("after_stop_all %d\n", active_total());
+    printf("after_stop_all_locks %d\n", locked_at(1) + locked_at(4));
+
+    /* A bare stopAudioPlayer() releases reservations too -- a looping
+     * track told to stop is not still owed its channel. */
+    festina_audio_play_on(adventure, 7, 1, 1);
+    festina_stop_audio_player(-1);
+    printf("clip_stop_locked %d\n", locked_at(7));
+    printf("clip_stop_playing %d\n", (int)festina_audio_is_playing(adventure));
+    return 0;
+}
+"""
+
+
+class TestMediaFormatsAndPaths:
+    """claude.md #101: `img sprite = 'sprite.png'` alongside claude.md
+    #100's `aud`, JPEG and MP3 decoding, and both types as sqlite BLOB
+    columns.
+
+    The format tests run against REAL files committed under
+    tests/fixtures/ rather than anything generated here. Nothing in this
+    repo can encode a JPEG or an MP3, so a hand-rolled approximation
+    would only prove that a hand-rolled approximation decodes -- the
+    point is that libjpeg and libmpg123 are genuinely wired up.
+    """
+
+    def test_a_path_declares_an_image(self, compile_and_run, tmp_path, monkeypatch,
+                                       sprite_sheet_png):
+        # The img counterpart of claude.md #100's aud form. Headless on
+        # purpose: decoding needs no display, and the short form must not
+        # quietly demand one where loadImage() never did.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        name = os.path.basename(sprite_sheet_png)   # already written into tmp_path
+        result = compile_and_run(
+            f"img sheet = '{name}'\nlog(`${{sheet.width}}x${{sheet.height}}`)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "128x64"
+
+    def test_an_image_path_may_be_a_computed_text_expression(self, compile_and_run, tmp_path,
+                                                               monkeypatch, sprite_sheet_png):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        stem = os.path.basename(sprite_sheet_png)[:-len(".png")]
+        result = compile_and_run(
+            f"text name = '{stem}'\nimg sheet = name + '.png'\nlog(sheet.width)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "128"
+
+    def test_jpeg_decodes(self, compile_and_run, tmp_path, monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        shutil.copy(_JPEG_FIXTURE, tmp_path / "gradient.jpg")
+        result = compile_and_run(
+            "img photo = 'gradient.jpg'\nlog(`${photo.width}x${photo.height}`)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "16x16"
+
+    def test_jpeg_pixels_are_right_way_round(self, compile_and_run, tmp_path, monkeypatch):
+        # The fixture is a gradient: red rises with x, green with y, blue
+        # is flat at 128. That makes a channel swap (the classic mistake
+        # converting libjpeg's RGB into Cairo's native-endian pixel)
+        # impossible to miss, which "it decoded to 16x16" would not
+        # catch. Tolerance is for JPEG being lossy, nothing else.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        shutil.copy(_JPEG_FIXTURE, tmp_path / "gradient.jpg")
+        result = compile_and_run(
+            "img photo = 'gradient.jpg'\n"
+            "drawImage(photo, 0, 0)\n"
+            "log(saveCanvas('out.png'))\n"
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        for x, y, expected in [(0, 0, (0, 0, 128)), (15, 0, (240, 0, 128)),
+                                (0, 15, (0, 240, 128)), (15, 15, (240, 240, 128))]:
+            got = pixel(x, y)
+            worst = max(abs(g - e) for g, e in zip(got, expected))
+            assert worst <= 24, f"({x},{y}) expected ~{expected}, got {got}"
+
+    def test_mp3_decodes_and_plays(self, compile_and_run, tmp_path, audio_null_env):
+        shutil.copy(_MP3_FIXTURE, tmp_path / "tone.mp3")
+        result = compile_and_run(
+            "aud tone = 'tone.mp3'\n"
+            "tone.play()\n"
+            "log(tone.isPlaying())\n",
+            env=audio_null_env,
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_format_is_sniffed_from_content_not_the_extension(self, compile_and_run, tmp_path,
+                                                                monkeypatch):
+        # A blob out of a database has no extension at all, so the
+        # decoder never had any business trusting one. Same JPEG, named
+        # ".png".
+        monkeypatch.delenv("DISPLAY", raising=False)
+        shutil.copy(_JPEG_FIXTURE, tmp_path / "lying.png")
+        result = compile_and_run("img photo = 'lying.png'\nlog(photo.width)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "16"
+
+
+class TestMediaColumnsInTables:
+    """claude.md #101: `file:aud` / `pic:img` table columns, stored as
+    SQLite BLOBs.
+
+    The stored bytes are the asset's OWN encoded bytes, not a
+    re-encoding, so a round trip is byte-identical and an MP3 stays an
+    MP3 rather than becoming a much larger WAV. That is checked here by
+    reading the database back with Python's own sqlite3 and comparing
+    against the fixture file, which is the only way to prove it is a
+    real BLOB rather than something that merely round-trips through
+    Festina.
+    """
+
+    def _db(self, tmp_path):
+        return sqlite3.connect(str(tmp_path / "festina.sqlite"))
+
+    def test_the_column_type_is_blob(self, compile_and_run, tmp_path):
+        source = """
+        table Music {
+            name:text
+            file:aud
+        }
+        table Sprites {
+            name:text
+            pic:img
+        }
+        log('synced')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        schema = dict(self._db(tmp_path).execute(
+            "SELECT name, sql FROM sqlite_master WHERE name IN ('Music','Sprites')").fetchall())
+        # TEXT (what these used to fall through to) would have silently
+        # truncated at the first NUL byte in a PNG header.
+        assert "file BLOB" in schema["Music"]
+        assert "pic BLOB" in schema["Sprites"]
+
+    def test_binding_an_aud_stores_its_own_bytes(self, compile_and_run, tmp_path, audio_null_env):
+        shutil.copy(_MP3_FIXTURE, tmp_path / "tone.mp3")
+        source = """
+        table Music {
+            name:text
+            file:aud
+        }
+        aud track = 'tone.mp3'
+        sqlite('INSERT INTO Music (name, file) VALUES (?, ?)', ['theme', track])
+        log('inserted')
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        stored = self._db(tmp_path).execute("SELECT file FROM Music").fetchone()[0]
+        assert isinstance(stored, bytes)
+        assert stored == open(_MP3_FIXTURE, "rb").read()
+
+    def test_binding_an_img_stores_its_own_bytes(self, compile_and_run, tmp_path, monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        shutil.copy(_JPEG_FIXTURE, tmp_path / "gradient.jpg")
+        source = """
+        table Sprites {
+            name:text
+            pic:img
+        }
+        img hero = 'gradient.jpg'
+        sqlite('INSERT INTO Sprites (name, pic) VALUES (?, ?)', ['hero', hero])
+        log('inserted')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        stored = self._db(tmp_path).execute("SELECT pic FROM Sprites").fetchone()[0]
+        assert isinstance(stored, bytes)
+        # Byte-identical: a JPEG stays a JPEG rather than being
+        # re-encoded as PNG on the way in.
+        assert stored == open(_JPEG_FIXTURE, "rb").read()
+
+    def test_a_stored_clip_reads_back_as_a_playable_aud(self, compile_and_run, tmp_path,
+                                                          audio_null_env):
+        shutil.copy(_MP3_FIXTURE, tmp_path / "tone.mp3")
+        source = """
+        table Music {
+            name:text
+            file:aud
+        }
+        aud track = 'tone.mp3'
+        sqlite('INSERT INTO Music (name, file) VALUES (?, ?)', ['theme', track])
+        arr[Music] rows = sqlite('SELECT * FROM Music')
+        log(rows[0].name)
+        rows[0].file.play()
+        log(rows[0].file.isPlaying())
+        stopAudioPlayer()
+        log(rows[0].file.isPlaying())
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["theme", "true", "false"]
+
+    def test_a_stored_image_reads_back_with_its_real_size(self, compile_and_run, tmp_path,
+                                                            monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        shutil.copy(_JPEG_FIXTURE, tmp_path / "gradient.jpg")
+        source = """
+        table Sprites {
+            name:text
+            pic:img
+        }
+        img hero = 'gradient.jpg'
+        sqlite('INSERT INTO Sprites (name, pic) VALUES (?, ?)', ['hero', hero])
+        arr[Sprites] rows = sqlite('SELECT * FROM Sprites')
+        log(`${rows[0].name} ${rows[0].pic.width}x${rows[0].pic.height}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "hero 16x16"
+
+    def test_a_clipped_image_with_no_source_bytes_is_encoded_on_demand(
+        self, compile_and_run, tmp_path, monkeypatch, sprite_sheet_png
+    ):
+        # A clip() result never came from a file, so it has no bytes to
+        # store -- festina_image_bytes encodes PNG for it. The round trip
+        # has to preserve the SIZE of the clipped tile, not the sheet.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        sheet = os.path.basename(sprite_sheet_png)
+        source = f"""
+        table Sprites {{
+            name:text
+            pic:img
+        }}
+        img sheet = '{sheet}'
+        img tile = sheet.clip(0, 0, 32, 32)
+        sqlite('INSERT INTO Sprites (name, pic) VALUES (?, ?)', ['tile', tile])
+        arr[Sprites] rows = sqlite('SELECT * FROM Sprites')
+        log(`${{rows[0].pic.width}}x${{rows[0].pic.height}}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "32x32"
+        stored = self._db(tmp_path).execute("SELECT pic FROM Sprites").fetchone()[0]
+        assert stored[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+class TestAudioChannels:
+    """claude.md #99: channels are named, and playLoop reserves one.
+
+    The pool from claude.md #98 was per-`aud`, which cannot express the
+    thing this section exists for -- two different clips sharing one
+    channel:
+
+        adventureMusic.playLoop(0)
+        battleMusic.playLoop(0)     // takes channel 0 over
+
+    With a per-clip pool those are two different pools and "channel 0"
+    means two different things. So the pool became process-global and
+    its slots became channels, which is also what lets
+    stopAudioPlayer(0) be a plain free function rather than something
+    that would have to name a clip to find the channel.
+    """
+
+    def _run(self, tmp_path):
+        cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
+        if not cc:
+            pytest.skip("no C compiler (clang/gcc/cc) on PATH")
+        # claude.md #101: the audio unit needs libmpg123 too now.
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa", "libmpg123"],
+                               capture_output=True, text=True)
+        if alsa.returncode != 0:
+            pytest.skip("alsa/libmpg123 dev headers are not installed")
+        runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
+        harness = tmp_path / "channel_harness.c"
+        harness.write_text(_CHANNEL_HARNESS)
+        binary = tmp_path / "channel_harness"
+        a = tmp_path / "adventure.wav"
+        b = tmp_path / "battle.wav"
+        # Short clips: the looping assertions below only mean something
+        # if a non-looping clip would have finished long before them.
+        _write_wav(a, duration_s=0.5)
+        _write_wav(b, duration_s=0.5)
+        build = subprocess.run(
+            [cc, "-I", runtime_dir, str(harness), "-o", str(binary), "-pthread"]
+            + alsa.stdout.split(),
+            capture_output=True, text=True,
+        )
+        assert build.returncode == 0, build.stderr
+        run = subprocess.run([str(binary), str(a), str(b)], capture_output=True,
+                              text=True, timeout=180)
+        assert run.returncode == 0, run.stderr
+        return dict(line.split() for line in run.stdout.splitlines())
+
+    def test_an_explicit_channel_is_honoured_exactly(self, tmp_path):
+        out = self._run(tmp_path)
+        assert out["explicit"] == "5"
+
+    def test_play_loop_reserves_its_channel_and_keeps_playing(self, tmp_path):
+        out = self._run(tmp_path)
+        assert out["loop_channel"] == "0"
+        assert out["loop_locked"] == "1"
+        # 30 pooled plays through a limit of 3, and the reservation is
+        # never touched -- without the lock, stealing would have taken
+        # channel 0 almost immediately.
+        assert out["stole_reserved"] == "0"
+        # And it is still going, far past its own half-second length,
+        # which only a real loop does.
+        assert out["still_looping"] == "1"
+
+    def test_a_second_clip_can_take_the_channel_over(self, tmp_path):
+        # The handover straight out of the motivating example.
+        out = self._run(tmp_path)
+        assert out["handover_battle"] == "0"
+        assert out["handover_adventure_playing"] == "0"
+        assert out["handover_still_locked"] == "1"
+
+    def test_an_explicit_one_shot_play_releases_the_reservation(self, tmp_path):
+        # "or if the channel is explicitly listed in play()/playLoop()":
+        # play(n) takes the channel over AND hands it back to the pool,
+        # since a one-shot has nothing to reserve it for.
+        out = self._run(tmp_path)
+        assert out["oneshot_released"] == "0"
+
+    def test_stop_audio_player_stops_and_releases_one_channel(self, tmp_path):
+        out = self._run(tmp_path)
+        assert out["before_stop_locked"] == "1"
+        assert out["before_stop_active"] == "1"
+        assert out["after_stop_locked"] == "0"
+        assert out["after_stop_active"] == "0"
+
+    def test_a_bare_stop_audio_player_stops_every_channel(self, tmp_path):
+        out = self._run(tmp_path)
+        assert out["before_stop_all"] == "1"
+        assert out["after_stop_all"] == "0"
+        assert out["after_stop_all_locks"] == "0"
+
+    def test_stopping_everything_releases_every_reservation(self, tmp_path):
+        out = self._run(tmp_path)
+        assert out["clip_stop_locked"] == "0"
+        assert out["clip_stop_playing"] == "0"
+
+
+class TestAudioOnANonMixingDevice:
+    """claude.md #98: the pool opens one ALSA handle per voice, and not
+    every "default" device does software mixing. On a bare hw: device
+    with no dmix -- ordinary on minimal/embedded Linux, and on any
+    machine where another program holds the device exclusively -- the
+    second concurrent open fails with EBUSY.
+
+    Treating that as fatal (which it briefly was) meant an overlapping
+    play() killed the program outright on such a system, with an error
+    claiming there was no audio device when there plainly was one. That
+    was a regression the pool introduced: the single-voice design it
+    replaced never had two handles open, so it could never hit it.
+
+    The right answer is to give a playing voice's handle back and retry,
+    which degrades to exactly the pre-pool behaviour -- overlapping
+    plays cut each other off instead of layering. On a device that
+    cannot mix, layering was never physically possible, and quietly
+    getting fewer simultaneous sounds beats not running.
+    """
+
+    def _run(self, tmp_path):
+        cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
+        if not cc:
+            pytest.skip("no C compiler (clang/gcc/cc) on PATH")
+        # claude.md #101: the audio unit needs libmpg123 too now.
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa", "libmpg123"],
+                               capture_output=True, text=True)
+        if alsa.returncode != 0:
+            pytest.skip("alsa/libmpg123 dev headers are not installed")
+        runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
+        harness = tmp_path / "single_stream_harness.c"
+        harness.write_text(_SINGLE_STREAM_HARNESS)
+        binary = tmp_path / "single_stream_harness"
+        wav = tmp_path / "clip.wav"
+        _write_wav(wav, duration_s=2.0)
+        build = subprocess.run(
+            [cc, "-I", runtime_dir, str(harness), "-o", str(binary), "-pthread"]
+            + alsa.stdout.split(),
+            capture_output=True, text=True,
+        )
+        assert build.returncode == 0, build.stderr
+        run = subprocess.run([str(binary), str(wav)], capture_output=True, text=True,
+                              timeout=120)
+        return run
+
+    def test_overlapping_plays_degrade_instead_of_killing_the_program(self, tmp_path):
+        run = self._run(tmp_path)
+        assert run.returncode == 0, run.stderr
+        out = dict(line.split() for line in run.stdout.splitlines())
+        # Five plays, one stream: one voice, no crash, still playing.
+        assert out["voices"] == "1"
+        assert out["open_handles"] == "1"
+        assert out["isplaying"] == "1"
+
+    def test_no_handle_is_leaked_by_the_retry(self, tmp_path):
+        run = self._run(tmp_path)
+        assert run.returncode == 0, run.stderr
+        out = dict(line.split() for line in run.stdout.splitlines())
+        # Every failed open must close nothing and every freed voice must
+        # release its handle -- otherwise the device would stay busy and
+        # the retry could never succeed a second time.
+        assert out["after_stop"] == "0"
+        assert out["leaked_handles"] == "0"
+
+
+class TestAudioVoicePool:
+    """claude.md #98: `aud.play()` no longer cuts off a playback that is
+    already running -- each clip owns a pool of voices, one thread and
+    one ALSA handle per simultaneous playback, all streaming the same
+    decoded PCM read-only.
+
+    See _VOICE_POOL_HARNESS's own comment for why this is a white-box C
+    test: the pool is deliberately invisible to the language, and the
+    null ALSA device the other audio tests use consumes PCM instantly,
+    so under it there is no concurrency left to observe at all.
+    """
+
+    def _run_harness(self, tmp_path):
+        cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
+        if not cc:
+            pytest.skip("no C compiler (clang/gcc/cc) on PATH")
+        # claude.md #101: the audio unit needs libmpg123 too now.
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa", "libmpg123"],
+                               capture_output=True, text=True)
+        if alsa.returncode != 0:
+            pytest.skip("alsa/libmpg123 dev headers are not installed")
+
+        runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
+        harness = tmp_path / "voice_pool_harness.c"
+        harness.write_text(_VOICE_POOL_HARNESS)
+        binary = tmp_path / "voice_pool_harness"
+        # 2 seconds at 8kHz is 16000 frames -- four 4096-frame chunks,
+        # so ~40ms of playback per voice under the harness's stub. Long
+        # enough that back-to-back plays overlap, short enough that 40
+        # of them through a pool of 3 still finish quickly.
+        wav = tmp_path / "clip.wav"
+        _write_wav(wav, duration_s=2.0)
+
+        build = subprocess.run(
+            [cc, "-I", runtime_dir, str(harness),
+             "-o", str(binary), "-pthread"] + alsa.stdout.split(),
+            capture_output=True, text=True,
+        )
+        assert build.returncode == 0, build.stderr
+        run = subprocess.run([str(binary), str(wav)], capture_output=True, text=True,
+                              timeout=180)
+        assert run.returncode == 0, run.stderr
+        return dict(line.split() for line in run.stdout.splitlines())
+
+    def test_overlapping_plays_each_get_their_own_voice(self, tmp_path):
+        out = self._run_harness(tmp_path)
+        assert out["default"] == "10"
+        # The whole point: three plays, three voices, none cut off.
+        assert out["three"] == "3"
+        assert out["isplaying"] == "1"
+
+    def test_stopping_every_channel_ends_every_voice(self, tmp_path):
+        out = self._run_harness(tmp_path)
+        assert out["stopped"] == "0"
+        assert out["isplaying_after_stop"] == "0"
+        assert out["final"] == "0"
+        assert out["drained"] == "0"
+
+    def test_the_limit_caps_the_pool_and_steals_rather_than_dropping(self, tmp_path):
+        out = self._run_harness(tmp_path)
+        # Six plays into a limit of 2: saturated, never exceeded, and
+        # still 2 rather than 0 -- the older voices were stolen and
+        # replaced, not merely stopped, and no play() was dropped.
+        assert out["limit2"] == "2"
+        # A limit of 1 is the old cut-off-the-previous-sound behaviour.
+        assert out["limit1"] == "1"
+
+    def test_slots_are_reused_rather_than_grown(self, tmp_path):
+        # 40 plays through a pool of 3. This only holds if a finished
+        # thread is joined and its slot reclaimed -- otherwise the pool
+        # would either overflow or leak one thread per play over the
+        # life of a long-running game.
+        out = self._run_harness(tmp_path)
+        assert out["peak"] == "3"
 
 
 class TestRegex:
@@ -5368,7 +6535,7 @@ class TestSlimBinaries:
         # validation) -- irrelevant here, this only checks what got
         # linked, never runs the binary.
         src = tmp_path / "main.f"
-        src.write_text("aud music = loadAudio('nonexistent.wav')")
+        src.write_text("aud music = 'nonexistent.wav'")
         out = tmp_path / "program"
         cli_mod.compile_file(str(src), str(out), cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
         ldd_output = self._ldd(out)
@@ -5477,3 +6644,2548 @@ class TestMissingDependencyErrors:
         src.write_text("log('hi')")
         with pytest.raises(errors.CompileError, match="clang.*install"):
             cli_mod.compile_file(str(src), str(tmp_path / "out"), cc="clang")
+
+
+class TestTextReferenceManagement:
+    """claude.md #83: every text-typed binding (local, global, struct
+    field, array element, map value, parameter) always holds either NULL
+    or a heap buffer it owns EXCLUSIVELY -- never a bare alias of a
+    `.str.N` literal constant or of another binding's buffer. Unlike
+    struct/arr[T]/map[T] (claude.md #77/#79, a refcount header in front
+    of the payload), text keeps its plain `char*` representation
+    everywhere -- sqlite, regex, log, and every other existing `char*`
+    consumer are untouched -- and gets its exclusivity by COPYING at
+    each binding site (festina_text_own, a NULL-safe strdup) whenever
+    the value's source isn't already a fresh buffer. That invariant is
+    what makes freeing unconditional: a text local is always safe to
+    free on reassignment and at scope exit, with no escape analysis
+    needed, because no other binding can ever be sharing its buffer.
+
+    Before this section text was never freed anywhere at all, which is
+    why benchmarks/string_concat.f spent its whole runtime growing the
+    heap (816 brk() calls, now 3)."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    # ---- IR-level: no C compiler needed ----
+
+    def test_text_local_from_a_literal_is_copied_not_aliased(self, parser, semantic, codegen):
+        # A StringLit is a pointer to a `.str.N` global CONSTANT -- if a
+        # local aliased it directly, the scope-exit free below would be
+        # handing free() a pointer into the binary's own static data.
+        source = """
+        void func f() {
+            text a = 'lit'
+            log(a)
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call ptr @festina_text_own(ptr @.str." in ir
+
+    def test_text_local_from_a_call_takes_ownership_with_no_copy(self, parser, semantic, codegen):
+        # A Call already returns a fresh, exclusively-held buffer
+        # (_is_owning_text_source), so copying it would be pure waste --
+        # the returned pointer is stored directly.
+        source = """
+        text func make() { return `x` }
+        void func f() {
+            text b = make()
+            log(b)
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        assert "call ptr @make()" in body
+        # the call's result is stored straight into b's slot, uncopied
+        assert "@festina_text_own" not in body
+
+    def test_uninitialized_text_local_is_null_initialized(self, parser, semantic, codegen):
+        # Prerequisite for freeing text at all: before this section a
+        # `text s` with no initializer got an alloca and no store
+        # whatsoever, so its slot held genuine uninitialized garbage --
+        # freeing that at scope exit would be freeing a wild pointer.
+        source = """
+        void func f() {
+            text u
+            log(u)
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        assert "store ptr null" in body
+
+    def test_text_local_reassignment_frees_the_old_buffer(self, parser, semantic, codegen):
+        source = """
+        text func make() { return `x` }
+        void func f() {
+            text a = 'lit'
+            a = make()
+            log(a)
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        assert "call void @free(" in body
+
+    def test_bare_interpolation_template_copies_its_only_piece(self, parser, semantic, codegen):
+        # `` `${s}` `` performs no concatenation at all (claude.md #82
+        # skips the two empty literal pieces), so without an explicit
+        # copy it would hand back s's OWN buffer -- and since every
+        # TemplateLit counts as owning, the caller would then free a
+        # buffer s still points at.
+        source = """
+        void func f(s:text) { log(`${s}`) }
+        f('x')
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f(ptr %arg.s)")[1].split("\n}")[0]
+        assert "@festina_text_own" in body
+        assert "@festina_str_concat" not in body
+
+    def test_interpolation_followed_by_a_literal_piece_skips_the_copy(self, parser, semantic, codegen):
+        # `` `${s}!` `` DOES concatenate, and festina_str_concat already
+        # mallocs a fresh buffer from its two operands -- copying s
+        # first would allocate a second buffer that nothing ever frees
+        # (festina_str_concat never frees what it is handed). This was a
+        # real leak, caught by LeakSanitizer while building this section.
+        source = """
+        void func f(s:text) { log(`${s}!`) }
+        f('x')
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f(ptr %arg.s)")[1].split("\n}")[0]
+        assert "@festina_str_concat" in body
+        # the only festina_text_own left is the parameter's own binding
+        # copy (claude.md #84), never one feeding the concat
+        assert body.count("@festina_text_own") == 1
+
+    def test_chained_template_frees_every_intermediate_concat(self, parser, semantic, codegen):
+        # Each festina_str_concat copies both operands into a brand new
+        # buffer and leaves them untouched, so a template chaining four
+        # of them leaks three intermediates unless each is freed the
+        # moment the next concat has finished copying out of it.
+        source = """
+        void func f(s:text) { log(`a${s}b${s}c`) }
+        f('x')
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f(ptr %arg.s)")[1].split("\n}")[0]
+        concats = body.count("@festina_str_concat")
+        assert concats == 4
+        # 3 intermediates + the final result (freed after log) + the
+        # parameter's own scope-exit free
+        assert body.count("call void @free(") == concats + 1
+
+    def test_text_temporary_passed_as_an_argument_is_freed_after_the_call(
+            self, parser, semantic, codegen):
+        # Callees never take ownership of a text argument -- one they
+        # reassign is copied at binding (claude.md #84), one they only
+        # read is borrowed for the call's duration -- so the caller
+        # still owns what it passed and must free it, or it leaks with
+        # no binding anywhere left to free it later.
+        source = """
+        text func make() { return `x` }
+        void func f() {
+            log(make())
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        assert "@festina_log_text" in body
+        assert "call void @free(" in body
+
+    def test_borrowed_text_argument_is_not_freed_by_the_caller(self, parser, semantic, codegen):
+        # A bare Identifier argument is the variable's own buffer, not a
+        # temporary -- freeing it here would leave the variable dangling.
+        source = """
+        void func f() {
+            text a = 'lit'
+            log(a)
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        # exactly one free: a's own scope-exit free, none after the log
+        assert body.count("call void @free(") == 1
+
+    # ---- behavioural: real compiled programs ----
+
+    def test_text_locals_globals_and_reassignment_stay_correct(self, compile_and_run):
+        source = """
+        text g = 'initial'
+        text func wrap(s:text) { return `<${s}>` }
+        void func run() {
+            text a = 'hello'
+            text b = wrap(a)
+            text c = `${a} ${b}`
+            a = wrap(b)
+            log(a)
+            log(b)
+            log(c)
+            g = wrap('global')
+            log(g)
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == (
+            "<<hello>>\n"
+            "<hello>\n"
+            "hello <hello>\n"
+            "<global>\n"
+        )
+
+    def test_text_in_struct_fields_arrays_and_maps_stays_correct(self, compile_and_run):
+        source = """
+        struct Person { name:text }
+        text func wrap(s:text) { return `<${s}>` }
+        void func run() {
+            Person p
+            p.name = 'field'
+            log(p.name)
+            p.name = wrap('field2')
+            log(p.name)
+            p.name = `tmpl ${p.name}`
+            log(p.name)
+
+            arr[text] names = ['one', wrap('two')]
+            names[0] = wrap('changed')
+            log(names[0])
+            log(names[1])
+
+            map[text] m = {'k1': 'v1'}
+            m['k1'] = wrap('v1b')
+            m['k2'] = `tmpl-${m['k1']}`
+            log(m['k1'])
+            log(m['k2'])
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == (
+            "field\n"
+            "<field2>\n"
+            "tmpl <field2>\n"
+            "<changed>\n"
+            "<two>\n"
+            "<v1b>\n"
+            "tmpl-<v1b>\n"
+        )
+
+    def test_repeated_concatenation_in_a_loop_builds_the_right_string(self, compile_and_run):
+        # benchmarks/string_concat.f's own shape: `s` is freed and
+        # replaced every iteration, so the heap stays flat instead of
+        # growing by one leaked buffer per iteration.
+        source = """
+        void func run() {
+            text s = ''
+            for int i = 0, i < 200, i++ {
+                s = `${s}x`
+            }
+            log(s)
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "x" * 200 + "\n"
+
+    def test_text_methods_on_temporaries_stay_correct(self, compile_and_run):
+        source = """
+        text func wrap(s:text) { return `<${s}>` }
+        void func run() {
+            log('room 42'.replace(/[0-9]+/, 'N'))
+            log(wrap('abc').replace('b', 'Z'))
+            log(`${'hello'}`.replaceAll('l', 'L'))
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "room N\n<aZc>\nheLLo\n"
+
+
+class TestParameterReassignmentOwnership:
+    """claude.md #84: a struct/arr[T]/map[T] parameter is passed as the
+    caller's own raw pointer, unretained -- a deliberately "borrowed"
+    convention, since a callee that only reads its parameter has no
+    reason to touch the refcount. But a callee that REASSIGNS its own
+    parameter (`p = somethingElse`) runs the ordinary local-reassignment
+    path, which releases whatever the binding currently holds -- and for
+    a borrowed parameter that is the CALLER's live value, dropping its
+    refcount to zero and freeing it out from under the caller.
+
+    That was a real, pre-existing use-after-free (confirmed under
+    AddressSanitizer with a heap-allocated local passed to a
+    parameter-reassigning callee), not something introduced by the text
+    work -- it was found while designing text's own parameter handling,
+    which has exactly the same shape. The fix: any parameter escape
+    analysis shows the callee assigns to is given its own reference at
+    binding time (festina_retain for struct/arr[T]/map[T], a
+    festina_text_own copy for text) and released at the callee's own
+    scope exit, so the callee is never mutating a binding it doesn't own.
+
+    Note the retain/copy is keyed on the whole `escaping` set rather
+    than on reassignment alone. Every reassigned name is necessarily in
+    that set (escape_analysis._walk_assign_target adds every bare
+    Identifier assignment target), so this is safe but conservative --
+    it also copies a text parameter that merely gets interpolated or
+    passed along. See todo.md."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_reassigned_struct_parameter_is_retained_at_binding(self, parser, semantic, codegen):
+        source = """
+        struct Point { x:int }
+        void func mutate(p:Point) {
+            Point fresh
+            fresh.x = 999
+            p = fresh
+        }
+        Point func make() { Point o o.x = 1 return o }
+        void func run() {
+            Point original = make()
+            mutate(original)
+            log(original.x)
+        }
+        run()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @mutate(ptr %arg.p)")[1].split("\n}")[0]
+        assert "call void @festina_retain(ptr %arg.p)" in body
+
+    def test_reassigned_text_parameter_is_copied_at_binding(self, parser, semantic, codegen):
+        source = """
+        void func mutate(s:text) { s = `${s}!` }
+        mutate('x')
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @mutate(ptr %arg.s)")[1].split("\n}")[0]
+        assert "call ptr @festina_text_own(ptr %arg.s)" in body
+
+    def test_callers_struct_survives_a_callee_reassigning_its_parameter(self, compile_and_run):
+        # The regression this section exists for: before the fix,
+        # `original` was freed by mutate()'s own reassignment and
+        # original.x read freed memory.
+        source = """
+        struct Point { x:int }
+        void func mutate(p:Point) {
+            Point fresh
+            fresh.x = 999
+            p = fresh
+        }
+        Point func make() { Point o o.x = 1 return o }
+        void func run() {
+            Point original = make()
+            mutate(original)
+            log(original.x)
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "1\n"
+
+    def test_callers_text_survives_a_callee_reassigning_its_parameter(self, compile_and_run):
+        source = """
+        void func mutate(s:text) { s = `${s}!` }
+        text func make() { return `hello` }
+        void func run() {
+            text original = make()
+            mutate(original)
+            log(original)
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "hello\n"
+
+
+class TestQueryRowAndRegexReclamation:
+    """claude.md #85: two leak classes the text work (claude.md #83)
+    surfaced but did not itself cause, both pre-existing and both
+    unbounded rather than one-off.
+
+    A sqlite result row is deliberately not shaped like any other
+    Festina value: `festina_sqlite_collect_rows` builds each one as a
+    plain `malloc(col_count * sizeof(int64_t))` with each text/blob
+    column strdup'd into its slot, and no refcount header in front of
+    it. Every `isinstance(t, (StructType, ArrayType, MapType))` check in
+    codegen misses `TableType` entirely, so nothing ever freed a row or
+    its text columns -- and `arr[People] rows = sqlite(...)` is the
+    language's most central idiom, so every query leaked its whole row
+    set. The array header and its pointer buffer WERE already freed
+    (an arr[T] is an arr[T] whatever its element type); only the rows
+    hanging off it were not.
+
+    Because a row has no refcount header, this cannot reuse
+    `festina_release`, and -- more importantly -- the array owns its
+    rows outright: a `People p = rows[0]` local is only ever borrowing
+    one. So the per-row free is reached solely from
+    `_release_fn_for_array`'s own cascade, never from
+    `_release_fn_for`, which would otherwise let an arbitrary
+    TableType-typed binding double-free a row the array still owns.
+
+    Separately, a regex compiled by a runtime `regex(...)` call was
+    never freed either, so a `regex(...)` inside a loop leaked a full
+    compiled automaton (several KB) per iteration. A /pattern/ literal
+    is compiled once into a process-lifetime cache and must NOT be
+    freed, which is exactly what separates the two: only `regex(...)`
+    is an ast.Call."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_array_of_query_rows_gets_a_per_row_release_cascade(self, parser, semantic, codegen):
+        source = """
+        table People { id:int  name:text }
+        void func run() {
+            arr[People] rows = sqlite('SELECT * FROM People')
+            log(rows.length)
+        }
+        run()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "@__festina_release_row_People" in ir
+        # the generated row release frees the text column and the row
+        row_fn = ir.split("define void @__festina_release_row_People")[1].split("\n}")[0]
+        assert row_fn.count("call void @free(") == 2
+
+    def test_row_release_only_frees_text_and_blob_columns(self, parser, semantic, codegen):
+        # int/float/bool columns are plain i64 slots, never heap
+        # pointers -- freeing one would be freeing an integer.
+        source = """
+        table Mixed { id:int  score:float  ok:bool  name:text  data:blob }
+        void func run() {
+            arr[Mixed] rows = sqlite('SELECT * FROM Mixed')
+            log(rows.length)
+        }
+        run()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        row_fn = ir.split("define void @__festina_release_row_Mixed")[1].split("\n}")[0]
+        # 2 heap columns (name, data) + the row buffer itself
+        assert row_fn.count("call void @free(") == 3
+
+    def test_runtime_regex_temporary_is_freed(self, parser, semantic, codegen):
+        source = """
+        void func run() {
+            log(regex('[0-9]+').test('abc 42'))
+        }
+        run()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_regex_free(" in ir
+
+    def test_cached_regex_literal_is_never_freed(self, parser, semantic, codegen):
+        # A /pattern/ literal is compiled once and reused for the life
+        # of the process -- freeing it would leave the cache holding a
+        # dangling regex_t for every later evaluation.
+        source = """
+        void func run() {
+            log(/[0-9]+/.test('abc 42'))
+        }
+        run()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_regex_free(" not in ir
+
+    def test_query_rows_and_borrowed_row_stay_correct(self, compile_and_run, tmp_path):
+        source = """
+        table People { id:int  name:text }
+        void func run() {
+            sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'alice'])
+            sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [2, 'bob'])
+            arr[People] rows = sqlite('SELECT * FROM People ORDER BY id')
+            log(rows.length)
+            People first = rows[0]
+            log(first.name)
+            text copied = rows[1].name
+            log(copied)
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\nalice\nbob\n"
+
+    def test_runtime_and_literal_regexes_stay_correct_together(self, compile_and_run):
+        source = """
+        void func run() {
+            for int i = 0, i < 3, i++ {
+                log(regex('[0-9]+').test('abc 42'))
+                log('room 42'.replace(regex('[0-9]+'), 'N'))
+                log('room 42'.match(regex('[0-9]+')))
+                log(/[0-9]+/.test('abc 42'))
+                log('room 42'.replace(/[0-9]+/, 'N'))
+            }
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\nroom N\n42\ntrue\nroom N\n" * 3
+
+
+class TestOwnedRegexLocals:
+    """claude.md #86: a `regex` local this scope provably owns outright
+    -- one whose initializer is a `regex(...)` Call (freshly compiled by
+    festina_regex_compile, so nothing else can reference it yet) and
+    whose name escape analysis proves never leaves the function -- is
+    freed at scope exit. Before this, `regex r = regex(p)` inside a loop
+    leaked a full compiled automaton (several KB) per iteration; #85 had
+    only closed the case where the regex is used as a temporary in the
+    same expression that compiled it.
+
+    Both halves of the ownership test are load-bearing, and relaxing
+    either frees something still in use. A `/pattern/` literal
+    initializer is a pointer into a process-lifetime cache, so freeing
+    it would leave every later evaluation of that literal running
+    regexec against freed memory. An escaping regex has no equivalent of
+    text's copy-on-alias escape hatch -- a regex "copy" would mean
+    recompiling, and the pattern string isn't retained to recompile
+    from -- so it is left to leak exactly as before rather than freed
+    while another binding may still point at it."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_non_escaping_regex_local_from_a_call_is_freed(self, parser, semantic, codegen):
+        source = """
+        void func f() {
+            regex r = regex('[0-9]+')
+            log(r.test('42'))
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        assert "call void @festina_regex_free(" in body
+
+    def test_regex_local_from_a_literal_is_never_freed(self, parser, semantic, codegen):
+        source = """
+        void func f() {
+            regex r = /[0-9]+/
+            log(r.test('42'))
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_regex_free(" not in ir
+
+    def test_escaping_regex_local_is_not_freed(self, parser, semantic, codegen):
+        source = """
+        regex g = /[a-z]+/
+        void func f() {
+            regex r = regex('[0-9]+')
+            g = r
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        assert "call void @festina_regex_free(" not in body
+
+    def test_owned_literal_and_escaping_regexes_stay_correct_together(self, compile_and_run):
+        source = """
+        regex g = /[0-9]+/
+        void func owned() {
+            for int i = 0, i < 50, i++ {
+                regex r = regex('[0-9]+')
+                log(r.test('abc 42'))
+            }
+        }
+        void func fromLiteral() {
+            regex r = /[a-z]+/
+            log(r.test('abc'))
+        }
+        void func escapes() {
+            regex r = regex('[0-9]+')
+            g = r
+            log(r.test('42'))
+        }
+        owned()
+        fromLiteral()
+        escapes()
+        log(g.test('42'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\n" * 53
+
+
+class TestStructTextFieldReclamation:
+    """claude.md #88: a struct's own text-typed field is freed when the
+    struct is, in both directions the same predicate gates.
+
+    claude.md #83 added the field-level free itself but never widened
+    the eligibility check that decides whether a struct needs field
+    cleanup at all -- it still only counted struct/arr[T]/map[T] fields
+    (`_struct_has_own_refcounted_field`, now
+    `_struct_has_own_managed_field`). So a struct whose only managed
+    field is a text one fell through both paths: stack-allocated, it was
+    never scheduled for field release at all; heap-allocated, it got the
+    plain generic @festina_release instead of a per-struct wrapper.
+    Either way the field's buffer was never freed. Caught by an ASan run
+    over a struct whose text field is reassigned in a loop."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_struct_with_only_a_text_field_gets_a_release_wrapper(self, parser, semantic, codegen):
+        source = """
+        struct Person { name:text }
+        Person g
+        Person func make() { Person p  p.name = `x`  return p }
+        g = make()
+        log(g.name)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "define void @__festina_release_struct_Person" in ir
+        wrapper = ir.split("define void @__festina_release_struct_Person")[1].split("\n}")[0]
+        # the text field, then the struct's own header
+        assert wrapper.count("call void @free(") == 2
+
+    def test_stack_allocated_struct_frees_its_text_field(self, parser, semantic, codegen):
+        source = """
+        struct Person { name:text }
+        void func f() {
+            Person p
+            p.name = `x`
+            log(p.name)
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        # stack-allocated: no calloc for the struct, but the field is freed
+        assert "alloca %struct.Person" in body
+        assert "call void @free(" in body
+
+    def test_struct_text_fields_stay_correct_across_stack_heap_and_global(self, compile_and_run):
+        source = """
+        struct Person { name:text  age:int }
+        Person g
+        text func upper(s:text) { return `[${s}]` }
+        Person func make(n:text) { Person p  p.name = upper(n)  return p }
+        void func run() {
+            Person p
+            p.name = 'field'
+            p.name = upper(p.name)
+            log(p.name)
+            Person q = make('heap')
+            log(q.name)
+        }
+        run()
+        g = make('global')
+        log(g.name)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "[field]\n[heap]\n[global]\n"
+
+
+
+
+class TestColorAndFontTypes:
+    """claude.md #91: `color` and `font` are real types, and a value of
+    either is resolved to its compiled form once, at the declaration
+    that names it.
+
+    ```festina
+    color brand = '#4a90d9'
+    font  body  = '13px arial bold'
+    fillStyle(brand)
+    changeFont(body)
+    ```
+
+    A `color` compiles to a packed 0xRRGGBB integer (negative meaning
+    'none'), so passing one costs a single register. A `font` compiles
+    to a pointer to a static `%struct._FestinaFont` constant -- size,
+    slant, weight, family -- living in the binary's read-only data, so
+    declaring a font costs no runtime work at all and `changeFont()`
+    passes one pointer.
+
+    Neither type interacts with the reference-counting or
+    text-ownership machinery: a colour is a plain integer, and a font
+    points at a constant nothing allocates or frees.
+
+    A colour name or font shorthand can therefore only come from a
+    literal. Anything chosen at runtime uses `fillStyle(r, g, b)` or
+    `changeFont(px, style, family)`, which are strictly more capable for
+    that job anyway."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    # ---- the color type ----
+
+    def test_a_color_declaration_compiles_to_a_packed_integer(
+            self, parser, semantic, codegen):
+        # 0x4a90d9 == 4886745; one immediate, not three arguments.
+        ir = self._ir(parser, semantic, codegen, "color brand = '#4a90d9'")
+        assert "4886745" in ir
+
+    def test_every_css_name_and_hex_shape_resolves(self, parser, semantic, codegen):
+        cases = {
+            "red": 0xFF0000,
+            "RED": 0xFF0000,
+            "rebeccapurple": 0x663399,
+            "yellowgreen": 0x9ACD32,
+            "#00f": 0x0000FF,
+            "#00FF7F": 0x00FF7F,
+        }
+        for spelling, packed in cases.items():
+            ir = self._ir(parser, semantic, codegen, f"color c = '{spelling}'")
+            assert str(packed) in ir, f"{spelling} did not resolve to {packed}"
+
+    def test_none_is_the_negative_sentinel(self, parser, semantic, codegen):
+        # A negative value can't be a real packed colour, so it says
+        # "no colour" without needing a second field or function.
+        for spelling in ["none", "transparent"]:
+            ir = self._ir(parser, semantic, codegen, f"color c = '{spelling}'")
+            assert "-1" in ir
+
+    def test_fillStyle_takes_a_color_value(self, parser, semantic, codegen):
+        source = """
+        color brand = 'teal'
+        fillStyle(brand)
+        borderColor(brand)
+        drawRect(0, 0, 10, 10)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_set_fill_color(i64 " in ir
+        assert "call void @festina_set_border_color(i64 " in ir
+
+    def test_a_bad_colour_name_fails_at_the_declaration(
+            self, parser, semantic, codegen, errors):
+        with pytest.raises(errors.CompileError, match="nosuchcolour"):
+            self._ir(parser, semantic, codegen, "color c = 'nosuchcolour'")
+        for bad in ["#12345", "#xyz", "#"]:
+            with pytest.raises(errors.CompileError, match="not a colour"):
+                self._ir(parser, semantic, codegen, f"color c = '{bad}'")
+
+    def test_a_text_literal_is_not_a_color(self, parser, semantic, errors):
+        # The whole point of the type: fillStyle('red') no longer works,
+        # because a colour name has to be resolved at a declaration.
+        program = parser.parse("fillStyle('red')", filename="main.f")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program, filename="main.f")
+
+    def test_a_runtime_text_cannot_become_a_color(
+            self, parser, semantic, codegen, errors):
+        source = """
+        text name = 'red'
+        color c = name
+        """
+        with pytest.raises(errors.CompileError, match="must come from a literal"):
+            self._ir(parser, semantic, codegen, source)
+
+    def test_the_explicit_rgb_form_remains_for_runtime_colours(
+            self, parser, semantic, codegen):
+        source = """
+        int shade = 200
+        fillStyle(shade, 0, 255 - shade)
+        borderColor(1, 2, 3)
+        drawRect(0, 0, 10, 10)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_set_border_rgb(i64 1, i64 2, i64 3)" in ir
+        assert "@festina_set_fill_rgb(i64 %" in ir
+
+    def test_colors_can_be_copied_and_passed_around(self, compile_and_run):
+        # A colour is an ordinary value: assignable, passable, returnable.
+        source = """
+        color brand = '#4a90d9'
+        color func pick(c:color) { return c }
+        void func run() {
+            color local = brand
+            fillStyle(pick(local))
+            log('ok')
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "ok\n"
+
+    # ---- the font type ----
+
+    def test_a_font_declaration_compiles_to_a_static_record(
+            self, parser, semantic, codegen):
+        ir = self._ir(parser, semantic, codegen, "font body = '13px arial bold'")
+        assert "%struct._FestinaFont = type { i64, i64, i64, ptr }" in ir
+        # 13px, upright, bold, a real family pointer
+        assert "private constant %struct._FestinaFont { i64 13, i64 0, i64 1, ptr @" in ir
+
+    def test_font_words_may_appear_in_any_order(self, parser, semantic, codegen):
+        # Every ordering of the same three facts yields the same record.
+        for spec in ["arial 14px bold", "bold 14px arial", "14px arial bold",
+                     "bold arial 14px"]:
+            ir = self._ir(parser, semantic, codegen, f"font f = '{spec}'")
+            assert "{ i64 14, i64 0, i64 1, ptr @" in ir
+
+    def test_omitted_font_parts_are_left_alone(self, parser, semantic, codegen):
+        # size only -- family stays null, meaning "don't change it"
+        ir = self._ir(parser, semantic, codegen, "font f = '12px'")
+        assert "{ i64 12, i64 0, i64 0, ptr null }" in ir
+        # family only -- px 0 means "don't change the size"
+        ir = self._ir(parser, semantic, codegen, "font f = 'monospace'")
+        assert "{ i64 0, i64 0, i64 0, ptr @" in ir
+        # italic and bold together
+        ir = self._ir(parser, semantic, codegen, "font f = 'italic bold 9px'")
+        assert "{ i64 9, i64 1, i64 1, ptr null }" in ir
+
+    def test_identical_fonts_share_one_constant(self, parser, semantic, codegen):
+        # Keyed on the resolved parts, not the source text, so differently
+        # written but identical fonts collapse together.
+        source = """
+        font a = 'bold 13px arial'
+        font b = 'arial bold 13px'
+        font c = '20px serif'
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert ir.count("private constant %struct._FestinaFont") == 2
+
+    def test_changeFont_takes_a_font_value(self, parser, semantic, codegen):
+        source = """
+        font body = '13px arial'
+        changeFont(body)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_set_font_value(ptr " in ir
+
+    def test_an_empty_font_literal_is_rejected(self, parser, semantic, codegen, errors):
+        with pytest.raises(errors.CompileError, match="says nothing about a font"):
+            self._ir(parser, semantic, codegen, "font f = ''")
+
+    def test_a_runtime_text_cannot_become_a_font(
+            self, parser, semantic, codegen, errors):
+        source = """
+        text spec = '14px'
+        font f = spec
+        """
+        with pytest.raises(errors.CompileError, match="must come from a literal"):
+            self._ir(parser, semantic, codegen, source)
+
+    def test_the_explicit_font_form_remains_for_runtime_sizes(
+            self, parser, semantic, codegen):
+        source = """
+        int size = 22
+        changeFont(size, null, null)
+        changeFont(18, 'italic', 'serif')
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "@festina_set_font(i64 %" in ir
+        assert "call void @festina_set_font(i64 18, ptr @" in ir
+
+    def test_font_is_a_type_name_not_a_function(self, parser, semantic, errors):
+        # `font(...)` was the setter before #91; it is a type now, so the
+        # old spelling must not silently keep working.
+        program = parser.parse("font('14px')", filename="main.f")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program, filename="main.f")
+
+    def test_a_user_function_may_not_shadow_changeFont(self, parser, semantic, errors):
+        program = parser.parse("void func changeFont() { log('mine') }",
+                                filename="main.f")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program, filename="main.f")
+
+    # ---- behaviour ----
+
+    def test_measuring_alone_does_not_open_a_canvas_window(
+            self, parser, semantic, codegen):
+        source = """
+        font body = '16px sans-serif'
+        color brand = 'red'
+        changeFont(body)
+        fillStyle(brand)
+        log(measureTextWidth('hello'))
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_graphics_init()" not in ir
+
+    def test_drawing_alone_no_longer_opens_a_canvas_window(
+            self, parser, semantic, codegen):
+        # claude.md #95: drawing paints the offscreen canvas, which needs
+        # no display at all -- render() is the one call that needs a GUI.
+        source = """
+        color brand = 'red'
+        fillStyle(brand)
+        drawRect(0, 0, 10, 10)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_graphics_init()" not in ir
+
+    def test_render_is_what_opens_the_window(self, parser, semantic, codegen):
+        source = """
+        color brand = 'red'
+        fillStyle(brand)
+        drawRect(0, 0, 10, 10)
+        render()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_graphics_init()" in ir
+
+    def test_text_metrics_follow_the_declared_font(self, compile_and_run):
+        source = """
+        font small = '8px sans-serif'
+        font big = '32px sans-serif'
+        changeFont(small)
+        int w1 = measureTextWidth('Hello')
+        changeFont(big)
+        int w2 = measureTextWidth('Hello')
+        log(w2 > w1)
+        changeFont(32, null, null)
+        log(measureTextWidth('Hello') == w2)
+        log(measureTextWidth(''))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\n0\n"
+
+
+class TestCanvasStyleRendersRealPixels:
+    """claude.md #89/#91, the tier the IR-level tests can't reach: that
+    the declared colours actually land on the canvas. Asserting a packed
+    integer appears in the IR proves the resolution, not that 'red'
+    comes out red, that `#00f` expands to `#0000ff`, or that a
+    `color`-typed 'none' genuinely leaves an interior unpainted.
+
+    Same opt-in tier as the rest of TestGraphics: needs a real display
+    (Xvfb is fine) plus `xdotool`/`xwd`."""
+
+    def test_fill_border_and_none_render_the_expected_pixels(
+            self, run_graphics_program, x_display):
+        if not shutil.which("xwd"):
+            pytest.skip("xwd isn't installed -- needed to read real canvas pixels")
+        source = """
+        color red = 'red'
+        color green = '#00ff00'
+        color blue = '#00f'
+        color yellow = 'yellow'
+        color black = 'black'
+        color nofill = 'none'
+        color purple = 'purple'
+        color teal = 'teal'
+
+        fillStyle(red)     drawRect(10, 10, 100, 100)
+        fillStyle(green)   drawRect(150, 10, 100, 100)
+        fillStyle(blue)    drawRect(290, 10, 100, 100)
+
+        fillStyle(yellow)  borderColor(black)  lineWidth(10)
+        drawRect(10, 150, 100, 100)
+
+        fillStyle(nofill)  borderColor(purple)  lineWidth(8)
+        drawRect(150, 150, 100, 100)
+
+        borderColor(nofill)  fillStyle(teal)
+        drawRect(290, 150, 100, 100)
+        render()
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            got = _xwd_pixels(x_display, wid, [
+                (60, 60),    # 'red'
+                (200, 60),   # '#00ff00'
+                (340, 60),   # '#00f' -> #0000ff
+                (60, 200),   # yellow fill, inside its black border
+                (10, 200),   # on that 10px black border
+                (152, 200),  # purple border of the unfilled rect
+                (200, 200),  # its interior -- 'none', so untouched
+                (340, 200),  # teal, after borderColor('none') turned it off
+                (500, 400),  # untouched canvas background
+            ])
+            assert got[0] == (255, 0, 0)
+            assert got[1] == (0, 255, 0)
+            assert got[2] == (0, 0, 255)
+            assert got[3] == (255, 255, 0)
+            assert got[4] == (0, 0, 0)
+            assert got[5] == (128, 0, 128)
+            assert got[6] == (255, 255, 255)
+            assert got[7] == (0, 128, 128)
+            assert got[8] == (255, 255, 255)
+        finally:
+            proc.terminate()
+
+    def test_a_declared_font_changes_what_is_drawn(self, run_graphics_program, x_display):
+        if not shutil.which("xwd"):
+            pytest.skip("xwd isn't installed -- needed to read real canvas pixels")
+        source = """
+        color black = 'black'
+        font tiny = '10px sans-serif'
+        font huge = '48px sans-serif'
+        fillStyle(black)
+        changeFont(tiny)
+        drawText('Hg', 20, 40)
+        changeFont(huge)
+        drawText('Hg', 20, 140)
+        render()
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            small = [(x, y) for x in range(20, 70, 2) for y in range(20, 45, 2)]
+            big = [(x, y) for x in range(20, 70, 2) for y in range(95, 145, 2)]
+            small_inked = sum(1 for p in _xwd_pixels(x_display, wid, small)
+                              if p != (255, 255, 255))
+            big_inked = sum(1 for p in _xwd_pixels(x_display, wid, big)
+                            if p != (255, 255, 255))
+            assert small_inked > 0, "the 10px text drew nothing at all"
+            assert big_inked > small_inked, (
+                f"48px text inked {big_inked} sampled pixels, 10px inked "
+                f"{small_inked} -- changeFont() had no effect")
+        finally:
+            proc.terminate()
+
+
+class TestImageClipResizeAndSize:
+    """claude.md #92: `img` gains `.width`/`.height` and the two methods
+    a spritesheet actually needs.
+
+    ```festina
+    img sheet = loadImage('sheet.png')
+    img grass = sheet.clip(0, 0, 64, 64)   // a new image
+    grass.resize(32, 32)                    // in place
+    ```
+
+    `clip` returns a NEW image and leaves the source untouched, so one
+    sheet can be clipped as many times as a program likes. `resize`
+    changes the image IN PLACE -- it reads as a statement, so it has to
+    -- which is why an `img` value is a pointer to a small box holding
+    the Cairo surface rather than the surface itself: a Cairo surface
+    can't be resized in place, and boxing it means every binding
+    sharing an image sees the new one.
+
+    That box is also why img now has an ownership story (`_OwnedImage`,
+    the same shape claude.md #86 uses for regex): clip() exists to be
+    called repeatedly, so without scope-exit reclamation, extracting
+    frames in a loop would leak a whole surface per iteration."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    # ---- IR level ----
+
+    def test_width_and_height_emit_runtime_calls(self, parser, semantic, codegen):
+        source = """
+        img sheet = loadImage('s.png')
+        log(sheet.width)
+        log(sheet.height)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call i64 @festina_image_width(ptr" in ir
+        assert "call i64 @festina_image_height(ptr" in ir
+
+    def test_clip_and_resize_emit_runtime_calls(self, parser, semantic, codegen):
+        source = """
+        img sheet = loadImage('s.png')
+        img tile = sheet.clip(0, 32, 64, 64)
+        tile.resize(16, 16)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert ("call ptr @festina_image_clip(ptr %" in ir
+                and "i64 0, i64 32, i64 64, i64 64)" in ir)
+        assert "call void @festina_image_resize(ptr %" in ir
+
+    def test_a_clipped_local_is_freed_at_scope_exit(self, parser, semantic, codegen):
+        # Without this, clipping inside a loop leaks a surface per pass.
+        source = """
+        void func f(sheet:img) {
+            img tile = sheet.clip(0, 0, 8, 8)
+            drawImage(tile, 0, 0)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f(ptr %arg.sheet)")[1].split("\n}")[0]
+        assert "call void @festina_image_free(ptr" in body
+
+    def test_a_borrowed_image_is_not_freed(self, parser, semantic, codegen):
+        # `other` merely aliases an image the caller owns -- freeing it
+        # here would destroy a surface still in use.
+        source = """
+        void func f(sheet:img) {
+            img other = sheet
+            drawImage(other, 0, 0)
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f(ptr %arg.sheet)")[1].split("\n}")[0]
+        assert "call void @festina_image_free(ptr" not in body
+
+    def test_an_escaping_image_is_not_freed(self, parser, semantic, codegen):
+        source = """
+        img kept
+        void func f(sheet:img) {
+            img tile = sheet.clip(0, 0, 8, 8)
+            kept = tile
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f(ptr %arg.sheet)")[1].split("\n}")[0]
+        assert "call void @festina_image_free(ptr" not in body
+
+    # ---- type checking ----
+
+    def test_wrong_arity_and_types_are_rejected(self, parser, semantic, errors):
+        for source in [
+            "img s = loadImage('a.png')\ns.clip(0, 0, 64)",
+            "img s = loadImage('a.png')\ns.resize(1, 2, 3)",
+            "img s = loadImage('a.png')\ns.clip(0, 0, 64, 'x')",
+            "img s = loadImage('a.png')\ns.resize('a', 2)",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+    def test_an_unknown_img_field_is_rejected(self, parser, semantic, errors):
+        # This branch used to be a permissive `return None`, which
+        # silently accepted every typo on an img.
+        program = parser.parse("img s = loadImage('a.png')\nlog(s.widht)",
+                                filename="main.f")
+        with pytest.raises(errors.CompileError, match="img has no field"):
+            semantic.analyze(program, filename="main.f")
+
+    def test_a_method_referenced_without_calling_says_so(self, parser, semantic, errors):
+        program = parser.parse("img s = loadImage('a.png')\nlog(s.clip)",
+                                filename="main.f")
+        with pytest.raises(errors.CompileError, match="is a method on img"):
+            semantic.analyze(program, filename="main.f")
+
+    def test_a_struct_field_named_width_still_works(self, compile_and_run):
+        # `.width` is only special on an img; a struct may still declare
+        # one, and the object must be evaluated exactly once either way.
+        source = """
+        struct Box { width:int  height:int }
+        Box func make() { Box b  b.width = 7  b.height = 9  return b }
+        log(make().width)
+        log(make().height)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "7\n9\n"
+
+    # ---- behaviour, against a real PNG ----
+
+    def test_clip_resize_and_dimensions_against_a_real_sheet(
+            self, compile_and_run, sprite_sheet_png):
+        source = f"""
+        img sheet = loadImage('{sprite_sheet_png}')
+        log(`${{sheet.width}}x${{sheet.height}}`)
+
+        img tile = sheet.clip(32, 32, 32, 32)
+        log(`${{tile.width}}x${{tile.height}}`)
+
+        // clipping leaves the source alone
+        log(`${{sheet.width}}x${{sheet.height}}`)
+
+        // resize changes the image in place
+        tile.resize(8, 4)
+        log(`${{tile.width}}x${{tile.height}}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "128x64\n32x32\n128x64\n8x4\n"
+
+    def test_resize_is_visible_through_every_binding(
+            self, compile_and_run, sprite_sheet_png):
+        # An img is a shared handle, so resizing through one name is
+        # visible through another -- that is what "in place" means.
+        source = f"""
+        img sheet = loadImage('{sprite_sheet_png}')
+        img a = sheet.clip(0, 0, 32, 32)
+        img b = a
+        a.resize(4, 4)
+        log(`${{b.width}}x${{b.height}}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "4x4\n"
+
+    def test_a_non_positive_size_fails_clearly(self, compile_and_run, sprite_sheet_png):
+        for call in ["sheet.clip(0, 0, 0, 8)", "sheet.resize(8, 0)"]:
+            source = f"""
+            img sheet = loadImage('{sprite_sheet_png}')
+            {call}
+            """
+            result = compile_and_run(source)
+            assert result.returncode != 0
+            assert "must both be positive" in result.stdout + result.stderr
+
+
+class TestImageClipRendersRealPixels:
+    """claude.md #92, the tier the rest can't reach: that clip() lifts
+    the region it was actually asked for. Asserting the runtime call was
+    emitted, or that the result reports 32x32, proves neither that the
+    right pixels came out nor that the offset was applied in the right
+    direction.
+
+    Same opt-in tier as the rest of TestGraphics: a real display plus
+    `xdotool`/`xwd`."""
+
+    def test_each_clipped_tile_carries_its_own_colour(
+            self, run_graphics_program, x_display, sprite_sheet_png):
+        if not shutil.which("xwd"):
+            pytest.skip("xwd isn't installed -- needed to read real canvas pixels")
+        # The fixture's grid: tile (col, row) -> index row*4+col.
+        # (0,0) red, (1,0) green, (1,1) cyan.
+        source = f"""
+        img sheet = loadImage('{sprite_sheet_png}')
+        img red = sheet.clip(0, 0, 32, 32)
+        img green = sheet.clip(32, 0, 32, 32)
+        img cyan = sheet.clip(32, 32, 32, 32)
+        drawImage(red, 10, 10)
+        drawImage(green, 100, 10)
+        drawImage(cyan, 200, 10)
+        render()
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            got = _xwd_pixels(x_display, wid, [(25, 25), (115, 25), (215, 25)])
+            assert got[0] == (255, 0, 0), "tile (0,0) should be red"
+            assert got[1] == (0, 255, 0), "tile (1,0) should be green"
+            assert got[2] == (0, 255, 255), "tile (1,1) should be cyan"
+        finally:
+            proc.terminate()
+
+    def test_a_resized_tile_covers_its_new_size(
+            self, run_graphics_program, x_display, sprite_sheet_png):
+        if not shutil.which("xwd"):
+            pytest.skip("xwd isn't installed -- needed to read real canvas pixels")
+        source = f"""
+        img sheet = loadImage('{sprite_sheet_png}')
+        img big = sheet.clip(0, 0, 32, 32)
+        big.resize(96, 96)
+        drawImage(big, 10, 10)
+        render()
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            # inside the scaled-up tile, and past where the 32x32
+            # original would have ended
+            got = _xwd_pixels(x_display, wid, [(20, 20), (90, 90), (120, 120)])
+            assert got[0] == (255, 0, 0)
+            assert got[1] == (255, 0, 0), "the tile did not scale up to 96x96"
+            assert got[2] == (255, 255, 255), "it scaled past its requested size"
+        finally:
+            proc.terminate()
+
+
+class TestMathFileAndTime:
+    """claude.md #93: the standard-library gaps that needed no new
+    dependency at all -- `-lm` and libc are already on every link line,
+    and Cairo's PNG *writer* is compiled into the same library whose
+    reader `loadImage` already uses.
+
+    `Math` had only floor/ceil/round/trunc, so a program couldn't take a
+    square root or a sine; there was no way to read or write a file, and
+    no way to ask the time even though the timer machinery already calls
+    clock_gettime. Rounding still answers with an `int` (claude.md #56);
+    everything added here answers in `float`, because "which integer" and
+    "which real number" are different questions and conflating them would
+    make `Math.sqrt(2.0)` silently an int."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    # ---- math ----
+
+    def test_float_math_uses_llvm_intrinsics_where_they_exist(
+            self, parser, semantic, codegen):
+        # Real intrinsics optimize and constant-fold in ways an opaque
+        # libm call can't.
+        ir = self._ir(parser, semantic, codegen, "log(Math.sqrt(2.0))")
+        assert "call double @llvm.sqrt.f64(double" in ir
+        ir = self._ir(parser, semantic, codegen, "log(Math.pow(2.0, 8.0))")
+        assert "call double @llvm.pow.f64(double" in ir
+
+    def test_math_without_an_intrinsic_falls_back_to_libm(
+            self, parser, semantic, codegen):
+        # -lm is already unconditional on every link line.
+        ir = self._ir(parser, semantic, codegen, "log(Math.tan(1.0))")
+        assert "call double @tan(double" in ir
+
+    def test_rounding_still_returns_int_and_the_rest_returns_float(
+            self, parser, semantic, codegen, errors):
+        # An int-typed binding accepts floor() and rejects sqrt().
+        self._ir(parser, semantic, codegen, "int a = Math.floor(3.7)\nlog(a)")
+        self._ir(parser, semantic, codegen, "float b = Math.sqrt(9.0)\nlog(b)")
+        with pytest.raises(errors.CompileError):
+            self._ir(parser, semantic, codegen, "int c = Math.sqrt(9.0)")
+
+    def test_math_constants_are_compile_time_values(self, parser, semantic, codegen):
+        ir = self._ir(parser, semantic, codegen, "log(Math.PI)")
+        # emitted as a raw double bit pattern, not a runtime call
+        assert "0x400921FB54442D18" in ir
+        assert "@festina_" not in ir.split("define void @__festina_main")[1].split("\n}")[0].replace(
+            "festina_log_float", "")
+
+    def test_math_arity_and_types_are_checked(self, parser, semantic, errors):
+        for source in ["log(Math.sqrt())", "log(Math.sqrt(1.0, 2.0))",
+                       "log(Math.pow(2.0))", "log(Math.sqrt(4))"]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+    def test_an_unknown_math_member_is_rejected(self, parser, semantic, errors):
+        program = parser.parse("log(Math.TAU)", filename="main.f")
+        with pytest.raises(errors.CompileError, match="Math has no member"):
+            semantic.analyze(program, filename="main.f")
+
+    def test_a_math_function_named_without_calling_says_so(
+            self, parser, semantic, errors):
+        program = parser.parse("log(Math.sqrt)", filename="main.f")
+        with pytest.raises(errors.CompileError, match="is a function"):
+            semantic.analyze(program, filename="main.f")
+
+    def test_math_computes_the_right_answers(self, compile_and_run):
+        source = """
+        log(Math.sqrt(16.0))
+        log(Math.pow(2.0, 10.0))
+        log(Math.abs(0.0 - 5.5))
+        log(Math.min(3.0, 7.0))
+        log(Math.max(3.0, 7.0))
+        log(Math.floor(3.7))
+        log(Math.sin(0.0))
+        log(Math.cos(0.0))
+        log(Math.log(Math.E))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "4\n1024\n5.5\n3\n7\n3\n0\n1\n1\n"
+
+    def test_random_stays_in_range_and_varies(self, compile_and_run):
+        # [0, 1) specifically: 1.0 would break the standard
+        # `arr[floor(random() * length)]` idiom.
+        source = """
+        bool inRange = true
+        float first = Math.random()
+        bool varied = false
+        for int i = 0, i < 200, i++ {
+            float r = Math.random()
+            if r < 0.0 || r >= 1.0 { inRange = false }
+            if r != first { varied = true }
+        }
+        log(inRange)
+        log(varied)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\n"
+
+    # ---- files ----
+
+    def test_file_round_trip(self, compile_and_run, tmp_path):
+        path = str(tmp_path / "note.txt")
+        source = f"""
+        log(writeFile('{path}', 'hello'))
+        log(appendFile('{path}', ' world'))
+        log(readFile('{path}'))
+        log(fileExists('{path}'))
+        log(deleteFile('{path}'))
+        log(fileExists('{path}'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\nhello world\ntrue\ntrue\nfalse\n"
+
+    def test_reading_a_missing_file_is_null_not_a_crash(
+            self, compile_and_run, tmp_path):
+        # A missing file is an ordinary condition to test for, the same
+        # reasoning claude.md #57 applies to division by zero.
+        missing = str(tmp_path / "nope.txt")
+        source = f"""
+        log(readFile('{missing}') == null)
+        log(fileExists('{missing}'))
+        log(deleteFile('{missing}'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\nfalse\nfalse\n"
+
+    def test_writing_somewhere_impossible_returns_false(self, compile_and_run):
+        source = "log(writeFile('/definitely/not/a/directory/x.txt', 'hi'))"
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "false\n"
+
+    def test_a_file_round_trips_through_text_operations(
+            self, compile_and_run, tmp_path):
+        # The value readFile hands back is an ordinary owned text, so it
+        # composes with everything else (claude.md #83).
+        path = str(tmp_path / "data.txt")
+        source = f"""
+        writeFile('{path}', 'a,b,c')
+        text body = readFile('{path}')
+        log(body.replaceAll(',', '-'))
+        log(`${{body}}!`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "a-b-c\na,b,c!\n"
+
+    # ---- time ----
+
+    def test_now_and_formatTime(self, compile_and_run):
+        source = """
+        int t = now()
+        log(t > 1700000000000)
+        log(formatTime(0, '%Y'))
+        """
+        result = compile_and_run(source, env={"TZ": "UTC"})
+        assert result.returncode == 0
+        assert result.stdout == "true\n1970\n"
+
+    def test_now_advances(self, compile_and_run):
+        source = """
+        int a = now()
+        int total = 0
+        for int i = 0, i < 2000000, i++ { total = total + i }
+        int b = now()
+        log(b >= a)
+        log(total > 0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\n"
+
+
+def _decode_png(path):
+    """Minimal PNG decoder -> (width, height, pixel(x, y) -> (r, g, b)).
+
+    claude.md #93's saveCanvas is only really verified by reading the
+    file back and finding the drawing in it -- "the call returned true"
+    proves the plumbing, not that the canvas was captured rather than a
+    blank surface. Written out here (zlib plus the five PNG filter
+    types) because the compiler has no image library and neither should
+    its tests; the same reasoning as the sprite_sheet_png fixture, which
+    encodes rather than decodes.
+    """
+    import struct
+    import zlib
+
+    data = open(path, "rb").read()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", f"{path} is not a PNG"
+    pos, idat, width, height, ctype = 8, b"", 0, 0, 0
+    while pos < len(data):
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        tag = data[pos + 4:pos + 8]
+        chunk = data[pos + 8:pos + 8 + length]
+        if tag == b"IHDR":
+            width, height, _depth, ctype = struct.unpack(">IIBB", chunk[:10])
+        elif tag == b"IDAT":
+            idat += chunk
+        pos += 12 + length
+    bpp = {2: 3, 6: 4}[ctype]
+    stride = width * bpp
+    raw = zlib.decompress(idat)
+    out, prev, i = bytearray(), bytearray(stride), 0
+    for _y in range(height):
+        filt = raw[i]
+        i += 1
+        line = bytearray(raw[i:i + stride])
+        i += stride
+        for x in range(stride):
+            a = line[x - bpp] if x >= bpp else 0
+            b = prev[x]
+            c = prev[x - bpp] if x >= bpp else 0
+            if filt == 1:
+                line[x] = (line[x] + a) & 255
+            elif filt == 2:
+                line[x] = (line[x] + b) & 255
+            elif filt == 3:
+                line[x] = (line[x] + (a + b) // 2) & 255
+            elif filt == 4:
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                pred = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                line[x] = (line[x] + pred) & 255
+        out += line
+        prev = line
+
+    def pixel(x, y):
+        off = y * stride + x * bpp
+        return tuple(out[off:off + 3])
+
+    return width, height, pixel
+
+
+class TestSaveCanvas:
+    """claude.md #93: saveCanvas() writes the canvas to a PNG through
+    Cairo's own writer -- compiled into the very library whose reader
+    `loadImage` already uses, so it costs no new dependency and no
+    encoder to write.
+
+    It saves the BACKING surface rather than the window, so the result
+    is what the program drew rather than whatever happened to be
+    unobscured on screen. Needs a display only because the canvas has to
+    exist at all."""
+
+    def test_the_saved_png_contains_what_was_drawn(self, compile_and_run, tmp_path):
+        # claude.md #95: no display, no window, no event loop. This used
+        # to need all three -- a program whose whole job was writing a
+        # PNG still opened a window and then blocked forever in the
+        # event loop, which is exactly what the render() split fixed.
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        color blue = 'blue'
+        fillStyle(red)
+        drawRect(0, 0, 40, 40)
+        fillStyle(blue)
+        drawRect(40, 0, 40, 40)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0, (
+            "drawing and saving should need no display at all: "
+            + result.stdout + result.stderr)
+        assert result.stdout == "true\n"
+        width, height, pixel = _decode_png(out)
+        assert (width, height) == (800, 600)
+        assert pixel(20, 20) == (255, 0, 0), "the red rect is missing"
+        assert pixel(60, 20) == (0, 0, 255), "the blue rect is missing"
+        assert pixel(400, 300) == (255, 255, 255), "background should be white"
+
+    def test_an_unwritable_path_returns_false(self, compile_and_run):
+        source = """
+        drawRect(0, 0, 10, 10)
+        log(saveCanvas('/definitely/not/a/directory/out.png'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "false\n"
+
+
+class TestScalarQueries:
+    """claude.md #94: sqliteInt/sqliteFloat/sqliteText take one value out
+    of a query without a `table` declaration to hold it.
+
+    That declaration isn't free: a `table` CREATES a real table
+    (claude.md #28-31's automatic schema sync), so before this, asking
+    for a `count(*)` or a single `json_extract` meant leaving a
+    throwaway table behind in the database forever. These share the
+    prepare-and-bind path `sqlite()` already uses; only the stepping
+    differs.
+
+    A query matching no rows, or whose value is SQL NULL, answers with
+    Festina's own null for that type -- an ordinary result to test for,
+    the same treatment claude.md #57 gives division by zero."""
+
+    def test_scalars_read_values_without_a_result_table(self, compile_and_run):
+        source = """
+        table Post { id:int  title:text  score:float }
+        sqlite(`DELETE FROM Post`)
+        sqlite(`INSERT INTO Post (id, title, score) VALUES (?, ?, ?)`, [1, 'alpha', 1.5])
+        sqlite(`INSERT INTO Post (id, title, score) VALUES (?, ?, ?)`, [2, 'beta', 2.5])
+        log(sqliteInt(`SELECT count(*) FROM Post`))
+        log(sqliteText(`SELECT title FROM Post WHERE id = ?`, [2]))
+        log(sqliteFloat(`SELECT sum(score) FROM Post`))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\nbeta\n4\n"
+
+    def test_no_matching_row_is_null(self, compile_and_run):
+        source = """
+        table Post { id:int  title:text }
+        sqlite(`DELETE FROM Post`)
+        log(sqliteText(`SELECT title FROM Post WHERE id = ?`, [99]) == null)
+        log(sqliteInt(`SELECT id FROM Post WHERE id = ?`, [99]) == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\n"
+
+    def test_a_scalar_query_creates_no_extra_table(self, compile_and_run, tmp_path):
+        # The gap this exists to close: the only table in the database
+        # afterwards should be the one actually declared.
+        source = """
+        table Post { id:int }
+        sqlite(`DELETE FROM Post`)
+        sqlite(`INSERT INTO Post (id) VALUES (?)`, [1])
+        log(sqliteInt(`SELECT count(*) FROM Post`))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "1\n"
+        import sqlite3
+        db = sqlite3.connect(str(tmp_path / "festina.sqlite"))
+        names = sorted(r[0] for r in db.execute(
+            "select name from sqlite_master where type='table' "
+            "and name not like 'sqlite_%'"))
+        db.close()
+        assert names == ["Post"]
+
+    def test_json1_works_through_scalar_queries(self, compile_and_run):
+        # SQLite's JSON1 needs no compiler feature at all -- it is
+        # ordinary SQL. This locks in that it stays reachable.
+        source = """
+        log(sqliteInt(`SELECT json_extract('{"n":42}','$.n')`))
+        log(sqliteText(`SELECT json_extract('{"name":"ada"}','$.name')`))
+        log(sqliteInt(`SELECT json_array_length('[1,2,3]')`))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "42\nada\n3\n"
+
+    def test_fts5_full_text_search_works_end_to_end(self, compile_and_run):
+        # Likewise FTS5: a virtual table, an index rebuild and a ranked
+        # MATCH query, all through SQL the language already passes
+        # through untouched.
+        source = """
+        table Post { id:int  title:text  body:text }
+        sqlite(`DELETE FROM Post`)
+        sqlite(`INSERT INTO Post (id, title, body) VALUES (?, ?, ?)`,
+               [1, 'Compilers', 'a compiler turns source into machine code'])
+        sqlite(`INSERT INTO Post (id, title, body) VALUES (?, ?, ?)`,
+               [2, 'Gardening', 'planting tomatoes in spring soil'])
+        sqlite(`INSERT INTO Post (id, title, body) VALUES (?, ?, ?)`,
+               [3, 'Machines', 'machine learning and machine code differ'])
+        sqlite(`DROP TABLE IF EXISTS PostSearch`)
+        sqlite(`CREATE VIRTUAL TABLE PostSearch USING fts5(title, body, content='Post', content_rowid='id')`)
+        sqlite(`INSERT INTO PostSearch(PostSearch) VALUES('rebuild')`)
+        log(sqliteInt(`SELECT count(*) FROM PostSearch WHERE PostSearch MATCH ?`, ['machine']))
+        log(sqliteText(`SELECT title FROM PostSearch WHERE PostSearch MATCH ? ORDER BY rank`, ['tomatoes']))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\nGardening\n"
+
+
+class TestCanvasPathsTransformsAndGradients:
+    """claude.md #94: the canvas gains arbitrary shapes.
+
+    Before this it could draw exactly three things -- a rectangle, a
+    circle and a line of text -- with no way to express a triangle, a
+    polygon, a curve, a rotated anything, a gradient or transparency.
+
+    Every drawing call builds its own short-lived Cairo context, so the
+    transform lives outside all of them and is applied to each; that is
+    what makes `translate(100, 0)` affect the NEXT drawRect rather than
+    nothing. `saveState`/`restoreState` save the whole drawing state,
+    matching the canvas `save()`/`restore()` they mirror."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_path_and_transform_calls_are_emitted(self, parser, semantic, codegen):
+        source = """
+        beginPath()
+        moveTo(0, 0)
+        lineTo(10, 10)
+        curveTo(1, 2, 3, 4, 5, 6)
+        closePath()
+        fillPath()
+        strokePath()
+        translate(5, 5)
+        rotate(45.0)
+        scale(2.0, 2.0)
+        resetTransform()
+        saveState()
+        restoreState()
+        fillAlpha(0.5)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        for fn in ["begin_path", "move_to", "line_to", "curve_to", "close_path",
+                   "fill_path", "stroke_path", "translate", "rotate", "scale",
+                   "reset_transform", "save_state", "restore_state", "set_alpha"]:
+            assert f"@festina_{fn}(" in ir, f"festina_{fn} not emitted"
+
+    def test_gradients_take_color_values(self, parser, semantic, codegen):
+        source = """
+        color a = 'red'
+        color b = 'blue'
+        fillLinearGradient(0, 0, a, 100, 0, b)
+        fillRadialGradient(50, 50, 40, a, b)
+        drawRect(0, 0, 10, 10)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "@festina_fill_linear_gradient(" in ir
+        assert "@festina_fill_radial_gradient(" in ir
+
+    def test_a_gradient_rejects_a_non_color(self, parser, semantic, errors):
+        program = parser.parse(
+            "fillLinearGradient(0, 0, 'red', 100, 0, 'blue')", filename="main.f")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program, filename="main.f")
+
+    def test_path_calls_do_not_open_a_canvas(self, parser, semantic, codegen):
+        # claude.md #95: a path paints the offscreen canvas like any
+        # other drawing -- only render() needs a window.
+        ir = self._ir(parser, semantic, codegen, "beginPath()\nmoveTo(0,0)\nfillPath()")
+        assert "call void @festina_graphics_init()" not in ir
+
+    def test_transforms_and_state_open_nothing(self, parser, semantic, codegen):
+        # Pure state, exactly like claude.md #89's own style setters --
+        # a program that only sets a transform shouldn't get a window.
+        source = """
+        saveState()
+        translate(5, 5)
+        rotate(45.0)
+        scale(2.0, 2.0)
+        fillAlpha(0.5)
+        restoreState()
+        resetTransform()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_graphics_init()" not in ir
+
+    def test_building_a_path_with_none_open_fails_clearly(self, compile_and_run):
+        result = compile_and_run("moveTo(10, 10)")
+        assert result.returncode != 0
+        assert "beginPath" in result.stdout + result.stderr
+
+    def test_restoring_more_than_was_saved_fails_clearly(self, compile_and_run):
+        # No drawing, so no display needed -- restoreState is pure state.
+        result = compile_and_run("restoreState()")
+        assert result.returncode != 0
+        assert "restoreState" in result.stdout + result.stderr
+
+
+class TestCanvasPathsRenderRealPixels:
+    """claude.md #94, the tier the IR tests can't reach: that a path is
+    a real shape rather than its bounding box, that a transform actually
+    moves what is drawn next, that a gradient interpolates, and that
+    alpha blends. Needs a display plus `xdotool`/`xwd`."""
+
+    def test_paths_transforms_gradients_and_alpha_render(
+            self, run_graphics_program, x_display):
+        if not shutil.which("xwd"):
+            pytest.skip("xwd isn't installed -- needed to read real canvas pixels")
+        source = """
+        color red = 'red'
+        color blue = 'blue'
+        color black = 'black'
+        color none = 'none'
+
+        fillStyle(red)
+        beginPath()
+        moveTo(50, 50)
+        lineTo(150, 50)
+        lineTo(100, 140)
+        closePath()
+        fillPath()
+
+        fillStyle(none)
+        borderColor(black)
+        lineWidth(6)
+        beginPath()
+        moveTo(200, 50)
+        lineTo(300, 140)
+        strokePath()
+
+        saveState()
+        translate(400, 40)
+        fillStyle(blue)
+        drawRect(0, 0, 60, 60)
+        restoreState()
+        fillStyle(blue)
+        drawRect(400, 200, 20, 20)
+
+        fillLinearGradient(50, 300, red, 250, 300, blue)
+        drawRect(50, 280, 200, 60)
+
+        fillStyle(red)
+        fillAlpha(0.5)
+        drawRect(500, 280, 80, 60)
+        render()
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            got = _xwd_pixels(x_display, wid, [
+                (100, 80),   # inside the triangle
+                (55, 130),   # inside its bounding box but OUTSIDE the shape
+                (250, 95),   # on the stroked diagonal
+                (430, 70),   # the translated square
+                (405, 205),  # drawn after restoreState -- untransformed
+                (55, 300),   # gradient, red end
+                (245, 300),  # gradient, blue end
+                (540, 300),  # 50% red over white
+            ])
+            assert got[0] == (255, 0, 0), "the triangle did not fill"
+            assert got[1] == (255, 255, 255), (
+                "a corner outside the triangle was filled -- the path was "
+                "treated as its bounding box")
+            assert got[2] == (0, 0, 0), "the stroked path is missing"
+            assert got[3] == (0, 0, 255), "translate() did not move drawRect"
+            assert got[4] == (0, 0, 255), "restoreState() did not undo translate()"
+            assert got[5][0] > 200 and got[5][2] < 60, "gradient start is not red"
+            assert got[6][2] > 200 and got[6][0] < 60, "gradient end is not blue"
+            assert got[7] == (255, 127, 127), "50% red over white should blend"
+        finally:
+            proc.terminate()
+
+
+class TestRenderClearAndHeadless:
+    """claude.md #95: drawing paints an offscreen canvas; `render()` is
+    the one call that puts it on screen.
+
+    That split does three things at once. A program that draws and saves
+    a PNG never opens a window, never enters an event loop, and runs
+    with no display at all -- previously impossible, since any drawing
+    forced a window. "Does this program need a GUI?" becomes answerable
+    by looking for `render()`. And a frame costs one blit instead of one
+    per shape: every draw call used to flush the whole canvas to X, so
+    2000 rectangles took ~1.6s; batched behind one render() they take
+    ~1ms.
+
+    `clearCanvas()` is the other half of animation -- without it a canvas
+    could only ever accumulate, so nothing could move."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_render_and_clears_emit_their_calls(self, parser, semantic, codegen):
+        source = """
+        clearCanvas()
+        clearRect(10, 10, 20, 20)
+        render()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_clear_canvas()" in ir
+        assert "call void @festina_clear_rect(i64 10, i64 10, i64 20, i64 20)" in ir
+        assert "call void @festina_render()" in ir
+
+    def test_clearing_alone_does_not_open_a_window(self, parser, semantic, codegen):
+        ir = self._ir(parser, semantic, codegen, "clearCanvas()\nclearRect(0,0,5,5)")
+        assert "call void @festina_graphics_init()" not in ir
+
+    def test_saving_a_canvas_needs_no_display(self, compile_and_run, tmp_path):
+        # The capability the split exists for.
+        out = str(tmp_path / "out.png")
+        source = f"""
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 30, 30)
+        log(saveCanvas('{out}'))
+        log('exited on its own')
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\nexited on its own\n"
+
+    def test_clear_canvas_erases_everything(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "cleared.png")
+        source = f"""
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 100, 100)
+        clearCanvas()
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        _w, _h, pixel = _decode_png(out)
+        assert pixel(50, 50) == (255, 255, 255), "clearCanvas() left the rect behind"
+
+    def test_clear_rect_erases_only_its_region(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "partial.png")
+        source = f"""
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 200, 200)
+        clearRect(50, 50, 40, 40)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        _w, _h, pixel = _decode_png(out)
+        assert pixel(60, 60) == (255, 255, 255), "clearRect() did not erase its region"
+        assert pixel(150, 150) == (255, 0, 0), "clearRect() erased outside its region"
+        assert pixel(10, 10) == (255, 0, 0), "clearRect() erased outside its region"
+
+    def test_drawing_survives_until_render(self, run_graphics_program, x_display):
+        # Drawing before the window exists is not an error -- the canvas
+        # is offscreen, and render() presents whatever is on it.
+        if not shutil.which("xwd"):
+            pytest.skip("xwd isn't installed -- needed to read real canvas pixels")
+        source = """
+        color red = 'red'
+        fillStyle(red)
+        drawRect(10, 10, 60, 60)
+        render()
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            got = _xwd_pixels(x_display, wid, [(30, 30), (400, 300)])
+            assert got[0] == (255, 0, 0), "what was drawn before render() was lost"
+            assert got[1] == (255, 255, 255)
+        finally:
+            proc.terminate()
+
+
+class TestArrayMethods:
+    """claude.md #96: push/pop/shift/unshift/splice, JS-shaped.
+
+    Before these, an array's length was fixed at construction and
+    writing past the end was an unchecked heap overflow -- so there was
+    no way to express a list that grows, which is most of what a program
+    does with one.
+
+    The ownership half matters as much as the resizing: `xs.push(s)`
+    follows the same rule `xs[i] = s` already does (claude.md #80/#83),
+    retaining a struct/array/map element and copying a text one unless
+    its source is already owning. Removal transfers rather than
+    releases -- pop/shift hand the element back and splice hands it to
+    the returned array."""
+
+    def test_push_and_pop(self, compile_and_run):
+        source = """
+        arr[int] xs = [1, 2, 3]
+        log(xs.push(4))
+        log(xs.length)
+        log(xs.pop())
+        log(xs.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "4\n4\n4\n3\n"
+
+    def test_shift_and_unshift(self, compile_and_run):
+        source = """
+        arr[int] xs = [1, 2, 3]
+        log(xs.shift())
+        log(xs[0])
+        log(xs.unshift(99))
+        log(xs[0])
+        log(xs.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "1\n2\n3\n99\n3\n"
+
+    def test_splice_removes_and_returns(self, compile_and_run):
+        source = """
+        arr[int] xs = [10, 20, 30, 40, 50]
+        arr[int] cut = xs.splice(1, 2)
+        log(`${cut.length}: ${cut[0]},${cut[1]}`)
+        log(`${xs.length}: ${xs[0]},${xs[1]},${xs[2]}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2: 20,30\n3: 10,40,50\n"
+
+    def test_splice_clamps_like_javascript(self, compile_and_run):
+        # A negative start counts back from the end, and an oversized
+        # count clamps -- so splice(i, 1) at a boundary is a no-op
+        # rather than a crash.
+        source = """
+        arr[int] a = [1, 2, 3, 4, 5]
+        arr[int] tail = a.splice(-2, 5)
+        log(`${tail.length}: ${tail[0]},${tail[1]}`)
+        log(a.length)
+        arr[int] b = [1, 2]
+        arr[int] none = b.splice(10, 3)
+        log(none.length)
+        log(b.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2: 4,5\n3\n0\n2\n"
+
+    def test_popping_an_empty_array_is_null(self, compile_and_run):
+        # Null, not zero: an empty pop() must be distinguishable from
+        # popping a real 0.
+        source = """
+        arr[int] e = []
+        log(e.pop() == null)
+        log(e.shift() == null)
+        arr[int] z = [0]
+        log(z.pop() == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\nfalse\n"
+
+    def test_growing_from_empty(self, compile_and_run):
+        source = """
+        arr[int] xs = []
+        for int i = 0, i < 100, i++ { xs.push(i * 2) }
+        log(xs.length)
+        log(xs[0])
+        log(xs[99])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "100\n0\n198\n"
+
+    def test_text_elements_are_owned_not_shared(self, compile_and_run):
+        # Pushing a text binding must copy it (claude.md #83), or the
+        # array and the variable would share one buffer.
+        source = """
+        arr[text] names = []
+        text n = 'first'
+        names.push(n)
+        n = 'changed'
+        log(names[0])
+        log(names.pop())
+        log(names.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "first\nfirst\n0\n"
+
+    def test_struct_elements_survive_push_and_pop(self, compile_and_run):
+        source = """
+        struct P { x:int }
+        P func make(v:int) { P p  p.x = v  return p }
+        arr[P] ps = []
+        ps.push(make(7))
+        ps.push(make(9))
+        log(ps.length)
+        P last = ps.pop()
+        log(last.x)
+        log(ps[0].x)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\n9\n7\n"
+
+    def test_wrong_arity_and_types_are_rejected(self, parser, semantic, errors):
+        for source in [
+            "arr[int] xs = [1]\nxs.push()",
+            "arr[int] xs = [1]\nxs.push(1, 2)",
+            "arr[int] xs = [1]\nxs.pop(1)",
+            "arr[int] xs = [1]\nxs.push('a')",
+            "arr[int] xs = [1]\nxs.splice(1)",
+            "arr[int] xs = [1]\nxs.splice(1, 'a')",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+    def test_a_queue_round_trips(self, compile_and_run):
+        # The shape a game's entity list actually takes.
+        source = """
+        arr[text] queue = []
+        queue.push('a')
+        queue.push('b')
+        queue.push('c')
+        log(queue.shift())
+        queue.push('d')
+        log(queue.shift())
+        log(`${queue.length}: ${queue[0]},${queue[1]}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "a\nb\n2: c,d\n"
+
+
+
+class TestArrayIndexOf:
+    """claude.md #97: xs.indexOf(v) -- the first index holding v, or -1.
+
+    -1 rather than null because the answer is an index and every use of
+    one is a comparison or a splice argument, both of which read
+    naturally against -1 and neither of which would against null. It is
+    also what JavaScript's own indexOf answers, and claude.md #26's
+    arrays are JS-shaped.
+
+    The comparison is by 8-byte slot for everything except text, which
+    compares by content -- two equal strings are almost always two
+    different buffers under claude.md #83's copy-on-alias rule, so
+    identity would make indexOf useless for exactly the element type
+    it's most often used with."""
+
+    def test_int_elements_found_and_missing(self, compile_and_run):
+        source = """
+        arr[int] xs = [10, 20, 30]
+        log(xs.indexOf(30))
+        log(xs.indexOf(10))
+        log(xs.indexOf(99))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\n0\n-1\n"
+
+    def test_text_elements_compare_by_content_not_identity(self, compile_and_run):
+        # Every one of these needles is a DIFFERENT buffer from the
+        # array's own element (claude.md #83 copies text on binding), so
+        # a pointer comparison would answer -1 for all three.
+        source = """
+        text func bang(s:text) {
+            return s + '!'
+        }
+        arr[text] names = ['ada!', 'grace!', 'alan!']
+        text who = 'grace'
+        log(names.indexOf('alan!'))
+        log(names.indexOf(bang(who)))
+        log(names.indexOf(`${who}!`))
+        log(names.indexOf(who + '!'))
+        log(names.indexOf('nobody'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\n1\n1\n1\n-1\n"
+
+    def test_first_match_wins_and_empty_is_minus_one(self, compile_and_run):
+        source = """
+        arr[int] dupes = [5, 5, 5]
+        log(dupes.indexOf(5))
+        arr[int] empty = []
+        log(empty.indexOf(1))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "0\n-1\n"
+
+    def test_bool_elements(self, compile_and_run):
+        # arr[bool] is the one element type whose slot is 1 byte wide,
+        # not 8 -- see _elem_size.
+        source = """
+        arr[bool] flags = [true, true, false]
+        log(flags.indexOf(false))
+        log(flags.indexOf(true))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\n0\n"
+
+    def test_float_elements(self, compile_and_run):
+        source = """
+        arr[float] fs = [1.5, 2.5]
+        log(fs.indexOf(2.5))
+        log(fs.indexOf(9.5))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "1\n-1\n"
+
+    def test_struct_elements_match_by_identity(self, compile_and_run):
+        # Two structs with identical fields are two distinct values --
+        # claude.md #79's arr[T] holds each element's own header
+        # pointer, so this is the same "aliasing means sharing one
+        # address" identity every other struct operation uses.
+        source = """
+        struct Point { x:int y:int }
+        Point a
+        a.x = 1
+        a.y = 2
+        Point b
+        b.x = 1
+        b.y = 2
+        arr[Point] ps = [a, b]
+        log(ps.indexOf(a))
+        log(ps.indexOf(b))
+        Point c
+        c.x = 1
+        c.y = 2
+        log(ps.indexOf(c))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "0\n1\n-1\n"
+
+    def test_composes_with_splice(self, compile_and_run):
+        # The reason -1 is the right answer shape: this is what removal
+        # by value looks like, and it needs no separate "was it found"
+        # dance for the found case.
+        source = """
+        arr[text] queue = ['a', 'b', 'c']
+        arr[text] gone = queue.splice(queue.indexOf('b'), 1)
+        log(gone[0])
+        log(`${queue.length}: ${queue[0]},${queue[1]}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "b\n2: a,c\n"
+
+    def test_wrong_arity_or_element_type_is_a_compile_error(self, parser, semantic, errors):
+        for source in [
+            "arr[int] xs = [1]\nlog(xs.indexOf())",
+            "arr[int] xs = [1]\nlog(xs.indexOf(1, 2))",
+            "arr[int] xs = [1]\nlog(xs.indexOf('a'))",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
+class TestBoolArrayElementStride:
+    """claude.md #97: arr[bool] is the one array whose element slot is
+    a single byte -- bool lowers to i8 (see _llvm_type's own note on
+    why it isn't i1), while int/float/text/struct/arr/map all lower to
+    something 8 bytes wide.
+
+    claude.md #96's array helpers move elements by a byte count the
+    compiler hands them, and that count was hardcoded to 8. For an
+    arr[bool] that made push() write to byte 8*i while xs[i] read byte
+    i: the value went in and a neighbouring element's byte came back
+    out. These pin every helper against the stride indexing actually
+    uses."""
+
+    def test_push_is_readable_at_its_own_index(self, compile_and_run):
+        source = """
+        arr[bool] bs = [true, false]
+        bs.push(true)
+        log(bs.length)
+        log(bs[0])
+        log(bs[1])
+        log(bs[2])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "3\ntrue\nfalse\ntrue\n"
+
+    def test_unshift_shift_and_splice(self, compile_and_run):
+        source = """
+        arr[bool] bs = [true, false, true, false]
+        bs.unshift(true)
+        log(`${bs.length} ${bs[0]} ${bs[1]}`)
+        log(bs.shift())
+        arr[bool] cut = bs.splice(1, 2)
+        log(`${cut.length} ${cut[0]} ${cut[1]}`)
+        log(`${bs.length} ${bs[0]} ${bs[1]}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == (
+            "5 true true\n"
+            "true\n"
+            "2 false true\n"
+            "2 true false\n"
+        )
+
+    def test_pop_on_an_empty_bool_array_is_null(self, compile_and_run):
+        source = """
+        arr[bool] bs = []
+        log(bs.pop())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "null\n"
+
+
+class TestUnassignedNestedFieldsAutoVivify:
+    """claude.md #97: reaching THROUGH an unassigned struct/arr/map
+    field used to segfault.
+
+    claude.md's own rule is that an uninitialized field reads as its
+    zero value, and for int/float/bool/text that already held. But a
+    struct/arr/map field starts as a null pointer (calloc, or a global's
+    zeroinitializer, gives it nothing else), so `o.inner.n` dereferenced
+    null -- a crash, not a zero. Both reads and writes crashed, and the
+    array and map cases crashed the same way the struct one did.
+
+    The fix gives such a field real storage the first time it is
+    reached, lazily. Lazily rather than eagerly at declaration because
+    one mechanism then covers stack locals, heap locals, globals (whose
+    storage is a compile-time zeroinitializer with nowhere to run an
+    initializer at all), parameters, and fields nested arbitrarily deep
+    inside other fields."""
+
+    def test_reading_through_an_unassigned_struct_field(self, compile_and_run):
+        source = """
+        struct Inner { n:int label:text }
+        struct Outer { inner:Inner }
+        Outer o
+        log(o.inner.n)
+        log(o.inner.label)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # A null text logs as an empty line -- the existing convention,
+        # unchanged here; what matters is that it does not crash.
+        assert result.stdout == "0\n\n"
+
+    def test_reading_an_unassigned_array_or_map_field(self, compile_and_run):
+        source = """
+        struct Bag { xs:arr[int] m:map[int] }
+        Bag b
+        log(b.xs.length)
+        log(b.m['nothing'])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # An absent map[int] key answers int's own null, which logs as
+        # its reserved sentinel (see codegen's INT_NULL_CONST).
+        assert result.stdout == "0\n-9223372036854775808\n"
+
+    def test_the_storage_is_created_once_not_per_access(self, compile_and_run):
+        # The identity check: if each read vivified a FRESH value, the
+        # write below would land somewhere the read never looks at.
+        source = """
+        struct Inner { n:int }
+        struct Outer { inner:Inner }
+        Outer o
+        o.inner.n = 5
+        log(o.inner.n)
+        o.inner.n = o.inner.n + 1
+        log(o.inner.n)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "5\n6\n"
+
+    def test_pushing_onto_an_unassigned_array_field(self, compile_and_run):
+        source = """
+        struct Bag { xs:arr[int] }
+        Bag b
+        b.xs.push(1)
+        b.xs.push(2)
+        log(`${b.xs.length}: ${b.xs[0]},${b.xs[1]}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2: 1,2\n"
+
+    def test_setting_a_key_on_an_unassigned_map_field(self, compile_and_run):
+        source = """
+        struct Bag { m:map[int] }
+        Bag b
+        b.m['k'] = 9
+        log(b.m['k'])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "9\n"
+
+    def test_an_explicit_assignment_still_wins(self, compile_and_run):
+        source = """
+        struct Inner { n:int }
+        struct Outer { inner:Inner }
+        Inner i
+        i.n = 7
+        Outer o
+        o.inner = i
+        log(o.inner.n)
+        i.n = 8
+        log(o.inner.n)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # Assigned by reference, so the later write to `i` is visible
+        # through `o.inner` -- claude.md #79's shared-header identity.
+        assert result.stdout == "7\n8\n"
+
+    def test_deeply_nested_unassigned_fields(self, compile_and_run):
+        source = """
+        struct C { n:int }
+        struct B { c:C }
+        struct A { b:B }
+        A a
+        log(a.b.c.n)
+        a.b.c.n = 3
+        log(a.b.c.n)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "0\n3\n"
+
+
+class TestTextConcatOwnership:
+    """claude.md #97: a `+` on text is an owning source.
+
+    claude.md #83 classified only a Call and a template literal as
+    "already a fresh, exclusively-owned buffer". A text `+` compiles to
+    exactly one festina_str_concat, which mallocs unconditionally with
+    no operand-passthrough path -- so it is just as owning, and leaving
+    it out meant every binding of a concatenation copied a buffer that
+    was already exclusively owned and dropped the original: `text j = a
+    + b` and `return s + '!'` each leaked one buffer per evaluation.
+
+    The other half is that festina_str_concat COPIES from both operands
+    and keeps neither, so a chained `a + b + c` has to free its own
+    intermediate -- the same fix _emit_template already applies to its
+    own intermediates.
+
+    These are behaviour tests; the leaks themselves were measured under
+    LeakSanitizer, which is not available here."""
+
+    def test_chained_concatenation_frees_its_intermediate(self, parser, semantic, codegen):
+        source = """
+        text a = 'aa'
+        text b = 'bb'
+        text c = 'cc'
+        void func use() {
+            text joined = a + b + c
+        }
+        use()
+        """
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        body = ir.split("define void @use()")[1].split("\n}")[0]
+        # Two concats, one free of the first one's result -- and no
+        # festina_text_own, since the outer concat is itself owning.
+        assert body.count("@festina_str_concat") == 2
+        # One free for the `a + b` intermediate, one for `joined` at
+        # scope exit -- and no festina_text_own at all, since the outer
+        # concat is itself owning and needs no copy.
+        assert body.count("call void @free(") == 2
+        assert "@festina_text_own" not in body
+
+    def test_returning_a_concatenation_does_not_copy_it(self, parser, semantic, codegen):
+        source = """
+        text func bang(s:text) {
+            return s + '!'
+        }
+        log(bang('x'))
+        """
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        body = ir.split("define ptr @bang(")[1].split("\n}")[0]
+        assert body.count("@festina_str_concat") == 1
+        # The only text_own left is the parameter binding (claude.md
+        # #84), never the returned concatenation itself.
+        assert body.count("@festina_text_own") == 1
+
+    def test_concatenation_still_produces_the_right_values(self, compile_and_run):
+        source = """
+        text func bang(s:text) {
+            return s + '!'
+        }
+        text a = 'aa'
+        text b = 'bb'
+        log(a + b + 'cc')
+        log(bang(a + b))
+        text kept = a + b
+        log(kept)
+        log(kept + kept)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "aabbcc\naabb!\naabb\naabbaabb\n"
+
+    def test_comparing_two_computed_texts(self, compile_and_run):
+        source = """
+        text a = 'aa'
+        log(a + 'b' == 'aab')
+        log(a + 'b' != 'aab')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\nfalse\n"
+
+
+class TestComputedMapKeyOwnership:
+    """claude.md #97: festina_map_set strdups the key it is given (see
+    its own comment on why it never aliases the caller's pointer) and
+    festina_map_get only reads it, so a key the CALLER allocated --
+    `m[`s${i}`] = v`, `m[a + b]` -- has no owner left once the call
+    returns. Both sites now free it."""
+
+    def test_a_computed_key_round_trips(self, compile_and_run):
+        source = """
+        map[int] scores = {}
+        for int i = 0, i < 3, i++ {
+            scores[`s${i}`] = i * 10
+        }
+        log(scores['s0'])
+        log(scores[`s${1}`])
+        log(scores['s' + '2'])
+        log(scores['missing'])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "0\n10\n20\n-9223372036854775808\n"
+
+    def test_the_map_keeps_its_own_copy_of_the_key(self, compile_and_run):
+        # The key buffer is freed at the call site now, so the map must
+        # genuinely own its copy for this lookup to still work.
+        source = """
+        map[text] m = {}
+        text k = 'na'
+        m[k + 'me'] = 'ada'
+        k = 'zzz'
+        log(m['name'])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "ada\n"
+
+
+class TestTopLevelBlockScopeTracking:
+    """claude.md #97: claude.md #74's scope tracking now covers the
+    top-level statements too.
+
+    A top-level VarDecl is a global and is unaffected. What this
+    reaches is a local declared inside a NESTED block at top level --
+    `text row = a + b` in a top-level `while` body -- which was emitted
+    as an ordinary alloca and, with tracking off, never freed: one
+    leaked buffer per iteration, in exactly the shape a game loop is
+    written in. Leak-freedom was measured under LeakSanitizer; what is
+    pinned here is that the values stay correct, since the same switch
+    also turns on claude.md #81's stack promotion for these locals."""
+
+    def test_locals_in_a_top_level_loop_stay_correct(self, compile_and_run):
+        source = """
+        struct P { x:int y:int }
+        arr[P] kept = []
+        int total = 0
+        for int i = 0, i < 5, i++ {
+            P local
+            local.x = i
+            local.y = i * 2
+            arr[int] nums = [i, i + 1]
+            text row = `${local.x},${local.y}` + '|'
+            total = total + nums[1]
+            if i % 2 == 0 {
+                kept.push(local)
+            }
+        }
+        log(total)
+        log(kept.length)
+        log(`${kept[0].x}/${kept[0].y} ${kept[2].x}/${kept[2].y}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "15\n3\n0/0 4/8\n"
+
+    def test_a_map_local_in_a_top_level_loop(self, compile_and_run):
+        source = """
+        text last = ''
+        for int i = 0, i < 3, i++ {
+            map[text] m = {'k': `v${i}`}
+            last = m['k']
+        }
+        log(last)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "v2\n"

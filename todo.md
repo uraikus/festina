@@ -1108,6 +1108,325 @@ bug in generated code.) Directly re-benchmarked afterward:
 Go's own equivalent rather than behind them, with byte-identical output
 before and after.
 
+### Stage 9: text values are owned and freed (done — claude.md #83)
+
+The largest single gap in this whole effort, and the one nobody had
+looked at: stages 1-8 gave `struct`/`arr[T]`/`map[T]` a complete
+ownership story, and `text` was left out of *all* of it. A text value
+was never freed anywhere in generated code, at any binding site, under
+any circumstance — every reassignment abandoned the previous buffer,
+every scope exit abandoned every text local. Found by profiling rather
+than by audit: `string_concat`'s 15,000 iterations of `` s = `${s}x` ``
+leaked every intermediate it built, so the heap grew quadratically and
+the program spent essentially all its runtime in `brk()` — **816 calls,
+against 3 for equivalent leak-free C**, which is where ~650ms of a
+~655ms benchmark was going.
+
+Closed *without* the refcount-header representation stages 4-7 use.
+That representation puts a counter in front of the payload, which every
+consumer must know about — and text's payload is a plain `char*` that
+sqlite, the regex engine, `festina_log_text`, and every comparison
+already take directly, so changing it would touch all of them. Text
+gets exclusivity by **copying** instead: every text binding always
+holds either NULL or a buffer it owns exclusively, never a bare alias
+of a `.str.N` constant or of another binding's buffer, with one new
+runtime helper (`festina_text_own`, a NULL-safe `strdup`) and plain
+`@free` for release. The payoff is that freeing needs **no escape
+analysis at all** — copying happens at each consuming site rather than
+by draining the source, so no number of other readers can make freeing
+a text local unsafe, and it is freed unconditionally on reassignment
+and at scope exit.
+
+Three things had to be fixed alongside it. An uninitialized `text s`
+local previously got an alloca and *no store at all*, leaving genuine
+garbage in the slot — harmless while text was never freed, an immediate
+wild-pointer `free()` afterward. Stage 8's sibling optimization
+(claude.md #82) had to be revised: a template that concatenates nothing
+(`` `${name}` ``) would otherwise hand back `name`'s own buffer to a
+caller that believes it owns what a template returns. And templates had
+to start freeing their own intermediates — `festina_str_concat` leaves
+both operands untouched, so a four-concatenation template leaks three
+buffers unless each is freed as the next one finishes copying out of it.
+
+Verified the same way every stage before it was: 13 new tests
+(`tests/test_codegen.py::TestTextReferenceManagement`) plus real
+AddressSanitizer/LeakSanitizer runs over locals, globals, uninitialized
+locals, reassignment, nested call temporaries, struct fields, array
+elements, map values, regex/text methods on temporaries, loop
+accumulation and parameter reassignment — all clean, with byte-identical
+output. `string_concat` went from ~77ms to **3.6ms** with the O(n²)
+naive-copy algorithm completely unchanged.
+
+One follow-up is deliberately left open rather than quietly claimed:
+
+- **Nothing frees a text global at process exit.** Deliberate, matching
+  how every other global already behaves — the process is ending — but
+  it does mean LeakSanitizer sees them as still-reachable rather than
+  freed.
+
+(An earlier version of this note also listed text arguments to the
+graphics, sqlite, and timer builtins as unfreed. Stage 11 closed the
+graphics and sqlite cases, along with `regex()` and `loadAudio()`; the
+timer entry was simply wrong — `setTimeout`/`setInterval` take a
+function name and an int delay, and `clearTimeout`/`clearInterval` take
+an int id, so no text ever reaches them.)
+
+### Stage 10: a reassigned parameter owns its own reference (done — claude.md #84)
+
+A **real, pre-existing use-after-free**, not introduced by stage 9 —
+found while designing text's own parameter handling, which has the same
+shape. A `struct`/`arr[T]`/`map[T]` parameter is passed as the caller's
+raw pointer, unretained; that borrowed convention is deliberate and
+worth keeping. But a callee that *reassigns* its own parameter
+(`p = somethingElse`) runs stage 4's ordinary local-reassignment path,
+which releases whatever the binding currently holds — and for a
+borrowed parameter that is the caller's live value, dropping a refcount
+the callee never incremented and freeing it out from under the caller.
+
+Confirming it took some care, because the two most obvious reproductions
+both hide it, which is worth recording so a future audit doesn't
+conclude the bug isn't there. A global that has never been assigned
+still carries the immortal negative-refcount sentinel static storage
+starts with, on which retain and release are both no-ops. A global that
+*has* been assigned got an unconditional retain on that assignment,
+leaving its count at 2, so the erroneous release only brings it to 1 and
+the symptom is a leak rather than a crash. Only a heap-allocated
+**local** passed to a parameter-reassigning callee exposes it — and
+under ASan that is an unambiguous heap-use-after-free with both the
+freeing and allocating stacks recorded.
+
+Closed by giving any parameter the callee assigns to its own reference
+at binding time (`festina_retain` for struct/arr[T]/map[T], a
+`festina_text_own` copy for text), released at the callee's own scope
+exit. This required computing escape analysis *before* parameters are
+bound rather than after, and giving parameters their own scope-exit
+frame outside the body's.
+
+One follow-up left open: **the retain/copy is keyed on the whole
+`escaping` set rather than on reassignment alone.** Every reassigned
+name is necessarily in that set (escape analysis adds every bare
+Identifier assignment target), which is what makes this safe — but the
+set is broader, so a text parameter that is merely interpolated or
+passed along takes a `strdup` it doesn't need, on every call. Narrowing
+it to genuine reassignment is safe (every other escaping use either
+borrows the parameter or does its own retain/copy at the storing site)
+and wants a `find_reassigned_names` alongside `find_escaping_names`;
+left undone here only to avoid threading a second collector through
+eight functions of a heavily-tested module late in an unrelated change.
+
+### Stage 11: query rows and runtime-compiled regexes are reclaimed (done — claude.md #85)
+
+Two leak classes stage 9 *surfaced* but did not cause — both
+pre-existing, and both unbounded rather than one-off: they grew with the
+number of queries run or regexes compiled, not with program size. Found
+by running the stage 9 verification programs against a workload that
+actually used sqlite and `regex()` together, rather than by audit.
+
+**Query rows.** A sqlite result row is deliberately not shaped like any
+other value in this language: `festina_sqlite_collect_rows` builds each
+one as a plain `malloc(col_count * sizeof(int64_t))` with each text/blob
+column strdup'd into its slot, and — unlike every struct/`arr[T]`/
+`map[T]` value since stage 4 — **no refcount header**. `TableType` is
+also a separate type class from `StructType`, so every
+`isinstance(t, (StructType, ArrayType, MapType))` test in codegen missed
+it entirely and nothing ever freed a row or any of its text columns.
+Since `arr[People] rows = sqlite(...)` is this language's single most
+central idiom, every query leaked its whole row set. What was already
+correct is the container: an `arr[T]` is an `arr[T]` whatever its
+element type, so the array header and its pointer buffer were always
+freed — only the rows those pointers point *at* were not.
+
+The fix respects two constraints at once. A row has no header, so
+`festina_release` (which reads the eight bytes before the payload) could
+never be pointed at one. And the array owns its rows outright, so a
+`People p = rows[0]` local — or a row passed to a function — is only
+borrowing one. The per-row free is therefore a bespoke, per-table
+generated function reached **solely** from `_release_fn_for_array`'s own
+element cascade, and deliberately *not* exposed through
+`_release_fn_for`, which would otherwise let an arbitrary
+TableType-typed binding free a row out from under the array holding it.
+Which columns need freeing uses the identical rule the runtime used when
+building the row (`text`/`blob` → strdup, everything else → a plain
+i64), with `free(NULL)` covering a column that was SQL NULL.
+
+**Runtime regexes.** Every `regex(pattern)` call compiles a fresh
+`regex_t` — several KB once regcomp's automaton is built — that nothing
+ever freed, so a `regex(...)` inside a loop leaked one per iteration. A
+regex used as a temporary in the expression that compiled it
+(`regex(p).test(s)`, the ordinary shape) is now released through a new
+`festina_regex_free` (`regfree` for what regcomp allocated inside the
+struct, then `free` for the struct), reusing stage 9's own
+free-immediately-after-the-consuming-call approach. The owning test
+separates the two ways a regex is produced, and getting it wrong either
+way is a real bug rather than a missed optimization: only `regex(...)`
+is an `ast.Call`, while a `/pattern/` literal is an `ast.RegexLit`
+compiled once into a process-lifetime cache that must never be freed —
+freeing one would leave every later evaluation running against a
+dangling `regex_t`.
+
+Verified with 6 new tests
+(`tests/test_codegen.py::TestQueryRowAndRegexReclamation`) covering both
+the generated IR and end-to-end behaviour, plus ASan/LeakSanitizer runs
+over a sqlite workload (multiple queries, a borrowed row, a text column
+copied out) and a regex loop mixing runtime and literal patterns — all
+clean. Full suite 829 → 835.
+
+One leak stayed open here and was closed by stage 12 below; the other
+is text globals at process exit, unchanged from stage 9.
+
+### Stage 12: a non-escaping regex local is freed (done — claude.md #86)
+
+Stage 11 left "a regex bound to a variable" open, described as bounded
+by the number of such declarations. That was wrong: `regex r = regex(p)`
+*inside a loop* leaks a full compiled automaton — several KB — on every
+iteration, so it was unbounded, and worth closing rather than accepting.
+
+Closed for exactly the provable case: a regex local whose initializer is
+a `regex(...)` call, and whose name escape analysis already proves never
+leaves the declaring function. Both halves are load-bearing, and
+relaxing either frees something still in use:
+
+- A `/pattern/` **literal** initializer is a pointer into the
+  process-lifetime cache from `claude.md #67`. Freeing it would leave
+  every later evaluation of that same literal running `regexec` against
+  freed memory.
+- An **escaping** regex has no equivalent of the copy-on-alias trick
+  that makes text's freeing unconditional (stage 9). A regex "copy"
+  would mean recompiling, and the pattern string isn't retained to
+  recompile from, so exclusivity can't be manufactured. It is left to
+  leak, deliberately, rather than freed while another binding may still
+  point at it.
+
+Reached only through the scope-exit path, never `_release_fn_for` —
+routing it through the generic dispatcher would make an `arr[regex]`
+element cascade free each element, and those can be cached literals,
+reintroducing the exact hazard one level down. Same containment argument
+stage 11 makes for a table row's per-row free. 4 new tests
+(`tests/test_codegen.py::TestOwnedRegexLocals`) plus ASan runs over a
+200-iteration loop, a cached-literal binding, and an escaping binding.
+
+### Stage 13: the X display connection is retried (done — claude.md #87)
+
+Not a leak — a robustness bug, and the cause of the one genuinely flaky
+test in the suite. `festina_graphics_init` called `XOpenDisplay` exactly
+once; Xlib does no retrying of its own, so a single transient connection
+refusal under load killed the whole program with a fatal error naming
+entirely the wrong cause ("is `$DISPLAY` set?").
+
+`TestGraphics` had been failing roughly one test per full-suite run and
+essentially never in isolation. That was previously attributed to
+contention making window startup slow, and "fixed" by doubling the
+test's polling timeout to 20s — a misdiagnosis that could never have
+worked, since the program had already exited before polling began. A
+window actually appears in **~0.2s**, measured, consistently.
+
+The forensics are recorded in claude.md #87 because the failure looks
+exactly like a dead or misaddressed X server and is neither: at the
+moment of failure the Xvfb process was alive, its socket and lock file
+were both present with the lock naming that same live server's pid
+(ruling out display-number collision), and `xdotool` connected to that
+exact display successfully both immediately before and immediately
+after. The connection was simply refused once.
+
+Ten attempts, 100ms apart, so a genuinely absent X server still fails
+with the same clear message in about a second. 0 failures in 216 runs
+under heavy parallel contention (against 4 in 128 before), three
+consecutive clean full-suite runs, and the suite ~25s faster for no
+longer timing out on an already-dead process.
+
+### Stage 14: a struct's own text field is freed (done — claude.md #88)
+
+A gap in stage 9's own work, found by ASan while verifying stage 12.
+Stage 9 added the machinery to free a struct's text-typed field but
+never widened the predicate deciding whether a struct needs field
+cleanup at all — it still counted only struct/`arr[T]`/`map[T]` fields.
+A struct whose only managed field is a text one fell through **both**
+directions that predicate gates: stack-allocated, never scheduled for
+field release; heap-allocated, given the generic `festina_release`
+instead of a per-struct wrapper. Either way the buffer leaked, so a
+struct rebuilt in a loop leaked one per iteration.
+
+Fixed by the widening stage 9 should have included, plus renaming the
+predicate to `_struct_has_own_managed_field` — "managed", not
+"refcounted", since text is managed by exclusive ownership rather than
+by counting. Worth recording *why* stage 9's own verification sweep
+missed it: none of its programs happened to leave a struct alive with a
+text field in it. 3 new tests
+(`tests/test_codegen.py::TestStructTextFieldReclamation`).
+
+### Stage 15: unassigned struct/array/map fields auto-vivify (done — claude.md #97)
+
+Recorded here after stage 14 as "found but not fixed", on the reasoning
+that fixing it meant a design decision about who owns a nested field's
+allocation. This stage made that decision. Probing it first showed the
+recorded scope was too narrow in two directions — **reads** crashed just
+as writes did, and `arr[T]`/`map[T]`-typed fields crashed the same way
+struct-typed ones did:
+
+```festina
+struct Inner { n:int }
+struct Bag   { inner:Inner  xs:arr[int] }
+Bag b
+log(b.inner.n)     // exit 139
+log(b.xs.length)   // exit 139
+```
+
+The decision: **lazily, on first reach**, not eagerly at the parent's
+declaration. Eager allocation needs somewhere to run an initializer, and
+a global has none — its storage is a compile-time `zeroinitializer`. Lazy
+vivification needs no such place, so one mechanism covers stack locals,
+heap locals, globals, parameters and arbitrarily deep nesting. The load
+becomes a null test, a make-and-store branch and a phi; the storage is
+created once, not per access, which is what makes `o.inner.n = 5`
+followed by a read answer 5. The ownership question stages 4–6 raised
+answers itself: the vivified value is created by the same
+`_emit_fresh_heap_header` path every other value of that type uses, and
+is owned by the field exactly as an explicitly assigned one is.
+7 new tests
+(`tests/test_codegen.py::TestUnassignedNestedFieldsAutoVivify`), plus a
+100-iteration ASan run.
+
+### Stage 16: three more leaks and one silent corruption (done — claude.md #97)
+
+Found while ASan-verifying `indexOf`, all pre-existing:
+
+- **A text `+` was not an owning source.** Stage 9 classified only a
+  call and a template literal as "already a fresh, exclusively-owned
+  buffer". A text `+` compiles to one `festina_str_concat`, which
+  mallocs unconditionally — so `text j = a + b` and `return s + '!'`
+  each copied an already-exclusive buffer and dropped the original, and
+  a chained `a + b + c` leaked its intermediate on top of that. This
+  should have been caught with stage 9's own `_emit_template` fix, which
+  is the identical bug one expression form over.
+- **Computed map keys.** `festina_map_set` strdups its key and
+  `festina_map_get` only reads one, so `m[`s${i}`] = v` leaked the key
+  it built. Both sites now free it.
+- **Top-level block scopes were never tracked.** Stage 4's scope
+  tracking only ran inside function/handler bodies, so a local declared
+  in a nested block at *top* level — `text row = a + b` inside a
+  top-level `while` — was emitted as an ordinary alloca and never
+  freed. One buffer per iteration, in exactly the shape a game loop
+  takes. The top-level statement list now gets the same whole-body
+  escape analysis every function gets.
+- **`arr[bool]` was silently corrupt** (not a leak — a wrong answer).
+  claude.md #96's array helpers move elements by a byte count passed in from
+  codegen, hardcoded to 8. Every element type is 8 bytes wide except
+  `bool`, which is `i8`, so `push` wrote byte `8*i` while `xs[i]` read
+  byte `i`. The stride now comes from the element type.
+
+### The one remaining leak
+
+- **Text globals at process exit.** Deliberate, and worth stating
+  precisely rather than repeating "matches other globals": LeakSanitizer
+  already reports these runs **clean**, because a global stays reachable
+  through its own variable — it only shows up if you explicitly disable
+  global-root scanning (`use_globals=0`), which is an artificial
+  configuration. Since every reassignment already frees the previous
+  value (stage 9), at most one buffer per global survives. Freeing them
+  would be pure exit-time busywork in every binary, for no observable
+  benefit; Rust doesn't drop statics and Go doesn't finalize globals
+  either.
+
 ### What's still ahead
 
 - **A real tracing GC** was never seriously considered as an
@@ -1133,6 +1452,33 @@ listed here only so they aren't lost:
   structs (`claude.md #43` promises this; not implemented -- see
   "Memory management" below, a deliberately separate, larger writeup
   rather than a one-line bullet here).
+- **No way to name one playback of a clip.** `stop()` and `isPlaying()`
+  are about the `aud` -- since claude.md #98 that means every channel
+  playing it. claude.md #99 narrowed this considerably (a program that
+  wants to address one playback names its channel:
+  `clip.playLoop(0)` / `stopAudioPlayer(0)`), but there is still no
+  per-playback `isPlaying`, which would need a handle to a playback --
+  the pool-as-language-surface both sections refused. Recorded as a
+  real limit, not as something expected to change.
+- **An escaping `aud`/`img`/`regex` is never freed.** claude.md #101
+  closed the ordinary case -- a non-escaping `aud` or `img` local is now
+  reclaimed at scope exit, as is one held in a query row -- so what is
+  left is the same conservative escape-analysis boundary a `regex` has
+  had since #86: a handle that escapes its function, or one bound to a
+  global, lives for the program's lifetime. Bounded (one allocation per
+  load, not per use) and the same accepted tradeoff as text globals at
+  exit.
+- **Only PNG/JPEG and WAV/MP3.** claude.md #101 added JPEG and MP3, and
+  drew the line there deliberately: each new format is a new
+  system dependency on every machine that compiles a graphics or audio
+  program, and PNG+JPEG / WAV+MP3 covers what a 2D game actually ships.
+  Ogg/FLAC/WebP/GIF would each need their own library and none of them
+  is the obvious next one.
+- **A key held down still repeats `keyDown`.** Deliberate -- that is
+  how text entry works, and claude.md #98 only guarantees that a HELD
+  key fires exactly one `keyUp`, when it is really let go. A program
+  that wants edge-triggered presses tracks which keys it has seen go
+  down; the language does not do that for it.
 - `regex(pattern, flags)` -- the dynamic builtin call, not a
   `/pattern/flags` literal (those are now cached, compiled once per
   source location on first reach -- see tests/CONTRACT.md) -- still
