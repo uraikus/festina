@@ -359,11 +359,11 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 835 tests in this directory pass against it: 556 need no external
+All 842 tests in this directory pass against it: 561 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-268 more need a working C compiler, plus 2 more
+270 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 9 more given
-`Xvfb`+`xdotool` too (556 + 268 + 2 + 9 = 835 -- re-verified directly
+`Xvfb`+`xdotool` too (561 + 270 + 2 + 9 = 842 -- re-verified directly
 by running the whole suite with a PATH containing nothing but Python,
 not just derived by counting `compile_and_run` call sites, since the
 true number had drifted well past a much older, since-inaccurate count
@@ -2095,8 +2095,33 @@ element cascade, so a borrowed `People p = rows[0]` can't double-free a
 row the array still owns, and `/pattern/` literals deliberately left
 uncached-freed since they live for the process.
 `tests/test_codegen.py::TestQueryRowAndRegexReclamation` (6 new tests)
-covers both. Two leaks stay deliberately open and tracked in todo.md:
-a regex bound to a variable, and text globals at process exit.
+covers both. **claude.md #86**: a `regex` local whose initializer is a
+`regex(...)` call and which escape analysis proves never escapes is now
+freed at scope exit too -- `regex r = regex(p)` inside a loop had been
+leaking a full compiled automaton per iteration, so that leak was
+unbounded rather than bounded by declaration count as #85 assumed. A
+`/pattern/` literal initializer (a process-lifetime cached pointer) and
+an escaping regex are both deliberately left alone; see
+`tests/test_codegen.py::TestOwnedRegexLocals` (4 new tests) for why
+relaxing either half frees something still in use.
+
+**claude.md #87**: `festina_graphics_init` called `XOpenDisplay` exactly
+once, so a single transient connection refusal under load killed the
+program with a fatal error naming the wrong cause. This was the entire
+reason `TestGraphics` was intermittently flaky (roughly a third of
+full-suite runs, essentially never in isolation) -- previously
+misattributed to slow window startup and "fixed" by doubling the test's
+polling timeout to 20s, which could never have helped because the
+process had already exited. A window actually appears in ~0.2s. Now
+retried ten times, 100ms apart: 0 failures in 216 runs under heavy
+parallel contention against 4 in 128 before, three consecutive clean
+full-suite runs, and the suite ~25s faster for no longer timing out on
+a dead process.
+
+One leak stays deliberately open and tracked in todo.md: text globals at
+process exit, which LeakSanitizer already reports as clean (a global
+stays reachable through its own variable) and which no other systems
+language frees either.
 
 See api.md for the current language/standard library reference and this
 file's own "Status" section above for the implemented-vs-not matrix; the
@@ -2853,9 +2878,9 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 556 passed, 279 skipped (needs a C compiler; 2 of
+pytest tests/                          # 561 passed, 281 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
                                         # 9 need Xvfb + xdotool installed too, 1 of those
                                         # also needs `openbox`) given a working C compiler,
-                                        # all 835 pass
+                                        # all 842 pass
 ```

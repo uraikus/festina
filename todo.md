@@ -1271,18 +1271,127 @@ over a sqlite workload (multiple queries, a borrowed row, a text column
 copied out) and a regex loop mixing runtime and literal patterns — all
 clean. Full suite 829 → 835.
 
-Two leaks stay deliberately open:
+One leak stayed open here and was closed by stage 12 below; the other
+is text globals at process exit, unchanged from stage 9.
 
-- **A regex bound to a variable** (`regex r = regex('x')`) is never
-  freed. Bounded by the number of such declarations rather than by how
-  often they run, since regex has no binding-level ownership story the
-  way text now does. Closing it means giving `RegexType` the same
-  copy-or-own decision text got — except a cached literal and a
-  runtime-compiled regex would need to stay distinguishable at every
-  binding site, which is the part that needs designing rather than
-  just wiring.
-- **Text globals at process exit**, unchanged from stage 9 and for the
-  same reason.
+### Stage 12: a non-escaping regex local is freed (done — claude.md #86)
+
+Stage 11 left "a regex bound to a variable" open, described as bounded
+by the number of such declarations. That was wrong: `regex r = regex(p)`
+*inside a loop* leaks a full compiled automaton — several KB — on every
+iteration, so it was unbounded, and worth closing rather than accepting.
+
+Closed for exactly the provable case: a regex local whose initializer is
+a `regex(...)` call, and whose name escape analysis already proves never
+leaves the declaring function. Both halves are load-bearing, and
+relaxing either frees something still in use:
+
+- A `/pattern/` **literal** initializer is a pointer into the
+  process-lifetime cache from `claude.md #67`. Freeing it would leave
+  every later evaluation of that same literal running `regexec` against
+  freed memory.
+- An **escaping** regex has no equivalent of the copy-on-alias trick
+  that makes text's freeing unconditional (stage 9). A regex "copy"
+  would mean recompiling, and the pattern string isn't retained to
+  recompile from, so exclusivity can't be manufactured. It is left to
+  leak, deliberately, rather than freed while another binding may still
+  point at it.
+
+Reached only through the scope-exit path, never `_release_fn_for` —
+routing it through the generic dispatcher would make an `arr[regex]`
+element cascade free each element, and those can be cached literals,
+reintroducing the exact hazard one level down. Same containment argument
+stage 11 makes for a table row's per-row free. 4 new tests
+(`tests/test_codegen.py::TestOwnedRegexLocals`) plus ASan runs over a
+200-iteration loop, a cached-literal binding, and an escaping binding.
+
+### Stage 13: the X display connection is retried (done — claude.md #87)
+
+Not a leak — a robustness bug, and the cause of the one genuinely flaky
+test in the suite. `festina_graphics_init` called `XOpenDisplay` exactly
+once; Xlib does no retrying of its own, so a single transient connection
+refusal under load killed the whole program with a fatal error naming
+entirely the wrong cause ("is `$DISPLAY` set?").
+
+`TestGraphics` had been failing roughly one test per full-suite run and
+essentially never in isolation. That was previously attributed to
+contention making window startup slow, and "fixed" by doubling the
+test's polling timeout to 20s — a misdiagnosis that could never have
+worked, since the program had already exited before polling began. A
+window actually appears in **~0.2s**, measured, consistently.
+
+The forensics are recorded in claude.md #87 because the failure looks
+exactly like a dead or misaddressed X server and is neither: at the
+moment of failure the Xvfb process was alive, its socket and lock file
+were both present with the lock naming that same live server's pid
+(ruling out display-number collision), and `xdotool` connected to that
+exact display successfully both immediately before and immediately
+after. The connection was simply refused once.
+
+Ten attempts, 100ms apart, so a genuinely absent X server still fails
+with the same clear message in about a second. 0 failures in 216 runs
+under heavy parallel contention (against 4 in 128 before), three
+consecutive clean full-suite runs, and the suite ~25s faster for no
+longer timing out on an already-dead process.
+
+### Stage 14: a struct's own text field is freed (done — claude.md #88)
+
+A gap in stage 9's own work, found by ASan while verifying stage 12.
+Stage 9 added the machinery to free a struct's text-typed field but
+never widened the predicate deciding whether a struct needs field
+cleanup at all — it still counted only struct/`arr[T]`/`map[T]` fields.
+A struct whose only managed field is a text one fell through **both**
+directions that predicate gates: stack-allocated, never scheduled for
+field release; heap-allocated, given the generic `festina_release`
+instead of a per-struct wrapper. Either way the buffer leaked, so a
+struct rebuilt in a loop leaked one per iteration.
+
+Fixed by the widening stage 9 should have included, plus renaming the
+predicate to `_struct_has_own_managed_field` — "managed", not
+"refcounted", since text is managed by exclusive ownership rather than
+by counting. Worth recording *why* stage 9's own verification sweep
+missed it: none of its programs happened to leave a struct alive with a
+text field in it. 3 new tests
+(`tests/test_codegen.py::TestStructTextFieldReclamation`).
+
+### Found but not fixed: nested struct fields segfault on write
+
+Surfaced while building stage 14's test program, and **not** a memory
+-management bug — a language-semantics question, which is why it is
+recorded rather than patched:
+
+```festina
+struct Inner { label:text }
+struct Outer { inner:Inner }
+Outer o
+o.inner.label = 'x'    // segfault
+```
+
+A stack-allocated struct is `zeroinitializer`d, so its struct-typed
+fields start as null pointers, and nothing allocates one on first use
+the way a top-level declaration does — so the write GEPs off null and
+dereferences it. **Confirmed long-standing**, not introduced by any of
+stages 9–14: reproduced directly on `b87948f`, the commit before this
+entire memory-management effort began.
+
+Fixing it means choosing between allocating a nested struct field
+eagerly at its parent's declaration or lazily on first write, and that
+choice interacts with stages 4–6's ownership rules (who owns the
+allocation, when it is released, what happens when the parent is
+reassigned). That design decision is why it isn't bolted on here.
+
+### The one remaining leak
+
+- **Text globals at process exit.** Deliberate, and worth stating
+  precisely rather than repeating "matches other globals": LeakSanitizer
+  already reports these runs **clean**, because a global stays reachable
+  through its own variable — it only shows up if you explicitly disable
+  global-root scanning (`use_globals=0`), which is an artificial
+  configuration. Since every reassignment already frees the previous
+  value (stage 9), at most one buffer per global survives. Freeing them
+  would be pure exit-time busywork in every binary, for no observable
+  benefit; Rust doesn't drop statics and Go doesn't finalize globals
+  either.
 
 ### What's still ahead
 

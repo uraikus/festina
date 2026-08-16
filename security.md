@@ -617,12 +617,46 @@ for the full design writeup.
   deliberately left alone, since freeing one would leave every later
   evaluation running against a dangling `regex_t`.
 
-  Two resource leaks remain deliberately open and are tracked rather
-  than claimed closed: a regex bound to a variable (bounded by the
-  number of such declarations, not by how often they run — regex has no
-  binding-level ownership story the way text now does), and text
-  globals at process exit, matching how every other global already
-  behaves. See [todo.md](todo.md#memory-management).
+  `claude.md #86` (stage 12) closes the regex-bound-to-a-variable leak
+  stage 11 had left open and mischaracterised as bounded: `regex r =
+  regex(p)` *inside a loop* leaks a full compiled automaton per
+  iteration, so it was unbounded. A regex local whose initializer is a
+  `regex(...)` call and which escape analysis proves never escapes is
+  now freed at scope exit. Both halves of that test are load-bearing —
+  a `/pattern/` literal initializer points into a process-lifetime
+  cache, so freeing it would leave every later evaluation running
+  `regexec` against freed memory, and an escaping regex has no
+  equivalent of text's copy-on-alias trick (a regex "copy" would mean
+  recompiling, and the pattern isn't retained to recompile from), so it
+  is deliberately left to leak rather than freed while still
+  referenced. Reached only through the scope-exit path and never
+  through `_release_fn_for`, since routing it through the generic
+  dispatcher would make an `arr[regex]` cascade free elements that may
+  themselves be cached literals.
+
+  One resource leak remains deliberately open: text globals at process
+  exit. Worth stating precisely — LeakSanitizer already reports these
+  runs clean, since a global stays reachable through its own variable;
+  it only appears if global-root scanning is explicitly disabled. At
+  most one buffer per global survives (every reassignment already frees
+  the previous value), so freeing them would be exit-time busywork for
+  no observable benefit. See [todo.md](todo.md#memory-management).
+
+- **A graphics program could die on a transient X connection failure**
+  (`claude.md #87`), which was also the sole cause of the test suite's
+  one intermittently flaky test. `festina_graphics_init` called
+  `XOpenDisplay` exactly once, and Xlib does no retrying of its own, so
+  a single refused connection under load killed the program with a
+  fatal error naming entirely the wrong cause ("is `$DISPLAY` set?").
+  Not a memory-safety issue, but a real robustness gap for anyone
+  launching a graphics program on a busy machine. Confirmed as a
+  genuine transient rather than a dead or misaddressed server: at the
+  moment of failure the X server process was alive, its socket and lock
+  file were present with the lock naming that same live server's pid,
+  and `xdotool` connected to that exact display successfully both
+  immediately before and immediately after. Now retried ten times,
+  100ms apart, so a genuinely absent server still fails with the same
+  clear message in about a second.
 
   What changed across all seven stages is that each one's own fix, at
   every step of building it out, was verified with the same rigor the

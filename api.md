@@ -279,9 +279,13 @@ row read out of one (`People p = rows[0]`) borrows from the array
 rather than owning a copy, so it stays valid exactly as long as the
 array does. A regex compiled at runtime and used straight away
 (`regex(p).test(s)`) is freed after use, while a `/pattern/` literal is
-compiled once and kept for the life of the process. Two things are
-still not reclaimed: a regex bound to a variable, and text globals at
-process exit.
+compiled once and kept for the life of the process. A regex bound to a variable is reclaimed too, when the
+compiler can prove it safe — one compiled by `regex(...)` and never
+shared outside the function it was declared in. A regex that escapes,
+and one bound from a `/pattern/` literal (which is compiled once and
+shared for the life of the process), are both deliberately left alone.
+The one thing not reclaimed is text globals at process exit, where the
+operating system reclaims everything anyway.
 
 ## Arrays
 

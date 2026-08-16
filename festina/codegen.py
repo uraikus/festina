@@ -492,6 +492,29 @@ class _StackArrayOrMap:
         self.type_ = type_
 
 
+class _OwnedRegex:
+    """claude.md #86: marks, in CodeGen._active_free_locals, a `regex`
+    local this scope provably owns outright -- one whose initializer is
+    a `regex(...)` Call (freshly compiled by festina_regex_compile, so
+    nothing else can reference it yet) and whose name escape analysis
+    proves never escapes the declaring function.
+
+    Both halves are load-bearing, and getting either wrong frees
+    something still in use. A regex whose initializer is a /pattern/
+    literal is NOT owned: that pointer comes from a process-lifetime
+    cache (see _emit_cached_regex_lit), and freeing it would leave every
+    later evaluation of that literal running regexec against a freed
+    regex_t. A regex that escapes is not owned either: `text`'s trick of
+    copying at each consuming site to guarantee exclusivity has no
+    regex equivalent (a "copy" would mean recompiling, and the pattern
+    string isn't retained to recompile from), so an escaping regex is
+    left to leak exactly as it did before, rather than freed while
+    another binding may still be pointing at it."""
+
+    def __init__(self):
+        pass
+
+
 class CodeGen:
     def __init__(self, analyzed, filename="main.f"):
         self.analyzed = analyzed
@@ -1067,6 +1090,15 @@ class CodeGen:
                     # retained a reference nothing else will ever
                     # release otherwise.
                     self._emit_release_nested_fields_only(ref, type_.struct_type, lines)
+                elif isinstance(type_, _OwnedRegex):
+                    # claude.md #86: a regex this scope compiled itself
+                    # and provably never shared -- regfree + free, via
+                    # the same helper #85 already uses for a regex
+                    # temporary. Never reached for a /pattern/ literal
+                    # or an escaping binding; see _OwnedRegex's comment.
+                    compiled = self.tmp()
+                    lines.append(f"  {compiled} = load ptr, ptr {ref}")
+                    lines.append(f"  call void @festina_regex_free(ptr {compiled})")
                 elif isinstance(type_, _StackArrayOrMap):
                     # claude.md #79: a stack-allocated arr[T]/map[T]
                     # local (see _emit_block's own tracking comment) --
@@ -1487,7 +1519,7 @@ class CodeGen:
                                                    and stmt.name not in self._current_escaping_names)
                             if not is_stack_allocated:
                                 self._active_free_locals[-1].append((ref, type_))
-                            elif self._struct_has_own_refcounted_field(type_.name):
+                            elif self._struct_has_own_managed_field(type_.name):
                                 # claude.md #78: this local's own
                                 # storage is stack-allocated and never
                                 # itself released -- but writing into
@@ -1500,6 +1532,21 @@ class CodeGen:
                                 # comment.
                                 self._active_free_locals[-1].append(
                                     (ref, _StackStructFieldsOnly(type_)))
+                        elif type_ == REGEX:
+                            # claude.md #86: only a regex this scope
+                            # compiled itself (a `regex(...)` Call, so
+                            # freshly allocated and unshared) and that
+                            # escape analysis proves never leaves this
+                            # function is freed here. A /pattern/
+                            # literal initializer is a process-lifetime
+                            # cached pointer that must never be freed,
+                            # and an escaping regex has no copy-on-alias
+                            # escape hatch the way text does -- both are
+                            # left to leak, exactly as before. See
+                            # _OwnedRegex's own comment.
+                            if (isinstance(stmt.init, ast.Call)
+                                    and stmt.name not in self._current_escaping_names):
+                                self._active_free_locals[-1].append((ref, _OwnedRegex()))
                         elif type_ == TEXT:
                             # claude.md #83: unlike the other three
                             # types, a text local is ALWAYS scheduled
@@ -3065,13 +3112,25 @@ class CodeGen:
             return "@free"
         raise CodegenError(f"cannot release a value of type {types_mod.type_name(type_)}")
 
-    def _struct_has_own_refcounted_field(self, name):
-        """claude.md #78 (widened by claude.md #79 to arr[T]/map[T]
-        fields too): True when the struct declared `name` has at least
-        one field of its own that is itself a struct/array/map-typed
-        value -- never transitively (see _release_fn_for_struct's own
-        comment on why only the direct case needs checking here)."""
+    def _struct_has_own_managed_field(self, name):
+        """claude.md #78 (widened by #79 to arr[T]/map[T] fields, and by
+        #83 to text ones): True when the struct declared `name` has at
+        least one field of its own whose value this compiler manages --
+        a struct/array/map (refcounted) or a text (an exclusively-owned
+        heap buffer) -- never transitively (see _release_fn_for_struct's
+        own comment on why only the direct case needs checking here).
+
+        The text case was missed when #83 first landed, and it was a
+        real leak in both directions this predicate gates: a
+        stack-allocated struct local with a text field was never
+        scheduled for field release at all, and a heap-allocated one got
+        the plain generic @festina_release instead of a per-struct
+        wrapper, so in neither case was the field's own buffer ever
+        freed. Caught by an ASan run over a struct whose text field is
+        reassigned (`p.name = `tmpl ${p.name}``), which leaked the
+        field's final buffer every time."""
         return any(isinstance(t, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+                   or t == TEXT
                    for _, t in self.struct_fields(name))
 
     def _release_fn_for_struct(self, type_):
@@ -3113,7 +3172,7 @@ class CodeGen:
         own fields" is a DAG by construction, never a cycle -- a
         struct's own release wrapper can transitively call another
         struct's, but never, even indirectly, its own."""
-        if not self._struct_has_own_refcounted_field(type_.name):
+        if not self._struct_has_own_managed_field(type_.name):
             return "@festina_release"
         if type_.name in self._struct_release_fns:
             return self._struct_release_fns[type_.name]
