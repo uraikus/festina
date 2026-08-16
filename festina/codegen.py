@@ -133,7 +133,7 @@ decoder dependency at all -- is the implementation-defined choice here,
 the same kind of call PNG-only images already made. play()/stop()/
 isPlaying() are ordinary Call-on-Member patterns (same family as
 Math.floor/int.toFloat()/the regex methods above), each emitting a
-single call to festina_audio_play/_stop/_is_playing; there's no IR-level
+single call to festina_audio_play_on/_is_playing; there's no IR-level
 machinery of its own; the interesting part -- playback actually running
 on a background thread so a playing clip doesn't block the rest of the
 program, matching what having a separate isPlaying() to poll implies --
@@ -321,6 +321,7 @@ from . import ast
 from . import types as types_mod
 from . import semantic as semantic_mod
 from . import escape_analysis
+from . import colors as colors_mod
 from .errors import CompileError
 
 BOOL = types_mod.PrimitiveType("bool")
@@ -341,6 +342,9 @@ FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
 # giving them separate names catches an accidental mix-up in the IR
 # itself rather than relying on convention alone.
 FESTINA_MAP_LLVM_TYPE = "%struct._FestinaMap"
+# claude.md #91: the compiled shape of a `font` value -- see _llvm_type's
+# own FontType branch and _emit_font_constant.
+FESTINA_FONT_LLVM_TYPE = "%struct._FestinaFont"
 
 # claude.md #57: division/modulo by zero returns null; null has no spare
 # bit pattern in a plain i64/double, so it's a reserved sentinel instead
@@ -371,11 +375,65 @@ MATH_INTRINSICS = {
     "round": "llvm.round.f64", "trunc": "llvm.trunc.f64",
 }
 
+# claude.md #93: float -> float. LLVM has real intrinsics for most of
+# these, which optimize and constant-fold in ways an opaque libm call
+# can't; the rest are declared straight from libm, which is already on
+# every link line (cli.py's link_libs has -lm unconditionally), so none
+# of this costs a new dependency. Both kinds are emitted identically --
+# a `call double @<name>(double)` -- so the split is purely about which
+# name to use.
+MATH_FLOAT_FNS = {
+    "sqrt": "llvm.sqrt.f64", "sin": "llvm.sin.f64", "cos": "llvm.cos.f64",
+    "exp": "llvm.exp.f64", "log": "llvm.log.f64", "log2": "llvm.log2.f64",
+    "log10": "llvm.log10.f64", "abs": "llvm.fabs.f64",
+    # no LLVM intrinsic for these -- libm directly
+    "tan": "tan", "asin": "asin", "acos": "acos", "atan": "atan",
+}
+MATH_FLOAT2_FNS = {
+    "pow": "llvm.pow.f64",
+    # llvm.minnum/maxnum match the IEEE-754 minNum/maxNum that every
+    # other language's Math.min/max implements (NaN-tolerant: if one
+    # operand is NaN the other is returned).
+    "min": "llvm.minnum.f64", "max": "llvm.maxnum.f64",
+    "atan2": "atan2",
+}
+
 
 class CodegenError(CompileError):
     def __init__(self, message, **kw):
         kw.setdefault("category", "not implemented")
         super().__init__(message, **kw)
+
+
+class _StmtList:
+    """The one thing escape_analysis.find_escaping_names actually reads
+    off an ast.Block -- its `.body` list. Lets the top-level statement
+    list be analyzed by the same function without inventing a synthetic
+    ast.Block (which carries a source position this list has no single
+    one of). See _emit_main_and_entry."""
+
+    __slots__ = ("body",)
+
+    def __init__(self, body):
+        self.body = body
+
+
+def _elem_size(t):
+    """The byte stride of one arr[T] element slot.
+
+    This has to agree EXACTLY with the stride _array_elem_ptr's
+    `getelementptr <elem type>` walks with, because the runtime's array
+    helpers move elements with memmove over a size the compiler hands
+    them while indexing still goes through that GEP. Everything Festina
+    stores in an array is 8 bytes wide -- i64, double, and every `ptr`
+    -- except bool, which is i8 (see _llvm_type's own note on why bool
+    is not i1). Assuming 8 across the board, as this originally did,
+    made push() on an arr[bool] write to byte 8*i while the read at
+    xs[i] looked at byte i: the value went in and a neighbouring
+    element's byte came back out. Confirmed, then fixed here rather
+    than by widening bool's storage, which would change every bool
+    array's layout for one method's convenience."""
+    return 1 if t == BOOL else 8
 
 
 def _llvm_type(t):
@@ -426,6 +484,16 @@ def _llvm_type(t):
     if isinstance(t, types_mod.RegexType):
         # claude.md #67: a compiled regex_t*, opaque to codegen -- see
         # _emit_regex_call.
+        return "ptr"
+    if isinstance(t, types_mod.ColorType):
+        # claude.md #91: a packed 0xRRGGBB integer (negative for 'none')
+        # -- see _pack_color. One register, and an integer compare is
+        # all that comparing two colours costs.
+        return "i64"
+    if isinstance(t, types_mod.FontType):
+        # claude.md #91: a pointer to the static %struct.FestinaFont
+        # constant codegen emitted for this font's own literal -- see
+        # _emit_font_constant. Read-only data, never allocated or freed.
         return "ptr"
     if isinstance(t, types_mod.MapType):
         # claude.md #79: see the ArrayType branch above -- identical
@@ -490,6 +558,35 @@ class _StackArrayOrMap:
 
     def __init__(self, type_):
         self.type_ = type_
+
+
+class _OwnedImage:
+    """claude.md #92: marks, in CodeGen._active_free_locals, an `img`
+    local this scope provably owns -- one whose initializer is a Call
+    (`loadImage(...)` or `sheet.clip(...)`, both of which hand back a
+    freshly created image nothing else references yet) and whose name
+    escape analysis proves never leaves the declaring function.
+
+    Exactly the shape claude.md #86 already uses for regex, and here for
+    a sharper reason: clip() exists to be called repeatedly -- one per
+    sprite -- so without this, extracting frames inside a loop would
+    leak a whole Cairo surface every iteration. An `img` bound from
+    anything else (another img binding, a struct field) is only
+    borrowing, and an escaping one may still be referenced after this
+    scope ends; neither is freed here."""
+
+    def __init__(self):
+        pass
+
+
+class _OwnedAudio:
+    """claude.md #101: the aud counterpart of _OwnedImage below --
+    marks, in CodeGen._active_free_locals, an `aud` local this scope
+    created itself and that escape analysis proves never leaves the
+    function, so scope exit can free it. Audio handles were never freed
+    at all before this; a clip loaded inside a loop leaked one decoded
+    buffer per iteration, which the `aud x = 'path'` short form made
+    easy to write by accident."""
 
 
 class _OwnedRegex:
@@ -673,6 +770,11 @@ class CodeGen:
                                                 # threaded through ctx" shape as _loop_targets, for the
                                                 # same reason: it needs to keep working correctly through
                                                 # arbitrary nesting depth.
+        self._font_constants = {}              # claude.md #91: (px, style, family) -> the name of the
+                                                # static %struct._FestinaFont constant holding it.
+                                                # Keyed on the RESOLVED parts rather than the source
+                                                # text, so 'bold 13px arial' and 'arial bold 13px'
+                                                # share one constant.
         self._regex_lit_cache = {}             # id(ast.RegexLit node) -> its private cache global's
                                                 # name -- see _emit_cached_regex_lit; keyed by node
                                                 # identity (not pattern text) so two textually
@@ -805,6 +907,17 @@ class CodeGen:
             # NULL-safe strdup); freeing uses plain @free directly
             # (also NULL-safe), no dedicated release function needed.
             "declare ptr @festina_text_own(ptr)",
+            # claude.md #93: math (libm/LLVM intrinsics), files, time
+            *[f"declare double @{fn}(double)" for fn in sorted(set(MATH_FLOAT_FNS.values()))],
+            *[f"declare double @{fn}(double, double)" for fn in sorted(set(MATH_FLOAT2_FNS.values()))],
+            "declare double @festina_random()",
+            "declare ptr @festina_read_file(ptr)",
+            "declare i8 @festina_write_file(ptr, ptr)",
+            "declare i8 @festina_append_file(ptr, ptr)",
+            "declare i8 @festina_file_exists(ptr)",
+            "declare i8 @festina_delete_file(ptr)",
+            "declare i64 @festina_now_ms()",
+            "declare ptr @festina_format_time(i64, ptr)",
             "declare i8 @festina_str_eq(ptr, ptr)",
             # claude.md #70: DatabaseURL -- path is festina.sqlite's
             # location, NULL/empty meaning "use the default" (a plain
@@ -819,7 +932,21 @@ class CodeGen:
             "declare void @festina_sqlite_bind_float(ptr, i32, double)",
             "declare void @festina_sqlite_bind_text(ptr, i32, ptr)",
             "declare void @festina_sqlite_bind_null(ptr, i32)",
+            # claude.md #101: aud/img columns are stored as their own
+            # encoded bytes.
+            "declare void @festina_sqlite_bind_blob(ptr, i32, ptr, i64)",
+            "declare void @festina_set_audio_decoder(ptr)",
+            "declare void @festina_set_image_decoder(ptr)",
+            "declare ptr @festina_audio_bytes(ptr, ptr)",
+            "declare ptr @festina_image_bytes(ptr, ptr)",
+            "declare ptr @festina_audio_from_bytes(ptr, i64, ptr)",
+            "declare void @festina_audio_free(ptr)",
+            "declare ptr @festina_image_from_bytes(ptr, i64, ptr)",
             "declare void @festina_sqlite_exec(ptr)",
+            # claude.md #94: single-value queries
+            "declare i64 @festina_sqlite_scalar_int(ptr)",
+            "declare double @festina_sqlite_scalar_float(ptr)",
+            "declare ptr @festina_sqlite_scalar_text(ptr)",
             "declare void @festina_sqlite_collect_rows(ptr, i32, ptr, ptr, ptr)",
             # claude.md #67-68: regex(), .test(), .match(), .replace()/.replaceAll().
             "declare ptr @festina_regex_compile(ptr, ptr)",
@@ -834,11 +961,55 @@ class CodeGen:
             "declare void @festina_draw_rect(i64, i64, i64, i64)",
             "declare void @festina_draw_circle(i64, i64, i64)",
             "declare void @festina_draw_text(ptr, i64, i64)",
+            # claude.md #89/#90: canvas drawing style + text metrics.
+            # Colours and fonts are resolved at compile time (see
+            # festina/colors.py), so these take numbers, not strings to
+            # be parsed on every call.
+            "declare void @festina_set_fill_rgb(i64, i64, i64)",
+            "declare void @festina_set_border_rgb(i64, i64, i64)",
+            # claude.md #91: the packed-colour and font-record forms
+            "declare void @festina_set_fill_color(i64)",
+            "declare void @festina_set_border_color(i64)",
+            "declare void @festina_set_font_value(ptr)",
+            "declare void @festina_set_line_width(i64)",
+            "declare void @festina_set_font(i64, ptr, ptr)",
+            "declare i64 @festina_measure_text_width(ptr)",
+            "declare i64 @festina_measure_text_height(ptr)",
             "declare ptr @festina_load_image(ptr)",
+            "declare i8 @festina_save_canvas(ptr)",  # claude.md #93
+            # claude.md #94: paths, transforms, gradients, alpha
+            # claude.md #95: render + clears
+            "declare void @festina_render()",
+            "declare void @festina_clear_canvas()",
+            "declare void @festina_clear_rect(i64, i64, i64, i64)",
+            "declare void @festina_set_alpha(double)",
+            "declare void @festina_fill_linear_gradient(i64, i64, i64, i64, i64, i64)",
+            "declare void @festina_fill_radial_gradient(i64, i64, i64, i64, i64)",
+            "declare void @festina_translate(i64, i64)",
+            "declare void @festina_rotate(double)",
+            "declare void @festina_scale(double, double)",
+            "declare void @festina_reset_transform()",
+            "declare void @festina_save_state()",
+            "declare void @festina_restore_state()",
+            "declare void @festina_begin_path()",
+            "declare void @festina_move_to(i64, i64)",
+            "declare void @festina_line_to(i64, i64)",
+            "declare void @festina_curve_to(i64, i64, i64, i64, i64, i64)",
+            "declare void @festina_close_path()",
+            "declare void @festina_fill_path()",
+            "declare void @festina_stroke_path()",
+            # claude.md #92: img methods/properties
+            "declare i64 @festina_image_width(ptr)",
+            "declare i64 @festina_image_height(ptr)",
+            "declare ptr @festina_image_clip(ptr, i64, i64, i64, i64)",
+            "declare void @festina_image_resize(ptr, i64, i64)",
+            "declare void @festina_image_free(ptr)",
             "declare void @festina_draw_image(ptr, i64, i64)",
             "declare void @festina_register_click_handler(ptr)",
             "declare void @festina_register_mouse_handler(ptr)",
-            "declare void @festina_register_key_handler(ptr)",
+            # claude.md #98: `on key` became `on keyDown` + `on keyUp`.
+            "declare void @festina_register_key_down_handler(ptr)",
+            "declare void @festina_register_key_up_handler(ptr)",
             "declare void @festina_register_resize_handler(ptr)",
             "declare void @festina_register_close_handler(ptr)",
             "declare i64 @festina_client_width()",
@@ -857,9 +1028,13 @@ class CodeGen:
             "declare void @festina_run_timer_loop()",
             # claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying().
             "declare ptr @festina_load_audio(ptr)",
-            "declare void @festina_audio_play(ptr)",
-            "declare void @festina_audio_stop(ptr)",
+            # claude.md #99: play/playLoop, with or without a channel.
+            "declare void @festina_audio_play_on(ptr, i64, i8, i8)",
+            "declare void @festina_stop_audio_player(i64)",
             "declare i8 @festina_audio_is_playing(ptr)",
+            # claude.md #98: the per-aud voice limit.
+            "declare void @festina_set_max_audio_players(i64)",
+            "declare i64 @festina_get_max_audio_players()",
             "declare ptr @malloc(i64)",
             "declare ptr @calloc(i64, i64)",
             # claude.md #74: automatic reclamation of provably non-
@@ -885,6 +1060,14 @@ class CodeGen:
             # values that escape -- see _release_fn_for and each
             # function's own doc comment in runtime/festina_runtime.c.
             "declare void @festina_release_array(ptr)",
+            # claude.md #96: array methods
+            "declare void @festina_array_push(ptr, i64, ptr)",
+            "declare void @festina_array_unshift(ptr, i64, ptr)",
+            "declare i8 @festina_array_pop(ptr, i64, ptr)",
+            "declare i8 @festina_array_shift(ptr, i64, ptr)",
+            "declare void @festina_array_splice(ptr, i64, i64, i64, ptr)",
+            # claude.md #97
+            "declare i64 @festina_array_index_of(ptr, i64, ptr, i8)",
             "declare void @festina_release_map(ptr)",
             # claude.md #71: environment.NAME / environment[keyExpr].
             "declare ptr @festina_getenv(ptr)",
@@ -924,6 +1107,11 @@ class CodeGen:
         lines = [
             f"{FESTINA_ARRAY_LLVM_TYPE} = type {{ i64, ptr }}",
             f"{FESTINA_MAP_LLVM_TYPE} = type {{ i64, ptr }}",
+            # claude.md #91: a `font` value points at one of these,
+            # emitted as read-only data from the declaration's own
+            # literal -- size in px, slant, weight, family. Layout must
+            # match FestinaFont in runtime/festina_runtime.h.
+            f"{FESTINA_FONT_LLVM_TYPE} = type {{ i64, i64, i64, ptr }}",
         ]
         for name in self.struct_order:
             fields = self.struct_fields(name)
@@ -990,6 +1178,10 @@ class CodeGen:
         # aggregate value here; "null" (the final fallback below) is
         # correct for all three now, the same as it already was for
         # StructType.
+        if isinstance(type_, types_mod.ColorType):
+            # claude.md #91: an unset colour is 'none', not 0 -- 0 is a
+            # real colour (opaque black), so it would silently paint.
+            return "-1"
         llvm_ty = _llvm_type(type_)
         if llvm_ty in ("i64", "i1", "i8"):
             return "0"
@@ -1090,6 +1282,22 @@ class CodeGen:
                     # retained a reference nothing else will ever
                     # release otherwise.
                     self._emit_release_nested_fields_only(ref, type_.struct_type, lines)
+                elif isinstance(type_, _OwnedImage):
+                    # claude.md #92: destroys the Cairo surface and the
+                    # box holding it. Never reached for a borrowed or
+                    # escaping img; see _OwnedImage's own comment.
+                    image = self.tmp()
+                    lines.append(f"  {image} = load ptr, ptr {ref}")
+                    lines.append(f"  call void @festina_image_free(ptr {image})")
+                elif isinstance(type_, _OwnedAudio):
+                    # claude.md #101: frees the decoded PCM, the stored
+                    # source bytes and the clip itself, stopping any
+                    # channel still playing it first. Never reached for
+                    # a borrowed or escaping aud, exactly as _OwnedImage
+                    # above.
+                    clip = self.tmp()
+                    lines.append(f"  {clip} = load ptr, ptr {ref}")
+                    lines.append(f"  call void @festina_audio_free(ptr {clip})")
                 elif isinstance(type_, _OwnedRegex):
                     # claude.md #86: a regex this scope compiled itself
                     # and provably never shared -- regfree + free, via
@@ -1403,7 +1611,7 @@ class CodeGen:
         self.func_defs.extend(func)
         self.func_defs.append("")
 
-        if decl.name in ("click", "mouse", "key", "resize", "close"):
+        if decl.name in ("click", "mouse", "keyDown", "keyUp", "resize", "close"):
             self.uses_graphics = True
             self.event_handlers[decl.name] = symbol
 
@@ -1532,6 +1740,34 @@ class CodeGen:
                                 # comment.
                                 self._active_free_locals[-1].append(
                                     (ref, _StackStructFieldsOnly(type_)))
+                        elif isinstance(type_, types_mod.ImageType):
+                            # claude.md #92: same two-part ownership test
+                            # #86 uses for regex -- created here (a Call:
+                            # loadImage or clip) and provably never
+                            # escaping. See _OwnedImage's own comment.
+                            #
+                            # claude.md #101: `img sprite = 'path.png'`
+                            # counts as "created here" too. It compiles
+                            # to a real festina_load_image call (see
+                            # _coerce), so the value is exactly as fresh
+                            # and unshared as loadImage()'s -- but the
+                            # AST node is a StringLit, so testing for a
+                            # Call alone silently stopped reclaiming
+                            # these the moment the short form existed.
+                            # Confirmed under LeakSanitizer: one handle
+                            # per loop iteration.
+                            if (self._is_owning_media_source(stmt.init)
+                                    and stmt.name not in self._current_escaping_names):
+                                self._active_free_locals[-1].append((ref, _OwnedImage()))
+                        elif isinstance(type_, types_mod.AudioType):
+                            # claude.md #101: `aud` gets the reclamation
+                            # `img` has had since #92 -- the two are the
+                            # same shape of handle and there was never a
+                            # reason for one to be freed and the other
+                            # not. Same two-part test.
+                            if (self._is_owning_media_source(stmt.init)
+                                    and stmt.name not in self._current_escaping_names):
+                                self._active_free_locals[-1].append((ref, _OwnedAudio()))
                         elif type_ == REGEX:
                             # claude.md #86: only a regex this scope
                             # compiled itself (a `regex(...)` Call, so
@@ -2100,6 +2336,33 @@ class CodeGen:
         # is genuinely permissive by design: a null literal (from_type is
         # None or NULL-ish) or an unconstrained builtin return (e.g.
         # sqlite()) flowing into a concretely-typed slot.
+        #
+        # claude.md #100/#101 add the two conversions that are not free:
+        # `aud music = 'track.wav'` and `img sprite = 'sprite.png'`. blob/color/font all reach an
+        # aud-shaped allowance in semantic.py's check_assignable too, but
+        # those need nothing here -- blob shares text's representation
+        # outright, and colour/font are resolved by their own literal
+        # handling. An `aud` is a decoded clip, so the conversion is a
+        # real loadAudio() call, emitted here so that every position that
+        # accepts one (declaration, assignment, argument, field) gets it
+        # from a single place rather than four.
+        if isinstance(to_type, types_mod.AudioType) and from_type == TEXT:
+            self.uses_audio = True
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_load_audio(ptr {val})")
+            return out
+        # claude.md #101: `img sprite = 'sprite.png'`, the exact
+        # counterpart of the aud case just above. uses_graphics_CODE,
+        # not uses_graphics: decoding an image needs no X server, and
+        # setting the stronger flag would make a headless program that
+        # merely loads a sprite die on "could not open the X display"
+        # -- exactly the artificial restriction loadImage() already
+        # avoids for the same reason (see _emit_graphics_call).
+        if isinstance(to_type, types_mod.ImageType) and from_type == TEXT:
+            self.uses_graphics_code = True
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_load_image(ptr {val})")
+            return out
         return val
 
     def _bool_cond(self, val, lines):
@@ -2151,11 +2414,17 @@ class CodeGen:
             # builtin-function dispatch; read the canvas's *current*
             # size from the runtime (not a compile-time constant, since
             # `on resize` can change it after startup -- see
-            # festina_client_width/_height's own doc comment) and set
-            # uses_graphics exactly like a draw* call does, since asking
-            # for the window's size implies a window exists.
+            # festina_client_width/_height's own doc comment).
+            #
+            # claude.md #95: this no longer opens a window either. It
+            # used to, on the reasoning that asking for the size implies
+            # a window -- but the canvas has a size (800x600 until a
+            # resize) whether or not it is on screen, and forcing a
+            # window here would defeat headless rendering for the very
+            # common case of a program that asks how big its canvas is
+            # before drawing into it.
             if expr.name in ("clientWidth", "clientHeight"):
-                self.uses_graphics = True
+                self.uses_graphics_code = True
                 fn = "festina_client_width" if expr.name == "clientWidth" else "festina_client_height"
                 out = self.tmp()
                 lines.append(f"  {out} = call i64 @{fn}()")
@@ -2185,6 +2454,37 @@ class CodeGen:
             # identifier to emit (see semantic.py's matching check).
             if isinstance(expr.obj, ast.Identifier) and expr.obj.name == "environment":
                 return self._emit_environment_get(expr, env, lines)
+            # claude.md #93: Math.PI / Math.E -- compile-time constants,
+            # emitted as raw double bit patterns for the same reason
+            # FLOAT_NULL_CONST is (see the module docstring): decimal
+            # text would round-trip through the IR parser and could lose
+            # the last bit.
+            if (not expr.computed and isinstance(expr.obj, ast.Identifier)
+                    and expr.obj.name == "Math"
+                    and expr.prop in semantic_mod.MATH_CONSTANTS):
+                raw = struct.unpack("<Q", struct.pack(
+                    "<d", semantic_mod.MATH_CONSTANTS[expr.prop]))[0]
+                return f"0x{raw:016X}", FLOAT
+            # claude.md #92: img.width / img.height -- a runtime call
+            # rather than a field read, since an `img` is a pointer to a
+            # box whose Cairo surface owns the real dimensions (and
+            # resize() replaces that surface underneath it, so caching
+            # them anywhere would go stale).
+            if not expr.computed and expr.prop in ("width", "height"):
+                obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+                if isinstance(obj_type, types_mod.ImageType):
+                    fn = ("festina_image_width" if expr.prop == "width"
+                          else "festina_image_height")
+                    out = self.tmp()
+                    lines.append(f"  {out} = call i64 @{fn}(ptr {obj_val})")
+                    return out, INT
+                # A struct/table field genuinely named "width" or
+                # "height" is perfectly legal, so it still resolves the
+                # ordinary way -- reusing the object value emitted just
+                # above rather than emitting expr.obj a second time,
+                # which would run any side effects in it twice.
+                ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
+                return self._load_field_value(ptr, ftype, lines)
             if not expr.computed and expr.prop == "length":
                 # claude.md #79: an arr[T] value is a `ptr` to its own
                 # {i64, ptr} storage now, so .length is a GEP+load of
@@ -2214,8 +2514,14 @@ class CodeGen:
                 # returning an array or map).
                 obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
                 if isinstance(obj_type, types_mod.MapType):
-                    key_val, _ = self._emit_expr(expr.prop, env, lines)
-                    return self._emit_map_get(obj_val, obj_type.value, key_val, lines)
+                    key_val, key_type = self._emit_expr(expr.prop, env, lines)
+                    out = self._emit_map_get(obj_val, obj_type.value, key_val, lines)
+                    # claude.md #97: festina_map_get only READS the key
+                    # (it strcmp's against each entry's own copy), so a
+                    # key this expression allocated -- `m[`k${i}`]` --
+                    # is finished the moment the lookup returns.
+                    self._free_text_temp(expr.prop, key_val, key_type, lines)
+                    return out
                 if not isinstance(obj_type, types_mod.ArrayType):
                     raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",
                                         file=self.filename, line=getattr(expr, "line", 0))
@@ -2349,6 +2655,35 @@ class CodeGen:
             return self._emit_array_lit(node, env, lines, expected_type)
         if isinstance(node, ast.MapLit):
             return self._emit_map_lit(node, env, lines, expected_type)
+        # claude.md #91: `color red = 'red'` / `font body = '13px arial'`.
+        # Resolving here rather than in the VarDecl branch means every
+        # position that knows its expected type gets it for free --
+        # declarations, reassignments, call arguments, struct fields,
+        # array elements and returns alike.
+        if isinstance(expected_type, (types_mod.ColorType, types_mod.FontType)):
+            what = types_mod.type_name(expected_type)
+            line = getattr(node, "line", 0)
+            if isinstance(node, ast.StringLit):
+                if isinstance(expected_type, types_mod.ColorType):
+                    return (self._emit_color_value(node, node.value, line, what),
+                            expected_type)
+                return (self._emit_font_constant(node.value, line, what),
+                        expected_type)
+            val, vtype = self._emit_expr(node, env, lines)
+            if vtype == TEXT:
+                # Text that isn't a literal can't be resolved at compile
+                # time, and there is deliberately no runtime resolver to
+                # fall back on (claude.md #90) -- so this is an error
+                # pointing at the two things that DO work.
+                alt = ("fillStyle(red, green, blue) with each component 0-255"
+                       if isinstance(expected_type, types_mod.ColorType)
+                       else "changeFont(px, style, family)")
+                raise CodegenError(
+                    f"a {what} must come from a literal, so the compiler can "
+                    f"resolve it once -- write `{what} name = '...'` and use "
+                    f"`name`, or, to choose one at runtime, use {alt}",
+                    file=self.filename, line=line)
+            return val, vtype
         if isinstance(node, ast.NullLit):
             if expected_type == INT:
                 return INT_NULL_CONST, INT
@@ -2398,6 +2733,115 @@ class CodeGen:
         payload = self.tmp()
         lines.append(f"  {payload} = getelementptr i8, ptr {raw}, i64 8")
         return payload
+
+    def _null_value(self, type_):
+        """claude.md #96: the NULL of a type, as opposed to its zero.
+
+        The two differ for exactly the types with no spare bit pattern
+        to spend on null -- int/float/bool carry a reserved sentinel
+        (see the module docstring's "Null for int/float" note), so an
+        int's zero is 0 and its null is i64's minimum. Everything
+        pointer-backed has a real null to use."""
+        if type_ == INT:
+            return INT_NULL_CONST
+        if type_ == FLOAT:
+            return FLOAT_NULL_CONST
+        if type_ == BOOL:
+            return BOOL_NULL_CONST
+        return self._zero_value(type_)
+
+    def _emit_array_method(self, name, obj_val, obj_type, expr, env, lines):
+        """claude.md #96: push/pop/shift/unshift/splice.
+
+        The runtime moves elements by BYTES with the element size passed
+        in, so one set of helpers covers every arr[T]. What has to
+        happen HERE is the ownership half, and it is the same rule
+        `arr[i] = value` already follows (claude.md #80/#83): a struct/
+        arr/map element being stored is retained, a text one is copied
+        unless its source is already owning. Without that, `xs.push(s)`
+        would leave the array and `s` sharing one buffer, and whichever
+        was freed first would leave the other dangling.
+
+        Nothing is released on removal: pop/shift hand the element back
+        and splice hands it to the returned array, so ownership
+        transfers rather than ending."""
+        elem_type = obj_type.element
+        elem_ir = _llvm_type(elem_type)
+        elem_size = _elem_size(elem_type)
+
+        if name in ("push", "unshift"):
+            val, vtype = self._emit_value_for(expr.args[0], env, lines, elem_type)
+            val = self._coerce(val, vtype, elem_type, lines)
+            if isinstance(elem_type, (types_mod.StructType, types_mod.ArrayType,
+                                       types_mod.MapType)):
+                if not self._is_owning_refcounted_source(expr.args[0]):
+                    lines.append(f"  call void @festina_retain(ptr {val})")
+            elif elem_type == TEXT and not self._is_owning_text_source(expr.args[0]):
+                owned = self.tmp()
+                lines.append(f"  {owned} = call ptr @festina_text_own(ptr {val})")
+                val = owned
+            slot = self.tmp()
+            lines.append(f"  {slot} = alloca {elem_ir}")
+            lines.append(f"  store {elem_ir} {val}, ptr {slot}")
+            fn = "festina_array_push" if name == "push" else "festina_array_unshift"
+            lines.append(f"  call void @{fn}(ptr {obj_val}, i64 {elem_size}, ptr {slot})")
+            # JS hands back the new length; reading it costs one load.
+            len_ptr = self.tmp()
+            lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 0")
+            out = self.tmp()
+            lines.append(f"  {out} = load i64, ptr {len_ptr}")
+            return out, INT
+
+        if name in ("pop", "shift"):
+            slot = self.tmp()
+            lines.append(f"  {slot} = alloca {elem_ir}")
+            # Pre-seeded with this element type's own NULL -- not its
+            # zero value, which for an int is a perfectly ordinary 0 and
+            # would make an empty pop() indistinguishable from popping a
+            # real zero. The runtime leaves the slot alone when there is
+            # nothing to remove, so this is what an empty array answers.
+            lines.append(f"  store {elem_ir} {self._null_value(elem_type)}, ptr {slot}")
+            fn = "festina_array_pop" if name == "pop" else "festina_array_shift"
+            lines.append(
+                f"  call i8 @{fn}(ptr {obj_val}, i64 {elem_size}, ptr {slot})")
+            out = self.tmp()
+            lines.append(f"  {out} = load {elem_ir}, ptr {slot}")
+            return out, elem_type
+
+        if name == "indexOf":
+            # claude.md #97. The needle is handed over BY ADDRESS so one
+            # runtime helper serves every arr[T]: it compares the raw
+            # 8-byte slot, which is right for int/float/bool and is
+            # identity for struct/arr/map (aliases share a pointer). Text
+            # is the exception the `is_text` flag exists for -- two equal
+            # strings are usually two different buffers, so the runtime
+            # switches to strcmp.
+            #
+            # No ownership work happens here in either direction: the
+            # needle is only read, and an index is not a reference. That
+            # also means the temporary is freed the ordinary way, exactly
+            # as any other text argument at a call site would be.
+            val, vtype = self._emit_value_for(expr.args[0], env, lines, elem_type)
+            val = self._coerce(val, vtype, elem_type, lines)
+            slot = self.tmp()
+            lines.append(f"  {slot} = alloca {elem_ir}")
+            lines.append(f"  store {elem_ir} {val}, ptr {slot}")
+            is_text = 1 if elem_type == TEXT else 0
+            out = self.tmp()
+            lines.append(
+                f"  {out} = call i64 @festina_array_index_of(ptr {obj_val}, "
+                f"i64 {elem_size}, ptr {slot}, i8 {is_text})")
+            self._free_text_temp(expr.args[0], val, elem_type, lines)
+            return out, INT
+
+        # splice(start, count) -> arr[T] of the removed elements
+        start_val, _ = self._emit_expr(expr.args[0], env, lines)
+        count_val, _ = self._emit_expr(expr.args[1], env, lines)
+        dst = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, lines)
+        lines.append(
+            f"  call void @festina_array_splice(ptr {obj_val}, i64 {elem_size}, "
+            f"i64 {start_val}, i64 {count_val}, ptr {dst})")
+        return dst, types_mod.ArrayType(elem_type)
 
     def _emit_array_lit(self, expr, env, lines, expected_type=None, header=None):
         # `header`, when given, is an already-allocated (and, for a
@@ -2528,7 +2972,8 @@ class CodeGen:
                 val_val = self._coerce(val_val, vtype, expected_value, lines)
                 vtype = expected_value
             value_type = value_type or vtype
-            self._emit_map_set(header, value_type, key_val, val_val, val_expr, lines)
+            self._emit_map_set(header, value_type, key_val, val_val, val_expr, lines,
+                                key_source_expr=key_expr)
 
         if value_type is None:
             raise CodegenError(
@@ -2618,7 +3063,8 @@ class CodeGen:
         lines.append(f"  {raw} = call i64 @festina_map_get(i64 {count}, ptr {entries}, ptr {key_val}, i64 {default})")
         return self._i64_to_map_value(raw, value_type, lines), value_type
 
-    def _emit_map_set(self, map_ptr, value_type, key_val, value_val, value_source_expr, lines):
+    def _emit_map_set(self, map_ptr, value_type, key_val, value_val, value_source_expr, lines,
+                       key_source_expr=None):
         """claude.md #72: npcHealths['npc1'] = 30 (and the equivalent
         per-entry calls a map literal builds itself out of -- see
         _emit_map_lit). Unlike a read, this needs the map's own actual
@@ -2692,6 +3138,15 @@ class CodeGen:
             lines.append(f"  call void @free(ptr {old_ptr})")
         raw_val = self._map_value_to_i64(value_val, value_type, lines)
         lines.append(f"  call void @festina_map_set(ptr {count_ptr}, ptr {entries_ptr}, ptr {key_val}, i64 {raw_val})")
+        # claude.md #97: the key is strdup'd by festina_map_set (see its
+        # own comment on why it never aliases the caller's pointer), so
+        # a key the caller ALLOCATED -- `m[`s${i}`] = v`, `m[a + b] = v`
+        # -- has no owner left once this returns. Freed here rather than
+        # at each call site so both the literal path and the assignment
+        # path get it from one place; `key_source_expr` is None only
+        # where the key is a compile-time constant with nothing to free.
+        if key_source_expr is not None:
+            self._free_text_temp(key_source_expr, key_val, TEXT, lines)
 
     def _emit_environment_get(self, expr, env, lines):
         """claude.md #71: environment.NAME / environment[keyExpr]. NAME
@@ -2710,8 +3165,67 @@ class CodeGen:
 
     def _emit_member_load(self, expr, env, lines):
         ptr, ftype = self._member_ptr(expr, env, lines)
+        return self._load_field_value(ptr, ftype, lines)
+
+    def _load_field_value(self, ptr, ftype, lines):
+        """Loads one field, giving a struct/arr[T]/map[T]-typed one real
+        storage the first time it is reached.
+
+        claude.md #97: a field of one of those three types starts as a
+        null pointer -- calloc/zeroinitializer gives it no value of its
+        own, unlike an int field whose zero IS 0. So reaching through an
+        unassigned one (`outer.inner.label`, `s.items.length`)
+        dereferenced null and segfaulted, on both reads and writes.
+        That contradicted the rule this language already states for
+        every other field: an uninitialized field reads as its zero
+        value (see _emit_stmt's own VarDecl comment, and #74's module
+        note). For a struct field, "zero" means a struct with every
+        field at ITS zero -- not the absence of a struct -- and for an
+        arr[T]/map[T] field it means an empty one.
+
+        So the storage is created on first use rather than eagerly at
+        the parent's declaration. Lazily, because it covers every way a
+        struct can come into being with one mechanism -- a stack local,
+        a heap local, a global's static storage, a parameter, a field of
+        a field -- where eager creation would need a separate pass for
+        globals, whose storage is a compile-time `zeroinitializer` with
+        nowhere to run an initializer. The value is stored back, so it
+        is created once and every later read sees the same one; freeing
+        the parent releases it through the field walk #78 already does.
+        """
+        if not isinstance(ftype, (types_mod.StructType, types_mod.ArrayType,
+                                   types_mod.MapType)):
+            out = self.tmp()
+            lines.append(f"  {out} = load {_llvm_type(ftype)}, ptr {ptr}")
+            return out, ftype
+
+        loaded = self.tmp()
+        lines.append(f"  {loaded} = load ptr, ptr {ptr}")
+        is_null = self.tmp()
+        lines.append(f"  {is_null} = icmp eq ptr {loaded}, null")
+        make_label = self.label("field.make")
+        done_label = self.label("field.done")
+        lines.append(f"  br i1 {is_null}, label %{make_label}, label %{done_label}")
+        load_pred = self.cur_block
+
+        self._start_block(make_label, lines)
+        if isinstance(ftype, types_mod.StructType):
+            payload_ty = self.struct_llvm_name(ftype.name)
+        elif isinstance(ftype, types_mod.ArrayType):
+            payload_ty = FESTINA_ARRAY_LLVM_TYPE
+        else:
+            payload_ty = FESTINA_MAP_LLVM_TYPE
+        # calloc'd, so every field lands on its own zero -- an empty
+        # arr[T]/map[T] is exactly {length 0, data null}.
+        made = self._emit_fresh_heap_header(payload_ty, lines)
+        lines.append(f"  store ptr {made}, ptr {ptr}")
+        make_pred = self.cur_block
+        lines.append(f"  br label %{done_label}")
+
+        self._start_block(done_label, lines)
         out = self.tmp()
-        lines.append(f"  {out} = load {_llvm_type(ftype)}, ptr {ptr}")
+        lines.append(
+            f"  {out} = phi ptr [ {loaded}, %{load_pred} ], [ {made}, %{make_pred} ]")
         return out, ftype
 
     def _array_elem_ptr(self, obj_val, obj_type, idx_val, lines):
@@ -2745,6 +3259,14 @@ class CodeGen:
         # (re-emitting expr.obj from scratch every time it's called)
         # can't guarantee.
         obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+        return self._member_ptr_from(obj_val, obj_type, expr, lines)
+
+    def _member_ptr_from(self, obj_val, obj_type, expr, lines):
+        """_member_ptr's body, split out so a caller that has ALREADY
+        emitted expr.obj can reuse that one emission instead of forcing
+        a second one -- see _emit_expr's img .width/.height handling,
+        where the object has to be emitted before its type is known and
+        expr.obj may be an arbitrary side-effecting expression."""
         if isinstance(obj_type, types_mod.TableType):
             # claude.md #32-34: a table-typed value is one query result
             # row -- flat `field_index * 8` byte offset, not a named
@@ -2874,6 +3396,25 @@ class CodeGen:
         the instant it's produced."""
         return isinstance(expr, (ast.Call, ast.ArrayLit, ast.MapLit))
 
+    def _is_owning_media_source(self, expr):
+        """claude.md #92/#101: whether an img/aud local's initializer
+        produced a FRESH handle this scope owns outright.
+
+        A Call is owning -- loadImage/loadAudio, or clip() -- for the
+        same reason it is for every other type: it allocates something
+        nothing else references yet.
+
+        A StringLit (or any text-typed expression) is owning too, and
+        that case is the whole reason this is a function rather than an
+        isinstance check. `img sprite = 'sprite.png'` compiles to a real
+        load call (see _coerce), so the handle is exactly as fresh as
+        loadImage()'s -- but the AST node is not a Call, so the
+        Call-only test #92 used silently stopped reclaiming these the
+        moment claude.md #101 added the short form. A bare Identifier
+        stays non-owning: that is an alias of a handle someone else
+        owns, and freeing it would leave them dangling."""
+        return isinstance(expr, (ast.Call, ast.StringLit, ast.TemplateLit, ast.BinOp))
+
     def _is_owning_text_source(self, expr):
         """claude.md #83: the text counterpart to
         _is_owning_refcounted_source -- "owning" here means "already a
@@ -2905,6 +3446,19 @@ class CodeGen:
         this section to preserve that guarantee once text started
         being freed for real).
 
+        A `+` BinOp is owning too (claude.md #97). In a text context
+        `+` is concatenation and _emit_binop compiles it to exactly one
+        @festina_str_concat, which mallocs unconditionally -- there is
+        no operand-passthrough path, not even for an empty operand, so
+        its result is always a fresh buffer. Leaving it out of this
+        list (as claude.md #83 originally did) meant EVERY binding of a
+        concatenation copied a buffer that was already exclusively
+        owned and then dropped the original on the floor: `text j = a +
+        b` and `return s + '!'` both leaked the concat result, once per
+        evaluation. Reading the op alone is safe because every caller
+        of this function has already established that the value's type
+        is text, so a `+` reaching here is never integer addition.
+
         Everything else -- a bare Identifier (a local, a global, a
         parameter -- all just aliasing whatever they already point
         to), a Member/field read, a Ternary, and critically a
@@ -2915,6 +3469,8 @@ class CodeGen:
         binding, the same directional bias every prior stage in this
         whole effort defaults to whenever a choice isn't fully provable
         either way."""
+        if isinstance(expr, ast.BinOp):
+            return expr.op == "+"
         return isinstance(expr, (ast.Call, ast.TemplateLit))
 
     def _free_text_temp(self, source_expr, val, vtype, lines):
@@ -3356,7 +3912,14 @@ class CodeGen:
         rule the runtime used when building the row (`text` or `blob`
         -> strdup, everything else -> a plain i64), read off the same
         declared column types. free(NULL) is a no-op, which covers a
-        column that was SQL NULL and so was never strdup'd at all."""
+        column that was SQL NULL and so was never strdup'd at all.
+
+        claude.md #101: an `aud`/`img` column is a heap pointer too, but
+        NOT a plain buffer -- the runtime decoded the stored BLOB into a
+        real handle, so freeing it needs that type's own destructor
+        rather than free(). Missing this would have leaked one decoded
+        clip or surface per row for as long as the result array lived,
+        which is the shape a `SELECT * FROM Music` in a loop takes."""
         key = table_type.name
         if key in self._table_row_release_fns:
             return self._table_row_release_fns[key]
@@ -3364,14 +3927,18 @@ class CodeGen:
         self._table_row_release_fns[key] = fn_name
         cols = self.tables[table_type.name]
         body = [f"define void {fn_name}(ptr %row) {{", "entry:"]
+        media_free = {"aud": "@festina_audio_free", "img": "@festina_image_free"}
         for i, col_type in enumerate(cols.values()):
-            if col_type not in ("text", "blob"):
+            if col_type not in ("text", "blob") and col_type not in media_free:
                 continue
             slot = self.tmp()
             body.append(f"  {slot} = getelementptr i64, ptr %row, i64 {i}")
             val = self.tmp()
             body.append(f"  {val} = load ptr, ptr {slot}")
-            body.append(f"  call void @free(ptr {val})")
+            # claude.md #101: a decoded handle needs its own destructor,
+            # not free() -- an img owns a Cairo surface and an aud owns
+            # its decoded PCM, neither of which a plain free() releases.
+            body.append(f"  call void {media_free.get(col_type, '@free')}(ptr {val})")
         body.append("  call void @free(ptr %row)")
         body.append("  ret void")
         body.append("}")
@@ -3565,7 +4132,8 @@ class CodeGen:
                     key_val, _ = self._emit_expr(expr.target.prop, env, lines)
                     val, vtype = self._emit_value_for(expr.value, env, lines, obj_type.value)
                     val = self._coerce(val, vtype, obj_type.value, lines)
-                    self._emit_map_set(obj_val, obj_type.value, key_val, val, expr.value, lines)
+                    self._emit_map_set(obj_val, obj_type.value, key_val, val, expr.value, lines,
+                                        key_source_expr=expr.target.prop)
                     return val, obj_type.value
                 if not isinstance(obj_type, types_mod.ArrayType):
                     raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",
@@ -3727,11 +4295,31 @@ class CodeGen:
                     # this needs no icmp/zext round trip the way a
                     # genuine i1 source would.
                     lines.append(f"  {neg} = xor i8 {out}, 1")
-                    return neg, BOOL
-                return out, BOOL
+                    result = neg
+                else:
+                    result = out
+                # claude.md #97: an operand that allocated its own buffer
+                # is consumed here and nothing downstream can reach it --
+                # a bool is not a text reference, so this is the last
+                # chance to free it. `f() == g()` leaked both results
+                # before this.
+                self._free_text_temp(expr.left, left_val, left_type, lines)
+                self._free_text_temp(expr.right, right_val, right_type, lines)
+                return result, BOOL
             if expr.op == "+":
                 out = self.tmp()
                 lines.append(f"  {out} = call ptr @festina_str_concat(ptr {left_val}, ptr {right_val})")
+                # claude.md #97: festina_str_concat COPIES from both
+                # operands and keeps neither, so an operand that was
+                # itself freshly allocated -- the `a + b` inside
+                # `a + b + c`, a call result, a template -- is dead the
+                # moment this returns. Freeing it here rather than at
+                # the eventual binding site is what keeps a chained
+                # concatenation from leaking one buffer per `+`, the
+                # same fix _emit_template already applies to its own
+                # intermediates (claude.md #83).
+                self._free_text_temp(expr.left, left_val, left_type, lines)
+                self._free_text_temp(expr.right, right_val, right_type, lines)
                 return out, TEXT
             raise CodegenError(f"operator '{expr.op}' is not supported on text",
                                 file=self.filename, line=expr.line)
@@ -3883,14 +4471,126 @@ class CodeGen:
                 text_val = self._to_text(val, vtype, lines)
                 lines.append(f"  call void @festina_fail(ptr {text_val})")
                 return "0", None
+            # claude.md #93: files, time and canvas export. Each frees
+            # any text temporary it was handed once the call returns --
+            # none of these runtime functions keeps a pointer past it
+            # (the file helpers read or write and close; strftime copies
+            # into its own buffer; Cairo's PNG writer takes the path by
+            # value).
+            _FILE_TIME_BUILTINS = {
+                "readFile": ("festina_read_file", "ptr", TEXT),
+                "writeFile": ("festina_write_file", "i8", BOOL),
+                "appendFile": ("festina_append_file", "i8", BOOL),
+                "fileExists": ("festina_file_exists", "i8", BOOL),
+                "deleteFile": ("festina_delete_file", "i8", BOOL),
+                "formatTime": ("festina_format_time", "ptr", TEXT),
+                "saveCanvas": ("festina_save_canvas", "i8", BOOL),
+            }
+            # claude.md #94: paths, transforms, gradients and alpha.
+            # All draw onto (or configure) the canvas, so all of them
+            # open one -- unlike the style setters of claude.md #89,
+            # which only record state.
+            _CANVAS_OPS = {
+                "render": ("festina_render", []),
+                "clearCanvas": ("festina_clear_canvas", []),
+                "clearRect": ("festina_clear_rect", ["i64"] * 4),
+                "beginPath": ("festina_begin_path", []),
+                "moveTo": ("festina_move_to", ["i64", "i64"]),
+                "lineTo": ("festina_line_to", ["i64", "i64"]),
+                "curveTo": ("festina_curve_to", ["i64"] * 6),
+                "closePath": ("festina_close_path", []),
+                "fillPath": ("festina_fill_path", []),
+                "strokePath": ("festina_stroke_path", []),
+                "translate": ("festina_translate", ["i64", "i64"]),
+                "rotate": ("festina_rotate", ["double"]),
+                "scale": ("festina_scale", ["double", "double"]),
+                "resetTransform": ("festina_reset_transform", []),
+                "saveState": ("festina_save_state", []),
+                "restoreState": ("festina_restore_state", []),
+                "fillAlpha": ("festina_set_alpha", ["double"]),
+                "fillLinearGradient": ("festina_fill_linear_gradient", ["i64"] * 6),
+                "fillRadialGradient": ("festina_fill_radial_gradient", ["i64"] * 5),
+            }
+            if name in _CANVAS_OPS:
+                fn, arg_irs = _CANVAS_OPS[name]
+                self.uses_graphics_code = True
+                # claude.md #95: render() is the ONLY thing here that
+                # needs a GUI. Everything else paints the offscreen
+                # canvas, which needs no X server at all.
+                if name == "render":
+                    self.uses_graphics = True
+                # A gradient's colour arguments are `color`-typed
+                # (semantic enforces it), so they arrive as the packed
+                # integers claude.md #91 already made them -- nothing
+                # here needs the expected-type path.
+                vals = [self._emit_expr(a, env, lines)[0] for a in expr.args]
+                sig = ", ".join(f"{ty} {v}" for ty, v in zip(arg_irs, vals))
+                lines.append(f"  call void @{fn}({sig})")
+                return "0", None
+            if name in ("sqliteInt", "sqliteFloat", "sqliteText"):
+                return self._emit_sqlite_scalar(name, expr, env, lines)
+            if name == "now":
+                out = self.tmp()
+                lines.append(f"  {out} = call i64 @festina_now_ms()")
+                return out, INT
+            if name in _FILE_TIME_BUILTINS:
+                fn, ret_ir, ret_type = _FILE_TIME_BUILTINS[name]
+                if name == "saveCanvas":
+                    # claude.md #95: writes the OFFSCREEN canvas, so it
+                    # needs no window -- this is the headless case the
+                    # render() split exists for. It used to open one,
+                    # which meant a program whose whole job was drawing
+                    # a PNG still needed a display and still blocked in
+                    # the event loop afterwards.
+                    self.uses_graphics_code = True
+                emitted = [self._emit_expr(a, env, lines) for a in expr.args]
+                sig = ", ".join(
+                    f"{'i64' if t == INT else 'ptr'} {v}" for v, t in emitted)
+                out = self.tmp()
+                lines.append(f"  {out} = call {ret_ir} @{fn}({sig})")
+                for arg_expr, (val, vtype) in zip(expr.args, emitted):
+                    self._free_text_temp(arg_expr, val, vtype, lines)
+                return out, ret_type
             if name == "sqlite":
                 return self._emit_sqlite_call(expr, env, lines, expected_type)
             if name == "regex":
                 return self._emit_regex_call(expr, env, lines)
-            if name in ("drawRect", "drawCircle", "drawText", "drawImage", "loadImage"):
+            if name in ("drawRect", "drawCircle", "drawText", "drawImage", "loadImage",
+                        "fillStyle", "borderColor", "lineWidth", "changeFont",
+                        "measureTextWidth", "measureTextHeight"):
                 return self._emit_graphics_call(name, expr, env, lines)
             if name in ("setTimeout", "setInterval", "clearTimeout", "clearInterval"):
                 return self._emit_timer_call(name, expr, env, lines)
+            if name == "stopAudioPlayer":
+                # claude.md #99. Lives in the audio translation unit, so
+                # naming it is what makes a program "use audio" -- see
+                # setMaxAudioPlayers just below for the same reasoning.
+                # A bare stopAudioPlayer() passes -1, the runtime's own
+                # "every channel" encoding: naming no channel obviously
+                # means all of them, and there is no other way to say it.
+                self.uses_audio = True
+                if expr.args:
+                    chan_val, chan_type = self._emit_expr(expr.args[0], env, lines)
+                    chan_val = self._coerce(chan_val, chan_type, INT, lines)
+                else:
+                    chan_val = "-1"
+                lines.append(f"  call void @festina_stop_audio_player(i64 {chan_val})")
+                return "0", None
+            if name in ("setMaxAudioPlayers", "maxAudioPlayers"):
+                # claude.md #98. Both live in the audio translation unit,
+                # so naming either is what makes a program "use audio" --
+                # which is right: a program that tunes the voice limit is
+                # a program that plays sounds, and one that never touches
+                # audio never links these in.
+                self.uses_audio = True
+                if name == "maxAudioPlayers":
+                    out = self.tmp()
+                    lines.append(f"  {out} = call i64 @festina_get_max_audio_players()")
+                    return out, INT
+                max_val, max_type = self._emit_expr(expr.args[0], env, lines)
+                max_val = self._coerce(max_val, max_type, INT, lines)
+                lines.append(f"  call void @festina_set_max_audio_players(i64 {max_val})")
+                return "0", None
             if name == "loadAudio":
                 self.uses_audio = True
                 path_val, path_type = self._emit_expr(expr.args[0], env, lines)
@@ -3925,6 +4625,28 @@ class CodeGen:
             raise CodegenError(f"unknown function '{name}'", file=self.filename, line=callee.line)
         if isinstance(callee, ast.Member) and not callee.computed:
             # claude.md #56: Math.floor/ceil/round/trunc(x:float) -> int
+            # claude.md #93: Math.sqrt/sin/pow/min/... and Math.random()
+            if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
+                    and callee.prop in MATH_FLOAT_FNS):
+                val, _ = self._emit_expr(expr.args[0], env, lines)
+                out = self.tmp()
+                lines.append(
+                    f"  {out} = call double @{MATH_FLOAT_FNS[callee.prop]}(double {val})")
+                return out, FLOAT
+            if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
+                    and callee.prop in MATH_FLOAT2_FNS):
+                a, _ = self._emit_expr(expr.args[0], env, lines)
+                b, _ = self._emit_expr(expr.args[1], env, lines)
+                out = self.tmp()
+                lines.append(
+                    f"  {out} = call double @{MATH_FLOAT2_FNS[callee.prop]}"
+                    f"(double {a}, double {b})")
+                return out, FLOAT
+            if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
+                    and callee.prop == "random"):
+                out = self.tmp()
+                lines.append(f"  {out} = call double @festina_random()")
+                return out, FLOAT
             if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
                     and callee.prop in MATH_INTRINSICS):
                 val, vtype = self._emit_expr(expr.args[0], env, lines)
@@ -4001,16 +4723,51 @@ class CodeGen:
                     self._free_regex_temp(expr.args[0], search_val, search_type, lines)
                     self._free_text_temp(expr.args[1], replacement_val, replacement_type, lines)
                     return out, TEXT
-            # claude.md #38: music.play() / music.stop() / music.isPlaying()
-            if callee.prop == "play":
+            # claude.md #96: array methods.
+            if callee.prop in ("push", "pop", "shift", "unshift", "splice",
+                               "indexOf"):
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
-                if obj_type == AUDIO:
-                    lines.append(f"  call void @festina_audio_play(ptr {obj_val})")
+                if isinstance(obj_type, types_mod.ArrayType):
+                    return self._emit_array_method(
+                        callee.prop, obj_val, obj_type, expr, env, lines)
+            # claude.md #92: sheet.clip(x, y, w, h) -> img (a new image,
+            # leaving the sheet untouched) and image.resize(w, h) -> void
+            # (in place, so every binding holding it sees the new size).
+            if callee.prop in ("clip", "resize"):
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.ImageType):
+                    arg_vals = [self._emit_expr(a, env, lines)[0] for a in expr.args]
+                    if callee.prop == "clip":
+                        out = self.tmp()
+                        lines.append(
+                            f"  {out} = call ptr @festina_image_clip(ptr {obj_val}, "
+                            f"i64 {arg_vals[0]}, i64 {arg_vals[1]}, "
+                            f"i64 {arg_vals[2]}, i64 {arg_vals[3]})")
+                        return out, types_mod.ImageType()
+                    lines.append(
+                        f"  call void @festina_image_resize(ptr {obj_val}, "
+                        f"i64 {arg_vals[0]}, i64 {arg_vals[1]})")
                     return "0", None
-            if callee.prop == "stop":
+            # claude.md #38: music.play() / music.stop() / music.isPlaying()
+            # claude.md #99: play/playLoop take an optional channel, and
+            # both compile to the same runtime entry point -- the four
+            # shapes differ only in two flags it already takes.
+            if callee.prop in ("play", "playLoop"):
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if obj_type == AUDIO:
-                    lines.append(f"  call void @festina_audio_stop(ptr {obj_val})")
+                    if expr.args:
+                        chan_val, chan_type = self._emit_expr(expr.args[0], env, lines)
+                        chan_val = self._coerce(chan_val, chan_type, INT, lines)
+                        explicit = 1
+                    else:
+                        # Never read when explicit is 0, but a real
+                        # constant rather than undef keeps the IR
+                        # readable and the call trivially verifiable.
+                        chan_val, explicit = "0", 0
+                    looping = 1 if callee.prop == "playLoop" else 0
+                    lines.append(
+                        f"  call void @festina_audio_play_on(ptr {obj_val}, "
+                        f"i64 {chan_val}, i8 {explicit}, i8 {looping})")
                     return "0", None
             if callee.prop == "isPlaying":
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
@@ -4182,6 +4939,59 @@ class CodeGen:
             self._free_text_temp(expr.args[1], flags_val, flags_type, lines)
         return out, REGEX
 
+    def _emit_color_value(self, decl_or_expr, text_value, line, what):
+        """claude.md #91: a colour LITERAL -> the packed 0xRRGGBB integer
+        a `color` value is. Negative means 'none'.
+
+        Packing is what makes a colour cost one register instead of
+        three, and makes `a == b` on two colours a single integer
+        compare. Unpacking is three shift/mask pairs in the runtime,
+        done once per fillStyle() call rather than per pixel."""
+        resolved = colors_mod.resolve_color(text_value)
+        if resolved is None:
+            raise CodegenError(
+                f"{what}: '{text_value}' is not a colour Festina understands "
+                f"-- use a CSS colour name (red, rebeccapurple, ...), a #rgb "
+                f"or #rrggbb hex value, or 'none' for no colour at all",
+                file=self.filename, line=line)
+        r, g, b = resolved
+        if (r, g, b) == colors_mod.NO_COLOR:
+            return "-1"
+        return str((r << 16) | (g << 8) | b)
+
+    def _emit_font_constant(self, text_value, line, what):
+        """claude.md #91: a font LITERAL -> a pointer to a static
+        %struct._FestinaFont constant holding its already-resolved
+        parts.
+
+        The whole record lands in the binary's read-only data, so
+        declaring a font costs no code at all at runtime and
+        changeFont() passes a single pointer. Identical literals share
+        one constant (cached by their resolved parts, not by source
+        text, so 'bold 13px arial' and 'arial bold 13px' collapse
+        together). Nothing allocates or frees this -- see FontType's
+        own comment."""
+        px, style, family = colors_mod.parse_font(text_value)
+        if px is None and style is None and family is None:
+            raise CodegenError(
+                f"{what}: '{text_value}' says nothing about a font -- give at "
+                f"least a size (like '14px'), a family (like 'arial'), or a "
+                f"style (like 'bold')",
+                file=self.filename, line=line)
+        key = (px, style, family)
+        cached = self._font_constants.get(key)
+        if cached is not None:
+            return cached
+        name = f"@.font.{len(self._font_constants)}"
+        self._font_constants[key] = name
+        slant = 1 if style and "italic" in style else 0
+        weight = 1 if style and "bold" in style else 0
+        family_ref = self.string_const(family) if family else "null"
+        self.extra_globals.append(
+            f"{name} = private constant {FESTINA_FONT_LLVM_TYPE} "
+            f"{{ i64 {px or 0}, i64 {slant}, i64 {weight}, ptr {family_ref} }}")
+        return name
+
     # ---- graphics: drawRect/drawCircle/drawText/drawImage/loadImage (claude.md #37, #39) ----
     def _emit_graphics_call(self, name, expr, env, lines):
         """Draws onto (or loads an image for) the graphics canvas.
@@ -4221,7 +5031,60 @@ class CodeGen:
             lines.append(f"  {out} = call ptr @festina_load_image(ptr {args[0]})")
             free_text_temps()
             return out, types_mod.ImageType()
-        self.uses_graphics = True
+
+        # claude.md #89: style setters and text metrics deliberately do
+        # NOT set self.uses_graphics, for the same reason loadImage()
+        # doesn't (see this method's own docstring): none of them draws
+        # anything, so none of them needs a canvas window to exist. A
+        # program that only measures text, or only sets a fill colour it
+        # never draws with, should not have a window opened on it -- and
+        # measuring genuinely works with no X server at all, since text
+        # metrics depend only on the font (festina_measure_text_* run
+        # against a scratch image surface).
+        if name in ("fillStyle", "borderColor"):
+            # claude.md #91: one argument is a `color` value -- already
+            # packed, whether it came from a declaration's own literal or
+            # from another colour-typed binding. Three are raw channels,
+            # for a colour chosen at runtime.
+            if len(expr.args) == 1:
+                fn = ("festina_set_fill_color" if name == "fillStyle"
+                      else "festina_set_border_color")
+                lines.append(f"  call void @{fn}(i64 {args[0]})")
+            else:
+                fn = ("festina_set_fill_rgb" if name == "fillStyle"
+                      else "festina_set_border_rgb")
+                lines.append(
+                    f"  call void @{fn}(i64 {args[0]}, i64 {args[1]}, i64 {args[2]})")
+            free_text_temps()
+            return "0", None
+        if name == "changeFont":
+            # claude.md #91: one argument is a `font` value (a pointer to
+            # its static record); three are the explicit parts, for a
+            # font whose size is computed at runtime.
+            if len(expr.args) == 1:
+                lines.append(f"  call void @festina_set_font_value(ptr {args[0]})")
+            else:
+                lines.append(
+                    f"  call void @festina_set_font(i64 {args[0]}, ptr {args[1]}, "
+                    f"ptr {args[2]})")
+            free_text_temps()
+            return "0", None
+        if name == "lineWidth":
+            lines.append(f"  call void @festina_set_line_width(i64 {args[0]})")
+            free_text_temps()
+            return "0", None
+        if name in ("measureTextWidth", "measureTextHeight"):
+            fn = ("festina_measure_text_width" if name == "measureTextWidth"
+                  else "festina_measure_text_height")
+            out = self.tmp()
+            lines.append(f"  {out} = call i64 @{fn}(ptr {args[0]})")
+            free_text_temps()
+            return out, INT
+
+        # claude.md #95: drawing paints the OFFSCREEN canvas -- it needs
+        # no window, so it deliberately does not open one. render() is
+        # the single call that does. That is what lets a program draw
+        # and saveCanvas() with no display present at all.
         if name == "drawRect":
             x, y, w, h = args
             lines.append(f"  call void @festina_draw_rect(i64 {x}, i64 {y}, i64 {w}, i64 {h})")
@@ -4350,11 +5213,71 @@ class CodeGen:
                 z = self.tmp()
                 lines.append(f"  {z} = zext i8 {val} to i64")
                 lines.append(f"  call void @festina_sqlite_bind_int(ptr {stmt_val}, i32 {idx}, i64 {z})")
+            elif isinstance(vtype, (types_mod.AudioType, types_mod.ImageType)):
+                # claude.md #101: an aud/img binds as its own encoded
+                # bytes, so `sqlite('... VALUES (?)', [track])` stores
+                # the file rather than a pointer. The accessor lives in
+                # the graphics/audio translation unit, which is linked
+                # because the program already holds one of these values.
+                is_audio = isinstance(vtype, types_mod.AudioType)
+                if is_audio:
+                    self.uses_audio = True
+                else:
+                    self.uses_graphics_code = True
+                fn = "festina_audio_bytes" if is_audio else "festina_image_bytes"
+                len_slot = self.tmp()
+                lines.append(f"  {len_slot} = alloca i64")
+                lines.append(f"  store i64 0, ptr {len_slot}")
+                data = self.tmp()
+                lines.append(f"  {data} = call ptr @{fn}(ptr {val}, ptr {len_slot})")
+                blob_len = self.tmp()
+                lines.append(f"  {blob_len} = load i64, ptr {len_slot}")
+                lines.append(
+                    f"  call void @festina_sqlite_bind_blob(ptr {stmt_val}, i32 {idx}, "
+                    f"ptr {data}, i64 {blob_len})")
             else:
                 raise CodegenError(
-                    "sqlite() parameters must be int/float/bool/text/null, "
+                    "sqlite() parameters must be int/float/bool/text/aud/img/null, "
                     f"found {types_mod.type_name(vtype)}",
                     file=self.filename, line=getattr(elem, "line", 0))
+
+    def _emit_sqlite_scalar(self, name, expr, env, lines):
+        """claude.md #94: sqliteInt/sqliteFloat/sqliteText -- one value
+        out of a query, with no `table` declaration to hold it.
+
+        Shares _emit_sqlite_call's own prepare-and-bind path exactly;
+        only the stepping differs, taking the first column of the first
+        row instead of collecting rows into an array. That matters
+        because a `table` declaration CREATES a table (claude.md
+        #28-31), so before this, asking for a `count(*)` meant leaving a
+        throwaway table behind in the database."""
+        self.uses_sqlite = True
+        callee = expr.callee
+        if not expr.args:
+            raise CodegenError(f"{name}() requires a SQL string argument",
+                                file=self.filename, line=callee.line)
+        sql_val, sql_type = self._emit_expr(expr.args[0], env, lines)
+        if sql_type != TEXT:
+            raise CodegenError(
+                f"{name}()'s first argument must be text, found "
+                f"{types_mod.type_name(sql_type)}",
+                file=self.filename, line=callee.line)
+        db_val = self.tmp()
+        lines.append(f"  {db_val} = load ptr, ptr @__festina_db")
+        stmt_val = self.tmp()
+        lines.append(
+            f"  {stmt_val} = call ptr @festina_sqlite_prepare(ptr {db_val}, ptr {sql_val})")
+        self._free_text_temp(expr.args[0], sql_val, sql_type, lines)
+        if len(expr.args) > 1:
+            self._emit_sqlite_bind_params(expr.args[1], stmt_val, env, lines)
+        fn, ret_ir, ret_type = {
+            "sqliteInt": ("festina_sqlite_scalar_int", "i64", INT),
+            "sqliteFloat": ("festina_sqlite_scalar_float", "double", FLOAT),
+            "sqliteText": ("festina_sqlite_scalar_text", "ptr", TEXT),
+        }[name]
+        out = self.tmp()
+        lines.append(f"  {out} = call {ret_ir} @{fn}(ptr {stmt_val})")
+        return out, ret_type
 
     def _emit_sqlite_collect(self, stmt_val, table_type, lines):
         table_name = table_type.name
@@ -4398,9 +5321,27 @@ class CodeGen:
         entry_ctx = {"lines": lines, "terminated": False}
         env = self.global_env
         self.cur_block = "entry"
-        for stmt in self.entry_stmts:
-            self.filename = getattr(stmt, "file", self.filename)  # see generate()'s note
-            self._emit_toplevel_stmt(stmt, env, entry_ctx)
+        # claude.md #97: claude.md #74's scope tracking now covers the
+        # top-level statements too, not just function/handler bodies.
+        # A top-level VarDecl is a GLOBAL (an `@name`, emitted by
+        # _emit_toplevel_stmt, which never consults this) and is
+        # unaffected -- what this reaches is a local declared inside a
+        # NESTED block at top level, `text row = a + b` in a top-level
+        # `while` body, which _emit_block emits as an ordinary alloca
+        # and, with tracking off, never freed: one leaked buffer per
+        # iteration, in exactly the shape a Festina game loop is
+        # written in. The analysis input is the same whole-body name
+        # set every function gets, computed over the top-level
+        # statement list; `escaping_params` carries over so a call
+        # argument already proven safe stays safe here too.
+        self._current_escaping_names = escape_analysis.find_escaping_names(
+            _StmtList(self.entry_stmts), escaping_params=self.escaping_params)
+        try:
+            for stmt in self.entry_stmts:
+                self.filename = getattr(stmt, "file", self.filename)  # see generate()'s note
+                self._emit_toplevel_stmt(stmt, env, entry_ctx)
+        finally:
+            self._current_escaping_names = None
         if not entry_ctx["terminated"]:
             lines.append("  ret void")
 
@@ -4434,6 +5375,20 @@ class CodeGen:
                 url_val = self._coerce(url_val, url_type, TEXT, main_lines)
             else:
                 url_val = self.string_const("festina.sqlite")
+            # claude.md #101: register the media decoders BEFORE any
+            # query can run, so a table with an aud/img column can turn
+            # a stored BLOB back into a handle. Emitted here rather than
+            # called by name from the core runtime, which must not
+            # reference the graphics/audio translation units at all --
+            # that separation is what lets a program using neither link
+            # neither. Only emitted when the program already links the
+            # feature in question, so the symbol always exists.
+            if self.uses_audio:
+                main_lines.append(
+                    "  call void @festina_set_audio_decoder(ptr @festina_audio_from_bytes)")
+            if self.uses_graphics_code or self.uses_graphics:
+                main_lines.append(
+                    "  call void @festina_set_image_decoder(ptr @festina_image_from_bytes)")
             main_lines.append(f"  %db = call ptr @festina_db_open(ptr {url_val})")
             main_lines.append("  store ptr %db, ptr @__festina_db")
             for tname, cols in self.tables.items():
@@ -4446,7 +5401,8 @@ class CodeGen:
             main_lines.append("  call void @festina_graphics_init()")
             register_fn = {"click": "festina_register_click_handler",
                             "mouse": "festina_register_mouse_handler",
-                            "key": "festina_register_key_handler",
+                            "keyDown": "festina_register_key_down_handler",
+                            "keyUp": "festina_register_key_up_handler",
                             "resize": "festina_register_resize_handler",
                             "close": "festina_register_close_handler"}
             for event_name, symbol in self.event_handlers.items():

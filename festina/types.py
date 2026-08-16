@@ -70,6 +70,39 @@ class RegexType:
 
 
 @dataclass(frozen=True)
+class ColorType:
+    """claude.md #91: a colour, resolved to its channels at compile time.
+
+    Like RegexType there is only one shape of this type -- the actual
+    channels live in the value, not the type. The value is a packed
+    0xRRGGBB integer (see codegen's `pack_color`), so passing a colour
+    costs one register and comparing two is one integer compare; a
+    negative value means "no colour at all" (Festina's 'none').
+
+    Nothing here is reference-counted or freed: a colour is a plain
+    integer, so it has no more lifetime than an `int` does."""
+
+    def __repr__(self):
+        return "ColorType()"
+
+
+@dataclass(frozen=True)
+class FontType:
+    """claude.md #91: a font, resolved to its parts at compile time.
+
+    The value is a pointer to a static constant record
+    (`%struct.FestinaFont` -- size, slant, weight, family) that codegen
+    emits into the binary's own read-only data from the declaration's
+    literal. Nothing allocates it, nothing frees it, and copying a font
+    value copies one pointer to storage that lives as long as the
+    process -- so, like ColorType, this type never interacts with the
+    reference-counting or text-ownership machinery at all."""
+
+    def __repr__(self):
+        return "FontType()"
+
+
+@dataclass(frozen=True)
 class MapType:
     """claude.md #72: map[T] -- keys are always text (never part of the
     type itself, the same way an array's index isn't), so only the
@@ -104,6 +137,10 @@ def type_name(t):
         return "aud"
     if isinstance(t, RegexType):
         return "regex"
+    if isinstance(t, ColorType):
+        return "color"
+    if isinstance(t, FontType):
+        return "font"
     if isinstance(t, MapType):
         return f"map[{type_name(t.value)}]"
     return str(t)

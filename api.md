@@ -72,10 +72,17 @@ map[T]    -- text-keyed map of any of the above except arr[T]/map[T]
              itself (see the Maps section below)
 struct    -- user-declared record type
 table     -- a struct that's also backed by a SQLite table
-img       -- an image loaded via loadImage() (opaque handle)
-aud       -- an audio clip loaded via loadAudio() (opaque handle)
+img       -- an image, declared from a path (`img hero = 'hero.png'`)
+aud       -- an audio clip, declared from a path (`aud hit = 'hit.wav'`)
 regex     -- a compiled pattern from a /pattern/flags literal or regex() (opaque handle)
+color     -- a canvas color, declared from a literal (`color red = 'red'`)
+font      -- a canvas font, declared from a literal (`font body = '13px arial'`)
 ```
+
+`color` and `font` are resolved by the compiler at the declaration that
+names them — see [Drawing style](#drawing-style). A `color` is a packed
+integer and a `font` is a pointer to a constant in the binary, so
+neither is reference-counted and neither costs anything at runtime.
 
 Every type may hold `null` (`bool x = null` included — see "Division and
 modulo by zero" below for how `int`/`float`/`bool` each represent it
@@ -93,11 +100,33 @@ float c = a.toFloat() + b        // int.toFloat() is the only int->float convers
 ```
 
 ```text
-Math.floor(x:float) -> int
-Math.ceil(x:float) -> int
-Math.round(x:float) -> int
-Math.trunc(x:float) -> int
+// float -> int (the rounding four)
+Math.floor(x)   Math.ceil(x)   Math.round(x)   Math.trunc(x)
+
+// float -> float
+Math.sqrt(x)    Math.abs(x)    Math.exp(x)
+Math.sin(x)     Math.cos(x)    Math.tan(x)
+Math.asin(x)    Math.acos(x)   Math.atan(x)
+Math.log(x)     Math.log2(x)   Math.log10(x)
+
+// (float, float) -> float
+Math.pow(a, b)  Math.min(a, b)  Math.max(a, b)  Math.atan2(y, x)
+
+// no arguments -> float
+Math.random()   // in [0, 1)
+
+// constants
+Math.PI   Math.E
 ```
+
+Only the rounding four return `int`; everything else returns `float`,
+because "which integer" and "which real number" are different questions
+— `Math.sqrt(2.0)` is a float.
+
+`Math.random()` is seeded once from the clock and is suitable for
+gameplay and sampling — **not** for anything security-related. It
+returns a value in `[0, 1)`, so `Math.floor(Math.random() * n)` is
+always a valid index.
 
 Division/modulo by zero return `null` (for both `int` and `float`)
 rather than crashing:
@@ -195,6 +224,25 @@ user.name = 'Patrick'
 
 Structs are native in-memory records — declaration, field read/write,
 and passing to/returning from functions by value.
+
+An unassigned field reads as its zero value, and that includes a field
+whose own type is a `struct`, `arr[T]`, or `map[T]` — reaching through
+one before anything was assigned to it gives you a real, empty value
+rather than an error:
+
+```festina
+struct Inner { n:int }
+struct Bag   { inner:Inner  xs:arr[int]  m:map[int] }
+
+Bag b
+log(b.inner.n)      // 0
+log(b.xs.length)    // 0
+b.xs.push(1)        // works -- the array is created on first reach
+b.m['k'] = 9
+```
+
+The value is created once, on first reach, and stays — the read above
+and the `push` below it are talking about the same array.
 
 Memory for structs, arrays, and maps is managed automatically — no
 manual allocation or freeing. A local struct/`arr[T]`/`map[T]`
@@ -296,9 +344,43 @@ log(numbers.length)
 numbers[0] = 10
 ```
 
-Not bounds-checked. Memory is reclaimed automatically — see "Structs"
-above for the full picture (non-escaping locals reclaimed at scope-exit,
-escaping values reference counted).
+Memory is reclaimed automatically — see "Structs" above for the full
+picture (non-escaping locals reclaimed at scope-exit, escaping values
+reference counted).
+
+### Indexing is not bounds-checked
+
+**`numbers[i]` is a raw memory access, and keeping `i` in range is
+yours to guarantee.** This is the one place Festina hands you a loaded
+gun, and it is deliberate: an index is checked in the hot path of every
+loop a game writes, and the check would cost more than the language is
+willing to spend. Nothing about it is soft.
+
+- **Reading past the end** returns whatever bytes follow the array. Not
+  `null`, not a zero, not an error — arbitrary heap contents, different
+  on each run.
+- **Writing past the end** corrupts the heap. Confirmed under
+  AddressSanitizer as a genuine heap-buffer-overflow. It may crash
+  immediately, or corrupt an unrelated value and crash somewhere else
+  much later, or appear to work.
+- **A negative index** is the same, backwards.
+- **`.length` is always right**; nothing else is checked against it.
+
+So guard the index yourself:
+
+```festina
+if i >= 0 && i < xs.length {
+    log(xs[i])
+}
+```
+
+This applies only to `arr[T]` indexing. A missing `map[T]` key answers
+`null` (see [Maps](#maps)); `pop()`/`shift()` on an empty array answer
+`null` (see below); and `splice()` clamps its own range. Indexing is the
+only unchecked operation in the language.
+
+Arrays grow, and are searched, through the methods in
+[Growing arrays](#growing-arrays) below.
 
 ## Maps
 
@@ -350,6 +432,37 @@ preserved via a temp-table rebuild) to match the declaration exactly.
 `sqlite()`'s optional second argument (bound parameters) must be a
 literal array expression, not an arbitrary `arr[T]` value. Query result
 columns map onto a declared table's fields by position, not by name.
+
+### Storing images and audio
+
+A column may be an `img` or an `aud`. SQLite stores it as a **BLOB**:
+
+```festina
+table Music {
+    name:text
+    file:aud
+}
+
+aud track = 'adventure.mp3'
+sqlite('INSERT INTO Music (name, file) VALUES (?, ?)', ['theme', track])
+
+arr[Music] rows = sqlite('SELECT * FROM Music')
+rows[0].file.playLoop(0)          // straight out of the database
+```
+
+What's stored is the asset's **own encoded bytes**, so a round trip is
+byte-identical — an MP3 stays an MP3 rather than becoming a much larger
+WAV, and a JPEG stays a JPEG rather than being re-encoded as PNG.
+Reading a row decodes it back into a real handle, so the value that
+comes out behaves exactly like one loaded from a file.
+
+The one case with no source bytes is an image you built rather than
+loaded — a `clip()` or `resize()` result. Those are encoded as PNG on
+demand, which is lossless.
+
+Binding is by value: the parameter is copied into the database as the
+statement runs, so nothing is retained afterwards and the asset stays
+yours.
 
 ### Database configuration
 
@@ -433,25 +546,485 @@ drawText('Hello', 20, 20)
 
 img profile = loadImage('profile.png')    // PNG only
 drawImage(profile, 0, 0)
+log(`${profile.width}x${profile.height}`)
+
+saveCanvas('screenshot.png')             // -> bool; writes what you drew
+
+render()                                  // put the canvas on screen
+clearCanvas()                             // erase everything
+clearRect(10, 10, 40, 40)                 // erase one region
 
 log(`canvas is ${clientWidth}x${clientHeight}`)
 
 on click(x:int, y:int)  { ... }
 on mouse(x:int, y:int)  { ... }
-on key(key:text)        { ... }
+on keyDown(key:text)    { ... }
+on keyUp(key:text)      { ... }
 on resize()             { ... }
 on close()               { ... }
 ```
 
-A real on-screen X11 window (via Cairo's Xlib backend), opened
-automatically the first time a program draws something, reads
-`clientWidth`/`clientHeight`, or declares one of the five event
-handlers above — `loadImage()` alone does *not* open a window (decoding
-a PNG needs no display). Undecorated, starts at 800×600, everything
-draws in solid black (no color argument in any of claude.md's own
-examples). After the entry file's top-level code finishes, if a window
-was opened, the process blocks handling redraws/input until the window
-closes.
+**Drawing is offscreen. `render()` puts it on screen.**
+
+Every drawing call paints an offscreen canvas that needs no display at
+all. `render()` is the one call that shows it, opening a real X11 window
+(via Cairo's Xlib backend) the first time it runs — undecorated, 800×600.
+Declaring one of the six event handlers opens a window too, since they
+can't fire without one. After the entry file's top-level code finishes,
+if a window was opened, the process blocks handling redraws/input until
+the window closes.
+
+That split means two useful things:
+
+```festina
+// No display needed. No window. Exits on its own.
+fillStyle(brand)
+drawRect(0, 0, 100, 100)
+saveCanvas('chart.png')
+```
+
+```festina
+// A frame: draw everything, then present once.
+clearCanvas()
+drawSprites()
+render()
+```
+
+Batching matters — drawing used to blit the whole canvas per call, so a
+frame of 2000 rectangles took ~1.6s. Behind one `render()` the same
+frame takes ~1ms.
+
+Nothing but `render()` and the event handlers needs a display —
+`saveCanvas`, `clientWidth`/`clientHeight` and `loadImage` all work
+headless.
+
+### Keyboard events
+
+`on keyDown` fires when a key goes down, `on keyUp` when it comes back
+up. Both report the same name for the same physical key: a key that
+types a character gives you that character (`'a'`, `'5'`, `' '`), and
+anything else gives you X11's own name for it (`'Left'`, `'Escape'`,
+`'Return'`, `'space'` is `' '`). So a release can always be matched
+against the press that started it:
+
+```festina
+map[bool] held = {}
+
+on keyDown(key:text) { held[key] = true }
+on keyUp(key:text)   { held[key] = false }
+```
+
+**Holding a key fires one `keyUp`, when you actually let go.** X's own
+auto-repeat would otherwise synthesize a release before every repeat,
+which would make the pair useless for exactly the movement keys it
+exists for; the runtime turns that off where the server supports it and
+filters it out where it doesn't.
+
+`keyDown` *does* repeat while a key is held — that is how text entry
+works, and a program that only wants the first press can check whether
+it has already seen that key go down without a matching up.
+
+### Images
+
+```festina
+img sheet = 'spritesheet.png'             // PNG or JPEG
+log(`${sheet.width}x${sheet.height}`)
+
+img grass = sheet.clip(0, 0, 64, 64)     // a new 64x64 image
+grass.resize(32, 32)                      // scaled in place
+drawImage(grass, 100, 100)
+```
+
+A path declares the image, the same way it declares an `aud` — and, like
+that one, it's a real load rather than a compile-time resolution, so the
+path may be any text expression (`img hero = spriteDir + 'hero.png'`).
+`loadImage('...')` still works and means exactly the same thing.
+
+**PNG and JPEG.** The format is sniffed from the file's contents, not
+its extension — an image out of a database column has no extension, and
+an extension was never evidence of anything anyway. Loading needs no
+display: decoding is pure computation, so a headless program can load,
+clip, resize and `saveCanvas` without an X server.
+
+| | |
+|---|---|
+| `img.width` / `img.height` | Current size in pixels, as `int`. |
+| `img.clip(x, y, w, h)` | A **new** `img` holding that rectangle. The source is untouched, so one sheet can be clipped as many times as you like. |
+| `img.resize(w, h)` | Scales the image **in place** — it changes the image itself, so every name for it sees the new size. |
+
+`clip` is the spritesheet operation: one PNG holding a grid of frames,
+sliced into the individual images you draw.
+
+```festina
+img sheet = 'tiles.png'
+arr[img] tiles = []
+for int i = 0, i < 8, i++ {
+    tiles[i] = sheet.clip(i * 32, 0, 32, 32)
+}
+```
+
+A clip region reaching past the source's edge isn't an error — the
+overlapping part is copied and the rest stays transparent, which is
+normal at a sheet's right or bottom margin. A zero or negative width or
+height *is* an error, since it could only ever produce an image nothing
+can draw.
+
+Because `resize` changes the image itself, two names for one image stay
+in step:
+
+```festina
+img a = sheet.clip(0, 0, 32, 32)
+img b = a
+a.resize(8, 8)
+log(b.width)      // 8 -- a and b are the same image
+```
+
+An image created in a function (by `loadImage` or `clip`) and never
+stored outside it is released when that function returns, so slicing
+frames inside a loop doesn't accumulate.
+
+### Drawing style
+
+```festina
+color brand = '#4a90d9'
+color line = 'gray'
+font  body  = 'bold 20px serif'
+
+fillStyle(brand)            // fills: drawRect, drawCircle, drawText
+borderColor(line)           // outlines drawRect/drawCircle
+lineWidth(4)                // border thickness, in pixels
+changeFont(body)            // used by drawText and both measure calls
+```
+
+Style is set once and applies to every later draw — the same model the
+HTML canvas uses. Defaults are black fill, no border, and 16px
+sans-serif, so a program that never calls these draws exactly what it
+did before they existed.
+
+> **Colors and fonts must be declared.** Anything other than raw RGB
+> numbers has to be a `color` or `font` declaration first:
+>
+> ```festina
+> color red = 'red'      // then: fillStyle(red)
+> font  body = '14px'    // then: changeFont(body)
+> ```
+>
+> `fillStyle('red')` and `changeFont('14px')` do **not** work. The
+> declaration is where the compiler resolves the name, once — after
+> that a `color` is just a packed integer and a `font` is a pointer to a
+> constant, so using either costs nothing.
+>
+> **If a color is chosen dynamically, use `fillStyle(r, g, b)`** — see
+> [Computing a color or font at runtime](#computing-a-color-or-font-at-runtime)
+> below. There is no way to turn a runtime `text` value into a `color`
+> or a `font`, and attempting it is a compile error that says so.
+
+#### The `color` type
+
+```festina
+color red   = 'red'
+color brand = '#4a90d9'
+color ghost = 'none'
+```
+
+A color literal is any of the **148 CSS color names** (`red`, `teal`,
+`rebeccapurple`, `lightgoldenrodyellow`, …), a `#rgb` or `#rrggbb` hex
+value, or `none`/`transparent`. Names are case-insensitive and `#abc`
+expands to `#aabbcc`, both as in CSS.
+
+The declaration is where the name is resolved: `color red = 'red'`
+becomes the packed integer `0xFF0000` at compile time, so nothing parses
+a color string while your program runs. A name the compiler doesn't
+recognize is a compile error naming the value and its line — it can't
+reach a running program, and it never silently falls back to black.
+
+A `color` is an ordinary value after that: assign it, pass it to a
+function, return one. It is a plain integer, so it is never
+reference-counted and costs nothing to copy.
+
+`none` works on both setters: as a fill it leaves a shape's interior
+untouched, so `borderColor` alone gives an outline-only shape; as a
+border color it switches borders back off.
+
+```festina
+color none = 'none'
+color ring = 'purple'
+
+fillStyle(none)
+borderColor(ring)
+lineWidth(8)
+drawCircle(200, 200, 60)    // a purple ring, nothing inside it
+```
+
+`borderColor` outlines shapes only, not the glyphs `drawText` draws.
+
+#### The `font` type
+
+```festina
+font body  = 'arial 14px bold'   // all three parts
+font same  = 'bold 14px arial'   // any order — identical result
+font small = '14px'              // just the size; family/style unchanged
+font mono  = 'monospace'         // just the family; size unchanged
+```
+
+A font literal takes the CSS/canvas shorthand with words in **any
+order**, and any part may be omitted — `italic`/`oblique` set the slant,
+`bold` the weight, a bare number or `<n>px` the size, and the first word
+that is none of those is the family. An omitted part means "leave that
+alone", which is what lets `font small = '14px'` change only the size.
+
+Each distinct font compiles to a constant in the binary's read-only
+data, so declaring one costs nothing at runtime and `changeFont()`
+passes a single pointer. Identical fonts share one constant, so `body`
+and `same` above are literally the same record. An empty literal
+(`font f = ''`) is rejected — it says nothing, and is far likelier to be
+a mistake than an intent.
+
+### Computing a color or font at runtime
+
+There is deliberately **no way to turn a runtime `text` value into a
+`color` or a `font`** — resolution happens at the declaration, so the
+declaration needs a literal. To choose either from values you compute,
+use the explicit numeric forms, which are strictly more capable for that
+job anyway (they take any `int` expression, where a color *name* could
+only ever have named one of a fixed set):
+
+```festina
+fillStyle(r, g, b)                // each 0-255; a negative value means 'none'
+borderColor(r, g, b)
+changeFont(px, style, family)     // style/family may be null;
+                                   // px <= 0 keeps the current size
+```
+
+```festina
+// a gradient of swatches — the color is different every iteration
+for int i = 0, i < 10, i++ {
+    fillStyle(i * 25, 0, 255 - i * 25)
+    drawRect(i * 40, 0, 36, 36)
+}
+
+// a font size that depends on runtime state
+int size = 12 + level * 4
+changeFont(size, 'bold', null)    // family left as-is
+```
+
+Passing a non-literal where a `color` or `font` is expected is a compile
+error that points at these forms:
+
+```text
+error: a color must come from a literal, so the compiler can resolve it
+once -- write `color name = '...'` and use `name`, or, to choose one at
+runtime, use fillStyle(red, green, blue) with each component 0-255
+```
+
+### Paths
+
+```festina
+fillStyle(red)
+beginPath()
+moveTo(50, 50)
+lineTo(150, 50)
+lineTo(100, 140)
+closePath()
+fillPath()        // a filled triangle
+```
+
+| | |
+|---|---|
+| `beginPath()` | Starts a new path. |
+| `moveTo(x, y)` / `lineTo(x, y)` | Move the pen / draw a straight segment. |
+| `curveTo(cx1, cy1, cx2, cy2, x, y)` | A cubic bezier to `(x, y)`. |
+| `closePath()` | Closes back to the start. |
+| `fillPath()` / `strokePath()` | Paints the path with the current fill / border colour, and **ends** it. |
+
+`fillPath` uses `fillStyle`; `strokePath` uses `borderColor` and
+`lineWidth`. Both consume the path, as `fill()`/`stroke()` do on a
+canvas — call `beginPath()` again for the next shape. Using `moveTo` and
+friends with no path open is a clean error naming the missing
+`beginPath()`.
+
+### Transforms
+
+```festina
+saveState()
+translate(400, 40)
+rotate(30.0)          // degrees
+scale(2.0, 2.0)
+drawRect(0, 0, 60, 60)
+restoreState()        // transform (and style) back as it was
+```
+
+A transform applies to everything drawn *after* it, until changed.
+`resetTransform()` returns to the identity.
+
+`saveState`/`restoreState` save the whole drawing state — transform,
+colors, alpha, line width and font — matching the canvas `save()`/
+`restore()` they mirror. A `restoreState()` with nothing saved is an
+error rather than a silent no-op.
+
+Rotation is in **degrees**. `Math.PI` is there if you'd rather work in
+radians.
+
+### Gradients and transparency
+
+```festina
+color a = 'red'
+color b = 'blue'
+
+fillLinearGradient(50, 300, a, 250, 300, b)   // start point, colour -> end point, colour
+drawRect(50, 280, 200, 60)
+
+fillRadialGradient(400, 300, 60, a, b)        // centre, radius, inner, outer
+drawCircle(400, 300, 60)
+
+fillAlpha(0.5)                                 // 0.0 transparent .. 1.0 opaque
+```
+
+A gradient replaces the flat fill until the next `fillStyle()`. Two
+stops rather than an arbitrary list — that covers essentially every
+gradient a program draws, and needs no separate gradient type.
+
+### Text metrics
+
+```festina
+int w = measureTextWidth('Hello')
+int h = measureTextHeight('Hello')
+```
+
+Both measure against the current `font` and return `int`. Neither opens
+a window — text metrics depend only on the font, so they work in a
+program that never draws, and with no X server at all.
+
+`measureTextWidth` is the advance width (how far the pen moves), which
+is what you want for laying strings out one after another — the same
+thing the canvas `measureText().width` reports. `measureTextHeight` is
+the inked height of *that string*, which is why it takes the text:
+`'x'` is shorter than `'Xg'`. For a stable line height independent of
+which letters appear, measure a string with both an ascender and a
+descender.
+
+## Files
+
+```festina
+writeFile('notes.txt', 'hello')       // -> bool (did it land?)
+appendFile('notes.txt', ' world')     // -> bool
+text body = readFile('notes.txt')     // -> text, or null if unreadable
+bool there = fileExists('notes.txt')  // -> bool
+deleteFile('notes.txt')               // -> bool
+```
+
+Whole-file text I/O. Nothing here fails the program: `readFile` returns
+`null` for a file it can't read and the writers return `false` on
+failure, so a missing file is something you test for rather than
+something that stops you — the same treatment division by zero gets.
+
+What `readFile` returns is an ordinary `text`, so it composes with
+everything else:
+
+```festina
+text body = readFile('data.csv')
+if body != null {
+    log(body.replaceAll(',', ' | '))
+}
+```
+
+## Time
+
+```festina
+int ms = now()                        // milliseconds since the Unix epoch
+log(formatTime(ms, '%Y-%m-%d %H:%M')) // strftime, local time -> text
+```
+
+`now()` uses the same unit and origin as JavaScript's `Date.now()`, and
+the same unit `setTimeout` already takes, so timing a block is just
+subtraction:
+
+```festina
+int started = now()
+doTheWork()
+log(`took ${now() - started}ms`)
+```
+
+### Single-value queries
+
+```festina
+int total  = sqliteInt(`SELECT count(*) FROM Post`)
+text name  = sqliteText(`SELECT title FROM Post WHERE id = ?`, [2])
+float mean = sqliteFloat(`SELECT avg(score) FROM Post`)
+```
+
+The first column of the first row. Use these instead of declaring a
+`table` just to receive a scalar — a `table` declaration *creates* a
+real table, so a throwaway one for a `count(*)` would sit in your
+database permanently.
+
+A query matching no rows (or whose value is SQL NULL) returns `null`,
+so it's something to test for rather than something that stops you.
+
+### JSON and full-text search
+
+Both are ordinary SQL, and `sqlite()` passes SQL through untouched — so
+SQLite's JSON1 and FTS5 work today with no extra language feature:
+
+```festina
+log(sqliteText(`SELECT json_extract(data, '$.name') FROM Doc WHERE id = ?`, [1]))
+
+sqlite(`CREATE VIRTUAL TABLE PostSearch USING fts5(title, body, content='Post', content_rowid='id')`)
+sqlite(`INSERT INTO PostSearch(PostSearch) VALUES('rebuild')`)
+log(sqliteInt(`SELECT count(*) FROM PostSearch WHERE PostSearch MATCH ?`, ['machine']))
+```
+
+## Growing arrays
+
+```festina
+arr[int] xs = [1, 2, 3]
+
+xs.push(4)          // -> new length
+xs.pop()            // -> last element, removed
+xs.shift()          // -> first element, removed
+xs.unshift(0)       // -> new length
+arr[int] cut = xs.splice(1, 2)   // remove 2 from index 1, return them
+xs.indexOf(3)       // -> first index holding 3, or -1
+```
+
+All six behave as their JavaScript namesakes do, including `splice`'s
+clamping — a negative start counts back from the end, and an oversized
+range clamps rather than failing, so `splice(i, 1)` at a boundary is a
+no-op. (`splice`'s variadic insert has no spelling here; Festina has no
+variadic calls.)
+
+`pop()`/`shift()` on an empty array return `null` — not zero, so an
+empty pop is distinguishable from popping a real `0`:
+
+```festina
+arr[int] empty = []
+log(empty.pop() == null)     // true
+```
+
+`indexOf()` answers `-1` when the value isn't present, rather than
+`null` — an index is the kind of thing you compare or feed straight to
+`splice`, and both read naturally against `-1`:
+
+```festina
+if queue.indexOf(target) >= 0 { ... }
+queue.splice(queue.indexOf(target), 1)   // remove by value
+```
+
+What "the same value" means depends on the element type:
+
+- `int`, `float`, `bool` — **by value**.
+- `text` — **by content**, so a needle built at runtime finds a match:
+  `names.indexOf('gr' + 'ace')` is `1` for `['ada', 'grace']`. (Identity
+  would be useless here: text is copied on binding, so two equal strings
+  are almost always two different buffers.)
+- `struct`, `arr`, `map` — **by identity**. Two separately-declared
+  structs with identical fields are two different values; only the one
+  actually in the array is found.
+
+Elements are owned the same way any other binding owns them: pushing a
+`text` copies it, so the array and the variable don't share a buffer.
+Removing transfers ownership to whoever receives it. `indexOf()` takes
+no ownership at all — an index isn't a reference.
 
 ## Timers
 
@@ -474,16 +1047,124 @@ deadlines together so neither blocks the other.
 ## Audio
 
 ```festina
-aud music = loadAudio('music.wav')   // WAV, 16-bit PCM only
-music.play()
-music.stop()
-music.isPlaying()                     // true the instant play() returns,
-                                       // false the instant stop() returns
+aud music = 'music.wav'               // WAV (16-bit PCM) or MP3
+music.play()                          // once
+music.playLoop()                      // until stopped
+music.isPlaying()                     // true the instant play() returns
+
+stopAudioPlayer()                     // stop every channel
 ```
 
+A path declares the clip, the same way `blob`, `color`, `font` and `img`
+are each written as the text that reads best. It's a real load, not a
+compile-time resolution, so the path may be any text expression
+(`aud hit = soundDir + 'hit.wav'`). `loadAudio('...')` still works and
+means exactly the same thing.
+
+**WAV (16-bit PCM) and MP3.** The format is sniffed from the file's
+contents, not its extension — a clip out of a database column has no
+extension, and an extension was never evidence of anything anyway.
+Anything else (a compressed WAV, 8/24/32-bit PCM, Ogg, FLAC) fails at
+load with a message naming both supported formats.
+
 Plays through a real ALSA output device on a background thread, so
-playback doesn't block the rest of the program. Calling `play()` again
-while already playing restarts from the beginning.
+playback doesn't block the rest of the program.
+
+**There is no `music.stop()`.** One clip can be playing on several
+channels at once — three overlapping gunshots are the ordinary case, not
+the exotic one — so "stop this clip" never named one thing. Playback is
+stopped by channel: `stopAudioPlayer(n)`, or `stopAudioPlayer()` for all.
+`isPlaying()` stays clip-wide, because "is this sound audible anywhere"
+does still have a single answer.
+
+### Overlapping sounds
+
+**`play()` while a sound is already playing does not cut it off.** Sound
+goes out through a pool of **channels** — so a footstep, a gunshot or a
+coin pickup firing in rapid succession layer instead of interrupting
+each other, which is what a game actually needs:
+
+```festina
+aud coin = loadAudio('coin.wav')
+coin.play()   // three overlapping copies, not one restarted three times
+coin.play()
+coin.play()
+```
+
+The clip's audio is decoded once, at `loadAudio()` time; a channel costs
+a thread and a device handle, never another copy of the samples.
+
+```festina
+setMaxAudioPlayers(4)          // channels the pool may assign on its own
+log(maxAudioPlayers())         // -> 4, i.e. what was actually applied
+```
+
+`setMaxAudioPlayers` is clamped into `[1, 64]` rather than rejected.
+When every unreserved channel in the pool is busy, the **oldest** is
+stolen. Something has to give at the limit, and the sound that has been
+playing longest is closest to finishing anyway — dropping the *new* play
+instead would silence a rapid-fire effect at exactly the moment it fires
+fastest.
+
+`setMaxAudioPlayers(1)` is the way to ask for the old behaviour back:
+one channel, restarted from the beginning on every `play()`.
+
+### Channels and looping
+
+Channels are **process-global and numbered from 0**, not per-clip — so
+two different clips can share one, which is what makes handing a music
+channel from one track to another expressible at all:
+
+```festina
+aud adventureMusic = loadAudio('adventure.wav')
+aud battleMusic = loadAudio('battle.wav')
+
+adventureMusic.playLoop(0)          // loops on channel 0, and reserves it
+setInterval(changeMusic, 100000)
+
+void func changeMusic() {
+    if adventureMusic.isPlaying() {
+        battleMusic.playLoop(0)     // takes channel 0 over
+    } else {
+        adventureMusic.playLoop(0)
+    }
+}
+
+stopAudioPlayer(0)                  // stop that channel, release it
+```
+
+| Call | What it does |
+|---|---|
+| `clip.play()` | Play once on a channel the pool picks. |
+| `clip.play(n)` | Play once on channel `n`, taking it over. |
+| `clip.playLoop()` | Loop on a channel the pool picks, and **reserve** it. |
+| `clip.playLoop(n)` | Loop on channel `n`, taking it over and **reserving** it. |
+| `stopAudioPlayer(n)` | Stop channel `n` and release it. |
+| `stopAudioPlayer()` | Stop every channel. |
+| `clip.isPlaying()` | True while any channel is playing that clip. |
+
+**`playLoop` reserves its channel.** A reserved channel is never chosen
+by automatic assignment and never stolen — so a looping music track
+cannot be evicted by an ordinary sound effect, however many are firing.
+Two things release it: `stopAudioPlayer(n)` (or a bare
+`stopAudioPlayer()`), and naming the channel explicitly in another
+`play(n)`/`playLoop(n)`. An explicit `play(n)` both takes the channel
+over *and* hands it back to the pool, since a one-shot has nothing to
+reserve it for.
+
+An out-of-range channel is clamped into `[0, 64)`, the same call
+`setMaxAudioPlayers` makes — a bad channel number should not kill a
+running game. `setMaxAudioPlayers` bounds only what the pool assigns on
+its own; an explicitly named channel is honoured anywhere in range, so
+`play(40)` works with a pool of 10.
+
+If you reserve *every* channel and then fire an unnamed `play()`, it is
+dropped — there is nothing left the pool is allowed to touch, and the
+alternative would be breaking a reservation you asked for.
+
+`isPlaying()` is about the **clip**, not one playback of it: it is true
+while any channel is playing that clip. To address a single playback,
+name its channel.
 
 ## Imports
 

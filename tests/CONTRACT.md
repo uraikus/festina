@@ -18,9 +18,13 @@ festina/codegen.py's module docstring's "Query rows" note for the row
 representation and the params-must-be-a-literal-array restriction).
 Arrays (claude.md #26) are
 implemented too -- literals, indexed get/set, nesting, function
-params/return values, and (claude.md #63) `.length` -- though claude.md
-still doesn't specify bounds checking or array growth, so neither of
-those exist (see festina/codegen.py's module docstring). claude.md
+params/return values, and (claude.md #63) `.length`. Arrays grow
+(claude.md #96/#97: `push`/`pop`/`shift`/`unshift`/`splice`/`indexOf`),
+but indexing is still not bounds-checked -- claude.md never specified it,
+and claude.md #97 makes that a documented, deliberate contract rather
+than an omission: `xs[i]` past the end is a raw memory access, and
+keeping `i` in range is the program's responsibility (see api.md's
+"Indexing is not bounds-checked"). claude.md
 #55-58 (added after a design review of the first codegen pass turned up
 real bugs -- see below) are implemented too: int/float never convert
 implicitly in any operator, `int.toFloat()`/`Math.floor/ceil/round/trunc`
@@ -44,8 +48,9 @@ claude.md #59. A regex value was originally constructible only via a
 dedicated literal syntax at all -- see this section's later "JS-style
 regex literal syntax" paragraph below for why and how that changed.
 claude.md #37/#39/#40 (`img`/`loadImage()`, `drawRect`/`drawCircle`/
-`drawText`/`drawImage`, `on click`/`on mouse`/`on key`/`on resize`/`on
-close`, `clientWidth`/`clientHeight`) are implemented too, per the
+`drawText`/`drawImage`, `on click`/`on mouse`/`on keyDown`/`on keyUp`/
+`on resize`/`on close`, `clientWidth`/`clientHeight`) are implemented
+too, per the
 user's own clarification that this means a real on-screen window --
 "not a file" -- showing only the drawing canvas ("a canvas renderer",
 not a GUI with any chrome): X11 (Xlib) + Cairo's Xlib surface backend,
@@ -359,11 +364,16 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 842 tests in this directory pass against it: 561 need no external
+All 1008 tests in this directory pass against it: 623 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-270 more need a working C compiler, plus 2 more
-(`tests/test_packaging.py`) given `pyinstaller` too, plus 9 more given
-`Xvfb`+`xdotool` too (561 + 270 + 2 + 9 = 842 -- re-verified directly
+364 more need a working C compiler, plus 2 more
+(`tests/test_packaging.py`) given `pyinstaller` too, plus 19 more given
+`Xvfb`+`xdotool` too (4 of those also need `xwd`, from the same
+x11-apps/x11-utils tier, to read real canvas pixels back --
+claude.md #89/#92/#94; two former `xwd` tests became display-free once
+claude.md #95 made saveCanvas headless; claude.md #98 added 4 more) (623
++ 364 + 2 + 19 = 1008 --
+re-verified directly
 by running the whole suite with a PATH containing nothing but Python,
 not just derived by counting `compile_and_run` call sites, since the
 true number had drifted well past a much older, since-inaccurate count
@@ -386,7 +396,7 @@ compiler `compile_and_run` already requires.
 
 `examples/` grew beyond the original hello/basic/arrays/geometry/
 multifile/regex set: `timers.f` (setTimeout/setInterval), `graphics.f`
-(drawing + all five event handlers), `audio.f` (loadAudio/play/stop/
+(drawing + all six event handlers), `audio.f` (loadAudio/play/stop/
 isPlaying, with a small generated `beep.wav` fixture), `fizzbuzz.f` (a
 dependency-free loops/modulo tour), and `tic_tac_toe.f` -- a real,
 playable two-player game (click a cell, alternating X/O, win detection
@@ -2123,6 +2133,500 @@ process exit, which LeakSanitizer already reports as clean (a global
 stays reachable through its own variable) and which no other systems
 language frees either.
 
+**claude.md #89**: the canvas gains drawing style and text metrics --
+`fillStyle`, `borderColor`, `lineWidth`, `font`, `measureTextWidth`,
+`measureTextHeight`. Style is process-global "set it, then draw" state,
+matching the HTML canvas 2D context, because claude.md #37/#39's own
+worked examples take geometry only (`drawRect(0, 0, 100, 100)`) and
+adding style parameters would have meant changing those signatures.
+Every default reproduces what these functions drew before (black fill,
+no border, 16px sans-serif), so no existing program's output changes.
+A colour is a name, a `#rgb`/`#rrggbb` hex value, or `none`/
+`transparent`; anything else fails at the `fillStyle()` call itself,
+naming the value, rather than deferring to the next draw or silently
+defaulting to black. `borderColor` outlines shapes, not glyphs, and the
+two measure functions deliberately open no window (text metrics depend
+only on the font -- the same rule `loadImage` already follows).
+`tests/test_codegen.py::TestCanvasStyleAndTextMetrics` (11 tests)
+covers codegen, the window-opening rule, argument typing, the
+builtin-shadowing rule these six now join, and the failure messages;
+`::TestCanvasStyleRendersRealPixels` (2 tests) captures the window with
+`xwd` and asserts the actual RGB values, since asserting the runtime
+call was emitted proves the plumbing but not that 'red' comes out red,
+that `#00f` expands to `#0000ff`, or that `fillStyle('none')` leaves an
+interior genuinely unpainted.
+
+**claude.md #90**: colours and fonts are now resolved *at compile time*
+rather than parsed by the runtime on every call. `fillStyle('red')`
+compiles to `festina_set_fill_rgb(255, 0, 0)` and
+`font('arial 14px bold')` to `festina_set_font(14, "bold", "arial")`, so
+the runtime holds no colour table, no hex parsing and no font grammar at
+all. Resolution lives in `festina/colors.py` -- deliberately the only
+copy, since duplicating a 148-entry table between a Python compiler and
+a C runtime invites drift. The colour set grew to the full CSS Color
+Module Level 4 list (147 X11 keywords + `rebeccapurple`): #89 had
+shipped a small table because every extra name was one a typo could
+silently resolve to, and that argument disappears once a typo is a
+compile error naming the value and its line. Both functions also take an
+explicit form (`fillStyle(r, g, b)`, `font(px, style, family)`) for
+values computed at runtime, which is why requiring a literal in the
+one-argument form costs nothing -- the explicit form is strictly more
+capable for anything dynamic. The one behaviour removed is a colour or
+font built from a runtime-computed *string*, now a compile error
+pointing at the explicit form.
+(That test class was superseded by #91's own, below.)
+
+**claude.md #91**: `color` and `font` became real **types**, so a colour
+or a font is resolved once -- at the declaration naming it -- rather
+than at each call site:
+
+```festina
+color brand = '#4a90d9'
+font  body  = '13px arial bold'
+fillStyle(brand)
+changeFont(body)
+```
+
+`font` becoming a type name forced the setter's rename: `font(...)`
+cannot be a call when `font` introduces a declaration, so it is now
+`changeFont(newFont:font)`. A `color` compiles to a packed `0xRRGGBB`
+integer (negative = `none`), so passing one costs a register; a `font`
+compiles to a pointer to a static `%struct._FestinaFont` constant in
+read-only data, so declaring one costs no runtime work and identical
+fonts share a constant (keyed on resolved parts, so `'bold 13px arial'`
+and `'arial bold 13px'` collapse together). Neither type touches the
+reference-counting or text-ownership machinery at all -- a colour is a
+plain integer, and a font points at a constant nothing allocates or
+frees.
+
+The rule this enforces: **a colour name or font shorthand can only come
+from a literal.** `fillStyle('red')` no longer works; a name must be
+declared as a `color` first, and no runtime `text` can become either
+type. Dynamic values use `fillStyle(r, g, b)` or
+`changeFont(px, style, family)`, which are strictly more capable for
+that job. `tests/test_codegen.py::TestColorAndFontTypes` (22 tests)
+covers both types end to end -- packing, the full CSS table, the `none`
+sentinel, any-order and omitted font parts, constant sharing, copying
+and passing colours, both explicit forms, and every compile-error path
+including `font('14px')` no longer being a call.
+
+**claude.md #92**: `img` gained `.width`, `.height`, `.clip(x, y, w, h)`
+and `.resize(w, h)` -- the spritesheet operations claude.md #37's
+load-and-draw-whole API couldn't express. `clip` returns a new image and
+leaves the source untouched; `resize` changes the image **in place**,
+which is what its statement spelling (`grass.resize(32, 32)`) implies,
+and is why an `img` value is now a pointer to a small box holding the
+Cairo surface rather than the surface itself -- a Cairo surface can't be
+resized in place, and boxing it keeps two names for one image in step. A
+region past the source edge copies the overlap and leaves the rest
+transparent (as a canvas `drawImage` with a source rect does); a
+non-positive size fails cleanly rather than producing a surface nothing
+can draw. The img branch of member access, previously a permissive
+"anything goes" fallthrough from when img had no members at all, is now
+strict, so `.widht` is an error and naming a method without calling it
+says so.
+
+The box also gave img an ownership story (`_OwnedImage`, the same
+two-part test #86 uses for regex: initialized from a Call and provably
+non-escaping), which matters more here than for regex because `clip`
+exists to be called repeatedly -- without it, slicing frames in a loop
+leaked a full Cairo surface per iteration. Reaching the common case
+required widening escape analysis: its stage-2 exemption only covers
+user functions whose bodies it can analyse, so every *builtin* call
+argument fell under the conservative "anything passed to a call
+escapes" default -- meaning `drawImage(tile, x, y)` alone kept `tile`
+alive forever, defeating the reclamation in exactly the clip-draw-repeat
+shape it exists for. Builtins are now listed as non-retaining, each
+checked against the runtime rather than assumed (Cairo copies what it
+paints, sqlite binds with `SQLITE_TRANSIENT`, the measure functions only
+read metrics, the style setters copy into their own state); anything
+unlisted keeps the conservative default, and this incidentally improves
+reclamation for struct/`arr[T]`/`map[T]` locals passed to those same
+builtins. `tests/test_codegen.py::TestImageClipResizeAndSize` (12 tests)
+and `::TestImageClipRendersRealPixels` (2 tests, reading back real
+canvas pixels to prove `clip` lifts the region actually asked for) cover
+it, against a spritesheet PNG generated by the `sprite_sheet_png`
+fixture rather than a checked-in binary -- its exact tile layout is part
+of what the tests assert.
+
+**claude.md #93**: the standard-library gaps that needed no new
+dependency at all -- `-lm` and libc are already on every link line, and
+Cairo's PNG *writer* is compiled into the same library whose reader
+`loadImage` uses. `Math` gained `sqrt`/`sin`/`cos`/`tan`/`asin`/`acos`/
+`atan`/`exp`/`log`/`log2`/`log10`/`abs`, `pow`/`min`/`max`/`atan2`,
+`random()`, and the constants `PI`/`E`; the rounding four still return
+`int` while everything new returns `float`, since collapsing those would
+make `Math.sqrt(2.0)` silently an int. Most compile to real LLVM
+intrinsics (which constant-fold and vectorise) rather than opaque libm
+calls. `random()` is plain `rand()` in `[0, 1)` -- right for gameplay,
+explicitly not for anything security-adjacent, and excluding 1.0 keeps
+`arr[floor(random() * n)]` in range. Files got `readFile`/`writeFile`/
+`appendFile`/`fileExists`/`deleteFile`, none of which fails the program:
+`readFile` answers `null` and the writers `false`, the same treatment
+#57 gives division by zero (a failing `fclose` counts as a failed write,
+since a full disk can fail there after every `fwrite` succeeded). Time
+got `now()` (ms since epoch, matching `Date.now()` and the unit
+`setTimeout` already takes) and `formatTime`. `saveCanvas(path)` writes
+the *backing* surface, so it captures what the program drew rather than
+whatever was unobscured on screen.
+`tests/test_codegen.py::TestMathFileAndTime` (15 tests) and
+`::TestSaveCanvas` (2 tests) cover it -- the latter decodes the written
+PNG and finds the drawn rectangles in it, since "the call returned true"
+proves the plumbing but not that a canvas rather than a blank surface
+was captured.
+
+**claude.md #94**: two gaps found by asking what the already-linked
+dependencies could do that the language couldn't reach.
+
+The canvas could draw exactly three things -- a rectangle, a circle and
+a line of text -- with no way to express a triangle, a polygon, a curve,
+a rotated anything, a gradient or transparency, all of which Cairo could
+always do on the library already linked for `drawRect`. Added: paths
+(`beginPath`/`moveTo`/`lineTo`/`curveTo`/`closePath`/`fillPath`/
+`strokePath`), transforms (`translate`/`rotate`/`scale`/
+`resetTransform`/`saveState`/`restoreState`), two-stop gradients and
+`fillAlpha`. Every drawing call builds its own short-lived Cairo
+context, so the transform lives outside all of them and is applied to
+each -- that is what makes `translate` affect the *next* `drawRect`.
+`saveState`/`restoreState` save the whole state (transform, colours,
+alpha, line width, font), since restoring a transform while leaving a
+colour changed is the kind of half-measure that produces baffling bugs.
+Only `beginPath`/`fillPath`/`strokePath` open a canvas; transforms,
+state, alpha and gradients are pure state and open nothing, exactly as
+#89's setters don't -- which is also why `restoreState()` with nothing
+saved reports *that* rather than a missing display.
+
+The database gap was narrower than expected, and worth recording because
+the obvious guess was wrong: **JSON1 and FTS5 need no compiler feature
+at all**. Both are ordinary SQL and `sqlite()` has always passed SQL
+through untouched, so `json_extract` queries and full FTS5 virtual
+tables with ranked `MATCH` already worked -- there are now tests locking
+that in. What made them unpleasant was that receiving *any* result
+required declaring a `table` to hold the row shape, and a `table`
+declaration CREATES a real table (#28-31's schema sync), so a
+`count(*)` left a throwaway table in the database forever.
+`sqliteInt`/`sqliteFloat`/`sqliteText` close that with no schema at all,
+sharing `sqlite()`'s own prepare-and-bind path and differing only in the
+stepping; no rows (or a SQL NULL) answers with null rather than failing.
+`tests/test_codegen.py::TestScalarQueries` (5 tests, one asserting the
+database ends up with only the declared table in it),
+`::TestCanvasPathsTransformsAndGradients` (7) and
+`::TestCanvasPathsRenderRealPixels` (1, which checks a point inside the
+triangle's bounding box but outside the triangle stays unpainted --
+proving a path is a real shape and not its bounds).
+
+**claude.md #95**: drawing is now offscreen and `render()` puts it on
+screen. Drawing used to imply a window -- any `drawRect` opened one,
+blitted the whole canvas and flushed X, so a program whose job was
+producing a PNG still needed a display, opened a window nobody would
+look at, and blocked forever in the event loop; a frame of 2000
+rectangles measured **1.6 seconds** against a 16ms 60fps budget. Now
+drawing paints an image surface needing no X server at all, and only
+`render()` (and the event handlers, which genuinely cannot fire without
+a window) requires a display. Three things fall out: headless rendering
+works (`DISPLAY` unset entirely -- two `TestSaveCanvas` tests that
+previously needed Xvfb are now display-free, which is the clearest
+demonstration), "does this need a GUI?" has a syntactic answer, and the
+same 2000 rectangles take **~1ms** plus 2ms for one `render()`.
+`clearCanvas()`/`clearRect()` are the other half of animation -- without
+them a canvas could only accumulate, so nothing could move.
+**This is a breaking change**: a program showing something must now call
+`render()`; both examples and every pixel test were updated.
+`tests/test_codegen.py::TestRenderClearAndHeadless` (6 tests).
+
+**claude.md #96**: arrays grow. `push`/`pop`/`shift`/`unshift`/`splice`,
+each behaving as its JavaScript namesake does -- previously an array's
+length was fixed at construction and writing past the end was an
+unchecked heap overflow, so a list that grows had no representation.
+The runtime moves elements by bytes with the element size passed in from
+codegen, so one set of helpers covers every `arr[T]`. The ownership half
+is where this could quietly corrupt memory: `xs.push(s)` follows exactly
+the rule `xs[i] = s` already does (#80/#83), retaining a struct/array/map
+element and copying a text one unless its source is owning -- otherwise
+the array and the pushed variable would share a buffer. Removal
+transfers rather than releases, since `pop`/`shift` hand the element
+back and `splice` hands it to the array it returns. An empty `pop()`
+answers the element type's **null**, not its zero, so it stays
+distinguishable from popping a real `0`; `splice` clamps exactly as
+JavaScript's does, negative start included.
+`tests/test_codegen.py::TestArrayMethods` (10 tests), plus a 100-
+iteration ASan run driving push/pop/unshift/splice over text elements.
+
+**claude.md #97**: unchecked indexing is documented as the user's; four
+defects that were ours are fixed.
+
+*Auto-vivification.* Reaching through an unassigned struct/`arr[T]`/
+`map[T]` field segfaulted -- those fields are pointers, and `calloc` (or
+a global's `zeroinitializer`) leaves them null, contradicting claude.md's
+own "an uninitialized field reads as its zero value". The recorded scope
+was "writes to nested struct fields"; probing showed reads crashed
+identically and the array/map cases crashed the same way. The value is
+now created lazily on first reach -- lazily rather than eagerly because a
+global's storage is a compile-time constant with nowhere to run an
+initializer, so one mechanism covers locals, globals, parameters and
+arbitrarily deep nesting. Identity is preserved: the storage is created
+once, not per access.
+`tests/test_codegen.py::TestUnassignedNestedFieldsAutoVivify` (7 tests),
+plus a 100-iteration ASan run.
+
+*`arr[bool]` element stride.* #96's helpers move elements by a byte count
+passed in from codegen, hardcoded to 8. Every element type is 8 bytes
+wide except `bool`, which is `i8` -- so `push` wrote byte `8*i` while
+`xs[i]` read byte `i`, and a neighbouring element's byte came back out.
+The stride now comes from the element type.
+`tests/test_codegen.py::TestBoolArrayElementStride` (3 tests).
+
+*Text `+` is an owning source.* #83 classified only a Call and a template
+literal as owning. A text `+` is one `festina_str_concat`, which mallocs
+unconditionally -- so `text j = a + b` and `return s + '!'` each copied
+an already-exclusive buffer and leaked the original, and a chained
+`a + b + c` leaked its intermediate on top of that. Both halves fixed;
+measured under LeakSanitizer.
+`tests/test_codegen.py::TestTextConcatOwnership` (4 tests).
+
+*Computed map keys and top-level block scopes.* `festina_map_set` strdups
+its key and `festina_map_get` only reads one, so `m[`s${i}`] = v` leaked
+the key it built -- both sites now free it. Separately, #74's scope
+tracking only ran inside function/handler bodies, so a local declared in
+a nested block at TOP level (`text row = a + b` in a top-level `while`)
+was never freed: one buffer per iteration, in exactly the shape a game
+loop takes. The top-level statement list now gets the same whole-body
+escape analysis every function gets.
+`tests/test_codegen.py::TestComputedMapKeyOwnership` (2 tests),
+`tests/test_codegen.py::TestTopLevelBlockScopeTracking` (2 tests).
+
+*`indexOf`.* The first index holding a value, or `-1` -- `-1` rather than
+null because every use of an index is a comparison or a `splice`
+argument, and both read naturally against it. Comparison is by raw slot
+(value for `int`/`float`/`bool`, identity for struct/`arr`/`map` per
+#79), with `text` switching to `strcmp` since #83 copies text on binding
+and two equal strings are almost always two different buffers. Takes no
+ownership: an index is not a reference.
+`tests/test_codegen.py::TestArrayIndexOf` (8 tests).
+
+*Indexing stays unchecked.* `xs[i]` past the end is a genuine
+heap-buffer-overflow, for reads as well as writes -- confirmed under
+AddressSanitizer. A bounds check would sit in the hot path of every loop
+a game writes, so api.md now states plainly that keeping the index in
+range is the user's responsibility, what actually happens when it isn't,
+and which neighbouring operations are *not* in that category (a missing
+map key answers null, an empty `pop`/`shift` answers null, `splice`
+clamps). Indexing is the only unchecked operation in the language.
+
+*One display fix rode along.* `bool`'s null is the reserved bit pattern
+2, and both `festina_log_bool` and `festina_str_from_bool` rendered it
+via a plain `v ? "true" : "false"` -- so it printed as `true`, which made
+#96's "an empty pop answers null" impossible to observe for an
+`arr[bool]`. Both now print `null`; only the sentinel takes that branch.
+
+**claude.md #98**: sounds overlap, and a key press is not a key release.
+
+*Audio voice pool.* `play()` used to cut off whatever that clip was
+already playing -- one `aud`, one thread, one ALSA handle -- so a
+footstep or gunshot fired in rapid succession silenced the one before
+it, and the faster the effect fired the quieter it got. Each `aud` now
+owns a pool of voices (one thread and one device handle per
+simultaneous playback, all streaming the same decoded PCM read-only),
+defaulting to 10 and overridable with `setMaxAudioPlayers(n)` /
+readable back with `maxAudioPlayers()` -- readable back because the
+value is clamped into [1, 64] rather than rejected. At the limit the
+OLDEST voice is stolen rather than the new play being dropped: the
+longest-playing sound is closest to finishing anyway, whereas dropping
+the new play would silence a rapid-fire effect at exactly the moment it
+fires fastest. `setMaxAudioPlayers(1)` reduces exactly to the old
+behaviour. `stop()`/`isPlaying()` stay about the CLIP, not one playback
+of it. A voice that ends naturally stays *joinable* and is joined by
+whoever next claims its slot -- the single-voice design got away with
+never joining a finished thread because it only ever had one; a pool
+that never joined would leak one thread per `play()`.
+One failure mode the pool introduced needed handling: it opens one
+ALSA handle per voice, and not every "default" device does software
+mixing. On a bare `hw:` device with no dmix -- ordinary on minimal and
+embedded Linux, and on any machine where another program holds the
+device exclusively -- the second concurrent open fails with EBUSY, and
+treating that as fatal meant an overlapping `play()` killed the program
+with an error claiming there was no audio device when there plainly was
+one. The single-voice design could never hit it, having never had two
+handles open. A failed open now gives a playing voice's handle back and
+retries, degrading to exactly the pre-pool behaviour (overlapping plays
+cut each other off) rather than dying; only when no other voice is left
+to free is it genuinely fatal, which is the case that error is about.
+`tests/test_codegen.py::TestAudioOnANonMixingDevice` (2 tests).
+
+`tests/test_codegen.py::TestAudioVoicePool` (4 tests) plus 4 more in
+`TestAudio`. The pool tests are a white-box C harness for two reasons
+worth stating: a Festina program cannot count voices (deliberately --
+the pool is not language surface), and the null ALSA device the other
+audio tests use consumes PCM instantly (measured: a 2-second clip
+finishes in 0ms), so under it there is no concurrency left to observe
+at all. The harness replaces the device layer and keeps every line
+above it real; clean under both ThreadSanitizer and AddressSanitizer.
+
+**claude.md #99**: channels are named, and a loop reserves one.
+
+#98's pool gave a clip overlapping playback but no way to address any
+of it -- everything was automatic. `play(n)`, `playLoop(n)` and
+`stopAudioPlayer(n)` add that, each with the channel optional.
+
+*The pool became process-global.* The motivating case is two music
+tracks trading one channel (`adventureMusic.playLoop(0)` then
+`battleMusic.playLoop(0)`), which cannot be expressed at all when each
+clip owns its own pool and "channel 0" means two different things. It
+is also what lets `stopAudioPlayer(0)` be a free function rather than
+something that would have to name a clip to find the channel -- exactly
+backwards, since the point of stopping a channel is not caring what is
+on it.
+
+*`playLoop` reserves.* It repeats the clip (restarting the frame
+counter rather than reopening the device, so there is no gap beyond
+ALSA's buffering) **and** reserves its channel: a reserved channel is
+never auto-assigned and never stolen at the limit. Without that,
+looping music would be evicted by an ordinary sound effect the moment
+the pool filled -- which makes `playLoop` useless for the one thing
+anyone would use it for. Released by `stopAudioPlayer(n)`, by the
+clip's own `stop()`, or by naming the channel in another
+`play(n)`/`playLoop(n)`. That last rule is one assignment in the
+runtime (`locked = looping`): `playLoop(n)` takes the channel and keeps
+it, `play(n)` takes it and hands it back, because a one-shot has
+nothing to reserve it for.
+
+*Boundaries.* An out-of-range channel is clamped into [0, 64) rather
+than being fatal, the same call #98's `setMaxAudioPlayers` already
+makes -- a bad channel number should not kill a running game.
+`setMaxAudioPlayers` bounds only AUTOMATIC assignment; an explicit
+channel is honoured anywhere in range, so `play(40)` works with a pool
+of 10. A limit that silently rewrote explicit requests would be the
+opposite of the control this section exists to give. If every channel
+is reserved, an unnamed `play()` is dropped -- automatic assignment
+looks above the limit first, so this only reaches a program that
+reserved all sixty-four, and the alternative is breaking a reservation
+it asked for.
+
+`stop()`/`isPlaying()` deliberately did not change: both are still
+about the CLIP. A per-playback `isPlaying` would need a handle to a
+playback, which is the pool-as-language-surface this design has refused
+twice.
+`tests/test_codegen.py::TestAudioChannels` (7 tests, white-box for the
+same reasons the pool tests are), 4 end-to-end tests in `TestAudio`
+(including the motivating example's own handover loop, asserting strict
+alternation), and 8 in `tests/test_audio.py` for the signatures. Clean
+under ThreadSanitizer and AddressSanitizer.
+
+**claude.md #101**: images are paths too, more formats, and both media
+types fit in a table.
+
+*`img sprite = 'sprite.png'`.* The `aud` treatment from #100, applied
+to the type that should have had it at the same time -- the asymmetry
+was never a decision, just build order. Sets `uses_graphics_CODE` rather
+than `uses_graphics`, so a headless program that loads a sprite does
+not die on "could not open the X display" (the restriction
+`loadImage()` already avoided, which the short form has no business
+reintroducing).
+
+*JPEG and MP3*, via libjpeg and libmpg123 -- the smallest dependency
+that does each job, chosen the way Xlib was chosen over a GUI toolkit
+(#59). claude.md's audio example always named a `.mp3`, so this closes
+a gap the spec had from the start. Format is sniffed from MAGIC BYTES,
+not the extension: an asset out of a database column has no extension.
+
+*`file:aud` / `pic:img` table columns, stored as SQLite BLOBs.*
+Previously such a column fell through to TEXT, which would truncate at
+the first NUL byte in a PNG header -- it compiled and was nonsense.
+Making it work meant inverting how loading is written: decoding from
+MEMORY is the primitive now and loading a path is "read the file, then
+decode the bytes", which is exactly why one code path serves a file and
+a BLOB. Each handle keeps the bytes it decoded from, so a column stores
+the asset's own encoding: a round trip is byte-identical, an MP3 stays
+an MP3 rather than becoming a much larger WAV, a JPEG stays a JPEG. The
+kept bytes are usually SMALLER than the decoded form beside them (a
+128x64 PNG is ~2KB against 32KB of ARGB32). An image with no source
+bytes (a `clip()`/`resize()` result) is encoded to PNG on demand,
+losslessly. Reading a column back registers the two decoders as
+function pointers from `main()` rather than calling them by name, since
+the core runtime must not reference the graphics/audio units at all --
+that split is what lets a program using neither link neither.
+`tests/test_codegen.py::TestMediaFormatsAndPaths` (6 tests, including a
+real JPEG whose gradient makes a channel swap impossible to miss) and
+`::TestMediaColumnsInTables` (6 tests, comparing stored bytes against
+the fixture with Python's own sqlite3). Fixtures under `tests/fixtures/`
+are committed rather than generated: nothing in this repo can encode a
+JPEG or an MP3, and a hand-rolled approximation would prove only that
+the approximation decodes.
+
+*Three leaks found under LeakSanitizer, two of them introduced here.*
+The `img x = 'path'` sugar silently broke #92's reclamation, whose test
+asks whether the initializer is a Call -- true for `loadImage()`, false
+for a StringLit -- so every image declared the new way leaked, one per
+loop iteration. The predicate is now about whether the initializer
+PRODUCES a fresh handle rather than what its AST node happens to be.
+Separately, `aud` had never been reclaimed by anything: #92 gave `img`
+scope-exit freeing and simply never did the same for audio, unnoticed
+because loading a clip in a loop was awkward to write until #100 made
+it natural. And a query row holding an `aud`/`img` column leaked its
+decoded handle, since #85's row release frees columns with `free()` --
+right for a strdup'd buffer, wrong for a handle owning a Cairo surface
+or a block of PCM.
+
+*One improvement, not a bug fix.* Escape analysis exempted an argument
+to a non-retaining builtin only when it was a bare identifier -- but
+`sqlite()`'s bound parameters are always a LITERAL ARRAY, so in
+practice every value ever bound to a query was treated as escaping and
+never reclaimed. The exemption now reaches inside a literal array
+argument, sound for the same reason the builtin was exempt at all:
+every parameter is bound with `SQLITE_TRANSIENT`.
+
+**claude.md #100**: a path declares a clip, and stopping is by channel.
+
+*`aud music = 'path/track.wav'`.* Every other type naturally written as
+text already worked this way -- `blob data = 'path'` (#36),
+`color red = 'red'` and `font body = '13px arial'` (#91) -- and `aud`
+was the odd one out for no reason beyond build order. Same
+one-directional text -> X allowance, same place in `check_assignable`,
+so it applies wherever an `aud` is expected rather than only at a
+declaration. It differs from colour/font in one way: those are resolved
+at compile time and so need a genuine literal, while this becomes a
+real `loadAudio()` call at the point of conversion -- so the path may
+be any text expression, and the conversion is a real file read wherever
+it happens. `loadAudio('...')` still works; it is the same call spelled
+longer, and breaking every program that uses it would gain nothing.
+
+*`aud.stop()` is removed.* **Breaking change.** It was already wrong
+when #98 gave a clip a pool of voices and #99 only made it more
+obviously so: one clip can be playing on several channels at once
+(three overlapping gunshots are the ordinary case), so "stop this clip"
+never named one thing. Its only honest reading -- stop every copy -- is
+almost never what a program firing overlapping effects wants, and it
+quietly discarded a channel the program had deliberately reserved.
+Playback is addressed by channel now, with no per-clip shortcut. The
+compiler catches `.stop()` by name rather than letting it fall into the
+generic unknown-method error, so the message can name the replacement.
+`isPlaying()` survives the same argument because it does not have the
+same problem: "is this sound audible anywhere" has one answer however
+many channels are playing it, and it is what #99's music-handover
+pattern is built on.
+`tests/test_codegen.py::TestAudio` (4 more tests) and
+`tests/test_audio.py` (4 more).
+
+*`on key` became `on keyDown` + `on keyUp`.* A key held down and a key
+tapped were the same event, so the most ordinary thing a 2D game does
+with the keyboard had no expressible form. **This is a breaking
+change**: `on key` still compiles (claude.md #40 never restricted event
+names) but is now dead code with no runtime event source, exactly like
+`on somethingElse` -- the give-away is that it no longer links the
+graphics runtime in. Both handlers take the same `(key:text)` and share
+one name function, so a release always reports what the press reported.
+Auto-repeat is what makes this usable rather than merely present: X
+synthesizes a KeyRelease before every repeated KeyPress, which would
+have fired a stream of phantom key-ups for exactly the keys the split
+exists for. XKB's detectable auto-repeat is requested at window
+creation, with a queue-peeking filter for servers that lack it; both
+paths verified against a real X server, the fallback by forcing it on.
+`keyDown` deliberately still repeats -- that is how text entry works.
+`tests/test_codegen.py::TestGraphics` (4 key tests, one of which holds a
+key for a full second and asserts exactly one keyUp),
+`tests/test_graphics.py` (5 more, including that bare `on key` no longer
+marks a program as using graphics).
+
 See api.md for the current language/standard library reference and this
 file's own "Status" section above for the implemented-vs-not matrix; the
 short version: nothing is left
@@ -2784,16 +3288,16 @@ own built-in decoder, the backing-store-plus-blit-on-Expose strategy a
 bare Cairo Xlib surface needs since it has no memory of prior drawing,
 and the fixed function-pointer signature per event -- `void
 (*)(int64_t, int64_t)` for click/mouse, `void (*)(const char *)` for
-key, `void (*)(void)` for resize/close -- that's the whole reason
-claude.md #40's five event handlers are each signature-restricted at
-the semantic.py level above). Event dispatch itself lives in a helper,
+keyDown/keyUp, `void (*)(void)` for resize/close -- that's the whole
+reason claude.md #40's six event handlers are each signature-restricted
+at the semantic.py level above). Event dispatch itself lives in a helper,
 `festina_handle_graphics_event` (one already-read `XEvent` in, `0`/`1`
 out signaling whether this was the window-close request) -- factored
 out of what used to be `festina_graphics_run`'s own `while(1)` loop body
 so `festina_run_event_loop` (below) can drive it either as-is or
 interleaved with timer processing: `Expose` -> re-blit, `ButtonPress`/
 `MotionNotify` -> call the registered click/mouse handler if any,
-`KeyPress` -> call the registered key handler if any, with the pressed
+`KeyPress`/`KeyRelease` -> call the registered keyDown/keyUp handler if any, with the pressed
 key's text from `XLookupString` for an ordinary printable character or
 `XKeysymToString`'s X11 key name otherwise (e.g. "Escape", "Return",
 "Left") for anything else, `ConfigureNotify` with a genuine size change
@@ -2878,9 +3382,10 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 561 passed, 281 skipped (needs a C compiler; 2 of
+pytest tests/                          # 605 passed, 323 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
-                                        # 9 need Xvfb + xdotool installed too, 1 of those
-                                        # also needs `openbox`) given a working C compiler,
-                                        # all 842 pass
+                                        # 15 need Xvfb + xdotool installed too, 1 of those
+                                        # also needs `openbox` and 4 need `xwd`) given a
+                                        # working C compiler,
+                                        # all 1008 pass
 ```

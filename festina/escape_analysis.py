@@ -85,6 +85,31 @@ semantic.py's own analyze_statement already uses.
 from . import ast
 
 
+# claude.md #92: builtins none of whose arguments ever escape. The
+# stage-2 machinery below already exempts a call argument when the
+# callee is a user function whose own body proves that position safe;
+# a builtin has no Festina body to analyse, so it defaulted to the
+# conservative "every call argument escapes" rule -- which meant
+# `drawImage(tile, x, y)` alone was enough to keep `tile` alive
+# forever, defeating claude.md #92's own reclamation of a clipped
+# image in exactly the shape it exists for (clip, draw, repeat).
+#
+# Every entry here has been checked against the runtime rather than
+# assumed: each of these reads its argument during the call and keeps
+# no pointer to it afterwards -- Cairo copies the glyphs and pixels it
+# paints, sqlite binds with SQLITE_TRANSIENT, the measure functions
+# only take metrics, and the style setters copy what they need into
+# their own state. Anything not listed keeps the conservative default.
+_NON_RETAINING_BUILTINS = frozenset({
+    "log", "fail",
+    "drawRect", "drawCircle", "drawText", "drawImage",
+    "loadImage", "loadAudio",
+    "fillStyle", "borderColor", "lineWidth", "changeFont",
+    "measureTextWidth", "measureTextHeight",
+    "sqlite", "regex",
+})
+
+
 def find_escaping_names(block, escaping_params=None):
     """Every name that appears anywhere in `block` (an ast.Block -- the
     top-level body of a function or event handler) in a position other
@@ -197,17 +222,43 @@ def _walk_expr(expr, escaping, escaping_params):
         # True when escaping_positions is None, by the `is not None`
         # check that guards it).
         escaping_positions = None
-        if escaping_params is not None and isinstance(expr.callee, ast.Identifier):
-            escaping_positions = escaping_params.get(expr.callee.name)
+        if isinstance(expr.callee, ast.Identifier):
+            if expr.callee.name in _NON_RETAINING_BUILTINS:
+                # claude.md #92: no argument position escapes -- an empty
+                # set exempts every one of them, the same way a fully
+                # safe user function's own analysis would.
+                escaping_positions = frozenset()
+            elif escaping_params is not None:
+                escaping_positions = escaping_params.get(expr.callee.name)
         for i, a in enumerate(expr.args):
-            if (escaping_positions is not None and i not in escaping_positions
-                    and isinstance(a, ast.Identifier)):
-                # Proven safe at this specific call site -- deliberately
-                # NOT added to `escaping` here. `a` may still end up in
-                # `escaping` anyway, through some other, unrelated use
-                # elsewhere in this same function; this only stops this
-                # one call site from being the *reason* it does.
-                continue
+            if escaping_positions is not None and i not in escaping_positions:
+                if isinstance(a, ast.Identifier):
+                    # Proven safe at this specific call site --
+                    # deliberately NOT added to `escaping` here. `a` may
+                    # still end up in `escaping` anyway, through some
+                    # other, unrelated use elsewhere in this same
+                    # function; this only stops this one call site from
+                    # being the *reason* it does.
+                    continue
+                if isinstance(a, ast.ArrayLit):
+                    # claude.md #101: reach INSIDE a literal array
+                    # argument. This exists for sqlite() specifically,
+                    # whose bound parameters must be a literal array
+                    # (see codegen's own restriction) -- so
+                    # `sqlite('... VALUES (?, ?)', [name, track])` is
+                    # the ordinary shape, and testing only for a direct
+                    # Identifier meant every value ever bound to a query
+                    # was treated as escaping. Each parameter is bound
+                    # with SQLITE_TRANSIENT, so sqlite has copied
+                    # whatever it needs before the call returns and
+                    # retains nothing -- exactly the property that put
+                    # this builtin in _NON_RETAINING_BUILTINS in the
+                    # first place. Only bare-Identifier elements are
+                    # exempted; anything else is walked normally.
+                    for element in a.elements:
+                        if not isinstance(element, ast.Identifier):
+                            _walk_expr(element, escaping, escaping_params)
+                    continue
             _walk_expr(a, escaping, escaping_params)
         return
     raise AssertionError(

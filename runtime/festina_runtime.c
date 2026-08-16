@@ -48,7 +48,15 @@
 
 void festina_log_int(int64_t v) { printf("%lld\n", (long long)v); }
 void festina_log_float(double v) { printf("%g\n", v); }
-void festina_log_bool(int8_t v) { printf("%s\n", v ? "true" : "false"); }
+/* claude.md #97: bool's null is the reserved third bit pattern 2 (see
+ * codegen's BOOL_NULL_CONST), and printing it with a plain `v ? true :
+ * false` rendered it as "true" -- indistinguishable from a genuine
+ * true, which made claude.md #96's "popping an empty array gives you
+ * null" impossible to actually observe for an arr[bool]. Only the
+ * sentinel takes this branch, so no real boolean's output changes. */
+void festina_log_bool(int8_t v) {
+    printf("%s\n", v == 2 ? "null" : (v ? "true" : "false"));
+}
 void festina_log_text(const char *v) { printf("%s\n", v ? v : ""); }
 
 void festina_fail(const char *msg) {
@@ -90,7 +98,11 @@ char *festina_str_from_float(double v) {
 }
 
 char *festina_str_from_bool(int8_t v) {
-    return strdup(v ? "true" : "false");
+    /* claude.md #97: same three-way split festina_log_bool uses -- a
+     * bool interpolated into a template has to render its null the
+     * same way logging it does, or `${b}` and `log(b)` would disagree
+     * about the same value. */
+    return strdup(v == 2 ? "null" : (v ? "true" : "false"));
 }
 
 char *festina_str_concat(const char *a, const char *b) {
@@ -126,6 +138,110 @@ char *festina_text_own(const char *s) {
     char *out = strdup(s);
     if (!out) festina_fail("out of memory in festina_text_own");
     return out;
+}
+
+/* ---- claude.md #93: math, files and time ----
+ *
+ * Everything here is libc or libm, both already on every link line
+ * (see cli.py's own link_libs), so none of it costs a new dependency --
+ * claude.md #59's minimal-dependency principle applied to the other
+ * direction: use what is already there before reaching for anything.
+ */
+
+/* Math.random() -- seeded once, lazily, from the clock. Deliberately
+ * plain rand(): this is for gameplay and sampling, not cryptography,
+ * and claiming otherwise by reaching for a CSPRNG would be worse than
+ * being clear about it (see api.md). */
+double festina_random(void) {
+    static int seeded = 0;
+    if (!seeded) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        srand((unsigned int)(ts.tv_sec ^ ts.tv_nsec));
+        seeded = 1;
+    }
+    /* RAND_MAX + 1.0 keeps this in [0, 1) -- dividing by RAND_MAX would
+     * make 1.0 reachable, which every other language's random() excludes
+     * and which breaks the common `arr[floor(random() * length)]`. */
+    return rand() / (RAND_MAX + 1.0);
+}
+
+/* claude.md #93: whole-file text I/O. readFile returns NULL (Festina's
+ * null text) for anything it cannot read, rather than failing the
+ * program -- a missing file is an ordinary condition a program should
+ * be able to test for, the same reasoning claude.md #57 applies to
+ * division by zero. */
+char *festina_read_file(const char *path) {
+    if (!path) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long size = ftell(f);
+    if (size < 0) { fclose(f); return NULL; }
+    rewind(f);
+    char *buf = malloc((size_t)size + 1);
+    if (!buf) { fclose(f); festina_fail("out of memory reading a file"); }
+    size_t got = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    buf[got] = '\0';
+    return buf;
+}
+
+static int8_t festina_put_file(const char *path, const char *content, const char *mode) {
+    if (!path) return 0;
+    if (!content) content = "";
+    FILE *f = fopen(path, mode);
+    if (!f) return 0;
+    size_t len = strlen(content);
+    size_t wrote = fwrite(content, 1, len, f);
+    /* fclose can fail on a full disk even when every fwrite succeeded,
+     * so its result is part of "did this write actually land". */
+    int closed = fclose(f);
+    return (wrote == len && closed == 0) ? 1 : 0;
+}
+
+int8_t festina_write_file(const char *path, const char *content) {
+    return festina_put_file(path, content, "wb");
+}
+
+int8_t festina_append_file(const char *path, const char *content) {
+    return festina_put_file(path, content, "ab");
+}
+
+int8_t festina_file_exists(const char *path) {
+    if (!path) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+int8_t festina_delete_file(const char *path) {
+    if (!path) return 0;
+    return remove(path) == 0 ? 1 : 0;
+}
+
+/* claude.md #93: milliseconds since the Unix epoch -- the same unit and
+ * origin JavaScript's Date.now() uses, which is the convention this
+ * language's timers already follow (setTimeout takes milliseconds). */
+int64_t festina_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* claude.md #93: strftime against local time. Returns NULL (null text)
+ * rather than failing when the format produces nothing that fits, so a
+ * bad format string is testable instead of fatal. */
+char *festina_format_time(int64_t ms, const char *format) {
+    if (!format) format = "%Y-%m-%d %H:%M:%S";
+    time_t secs = (time_t)(ms / 1000);
+    struct tm parts;
+    if (!localtime_r(&secs, &parts)) return NULL;
+    char buf[512];
+    size_t n = strftime(buf, sizeof(buf), format, &parts);
+    if (n == 0) return NULL;
+    return strdup(buf);
 }
 
 int8_t festina_str_eq(const char *a, const char *b) {
@@ -182,7 +298,33 @@ static const char *festina_sql_type(const char *festina_type) {
     if (strcmp(festina_type, "bool") == 0) return "INTEGER";
     if (strcmp(festina_type, "text") == 0) return "TEXT";
     if (strcmp(festina_type, "blob") == 0) return "BLOB";
+    /* claude.md #101: an `aud`/`img` column stores the asset's own
+     * encoded bytes, so BLOB is the only honest SQL type for it. TEXT
+     * (what these used to fall through to) would have silently
+     * truncated at the first NUL byte in a PNG header. */
+    if (strcmp(festina_type, "aud") == 0) return "BLOB";
+    if (strcmp(festina_type, "img") == 0) return "BLOB";
     return "TEXT";
+}
+
+/* claude.md #101: decoders for the two media types, registered by
+ * main() rather than called by name. This translation unit must not
+ * reference anything in the graphics or audio ones -- that separation
+ * is what lets a program which uses neither link neither (see
+ * festina_runtime.h's top-of-file note) -- so a row containing an
+ * `aud`/`img` column reaches its decoder through a pointer that
+ * codegen fills in exactly when the program already links that
+ * feature. Left NULL otherwise, in which case such a column reads as
+ * null rather than crashing. */
+static void *(*g_audio_decoder)(const void *, int64_t, const char *) = NULL;
+static void *(*g_image_decoder)(const void *, int64_t, const char *) = NULL;
+
+void festina_set_audio_decoder(void *(*fn)(const void *, int64_t, const char *)) {
+    g_audio_decoder = fn;
+}
+
+void festina_set_image_decoder(void *(*fn)(const void *, int64_t, const char *)) {
+    g_image_decoder = fn;
 }
 
 /* festina_sync_table below builds several SQL statements incrementally
@@ -398,8 +540,67 @@ void festina_sqlite_bind_text(sqlite3_stmt *stmt, int32_t idx, const char *val) 
     }
 }
 
+/* claude.md #101: binds an `aud`/`img` as its own encoded bytes.
+ * SQLITE_TRANSIENT so sqlite copies immediately -- the asset owns those
+ * bytes and outlives nothing in particular, and a borrowed pointer
+ * would be a live landmine the first time one was freed. */
+void festina_sqlite_bind_blob(sqlite3_stmt *stmt, int32_t idx, const void *data, int64_t len) {
+    if (data && len > 0) {
+        sqlite3_bind_blob64(stmt, idx, data, (sqlite3_uint64)len, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, idx);
+    }
+}
+
 void festina_sqlite_bind_null(sqlite3_stmt *stmt, int32_t idx) {
     sqlite3_bind_null(stmt, idx);
+}
+
+/* claude.md #94: single-value queries.
+ *
+ * Receiving a result previously meant declaring a `table` to hold the
+ * row shape -- and a table declaration CREATES a real table (claude.md
+ * #28-31's automatic schema sync), so asking for `count(*)` or one
+ * json_extract() left a throwaway table sitting in the database
+ * forever. These three take the first column of the first row and
+ * finalize, so a scalar query costs no schema at all.
+ *
+ * A query returning no rows answers with Festina's own null for that
+ * type, rather than failing: "no rows matched" is an ordinary result a
+ * program should be able to test for, the same reasoning claude.md #57
+ * applies to division by zero. */
+int64_t festina_sqlite_scalar_int(sqlite3_stmt *stmt) {
+    int64_t out = festina_null_int();
+    if (sqlite3_step(stmt) == SQLITE_ROW
+            && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+        out = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+double festina_sqlite_scalar_float(sqlite3_stmt *stmt) {
+    double out = festina_null_float();
+    if (sqlite3_step(stmt) == SQLITE_ROW
+            && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+        out = sqlite3_column_double(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+char *festina_sqlite_scalar_text(sqlite3_stmt *stmt) {
+    char *out = NULL;
+    if (sqlite3_step(stmt) == SQLITE_ROW
+            && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+        const unsigned char *txt = sqlite3_column_text(stmt, 0);
+        /* Copied: sqlite owns that buffer only until the next step or
+         * finalize, and Festina text is always an owned buffer
+         * (claude.md #83). */
+        if (txt) out = strdup((const char *)txt);
+    }
+    sqlite3_finalize(stmt);
+    return out;
 }
 
 void festina_sqlite_exec(sqlite3_stmt *stmt) {
@@ -446,6 +647,20 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
             if (strcmp(t, "float") == 0) {
                 double d = is_null ? festina_null_float() : sqlite3_column_double(stmt, c);
                 memcpy(&row[c], &d, sizeof(double));
+            } else if (strcmp(t, "aud") == 0 || strcmp(t, "img") == 0) {
+                /* claude.md #101: rebuild the asset from the stored
+                 * bytes. sqlite3_column_blob's pointer is only valid
+                 * until the next step, which is exactly why the decoder
+                 * copies what it needs rather than borrowing. */
+                void *handle = NULL;
+                void *(*decode)(const void *, int64_t, const char *) =
+                    strcmp(t, "aud") == 0 ? g_audio_decoder : g_image_decoder;
+                if (!is_null && decode) {
+                    const void *blob = sqlite3_column_blob(stmt, c);
+                    int blob_len = sqlite3_column_bytes(stmt, c);
+                    if (blob && blob_len > 0) handle = decode(blob, blob_len, "<database>");
+                }
+                memcpy(&row[c], &handle, sizeof(void *));
             } else if (strcmp(t, "text") == 0 || strcmp(t, "blob") == 0) {
                 char *copy = NULL;
                 if (!is_null) {
@@ -1055,6 +1270,161 @@ void festina_map_free_entries(int64_t count, void *entries) {
  * function handles every arr[T] and a single generic function handles
  * every map[T] -- no per-type codegen-generated wrapper needed here at
  * all, unlike the struct case. */
+/* ---- claude.md #96: array methods ----
+ *
+ * The header layout is the one festina/codegen.py's own
+ * FESTINA_ARRAY_LLVM_TYPE describes -- {length, data} -- shared here
+ * the same way the sqlite row layout already is, since these functions
+ * have to resize a buffer codegen allocated.
+ *
+ * Values move by BYTES, with the element size passed in: codegen knows
+ * it at compile time for every arr[T], so one set of functions covers
+ * every element type instead of a family per type. Ownership of an
+ * element being removed transfers to whoever receives it (pop/shift
+ * hand it back, splice hands it to the returned array), which is why
+ * nothing here releases anything -- doing so would free a value the
+ * caller is about to be handed.
+ *
+ * Growth is a plain realloc per push rather than geometric
+ * over-allocation, which would need a capacity field in the header. In
+ * practice glibc extends in place for a growing buffer most of the
+ * time, and the lists this is for (entities in a scene, rows being
+ * accumulated) are small; if that ever stops being true, adding
+ * capacity is an additive change to the header, not a redesign.
+ */
+typedef struct {
+    int64_t length;
+    void *data;
+} FestinaArrayHeader;
+
+static void festina_array_resize(FestinaArrayHeader *a, int64_t elem_size,
+                                  int64_t new_length) {
+    if (new_length <= 0) {
+        free(a->data);
+        a->data = NULL;
+        a->length = 0;
+        return;
+    }
+    void *grown = realloc(a->data, (size_t)(new_length * elem_size));
+    if (!grown) festina_fail("out of memory growing an array");
+    a->data = grown;
+    a->length = new_length;
+}
+
+void festina_array_push(void *hdr, int64_t elem_size, const void *value) {
+    FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
+    if (!a || !value) return;
+    int64_t at = a->length;
+    festina_array_resize(a, elem_size, at + 1);
+    memcpy((char *)a->data + at * elem_size, value, (size_t)elem_size);
+}
+
+void festina_array_unshift(void *hdr, int64_t elem_size, const void *value) {
+    FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
+    if (!a || !value) return;
+    int64_t was = a->length;
+    festina_array_resize(a, elem_size, was + 1);
+    if (was > 0) {
+        memmove((char *)a->data + elem_size, a->data, (size_t)(was * elem_size));
+    }
+    memcpy(a->data, value, (size_t)elem_size);
+}
+
+/* pop/shift leave *out untouched when there is nothing to remove --
+ * codegen has already stored the element type's own null there, so an
+ * empty pop() answers null rather than needing a second return value. */
+int8_t festina_array_pop(void *hdr, int64_t elem_size, void *out) {
+    FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
+    if (!a || a->length <= 0) return 0;
+    memcpy(out, (char *)a->data + (a->length - 1) * elem_size, (size_t)elem_size);
+    festina_array_resize(a, elem_size, a->length - 1);
+    return 1;
+}
+
+int8_t festina_array_shift(void *hdr, int64_t elem_size, void *out) {
+    FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
+    if (!a || a->length <= 0) return 0;
+    memcpy(out, a->data, (size_t)elem_size);
+    int64_t rest = a->length - 1;
+    if (rest > 0) {
+        memmove(a->data, (char *)a->data + elem_size, (size_t)(rest * elem_size));
+    }
+    festina_array_resize(a, elem_size, rest);
+    return 1;
+}
+
+/* JavaScript's own clamping, deliberately: a negative start counts back
+ * from the end, everything out of range clamps rather than failing, and
+ * a start past the end removes nothing. Anything stricter would make
+ * the common `splice(i, 1)` inside a loop a source of crashes at the
+ * boundaries instead of a no-op. `dst` is a header codegen already
+ * allocated for the result. */
+void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
+                           int64_t count, void *dst_hdr) {
+    FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
+    FestinaArrayHeader *dst = (FestinaArrayHeader *)dst_hdr;
+    if (dst) { dst->length = 0; dst->data = NULL; }
+    if (!a || a->length <= 0) return;
+
+    int64_t len = a->length;
+    if (start < 0) {
+        start = len + start;
+        if (start < 0) start = 0;
+    }
+    if (start > len) start = len;
+    if (count < 0) count = 0;
+    if (start + count > len) count = len - start;
+    if (count == 0) return;
+
+    if (dst) {
+        dst->data = malloc((size_t)(count * elem_size));
+        if (!dst->data) festina_fail("out of memory in splice()");
+        memcpy(dst->data, (char *)a->data + start * elem_size,
+               (size_t)(count * elem_size));
+        dst->length = count;
+    }
+    int64_t tail = len - (start + count);
+    if (tail > 0) {
+        memmove((char *)a->data + start * elem_size,
+                (char *)a->data + (start + count) * elem_size,
+                (size_t)(tail * elem_size));
+    }
+    festina_array_resize(a, elem_size, len - count);
+}
+
+/* claude.md #97: indexOf -- the first index holding `value`, or -1.
+ *
+ * -1 rather than null because the answer is an INDEX, and every use of
+ * it is a comparison or a splice argument: `if xs.indexOf(v) >= 0` and
+ * `xs.splice(xs.indexOf(v), 1)` both read naturally, where a null index
+ * would have to be tested separately before it could be used at all.
+ * It is also what JavaScript's own indexOf answers, which is the
+ * convention this language's array methods already follow.
+ *
+ * Comparison is by the element's raw 8-byte slot, which is exactly
+ * right for int/float/bool and for identity on struct/arr[T]/map[T]
+ * (two bindings naming one value share its pointer -- claude.md #79).
+ * `text` is the one type where that is wrong, since equal strings are
+ * usually different buffers, so codegen passes is_text and this
+ * compares with strcmp instead. */
+int64_t festina_array_index_of(void *hdr, int64_t elem_size,
+                                const void *value, int8_t is_text) {
+    FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
+    if (!a || !value || a->length <= 0 || !a->data) return -1;
+    for (int64_t i = 0; i < a->length; i++) {
+        const char *slot = (const char *)a->data + i * elem_size;
+        if (is_text) {
+            const char *have = *(const char *const *)slot;
+            const char *want = *(const char *const *)value;
+            if (have == want) return i;              /* both null, or same buffer */
+            if (have && want && strcmp(have, want) == 0) return i;
+        } else if (memcmp(slot, value, (size_t)elem_size) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 void festina_release_array(void *payload) {
     if (!festina_release_check(payload)) return;
     /* payload is {i64 length, ptr data} -- skip past the i64 to reach
