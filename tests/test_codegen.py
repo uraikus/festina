@@ -3873,15 +3873,25 @@ class TestAutomaticMemoryReclamation:
 
 
 def _find_window(display, timeout=20):
-    # 20s, not the 10s an isolated run needs comfortably -- TestGraphics
-    # compiles a fresh binary (a real gcc invocation) and spawns a fresh
-    # Xvfb instance per interactive test, back to back; under real
-    # contention (the full suite, or just a loaded sandbox) that
-    # occasionally pushes a single window's startup past 10s even though
-    # the underlying Xvfb/window-creation code itself is reliable in
-    # isolation (verified directly, outside pytest, with no failures in
-    # 15 repeated runs). Module-level (not a method) so TestTimers's one
-    # combined graphics+timers test can reuse it too.
+    # A window actually appears in ~0.2s, measured, consistently -- this
+    # timeout is generous insurance, not a figure anything is expected
+    # to approach.
+    #
+    # It used to be 20s for a reason that turned out to be a
+    # misdiagnosis, recorded here so it isn't re-derived: TestGraphics
+    # was intermittently flaky (roughly a third of full-suite runs,
+    # essentially never in isolation), and that was attributed to
+    # contention pushing a window's startup past the old 10s, so the
+    # timeout was doubled. Raising it never helped, and could not have:
+    # the compiled program had already exited by then. The real cause
+    # was a single un-retried XOpenDisplay in festina_graphics_init --
+    # one transient connection refusal under load killed the program
+    # outright, with a fatal error naming entirely the wrong cause ("is
+    # $DISPLAY set?"). Fixed in the runtime (claude.md #87), which is
+    # what actually made these tests deterministic; see that section for
+    # the forensics proving the server was alive and reachable the whole
+    # time. Module-level (not a method) so TestTimers's one combined
+    # graphics+timers test can reuse it too.
     deadline = time.time() + timeout
     while time.time() < deadline:
         result = subprocess.run(
@@ -5847,3 +5857,293 @@ class TestParameterReassignmentOwnership:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "hello\n"
+
+
+class TestQueryRowAndRegexReclamation:
+    """claude.md #85: two leak classes the text work (claude.md #83)
+    surfaced but did not itself cause, both pre-existing and both
+    unbounded rather than one-off.
+
+    A sqlite result row is deliberately not shaped like any other
+    Festina value: `festina_sqlite_collect_rows` builds each one as a
+    plain `malloc(col_count * sizeof(int64_t))` with each text/blob
+    column strdup'd into its slot, and no refcount header in front of
+    it. Every `isinstance(t, (StructType, ArrayType, MapType))` check in
+    codegen misses `TableType` entirely, so nothing ever freed a row or
+    its text columns -- and `arr[People] rows = sqlite(...)` is the
+    language's most central idiom, so every query leaked its whole row
+    set. The array header and its pointer buffer WERE already freed
+    (an arr[T] is an arr[T] whatever its element type); only the rows
+    hanging off it were not.
+
+    Because a row has no refcount header, this cannot reuse
+    `festina_release`, and -- more importantly -- the array owns its
+    rows outright: a `People p = rows[0]` local is only ever borrowing
+    one. So the per-row free is reached solely from
+    `_release_fn_for_array`'s own cascade, never from
+    `_release_fn_for`, which would otherwise let an arbitrary
+    TableType-typed binding double-free a row the array still owns.
+
+    Separately, a regex compiled by a runtime `regex(...)` call was
+    never freed either, so a `regex(...)` inside a loop leaked a full
+    compiled automaton (several KB) per iteration. A /pattern/ literal
+    is compiled once into a process-lifetime cache and must NOT be
+    freed, which is exactly what separates the two: only `regex(...)`
+    is an ast.Call."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_array_of_query_rows_gets_a_per_row_release_cascade(self, parser, semantic, codegen):
+        source = """
+        table People { id:int  name:text }
+        void func run() {
+            arr[People] rows = sqlite('SELECT * FROM People')
+            log(rows.length)
+        }
+        run()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "@__festina_release_row_People" in ir
+        # the generated row release frees the text column and the row
+        row_fn = ir.split("define void @__festina_release_row_People")[1].split("\n}")[0]
+        assert row_fn.count("call void @free(") == 2
+
+    def test_row_release_only_frees_text_and_blob_columns(self, parser, semantic, codegen):
+        # int/float/bool columns are plain i64 slots, never heap
+        # pointers -- freeing one would be freeing an integer.
+        source = """
+        table Mixed { id:int  score:float  ok:bool  name:text  data:blob }
+        void func run() {
+            arr[Mixed] rows = sqlite('SELECT * FROM Mixed')
+            log(rows.length)
+        }
+        run()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        row_fn = ir.split("define void @__festina_release_row_Mixed")[1].split("\n}")[0]
+        # 2 heap columns (name, data) + the row buffer itself
+        assert row_fn.count("call void @free(") == 3
+
+    def test_runtime_regex_temporary_is_freed(self, parser, semantic, codegen):
+        source = """
+        void func run() {
+            log(regex('[0-9]+').test('abc 42'))
+        }
+        run()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_regex_free(" in ir
+
+    def test_cached_regex_literal_is_never_freed(self, parser, semantic, codegen):
+        # A /pattern/ literal is compiled once and reused for the life
+        # of the process -- freeing it would leave the cache holding a
+        # dangling regex_t for every later evaluation.
+        source = """
+        void func run() {
+            log(/[0-9]+/.test('abc 42'))
+        }
+        run()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_regex_free(" not in ir
+
+    def test_query_rows_and_borrowed_row_stay_correct(self, compile_and_run, tmp_path):
+        source = """
+        table People { id:int  name:text }
+        void func run() {
+            sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'alice'])
+            sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [2, 'bob'])
+            arr[People] rows = sqlite('SELECT * FROM People ORDER BY id')
+            log(rows.length)
+            People first = rows[0]
+            log(first.name)
+            text copied = rows[1].name
+            log(copied)
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\nalice\nbob\n"
+
+    def test_runtime_and_literal_regexes_stay_correct_together(self, compile_and_run):
+        source = """
+        void func run() {
+            for int i = 0, i < 3, i++ {
+                log(regex('[0-9]+').test('abc 42'))
+                log('room 42'.replace(regex('[0-9]+'), 'N'))
+                log('room 42'.match(regex('[0-9]+')))
+                log(/[0-9]+/.test('abc 42'))
+                log('room 42'.replace(/[0-9]+/, 'N'))
+            }
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\nroom N\n42\ntrue\nroom N\n" * 3
+
+
+class TestOwnedRegexLocals:
+    """claude.md #86: a `regex` local this scope provably owns outright
+    -- one whose initializer is a `regex(...)` Call (freshly compiled by
+    festina_regex_compile, so nothing else can reference it yet) and
+    whose name escape analysis proves never leaves the function -- is
+    freed at scope exit. Before this, `regex r = regex(p)` inside a loop
+    leaked a full compiled automaton (several KB) per iteration; #85 had
+    only closed the case where the regex is used as a temporary in the
+    same expression that compiled it.
+
+    Both halves of the ownership test are load-bearing, and relaxing
+    either frees something still in use. A `/pattern/` literal
+    initializer is a pointer into a process-lifetime cache, so freeing
+    it would leave every later evaluation of that literal running
+    regexec against freed memory. An escaping regex has no equivalent of
+    text's copy-on-alias escape hatch -- a regex "copy" would mean
+    recompiling, and the pattern string isn't retained to recompile
+    from -- so it is left to leak exactly as before rather than freed
+    while another binding may still point at it."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_non_escaping_regex_local_from_a_call_is_freed(self, parser, semantic, codegen):
+        source = """
+        void func f() {
+            regex r = regex('[0-9]+')
+            log(r.test('42'))
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        assert "call void @festina_regex_free(" in body
+
+    def test_regex_local_from_a_literal_is_never_freed(self, parser, semantic, codegen):
+        source = """
+        void func f() {
+            regex r = /[0-9]+/
+            log(r.test('42'))
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_regex_free(" not in ir
+
+    def test_escaping_regex_local_is_not_freed(self, parser, semantic, codegen):
+        source = """
+        regex g = /[a-z]+/
+        void func f() {
+            regex r = regex('[0-9]+')
+            g = r
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        assert "call void @festina_regex_free(" not in body
+
+    def test_owned_literal_and_escaping_regexes_stay_correct_together(self, compile_and_run):
+        source = """
+        regex g = /[0-9]+/
+        void func owned() {
+            for int i = 0, i < 50, i++ {
+                regex r = regex('[0-9]+')
+                log(r.test('abc 42'))
+            }
+        }
+        void func fromLiteral() {
+            regex r = /[a-z]+/
+            log(r.test('abc'))
+        }
+        void func escapes() {
+            regex r = regex('[0-9]+')
+            g = r
+            log(r.test('42'))
+        }
+        owned()
+        fromLiteral()
+        escapes()
+        log(g.test('42'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\n" * 53
+
+
+class TestStructTextFieldReclamation:
+    """claude.md #88: a struct's own text-typed field is freed when the
+    struct is, in both directions the same predicate gates.
+
+    claude.md #83 added the field-level free itself but never widened
+    the eligibility check that decides whether a struct needs field
+    cleanup at all -- it still only counted struct/arr[T]/map[T] fields
+    (`_struct_has_own_refcounted_field`, now
+    `_struct_has_own_managed_field`). So a struct whose only managed
+    field is a text one fell through both paths: stack-allocated, it was
+    never scheduled for field release at all; heap-allocated, it got the
+    plain generic @festina_release instead of a per-struct wrapper.
+    Either way the field's buffer was never freed. Caught by an ASan run
+    over a struct whose text field is reassigned in a loop."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_struct_with_only_a_text_field_gets_a_release_wrapper(self, parser, semantic, codegen):
+        source = """
+        struct Person { name:text }
+        Person g
+        Person func make() { Person p  p.name = `x`  return p }
+        g = make()
+        log(g.name)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "define void @__festina_release_struct_Person" in ir
+        wrapper = ir.split("define void @__festina_release_struct_Person")[1].split("\n}")[0]
+        # the text field, then the struct's own header
+        assert wrapper.count("call void @free(") == 2
+
+    def test_stack_allocated_struct_frees_its_text_field(self, parser, semantic, codegen):
+        source = """
+        struct Person { name:text }
+        void func f() {
+            Person p
+            p.name = `x`
+            log(p.name)
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        # stack-allocated: no calloc for the struct, but the field is freed
+        assert "alloca %struct.Person" in body
+        assert "call void @free(" in body
+
+    def test_struct_text_fields_stay_correct_across_stack_heap_and_global(self, compile_and_run):
+        source = """
+        struct Person { name:text  age:int }
+        Person g
+        text func upper(s:text) { return `[${s}]` }
+        Person func make(n:text) { Person p  p.name = upper(n)  return p }
+        void func run() {
+            Person p
+            p.name = 'field'
+            p.name = upper(p.name)
+            log(p.name)
+            Person q = make('heap')
+            log(q.name)
+        }
+        run()
+        g = make('global')
+        log(g.name)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "[field]\n[heap]\n[global]\n"

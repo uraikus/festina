@@ -270,9 +270,22 @@ difference except that each binding can be freed independently. That's
 what lets a text value be freed on every reassignment and at every
 scope exit unconditionally, with no escape analysis involved — a loop
 that rebuilds a string each iteration (`` s = `${s}x` ``) frees the
-previous buffer every time instead of accumulating them. Two cases are
-not yet reclaimed: text passed to the graphics, sqlite, and timer
-builtins, and text globals at process exit.
+previous buffer every time instead of accumulating them.
+
+Query results are reclaimed too: the rows an `arr[Table]` holds, and
+each row's own text columns, are freed when that array is — so a
+program that queries repeatedly no longer grows without bound. A single
+row read out of one (`People p = rows[0]`) borrows from the array
+rather than owning a copy, so it stays valid exactly as long as the
+array does. A regex compiled at runtime and used straight away
+(`regex(p).test(s)`) is freed after use, while a `/pattern/` literal is
+compiled once and kept for the life of the process. A regex bound to a variable is reclaimed too, when the
+compiler can prove it safe — one compiled by `regex(...)` and never
+shared outside the function it was declared in. A regex that escapes,
+and one bound from a `/pattern/` literal (which is compiled once and
+shared for the life of the process), are both deliberately left alone.
+The one thing not reclaimed is text globals at process exit, where the
+operating system reclaims everything anyway.
 
 ## Arrays
 

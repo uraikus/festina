@@ -593,12 +593,70 @@ for the full design writeup.
   parameter the callee assigns to its own reference at binding time,
   released at the callee's own scope exit.
 
-  Two text-related resource leaks remain deliberately open and are
-  tracked rather than claimed closed: text arguments to the graphics,
-  sqlite, and timer builtins are not yet freed (temporaries at
-  `log()`, user function calls, and the text/regex methods are), and
-  text globals are not freed at process exit — matching how every other
-  global already behaves. See [todo.md](todo.md#memory-management).
+  `claude.md #85` (stage 11) closes two further pre-existing leak
+  classes that the text work surfaced but did not cause, both unbounded
+  rather than one-off. A sqlite result row is built by
+  `festina_sqlite_collect_rows` as a plain `malloc` with its text
+  columns strdup'd in and **no refcount header**, and `TableType` is a
+  separate type class from `StructType`, so every
+  `isinstance(t, (StructType, ArrayType, MapType))` check in codegen
+  missed it and nothing ever freed a row or its text columns — meaning
+  `arr[People] rows = sqlite(...)`, this language's most central idiom,
+  leaked its entire row set on every query. The container itself was
+  always freed correctly; only the rows hanging off it were not.
+  Because a row has no header it cannot go through `festina_release`,
+  and because the array owns its rows outright a `People p = rows[0]`
+  local is only borrowing one — so the per-row free is reached solely
+  from the array's own element cascade and deliberately not exposed
+  through `_release_fn_for`, which would otherwise let an arbitrary
+  TableType binding free a row the array still owns. Separately, every
+  runtime `regex(...)` call compiled a `regex_t` nothing ever freed, so
+  a `regex(...)` inside a loop leaked a full automaton per iteration;
+  those are now released via `festina_regex_free`, while a `/pattern/`
+  literal — compiled once into a process-lifetime cache — is
+  deliberately left alone, since freeing one would leave every later
+  evaluation running against a dangling `regex_t`.
+
+  `claude.md #86` (stage 12) closes the regex-bound-to-a-variable leak
+  stage 11 had left open and mischaracterised as bounded: `regex r =
+  regex(p)` *inside a loop* leaks a full compiled automaton per
+  iteration, so it was unbounded. A regex local whose initializer is a
+  `regex(...)` call and which escape analysis proves never escapes is
+  now freed at scope exit. Both halves of that test are load-bearing —
+  a `/pattern/` literal initializer points into a process-lifetime
+  cache, so freeing it would leave every later evaluation running
+  `regexec` against freed memory, and an escaping regex has no
+  equivalent of text's copy-on-alias trick (a regex "copy" would mean
+  recompiling, and the pattern isn't retained to recompile from), so it
+  is deliberately left to leak rather than freed while still
+  referenced. Reached only through the scope-exit path and never
+  through `_release_fn_for`, since routing it through the generic
+  dispatcher would make an `arr[regex]` cascade free elements that may
+  themselves be cached literals.
+
+  One resource leak remains deliberately open: text globals at process
+  exit. Worth stating precisely — LeakSanitizer already reports these
+  runs clean, since a global stays reachable through its own variable;
+  it only appears if global-root scanning is explicitly disabled. At
+  most one buffer per global survives (every reassignment already frees
+  the previous value), so freeing them would be exit-time busywork for
+  no observable benefit. See [todo.md](todo.md#memory-management).
+
+- **A graphics program could die on a transient X connection failure**
+  (`claude.md #87`), which was also the sole cause of the test suite's
+  one intermittently flaky test. `festina_graphics_init` called
+  `XOpenDisplay` exactly once, and Xlib does no retrying of its own, so
+  a single refused connection under load killed the program with a
+  fatal error naming entirely the wrong cause ("is `$DISPLAY` set?").
+  Not a memory-safety issue, but a real robustness gap for anyone
+  launching a graphics program on a busy machine. Confirmed as a
+  genuine transient rather than a dead or misaddressed server: at the
+  moment of failure the X server process was alive, its socket and lock
+  file were present with the lock naming that same live server's pid,
+  and `xdotool` connected to that exact display successfully both
+  immediately before and immediately after. Now retried ten times,
+  100ms apart, so a genuinely absent server still fails with the same
+  clear message in about a second.
 
   What changed across all seven stages is that each one's own fix, at
   every step of building it out, was verified with the same rigor the

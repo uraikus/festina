@@ -492,6 +492,29 @@ class _StackArrayOrMap:
         self.type_ = type_
 
 
+class _OwnedRegex:
+    """claude.md #86: marks, in CodeGen._active_free_locals, a `regex`
+    local this scope provably owns outright -- one whose initializer is
+    a `regex(...)` Call (freshly compiled by festina_regex_compile, so
+    nothing else can reference it yet) and whose name escape analysis
+    proves never escapes the declaring function.
+
+    Both halves are load-bearing, and getting either wrong frees
+    something still in use. A regex whose initializer is a /pattern/
+    literal is NOT owned: that pointer comes from a process-lifetime
+    cache (see _emit_cached_regex_lit), and freeing it would leave every
+    later evaluation of that literal running regexec against a freed
+    regex_t. A regex that escapes is not owned either: `text`'s trick of
+    copying at each consuming site to guarantee exclusivity has no
+    regex equivalent (a "copy" would mean recompiling, and the pattern
+    string isn't retained to recompile from), so an escaping regex is
+    left to leak exactly as it did before, rather than freed while
+    another binding may still be pointing at it."""
+
+    def __init__(self):
+        pass
+
+
 class CodeGen:
     def __init__(self, analyzed, filename="main.f"):
         self.analyzed = analyzed
@@ -523,6 +546,16 @@ class CodeGen:
         self._map_release_fns = {}             # claude.md #80: the map[T] counterpart to
                                                 # self._array_release_fns -- see
                                                 # _release_fn_for_map's own comment.
+        self._table_row_release_fns = {}       # claude.md #85: table name -> LLVM function name of its
+                                                # own lazily-generated per-row release function, freeing
+                                                # one sqlite result row's text/blob columns and then the
+                                                # row buffer itself. Deliberately NOT reachable through
+                                                # _release_fn_for: a sqlite row has no refcount header
+                                                # (see festina_sqlite_collect_rows, a plain malloc), so
+                                                # it is owned solely by the arr[T] holding it and must
+                                                # only ever be freed by that array's own release --
+                                                # never by an arbitrary TableType-typed binding, which
+                                                # would double-free a row the array still owns.
         self.extra_globals = []                # globals discovered while emitting main() (e.g. table column arrays)
         self.entry_stmts = []                  # top-level statements for __festina_main
         self.func_decls = {}                   # name -> ast.FuncDecl (for signatures)
@@ -790,6 +823,7 @@ class CodeGen:
             "declare void @festina_sqlite_collect_rows(ptr, i32, ptr, ptr, ptr)",
             # claude.md #67-68: regex(), .test(), .match(), .replace()/.replaceAll().
             "declare ptr @festina_regex_compile(ptr, ptr)",
+            "declare void @festina_regex_free(ptr)",
             "declare i8 @festina_regex_test(ptr, ptr)",
             "declare ptr @festina_regex_match(ptr, ptr)",
             "declare ptr @festina_str_replace(ptr, ptr, ptr, i8)",
@@ -1056,6 +1090,15 @@ class CodeGen:
                     # retained a reference nothing else will ever
                     # release otherwise.
                     self._emit_release_nested_fields_only(ref, type_.struct_type, lines)
+                elif isinstance(type_, _OwnedRegex):
+                    # claude.md #86: a regex this scope compiled itself
+                    # and provably never shared -- regfree + free, via
+                    # the same helper #85 already uses for a regex
+                    # temporary. Never reached for a /pattern/ literal
+                    # or an escaping binding; see _OwnedRegex's comment.
+                    compiled = self.tmp()
+                    lines.append(f"  {compiled} = load ptr, ptr {ref}")
+                    lines.append(f"  call void @festina_regex_free(ptr {compiled})")
                 elif isinstance(type_, _StackArrayOrMap):
                     # claude.md #79: a stack-allocated arr[T]/map[T]
                     # local (see _emit_block's own tracking comment) --
@@ -1476,7 +1519,7 @@ class CodeGen:
                                                    and stmt.name not in self._current_escaping_names)
                             if not is_stack_allocated:
                                 self._active_free_locals[-1].append((ref, type_))
-                            elif self._struct_has_own_refcounted_field(type_.name):
+                            elif self._struct_has_own_managed_field(type_.name):
                                 # claude.md #78: this local's own
                                 # storage is stack-allocated and never
                                 # itself released -- but writing into
@@ -1489,6 +1532,21 @@ class CodeGen:
                                 # comment.
                                 self._active_free_locals[-1].append(
                                     (ref, _StackStructFieldsOnly(type_)))
+                        elif type_ == REGEX:
+                            # claude.md #86: only a regex this scope
+                            # compiled itself (a `regex(...)` Call, so
+                            # freshly allocated and unshared) and that
+                            # escape analysis proves never leaves this
+                            # function is freed here. A /pattern/
+                            # literal initializer is a process-lifetime
+                            # cached pointer that must never be freed,
+                            # and an escaping regex has no copy-on-alias
+                            # escape hatch the way text does -- both are
+                            # left to leak, exactly as before. See
+                            # _OwnedRegex's own comment.
+                            if (isinstance(stmt.init, ast.Call)
+                                    and stmt.name not in self._current_escaping_names):
+                                self._active_free_locals[-1].append((ref, _OwnedRegex()))
                         elif type_ == TEXT:
                             # claude.md #83: unlike the other three
                             # types, a text local is ALWAYS scheduled
@@ -2885,6 +2943,26 @@ class CodeGen:
         if vtype == TEXT and self._is_owning_text_source(source_expr):
             lines.append(f"  call void @free(ptr {val})")
 
+    def _free_regex_temp(self, source_expr, val, vtype, lines):
+        """claude.md #85: the regex counterpart to _free_text_temp --
+        frees a regex_t compiled by a runtime `regex(...)` call and used
+        directly as a method's own receiver or argument
+        (`regex(p).test(s)`), which nothing previously ever freed, so a
+        `regex(...)` inside a loop leaked a full compiled automaton
+        (several kilobytes) per iteration.
+
+        The owning test is `isinstance(source_expr, ast.Call)`, which
+        cleanly separates the two ways a regex value is produced: only
+        `regex(...)` is a Call, while a /pattern/ literal is an
+        ast.RegexLit compiled once into a process-lifetime cache (see
+        _emit_cached_regex_lit) that must never be freed. A regex bound
+        to a variable is an Identifier at its use sites and so is
+        likewise never freed here -- it still leaks, as it did before,
+        since regex has no binding-level ownership story the way text
+        now does (see todo.md)."""
+        if vtype == REGEX and isinstance(source_expr, ast.Call):
+            lines.append(f"  call void @festina_regex_free(ptr {val})")
+
     def _is_stack_allocatable_array_or_map_decl(self, stmt, type_):
         """claude.md #79 (extended by #81): whether an arr[T]/map[T]-
         typed VarDecl can keep its own HEADER on the stack instead of
@@ -3034,13 +3112,25 @@ class CodeGen:
             return "@free"
         raise CodegenError(f"cannot release a value of type {types_mod.type_name(type_)}")
 
-    def _struct_has_own_refcounted_field(self, name):
-        """claude.md #78 (widened by claude.md #79 to arr[T]/map[T]
-        fields too): True when the struct declared `name` has at least
-        one field of its own that is itself a struct/array/map-typed
-        value -- never transitively (see _release_fn_for_struct's own
-        comment on why only the direct case needs checking here)."""
+    def _struct_has_own_managed_field(self, name):
+        """claude.md #78 (widened by #79 to arr[T]/map[T] fields, and by
+        #83 to text ones): True when the struct declared `name` has at
+        least one field of its own whose value this compiler manages --
+        a struct/array/map (refcounted) or a text (an exclusively-owned
+        heap buffer) -- never transitively (see _release_fn_for_struct's
+        own comment on why only the direct case needs checking here).
+
+        The text case was missed when #83 first landed, and it was a
+        real leak in both directions this predicate gates: a
+        stack-allocated struct local with a text field was never
+        scheduled for field release at all, and a heap-allocated one got
+        the plain generic @festina_release instead of a per-struct
+        wrapper, so in neither case was the field's own buffer ever
+        freed. Caught by an ASan run over a struct whose text field is
+        reassigned (`p.name = `tmpl ${p.name}``), which leaked the
+        field's final buffer every time."""
         return any(isinstance(t, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+                   or t == TEXT
                    for _, t in self.struct_fields(name))
 
     def _release_fn_for_struct(self, type_):
@@ -3082,7 +3172,7 @@ class CodeGen:
         own fields" is a DAG by construction, never a cycle -- a
         struct's own release wrapper can transitively call another
         struct's, but never, even indirectly, its own."""
-        if not self._struct_has_own_refcounted_field(type_.name):
+        if not self._struct_has_own_managed_field(type_.name):
             return "@festina_release"
         if type_.name in self._struct_release_fns:
             return self._struct_release_fns[type_.name]
@@ -3198,7 +3288,8 @@ class CodeGen:
         used" rule forbids it -- there is no way to even *write* a
         self-referential arr[T] type in Festina's own grammar."""
         elem_type = type_.element
-        if not (isinstance(elem_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+        if not (isinstance(elem_type, (types_mod.StructType, types_mod.ArrayType,
+                                       types_mod.MapType, types_mod.TableType))
                 or elem_type == TEXT):
             return "@festina_release_array"
         key = types_mod.type_name(type_)
@@ -3206,7 +3297,13 @@ class CodeGen:
             return self._array_release_fns[key]
         fn_name = f"@__festina_release_array_{self._unique()}"
         self._array_release_fns[key] = fn_name
-        elem_release_fn = self._release_fn_for(elem_type)
+        # claude.md #85: an arr[Table] owns its rows outright (they have
+        # no refcount header of their own to share), so its cascade
+        # frees each one directly instead of releasing a reference.
+        if isinstance(elem_type, types_mod.TableType):
+            elem_release_fn = self._emit_table_row_release_fn(elem_type)
+        else:
+            elem_release_fn = self._release_fn_for(elem_type)
         elem_llvm_ty = _llvm_type(elem_type)
         body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
         should_free = self.tmp()
@@ -3232,6 +3329,50 @@ class CodeGen:
         body.append(f"  call void @free(ptr {header})")
         body.append(f"  br label %{done_label}")
         body.append(f"{done_label}:")
+        body.append("  ret void")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _emit_table_row_release_fn(self, table_type):
+        """claude.md #85: generates and registers a per-table function
+        freeing exactly one sqlite result row -- each of its own
+        text/blob columns, then the row buffer itself.
+
+        A row is deliberately not shaped like any other Festina value:
+        festina_sqlite_collect_rows builds it as a plain
+        `malloc(col_count * sizeof(int64_t))` with each text/blob column
+        strdup'd into its slot, with no refcount header in front of it,
+        so `festina_release` (which reads the 8 bytes before the
+        payload) could never be pointed at one. That is why this is a
+        bespoke function reached only from _release_fn_for_array, rather
+        than a TableType case inside _release_fn_for: the array owns its
+        rows outright, and any other TableType-typed binding -- a
+        `People p = rows[0]` local, a row passed to a function -- is
+        only ever borrowing one the array still owns.
+
+        Which columns hold a heap pointer is decided by the identical
+        rule the runtime used when building the row (`text` or `blob`
+        -> strdup, everything else -> a plain i64), read off the same
+        declared column types. free(NULL) is a no-op, which covers a
+        column that was SQL NULL and so was never strdup'd at all."""
+        key = table_type.name
+        if key in self._table_row_release_fns:
+            return self._table_row_release_fns[key]
+        fn_name = f"@__festina_release_row_{table_type.name}_{self._unique()}"
+        self._table_row_release_fns[key] = fn_name
+        cols = self.tables[table_type.name]
+        body = [f"define void {fn_name}(ptr %row) {{", "entry:"]
+        for i, col_type in enumerate(cols.values()):
+            if col_type not in ("text", "blob"):
+                continue
+            slot = self.tmp()
+            body.append(f"  {slot} = getelementptr i64, ptr %row, i64 {i}")
+            val = self.tmp()
+            body.append(f"  {val} = load ptr, ptr {slot}")
+            body.append(f"  call void @free(ptr {val})")
+        body.append("  call void @free(ptr %row)")
         body.append("  ret void")
         body.append("}")
         body.append("")
@@ -3752,9 +3893,11 @@ class CodeGen:
                 return self._emit_timer_call(name, expr, env, lines)
             if name == "loadAudio":
                 self.uses_audio = True
-                path_val, _ = self._emit_expr(expr.args[0], env, lines)
+                path_val, path_type = self._emit_expr(expr.args[0], env, lines)
                 out = self.tmp()
                 lines.append(f"  {out} = call ptr @festina_load_audio(ptr {path_val})")
+                # claude.md #83: the path is only fopen()'d, never kept.
+                self._free_text_temp(expr.args[0], path_val, path_type, lines)
                 return out, AUDIO
             if name in self.func_decls:
                 decl = self.func_decls[name]
@@ -3819,15 +3962,17 @@ class CodeGen:
                     out = self.tmp()
                     lines.append(f"  {out} = call i8 @festina_regex_test(ptr {obj_val}, ptr {arg_val})")
                     self._free_text_temp(expr.args[0], arg_val, arg_type, lines)
+                    self._free_regex_temp(callee.obj, obj_val, obj_type, lines)
                     return out, BOOL
             # claude.md #68: value.match(pattern:regex) -> text (or null)
             if callee.prop == "match":
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if obj_type == TEXT:
-                    arg_val, _ = self._emit_expr(expr.args[0], env, lines)
+                    arg_val, arg_type = self._emit_expr(expr.args[0], env, lines)
                     out = self.tmp()
                     lines.append(f"  {out} = call ptr @festina_regex_match(ptr {arg_val}, ptr {obj_val})")
                     self._free_text_temp(callee.obj, obj_val, obj_type, lines)
+                    self._free_regex_temp(expr.args[0], arg_val, arg_type, lines)
                     return out, TEXT
             # claude.md #68: value.replace(search, replacement:text) -> text
             #                value.replaceAll(search, replacement:text) -> text
@@ -3853,6 +3998,7 @@ class CodeGen:
                         )
                     self._free_text_temp(callee.obj, obj_val, obj_type, lines)
                     self._free_text_temp(expr.args[0], search_val, search_type, lines)
+                    self._free_regex_temp(expr.args[0], search_val, search_type, lines)
                     self._free_text_temp(expr.args[1], replacement_val, replacement_type, lines)
                     return out, TEXT
             # claude.md #38: music.play() / music.stop() / music.isPlaying()
@@ -4027,6 +4173,13 @@ class CodeGen:
             flags_val = self.string_const("")
         out = self.tmp()
         lines.append(f"  {out} = call ptr @festina_regex_compile(ptr {pattern_val}, ptr {flags_val})")
+        # claude.md #83: regcomp() compiles the pattern into its own
+        # regex_t and reads the flags inline -- neither pointer is
+        # retained past this call, so a temporary passed for either is
+        # the caller's to free.
+        self._free_text_temp(expr.args[0], pattern_val, pattern_type, lines)
+        if len(expr.args) > 1:
+            self._free_text_temp(expr.args[1], flags_val, flags_type, lines)
         return out, REGEX
 
     # ---- graphics: drawRect/drawCircle/drawText/drawImage/loadImage (claude.md #37, #39) ----
@@ -4052,10 +4205,21 @@ class CodeGen:
         where requiring a window/display would be an artificial
         restriction claude.md never asks for."""
         self.uses_graphics_code = True
-        args = [self._emit_expr(a, env, lines)[0] for a in expr.args]
+        emitted = [self._emit_expr(a, env, lines) for a in expr.args]
+        args = [val for val, _ in emitted]
+
+        def free_text_temps():
+            # claude.md #83: Cairo copies the glyphs it draws and reads
+            # the PNG path inline -- neither festina_draw_text nor
+            # festina_load_image retains the pointer it was handed, so a
+            # temporary passed to either is the caller's to free.
+            for arg_expr, (val, vtype) in zip(expr.args, emitted):
+                self._free_text_temp(arg_expr, val, vtype, lines)
+
         if name == "loadImage":
             out = self.tmp()
             lines.append(f"  {out} = call ptr @festina_load_image(ptr {args[0]})")
+            free_text_temps()
             return out, types_mod.ImageType()
         self.uses_graphics = True
         if name == "drawRect":
@@ -4070,6 +4234,7 @@ class CodeGen:
         elif name == "drawImage":
             img, x, y = args
             lines.append(f"  call void @festina_draw_image(ptr {img}, i64 {x}, i64 {y})")
+        free_text_temps()
         return "0", None
 
     # ---- setTimeout/setInterval/clearTimeout/clearInterval (claude.md
@@ -4130,6 +4295,10 @@ class CodeGen:
         lines.append(f"  {db_val} = load ptr, ptr @__festina_db")
         stmt_val = self.tmp()
         lines.append(f"  {stmt_val} = call ptr @festina_sqlite_prepare(ptr {db_val}, ptr {sql_val})")
+        # claude.md #83: sqlite3_prepare_v2 compiles the SQL into the
+        # statement rather than holding the string, so a temporary
+        # (`sqlite(`SELECT ... ${n}`)`) is the caller's to free here.
+        self._free_text_temp(expr.args[0], sql_val, sql_type, lines)
 
         if len(expr.args) > 1:
             self._emit_sqlite_bind_params(expr.args[1], stmt_val, env, lines)
@@ -4168,6 +4337,10 @@ class CodeGen:
                 lines.append(f"  call void @festina_sqlite_bind_float(ptr {stmt_val}, i32 {idx}, double {val})")
             elif vtype == TEXT:
                 lines.append(f"  call void @festina_sqlite_bind_text(ptr {stmt_val}, i32 {idx}, ptr {val})")
+                # claude.md #83: bound with SQLITE_TRANSIENT, so sqlite
+                # has taken its own copy by the time this returns and a
+                # temporary is safe (and necessary) to free right here.
+                self._free_text_temp(elem, val, vtype, lines)
             elif vtype == BOOL:
                 # claude.md #30: bool maps to SQLite INTEGER, same as int.
                 # An already-null bool (BOOL_NULL_CONST) binds as plain

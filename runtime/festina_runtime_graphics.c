@@ -19,6 +19,7 @@
 #include <string.h>     /* memset -- Motif WM hints */
 #include <stdio.h>      /* snprintf -- festina_load_image's error message */
 #include <sys/select.h> /* select() -- multiplexes X11 events with timers */
+#include <time.h>       /* nanosleep -- festina_graphics_init's connect retry */
 #include <X11/Xlib.h>
 #include <X11/Xutil.h> /* XLookupString/XKeysymToString -- `on key` */
 #include <cairo/cairo-xlib.h>
@@ -80,7 +81,39 @@ static int festina_ignore_focus_error(Display *display, XErrorEvent *error) {
 }
 
 void festina_graphics_init(void) {
-    g_display = XOpenDisplay(NULL);
+    /* claude.md #87: retried, not a single attempt. XOpenDisplay does no
+     * retrying of its own, so ONE transient failure to connect -- a full
+     * listen backlog on the X server's socket under load, or a server
+     * that is accepting connections but momentarily not completing them
+     * -- used to kill the whole program with a fatal "is $DISPLAY set?"
+     * error that named entirely the wrong cause.
+     *
+     * Confirmed as a real, reproducible transient rather than a
+     * misdiagnosed dead server: instrumenting the failure showed the
+     * Xvfb process still alive, /tmp/.X11-unix/X<n> and /tmp/.X<n>-lock
+     * both present with the lock file naming that same live server's own
+     * pid (so not a display-number collision either), and `xdotool`
+     * connecting to that exact display successfully both immediately
+     * before and immediately after the failed attempt. The connection
+     * was simply refused once, under load.
+     *
+     * This was also the entire cause of tests/test_codegen.py's
+     * TestGraphics being intermittently flaky -- roughly a third of
+     * full-suite runs, essentially never when run in isolation, which
+     * had previously been attributed to slow window startup and
+     * "fixed" by raising the test-side polling timeout to 20s. That
+     * diagnosis was wrong: the window appears in ~0.2s consistently,
+     * and no timeout could ever have helped, because the program had
+     * already exited by then.
+     *
+     * Ten attempts, 100ms apart, so a genuinely absent X server still
+     * fails with the same clear message in about a second. */
+    for (int attempt = 0; attempt < 10; attempt++) {
+        g_display = XOpenDisplay(NULL);
+        if (g_display) break;
+        struct timespec pause = {0, 100L * 1000L * 1000L}; /* 100ms */
+        nanosleep(&pause, NULL);
+    }
     if (!g_display) {
         festina_fail("could not open the X display -- claude.md #39's graphics "
                       "functions need a running X server (is $DISPLAY set?)");
