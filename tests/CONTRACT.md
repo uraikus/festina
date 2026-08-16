@@ -364,15 +364,17 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 1008 tests in this directory pass against it: 623 need no external
+All 1061 tests in this directory pass against it: 628 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-364 more need a working C compiler, plus 2 more
+405 more need a working C compiler, plus 7 more needing a compiler that
+can also link with `-fsanitize=address` (the leak stress suite; skipped
+with a clear reason otherwise), plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 19 more given
 `Xvfb`+`xdotool` too (4 of those also need `xwd`, from the same
 x11-apps/x11-utils tier, to read real canvas pixels back --
 claude.md #89/#92/#94; two former `xwd` tests became display-free once
-claude.md #95 made saveCanvas headless; claude.md #98 added 4 more) (623
-+ 364 + 2 + 19 = 1008 --
+claude.md #95 made saveCanvas headless; claude.md #98 added 4 more) (628
++ 405 + 7 + 2 + 19 = 1061 --
 re-verified directly
 by running the whole suite with a PATH containing nothing but Python,
 not just derived by counting `compile_and_run` call sites, since the
@@ -2512,6 +2514,100 @@ same reasons the pool tests are), 4 end-to-end tests in `TestAudio`
 alternation), and 8 in `tests/test_audio.py` for the signatures. Clean
 under ThreadSanitizer and AddressSanitizer.
 
+**claude.md #104**: filled circles are stamped, not tessellated.
+
+claude.md #103 measured Festina's canvas at 1.4x *slower* than a
+browser's; this reverses it to 2.1x faster. The obvious suspect was
+wrong -- a fresh Cairo context per draw call accounts for 4 ms of 90 --
+and splitting the frame by shape type found the real cost at once:
+20,000 rectangles cost 10 ms, 20,000 circles cost 76 ms, because
+`cairo_arc` + `cairo_fill` tessellates the curve and scan-converts a
+general polygon every time. A filled circle of a given radius is the
+same picture wherever it lands, so it is now rasterized once into an A8
+alpha mask and stamped -- what a glyph cache does. Circles: 76 ms -> 20
+ms (4.4x). The frame: 90 ms -> 31 ms.
+
+The cache is keyed on radius (an `int`, so nothing to quantize), holds
+16 entries and evicts round-robin. What makes it safe rather than merely
+fast is where it is *not* allowed: a scale or rotation (would resample
+the mask), a fractional translation (off the pixel grid), or a border
+(a stroke needs a real path). Those fall back.
+
+Verified by rendering a frame covering every one of those cases twice --
+once with the fast path, once with it forcibly disabled -- and comparing
+pixel by pixel: 5 pixels of 480,000 differed, all by 1/255, all inside a
+gradient (sampling rounding, not geometry). Isolated circles are
+bit-identical from r=1 to r=20.
+`tests/test_codegen.py::TestCircleMaskFastPath` (15 tests).
+
+**claude.md #102**: a bug hunt, and a leak harness that can fail.
+
+Six bugs found by deliberate probing rather than by waiting for them:
+
+- **`x == null` did not compile** on any pointer-backed type (struct,
+  `arr[T]`, `map[T]`, `img`, `aud`, `regex`) -- it emitted
+  `icmp eq i64 <a pointer>, null`, so the compile died with an LLVM
+  parse error naming a generated temporary. An internal-error message
+  for something entirely reasonable to write. Surfaced from a nullable
+  BLOB column, where checking for null is the only way to ask whether a
+  row has a file. `float` keeps its documented IEEE behaviour (neither
+  `== null` nor `!= null`, since ordered comparisons against NaN are
+  all false).
+  `tests/test_codegen.py::TestNullComparisonOnEveryType` (11 tests).
+- **A table column of type `aud`/`img` did not link.** #101 gave such a
+  column a decoder registration and a destructor call but nothing marked
+  the program as using that feature, so a program whose only audio was
+  `file:aud` failed at the link step with an undefined reference to
+  `festina_audio_free` -- a compiler bug reported as a linker error.
+  `tests/test_codegen.py::TestMediaColumnsLinkTheirRuntime` (3 tests).
+- **`Math.floor` of a null float returned a stack address.** `fptosi` is
+  UB for NaN, infinities and out-of-range doubles. Measured:
+  `Math.floor(1.0 / 0.0)` printed a different value per build, once a
+  stack address, and `Math.floor(nan)` answered 1 while `Math.ceil(nan)`
+  on the next line answered the null sentinel -- two identical UB sites
+  folded differently. Now null in all three cases via
+  `llvm.fptosi.sat` plus an explicit test.
+  `tests/test_codegen.py::TestFloatToIntIsNeverUndefined` (11 tests).
+- **A call result reached for one field leaked the whole value.** #77
+  released a call result discarded as a bare statement; `f().count` is
+  the same situation and was never covered. Released now, but only for a
+  non-managed field type -- releasing the parent recursively releases
+  its struct/arr/map fields and frees its text ones, so doing it for
+  those would trade a leak for a use-after-free. `f().inner.n` therefore
+  still leaks, deliberately, with a test pinning that the value stays
+  intact so a later "optimization" cannot make that trade.
+  `tests/test_codegen.py::TestDiscardedCallResultReachedForAField` (3).
+- **A literal of all nulls could not be written.** `arr[text] a = [null]`
+  inferred `arr[null]` and was rejected, while `a.push(null)` and
+  `[null, 'x']` were both already fine -- an inconsistency, not a
+  policy. `tests/test_codegen.py::TestAllNullLiterals` (5 tests).
+- **A sqlite parameter was never reclaimed** (fixed in #101, found in
+  this sweep).
+
+*The leak stress suite* is the durable half. Five programs under
+AddressSanitizer and LeakSanitizer -- `tests/stress/*.f`, driven by
+`scripts/leak_stress.sh` and run by
+`tests/test_leak_stress.py::TestLeakStress` -- each hammering one
+ownership mechanism (text; collections; structs and query rows; media
+handles; regexes and files) some thousands of times, so a leak of a few
+bytes per pass is unmissable. Written as one long loop each rather than
+many small cases on purpose: the interesting failures are where a
+value's ownership is right in isolation and wrong when it is aliased,
+returned, stored and discarded in the same breath -- which is exactly
+how the call-result leak above was found.
+
+Two traps are worth naming because neither is visible in a passing run.
+`clang -fsanitize=address -c file.ll` does **not** instrument raw LLVM
+IR text (ASan's per-function opt-in comes from clang's C frontend, which
+a `.ll` input bypasses), so a harness built the obvious way passes
+everything and proves nothing; the attribute is stamped onto every
+`define` line first. And the harness needs **two** compilers, since
+clang is the only one that parses `.ll` while its ASan runtime library
+ships separately and is routinely absent -- so the linking compiler is
+probed, not assumed. The only real defence against both is a canary:
+`test_the_harness_can_actually_fail` feeds it a known-leaking program
+and fails if it comes back clean.
+
 **claude.md #101**: images are paths too, more formats, and both media
 types fit in a table.
 
@@ -3387,5 +3483,5 @@ pytest tests/                          # 605 passed, 323 skipped (needs a C comp
                                         # 15 need Xvfb + xdotool installed too, 1 of those
                                         # also needs `openbox` and 4 need `xwd`) given a
                                         # working C compiler,
-                                        # all 1008 pass
+                                        # all 1061 pass
 ```

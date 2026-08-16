@@ -168,9 +168,25 @@ def run_all():
             if not toolchain.available():
                 print(f"-- {toolchain.name}: not installed, skipping", file=sys.stderr)
                 continue
+            lang_dir = os.path.join(workdir, toolchain.name)
+            os.makedirs(lang_dir, exist_ok=True)
+            # One untimed throwaway build before any timed one, for the
+            # same reason each program gets an untimed warmup RUN: the
+            # first build a toolchain does in a session pays for a cold
+            # page cache and, for rustc/go, for their own one-time
+            # startup work. Without this the first benchmark in the list
+            # absorbed all of it and reported a build time several times
+            # everyone else's -- measured at 5.1 s for Rust's `hello`
+            # against 0.1 s for the very next program it built, which
+            # says nothing about `hello`.
+            warmup_dir = os.path.join(lang_dir, "_warmup")
+            os.makedirs(warmup_dir, exist_ok=True)
+            try:
+                toolchain.build(BENCHMARKS[0], warmup_dir)
+            except subprocess.CalledProcessError:
+                pass  # a real failure is reported by the timed build below
+
             for bench in BENCHMARKS:
-                lang_dir = os.path.join(workdir, toolchain.name)
-                os.makedirs(lang_dir, exist_ok=True)
                 try:
                     built_path, build_seconds = toolchain.build(bench, lang_dir)
                 except subprocess.CalledProcessError as e:

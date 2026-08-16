@@ -431,6 +431,20 @@ def analyze(program, filename="<string>"):
         # site rather than a declaration.
         if isinstance(declared, (types_mod.AudioType, types_mod.ImageType)) and actual == _TEXT:
             return
+        # claude.md #102: `arr[text] a = [null]` / `map[int] m = {'k': null}`.
+        # A literal whose values are ALL null infers its element type as
+        # null itself, and that was then rejected against every declared
+        # element type -- so the one literal shape that says "empty of
+        # meaning but not empty of entries" could not be written at all,
+        # even though `a.push(null)` and `m[k] = null` were both already
+        # fine and `[null, 'x']` inferred text without complaint. null is
+        # a valid value of every type (claude.md #10/#25), so a container
+        # of nulls is assignable to a container of anything.
+        for container in (types_mod.ArrayType, types_mod.MapType):
+            if isinstance(declared, container) and isinstance(actual, container):
+                inner = actual.element if container is types_mod.ArrayType else actual.value
+                if inner is NULL or inner is None:
+                    return
         if declared != actual:
             raise CompileError(
                 f"cannot assign {what} of type {types_mod.type_name(actual)} "
