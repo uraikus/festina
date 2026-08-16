@@ -364,15 +364,15 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 969 tests in this directory pass against it: 613 need no external
+All 971 tests in this directory pass against it: 613 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-335 more need a working C compiler, plus 2 more
+337 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 19 more given
 `Xvfb`+`xdotool` too (4 of those also need `xwd`, from the same
 x11-apps/x11-utils tier, to read real canvas pixels back --
 claude.md #89/#92/#94; two former `xwd` tests became display-free once
 claude.md #95 made saveCanvas headless; claude.md #98 added 4 more) (613
-+ 335 + 2 + 19 = 969 --
++ 337 + 2 + 19 = 971 --
 re-verified directly
 by running the whole suite with a PATH containing nothing but Python,
 not just derived by counting `compile_and_run` call sites, since the
@@ -2439,6 +2439,20 @@ of it. A voice that ends naturally stays *joinable* and is joined by
 whoever next claims its slot -- the single-voice design got away with
 never joining a finished thread because it only ever had one; a pool
 that never joined would leak one thread per `play()`.
+One failure mode the pool introduced needed handling: it opens one
+ALSA handle per voice, and not every "default" device does software
+mixing. On a bare `hw:` device with no dmix -- ordinary on minimal and
+embedded Linux, and on any machine where another program holds the
+device exclusively -- the second concurrent open fails with EBUSY, and
+treating that as fatal meant an overlapping `play()` killed the program
+with an error claiming there was no audio device when there plainly was
+one. The single-voice design could never hit it, having never had two
+handles open. A failed open now gives a playing voice's handle back and
+retries, degrading to exactly the pre-pool behaviour (overlapping plays
+cut each other off) rather than dying; only when no other voice is left
+to free is it genuinely fatal, which is the case that error is about.
+`tests/test_codegen.py::TestAudioOnANonMixingDevice` (2 tests).
+
 `tests/test_codegen.py::TestAudioVoicePool` (4 tests) plus 4 more in
 `TestAudio`. The pool tests are a white-box C harness for two reasons
 worth stating: a Festina program cannot count voices (deliberately --
@@ -3228,5 +3242,5 @@ pytest tests/                          # 605 passed, 323 skipped (needs a C comp
                                         # 15 need Xvfb + xdotool installed too, 1 of those
                                         # also needs `openbox` and 4 need `xwd`) given a
                                         # working C compiler,
-                                        # all 969 pass
+                                        # all 971 pass
 ```

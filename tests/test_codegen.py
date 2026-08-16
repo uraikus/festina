@@ -4817,6 +4817,141 @@ int main(int argc, char **argv) {
 """
 
 
+_SINGLE_STREAM_HARNESS = r"""
+/* claude.md #98: a "default" device that does NO software mixing, so
+ * the second concurrent open fails with EBUSY -- a bare hw: device
+ * with no dmix, which is ordinary on minimal/embedded Linux and on any
+ * machine where another program holds the device exclusively.
+ *
+ * The voice pool opens one handle per voice, so this is the case where
+ * layering is not physically available. What must NOT happen is the
+ * program dying: overlapping plays have to degrade back to cutting
+ * each other off, which is exactly what they did before there was a
+ * pool at all.
+ */
+#include <alsa/asoundlib.h>
+#include <time.h>
+
+static int g_open_count = 0;
+static int lim_open(snd_pcm_t **p) {
+    if (g_open_count >= 1) return -EBUSY;
+    g_open_count++;
+    *p = (snd_pcm_t *)(long)g_open_count;
+    return 0;
+}
+static int lim_close(snd_pcm_t *p) { (void)p; g_open_count--; return 0; }
+static long lim_writei(snd_pcm_t *p, const void *b, unsigned long f) {
+    (void)p; (void)b;
+    struct timespec ts = { 0, 10L * 1000L * 1000L };
+    nanosleep(&ts, NULL);
+    return (long)f;
+}
+
+#define snd_pcm_open(pcmp, name, stream, mode) lim_open(pcmp)
+#define snd_pcm_set_params(pcm, f, a, c, r, s, l) 0
+#define snd_pcm_writei(pcm, buf, frames) lim_writei(pcm, buf, frames)
+#define snd_pcm_recover(pcm, err, silent) (-1)
+#define snd_pcm_close(pcm) lim_close(pcm)
+
+#include "festina_runtime_audio.c"
+
+void festina_fail(const char *msg) {
+    fprintf(stderr, "fail: %s\n", msg ? msg : "");
+    exit(1);
+}
+
+static int active_voices(void *audio) {
+    FestinaAudio *a = (FestinaAudio *)audio;
+    int n = 0;
+    pthread_mutex_lock(&a->lock);
+    for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+        if (a->voices[i].active) n++;
+    }
+    pthread_mutex_unlock(&a->lock);
+    return n;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    void *clip = festina_load_audio(argv[1]);
+    for (int i = 0; i < 5; i++) festina_audio_play(clip);
+    /* One stream is all the device has, so one voice is all there is --
+     * and crucially the program is still running to say so. */
+    printf("voices %d\n", active_voices(clip));
+    printf("open_handles %d\n", g_open_count);
+    printf("isplaying %d\n", (int)festina_audio_is_playing(clip));
+    festina_audio_stop(clip);
+    printf("after_stop %d\n", active_voices(clip));
+    printf("leaked_handles %d\n", g_open_count);
+    return 0;
+}
+"""
+
+
+class TestAudioOnANonMixingDevice:
+    """claude.md #98: the pool opens one ALSA handle per voice, and not
+    every "default" device does software mixing. On a bare hw: device
+    with no dmix -- ordinary on minimal/embedded Linux, and on any
+    machine where another program holds the device exclusively -- the
+    second concurrent open fails with EBUSY.
+
+    Treating that as fatal (which it briefly was) meant an overlapping
+    play() killed the program outright on such a system, with an error
+    claiming there was no audio device when there plainly was one. That
+    was a regression the pool introduced: the single-voice design it
+    replaced never had two handles open, so it could never hit it.
+
+    The right answer is to give a playing voice's handle back and retry,
+    which degrades to exactly the pre-pool behaviour -- overlapping
+    plays cut each other off instead of layering. On a device that
+    cannot mix, layering was never physically possible, and quietly
+    getting fewer simultaneous sounds beats not running.
+    """
+
+    def _run(self, tmp_path):
+        cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
+        if not cc:
+            pytest.skip("no C compiler (clang/gcc/cc) on PATH")
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa"],
+                               capture_output=True, text=True)
+        if alsa.returncode != 0:
+            pytest.skip("alsa dev headers are not installed")
+        runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
+        harness = tmp_path / "single_stream_harness.c"
+        harness.write_text(_SINGLE_STREAM_HARNESS)
+        binary = tmp_path / "single_stream_harness"
+        wav = tmp_path / "clip.wav"
+        _write_wav(wav, duration_s=2.0)
+        build = subprocess.run(
+            [cc, "-I", runtime_dir, str(harness), "-o", str(binary), "-pthread"]
+            + alsa.stdout.split(),
+            capture_output=True, text=True,
+        )
+        assert build.returncode == 0, build.stderr
+        run = subprocess.run([str(binary), str(wav)], capture_output=True, text=True,
+                              timeout=120)
+        return run
+
+    def test_overlapping_plays_degrade_instead_of_killing_the_program(self, tmp_path):
+        run = self._run(tmp_path)
+        assert run.returncode == 0, run.stderr
+        out = dict(line.split() for line in run.stdout.splitlines())
+        # Five plays, one stream: one voice, no crash, still playing.
+        assert out["voices"] == "1"
+        assert out["open_handles"] == "1"
+        assert out["isplaying"] == "1"
+
+    def test_no_handle_is_leaked_by_the_retry(self, tmp_path):
+        run = self._run(tmp_path)
+        assert run.returncode == 0, run.stderr
+        out = dict(line.split() for line in run.stdout.splitlines())
+        # Every failed open must close nothing and every freed voice must
+        # release its handle -- otherwise the device would stay busy and
+        # the retry could never succeed a second time.
+        assert out["after_stop"] == "0"
+        assert out["leaked_handles"] == "0"
+
+
 class TestAudioVoicePool:
     """claude.md #98: `aud.play()` no longer cuts off a playback that is
     already running -- each clip owns a pool of voices, one thread and

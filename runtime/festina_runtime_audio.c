@@ -260,6 +260,42 @@ static FestinaVoice *festina_audio_claim_voice(FestinaAudio *a) {
     return oldest;
 }
 
+/* Stops and joins the oldest ACTIVE voice other than `except`,
+ * returning 1 if there was one. Called with the lock HELD (and drops
+ * it across the join, same as festina_audio_reap_locked).
+ *
+ * This exists for a failure mode the pool introduced and the old
+ * single-voice design could not have: this file opens one ALSA handle
+ * per voice, and not every "default" device does software mixing. On a
+ * bare hw: device with no dmix -- ordinary on minimal/embedded Linux,
+ * and on any machine where another program holds the device
+ * exclusively -- the SECOND concurrent open fails with EBUSY. Treating
+ * that as fatal (which it was, briefly) meant an overlapping play()
+ * killed the program outright on such a system, with an error message
+ * about there being no audio device when there plainly was one.
+ *
+ * Freeing a voice and retrying degrades that case back to exactly the
+ * pre-pool behaviour -- overlapping plays cut each other off instead of
+ * layering -- which is the right answer: on a device that cannot mix,
+ * layering was never physically possible, and silently getting fewer
+ * simultaneous sounds beats not running. */
+static int festina_audio_free_oldest_locked(FestinaAudio *a, FestinaVoice *except) {
+    FestinaVoice *oldest = NULL;
+    for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+        FestinaVoice *v = &a->voices[i];
+        if (v == except || !v->active) continue;
+        if (!oldest || v->started_seq < oldest->started_seq) oldest = v;
+    }
+    if (!oldest) return 0;
+    oldest->stop_requested = 1;
+    pthread_t thread = oldest->thread;
+    oldest->joinable = 0;
+    pthread_mutex_unlock(&a->lock);
+    pthread_join(thread, NULL);
+    pthread_mutex_lock(&a->lock);
+    return 1;
+}
+
 void festina_set_max_audio_players(int64_t max) {
     /* Clamped rather than rejected: this is a tuning knob, and failing
      * a program outright over a number that is merely unreasonable
@@ -286,12 +322,28 @@ void festina_audio_play(void *audio) {
      * thread -- so a missing/unusable audio device fails loudly and
      * immediately at the play() call site (festina_fail(), same as
      * "could not open the X display" for graphics), not silently on a
-     * background thread with no way to report it back. */
+     * background thread with no way to report it back.
+     *
+     * The retry loop distinguishes the two ways this can fail, which
+     * matters because only ONE of them is actually fatal. "The device
+     * will not give me an Nth simultaneous stream" is a limit of the
+     * device, not the absence of one, and the answer is to give a
+     * playing voice's handle back and try again -- see
+     * festina_audio_free_oldest_locked. Only when there is no other
+     * voice left to free has the program genuinely failed to open any
+     * audio device at all, which is what the error below claims. */
     snd_pcm_t *pcm = NULL;
-    int rc = snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
-    if (rc >= 0) {
-        rc = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
-                                 (unsigned int)a->channels, a->sample_rate, 1, 500000);
+    int rc;
+    for (;;) {
+        pcm = NULL;
+        rc = snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
+        if (rc >= 0) {
+            rc = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
+                                     (unsigned int)a->channels, a->sample_rate, 1, 500000);
+            if (rc < 0) snd_pcm_close(pcm);
+        }
+        if (rc >= 0) break;
+        if (!festina_audio_free_oldest_locked(a, v)) break;
     }
     if (rc < 0) {
         pthread_mutex_unlock(&a->lock);
