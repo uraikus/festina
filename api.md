@@ -72,7 +72,7 @@ map[T]    -- text-keyed map of any of the above except arr[T]/map[T]
              itself (see the Maps section below)
 struct    -- user-declared record type
 table     -- a struct that's also backed by a SQLite table
-img       -- an image loaded via loadImage() (opaque handle)
+img       -- an image, declared from a path (`img hero = 'hero.png'`)
 aud       -- an audio clip, declared from a path (`aud hit = 'hit.wav'`)
 regex     -- a compiled pattern from a /pattern/flags literal or regex() (opaque handle)
 color     -- a canvas color, declared from a literal (`color red = 'red'`)
@@ -433,6 +433,37 @@ preserved via a temp-table rebuild) to match the declaration exactly.
 literal array expression, not an arbitrary `arr[T]` value. Query result
 columns map onto a declared table's fields by position, not by name.
 
+### Storing images and audio
+
+A column may be an `img` or an `aud`. SQLite stores it as a **BLOB**:
+
+```festina
+table Music {
+    name:text
+    file:aud
+}
+
+aud track = 'adventure.mp3'
+sqlite('INSERT INTO Music (name, file) VALUES (?, ?)', ['theme', track])
+
+arr[Music] rows = sqlite('SELECT * FROM Music')
+rows[0].file.playLoop(0)          // straight out of the database
+```
+
+What's stored is the asset's **own encoded bytes**, so a round trip is
+byte-identical — an MP3 stays an MP3 rather than becoming a much larger
+WAV, and a JPEG stays a JPEG rather than being re-encoded as PNG.
+Reading a row decodes it back into a real handle, so the value that
+comes out behaves exactly like one loaded from a file.
+
+The one case with no source bytes is an image you built rather than
+loaded — a `clip()` or `resize()` result. Those are encoded as PNG on
+demand, which is lossless.
+
+Binding is by value: the parameter is copied into the database as the
+statement runs, so nothing is retained afterwards and the asset stays
+yours.
+
 ### Database configuration
 
 `festina.sqlite` is the default, but the entry file's very first line
@@ -596,13 +627,24 @@ it has already seen that key go down without a matching up.
 ### Images
 
 ```festina
-img sheet = loadImage('spritesheet.png')
+img sheet = 'spritesheet.png'             // PNG or JPEG
 log(`${sheet.width}x${sheet.height}`)
 
 img grass = sheet.clip(0, 0, 64, 64)     // a new 64x64 image
 grass.resize(32, 32)                      // scaled in place
 drawImage(grass, 100, 100)
 ```
+
+A path declares the image, the same way it declares an `aud` — and, like
+that one, it's a real load rather than a compile-time resolution, so the
+path may be any text expression (`img hero = spriteDir + 'hero.png'`).
+`loadImage('...')` still works and means exactly the same thing.
+
+**PNG and JPEG.** The format is sniffed from the file's contents, not
+its extension — an image out of a database column has no extension, and
+an extension was never evidence of anything anyway. Loading needs no
+display: decoding is pure computation, so a headless program can load,
+clip, resize and `saveCanvas` without an X server.
 
 | | |
 |---|---|
@@ -614,7 +656,7 @@ drawImage(grass, 100, 100)
 sliced into the individual images you draw.
 
 ```festina
-img sheet = loadImage('tiles.png')
+img sheet = 'tiles.png'
 arr[img] tiles = []
 for int i = 0, i < 8, i++ {
     tiles[i] = sheet.clip(i * 32, 0, 32, 32)
@@ -1005,7 +1047,7 @@ deadlines together so neither blocks the other.
 ## Audio
 
 ```festina
-aud music = 'music.wav'               // WAV, 16-bit PCM only
+aud music = 'music.wav'               // WAV (16-bit PCM) or MP3
 music.play()                          // once
 music.playLoop()                      // until stopped
 music.isPlaying()                     // true the instant play() returns
@@ -1013,11 +1055,17 @@ music.isPlaying()                     // true the instant play() returns
 stopAudioPlayer()                     // stop every channel
 ```
 
-A path declares the clip, the same way `blob`, `color` and `font` are
-each written as the text that reads best. It's a real load, not a
+A path declares the clip, the same way `blob`, `color`, `font` and `img`
+are each written as the text that reads best. It's a real load, not a
 compile-time resolution, so the path may be any text expression
 (`aud hit = soundDir + 'hit.wav'`). `loadAudio('...')` still works and
 means exactly the same thing.
+
+**WAV (16-bit PCM) and MP3.** The format is sniffed from the file's
+contents, not its extension — a clip out of a database column has no
+extension, and an extension was never evidence of anything anyway.
+Anything else (a compressed WAV, 8/24/32-bit PCM, Ogg, FLAC) fails at
+load with a message naming both supported formats.
 
 Plays through a real ALSA output device on a background thread, so
 playback doesn't block the rest of the program.

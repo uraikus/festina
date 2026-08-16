@@ -417,17 +417,19 @@ def analyze(program, filename="<string>"):
         if (isinstance(declared, (types_mod.ColorType, types_mod.FontType))
                 and actual == _TEXT):
             return
-        # claude.md #100: `aud music = 'path/track.wav'` -- the same
+        # claude.md #100/#101: `aud music = 'path/track.wav'` and
+        # `img sprite = 'sprite.png'` -- the same
         # one-directional text -> X allowance, for the same reason the
         # three above have it: a path is what reads well, and there is no
         # other literal syntax for an audio clip. Unlike colour and font
         # this is NOT resolved at compile time -- it becomes a real
         # loadAudio() call wherever the conversion happens (see codegen's
         # _coerce), so the path may be any text expression, not just a
-        # literal. That also means it is a genuine file read at that
+        # literal. claude.md #101 gave `img` the same treatment, so the
+        # two media types no longer differ for no reason. That also means it is a genuine file read at that
         # point, which is worth knowing when the conversion is at a call
         # site rather than a declaration.
-        if isinstance(declared, types_mod.AudioType) and actual == _TEXT:
+        if isinstance(declared, (types_mod.AudioType, types_mod.ImageType)) and actual == _TEXT:
             return
         if declared != actual:
             raise CompileError(

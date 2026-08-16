@@ -579,6 +579,16 @@ class _OwnedImage:
         pass
 
 
+class _OwnedAudio:
+    """claude.md #101: the aud counterpart of _OwnedImage below --
+    marks, in CodeGen._active_free_locals, an `aud` local this scope
+    created itself and that escape analysis proves never leaves the
+    function, so scope exit can free it. Audio handles were never freed
+    at all before this; a clip loaded inside a loop leaked one decoded
+    buffer per iteration, which the `aud x = 'path'` short form made
+    easy to write by accident."""
+
+
 class _OwnedRegex:
     """claude.md #86: marks, in CodeGen._active_free_locals, a `regex`
     local this scope provably owns outright -- one whose initializer is
@@ -922,6 +932,16 @@ class CodeGen:
             "declare void @festina_sqlite_bind_float(ptr, i32, double)",
             "declare void @festina_sqlite_bind_text(ptr, i32, ptr)",
             "declare void @festina_sqlite_bind_null(ptr, i32)",
+            # claude.md #101: aud/img columns are stored as their own
+            # encoded bytes.
+            "declare void @festina_sqlite_bind_blob(ptr, i32, ptr, i64)",
+            "declare void @festina_set_audio_decoder(ptr)",
+            "declare void @festina_set_image_decoder(ptr)",
+            "declare ptr @festina_audio_bytes(ptr, ptr)",
+            "declare ptr @festina_image_bytes(ptr, ptr)",
+            "declare ptr @festina_audio_from_bytes(ptr, i64, ptr)",
+            "declare void @festina_audio_free(ptr)",
+            "declare ptr @festina_image_from_bytes(ptr, i64, ptr)",
             "declare void @festina_sqlite_exec(ptr)",
             # claude.md #94: single-value queries
             "declare i64 @festina_sqlite_scalar_int(ptr)",
@@ -1269,6 +1289,15 @@ class CodeGen:
                     image = self.tmp()
                     lines.append(f"  {image} = load ptr, ptr {ref}")
                     lines.append(f"  call void @festina_image_free(ptr {image})")
+                elif isinstance(type_, _OwnedAudio):
+                    # claude.md #101: frees the decoded PCM, the stored
+                    # source bytes and the clip itself, stopping any
+                    # channel still playing it first. Never reached for
+                    # a borrowed or escaping aud, exactly as _OwnedImage
+                    # above.
+                    clip = self.tmp()
+                    lines.append(f"  {clip} = load ptr, ptr {ref}")
+                    lines.append(f"  call void @festina_audio_free(ptr {clip})")
                 elif isinstance(type_, _OwnedRegex):
                     # claude.md #86: a regex this scope compiled itself
                     # and provably never shared -- regfree + free, via
@@ -1716,9 +1745,29 @@ class CodeGen:
                             # #86 uses for regex -- created here (a Call:
                             # loadImage or clip) and provably never
                             # escaping. See _OwnedImage's own comment.
-                            if (isinstance(stmt.init, ast.Call)
+                            #
+                            # claude.md #101: `img sprite = 'path.png'`
+                            # counts as "created here" too. It compiles
+                            # to a real festina_load_image call (see
+                            # _coerce), so the value is exactly as fresh
+                            # and unshared as loadImage()'s -- but the
+                            # AST node is a StringLit, so testing for a
+                            # Call alone silently stopped reclaiming
+                            # these the moment the short form existed.
+                            # Confirmed under LeakSanitizer: one handle
+                            # per loop iteration.
+                            if (self._is_owning_media_source(stmt.init)
                                     and stmt.name not in self._current_escaping_names):
                                 self._active_free_locals[-1].append((ref, _OwnedImage()))
+                        elif isinstance(type_, types_mod.AudioType):
+                            # claude.md #101: `aud` gets the reclamation
+                            # `img` has had since #92 -- the two are the
+                            # same shape of handle and there was never a
+                            # reason for one to be freed and the other
+                            # not. Same two-part test.
+                            if (self._is_owning_media_source(stmt.init)
+                                    and stmt.name not in self._current_escaping_names):
+                                self._active_free_locals[-1].append((ref, _OwnedAudio()))
                         elif type_ == REGEX:
                             # claude.md #86: only a regex this scope
                             # compiled itself (a `regex(...)` Call, so
@@ -2288,8 +2337,8 @@ class CodeGen:
         # None or NULL-ish) or an unconstrained builtin return (e.g.
         # sqlite()) flowing into a concretely-typed slot.
         #
-        # claude.md #100 adds the one conversion that is not free:
-        # `aud music = 'path/track.wav'`. blob/color/font all reach an
+        # claude.md #100/#101 add the two conversions that are not free:
+        # `aud music = 'track.wav'` and `img sprite = 'sprite.png'`. blob/color/font all reach an
         # aud-shaped allowance in semantic.py's check_assignable too, but
         # those need nothing here -- blob shares text's representation
         # outright, and colour/font are resolved by their own literal
@@ -2301,6 +2350,18 @@ class CodeGen:
             self.uses_audio = True
             out = self.tmp()
             lines.append(f"  {out} = call ptr @festina_load_audio(ptr {val})")
+            return out
+        # claude.md #101: `img sprite = 'sprite.png'`, the exact
+        # counterpart of the aud case just above. uses_graphics_CODE,
+        # not uses_graphics: decoding an image needs no X server, and
+        # setting the stronger flag would make a headless program that
+        # merely loads a sprite die on "could not open the X display"
+        # -- exactly the artificial restriction loadImage() already
+        # avoids for the same reason (see _emit_graphics_call).
+        if isinstance(to_type, types_mod.ImageType) and from_type == TEXT:
+            self.uses_graphics_code = True
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_load_image(ptr {val})")
             return out
         return val
 
@@ -3335,6 +3396,25 @@ class CodeGen:
         the instant it's produced."""
         return isinstance(expr, (ast.Call, ast.ArrayLit, ast.MapLit))
 
+    def _is_owning_media_source(self, expr):
+        """claude.md #92/#101: whether an img/aud local's initializer
+        produced a FRESH handle this scope owns outright.
+
+        A Call is owning -- loadImage/loadAudio, or clip() -- for the
+        same reason it is for every other type: it allocates something
+        nothing else references yet.
+
+        A StringLit (or any text-typed expression) is owning too, and
+        that case is the whole reason this is a function rather than an
+        isinstance check. `img sprite = 'sprite.png'` compiles to a real
+        load call (see _coerce), so the handle is exactly as fresh as
+        loadImage()'s -- but the AST node is not a Call, so the
+        Call-only test #92 used silently stopped reclaiming these the
+        moment claude.md #101 added the short form. A bare Identifier
+        stays non-owning: that is an alias of a handle someone else
+        owns, and freeing it would leave them dangling."""
+        return isinstance(expr, (ast.Call, ast.StringLit, ast.TemplateLit, ast.BinOp))
+
     def _is_owning_text_source(self, expr):
         """claude.md #83: the text counterpart to
         _is_owning_refcounted_source -- "owning" here means "already a
@@ -3832,7 +3912,14 @@ class CodeGen:
         rule the runtime used when building the row (`text` or `blob`
         -> strdup, everything else -> a plain i64), read off the same
         declared column types. free(NULL) is a no-op, which covers a
-        column that was SQL NULL and so was never strdup'd at all."""
+        column that was SQL NULL and so was never strdup'd at all.
+
+        claude.md #101: an `aud`/`img` column is a heap pointer too, but
+        NOT a plain buffer -- the runtime decoded the stored BLOB into a
+        real handle, so freeing it needs that type's own destructor
+        rather than free(). Missing this would have leaked one decoded
+        clip or surface per row for as long as the result array lived,
+        which is the shape a `SELECT * FROM Music` in a loop takes."""
         key = table_type.name
         if key in self._table_row_release_fns:
             return self._table_row_release_fns[key]
@@ -3840,14 +3927,18 @@ class CodeGen:
         self._table_row_release_fns[key] = fn_name
         cols = self.tables[table_type.name]
         body = [f"define void {fn_name}(ptr %row) {{", "entry:"]
+        media_free = {"aud": "@festina_audio_free", "img": "@festina_image_free"}
         for i, col_type in enumerate(cols.values()):
-            if col_type not in ("text", "blob"):
+            if col_type not in ("text", "blob") and col_type not in media_free:
                 continue
             slot = self.tmp()
             body.append(f"  {slot} = getelementptr i64, ptr %row, i64 {i}")
             val = self.tmp()
             body.append(f"  {val} = load ptr, ptr {slot}")
-            body.append(f"  call void @free(ptr {val})")
+            # claude.md #101: a decoded handle needs its own destructor,
+            # not free() -- an img owns a Cairo surface and an aud owns
+            # its decoded PCM, neither of which a plain free() releases.
+            body.append(f"  call void {media_free.get(col_type, '@free')}(ptr {val})")
         body.append("  call void @free(ptr %row)")
         body.append("  ret void")
         body.append("}")
@@ -5122,9 +5213,31 @@ class CodeGen:
                 z = self.tmp()
                 lines.append(f"  {z} = zext i8 {val} to i64")
                 lines.append(f"  call void @festina_sqlite_bind_int(ptr {stmt_val}, i32 {idx}, i64 {z})")
+            elif isinstance(vtype, (types_mod.AudioType, types_mod.ImageType)):
+                # claude.md #101: an aud/img binds as its own encoded
+                # bytes, so `sqlite('... VALUES (?)', [track])` stores
+                # the file rather than a pointer. The accessor lives in
+                # the graphics/audio translation unit, which is linked
+                # because the program already holds one of these values.
+                is_audio = isinstance(vtype, types_mod.AudioType)
+                if is_audio:
+                    self.uses_audio = True
+                else:
+                    self.uses_graphics_code = True
+                fn = "festina_audio_bytes" if is_audio else "festina_image_bytes"
+                len_slot = self.tmp()
+                lines.append(f"  {len_slot} = alloca i64")
+                lines.append(f"  store i64 0, ptr {len_slot}")
+                data = self.tmp()
+                lines.append(f"  {data} = call ptr @{fn}(ptr {val}, ptr {len_slot})")
+                blob_len = self.tmp()
+                lines.append(f"  {blob_len} = load i64, ptr {len_slot}")
+                lines.append(
+                    f"  call void @festina_sqlite_bind_blob(ptr {stmt_val}, i32 {idx}, "
+                    f"ptr {data}, i64 {blob_len})")
             else:
                 raise CodegenError(
-                    "sqlite() parameters must be int/float/bool/text/null, "
+                    "sqlite() parameters must be int/float/bool/text/aud/img/null, "
                     f"found {types_mod.type_name(vtype)}",
                     file=self.filename, line=getattr(elem, "line", 0))
 
@@ -5262,6 +5375,20 @@ class CodeGen:
                 url_val = self._coerce(url_val, url_type, TEXT, main_lines)
             else:
                 url_val = self.string_const("festina.sqlite")
+            # claude.md #101: register the media decoders BEFORE any
+            # query can run, so a table with an aud/img column can turn
+            # a stored BLOB back into a handle. Emitted here rather than
+            # called by name from the core runtime, which must not
+            # reference the graphics/audio translation units at all --
+            # that separation is what lets a program using neither link
+            # neither. Only emitted when the program already links the
+            # feature in question, so the symbol always exists.
+            if self.uses_audio:
+                main_lines.append(
+                    "  call void @festina_set_audio_decoder(ptr @festina_audio_from_bytes)")
+            if self.uses_graphics_code or self.uses_graphics:
+                main_lines.append(
+                    "  call void @festina_set_image_decoder(ptr @festina_image_from_bytes)")
             main_lines.append(f"  %db = call ptr @festina_db_open(ptr {url_val})")
             main_lines.append("  store ptr %db, ptr @__festina_db")
             for tname, cols in self.tables.items():

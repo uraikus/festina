@@ -17,9 +17,13 @@
  * through festina_runtime_internal.h rather than owning any of its own.
  */
 #include <string.h>     /* memset -- Motif WM hints */
-#include <stdio.h>      /* snprintf -- festina_load_image's error message */
+#include <stdio.h>      /* snprintf/fopen -- image loading and its errors */
 #include <stdlib.h>     /* malloc/free -- claude.md #92's image box */
 #include <ctype.h>      /* tolower -- claude.md #90's case-insensitive style match */
+#include <errno.h>      /* strerror -- festina_load_image's error message */
+#include <stdint.h>     /* uint32_t -- claude.md #101's JPEG pixel conversion */
+#include <setjmp.h>     /* libjpeg reports errors by longjmp -- claude.md #101 */
+#include <jpeglib.h>    /* claude.md #101: JPEG decoding */
 #include <sys/select.h> /* select() -- multiplexes X11 events with timers */
 #include <time.h>       /* nanosleep -- festina_graphics_init's connect retry */
 #include <X11/Xlib.h>
@@ -800,10 +804,21 @@ void festina_draw_text(const char *text, int64_t x, int64_t y) {
  * sees the new one, exactly as they shared the old. */
 typedef struct {
     cairo_surface_t *surface;
+    /* claude.md #101: the bytes this image was LOADED from, kept so a
+     * `file:img` table column round-trips byte for byte rather than
+     * being re-encoded. NULL for an image that never came from a file
+     * (a clip() or a resize() result, or one decoded from a blob that
+     * has since been resized) -- festina_image_bytes encodes PNG on
+     * demand in that case, and caches it here. Usually SMALLER than
+     * the decoded surface it sits next to: a 128x64 PNG is a couple of
+     * kilobytes against 32KB of ARGB32, so keeping it is a modest
+     * overhead rather than a doubling. */
+    unsigned char *bytes;
+    size_t byte_count;
 } FestinaImageBox;
 
 static FestinaImageBox *festina_image_box(cairo_surface_t *surface) {
-    FestinaImageBox *box = malloc(sizeof(FestinaImageBox));
+    FestinaImageBox *box = calloc(1, sizeof(FestinaImageBox));
     if (!box) festina_fail("out of memory creating an image");
     box->surface = surface;
     return box;
@@ -821,20 +836,200 @@ static void festina_check_image_size(const char *fn, int64_t w, int64_t h) {
     festina_fail(msg);
 }
 
-void *festina_load_image(const char *path) {
-    if (!path) path = "";
-    /* claude.md #37: "Supported image formats are determined by the
-     * runtime" -- PNG only, via Cairo's own built-in decoder. */
-    cairo_surface_t *img = cairo_image_surface_create_from_png(path);
-    cairo_status_t status = cairo_surface_status(img);
-    if (status != CAIRO_STATUS_SUCCESS) {
+/* claude.md #101: decoding from MEMORY is the primitive now, and
+ * loading a path is "read the file, then decode the bytes". That is
+ * what lets an `img` come out of a sqlite BLOB column as easily as out
+ * of a file -- the two paths differ only in where the bytes came from.
+ *
+ * PNG goes through Cairo's own decoder (via a stream callback, since
+ * Cairo has no decode-this-buffer entry point) and JPEG through
+ * libjpeg. Sniffing is by magic bytes rather than by file extension:
+ * a blob out of a database has no extension, and an extension was
+ * never evidence of anything anyway. */
+
+typedef struct {
+    const unsigned char *data;
+    size_t len;
+    size_t pos;
+} FestinaByteReader;
+
+static cairo_status_t festina_png_read(void *closure, unsigned char *out, unsigned int len) {
+    FestinaByteReader *r = (FestinaByteReader *)closure;
+    if (r->pos + len > r->len) return CAIRO_STATUS_READ_ERROR;
+    memcpy(out, r->data + r->pos, len);
+    r->pos += len;
+    return CAIRO_STATUS_SUCCESS;
+}
+
+/* libjpeg's error handler exits the process by default, which would
+ * turn a corrupt image into a silent death with no Festina-level
+ * message. This one longjmps back into the decoder below so the
+ * failure can be reported the same way every other load failure is. */
+struct festina_jpeg_error {
+    struct jpeg_error_mgr base;
+    jmp_buf escape;
+};
+
+static void festina_jpeg_fail(j_common_ptr info) {
+    longjmp(((struct festina_jpeg_error *)info->err)->escape, 1);
+}
+
+static cairo_surface_t *festina_decode_jpeg(const unsigned char *data, size_t len) {
+    struct jpeg_decompress_struct info;
+    struct festina_jpeg_error err;
+    cairo_surface_t *surface = NULL;
+    unsigned char *scanline = NULL;
+
+    info.err = jpeg_std_error(&err.base);
+    err.base.error_exit = festina_jpeg_fail;
+    if (setjmp(err.escape)) {
+        jpeg_destroy_decompress(&info);
+        free(scanline);
+        if (surface) cairo_surface_destroy(surface);
+        return NULL;
+    }
+
+    jpeg_create_decompress(&info);
+    jpeg_mem_src(&info, data, (unsigned long)len);
+    if (jpeg_read_header(&info, TRUE) != JPEG_HEADER_OK) longjmp(err.escape, 1);
+    /* Ask for plain RGB regardless of what the file actually is
+     * (greyscale, CMYK, YCbCr) -- libjpeg converts, and one output
+     * shape means one conversion loop below instead of four. */
+    info.out_color_space = JCS_RGB;
+    jpeg_start_decompress(&info);
+
+    surface = cairo_image_surface_create(CAIRO_FORMAT_RGB24,
+                                          (int)info.output_width, (int)info.output_height);
+    if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) longjmp(err.escape, 1);
+    unsigned char *pixels = cairo_image_surface_get_data(surface);
+    int stride = cairo_image_surface_get_stride(surface);
+    scanline = malloc((size_t)info.output_width * 3);
+    if (!scanline) longjmp(err.escape, 1);
+
+    while (info.output_scanline < info.output_height) {
+        unsigned char *rows[1] = { scanline };
+        int y = (int)info.output_scanline;
+        jpeg_read_scanlines(&info, rows, 1);
+        /* CAIRO_FORMAT_RGB24 is a 32-bit pixel with the top byte
+         * unused, laid out natively -- so on a little-endian target
+         * (the only kind this runtime targets, same assumption the WAV
+         * loader already makes) the bytes go B, G, R, x. */
+        uint32_t *out = (uint32_t *)(pixels + (size_t)y * (size_t)stride);
+        for (unsigned int x = 0; x < info.output_width; x++) {
+            out[x] = ((uint32_t)scanline[x * 3] << 16) |
+                     ((uint32_t)scanline[x * 3 + 1] << 8) |
+                     (uint32_t)scanline[x * 3 + 2];
+        }
+    }
+
+    jpeg_finish_decompress(&info);
+    jpeg_destroy_decompress(&info);
+    free(scanline);
+    cairo_surface_mark_dirty(surface);
+    return surface;
+}
+
+void *festina_image_from_bytes(const void *data, int64_t len, const char *label) {
+    const unsigned char *bytes = (const unsigned char *)data;
+    if (!label) label = "<blob>";
+    if (!bytes || len <= 0) {
         char msg[512];
-        snprintf(msg, sizeof(msg), "could not load image '%s': %s (only PNG images are supported)",
-                 path, cairo_status_to_string(status));
-        cairo_surface_destroy(img);
+        snprintf(msg, sizeof(msg), "could not load image '%s': no image data", label);
         festina_fail(msg);
     }
-    return festina_image_box(img);
+
+    cairo_surface_t *img = NULL;
+    if (len >= 8 && memcmp(bytes, "\x89PNG\r\n\x1a\n", 8) == 0) {
+        FestinaByteReader reader = { bytes, (size_t)len, 0 };
+        img = cairo_image_surface_create_from_png_stream(festina_png_read, &reader);
+        if (cairo_surface_status(img) != CAIRO_STATUS_SUCCESS) {
+            cairo_surface_destroy(img);
+            img = NULL;
+        }
+    } else if (len >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) {
+        img = festina_decode_jpeg(bytes, (size_t)len);
+    } else {
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+                 "could not load image '%s': not a PNG or JPEG "
+                 "(those are the two formats this runtime decodes)", label);
+        festina_fail(msg);
+    }
+
+    if (!img) {
+        char msg[512];
+        snprintf(msg, sizeof(msg), "could not load image '%s': the image data is corrupt", label);
+        festina_fail(msg);
+    }
+
+    FestinaImageBox *box = festina_image_box(img);
+    box->bytes = malloc((size_t)len);
+    if (!box->bytes) festina_fail("out of memory loading an image");
+    memcpy(box->bytes, bytes, (size_t)len);
+    box->byte_count = (size_t)len;
+    return box;
+}
+
+void *festina_load_image(const char *path) {
+    if (!path) path = "";
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        char msg[512];
+        snprintf(msg, sizeof(msg), "could not open image file '%s': %s", path, strerror(errno));
+        festina_fail(msg);
+    }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); festina_fail("could not read image file"); }
+    long size = ftell(f);
+    if (size < 0) { fclose(f); festina_fail("could not read image file"); }
+    rewind(f);
+    unsigned char *data = malloc((size_t)size ? (size_t)size : 1);
+    if (!data) { fclose(f); festina_fail("out of memory loading an image"); }
+    size_t got = fread(data, 1, (size_t)size, f);
+    fclose(f);
+    if (got != (size_t)size) {
+        free(data);
+        char msg[512];
+        snprintf(msg, sizeof(msg), "could not read image file '%s'", path);
+        festina_fail(msg);
+    }
+    void *box = festina_image_from_bytes(data, (int64_t)size, path);
+    free(data);
+    return box;
+}
+
+/* claude.md #101: the bytes to store when an `img` is bound as a sqlite
+ * BLOB. For an image loaded from a file or a blob these are exactly the
+ * bytes it came from, so a round trip through a table is byte-identical
+ * and a JPEG stays a JPEG. An image with no source bytes -- a clip() or
+ * resize() result -- is encoded to PNG on demand and the result cached,
+ * since PNG is lossless and Cairo can already write it. */
+static cairo_status_t festina_png_write(void *closure, const unsigned char *data,
+                                         unsigned int len) {
+    FestinaImageBox *box = (FestinaImageBox *)closure;
+    unsigned char *grown = realloc(box->bytes, box->byte_count + len);
+    if (!grown) return CAIRO_STATUS_WRITE_ERROR;
+    memcpy(grown + box->byte_count, data, len);
+    box->bytes = grown;
+    box->byte_count += len;
+    return CAIRO_STATUS_SUCCESS;
+}
+
+const void *festina_image_bytes(void *img, int64_t *out_len) {
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    if (out_len) *out_len = 0;
+    if (!box) return NULL;
+    if (!box->bytes) {
+        box->byte_count = 0;
+        if (cairo_surface_write_to_png_stream(box->surface, festina_png_write, box)
+                != CAIRO_STATUS_SUCCESS) {
+            free(box->bytes);
+            box->bytes = NULL;
+            box->byte_count = 0;
+            festina_fail("could not encode an image for storage");
+        }
+    }
+    if (out_len) *out_len = (int64_t)box->byte_count;
+    return box->bytes;
 }
 
 int64_t festina_image_width(void *img) {
@@ -891,6 +1086,13 @@ void festina_image_resize(void *img, int64_t w, int64_t h) {
     cairo_destroy(cr);
     cairo_surface_destroy(box->surface);
     box->surface = out;
+    /* claude.md #101: the source bytes describe the OLD size, so they
+     * are no longer this image's bytes. Dropped rather than re-encoded
+     * eagerly -- festina_image_bytes will encode a PNG if and only if
+     * something actually asks for them. */
+    free(box->bytes);
+    box->bytes = NULL;
+    box->byte_count = 0;
 }
 
 /* claude.md #92: releases an image and the surface it holds. Reached
@@ -900,6 +1102,7 @@ void festina_image_free(void *img) {
     if (!img) return;
     FestinaImageBox *box = (FestinaImageBox *)img;
     if (box->surface) cairo_surface_destroy(box->surface);
+    free(box->bytes);   /* claude.md #101 */
     free(box);
 }
 

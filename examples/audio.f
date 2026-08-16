@@ -11,9 +11,11 @@
 // section for why. Run from the repository root so the relative path
 // below resolves (or edit it to point at any 16-bit PCM WAV file).
 
-// claude.md #100: a path declares the clip -- the same way a
-// blob, a color and a font are each written as the text that
-// reads best. loadAudio('...') still works and means the same.
+// claude.md #100/#101: a path declares the clip -- the same way a
+// blob, a color, a font and an img are each written as the text
+// that reads best. loadAudio('...') still works and means the
+// same. WAV (16-bit PCM) and MP3 are both decoded, sniffed from
+// the file's contents rather than its extension.
 aud beep = 'examples/beep.wav'
 
 log('playing...')

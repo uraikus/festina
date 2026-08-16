@@ -146,6 +146,12 @@ _PKG_INSTALL_HINTS = {
     "cairo-xlib": "install Cairo's and X11's development packages, e.g. "
                   "`apt install libcairo2-dev libx11-dev` on Debian/Ubuntu -- "
                   "needed for claude.md #37/#39's img/graphics functions",
+    "libjpeg": "install libjpeg's development package, e.g. "
+                "`apt install libjpeg-dev` (Debian/Ubuntu) or "
+                "`brew install jpeg-turbo` (macOS)",
+    "libmpg123": "install mpg123's development package, e.g. "
+                  "`apt install libmpg123-dev` (Debian/Ubuntu) or "
+                  "`brew install mpg123` (macOS)",
     "alsa": "install ALSA's development package, e.g. `apt install libasound2-dev` "
             "on Debian/Ubuntu -- needed for claude.md #38's aud/loadAudio()",
 }
@@ -235,12 +241,20 @@ def _sqlite_link_flags(cc):
 _RUNTIME_FEATURES = {
     "graphics": {
         "source": _RUNTIME_GRAPHICS_C,
-        "pkg": "cairo-xlib",
+        # claude.md #101 added libjpeg alongside Cairo: Cairo decodes
+        # PNG on its own but nothing else, and JPEG needs a real
+        # decoder. libjpeg rather than a heavier toolkit for the same
+        # reason Xlib was picked over a GUI toolkit (claude.md #59) --
+        # the smallest dependency that does the job.
+        "pkgs": ["cairo-xlib", "libjpeg"],
         "extra_link_flags": [],
     },
     "audio": {
         "source": _RUNTIME_AUDIO_C,
-        "pkg": "alsa",
+        # claude.md #101: libmpg123 is the MP3 counterpart to libjpeg
+        # above -- the WAV parser is hand-written (a container simple
+        # enough to walk directly), MP3 is not.
+        "pkgs": ["alsa", "libmpg123"],
         # claude.md #38's audio playback runs on a background thread
         # (see festina_runtime.h's doc comment on festina_audio_play) --
         # -pthread is only ever needed for that, so (unlike before the
@@ -250,7 +264,7 @@ _RUNTIME_FEATURES = {
 }
 
 
-def _ensure_runtime_object(cc, name, source, pkg_config_package):
+def _ensure_runtime_object(cc, name, source, pkg_config_packages):
     """Compile one runtime translation unit (core/graphics/audio) to an
     object file once and reuse it (cached in the system temp dir, keyed
     by mtime and by which `cc` compiled it) instead of recompiling the
@@ -261,7 +275,9 @@ def _ensure_runtime_object(cc, name, source, pkg_config_package):
     Each translation unit gets ONLY the pkg-config cflags it actually
     needs (None for core, which needs nothing beyond sqlite3 -- see the
     caller) -- see _RUNTIME_FEATURES' module docstring note for why this
-    matters for the *linked* binary, not just compile-time cflags."""
+    matters for the *linked* binary, not just compile-time cflags. A
+    feature may need several packages (claude.md #101: graphics is
+    Cairo/X11 *and* libjpeg, audio is ALSA *and* libmpg123)."""
     cache_dir = os.path.join(tempfile.gettempdir(), "festina-runtime-cache")
     os.makedirs(cache_dir, exist_ok=True)
     cc_key = hashlib.sha1(cc.encode()).hexdigest()[:8]
@@ -273,8 +289,8 @@ def _ensure_runtime_object(cc, name, source, pkg_config_package):
         return obj_path
 
     cflags = _pkg_config("--cflags", "sqlite3")
-    if pkg_config_package:
-        cflags += _pkg_config("--cflags", pkg_config_package)
+    for pkg in pkg_config_packages or ():
+        cflags += _pkg_config("--cflags", pkg)
     cmd = [cc, "-O2", "-c", source, *cflags, "-o", obj_path]
     result = _run_tool(cmd)
     if result.returncode != 0:
@@ -302,8 +318,10 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio):
         if not wants:
             continue
         feature = _RUNTIME_FEATURES[name]
-        objects.append(_ensure_runtime_object(cc, name, feature["source"], feature["pkg"]))
-        link_libs += _pkg_config("--libs", feature["pkg"]) + feature["extra_link_flags"]
+        objects.append(_ensure_runtime_object(cc, name, feature["source"], feature["pkgs"]))
+        for pkg in feature["pkgs"]:
+            link_libs += _pkg_config("--libs", pkg)
+        link_libs += feature["extra_link_flags"]
 
     return objects, link_libs
 
@@ -403,10 +421,10 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
     extra_link_flags = []
     if needs_graphics:
         runtime_sources.append(_RUNTIME_GRAPHICS_C)
-        pkg_configs.append("cairo-xlib")
+        pkg_configs += _RUNTIME_FEATURES["graphics"]["pkgs"]
     if needs_audio:
         runtime_sources.append(_RUNTIME_AUDIO_C)
-        pkg_configs.append("alsa")
+        pkg_configs += _RUNTIME_FEATURES["audio"]["pkgs"]
         extra_link_flags.append("-pthread")
     cflags = []
     for pkg in pkg_configs:
@@ -503,7 +521,17 @@ def _doctor_report():
     check(_pkg_config_has("cairo-xlib"), False,
           "cairo-xlib dev headers (optional -- only used by graphics: drawRect, on click, img, ...)",
           _PKG_INSTALL_HINTS["cairo-xlib"])
+    # claude.md #101: JPEG/MP3 decoding. Grouped with their own feature
+    # rather than listed as separate tiers -- a program that uses
+    # graphics needs libjpeg whether or not it happens to load a .jpg,
+    # since the whole translation unit is compiled either way.
+    check(_pkg_config_has("libjpeg"), False,
+          "libjpeg dev headers (optional -- only used by graphics: JPEG images)",
+          _PKG_INSTALL_HINTS["libjpeg"])
 
+    check(_pkg_config_has("libmpg123"), False,
+          "libmpg123 dev headers (optional -- only used by audio: MP3 clips)",
+          _PKG_INSTALL_HINTS["libmpg123"])
     check(_pkg_config_has("alsa"), False,
           "alsa dev headers (optional -- only used by audio: loadAudio(), .play(), ...)",
           _PKG_INSTALL_HINTS["alsa"])

@@ -364,15 +364,15 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 995 tests in this directory pass against it: 624 need no external
+All 1008 tests in this directory pass against it: 623 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-350 more need a working C compiler, plus 2 more
+364 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 19 more given
 `Xvfb`+`xdotool` too (4 of those also need `xwd`, from the same
 x11-apps/x11-utils tier, to read real canvas pixels back --
 claude.md #89/#92/#94; two former `xwd` tests became display-free once
-claude.md #95 made saveCanvas headless; claude.md #98 added 4 more) (624
-+ 350 + 2 + 19 = 995 --
+claude.md #95 made saveCanvas headless; claude.md #98 added 4 more) (623
++ 364 + 2 + 19 = 1008 --
 re-verified directly
 by running the whole suite with a PATH containing nothing but Python,
 not just derived by counting `compile_and_run` call sites, since the
@@ -2512,6 +2512,69 @@ same reasons the pool tests are), 4 end-to-end tests in `TestAudio`
 alternation), and 8 in `tests/test_audio.py` for the signatures. Clean
 under ThreadSanitizer and AddressSanitizer.
 
+**claude.md #101**: images are paths too, more formats, and both media
+types fit in a table.
+
+*`img sprite = 'sprite.png'`.* The `aud` treatment from #100, applied
+to the type that should have had it at the same time -- the asymmetry
+was never a decision, just build order. Sets `uses_graphics_CODE` rather
+than `uses_graphics`, so a headless program that loads a sprite does
+not die on "could not open the X display" (the restriction
+`loadImage()` already avoided, which the short form has no business
+reintroducing).
+
+*JPEG and MP3*, via libjpeg and libmpg123 -- the smallest dependency
+that does each job, chosen the way Xlib was chosen over a GUI toolkit
+(#59). claude.md's audio example always named a `.mp3`, so this closes
+a gap the spec had from the start. Format is sniffed from MAGIC BYTES,
+not the extension: an asset out of a database column has no extension.
+
+*`file:aud` / `pic:img` table columns, stored as SQLite BLOBs.*
+Previously such a column fell through to TEXT, which would truncate at
+the first NUL byte in a PNG header -- it compiled and was nonsense.
+Making it work meant inverting how loading is written: decoding from
+MEMORY is the primitive now and loading a path is "read the file, then
+decode the bytes", which is exactly why one code path serves a file and
+a BLOB. Each handle keeps the bytes it decoded from, so a column stores
+the asset's own encoding: a round trip is byte-identical, an MP3 stays
+an MP3 rather than becoming a much larger WAV, a JPEG stays a JPEG. The
+kept bytes are usually SMALLER than the decoded form beside them (a
+128x64 PNG is ~2KB against 32KB of ARGB32). An image with no source
+bytes (a `clip()`/`resize()` result) is encoded to PNG on demand,
+losslessly. Reading a column back registers the two decoders as
+function pointers from `main()` rather than calling them by name, since
+the core runtime must not reference the graphics/audio units at all --
+that split is what lets a program using neither link neither.
+`tests/test_codegen.py::TestMediaFormatsAndPaths` (6 tests, including a
+real JPEG whose gradient makes a channel swap impossible to miss) and
+`::TestMediaColumnsInTables` (6 tests, comparing stored bytes against
+the fixture with Python's own sqlite3). Fixtures under `tests/fixtures/`
+are committed rather than generated: nothing in this repo can encode a
+JPEG or an MP3, and a hand-rolled approximation would prove only that
+the approximation decodes.
+
+*Three leaks found under LeakSanitizer, two of them introduced here.*
+The `img x = 'path'` sugar silently broke #92's reclamation, whose test
+asks whether the initializer is a Call -- true for `loadImage()`, false
+for a StringLit -- so every image declared the new way leaked, one per
+loop iteration. The predicate is now about whether the initializer
+PRODUCES a fresh handle rather than what its AST node happens to be.
+Separately, `aud` had never been reclaimed by anything: #92 gave `img`
+scope-exit freeing and simply never did the same for audio, unnoticed
+because loading a clip in a loop was awkward to write until #100 made
+it natural. And a query row holding an `aud`/`img` column leaked its
+decoded handle, since #85's row release frees columns with `free()` --
+right for a strdup'd buffer, wrong for a handle owning a Cairo surface
+or a block of PCM.
+
+*One improvement, not a bug fix.* Escape analysis exempted an argument
+to a non-retaining builtin only when it was a bare identifier -- but
+`sqlite()`'s bound parameters are always a LITERAL ARRAY, so in
+practice every value ever bound to a query was treated as escaping and
+never reclaimed. The exemption now reaches inside a literal array
+argument, sound for the same reason the builtin was exempt at all:
+every parameter is bound with `SQLITE_TRANSIENT`.
+
 **claude.md #100**: a path declares a clip, and stopping is by channel.
 
 *`aud music = 'path/track.wav'`.* Every other type naturally written as
@@ -3324,5 +3387,5 @@ pytest tests/                          # 605 passed, 323 skipped (needs a C comp
                                         # 15 need Xvfb + xdotool installed too, 1 of those
                                         # also needs `openbox` and 4 need `xwd`) given a
                                         # working C compiler,
-                                        # all 995 pass
+                                        # all 1008 pass
 ```

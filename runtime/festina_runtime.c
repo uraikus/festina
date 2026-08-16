@@ -298,7 +298,33 @@ static const char *festina_sql_type(const char *festina_type) {
     if (strcmp(festina_type, "bool") == 0) return "INTEGER";
     if (strcmp(festina_type, "text") == 0) return "TEXT";
     if (strcmp(festina_type, "blob") == 0) return "BLOB";
+    /* claude.md #101: an `aud`/`img` column stores the asset's own
+     * encoded bytes, so BLOB is the only honest SQL type for it. TEXT
+     * (what these used to fall through to) would have silently
+     * truncated at the first NUL byte in a PNG header. */
+    if (strcmp(festina_type, "aud") == 0) return "BLOB";
+    if (strcmp(festina_type, "img") == 0) return "BLOB";
     return "TEXT";
+}
+
+/* claude.md #101: decoders for the two media types, registered by
+ * main() rather than called by name. This translation unit must not
+ * reference anything in the graphics or audio ones -- that separation
+ * is what lets a program which uses neither link neither (see
+ * festina_runtime.h's top-of-file note) -- so a row containing an
+ * `aud`/`img` column reaches its decoder through a pointer that
+ * codegen fills in exactly when the program already links that
+ * feature. Left NULL otherwise, in which case such a column reads as
+ * null rather than crashing. */
+static void *(*g_audio_decoder)(const void *, int64_t, const char *) = NULL;
+static void *(*g_image_decoder)(const void *, int64_t, const char *) = NULL;
+
+void festina_set_audio_decoder(void *(*fn)(const void *, int64_t, const char *)) {
+    g_audio_decoder = fn;
+}
+
+void festina_set_image_decoder(void *(*fn)(const void *, int64_t, const char *)) {
+    g_image_decoder = fn;
 }
 
 /* festina_sync_table below builds several SQL statements incrementally
@@ -514,6 +540,18 @@ void festina_sqlite_bind_text(sqlite3_stmt *stmt, int32_t idx, const char *val) 
     }
 }
 
+/* claude.md #101: binds an `aud`/`img` as its own encoded bytes.
+ * SQLITE_TRANSIENT so sqlite copies immediately -- the asset owns those
+ * bytes and outlives nothing in particular, and a borrowed pointer
+ * would be a live landmine the first time one was freed. */
+void festina_sqlite_bind_blob(sqlite3_stmt *stmt, int32_t idx, const void *data, int64_t len) {
+    if (data && len > 0) {
+        sqlite3_bind_blob64(stmt, idx, data, (sqlite3_uint64)len, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, idx);
+    }
+}
+
 void festina_sqlite_bind_null(sqlite3_stmt *stmt, int32_t idx) {
     sqlite3_bind_null(stmt, idx);
 }
@@ -609,6 +647,20 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
             if (strcmp(t, "float") == 0) {
                 double d = is_null ? festina_null_float() : sqlite3_column_double(stmt, c);
                 memcpy(&row[c], &d, sizeof(double));
+            } else if (strcmp(t, "aud") == 0 || strcmp(t, "img") == 0) {
+                /* claude.md #101: rebuild the asset from the stored
+                 * bytes. sqlite3_column_blob's pointer is only valid
+                 * until the next step, which is exactly why the decoder
+                 * copies what it needs rather than borrowing. */
+                void *handle = NULL;
+                void *(*decode)(const void *, int64_t, const char *) =
+                    strcmp(t, "aud") == 0 ? g_audio_decoder : g_image_decoder;
+                if (!is_null && decode) {
+                    const void *blob = sqlite3_column_blob(stmt, c);
+                    int blob_len = sqlite3_column_bytes(stmt, c);
+                    if (blob && blob_len > 0) handle = decode(blob, blob_len, "<database>");
+                }
+                memcpy(&row[c], &handle, sizeof(void *));
             } else if (strcmp(t, "text") == 0 || strcmp(t, "blob") == 0) {
                 char *copy = NULL;
                 if (!is_null) {

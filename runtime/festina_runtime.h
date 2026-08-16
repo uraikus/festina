@@ -116,7 +116,19 @@ sqlite3_stmt *festina_sqlite_prepare(sqlite3 *db, const char *sql);
 void festina_sqlite_bind_int(sqlite3_stmt *stmt, int32_t idx, int64_t val);
 void festina_sqlite_bind_float(sqlite3_stmt *stmt, int32_t idx, double val);
 void festina_sqlite_bind_text(sqlite3_stmt *stmt, int32_t idx, const char *val);
+void festina_sqlite_bind_blob(sqlite3_stmt *stmt, int32_t idx, const void *data, int64_t len);
 void festina_sqlite_bind_null(sqlite3_stmt *stmt, int32_t idx);
+
+/* claude.md #101: an `aud`/`img` table column stores the asset's own
+ * encoded bytes as a BLOB, so reading such a row has to turn bytes back
+ * into a handle. This translation unit must not reference the graphics
+ * or audio ones by name -- that separation is what lets a program using
+ * neither link neither (see this file's top-of-file note) -- so main()
+ * registers the decoders instead, exactly when the program already
+ * links that feature. Unregistered, such a column reads as null rather
+ * than crashing. */
+void festina_set_audio_decoder(void *(*fn)(const void *, int64_t, const char *));
+void festina_set_image_decoder(void *(*fn)(const void *, int64_t, const char *));
 
 /* Runs a prepared statement to completion and finalizes it, discarding
  * any rows (INSERT/UPDATE/DELETE, or a SELECT whose result isn't
@@ -238,10 +250,14 @@ char *festina_regex_replace(void *compiled, const char *text,
  * doesn't never opens a window, exactly like festina_db_open() only
  * ever runs for a program that declares a `table`.
  *
- * festina_load_image supports PNG only, via Cairo's own built-in
- * decoder -- claude.md #37: "Supported image formats are determined by
- * the runtime," and PNG is the one format Cairo can decode without
- * pulling in another image-format library.
+ * festina_load_image supports PNG (via Cairo's own built-in decoder)
+ * and, since claude.md #101, JPEG (via libjpeg) -- claude.md #37:
+ * "Supported image formats are determined by the runtime." libjpeg
+ * rather than a heavier toolkit for the same reason Xlib was picked
+ * over a GUI toolkit: the smallest dependency that does the job.
+ * Format is sniffed from the MAGIC BYTES, not the file extension -- a
+ * blob out of a database column has no extension, and an extension was
+ * never evidence of anything anyway.
  *
  * festina_register_click_handler/_mouse_handler take a fixed
  * `void (*)(int64_t, int64_t)` signature,
@@ -300,6 +316,12 @@ void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h);
 void festina_draw_circle(int64_t x, int64_t y, int64_t r);
 void festina_draw_text(const char *text, int64_t x, int64_t y);
 void *festina_load_image(const char *path);
+/* claude.md #101: the image counterparts of the two audio entry points
+ * above, with one difference -- an image that never came from a file
+ * (a clip() or resize() result) has no source bytes, so
+ * festina_image_bytes encodes PNG on demand and caches it. */
+void *festina_image_from_bytes(const void *data, int64_t len, const char *label);
+const void *festina_image_bytes(void *img, int64_t *out_len);
 /* claude.md #92: img methods and properties. An `img` value is a
  * pointer to a small box holding the Cairo surface, not the surface
  * itself -- that indirection is what lets resize() change the image in
@@ -507,16 +529,14 @@ void festina_run_timer_loop(void);
  * that does the job (claude.md #59; the same reasoning that picked
  * Xlib over a GUI toolkit for graphics).
  *
- * festina_load_audio only supports WAV (16-bit PCM) -- claude.md's own
- * example names a `.mp3`, but unlike Cairo (which decodes PNG on its
- * own, so images support PNG "for free") nothing this project already
- * depends on can decode MP3 without a real new library, so WAV -- a
- * container simple enough to parse directly in festina_runtime.c with
- * zero decoder dependencies at all -- is the implementation-defined
- * choice here, the same kind of call PNG-only images already made.
- * Anything else (a compressed WAV, 8/24/32-bit PCM, an actual MP3,
- * ...) fails at load time with a clear message, not a crash or silent
- * garbage.
+ * festina_load_audio supports WAV (16-bit PCM), parsed directly here
+ * since RIFF is simple enough to walk, and -- since claude.md #101 --
+ * MP3 via libmpg123, which claude.md's own `.mp3` example always
+ * implied. libmpg123 is the audio counterpart of libjpeg above and was
+ * chosen the same way. Format is sniffed from content, not from the
+ * file extension. Anything else (a compressed WAV, 8/24/32-bit PCM,
+ * Ogg, FLAC, ...) fails at load time with a clear message naming both
+ * supported formats, not a crash or silent garbage.
  *
  * festina_audio_play_on(): calling play() opens (and configures) the ALSA
  * device *synchronously*, right there in the play() call itself -- not
@@ -593,6 +613,19 @@ void festina_run_timer_loop(void);
  * closes), it does not wait for playback to finish.
  */
 void *festina_load_audio(const char *path);
+/* claude.md #101: decoding from memory is the primitive; loading a path
+ * is "read the file, then decode the bytes". `label` only names the
+ * source in an error message. festina_audio_bytes hands back the bytes
+ * the clip was decoded from, for storing an `aud` in a sqlite BLOB
+ * column -- so a round trip is byte-identical and an MP3 stays an MP3
+ * rather than becoming a much larger WAV. */
+void *festina_audio_from_bytes(const void *data, int64_t len, const char *label);
+const void *festina_audio_bytes(void *audio, int64_t *out_len);
+/* claude.md #101: frees a clip codegen has proven this scope created
+ * and never shared -- the aud counterpart of festina_image_free, which
+ * `img` has had since claude.md #92. Stops any channel still playing it
+ * first, so "freed while a thread is streaming it" cannot happen. */
+void festina_audio_free(void *audio);
 /* claude.md #38/#99: `channel` names a channel and `explicit_channel`
  * says whether the program actually named one (a bare play() passes 0
  * and gets automatic assignment); `looping` selects playLoop() over

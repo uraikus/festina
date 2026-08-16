@@ -26,6 +26,14 @@ import wave
 import pytest
 
 _EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
+# claude.md #101: real JPEG/MP3 files, committed rather than generated,
+# because nothing in this repo can encode either and a test that only
+# exercised a hand-rolled approximation would prove nothing about
+# libjpeg/libmpg123 actually being wired up. Both are tiny (a 16x16
+# gradient and a fifth of a second of a 440Hz tone).
+_FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+_JPEG_FIXTURE = os.path.join(_FIXTURES_DIR, "gradient.jpg")
+_MP3_FIXTURE = os.path.join(_FIXTURES_DIR, "tone.mp3")
 
 
 # ---- no C toolchain needed -- IR-text-only checks ----
@@ -4068,10 +4076,22 @@ class TestGraphics:
         assert result.stdout == "drew headlessly\n"
 
     def test_invalid_image_path_is_a_clear_runtime_error(self, compile_and_run, monkeypatch):
+        # claude.md #101 split "cannot open the file" from "cannot
+        # decode what is in it" -- they are different mistakes and the
+        # old single message named neither precisely.
         monkeypatch.delenv("DISPLAY", raising=False)
-        result = compile_and_run("img icon = loadImage('/nonexistent/path.png')\nlog('unreachable')")
+        result = compile_and_run("img icon = '/nonexistent/path.png'\nlog('unreachable')")
         assert result.returncode == 1
-        assert "could not load image" in result.stderr
+        assert "could not open image file" in result.stderr
+        assert "unreachable" not in result.stdout
+
+    def test_an_undecodable_image_names_both_supported_formats(self, compile_and_run, tmp_path,
+                                                                 monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        (tmp_path / "bad.png").write_bytes(b"this is not an image at all")
+        result = compile_and_run("img icon = 'bad.png'\nlog('unreachable')")
+        assert result.returncode == 1
+        assert "not a PNG or JPEG" in result.stderr
         assert "unreachable" not in result.stdout
 
     def test_program_without_graphics_never_opens_a_window(self, compile_and_run, monkeypatch):
@@ -4560,11 +4580,13 @@ class TestAudio:
         assert "could not open audio file" in result.stderr
         assert "unreachable" not in result.stdout
 
-    def test_non_wav_file_is_a_clear_runtime_error(self, compile_and_run, tmp_path):
+    def test_undecodable_audio_is_a_clear_runtime_error(self, compile_and_run, tmp_path):
         (tmp_path / "bad.wav").write_bytes(b"this is not a wav file at all")
         result = compile_and_run("aud music = 'bad.wav'\nlog('unreachable')")
         assert result.returncode == 1
-        assert "only 16-bit PCM WAV audio is supported" in result.stderr
+        # claude.md #101: the message names both formats this runtime
+        # decodes, since "not a WAV" stopped being the whole story.
+        assert "not 16-bit PCM WAV or MP3" in result.stderr
         assert "unreachable" not in result.stdout
 
     def test_is_playing_true_immediately_after_play(self, compile_and_run, tmp_path, audio_null_env):
@@ -4642,16 +4664,25 @@ class TestAudio:
         # claude.md #98: the behaviour this replaced would have had the
         # second play() stop the first. Festina has no way to count
         # voices (deliberately -- the pool is not language surface), so
-        # what is observable here is that three rapid plays of a clip
-        # long enough not to have finished all report as playing and
-        # nothing crashes; TestAudioVoicePool below opens the runtime up
-        # and counts the voices directly.
+        # what is observable here is that three overlapping playbacks all
+        # report as playing and nothing crashes; TestAudioVoicePool below
+        # opens the runtime up and counts the voices directly.
+        #
+        # playLoop, not play, and that is not incidental: the null ALSA
+        # device this runs against consumes PCM instantly (measured -- a
+        # 2-second clip finishes in 0ms), so a one-shot can legitimately
+        # finish between the play() call and the next statement. Written
+        # with play() this test passed in isolation and failed under
+        # full-suite load, which is a race in the TEST rather than in the
+        # runtime -- "isPlaying() is true the instant play() returns" is
+        # still honoured, it just says nothing about the statement after.
+        # A loop never finishes on its own, so there is no window at all.
         _write_wav(tmp_path / "clip.wav", duration_s=1.0)
         source = (
             "aud music = 'clip.wav'\n"
-            "music.play()\n"
-            "music.play()\n"
-            "music.play()\n"
+            "music.playLoop(0)\n"
+            "music.playLoop(1)\n"
+            "music.playLoop(2)\n"
             "log(music.isPlaying())\n"
             "stopAudioPlayer()\n"
             "log(music.isPlaying())\n"
@@ -5172,6 +5203,231 @@ int main(int argc, char **argv) {
 """
 
 
+class TestMediaFormatsAndPaths:
+    """claude.md #101: `img sprite = 'sprite.png'` alongside claude.md
+    #100's `aud`, JPEG and MP3 decoding, and both types as sqlite BLOB
+    columns.
+
+    The format tests run against REAL files committed under
+    tests/fixtures/ rather than anything generated here. Nothing in this
+    repo can encode a JPEG or an MP3, so a hand-rolled approximation
+    would only prove that a hand-rolled approximation decodes -- the
+    point is that libjpeg and libmpg123 are genuinely wired up.
+    """
+
+    def test_a_path_declares_an_image(self, compile_and_run, tmp_path, monkeypatch,
+                                       sprite_sheet_png):
+        # The img counterpart of claude.md #100's aud form. Headless on
+        # purpose: decoding needs no display, and the short form must not
+        # quietly demand one where loadImage() never did.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        name = os.path.basename(sprite_sheet_png)   # already written into tmp_path
+        result = compile_and_run(
+            f"img sheet = '{name}'\nlog(`${{sheet.width}}x${{sheet.height}}`)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "128x64"
+
+    def test_an_image_path_may_be_a_computed_text_expression(self, compile_and_run, tmp_path,
+                                                               monkeypatch, sprite_sheet_png):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        stem = os.path.basename(sprite_sheet_png)[:-len(".png")]
+        result = compile_and_run(
+            f"text name = '{stem}'\nimg sheet = name + '.png'\nlog(sheet.width)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "128"
+
+    def test_jpeg_decodes(self, compile_and_run, tmp_path, monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        shutil.copy(_JPEG_FIXTURE, tmp_path / "gradient.jpg")
+        result = compile_and_run(
+            "img photo = 'gradient.jpg'\nlog(`${photo.width}x${photo.height}`)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "16x16"
+
+    def test_jpeg_pixels_are_right_way_round(self, compile_and_run, tmp_path, monkeypatch):
+        # The fixture is a gradient: red rises with x, green with y, blue
+        # is flat at 128. That makes a channel swap (the classic mistake
+        # converting libjpeg's RGB into Cairo's native-endian pixel)
+        # impossible to miss, which "it decoded to 16x16" would not
+        # catch. Tolerance is for JPEG being lossy, nothing else.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        shutil.copy(_JPEG_FIXTURE, tmp_path / "gradient.jpg")
+        result = compile_and_run(
+            "img photo = 'gradient.jpg'\n"
+            "drawImage(photo, 0, 0)\n"
+            "log(saveCanvas('out.png'))\n"
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        for x, y, expected in [(0, 0, (0, 0, 128)), (15, 0, (240, 0, 128)),
+                                (0, 15, (0, 240, 128)), (15, 15, (240, 240, 128))]:
+            got = pixel(x, y)
+            worst = max(abs(g - e) for g, e in zip(got, expected))
+            assert worst <= 24, f"({x},{y}) expected ~{expected}, got {got}"
+
+    def test_mp3_decodes_and_plays(self, compile_and_run, tmp_path, audio_null_env):
+        shutil.copy(_MP3_FIXTURE, tmp_path / "tone.mp3")
+        result = compile_and_run(
+            "aud tone = 'tone.mp3'\n"
+            "tone.play()\n"
+            "log(tone.isPlaying())\n",
+            env=audio_null_env,
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_format_is_sniffed_from_content_not_the_extension(self, compile_and_run, tmp_path,
+                                                                monkeypatch):
+        # A blob out of a database has no extension at all, so the
+        # decoder never had any business trusting one. Same JPEG, named
+        # ".png".
+        monkeypatch.delenv("DISPLAY", raising=False)
+        shutil.copy(_JPEG_FIXTURE, tmp_path / "lying.png")
+        result = compile_and_run("img photo = 'lying.png'\nlog(photo.width)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "16"
+
+
+class TestMediaColumnsInTables:
+    """claude.md #101: `file:aud` / `pic:img` table columns, stored as
+    SQLite BLOBs.
+
+    The stored bytes are the asset's OWN encoded bytes, not a
+    re-encoding, so a round trip is byte-identical and an MP3 stays an
+    MP3 rather than becoming a much larger WAV. That is checked here by
+    reading the database back with Python's own sqlite3 and comparing
+    against the fixture file, which is the only way to prove it is a
+    real BLOB rather than something that merely round-trips through
+    Festina.
+    """
+
+    def _db(self, tmp_path):
+        return sqlite3.connect(str(tmp_path / "festina.sqlite"))
+
+    def test_the_column_type_is_blob(self, compile_and_run, tmp_path):
+        source = """
+        table Music {
+            name:text
+            file:aud
+        }
+        table Sprites {
+            name:text
+            pic:img
+        }
+        log('synced')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        schema = dict(self._db(tmp_path).execute(
+            "SELECT name, sql FROM sqlite_master WHERE name IN ('Music','Sprites')").fetchall())
+        # TEXT (what these used to fall through to) would have silently
+        # truncated at the first NUL byte in a PNG header.
+        assert "file BLOB" in schema["Music"]
+        assert "pic BLOB" in schema["Sprites"]
+
+    def test_binding_an_aud_stores_its_own_bytes(self, compile_and_run, tmp_path, audio_null_env):
+        shutil.copy(_MP3_FIXTURE, tmp_path / "tone.mp3")
+        source = """
+        table Music {
+            name:text
+            file:aud
+        }
+        aud track = 'tone.mp3'
+        sqlite('INSERT INTO Music (name, file) VALUES (?, ?)', ['theme', track])
+        log('inserted')
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        stored = self._db(tmp_path).execute("SELECT file FROM Music").fetchone()[0]
+        assert isinstance(stored, bytes)
+        assert stored == open(_MP3_FIXTURE, "rb").read()
+
+    def test_binding_an_img_stores_its_own_bytes(self, compile_and_run, tmp_path, monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        shutil.copy(_JPEG_FIXTURE, tmp_path / "gradient.jpg")
+        source = """
+        table Sprites {
+            name:text
+            pic:img
+        }
+        img hero = 'gradient.jpg'
+        sqlite('INSERT INTO Sprites (name, pic) VALUES (?, ?)', ['hero', hero])
+        log('inserted')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        stored = self._db(tmp_path).execute("SELECT pic FROM Sprites").fetchone()[0]
+        assert isinstance(stored, bytes)
+        # Byte-identical: a JPEG stays a JPEG rather than being
+        # re-encoded as PNG on the way in.
+        assert stored == open(_JPEG_FIXTURE, "rb").read()
+
+    def test_a_stored_clip_reads_back_as_a_playable_aud(self, compile_and_run, tmp_path,
+                                                          audio_null_env):
+        shutil.copy(_MP3_FIXTURE, tmp_path / "tone.mp3")
+        source = """
+        table Music {
+            name:text
+            file:aud
+        }
+        aud track = 'tone.mp3'
+        sqlite('INSERT INTO Music (name, file) VALUES (?, ?)', ['theme', track])
+        arr[Music] rows = sqlite('SELECT * FROM Music')
+        log(rows[0].name)
+        rows[0].file.play()
+        log(rows[0].file.isPlaying())
+        stopAudioPlayer()
+        log(rows[0].file.isPlaying())
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["theme", "true", "false"]
+
+    def test_a_stored_image_reads_back_with_its_real_size(self, compile_and_run, tmp_path,
+                                                            monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        shutil.copy(_JPEG_FIXTURE, tmp_path / "gradient.jpg")
+        source = """
+        table Sprites {
+            name:text
+            pic:img
+        }
+        img hero = 'gradient.jpg'
+        sqlite('INSERT INTO Sprites (name, pic) VALUES (?, ?)', ['hero', hero])
+        arr[Sprites] rows = sqlite('SELECT * FROM Sprites')
+        log(`${rows[0].name} ${rows[0].pic.width}x${rows[0].pic.height}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "hero 16x16"
+
+    def test_a_clipped_image_with_no_source_bytes_is_encoded_on_demand(
+        self, compile_and_run, tmp_path, monkeypatch, sprite_sheet_png
+    ):
+        # A clip() result never came from a file, so it has no bytes to
+        # store -- festina_image_bytes encodes PNG for it. The round trip
+        # has to preserve the SIZE of the clipped tile, not the sheet.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        sheet = os.path.basename(sprite_sheet_png)
+        source = f"""
+        table Sprites {{
+            name:text
+            pic:img
+        }}
+        img sheet = '{sheet}'
+        img tile = sheet.clip(0, 0, 32, 32)
+        sqlite('INSERT INTO Sprites (name, pic) VALUES (?, ?)', ['tile', tile])
+        arr[Sprites] rows = sqlite('SELECT * FROM Sprites')
+        log(`${{rows[0].pic.width}}x${{rows[0].pic.height}}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "32x32"
+        stored = self._db(tmp_path).execute("SELECT pic FROM Sprites").fetchone()[0]
+        assert stored[:8] == b"\x89PNG\r\n\x1a\n"
+
+
 class TestAudioChannels:
     """claude.md #99: channels are named, and playLoop reserves one.
 
@@ -5193,10 +5449,11 @@ class TestAudioChannels:
         cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
         if not cc:
             pytest.skip("no C compiler (clang/gcc/cc) on PATH")
-        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa"],
+        # claude.md #101: the audio unit needs libmpg123 too now.
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa", "libmpg123"],
                                capture_output=True, text=True)
         if alsa.returncode != 0:
-            pytest.skip("alsa dev headers are not installed")
+            pytest.skip("alsa/libmpg123 dev headers are not installed")
         runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
         harness = tmp_path / "channel_harness.c"
         harness.write_text(_CHANNEL_HARNESS)
@@ -5291,10 +5548,11 @@ class TestAudioOnANonMixingDevice:
         cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
         if not cc:
             pytest.skip("no C compiler (clang/gcc/cc) on PATH")
-        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa"],
+        # claude.md #101: the audio unit needs libmpg123 too now.
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa", "libmpg123"],
                                capture_output=True, text=True)
         if alsa.returncode != 0:
-            pytest.skip("alsa dev headers are not installed")
+            pytest.skip("alsa/libmpg123 dev headers are not installed")
         runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
         harness = tmp_path / "single_stream_harness.c"
         harness.write_text(_SINGLE_STREAM_HARNESS)
@@ -5347,10 +5605,11 @@ class TestAudioVoicePool:
         cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
         if not cc:
             pytest.skip("no C compiler (clang/gcc/cc) on PATH")
-        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa"],
+        # claude.md #101: the audio unit needs libmpg123 too now.
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa", "libmpg123"],
                                capture_output=True, text=True)
         if alsa.returncode != 0:
-            pytest.skip("alsa dev headers are not installed")
+            pytest.skip("alsa/libmpg123 dev headers are not installed")
 
         runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
         harness = tmp_path / "voice_pool_harness.c"

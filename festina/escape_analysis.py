@@ -231,14 +231,34 @@ def _walk_expr(expr, escaping, escaping_params):
             elif escaping_params is not None:
                 escaping_positions = escaping_params.get(expr.callee.name)
         for i, a in enumerate(expr.args):
-            if (escaping_positions is not None and i not in escaping_positions
-                    and isinstance(a, ast.Identifier)):
-                # Proven safe at this specific call site -- deliberately
-                # NOT added to `escaping` here. `a` may still end up in
-                # `escaping` anyway, through some other, unrelated use
-                # elsewhere in this same function; this only stops this
-                # one call site from being the *reason* it does.
-                continue
+            if escaping_positions is not None and i not in escaping_positions:
+                if isinstance(a, ast.Identifier):
+                    # Proven safe at this specific call site --
+                    # deliberately NOT added to `escaping` here. `a` may
+                    # still end up in `escaping` anyway, through some
+                    # other, unrelated use elsewhere in this same
+                    # function; this only stops this one call site from
+                    # being the *reason* it does.
+                    continue
+                if isinstance(a, ast.ArrayLit):
+                    # claude.md #101: reach INSIDE a literal array
+                    # argument. This exists for sqlite() specifically,
+                    # whose bound parameters must be a literal array
+                    # (see codegen's own restriction) -- so
+                    # `sqlite('... VALUES (?, ?)', [name, track])` is
+                    # the ordinary shape, and testing only for a direct
+                    # Identifier meant every value ever bound to a query
+                    # was treated as escaping. Each parameter is bound
+                    # with SQLITE_TRANSIENT, so sqlite has copied
+                    # whatever it needs before the call returns and
+                    # retains nothing -- exactly the property that put
+                    # this builtin in _NON_RETAINING_BUILTINS in the
+                    # first place. Only bare-Identifier elements are
+                    # exempted; anything else is walked normally.
+                    for element in a.elements:
+                        if not isinstance(element, ast.Identifier):
+                            _walk_expr(element, escaping, escaping_params)
+                    continue
             _walk_expr(a, escaping, escaping_params)
         return
     raise AssertionError(

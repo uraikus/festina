@@ -18,6 +18,7 @@
 #include <string.h>
 #include <pthread.h>    /* background audio playback */
 #include <alsa/asoundlib.h>
+#include <mpg123.h>    /* claude.md #101: MP3 decoding */
 #include "festina_runtime.h"
 
 /* claude.md #98/#99: the channel table.
@@ -48,6 +49,11 @@ typedef struct FestinaAudio {
     size_t frame_count;  /* frames (per channel), not raw samples */
     int channels;
     unsigned int sample_rate;
+    /* claude.md #101: the bytes this clip was decoded FROM, kept so a
+     * `file:aud` table column round-trips byte for byte -- an MP3 stays
+     * an MP3 rather than becoming a much larger WAV. */
+    unsigned char *bytes;
+    size_t byte_count;
 } FestinaAudio;
 
 typedef struct FestinaChannel {
@@ -212,6 +218,221 @@ static void festina_audio_halt_locked(FestinaChannel *ch, int release) {
     }
 }
 
+/* claude.md #101: decoding from MEMORY is the primitive, and loading a
+ * path is "read the file, then decode the bytes" -- which is what lets
+ * an `aud` come out of a sqlite BLOB column as easily as out of a file.
+ * Sniffing is by content, not by file extension: a blob out of a
+ * database has no extension, and an extension was never evidence of
+ * anything anyway. */
+
+/* WAV (16-bit PCM). Walks the RIFF chunk list over a byte buffer.
+ * Returns 0 and leaves *out_* untouched on anything it cannot use. */
+static int festina_decode_wav(const unsigned char *data, size_t len,
+                               int16_t **out_samples, size_t *out_frames,
+                               int *out_channels, unsigned int *out_rate) {
+    if (len < 12 || memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "WAVE", 4) != 0) return 0;
+
+    size_t pos = 12;
+    int have_fmt = 0, is_pcm = 0;
+    int16_t channels = 0, bits_per_sample = 0;
+    uint32_t sample_rate = 0;
+    const unsigned char *audio = NULL;
+    uint32_t audio_size = 0;
+
+    while (pos + 8 <= len) {
+        uint32_t chunk_size = (uint32_t)data[pos + 4] | ((uint32_t)data[pos + 5] << 8) |
+                               ((uint32_t)data[pos + 6] << 16) | ((uint32_t)data[pos + 7] << 24);
+        const unsigned char *body = data + pos + 8;
+        size_t available = len - (pos + 8);
+        if (chunk_size > available) chunk_size = (uint32_t)available;
+
+        if (memcmp(data + pos, "fmt ", 4) == 0 && chunk_size >= 16) {
+            int16_t audio_format = (int16_t)(body[0] | (body[1] << 8));
+            channels = (int16_t)(body[2] | (body[3] << 8));
+            sample_rate = (uint32_t)body[4] | ((uint32_t)body[5] << 8) |
+                          ((uint32_t)body[6] << 16) | ((uint32_t)body[7] << 24);
+            bits_per_sample = (int16_t)(body[14] | (body[15] << 8));
+            is_pcm = (audio_format == 1);
+            have_fmt = 1;
+        } else if (memcmp(data + pos, "data", 4) == 0) {
+            audio = body;
+            audio_size = chunk_size;
+            if (have_fmt) break; /* ignore any chunks after data -- metadata etc. */
+        }
+        /* Chunks are padded to an even length, so an odd-sized one has
+         * one extra byte to skip. */
+        pos += 8 + chunk_size + (chunk_size % 2);
+    }
+
+    if (!have_fmt || !is_pcm || !audio || bits_per_sample != 16 || channels < 1) return 0;
+
+    int16_t *samples = malloc(audio_size ? audio_size : 1);
+    if (!samples) festina_fail("out of memory loading audio");
+    /* WAV's PCM data is little-endian; every target this compiler
+     * generates code for (x86/x86_64, ARM in its default mode) is too,
+     * so these bytes are already exactly int16_t samples with no
+     * conversion needed -- the same little-endian assumption this
+     * runtime already makes for int/float elsewhere. */
+    memcpy(samples, audio, audio_size);
+    *out_samples = samples;
+    *out_frames = audio_size / (size_t)(channels * 2);
+    *out_channels = channels;
+    *out_rate = sample_rate;
+    return 1;
+}
+
+/* MP3, via libmpg123. Feeding the whole buffer at once and reading
+ * until the decoder is done is the simplest correct shape, and the
+ * whole file is already in memory anyway. */
+static int festina_decode_mp3(const unsigned char *data, size_t len,
+                               int16_t **out_samples, size_t *out_frames,
+                               int *out_channels, unsigned int *out_rate) {
+    static int initialized = 0;
+    if (!initialized) {
+        if (mpg123_init() != MPG123_OK) return 0;
+        initialized = 1;
+    }
+
+    int err = MPG123_OK;
+    mpg123_handle *mh = mpg123_new(NULL, &err);
+    if (!mh) return 0;
+
+    /* Ask for signed 16-bit at whatever rate the file actually is:
+     * ALSA is configured per clip from these values anyway, so there is
+     * nothing to gain by resampling here and something to lose. */
+    mpg123_format_none(mh);
+    long rates[] = { 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000 };
+    for (size_t i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
+        mpg123_format(mh, rates[i], MPG123_MONO | MPG123_STEREO, MPG123_ENC_SIGNED_16);
+    }
+
+    if (mpg123_open_feed(mh) != MPG123_OK) { mpg123_delete(mh); return 0; }
+
+    unsigned char *pcm = NULL;
+    size_t pcm_len = 0;
+    unsigned char chunk[16384];
+    size_t done = 0;
+    int rc = mpg123_decode(mh, data, len, chunk, sizeof(chunk), &done);
+    for (;;) {
+        if (done > 0) {
+            unsigned char *grown = realloc(pcm, pcm_len + done);
+            if (!grown) { free(pcm); mpg123_delete(mh); festina_fail("out of memory loading audio"); }
+            memcpy(grown + pcm_len, chunk, done);
+            pcm = grown;
+            pcm_len += done;
+        }
+        if (rc == MPG123_NEED_MORE || rc == MPG123_DONE) break;
+        if (rc != MPG123_OK && rc != MPG123_NEW_FORMAT) break;
+        rc = mpg123_decode(mh, NULL, 0, chunk, sizeof(chunk), &done);
+    }
+
+    long rate = 0;
+    int channels = 0, encoding = 0;
+    int have_format = mpg123_getformat(mh, &rate, &channels, &encoding) == MPG123_OK;
+    mpg123_delete(mh);
+
+    if (!pcm || pcm_len == 0 || !have_format || channels < 1 || rate <= 0) {
+        free(pcm);
+        return 0;
+    }
+    *out_samples = (int16_t *)pcm;
+    *out_frames = pcm_len / (size_t)(channels * 2);
+    *out_channels = channels;
+    *out_rate = (unsigned int)rate;
+    return 1;
+}
+
+void *festina_audio_from_bytes(const void *data, int64_t len, const char *label) {
+    const unsigned char *bytes = (const unsigned char *)data;
+    if (!label) label = "<blob>";
+    if (!bytes || len <= 0) {
+        char msg[512];
+        snprintf(msg, sizeof(msg), "could not load audio '%s': no audio data", label);
+        festina_fail(msg);
+    }
+
+    int16_t *samples = NULL;
+    size_t frames = 0;
+    int channels = 0;
+    unsigned int rate = 0;
+    int ok = 0;
+
+    if (len >= 12 && memcmp(bytes, "RIFF", 4) == 0 && memcmp(bytes + 8, "WAVE", 4) == 0) {
+        ok = festina_decode_wav(bytes, (size_t)len, &samples, &frames, &channels, &rate);
+        if (!ok) {
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                     "could not load audio '%s': only 16-bit PCM WAV audio is supported "
+                     "(this WAV is compressed or is not 16-bit)", label);
+            festina_fail(msg);
+        }
+    } else {
+        /* Anything else is offered to the MP3 decoder. An ID3v2 tag
+         * ("ID3") or a raw frame sync (0xFF 0xEx) are the two ordinary
+         * openings, but mpg123 resyncs on its own, so handing it the
+         * buffer and believing its answer beats trying to out-guess it
+         * here. */
+        ok = festina_decode_mp3(bytes, (size_t)len, &samples, &frames, &channels, &rate);
+        if (!ok) {
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                     "could not load audio '%s': not 16-bit PCM WAV or MP3 "
+                     "(those are the two formats this runtime decodes)", label);
+            festina_fail(msg);
+        }
+    }
+
+    FestinaAudio *a = calloc(1, sizeof(FestinaAudio));
+    if (!a) festina_fail("out of memory loading audio");
+    a->samples = samples;
+    a->frame_count = frames;
+    a->channels = channels;
+    a->sample_rate = rate;
+    /* claude.md #101: kept so a `file:aud` table column round-trips
+     * byte for byte rather than being re-encoded -- an MP3 stays an
+     * MP3 rather than becoming a much larger WAV. */
+    a->bytes = malloc((size_t)len);
+    if (!a->bytes) festina_fail("out of memory loading audio");
+    memcpy(a->bytes, bytes, (size_t)len);
+    a->byte_count = (size_t)len;
+    return a;
+}
+
+/* claude.md #101: `img` has had scope-exit reclamation since claude.md
+ * #92 and `aud` never did, for no reason beyond nobody having written
+ * it -- a clip loaded inside a loop leaked one decoded buffer per
+ * iteration. Only ever called for a clip codegen has proven this scope
+ * created and never shared, so stopping every channel playing it first
+ * is a safety net rather than a likely case; it costs nothing and
+ * turns "freed while a thread is still streaming it" from a crash into
+ * an impossibility. */
+void festina_audio_free(void *audio) {
+    FestinaAudio *a = (FestinaAudio *)audio;
+    if (!a) return;
+    pthread_mutex_lock(&g_audio_lock);
+    int busy = 0;
+    for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+        if (g_channels[i].clip == a) { g_channels[i].stop_requested = 1; busy = 1; }
+    }
+    if (busy) {
+        for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+            if (g_channels[i].clip == a) festina_audio_halt_locked(&g_channels[i], 1);
+        }
+    }
+    pthread_mutex_unlock(&g_audio_lock);
+    free(a->samples);
+    free(a->bytes);
+    free(a);
+}
+
+const void *festina_audio_bytes(void *audio, int64_t *out_len) {
+    FestinaAudio *a = (FestinaAudio *)audio;
+    if (out_len) *out_len = 0;
+    if (!a) return NULL;
+    if (out_len) *out_len = (int64_t)a->byte_count;
+    return a->bytes;
+}
+
 void *festina_load_audio(const char *path) {
     if (!path) path = "";
     FILE *f = fopen(path, "rb");
@@ -220,79 +441,24 @@ void *festina_load_audio(const char *path) {
         snprintf(msg, sizeof(msg), "could not open audio file '%s': %s", path, strerror(errno));
         festina_fail(msg);
     }
-
-    unsigned char riff_hdr[12];
-    if (fread(riff_hdr, 1, 12, f) != 12 ||
-            memcmp(riff_hdr, "RIFF", 4) != 0 || memcmp(riff_hdr + 8, "WAVE", 4) != 0) {
-        fclose(f);
-        char msg[512];
-        snprintf(msg, sizeof(msg),
-                 "could not load audio '%s': not a WAV file (only 16-bit PCM WAV audio is supported)",
-                 path);
-        festina_fail(msg);
-    }
-
-    int have_fmt = 0, have_data = 0, is_pcm = 0;
-    int16_t channels = 0, bits_per_sample = 0;
-    uint32_t sample_rate = 0;
-    unsigned char *data = NULL;
-    uint32_t data_size = 0;
-
-    unsigned char chunk_hdr[8];
-    while (fread(chunk_hdr, 1, 8, f) == 8) {
-        uint32_t chunk_size = (uint32_t)chunk_hdr[4] | ((uint32_t)chunk_hdr[5] << 8) |
-                               ((uint32_t)chunk_hdr[6] << 16) | ((uint32_t)chunk_hdr[7] << 24);
-        if (memcmp(chunk_hdr, "fmt ", 4) == 0 && chunk_size >= 16) {
-            unsigned char fmt[16];
-            if (fread(fmt, 1, 16, f) != 16) break;
-            int16_t audio_format = (int16_t)(fmt[0] | (fmt[1] << 8));
-            channels = (int16_t)(fmt[2] | (fmt[3] << 8));
-            sample_rate = (uint32_t)fmt[4] | ((uint32_t)fmt[5] << 8) |
-                          ((uint32_t)fmt[6] << 16) | ((uint32_t)fmt[7] << 24);
-            bits_per_sample = (int16_t)(fmt[14] | (fmt[15] << 8));
-            is_pcm = (audio_format == 1);
-            have_fmt = 1;
-            if (chunk_size > 16 && fseek(f, (long)(chunk_size - 16), SEEK_CUR) != 0) break;
-        } else if (memcmp(chunk_hdr, "data", 4) == 0) {
-            data = malloc(chunk_size ? chunk_size : 1);
-            if (!data || fread(data, 1, chunk_size, f) != chunk_size) {
-                free(data);
-                data = NULL;
-                break;
-            }
-            data_size = chunk_size;
-            have_data = 1;
-            if (have_fmt) break; /* ignore any chunks after data -- metadata etc. */
-        } else {
-            /* skip an unrecognized chunk -- chunks are padded to an even
-             * length, so an odd-sized chunk has one extra byte to skip. */
-            if (fseek(f, (long)chunk_size + (long)(chunk_size % 2), SEEK_CUR) != 0) break;
-        }
-    }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); festina_fail("could not read audio file"); }
+    long size = ftell(f);
+    if (size < 0) { fclose(f); festina_fail("could not read audio file"); }
+    rewind(f);
+    unsigned char *data = malloc((size_t)size ? (size_t)size : 1);
+    if (!data) { fclose(f); festina_fail("out of memory loading audio"); }
+    size_t got = fread(data, 1, (size_t)size, f);
     fclose(f);
-
-    if (!have_fmt || !is_pcm || !have_data || bits_per_sample != 16 || channels < 1) {
+    if (got != (size_t)size) {
         free(data);
         char msg[512];
-        snprintf(msg, sizeof(msg),
-                 "could not load audio '%s': only 16-bit PCM WAV audio is supported", path);
+        snprintf(msg, sizeof(msg), "could not read audio file '%s'", path);
         festina_fail(msg);
     }
-
-    FestinaAudio *a = calloc(1, sizeof(FestinaAudio));
-    if (!a) festina_fail("out of memory loading audio");
-    /* WAV's PCM data is little-endian; every target this compiler
-     * generates code for (x86/x86_64, ARM in its default mode) is too,
-     * so the bytes malloc'd above are already exactly int16_t samples
-     * with no conversion needed -- the same little-endian assumption
-     * this runtime already makes for int/float elsewhere. */
-    a->samples = (int16_t *)data;
-    a->frame_count = data_size / (size_t)(channels * 2);
-    a->channels = channels;
-    a->sample_rate = sample_rate;
-    return a;
+    void *clip = festina_audio_from_bytes(data, (int64_t)size, path);
+    free(data);
+    return clip;
 }
-
 
 
 /* claude.md #98/#99: picks the channel this play() will use. Called

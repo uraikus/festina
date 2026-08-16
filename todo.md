@@ -1460,14 +1460,20 @@ listed here only so they aren't lost:
   per-playback `isPlaying`, which would need a handle to a playback --
   the pool-as-language-surface both sections refused. Recorded as a
   real limit, not as something expected to change.
-- **An `aud` (like an `img` or a `regex`) is never freed.** Deliberate:
-  a loaded resource lives for the program's lifetime, so there is no
-  point at which freeing it would be safe without tracking every
-  binding. Confirmed pre-existing under LeakSanitizer, and bounded --
-  one allocation per `loadAudio()` call, not per play. Only visible at
-  all with `use_globals=0`-style scanning or at `-O1` where the local
-  handle has been optimized away; the same accepted tradeoff as text
-  globals at exit.
+- **An escaping `aud`/`img`/`regex` is never freed.** claude.md #101
+  closed the ordinary case -- a non-escaping `aud` or `img` local is now
+  reclaimed at scope exit, as is one held in a query row -- so what is
+  left is the same conservative escape-analysis boundary a `regex` has
+  had since #86: a handle that escapes its function, or one bound to a
+  global, lives for the program's lifetime. Bounded (one allocation per
+  load, not per use) and the same accepted tradeoff as text globals at
+  exit.
+- **Only PNG/JPEG and WAV/MP3.** claude.md #101 added JPEG and MP3, and
+  drew the line there deliberately: each new format is a new
+  system dependency on every machine that compiles a graphics or audio
+  program, and PNG+JPEG / WAV+MP3 covers what a 2D game actually ships.
+  Ogg/FLAC/WebP/GIF would each need their own library and none of them
+  is the obvious next one.
 - **A key held down still repeats `keyDown`.** Deliberate -- that is
   how text entry works, and claude.md #98 only guarantees that a HELD
   key fires exactly one `keyUp`, when it is really let go. A program
