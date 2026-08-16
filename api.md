@@ -75,7 +75,14 @@ table     -- a struct that's also backed by a SQLite table
 img       -- an image loaded via loadImage() (opaque handle)
 aud       -- an audio clip loaded via loadAudio() (opaque handle)
 regex     -- a compiled pattern from a /pattern/flags literal or regex() (opaque handle)
+color     -- a canvas color, declared from a literal (`color red = 'red'`)
+font      -- a canvas font, declared from a literal (`font body = '13px arial'`)
 ```
+
+`color` and `font` are resolved by the compiler at the declaration that
+names them — see [Drawing style](#drawing-style). A `color` is a packed
+integer and a `font` is a pointer to a constant in the binary, so
+neither is reference-counted and neither costs anything at runtime.
 
 Every type may hold `null` (`bool x = null` included — see "Division and
 modulo by zero" below for how `int`/`float`/`bool` each represent it
@@ -454,10 +461,14 @@ blocks handling redraws/input until the window closes.
 ### Drawing style
 
 ```festina
-fillStyle('red')            // fills: drawRect, drawCircle, drawText
-borderColor('#333')         // outlines drawRect/drawCircle
+color brand = '#4a90d9'
+color line = 'gray'
+font  body  = 'bold 20px serif'
+
+fillStyle(brand)            // fills: drawRect, drawCircle, drawText
+borderColor(line)           // outlines drawRect/drawCircle
 lineWidth(4)                // border thickness, in pixels
-font('bold 20px serif')     // used by drawText and both measure calls
+changeFont(body)            // used by drawText and both measure calls
 ```
 
 Style is set once and applies to every later draw — the same model the
@@ -465,68 +476,121 @@ HTML canvas uses. Defaults are black fill, no border, and 16px
 sans-serif, so a program that never calls these draws exactly what it
 did before they existed.
 
-A **color** is any of the 148 CSS color names (`red`, `teal`,
+> **Colors and fonts must be declared.** Anything other than raw RGB
+> numbers has to be a `color` or `font` declaration first:
+>
+> ```festina
+> color red = 'red'      // then: fillStyle(red)
+> font  body = '14px'    // then: changeFont(body)
+> ```
+>
+> `fillStyle('red')` and `changeFont('14px')` do **not** work. The
+> declaration is where the compiler resolves the name, once — after
+> that a `color` is just a packed integer and a `font` is a pointer to a
+> constant, so using either costs nothing.
+>
+> **If a color is chosen dynamically, use `fillStyle(r, g, b)`** — see
+> [Computing a color or font at runtime](#computing-a-color-or-font-at-runtime)
+> below. There is no way to turn a runtime `text` value into a `color`
+> or a `font`, and attempting it is a compile error that says so.
+
+#### The `color` type
+
+```festina
+color red   = 'red'
+color brand = '#4a90d9'
+color ghost = 'none'
+```
+
+A color literal is any of the **148 CSS color names** (`red`, `teal`,
 `rebeccapurple`, `lightgoldenrodyellow`, …), a `#rgb` or `#rrggbb` hex
 value, or `none`/`transparent`. Names are case-insensitive and `#abc`
 expands to `#aabbcc`, both as in CSS.
 
-Colors are resolved **at compile time**: `fillStyle('red')` compiles to
-the numbers `255, 0, 0`, so nothing parses a color string while your
-program is drawing. A name it doesn't recognize is a compile error
-naming the value and its line — it can't reach a running program, and it
-never silently falls back to black.
+The declaration is where the name is resolved: `color red = 'red'`
+becomes the packed integer `0xFF0000` at compile time, so nothing parses
+a color string while your program runs. A name the compiler doesn't
+recognize is a compile error naming the value and its line — it can't
+reach a running program, and it never silently falls back to black.
 
-`none` is useful on both: as a fill it leaves a shape's interior
-untouched, so `borderColor` alone gives you an outline-only shape; as a
+A `color` is an ordinary value after that: assign it, pass it to a
+function, return one. It is a plain integer, so it is never
+reference-counted and costs nothing to copy.
+
+`none` works on both setters: as a fill it leaves a shape's interior
+untouched, so `borderColor` alone gives an outline-only shape; as a
 border color it switches borders back off.
 
 ```festina
-fillStyle('none')
-borderColor('purple')
+color none = 'none'
+color ring = 'purple'
+
+fillStyle(none)
+borderColor(ring)
 lineWidth(8)
 drawCircle(200, 200, 60)    // a purple ring, nothing inside it
 ```
 
 `borderColor` outlines shapes only, not the glyphs `drawText` draws.
 
-**`font`** takes the CSS/canvas shorthand, with words in **any order**
-and any part omitted — `italic`/`oblique` set the slant, `bold` the
-weight, a bare number or `<n>px` the size, and the first word that is
-none of those is the family:
+#### The `font` type
 
 ```festina
-font('arial 14px bold')     // all three
-font('bold 14px arial')     // same thing, any order
-font('14px')                // just the size; slant/weight/family unchanged
-font('monospace')           // just the family; size unchanged
+font body  = 'arial 14px bold'   // all three parts
+font same  = 'bold 14px arial'   // any order — identical result
+font small = '14px'              // just the size; family/style unchanged
+font mono  = 'monospace'         // just the family; size unchanged
 ```
+
+A font literal takes the CSS/canvas shorthand with words in **any
+order**, and any part may be omitted — `italic`/`oblique` set the slant,
+`bold` the weight, a bare number or `<n>px` the size, and the first word
+that is none of those is the family. An omitted part means "leave that
+alone", which is what lets `font small = '14px'` change only the size.
+
+Each distinct font compiles to a constant in the binary's read-only
+data, so declaring one costs nothing at runtime and `changeFont()`
+passes a single pointer. Identical fonts share one constant, so `body`
+and `same` above are literally the same record. An empty literal
+(`font f = ''`) is rejected — it says nothing, and is far likelier to be
+a mistake than an intent.
 
 ### Computing a color or font at runtime
 
-The one-argument forms take a *literal*, because that's what lets the
-compiler resolve them. To build one from values you compute, use the
-explicit forms instead — which are strictly more capable anyway, since
-they take any `int` expression where a color name could only ever have
-named one of a fixed set:
+There is deliberately **no way to turn a runtime `text` value into a
+`color` or a `font`** — resolution happens at the declaration, so the
+declaration needs a literal. To choose either from values you compute,
+use the explicit numeric forms, which are strictly more capable for that
+job anyway (they take any `int` expression, where a color *name* could
+only ever have named one of a fixed set):
 
 ```festina
-fillStyle(r, g, b)              // each 0-255; a negative value means 'none'
-font(px, style, family)         // style/family may be null; px <= 0 keeps
-                                 // the current size
+fillStyle(r, g, b)                // each 0-255; a negative value means 'none'
+borderColor(r, g, b)
+changeFont(px, style, family)     // style/family may be null;
+                                   // px <= 0 keeps the current size
 ```
 
 ```festina
+// a gradient of swatches — the color is different every iteration
 for int i = 0, i < 10, i++ {
-    fillStyle(i * 25, 0, 255 - i * 25)   // a gradient of swatches
+    fillStyle(i * 25, 0, 255 - i * 25)
     drawRect(i * 40, 0, 36, 36)
 }
 
+// a font size that depends on runtime state
 int size = 12 + level * 4
-font(size, 'bold', null)                 // family left as-is
+changeFont(size, 'bold', null)    // family left as-is
 ```
 
-Passing a non-literal to the one-argument form is a compile error that
-points at the explicit form.
+Passing a non-literal where a `color` or `font` is expected is a compile
+error that points at these forms:
+
+```text
+error: a color must come from a literal, so the compiler can resolve it
+once -- write `color name = '...'` and use `name`, or, to choose one at
+runtime, use fillStyle(red, green, blue) with each component 0-255
+```
 
 ### Text metrics
 

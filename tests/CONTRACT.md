@@ -359,13 +359,13 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 868 tests in this directory pass against it: 582 need no external
+All 866 tests in this directory pass against it: 581 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-273 more need a working C compiler, plus 2 more
+272 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 11 more given
 `Xvfb`+`xdotool` too (2 of those also need `xwd`, from the same
 x11-apps/x11-utils tier, to read real canvas pixels back --
-claude.md #89) (582 + 273 + 2 + 11 = 868 -- re-verified directly
+claude.md #89) (581 + 272 + 2 + 11 = 866 -- re-verified directly
 by running the whole suite with a PATH containing nothing but Python,
 not just derived by counting `compile_and_run` call sites, since the
 true number had drifted well past a much older, since-inaccurate count
@@ -2166,10 +2166,41 @@ one-argument form costs nothing -- the explicit form is strictly more
 capable for anything dynamic. The one behaviour removed is a colour or
 font built from a runtime-computed *string*, now a compile error
 pointing at the explicit form.
-`tests/test_codegen.py::TestCompileTimeColorAndFontResolution` (13 new
-tests) covers the full table, case-insensitivity, hex expansion, the
-negative-component `none` sentinel, any-order and omitted font parts,
-both explicit forms, and both compile-error paths.
+(That test class was superseded by #91's own, below.)
+
+**claude.md #91**: `color` and `font` became real **types**, so a colour
+or a font is resolved once -- at the declaration naming it -- rather
+than at each call site:
+
+```festina
+color brand = '#4a90d9'
+font  body  = '13px arial bold'
+fillStyle(brand)
+changeFont(body)
+```
+
+`font` becoming a type name forced the setter's rename: `font(...)`
+cannot be a call when `font` introduces a declaration, so it is now
+`changeFont(newFont:font)`. A `color` compiles to a packed `0xRRGGBB`
+integer (negative = `none`), so passing one costs a register; a `font`
+compiles to a pointer to a static `%struct._FestinaFont` constant in
+read-only data, so declaring one costs no runtime work and identical
+fonts share a constant (keyed on resolved parts, so `'bold 13px arial'`
+and `'arial bold 13px'` collapse together). Neither type touches the
+reference-counting or text-ownership machinery at all -- a colour is a
+plain integer, and a font points at a constant nothing allocates or
+frees.
+
+The rule this enforces: **a colour name or font shorthand can only come
+from a literal.** `fillStyle('red')` no longer works; a name must be
+declared as a `color` first, and no runtime `text` can become either
+type. Dynamic values use `fillStyle(r, g, b)` or
+`changeFont(px, style, family)`, which are strictly more capable for
+that job. `tests/test_codegen.py::TestColorAndFontTypes` (22 tests)
+covers both types end to end -- packing, the full CSS table, the `none`
+sentinel, any-order and omitted font parts, constant sharing, copying
+and passing colours, both explicit forms, and every compile-error path
+including `font('14px')` no longer being a call.
 
 See api.md for the current language/standard library reference and this
 file's own "Status" section above for the implemented-vs-not matrix; the
@@ -2926,10 +2957,10 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 582 passed, 286 skipped (needs a C compiler; 2 of
+pytest tests/                          # 581 passed, 285 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
                                         # 11 need Xvfb + xdotool installed too, 1 of those
                                         # also needs `openbox` and 2 need `xwd`) given a
                                         # working C compiler,
-                                        # all 868 pass
+                                        # all 866 pass
 ```

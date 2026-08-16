@@ -1965,3 +1965,27 @@ Both functions also accept an explicit form -- `fillStyle(red, green, blue)` wit
 The font shorthand accepts its words in any order, and any part may be omitted: `'arial 14px bold'`, `'bold 14px arial'` and `'14px'` are all accepted, the last compiling to `font(14, null, null)`. Order-independence is deliberate -- CSS's own grammar requires size and family last and in that order, exactly the kind of rule that turns a reasonable-looking string into a silent no-op, and none of the ambiguity that grammar exists to resolve can arise here. `style` is normalised by the compiler to `null`/`'bold'`/`'italic'`/`'italic bold'`, so the runtime never sees an ordering or spelling variant; the substring tests it does use exist only because the explicit form can hand it an arbitrary runtime string.
 
 The one behaviour this removes is a colour or font built from a runtime-computed *string*. That was expressible under section 89 and is now a compile error. It is not a loss in practice -- the explicit numeric form covers every dynamic case more directly, and does so without the string ever existing -- but it is a real difference from what section 89 shipped, so it is called out here rather than left to be discovered.
+
+91. COLOR AND FONT ARE TYPES
+
+Section 90 resolved colour and font literals at compile time, but they were still *arguments*: every `fillStyle('red')` re-resolved the same name, and a colour used in twenty places was written out twenty times. This section makes both first-class types, so a colour or a font is resolved exactly once -- at the declaration that names it -- and referred to by name everywhere after.
+
+```festina
+color brand = '#4a90d9'
+font  body  = '13px arial bold'
+
+fillStyle(brand)
+changeFont(body)
+```
+
+`font` becoming a type name is what forces the setter's rename: `font(...)` can no longer be a function call when `font` introduces a declaration, so the setter is now `changeFont(newFont:font)`. `fillStyle`/`borderColor` keep their names and take a `color`.
+
+Each type compiles to the shape its use actually wants. A `color` is a packed `0xRRGGBB` integer, so passing one costs a single register, comparing two is one integer compare, and a negative value means "no colour at all" without needing a second field or a separate function to say so. A `font` is a pointer to a static `%struct._FestinaFont` constant -- size, slant, weight, family -- that codegen emits into the binary's own read-only data from the declaration's literal, so declaring a font costs no runtime work whatsoever and `changeFont` passes one pointer. Identical fonts share one constant, keyed on their resolved parts rather than their source text, so `'bold 13px arial'` and `'arial bold 13px'` collapse together.
+
+Neither type touches the memory machinery sections 74-88 built, and this is worth stating plainly because both look like they might. A colour is a plain integer, with no more lifetime than an `int`. A font is a pointer to a constant that nothing allocates and nothing frees, so copying a font value copies a pointer to storage that outlives every binding that could ever hold it. Neither is reference-counted, neither is copy-managed, and neither appears anywhere in scope-exit handling.
+
+Both are written as text at the declaration, because `color brand = '#4a90d9'` reads better than any constructor syntax would, and there is no separate literal form for either. That reuses exactly the one-directional `text -> X` allowance section 36 already established for `blob`, for the same reason: nothing else in the language could construct one.
+
+The consequence, and the rule this section is really about: **a colour name or a font shorthand can only ever come from a literal.** `fillStyle('red')` is no longer valid -- a name must be declared as a `color` first. A `text` value computed at runtime cannot become either type, and trying is a compile error naming the alternative. That alternative is `fillStyle(red, green, blue)` with each component 0-255, and `changeFont(px, style, family)` with a nullable style and family; both remain exactly as section 90 left them. This costs nothing, because those forms are strictly MORE capable for anything dynamic -- they take arbitrary int expressions, where a colour *name* could only ever have named one of a fixed set -- and it buys a language where no colour string and no font grammar exists at runtime at all.
+
+A `font` literal that says nothing (`font f = ''`) is rejected rather than silently producing a record that changes nothing, since it is far more likely to be a mistake than an intent.

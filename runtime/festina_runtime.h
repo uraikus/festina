@@ -286,8 +286,27 @@ void festina_draw_image(void *img, int64_t x, int64_t y);
  * The two measure functions deliberately need no canvas window -- text
  * metrics depend only on the font, so they run against a scratch
  * surface. */
+/* claude.md #91: the compiled form of a Festina `font` value. Codegen
+ * emits one of these as read-only data per distinct font literal (see
+ * _emit_font_constant) and changeFont() is handed a pointer to it, so
+ * declaring a font costs no runtime work at all. Layout must stay in
+ * step with FESTINA_FONT_LLVM_TYPE in festina/codegen.py. `px <= 0`
+ * means "leave the size alone" and a NULL family means "leave the
+ * family alone", which is what lets `font small = '12px'` change only
+ * the size. */
+typedef struct {
+    int64_t px;
+    int64_t slant;   /* 0 normal, 1 italic */
+    int64_t weight;  /* 0 normal, 1 bold */
+    const char *family;
+} FestinaFont;
+
 void festina_set_fill_rgb(int64_t r, int64_t g, int64_t b);
 void festina_set_border_rgb(int64_t r, int64_t g, int64_t b);
+/* claude.md #91: a `color` value -- packed 0xRRGGBB, negative = 'none'. */
+void festina_set_fill_color(int64_t packed);
+void festina_set_border_color(int64_t packed);
+void festina_set_font_value(const FestinaFont *f);
 void festina_set_line_width(int64_t width);
 void festina_set_font(int64_t px, const char *style, const char *family);
 int64_t festina_measure_text_width(const char *text);

@@ -342,6 +342,9 @@ FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
 # giving them separate names catches an accidental mix-up in the IR
 # itself rather than relying on convention alone.
 FESTINA_MAP_LLVM_TYPE = "%struct._FestinaMap"
+# claude.md #91: the compiled shape of a `font` value -- see _llvm_type's
+# own FontType branch and _emit_font_constant.
+FESTINA_FONT_LLVM_TYPE = "%struct._FestinaFont"
 
 # claude.md #57: division/modulo by zero returns null; null has no spare
 # bit pattern in a plain i64/double, so it's a reserved sentinel instead
@@ -427,6 +430,16 @@ def _llvm_type(t):
     if isinstance(t, types_mod.RegexType):
         # claude.md #67: a compiled regex_t*, opaque to codegen -- see
         # _emit_regex_call.
+        return "ptr"
+    if isinstance(t, types_mod.ColorType):
+        # claude.md #91: a packed 0xRRGGBB integer (negative for 'none')
+        # -- see _pack_color. One register, and an integer compare is
+        # all that comparing two colours costs.
+        return "i64"
+    if isinstance(t, types_mod.FontType):
+        # claude.md #91: a pointer to the static %struct.FestinaFont
+        # constant codegen emitted for this font's own literal -- see
+        # _emit_font_constant. Read-only data, never allocated or freed.
         return "ptr"
     if isinstance(t, types_mod.MapType):
         # claude.md #79: see the ArrayType branch above -- identical
@@ -674,6 +687,11 @@ class CodeGen:
                                                 # threaded through ctx" shape as _loop_targets, for the
                                                 # same reason: it needs to keep working correctly through
                                                 # arbitrary nesting depth.
+        self._font_constants = {}              # claude.md #91: (px, style, family) -> the name of the
+                                                # static %struct._FestinaFont constant holding it.
+                                                # Keyed on the RESOLVED parts rather than the source
+                                                # text, so 'bold 13px arial' and 'arial bold 13px'
+                                                # share one constant.
         self._regex_lit_cache = {}             # id(ast.RegexLit node) -> its private cache global's
                                                 # name -- see _emit_cached_regex_lit; keyed by node
                                                 # identity (not pattern text) so two textually
@@ -841,6 +859,10 @@ class CodeGen:
             # be parsed on every call.
             "declare void @festina_set_fill_rgb(i64, i64, i64)",
             "declare void @festina_set_border_rgb(i64, i64, i64)",
+            # claude.md #91: the packed-colour and font-record forms
+            "declare void @festina_set_fill_color(i64)",
+            "declare void @festina_set_border_color(i64)",
+            "declare void @festina_set_font_value(ptr)",
             "declare void @festina_set_line_width(i64)",
             "declare void @festina_set_font(i64, ptr, ptr)",
             "declare i64 @festina_measure_text_width(ptr)",
@@ -935,6 +957,11 @@ class CodeGen:
         lines = [
             f"{FESTINA_ARRAY_LLVM_TYPE} = type {{ i64, ptr }}",
             f"{FESTINA_MAP_LLVM_TYPE} = type {{ i64, ptr }}",
+            # claude.md #91: a `font` value points at one of these,
+            # emitted as read-only data from the declaration's own
+            # literal -- size in px, slant, weight, family. Layout must
+            # match FestinaFont in runtime/festina_runtime.h.
+            f"{FESTINA_FONT_LLVM_TYPE} = type {{ i64, i64, i64, ptr }}",
         ]
         for name in self.struct_order:
             fields = self.struct_fields(name)
@@ -1001,6 +1028,10 @@ class CodeGen:
         # aggregate value here; "null" (the final fallback below) is
         # correct for all three now, the same as it already was for
         # StructType.
+        if isinstance(type_, types_mod.ColorType):
+            # claude.md #91: an unset colour is 'none', not 0 -- 0 is a
+            # real colour (opaque black), so it would silently paint.
+            return "-1"
         llvm_ty = _llvm_type(type_)
         if llvm_ty in ("i64", "i1", "i8"):
             return "0"
@@ -2360,6 +2391,35 @@ class CodeGen:
             return self._emit_array_lit(node, env, lines, expected_type)
         if isinstance(node, ast.MapLit):
             return self._emit_map_lit(node, env, lines, expected_type)
+        # claude.md #91: `color red = 'red'` / `font body = '13px arial'`.
+        # Resolving here rather than in the VarDecl branch means every
+        # position that knows its expected type gets it for free --
+        # declarations, reassignments, call arguments, struct fields,
+        # array elements and returns alike.
+        if isinstance(expected_type, (types_mod.ColorType, types_mod.FontType)):
+            what = types_mod.type_name(expected_type)
+            line = getattr(node, "line", 0)
+            if isinstance(node, ast.StringLit):
+                if isinstance(expected_type, types_mod.ColorType):
+                    return (self._emit_color_value(node, node.value, line, what),
+                            expected_type)
+                return (self._emit_font_constant(node.value, line, what),
+                        expected_type)
+            val, vtype = self._emit_expr(node, env, lines)
+            if vtype == TEXT:
+                # Text that isn't a literal can't be resolved at compile
+                # time, and there is deliberately no runtime resolver to
+                # fall back on (claude.md #90) -- so this is an error
+                # pointing at the two things that DO work.
+                alt = ("fillStyle(red, green, blue) with each component 0-255"
+                       if isinstance(expected_type, types_mod.ColorType)
+                       else "changeFont(px, style, family)")
+                raise CodegenError(
+                    f"a {what} must come from a literal, so the compiler can "
+                    f"resolve it once -- write `{what} name = '...'` and use "
+                    f"`name`, or, to choose one at runtime, use {alt}",
+                    file=self.filename, line=line)
+            return val, vtype
         if isinstance(node, ast.NullLit):
             if expected_type == INT:
                 return INT_NULL_CONST, INT
@@ -3899,7 +3959,7 @@ class CodeGen:
             if name == "regex":
                 return self._emit_regex_call(expr, env, lines)
             if name in ("drawRect", "drawCircle", "drawText", "drawImage", "loadImage",
-                        "fillStyle", "borderColor", "lineWidth", "font",
+                        "fillStyle", "borderColor", "lineWidth", "changeFont",
                         "measureTextWidth", "measureTextHeight"):
                 return self._emit_graphics_call(name, expr, env, lines)
             if name in ("setTimeout", "setInterval", "clearTimeout", "clearInterval"):
@@ -4195,34 +4255,58 @@ class CodeGen:
             self._free_text_temp(expr.args[1], flags_val, flags_type, lines)
         return out, REGEX
 
-    def _resolve_color_literal(self, fn_name, arg_expr, line):
-        """claude.md #90: a one-argument fillStyle()/borderColor() takes
-        a colour LITERAL, resolved to (r, g, b) right here so the
-        generated call carries three integers rather than a pointer to a
-        string the runtime would re-parse on every call.
+    def _emit_color_value(self, decl_or_expr, text_value, line, what):
+        """claude.md #91: a colour LITERAL -> the packed 0xRRGGBB integer
+        a `color` value is. Negative means 'none'.
 
-        Requiring a literal is what makes that possible, and it costs
-        nothing in expressiveness: the three-argument form is strictly
-        more capable for anything computed at runtime (it can take any
-        int expression, where a colour NAME could only ever have named
-        one of a fixed set), so the error below points straight at it.
-        """
-        if arg_expr.__class__ is not ast.StringLit:
-            raise CodegenError(
-                f"{fn_name}() needs a colour literal like {fn_name}('red') or "
-                f"{fn_name}('#ff8800') so the compiler can resolve it -- to "
-                f"compute a colour at runtime, use the three-argument form "
-                f"instead: {fn_name}(red, green, blue), each 0-255",
-                file=self.filename, line=line)
-        resolved = colors_mod.resolve_color(arg_expr.value)
+        Packing is what makes a colour cost one register instead of
+        three, and makes `a == b` on two colours a single integer
+        compare. Unpacking is three shift/mask pairs in the runtime,
+        done once per fillStyle() call rather than per pixel."""
+        resolved = colors_mod.resolve_color(text_value)
         if resolved is None:
             raise CodegenError(
-                f"{fn_name}(): '{arg_expr.value}' is not a colour Festina "
-                f"understands -- use a CSS colour name (red, rebeccapurple, "
-                f"...), a #rgb or #rrggbb hex value, or 'none' for no colour "
-                f"at all",
+                f"{what}: '{text_value}' is not a colour Festina understands "
+                f"-- use a CSS colour name (red, rebeccapurple, ...), a #rgb "
+                f"or #rrggbb hex value, or 'none' for no colour at all",
                 file=self.filename, line=line)
-        return resolved
+        r, g, b = resolved
+        if (r, g, b) == colors_mod.NO_COLOR:
+            return "-1"
+        return str((r << 16) | (g << 8) | b)
+
+    def _emit_font_constant(self, text_value, line, what):
+        """claude.md #91: a font LITERAL -> a pointer to a static
+        %struct._FestinaFont constant holding its already-resolved
+        parts.
+
+        The whole record lands in the binary's read-only data, so
+        declaring a font costs no code at all at runtime and
+        changeFont() passes a single pointer. Identical literals share
+        one constant (cached by their resolved parts, not by source
+        text, so 'bold 13px arial' and 'arial bold 13px' collapse
+        together). Nothing allocates or frees this -- see FontType's
+        own comment."""
+        px, style, family = colors_mod.parse_font(text_value)
+        if px is None and style is None and family is None:
+            raise CodegenError(
+                f"{what}: '{text_value}' says nothing about a font -- give at "
+                f"least a size (like '14px'), a family (like 'arial'), or a "
+                f"style (like 'bold')",
+                file=self.filename, line=line)
+        key = (px, style, family)
+        cached = self._font_constants.get(key)
+        if cached is not None:
+            return cached
+        name = f"@.font.{len(self._font_constants)}"
+        self._font_constants[key] = name
+        slant = 1 if style and "italic" in style else 0
+        weight = 1 if style and "bold" in style else 0
+        family_ref = self.string_const(family) if family else "null"
+        self.extra_globals.append(
+            f"{name} = private constant {FESTINA_FONT_LLVM_TYPE} "
+            f"{{ i64 {px or 0}, i64 {slant}, i64 {weight}, ptr {family_ref} }}")
+        return name
 
     # ---- graphics: drawRect/drawCircle/drawText/drawImage/loadImage (claude.md #37, #39) ----
     def _emit_graphics_call(self, name, expr, env, lines):
@@ -4274,35 +4358,27 @@ class CodeGen:
         # metrics depend only on the font (festina_measure_text_* run
         # against a scratch image surface).
         if name in ("fillStyle", "borderColor"):
-            fn = ("festina_set_fill_rgb" if name == "fillStyle"
-                  else "festina_set_border_rgb")
+            # claude.md #91: one argument is a `color` value -- already
+            # packed, whether it came from a declaration's own literal or
+            # from another colour-typed binding. Three are raw channels,
+            # for a colour chosen at runtime.
             if len(expr.args) == 1:
-                # claude.md #90: resolved here, not at runtime.
-                # a literal carries no line of its own; the callee does
-                r, g, b = self._resolve_color_literal(
-                    name, expr.args[0], getattr(expr.callee, "line", 0))
-                lines.append(f"  call void @{fn}(i64 {r}, i64 {g}, i64 {b})")
+                fn = ("festina_set_fill_color" if name == "fillStyle"
+                      else "festina_set_border_color")
+                lines.append(f"  call void @{fn}(i64 {args[0]})")
             else:
+                fn = ("festina_set_fill_rgb" if name == "fillStyle"
+                      else "festina_set_border_rgb")
                 lines.append(
                     f"  call void @{fn}(i64 {args[0]}, i64 {args[1]}, i64 {args[2]})")
             free_text_temps()
             return "0", None
-        if name == "font":
-            if len(expr.args) == 1 and expr.args[0].__class__ is ast.StringLit:
-                px, style, family = colors_mod.parse_font(expr.args[0].value)
-                px_ir = str(px) if px is not None else "0"
-                style_ir = self._const_string(style, lines) if style else "null"
-                family_ir = self._const_string(family, lines) if family else "null"
-                lines.append(
-                    f"  call void @festina_set_font(i64 {px_ir}, ptr {style_ir}, "
-                    f"ptr {family_ir})")
-            elif len(expr.args) == 1:
-                raise CodegenError(
-                    "font() needs a literal like font('bold 14px arial') so the "
-                    "compiler can resolve it -- to build one at runtime, use the "
-                    "three-argument form instead: font(px, style, family), where "
-                    "style and family may be null",
-                    file=self.filename, line=getattr(expr.callee, "line", 0))
+        if name == "changeFont":
+            # claude.md #91: one argument is a `font` value (a pointer to
+            # its static record); three are the explicit parts, for a
+            # font whose size is computed at runtime.
+            if len(expr.args) == 1:
+                lines.append(f"  call void @festina_set_font_value(ptr {args[0]})")
             else:
                 lines.append(
                     f"  call void @festina_set_font(i64 {args[0]}, ptr {args[1]}, "

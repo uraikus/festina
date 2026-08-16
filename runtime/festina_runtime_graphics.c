@@ -121,6 +121,43 @@ void festina_set_border_rgb(int64_t r, int64_t g, int64_t b) {
     g_border_b = (b > 255 ? 255 : b) / 255.0;
 }
 
+/* claude.md #91: a `color` value is a packed 0xRRGGBB integer, and a
+ * negative one means 'none'. Packing is what makes a colour cost one
+ * register to pass and one integer compare to test; unpacking is three
+ * shift/mask pairs, done once per fillStyle() call. */
+void festina_set_fill_color(int64_t packed) {
+    if (packed < 0) {
+        festina_set_fill_rgb(-1, -1, -1);
+        return;
+    }
+    festina_set_fill_rgb((packed >> 16) & 0xFF, (packed >> 8) & 0xFF, packed & 0xFF);
+}
+
+void festina_set_border_color(int64_t packed) {
+    if (packed < 0) {
+        festina_set_border_rgb(-1, -1, -1);
+        return;
+    }
+    festina_set_border_rgb((packed >> 16) & 0xFF, (packed >> 8) & 0xFF, packed & 0xFF);
+}
+
+/* claude.md #91: changeFont(f) hands over a pointer to the static
+ * record the compiler emitted for that font's own literal -- read-only
+ * data in the binary, never allocated and never freed. A NULL record
+ * (a `font` binding that was never given a value) is a no-op rather
+ * than a crash, matching how an unset colour simply doesn't paint. */
+void festina_set_font_value(const FestinaFont *f) {
+    if (!f) return;
+    if (f->px > 0) {
+        g_font_size = (double)f->px;
+    }
+    g_font_slant = f->slant ? CAIRO_FONT_SLANT_ITALIC : CAIRO_FONT_SLANT_NORMAL;
+    g_font_weight = f->weight ? CAIRO_FONT_WEIGHT_BOLD : CAIRO_FONT_WEIGHT_NORMAL;
+    if (f->family) {
+        snprintf(g_font_family, sizeof(g_font_family), "%s", f->family);
+    }
+}
+
 void festina_set_line_width(int64_t width) {
     /* A negative width is meaningless to Cairo (and would silently draw
      * nothing); clamping to 0 keeps "no border" expressible both ways. */

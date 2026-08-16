@@ -39,8 +39,10 @@ BUILTIN_FUNCTIONS = {
     "log", "fail", "sqlite",
     "drawRect", "drawCircle", "drawText", "drawImage",
     "loadImage", "loadAudio",
-    # claude.md #89: canvas drawing style + text metrics
-    "fillStyle", "borderColor", "lineWidth", "font",
+    # claude.md #89/#91: canvas drawing style + text metrics. `font` is
+    # NOT here -- claude.md #91 turned it into a type name, so the
+    # setter is changeFont().
+    "fillStyle", "borderColor", "lineWidth", "changeFont",
     "measureTextWidth", "measureTextHeight",
     "regex",
     "setTimeout", "setInterval", "clearTimeout", "clearInterval",
@@ -90,12 +92,21 @@ _BUILTIN_SIGNATURES = {
 # the already-resolved parts, and is what a program uses to compute a
 # colour or font size at runtime. Checked here as "any of these
 # signatures", with the arity picking which one applies.
+_COLOR = types_mod.ColorType()
+_FONT = types_mod.FontType()
+
 _BUILTIN_SIGNATURE_ALTERNATES = {
-    "fillStyle": [(_TEXT,), (_INT, _INT, _INT)],
-    "borderColor": [(_TEXT,), (_INT, _INT, _INT)],
-    # px, style, family -- style/family may be null (claude.md #90's own
-    # `font('14px') -> font(14, null, null)`)
-    "font": [(_TEXT,), (_INT, _TEXT, _TEXT)],
+    # claude.md #91: the one-argument form takes a `color` value, not a
+    # text literal -- a colour name has to be declared as one
+    # (`color red = 'red'`) so that resolution happens exactly once, at
+    # that declaration. The three-int form is what a program uses to
+    # compute a colour at runtime.
+    "fillStyle": [(_COLOR,), (_INT, _INT, _INT)],
+    "borderColor": [(_COLOR,), (_INT, _INT, _INT)],
+    # claude.md #91: likewise a `font` value; the explicit form (px,
+    # style, family -- style/family nullable, px <= 0 keeps the current
+    # size) remains for a font whose size is computed at runtime.
+    "changeFont": [(_FONT,), (_INT, _TEXT, _TEXT)],
 }
 _REGEX = types_mod.RegexType()
 _AUDIO = types_mod.AudioType()
@@ -246,6 +257,10 @@ def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None
         return types_mod.AudioType()
     if name == "regex":
         return types_mod.RegexType()
+    if name == "color":
+        return types_mod.ColorType()
+    if name == "font":
+        return types_mod.FontType()
     if name in structs:
         return types_mod.StructType(name)
     if name in tables:
@@ -290,6 +305,19 @@ def analyze(program, filename="<string>"):
         # blob and text already share the identical `ptr` runtime
         # representation (see _llvm_type).
         if declared == _BLOB and actual == _TEXT:
+            return
+        # claude.md #91: `color red = 'red'` / `font body = '13px arial'`
+        # -- a colour and a font are written as text because that is what
+        # reads well, and resolved to their compiled form at the
+        # declaration. Same one-directional text -> X allowance blob
+        # already has above, and for the same reason: there is no
+        # separate literal syntax for either, and nothing else in the
+        # language could construct one. Whether the value is a genuine
+        # LITERAL (and so resolvable at all) is checked in codegen, which
+        # is where the resolution happens and where the error can name
+        # the offending text.
+        if (isinstance(declared, (types_mod.ColorType, types_mod.FontType))
+                and actual == _TEXT):
             return
         if declared != actual:
             raise CompileError(

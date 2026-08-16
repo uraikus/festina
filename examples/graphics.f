@@ -12,48 +12,61 @@
 // ever adds to the canvas, never erases (see examples/tic_tac_toe.f for
 // a small game built entirely around that same constraint).
 //
-// claude.md #89/#90: fillStyle/borderColor/lineWidth/font are set once
-// and apply to every later draw, and measureTextWidth/measureTextHeight
-// report metrics for the current font without needing a window at all.
-// Colour and font literals are resolved by the compiler, so nothing
-// parses a colour name or a font shorthand while this is drawing --
-// fillStyle('#4a90d9') below compiles straight to the numbers 74/144/217.
-// To compute either at runtime, use the explicit forms instead:
-// fillStyle(r, g, b) and font(px, style, family) -- see the swatch row
-// near the bottom of this file.
+// claude.md #89/#90/#91: fillStyle/borderColor/lineWidth/changeFont are
+// set once and apply to every later draw, and measureTextWidth/
+// measureTextHeight report metrics for the current font without needing
+// a window at all.
+//
+// Colours and fonts are their own TYPES, declared once and resolved by
+// the compiler: `color brand = '#4a90d9'` becomes a packed integer and
+// `font title = 'bold 24px sans-serif'` becomes a static record in the
+// binary's read-only data, so nothing parses a colour name or a font
+// shorthand while this is drawing. To choose either at runtime, use
+// fillStyle(r, g, b) or changeFont(px, style, family) -- see the swatch
+// row near the bottom of this file.
 
 log('opening the canvas -- close the window to exit')
 
+// Declared once, used everywhere -- each of these is resolved by the
+// compiler, not parsed while the program runs.
+color brand = '#4a90d9'
+color navy = 'navy'
+color orange = 'orange'
+color black = 'black'
+color gray = 'gray'
+color none = 'none'
+font titleFont = 'bold 24px sans-serif'
+
 // A filled shape with a border: fill colour, border colour, thickness.
-fillStyle('#4a90d9')
-borderColor('navy')
+fillStyle(brand)
+borderColor(navy)
 lineWidth(4)
 drawRect(50, 50, 200, 100)
 
-// fillStyle('none') leaves the interior untouched, so borderColor alone
+// A 'none' fill leaves the interior untouched, so borderColor alone
 // draws an outline-only shape.
-fillStyle('none')
-borderColor('orange')
+fillStyle(none)
+borderColor(orange)
 lineWidth(6)
 drawCircle(400, 100, 50)
 
 // Text is drawn in the current fill colour and font.
-fillStyle('black')
-font('bold 24px sans-serif')
+fillStyle(black)
+changeFont(titleFont)
 text title = 'Festina graphics demo'
 drawText(title, 50, 220)
 
 // Metrics let a program lay out relative to what it just drew -- here,
 // a rule underlining the title at exactly its width.
-borderColor('gray')
+borderColor(gray)
 lineWidth(2)
-fillStyle('none')
+fillStyle(none)
 drawRect(50, 228, measureTextWidth(title), 2)
 log(`title is ${measureTextWidth(title)}x${measureTextHeight(title)} px`)
 
 // The explicit rgb form, for a colour that isn't known until it runs:
 // a row of swatches fading from blue to red.
-borderColor('none')
+borderColor(none)
 for int i = 0, i < 10, i++ {
     fillStyle(i * 25, 0, 255 - i * 25)
     drawRect(50 + i * 40, 280, 36, 36)
