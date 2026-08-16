@@ -12,9 +12,15 @@
 // ever adds to the canvas, never erases (see examples/tic_tac_toe.f for
 // a small game built entirely around that same constraint).
 //
-// claude.md #89: fillStyle/borderColor/lineWidth/font are set once and
-// apply to every later draw, and measureTextWidth/measureTextHeight
+// claude.md #89/#90: fillStyle/borderColor/lineWidth/font are set once
+// and apply to every later draw, and measureTextWidth/measureTextHeight
 // report metrics for the current font without needing a window at all.
+// Colour and font literals are resolved by the compiler, so nothing
+// parses a colour name or a font shorthand while this is drawing --
+// fillStyle('#4a90d9') below compiles straight to the numbers 74/144/217.
+// To compute either at runtime, use the explicit forms instead:
+// fillStyle(r, g, b) and font(px, style, family) -- see the swatch row
+// near the bottom of this file.
 
 log('opening the canvas -- close the window to exit')
 
@@ -44,6 +50,14 @@ lineWidth(2)
 fillStyle('none')
 drawRect(50, 228, measureTextWidth(title), 2)
 log(`title is ${measureTextWidth(title)}x${measureTextHeight(title)} px`)
+
+// The explicit rgb form, for a colour that isn't known until it runs:
+// a row of swatches fading from blue to red.
+borderColor('none')
+for int i = 0, i < 10, i++ {
+    fillStyle(i * 25, 0, 255 - i * 25)
+    drawRect(50 + i * 40, 280, 36, 36)
+}
 
 log(`canvas started at ${clientWidth}x${clientHeight}`)
 

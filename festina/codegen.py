@@ -321,6 +321,7 @@ from . import ast
 from . import types as types_mod
 from . import semantic as semantic_mod
 from . import escape_analysis
+from . import colors as colors_mod
 from .errors import CompileError
 
 BOOL = types_mod.PrimitiveType("bool")
@@ -834,11 +835,14 @@ class CodeGen:
             "declare void @festina_draw_rect(i64, i64, i64, i64)",
             "declare void @festina_draw_circle(i64, i64, i64)",
             "declare void @festina_draw_text(ptr, i64, i64)",
-            # claude.md #89: canvas drawing style + text metrics
-            "declare void @festina_set_fill_style(ptr)",
-            "declare void @festina_set_border_color(ptr)",
+            # claude.md #89/#90: canvas drawing style + text metrics.
+            # Colours and fonts are resolved at compile time (see
+            # festina/colors.py), so these take numbers, not strings to
+            # be parsed on every call.
+            "declare void @festina_set_fill_rgb(i64, i64, i64)",
+            "declare void @festina_set_border_rgb(i64, i64, i64)",
             "declare void @festina_set_line_width(i64)",
-            "declare void @festina_set_font(ptr)",
+            "declare void @festina_set_font(i64, ptr, ptr)",
             "declare i64 @festina_measure_text_width(ptr)",
             "declare i64 @festina_measure_text_height(ptr)",
             "declare ptr @festina_load_image(ptr)",
@@ -4191,6 +4195,35 @@ class CodeGen:
             self._free_text_temp(expr.args[1], flags_val, flags_type, lines)
         return out, REGEX
 
+    def _resolve_color_literal(self, fn_name, arg_expr, line):
+        """claude.md #90: a one-argument fillStyle()/borderColor() takes
+        a colour LITERAL, resolved to (r, g, b) right here so the
+        generated call carries three integers rather than a pointer to a
+        string the runtime would re-parse on every call.
+
+        Requiring a literal is what makes that possible, and it costs
+        nothing in expressiveness: the three-argument form is strictly
+        more capable for anything computed at runtime (it can take any
+        int expression, where a colour NAME could only ever have named
+        one of a fixed set), so the error below points straight at it.
+        """
+        if arg_expr.__class__ is not ast.StringLit:
+            raise CodegenError(
+                f"{fn_name}() needs a colour literal like {fn_name}('red') or "
+                f"{fn_name}('#ff8800') so the compiler can resolve it -- to "
+                f"compute a colour at runtime, use the three-argument form "
+                f"instead: {fn_name}(red, green, blue), each 0-255",
+                file=self.filename, line=line)
+        resolved = colors_mod.resolve_color(arg_expr.value)
+        if resolved is None:
+            raise CodegenError(
+                f"{fn_name}(): '{arg_expr.value}' is not a colour Festina "
+                f"understands -- use a CSS colour name (red, rebeccapurple, "
+                f"...), a #rgb or #rrggbb hex value, or 'none' for no colour "
+                f"at all",
+                file=self.filename, line=line)
+        return resolved
+
     # ---- graphics: drawRect/drawCircle/drawText/drawImage/loadImage (claude.md #37, #39) ----
     def _emit_graphics_call(self, name, expr, env, lines):
         """Draws onto (or loads an image for) the graphics canvas.
@@ -4240,15 +4273,44 @@ class CodeGen:
         # measuring genuinely works with no X server at all, since text
         # metrics depend only on the font (festina_measure_text_* run
         # against a scratch image surface).
-        _STYLE_SETTERS = {
-            "fillStyle": ("festina_set_fill_style", "ptr"),
-            "borderColor": ("festina_set_border_color", "ptr"),
-            "font": ("festina_set_font", "ptr"),
-            "lineWidth": ("festina_set_line_width", "i64"),
-        }
-        if name in _STYLE_SETTERS:
-            fn, ty = _STYLE_SETTERS[name]
-            lines.append(f"  call void @{fn}({ty} {args[0]})")
+        if name in ("fillStyle", "borderColor"):
+            fn = ("festina_set_fill_rgb" if name == "fillStyle"
+                  else "festina_set_border_rgb")
+            if len(expr.args) == 1:
+                # claude.md #90: resolved here, not at runtime.
+                # a literal carries no line of its own; the callee does
+                r, g, b = self._resolve_color_literal(
+                    name, expr.args[0], getattr(expr.callee, "line", 0))
+                lines.append(f"  call void @{fn}(i64 {r}, i64 {g}, i64 {b})")
+            else:
+                lines.append(
+                    f"  call void @{fn}(i64 {args[0]}, i64 {args[1]}, i64 {args[2]})")
+            free_text_temps()
+            return "0", None
+        if name == "font":
+            if len(expr.args) == 1 and expr.args[0].__class__ is ast.StringLit:
+                px, style, family = colors_mod.parse_font(expr.args[0].value)
+                px_ir = str(px) if px is not None else "0"
+                style_ir = self._const_string(style, lines) if style else "null"
+                family_ir = self._const_string(family, lines) if family else "null"
+                lines.append(
+                    f"  call void @festina_set_font(i64 {px_ir}, ptr {style_ir}, "
+                    f"ptr {family_ir})")
+            elif len(expr.args) == 1:
+                raise CodegenError(
+                    "font() needs a literal like font('bold 14px arial') so the "
+                    "compiler can resolve it -- to build one at runtime, use the "
+                    "three-argument form instead: font(px, style, family), where "
+                    "style and family may be null",
+                    file=self.filename, line=getattr(expr.callee, "line", 0))
+            else:
+                lines.append(
+                    f"  call void @festina_set_font(i64 {args[0]}, ptr {args[1]}, "
+                    f"ptr {args[2]})")
+            free_text_temps()
+            return "0", None
+        if name == "lineWidth":
+            lines.append(f"  call void @festina_set_line_width(i64 {args[0]})")
             free_text_temps()
             return "0", None
         if name in ("measureTextWidth", "measureTextHeight"):

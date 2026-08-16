@@ -465,12 +465,16 @@ HTML canvas uses. Defaults are black fill, no border, and 16px
 sans-serif, so a program that never calls these draws exactly what it
 did before they existed.
 
-A **color** is a name (`red`, `blue`, `black`, `orange`, `teal`,
-`purple`, …), a `#rgb` or `#rrggbb` hex value, or `none`/`transparent`.
-Names are case-insensitive and `#abc` expands to `#aabbcc`, both as in
-CSS. Anything else fails immediately, at the `fillStyle()` call rather
-than at the next draw, naming the value it didn't understand — it never
-silently falls back to black.
+A **color** is any of the 148 CSS color names (`red`, `teal`,
+`rebeccapurple`, `lightgoldenrodyellow`, …), a `#rgb` or `#rrggbb` hex
+value, or `none`/`transparent`. Names are case-insensitive and `#abc`
+expands to `#aabbcc`, both as in CSS.
+
+Colors are resolved **at compile time**: `fillStyle('red')` compiles to
+the numbers `255, 0, 0`, so nothing parses a color string while your
+program is drawing. A name it doesn't recognize is a compile error
+naming the value and its line — it can't reach a running program, and it
+never silently falls back to black.
 
 `none` is useful on both: as a fill it leaves a shape's interior
 untouched, so `borderColor` alone gives you an outline-only shape; as a
@@ -485,12 +489,44 @@ drawCircle(200, 200, 60)    // a purple ring, nothing inside it
 
 `borderColor` outlines shapes only, not the glyphs `drawText` draws.
 
-**`font`** takes a tolerant subset of the CSS/canvas shorthand:
-whitespace-separated words in any order, where `italic`/`oblique` set
-the slant, `bold` sets the weight, a bare number or `<n>px` sets the
-size, and the first word that is none of those is the family. All of
-`'20px serif'`, `'bold 20px'`, `'italic monospace'` and
-`'monospace bold 14px'` work.
+**`font`** takes the CSS/canvas shorthand, with words in **any order**
+and any part omitted — `italic`/`oblique` set the slant, `bold` the
+weight, a bare number or `<n>px` the size, and the first word that is
+none of those is the family:
+
+```festina
+font('arial 14px bold')     // all three
+font('bold 14px arial')     // same thing, any order
+font('14px')                // just the size; slant/weight/family unchanged
+font('monospace')           // just the family; size unchanged
+```
+
+### Computing a color or font at runtime
+
+The one-argument forms take a *literal*, because that's what lets the
+compiler resolve them. To build one from values you compute, use the
+explicit forms instead — which are strictly more capable anyway, since
+they take any `int` expression where a color name could only ever have
+named one of a fixed set:
+
+```festina
+fillStyle(r, g, b)              // each 0-255; a negative value means 'none'
+font(px, style, family)         // style/family may be null; px <= 0 keeps
+                                 // the current size
+```
+
+```festina
+for int i = 0, i < 10, i++ {
+    fillStyle(i * 25, 0, 255 - i * 25)   // a gradient of swatches
+    drawRect(i * 40, 0, 36, 36)
+}
+
+int size = 12 + level * 4
+font(size, 'bold', null)                 // family left as-is
+```
+
+Passing a non-literal to the one-argument form is a compile error that
+points at the explicit form.
 
 ### Text metrics
 

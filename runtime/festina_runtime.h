@@ -266,18 +266,30 @@ void festina_draw_circle(int64_t x, int64_t y, int64_t r);
 void festina_draw_text(const char *text, int64_t x, int64_t y);
 void *festina_load_image(const char *path);
 void festina_draw_image(void *img, int64_t x, int64_t y);
-/* claude.md #89: canvas drawing style -- process-global state set by
+/* claude.md #89/#90: canvas drawing style -- process-global state set by
  * fillStyle()/borderColor()/lineWidth()/font() and read by every later
  * draw call, the same "set it, then draw" model the HTML canvas 2D
- * context uses. A colour is a name (red, blue, ...), a #rgb/#rrggbb hex
- * value, or 'none'/'transparent'; anything else calls festina_fail()
- * naming the offending value rather than silently defaulting. The two
- * measure functions deliberately need no canvas window -- text metrics
- * depend only on the font, so they run against a scratch surface. */
-void festina_set_fill_style(const char *color);
-void festina_set_border_color(const char *color);
+ * context uses.
+ *
+ * Everything arrives here already resolved. Festina source writes
+ * fillStyle('red') and font('arial 14px bold'), but the compiler turns
+ * both into the numeric forms below (festina/colors.py), so this
+ * runtime holds no colour-name table, no hex parsing and no font
+ * grammar, and does none of that work per draw call.
+ *
+ * A negative colour component means "no colour at all" -- Festina's
+ * 'none'/'transparent' -- which needs no extra argument to express,
+ * since no real channel value can be negative. For fonts, a
+ * non-positive `px` or a NULL string means "leave that aspect alone",
+ * which is what lets font('14px') change only the size.
+ *
+ * The two measure functions deliberately need no canvas window -- text
+ * metrics depend only on the font, so they run against a scratch
+ * surface. */
+void festina_set_fill_rgb(int64_t r, int64_t g, int64_t b);
+void festina_set_border_rgb(int64_t r, int64_t g, int64_t b);
 void festina_set_line_width(int64_t width);
-void festina_set_font(const char *spec);
+void festina_set_font(int64_t px, const char *style, const char *family);
 int64_t festina_measure_text_width(const char *text);
 int64_t festina_measure_text_height(const char *text);
 void festina_register_click_handler(void (*handler)(int64_t, int64_t));

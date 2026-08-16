@@ -79,12 +79,23 @@ _BUILTIN_SIGNATURES = {
     # validated at runtime rather than compile time -- the value is an
     # arbitrary expression, so there is nothing to check here beyond its
     # type (the same split regex() already uses for its own pattern).
-    "fillStyle": (_TEXT,),
-    "borderColor": (_TEXT,),
     "lineWidth": (_INT,),
-    "font": (_TEXT,),
     "measureTextWidth": (_TEXT,),
     "measureTextHeight": (_TEXT,),
+}
+
+# claude.md #90: three builtins accept two different shapes. The
+# one-argument form takes a literal the compiler resolves outright
+# (fillStyle('red'), font('bold 14px arial')); the explicit form takes
+# the already-resolved parts, and is what a program uses to compute a
+# colour or font size at runtime. Checked here as "any of these
+# signatures", with the arity picking which one applies.
+_BUILTIN_SIGNATURE_ALTERNATES = {
+    "fillStyle": [(_TEXT,), (_INT, _INT, _INT)],
+    "borderColor": [(_TEXT,), (_INT, _INT, _INT)],
+    # px, style, family -- style/family may be null (claude.md #90's own
+    # `font('14px') -> font(14, null, null)`)
+    "font": [(_TEXT,), (_INT, _TEXT, _TEXT)],
 }
 _REGEX = types_mod.RegexType()
 _AUDIO = types_mod.AudioType()
@@ -776,6 +787,17 @@ def analyze(program, filename="<string>"):
                 return None
             if name in BUILTIN_FUNCTIONS:
                 sig = _BUILTIN_SIGNATURES.get(name)
+                alternates = _BUILTIN_SIGNATURE_ALTERNATES.get(name)
+                if alternates is not None:
+                    sig = next((a for a in alternates if len(a) == len(expr.args)), None)
+                    if sig is None:
+                        shapes = " or ".join(str(len(a)) for a in alternates)
+                        raise CompileError(
+                            f"{name}() expects {shapes} argument(s), "
+                            f"got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
                 if sig is None:
                     for a in expr.args:
                         if name == "sqlite" and isinstance(a, ast.ArrayLit):

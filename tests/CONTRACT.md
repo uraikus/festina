@@ -359,13 +359,13 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 855 tests in this directory pass against it: 567 need no external
+All 868 tests in this directory pass against it: 582 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-275 more need a working C compiler, plus 2 more
+273 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 11 more given
 `Xvfb`+`xdotool` too (2 of those also need `xwd`, from the same
 x11-apps/x11-utils tier, to read real canvas pixels back --
-claude.md #89) (567 + 275 + 2 + 11 = 855 -- re-verified directly
+claude.md #89) (582 + 273 + 2 + 11 = 868 -- re-verified directly
 by running the whole suite with a PATH containing nothing but Python,
 not just derived by counting `compile_and_run` call sites, since the
 true number had drifted well past a much older, since-inaccurate count
@@ -2148,6 +2148,29 @@ call was emitted proves the plumbing but not that 'red' comes out red,
 that `#00f` expands to `#0000ff`, or that `fillStyle('none')` leaves an
 interior genuinely unpainted.
 
+**claude.md #90**: colours and fonts are now resolved *at compile time*
+rather than parsed by the runtime on every call. `fillStyle('red')`
+compiles to `festina_set_fill_rgb(255, 0, 0)` and
+`font('arial 14px bold')` to `festina_set_font(14, "bold", "arial")`, so
+the runtime holds no colour table, no hex parsing and no font grammar at
+all. Resolution lives in `festina/colors.py` -- deliberately the only
+copy, since duplicating a 148-entry table between a Python compiler and
+a C runtime invites drift. The colour set grew to the full CSS Color
+Module Level 4 list (147 X11 keywords + `rebeccapurple`): #89 had
+shipped a small table because every extra name was one a typo could
+silently resolve to, and that argument disappears once a typo is a
+compile error naming the value and its line. Both functions also take an
+explicit form (`fillStyle(r, g, b)`, `font(px, style, family)`) for
+values computed at runtime, which is why requiring a literal in the
+one-argument form costs nothing -- the explicit form is strictly more
+capable for anything dynamic. The one behaviour removed is a colour or
+font built from a runtime-computed *string*, now a compile error
+pointing at the explicit form.
+`tests/test_codegen.py::TestCompileTimeColorAndFontResolution` (13 new
+tests) covers the full table, case-insensitivity, hex expansion, the
+negative-component `none` sentinel, any-order and omitted font parts,
+both explicit forms, and both compile-error paths.
+
 See api.md for the current language/standard library reference and this
 file's own "Status" section above for the implemented-vs-not matrix; the
 short version: nothing is left
@@ -2903,10 +2926,10 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 567 passed, 288 skipped (needs a C compiler; 2 of
+pytest tests/                          # 582 passed, 286 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
                                         # 11 need Xvfb + xdotool installed too, 1 of those
                                         # also needs `openbox` and 2 need `xwd`) given a
                                         # working C compiler,
-                                        # all 855 pass
+                                        # all 868 pass
 ```

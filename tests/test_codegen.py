@@ -6216,6 +6216,8 @@ class TestCanvasStyleAndTextMetrics:
     # ---- compile-only: no display needed ----
 
     def test_style_setters_emit_their_runtime_calls(self, parser, semantic, codegen):
+        # claude.md #90: colours and fonts are resolved at compile time,
+        # so what lands in the IR is numbers, not strings to be parsed.
         source = """
         fillStyle('red')
         borderColor('#00ff00')
@@ -6224,10 +6226,10 @@ class TestCanvasStyleAndTextMetrics:
         drawRect(0, 0, 10, 10)
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @festina_set_fill_style(ptr" in ir
-        assert "call void @festina_set_border_color(ptr" in ir
+        assert "call void @festina_set_fill_rgb(i64 255, i64 0, i64 0)" in ir
+        assert "call void @festina_set_border_rgb(i64 0, i64 255, i64 0)" in ir
         assert "call void @festina_set_line_width(i64 4)" in ir
-        assert "call void @festina_set_font(ptr" in ir
+        assert "call void @festina_set_font(i64 20, ptr @" in ir
 
     def test_measure_functions_return_int(self, parser, semantic, codegen):
         source = """
@@ -6294,36 +6296,26 @@ class TestCanvasStyleAndTextMetrics:
         assert result.returncode == 0
         assert result.stdout == "true\ntrue\ntrue\n0\n"
 
-    def test_an_unrecognised_colour_fails_with_a_clear_message(self, compile_and_run):
-        # No drawing, and so no display needed: a colour is validated at
-        # the fillStyle() call itself rather than deferred to the next
-        # draw, which is both a better error (it points at the line that
-        # set the bad value) and what makes this testable anywhere.
-        source = "fillStyle('nosuchcolour')"
-        result = compile_and_run(source)
-        assert result.returncode != 0
-        combined = result.stdout + result.stderr
-        assert "nosuchcolour" in combined
-        assert "not a colour" in combined
+    def test_an_unrecognised_colour_fails_at_compile_time(self, parser, semantic, codegen, errors):
+        # claude.md #90: since colours are resolved during compilation, a
+        # bad one can't reach a running program at all -- it's a compile
+        # error naming the value, not a runtime failure.
+        with pytest.raises(errors.CompileError, match="nosuchcolour"):
+            self._ir(parser, semantic, codegen, "fillStyle('nosuchcolour')")
 
-    def test_a_malformed_hex_colour_fails_too(self, compile_and_run):
-        source = "fillStyle('#12345')"
-        result = compile_and_run(source)
-        assert result.returncode != 0
-        assert "#12345" in result.stdout + result.stderr
+    def test_a_malformed_hex_colour_fails_too(self, parser, semantic, codegen, errors):
+        for bad in ["#12345", "#xyz", "#", "#1234567"]:
+            with pytest.raises(errors.CompileError, match="not a colour"):
+                self._ir(parser, semantic, codegen, f"fillStyle('{bad}')")
 
-    def test_borderColor_validates_its_colour_too(self, compile_and_run):
-        source = "borderColor('bogus')"
-        result = compile_and_run(source)
-        assert result.returncode != 0
-        combined = result.stdout + result.stderr
-        assert "borderColor()" in combined
-        assert "bogus" in combined
+    def test_borderColor_validates_its_colour_too(self, parser, semantic, codegen, errors):
+        with pytest.raises(errors.CompileError, match="borderColor"):
+            self._ir(parser, semantic, codegen, "borderColor('bogus')")
 
     def test_named_hex_and_none_colours_are_all_accepted(self, compile_and_run):
-        # Exercises every accepted colour shape without drawing: a name,
-        # both hex lengths, case-insensitivity, and the two "no colour"
-        # spellings. Reaching the end means none of them failed.
+        # Every accepted colour shape: a name, both hex lengths,
+        # case-insensitivity, and the two "no colour" spellings.
+        # Compiling and running at all means none of them was rejected.
         source = """
         fillStyle('red')
         fillStyle('ORANGE')
@@ -6436,3 +6428,152 @@ class TestCanvasStyleRendersRealPixels:
                 f"{small_inked} -- font() had no effect")
         finally:
             proc.terminate()
+
+
+class TestCompileTimeColorAndFontResolution:
+    """claude.md #90: `fillStyle('red')` and `font('arial 14px bold')`
+    read well in source, but neither needs to stay text -- both are
+    fully knowable at compile time whenever written as a literal, which
+    is essentially always. The compiler resolves them (festina/colors.py)
+    and emits calls taking plain numbers, so the runtime holds no colour
+    table, no hex parsing and no font grammar, and does none of that work
+    per draw call.
+
+    Requiring a literal costs nothing in expressiveness, because the
+    explicit form is strictly more capable for anything computed at
+    runtime: `fillStyle(r, g, b)` takes any int expression, where a
+    colour *name* could only ever have named one of a fixed set."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    # ---- colours ----
+
+    def test_the_full_css_named_colour_set_is_supported(self):
+        from festina import colors
+        assert len(colors.CSS_COLORS) == 148
+        # spot-checks across the table, including the one CSS 4 addition
+        assert colors.resolve_color("red") == (255, 0, 0)
+        assert colors.resolve_color("rebeccapurple") == (102, 51, 153)
+        assert colors.resolve_color("aliceblue") == (240, 248, 255)
+        assert colors.resolve_color("yellowgreen") == (154, 205, 50)
+        assert colors.resolve_color("darkslategrey") == (47, 79, 79)
+        # both spellings of the grey family resolve identically
+        assert colors.resolve_color("gray") == colors.resolve_color("grey")
+        assert colors.resolve_color("darkgray") == colors.resolve_color("darkgrey")
+
+    def test_colour_names_are_case_insensitive(self, parser, semantic, codegen):
+        for spelling in ["red", "RED", "Red", "  red  "]:
+            ir = self._ir(parser, semantic, codegen, f"fillStyle('{spelling}')")
+            assert "call void @festina_set_fill_rgb(i64 255, i64 0, i64 0)" in ir
+
+    def test_hex_colours_resolve_including_three_digit_expansion(
+            self, parser, semantic, codegen):
+        ir = self._ir(parser, semantic, codegen, "fillStyle('#00f')")
+        assert "call void @festina_set_fill_rgb(i64 0, i64 0, i64 255)" in ir
+        ir = self._ir(parser, semantic, codegen, "fillStyle('#00FF7F')")
+        assert "call void @festina_set_fill_rgb(i64 0, i64 255, i64 127)" in ir
+
+    def test_none_becomes_the_negative_sentinel(self, parser, semantic, codegen):
+        # A negative component can't be a real channel value, so it says
+        # "no colour" without needing an extra argument or a second call.
+        for spelling in ["none", "transparent"]:
+            ir = self._ir(parser, semantic, codegen, f"fillStyle('{spelling}')")
+            assert "call void @festina_set_fill_rgb(i64 -1, i64 -1, i64 -1)" in ir
+
+    def test_the_explicit_rgb_form_takes_runtime_values(self, parser, semantic, codegen):
+        source = """
+        int shade = 200
+        fillStyle(shade, 0, shade / 2)
+        borderColor(10, 20, 30)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_set_border_rgb(i64 10, i64 20, i64 30)" in ir
+        # the computed one passes registers straight through -- no
+        # constant folding expected, just no string anywhere
+        assert "@festina_set_fill_rgb(i64 %" in ir
+
+    def test_a_non_literal_colour_points_at_the_explicit_form(
+            self, parser, semantic, codegen, errors):
+        source = """
+        text c = 'red'
+        fillStyle(c)
+        """
+        with pytest.raises(errors.CompileError, match="three-argument form"):
+            self._ir(parser, semantic, codegen, source)
+
+    # ---- fonts ----
+
+    def test_font_words_may_appear_in_any_order(self, parser, semantic, codegen):
+        # Every ordering of the same three facts must compile to the
+        # identical canonical call.
+        for spec in ["arial 14px bold", "bold 14px arial", "14px arial bold",
+                     "bold arial 14px"]:
+            ir = self._ir(parser, semantic, codegen, f"font('{spec}')")
+            assert "call void @festina_set_font(i64 14, ptr @" in ir
+
+    def test_omitted_font_parts_become_null(self, parser, semantic, codegen):
+        # claude.md #90's own worked example: font('14px') -> font(14, null, null)
+        ir = self._ir(parser, semantic, codegen, "font('14px')")
+        assert "call void @festina_set_font(i64 14, ptr null, ptr null)" in ir
+        # family only -- 0 px means "leave the size alone"
+        ir = self._ir(parser, semantic, codegen, "font('monospace')")
+        assert "call void @festina_set_font(i64 0, ptr null, ptr @" in ir
+
+    def test_font_style_is_normalised(self):
+        from festina import colors
+        assert colors.parse_font("14px") == (14, None, None)
+        assert colors.parse_font("arial 14px bold") == (14, "bold", "arial")
+        assert colors.parse_font("bold 14px arial") == (14, "bold", "arial")
+        # both orderings of italic+bold normalise to one spelling, so the
+        # runtime never sees a variant
+        assert colors.parse_font("italic bold 9px")[1] == "italic bold"
+        assert colors.parse_font("bold italic 9px")[1] == "italic bold"
+        # 'normal' names the default and carries no information, as in CSS
+        assert colors.parse_font("normal 12px serif") == (12, None, "serif")
+        # a bare number is a size too
+        assert colors.parse_font("20") == (20, None, None)
+
+    def test_the_explicit_font_form_takes_runtime_values(self, parser, semantic, codegen):
+        source = """
+        int size = 22
+        font(size, null, null)
+        font(18, 'italic', 'serif')
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "@festina_set_font(i64 %" in ir
+        assert "call void @festina_set_font(i64 18, ptr @" in ir
+
+    def test_a_non_literal_font_points_at_the_explicit_form(
+            self, parser, semantic, codegen, errors):
+        source = """
+        text f = '14px'
+        font(f)
+        """
+        with pytest.raises(errors.CompileError, match="three-argument form"):
+            self._ir(parser, semantic, codegen, source)
+
+    def test_wrong_arity_names_both_accepted_shapes(self, parser, semantic, errors):
+        program = parser.parse("fillStyle('red','x')", filename="main.f")
+        with pytest.raises(errors.CompileError, match="1 or 3 argument"):
+            semantic.analyze(program, filename="main.f")
+
+    # ---- behavioural ----
+
+    def test_resolved_colours_and_fonts_still_render(self, compile_and_run):
+        # The compile-time path must produce a program that actually runs;
+        # metrics prove the font really was applied.
+        source = """
+        font('bold 32px sans-serif')
+        int big = measureTextWidth('Hello')
+        font('8px sans-serif')
+        int small = measureTextWidth('Hello')
+        log(big > small)
+        font(32, null, null)
+        log(measureTextWidth('Hello') == big)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\n"
