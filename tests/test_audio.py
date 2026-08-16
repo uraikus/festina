@@ -50,12 +50,50 @@ class TestAudioMethods:
         program = parser.parse(source)
         semantic.analyze(program)
 
-    @pytest.mark.parametrize("method", ["play", "stop", "isPlaying"])
+    @pytest.mark.parametrize("method", ["stop", "isPlaying"])
     def test_takes_no_arguments(self, parser, semantic, errors, method):
+        # claude.md #99: play/playLoop now take an optional channel, so
+        # only these two are still argument-free. stop() stays that way
+        # deliberately -- it names the CLIP, and stopAudioPlayer(n) is
+        # how a program addresses one channel.
         source = f"aud music = loadAudio('music.wav')\nmusic.{method}(1)"
         program = parser.parse(source)
         with pytest.raises(errors.CompileError, match="no arguments"):
             semantic.analyze(program)
+
+    @pytest.mark.parametrize("method", ["play", "playLoop"])
+    def test_play_takes_an_optional_int_channel(self, parser, semantic, method):
+        # claude.md #99.
+        source = (f"aud music = loadAudio('music.wav')\n"
+                  f"music.{method}()\nmusic.{method}(2)")
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    @pytest.mark.parametrize("method", ["play", "playLoop"])
+    def test_play_rejects_too_many_arguments(self, parser, semantic, errors, method):
+        source = f"aud music = loadAudio('music.wav')\nmusic.{method}(1, 2)"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match="0 or 1 argument"):
+            semantic.analyze(program)
+
+    @pytest.mark.parametrize("method", ["play", "playLoop"])
+    def test_play_rejects_a_non_int_channel(self, parser, semantic, errors, method):
+        source = f"aud music = loadAudio('music.wav')\nmusic.{method}('two')"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match="channel must be int"):
+            semantic.analyze(program)
+
+    def test_stop_audio_player_takes_an_optional_int_channel(self, parser, semantic):
+        # claude.md #99: a free function, not a method -- channels are
+        # process-global, so there is no clip to hang it off.
+        program = parser.parse("stopAudioPlayer()\nstopAudioPlayer(0)")
+        semantic.analyze(program)
+
+    def test_stop_audio_player_rejects_a_bad_call(self, parser, semantic, errors):
+        for source in ["stopAudioPlayer(1, 2)", "stopAudioPlayer('a')"]:
+            program = parser.parse(source)
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program)
 
     def test_unrecognized_method_is_a_compile_error(self, parser, semantic, errors):
         source = "aud music = loadAudio('music.wav')\nmusic.pause()"

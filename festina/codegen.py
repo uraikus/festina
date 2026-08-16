@@ -133,7 +133,7 @@ decoder dependency at all -- is the implementation-defined choice here,
 the same kind of call PNG-only images already made. play()/stop()/
 isPlaying() are ordinary Call-on-Member patterns (same family as
 Math.floor/int.toFloat()/the regex methods above), each emitting a
-single call to festina_audio_play/_stop/_is_playing; there's no IR-level
+single call to festina_audio_play_on/_stop/_is_playing; there's no IR-level
 machinery of its own; the interesting part -- playback actually running
 on a background thread so a playing clip doesn't block the rest of the
 program, matching what having a separate isPlaying() to poll implies --
@@ -1008,7 +1008,9 @@ class CodeGen:
             "declare void @festina_run_timer_loop()",
             # claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying().
             "declare ptr @festina_load_audio(ptr)",
-            "declare void @festina_audio_play(ptr)",
+            # claude.md #99: play/playLoop, with or without a channel.
+            "declare void @festina_audio_play_on(ptr, i64, i8, i8)",
+            "declare void @festina_stop_audio_player(i64)",
             "declare void @festina_audio_stop(ptr)",
             "declare i8 @festina_audio_is_playing(ptr)",
             # claude.md #98: the per-aud voice limit.
@@ -4454,6 +4456,21 @@ class CodeGen:
                 return self._emit_graphics_call(name, expr, env, lines)
             if name in ("setTimeout", "setInterval", "clearTimeout", "clearInterval"):
                 return self._emit_timer_call(name, expr, env, lines)
+            if name == "stopAudioPlayer":
+                # claude.md #99. Lives in the audio translation unit, so
+                # naming it is what makes a program "use audio" -- see
+                # setMaxAudioPlayers just below for the same reasoning.
+                # A bare stopAudioPlayer() passes -1, the runtime's own
+                # "every channel" encoding: naming no channel obviously
+                # means all of them, and there is no other way to say it.
+                self.uses_audio = True
+                if expr.args:
+                    chan_val, chan_type = self._emit_expr(expr.args[0], env, lines)
+                    chan_val = self._coerce(chan_val, chan_type, INT, lines)
+                else:
+                    chan_val = "-1"
+                lines.append(f"  call void @festina_stop_audio_player(i64 {chan_val})")
+                return "0", None
             if name in ("setMaxAudioPlayers", "maxAudioPlayers"):
                 # claude.md #98. Both live in the audio translation unit,
                 # so naming either is what makes a program "use audio" --
@@ -4627,10 +4644,25 @@ class CodeGen:
                         f"i64 {arg_vals[0]}, i64 {arg_vals[1]})")
                     return "0", None
             # claude.md #38: music.play() / music.stop() / music.isPlaying()
-            if callee.prop == "play":
+            # claude.md #99: play/playLoop take an optional channel, and
+            # both compile to the same runtime entry point -- the four
+            # shapes differ only in two flags it already takes.
+            if callee.prop in ("play", "playLoop"):
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if obj_type == AUDIO:
-                    lines.append(f"  call void @festina_audio_play(ptr {obj_val})")
+                    if expr.args:
+                        chan_val, chan_type = self._emit_expr(expr.args[0], env, lines)
+                        chan_val = self._coerce(chan_val, chan_type, INT, lines)
+                        explicit = 1
+                    else:
+                        # Never read when explicit is 0, but a real
+                        # constant rather than undef keeps the IR
+                        # readable and the call trivially verifiable.
+                        chan_val, explicit = "0", 0
+                    looping = 1 if callee.prop == "playLoop" else 0
+                    lines.append(
+                        f"  call void @festina_audio_play_on(ptr {obj_val}, "
+                        f"i64 {chan_val}, i8 {explicit}, i8 {looping})")
                     return "0", None
             if callee.prop == "stop":
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)

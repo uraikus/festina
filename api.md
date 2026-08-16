@@ -1006,7 +1006,8 @@ deadlines together so neither blocks the other.
 
 ```festina
 aud music = loadAudio('music.wav')   // WAV, 16-bit PCM only
-music.play()
+music.play()                          // once
+music.playLoop()                      // until stopped
 music.stop()
 music.isPlaying()                     // true the instant play() returns,
                                        // false the instant stop() returns
@@ -1017,8 +1018,8 @@ playback doesn't block the rest of the program.
 
 ### Overlapping sounds
 
-**`play()` while a sound is already playing does not cut it off.** Each
-`aud` owns a pool of up to 10 voices — so a footstep, a gunshot or a
+**`play()` while a sound is already playing does not cut it off.** Sound
+goes out through a pool of **channels** — so a footstep, a gunshot or a
 coin pickup firing in rapid succession layer instead of interrupting
 each other, which is what a game actually needs:
 
@@ -1029,27 +1030,81 @@ coin.play()
 coin.play()
 ```
 
-The clip's audio is decoded once, at `loadAudio()` time; a voice costs a
-thread and a device handle, never another copy of the samples.
+The clip's audio is decoded once, at `loadAudio()` time; a channel costs
+a thread and a device handle, never another copy of the samples.
 
 ```festina
-setMaxAudioPlayers(4)          // per aud; clamped into [1, 64]
+setMaxAudioPlayers(4)          // channels the pool may assign on its own
 log(maxAudioPlayers())         // -> 4, i.e. what was actually applied
 ```
 
-When every voice is busy, the **oldest** is stolen. Something has to
-give at the limit, and the sound that has been playing longest is
-closest to finishing anyway — dropping the *new* play instead would
-silence a rapid-fire effect at exactly the moment it fires fastest.
+`setMaxAudioPlayers` is clamped into `[1, 64]` rather than rejected.
+When every unreserved channel in the pool is busy, the **oldest** is
+stolen. Something has to give at the limit, and the sound that has been
+playing longest is closest to finishing anyway — dropping the *new* play
+instead would silence a rapid-fire effect at exactly the moment it fires
+fastest.
 
 `setMaxAudioPlayers(1)` is the way to ask for the old behaviour back:
-one voice, restarted from the beginning on every `play()`.
+one channel, restarted from the beginning on every `play()`.
+
+### Channels and looping
+
+Channels are **process-global and numbered from 0**, not per-clip — so
+two different clips can share one, which is what makes handing a music
+channel from one track to another expressible at all:
+
+```festina
+aud adventureMusic = loadAudio('adventure.wav')
+aud battleMusic = loadAudio('battle.wav')
+
+adventureMusic.playLoop(0)          // loops on channel 0, and reserves it
+setInterval(changeMusic, 100000)
+
+void func changeMusic() {
+    if adventureMusic.isPlaying() {
+        battleMusic.playLoop(0)     // takes channel 0 over
+    } else {
+        adventureMusic.playLoop(0)
+    }
+}
+
+stopAudioPlayer(0)                  // stop that channel, release it
+```
+
+| Call | What it does |
+|---|---|
+| `clip.play()` | Play once on a channel the pool picks. |
+| `clip.play(n)` | Play once on channel `n`, taking it over. |
+| `clip.playLoop()` | Loop on a channel the pool picks, and **reserve** it. |
+| `clip.playLoop(n)` | Loop on channel `n`, taking it over and **reserving** it. |
+| `stopAudioPlayer(n)` | Stop channel `n` and release it. |
+| `stopAudioPlayer()` | Stop every channel. |
+| `clip.stop()` | Stop every channel playing *that clip*, releasing each. |
+| `clip.isPlaying()` | True while any channel is playing that clip. |
+
+**`playLoop` reserves its channel.** A reserved channel is never chosen
+by automatic assignment and never stolen — so a looping music track
+cannot be evicted by an ordinary sound effect, however many are firing.
+Three things release it: `stopAudioPlayer(n)`, that clip's own `stop()`,
+or naming the channel explicitly in another `play(n)`/`playLoop(n)`. An
+explicit `play(n)` both takes the channel over *and* hands it back to
+the pool, since a one-shot has nothing to reserve it for.
+
+An out-of-range channel is clamped into `[0, 64)`, the same call
+`setMaxAudioPlayers` makes — a bad channel number should not kill a
+running game. `setMaxAudioPlayers` bounds only what the pool assigns on
+its own; an explicitly named channel is honoured anywhere in range, so
+`play(40)` works with a pool of 10.
+
+If you reserve *every* channel and then fire an unnamed `play()`, it is
+dropped — there is nothing left the pool is allowed to touch, and the
+alternative would be breaking a reservation you asked for.
 
 `stop()` and `isPlaying()` are about the **clip**, not one playback of
-it: `stop()` ends every voice of that clip, and `isPlaying()` is true
-while any is still going. There is no way to name an individual
-playback — that would mean exposing the pool, which is deliberately not
-part of the language.
+it: `stop()` ends every channel playing that clip, and `isPlaying()` is
+true while any is still going. To address a single playback, name its
+channel.
 
 ## Imports
 

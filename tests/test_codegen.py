@@ -4676,6 +4676,103 @@ class TestAudio:
         assert result.returncode == 0
         assert result.stdout.strip() == "true"
 
+    def test_channels_and_loops_compile_and_run(self, compile_and_run, tmp_path, audio_null_env):
+        # claude.md #99: every shape of the new surface, through the
+        # real compiler and the real runtime. What is observable from
+        # Festina is that these run and that stop/isPlaying still agree;
+        # which CHANNEL each landed on is checked white-box in
+        # TestAudioChannels, since the language deliberately cannot see
+        # it.
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = (
+            "aud music = loadAudio('clip.wav')\n"
+            "music.play()\n"
+            "music.play(3)\n"
+            "music.playLoop()\n"
+            "music.playLoop(0)\n"
+            "log(music.isPlaying())\n"
+            "stopAudioPlayer(0)\n"
+            "stopAudioPlayer(3)\n"
+            "stopAudioPlayer()\n"
+            "log(music.isPlaying())\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_a_looping_track_outlives_its_own_length(self, compile_and_run, tmp_path,
+                                                       audio_null_env):
+        # The one loop property observable from Festina: a clip that
+        # would long since have finished is still playing. 50ms of
+        # audio, checked 400ms later.
+        _write_wav(tmp_path / "clip.wav", duration_s=0.05)
+        source = (
+            "aud music = loadAudio('clip.wav')\n"
+            "void func check() {\n"
+            "    log(`still playing: ${music.isPlaying()}`)\n"
+            "    stopAudioPlayer(0)\n"
+            "    log(`after stop: ${music.isPlaying()}`)\n"
+            "}\n"
+            "music.playLoop(0)\n"
+            "setTimeout(check, 400)\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["still playing: true", "after stop: false"]
+
+    def test_a_non_looping_play_still_finishes_on_its_own(self, compile_and_run, tmp_path,
+                                                            audio_null_env):
+        # The control for the test above -- same clip, same delay,
+        # play() instead of playLoop(). Without this pair, "still
+        # playing" would not distinguish looping from a slow device.
+        _write_wav(tmp_path / "clip.wav", duration_s=0.05)
+        source = (
+            "aud music = loadAudio('clip.wav')\n"
+            "void func check() {\n"
+            "    log(`still playing: ${music.isPlaying()}`)\n"
+            "}\n"
+            "music.play(0)\n"
+            "setTimeout(check, 400)\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "still playing: false"
+
+    def test_the_music_handover_from_the_motivating_example(self, compile_and_run, tmp_path,
+                                                              audio_null_env):
+        # claude.md #99's own worked example, shortened: two tracks
+        # trading channel 0 back and forth. The point is that
+        # isPlaying() flips each time, which only works if the second
+        # playLoop(0) genuinely evicts the first.
+        _write_wav(tmp_path / "adventure.wav", duration_s=0.05)
+        _write_wav(tmp_path / "battle.wav", duration_s=0.05)
+        source = (
+            "aud adventureMusic = loadAudio('adventure.wav')\n"
+            "aud battleMusic = loadAudio('battle.wav')\n"
+            "void func changeMusic() {\n"
+            "    if adventureMusic.isPlaying() {\n"
+            "        battleMusic.playLoop(0)\n"
+            "        log('battle')\n"
+            "    } else {\n"
+            "        adventureMusic.playLoop(0)\n"
+            "        log('adventure')\n"
+            "    }\n"
+            "}\n"
+            "int id = 0\n"
+            "void func done() {\n"
+            "    stopAudioPlayer(0)\n"
+            "    clearInterval(id)\n"
+            "}\n"
+            "adventureMusic.playLoop(0)\n"
+            "id = setInterval(changeMusic, 100)\n"
+            "setTimeout(done, 450)\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        lines = result.stdout.splitlines()
+        # Strict alternation: each tick sees the other track playing.
+        assert lines[:4] == ["battle", "adventure", "battle", "adventure"]
+
     def test_timers_and_audio_work_together(self, compile_and_run, tmp_path, audio_null_env):
         # A short clip finishes (isPlaying() -> false) on its own, with
         # no stop() call -- checked from a setTimeout callback, proving
@@ -4750,13 +4847,12 @@ void festina_fail(const char *msg) {
 }
 
 static int active_voices(void *audio) {
-    FestinaAudio *a = (FestinaAudio *)audio;
     int n = 0;
-    pthread_mutex_lock(&a->lock);
+    pthread_mutex_lock(&g_audio_lock);
     for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
-        if (a->voices[i].active) n++;
+        if (g_channels[i].active && g_channels[i].clip == audio) n++;
     }
-    pthread_mutex_unlock(&a->lock);
+    pthread_mutex_unlock(&g_audio_lock);
     return n;
 }
 
@@ -4769,9 +4865,9 @@ int main(int argc, char **argv) {
     /* Three overlapping plays, well inside the default limit of 10.
      * Before claude.md #98 the second would have cut the first off and
      * this would read 1. */
-    festina_audio_play(clip);
-    festina_audio_play(clip);
-    festina_audio_play(clip);
+    festina_audio_play_on(clip, 0, 0, 0);
+    festina_audio_play_on(clip, 0, 0, 0);
+    festina_audio_play_on(clip, 0, 0, 0);
     printf("three %d\n", active_voices(clip));
     printf("isplaying %d\n", (int)festina_audio_is_playing(clip));
 
@@ -4785,14 +4881,14 @@ int main(int argc, char **argv) {
      * exceeds it, and never collapses to zero however many plays pile
      * up. */
     festina_set_max_audio_players(2);
-    for (int i = 0; i < 6; i++) festina_audio_play(clip);
+    for (int i = 0; i < 6; i++) festina_audio_play_on(clip, 0, 0, 0);
     printf("limit2 %d\n", active_voices(clip));
 
     /* A limit of 1 is exactly the old behaviour: one voice, restarted. */
     festina_audio_stop(clip);
     festina_set_max_audio_players(1);
-    festina_audio_play(clip);
-    festina_audio_play(clip);
+    festina_audio_play_on(clip, 0, 0, 0);
+    festina_audio_play_on(clip, 0, 0, 0);
     printf("limit1 %d\n", active_voices(clip));
 
     festina_audio_stop(clip);
@@ -4805,7 +4901,7 @@ int main(int argc, char **argv) {
     festina_set_max_audio_players(3);
     int peak = 0;
     for (int i = 0; i < 40; i++) {
-        festina_audio_play(clip);
+        festina_audio_play_on(clip, 0, 0, 0);
         int n = active_voices(clip);
         if (n > peak) peak = n;
     }
@@ -4861,20 +4957,19 @@ void festina_fail(const char *msg) {
 }
 
 static int active_voices(void *audio) {
-    FestinaAudio *a = (FestinaAudio *)audio;
     int n = 0;
-    pthread_mutex_lock(&a->lock);
+    pthread_mutex_lock(&g_audio_lock);
     for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
-        if (a->voices[i].active) n++;
+        if (g_channels[i].active && g_channels[i].clip == audio) n++;
     }
-    pthread_mutex_unlock(&a->lock);
+    pthread_mutex_unlock(&g_audio_lock);
     return n;
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     void *clip = festina_load_audio(argv[1]);
-    for (int i = 0; i < 5; i++) festina_audio_play(clip);
+    for (int i = 0; i < 5; i++) festina_audio_play_on(clip, 0, 0, 0);
     /* One stream is all the device has, so one voice is all there is --
      * and crucially the program is still running to say so. */
     printf("voices %d\n", active_voices(clip));
@@ -4886,6 +4981,244 @@ int main(int argc, char **argv) {
     return 0;
 }
 """
+
+
+_CHANNEL_HARNESS = r"""
+/* claude.md #99: named channels -- play(n)/playLoop(n)/
+ * stopAudioPlayer(n), and the reservation playLoop takes out.
+ *
+ * White-box for the same two reasons the pool harness is (see
+ * _VOICE_POOL_HARNESS): a Festina program cannot see which channel a
+ * clip landed on, and the null ALSA device consumes PCM instantly so
+ * there is no concurrency to observe under it. The device layer is
+ * stubbed; the channel table is the real one.
+ */
+#include <alsa/asoundlib.h>
+#include <time.h>
+
+static int harness_pcm_open(snd_pcm_t **out) { *out = (snd_pcm_t *)1; return 0; }
+static long harness_pcm_writei(snd_pcm_t *pcm, const void *buf, unsigned long frames) {
+    (void)pcm; (void)buf;
+    struct timespec ts = { 0, 10L * 1000L * 1000L };
+    nanosleep(&ts, NULL);
+    return (long)frames;
+}
+
+#define snd_pcm_open(pcmp, name, stream, mode) harness_pcm_open(pcmp)
+#define snd_pcm_set_params(pcm, f, a, c, r, s, l) 0
+#define snd_pcm_writei(pcm, buf, frames) harness_pcm_writei(pcm, buf, frames)
+#define snd_pcm_recover(pcm, err, silent) (-1)
+#define snd_pcm_close(pcm) 0
+
+#include "festina_runtime_audio.c"
+
+void festina_fail(const char *msg) {
+    fprintf(stderr, "fail: %s\n", msg ? msg : "");
+    exit(1);
+}
+
+/* Which channel index a clip is playing on, or -1. */
+static int channel_of(void *clip) {
+    int found = -1;
+    pthread_mutex_lock(&g_audio_lock);
+    for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+        if (g_channels[i].active && g_channels[i].clip == clip) { found = i; break; }
+    }
+    pthread_mutex_unlock(&g_audio_lock);
+    return found;
+}
+
+static int locked_at(int i) {
+    pthread_mutex_lock(&g_audio_lock);
+    int v = g_channels[i].locked;
+    pthread_mutex_unlock(&g_audio_lock);
+    return v;
+}
+
+static int active_at(int i) {
+    pthread_mutex_lock(&g_audio_lock);
+    int v = g_channels[i].active;
+    pthread_mutex_unlock(&g_audio_lock);
+    return v;
+}
+
+static int active_total(void) {
+    int n = 0;
+    pthread_mutex_lock(&g_audio_lock);
+    for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) if (g_channels[i].active) n++;
+    pthread_mutex_unlock(&g_audio_lock);
+    return n;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 3) return 2;
+    void *adventure = festina_load_audio(argv[1]);
+    void *battle = festina_load_audio(argv[2]);
+
+    /* An explicit channel is honoured exactly. */
+    festina_audio_play_on(adventure, 5, 1, 0);
+    printf("explicit %d\n", channel_of(adventure));
+    festina_stop_audio_player(5);
+
+    /* playLoop reserves the channel it uses. */
+    festina_audio_play_on(adventure, 0, 1, 1);
+    printf("loop_channel %d\n", channel_of(adventure));
+    printf("loop_locked %d\n", locked_at(0));
+
+    /* A reserved channel is never taken by automatic assignment, even
+     * under pressure: 30 pooled plays with a limit of 3 must never land
+     * on channel 0 or evict what is looping there. */
+    festina_set_max_audio_players(3);
+    int stole_channel_0 = 0;
+    for (int i = 0; i < 30; i++) {
+        festina_audio_play_on(battle, 0, 0, 0);
+        pthread_mutex_lock(&g_audio_lock);
+        if (g_channels[0].clip != adventure) stole_channel_0 = 1;
+        pthread_mutex_unlock(&g_audio_lock);
+    }
+    printf("stole_reserved %d\n", stole_channel_0);
+
+    /* The looping clip is STILL playing after all that -- it has run
+     * far past its own length, which only a real loop does. */
+    printf("still_looping %d\n", (int)festina_audio_is_playing(adventure));
+
+    /* The handover from the user's own example: a different clip named
+     * on the same channel takes it over. */
+    festina_audio_play_on(battle, 0, 1, 1);
+    printf("handover_battle %d\n", channel_of(battle));
+    printf("handover_adventure_playing %d\n", (int)festina_audio_is_playing(adventure));
+    printf("handover_still_locked %d\n", locked_at(0));
+
+    /* An explicit one-shot play() on a reserved channel takes it over
+     * AND releases the reservation. */
+    festina_audio_play_on(adventure, 0, 1, 0);
+    printf("oneshot_released %d\n", locked_at(0));
+
+    /* stopAudioPlayer(n) stops that channel and releases it. Asserted
+     * per CHANNEL, not per clip: isPlaying() is deliberately clip-wide
+     * (claude.md #98), so with the same clip also running on channel 0
+     * from the block above it would stay true regardless of what
+     * channel 2 does -- which would make this assert nothing. */
+    festina_audio_play_on(adventure, 2, 1, 1);
+    printf("before_stop_locked %d\n", locked_at(2));
+    printf("before_stop_active %d\n", active_at(2));
+    festina_stop_audio_player(2);
+    printf("after_stop_locked %d\n", locked_at(2));
+    printf("after_stop_active %d\n", active_at(2));
+
+    /* A bare stopAudioPlayer() stops everything. */
+    festina_audio_play_on(adventure, 1, 1, 1);
+    festina_audio_play_on(battle, 4, 1, 1);
+    festina_audio_play_on(battle, 0, 0, 0);
+    printf("before_stop_all %d\n", active_total() > 0);
+    festina_stop_audio_player(-1);
+    printf("after_stop_all %d\n", active_total());
+    printf("after_stop_all_locks %d\n", locked_at(1) + locked_at(4));
+
+    /* A clip's own stop() releases the reservation too -- a looping
+     * track told to stop is not still owed its channel. */
+    festina_audio_play_on(adventure, 7, 1, 1);
+    festina_audio_stop(adventure);
+    printf("clip_stop_locked %d\n", locked_at(7));
+    printf("clip_stop_playing %d\n", (int)festina_audio_is_playing(adventure));
+    return 0;
+}
+"""
+
+
+class TestAudioChannels:
+    """claude.md #99: channels are named, and playLoop reserves one.
+
+    The pool from claude.md #98 was per-`aud`, which cannot express the
+    thing this section exists for -- two different clips sharing one
+    channel:
+
+        adventureMusic.playLoop(0)
+        battleMusic.playLoop(0)     // takes channel 0 over
+
+    With a per-clip pool those are two different pools and "channel 0"
+    means two different things. So the pool became process-global and
+    its slots became channels, which is also what lets
+    stopAudioPlayer(0) be a plain free function rather than something
+    that would have to name a clip to find the channel.
+    """
+
+    def _run(self, tmp_path):
+        cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
+        if not cc:
+            pytest.skip("no C compiler (clang/gcc/cc) on PATH")
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa"],
+                               capture_output=True, text=True)
+        if alsa.returncode != 0:
+            pytest.skip("alsa dev headers are not installed")
+        runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
+        harness = tmp_path / "channel_harness.c"
+        harness.write_text(_CHANNEL_HARNESS)
+        binary = tmp_path / "channel_harness"
+        a = tmp_path / "adventure.wav"
+        b = tmp_path / "battle.wav"
+        # Short clips: the looping assertions below only mean something
+        # if a non-looping clip would have finished long before them.
+        _write_wav(a, duration_s=0.5)
+        _write_wav(b, duration_s=0.5)
+        build = subprocess.run(
+            [cc, "-I", runtime_dir, str(harness), "-o", str(binary), "-pthread"]
+            + alsa.stdout.split(),
+            capture_output=True, text=True,
+        )
+        assert build.returncode == 0, build.stderr
+        run = subprocess.run([str(binary), str(a), str(b)], capture_output=True,
+                              text=True, timeout=180)
+        assert run.returncode == 0, run.stderr
+        return dict(line.split() for line in run.stdout.splitlines())
+
+    def test_an_explicit_channel_is_honoured_exactly(self, tmp_path):
+        out = self._run(tmp_path)
+        assert out["explicit"] == "5"
+
+    def test_play_loop_reserves_its_channel_and_keeps_playing(self, tmp_path):
+        out = self._run(tmp_path)
+        assert out["loop_channel"] == "0"
+        assert out["loop_locked"] == "1"
+        # 30 pooled plays through a limit of 3, and the reservation is
+        # never touched -- without the lock, stealing would have taken
+        # channel 0 almost immediately.
+        assert out["stole_reserved"] == "0"
+        # And it is still going, far past its own half-second length,
+        # which only a real loop does.
+        assert out["still_looping"] == "1"
+
+    def test_a_second_clip_can_take_the_channel_over(self, tmp_path):
+        # The handover straight out of the motivating example.
+        out = self._run(tmp_path)
+        assert out["handover_battle"] == "0"
+        assert out["handover_adventure_playing"] == "0"
+        assert out["handover_still_locked"] == "1"
+
+    def test_an_explicit_one_shot_play_releases_the_reservation(self, tmp_path):
+        # "or if the channel is explicitly listed in play()/playLoop()":
+        # play(n) takes the channel over AND hands it back to the pool,
+        # since a one-shot has nothing to reserve it for.
+        out = self._run(tmp_path)
+        assert out["oneshot_released"] == "0"
+
+    def test_stop_audio_player_stops_and_releases_one_channel(self, tmp_path):
+        out = self._run(tmp_path)
+        assert out["before_stop_locked"] == "1"
+        assert out["before_stop_active"] == "1"
+        assert out["after_stop_locked"] == "0"
+        assert out["after_stop_active"] == "0"
+
+    def test_a_bare_stop_audio_player_stops_every_channel(self, tmp_path):
+        out = self._run(tmp_path)
+        assert out["before_stop_all"] == "1"
+        assert out["after_stop_all"] == "0"
+        assert out["after_stop_all_locks"] == "0"
+
+    def test_a_clips_own_stop_releases_its_reservations(self, tmp_path):
+        out = self._run(tmp_path)
+        assert out["clip_stop_locked"] == "0"
+        assert out["clip_stop_playing"] == "0"
 
 
 class TestAudioOnANonMixingDevice:

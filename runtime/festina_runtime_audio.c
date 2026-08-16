@@ -1,6 +1,7 @@
 /*
  * Festina native runtime -- audio translation unit: claude.md #38 (aud,
- * loadAudio(), .play()/.stop()/.isPlaying()). See festina_runtime.h's
+ * loadAudio(), .play()/.stop()/.isPlaying()) and claude.md #99 (named
+ * channels: play(n)/playLoop(n)/stopAudioPlayer(n)). See festina_runtime.h's
  * doc comment for the full design rationale -- this file is pure
  * implementation, split out of the single original festina_runtime.c so
  * that a compiled program which never uses audio never needs ALSA (or
@@ -19,28 +20,38 @@
 #include <alsa/asoundlib.h>
 #include "festina_runtime.h"
 
-/* claude.md #98: how many voices one `aud` may have playing at once.
- * FESTINA_AUDIO_PLAYER_CAP is a hard ceiling on what setMaxAudioPlayers
- * will accept -- each voice is its own thread and its own ALSA device
- * handle, and a program asking for thousands of those has a bug rather
- * than a requirement. 10 is the default: enough that a game firing
- * overlapping effects never hears one cut another off, small enough
- * that the per-aud array costs nothing worth thinking about. */
+/* claude.md #98/#99: the channel table.
+ *
+ * A CHANNEL is a playback slot: one thread, one ALSA handle, and
+ * whichever clip is currently going through it. The table is
+ * PROCESS-GLOBAL, not per-`aud`, and claude.md #99 is what forced that
+ * -- two different clips have to be able to share a channel:
+ *
+ *     adventureMusic.playLoop(0)
+ *     battleMusic.playLoop(0)     // takes channel 0 over
+ *
+ * With a per-clip pool (claude.md #98's own shape) those two are
+ * different pools and "channel 0" means two different things, so the
+ * handover cannot be expressed at all. Global channels also make
+ * stopAudioPlayer(0) a plain free function rather than something that
+ * would have to name a clip to find the channel.
+ *
+ * FESTINA_AUDIO_PLAYER_CAP is a hard ceiling: each channel is a thread
+ * and a device handle, and a program asking for thousands of those has
+ * a bug rather than a requirement. The DEFAULT of 10 bounds only
+ * AUTOMATIC assignment -- see festina_audio_claim_channel. */
 #define FESTINA_AUDIO_PLAYER_CAP 64
 #define FESTINA_AUDIO_PLAYERS_DEFAULT 10
 
-/* Read by every play() and written only by setMaxAudioPlayers. Not
- * mutex-guarded: Festina programs are single-threaded apart from the
- * playback threads this file spawns, and none of those ever touches
- * it -- setMaxAudioPlayers is only ever reached from program code. */
-static int g_max_audio_players = FESTINA_AUDIO_PLAYERS_DEFAULT;
+typedef struct FestinaAudio {
+    int16_t *samples;    /* interleaved PCM, 16-bit signed, little-endian */
+    size_t frame_count;  /* frames (per channel), not raw samples */
+    int channels;
+    unsigned int sample_rate;
+} FestinaAudio;
 
-/* One voice = one simultaneous playback of the clip that owns it. The
- * decoded PCM lives once on the FestinaAudio and every voice streams
- * the same buffer read-only, so N voices cost N threads and N device
- * handles, never N copies of the audio. */
-typedef struct FestinaVoice {
-    struct FestinaAudio *owner;
+typedef struct FestinaChannel {
+    FestinaAudio *clip;      /* what is playing here; NULL when never used */
     pthread_t thread;
     snd_pcm_t *pcm;          /* only meaningful while active */
     int active;              /* a thread is streaming right now */
@@ -48,23 +59,54 @@ typedef struct FestinaVoice {
                                 stays 1 after the thread exits, since a
                                 finished thread still has to be joined
                                 before its slot can be reused */
-    int stop_requested;      /* set by stop()/voice stealing, read by the thread */
-    uint64_t started_seq;    /* play order, for choosing which voice to steal */
-} FestinaVoice;
+    int stop_requested;      /* set by stop()/stealing, read by the thread */
+    int looping;             /* playLoop: restart at the end instead of ending */
+    int locked;              /* claude.md #99: playLoop reserves the channel.
+                                A locked channel is never chosen by automatic
+                                assignment and never stolen -- only an explicit
+                                play(n)/playLoop(n) on that exact channel, or
+                                stopAudioPlayer(n), can take it back. Without
+                                this a looping music track would eventually be
+                                stolen by an ordinary sound effect. */
+    uint64_t started_seq;    /* play order, for choosing which channel to steal */
+} FestinaChannel;
 
-typedef struct FestinaAudio {
-    int16_t *samples;    /* interleaved PCM, 16-bit signed, little-endian */
-    size_t frame_count;  /* frames (per channel), not raw samples */
-    int channels;
-    unsigned int sample_rate;
+/* One lock for the whole table rather than one per channel: every
+ * operation here either walks the table (isPlaying, stop, stealing) or
+ * hands a channel from one clip to another, so per-channel locks would
+ * have to be taken in bulk anyway. Contention is not a concern -- a
+ * playback thread takes it once per 4096-frame chunk, which at 44.1kHz
+ * is about once every 93ms. */
+static pthread_mutex_t g_audio_lock = PTHREAD_MUTEX_INITIALIZER;
+static FestinaChannel g_channels[FESTINA_AUDIO_PLAYER_CAP];
+static uint64_t g_next_seq = 1;
 
-    pthread_mutex_t lock;    /* guards everything below */
-    FestinaVoice voices[FESTINA_AUDIO_PLAYER_CAP];
-    uint64_t next_seq;       /* monotonic, so started_seq orders voices */
-} FestinaAudio;
+/* Read by every play() and written only by setMaxAudioPlayers. Not
+ * guarded: Festina programs are single-threaded apart from the playback
+ * threads this file spawns, and none of those ever touches it. */
+static int g_max_audio_players = FESTINA_AUDIO_PLAYERS_DEFAULT;
+
+/* claude.md #99: an out-of-range channel is CLAMPED rather than
+ * rejected, the same call setMaxAudioPlayers already makes for the same
+ * reason (claude.md #98) -- this is a tuning knob, and killing a
+ * running game over a number that is merely out of range is a worse
+ * trade than giving it the nearest workable one. maxAudioPlayers() is
+ * there for a program that wants to check rather than guess. */
+static int festina_clamp_channel(int64_t channel) {
+    if (channel < 0) return 0;
+    if (channel >= FESTINA_AUDIO_PLAYER_CAP) return FESTINA_AUDIO_PLAYER_CAP - 1;
+    return (int)channel;
+}
+
+static int festina_pool_limit(void) {
+    int limit = g_max_audio_players;
+    if (limit < 1) limit = 1;
+    if (limit > FESTINA_AUDIO_PLAYER_CAP) limit = FESTINA_AUDIO_PLAYER_CAP;
+    return limit;
+}
 
 /* The playback thread's whole job: stream already-decoded PCM to ALSA
- * in small chunks, checking stop_requested between each one so stop()
+ * in small chunks, checking stop_requested between each one so a stop
  * gets a prompt response rather than waiting for the entire clip to
  * finish. The PCM device itself was already opened+configured by
  * festina_audio_play (synchronously, before this thread was even
@@ -73,62 +115,101 @@ typedef struct FestinaAudio {
  * stopped, or an unrecoverable ALSA error), closing the device and
  * resetting state so isPlaying() reflects reality again. */
 static void *festina_audio_thread_main(void *arg) {
-    FestinaVoice *v = (FestinaVoice *)arg;
-    FestinaAudio *a = v->owner;
+    FestinaChannel *ch = (FestinaChannel *)arg;
+    FestinaAudio *a = ch->clip;
     const snd_pcm_uframes_t chunk_frames = 4096;
     size_t frame = 0;
 
-    while (frame < a->frame_count) {
-        pthread_mutex_lock(&a->lock);
-        int stop = v->stop_requested;
-        pthread_mutex_unlock(&a->lock);
+    for (;;) {
+        pthread_mutex_lock(&g_audio_lock);
+        int stop = ch->stop_requested;
+        int looping = ch->looping;
+        pthread_mutex_unlock(&g_audio_lock);
         if (stop) break;
+
+        if (frame >= a->frame_count) {
+            /* claude.md #99: playLoop restarts here rather than ending.
+             * Seamless in the sense that matters -- the device is never
+             * closed and reopened between repetitions, so there is no
+             * gap beyond ALSA's own buffering. A zero-length clip would
+             * otherwise spin this loop at full speed, so it ends
+             * instead: looping silence forever is never what anyone
+             * meant. */
+            if (!looping || a->frame_count == 0) break;
+            frame = 0;
+            continue;
+        }
 
         size_t remaining = a->frame_count - frame;
         snd_pcm_uframes_t this_chunk =
             remaining < chunk_frames ? (snd_pcm_uframes_t)remaining : chunk_frames;
         /* a->samples is read-only for the whole life of the clip, so
-         * every voice streams the same buffer with no lock held here --
-         * only the voice's own mutable state above needs guarding. */
+         * every channel streams the same buffer with no lock held here
+         * -- only the channel's own mutable state above needs guarding. */
         snd_pcm_sframes_t written = snd_pcm_writei(
-            v->pcm, a->samples + frame * (size_t)a->channels, this_chunk);
+            ch->pcm, a->samples + frame * (size_t)a->channels, this_chunk);
         if (written < 0) {
             /* snd_pcm_recover handles the common recoverable cases
              * (buffer underrun, a suspended device); anything it can't
              * fix, just stop -- there's no Festina-level way to report
              * a mid-playback error after play() has already returned
              * successfully. */
-            written = snd_pcm_recover(v->pcm, (int)written, 0);
+            written = snd_pcm_recover(ch->pcm, (int)written, 0);
             if (written < 0) break;
             continue;
         }
         frame += (size_t)written;
     }
 
-    pthread_mutex_lock(&a->lock);
-    snd_pcm_close(v->pcm);
-    v->pcm = NULL;
-    v->active = 0;
-    /* joinable stays 1: this thread has exited but nothing has joined
-     * it yet, and reusing the slot without joining would leak the
-     * thread's own resources. Whoever next claims this slot joins
-     * first -- see festina_audio_claim_voice. */
-    pthread_mutex_unlock(&a->lock);
+    pthread_mutex_lock(&g_audio_lock);
+    snd_pcm_close(ch->pcm);
+    ch->pcm = NULL;
+    ch->active = 0;
+    ch->looping = 0;
+    /* The lock is deliberately NOT cleared here. A looping track that
+     * hit an unrecoverable device error should leave its channel
+     * reserved rather than silently handing it to the next sound
+     * effect -- the program asked for that channel and nothing has told
+     * it otherwise. stopAudioPlayer(n) and an explicit play(n) both
+     * still release it. `joinable` stays 1 for the same reason it did
+     * in claude.md #98: this thread has exited but nothing has joined
+     * it, and reusing the slot without joining would leak it. */
+    pthread_mutex_unlock(&g_audio_lock);
     return NULL;
 }
 
-/* Joins a slot's finished thread, if it has one, so the slot can be
- * reused or the clip torn down. Must be called with the lock HELD; it
- * drops the lock across the join (a thread that is exiting takes the
- * same lock on its way out, so joining while holding it would
- * deadlock) and takes it again before returning. */
-static void festina_audio_reap_locked(FestinaAudio *a, FestinaVoice *v) {
-    if (!v->joinable) return;
-    pthread_t thread = v->thread;
-    v->joinable = 0;
-    pthread_mutex_unlock(&a->lock);
+/* Joins a channel's finished thread, if it has one, so the channel can
+ * be reused. Must be called with the lock HELD; it drops the lock
+ * across the join (an exiting thread takes the same lock on its way
+ * out, so joining while holding it would deadlock) and retakes it. */
+static void festina_audio_reap_locked(FestinaChannel *ch) {
+    if (!ch->joinable) return;
+    pthread_t thread = ch->thread;
+    ch->joinable = 0;
+    pthread_mutex_unlock(&g_audio_lock);
     pthread_join(thread, NULL);
-    pthread_mutex_lock(&a->lock);
+    pthread_mutex_lock(&g_audio_lock);
+}
+
+/* Stops a channel and joins it, so the caller can be sure nothing is
+ * streaming through it once this returns. Lock HELD, dropped across
+ * the join. `release` also clears the claude.md #99 reservation --
+ * true for stopAudioPlayer() and for an explicit play(n) taking the
+ * channel over, false for stealing (which never touches a locked
+ * channel anyway). */
+static void festina_audio_halt_locked(FestinaChannel *ch, int release) {
+    if (ch->active) {
+        ch->stop_requested = 1;
+        festina_audio_reap_locked(ch);
+    } else {
+        festina_audio_reap_locked(ch);
+    }
+    ch->stop_requested = 0;
+    ch->looping = 0;
+    if (release) {
+        ch->locked = 0;
+        ch->clip = NULL;
+    }
 }
 
 void *festina_load_audio(const char *path) {
@@ -209,90 +290,105 @@ void *festina_load_audio(const char *path) {
     a->frame_count = data_size / (size_t)(channels * 2);
     a->channels = channels;
     a->sample_rate = sample_rate;
-    pthread_mutex_init(&a->lock, NULL);
     return a;
 }
 
-/* claude.md #98: picks the slot this play() will use. Called with the
- * lock HELD (and may drop/retake it, via festina_audio_reap_locked).
- *
- * The order of preference is what makes overlapping playback behave
- * the way a game expects:
- *   1. An idle slot below the current limit -- the common case, and
- *      the whole point: a second play() while the first is still
- *      going gets its own voice instead of cutting the first off.
- *   2. If every slot in range is busy, steal the OLDEST one. Something
- *      has to give at the limit, and the sound that has been playing
- *      longest is the one closest to finishing anyway -- dropping the
- *      new play instead would make a machine-gun effect go silent at
- *      exactly the moment it is firing fastest.
- *
- * Note that at a limit of 1 this reduces exactly to the old behaviour
- * (play() while playing restarts from the beginning), which is what
- * makes setMaxAudioPlayers(1) a genuine way to ask for it back. */
-static FestinaVoice *festina_audio_claim_voice(FestinaAudio *a) {
-    int limit = g_max_audio_players;
-    if (limit < 1) limit = 1;
-    if (limit > FESTINA_AUDIO_PLAYER_CAP) limit = FESTINA_AUDIO_PLAYER_CAP;
 
+
+/* claude.md #98/#99: picks the channel this play() will use. Called
+ * with the lock HELD (and may drop/retake it, via the helpers above).
+ * Returns NULL only in the one case where there is genuinely nowhere
+ * to play -- see the end of this function.
+ *
+ * An EXPLICIT channel always wins outright: the program named it, so
+ * whatever was there is stopped and the channel handed over, locked or
+ * not. That is what makes `battleMusic.playLoop(0)` take channel 0
+ * away from `adventureMusic.playLoop(0)`, which is the whole point of
+ * naming channels.
+ *
+ * Automatic assignment prefers, in order:
+ *   1. An idle, unlocked channel below the pool limit -- the common
+ *      case, and what makes overlapping effects layer instead of
+ *      cutting each other off.
+ *   2. If all of those are busy, the OLDEST unlocked one below the
+ *      limit is stolen. Something has to give at the limit, and the
+ *      sound playing longest is closest to finishing anyway, whereas
+ *      dropping the NEW play would silence a rapid-fire effect at
+ *      exactly the moment it fires fastest.
+ *   3. An idle unlocked channel ABOVE the limit, if reserved channels
+ *      have eaten the whole pool. A program that locks channels 0-9
+ *      and then fires a sound effect should still hear it; the limit
+ *      exists to bound automatic growth, not to strand a program that
+ *      reserved its way out of the pool.
+ * If every channel in the table is locked, there is nothing left that
+ * automatic assignment is allowed to touch, and the play is dropped.
+ * That is the program's own doing and the only alternative would be to
+ * break a reservation it explicitly asked for. */
+static FestinaChannel *festina_audio_claim_channel(int64_t channel, int explicit_channel) {
+    if (explicit_channel) {
+        FestinaChannel *ch = &g_channels[festina_clamp_channel(channel)];
+        festina_audio_halt_locked(ch, 1);
+        return ch;
+    }
+
+    int limit = festina_pool_limit();
     for (int i = 0; i < limit; i++) {
-        if (!a->voices[i].active) {
-            festina_audio_reap_locked(a, &a->voices[i]);
-            /* Re-checked after the reap: the lock was dropped, so
-             * another voice could have finished and this slot could
-             * (in principle) have been claimed. Nothing else claims
-             * slots today -- play() is only ever reached from the
-             * single Festina program thread -- but re-testing costs
-             * one branch and removes the assumption entirely. */
-            if (!a->voices[i].active) return &a->voices[i];
-        }
+        FestinaChannel *ch = &g_channels[i];
+        if (ch->active || ch->locked) continue;
+        festina_audio_reap_locked(ch);
+        if (!ch->active && !ch->locked) return ch;
     }
 
-    FestinaVoice *oldest = &a->voices[0];
-    for (int i = 1; i < limit; i++) {
-        if (a->voices[i].started_seq < oldest->started_seq) oldest = &a->voices[i];
+    FestinaChannel *oldest = NULL;
+    for (int i = 0; i < limit; i++) {
+        FestinaChannel *ch = &g_channels[i];
+        if (!ch->active || ch->locked) continue;
+        if (!oldest || ch->started_seq < oldest->started_seq) oldest = ch;
     }
-    oldest->stop_requested = 1;
-    pthread_mutex_unlock(&a->lock);
-    pthread_join(oldest->thread, NULL);
-    pthread_mutex_lock(&a->lock);
-    oldest->joinable = 0;
-    return oldest;
+    if (oldest) {
+        festina_audio_halt_locked(oldest, 0);
+        return oldest;
+    }
+
+    for (int i = limit; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+        FestinaChannel *ch = &g_channels[i];
+        if (ch->active || ch->locked) continue;
+        festina_audio_reap_locked(ch);
+        if (!ch->active && !ch->locked) return ch;
+    }
+    return NULL;
 }
 
-/* Stops and joins the oldest ACTIVE voice other than `except`,
- * returning 1 if there was one. Called with the lock HELD (and drops
- * it across the join, same as festina_audio_reap_locked).
+/* Stops and joins the oldest ACTIVE unlocked channel other than
+ * `except`, returning 1 if there was one. Lock HELD.
  *
- * This exists for a failure mode the pool introduced and the old
- * single-voice design could not have: this file opens one ALSA handle
- * per voice, and not every "default" device does software mixing. On a
- * bare hw: device with no dmix -- ordinary on minimal/embedded Linux,
- * and on any machine where another program holds the device
- * exclusively -- the SECOND concurrent open fails with EBUSY. Treating
- * that as fatal (which it was, briefly) meant an overlapping play()
- * killed the program outright on such a system, with an error message
- * about there being no audio device when there plainly was one.
+ * This exists for a failure mode the pool introduced and the original
+ * one-thread-per-clip design could not have: this file opens one ALSA
+ * handle per channel, and not every "default" device does software
+ * mixing. On a bare hw: device with no dmix -- ordinary on minimal and
+ * embedded Linux, and on any machine where another program holds the
+ * device exclusively -- the SECOND concurrent open fails with EBUSY.
+ * Treating that as fatal (which it was, briefly) meant an overlapping
+ * play() killed the program outright on such a system, with an error
+ * message about there being no audio device when there plainly was one.
  *
- * Freeing a voice and retrying degrades that case back to exactly the
- * pre-pool behaviour -- overlapping plays cut each other off instead of
- * layering -- which is the right answer: on a device that cannot mix,
- * layering was never physically possible, and silently getting fewer
- * simultaneous sounds beats not running. */
-static int festina_audio_free_oldest_locked(FestinaAudio *a, FestinaVoice *except) {
-    FestinaVoice *oldest = NULL;
+ * Freeing a channel and retrying degrades that case back to exactly
+ * the pre-pool behaviour -- overlapping plays cut each other off
+ * instead of layering -- which is the right answer: on a device that
+ * cannot mix, layering was never physically possible, and silently
+ * getting fewer simultaneous sounds beats not running. Locked channels
+ * are skipped even here: a reserved music track losing its handle to a
+ * sound effect would be exactly the takeover claude.md #99's lock
+ * exists to prevent. */
+static int festina_audio_free_oldest_locked(FestinaChannel *except) {
+    FestinaChannel *oldest = NULL;
     for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
-        FestinaVoice *v = &a->voices[i];
-        if (v == except || !v->active) continue;
-        if (!oldest || v->started_seq < oldest->started_seq) oldest = v;
+        FestinaChannel *ch = &g_channels[i];
+        if (ch == except || !ch->active || ch->locked) continue;
+        if (!oldest || ch->started_seq < oldest->started_seq) oldest = ch;
     }
     if (!oldest) return 0;
-    oldest->stop_requested = 1;
-    pthread_t thread = oldest->thread;
-    oldest->joinable = 0;
-    pthread_mutex_unlock(&a->lock);
-    pthread_join(thread, NULL);
-    pthread_mutex_lock(&a->lock);
+    festina_audio_halt_locked(oldest, 0);
     return 1;
 }
 
@@ -311,12 +407,25 @@ int64_t festina_get_max_audio_players(void) {
     return g_max_audio_players;
 }
 
-void festina_audio_play(void *audio) {
+/* claude.md #38/#99. `channel` is the channel to play on and
+ * `explicit_channel` says whether the program actually named it (a
+ * bare play() passes 0 and gets automatic assignment); `looping` is
+ * playLoop() rather than play(). One function rather than four
+ * because the four differ only in these two flags -- everything about
+ * claiming a channel, opening a device and spawning a thread is
+ * identical. */
+void festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel,
+                            int8_t looping) {
     FestinaAudio *a = (FestinaAudio *)audio;
     if (!a) return;
 
-    pthread_mutex_lock(&a->lock);
-    FestinaVoice *v = festina_audio_claim_voice(a);
+    pthread_mutex_lock(&g_audio_lock);
+    FestinaChannel *ch = festina_audio_claim_channel(channel, explicit_channel);
+    if (!ch) {
+        /* Every channel is reserved -- see festina_audio_claim_channel. */
+        pthread_mutex_unlock(&g_audio_lock);
+        return;
+    }
 
     /* Opened here, synchronously, rather than inside the background
      * thread -- so a missing/unusable audio device fails loudly and
@@ -328,9 +437,9 @@ void festina_audio_play(void *audio) {
      * matters because only ONE of them is actually fatal. "The device
      * will not give me an Nth simultaneous stream" is a limit of the
      * device, not the absence of one, and the answer is to give a
-     * playing voice's handle back and try again -- see
+     * playing channel's handle back and try again -- see
      * festina_audio_free_oldest_locked. Only when there is no other
-     * voice left to free has the program genuinely failed to open any
+     * channel left to free has the program genuinely failed to open any
      * audio device at all, which is what the error below claims. */
     snd_pcm_t *pcm = NULL;
     int rc;
@@ -343,10 +452,10 @@ void festina_audio_play(void *audio) {
             if (rc < 0) snd_pcm_close(pcm);
         }
         if (rc >= 0) break;
-        if (!festina_audio_free_oldest_locked(a, v)) break;
+        if (!festina_audio_free_oldest_locked(ch)) break;
     }
     if (rc < 0) {
-        pthread_mutex_unlock(&a->lock);
+        pthread_mutex_unlock(&g_audio_lock);
         char msg[256];
         snprintf(msg, sizeof(msg),
                  "could not open an audio output device: %s (is any audio device available?)",
@@ -355,58 +464,92 @@ void festina_audio_play(void *audio) {
         return; /* unreachable -- festina_fail() calls exit() */
     }
 
-    v->owner = a;
-    v->pcm = pcm;
-    v->stop_requested = 0;
-    v->started_seq = a->next_seq++;
-    v->active = 1;  /* set synchronously, before spawning, so isPlaying()
-                       is deterministic immediately after play() returns */
-    rc = pthread_create(&v->thread, NULL, festina_audio_thread_main, v);
+    ch->clip = a;
+    ch->pcm = pcm;
+    ch->stop_requested = 0;
+    ch->looping = looping ? 1 : 0;
+    /* claude.md #99: playLoop reserves, play releases. That single
+     * assignment is the whole "or if the channel is explicitly listed
+     * in play()/playLoop()" rule -- an explicit play(n) on a reserved
+     * channel takes it over AND hands it back to the pool, while
+     * playLoop(n) takes it over and keeps it. */
+    ch->locked = looping ? 1 : 0;
+    ch->started_seq = g_next_seq++;
+    ch->active = 1;  /* set synchronously, before spawning, so isPlaying()
+                        is deterministic immediately after play() returns */
+    rc = pthread_create(&ch->thread, NULL, festina_audio_thread_main, ch);
     if (rc != 0) {
         snd_pcm_close(pcm);
-        v->pcm = NULL;
-        v->active = 0;
-        pthread_mutex_unlock(&a->lock);
+        ch->pcm = NULL;
+        ch->active = 0;
+        ch->locked = 0;
+        pthread_mutex_unlock(&g_audio_lock);
         festina_fail("could not start an audio playback thread");
         return;
     }
-    v->joinable = 1;
-    pthread_mutex_unlock(&a->lock);
+    ch->joinable = 1;
+    pthread_mutex_unlock(&g_audio_lock);
+}
+
+/* claude.md #99: stopAudioPlayer(n) -- stop one channel and release
+ * its reservation. A negative channel means every channel, which is
+ * what a bare stopAudioPlayer() compiles to: "stop all audio" is the
+ * obvious reading of naming no channel, and there is no other way to
+ * say it.
+ *
+ * Like festina_audio_stop this JOINS rather than merely signalling, so
+ * a channel is guaranteed idle the instant this returns. */
+void festina_stop_audio_player(int64_t channel) {
+    pthread_mutex_lock(&g_audio_lock);
+    if (channel < 0) {
+        for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+            g_channels[i].stop_requested = 1;
+        }
+        for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+            festina_audio_halt_locked(&g_channels[i], 1);
+        }
+    } else {
+        festina_audio_halt_locked(&g_channels[festina_clamp_channel(channel)], 1);
+    }
+    pthread_mutex_unlock(&g_audio_lock);
 }
 
 void festina_audio_stop(void *audio) {
     FestinaAudio *a = (FestinaAudio *)audio;
     if (!a) return;
 
-    /* Stops EVERY voice, not just one: `sound.stop()` names the clip,
-     * and a program that asked for a clip to stop while three copies
-     * of it are overlapping means all three. There is no syntax for
-     * naming an individual voice, and inventing one would mean
-     * exposing the pool -- which is exactly what claude.md #98 exists
-     * to keep out of the language.
+    /* Stops every channel playing this CLIP, and releases each one:
+     * `sound.stop()` names the clip, and a program that asked for a
+     * clip to stop while three copies of it are overlapping means all
+     * three. It releases reservations for the same reason -- a looping
+     * track that was told to stop is not still owed its channel. There
+     * is no syntax for naming an individual playback of a clip;
+     * stopAudioPlayer(n) is how a program addresses one channel.
      *
-     * Signals all of them before joining any, so N voices cost one
+     * Signals all of them before joining any, so N channels cost one
      * clip's worth of latency rather than N. As before, this joins
-     * rather than merely signalling, so isPlaying() is guaranteed
-     * false the instant stop() returns -- not just "false soon". */
-    pthread_mutex_lock(&a->lock);
-    for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) a->voices[i].stop_requested = 1;
+     * rather than merely signalling, so isPlaying() is guaranteed false
+     * the instant stop() returns -- not just "false soon". */
+    pthread_mutex_lock(&g_audio_lock);
     for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
-        festina_audio_reap_locked(a, &a->voices[i]);
+        if (g_channels[i].clip == a) g_channels[i].stop_requested = 1;
     }
-    pthread_mutex_unlock(&a->lock);
+    for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+        if (g_channels[i].clip == a) festina_audio_halt_locked(&g_channels[i], 1);
+    }
+    pthread_mutex_unlock(&g_audio_lock);
 }
 
 int8_t festina_audio_is_playing(void *audio) {
     FestinaAudio *a = (FestinaAudio *)audio;
     if (!a) return 0;
-    /* True while ANY voice is still streaming -- the mirror image of
-     * stop()'s "the clip" reading. */
-    pthread_mutex_lock(&a->lock);
+    /* True while ANY channel is still streaming this clip -- the mirror
+     * image of stop()'s "the clip" reading. */
+    pthread_mutex_lock(&g_audio_lock);
     int8_t playing = 0;
     for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
-        if (a->voices[i].active) { playing = 1; break; }
+        if (g_channels[i].active && g_channels[i].clip == a) { playing = 1; break; }
     }
-    pthread_mutex_unlock(&a->lock);
+    pthread_mutex_unlock(&g_audio_lock);
     return playing;
 }

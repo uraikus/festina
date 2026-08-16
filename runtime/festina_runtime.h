@@ -518,7 +518,7 @@ void festina_run_timer_loop(void);
  * ...) fails at load time with a clear message, not a crash or silent
  * garbage.
  *
- * festina_audio_play(): calling play() opens (and configures) the ALSA
+ * festina_audio_play_on(): calling play() opens (and configures) the ALSA
  * device *synchronously*, right there in the play() call itself -- not
  * on the background thread described below -- so a missing or unusable
  * audio device fails loudly and immediately at the call site
@@ -537,15 +537,32 @@ void festina_run_timer_loop(void);
  * clip's own samples are loaded once, at loadAudio() time, and are
  * never re-decoded per voice.
  *
- * The pool size is per-`aud` and defaults to 10, overridable with
+ * claude.md #99 made the pool PROCESS-GLOBAL rather than per-`aud`,
+ * and named its slots CHANNELS. Two different clips have to be able to
+ * share one -- `adventureMusic.playLoop(0)` then
+ * `battleMusic.playLoop(0)` hands channel 0 over -- which cannot be
+ * expressed at all when each clip owns its own pool and "channel 0"
+ * means two different things. It is also what lets
+ * stopAudioPlayer(0) be a plain free function instead of something
+ * that would have to name a clip to find the channel.
+ *
+ * The pool defaults to 10 channels, overridable with
  * setMaxAudioPlayers(n) (festina_set_max_audio_players below). When
- * every voice within the limit is busy, the OLDEST is stolen -- at the
- * limit something has to give, and the sound that has been playing
- * longest is closest to finishing anyway, whereas dropping the NEW
- * play would silence a rapid-fire effect at exactly the moment it
- * fires fastest. At a limit of 1 this reduces exactly to the old
- * restart-from-the-beginning behaviour, which is what makes
+ * every unreserved channel within the limit is busy, the OLDEST is
+ * stolen -- at the limit something has to give, and the sound that has
+ * been playing longest is closest to finishing anyway, whereas
+ * dropping the NEW play would silence a rapid-fire effect at exactly
+ * the moment it fires fastest. At a limit of 1 this reduces exactly to
+ * the old restart-from-the-beginning behaviour, which is what makes
  * setMaxAudioPlayers(1) a real way to ask for it back.
+ *
+ * playLoop() RESERVES its channel: a reserved channel is never chosen
+ * by automatic assignment and never stolen, so a looping music track
+ * cannot be evicted by an ordinary sound effect. Only an explicit
+ * play(n)/playLoop(n) on that exact channel, stopAudioPlayer(n), or
+ * that clip's own stop() releases it. An explicit play(n) both takes
+ * the channel over and hands it back to the pool, since a one-shot has
+ * nothing to reserve it for.
  *
  * festina_audio_stop() stops EVERY voice of that clip, and
  * festina_audio_is_playing() is true while ANY is still streaming:
@@ -572,14 +589,27 @@ void festina_run_timer_loop(void);
  * closes), it does not wait for playback to finish.
  */
 void *festina_load_audio(const char *path);
-void festina_audio_play(void *audio);
+/* claude.md #38/#99: `channel` names a channel and `explicit_channel`
+ * says whether the program actually named one (a bare play() passes 0
+ * and gets automatic assignment); `looping` selects playLoop() over
+ * play(). One entry point rather than four, because the four differ
+ * only in these two flags -- claiming a channel, opening a device and
+ * spawning a thread are identical for all of them. */
+void festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel,
+                            int8_t looping);
 void festina_audio_stop(void *audio);
 int8_t festina_audio_is_playing(void *audio);
-/* claude.md #98: the per-aud voice limit. Clamped into [1, 64] rather
+/* claude.md #99: stopAudioPlayer(n) -- stop one channel and release its
+ * reservation. A negative channel means every channel, which is what a
+ * bare stopAudioPlayer() compiles to. */
+void festina_stop_audio_player(int64_t channel);
+/* claude.md #98: the channel-pool limit. Clamped into [1, 64] rather
  * than rejected -- this is a tuning knob, and failing a program over a
  * number that is merely unreasonable would be a worse trade than
  * giving it the nearest workable one. The getter exists so a program
- * can read back what it actually got after clamping. */
+ * can read back what it actually got after clamping. claude.md #99:
+ * this bounds AUTOMATIC assignment only; an explicitly named channel is
+ * honoured anywhere in [0, 64). */
 void festina_set_max_audio_players(int64_t max);
 int64_t festina_get_max_audio_players(void);
 

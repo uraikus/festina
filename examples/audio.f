@@ -17,16 +17,28 @@ beep.play()
 log(`isPlaying(): ${beep.isPlaying()}`)   // true immediately -- see api.md
 
 // claude.md #98: play() does NOT cut off a playback already running --
-// each clip has a pool of voices (10 by default), so these two layer on
-// top of the one above instead of restarting it. That is what makes a
-// rapid-fire sound effect work: the faster it fires, the more copies
-// overlap, rather than each one silencing the last.
-log(`voices available per clip: ${maxAudioPlayers()}`)
+// sound goes out through a pool of channels (10 by default), so these
+// two layer on top of the one above instead of restarting it. That is
+// what makes a rapid-fire sound effect work: the faster it fires, the
+// more copies overlap, rather than each one silencing the last.
+log(`pooled channels: ${maxAudioPlayers()}`)
 beep.play()
 beep.play()
 
 // setMaxAudioPlayers(1) is how to ask for the old behaviour back: one
-// voice, restarted from the beginning on every play().
+// channel, restarted from the beginning on every play().
+
+// claude.md #99: channels are numbered and process-global, so a program
+// can reserve one for music and leave the rest to the pool. playLoop
+// repeats until stopped AND reserves its channel, so no sound effect can
+// ever steal it -- which is the whole reason the reservation exists.
+beep.playLoop(0)
+log(`looping on channel 0: ${beep.isPlaying()}`)
+stopAudioPlayer(0)          // stop that channel and hand it back
+log(`after stopAudioPlayer(0): ${beep.isPlaying()}`)
+
+// Back to a one-shot for the timer demo below.
+beep.play()
 
 // setTimeout, not a busy-loop -- playback runs on its own background
 // thread (see api.md's Audio section), so the program is free to keep

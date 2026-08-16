@@ -1453,12 +1453,21 @@ listed here only so they aren't lost:
   "Memory management" below, a deliberately separate, larger writeup
   rather than a one-line bullet here).
 - **No way to name one playback of a clip.** `stop()` and `isPlaying()`
-  are about the `aud` -- since claude.md #98, that means every voice in
-  its pool. Naming an individual voice would mean handing the pool to
-  the language, which is precisely what #98 kept out of it; the two
-  knobs a program actually needs (how many may overlap, and stopping
-  the clip) are both there. Recorded because it is a real limit, not
-  because it is expected to change.
+  are about the `aud` -- since claude.md #98 that means every channel
+  playing it. claude.md #99 narrowed this considerably (a program that
+  wants to address one playback names its channel:
+  `clip.playLoop(0)` / `stopAudioPlayer(0)`), but there is still no
+  per-playback `isPlaying`, which would need a handle to a playback --
+  the pool-as-language-surface both sections refused. Recorded as a
+  real limit, not as something expected to change.
+- **An `aud` (like an `img` or a `regex`) is never freed.** Deliberate:
+  a loaded resource lives for the program's lifetime, so there is no
+  point at which freeing it would be safe without tracking every
+  binding. Confirmed pre-existing under LeakSanitizer, and bounded --
+  one allocation per `loadAudio()` call, not per play. Only visible at
+  all with `use_globals=0`-style scanning or at `-O1` where the local
+  handle has been optimized away; the same accepted tradeoff as text
+  globals at exit.
 - **A key held down still repeats `keyDown`.** Deliberate -- that is
   how text entry works, and claude.md #98 only guarantees that a HELD
   key fires exactly one `keyUp`, when it is really let go. A program

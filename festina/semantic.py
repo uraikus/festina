@@ -41,8 +41,10 @@ BUILTIN_FUNCTIONS = {
     "log", "fail", "sqlite",
     "drawRect", "drawCircle", "drawText", "drawImage",
     "loadImage", "loadAudio",
-    # claude.md #98: how many voices one aud may play at once.
+    # claude.md #98: how many channels the pool may assign automatically.
     "setMaxAudioPlayers", "maxAudioPlayers",
+    # claude.md #99: stop one channel (or, with no argument, all of them).
+    "stopAudioPlayer",
     # claude.md #89/#91: canvas drawing style + text metrics. `font` is
     # NOT here -- claude.md #91 turned it into a type name, so the
     # setter is changeFont().
@@ -178,6 +180,9 @@ _BUILTIN_SIGNATURE_ALTERNATES = {
     # style, family -- style/family nullable, px <= 0 keeps the current
     # size) remains for a font whose size is computed at runtime.
     "changeFont": [(_FONT,), (_INT, _TEXT, _TEXT)],
+    # claude.md #99: stopAudioPlayer(n) stops one channel;
+    # stopAudioPlayer() stops every channel.
+    "stopAudioPlayer": [(), (_INT,)],
 }
 _REGEX = types_mod.RegexType()
 _AUDIO = types_mod.AudioType()
@@ -1126,7 +1131,28 @@ def analyze(program, filename="<string>"):
             # generic "Member call" fallback below and fails there via
             # _infer_member's now-strict AudioType handling, the same
             # way an unknown struct field does.
-            if callee.prop in ("play", "stop") and infer(callee.obj, scope) == _AUDIO:
+            # claude.md #99: play/playLoop take an OPTIONAL channel;
+            # stop still takes none (it names the clip, not a channel --
+            # stopAudioPlayer(n) is how a program addresses one channel).
+            if callee.prop in ("play", "playLoop") and infer(callee.obj, scope) == _AUDIO:
+                if len(expr.args) > 1:
+                    raise CompileError(
+                        f"{callee.prop}() expects 0 or 1 argument (an optional "
+                        f"channel), got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                if expr.args:
+                    arg_type = infer(expr.args[0], scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != _INT:
+                        raise CompileError(
+                            f"{callee.prop}()'s channel must be int, found "
+                            f"{types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return None
+            if callee.prop == "stop" and infer(callee.obj, scope) == _AUDIO:
                 if expr.args:
                     raise CompileError(
                         f"{callee.prop}() takes no arguments, got {len(expr.args)}",

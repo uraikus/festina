@@ -364,15 +364,15 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 971 tests in this directory pass against it: 613 need no external
+All 989 tests in this directory pass against it: 620 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-337 more need a working C compiler, plus 2 more
+348 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 19 more given
 `Xvfb`+`xdotool` too (4 of those also need `xwd`, from the same
 x11-apps/x11-utils tier, to read real canvas pixels back --
 claude.md #89/#92/#94; two former `xwd` tests became display-free once
-claude.md #95 made saveCanvas headless; claude.md #98 added 4 more) (613
-+ 337 + 2 + 19 = 971 --
+claude.md #95 made saveCanvas headless; claude.md #98 added 4 more) (620
++ 348 + 2 + 19 = 989 --
 re-verified directly
 by running the whole suite with a PATH containing nothing but Python,
 not just derived by counting `compile_and_run` call sites, since the
@@ -2462,6 +2462,56 @@ finishes in 0ms), so under it there is no concurrency left to observe
 at all. The harness replaces the device layer and keeps every line
 above it real; clean under both ThreadSanitizer and AddressSanitizer.
 
+**claude.md #99**: channels are named, and a loop reserves one.
+
+#98's pool gave a clip overlapping playback but no way to address any
+of it -- everything was automatic. `play(n)`, `playLoop(n)` and
+`stopAudioPlayer(n)` add that, each with the channel optional.
+
+*The pool became process-global.* The motivating case is two music
+tracks trading one channel (`adventureMusic.playLoop(0)` then
+`battleMusic.playLoop(0)`), which cannot be expressed at all when each
+clip owns its own pool and "channel 0" means two different things. It
+is also what lets `stopAudioPlayer(0)` be a free function rather than
+something that would have to name a clip to find the channel -- exactly
+backwards, since the point of stopping a channel is not caring what is
+on it.
+
+*`playLoop` reserves.* It repeats the clip (restarting the frame
+counter rather than reopening the device, so there is no gap beyond
+ALSA's buffering) **and** reserves its channel: a reserved channel is
+never auto-assigned and never stolen at the limit. Without that,
+looping music would be evicted by an ordinary sound effect the moment
+the pool filled -- which makes `playLoop` useless for the one thing
+anyone would use it for. Released by `stopAudioPlayer(n)`, by the
+clip's own `stop()`, or by naming the channel in another
+`play(n)`/`playLoop(n)`. That last rule is one assignment in the
+runtime (`locked = looping`): `playLoop(n)` takes the channel and keeps
+it, `play(n)` takes it and hands it back, because a one-shot has
+nothing to reserve it for.
+
+*Boundaries.* An out-of-range channel is clamped into [0, 64) rather
+than being fatal, the same call #98's `setMaxAudioPlayers` already
+makes -- a bad channel number should not kill a running game.
+`setMaxAudioPlayers` bounds only AUTOMATIC assignment; an explicit
+channel is honoured anywhere in range, so `play(40)` works with a pool
+of 10. A limit that silently rewrote explicit requests would be the
+opposite of the control this section exists to give. If every channel
+is reserved, an unnamed `play()` is dropped -- automatic assignment
+looks above the limit first, so this only reaches a program that
+reserved all sixty-four, and the alternative is breaking a reservation
+it asked for.
+
+`stop()`/`isPlaying()` deliberately did not change: both are still
+about the CLIP. A per-playback `isPlaying` would need a handle to a
+playback, which is the pool-as-language-surface this design has refused
+twice.
+`tests/test_codegen.py::TestAudioChannels` (7 tests, white-box for the
+same reasons the pool tests are), 4 end-to-end tests in `TestAudio`
+(including the motivating example's own handover loop, asserting strict
+alternation), and 8 in `tests/test_audio.py` for the signatures. Clean
+under ThreadSanitizer and AddressSanitizer.
+
 *`on key` became `on keyDown` + `on keyUp`.* A key held down and a key
 tapped were the same event, so the most ordinary thing a 2D game does
 with the keyboard had no expressible form. **This is a breaking
@@ -3242,5 +3292,5 @@ pytest tests/                          # 605 passed, 323 skipped (needs a C comp
                                         # 15 need Xvfb + xdotool installed too, 1 of those
                                         # also needs `openbox` and 4 need `xwd`) given a
                                         # working C compiler,
-                                        # all 971 pass
+                                        # all 989 pass
 ```
