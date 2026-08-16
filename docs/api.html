@@ -250,6 +250,13 @@
     margin: 28px 0 10px;
     scroll-margin-top: 72px;
   }
+  h4 {
+    font-size: 0.92rem;
+    margin: 22px 0 8px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
   h2 .anchor, h3 .anchor {
     opacity: 0;
     text-decoration: none;
@@ -291,6 +298,12 @@
   }
   .callout strong { color: var(--text); }
 
+  .table-wrap {
+    overflow-x: auto;
+    border-radius: 10px;
+    margin: 0 0 16px;
+  }
+  .table-wrap .sig-table { margin: 0; }
   .sig-table {
     width: 100%;
     border-collapse: collapse;
@@ -389,17 +402,34 @@
         <a href="#strings">Strings</a>
         <a href="#structs">Structs</a>
         <a href="#arrays">Arrays</a>
+        <a class="sub" href="#indexing-is-not-bounds-checked">Indexing is not bounds-checked</a>
         <a href="#maps">Maps</a>
       </div>
       <div class="nav-group">
         <div class="nav-group-title">Standard library</div>
         <a href="#built-in-sqlite">Built-in SQLite</a>
+        <a class="sub" href="#storing-images-and-audio">Storing images and audio</a>
         <a class="sub" href="#database-configuration">Database configuration</a>
         <a href="#environment-variables">Environment variables</a>
         <a href="#regex">Regex</a>
         <a href="#graphics">Graphics</a>
+        <a class="sub" href="#keyboard-events">Keyboard events</a>
+        <a class="sub" href="#images">Images</a>
+        <a class="sub" href="#drawing-style">Drawing style</a>
+        <a class="sub" href="#computing-a-color-or-font-at-runtime">Computing a color/font at runtime</a>
+        <a class="sub" href="#paths">Paths</a>
+        <a class="sub" href="#transforms">Transforms</a>
+        <a class="sub" href="#gradients-and-transparency">Gradients and transparency</a>
+        <a class="sub" href="#text-metrics">Text metrics</a>
+        <a href="#files">Files</a>
+        <a href="#time">Time</a>
+        <a class="sub" href="#single-value-queries">Single-value queries</a>
+        <a class="sub" href="#json-and-full-text-search">JSON and full-text search</a>
+        <a href="#growing-arrays">Growing arrays</a>
         <a href="#timers">Timers</a>
         <a href="#audio">Audio</a>
+        <a class="sub" href="#overlapping-sounds">Overlapping sounds</a>
+        <a class="sub" href="#channels-and-looping">Channels and looping</a>
       </div>
       <div class="nav-group">
         <div class="nav-group-title">Reference</div>
@@ -432,12 +462,14 @@
           ambiguous with <code>festina compile</code> (which never does)
           without inventing a flag to distinguish them.
         </p>
+        <div class="table-wrap">
         <table class="sig-table">
           <tr><td>festina compile entry.f -o out</td><td>Compile to a native executable at <code>out</code> (default: <code>entry</code>'s own filename without <code>.f</code>). <code>--emit-llvm</code> prints LLVM IR to stdout instead of linking. <code>--cc</code> picks the C compiler/linker (default: whichever of <code>clang</code>/<code>gcc</code>/<code>cc</code> is found first).</td></tr>
           <tr><td>festina run entry.f</td><td>Compile to a throwaway temp executable and run it immediately — stdin/stdout/stderr inherited directly (not captured), so an interactive program (graphics/audio/timers) behaves exactly like a normal compile-then-run. Exits with the <em>compiled program's own</em> exit code, so <code>festina run x.f &amp;&amp; ...</code> composes the same way <code>go run</code>/<code>cargo run</code> do. The temp binary is always cleaned up afterward.</td></tr>
           <tr><td>festina doctor</td><td>Checks every dependency the compiler itself needs (a C compiler, <code>pkg-config</code>, sqlite3/cairo-xlib/alsa dev headers, <code>libLLVM</code>) and reports what's missing and how to install it — the same install hints a real compile failure would give, just checked proactively instead of only on failure. Also reports whether <code>festina</code> itself is resolvable on <code>PATH</code>. Exits 0 if every <em>required</em> dependency is present — graphics/audio are optional.</td></tr>
           <tr><td>festina help</td><td>Prints this same command list.</td></tr>
         </table>
+        </div>
         <pre class="code"><span class="mut">$</span> bin/festina compile program.f -o program   <span class="cm"># compile</span>
 <span class="mut">$</span> bin/festina compile program.f --emit-llvm  <span class="cm"># print LLVM IR instead of linking</span>
 <span class="mut">$</span> ./program                                  <span class="cm"># the result needs neither</span>
@@ -490,9 +522,20 @@
              itself (see the Maps section below)
 <span class="kw">struct</span>    -- user-declared record type
 <span class="kw">table</span>     -- a struct that's also backed by a SQLite table
-<span class="kw">img</span>       -- an image loaded via loadImage() (opaque handle)
-<span class="kw">aud</span>       -- an audio clip loaded via loadAudio() (opaque handle)
-<span class="kw">regex</span>     -- a compiled pattern from a /pattern/flags literal or regex() (opaque handle)</pre>
+<span class="kw">img</span>       -- an image, declared from a path (img hero = 'hero.png')
+<span class="kw">aud</span>       -- an audio clip, declared from a path (aud hit = 'hit.wav')
+<span class="kw">regex</span>     -- a compiled pattern from a /pattern/flags literal or regex() (opaque handle)
+<span class="kw">color</span>     -- a canvas color, declared from a literal (color red = 'red')
+<span class="kw">font</span>      -- a canvas font, declared from a literal (font body = '13px arial')</pre>
+
+        <p class="muted">
+          <code>color</code> and <code>font</code> are resolved by the
+          compiler at the declaration that names them — see
+          <a href="#drawing-style">Drawing style</a>. A <code>color</code>
+          is a packed integer and a <code>font</code> is a pointer to a
+          constant in the binary, so neither is reference-counted and
+          neither costs anything at runtime.
+        </p>
 
         <p class="muted">
           Every type may hold <code>null</code>
@@ -510,12 +553,34 @@
 <span class="kw">float</span> b = 2.5
 <span class="kw">float</span> c = a.toFloat() + b        <span class="cm">// int.toFloat() is the only int-&gt;float conversion</span></pre>
 
-        <table class="sig-table">
-          <tr><td>Math.floor(x:float)</td><td>-&gt; int</td></tr>
-          <tr><td>Math.ceil(x:float)</td><td>-&gt; int</td></tr>
-          <tr><td>Math.round(x:float)</td><td>-&gt; int</td></tr>
-          <tr><td>Math.trunc(x:float)</td><td>-&gt; int</td></tr>
-        </table>
+        <pre class="code"><span class="cm">// float -&gt; int (the rounding four)</span>
+Math.floor(x)   Math.ceil(x)   Math.round(x)   Math.trunc(x)
+
+<span class="cm">// float -&gt; float</span>
+Math.sqrt(x)    Math.abs(x)    Math.exp(x)
+Math.sin(x)     Math.cos(x)    Math.tan(x)
+Math.asin(x)    Math.acos(x)   Math.atan(x)
+Math.log(x)     Math.log2(x)   Math.log10(x)
+
+<span class="cm">// (float, float) -&gt; float</span>
+Math.pow(a, b)  Math.min(a, b)  Math.max(a, b)  Math.atan2(y, x)
+
+<span class="cm">// no arguments -&gt; float</span>
+Math.random()   <span class="cm">// in [0, 1)</span>
+
+<span class="cm">// constants</span>
+Math.PI   Math.E</pre>
+        <p class="muted">
+          Only the rounding four return <code>int</code>; everything else
+          returns <code>float</code>, because "which integer" and "which
+          real number" are different questions — <code>Math.sqrt(2.0)</code>
+          is a float. <code>Math.random()</code> is seeded once from the
+          clock and is suitable for gameplay and sampling —
+          <strong>not</strong> for anything security-related. It returns a
+          value in <code>[0, 1)</code>, so
+          <code>Math.floor(Math.random() * n)</code> is always a valid
+          index.
+        </p>
 
         <p>Division/modulo by zero return <code>null</code> (for both <code>int</code> and <code>float</code>) rather than crashing:</p>
         <pre class="code"><span class="kw">int</span> result = 10 / 0   <span class="cm">// null</span></pre>
@@ -614,6 +679,26 @@ user.name = <span class="str">'Patrick'</span></pre>
           Structs are native in-memory records — declaration, field
           read/write, and passing to/returning from functions by value.
         </p>
+        <p>
+          An unassigned field reads as its zero value, and that includes
+          a field whose own type is a <code>struct</code>,
+          <code>arr[T]</code>, or <code>map[T]</code> — reaching through
+          one before anything was assigned to it gives you a real, empty
+          value rather than an error:
+        </p>
+        <pre class="code"><span class="kw">struct</span> Inner { n:<span class="kw">int</span> }
+<span class="kw">struct</span> Bag   { inner:Inner  xs:arr[<span class="kw">int</span>]  m:map[<span class="kw">int</span>] }
+
+<span class="kw">Bag</span> b
+log(b.inner.n)      <span class="cm">// 0</span>
+log(b.xs.length)    <span class="cm">// 0</span>
+b.xs.push(1)        <span class="cm">// works -- the array is created on first reach</span>
+b.m[<span class="str">'k'</span>] = 9</pre>
+        <p class="muted">
+          The value is created once, on first reach, and stays — the
+          read above and the <code>push</code> below it are talking
+          about the same array.
+        </p>
         <p class="muted">
           Memory for structs, arrays, and maps is managed automatically
           — no manual allocation or freeing, anywhere:
@@ -653,6 +738,33 @@ user.name = <span class="str">'Patrick'</span></pre>
           <a href="https://github.com/uraikus/festina/blob/main/todo.md#memory-management">todo.md</a>
           for the full seven-stage history.
         </p>
+        <div class="callout">
+          <strong><code>text</code>, reclaimed a different way.</strong>
+          Rather than being reference counted, every text-typed binding
+          — local, global, struct field, array element, map value,
+          parameter — always holds its own private copy of the string,
+          made automatically wherever one is needed. So unlike
+          <code>arr[T]</code>/<code>map[T]</code>, two text variables
+          never come to share one underlying buffer:
+          <code>text b = a</code> gives <code>b</code> its own copy. That's
+          what lets a text value be freed on every reassignment and at
+          every scope exit unconditionally, with no escape analysis
+          involved — a loop that rebuilds a string each iteration
+          (<code>`${s}x`</code>) frees the previous buffer every time
+          instead of accumulating them.
+        </div>
+        <p class="muted">
+          Query results are reclaimed too: the rows an
+          <code>arr[Table]</code> holds, and each row's own text columns,
+          are freed when that array is — so a program that queries
+          repeatedly no longer grows without bound. A single row read out
+          of one (<code>People p = rows[0]</code>) borrows from the array
+          rather than owning a copy, so it stays valid exactly as long as
+          the array does. A regex compiled at runtime and used straight
+          away (<code>regex(p).test(s)</code>) is freed after use, while a
+          <code>/pattern/</code> literal is compiled once and kept for the
+          life of the process.
+        </p>
       </section>
 
       <section class="doc-section" id="arrays">
@@ -661,7 +773,36 @@ user.name = <span class="str">'Patrick'</span></pre>
 <span class="kw">arr[arr[int]]</span> matrix
 log(numbers.length)
 numbers[0] = 10</pre>
-        <p>Not bounds-checked. Memory is reclaimed automatically — see <a href="#structs">Structs</a> above for the full picture (non-escaping locals reclaimed at scope-exit, escaping values reference counted).</p>
+        <p>Memory is reclaimed automatically — see <a href="#structs">Structs</a> above for the full picture (non-escaping locals reclaimed at scope-exit, escaping values reference counted).</p>
+
+        <h3 id="indexing-is-not-bounds-checked">Indexing is not bounds-checked <a class="anchor" href="#indexing-is-not-bounds-checked">#</a></h3>
+        <div class="callout">
+          <strong><code>numbers[i]</code> is a raw memory access</strong>,
+          and keeping <code>i</code> in range is yours to guarantee. This
+          is the one place Festina hands you a loaded gun, and it is
+          deliberate: an index is checked in the hot path of every loop a
+          game writes, and the check would cost more than the language is
+          willing to spend. Nothing about it is soft.
+        </div>
+        <ul>
+          <li><strong>Reading past the end</strong> returns whatever bytes follow the array. Not <code>null</code>, not a zero, not an error — arbitrary heap contents, different on each run.</li>
+          <li><strong>Writing past the end</strong> corrupts the heap. Confirmed under AddressSanitizer as a genuine heap-buffer-overflow. It may crash immediately, or corrupt an unrelated value and crash somewhere else much later, or appear to work.</li>
+          <li><strong>A negative index</strong> is the same, backwards.</li>
+          <li><strong><code>.length</code> is always right</strong>; nothing else is checked against it.</li>
+        </ul>
+        <p>So guard the index yourself:</p>
+        <pre class="code"><span class="kw">if</span> i &gt;= 0 &amp;&amp; i &lt; xs.length {
+    log(xs[i])
+}</pre>
+        <p class="muted">
+          This applies only to <code>arr[T]</code> indexing. A missing
+          <code>map[T]</code> key answers <code>null</code> (see
+          <a href="#maps">Maps</a>); <code>pop()</code>/<code>shift()</code>
+          on an empty array answer <code>null</code>, and
+          <code>splice()</code> clamps its own range (see
+          <a href="#growing-arrays">Growing arrays</a> below). Indexing is
+          the only unchecked operation in the language.
+        </p>
       </section>
 
       <section class="doc-section" id="maps">
@@ -718,6 +859,35 @@ sqlite(<span class="str">'INSERT INTO People (id, name) VALUES (?, ?)'</span>, [
           parameters) must be a literal array expression, not an
           arbitrary <code>arr[T]</code> value. Query result columns map
           onto a declared table's fields by position, not by name.
+        </p>
+
+        <h3 id="storing-images-and-audio">Storing images and audio <a class="anchor" href="#storing-images-and-audio">#</a></h3>
+        <p>A column may be an <code>img</code> or an <code>aud</code>. SQLite stores it as a <strong>BLOB</strong>:</p>
+        <pre class="code"><span class="kw">table</span> Music {
+    name:<span class="kw">text</span>
+    file:<span class="kw">aud</span>
+}
+
+<span class="kw">aud</span> track = <span class="str">'adventure.mp3'</span>
+sqlite(<span class="str">'INSERT INTO Music (name, file) VALUES (?, ?)'</span>, [<span class="str">'theme'</span>, track])
+
+<span class="kw">arr[Music]</span> rows = sqlite(<span class="str">'SELECT * FROM Music'</span>)
+rows[0].file.playLoop(0)          <span class="cm">// straight out of the database</span></pre>
+        <p>
+          What's stored is the asset's <strong>own encoded bytes</strong>,
+          so a round trip is byte-identical — an MP3 stays an MP3 rather
+          than becoming a much larger WAV, and a JPEG stays a JPEG rather
+          than being re-encoded as PNG. Reading a row decodes it back into
+          a real handle, so the value that comes out behaves exactly like
+          one loaded from a file.
+        </p>
+        <p class="muted">
+          The one case with no source bytes is an image you built rather
+          than loaded — a <code>clip()</code> or <code>resize()</code>
+          result. Those are encoded as PNG on demand, which is lossless.
+          Binding is by value: the parameter is copied into the database
+          as the statement runs, so nothing is retained afterwards and
+          the asset stays yours.
         </p>
 
         <h3 id="database-configuration">Database configuration <a class="anchor" href="#database-configuration">#</a></h3>
@@ -805,25 +975,455 @@ drawText(<span class="str">'Hello'</span>, 20, 20)
 
 <span class="kw">img</span> profile = loadImage(<span class="str">'profile.png'</span>)    <span class="cm">// PNG only</span>
 drawImage(profile, 0, 0)
+log(<span class="str">`${profile.width}x${profile.height}`</span>)
+
+saveCanvas(<span class="str">'screenshot.png'</span>)             <span class="cm">// -&gt; bool; writes what you drew</span>
+
+render()                                  <span class="cm">// put the canvas on screen</span>
+clearCanvas()                             <span class="cm">// erase everything</span>
+clearRect(10, 10, 40, 40)                 <span class="cm">// erase one region</span>
 
 log(<span class="str">`canvas is ${clientWidth}x${clientHeight}`</span>)
 
 <span class="kw">on</span> click(x:<span class="kw">int</span>, y:<span class="kw">int</span>)  { ... }
 <span class="kw">on</span> mouse(x:<span class="kw">int</span>, y:<span class="kw">int</span>)  { ... }
-<span class="kw">on</span> key(key:<span class="kw">text</span>)        { ... }
+<span class="kw">on</span> keyDown(key:<span class="kw">text</span>)    { ... }
+<span class="kw">on</span> keyUp(key:<span class="kw">text</span>)      { ... }
 <span class="kw">on</span> resize()             { ... }
-<span class="kw">on</span> close()              { ... }</pre>
+<span class="kw">on</span> close()               { ... }</pre>
+        <div class="callout">
+          <strong>Drawing is offscreen. <code>render()</code> puts it on
+          screen.</strong> Every drawing call paints an offscreen canvas
+          that needs no display at all. <code>render()</code> is the one
+          call that shows it, opening a real X11 window (via Cairo's
+          Xlib backend) the first time it runs — undecorated, 800×600.
+          Declaring one of the six event handlers opens a window too,
+          since they can't fire without one. After the entry file's
+          top-level code finishes, if a window was opened, the process
+          blocks handling redraws/input until the window closes.
+        </div>
+        <p>That split means two useful things:</p>
+        <pre class="code"><span class="cm">// No display needed. No window. Exits on its own.</span>
+fillStyle(brand)
+drawRect(0, 0, 100, 100)
+saveCanvas(<span class="str">'chart.png'</span>)</pre>
+        <pre class="code"><span class="cm">// A frame: draw everything, then present once.</span>
+clearCanvas()
+drawSprites()
+render()</pre>
+        <p class="muted">
+          Batching matters — drawing used to blit the whole canvas per
+          call, so a frame of 2000 rectangles took ~1.6s. Behind one
+          <code>render()</code> the same frame takes ~1ms. Nothing but
+          <code>render()</code> and the event handlers needs a display —
+          <code>saveCanvas</code>, <code>clientWidth</code>/<code>clientHeight</code>
+          and <code>loadImage</code> all work headless.
+        </p>
+
+        <h3 id="keyboard-events">Keyboard events <a class="anchor" href="#keyboard-events">#</a></h3>
         <p>
-          A real on-screen X11 window (via Cairo's Xlib backend), opened
-          automatically the first time a program draws something, reads
-          <code>clientWidth</code>/<code>clientHeight</code>, or declares
-          one of the five event handlers above — <code>loadImage()</code>
-          alone does <em>not</em> open a window (decoding a PNG needs no
-          display). Undecorated, starts at 800×600, everything draws in
-          solid black (no color argument in any of claude.md's own
-          examples). After the entry file's top-level code finishes, if a
-          window was opened, the process blocks handling redraws/input
-          until the window closes.
+          <code>on keyDown</code> fires when a key goes down,
+          <code>on keyUp</code> when it comes back up. Both report the
+          same name for the same physical key: a key that types a
+          character gives you that character (<code>'a'</code>,
+          <code>'5'</code>, <code>' '</code>), and anything else gives
+          you X11's own name for it (<code>'Left'</code>,
+          <code>'Escape'</code>, <code>'Return'</code>,
+          <code>'space'</code> is <code>' '</code>). So a release can
+          always be matched against the press that started it:
+        </p>
+        <pre class="code"><span class="kw">map[bool]</span> held = {}
+
+<span class="kw">on</span> keyDown(key:<span class="kw">text</span>) { held[key] = <span class="kw">true</span> }
+<span class="kw">on</span> keyUp(key:<span class="kw">text</span>)   { held[key] = <span class="kw">false</span> }</pre>
+        <div class="callout">
+          <strong>Holding a key fires one <code>keyUp</code>, when you
+          actually let go.</strong> X's own auto-repeat would otherwise
+          synthesize a release before every repeat, which would make the
+          pair useless for exactly the movement keys it exists for; the
+          runtime turns that off where the server supports it and
+          filters it out where it doesn't. <code>keyDown</code> does
+          repeat while a key is held — that is how text entry works, and
+          a program that only wants the first press can check whether it
+          has already seen that key go down without a matching up.
+        </div>
+
+        <h3 id="images">Images <a class="anchor" href="#images">#</a></h3>
+        <pre class="code"><span class="kw">img</span> sheet = <span class="str">'spritesheet.png'</span>             <span class="cm">// PNG or JPEG</span>
+log(<span class="str">`${sheet.width}x${sheet.height}`</span>)
+
+<span class="kw">img</span> grass = sheet.clip(0, 0, 64, 64)     <span class="cm">// a new 64x64 image</span>
+grass.resize(32, 32)                      <span class="cm">// scaled in place</span>
+drawImage(grass, 100, 100)</pre>
+        <p>
+          A path declares the image, the same way it declares an
+          <code>aud</code> — and, like that one, it's a real load rather
+          than a compile-time resolution, so the path may be any text
+          expression (<code>img hero = spriteDir + 'hero.png'</code>).
+          <code>loadImage('...')</code> still works and means exactly the
+          same thing.
+        </p>
+        <p class="muted">
+          <strong>PNG and JPEG.</strong> The format is sniffed from the
+          file's contents, not its extension — an image out of a database
+          column has no extension, and an extension was never evidence of
+          anything anyway. Loading needs no display: decoding is pure
+          computation, so a headless program can load, clip, resize and
+          <code>saveCanvas</code> without an X server.
+        </p>
+        <div class="table-wrap">
+        <table class="sig-table">
+          <tr><td>img.width / img.height</td><td>Current size in pixels, as <code>int</code>.</td></tr>
+          <tr><td>img.clip(x, y, w, h)</td><td>A <strong>new</strong> <code>img</code> holding that rectangle. The source is untouched, so one sheet can be clipped as many times as you like.</td></tr>
+          <tr><td>img.resize(w, h)</td><td>Scales the image <strong>in place</strong> — it changes the image itself, so every name for it sees the new size.</td></tr>
+        </table>
+        </div>
+        <p><code>clip</code> is the spritesheet operation: one PNG holding a grid of frames, sliced into the individual images you draw.</p>
+        <pre class="code"><span class="kw">img</span> sheet = <span class="str">'tiles.png'</span>
+<span class="kw">arr[img]</span> tiles = []
+<span class="kw">for int</span> i = 0, i &lt; 8, i++ {
+    tiles[i] = sheet.clip(i * 32, 0, 32, 32)
+}</pre>
+        <p class="muted">
+          A clip region reaching past the source's edge isn't an error —
+          the overlapping part is copied and the rest stays transparent,
+          which is normal at a sheet's right or bottom margin. A zero or
+          negative width or height <em>is</em> an error, since it could
+          only ever produce an image nothing can draw. Because
+          <code>resize</code> changes the image itself, two names for one
+          image stay in step:
+        </p>
+        <pre class="code"><span class="kw">img</span> a = sheet.clip(0, 0, 32, 32)
+<span class="kw">img</span> b = a
+a.resize(8, 8)
+log(b.width)      <span class="cm">// 8 -- a and b are the same image</span></pre>
+        <p class="muted">
+          An image created in a function (by <code>loadImage</code> or
+          <code>clip</code>) and never stored outside it is released when
+          that function returns, so slicing frames inside a loop doesn't
+          accumulate.
+        </p>
+
+        <h3 id="drawing-style">Drawing style <a class="anchor" href="#drawing-style">#</a></h3>
+        <pre class="code"><span class="kw">color</span> brand = <span class="str">'#4a90d9'</span>
+<span class="kw">color</span> line = <span class="str">'gray'</span>
+<span class="kw">font</span>  body  = <span class="str">'bold 20px serif'</span>
+
+fillStyle(brand)            <span class="cm">// fills: drawRect, drawCircle, drawText</span>
+borderColor(line)           <span class="cm">// outlines drawRect/drawCircle</span>
+lineWidth(4)                <span class="cm">// border thickness, in pixels</span>
+changeFont(body)            <span class="cm">// used by drawText and both measure calls</span></pre>
+        <p class="muted">
+          Style is set once and applies to every later draw — the same
+          model the HTML canvas uses. Defaults are black fill, no border,
+          and 16px sans-serif, so a program that never calls these draws
+          exactly what it did before they existed.
+        </p>
+        <div class="callout">
+          <strong>Colors and fonts must be declared.</strong> Anything
+          other than raw RGB numbers has to be a <code>color</code> or
+          <code>font</code> declaration first:
+          <pre class="code" style="margin:10px 0 6px;"><span class="kw">color</span> red = <span class="str">'red'</span>      <span class="cm">// then: fillStyle(red)</span>
+<span class="kw">font</span>  body = <span class="str">'14px'</span>    <span class="cm">// then: changeFont(body)</span></pre>
+          <code>fillStyle('red')</code> and <code>changeFont('14px')</code>
+          do <strong>not</strong> work. The declaration is where the
+          compiler resolves the name, once — after that a
+          <code>color</code> is just a packed integer and a
+          <code>font</code> is a pointer to a constant, so using either
+          costs nothing. <strong>If a color is chosen dynamically, use
+          <code>fillStyle(r, g, b)</code></strong> — see
+          <a href="#computing-a-color-or-font-at-runtime">Computing a color or font at runtime</a>
+          below. There is no way to turn a runtime <code>text</code>
+          value into a <code>color</code> or a <code>font</code>, and
+          attempting it is a compile error that says so.
+        </div>
+
+        <h4>The <code>color</code> type</h4>
+        <pre class="code"><span class="kw">color</span> red   = <span class="str">'red'</span>
+<span class="kw">color</span> brand = <span class="str">'#4a90d9'</span>
+<span class="kw">color</span> ghost = <span class="str">'none'</span></pre>
+        <p>
+          A color literal is any of the <strong>148 CSS color names</strong>
+          (<code>red</code>, <code>teal</code>, <code>rebeccapurple</code>,
+          <code>lightgoldenrodyellow</code>, …), a <code>#rgb</code> or
+          <code>#rrggbb</code> hex value, or <code>none</code>/<code>transparent</code>.
+          Names are case-insensitive and <code>#abc</code> expands to
+          <code>#aabbcc</code>, both as in CSS.
+        </p>
+        <p class="muted">
+          The declaration is where the name is resolved:
+          <code>color red = 'red'</code> becomes the packed integer
+          <code>0xFF0000</code> at compile time, so nothing parses a color
+          string while your program runs. A name the compiler doesn't
+          recognize is a compile error naming the value and its line — it
+          can't reach a running program, and it never silently falls back
+          to black. A <code>color</code> is an ordinary value after that:
+          assign it, pass it to a function, return one. It is a plain
+          integer, so it is never reference-counted and costs nothing to
+          copy.
+        </p>
+        <p>
+          <code>none</code> works on both setters: as a fill it leaves a
+          shape's interior untouched, so <code>borderColor</code> alone
+          gives an outline-only shape; as a border color it switches
+          borders back off.
+        </p>
+        <pre class="code"><span class="kw">color</span> none = <span class="str">'none'</span>
+<span class="kw">color</span> ring = <span class="str">'purple'</span>
+
+fillStyle(none)
+borderColor(ring)
+lineWidth(8)
+drawCircle(200, 200, 60)    <span class="cm">// a purple ring, nothing inside it</span></pre>
+        <p class="muted"><code>borderColor</code> outlines shapes only, not the glyphs <code>drawText</code> draws.</p>
+
+        <h4>The <code>font</code> type</h4>
+        <pre class="code"><span class="kw">font</span> body  = <span class="str">'arial 14px bold'</span>   <span class="cm">// all three parts</span>
+<span class="kw">font</span> same  = <span class="str">'bold 14px arial'</span>   <span class="cm">// any order — identical result</span>
+<span class="kw">font</span> small = <span class="str">'14px'</span>              <span class="cm">// just the size; family/style unchanged</span>
+<span class="kw">font</span> mono  = <span class="str">'monospace'</span>         <span class="cm">// just the family; size unchanged</span></pre>
+        <p>
+          A font literal takes the CSS/canvas shorthand with words in
+          <strong>any order</strong>, and any part may be omitted —
+          <code>italic</code>/<code>oblique</code> set the slant,
+          <code>bold</code> the weight, a bare number or
+          <code>&lt;n&gt;px</code> the size, and the first word that is
+          none of those is the family. An omitted part means "leave that
+          alone", which is what lets <code>font small = '14px'</code>
+          change only the size.
+        </p>
+        <p class="muted">
+          Each distinct font compiles to a constant in the binary's
+          read-only data, so declaring one costs nothing at runtime and
+          <code>changeFont()</code> passes a single pointer. Identical
+          fonts share one constant, so <code>body</code> and
+          <code>same</code> above are literally the same record. An empty
+          literal (<code>font f = ''</code>) is rejected — it says
+          nothing, and is far likelier to be a mistake than an intent.
+        </p>
+
+        <h3 id="computing-a-color-or-font-at-runtime">Computing a color or font at runtime <a class="anchor" href="#computing-a-color-or-font-at-runtime">#</a></h3>
+        <p>
+          There is deliberately <strong>no way to turn a runtime
+          <code>text</code> value into a <code>color</code> or a
+          <code>font</code></strong> — resolution happens at the
+          declaration, so the declaration needs a literal. To choose
+          either from values you compute, use the explicit numeric forms,
+          which are strictly more capable for that job anyway (they take
+          any <code>int</code> expression, where a color <em>name</em>
+          could only ever have named one of a fixed set):
+        </p>
+        <pre class="code">fillStyle(r, g, b)                <span class="cm">// each 0-255; a negative value means 'none'</span>
+borderColor(r, g, b)
+changeFont(px, style, family)     <span class="cm">// style/family may be null;</span>
+                                   <span class="cm">// px &lt;= 0 keeps the current size</span></pre>
+        <pre class="code"><span class="cm">// a gradient of swatches — the color is different every iteration</span>
+<span class="kw">for int</span> i = 0, i &lt; 10, i++ {
+    fillStyle(i * 25, 0, 255 - i * 25)
+    drawRect(i * 40, 0, 36, 36)
+}
+
+<span class="cm">// a font size that depends on runtime state</span>
+<span class="kw">int</span> size = 12 + level * 4
+changeFont(size, <span class="str">'bold'</span>, <span class="kw">null</span>)    <span class="cm">// family left as-is</span></pre>
+        <p class="muted">
+          Passing a non-literal where a <code>color</code> or
+          <code>font</code> is expected is a compile error that points at
+          these forms.
+        </p>
+
+        <h3 id="paths">Paths <a class="anchor" href="#paths">#</a></h3>
+        <pre class="code">fillStyle(red)
+beginPath()
+moveTo(50, 50)
+lineTo(150, 50)
+lineTo(100, 140)
+closePath()
+fillPath()        <span class="cm">// a filled triangle</span></pre>
+        <div class="table-wrap">
+        <table class="sig-table">
+          <tr><td>beginPath()</td><td>Starts a new path.</td></tr>
+          <tr><td>moveTo(x, y) / lineTo(x, y)</td><td>Move the pen / draw a straight segment.</td></tr>
+          <tr><td>curveTo(cx1, cy1, cx2, cy2, x, y)</td><td>A cubic bezier to <code>(x, y)</code>.</td></tr>
+          <tr><td>closePath()</td><td>Closes back to the start.</td></tr>
+          <tr><td>fillPath() / strokePath()</td><td>Paints the path with the current fill / border colour, and <strong>ends</strong> it.</td></tr>
+        </table>
+        </div>
+        <p class="muted">
+          <code>fillPath</code> uses <code>fillStyle</code>;
+          <code>strokePath</code> uses <code>borderColor</code> and
+          <code>lineWidth</code>. Both consume the path, as
+          <code>fill()</code>/<code>stroke()</code> do on a canvas — call
+          <code>beginPath()</code> again for the next shape. Using
+          <code>moveTo</code> and friends with no path open is a clean
+          error naming the missing <code>beginPath()</code>.
+        </p>
+
+        <h3 id="transforms">Transforms <a class="anchor" href="#transforms">#</a></h3>
+        <pre class="code">saveState()
+translate(400, 40)
+rotate(30.0)          <span class="cm">// degrees</span>
+scale(2.0, 2.0)
+drawRect(0, 0, 60, 60)
+restoreState()        <span class="cm">// transform (and style) back as it was</span></pre>
+        <p class="muted">
+          A transform applies to everything drawn <em>after</em> it,
+          until changed. <code>resetTransform()</code> returns to the
+          identity. <code>saveState</code>/<code>restoreState</code> save
+          the whole drawing state — transform, colors, alpha, line width
+          and font — matching the canvas <code>save()</code>/<code>restore()</code>
+          they mirror. A <code>restoreState()</code> with nothing saved is
+          an error rather than a silent no-op. Rotation is in
+          <strong>degrees</strong>. <code>Math.PI</code> is there if
+          you'd rather work in radians.
+        </p>
+
+        <h3 id="gradients-and-transparency">Gradients and transparency <a class="anchor" href="#gradients-and-transparency">#</a></h3>
+        <pre class="code"><span class="kw">color</span> a = <span class="str">'red'</span>
+<span class="kw">color</span> b = <span class="str">'blue'</span>
+
+fillLinearGradient(50, 300, a, 250, 300, b)   <span class="cm">// start point, colour -&gt; end point, colour</span>
+drawRect(50, 280, 200, 60)
+
+fillRadialGradient(400, 300, 60, a, b)        <span class="cm">// centre, radius, inner, outer</span>
+drawCircle(400, 300, 60)
+
+fillAlpha(0.5)                                 <span class="cm">// 0.0 transparent .. 1.0 opaque</span></pre>
+        <p class="muted">
+          A gradient replaces the flat fill until the next
+          <code>fillStyle()</code>. Two stops rather than an arbitrary
+          list — that covers essentially every gradient a program draws,
+          and needs no separate gradient type.
+        </p>
+
+        <h3 id="text-metrics">Text metrics <a class="anchor" href="#text-metrics">#</a></h3>
+        <pre class="code"><span class="kw">int</span> w = measureTextWidth(<span class="str">'Hello'</span>)
+<span class="kw">int</span> h = measureTextHeight(<span class="str">'Hello'</span>)</pre>
+        <p class="muted">
+          Both measure against the current <code>font</code> and return
+          <code>int</code>. Neither opens a window — text metrics depend
+          only on the font, so they work in a program that never draws,
+          and with no X server at all. <code>measureTextWidth</code> is
+          the advance width (how far the pen moves), which is what you
+          want for laying strings out one after another — the same thing
+          the canvas <code>measureText().width</code> reports.
+          <code>measureTextHeight</code> is the inked height of
+          <em>that string</em>, which is why it takes the text:
+          <code>'x'</code> is shorter than <code>'Xg'</code>. For a stable
+          line height independent of which letters appear, measure a
+          string with both an ascender and a descender.
+        </p>
+      </section>
+
+      <section class="doc-section" id="files">
+        <h2>Files <a class="anchor" href="#files">#</a></h2>
+        <pre class="code">writeFile(<span class="str">'notes.txt'</span>, <span class="str">'hello'</span>)       <span class="cm">// -&gt; bool (did it land?)</span>
+appendFile(<span class="str">'notes.txt'</span>, <span class="str">' world'</span>)     <span class="cm">// -&gt; bool</span>
+<span class="kw">text</span> body = readFile(<span class="str">'notes.txt'</span>)     <span class="cm">// -&gt; text, or null if unreadable</span>
+<span class="kw">bool</span> there = fileExists(<span class="str">'notes.txt'</span>)  <span class="cm">// -&gt; bool</span>
+deleteFile(<span class="str">'notes.txt'</span>)                    <span class="cm">// -&gt; bool</span></pre>
+        <p class="muted">
+          Whole-file text I/O. Nothing here fails the program:
+          <code>readFile</code> returns <code>null</code> for a file it
+          can't read and the writers return <code>false</code> on
+          failure, so a missing file is something you test for rather
+          than something that stops you — the same treatment division by
+          zero gets.
+        </p>
+        <p>What <code>readFile</code> returns is an ordinary <code>text</code>, so it composes with everything else:</p>
+        <pre class="code"><span class="kw">text</span> body = readFile(<span class="str">'data.csv'</span>)
+<span class="kw">if</span> body != <span class="kw">null</span> {
+    log(body.replaceAll(<span class="str">','</span>, <span class="str">' | '</span>))
+}</pre>
+      </section>
+
+      <section class="doc-section" id="time">
+        <h2>Time <a class="anchor" href="#time">#</a></h2>
+        <pre class="code"><span class="kw">int</span> ms = now()                        <span class="cm">// milliseconds since the Unix epoch</span>
+log(formatTime(ms, <span class="str">'%Y-%m-%d %H:%M'</span>)) <span class="cm">// strftime, local time -&gt; text</span></pre>
+        <p class="muted">
+          <code>now()</code> uses the same unit and origin as
+          JavaScript's <code>Date.now()</code>, and the same unit
+          <code>setTimeout</code> already takes, so timing a block is
+          just subtraction:
+        </p>
+        <pre class="code"><span class="kw">int</span> started = now()
+doTheWork()
+log(<span class="str">`took ${now() - started}ms`</span>)</pre>
+
+        <h3 id="single-value-queries">Single-value queries <a class="anchor" href="#single-value-queries">#</a></h3>
+        <pre class="code"><span class="kw">int</span> total  = sqliteInt(<span class="str">`SELECT count(*) FROM Post`</span>)
+<span class="kw">text</span> name  = sqliteText(<span class="str">`SELECT title FROM Post WHERE id = ?`</span>, [2])
+<span class="kw">float</span> mean = sqliteFloat(<span class="str">`SELECT avg(score) FROM Post`</span>)</pre>
+        <p class="muted">
+          The first column of the first row. Use these instead of
+          declaring a <code>table</code> just to receive a scalar — a
+          <code>table</code> declaration <em>creates</em> a real table,
+          so a throwaway one for a <code>count(*)</code> would sit in
+          your database permanently. A query matching no rows (or whose
+          value is SQL NULL) returns <code>null</code>, so it's something
+          to test for rather than something that stops you.
+        </p>
+
+        <h3 id="json-and-full-text-search">JSON and full-text search <a class="anchor" href="#json-and-full-text-search">#</a></h3>
+        <p>
+          Both are ordinary SQL, and <code>sqlite()</code> passes SQL
+          through untouched — so SQLite's JSON1 and FTS5 work today with
+          no extra language feature:
+        </p>
+        <pre class="code">log(sqliteText(<span class="str">`SELECT json_extract(data, '$.name') FROM Doc WHERE id = ?`</span>, [1]))
+
+sqlite(<span class="str">`CREATE VIRTUAL TABLE PostSearch USING fts5(title, body, content='Post', content_rowid='id')`</span>)
+sqlite(<span class="str">`INSERT INTO PostSearch(PostSearch) VALUES('rebuild')`</span>)
+log(sqliteInt(<span class="str">`SELECT count(*) FROM PostSearch WHERE PostSearch MATCH ?`</span>, [<span class="str">'machine'</span>]))</pre>
+      </section>
+
+      <section class="doc-section" id="growing-arrays">
+        <h2>Growing arrays <a class="anchor" href="#growing-arrays">#</a></h2>
+        <pre class="code"><span class="kw">arr[int]</span> xs = [1, 2, 3]
+
+xs.push(4)          <span class="cm">// -&gt; new length</span>
+xs.pop()            <span class="cm">// -&gt; last element, removed</span>
+xs.shift()          <span class="cm">// -&gt; first element, removed</span>
+xs.unshift(0)       <span class="cm">// -&gt; new length</span>
+<span class="kw">arr[int]</span> cut = xs.splice(1, 2)   <span class="cm">// remove 2 from index 1, return them</span>
+xs.indexOf(3)       <span class="cm">// -&gt; first index holding 3, or -1</span></pre>
+        <p class="muted">
+          All six behave as their JavaScript namesakes do, including
+          <code>splice</code>'s clamping — a negative start counts back
+          from the end, and an oversized range clamps rather than
+          failing, so <code>splice(i, 1)</code> at a boundary is a no-op.
+          (<code>splice</code>'s variadic insert has no spelling here;
+          Festina has no variadic calls.)
+        </p>
+        <p>
+          <code>pop()</code>/<code>shift()</code> on an empty array
+          return <code>null</code> — not zero, so an empty pop is
+          distinguishable from popping a real <code>0</code>:
+        </p>
+        <pre class="code"><span class="kw">arr[int]</span> empty = []
+log(empty.pop() == <span class="kw">null</span>)     <span class="cm">// true</span></pre>
+        <p>
+          <code>indexOf()</code> answers <code>-1</code> when the value
+          isn't present, rather than <code>null</code> — an index is the
+          kind of thing you compare or feed straight to
+          <code>splice</code>, and both read naturally against
+          <code>-1</code>:
+        </p>
+        <pre class="code"><span class="kw">if</span> queue.indexOf(target) &gt;= 0 { ... }
+queue.splice(queue.indexOf(target), 1)   <span class="cm">// remove by value</span></pre>
+        <p>What "the same value" means depends on the element type:</p>
+        <ul>
+          <li><code>int</code>, <code>float</code>, <code>bool</code> — <strong>by value</strong>.</li>
+          <li><code>text</code> — <strong>by content</strong>, so a needle built at runtime finds a match: <code>names.indexOf('gr' + 'ace')</code> is <code>1</code> for <code>['ada', 'grace']</code>. (Identity would be useless here: text is copied on binding, so two equal strings are almost always two different buffers.)</li>
+          <li><code>struct</code>, <code>arr</code>, <code>map</code> — <strong>by identity</strong>. Two separately-declared structs with identical fields are two different values; only the one actually in the array is found.</li>
+        </ul>
+        <p class="muted">
+          Elements are owned the same way any other binding owns them:
+          pushing a <code>text</code> copies it, so the array and the
+          variable don't share a buffer. Removing transfers ownership to
+          whoever receives it. <code>indexOf()</code> takes no ownership
+          at all — an index isn't a reference.
         </p>
       </section>
 
@@ -849,16 +1449,133 @@ clearInterval(id)          <span class="cm">// clearTimeout()/clearInterval() ar
 
       <section class="doc-section" id="audio">
         <h2>Audio <a class="anchor" href="#audio">#</a></h2>
-        <pre class="code"><span class="kw">aud</span> music = loadAudio(<span class="str">'music.wav'</span>)   <span class="cm">// WAV, 16-bit PCM only</span>
-music.play()
-music.stop()
-music.isPlaying()                     <span class="cm">// true the instant play() returns,</span>
-                                       <span class="cm">// false the instant stop() returns</span></pre>
+        <pre class="code"><span class="kw">aud</span> music = <span class="str">'music.wav'</span>               <span class="cm">// WAV (16-bit PCM) or MP3</span>
+music.play()                          <span class="cm">// once</span>
+music.playLoop()                      <span class="cm">// until stopped</span>
+music.isPlaying()                     <span class="cm">// true the instant play() returns</span>
+
+stopAudioPlayer()                     <span class="cm">// stop every channel</span></pre>
         <p>
-          Plays through a real ALSA output device on a background thread,
-          so playback doesn't block the rest of the program. Calling
-          <code>play()</code> again while already playing restarts from
-          the beginning.
+          A path declares the clip, the same way <code>blob</code>,
+          <code>color</code>, <code>font</code> and <code>img</code> are
+          each written as the text that reads best. It's a real load, not
+          a compile-time resolution, so the path may be any text
+          expression (<code>aud hit = soundDir + 'hit.wav'</code>).
+          <code>loadAudio('...')</code> still works and means exactly the
+          same thing.
+        </p>
+        <p class="muted">
+          <strong>WAV (16-bit PCM) and MP3.</strong> The format is
+          sniffed from the file's contents, not its extension — a clip
+          out of a database column has no extension, and an extension was
+          never evidence of anything anyway. Anything else (a compressed
+          WAV, 8/24/32-bit PCM, Ogg, FLAC) fails at load with a message
+          naming both supported formats. Plays through a real ALSA output
+          device on a background thread, so playback doesn't block the
+          rest of the program.
+        </p>
+        <div class="callout">
+          <strong>There is no <code>music.stop()</code>.</strong> One
+          clip can be playing on several channels at once — three
+          overlapping gunshots are the ordinary case, not the exotic one
+          — so "stop this clip" never named one thing. Playback is
+          stopped by channel: <code>stopAudioPlayer(n)</code>, or
+          <code>stopAudioPlayer()</code> for all. <code>isPlaying()</code>
+          stays clip-wide, because "is this sound audible anywhere" does
+          still have a single answer.
+        </div>
+
+        <h3 id="overlapping-sounds">Overlapping sounds <a class="anchor" href="#overlapping-sounds">#</a></h3>
+        <p>
+          <strong><code>play()</code> while a sound is already playing
+          does not cut it off.</strong> Sound goes out through a pool of
+          <strong>channels</strong> — so a footstep, a gunshot or a coin
+          pickup firing in rapid succession layer instead of interrupting
+          each other, which is what a game actually needs:
+        </p>
+        <pre class="code"><span class="kw">aud</span> coin = loadAudio(<span class="str">'coin.wav'</span>)
+coin.play()   <span class="cm">// three overlapping copies, not one restarted three times</span>
+coin.play()
+coin.play()</pre>
+        <p class="muted">
+          The clip's audio is decoded once, at <code>loadAudio()</code>
+          time; a channel costs a thread and a device handle, never
+          another copy of the samples.
+        </p>
+        <pre class="code">setMaxAudioPlayers(4)          <span class="cm">// channels the pool may assign on its own</span>
+log(maxAudioPlayers())         <span class="cm">// -&gt; 4, i.e. what was actually applied</span></pre>
+        <p class="muted">
+          <code>setMaxAudioPlayers</code> is clamped into
+          <code>[1, 64]</code> rather than rejected. When every
+          unreserved channel in the pool is busy, the <strong>oldest</strong>
+          is stolen. Something has to give at the limit, and the sound
+          that has been playing longest is closest to finishing anyway —
+          dropping the <em>new</em> play instead would silence a
+          rapid-fire effect at exactly the moment it fires fastest.
+          <code>setMaxAudioPlayers(1)</code> is the way to ask for the old
+          behaviour back: one channel, restarted from the beginning on
+          every <code>play()</code>.
+        </p>
+
+        <h3 id="channels-and-looping">Channels and looping <a class="anchor" href="#channels-and-looping">#</a></h3>
+        <p>
+          Channels are <strong>process-global and numbered from 0</strong>,
+          not per-clip — so two different clips can share one, which is
+          what makes handing a music channel from one track to another
+          expressible at all:
+        </p>
+        <pre class="code"><span class="kw">aud</span> adventureMusic = loadAudio(<span class="str">'adventure.wav'</span>)
+<span class="kw">aud</span> battleMusic = loadAudio(<span class="str">'battle.wav'</span>)
+
+adventureMusic.playLoop(0)          <span class="cm">// loops on channel 0, and reserves it</span>
+setInterval(changeMusic, 100000)
+
+<span class="kw">void func</span> changeMusic() {
+    <span class="kw">if</span> adventureMusic.isPlaying() {
+        battleMusic.playLoop(0)     <span class="cm">// takes channel 0 over</span>
+    } <span class="kw">else</span> {
+        adventureMusic.playLoop(0)
+    }
+}
+
+stopAudioPlayer(0)                  <span class="cm">// stop that channel, release it</span></pre>
+        <div class="table-wrap">
+        <table class="sig-table">
+          <tr><td>clip.play()</td><td>Play once on a channel the pool picks.</td></tr>
+          <tr><td>clip.play(n)</td><td>Play once on channel <code>n</code>, taking it over.</td></tr>
+          <tr><td>clip.playLoop()</td><td>Loop on a channel the pool picks, and <strong>reserve</strong> it.</td></tr>
+          <tr><td>clip.playLoop(n)</td><td>Loop on channel <code>n</code>, taking it over and <strong>reserving</strong> it.</td></tr>
+          <tr><td>stopAudioPlayer(n)</td><td>Stop channel <code>n</code> and release it.</td></tr>
+          <tr><td>stopAudioPlayer()</td><td>Stop every channel.</td></tr>
+          <tr><td>clip.isPlaying()</td><td>True while any channel is playing that clip.</td></tr>
+        </table>
+        </div>
+        <p class="muted">
+          <strong>playLoop reserves its channel.</strong> A reserved
+          channel is never chosen by automatic assignment and never
+          stolen — so a looping music track cannot be evicted by an
+          ordinary sound effect, however many are firing. Two things
+          release it: <code>stopAudioPlayer(n)</code> (or a bare
+          <code>stopAudioPlayer()</code>), and naming the channel
+          explicitly in another <code>play(n)</code>/<code>playLoop(n)</code>.
+          An explicit <code>play(n)</code> both takes the channel over
+          <em>and</em> hands it back to the pool, since a one-shot has
+          nothing to reserve it for.
+        </p>
+        <p class="muted">
+          An out-of-range channel is clamped into <code>[0, 64)</code>,
+          the same call <code>setMaxAudioPlayers</code> makes — a bad
+          channel number should not kill a running game.
+          <code>setMaxAudioPlayers</code> bounds only what the pool
+          assigns on its own; an explicitly named channel is honoured
+          anywhere in range, so <code>play(40)</code> works with a pool
+          of 10. If you reserve <em>every</em> channel and then fire an
+          unnamed <code>play()</code>, it is dropped — there is nothing
+          left the pool is allowed to touch, and the alternative would be
+          breaking a reservation you asked for. <code>isPlaying()</code>
+          is about the <strong>clip</strong>, not one playback of it: it
+          is true while any channel is playing that clip. To address a
+          single playback, name its channel.
         </p>
       </section>
 

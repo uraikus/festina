@@ -351,7 +351,7 @@
 <header class="hero">
   <div class="wrap">
     <div class="badges">
-      <span class="badge">812 tests passing</span>
+      <span class="badge">1008 tests passing</span>
       <span class="badge">MIT license</span>
       <span class="badge">Linux</span>
     </div>
@@ -406,7 +406,7 @@ Hello, Festina!</pre>
       </div>
       <div class="card">
         <h3>Graphics and audio, wired in</h3>
-        <p>A real on-screen canvas (<code>drawRect</code>, <code>on click</code>, …) and real audio playback (<code>loadAudio().play()</code>), backed by Cairo/X11 and ALSA.</p>
+        <p>A real canvas (<code>drawRect</code>, <code>on click</code>, paths, gradients, typed <code>color</code>/<code>font</code> values, …) and layered audio playback with channels (<code>music.playLoop()</code>), backed by Cairo/X11 and ALSA.</p>
       </div>
       <div class="card">
         <h3>Familiar syntax, none of the surprises</h3>
@@ -480,6 +480,10 @@ Hello, Festina!</pre>
 <span class="kw">arr[People]</span> people = sqlite(<span class="str">'SELECT * FROM People'</span>)
 
 <span class="cm">// Graphics -- a real window, opened on first use</span>
+<span class="kw">color</span> brand = <span class="str">'#4a90d9'</span>
+<span class="kw">font</span>  title = <span class="str">'bold 24px sans-serif'</span>
+fillStyle(brand)
+changeFont(title)
 drawRect(0, 0, 100, 100)
 <span class="kw">on</span> click(x:<span class="kw">int</span>, y:<span class="kw">int</span>) { log(<span class="str">`clicked ${x}, ${y}`</span>) }
 
@@ -519,10 +523,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>hello</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">1.4 ms</td><td class="num">714.7 ms</td><td class="num">1.44 MB</td></tr>
-          <tr><td>Rust</td><td class="num">1.7 ms</td><td class="num">90.4 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">1.4 ms</td><td class="num">204.9 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">12.0 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">1.4 ms</td><td class="num">475.1 ms</td><td class="num">1.44 MB</td></tr>
+          <tr><td>Rust</td><td class="num">1.5 ms</td><td class="num">72.2 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">1.2 ms</td><td class="num">151.1 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">9.7 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -533,10 +537,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>fib(32)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">9.4 ms</td><td class="num">102.7 ms</td><td class="num">1.44 MB</td></tr>
-          <tr><td>Rust</td><td class="num">9.6 ms</td><td class="num">97.4 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">13.6 ms</td><td class="num">192.9 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">35.8 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">7.7 ms</td><td class="num">63.6 ms</td><td class="num">1.44 MB</td></tr>
+          <tr><td>Rust</td><td class="num">7.7 ms</td><td class="num">73.4 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">13.5 ms</td><td class="num">147.9 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">28.4 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -547,10 +551,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>loop_sum (100M)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">526.8 ms</td><td class="num">90.4 ms</td><td class="num">1.44 MB</td></tr>
-          <tr><td>Rust</td><td class="num">498.1 ms</td><td class="num">98.3 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">458.7 ms</td><td class="num">169.1 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">9245.6 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">519.0 ms</td><td class="num">69.1 ms</td><td class="num">1.44 MB</td></tr>
+          <tr><td>Rust</td><td class="num">523.5 ms</td><td class="num">74.8 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">458.5 ms</td><td class="num">156.5 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">8963.5 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -561,10 +565,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>array_sum (2M)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">86.0 ms</td><td class="num">102.3 ms</td><td class="num">1.44 MB</td></tr>
-          <tr><td>Rust</td><td class="num">86.1 ms</td><td class="num">112.1 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">88.6 ms</td><td class="num">181.7 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">2645.5 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">91.9 ms</td><td class="num">83.1 ms</td><td class="num">1.44 MB</td></tr>
+          <tr><td>Rust</td><td class="num">89.6 ms</td><td class="num">93.9 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">87.0 ms</td><td class="num">142.5 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">2272.7 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -575,10 +579,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>string_concat (15K)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">71.6 ms</td><td class="num">117.5 ms</td><td class="num">1.44 MB</td></tr>
-          <tr><td>Rust</td><td class="num">1.6 ms</td><td class="num">114.5 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">49.5 ms</td><td class="num">197.9 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">12.4 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">3.6 ms</td><td class="num">69.3 ms</td><td class="num">1.44 MB</td></tr>
+          <tr><td>Rust</td><td class="num">1.5 ms</td><td class="num">95.1 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">33.0 ms</td><td class="num">146.7 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">10.9 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -586,11 +590,13 @@ npcHealths[<span class="str">'npc1'</span>] = 30
       Short version: Festina holds its own against Rust and Go on
       compute-bound native code and lands right at them on
       allocation-heavy work too, comfortably outruns a JIT on cold
-      single-shot execution — and <code>string_concat</code> is the one
-      honest gap in the suite: Rust's <code>String</code> reuses spare
-      capacity in place on repeated concatenation, an algorithmic
-      advantage Festina isn't attempting to match with the same naive
-      O(n²) approach Go takes too.
+      single-shot execution — and <code>string_concat</code>, once the
+      sharpest divergence in the suite, closed from a 140ms leak-driven
+      gap down to 3.6ms once <code>text</code> values were made
+      genuinely owned and freed, landing Festina second place overall,
+      ahead of both Go and Bun and within ~2.4x of Rust's
+      spare-capacity-reusing <code>String</code> — the one gap left that's
+      genuinely algorithmic, not an allocator artifact.
     </p>
   </div>
 </section>
@@ -600,7 +606,7 @@ npcHealths[<span class="str">'npc1'</span>] = 30
     <h2>Project status</h2>
     <div class="status-line">
       <span class="dot"></span>
-      <span><strong>812 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
+      <span><strong>1008 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
     </div>
     <p class="section-intro">
       The compiler frontend, LLVM codegen backend, and native C runtime are
