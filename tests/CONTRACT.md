@@ -364,15 +364,15 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 989 tests in this directory pass against it: 620 need no external
+All 995 tests in this directory pass against it: 624 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-348 more need a working C compiler, plus 2 more
+350 more need a working C compiler, plus 2 more
 (`tests/test_packaging.py`) given `pyinstaller` too, plus 19 more given
 `Xvfb`+`xdotool` too (4 of those also need `xwd`, from the same
 x11-apps/x11-utils tier, to read real canvas pixels back --
 claude.md #89/#92/#94; two former `xwd` tests became display-free once
-claude.md #95 made saveCanvas headless; claude.md #98 added 4 more) (620
-+ 348 + 2 + 19 = 989 --
+claude.md #95 made saveCanvas headless; claude.md #98 added 4 more) (624
++ 350 + 2 + 19 = 995 --
 re-verified directly
 by running the whole suite with a PATH containing nothing but Python,
 not just derived by counting `compile_and_run` call sites, since the
@@ -2512,6 +2512,38 @@ same reasons the pool tests are), 4 end-to-end tests in `TestAudio`
 alternation), and 8 in `tests/test_audio.py` for the signatures. Clean
 under ThreadSanitizer and AddressSanitizer.
 
+**claude.md #100**: a path declares a clip, and stopping is by channel.
+
+*`aud music = 'path/track.wav'`.* Every other type naturally written as
+text already worked this way -- `blob data = 'path'` (#36),
+`color red = 'red'` and `font body = '13px arial'` (#91) -- and `aud`
+was the odd one out for no reason beyond build order. Same
+one-directional text -> X allowance, same place in `check_assignable`,
+so it applies wherever an `aud` is expected rather than only at a
+declaration. It differs from colour/font in one way: those are resolved
+at compile time and so need a genuine literal, while this becomes a
+real `loadAudio()` call at the point of conversion -- so the path may
+be any text expression, and the conversion is a real file read wherever
+it happens. `loadAudio('...')` still works; it is the same call spelled
+longer, and breaking every program that uses it would gain nothing.
+
+*`aud.stop()` is removed.* **Breaking change.** It was already wrong
+when #98 gave a clip a pool of voices and #99 only made it more
+obviously so: one clip can be playing on several channels at once
+(three overlapping gunshots are the ordinary case), so "stop this clip"
+never named one thing. Its only honest reading -- stop every copy -- is
+almost never what a program firing overlapping effects wants, and it
+quietly discarded a channel the program had deliberately reserved.
+Playback is addressed by channel now, with no per-clip shortcut. The
+compiler catches `.stop()` by name rather than letting it fall into the
+generic unknown-method error, so the message can name the replacement.
+`isPlaying()` survives the same argument because it does not have the
+same problem: "is this sound audible anywhere" has one answer however
+many channels are playing it, and it is what #99's music-handover
+pattern is built on.
+`tests/test_codegen.py::TestAudio` (4 more tests) and
+`tests/test_audio.py` (4 more).
+
 *`on key` became `on keyDown` + `on keyUp`.* A key held down and a key
 tapped were the same event, so the most ordinary thing a 2D game does
 with the keyboard had no expressible form. **This is a breaking
@@ -3292,5 +3324,5 @@ pytest tests/                          # 605 passed, 323 skipped (needs a C comp
                                         # 15 need Xvfb + xdotool installed too, 1 of those
                                         # also needs `openbox` and 4 need `xwd`) given a
                                         # working C compiler,
-                                        # all 989 pass
+                                        # all 995 pass
 ```

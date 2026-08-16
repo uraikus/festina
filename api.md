@@ -73,7 +73,7 @@ map[T]    -- text-keyed map of any of the above except arr[T]/map[T]
 struct    -- user-declared record type
 table     -- a struct that's also backed by a SQLite table
 img       -- an image loaded via loadImage() (opaque handle)
-aud       -- an audio clip loaded via loadAudio() (opaque handle)
+aud       -- an audio clip, declared from a path (`aud hit = 'hit.wav'`)
 regex     -- a compiled pattern from a /pattern/flags literal or regex() (opaque handle)
 color     -- a canvas color, declared from a literal (`color red = 'red'`)
 font      -- a canvas font, declared from a literal (`font body = '13px arial'`)
@@ -1005,16 +1005,29 @@ deadlines together so neither blocks the other.
 ## Audio
 
 ```festina
-aud music = loadAudio('music.wav')   // WAV, 16-bit PCM only
+aud music = 'music.wav'               // WAV, 16-bit PCM only
 music.play()                          // once
 music.playLoop()                      // until stopped
-music.stop()
-music.isPlaying()                     // true the instant play() returns,
-                                       // false the instant stop() returns
+music.isPlaying()                     // true the instant play() returns
+
+stopAudioPlayer()                     // stop every channel
 ```
+
+A path declares the clip, the same way `blob`, `color` and `font` are
+each written as the text that reads best. It's a real load, not a
+compile-time resolution, so the path may be any text expression
+(`aud hit = soundDir + 'hit.wav'`). `loadAudio('...')` still works and
+means exactly the same thing.
 
 Plays through a real ALSA output device on a background thread, so
 playback doesn't block the rest of the program.
+
+**There is no `music.stop()`.** One clip can be playing on several
+channels at once — three overlapping gunshots are the ordinary case, not
+the exotic one — so "stop this clip" never named one thing. Playback is
+stopped by channel: `stopAudioPlayer(n)`, or `stopAudioPlayer()` for all.
+`isPlaying()` stays clip-wide, because "is this sound audible anywhere"
+does still have a single answer.
 
 ### Overlapping sounds
 
@@ -1080,16 +1093,16 @@ stopAudioPlayer(0)                  // stop that channel, release it
 | `clip.playLoop(n)` | Loop on channel `n`, taking it over and **reserving** it. |
 | `stopAudioPlayer(n)` | Stop channel `n` and release it. |
 | `stopAudioPlayer()` | Stop every channel. |
-| `clip.stop()` | Stop every channel playing *that clip*, releasing each. |
 | `clip.isPlaying()` | True while any channel is playing that clip. |
 
 **`playLoop` reserves its channel.** A reserved channel is never chosen
 by automatic assignment and never stolen — so a looping music track
 cannot be evicted by an ordinary sound effect, however many are firing.
-Three things release it: `stopAudioPlayer(n)`, that clip's own `stop()`,
-or naming the channel explicitly in another `play(n)`/`playLoop(n)`. An
-explicit `play(n)` both takes the channel over *and* hands it back to
-the pool, since a one-shot has nothing to reserve it for.
+Two things release it: `stopAudioPlayer(n)` (or a bare
+`stopAudioPlayer()`), and naming the channel explicitly in another
+`play(n)`/`playLoop(n)`. An explicit `play(n)` both takes the channel
+over *and* hands it back to the pool, since a one-shot has nothing to
+reserve it for.
 
 An out-of-range channel is clamped into `[0, 64)`, the same call
 `setMaxAudioPlayers` makes — a bad channel number should not kill a
@@ -1101,10 +1114,9 @@ If you reserve *every* channel and then fire an unnamed `play()`, it is
 dropped — there is nothing left the pool is allowed to touch, and the
 alternative would be breaking a reservation you asked for.
 
-`stop()` and `isPlaying()` are about the **clip**, not one playback of
-it: `stop()` ends every channel playing that clip, and `isPlaying()` is
-true while any is still going. To address a single playback, name its
-channel.
+`isPlaying()` is about the **clip**, not one playback of it: it is true
+while any channel is playing that clip. To address a single playback,
+name its channel.
 
 ## Imports
 

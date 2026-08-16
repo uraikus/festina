@@ -182,10 +182,13 @@ class TestBlobImgAud:
         parser.parse(source)
 
     def test_aud_declaration_and_methods_parse(self, parser):
+        # claude.md #100: a path declares the clip directly, and playback
+        # is stopped by channel rather than by clip.
         source = """
-        aud music = loadAudio('path/to/music.mp3')
+        aud music = 'path/to/music.wav'
         music.play()
-        music.stop()
+        music.playLoop(0)
+        stopAudioPlayer(0)
         bool playing = music.isPlaying()
         """
         parser.parse(source)

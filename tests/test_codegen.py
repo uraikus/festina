@@ -4495,7 +4495,8 @@ def _write_wav(path, duration_s=0.2, sample_rate=8000, channels=1):
 
 
 class TestAudio:
-    """claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying().
+    """claude.md #38/#99/#100: aud, `aud m = 'path'`, .play()/
+    .playLoop()/.isPlaying(), and stopAudioPlayer().
 
     Unlike TestGraphics, none of this needs an opt-in skip tier: the
     null-device trick audio_null_env uses (see conftest.py) needs no
@@ -4521,9 +4522,9 @@ class TestAudio:
         if not (shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")):
             pytest.skip("no C compiler (clang/gcc/cc) on PATH")
         source = """
-        aud music = loadAudio('nonexistent.wav')
+        aud music = 'nonexistent.wav'
         music.play()
-        music.stop()
+        stopAudioPlayer()
         log(music.isPlaying())
         """
         src_path = tmp_path / "main.f"
@@ -4553,7 +4554,7 @@ class TestAudio:
 
     def test_invalid_audio_path_is_a_clear_runtime_error(self, compile_and_run):
         result = compile_and_run(
-            "aud music = loadAudio('/nonexistent/path.wav')\nlog('unreachable')"
+            "aud music = '/nonexistent/path.wav'\nlog('unreachable')"
         )
         assert result.returncode == 1
         assert "could not open audio file" in result.stderr
@@ -4561,7 +4562,7 @@ class TestAudio:
 
     def test_non_wav_file_is_a_clear_runtime_error(self, compile_and_run, tmp_path):
         (tmp_path / "bad.wav").write_bytes(b"this is not a wav file at all")
-        result = compile_and_run("aud music = loadAudio('bad.wav')\nlog('unreachable')")
+        result = compile_and_run("aud music = 'bad.wav'\nlog('unreachable')")
         assert result.returncode == 1
         assert "only 16-bit PCM WAV audio is supported" in result.stderr
         assert "unreachable" not in result.stdout
@@ -4569,7 +4570,7 @@ class TestAudio:
     def test_is_playing_true_immediately_after_play(self, compile_and_run, tmp_path, audio_null_env):
         _write_wav(tmp_path / "clip.wav")
         source = (
-            "aud music = loadAudio('clip.wav')\n"
+            "aud music = 'clip.wav'\n"
             "music.play()\n"
             "log(music.isPlaying())\n"
         )
@@ -4580,9 +4581,9 @@ class TestAudio:
     def test_is_playing_false_immediately_after_stop(self, compile_and_run, tmp_path, audio_null_env):
         _write_wav(tmp_path / "clip.wav")
         source = (
-            "aud music = loadAudio('clip.wav')\n"
+            "aud music = 'clip.wav'\n"
             "music.play()\n"
-            "music.stop()\n"
+            "stopAudioPlayer()\n"
             "log(music.isPlaying())\n"
         )
         result = compile_and_run(source, env=audio_null_env)
@@ -4591,7 +4592,7 @@ class TestAudio:
 
     def test_stop_when_nothing_playing_is_a_safe_no_op(self, compile_and_run, tmp_path, audio_null_env):
         _write_wav(tmp_path / "clip.wav")
-        source = "aud music = loadAudio('clip.wav')\nmusic.stop()\nlog(music.isPlaying())\n"
+        source = "aud music = 'clip.wav'\nstopAudioPlayer()\nlog(music.isPlaying())\n"
         result = compile_and_run(source, env=audio_null_env)
         assert result.returncode == 0
         assert result.stdout.strip() == "false"
@@ -4601,7 +4602,7 @@ class TestAudio:
     ):
         _write_wav(tmp_path / "clip.wav", duration_s=1.0)
         source = (
-            "aud music = loadAudio('clip.wav')\n"
+            "aud music = 'clip.wav'\n"
             "music.play()\n"
             "music.play()\n"
             "log(music.isPlaying())\n"
@@ -4647,12 +4648,12 @@ class TestAudio:
         # and counts the voices directly.
         _write_wav(tmp_path / "clip.wav", duration_s=1.0)
         source = (
-            "aud music = loadAudio('clip.wav')\n"
+            "aud music = 'clip.wav'\n"
             "music.play()\n"
             "music.play()\n"
             "music.play()\n"
             "log(music.isPlaying())\n"
-            "music.stop()\n"
+            "stopAudioPlayer()\n"
             "log(music.isPlaying())\n"
         )
         result = compile_and_run(source, env=audio_null_env)
@@ -4667,7 +4668,7 @@ class TestAudio:
         _write_wav(tmp_path / "clip.wav", duration_s=1.0)
         source = (
             "setMaxAudioPlayers(1)\n"
-            "aud music = loadAudio('clip.wav')\n"
+            "aud music = 'clip.wav'\n"
             "music.play()\n"
             "music.play()\n"
             "log(music.isPlaying())\n"
@@ -4675,6 +4676,50 @@ class TestAudio:
         result = compile_and_run(source, env=audio_null_env)
         assert result.returncode == 0
         assert result.stdout.strip() == "true"
+
+    def test_a_path_declares_a_clip_and_really_loads_it(self, compile_and_run, tmp_path,
+                                                          audio_null_env):
+        # claude.md #100: `aud m = 'path'`. The proof that it is a real
+        # load and not just a type-check allowance is that playing it
+        # works -- and that a bad path fails exactly the way
+        # loadAudio()'s own bad path does.
+        _write_wav(tmp_path / "clip.wav", duration_s=0.5)
+        source = (
+            "aud music = 'clip.wav'\n"
+            "music.play()\n"
+            "log(music.isPlaying())\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_a_path_may_be_a_computed_text_expression(self, compile_and_run, tmp_path,
+                                                        audio_null_env):
+        # Unlike color/font (resolved at compile time, so literal-only),
+        # this becomes a real loadAudio() call, so any text works.
+        _write_wav(tmp_path / "clip.wav", duration_s=0.5)
+        source = (
+            "text name = 'clip'\n"
+            "aud music = name + '.wav'\n"
+            "music.play()\n"
+            "log(music.isPlaying())\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_a_bad_path_in_the_short_form_fails_the_same_way(self, compile_and_run):
+        result = compile_and_run("aud music = '/nonexistent/path.wav'\nlog('unreachable')")
+        assert result.returncode == 1
+        assert "could not open audio file" in result.stderr
+        assert "unreachable" not in result.stdout
+
+    def test_stop_is_gone_from_aud(self, parser, semantic, errors):
+        # claude.md #100: one clip can be playing on several channels at
+        # once, so "stop this clip" never named one thing.
+        program = parser.parse("aud music = 'x.wav'\nmusic.stop()", filename="main.f")
+        with pytest.raises(errors.CompileError, match="stopAudioPlayer"):
+            semantic.analyze(program, filename="main.f")
 
     def test_channels_and_loops_compile_and_run(self, compile_and_run, tmp_path, audio_null_env):
         # claude.md #99: every shape of the new surface, through the
@@ -4685,7 +4730,7 @@ class TestAudio:
         # it.
         _write_wav(tmp_path / "clip.wav", duration_s=1.0)
         source = (
-            "aud music = loadAudio('clip.wav')\n"
+            "aud music = 'clip.wav'\n"
             "music.play()\n"
             "music.play(3)\n"
             "music.playLoop()\n"
@@ -4707,7 +4752,7 @@ class TestAudio:
         # audio, checked 400ms later.
         _write_wav(tmp_path / "clip.wav", duration_s=0.05)
         source = (
-            "aud music = loadAudio('clip.wav')\n"
+            "aud music = 'clip.wav'\n"
             "void func check() {\n"
             "    log(`still playing: ${music.isPlaying()}`)\n"
             "    stopAudioPlayer(0)\n"
@@ -4727,7 +4772,7 @@ class TestAudio:
         # playing" would not distinguish looping from a slow device.
         _write_wav(tmp_path / "clip.wav", duration_s=0.05)
         source = (
-            "aud music = loadAudio('clip.wav')\n"
+            "aud music = 'clip.wav'\n"
             "void func check() {\n"
             "    log(`still playing: ${music.isPlaying()}`)\n"
             "}\n"
@@ -4747,8 +4792,8 @@ class TestAudio:
         _write_wav(tmp_path / "adventure.wav", duration_s=0.05)
         _write_wav(tmp_path / "battle.wav", duration_s=0.05)
         source = (
-            "aud adventureMusic = loadAudio('adventure.wav')\n"
-            "aud battleMusic = loadAudio('battle.wav')\n"
+            "aud adventureMusic = 'adventure.wav'\n"
+            "aud battleMusic = 'battle.wav'\n"
             "void func changeMusic() {\n"
             "    if adventureMusic.isPlaying() {\n"
             "        battleMusic.playLoop(0)\n"
@@ -4781,7 +4826,7 @@ class TestAudio:
         # or festina_run_event_loop() on the main thread).
         _write_wav(tmp_path / "clip.wav", duration_s=0.05)
         source = (
-            "aud music = loadAudio('clip.wav')\n"
+            "aud music = 'clip.wav'\n"
             "void func check() {\n"
             "    log(`playing after delay: ${music.isPlaying()}`)\n"
             "}\n"
@@ -4871,8 +4916,9 @@ int main(int argc, char **argv) {
     printf("three %d\n", active_voices(clip));
     printf("isplaying %d\n", (int)festina_audio_is_playing(clip));
 
-    /* stop() means the CLIP, so every voice goes. */
-    festina_audio_stop(clip);
+    /* claude.md #100: playback is stopped by CHANNEL now, and a
+     * negative channel means every channel. */
+    festina_stop_audio_player(-1);
     printf("stopped %d\n", active_voices(clip));
     printf("isplaying_after_stop %d\n", (int)festina_audio_is_playing(clip));
 
@@ -4885,13 +4931,13 @@ int main(int argc, char **argv) {
     printf("limit2 %d\n", active_voices(clip));
 
     /* A limit of 1 is exactly the old behaviour: one voice, restarted. */
-    festina_audio_stop(clip);
+    festina_stop_audio_player(-1);
     festina_set_max_audio_players(1);
     festina_audio_play_on(clip, 0, 0, 0);
     festina_audio_play_on(clip, 0, 0, 0);
     printf("limit1 %d\n", active_voices(clip));
 
-    festina_audio_stop(clip);
+    festina_stop_audio_player(-1);
     printf("final %d\n", active_voices(clip));
 
     /* Slots are REUSED, not grown: 40 plays through a pool of 3 must
@@ -4906,7 +4952,7 @@ int main(int argc, char **argv) {
         if (n > peak) peak = n;
     }
     printf("peak %d\n", peak);
-    festina_audio_stop(clip);
+    festina_stop_audio_player(-1);
     printf("drained %d\n", active_voices(clip));
     return 0;
 }
@@ -4975,7 +5021,7 @@ int main(int argc, char **argv) {
     printf("voices %d\n", active_voices(clip));
     printf("open_handles %d\n", g_open_count);
     printf("isplaying %d\n", (int)festina_audio_is_playing(clip));
-    festina_audio_stop(clip);
+    festina_stop_audio_player(-1);
     printf("after_stop %d\n", active_voices(clip));
     printf("leaked_handles %d\n", g_open_count);
     return 0;
@@ -5115,10 +5161,10 @@ int main(int argc, char **argv) {
     printf("after_stop_all %d\n", active_total());
     printf("after_stop_all_locks %d\n", locked_at(1) + locked_at(4));
 
-    /* A clip's own stop() releases the reservation too -- a looping
+    /* A bare stopAudioPlayer() releases reservations too -- a looping
      * track told to stop is not still owed its channel. */
     festina_audio_play_on(adventure, 7, 1, 1);
-    festina_audio_stop(adventure);
+    festina_stop_audio_player(-1);
     printf("clip_stop_locked %d\n", locked_at(7));
     printf("clip_stop_playing %d\n", (int)festina_audio_is_playing(adventure));
     return 0;
@@ -5215,7 +5261,7 @@ class TestAudioChannels:
         assert out["after_stop_all"] == "0"
         assert out["after_stop_all_locks"] == "0"
 
-    def test_a_clips_own_stop_releases_its_reservations(self, tmp_path):
+    def test_stopping_everything_releases_every_reservation(self, tmp_path):
         out = self._run(tmp_path)
         assert out["clip_stop_locked"] == "0"
         assert out["clip_stop_playing"] == "0"
@@ -5335,7 +5381,7 @@ class TestAudioVoicePool:
         assert out["three"] == "3"
         assert out["isplaying"] == "1"
 
-    def test_stop_ends_every_voice_of_the_clip(self, tmp_path):
+    def test_stopping_every_channel_ends_every_voice(self, tmp_path):
         out = self._run_harness(tmp_path)
         assert out["stopped"] == "0"
         assert out["isplaying_after_stop"] == "0"
@@ -6230,7 +6276,7 @@ class TestSlimBinaries:
         # validation) -- irrelevant here, this only checks what got
         # linked, never runs the binary.
         src = tmp_path / "main.f"
-        src.write_text("aud music = loadAudio('nonexistent.wav')")
+        src.write_text("aud music = 'nonexistent.wav'")
         out = tmp_path / "program"
         cli_mod.compile_file(str(src), str(out), cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
         ldd_output = self._ldd(out)

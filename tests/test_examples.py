@@ -135,8 +135,9 @@ class TestIndividualExamples:
         assert lines[4] == "after stopAudioPlayer(0): false"
         assert lines[5].startswith("isPlaying() after 100ms: ")
         assert lines[6] == "stopping early"
-        # stop() names the clip, so every channel playing it ends.
-        assert lines[7] == "isPlaying() after stop(): false"
+        # claude.md #100: playback is stopped by channel; a bare
+        # stopAudioPlayer() stops every one.
+        assert lines[7] == "isPlaying() after stopAudioPlayer(): false"
 
     def test_maps_demo_runs_correctly(self, cli_mod, tmp_path):
         result = _run_example(cli_mod, tmp_path, "maps.f")

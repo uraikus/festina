@@ -417,6 +417,18 @@ def analyze(program, filename="<string>"):
         if (isinstance(declared, (types_mod.ColorType, types_mod.FontType))
                 and actual == _TEXT):
             return
+        # claude.md #100: `aud music = 'path/track.wav'` -- the same
+        # one-directional text -> X allowance, for the same reason the
+        # three above have it: a path is what reads well, and there is no
+        # other literal syntax for an audio clip. Unlike colour and font
+        # this is NOT resolved at compile time -- it becomes a real
+        # loadAudio() call wherever the conversion happens (see codegen's
+        # _coerce), so the path may be any text expression, not just a
+        # literal. That also means it is a genuine file read at that
+        # point, which is worth knowing when the conversion is at a call
+        # site rather than a declaration.
+        if isinstance(declared, types_mod.AudioType) and actual == _TEXT:
+            return
         if declared != actual:
             raise CompileError(
                 f"cannot assign {what} of type {types_mod.type_name(actual)} "
@@ -1152,14 +1164,23 @@ def analyze(program, filename="<string>"):
                             category="invalid function argument type",
                         )
                 return None
+            # claude.md #100: aud.stop() is GONE. One clip can be playing
+            # on several channels at once -- three overlapping gunshots
+            # are the ordinary case, not the exotic one -- so "stop this
+            # clip" never named one thing, and its only honest reading
+            # (stop every copy of it) is almost never what a program
+            # firing overlapping effects wants. Channels are how a
+            # program addresses playback now. Caught by name here rather
+            # than left to the generic unknown-method error so the
+            # message can say what to use instead.
             if callee.prop == "stop" and infer(callee.obj, scope) == _AUDIO:
-                if expr.args:
-                    raise CompileError(
-                        f"{callee.prop}() takes no arguments, got {len(expr.args)}",
-                        file=filename, line=callee.line, column=callee.column,
-                        category="invalid function argument type",
-                    )
-                return None
+                raise CompileError(
+                    "aud has no stop() -- one clip can be playing on several "
+                    "channels at once, so stop it by channel: "
+                    "stopAudioPlayer(channel), or stopAudioPlayer() for all",
+                    file=filename, line=callee.line, column=callee.column,
+                    category="unknown method",
+                )
             # claude.md #92: sheet.clip(x, y, w, h) -> img, and
             # image.resize(w, h) -> void (in place). Checked here rather
             # than left to the generic Member-call fallback so the arity

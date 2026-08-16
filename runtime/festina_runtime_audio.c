@@ -497,8 +497,8 @@ void festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel
  * obvious reading of naming no channel, and there is no other way to
  * say it.
  *
- * Like festina_audio_stop this JOINS rather than merely signalling, so
- * a channel is guaranteed idle the instant this returns. */
+ * JOINS rather than merely signalling, so a channel is guaranteed
+ * idle the instant this returns, not just "idle soon". */
 void festina_stop_audio_player(int64_t channel) {
     pthread_mutex_lock(&g_audio_lock);
     if (channel < 0) {
@@ -510,32 +510,6 @@ void festina_stop_audio_player(int64_t channel) {
         }
     } else {
         festina_audio_halt_locked(&g_channels[festina_clamp_channel(channel)], 1);
-    }
-    pthread_mutex_unlock(&g_audio_lock);
-}
-
-void festina_audio_stop(void *audio) {
-    FestinaAudio *a = (FestinaAudio *)audio;
-    if (!a) return;
-
-    /* Stops every channel playing this CLIP, and releases each one:
-     * `sound.stop()` names the clip, and a program that asked for a
-     * clip to stop while three copies of it are overlapping means all
-     * three. It releases reservations for the same reason -- a looping
-     * track that was told to stop is not still owed its channel. There
-     * is no syntax for naming an individual playback of a clip;
-     * stopAudioPlayer(n) is how a program addresses one channel.
-     *
-     * Signals all of them before joining any, so N channels cost one
-     * clip's worth of latency rather than N. As before, this joins
-     * rather than merely signalling, so isPlaying() is guaranteed false
-     * the instant stop() returns -- not just "false soon". */
-    pthread_mutex_lock(&g_audio_lock);
-    for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
-        if (g_channels[i].clip == a) g_channels[i].stop_requested = 1;
-    }
-    for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
-        if (g_channels[i].clip == a) festina_audio_halt_locked(&g_channels[i], 1);
     }
     pthread_mutex_unlock(&g_audio_lock);
 }

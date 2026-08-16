@@ -133,7 +133,7 @@ decoder dependency at all -- is the implementation-defined choice here,
 the same kind of call PNG-only images already made. play()/stop()/
 isPlaying() are ordinary Call-on-Member patterns (same family as
 Math.floor/int.toFloat()/the regex methods above), each emitting a
-single call to festina_audio_play_on/_stop/_is_playing; there's no IR-level
+single call to festina_audio_play_on/_is_playing; there's no IR-level
 machinery of its own; the interesting part -- playback actually running
 on a background thread so a playing clip doesn't block the rest of the
 program, matching what having a separate isPlaying() to poll implies --
@@ -1011,7 +1011,6 @@ class CodeGen:
             # claude.md #99: play/playLoop, with or without a channel.
             "declare void @festina_audio_play_on(ptr, i64, i8, i8)",
             "declare void @festina_stop_audio_player(i64)",
-            "declare void @festina_audio_stop(ptr)",
             "declare i8 @festina_audio_is_playing(ptr)",
             # claude.md #98: the per-aud voice limit.
             "declare void @festina_set_max_audio_players(i64)",
@@ -2288,6 +2287,21 @@ class CodeGen:
         # is genuinely permissive by design: a null literal (from_type is
         # None or NULL-ish) or an unconstrained builtin return (e.g.
         # sqlite()) flowing into a concretely-typed slot.
+        #
+        # claude.md #100 adds the one conversion that is not free:
+        # `aud music = 'path/track.wav'`. blob/color/font all reach an
+        # aud-shaped allowance in semantic.py's check_assignable too, but
+        # those need nothing here -- blob shares text's representation
+        # outright, and colour/font are resolved by their own literal
+        # handling. An `aud` is a decoded clip, so the conversion is a
+        # real loadAudio() call, emitted here so that every position that
+        # accepts one (declaration, assignment, argument, field) gets it
+        # from a single place rather than four.
+        if isinstance(to_type, types_mod.AudioType) and from_type == TEXT:
+            self.uses_audio = True
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_load_audio(ptr {val})")
+            return out
         return val
 
     def _bool_cond(self, val, lines):
@@ -4663,11 +4677,6 @@ class CodeGen:
                     lines.append(
                         f"  call void @festina_audio_play_on(ptr {obj_val}, "
                         f"i64 {chan_val}, i8 {explicit}, i8 {looping})")
-                    return "0", None
-            if callee.prop == "stop":
-                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
-                if obj_type == AUDIO:
-                    lines.append(f"  call void @festina_audio_stop(ptr {obj_val})")
                     return "0", None
             if callee.prop == "isPlaying":
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)

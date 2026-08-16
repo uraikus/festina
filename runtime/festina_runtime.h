@@ -564,16 +564,20 @@ void festina_run_timer_loop(void);
  * the channel over and hands it back to the pool, since a one-shot has
  * nothing to reserve it for.
  *
- * festina_audio_stop() stops EVERY voice of that clip, and
- * festina_audio_is_playing() is true while ANY is still streaming:
- * `sound.stop()` names the clip, not one playback of it, and there is
- * no syntax for naming an individual voice -- inventing one would mean
- * exposing the pool, which is exactly what this design keeps out of
- * the language. stop() signals all voices before joining any (so N
- * voices cost one clip's worth of latency, not N) and *joins* rather
- * than merely signalling, so festina_audio_is_playing() is guaranteed
- * false the instant stop() returns, not just "false soon" -- calling
- * stop() when nothing is playing is a safe no-op.
+ * claude.md #100 REMOVED the per-clip stop. One clip can be playing on
+ * several channels at once -- three overlapping gunshots are the
+ * ordinary case, not the exotic one -- so "stop this clip" never named
+ * one thing, and its only honest reading (stop every copy) is almost
+ * never what a program firing overlapping effects wants. Channels are
+ * how playback is addressed: festina_stop_audio_player(n) for one,
+ * festina_stop_audio_player(-1) for all. Both *join* rather than merely
+ * signalling, so a stopped channel is guaranteed idle the instant the
+ * call returns, not just "idle soon"; stopping a channel with nothing
+ * on it is a safe no-op.
+ *
+ * festina_audio_is_playing() survives, and stays clip-wide: "is this
+ * sound audible anywhere" is still a meaningful question with a single
+ * answer, unlike "stop it".
  *
  * A voice that reaches its own natural end clears itself but stays
  * *joinable*: whoever next claims that slot joins the finished thread
@@ -597,7 +601,6 @@ void *festina_load_audio(const char *path);
  * spawning a thread are identical for all of them. */
 void festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel,
                             int8_t looping);
-void festina_audio_stop(void *audio);
 int8_t festina_audio_is_playing(void *audio);
 /* claude.md #99: stopAudioPlayer(n) -- stop one channel and release its
  * reservation. A negative channel means every channel, which is what a

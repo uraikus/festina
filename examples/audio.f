@@ -1,4 +1,5 @@
-// claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying(). Build
+// claude.md #38/#99/#100: aud, .play()/.playLoop()/.isPlaying(),
+// and stopAudioPlayer(). Build
 // and run with:
 //
 //   ./bin/festina examples/audio.f -o audio_demo
@@ -10,7 +11,10 @@
 // section for why. Run from the repository root so the relative path
 // below resolves (or edit it to point at any 16-bit PCM WAV file).
 
-aud beep = loadAudio('examples/beep.wav')
+// claude.md #100: a path declares the clip -- the same way a
+// blob, a color and a font are each written as the text that
+// reads best. loadAudio('...') still works and means the same.
+aud beep = 'examples/beep.wav'
 
 log('playing...')
 beep.play()
@@ -48,10 +52,13 @@ void func checkStillPlaying() {
 }
 
 void func stopEarly() {
-    // stop() names the CLIP, so all three overlapping voices end here.
+    // claude.md #100: there is no beep.stop() -- one clip can be on
+    // several channels at once (three overlapping gunshots are the
+    // ordinary case), so playback is stopped BY CHANNEL. A bare
+    // stopAudioPlayer() stops every channel.
     log('stopping early')
-    beep.stop()
-    log(`isPlaying() after stop(): ${beep.isPlaying()}`)   // false immediately
+    stopAudioPlayer()
+    log(`isPlaying() after stopAudioPlayer(): ${beep.isPlaying()}`)   // false immediately
 }
 
 setTimeout(checkStillPlaying, 100)
