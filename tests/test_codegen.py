@@ -6767,3 +6767,294 @@ class TestImageClipRendersRealPixels:
             assert got[2] == (255, 255, 255), "it scaled past its requested size"
         finally:
             proc.terminate()
+
+
+class TestMathFileAndTime:
+    """claude.md #93: the standard-library gaps that needed no new
+    dependency at all -- `-lm` and libc are already on every link line,
+    and Cairo's PNG *writer* is compiled into the same library whose
+    reader `loadImage` already uses.
+
+    `Math` had only floor/ceil/round/trunc, so a program couldn't take a
+    square root or a sine; there was no way to read or write a file, and
+    no way to ask the time even though the timer machinery already calls
+    clock_gettime. Rounding still answers with an `int` (claude.md #56);
+    everything added here answers in `float`, because "which integer" and
+    "which real number" are different questions and conflating them would
+    make `Math.sqrt(2.0)` silently an int."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    # ---- math ----
+
+    def test_float_math_uses_llvm_intrinsics_where_they_exist(
+            self, parser, semantic, codegen):
+        # Real intrinsics optimize and constant-fold in ways an opaque
+        # libm call can't.
+        ir = self._ir(parser, semantic, codegen, "log(Math.sqrt(2.0))")
+        assert "call double @llvm.sqrt.f64(double" in ir
+        ir = self._ir(parser, semantic, codegen, "log(Math.pow(2.0, 8.0))")
+        assert "call double @llvm.pow.f64(double" in ir
+
+    def test_math_without_an_intrinsic_falls_back_to_libm(
+            self, parser, semantic, codegen):
+        # -lm is already unconditional on every link line.
+        ir = self._ir(parser, semantic, codegen, "log(Math.tan(1.0))")
+        assert "call double @tan(double" in ir
+
+    def test_rounding_still_returns_int_and_the_rest_returns_float(
+            self, parser, semantic, codegen, errors):
+        # An int-typed binding accepts floor() and rejects sqrt().
+        self._ir(parser, semantic, codegen, "int a = Math.floor(3.7)\nlog(a)")
+        self._ir(parser, semantic, codegen, "float b = Math.sqrt(9.0)\nlog(b)")
+        with pytest.raises(errors.CompileError):
+            self._ir(parser, semantic, codegen, "int c = Math.sqrt(9.0)")
+
+    def test_math_constants_are_compile_time_values(self, parser, semantic, codegen):
+        ir = self._ir(parser, semantic, codegen, "log(Math.PI)")
+        # emitted as a raw double bit pattern, not a runtime call
+        assert "0x400921FB54442D18" in ir
+        assert "@festina_" not in ir.split("define void @__festina_main")[1].split("\n}")[0].replace(
+            "festina_log_float", "")
+
+    def test_math_arity_and_types_are_checked(self, parser, semantic, errors):
+        for source in ["log(Math.sqrt())", "log(Math.sqrt(1.0, 2.0))",
+                       "log(Math.pow(2.0))", "log(Math.sqrt(4))"]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+    def test_an_unknown_math_member_is_rejected(self, parser, semantic, errors):
+        program = parser.parse("log(Math.TAU)", filename="main.f")
+        with pytest.raises(errors.CompileError, match="Math has no member"):
+            semantic.analyze(program, filename="main.f")
+
+    def test_a_math_function_named_without_calling_says_so(
+            self, parser, semantic, errors):
+        program = parser.parse("log(Math.sqrt)", filename="main.f")
+        with pytest.raises(errors.CompileError, match="is a function"):
+            semantic.analyze(program, filename="main.f")
+
+    def test_math_computes_the_right_answers(self, compile_and_run):
+        source = """
+        log(Math.sqrt(16.0))
+        log(Math.pow(2.0, 10.0))
+        log(Math.abs(0.0 - 5.5))
+        log(Math.min(3.0, 7.0))
+        log(Math.max(3.0, 7.0))
+        log(Math.floor(3.7))
+        log(Math.sin(0.0))
+        log(Math.cos(0.0))
+        log(Math.log(Math.E))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "4\n1024\n5.5\n3\n7\n3\n0\n1\n1\n"
+
+    def test_random_stays_in_range_and_varies(self, compile_and_run):
+        # [0, 1) specifically: 1.0 would break the standard
+        # `arr[floor(random() * length)]` idiom.
+        source = """
+        bool inRange = true
+        float first = Math.random()
+        bool varied = false
+        for int i = 0, i < 200, i++ {
+            float r = Math.random()
+            if r < 0.0 || r >= 1.0 { inRange = false }
+            if r != first { varied = true }
+        }
+        log(inRange)
+        log(varied)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\n"
+
+    # ---- files ----
+
+    def test_file_round_trip(self, compile_and_run, tmp_path):
+        path = str(tmp_path / "note.txt")
+        source = f"""
+        log(writeFile('{path}', 'hello'))
+        log(appendFile('{path}', ' world'))
+        log(readFile('{path}'))
+        log(fileExists('{path}'))
+        log(deleteFile('{path}'))
+        log(fileExists('{path}'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\nhello world\ntrue\ntrue\nfalse\n"
+
+    def test_reading_a_missing_file_is_null_not_a_crash(
+            self, compile_and_run, tmp_path):
+        # A missing file is an ordinary condition to test for, the same
+        # reasoning claude.md #57 applies to division by zero.
+        missing = str(tmp_path / "nope.txt")
+        source = f"""
+        log(readFile('{missing}') == null)
+        log(fileExists('{missing}'))
+        log(deleteFile('{missing}'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\nfalse\nfalse\n"
+
+    def test_writing_somewhere_impossible_returns_false(self, compile_and_run):
+        source = "log(writeFile('/definitely/not/a/directory/x.txt', 'hi'))"
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "false\n"
+
+    def test_a_file_round_trips_through_text_operations(
+            self, compile_and_run, tmp_path):
+        # The value readFile hands back is an ordinary owned text, so it
+        # composes with everything else (claude.md #83).
+        path = str(tmp_path / "data.txt")
+        source = f"""
+        writeFile('{path}', 'a,b,c')
+        text body = readFile('{path}')
+        log(body.replaceAll(',', '-'))
+        log(`${{body}}!`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "a-b-c\na,b,c!\n"
+
+    # ---- time ----
+
+    def test_now_and_formatTime(self, compile_and_run):
+        source = """
+        int t = now()
+        log(t > 1700000000000)
+        log(formatTime(0, '%Y'))
+        """
+        result = compile_and_run(source, env={"TZ": "UTC"})
+        assert result.returncode == 0
+        assert result.stdout == "true\n1970\n"
+
+    def test_now_advances(self, compile_and_run):
+        source = """
+        int a = now()
+        int total = 0
+        for int i = 0, i < 2000000, i++ { total = total + i }
+        int b = now()
+        log(b >= a)
+        log(total > 0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\n"
+
+
+def _decode_png(path):
+    """Minimal PNG decoder -> (width, height, pixel(x, y) -> (r, g, b)).
+
+    claude.md #93's saveCanvas is only really verified by reading the
+    file back and finding the drawing in it -- "the call returned true"
+    proves the plumbing, not that the canvas was captured rather than a
+    blank surface. Written out here (zlib plus the five PNG filter
+    types) because the compiler has no image library and neither should
+    its tests; the same reasoning as the sprite_sheet_png fixture, which
+    encodes rather than decodes.
+    """
+    import struct
+    import zlib
+
+    data = open(path, "rb").read()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", f"{path} is not a PNG"
+    pos, idat, width, height, ctype = 8, b"", 0, 0, 0
+    while pos < len(data):
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        tag = data[pos + 4:pos + 8]
+        chunk = data[pos + 8:pos + 8 + length]
+        if tag == b"IHDR":
+            width, height, _depth, ctype = struct.unpack(">IIBB", chunk[:10])
+        elif tag == b"IDAT":
+            idat += chunk
+        pos += 12 + length
+    bpp = {2: 3, 6: 4}[ctype]
+    stride = width * bpp
+    raw = zlib.decompress(idat)
+    out, prev, i = bytearray(), bytearray(stride), 0
+    for _y in range(height):
+        filt = raw[i]
+        i += 1
+        line = bytearray(raw[i:i + stride])
+        i += stride
+        for x in range(stride):
+            a = line[x - bpp] if x >= bpp else 0
+            b = prev[x]
+            c = prev[x - bpp] if x >= bpp else 0
+            if filt == 1:
+                line[x] = (line[x] + a) & 255
+            elif filt == 2:
+                line[x] = (line[x] + b) & 255
+            elif filt == 3:
+                line[x] = (line[x] + (a + b) // 2) & 255
+            elif filt == 4:
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                pred = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                line[x] = (line[x] + pred) & 255
+        out += line
+        prev = line
+
+    def pixel(x, y):
+        off = y * stride + x * bpp
+        return tuple(out[off:off + 3])
+
+    return width, height, pixel
+
+
+class TestSaveCanvas:
+    """claude.md #93: saveCanvas() writes the canvas to a PNG through
+    Cairo's own writer -- compiled into the very library whose reader
+    `loadImage` already uses, so it costs no new dependency and no
+    encoder to write.
+
+    It saves the BACKING surface rather than the window, so the result
+    is what the program drew rather than whatever happened to be
+    unobscured on screen. Needs a display only because the canvas has to
+    exist at all."""
+
+    def test_the_saved_png_contains_what_was_drawn(
+            self, run_graphics_program, x_display, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        color blue = 'blue'
+        fillStyle(red)
+        drawRect(0, 0, 40, 40)
+        fillStyle(blue)
+        drawRect(40, 0, 40, 40)
+        log(saveCanvas('{out}'))
+        """
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            _find_window(x_display)
+            text = _wait_for_output(stdout_path, lambda t: "true" in t)
+            assert "true" in text, "saveCanvas() reported failure"
+            width, height, pixel = _decode_png(out)
+            assert (width, height) == (800, 600)
+            assert pixel(20, 20) == (255, 0, 0), "the red rect is missing"
+            assert pixel(60, 20) == (0, 0, 255), "the blue rect is missing"
+            assert pixel(400, 300) == (255, 255, 255), "background should be white"
+        finally:
+            proc.terminate()
+
+    def test_an_unwritable_path_returns_false(self, run_graphics_program, x_display):
+        source = """
+        drawRect(0, 0, 10, 10)
+        log(saveCanvas('/definitely/not/a/directory/out.png'))
+        """
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            _find_window(x_display)
+            text = _wait_for_output(stdout_path, lambda t: "false" in t)
+            assert "false" in text
+        finally:
+            proc.terminate()

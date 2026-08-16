@@ -25,6 +25,8 @@ analyzing it, so errors still name the right file (see the loop at the
 bottom of analyze()).
 """
 from . import ast
+import math
+
 from . import types as types_mod
 from .errors import CompileError
 
@@ -46,6 +48,10 @@ BUILTIN_FUNCTIONS = {
     "measureTextWidth", "measureTextHeight",
     "regex",
     "setTimeout", "setInterval", "clearTimeout", "clearInterval",
+    # claude.md #93: files, time, and canvas export -- all backed by
+    # libc or by Cairo's own PNG writer, both already linked.
+    "readFile", "writeFile", "appendFile", "fileExists", "deleteFile",
+    "now", "formatTime", "saveCanvas",
 }
 
 _BUILTIN_RETURN_TYPES = {
@@ -55,6 +61,15 @@ _BUILTIN_RETURN_TYPES = {
     # claude.md #89: the only two graphics builtins that return anything
     "measureTextWidth": types_mod.PrimitiveType("int"),
     "measureTextHeight": types_mod.PrimitiveType("int"),
+    # claude.md #93
+    "readFile": types_mod.PrimitiveType("text"),
+    "writeFile": types_mod.PrimitiveType("bool"),
+    "appendFile": types_mod.PrimitiveType("bool"),
+    "fileExists": types_mod.PrimitiveType("bool"),
+    "deleteFile": types_mod.PrimitiveType("bool"),
+    "now": types_mod.PrimitiveType("int"),
+    "formatTime": types_mod.PrimitiveType("text"),
+    "saveCanvas": types_mod.PrimitiveType("bool"),
 }
 
 # claude.md #55: int and float never mix directly in a binary operator.
@@ -84,6 +99,15 @@ _BUILTIN_SIGNATURES = {
     "lineWidth": (_INT,),
     "measureTextWidth": (_TEXT,),
     "measureTextHeight": (_TEXT,),
+    # claude.md #93
+    "readFile": (_TEXT,),
+    "writeFile": (_TEXT, _TEXT),
+    "appendFile": (_TEXT, _TEXT),
+    "fileExists": (_TEXT,),
+    "deleteFile": (_TEXT,),
+    "now": (),
+    "formatTime": (_INT, _TEXT),
+    "saveCanvas": (_TEXT,),
 }
 
 # claude.md #90: three builtins accept two different shapes. The
@@ -113,7 +137,24 @@ _AUDIO = types_mod.AudioType()
 _IMAGE = types_mod.ImageType()
 
 # claude.md #56: float -> int, with an explicit rounding decision.
-MATH_FUNCTIONS = {"floor", "ceil", "round", "trunc"}
+MATH_ROUNDING_FUNCTIONS = {"floor", "ceil", "round", "trunc"}
+# claude.md #93: float -> float. Kept separate from the rounding four
+# above because the RETURN type differs -- rounding answers "which
+# integer", these answer "which real number" -- and conflating them
+# would make Math.sqrt(2.0) silently an int.
+MATH_FLOAT_FUNCTIONS = {"sqrt", "sin", "cos", "tan", "asin", "acos", "atan",
+                        "exp", "log", "log2", "log10", "abs"}
+# claude.md #93: (float, float) -> float.
+MATH_FLOAT2_FUNCTIONS = {"pow", "min", "max", "atan2"}
+# Every name reachable as Math.<name>(...), for the "is this a Math
+# call at all" test; the three sets above decide arity and result type.
+MATH_FUNCTIONS = (MATH_ROUNDING_FUNCTIONS | MATH_FLOAT_FUNCTIONS
+                  | MATH_FLOAT2_FUNCTIONS | {"random"})
+# claude.md #93: Math.PI / Math.E -- constants, not calls. Trigonometry
+# is unusable without at least PI, and making a program spell out
+# 3.14159... is exactly the kind of thing a standard library exists to
+# prevent.
+MATH_CONSTANTS = {"PI": math.pi, "E": math.e}
 
 # claude.md #40: these five event names are the only ones with a real
 # runtime source (an X11 event of some kind -- see festina_runtime.h's
@@ -632,6 +673,27 @@ def analyze(program, filename="<string>"):
         return None
 
     def _infer_member(expr, scope):
+        # claude.md #93: Math.PI / Math.E -- checked here for the same
+        # reason `environment` is below: Math is a namespace, not a
+        # value, so there is nothing to infer the type of.
+        if (isinstance(expr.obj, ast.Identifier) and expr.obj.name == "Math"
+                and not expr.computed):
+            if expr.prop in MATH_CONSTANTS:
+                return _FLOAT
+            if expr.prop in MATH_FUNCTIONS:
+                raise CompileError(
+                    f"Math.{expr.prop} is a function -- call it, "
+                    f"e.g. `Math.{expr.prop}(...)`",
+                    file=filename, line=getattr(expr, "line", 0),
+                    column=getattr(expr, "column", 0),
+                    category="invalid field access",
+                )
+            raise CompileError(
+                f"Math has no member '{expr.prop}'",
+                file=filename, line=getattr(expr, "line", 0),
+                column=getattr(expr, "column", 0),
+                category="invalid field access",
+            )
         # claude.md #71: environment.NAME / environment[keyExpr] --
         # checked structurally (an Identifier literally named
         # "environment"), before the generic infer(expr.obj, scope)
@@ -914,20 +976,26 @@ def analyze(program, filename="<string>"):
             # claude.md #56: Math.floor/ceil/round/trunc(x:float) -> int
             if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
                     and callee.prop in MATH_FUNCTIONS):
-                if len(expr.args) != 1:
+                expected = 0 if callee.prop == "random" else (
+                    2 if callee.prop in MATH_FLOAT2_FUNCTIONS else 1)
+                if len(expr.args) != expected:
                     raise CompileError(
-                        f"Math.{callee.prop}() expects exactly 1 argument, got {len(expr.args)}",
+                        f"Math.{callee.prop}() expects exactly {expected} "
+                        f"argument(s), got {len(expr.args)}",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
-                arg_type = infer(expr.args[0], scope)
-                if arg_type is not None and arg_type is not NULL and arg_type != _FLOAT:
-                    raise CompileError(
-                        f"Math.{callee.prop}() expects a float argument, found {types_mod.type_name(arg_type)}",
-                        file=filename, line=callee.line, column=callee.column,
-                        category="invalid function argument type",
-                    )
-                return _INT
+                for arg in expr.args:
+                    arg_type = infer(arg, scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != _FLOAT:
+                        raise CompileError(
+                            f"Math.{callee.prop}() expects float argument(s), found {types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                # claude.md #56 vs #93: only the rounding four answer
+                # with an int; everything else stays in float.
+                return _INT if callee.prop in MATH_ROUNDING_FUNCTIONS else _FLOAT
             # claude.md #55: int.toFloat() -> float
             if callee.prop == "toFloat" and not expr.args and infer(callee.obj, scope) == _INT:
                 return _FLOAT

@@ -395,6 +395,22 @@ void festina_graphics_init(void) {
     cairo_destroy(cr);
 }
 
+/* claude.md #93: writes the canvas to a PNG. Cairo's PNG *writer* has
+ * been compiled into every build this language already links against
+ * for loadImage's reader (CAIRO_HAS_PNG_FUNCTIONS covers both), so this
+ * is one call against a dependency already present -- no new library,
+ * and no encoder to write.
+ *
+ * Saves the BACKING surface, not the window: that is the source of
+ * truth for everything drawn (see festina_graphics_present), so the
+ * result is what the program drew rather than whatever happened to be
+ * unobscured on screen. */
+int8_t festina_save_canvas(const char *path) {
+    if (!path || !g_backing_surface) return 0;
+    cairo_status_t st = cairo_surface_write_to_png(g_backing_surface, path);
+    return st == CAIRO_STATUS_SUCCESS ? 1 : 0;
+}
+
 /* Blits the backing store (source of truth for what's been drawn) onto
  * the visible window -- called after every draw call for immediate
  * feedback, and on every Expose event to repaint correctly. */

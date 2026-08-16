@@ -375,6 +375,29 @@ MATH_INTRINSICS = {
     "round": "llvm.round.f64", "trunc": "llvm.trunc.f64",
 }
 
+# claude.md #93: float -> float. LLVM has real intrinsics for most of
+# these, which optimize and constant-fold in ways an opaque libm call
+# can't; the rest are declared straight from libm, which is already on
+# every link line (cli.py's link_libs has -lm unconditionally), so none
+# of this costs a new dependency. Both kinds are emitted identically --
+# a `call double @<name>(double)` -- so the split is purely about which
+# name to use.
+MATH_FLOAT_FNS = {
+    "sqrt": "llvm.sqrt.f64", "sin": "llvm.sin.f64", "cos": "llvm.cos.f64",
+    "exp": "llvm.exp.f64", "log": "llvm.log.f64", "log2": "llvm.log2.f64",
+    "log10": "llvm.log10.f64", "abs": "llvm.fabs.f64",
+    # no LLVM intrinsic for these -- libm directly
+    "tan": "tan", "asin": "asin", "acos": "acos", "atan": "atan",
+}
+MATH_FLOAT2_FNS = {
+    "pow": "llvm.pow.f64",
+    # llvm.minnum/maxnum match the IEEE-754 minNum/maxNum that every
+    # other language's Math.min/max implements (NaN-tolerant: if one
+    # operand is NaN the other is returned).
+    "min": "llvm.minnum.f64", "max": "llvm.maxnum.f64",
+    "atan2": "atan2",
+}
+
 
 class CodegenError(CompileError):
     def __init__(self, message, **kw):
@@ -843,6 +866,17 @@ class CodeGen:
             # NULL-safe strdup); freeing uses plain @free directly
             # (also NULL-safe), no dedicated release function needed.
             "declare ptr @festina_text_own(ptr)",
+            # claude.md #93: math (libm/LLVM intrinsics), files, time
+            *[f"declare double @{fn}(double)" for fn in sorted(set(MATH_FLOAT_FNS.values()))],
+            *[f"declare double @{fn}(double, double)" for fn in sorted(set(MATH_FLOAT2_FNS.values()))],
+            "declare double @festina_random()",
+            "declare ptr @festina_read_file(ptr)",
+            "declare i8 @festina_write_file(ptr, ptr)",
+            "declare i8 @festina_append_file(ptr, ptr)",
+            "declare i8 @festina_file_exists(ptr)",
+            "declare i8 @festina_delete_file(ptr)",
+            "declare i64 @festina_now_ms()",
+            "declare ptr @festina_format_time(i64, ptr)",
             "declare i8 @festina_str_eq(ptr, ptr)",
             # claude.md #70: DatabaseURL -- path is festina.sqlite's
             # location, NULL/empty meaning "use the default" (a plain
@@ -887,6 +921,7 @@ class CodeGen:
             "declare i64 @festina_measure_text_width(ptr)",
             "declare i64 @festina_measure_text_height(ptr)",
             "declare ptr @festina_load_image(ptr)",
+            "declare i8 @festina_save_canvas(ptr)",  # claude.md #93
             # claude.md #92: img methods/properties
             "declare i64 @festina_image_width(ptr)",
             "declare i64 @festina_image_height(ptr)",
@@ -2267,6 +2302,17 @@ class CodeGen:
             # identifier to emit (see semantic.py's matching check).
             if isinstance(expr.obj, ast.Identifier) and expr.obj.name == "environment":
                 return self._emit_environment_get(expr, env, lines)
+            # claude.md #93: Math.PI / Math.E -- compile-time constants,
+            # emitted as raw double bit patterns for the same reason
+            # FLOAT_NULL_CONST is (see the module docstring): decimal
+            # text would round-trip through the IR parser and could lose
+            # the last bit.
+            if (not expr.computed and isinstance(expr.obj, ast.Identifier)
+                    and expr.obj.name == "Math"
+                    and expr.prop in semantic_mod.MATH_CONSTANTS):
+                raw = struct.unpack("<Q", struct.pack(
+                    "<d", semantic_mod.MATH_CONSTANTS[expr.prop]))[0]
+                return f"0x{raw:016X}", FLOAT
             # claude.md #92: img.width / img.height -- a runtime call
             # rather than a field read, since an `img` is a pointer to a
             # box whose Cairo surface owns the real dimensions (and
@@ -4024,6 +4070,40 @@ class CodeGen:
                 text_val = self._to_text(val, vtype, lines)
                 lines.append(f"  call void @festina_fail(ptr {text_val})")
                 return "0", None
+            # claude.md #93: files, time and canvas export. Each frees
+            # any text temporary it was handed once the call returns --
+            # none of these runtime functions keeps a pointer past it
+            # (the file helpers read or write and close; strftime copies
+            # into its own buffer; Cairo's PNG writer takes the path by
+            # value).
+            _FILE_TIME_BUILTINS = {
+                "readFile": ("festina_read_file", "ptr", TEXT),
+                "writeFile": ("festina_write_file", "i8", BOOL),
+                "appendFile": ("festina_append_file", "i8", BOOL),
+                "fileExists": ("festina_file_exists", "i8", BOOL),
+                "deleteFile": ("festina_delete_file", "i8", BOOL),
+                "formatTime": ("festina_format_time", "ptr", TEXT),
+                "saveCanvas": ("festina_save_canvas", "i8", BOOL),
+            }
+            if name == "now":
+                out = self.tmp()
+                lines.append(f"  {out} = call i64 @festina_now_ms()")
+                return out, INT
+            if name in _FILE_TIME_BUILTINS:
+                fn, ret_ir, ret_type = _FILE_TIME_BUILTINS[name]
+                if name == "saveCanvas":
+                    # Writes the canvas, so it needs one to exist -- the
+                    # same rule every drawing function follows.
+                    self.uses_graphics_code = True
+                    self.uses_graphics = True
+                emitted = [self._emit_expr(a, env, lines) for a in expr.args]
+                sig = ", ".join(
+                    f"{'i64' if t == INT else 'ptr'} {v}" for v, t in emitted)
+                out = self.tmp()
+                lines.append(f"  {out} = call {ret_ir} @{fn}({sig})")
+                for arg_expr, (val, vtype) in zip(expr.args, emitted):
+                    self._free_text_temp(arg_expr, val, vtype, lines)
+                return out, ret_type
             if name == "sqlite":
                 return self._emit_sqlite_call(expr, env, lines, expected_type)
             if name == "regex":
@@ -4068,6 +4148,28 @@ class CodeGen:
             raise CodegenError(f"unknown function '{name}'", file=self.filename, line=callee.line)
         if isinstance(callee, ast.Member) and not callee.computed:
             # claude.md #56: Math.floor/ceil/round/trunc(x:float) -> int
+            # claude.md #93: Math.sqrt/sin/pow/min/... and Math.random()
+            if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
+                    and callee.prop in MATH_FLOAT_FNS):
+                val, _ = self._emit_expr(expr.args[0], env, lines)
+                out = self.tmp()
+                lines.append(
+                    f"  {out} = call double @{MATH_FLOAT_FNS[callee.prop]}(double {val})")
+                return out, FLOAT
+            if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
+                    and callee.prop in MATH_FLOAT2_FNS):
+                a, _ = self._emit_expr(expr.args[0], env, lines)
+                b, _ = self._emit_expr(expr.args[1], env, lines)
+                out = self.tmp()
+                lines.append(
+                    f"  {out} = call double @{MATH_FLOAT2_FNS[callee.prop]}"
+                    f"(double {a}, double {b})")
+                return out, FLOAT
+            if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
+                    and callee.prop == "random"):
+                out = self.tmp()
+                lines.append(f"  {out} = call double @festina_random()")
+                return out, FLOAT
             if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
                     and callee.prop in MATH_INTRINSICS):
                 val, vtype = self._emit_expr(expr.args[0], env, lines)

@@ -33,6 +33,27 @@ char *festina_str_from_float(double v);
 char *festina_str_from_bool(int8_t v);
 char *festina_str_concat(const char *a, const char *b);
 char *festina_text_own(const char *s);  /* claude.md #83: NULL-safe strdup */
+
+/* claude.md #93: math, files and time -- all libc/libm, both already on
+ * every link line, so none of this costs a new dependency.
+ *
+ * festina_read_file returns NULL (Festina's null text) for anything it
+ * cannot read and festina_format_time returns NULL for a format that
+ * produces nothing, rather than failing the program: a missing file or
+ * a bad format is an ordinary condition a program should be able to
+ * test for, the same reasoning claude.md #57 applies to division by
+ * zero. The write helpers return 0/1 for the same reason, and count a
+ * failing fclose as a failed write (a full disk can fail there even
+ * when every fwrite succeeded). festina_random is plain rand() --
+ * suitable for gameplay and sampling, explicitly not for cryptography. */
+double festina_random(void);
+char *festina_read_file(const char *path);
+int8_t festina_write_file(const char *path, const char *content);
+int8_t festina_append_file(const char *path, const char *content);
+int8_t festina_file_exists(const char *path);
+int8_t festina_delete_file(const char *path);
+int64_t festina_now_ms(void);
+char *festina_format_time(int64_t ms, const char *format);
 int8_t festina_str_eq(const char *a, const char *b);
 
 /*
@@ -275,6 +296,9 @@ void *festina_load_image(const char *path);
  * rest transparent rather than failing. Both reject a non-positive
  * width or height, which Cairo would otherwise accept and turn into a
  * surface nothing can draw. */
+/* claude.md #93: saves the backing canvas as a PNG via Cairo's own
+ * writer, already compiled in alongside the reader loadImage uses. */
+int8_t festina_save_canvas(const char *path);
 int64_t festina_image_width(void *img);
 int64_t festina_image_height(void *img);
 void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h);

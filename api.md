@@ -100,11 +100,33 @@ float c = a.toFloat() + b        // int.toFloat() is the only int->float convers
 ```
 
 ```text
-Math.floor(x:float) -> int
-Math.ceil(x:float) -> int
-Math.round(x:float) -> int
-Math.trunc(x:float) -> int
+// float -> int (the rounding four)
+Math.floor(x)   Math.ceil(x)   Math.round(x)   Math.trunc(x)
+
+// float -> float
+Math.sqrt(x)    Math.abs(x)    Math.exp(x)
+Math.sin(x)     Math.cos(x)    Math.tan(x)
+Math.asin(x)    Math.acos(x)   Math.atan(x)
+Math.log(x)     Math.log2(x)   Math.log10(x)
+
+// (float, float) -> float
+Math.pow(a, b)  Math.min(a, b)  Math.max(a, b)  Math.atan2(y, x)
+
+// no arguments -> float
+Math.random()   // in [0, 1)
+
+// constants
+Math.PI   Math.E
 ```
+
+Only the rounding four return `int`; everything else returns `float`,
+because "which integer" and "which real number" are different questions
+— `Math.sqrt(2.0)` is a float.
+
+`Math.random()` is seeded once from the clock and is suitable for
+gameplay and sampling — **not** for anything security-related. It
+returns a value in `[0, 1)`, so `Math.floor(Math.random() * n)` is
+always a valid index.
 
 Division/modulo by zero return `null` (for both `int` and `float`)
 rather than crashing:
@@ -442,6 +464,8 @@ img profile = loadImage('profile.png')    // PNG only
 drawImage(profile, 0, 0)
 log(`${profile.width}x${profile.height}`)
 
+saveCanvas('screenshot.png')             // -> bool; writes what you drew
+
 log(`canvas is ${clientWidth}x${clientHeight}`)
 
 on click(x:int, y:int)  { ... }
@@ -659,6 +683,48 @@ the inked height of *that string*, which is why it takes the text:
 `'x'` is shorter than `'Xg'`. For a stable line height independent of
 which letters appear, measure a string with both an ascender and a
 descender.
+
+## Files
+
+```festina
+writeFile('notes.txt', 'hello')       // -> bool (did it land?)
+appendFile('notes.txt', ' world')     // -> bool
+text body = readFile('notes.txt')     // -> text, or null if unreadable
+bool there = fileExists('notes.txt')  // -> bool
+deleteFile('notes.txt')               // -> bool
+```
+
+Whole-file text I/O. Nothing here fails the program: `readFile` returns
+`null` for a file it can't read and the writers return `false` on
+failure, so a missing file is something you test for rather than
+something that stops you — the same treatment division by zero gets.
+
+What `readFile` returns is an ordinary `text`, so it composes with
+everything else:
+
+```festina
+text body = readFile('data.csv')
+if body != null {
+    log(body.replaceAll(',', ' | '))
+}
+```
+
+## Time
+
+```festina
+int ms = now()                        // milliseconds since the Unix epoch
+log(formatTime(ms, '%Y-%m-%d %H:%M')) // strftime, local time -> text
+```
+
+`now()` uses the same unit and origin as JavaScript's `Date.now()`, and
+the same unit `setTimeout` already takes, so timing a block is just
+subtraction:
+
+```festina
+int started = now()
+doTheWork()
+log(`took ${now() - started}ms`)
+```
 
 ## Timers
 

@@ -128,6 +128,110 @@ char *festina_text_own(const char *s) {
     return out;
 }
 
+/* ---- claude.md #93: math, files and time ----
+ *
+ * Everything here is libc or libm, both already on every link line
+ * (see cli.py's own link_libs), so none of it costs a new dependency --
+ * claude.md #59's minimal-dependency principle applied to the other
+ * direction: use what is already there before reaching for anything.
+ */
+
+/* Math.random() -- seeded once, lazily, from the clock. Deliberately
+ * plain rand(): this is for gameplay and sampling, not cryptography,
+ * and claiming otherwise by reaching for a CSPRNG would be worse than
+ * being clear about it (see api.md). */
+double festina_random(void) {
+    static int seeded = 0;
+    if (!seeded) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        srand((unsigned int)(ts.tv_sec ^ ts.tv_nsec));
+        seeded = 1;
+    }
+    /* RAND_MAX + 1.0 keeps this in [0, 1) -- dividing by RAND_MAX would
+     * make 1.0 reachable, which every other language's random() excludes
+     * and which breaks the common `arr[floor(random() * length)]`. */
+    return rand() / (RAND_MAX + 1.0);
+}
+
+/* claude.md #93: whole-file text I/O. readFile returns NULL (Festina's
+ * null text) for anything it cannot read, rather than failing the
+ * program -- a missing file is an ordinary condition a program should
+ * be able to test for, the same reasoning claude.md #57 applies to
+ * division by zero. */
+char *festina_read_file(const char *path) {
+    if (!path) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long size = ftell(f);
+    if (size < 0) { fclose(f); return NULL; }
+    rewind(f);
+    char *buf = malloc((size_t)size + 1);
+    if (!buf) { fclose(f); festina_fail("out of memory reading a file"); }
+    size_t got = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    buf[got] = '\0';
+    return buf;
+}
+
+static int8_t festina_put_file(const char *path, const char *content, const char *mode) {
+    if (!path) return 0;
+    if (!content) content = "";
+    FILE *f = fopen(path, mode);
+    if (!f) return 0;
+    size_t len = strlen(content);
+    size_t wrote = fwrite(content, 1, len, f);
+    /* fclose can fail on a full disk even when every fwrite succeeded,
+     * so its result is part of "did this write actually land". */
+    int closed = fclose(f);
+    return (wrote == len && closed == 0) ? 1 : 0;
+}
+
+int8_t festina_write_file(const char *path, const char *content) {
+    return festina_put_file(path, content, "wb");
+}
+
+int8_t festina_append_file(const char *path, const char *content) {
+    return festina_put_file(path, content, "ab");
+}
+
+int8_t festina_file_exists(const char *path) {
+    if (!path) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+int8_t festina_delete_file(const char *path) {
+    if (!path) return 0;
+    return remove(path) == 0 ? 1 : 0;
+}
+
+/* claude.md #93: milliseconds since the Unix epoch -- the same unit and
+ * origin JavaScript's Date.now() uses, which is the convention this
+ * language's timers already follow (setTimeout takes milliseconds). */
+int64_t festina_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* claude.md #93: strftime against local time. Returns NULL (null text)
+ * rather than failing when the format produces nothing that fits, so a
+ * bad format string is testable instead of fatal. */
+char *festina_format_time(int64_t ms, const char *format) {
+    if (!format) format = "%Y-%m-%d %H:%M:%S";
+    time_t secs = (time_t)(ms / 1000);
+    struct tm parts;
+    if (!localtime_r(&secs, &parts)) return NULL;
+    char buf[512];
+    size_t n = strftime(buf, sizeof(buf), format, &parts);
+    if (n == 0) return NULL;
+    return strdup(buf);
+}
+
 int8_t festina_str_eq(const char *a, const char *b) {
     if (!a) a = "";
     if (!b) b = "";
