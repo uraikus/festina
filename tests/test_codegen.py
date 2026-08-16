@@ -4051,10 +4051,21 @@ class TestGraphics:
         assert out_path.exists()
 
     def test_missing_display_is_a_clear_runtime_error(self, compile_and_run, monkeypatch):
+        # claude.md #95: it is render() that needs a display now, not
+        # drawing -- drawing paints an offscreen canvas and is perfectly
+        # happy with no X server, which is what makes headless PNG
+        # output possible. So this is the call that must report it.
         monkeypatch.delenv("DISPLAY", raising=False)
-        result = compile_and_run("drawRect(0, 0, 10, 10)")
+        result = compile_and_run("drawRect(0, 0, 10, 10)\nrender()")
         assert result.returncode == 1
         assert "X display" in result.stderr
+
+    def test_drawing_without_a_display_is_no_longer_an_error(
+            self, compile_and_run, monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        result = compile_and_run("drawRect(0, 0, 10, 10)\nlog('drew headlessly')")
+        assert result.returncode == 0
+        assert result.stdout == "drew headlessly\n"
 
     def test_invalid_image_path_is_a_clear_runtime_error(self, compile_and_run, monkeypatch):
         monkeypatch.delenv("DISPLAY", raising=False)
@@ -4128,7 +4139,10 @@ class TestGraphics:
             proc.wait(timeout=5)
 
     def test_client_size_matches_the_initial_canvas_before_any_resize(self, run_graphics_program, x_display):
-        source = "log(`${clientWidth}x${clientHeight}`)"
+        # claude.md #95: reading the canvas size no longer opens a
+        # window -- render() is what does, so the window this asserts on
+        # comes from that call rather than from the size read.
+        source = "log(`${clientWidth}x${clientHeight}`)\nrender()"
         proc, stdout_path = run_graphics_program(source)
         try:
             _find_window(x_display)  # also proves a bare reference opens a window
@@ -4164,7 +4178,10 @@ class TestGraphics:
         # always just succeeds there, no matter how many times it's run.
         # See festina_ignore_focus_error's own comment in
         # festina_runtime_graphics.c for the fix this guards.
-        source = "log(`${clientWidth}x${clientHeight}`)"
+        # claude.md #95: reading the canvas size no longer opens a
+        # window -- render() is what does, so the window this asserts on
+        # comes from that call rather than from the size read.
+        source = "log(`${clientWidth}x${clientHeight}`)\nrender()"
         proc, stdout_path = run_graphics_program(source, display=x_display_with_wm)
         try:
             _find_window(x_display_with_wm)  # the window actually opened and is mapped
@@ -6411,11 +6428,24 @@ class TestColorAndFontTypes:
         ir = self._ir(parser, semantic, codegen, source)
         assert "call void @festina_graphics_init()" not in ir
 
-    def test_drawing_still_opens_a_canvas_window(self, parser, semantic, codegen):
+    def test_drawing_alone_no_longer_opens_a_canvas_window(
+            self, parser, semantic, codegen):
+        # claude.md #95: drawing paints the offscreen canvas, which needs
+        # no display at all -- render() is the one call that needs a GUI.
         source = """
         color brand = 'red'
         fillStyle(brand)
         drawRect(0, 0, 10, 10)
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_graphics_init()" not in ir
+
+    def test_render_is_what_opens_the_window(self, parser, semantic, codegen):
+        source = """
+        color brand = 'red'
+        fillStyle(brand)
+        drawRect(0, 0, 10, 10)
+        render()
         """
         ir = self._ir(parser, semantic, codegen, source)
         assert "call void @festina_graphics_init()" in ir
@@ -6474,6 +6504,7 @@ class TestCanvasStyleRendersRealPixels:
 
         borderColor(nofill)  fillStyle(teal)
         drawRect(290, 150, 100, 100)
+        render()
         """
         proc, _stdout_path = run_graphics_program(source)
         try:
@@ -6514,6 +6545,7 @@ class TestCanvasStyleRendersRealPixels:
         drawText('Hg', 20, 40)
         changeFont(huge)
         drawText('Hg', 20, 140)
+        render()
         """
         proc, _stdout_path = run_graphics_program(source)
         try:
@@ -6733,6 +6765,7 @@ class TestImageClipRendersRealPixels:
         drawImage(red, 10, 10)
         drawImage(green, 100, 10)
         drawImage(cyan, 200, 10)
+        render()
         """
         proc, _stdout_path = run_graphics_program(source)
         try:
@@ -6754,6 +6787,7 @@ class TestImageClipRendersRealPixels:
         img big = sheet.clip(0, 0, 32, 32)
         big.resize(96, 96)
         drawImage(big, 10, 10)
+        render()
         """
         proc, _stdout_path = run_graphics_program(source)
         try:
@@ -7021,8 +7055,11 @@ class TestSaveCanvas:
     unobscured on screen. Needs a display only because the canvas has to
     exist at all."""
 
-    def test_the_saved_png_contains_what_was_drawn(
-            self, run_graphics_program, x_display, tmp_path):
+    def test_the_saved_png_contains_what_was_drawn(self, compile_and_run, tmp_path):
+        # claude.md #95: no display, no window, no event loop. This used
+        # to need all three -- a program whose whole job was writing a
+        # PNG still opened a window and then blocked forever in the
+        # event loop, which is exactly what the render() split fixed.
         out = str(tmp_path / "canvas.png")
         source = f"""
         color red = 'red'
@@ -7033,31 +7070,25 @@ class TestSaveCanvas:
         drawRect(40, 0, 40, 40)
         log(saveCanvas('{out}'))
         """
-        proc, stdout_path = run_graphics_program(source)
-        try:
-            _find_window(x_display)
-            text = _wait_for_output(stdout_path, lambda t: "true" in t)
-            assert "true" in text, "saveCanvas() reported failure"
-            width, height, pixel = _decode_png(out)
-            assert (width, height) == (800, 600)
-            assert pixel(20, 20) == (255, 0, 0), "the red rect is missing"
-            assert pixel(60, 20) == (0, 0, 255), "the blue rect is missing"
-            assert pixel(400, 300) == (255, 255, 255), "background should be white"
-        finally:
-            proc.terminate()
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0, (
+            "drawing and saving should need no display at all: "
+            + result.stdout + result.stderr)
+        assert result.stdout == "true\n"
+        width, height, pixel = _decode_png(out)
+        assert (width, height) == (800, 600)
+        assert pixel(20, 20) == (255, 0, 0), "the red rect is missing"
+        assert pixel(60, 20) == (0, 0, 255), "the blue rect is missing"
+        assert pixel(400, 300) == (255, 255, 255), "background should be white"
 
-    def test_an_unwritable_path_returns_false(self, run_graphics_program, x_display):
+    def test_an_unwritable_path_returns_false(self, compile_and_run):
         source = """
         drawRect(0, 0, 10, 10)
         log(saveCanvas('/definitely/not/a/directory/out.png'))
         """
-        proc, stdout_path = run_graphics_program(source)
-        try:
-            _find_window(x_display)
-            text = _wait_for_output(stdout_path, lambda t: "false" in t)
-            assert "false" in text
-        finally:
-            proc.terminate()
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "false\n"
 
 
 class TestScalarQueries:
@@ -7215,11 +7246,11 @@ class TestCanvasPathsTransformsAndGradients:
         with pytest.raises(errors.CompileError):
             semantic.analyze(program, filename="main.f")
 
-    def test_path_calls_open_a_canvas(self, parser, semantic, codegen):
-        # beginPath builds its context against the surface, so it needs
-        # one to exist.
+    def test_path_calls_do_not_open_a_canvas(self, parser, semantic, codegen):
+        # claude.md #95: a path paints the offscreen canvas like any
+        # other drawing -- only render() needs a window.
         ir = self._ir(parser, semantic, codegen, "beginPath()\nmoveTo(0,0)\nfillPath()")
-        assert "call void @festina_graphics_init()" in ir
+        assert "call void @festina_graphics_init()" not in ir
 
     def test_transforms_and_state_open_nothing(self, parser, semantic, codegen):
         # Pure state, exactly like claude.md #89's own style setters --
@@ -7294,6 +7325,7 @@ class TestCanvasPathsRenderRealPixels:
         fillStyle(red)
         fillAlpha(0.5)
         drawRect(500, 280, 80, 60)
+        render()
         """
         proc, _stdout_path = run_graphics_program(source)
         try:
@@ -7321,3 +7353,262 @@ class TestCanvasPathsRenderRealPixels:
             assert got[7] == (255, 127, 127), "50% red over white should blend"
         finally:
             proc.terminate()
+
+
+class TestRenderClearAndHeadless:
+    """claude.md #95: drawing paints an offscreen canvas; `render()` is
+    the one call that puts it on screen.
+
+    That split does three things at once. A program that draws and saves
+    a PNG never opens a window, never enters an event loop, and runs
+    with no display at all -- previously impossible, since any drawing
+    forced a window. "Does this program need a GUI?" becomes answerable
+    by looking for `render()`. And a frame costs one blit instead of one
+    per shape: every draw call used to flush the whole canvas to X, so
+    2000 rectangles took ~1.6s; batched behind one render() they take
+    ~1ms.
+
+    `clearCanvas()` is the other half of animation -- without it a canvas
+    could only ever accumulate, so nothing could move."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_render_and_clears_emit_their_calls(self, parser, semantic, codegen):
+        source = """
+        clearCanvas()
+        clearRect(10, 10, 20, 20)
+        render()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call void @festina_clear_canvas()" in ir
+        assert "call void @festina_clear_rect(i64 10, i64 10, i64 20, i64 20)" in ir
+        assert "call void @festina_render()" in ir
+
+    def test_clearing_alone_does_not_open_a_window(self, parser, semantic, codegen):
+        ir = self._ir(parser, semantic, codegen, "clearCanvas()\nclearRect(0,0,5,5)")
+        assert "call void @festina_graphics_init()" not in ir
+
+    def test_saving_a_canvas_needs_no_display(self, compile_and_run, tmp_path):
+        # The capability the split exists for.
+        out = str(tmp_path / "out.png")
+        source = f"""
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 30, 30)
+        log(saveCanvas('{out}'))
+        log('exited on its own')
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\nexited on its own\n"
+
+    def test_clear_canvas_erases_everything(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "cleared.png")
+        source = f"""
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 100, 100)
+        clearCanvas()
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        _w, _h, pixel = _decode_png(out)
+        assert pixel(50, 50) == (255, 255, 255), "clearCanvas() left the rect behind"
+
+    def test_clear_rect_erases_only_its_region(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "partial.png")
+        source = f"""
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 200, 200)
+        clearRect(50, 50, 40, 40)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        _w, _h, pixel = _decode_png(out)
+        assert pixel(60, 60) == (255, 255, 255), "clearRect() did not erase its region"
+        assert pixel(150, 150) == (255, 0, 0), "clearRect() erased outside its region"
+        assert pixel(10, 10) == (255, 0, 0), "clearRect() erased outside its region"
+
+    def test_drawing_survives_until_render(self, run_graphics_program, x_display):
+        # Drawing before the window exists is not an error -- the canvas
+        # is offscreen, and render() presents whatever is on it.
+        if not shutil.which("xwd"):
+            pytest.skip("xwd isn't installed -- needed to read real canvas pixels")
+        source = """
+        color red = 'red'
+        fillStyle(red)
+        drawRect(10, 10, 60, 60)
+        render()
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            got = _xwd_pixels(x_display, wid, [(30, 30), (400, 300)])
+            assert got[0] == (255, 0, 0), "what was drawn before render() was lost"
+            assert got[1] == (255, 255, 255)
+        finally:
+            proc.terminate()
+
+
+class TestArrayMethods:
+    """claude.md #96: push/pop/shift/unshift/splice, JS-shaped.
+
+    Before these, an array's length was fixed at construction and
+    writing past the end was an unchecked heap overflow -- so there was
+    no way to express a list that grows, which is most of what a program
+    does with one.
+
+    The ownership half matters as much as the resizing: `xs.push(s)`
+    follows the same rule `xs[i] = s` already does (claude.md #80/#83),
+    retaining a struct/array/map element and copying a text one unless
+    its source is already owning. Removal transfers rather than
+    releases -- pop/shift hand the element back and splice hands it to
+    the returned array."""
+
+    def test_push_and_pop(self, compile_and_run):
+        source = """
+        arr[int] xs = [1, 2, 3]
+        log(xs.push(4))
+        log(xs.length)
+        log(xs.pop())
+        log(xs.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "4\n4\n4\n3\n"
+
+    def test_shift_and_unshift(self, compile_and_run):
+        source = """
+        arr[int] xs = [1, 2, 3]
+        log(xs.shift())
+        log(xs[0])
+        log(xs.unshift(99))
+        log(xs[0])
+        log(xs.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "1\n2\n3\n99\n3\n"
+
+    def test_splice_removes_and_returns(self, compile_and_run):
+        source = """
+        arr[int] xs = [10, 20, 30, 40, 50]
+        arr[int] cut = xs.splice(1, 2)
+        log(`${cut.length}: ${cut[0]},${cut[1]}`)
+        log(`${xs.length}: ${xs[0]},${xs[1]},${xs[2]}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2: 20,30\n3: 10,40,50\n"
+
+    def test_splice_clamps_like_javascript(self, compile_and_run):
+        # A negative start counts back from the end, and an oversized
+        # count clamps -- so splice(i, 1) at a boundary is a no-op
+        # rather than a crash.
+        source = """
+        arr[int] a = [1, 2, 3, 4, 5]
+        arr[int] tail = a.splice(-2, 5)
+        log(`${tail.length}: ${tail[0]},${tail[1]}`)
+        log(a.length)
+        arr[int] b = [1, 2]
+        arr[int] none = b.splice(10, 3)
+        log(none.length)
+        log(b.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2: 4,5\n3\n0\n2\n"
+
+    def test_popping_an_empty_array_is_null(self, compile_and_run):
+        # Null, not zero: an empty pop() must be distinguishable from
+        # popping a real 0.
+        source = """
+        arr[int] e = []
+        log(e.pop() == null)
+        log(e.shift() == null)
+        arr[int] z = [0]
+        log(z.pop() == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\nfalse\n"
+
+    def test_growing_from_empty(self, compile_and_run):
+        source = """
+        arr[int] xs = []
+        for int i = 0, i < 100, i++ { xs.push(i * 2) }
+        log(xs.length)
+        log(xs[0])
+        log(xs[99])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "100\n0\n198\n"
+
+    def test_text_elements_are_owned_not_shared(self, compile_and_run):
+        # Pushing a text binding must copy it (claude.md #83), or the
+        # array and the variable would share one buffer.
+        source = """
+        arr[text] names = []
+        text n = 'first'
+        names.push(n)
+        n = 'changed'
+        log(names[0])
+        log(names.pop())
+        log(names.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "first\nfirst\n0\n"
+
+    def test_struct_elements_survive_push_and_pop(self, compile_and_run):
+        source = """
+        struct P { x:int }
+        P func make(v:int) { P p  p.x = v  return p }
+        arr[P] ps = []
+        ps.push(make(7))
+        ps.push(make(9))
+        log(ps.length)
+        P last = ps.pop()
+        log(last.x)
+        log(ps[0].x)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\n9\n7\n"
+
+    def test_wrong_arity_and_types_are_rejected(self, parser, semantic, errors):
+        for source in [
+            "arr[int] xs = [1]\nxs.push()",
+            "arr[int] xs = [1]\nxs.push(1, 2)",
+            "arr[int] xs = [1]\nxs.pop(1)",
+            "arr[int] xs = [1]\nxs.push('a')",
+            "arr[int] xs = [1]\nxs.splice(1)",
+            "arr[int] xs = [1]\nxs.splice(1, 'a')",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+    def test_a_queue_round_trips(self, compile_and_run):
+        # The shape a game's entity list actually takes.
+        source = """
+        arr[text] queue = []
+        queue.push('a')
+        queue.push('b')
+        queue.push('c')
+        log(queue.shift())
+        queue.push('d')
+        log(queue.shift())
+        log(`${queue.length}: ${queue[0]},${queue[1]}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "a\nb\n2: c,d\n"

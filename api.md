@@ -466,6 +466,10 @@ log(`${profile.width}x${profile.height}`)
 
 saveCanvas('screenshot.png')             // -> bool; writes what you drew
 
+render()                                  // put the canvas on screen
+clearCanvas()                             // erase everything
+clearRect(10, 10, 40, 40)                 // erase one region
+
 log(`canvas is ${clientWidth}x${clientHeight}`)
 
 on click(x:int, y:int)  { ... }
@@ -475,13 +479,39 @@ on resize()             { ... }
 on close()               { ... }
 ```
 
-A real on-screen X11 window (via Cairo's Xlib backend), opened
-automatically the first time a program draws something, reads
-`clientWidth`/`clientHeight`, or declares one of the five event
-handlers above — `loadImage()` alone does *not* open a window (decoding
-a PNG needs no display). Undecorated, starts at 800×600. After the entry
-file's top-level code finishes, if a window was opened, the process
-blocks handling redraws/input until the window closes.
+**Drawing is offscreen. `render()` puts it on screen.**
+
+Every drawing call paints an offscreen canvas that needs no display at
+all. `render()` is the one call that shows it, opening a real X11 window
+(via Cairo's Xlib backend) the first time it runs — undecorated, 800×600.
+Declaring one of the five event handlers opens a window too, since they
+can't fire without one. After the entry file's top-level code finishes,
+if a window was opened, the process blocks handling redraws/input until
+the window closes.
+
+That split means two useful things:
+
+```festina
+// No display needed. No window. Exits on its own.
+fillStyle(brand)
+drawRect(0, 0, 100, 100)
+saveCanvas('chart.png')
+```
+
+```festina
+// A frame: draw everything, then present once.
+clearCanvas()
+drawSprites()
+render()
+```
+
+Batching matters — drawing used to blit the whole canvas per call, so a
+frame of 2000 rectangles took ~1.6s. Behind one `render()` the same
+frame takes ~1ms.
+
+Nothing but `render()` and the event handlers needs a display —
+`saveCanvas`, `clientWidth`/`clientHeight` and `loadImage` all work
+headless.
 
 ### Images
 
@@ -821,6 +851,36 @@ sqlite(`CREATE VIRTUAL TABLE PostSearch USING fts5(title, body, content='Post', 
 sqlite(`INSERT INTO PostSearch(PostSearch) VALUES('rebuild')`)
 log(sqliteInt(`SELECT count(*) FROM PostSearch WHERE PostSearch MATCH ?`, ['machine']))
 ```
+
+## Growing arrays
+
+```festina
+arr[int] xs = [1, 2, 3]
+
+xs.push(4)          // -> new length
+xs.pop()            // -> last element, removed
+xs.shift()          // -> first element, removed
+xs.unshift(0)       // -> new length
+arr[int] cut = xs.splice(1, 2)   // remove 2 from index 1, return them
+```
+
+All five behave as their JavaScript namesakes do, including `splice`'s
+clamping — a negative start counts back from the end, and an oversized
+range clamps rather than failing, so `splice(i, 1)` at a boundary is a
+no-op. (`splice`'s variadic insert has no spelling here; Festina has no
+variadic calls.)
+
+`pop()`/`shift()` on an empty array return `null` — not zero, so an
+empty pop is distinguishable from popping a real `0`:
+
+```festina
+arr[int] empty = []
+log(empty.pop() == null)     // true
+```
+
+Elements are owned the same way any other binding owns them: pushing a
+`text` copies it, so the array and the variable don't share a buffer.
+Removing transfers ownership to whoever receives it.
 
 ## Timers
 

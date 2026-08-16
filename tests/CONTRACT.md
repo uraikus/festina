@@ -359,13 +359,15 @@ each tool from PATH in turn; `_pkg_config` got the same treatment for a
 genuinely missing `.pc` package (a pre-existing gap that already applied
 to `sqlite3`, caught and fixed while wiring up graphics's own
 `cairo-xlib` pkg-config dependency, not something graphics introduced).
-All 910 tests in this directory pass against it: 601 need no external
+All 928 tests in this directory pass against it: 605 need no external
 tool at all (parser/semantic/IR-level tests, no compile-and-run step),
-291 more need a working C compiler, plus 2 more
-(`tests/test_packaging.py`) given `pyinstaller` too, plus 16 more given
-`Xvfb`+`xdotool` too (5 of those also need `xwd`, from the same
+306 more need a working C compiler, plus 2 more
+(`tests/test_packaging.py`) given `pyinstaller` too, plus 15 more given
+`Xvfb`+`xdotool` too (4 of those also need `xwd`, from the same
 x11-apps/x11-utils tier, to read real canvas pixels back --
-claude.md #89/#92/#94) (601 + 291 + 2 + 16 = 910 -- re-verified directly
+claude.md #89/#92/#94; two former `xwd` tests became display-free once
+claude.md #95 made saveCanvas headless) (605 + 306 + 2 + 15 = 928 --
+re-verified directly
 by running the whole suite with a PATH containing nothing but Python,
 not just derived by counting `compile_and_run` call sites, since the
 true number had drifted well past a much older, since-inaccurate count
@@ -2307,6 +2309,43 @@ database ends up with only the declared table in it),
 triangle's bounding box but outside the triangle stays unpainted --
 proving a path is a real shape and not its bounds).
 
+**claude.md #95**: drawing is now offscreen and `render()` puts it on
+screen. Drawing used to imply a window -- any `drawRect` opened one,
+blitted the whole canvas and flushed X, so a program whose job was
+producing a PNG still needed a display, opened a window nobody would
+look at, and blocked forever in the event loop; a frame of 2000
+rectangles measured **1.6 seconds** against a 16ms 60fps budget. Now
+drawing paints an image surface needing no X server at all, and only
+`render()` (and the event handlers, which genuinely cannot fire without
+a window) requires a display. Three things fall out: headless rendering
+works (`DISPLAY` unset entirely -- two `TestSaveCanvas` tests that
+previously needed Xvfb are now display-free, which is the clearest
+demonstration), "does this need a GUI?" has a syntactic answer, and the
+same 2000 rectangles take **~1ms** plus 2ms for one `render()`.
+`clearCanvas()`/`clearRect()` are the other half of animation -- without
+them a canvas could only accumulate, so nothing could move.
+**This is a breaking change**: a program showing something must now call
+`render()`; both examples and every pixel test were updated.
+`tests/test_codegen.py::TestRenderClearAndHeadless` (6 tests).
+
+**claude.md #96**: arrays grow. `push`/`pop`/`shift`/`unshift`/`splice`,
+each behaving as its JavaScript namesake does -- previously an array's
+length was fixed at construction and writing past the end was an
+unchecked heap overflow, so a list that grows had no representation.
+The runtime moves elements by bytes with the element size passed in from
+codegen, so one set of helpers covers every `arr[T]`. The ownership half
+is where this could quietly corrupt memory: `xs.push(s)` follows exactly
+the rule `xs[i] = s` already does (#80/#83), retaining a struct/array/map
+element and copying a text one unless its source is owning -- otherwise
+the array and the pushed variable would share a buffer. Removal
+transfers rather than releases, since `pop`/`shift` hand the element
+back and `splice` hands it to the array it returns. An empty `pop()`
+answers the element type's **null**, not its zero, so it stays
+distinguishable from popping a real `0`; `splice` clamps exactly as
+JavaScript's does, negative start included.
+`tests/test_codegen.py::TestArrayMethods` (10 tests), plus a 100-
+iteration ASan run driving push/pop/unshift/splice over text elements.
+
 See api.md for the current language/standard library reference and this
 file's own "Status" section above for the implemented-vs-not matrix; the
 short version: nothing is left
@@ -3062,10 +3101,10 @@ design, verified against a real (virtual) ALSA device via
 
 ```
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 601 passed, 309 skipped (needs a C compiler; 2 of
+pytest tests/                          # 605 passed, 323 skipped (needs a C compiler; 2 of
                                         # those skips need `pip install pyinstaller` too,
-                                        # 16 need Xvfb + xdotool installed too, 1 of those
-                                        # also needs `openbox` and 5 need `xwd`) given a
+                                        # 15 need Xvfb + xdotool installed too, 1 of those
+                                        # also needs `openbox` and 4 need `xwd`) given a
                                         # working C compiler,
-                                        # all 910 pass
+                                        # all 928 pass
 ```

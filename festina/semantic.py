@@ -53,6 +53,7 @@ BUILTIN_FUNCTIONS = {
     "readFile", "writeFile", "appendFile", "fileExists", "deleteFile",
     "now", "formatTime", "saveCanvas",
     # claude.md #94: paths, transforms, gradients, alpha
+    "render", "clearCanvas", "clearRect",
     "beginPath", "moveTo", "lineTo", "curveTo", "closePath",
     "fillPath", "strokePath",
     "translate", "rotate", "scale", "resetTransform",
@@ -122,6 +123,9 @@ _BUILTIN_SIGNATURES = {
     "formatTime": (_INT, _TEXT),
     "saveCanvas": (_TEXT,),
     # claude.md #94
+    "render": (),
+    "clearCanvas": (),
+    "clearRect": (_INT, _INT, _INT, _INT),
     "beginPath": (),
     "moveTo": (_INT, _INT),
     "lineTo": (_INT, _INT),
@@ -1123,6 +1127,50 @@ def analyze(program, filename="<string>"):
             # image.resize(w, h) -> void (in place). Checked here rather
             # than left to the generic Member-call fallback so the arity
             # and the int-ness of every argument are enforced.
+            # claude.md #96: array methods, JS-shaped.
+            if callee.prop in ("push", "pop", "shift", "unshift", "splice"):
+                obj_type = infer(callee.obj, scope)
+                if isinstance(obj_type, types_mod.ArrayType):
+                    elem = obj_type.element
+                    if callee.prop in ("push", "unshift"):
+                        if len(expr.args) != 1:
+                            raise CompileError(
+                                f"{callee.prop}() expects exactly 1 argument, "
+                                f"got {len(expr.args)}",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
+                        check_assignable(elem, infer(expr.args[0], scope),
+                                          callee, what=f"{callee.prop}() argument")
+                        # The new length, as JS returns.
+                        return _INT
+                    if callee.prop in ("pop", "shift"):
+                        if expr.args:
+                            raise CompileError(
+                                f"{callee.prop}() takes no arguments, "
+                                f"got {len(expr.args)}",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
+                        return elem
+                    # splice(start, count) -> arr[T] of what was removed
+                    if len(expr.args) != 2:
+                        raise CompileError(
+                            "splice() expects 2 arguments (start, count), "
+                            f"got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    for arg in expr.args:
+                        arg_type = infer(arg, scope)
+                        if arg_type is not None and arg_type is not NULL and arg_type != _INT:
+                            raise CompileError(
+                                "splice() expects int arguments, found "
+                                f"{types_mod.type_name(arg_type)}",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
+                    return types_mod.ArrayType(elem)
             if callee.prop in ("clip", "resize") and infer(callee.obj, scope) == _IMAGE:
                 expected = 4 if callee.prop == "clip" else 2
                 if len(expr.args) != expected:

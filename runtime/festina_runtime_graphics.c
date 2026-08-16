@@ -127,6 +127,25 @@ static cairo_t *g_path_cr = NULL;
 static void festina_clear_gradient(void);
 static void festina_graphics_present(void);
 
+/* claude.md #95: the canvas exists WITHOUT a window.
+ *
+ * Drawing paints onto this image surface, which needs no X server, no
+ * display and no window manager. Only render() puts it on screen. That
+ * split is what lets a program draw and saveCanvas() headlessly -- on a
+ * build server, in a container, over ssh -- and it is also what makes
+ * "does this program need a GUI?" a question the compiler can answer by
+ * looking for render(), rather than something implied by whether any
+ * drawing happens at all. */
+static void festina_backing_require(void) {
+    if (g_backing_surface) return;
+    g_backing_surface = cairo_image_surface_create(
+        CAIRO_FORMAT_ARGB32, (int)g_canvas_width, (int)g_canvas_height);
+    cairo_t *cr = cairo_create(g_backing_surface);
+    cairo_set_source_rgb(cr, 1, 1, 1); /* white canvas background */
+    cairo_paint(cr);
+    cairo_destroy(cr);
+}
+
 static void festina_graphics_require_init(void) {
     if (!g_display) {
         festina_fail("a graphics function was called but the canvas window "
@@ -455,7 +474,7 @@ void festina_restore_state(void) {
 /* ---- claude.md #94: paths ---- */
 
 void festina_begin_path(void) {
-    festina_graphics_require_init();
+    festina_backing_require();
     if (g_path_cr) cairo_destroy(g_path_cr);
     g_path_cr = festina_canvas_context();
 }
@@ -502,7 +521,6 @@ void festina_fill_path(void) {
     }
     cairo_destroy(g_path_cr);
     g_path_cr = NULL;
-    festina_graphics_present();
 }
 
 void festina_stroke_path(void) {
@@ -514,7 +532,6 @@ void festina_stroke_path(void) {
     }
     cairo_destroy(g_path_cr);
     g_path_cr = NULL;
-    festina_graphics_present();
 }
 
 static void festina_fill_and_border(cairo_t *cr) {
@@ -642,12 +659,9 @@ void festina_graphics_init(void) {
     g_canvas_height = FESTINA_CANVAS_HEIGHT;
     g_window_surface = cairo_xlib_surface_create(g_display, g_window, DefaultVisual(g_display, screen),
                                                   FESTINA_CANVAS_WIDTH, FESTINA_CANVAS_HEIGHT);
-    g_backing_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
-                                                     FESTINA_CANVAS_WIDTH, FESTINA_CANVAS_HEIGHT);
-    cairo_t *cr = cairo_create(g_backing_surface);
-    cairo_set_source_rgb(cr, 1, 1, 1); /* white canvas background */
-    cairo_paint(cr);
-    cairo_destroy(cr);
+    /* claude.md #95: whatever was already drawn headlessly is kept --
+     * a program may well have drawn before its first render(). */
+    festina_backing_require();
 }
 
 /* claude.md #93: writes the canvas to a PNG. Cairo's PNG *writer* has
@@ -661,15 +675,64 @@ void festina_graphics_init(void) {
  * result is what the program drew rather than whatever happened to be
  * unobscured on screen. */
 int8_t festina_save_canvas(const char *path) {
-    if (!path || !g_backing_surface) return 0;
+    if (!path) return 0;
+    festina_backing_require();
     cairo_status_t st = cairo_surface_write_to_png(g_backing_surface, path);
     return st == CAIRO_STATUS_SUCCESS ? 1 : 0;
+}
+
+/* claude.md #95: puts the canvas on screen, opening the window the
+ * first time it is called.
+ *
+ * Drawing alone never reaches a display -- it paints the offscreen
+ * canvas. This is the one call that needs a GUI, which is exactly why
+ * it is separate: a program that draws and saves a PNG never calls it,
+ * so it never opens a window, never enters an event loop, and runs
+ * anywhere. It also fixes the cost of drawing: every shape used to blit
+ * the whole canvas and flush X, so a frame of 100 sprites was 100 full-
+ * canvas round trips. Now a frame is however many draw calls it takes,
+ * plus one render(). */
+void festina_render(void) {
+    if (!g_display) festina_graphics_init();
+    festina_backing_require();
+    festina_graphics_present();
+}
+
+/* claude.md #95: erases the whole canvas to opaque white -- the missing
+ * half of animation. Without it a canvas could only ever accumulate, so
+ * nothing could move: every frame painted on top of every frame before
+ * it. */
+void festina_clear_canvas(void) {
+    festina_backing_require();
+    cairo_t *cr = cairo_create(g_backing_surface);
+    /* Deliberately NOT the current transform: clearing is about the
+     * canvas itself, and a rotated "clear everything" that leaves
+     * wedges behind would be a trap rather than a feature. */
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_paint(cr);
+    cairo_destroy(cr);
+}
+
+/* Erases one rectangle back to white. Unlike clearCanvas this DOES
+ * honour the current transform, since it names a region in the same
+ * coordinates the drawing calls around it use. */
+void festina_clear_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
+    festina_backing_require();
+    cairo_t *cr = festina_canvas_context();
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
+    cairo_fill(cr);
+    cairo_destroy(cr);
 }
 
 /* Blits the backing store (source of truth for what's been drawn) onto
  * the visible window -- called after every draw call for immediate
  * feedback, and on every Expose event to repaint correctly. */
 static void festina_graphics_present(void) {
+    /* claude.md #95: nothing to present to until render() has opened a
+     * window -- drawing headlessly is not an error, it just has no
+     * screen to reach. */
+    if (!g_window_surface || !g_backing_surface) return;
     cairo_t *cr = cairo_create(g_window_surface);
     cairo_set_source_surface(cr, g_backing_surface, 0, 0);
     cairo_paint(cr);
@@ -679,25 +742,23 @@ static void festina_graphics_present(void) {
 }
 
 void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
-    festina_graphics_require_init();
+    festina_backing_require();
     cairo_t *cr = festina_canvas_context();
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     festina_fill_and_border(cr); /* claude.md #89 */
     cairo_destroy(cr);
-    festina_graphics_present();
 }
 
 void festina_draw_circle(int64_t x, int64_t y, int64_t r) {
-    festina_graphics_require_init();
+    festina_backing_require();
     cairo_t *cr = festina_canvas_context();
     cairo_arc(cr, (double)x, (double)y, (double)r, 0.0, 2.0 * 3.14159265358979323846);
     festina_fill_and_border(cr); /* claude.md #89 */
     cairo_destroy(cr);
-    festina_graphics_present();
 }
 
 void festina_draw_text(const char *text, int64_t x, int64_t y) {
-    festina_graphics_require_init();
+    festina_backing_require();
     if (!text) text = "";
     cairo_t *cr = festina_canvas_context();
     /* claude.md #89: drawn in the current fill colour and font. Text is
@@ -708,7 +769,6 @@ void festina_draw_text(const char *text, int64_t x, int64_t y) {
     cairo_move_to(cr, (double)x, (double)y);
     cairo_show_text(cr, text);
     cairo_destroy(cr);
-    festina_graphics_present();
 }
 
 /* claude.md #92: an `img` value is a pointer to one of these, not the
@@ -823,13 +883,12 @@ void festina_image_free(void *img) {
 }
 
 void festina_draw_image(void *img, int64_t x, int64_t y) {
-    festina_graphics_require_init();
+    festina_backing_require();
     if (!img) return;
     cairo_t *cr = festina_canvas_context();
     cairo_set_source_surface(cr, ((FestinaImageBox *)img)->surface, (double)x, (double)y);
     cairo_paint(cr);
     cairo_destroy(cr);
-    festina_graphics_present();
 }
 
 void festina_register_click_handler(void (*handler)(int64_t, int64_t)) {
@@ -852,13 +911,16 @@ void festina_register_close_handler(void (*handler)(void)) {
     g_close_handler = handler;
 }
 
+/* claude.md #95: readable with no window open. The canvas has a size
+ * (800x600 until an `on resize` changes it) whether or not it is on
+ * screen, and requiring a window here would defeat headless rendering
+ * for the very common case of asking how big the canvas is before
+ * drawing into it. */
 int64_t festina_client_width(void) {
-    festina_graphics_require_init();
     return g_canvas_width;
 }
 
 int64_t festina_client_height(void) {
-    festina_graphics_require_init();
     return g_canvas_height;
 }
 

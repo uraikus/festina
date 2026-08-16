@@ -72,11 +72,18 @@ for int i = 0, i < 10, i++ {
     drawRect(50 + i * 40, 280, 36, 36)
 }
 
+// claude.md #95: drawing paints an offscreen canvas -- render() is what
+// puts it on screen, and the only call here that needs a display at all.
+// A program that drew this and called saveCanvas() instead would run
+// with no window and no event loop.
+render()
+
 log(`canvas started at ${clientWidth}x${clientHeight}`)
 
 on click(x:int, y:int) {
     log(`clicked at ${x}, ${y}`)
     drawCircle(x, y, 5)   // a small dot marking every click
+    render()              // show it
 }
 
 on mouse(x:int, y:int) {

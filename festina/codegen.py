@@ -927,6 +927,10 @@ class CodeGen:
             "declare ptr @festina_load_image(ptr)",
             "declare i8 @festina_save_canvas(ptr)",  # claude.md #93
             # claude.md #94: paths, transforms, gradients, alpha
+            # claude.md #95: render + clears
+            "declare void @festina_render()",
+            "declare void @festina_clear_canvas()",
+            "declare void @festina_clear_rect(i64, i64, i64, i64)",
             "declare void @festina_set_alpha(double)",
             "declare void @festina_fill_linear_gradient(i64, i64, i64, i64, i64, i64)",
             "declare void @festina_fill_radial_gradient(i64, i64, i64, i64, i64)",
@@ -999,6 +1003,12 @@ class CodeGen:
             # values that escape -- see _release_fn_for and each
             # function's own doc comment in runtime/festina_runtime.c.
             "declare void @festina_release_array(ptr)",
+            # claude.md #96: array methods
+            "declare void @festina_array_push(ptr, i64, ptr)",
+            "declare void @festina_array_unshift(ptr, i64, ptr)",
+            "declare i8 @festina_array_pop(ptr, i64, ptr)",
+            "declare i8 @festina_array_shift(ptr, i64, ptr)",
+            "declare void @festina_array_splice(ptr, i64, i64, i64, ptr)",
             "declare void @festina_release_map(ptr)",
             # claude.md #71: environment.NAME / environment[keyExpr].
             "declare ptr @festina_getenv(ptr)",
@@ -2289,11 +2299,17 @@ class CodeGen:
             # builtin-function dispatch; read the canvas's *current*
             # size from the runtime (not a compile-time constant, since
             # `on resize` can change it after startup -- see
-            # festina_client_width/_height's own doc comment) and set
-            # uses_graphics exactly like a draw* call does, since asking
-            # for the window's size implies a window exists.
+            # festina_client_width/_height's own doc comment).
+            #
+            # claude.md #95: this no longer opens a window either. It
+            # used to, on the reasoning that asking for the size implies
+            # a window -- but the canvas has a size (800x600 until a
+            # resize) whether or not it is on screen, and forcing a
+            # window here would defeat headless rendering for the very
+            # common case of a program that asks how big its canvas is
+            # before drawing into it.
             if expr.name in ("clientWidth", "clientHeight"):
-                self.uses_graphics = True
+                self.uses_graphics_code = True
                 fn = "festina_client_width" if expr.name == "clientWidth" else "festina_client_height"
                 out = self.tmp()
                 lines.append(f"  {out} = call i64 @{fn}()")
@@ -2598,6 +2614,89 @@ class CodeGen:
         payload = self.tmp()
         lines.append(f"  {payload} = getelementptr i8, ptr {raw}, i64 8")
         return payload
+
+    def _null_value(self, type_):
+        """claude.md #96: the NULL of a type, as opposed to its zero.
+
+        The two differ for exactly the types with no spare bit pattern
+        to spend on null -- int/float/bool carry a reserved sentinel
+        (see the module docstring's "Null for int/float" note), so an
+        int's zero is 0 and its null is i64's minimum. Everything
+        pointer-backed has a real null to use."""
+        if type_ == INT:
+            return INT_NULL_CONST
+        if type_ == FLOAT:
+            return FLOAT_NULL_CONST
+        if type_ == BOOL:
+            return BOOL_NULL_CONST
+        return self._zero_value(type_)
+
+    def _emit_array_method(self, name, obj_val, obj_type, expr, env, lines):
+        """claude.md #96: push/pop/shift/unshift/splice.
+
+        The runtime moves elements by BYTES with the element size passed
+        in, so one set of helpers covers every arr[T]. What has to
+        happen HERE is the ownership half, and it is the same rule
+        `arr[i] = value` already follows (claude.md #80/#83): a struct/
+        arr/map element being stored is retained, a text one is copied
+        unless its source is already owning. Without that, `xs.push(s)`
+        would leave the array and `s` sharing one buffer, and whichever
+        was freed first would leave the other dangling.
+
+        Nothing is released on removal: pop/shift hand the element back
+        and splice hands it to the returned array, so ownership
+        transfers rather than ending."""
+        elem_type = obj_type.element
+        elem_ir = _llvm_type(elem_type)
+        elem_size = 8  # every element slot is 8 bytes -- see _array_elem_ptr
+
+        if name in ("push", "unshift"):
+            val, vtype = self._emit_value_for(expr.args[0], env, lines, elem_type)
+            val = self._coerce(val, vtype, elem_type, lines)
+            if isinstance(elem_type, (types_mod.StructType, types_mod.ArrayType,
+                                       types_mod.MapType)):
+                if not self._is_owning_refcounted_source(expr.args[0]):
+                    lines.append(f"  call void @festina_retain(ptr {val})")
+            elif elem_type == TEXT and not self._is_owning_text_source(expr.args[0]):
+                owned = self.tmp()
+                lines.append(f"  {owned} = call ptr @festina_text_own(ptr {val})")
+                val = owned
+            slot = self.tmp()
+            lines.append(f"  {slot} = alloca {elem_ir}")
+            lines.append(f"  store {elem_ir} {val}, ptr {slot}")
+            fn = "festina_array_push" if name == "push" else "festina_array_unshift"
+            lines.append(f"  call void @{fn}(ptr {obj_val}, i64 {elem_size}, ptr {slot})")
+            # JS hands back the new length; reading it costs one load.
+            len_ptr = self.tmp()
+            lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 0")
+            out = self.tmp()
+            lines.append(f"  {out} = load i64, ptr {len_ptr}")
+            return out, INT
+
+        if name in ("pop", "shift"):
+            slot = self.tmp()
+            lines.append(f"  {slot} = alloca {elem_ir}")
+            # Pre-seeded with this element type's own NULL -- not its
+            # zero value, which for an int is a perfectly ordinary 0 and
+            # would make an empty pop() indistinguishable from popping a
+            # real zero. The runtime leaves the slot alone when there is
+            # nothing to remove, so this is what an empty array answers.
+            lines.append(f"  store {elem_ir} {self._null_value(elem_type)}, ptr {slot}")
+            fn = "festina_array_pop" if name == "pop" else "festina_array_shift"
+            lines.append(
+                f"  call i8 @{fn}(ptr {obj_val}, i64 {elem_size}, ptr {slot})")
+            out = self.tmp()
+            lines.append(f"  {out} = load {elem_ir}, ptr {slot}")
+            return out, elem_type
+
+        # splice(start, count) -> arr[T] of the removed elements
+        start_val, _ = self._emit_expr(expr.args[0], env, lines)
+        count_val, _ = self._emit_expr(expr.args[1], env, lines)
+        dst = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, lines)
+        lines.append(
+            f"  call void @festina_array_splice(ptr {obj_val}, i64 {elem_size}, "
+            f"i64 {start_val}, i64 {count_val}, ptr {dst})")
+        return dst, types_mod.ArrayType(elem_type)
 
     def _emit_array_lit(self, expr, env, lines, expected_type=None, header=None):
         # `header`, when given, is an already-allocated (and, for a
@@ -4111,6 +4210,9 @@ class CodeGen:
             # open one -- unlike the style setters of claude.md #89,
             # which only record state.
             _CANVAS_OPS = {
+                "render": ("festina_render", []),
+                "clearCanvas": ("festina_clear_canvas", []),
+                "clearRect": ("festina_clear_rect", ["i64"] * 4),
                 "beginPath": ("festina_begin_path", []),
                 "moveTo": ("festina_move_to", ["i64", "i64"]),
                 "lineTo": ("festina_line_to", ["i64", "i64"]),
@@ -4131,14 +4233,10 @@ class CodeGen:
             if name in _CANVAS_OPS:
                 fn, arg_irs = _CANVAS_OPS[name]
                 self.uses_graphics_code = True
-                # Only the three that genuinely touch the surface open a
-                # canvas -- beginPath builds its context against it, and
-                # fill/strokePath paint and present. Transforms, saved
-                # state, alpha and gradients are pure state and open
-                # nothing, exactly as claude.md #89's own style setters
-                # don't (and so `restoreState()` with nothing saved
-                # reports THAT, rather than a missing display).
-                if name in ("beginPath", "fillPath", "strokePath"):
+                # claude.md #95: render() is the ONLY thing here that
+                # needs a GUI. Everything else paints the offscreen
+                # canvas, which needs no X server at all.
+                if name == "render":
                     self.uses_graphics = True
                 # A gradient's colour arguments are `color`-typed
                 # (semantic enforces it), so they arrive as the packed
@@ -4157,10 +4255,13 @@ class CodeGen:
             if name in _FILE_TIME_BUILTINS:
                 fn, ret_ir, ret_type = _FILE_TIME_BUILTINS[name]
                 if name == "saveCanvas":
-                    # Writes the canvas, so it needs one to exist -- the
-                    # same rule every drawing function follows.
+                    # claude.md #95: writes the OFFSCREEN canvas, so it
+                    # needs no window -- this is the headless case the
+                    # render() split exists for. It used to open one,
+                    # which meant a program whose whole job was drawing
+                    # a PNG still needed a display and still blocked in
+                    # the event loop afterwards.
                     self.uses_graphics_code = True
-                    self.uses_graphics = True
                 emitted = [self._emit_expr(a, env, lines) for a in expr.args]
                 sig = ", ".join(
                     f"{'i64' if t == INT else 'ptr'} {v}" for v, t in emitted)
@@ -4311,6 +4412,12 @@ class CodeGen:
                     self._free_regex_temp(expr.args[0], search_val, search_type, lines)
                     self._free_text_temp(expr.args[1], replacement_val, replacement_type, lines)
                     return out, TEXT
+            # claude.md #96: array methods.
+            if callee.prop in ("push", "pop", "shift", "unshift", "splice"):
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.ArrayType):
+                    return self._emit_array_method(
+                        callee.prop, obj_val, obj_type, expr, env, lines)
             # claude.md #92: sheet.clip(x, y, w, h) -> img (a new image,
             # leaving the sheet untouched) and image.resize(w, h) -> void
             # (in place, so every binding holding it sees the new size).
@@ -4652,7 +4759,10 @@ class CodeGen:
             free_text_temps()
             return out, INT
 
-        self.uses_graphics = True
+        # claude.md #95: drawing paints the OFFSCREEN canvas -- it needs
+        # no window, so it deliberately does not open one. render() is
+        # the single call that does. That is what lets a program draw
+        # and saveCanvas() with no display present at all.
         if name == "drawRect":
             x, y, w, h = args
             lines.append(f"  call void @festina_draw_rect(i64 {x}, i64 {y}, i64 {w}, i64 {h})")

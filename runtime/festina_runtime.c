@@ -1206,6 +1206,128 @@ void festina_map_free_entries(int64_t count, void *entries) {
  * function handles every arr[T] and a single generic function handles
  * every map[T] -- no per-type codegen-generated wrapper needed here at
  * all, unlike the struct case. */
+/* ---- claude.md #96: array methods ----
+ *
+ * The header layout is the one festina/codegen.py's own
+ * FESTINA_ARRAY_LLVM_TYPE describes -- {length, data} -- shared here
+ * the same way the sqlite row layout already is, since these functions
+ * have to resize a buffer codegen allocated.
+ *
+ * Values move by BYTES, with the element size passed in: codegen knows
+ * it at compile time for every arr[T], so one set of functions covers
+ * every element type instead of a family per type. Ownership of an
+ * element being removed transfers to whoever receives it (pop/shift
+ * hand it back, splice hands it to the returned array), which is why
+ * nothing here releases anything -- doing so would free a value the
+ * caller is about to be handed.
+ *
+ * Growth is a plain realloc per push rather than geometric
+ * over-allocation, which would need a capacity field in the header. In
+ * practice glibc extends in place for a growing buffer most of the
+ * time, and the lists this is for (entities in a scene, rows being
+ * accumulated) are small; if that ever stops being true, adding
+ * capacity is an additive change to the header, not a redesign.
+ */
+typedef struct {
+    int64_t length;
+    void *data;
+} FestinaArrayHeader;
+
+static void festina_array_resize(FestinaArrayHeader *a, int64_t elem_size,
+                                  int64_t new_length) {
+    if (new_length <= 0) {
+        free(a->data);
+        a->data = NULL;
+        a->length = 0;
+        return;
+    }
+    void *grown = realloc(a->data, (size_t)(new_length * elem_size));
+    if (!grown) festina_fail("out of memory growing an array");
+    a->data = grown;
+    a->length = new_length;
+}
+
+void festina_array_push(void *hdr, int64_t elem_size, const void *value) {
+    FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
+    if (!a || !value) return;
+    int64_t at = a->length;
+    festina_array_resize(a, elem_size, at + 1);
+    memcpy((char *)a->data + at * elem_size, value, (size_t)elem_size);
+}
+
+void festina_array_unshift(void *hdr, int64_t elem_size, const void *value) {
+    FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
+    if (!a || !value) return;
+    int64_t was = a->length;
+    festina_array_resize(a, elem_size, was + 1);
+    if (was > 0) {
+        memmove((char *)a->data + elem_size, a->data, (size_t)(was * elem_size));
+    }
+    memcpy(a->data, value, (size_t)elem_size);
+}
+
+/* pop/shift leave *out untouched when there is nothing to remove --
+ * codegen has already stored the element type's own null there, so an
+ * empty pop() answers null rather than needing a second return value. */
+int8_t festina_array_pop(void *hdr, int64_t elem_size, void *out) {
+    FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
+    if (!a || a->length <= 0) return 0;
+    memcpy(out, (char *)a->data + (a->length - 1) * elem_size, (size_t)elem_size);
+    festina_array_resize(a, elem_size, a->length - 1);
+    return 1;
+}
+
+int8_t festina_array_shift(void *hdr, int64_t elem_size, void *out) {
+    FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
+    if (!a || a->length <= 0) return 0;
+    memcpy(out, a->data, (size_t)elem_size);
+    int64_t rest = a->length - 1;
+    if (rest > 0) {
+        memmove(a->data, (char *)a->data + elem_size, (size_t)(rest * elem_size));
+    }
+    festina_array_resize(a, elem_size, rest);
+    return 1;
+}
+
+/* JavaScript's own clamping, deliberately: a negative start counts back
+ * from the end, everything out of range clamps rather than failing, and
+ * a start past the end removes nothing. Anything stricter would make
+ * the common `splice(i, 1)` inside a loop a source of crashes at the
+ * boundaries instead of a no-op. `dst` is a header codegen already
+ * allocated for the result. */
+void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
+                           int64_t count, void *dst_hdr) {
+    FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
+    FestinaArrayHeader *dst = (FestinaArrayHeader *)dst_hdr;
+    if (dst) { dst->length = 0; dst->data = NULL; }
+    if (!a || a->length <= 0) return;
+
+    int64_t len = a->length;
+    if (start < 0) {
+        start = len + start;
+        if (start < 0) start = 0;
+    }
+    if (start > len) start = len;
+    if (count < 0) count = 0;
+    if (start + count > len) count = len - start;
+    if (count == 0) return;
+
+    if (dst) {
+        dst->data = malloc((size_t)(count * elem_size));
+        if (!dst->data) festina_fail("out of memory in splice()");
+        memcpy(dst->data, (char *)a->data + start * elem_size,
+               (size_t)(count * elem_size));
+        dst->length = count;
+    }
+    int64_t tail = len - (start + count);
+    if (tail > 0) {
+        memmove((char *)a->data + start * elem_size,
+                (char *)a->data + (start + count) * elem_size,
+                (size_t)(tail * elem_size));
+    }
+    festina_array_resize(a, elem_size, len - count);
+}
+
 void festina_release_array(void *payload) {
     if (!festina_release_check(payload)) return;
     /* payload is {i64 length, ptr data} -- skip past the i64 to reach

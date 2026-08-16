@@ -99,6 +99,7 @@ on click(x:int, y:int) {
         text winner = turn == 1 ? 'X' : 'O'
         log(`${winner} wins!`)
         drawText(`${winner} wins!`, GRID_X, GRID_Y + CELL * 3 + 40)
+        render()
         return
     }
 
@@ -106,10 +107,12 @@ on click(x:int, y:int) {
         gameOver = true
         log('draw')
         drawText('draw!', GRID_X, GRID_Y + CELL * 3 + 40)
+        render()
         return
     }
 
     turn = turn == 1 ? 2 : 1
+    render()
 }
 
 on close() {
@@ -118,3 +121,7 @@ on close() {
 
 log('tic-tac-toe: click a cell to place a mark. X goes first.')
 drawGrid()
+// claude.md #95: drawing paints an offscreen canvas; render() is what
+// puts it on screen. Every handler below ends with one for the same
+// reason -- a move isn't visible until the canvas is presented.
+render()

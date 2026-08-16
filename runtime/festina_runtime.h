@@ -310,6 +310,25 @@ void *festina_load_image(const char *path);
  * writer, already compiled in alongside the reader loadImage uses. */
 int8_t festina_save_canvas(const char *path);
 
+/* claude.md #95: the canvas exists without a window.
+ *
+ * Drawing paints an offscreen image surface that needs no X server at
+ * all; render() is the single call that puts it on screen, opening the
+ * window the first time it runs. That split does three things: a
+ * program that draws and saves a PNG never opens a window or enters an
+ * event loop (so it runs on a build server or over ssh), "does this
+ * need a GUI?" becomes answerable by looking for render(), and a frame
+ * costs one blit instead of one per shape -- drawing used to flush the
+ * whole canvas to X on every single call.
+ *
+ * clearCanvas() deliberately ignores the current transform (a rotated
+ * "erase everything" leaving wedges behind would be a trap);
+ * clearRect() honours it, since it names a region in the same
+ * coordinates as the drawing around it. */
+void festina_render(void);
+void festina_clear_canvas(void);
+void festina_clear_rect(int64_t x, int64_t y, int64_t w, int64_t h);
+
 /* claude.md #94: paths, transforms, gradients and alpha.
  *
  * Every drawing function builds its own short-lived Cairo context, so a
@@ -628,6 +647,27 @@ void festina_map_free_entries(int64_t count, void *entries);
  * festina_retain/festina_release, always safe to call on any arr[T]/
  * map[T] value, including a null one.
  */
+/* claude.md #96: array methods. The header layout is the one
+ * festina/codegen.py's FESTINA_ARRAY_LLVM_TYPE describes ({length,
+ * data}), shared here the same way the sqlite row layout already is,
+ * since these have to resize a buffer codegen allocated. Values move by
+ * BYTES with the element size passed in, so one set of functions covers
+ * every arr[T] instead of a family per element type.
+ *
+ * Ownership of a removed element TRANSFERS to whoever receives it
+ * (pop/shift hand it back, splice hands it to the returned array), so
+ * nothing here releases anything -- that would free a value the caller
+ * is about to be given. pop/shift leave *out untouched when there is
+ * nothing to remove, because codegen has already stored the element
+ * type's own null there. splice clamps exactly as JavaScript's does,
+ * negative start included, so `splice(i, 1)` at a boundary is a no-op
+ * rather than a crash. */
+void festina_array_push(void *hdr, int64_t elem_size, const void *value);
+void festina_array_unshift(void *hdr, int64_t elem_size, const void *value);
+int8_t festina_array_pop(void *hdr, int64_t elem_size, void *out);
+int8_t festina_array_shift(void *hdr, int64_t elem_size, void *out);
+void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
+                           int64_t count, void *dst_hdr);
 void festina_release_array(void *payload);
 void festina_release_map(void *payload);
 
