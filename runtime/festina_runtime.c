@@ -105,6 +105,128 @@ char *festina_str_from_bool(int8_t v) {
     return strdup(v == 2 ? "null" : (v ? "true" : "false"));
 }
 
+/* ---- JSON-ish rendering -- claude.md #114 ----
+ *
+ * `${someStruct}` and log(someArr) render containers as JSON-like text.
+ * The structure walking lives in generated IR (only the compiler knows
+ * a struct's layout); everything that touches BYTES lives here, as a
+ * small growable string builder plus append helpers that know the
+ * null sentinels. One builder per rendering, O(n) overall -- repeated
+ * festina_str_concat would have been O(n^2) and this is exactly the
+ * feature people reach for in a loop. */
+static int64_t festina_null_int(void);   /* defined with the sqlite helpers below */
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} FestinaSB;
+
+void *festina_sb_new(void) {
+    FestinaSB *sb = malloc(sizeof(FestinaSB));
+    if (!sb) festina_fail("out of memory rendering a value");
+    sb->cap = 64;
+    sb->len = 0;
+    sb->data = malloc(sb->cap);
+    if (!sb->data) festina_fail("out of memory rendering a value");
+    sb->data[0] = '\0';
+    return sb;
+}
+
+static void festina_sb_grow(FestinaSB *sb, size_t add) {
+    if (sb->len + add + 1 <= sb->cap) return;
+    while (sb->cap < sb->len + add + 1) sb->cap *= 2;
+    char *grown = realloc(sb->data, sb->cap);
+    if (!grown) festina_fail("out of memory rendering a value");
+    sb->data = grown;
+}
+
+void festina_sb_append(void *sbv, const char *s) {
+    if (!s) return;
+    FestinaSB *sb = (FestinaSB *)sbv;
+    size_t n = strlen(s);
+    festina_sb_grow(sb, n);
+    memcpy(sb->data + sb->len, s, n + 1);
+    sb->len += n;
+}
+
+/* A JSON string: quoted, with the escapes JSON requires. A NULL text
+ * renders as the JSON null literal, unquoted -- the same three-way
+ * honesty festina_str_from_bool already applies. */
+void festina_sb_append_json_text(void *sbv, const char *s) {
+    FestinaSB *sb = (FestinaSB *)sbv;
+    if (!s) { festina_sb_append(sb, "null"); return; }
+    festina_sb_grow(sb, 2);
+    sb->data[sb->len++] = '"';
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        char esc[8];
+        const char *out = esc;
+        switch (*p) {
+        case '"':  out = "\\\""; break;
+        case '\\': out = "\\\\"; break;
+        case '\n': out = "\\n"; break;
+        case '\r': out = "\\r"; break;
+        case '\t': out = "\\t"; break;
+        default:
+            if (*p < 0x20) { snprintf(esc, sizeof(esc), "\\u%04x", *p); }
+            else { esc[0] = (char)*p; esc[1] = '\0'; }
+        }
+        size_t n = strlen(out);
+        festina_sb_grow(sb, n);
+        memcpy(sb->data + sb->len, out, n);
+        sb->len += n;
+    }
+    festina_sb_grow(sb, 1);
+    sb->data[sb->len++] = '"';
+    sb->data[sb->len] = '\0';
+}
+
+void festina_sb_append_json_int(void *sbv, int64_t v) {
+    if (v == festina_null_int()) { festina_sb_append(sbv, "null"); return; }
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", (long long)v);
+    festina_sb_append(sbv, buf);
+}
+
+void festina_sb_append_json_float(void *sbv, double v) {
+    /* JSON has no NaN/Infinity, and Festina's float null IS a NaN --
+     * both render as null, which is also what JSON.stringify does. */
+    if (v != v || v > 1.7e308 || v < -1.7e308) {
+        festina_sb_append(sbv, "null");
+        return;
+    }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%g", v);
+    festina_sb_append(sbv, buf);
+}
+
+void festina_sb_append_json_bool(void *sbv, int8_t v) {
+    festina_sb_append(sbv, v == 2 ? "null" : (v ? "true" : "false"));
+}
+
+/* A bool that lives in an 8-byte slot (a table row's column), where
+ * null is the INT sentinel rather than 2. */
+void festina_sb_append_json_bool64(void *sbv, int64_t v) {
+    if (v == festina_null_int()) { festina_sb_append(sbv, "null"); return; }
+    festina_sb_append(sbv, v ? "true" : "false");
+}
+
+/* An opaque handle (blob/img/aud/regex) inside a rendered container:
+ * `null` when null, a placeholder naming the type otherwise -- its
+ * bytes have no honest JSON form, and silently dumping binary into a
+ * debug string would be worse than saying what it is. */
+void festina_sb_append_handle(void *sbv, const void *handle, const char *label) {
+    if (!handle) { festina_sb_append(sbv, "null"); return; }
+    festina_sb_append(sbv, label);
+}
+
+char *festina_sb_finish(void *sbv) {
+    FestinaSB *sb = (FestinaSB *)sbv;
+    char *out = sb->data;
+    free(sb);
+    return out;
+}
+
 char *festina_str_concat(const char *a, const char *b) {
     if (!a) a = "";
     if (!b) b = "";

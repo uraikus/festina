@@ -2661,6 +2661,24 @@ carries a presence bitmask one hidden slot past its columns; an unknown
 name in undefined() fails the program.
 `tests/test_codegen.py::TestUndefinedAndNameMatchedColumns` (6 tests).
 
+**claude.md #114**: implicit .toText() in log()/templates, JSON-like
+containers, and a refusal for media types.
+
+Any non-text value in log() or `${}` compiles as its .toText():
+int/float/bool unchanged, struct/table-row/arr/map rendered JSON-like by
+generated per-type functions (bytes handled by a runtime string
+builder, structure by IR that knows the layouts; registered-before-
+generated so self-referencing types terminate; runtime depth cap 32 so
+cycles truncate to null instead of crashing). Escaped text, JSON null
+for null/NaN, database NULL as null but UNDEFINED columns omitted
+(JSON.stringify's own treatment, completing #111's analogy), opaque
+handles as "<blob>"-style placeholders. blob/img/aud directly in log or
+a template are compile errors naming the fix -- reversing #109's
+log(blob)-prints-contents, since binary bytes mid-string should be
+asked for (.toText()) rather than defaulted. .toText() is the explicit
+spelling on all four container kinds.
+`tests/test_codegen.py::TestJsonRendering` (14 tests).
+
 **claude.md #113**: literal-SQL statement caching, WAL, and per-type
 leak isolation.
 

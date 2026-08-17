@@ -296,16 +296,16 @@ class TestBlob:
         assert result.returncode == 0
         assert result.stdout.strip() == "the contents"
 
-    def test_logging_a_blob_prints_its_contents_not_its_path(
-            self, compile_and_run, tmp_path):
-        # The old behavior printed the path, because the path was all
-        # there was. Printing it now would mean printing a struct's
-        # first field as if it were a string.
-        path = tmp_path / "data.txt"
-        path.write_text("the contents")
-        result = compile_and_run(f"blob data = '{path}'\nlog(data)")
-        assert result.returncode == 0
-        assert result.stdout.strip() == "the contents"
+    def test_logging_a_blob_directly_is_a_compile_error(
+            self, parser, semantic, codegen, tmp_path):
+        # claude.md #114: #109 made log(blob) print the contents; #114
+        # made it refuse instead, because a blob's bytes may be binary
+        # garbage mid-string and the explicit spelling is one method
+        # call away. The error names it.
+        program = parser.parse("blob data = 'x'\nlog(data)", filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        with pytest.raises(Exception, match=r"toText"):
+            codegen.generate_ir(program, analyzed, filename="main.f")
 
     def test_a_missing_path_is_an_empty_blob_not_a_failure(self, compile_and_run):
         # claude.md #93's rule, inherited: a missing file is something
@@ -6355,6 +6355,157 @@ class TestAudioChannelReturnAndClipStop:
         result = compile_and_run(source, env=audio_null_env)
         assert result.returncode == 0
         assert result.stdout.strip() == "-1"
+
+
+class TestJsonRendering:
+    '''claude.md #114: any non-text value in log() or `${}` compiles as
+    its .toText(). int/float/bool keep their stringifiers; struct/table
+    row/arr/map render JSON-like through generated per-type functions;
+    blob/img/aud are compile errors, since a blob's bytes may be binary
+    (its explicit .toText() exists for when that is wanted) and img/aud
+    have no text form at all.'''
+
+    def test_a_struct_renders_as_json(self, compile_and_run):
+        source = '''
+        struct Inner { n:int  tag:text }
+        struct P { id:int  ok:bool  name:text  inner:Inner  xs:arr[int] }
+        P p
+        p.id = 7
+        p.ok = true
+        p.name = 'x'
+        p.inner.n = 3
+        p.inner.tag = 'in'
+        p.xs.push(1)
+        p.xs.push(2)
+        log(p)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.strip() == (
+            '{"id":7,"ok":true,"name":"x",'
+            '"inner":{"n":3,"tag":"in"},"xs":[1,2]}')
+
+    def test_arrays_and_maps_render_as_json(self, compile_and_run):
+        source = '''
+        arr[int] nums = [1, 2, 3]
+        log(nums)
+        arr[text] words = ['a', null, 'c']
+        log(words)
+        map[int] m = {'one': 1}
+        log(m)
+        log(`inline: ${nums}`)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            '[1,2,3]', '["a",null,"c"]', '{"one":1}', 'inline: [1,2,3]']
+
+    def test_text_is_escaped_and_assigned_null_renders_null(self, compile_and_run):
+        # The name contains a real double quote and a real tab, which
+        # must come out as \" and \t. An UNASSIGNED scalar field renders
+        # its zero (claude.md #97: calloc'd storage reads 0, not the
+        # null sentinel); a field explicitly made null renders null.
+        source = r'''
+        struct P { name:text  score:float  missing:float }
+        P p
+        p.name = 'has "quotes" and	tab'
+        p.score = 1.0 / 0.0
+        log(p)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.strip() == (
+            '{"name":"has \\"quotes\\" and\\ttab","score":null,"missing":0}')
+
+    def test_a_table_row_renders_with_database_null_and_omits_undefined(
+            self, compile_and_run, tmp_path):
+        # A database NULL is the JSON null; a column the query never
+        # selected is OMITTED, exactly what JSON.stringify does for an
+        # undefined property -- the analogy claude.md #111 built.
+        db = tmp_path / 't.sqlite'
+        source = f'''
+        DatabaseURL = '{db}'
+        table T {{ id:int  name:text  ok:bool }}
+        sqlite('INSERT INTO T (id, name, ok) VALUES (?, ?, ?)', [1, null, 1])
+        arr[T] rows = sqlite('SELECT * FROM T')
+        log(rows[0])
+        arr[T] partial = sqlite('SELECT id FROM T')
+        log(partial[0])
+        log(rows)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            '{"id":1,"name":null,"ok":true}',
+            '{"id":1}',
+            '[{"id":1,"name":null,"ok":true}]']
+
+    def test_explicit_to_text_is_the_same_rendering(self, compile_and_run):
+        source = '''
+        arr[int] nums = [1, 2]
+        text json = nums.toText()
+        log(json)
+        struct P { n:int }
+        P p
+        p.n = 5
+        log(p.toText())
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ['[1,2]', '{"n":5}']
+
+    def test_a_null_container_renders_as_null(self, compile_and_run):
+        source = '''
+        struct P { n:int }
+        P nothing = null
+        log(nothing)
+        log(`v: ${nothing}`)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ['null', 'v: null']
+
+    def test_a_cycle_truncates_instead_of_crashing(self, compile_and_run):
+        # claude.md #106 made cycles constructible; a debug rendering
+        # that overflowed the stack on one would crash the program it
+        # exists to debug. Depth caps at 32, rendering null beyond.
+        source = '''
+        struct Node { n:int  next:Node }
+        Node a
+        a.n = 1
+        a.next = a
+        log(a)
+        '''
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().endswith('null}' + '}' * 32)
+
+    def test_an_opaque_handle_in_a_struct_renders_as_a_placeholder(
+            self, compile_and_run, tmp_path):
+        path = tmp_path / 'f.txt'
+        source = f'''
+        struct Holder {{ name:text  data:blob }}
+        Holder empty
+        empty.name = 'no file'
+        log(empty)
+        Holder full
+        full.name = 'with file'
+        full.data = '{path}'
+        log(full)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            '{"name":"no file","data":null}',
+            '{"name":"with file","data":"<blob>"}']
+
+    @pytest.mark.parametrize('decl,use', [
+        ("blob v = 'x'", 'log(v)'),
+        ("blob v = 'x'", 'log(`${v}`)'),
+        ("img v = 'x.png'", 'log(v)'),
+        ("img v = 'x.png'", 'log(`${v}`)'),
+        ("aud v = 'x.wav'", 'log(v)'),
+        ("aud v = 'x.wav'", 'log(`${v}`)'),
+    ])
+    def test_media_in_log_or_template_is_a_compile_error(
+            self, parser, semantic, codegen, decl, use):
+        program = parser.parse(f'{decl}\n{use}', filename='main.f')
+        analyzed = semantic.analyze(program, filename='main.f')
+        with pytest.raises(Exception, match=r'toText|text form'):
+            codegen.generate_ir(program, analyzed, filename='main.f')
 
 
 class TestStatementCache:
