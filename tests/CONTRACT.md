@@ -2632,6 +2632,22 @@ Six bugs found by deliberate probing rather than by waiting for them:
   still leaks, deliberately, with a test pinning that the value stays
   intact so a later "optimization" cannot make that trade.
   `tests/test_codegen.py::TestDiscardedCallResultReachedForAField` (3).
+
+  > **Widened by claude.md #108.** The "therefore" above does not
+  > follow. `f().inner` yields a struct and genuinely cannot be
+  > released; `f().inner.n` yields an int, a copy that owes the object
+  > nothing, and is safe once loaded. #102 could not tell them apart
+  > because it decided one link too early. The decision moved to the
+  > OUTERMOST link of a member chain, so any chain yielding a plain
+  > copy now releases every call result it produced (5,200 bytes over
+  > 100 iterations, recovered). `.length` was fixed in the same pass:
+  > it has its own branch in the expression emitter and never reached
+  > this path at all, so `rowsFor(x).length` leaked (2,880 bytes over
+  > 60 iterations) despite the code's own docstring listing it as
+  > covered. A chain ending in a managed value or a text still leaks,
+  > for #102's original reason, with tests pinning that the loaded
+  > value stays intact.
+  > `tests/test_codegen.py::TestChainedCallResultReachedForAField` (7).
 - **A literal of all nulls could not be written.** `arr[text] a = [null]`
   inferred `arr[null]` and was rejected, while `a.push(null)` and
   `[null, 'x']` were both already fine -- an inconsistency, not a
@@ -2661,7 +2677,11 @@ clang is the only one that parses `.ll` while its ASan runtime library
 ships separately and is routinely absent -- so the linking compiler is
 probed, not assumed. The only real defence against both is a canary:
 `test_the_harness_can_actually_fail` feeds it a known-leaking program
-and fails if it comes back clean.
+and fails if it comes back clean. That canary was a chained call-result
+read until claude.md #108 fixed it, at which point the test failed
+loudly -- exactly the failure mode a canary should have. It is a
+reference cycle now (claude.md #106), which needs a tracing collector
+and so should outlast anything else available to leak on purpose.
 
 **claude.md #101**: images are paths too, more formats, and both media
 types fit in a table.

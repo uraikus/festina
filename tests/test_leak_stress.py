@@ -73,21 +73,25 @@ class TestLeakStress:
 
         This is not hypothetical caution: `clang -fsanitize=address -c
         file.ll` silently produces an UNinstrumented object, so a harness
-        built the obvious way passes everything and proves nothing. The
-        canary below leaks on purpose -- a call result reached through a
-        chain and discarded, which claude.md #102 documents as still
-        leaking because releasing the parent there would free the field
-        just loaded -- and the harness must say so.
+        built the obvious way passes everything and proves nothing.
+
+        The canary leaks on purpose and the harness must say so. It is a
+        REFERENCE CYCLE (claude.md #106): reference counting cannot free
+        one, so this leaks until this language grows a tracing
+        collector, which makes it about as durable a canary as exists
+        here. The previous canary -- a call result reached through a
+        chain -- was retired because claude.md #108 fixed it, which is
+        exactly the failure mode a canary is supposed to have: it stops
+        leaking, the test fails loudly, and nobody discovers months
+        later that the harness had been vacuous.
         """
         canary = tmp_path / "canary.f"
         canary.write_text(
-            "struct S2 { m:int }\n"
-            "struct S { n:int inner:S2 }\n"
-            "S func make() { S s s.n = 1 return s }\n"
-            "int total = 0\n"
+            "struct Node { n:int next:Node }\n"
+            "void func build() { Node a a.n = 1 a.next = a }\n"
             "int i = 0\n"
-            "while i < 200 { total = total + make().inner.m i = i + 1 }\n"
-            "log(total)\n"
+            "while i < 200 { build() i = i + 1 }\n"
+            "log('done')\n"
         )
         result = _run_harness(str(canary))
         if result.returncode == _SKIP_EXIT:

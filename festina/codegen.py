@@ -802,6 +802,18 @@ class CodeGen:
                                                 # source locations still each get their own slot,
                                                 # simpler than deduplicating by text and just as
                                                 # correct (each still only ever compiles once)
+        # claude.md #108: state for a MEMBER CHAIN's deferred receiver
+        # release -- see _emit_member_load. _chain_receiver holds the
+        # exact AST node the enclosing member load is about to emit as
+        # its receiver, so a nested member load can recognize, by node
+        # IDENTITY, that it is part of a chain rather than an unrelated
+        # subexpression (a call argument, an index) that merely happens
+        # to be emitted while a chain is in flight. _chain_pending
+        # collects the receivers those nested frames produced, for the
+        # outermost frame to decide about once it knows the type of the
+        # value that actually escapes the whole chain.
+        self._chain_receiver = None
+        self._chain_pending = []
 
     # ---- naming ----
     def tmp(self):
@@ -2525,12 +2537,29 @@ class CodeGen:
                 # function call's own return value), even though every
                 # one of them is now a `ptr` at the LLVM level -- and
                 # .length is read-only anyway (see semantic.py).
-                obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+                # claude.md #108: .length participates in the member
+                # chain too. It never did, which made
+                # _release_member_receiver_temp's own docstring wrong
+                # about `rowsFor(x).length` -- that shape does not reach
+                # _emit_member_load at all, so #102 never covered it and
+                # it leaked the whole array (measured: 2,880 bytes over
+                # 60 iterations). A length is an i64 copy that owes the
+                # array nothing, so the receiver is always releasable
+                # here, whether it is the call itself or the base of a
+                # longer chain (`make().inner.items.length`).
+                state = self._begin_member_chain(expr)
+                try:
+                    obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+                finally:
+                    pending = self._end_member_chain(state)
                 if isinstance(obj_type, types_mod.ArrayType):
                     len_ptr = self.tmp()
                     lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 0")
                     out = self.tmp()
                     lines.append(f"  {out} = load i64, ptr {len_ptr}")
+                    if pending is not None:
+                        self._release_member_chain(pending, expr.obj, obj_val,
+                                                   obj_type, INT, lines)
                     return out, INT
             if expr.computed:
                 # claude.md #26/#72: arr[i] / map[key] -- expr.obj is
@@ -3192,17 +3221,95 @@ class CodeGen:
         return out, TEXT
 
     def _emit_member_load(self, expr, env, lines):
-        obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
-        ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
-        out, ftype = self._load_field_value(ptr, ftype, lines)
-        self._release_member_receiver_temp(expr.obj, obj_val, obj_type, ftype, lines)
+        """claude.md #102 released the receiver of a ONE-step field read
+        off a call result (`make().n`). claude.md #108 extends that to a
+        CHAIN (`make().inner.n`), which #102 could not reach and which
+        leaked the entire object graph: `make().inner` saw a struct-typed
+        field and bailed out (correctly -- releasing there would free the
+        Inner it was about to hand back), and `.n`'s own receiver is a
+        Member rather than a Call, so nothing was left to notice the
+        call result at all.
+
+        The fix is to decide at the OUTERMOST link, where the type of
+        the value that actually escapes the chain is finally known. Each
+        nested link parks its receiver instead of releasing it; the
+        outermost link, if what it loaded is an ordinary unmanaged value
+        (an int/float/bool -- a copy that owes nothing to the object it
+        came from), releases every parked receiver. If the chain ends in
+        a managed value or a text, nothing is released and the leak
+        stands, exactly as before -- freeing the parent would free the
+        thing just loaded.
+
+        "Nested" is decided by AST node IDENTITY (_chain_receiver), not
+        by "a chain is in flight". A member load reached while emitting
+        a call ARGUMENT (`make(other.field).inner.n`) is not part of
+        this chain, and treating it as one would silently move its own
+        release to a point that may never come."""
+        state = self._begin_member_chain(expr)
+        try:
+            obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+            ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
+            out, ftype = self._load_field_value(ptr, ftype, lines)
+        finally:
+            pending = self._end_member_chain(state)
+        if pending is None:
+            # An inner link. Park the receiver -- whether it is
+            # releasable depends on a type this frame cannot see yet.
+            self._chain_pending.append((expr.obj, obj_val, obj_type))
+            return out, ftype
+        self._release_member_chain(pending, expr.obj, obj_val, obj_type, ftype, lines)
         return out, ftype
 
+    def _begin_member_chain(self, expr):
+        """claude.md #108: marks `expr.obj` as the receiver about to be
+        emitted, so that if it turns out to be another member load it
+        can recognize itself as an inner link of this same chain (see
+        _emit_member_load). Returns opaque state for _end_member_chain,
+        which must be called in a `finally`."""
+        nested = self._chain_receiver is expr
+        state = (nested, self._chain_receiver, self._chain_pending)
+        if not nested:
+            self._chain_pending = []
+        self._chain_receiver = expr.obj
+        return state
+
+    def _end_member_chain(self, state):
+        """Undoes _begin_member_chain. Returns the receivers parked by
+        inner links, or None if this frame was ITSELF an inner link and
+        so has no decision to make."""
+        nested, saved_receiver, saved_pending = state
+        self._chain_receiver = saved_receiver
+        if nested:
+            return None
+        pending = self._chain_pending
+        self._chain_pending = saved_pending
+        return pending
+
+    def _release_member_chain(self, pending, obj_expr, obj_val, obj_type, ftype, lines):
+        """Releases every call result the chain produced, innermost
+        first, if `ftype` -- the type of the value that actually escapes
+        the whole chain -- permits it. _release_member_receiver_temp
+        makes that judgement per receiver."""
+        for parked_expr, parked_val, parked_type in pending:
+            self._release_member_receiver_temp(parked_expr, parked_val, parked_type,
+                                               ftype, lines)
+        self._release_member_receiver_temp(obj_expr, obj_val, obj_type, ftype, lines)
+
     def _release_member_receiver_temp(self, obj_expr, obj_val, obj_type, field_type, lines):
-        """claude.md #102: releases a struct/arr[T]/map[T] that this
-        expression's own CALL produced purely to read one field out of,
-        with nothing else ever referencing it -- `makeOuter(i).inner.n`,
-        `rowsFor(x).length`, `config().retries`.
+        """claude.md #102 (widened by claude.md #108): releases a
+        struct/arr[T]/map[T] that a CALL produced purely to read one
+        value out of, with nothing else ever referencing it --
+        `config().retries`, `makeOuter(i).inner.n`, `rowsFor(x).length`.
+
+        #102 covered only the first of those, and this docstring used to
+        claim all three. The other two did not go through here at all: a
+        chained read reaches _emit_member_load twice and neither frame
+        saw both a Call receiver and an unmanaged result, and `.length`
+        has its own branch in _emit_expr that never called this. #108
+        routes both here by deciding at the OUTERMOST link of a member
+        chain, where `field_type` is the type of the value that actually
+        escapes it -- so the parameter means "what the whole expression
+        yields", not "the field this one link loaded".
 
         claude.md #77 already releases a call result discarded as a bare
         statement (`someFunc();`), on the reasoning that a Call's result
@@ -3212,16 +3319,16 @@ class CodeGen:
         LeakSanitizer at one whole struct -- header, fields and all --
         per evaluation, which in a loop is per iteration.
 
-        Restricted to a field whose own type is NOT managed, and that
+        Restricted to a result whose own type is NOT managed, and that
         restriction is load-bearing rather than conservative. Releasing
         the parent recursively releases whatever its struct/arr/map
         fields point at and frees its text fields outright, so for those
-        field types the value just loaded would be freed before the
+        result types the value just loaded would be freed before the
         caller ever saw it -- trading a leak for a use-after-free. Making
         those cases work needs a notion of an owned temporary that
         outlives its producing expression, which this codegen does not
-        have; they keep leaking, which is at least safe, and the far
-        commoner scalar case is fixed."""
+        have; they keep leaking, which is at least safe, and every case
+        that yields a plain copy is now fixed."""
         if not isinstance(obj_expr, ast.Call):
             return
         if not isinstance(obj_type, (types_mod.StructType, types_mod.ArrayType,

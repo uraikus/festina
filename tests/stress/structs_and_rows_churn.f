@@ -43,11 +43,23 @@ while i < 400 {
     total = total + o.inner.n + o.xs.length + o.m[`k${i}`]
     // claude.md #102: a call result reached for one field and then
     // discarded, with nothing binding it. The field is a SCALAR on
-    // purpose -- that is the case the release is safe for. The chained
-    // form (makeOuter(i).inner.n) still leaks, deliberately: releasing
-    // the parent there would free the very field just loaded. See
-    // todo.md.
+    // purpose -- that is the case the release is safe for.
     total = total + makeOuter(i).count
+
+    // claude.md #108: the same thing reached through a CHAIN, which
+    // #102 could not cover and which leaked the whole object graph.
+    // The decision is made at the outermost link now, where the type of
+    // the value that escapes is finally known.
+    total = total + makeOuter(i).inner.n
+
+    // .length off a chain, and off a call result directly -- neither
+    // ever reached the member-load path before #108, so `rows(x).length`
+    // leaked despite #102's own docstring claiming otherwise.
+    total = total + makeOuter(i).xs.length
+
+    // A member load inside a call ARGUMENT is not part of the outer
+    // chain, and must still be released on its own schedule.
+    total = total + makeOuter(makeOuter(i).count).inner.n
 
     // A ternary between two locals: whichever loses still has to go.
     Inner a

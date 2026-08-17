@@ -1499,25 +1499,31 @@ listed here only so they aren't lost:
   allocation and genuinely comparable to text globals at exit; a
   handle loaded inside a loop is an unbounded leak, and the old wording
   hid the difference.
-- **A call result reached through a CHAIN for a managed field still
-  leaks.** `makeThing().count` is reclaimed (claude.md #102), but
-  `makeThing().inner.n` is not: releasing the parent there recursively
-  releases its struct/arr/map fields and frees its text fields, so the
-  value just loaded would be freed before the caller saw it. Fixing it
-  properly needs a notion of an owned temporary that outlives its
-  producing expression -- a statement-level pending-release list, most
-  likely -- which this codegen does not have. A test pins that the
-  loaded value stays intact, so the leak cannot quietly become a
-  use-after-free. Repro: `total = total + make().inner.n` in a loop,
-  under `scripts/leak_stress.sh`.
-- **A struct cannot reference its own type.** `struct Node { n:int
-  next:Node }` fails with "unknown type 'Node'", because a struct's
-  name is registered only after its own fields resolve. Nothing about
-  the representation prevents it -- a struct-typed field is a pointer,
-  so a self-reference is finite-sized, and claude.md #97's
-  auto-vivification would make a linked list work the moment the name
-  resolved. The error message is also misleading, since it reads like a
-  typo rather than an ordering rule.
+- **A call result reached through a chain that yields a MANAGED value
+  still leaks.** Mostly closed by claude.md #108. `make().count`
+  (claude.md #102), `make().inner.n`, `rows(x).length` and
+  `make().inner.items.length` are all reclaimed now -- the decision
+  moved to the outermost link of a member chain, where the type of the
+  value that actually escapes is known, and any chain yielding a plain
+  copy releases every call result it produced.
+
+  What remains is a chain whose result is itself managed or is a text:
+  `Inner got = make().inner`, `text t = make().inner.label`. Releasing
+  the parent there recursively releases its struct/arr/map fields and
+  frees its text fields, so the value just loaded would be freed before
+  the caller saw it -- a use-after-free traded for a leak, which is the
+  wrong direction. Fixing these needs a notion of an owned temporary
+  that outlives its producing expression, which this codegen does not
+  have. Tests pin that the loaded value stays intact in both shapes, so
+  the leak cannot quietly become a use-after-free. Measured: 5,520
+  bytes over 60 iterations for the text case, 5,388 for the struct
+  case.
+
+- ~~**A struct cannot reference its own type.**~~ Fixed by claude.md
+  #106. `struct Node { n:int next:Node }` compiles, forward references
+  compile, and acyclic linked structures are reclaimed normally. The
+  cost is that reference cycles became constructible; see the tracing
+  GC note above.
 - **Only PNG/JPEG and WAV/MP3.** claude.md #101 added JPEG and MP3, and
   drew the line there deliberately: each new format is a new
   system dependency on every machine that compiles a graphics or audio
@@ -1536,4 +1542,8 @@ listed here only so they aren't lost:
   general runtime expression, so the same call site can legitimately see
   a different pattern on different calls (e.g. `regex(userPattern)`
   inside a loop), and caching by call site the way the literal case does
-  would be a correctness bug, not a caching gap to close.
+  would be a correctness bug, not a caching gap to close. Measured over
+  200,000 iterations: literal 15 ms, `regex()` hoisted into a variable
+  outside the loop 13 ms, `regex()` called inside the loop 367 ms.
+  Documented in api.md with the workaround, since the fix is to hoist
+  it rather than for the compiler to guess.

@@ -5861,6 +5861,185 @@ class TestDiscardedCallResultReachedForAField:
         assert result.stdout.strip() == "intact"
 
 
+class TestChainedCallResultReachedForAField:
+    """claude.md #108: `make().inner.n` -- a call result reached through
+    a CHAIN of fields, which claude.md #102 could not cover.
+
+    #102 released the receiver of a one-step read (`make().n`) and had
+    to give up on `make().inner`, because releasing the parent there
+    frees the Inner it is about to hand back. But that left the longer
+    chain leaking the entire object graph: at `.inner` the field type is
+    managed so nothing is released, and at `.n` the receiver is a Member
+    rather than a Call so nothing notices the call result exists.
+    Measured under LeakSanitizer at 5,200 bytes over 100 iterations.
+
+    The decision now happens at the outermost link, where the type of
+    the value that actually escapes the chain is known.
+    """
+
+    def test_a_chained_read_produces_the_right_value(self, compile_and_run):
+        source = """
+        struct Inner { n:int label:text }
+        struct Outer { inner:Inner tag:text }
+        Outer func make(v:int) {
+            Outer o
+            o.inner.n = v
+            o.inner.label = 'L'
+            o.tag = 'T'
+            return o
+        }
+        int total = 0
+        for int i = 0, i < 100, i++ {
+            total = total + make(i).inner.n
+        }
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "4950"
+
+    def test_the_chain_releases_the_call_result_exactly_once(
+            self, parser, semantic, codegen):
+        source = """
+        struct Inner { n:int }
+        struct Outer { inner:Inner }
+        Outer func make() {
+            Outer o
+            o.inner.n = 3
+            return o
+        }
+        void func use() {
+            log(make().inner.n)
+        }
+        use()
+        """
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        body = ir.split("define void @use()")[1].split("\n}")[0]
+        # Exactly one release, of the Outer -- Outer has a struct-typed
+        # field so it gets #78's per-type wrapper rather than the plain
+        # runtime function, and the wrapper cascades into Inner itself.
+        assert body.count("@__festina_release_struct_Outer(") == 1
+        assert body.count("@festina_release") == 0
+
+    def test_a_chain_ending_in_a_managed_value_is_still_not_released(
+            self, parser, semantic, codegen):
+        # The restriction #102 identified is unchanged and still
+        # load-bearing: if the value escaping the chain is itself
+        # managed, releasing the parent would free it. Nothing is
+        # emitted, and the leak stands -- deliberately.
+        source = """
+        struct Inner { n:int }
+        struct Outer { inner:Inner }
+        Outer func make() {
+            Outer o
+            o.inner.n = 3
+            return o
+        }
+        void func use() {
+            Inner got = make().inner
+            log(got.n)
+        }
+        use()
+        """
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        body = ir.split("define void @use()")[1].split("\n}")[0]
+        assert "@__festina_release_struct_Outer(" not in body
+
+    def test_a_chain_ending_in_text_is_still_not_released(self, compile_and_run):
+        # Same reasoning, and the same thing that must never happen:
+        # the text read back must be intact, not freed out from under
+        # the binding.
+        source = """
+        struct Inner { n:int label:text }
+        struct Outer { inner:Inner }
+        Outer func make(v:int) {
+            Outer o
+            o.inner.n = v
+            o.inner.label = `label ${v}`
+            return o
+        }
+        for int i = 0, i < 20, i++ {
+            text got = make(i).inner.label
+            if got != `label ${i}` {
+                log('corrupted')
+            }
+        }
+        log('intact')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "intact"
+
+    def test_length_off_a_call_result_is_released(self, parser, semantic, codegen):
+        # claude.md #108: .length never reached _emit_member_load at all,
+        # so #102 never covered `rowsFor(x).length` even though its own
+        # docstring claimed it did. A length is an i64 copy that owes the
+        # array nothing, so the receiver is always releasable.
+        source = """
+        arr[int] func rows(v:int) {
+            arr[int] a = [v, v, v]
+            return a
+        }
+        void func use() {
+            log(rows(1).length)
+        }
+        use()
+        """
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        body = ir.split("define void @use()")[1].split("\n}")[0]
+        assert body.count("@festina_release") == 1
+
+    def test_length_reached_through_a_chain_is_released(self, compile_and_run):
+        source = """
+        struct Inner { items:arr[int] }
+        struct Outer { inner:Inner }
+        Outer func make(v:int) {
+            Outer o
+            o.inner.items.push(v)
+            o.inner.items.push(v)
+            return o
+        }
+        int total = 0
+        for int i = 0, i < 50, i++ {
+            total = total + make(i).inner.items.length
+        }
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "100"
+
+    def test_a_member_load_in_a_call_argument_is_not_swallowed_by_the_chain(
+            self, compile_and_run):
+        # "Part of this chain" is decided by AST node identity, not by
+        # "a chain is in flight". A member load reached while emitting a
+        # call ARGUMENT belongs to no chain, and treating it as one
+        # would move its release to a point that may never arrive.
+        source = """
+        struct Inner { n:int }
+        struct Outer { inner:Inner }
+        Outer func make(v:int) {
+            Outer o
+            o.inner.n = v
+            return o
+        }
+        int total = 0
+        for int i = 0, i < 50, i++ {
+            total = total + make(make(i).inner.n).inner.n
+        }
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "1225"
+
+
 class TestMediaFormatsAndPaths:
     """claude.md #101: `img sprite = 'sprite.png'` alongside claude.md
     #100's `aud`, JPEG and MP3 decoding, and both types as sqlite BLOB
