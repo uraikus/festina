@@ -3006,12 +3006,12 @@ class CodeGen:
     def _to_text(self, val, type_, lines):
         """claude.md #114: every non-text value in log() or `${}`
         compiles as its .toText() -- int/float/bool through the
-        stringifiers they always had, and struct/table/arr/map through a
-        generated JSON-like render. blob, img and aud are COMPILE
-        ERRORS here rather than auto-rendered: a blob's bytes may be
-        binary garbage mid-string (and it has an explicit .toText() for
-        when that is genuinely wanted), and an img/aud has no text form
-        at all -- silently printing a placeholder would hide a mistake
+        stringifiers they always had, struct/table/arr/map through a
+        generated JSON-like render, and (claude.md #115) a blob through
+        its own toText(), because a blob is very often a text file and
+        the implicit conversion is DEFINED as the method it already
+        has. img and aud are COMPILE ERRORS: they have no text form at
+        all, and silently printing a placeholder would hide a mistake
         the type system can catch."""
         if type_ == TEXT:
             return val
@@ -3030,10 +3030,10 @@ class CodeGen:
             lines.append(f"  call void {fn}(ptr {val}, ptr {sb}, i64 0)")
             lines.append(f"  {out} = call ptr @festina_sb_finish(ptr {sb})")
         elif type_ == BLOB:
-            raise CodegenError(
-                "a blob cannot be rendered directly -- its bytes may be "
-                "binary; use value.toText() for the contents",
-                file=self.filename)
+            # claude.md #115: the contents. A binary blob renders its
+            # bytes up to the first NUL -- which is exactly what its
+            # explicit toText() does, and the two must not disagree.
+            lines.append(f"  {out} = call ptr @festina_blob_to_text(ptr {val})")
         elif isinstance(type_, (types_mod.ImageType, types_mod.AudioType)):
             raise CodegenError(
                 f"a value of type {types_mod.type_name(type_)} has no text "
@@ -5356,10 +5356,15 @@ class CodeGen:
                                                        INT, lines)
                     return "0", None
                 if vtype == BLOB:
-                    raise CodegenError(
-                        "log() cannot print a blob directly -- its bytes may "
-                        "be binary; log(value.toText()) prints the contents",
-                        file=self.filename, line=callee.line)
+                    # claude.md #115: log(blob) prints the contents,
+                    # exactly as `${blob}` renders them -- one implicit
+                    # conversion, both positions.
+                    rendered = self._to_text(val, vtype, lines)
+                    lines.append(f"  call void @festina_log_text(ptr {rendered})")
+                    lines.append(f"  call void @free(ptr {rendered})")
+                    self._release_member_receiver_temp(expr.args[0], val, vtype,
+                                                       INT, lines)
+                    return "0", None
                 if isinstance(vtype, (types_mod.ImageType, types_mod.AudioType)):
                     raise CodegenError(
                         f"log() cannot print a value of type "

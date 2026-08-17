@@ -2661,6 +2661,13 @@ carries a presence bitmask one hidden slot past its columns; an unknown
 name in undefined() fails the program.
 `tests/test_codegen.py::TestUndefinedAndNameMatchedColumns` (6 tests).
 
+**claude.md #115**: log(blob)/`${blob}` render the contents after all —
+#114 had put blob in the refuse list; a blob is very often a text file
+and already carries the method the implicit conversion is defined as,
+so both positions now compile to its toText(). img/aud still refuse
+(no text form), and a blob FIELD inside a rendered container keeps the
+"<blob>" placeholder — inlining whole files would drown the structure.
+
 **claude.md #114**: implicit .toText() in log()/templates, JSON-like
 containers, and a refusal for media types.
 

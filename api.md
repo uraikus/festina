@@ -236,16 +236,22 @@ cyclic value truncates at depth 32 instead of crashing. An **unassigned**
 scalar field renders its zero value (per the zero-value rule); a field
 explicitly assigned `null` renders `null`.
 
-- **`blob`, `img`, `aud`** — a **compile error**, not an auto-render. A
-  blob's bytes may be binary garbage mid-string, and it has an explicit
-  `.toText()` for when that's genuinely wanted; `img`/`aud` have no text
-  form at all.
+- **`blob`** — the contents, via its own `.toText()`: a blob is very
+  often a text file. (A binary blob renders its bytes up to the first
+  NUL — the same thing its explicit `.toText()` does.) A blob *field
+  inside a rendered container* still shows as the `"<blob>"`
+  placeholder, since embedding a whole file mid-JSON would drown the
+  structure the rendering exists to show.
 
 ```festina
 blob f = 'notes.txt'
-log(f)                     // compile error
-log(f.toText())            // the contents, explicitly
+log(f)                     // the contents
+log(`config: ${f}`)        // interpolates the contents
 ```
+
+- **`img`, `aud`** — a **compile error**: neither has a text form, and
+  silently printing a placeholder would hide a mistake the type system
+  can catch.
 
 ## Structs
 

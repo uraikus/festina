@@ -296,16 +296,21 @@ class TestBlob:
         assert result.returncode == 0
         assert result.stdout.strip() == "the contents"
 
-    def test_logging_a_blob_directly_is_a_compile_error(
-            self, parser, semantic, codegen, tmp_path):
-        # claude.md #114: #109 made log(blob) print the contents; #114
-        # made it refuse instead, because a blob's bytes may be binary
-        # garbage mid-string and the explicit spelling is one method
-        # call away. The error names it.
-        program = parser.parse("blob data = 'x'\nlog(data)", filename="main.f")
-        analyzed = semantic.analyze(program, filename="main.f")
-        with pytest.raises(Exception, match=r"toText"):
-            codegen.generate_ir(program, analyzed, filename="main.f")
+    def test_logging_a_blob_prints_its_contents(self, compile_and_run, tmp_path):
+        # claude.md #115: log(blob) and `${blob}` print the contents --
+        # the blob's own toText(), which is what the implicit conversion
+        # means. (#114 briefly made this an error; a blob is very often
+        # a text file, so the conversion it already had wins.)
+        path = tmp_path / "data.txt"
+        path.write_text("the contents")
+        source = f"""
+        blob data = '{path}'
+        log(data)
+        log(`inline: ${{data}}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["the contents", "inline: the contents"]
 
     def test_a_missing_path_is_an_empty_blob_not_a_failure(self, compile_and_run):
         # claude.md #93's rule, inherited: a missing file is something
@@ -6493,18 +6498,18 @@ class TestJsonRendering:
             '{"name":"with file","data":"<blob>"}']
 
     @pytest.mark.parametrize('decl,use', [
-        ("blob v = 'x'", 'log(v)'),
-        ("blob v = 'x'", 'log(`${v}`)'),
         ("img v = 'x.png'", 'log(v)'),
         ("img v = 'x.png'", 'log(`${v}`)'),
         ("aud v = 'x.wav'", 'log(v)'),
         ("aud v = 'x.wav'", 'log(`${v}`)'),
     ])
-    def test_media_in_log_or_template_is_a_compile_error(
+    def test_img_and_aud_in_log_or_template_are_compile_errors(
             self, parser, semantic, codegen, decl, use):
+        # claude.md #115: blob renders (it has a text form); img and aud
+        # do not, so they refuse.
         program = parser.parse(f'{decl}\n{use}', filename='main.f')
         analyzed = semantic.analyze(program, filename='main.f')
-        with pytest.raises(Exception, match=r'toText|text form'):
+        with pytest.raises(Exception, match=r'text form'):
             codegen.generate_ir(program, analyzed, filename='main.f')
 
 
