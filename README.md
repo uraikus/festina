@@ -7,7 +7,7 @@ overhead, and the boilerplate. Festina compiles through LLVM to a real,
 standalone executable — with SQLite, graphics, audio, and JS-style
 timers built directly into the language, not bolted on as libraries.
 
-[![Tests](https://img.shields.io/badge/tests-1061%20passing-brightgreen)](tests/CONTRACT.md)
+[![Tests](https://img.shields.io/badge/tests-1232%20passing-brightgreen)](tests/CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ```festina
@@ -57,9 +57,9 @@ bin/festina compile examples/greet.f -o greet && ./greet
 - **Slim by default.** A compiled program only links what it actually
   uses — skip graphics and audio in your source, and the binary skips
   Cairo, X11, and ALSA too. See [security.md](security.md#binary-slimming).
-- **Minimal setup, by design.** `claude.md #59`'s whole premise: the
-  fewest dependencies that get the job done, failing loudly and clearly
-  the moment one is actually missing. See [setup.md](setup.md).
+- **Minimal setup, by design.** The fewest dependencies that get the
+  job done, failing loudly and clearly the moment one is actually
+  missing. See [setup.md](setup.md).
 
 ## Get started
 
@@ -192,25 +192,23 @@ benchmarks (recursive function calls, tight-loop arithmetic, process
 startup, array allocation, string concatenation) — see
 [benchmark.md](benchmark.md) for the methodology and the full,
 regularly-refreshed results table. Short version: Festina holds its own
-against Rust and Go on compute-bound native code, and comfortably
-outruns a JIT on cold single-shot execution — unsurprising for a young
-optimizer against two of the most mature compiled-language backends
-around, and exactly the kind of regression tracking a young compiler
-needs.
+against Rust and Go on compute-bound native code, comfortably outruns a
+JIT on cold single-shot execution, and its canvas draws a 40,000-shape
+frame about twice as fast as Chromium's.
 
 ## Project status
 
-Festina is under active development, but not vaporware — the compiler
-frontend, LLVM codegen backend, and native C runtime are real and
-tested: **1061 tests, 0 failures.** Every `claude.md` language construct
-this project has committed to is implemented end to end, not just
+The compiler frontend, LLVM codegen backend, and native C runtime are
+real and tested: **1232 tests, 0 failures.** Every language construct
+in the [specification](claude.md) is implemented end to end, not just
 parsed. That includes a leak stress suite —
-[`scripts/leak_stress.sh`](scripts/leak_stress.sh) runs five programs
-under AddressSanitizer and LeakSanitizer, each hammering one ownership
-mechanism thousands of times — because "the answers are right" and
-"nothing accumulates while producing them" are different claims. See
-[`tests/CONTRACT.md`](tests/CONTRACT.md) for exactly what's covered and
-how, and [todo.md](todo.md) for what's next (macOS, Windows, HTTP).
+[`scripts/leak_stress.sh`](scripts/leak_stress.sh) runs mixed churn
+programs plus one isolation program per data type under
+AddressSanitizer and LeakSanitizer — because "the answers are right"
+and "nothing accumulates while producing them" are different claims.
+See [`tests/CONTRACT.md`](tests/CONTRACT.md) for exactly what's covered
+and how, and [todo.md](todo.md) for what's next (macOS, Windows,
+HTTP).
 
 ```bash
 python3 -m pytest            # the whole suite
@@ -221,7 +219,7 @@ scripts/leak_stress.sh       # just the sanitizer stress runs
 |---|---|
 | **Language & API reference** | [api.md](api.md) |
 | **Setup & dependencies** | [setup.md](setup.md) |
-| **Security & audit history** | [security.md](security.md) |
+| **Security** | [security.md](security.md) |
 | **Benchmarks vs. Rust/Go/Bun** | [benchmark.md](benchmark.md) |
 | **Roadmap** | [todo.md](todo.md) |
 | **Full spec-compliance test suite** | [tests/CONTRACT.md](tests/CONTRACT.md) |
