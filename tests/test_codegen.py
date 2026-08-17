@@ -6357,6 +6357,329 @@ class TestAudioChannelReturnAndClipStop:
         assert result.stdout.strip() == "-1"
 
 
+class TestFreeStatement:
+    """claude.md #111: `free name` -- release what the binding holds,
+    null the binding. For refcounted types it is a DECREMENT, so a value
+    something else still references survives; for img/aud it is the
+    manual escape hatch for the escaping-handle leak; for value types it
+    degenerates to `x = null`. Composable with automatic reclamation
+    because every release in the runtime is null-safe and a free target
+    counts as escaping (see escape_analysis's own comment)."""
+
+    def test_freeing_nulls_the_binding(self, compile_and_run, tmp_path):
+        path = tmp_path / "b.txt"
+        source = f"""
+        blob b = '{path}'
+        free b
+        log(b == null)
+        int n = 5
+        free n
+        log(n == null)
+        text t = 'x'
+        free t
+        log(t == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true", "true"]
+
+    def test_freeing_twice_is_a_no_op(self, compile_and_run):
+        source = """
+        struct P { n:int }
+        P p
+        p.n = 1
+        free p
+        free p
+        log('survived')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "survived"
+
+    def test_a_shared_value_survives_freeing_one_reference(self, compile_and_run):
+        # The user-facing half of "free is a decrement": the array is
+        # freed, the element it shared with `keep` is not. Verified
+        # leak-free AND corruption-free under ASan separately; this pins
+        # the visible behavior.
+        source = """
+        struct P { n:int  label:text }
+        P keep
+        keep.n = 7
+        keep.label = 'held'
+        arr[P] xs = [keep, keep]
+        free xs
+        log(xs == null)
+        log(keep.label)
+        free keep
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "held"]
+
+    def test_freeing_a_clip_source_leaves_its_clips_alone(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        # The motivating example: clips carry their own surfaces, so the
+        # sheet can go the moment the clips are cut.
+        source = f"""
+        img spritesheet = '{sprite_sheet_png}'
+        img grass = spritesheet.clip(0, 0, 31, 31)
+        img dirt = spritesheet.clip(32, 0, 31, 31)
+        free spritesheet
+        log(spritesheet == null)
+        log(grass.width)
+        log(dirt.width)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "31", "31"]
+
+    def test_freeing_a_regex_literal_binding_keeps_the_cache_intact(
+            self, compile_and_run):
+        # A /pattern/ literal is compiled once and cached for the whole
+        # process (claude.md #85); the value carries a `cached` mark and
+        # festina_regex_free no-ops on it, so free is safe on a regex
+        # binding whichever way it was produced.
+        source = """
+        for int i = 0, i < 3, i++ {
+            regex r = /a+/i
+            log(r.test('AAA'))
+            free r
+        }
+        regex dyn = regex('[0-9]+')
+        free dyn
+        log(dyn == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true", "true", "true"]
+
+    def test_freeing_a_query_row_drops_the_binding_without_freeing(
+            self, compile_and_run, tmp_path):
+        # A row is owned by the array it came from -- freeing it here
+        # would double-free at the array's own release, so `free row`
+        # only nulls the binding. Freeing the ARRAY is the real release.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table T {{ id:int }}
+        sqlite('INSERT INTO T (id) VALUES (1)')
+        arr[T] rows = sqlite('SELECT * FROM T')
+        T first = rows[0]
+        free first
+        log(first == null)
+        log(rows[0].id)
+        free rows
+        log(rows == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "1", "true"]
+
+    def test_free_on_an_unknown_name_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("free nothing")
+        with pytest.raises(errors.CompileError, match="unknown variable"):
+            semantic.analyze(program)
+
+    def test_free_on_a_constant_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("const int N = 5\nfree N")
+        with pytest.raises(errors.CompileError, match="constant"):
+            semantic.analyze(program)
+
+    def test_free_on_a_parameter_is_a_compile_error(self, parser, semantic, errors):
+        # A parameter borrows its caller's value (claude.md #84).
+        program = parser.parse(
+            "void func f(t:text) {\n    free t\n}\nf('x')")
+        with pytest.raises(errors.CompileError, match="parameter"):
+            semantic.analyze(program)
+
+
+class TestDeleteStatement:
+    """claude.md #111: `delete`, JS-shaped. A map entry stops existing;
+    a struct field reads null afterwards; a query-row field reads null
+    AND its presence bit clears, so undefined() reports it like a column
+    the query never selected."""
+
+    def test_both_map_forms_from_the_spec_example(self, compile_and_run):
+        source = """
+        map[text] example = {'data': 'some data', 'more-data': 'Some more data'}
+        delete example.data
+        delete example['more-data']
+        log(example['data'] == null)
+        log(example['more-data'] == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true"]
+
+    def test_a_deleted_key_stops_existing_for_for_each(self, compile_and_run):
+        # Removal, not set-to-null: forEach never visits the deleted key,
+        # which null could not express.
+        source = """
+        void func show(v:int, k:text) {
+            log(`${k}=${v}`)
+        }
+        map[int] m = {'a': 1, 'b': 2, 'c': 3}
+        delete m.b
+        m.forEach(show)
+        """
+        result = compile_and_run(source)
+        assert sorted(result.stdout.splitlines()) == ["a=1", "c=3"]
+
+    def test_deleting_a_missing_key_is_a_no_op(self, compile_and_run):
+        source = """
+        map[int] m = {'a': 1}
+        delete m.nothing
+        delete m['also-nothing']
+        log(m['a'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "1"
+
+    def test_a_computed_key_expression_works(self, compile_and_run):
+        source = """
+        map[int] m = {'k1': 10, 'k2': 20}
+        int i = 1
+        delete m[`k${i}`]
+        log(m['k1'] == null)
+        log(m['k2'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "20"]
+
+    def test_a_deleted_struct_field_reads_null(self, compile_and_run):
+        source = """
+        struct P { n:int  label:text }
+        P p
+        p.n = 5
+        p.label = 'x'
+        delete p.label
+        delete p.n
+        log(p.label == null)
+        log(p.n == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true"]
+
+    def test_delete_on_a_non_container_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("int x = 5\nint y = 1\ndelete y.something")
+        with pytest.raises(errors.CompileError, match="delete"):
+            semantic.analyze(program)
+
+    def test_delete_of_a_whole_variable_says_to_use_free(self, parser, errors):
+        with pytest.raises(errors.CompileError, match="free"):
+            parser.parse("int x = 5\ndelete x")
+
+    def test_deleting_an_unknown_struct_field_is_a_compile_error(
+            self, parser, semantic, errors):
+        program = parser.parse("struct P { n:int }\nP p\ndelete p.missing")
+        with pytest.raises(errors.CompileError, match="missing"):
+            semantic.analyze(program)
+
+    def test_blob_delete_method_still_works(self, compile_and_run, tmp_path):
+        # `delete` became a keyword; member names accept keywords
+        # (parser.eat_name), so blob's method is untouched.
+        path = tmp_path / "f.txt"
+        source = f"""
+        blob f = '{path}'
+        f.write('x')
+        log(f.delete())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+
+
+class TestUndefinedAndNameMatchedColumns:
+    """claude.md #111: result columns match declared columns by NAME
+    (positional matching silently misaligned every partial or reordered
+    SELECT), and each row records which declared columns the result set
+    actually contained -- read by row.undefined('col'), which is the
+    difference between "the database said NULL" and "the query never
+    asked"."""
+
+    def test_the_spec_example(self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table examples {{ id:int  name:text }}
+        sqlite('INSERT INTO examples (id, name) VALUES (?, ?)', [1, null])
+        arr[examples] data = sqlite('select id from examples')
+        if data[0] != null {{
+          log('should log')
+          if data[0].name == null && data[0].undefined('name') {{
+            log('should also log')
+          }}
+        }}
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["should log", "should also log"]
+
+    def test_a_genuine_database_null_is_not_undefined(self, compile_and_run, tmp_path):
+        # The whole point of the distinction: NULL that came from the
+        # database is a VALUE, and undefined() says so.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table examples {{ id:int  name:text }}
+        sqlite('INSERT INTO examples (id, name) VALUES (?, ?)', [1, null])
+        arr[examples] data = sqlite('select * from examples')
+        log(data[0].name == null)
+        log(data[0].undefined('name'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_a_deleted_row_column_becomes_undefined(self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table examples {{ id:int  name:text }}
+        sqlite('INSERT INTO examples (id, name) VALUES (?, ?)', [1, 'x'])
+        arr[examples] data = sqlite('select * from examples')
+        log(data[0].undefined('name'))
+        delete data[0].name
+        log(data[0].name == null)
+        log(data[0].undefined('name'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["false", "true", "true"]
+
+    def test_a_reordered_select_lands_by_name(self, compile_and_run, tmp_path):
+        # The bug the name matching fixes: this used to read name's text
+        # into the id slot as an integer.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table T {{ id:int  name:text  score:float }}
+        sqlite('INSERT INTO T (id, name, score) VALUES (?, ?, ?)', [7, 'seven', 1.5])
+        arr[T] rows = sqlite('select score, name from T')
+        log(rows[0].name)
+        log(rows[0].score)
+        log(rows[0].id == null)
+        log(rows[0].undefined('id'))
+        log(rows[0].undefined('score'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            "seven", "1.5", "true", "true", "false"]
+
+    def test_an_unknown_column_name_fails_clearly(self, compile_and_run, tmp_path):
+        # Asking about a column the table does not have is a typo, and
+        # true or false would both bury it.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table T {{ id:int }}
+        sqlite('INSERT INTO T (id) VALUES (1)')
+        arr[T] rows = sqlite('SELECT * FROM T')
+        log(rows[0].undefined('nmae'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode != 0
+        assert "no column by that name" in result.stderr
+
+    def test_undefined_requires_one_text_argument(self, parser, semantic, errors):
+        program = parser.parse(
+            "table T { id:int }\n"
+            "arr[T] rows = sqlite('SELECT * FROM T')\n"
+            "log(rows[0].undefined(5))")
+        with pytest.raises(errors.CompileError, match="must be text"):
+            semantic.analyze(program)
+
+
 class TestSaveAndSaveCopy:
     """claude.md #110: save()/saveCopy() on blob, img and aud.
 
@@ -8008,23 +8331,36 @@ class TestSqliteQueries:
         assert result.returncode == 0
         assert result.stdout.strip() == "nan"
 
-    def test_columns_map_by_position_not_name(self, compile_and_run):
-        # claude.md #34: "The table declaration defines the expected
-        # fields and their types" -- a query returning the same columns
-        # in the same order (even via a differently-aliased SELECT) still
-        # maps positionally onto the declared table.
+    def test_columns_map_by_name_not_position(self, compile_and_run):
+        # claude.md #111 INVERTED this test, which used to pin positional
+        # mapping (and was named test_columns_map_by_position_not_name).
+        # Positional mapping was a bug hiding behind the SELECT * habit:
+        # `SELECT name FROM People` read the name's text into the id slot
+        # as an integer, and `SELECT id` read a result column that did
+        # not exist. Matching is by name now, case-insensitively, so a
+        # REORDERED select lands every value in its declared column --
+        # and an alias renames a column away from its declared name, so
+        # aliased columns are simply not matched (they read as null and
+        # undefined()). Alias TO a declared name to remap deliberately.
         source = """
         table People {
             id:int
             name:text
         }
         sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'Patrick'])
-        arr[People] people = sqlite('SELECT id AS whatever, name AS anything FROM People')
+        arr[People] people = sqlite('SELECT name, id FROM People')
+        log(people[0].id)
         log(people[0].name)
+        arr[People] aliased = sqlite('SELECT id AS whatever FROM People')
+        log(aliased[0].id == null)
+        log(aliased[0].undefined('id'))
+        arr[People] remapped = sqlite("SELECT 'Renamed' AS name FROM People")
+        log(remapped[0].name)
         """
         result = compile_and_run(source)
         assert result.returncode == 0
-        assert result.stdout.strip() == "Patrick"
+        assert result.stdout.splitlines() == [
+            "1", "Patrick", "true", "true", "Renamed"]
 
     def test_exec_only_query_discards_result(self, compile_and_run):
         # A statement whose result isn't captured into an arr[Table]

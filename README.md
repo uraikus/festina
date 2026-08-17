@@ -47,6 +47,9 @@ bin/festina compile examples/greet.f -o greet && ./greet
   (`aud music = 'music.mp3'` then `music.play()`) are just declarations
   and methods, backed by Cairo/X11 and
   ALSA under the hood.
+- **Automatic memory, manual override.** Values are reclaimed for you —
+  and `free spritesheet` / `delete map.key` exist for the moments you
+  know the lifetime better than the compiler does.
 - **JavaScript syntax, none of the surprises.** Template strings,
   ternaries, familiar control flow — but `int`/`float` never silently
   mix, every condition is a real `bool`, and everything is statically

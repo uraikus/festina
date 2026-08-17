@@ -1514,6 +1514,13 @@ listed here only so they aren't lost:
   a `/pattern/` literal is a process-lifetime cached pointer that must
   never be freed, so it would need an immortal sentinel — which #77's
   header already has, for exactly this shape of problem.
+
+  **claude.md #111 added the manual answer:** `free handle` releases an
+  img/aud outright, so a program that knows its own lifetimes can close
+  the leak by hand (`free spritesheet` after cutting clips — the exact
+  motivating case). The automatic answer above is still the right
+  eventual fix; `free` on an aliased img/aud is the C contract, dangling
+  alias and all, which refcounting would make safe.
 - **A call result reached through a chain that yields a MANAGED value
   still leaks.** Mostly closed by claude.md #108. `make().count`
   (claude.md #102), `make().inner.n`, `rows(x).length` and

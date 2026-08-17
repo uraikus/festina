@@ -2627,6 +2627,40 @@ gradient (sampling rounding, not geometry). Isolated circles are
 bit-identical from r=1 to r=20.
 `tests/test_codegen.py::TestCircleMaskFastPath` (15 tests).
 
+**claude.md #111**: `free`, `delete`, `undefined()` — and columns match
+by name.
+
+`free name` releases and nulls a binding of any type — a refcount
+decrement for struct/arr/map/blob (shared values survive), an outright
+free for img/aud (the manual escape hatch for the escaping-handle leak),
+`x = null` for scalars, and a drop-without-free for a borrowed query
+row. Safe because every runtime release is null-safe and a free target
+counts as escaping (stack-allocated storage has no refcount header to
+release through — ASan caught the underflow on the first try, and the
+escape rule is the fix). A regex value carries a `cached` mark so
+freeing a /pattern/ literal binding no-ops instead of corrupting the
+line's shared cache. Constants and parameters refuse at compile time.
+Also surfaced a real latent bug: globals retained fresh values
+unconditionally (count 2), unobservable until `free` tried to drop the
+last reference; globals now use locals' freshness test.
+`tests/test_codegen.py::TestFreeStatement` (9 tests).
+
+`delete m.key`/`delete m['key']` removes a map entry outright (forEach
+skips it; missing key is a no-op); `delete s.field` releases and nulls;
+on a query row it also clears the presence bit so the column reads as
+undefined. `delete x` on a variable errors, naming `free`. blob's
+`f.delete()` method still parses — member names accept keywords.
+`tests/test_codegen.py::TestDeleteStatement` (9 tests).
+
+`row.undefined('col')` distinguishes a database NULL from a column the
+query never selected (or deleted). Building it exposed that column
+matching was POSITIONAL — `select name from t` put text bits in the id
+slot, and a test named test_columns_map_by_position_not_name pinned the
+bug as a contract. Matching is by name now (case-insensitive); each row
+carries a presence bitmask one hidden slot past its columns; an unknown
+name in undefined() fails the program.
+`tests/test_codegen.py::TestUndefinedAndNameMatchedColumns` (6 tests).
+
 **claude.md #102**: a bug hunt, and a leak harness that can fail.
 
 Six bugs found by deliberate probing rather than by waiting for them:

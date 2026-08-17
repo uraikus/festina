@@ -181,6 +181,27 @@ class Parser:
             return self.parse_for()
         if t.type == "return":
             return self.parse_return()
+        if t.type == "free":
+            # claude.md #111: `free name`. The target is a bare variable
+            # -- freeing THROUGH an expression (a field, an element)
+            # would be `delete`'s territory, and a computed target has
+            # no binding to null afterwards.
+            free_tok = self.eat()
+            name_tok = self.eat("IDENT")
+            return ast.FreeStmt(name_tok.value, free_tok.line, free_tok.column)
+        if t.type == "delete":
+            # claude.md #111: `delete m.key` / `delete m['key']` /
+            # `delete s.field`. Parsed as a full postfix expression and
+            # then required to be a Member, so the error for `delete x`
+            # can say what delete is FOR instead of being a parse error.
+            del_tok = self.eat()
+            target = self.parse_call_member()
+            if not isinstance(target, ast.Member):
+                raise self.err(del_tok, "invalid statement",
+                                "delete removes a map key or nulls a struct/row "
+                                "field (delete m['key'], delete s.field) -- to "
+                                "release a whole variable, use `free name`")
+            return ast.DeleteStmt(target, del_tok.line, del_tok.column)
         if t.type == "break":
             return self.parse_break()
         if t.type == "continue":

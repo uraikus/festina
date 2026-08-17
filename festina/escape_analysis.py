@@ -133,6 +133,23 @@ def _walk_stmt(stmt, escaping, escaping_params):
             _walk_expr(stmt.init, escaping, escaping_params)
     elif isinstance(stmt, ast.ExprStmt):
         _walk_expr(stmt.expr, escaping, escaping_params)
+    elif isinstance(stmt, ast.FreeStmt):
+        # claude.md #111: a `free` target is treated as escaping, and
+        # this single line is what makes `free` SAFE rather than merely
+        # implemented. Escaping-ness is what forces the binding's value
+        # onto the heap behind a real refcount header (a non-escaping
+        # struct/arr/map local stack-allocates its storage, and calling
+        # a refcounted release on a stack address underflows into the
+        # frame -- caught by ASan the first time it was tried), and what
+        # keeps the compiler's own scope-exit reclamation from ALSO
+        # claiming ownership of a value the program said it would manage
+        # by hand. The cost -- one binding that could have been a stack
+        # slot now heap-allocates -- is paid only by bindings the
+        # program explicitly frees, which are exactly the ones whose
+        # lifetime it wanted to control.
+        escaping.add(stmt.name)
+    elif isinstance(stmt, ast.DeleteStmt):
+        _walk_expr(stmt.target, escaping, escaping_params)
     elif isinstance(stmt, ast.Return):
         if stmt.value is not None:
             _walk_expr(stmt.value, escaping, escaping_params)

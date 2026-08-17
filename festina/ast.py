@@ -146,6 +146,24 @@ class ForStmt(Node):
         self.column = column
 
 
+class FreeStmt(Node):
+    """claude.md #111: `free name` -- release whatever the binding holds
+    and null the binding."""
+    def __init__(self, name, line=0, column=0):
+        self.name = name
+        self.line = line
+        self.column = column
+
+
+class DeleteStmt(Node):
+    """claude.md #111: `delete m.key` / `delete m['key']` /
+    `delete s.field` -- target is always a Member."""
+    def __init__(self, target, line=0, column=0):
+        self.target = target
+        self.line = line
+        self.column = column
+
+
 class BreakStmt(Node):
     """claude.md #73: exits the nearest enclosing for/while loop
     immediately. No value, no target label -- Festina has no labeled

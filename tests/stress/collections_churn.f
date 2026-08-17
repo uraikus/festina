@@ -58,6 +58,23 @@ while i < 1500 {
     arr[int] alias = xs
     alias.push(1)
     total = total + xs.length
+
+    // claude.md #111: delete removes entries (releasing their values),
+    // and free releases a whole binding by hand -- a decrement, so the
+    // alias above keeps the array alive until its own release. Freeing
+    // and deleting per iteration makes any imbalance one leak or one
+    // double-free per pass.
+    delete names[`n${i % 3}`]
+    delete counts.c4
+    delete counts.nothing
+    free counts
+    free names
+    free alias
+    if xs.length == 0 { log('unreachable') }
+    delete it.name
+    if it.name != null { log('unreachable') }
+    free it
+    free items
     i = i + 1
 }
 log(total)

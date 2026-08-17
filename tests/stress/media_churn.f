@@ -85,6 +85,16 @@ while i < 120 {
         }
     }
 
+    // claude.md #111: manual free -- the escape hatch for the one leak
+    // class img/aud still have (an escaping handle). aliasedSheet makes
+    // png escaping, which used to leak the whole decoded surface per
+    // iteration by design; free closes it by hand.
+    img aliasedSheet = png
+    free png
+    if aliasedSheet == null { log('unreachable') }
+    free jpg
+    free save
+
     // Playback through the channel pool, including a reserved channel.
     // claude.md #109: play/playLoop hand back their channel, and
     // stop() silences every voice of one clip.

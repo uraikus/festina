@@ -513,6 +513,36 @@ Binding is by value: the parameter is copied into the database as the
 statement runs, so nothing is retained afterwards and the asset stays
 yours.
 
+### Partial queries and `undefined()`
+
+Result columns are matched to the table's declared columns **by name**
+(case-insensitively), not by position — so a query may select any
+subset of columns, in any order, and every value lands where it
+belongs. A column the query didn't mention reads as `null`.
+
+But "the query never asked" and "the database said NULL" are different
+facts, and `row.undefined('col')` tells them apart:
+
+```festina
+table examples { id:int  name:text }
+arr[examples] data = sqlite('select id from examples')
+
+if data[0].name == null && data[0].undefined('name') {
+    // name is null because it wasn't selected -- not because the
+    // database has no name for this row
+}
+```
+
+`undefined('col')` is `true` when the column wasn't in the result set
+(or was `delete`d off the row), `false` when the database genuinely
+returned a value or a NULL. Asking about a column the table doesn't
+declare fails the program — that's a typo, and `true` or `false` would
+both bury it.
+
+A `SELECT ... AS alias` renames a column *away* from its declared name,
+so an aliased column simply doesn't match; alias *to* a declared name to
+remap a computed value into a column deliberately.
+
 ### Database configuration
 
 `festina.sqlite` is the default, but the entry file's very first line
@@ -1129,6 +1159,67 @@ log(back.exists())                    // false -- no path
 back.save('recovered.dat')            // now it has one
 log(back.exists())                    // true
 ```
+
+## Freeing and deleting
+
+Memory is automatic — but `free` and `delete` exist for the moments you
+know better than the compiler does.
+
+### `free`
+
+```festina
+img spritesheet = 'spritesheet.png'
+img grass = spritesheet.clip(0, 0, 31, 31)
+img dirt = spritesheet.clip(32, 0, 31, 31)
+free spritesheet                       // the sheet goes now, not at exit
+```
+
+`free name` releases whatever the binding holds and sets the binding to
+`null`. It works on **every type**:
+
+- **struct / `arr[T]` / `map[T]` / `blob`** — a reference-count
+  *decrement*, not a forced free. A value something else still points at
+  survives until its last reference drops; freeing an array releases
+  each element the same way, so a shared element outlives its array.
+- **`img` / `aud`** — freed outright. These are the types the compiler
+  can't always reclaim on its own (an escaping handle lives for the
+  program's lifetime — see the note under Images), so `free` is the
+  manual escape hatch: cut your clips, then `free spritesheet`. The
+  contract is the manual one: another binding still aliasing the handle
+  is left dangling — the freed *binding* reads `null`, an alias does not.
+- **`text`** — the buffer is freed (a text is exclusively owned).
+- **`regex`** — a `regex()` result is freed; a `/pattern/` literal's
+  process-lifetime cache marks itself and survives, so `free` is safe on
+  either.
+- **a query row** — the binding is nulled *without* freeing: the row is
+  owned by the array it came from. Free the array.
+- **`int` / `float` / `bool`** — nothing to release; `free x` is `x = null`.
+
+`free` composes with automatic reclamation: freeing twice is a no-op,
+and a freed binding that scope-exit cleanup later visits is already
+`null`, which every release treats as nothing-to-do. Constants and
+parameters can't be freed (a parameter borrows its caller's value).
+
+### `delete`
+
+```festina
+map[text] example = {'data': 'some data', 'more-data': 'Some more data'}
+delete example.data
+delete example['more-data']
+```
+
+On a **map**, `delete` removes the entry, JS-style — the key stops
+existing (`forEach` no longer visits it), which setting `null` could
+never express. Deleting a missing key is a safe no-op. The key can be a
+computed expression: `delete m[`k${i}`]`.
+
+On a **struct or query-row field**, `delete` releases the value and the
+field reads `null` afterwards. On a query row it *also* marks the column
+undefined — see below. (One inherited caveat: a struct field whose own
+type is struct/arr/map auto-vivifies on the next reach-through, per the
+zero-value rule, so it re-appears empty rather than staying null.)
+
+To remove a whole *variable*, that's `free` — `delete x` says so.
 
 ## Saving bytes to a path
 

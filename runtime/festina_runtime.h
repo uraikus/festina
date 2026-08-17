@@ -148,9 +148,26 @@ char *festina_sqlite_scalar_text(sqlite3_stmt *stmt);
 /* Steps a prepared statement to completion, collecting each row per the
  * layout above, then finalizes it. col_types has col_count entries,
  * one per declared table field in order ("int"/"float"/"bool"/"text"). */
+/* claude.md #111: takes the declared column NAMES too, because result
+ * columns are matched by name rather than position now (partial and
+ * reordered SELECTs used to silently misalign), and each row carries a
+ * hidden presence bitmask one slot past its columns, read by
+ * festina_row_undefined. */
 void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
-                                  const char **col_types,
+                                  const char **col_types, const char **col_names,
                                   int64_t *out_length, void **out_data);
+int8_t festina_row_undefined(void *row, const char **col_names,
+                             int32_t col_count, const char *name);
+/* claude.md #111: `delete m[key]` -- removes the entry, releasing its
+ * value through the same per-type trampoline whole-map release uses.
+ * Returns whether the key existed; a missing key is a safe no-op. */
+int8_t festina_map_delete(int64_t *count, void **entries, const char *key,
+                          void (*release)(int64_t, const char *));
+/* claude.md #111: `free` on a regex -- frees a runtime regex() result,
+ * but a /pattern/ literal's cached compilation is shared with every
+ * later execution of its line, so the value carries a `cached` flag and
+ * festina_regex_free no-ops on it. Set by generated code. */
+void festina_regex_mark_cached(void *compiled);
 
 /*
  * claude.md #67-68 (#107): regex(), .test(), .match(), .replace().

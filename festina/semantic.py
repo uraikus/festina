@@ -1248,6 +1248,30 @@ def analyze(program, filename="<string>"):
                             category="invalid function argument type",
                         )
                 return _INT
+            # claude.md #111: row.undefined('col') -- true when the named
+            # column was not in the query's result set, or was deleted;
+            # false when the database genuinely returned NULL (or a
+            # value). The distinction null alone cannot carry.
+            if callee.prop == "undefined":
+                obj_type = infer(callee.obj, scope)
+                if isinstance(obj_type, types_mod.TableType):
+                    if len(expr.args) != 1:
+                        raise CompileError(
+                            f"undefined() expects exactly 1 argument (a column "
+                            f"name), got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    arg_type = infer(expr.args[0], scope)
+                    if (arg_type is not None and arg_type is not NULL
+                            and arg_type != _TEXT):
+                        raise CompileError(
+                            f"undefined()'s column name must be text, found "
+                            f"{types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    return _BOOL
             # claude.md #110: save()/saveCopy() -- shared by blob, img and
             # aud, because all three are the same shape of value
             # (claude.md #101/#109: content plus the bytes it came from)
@@ -1665,6 +1689,88 @@ def analyze(program, filename="<string>"):
             check_condition_bool(cond_type, stmt)
             infer(stmt.update, loop_scope)
             analyze_block(stmt.body, loop_scope, return_type, loop_depth + 1)
+        elif isinstance(stmt, ast.FreeStmt):
+            # claude.md #111: `free name`. Any declared variable of any
+            # type -- releasing is type-dispatched in codegen, and for a
+            # type with nothing to release (int, a borrowed query row)
+            # freeing degenerates to nulling the binding, which is still
+            # a coherent thing to ask for.
+            sym = scope.lookup(stmt.name)
+            if sym is None or sym.kind not in ("variable", "constant", "parameter"):
+                raise CompileError(
+                    f"free: unknown variable '{stmt.name}'",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="unknown variable",
+                )
+            if sym.kind == "constant":
+                raise CompileError(
+                    f"cannot free the constant '{stmt.name}'",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="invalid statement",
+                )
+            if sym.kind == "parameter":
+                # A parameter is a BORROWED reference (claude.md #84) --
+                # the caller's value, which the caller will release.
+                raise CompileError(
+                    f"cannot free the parameter '{stmt.name}' -- a parameter "
+                    f"borrows its caller's value; free it in the caller",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="invalid statement",
+                )
+        elif isinstance(stmt, ast.DeleteStmt):
+            # claude.md #111: `delete m.key` / `delete m['key']` /
+            # `delete s.field`. The target's OBJECT decides the meaning:
+            # a map loses the entry, a struct/table field becomes null
+            # (a row also clears its presence bit -- see undefined()).
+            tgt = stmt.target
+            obj_type = infer(tgt.obj, scope)
+            if isinstance(obj_type, types_mod.MapType):
+                if tgt.computed:
+                    key_type = infer(tgt.prop, scope)
+                    if (key_type is not None and key_type is not NULL
+                            and key_type != _TEXT):
+                        raise CompileError(
+                            f"delete on a map takes a text key, found "
+                            f"{types_mod.type_name(key_type)}",
+                            file=filename, line=stmt.line, column=stmt.column,
+                            category="invalid statement",
+                        )
+            elif isinstance(obj_type, types_mod.StructType):
+                if tgt.computed:
+                    raise CompileError(
+                        "a struct field is deleted by name (delete s.field), "
+                        "not by a computed key",
+                        file=filename, line=stmt.line, column=stmt.column,
+                        category="invalid statement",
+                    )
+                if tgt.prop not in structs.get(obj_type.name, {}):
+                    raise CompileError(
+                        f"struct '{obj_type.name}' has no field '{tgt.prop}'",
+                        file=filename, line=stmt.line, column=stmt.column,
+                        category="invalid field access",
+                    )
+            elif isinstance(obj_type, types_mod.TableType):
+                if tgt.computed:
+                    raise CompileError(
+                        "a row field is deleted by name (delete row.field), "
+                        "not by a computed key",
+                        file=filename, line=stmt.line, column=stmt.column,
+                        category="invalid statement",
+                    )
+                cols = tables.get(obj_type.name) or {}
+                if tgt.prop not in cols:
+                    raise CompileError(
+                        f"table '{obj_type.name}' has no column '{tgt.prop}'",
+                        file=filename, line=stmt.line, column=stmt.column,
+                        category="invalid field access",
+                    )
+            elif obj_type is not None:
+                raise CompileError(
+                    f"delete works on a map key or a struct/row field, not on "
+                    f"{types_mod.type_name(obj_type)}",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="invalid statement",
+                )
         elif isinstance(stmt, ast.BreakStmt):
             if loop_depth == 0:
                 raise CompileError(
