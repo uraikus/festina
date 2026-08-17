@@ -227,6 +227,132 @@ char *festina_sb_finish(void *sbv) {
     return out;
 }
 
+/* ---- split and join -- claude.md #116 ----
+ *
+ * `sentence.split(sep)` -> arr[text], with sep either a text or a
+ * regex; `words.join(sep)` -> text. JS semantics throughout, because
+ * that is the dialect every other string operation here speaks:
+ * empty pieces between adjacent separators are KEPT ('a,,b' -> three
+ * pieces), a separator at the edge yields an edge empty, an
+ * empty-match regex splits between characters without looping forever,
+ * and join renders a null element as an empty string.
+ *
+ * The result array is built right here: the same {refcount | len, data}
+ * layout every arr[text] has (festina_sqlite_collect_rows already
+ * builds compatible arrays), refcount starting at 1, each piece an
+ * owned buffer -- so scope exit, aliasing, free and element release
+ * all apply to a split result with nothing new. */
+
+typedef struct {
+    char **items;
+    int64_t count;
+    int64_t cap;
+} FestinaPieces;
+
+static void festina_pieces_push(FestinaPieces *p, const char *start, size_t len) {
+    if (p->count == p->cap) {
+        p->cap = p->cap ? p->cap * 2 : 8;
+        char **grown = realloc(p->items, (size_t)p->cap * sizeof(char *));
+        if (!grown) festina_fail("out of memory in split()");
+        p->items = grown;
+    }
+    char *piece = malloc(len + 1);
+    if (!piece) festina_fail("out of memory in split()");
+    memcpy(piece, start, len);
+    piece[len] = '\0';
+    p->items[p->count++] = piece;
+}
+
+/* Wraps the collected pieces in a fresh refcounted arr[text]. */
+static void *festina_pieces_finish(FestinaPieces *p) {
+    char *raw = malloc(8 + 16);
+    if (!raw) festina_fail("out of memory in split()");
+    *(int64_t *)raw = 1;                       /* refcount */
+    int64_t *header = (int64_t *)(raw + 8);
+    header[0] = p->count;                      /* length */
+    memcpy(&header[1], &p->items, sizeof(char **));
+    return header;
+}
+
+void *festina_text_split(const char *s, const char *sep) {
+    FestinaPieces p = {NULL, 0, 0};
+    if (!s) s = "";
+    if (!sep) {
+        /* No separator to split on: the whole string, one piece --
+         * what JS's no-argument split does. */
+        festina_pieces_push(&p, s, strlen(s));
+        return festina_pieces_finish(&p);
+    }
+    if (!*sep) {
+        /* Empty separator: split between characters -- UTF-8 CODE
+         * POINTS, not bytes, or every non-ASCII string would shatter
+         * into invalid fragments. A continuation byte is 10xxxxxx. */
+        const char *c = s;
+        while (*c) {
+            const char *start = c;
+            c++;
+            while ((*c & 0xC0) == 0x80) c++;
+            festina_pieces_push(&p, start, (size_t)(c - start));
+        }
+        if (p.count == 0) festina_pieces_push(&p, s, 0);
+        return festina_pieces_finish(&p);
+    }
+    size_t sep_len = strlen(sep);
+    const char *cursor = s;
+    for (;;) {
+        const char *found = strstr(cursor, sep);
+        if (!found) {
+            festina_pieces_push(&p, cursor, strlen(cursor));
+            break;
+        }
+        festina_pieces_push(&p, cursor, (size_t)(found - cursor));
+        cursor = found + sep_len;
+    }
+    return festina_pieces_finish(&p);
+}
+
+/* `kind` names the element type ("text"/"int"/"float"/"bool") -- codegen
+ * passes it as a constant, since this runtime cannot know an arr[T]'s T.
+ * A null element joins as an empty string, exactly JS's choice. */
+char *festina_arr_join(void *arr, const char *sep, const char *kind) {
+    if (!sep) sep = "";
+    void *sb = festina_sb_new();
+    if (arr) {
+        int64_t *header = (int64_t *)arr;
+        int64_t n = header[0];
+        char *data;
+        memcpy(&data, &header[1], sizeof(char *));
+        int is_text = strcmp(kind, "text") == 0;
+        int is_int = strcmp(kind, "int") == 0;
+        int is_float = strcmp(kind, "float") == 0;
+        for (int64_t i = 0; i < n; i++) {
+            if (i > 0) festina_sb_append(sb, sep);
+            if (is_text) {
+                char *v = ((char **)data)[i];
+                if (v) festina_sb_append(sb, v);
+            } else if (is_int) {
+                int64_t v = ((int64_t *)data)[i];
+                if (v != festina_null_int()) {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "%lld", (long long)v);
+                    festina_sb_append(sb, buf);
+                }
+            } else if (is_float) {
+                double v = ((double *)data)[i];
+                if (v == v) {   /* NaN is Festina's float null */
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "%g", v);
+                    festina_sb_append(sb, buf);
+                }
+            } else {            /* bool: one byte per element, 2 = null */
+                int8_t v = ((int8_t *)data)[i];
+                if (v != 2) festina_sb_append(sb, v ? "true" : "false");
+            }
+        }
+    }
+    return festina_sb_finish(sb);
+}
+
 char *festina_str_concat(const char *a, const char *b) {
     if (!a) a = "";
     if (!b) b = "";
@@ -1322,6 +1448,51 @@ void festina_regex_free(void *compiled) {
 void festina_regex_mark_cached(void *compiled) {
     if (compiled) ((FestinaRegex *)compiled)->cached = 1;
 }
+
+/* claude.md #116: the regex half of split() -- lives here with the
+ * other FestinaRegex consumers; the pieces machinery it uses is up
+ * with the text half. */
+void *festina_regex_split(void *compiled, const char *s) {
+    FestinaPieces p = {NULL, 0, 0};
+    if (!s) s = "";
+    if (!compiled) {
+        festina_pieces_push(&p, s, strlen(s));
+        return festina_pieces_finish(&p);
+    }
+    regex_t *re = &((FestinaRegex *)compiled)->re;
+    const char *start = s;    /* start of the piece being accumulated */
+    const char *cursor = s;   /* where the next match is searched from */
+    for (;;) {
+        regmatch_t m;
+        int eflags = (cursor == s) ? 0 : REG_NOTBOL;
+        if (regexec(re, cursor, 1, &m, eflags) != 0) {
+            festina_pieces_push(&p, start, strlen(start));
+            break;
+        }
+        if (m.rm_so == m.rm_eo) {
+            /* An empty match splits BETWEEN characters, JS-style:
+             * 'abc'.split(/x*<em>/) is ['a','b','c'], with no trailing
+             * empty. Emitting the piece behind the cursor and stepping
+             * one character forward is both the split and the
+             * guarantee of progress. */
+            const char *at = cursor + m.rm_so;
+            if (at > start) {
+                festina_pieces_push(&p, start, (size_t)(at - start));
+                start = at;
+            }
+            if (!*at) break;
+            cursor = at + 1;
+        } else {
+            const char *match_start = cursor + m.rm_so;
+            festina_pieces_push(&p, start, (size_t)(match_start - start));
+            cursor += m.rm_eo;
+            start = cursor;
+        }
+    }
+    if (p.count == 0) festina_pieces_push(&p, s, strlen(s));
+    return festina_pieces_finish(&p);
+}
+
 
 int8_t festina_regex_test(void *compiled, const char *text) {
     if (!compiled) return 0;

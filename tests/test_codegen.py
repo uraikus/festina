@@ -6362,6 +6362,109 @@ class TestAudioChannelReturnAndClipStop:
         assert result.stdout.strip() == "-1"
 
 
+class TestSplitAndJoin:
+    '''claude.md #116: sentence.split(sep) -> arr[text], sep a text or a
+    regex; words.join(sep) -> text, on arrays of text/int/float/bool.
+    JS semantics throughout: empty pieces kept, edge empties kept, an
+    empty-match regex splits between characters without a trailing
+    empty, an empty text separator splits per UTF-8 code point, and a
+    null element joins as an empty string.'''
+
+    def test_the_spec_example(self, compile_and_run):
+        source = r'''
+        text sentence = 'the quick brown fox'
+        arr[text] words = sentence.split(' ')
+        log(words.length)
+        sentence = words.join('\t')
+        log(sentence)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ['4', 'the\tquick\tbrown\tfox']
+
+    def test_regex_split(self, compile_and_run):
+        source = r'''
+        arr[text] words = 'one   two	three'.split(/\s+/g)
+        log(words)
+        log(words.join('-'))
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            '["one","two","three"]', 'one-two-three']
+
+    def test_empty_pieces_are_kept(self, compile_and_run):
+        # JS: 'a,,b'.split(',') has three pieces; separators at the
+        # edges yield edge empties.
+        source = '''
+        log('a,,b'.split(','))
+        log(',start'.split(','))
+        log('end,'.split(','))
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            '["a","","b"]', '["","start"]', '["end",""]']
+
+    def test_no_match_is_one_piece(self, compile_and_run):
+        result = compile_and_run("log('whole'.split(','))")
+        assert result.stdout.strip() == '["whole"]'
+
+    def test_an_empty_match_regex_splits_between_characters(self, compile_and_run):
+        # ...and does not loop forever, and adds no trailing empty --
+        # both exactly JS.
+        result = compile_and_run("log('abc'.split(/x*/))")
+        assert result.stdout.strip() == '["a","b","c"]'
+
+    def test_an_empty_text_separator_splits_utf8_code_points(self, compile_and_run):
+        # Per CODE POINT, not per byte -- a byte split would shatter
+        # every non-ASCII character into invalid fragments.
+        result = compile_and_run("log('h\u00e9llo'.split(''))")
+        assert result.stdout.strip() == '["h","\u00e9","l","l","o"]'
+
+    def test_join_renders_scalars_and_null_as_empty(self, compile_and_run):
+        # JS: [1, null, 3].join('-') is '1--3'.
+        source = '''
+        arr[int] nums = [1, null, 3]
+        log(nums.join('-'))
+        arr[bool] flags = [true, false]
+        log(flags.join('|'))
+        arr[float] fs = [1.5, 2.5]
+        log(fs.join(', '))
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ['1--3', 'true|false', '1.5, 2.5']
+
+    def test_a_split_result_is_an_ordinary_array(self, compile_and_run):
+        # Refcounted, aliasable, freeable -- built by the runtime with
+        # the same layout every arr[text] has.
+        source = '''
+        arr[text] words = 'a b c'.split(' ')
+        arr[text] alias = words
+        words.push('d')
+        log(alias.length)
+        free words
+        log(alias[0])
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ['4', 'a']
+
+    def test_split_separator_must_be_text_or_regex(self, parser, semantic, errors):
+        program = parser.parse("log('a b'.split(5))")
+        with pytest.raises(errors.CompileError, match='text or regex'):
+            semantic.analyze(program)
+
+    def test_join_needs_a_joinable_element_type(self, parser, semantic, errors):
+        program = parser.parse(
+            'struct P { n:int }\n'
+            'arr[P] ps = []\n'
+            "log(ps.join(','))")
+        with pytest.raises(errors.CompileError, match='join'):
+            semantic.analyze(program)
+
+    def test_join_separator_must_be_text(self, parser, semantic, errors):
+        program = parser.parse("arr[int] ns = [1]\nlog(ns.join(5))")
+        with pytest.raises(errors.CompileError, match='separator must be text'):
+            semantic.analyze(program)
+
+
 class TestJsonRendering:
     '''claude.md #114: any non-text value in log() or `${}` compiles as
     its .toText(). int/float/bool keep their stringifiers; struct/table

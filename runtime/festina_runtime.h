@@ -44,6 +44,13 @@ void festina_sb_append_json_bool(void *sb, int8_t v);
 void festina_sb_append_json_bool64(void *sb, int64_t v);
 void festina_sb_append_handle(void *sb, const void *handle, const char *label);
 char *festina_sb_finish(void *sb);
+/* claude.md #116: text.split(text|regex) -> arr[text] (a fresh
+ * refcounted array of owned pieces, JS semantics -- see the .c doc
+ * comment), and arr.join(sep) -> owned text, `kind` naming the element
+ * type since the runtime cannot know an arr[T]'s T. */
+void *festina_text_split(const char *s, const char *sep);
+void *festina_regex_split(void *compiled, const char *s);
+char *festina_arr_join(void *arr, const char *sep, const char *kind);
 char *festina_text_own(const char *s);  /* claude.md #83: NULL-safe strdup */
 
 /* claude.md #93: math, files and time -- all libc/libm, both already on

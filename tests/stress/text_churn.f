@@ -52,3 +52,19 @@ while i < 2000 {
     i = i + 1
 }
 log(`${collected.length} ${sameish(byName['k0'], byName['k1'])}`)
+
+// claude.md #116: split allocates an array plus one owned piece per
+// element, join allocates through the string builder -- both per
+// iteration, so a missed release is one leak per pass.
+int extra = 0
+int j = 0
+while j < 300 {
+    arr[text] words = `piece ${j} of text`.split(' ')
+    extra = extra + words.length
+    text joined = words.join('|')
+    if joined == '' { log('unreachable') }
+    arr[text] rx = joined.split(/\|/g)
+    extra = extra + rx.length
+    j = j + 1
+}
+log(extra)

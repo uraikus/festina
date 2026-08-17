@@ -2661,6 +2661,15 @@ carries a presence bitmask one hidden slot past its columns; an unknown
 name in undefined() fails the program.
 `tests/test_codegen.py::TestUndefinedAndNameMatchedColumns` (6 tests).
 
+**claude.md #116**: text.split(text|regex) -> arr[text] and
+arr.join(text) -> text, on text/int/float/bool element types. JS
+semantics in full (kept empties, edge empties, empty-match regex splits
+between characters, empty text separator splits per UTF-8 code point,
+null joins as ''), each pinned as its own test since each is a
+decision. The split result is a runtime-built refcounted arr[text], so
+every existing array mechanism applies unchanged.
+`tests/test_codegen.py::TestSplitAndJoin` (11 tests).
+
 **claude.md #115**: log(blob)/`${blob}` render the contents after all —
 #114 had put blob in the refuse list; a blob is very often a text file
 and already carries the method the implicit conversion is defined as,

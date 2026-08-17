@@ -1026,6 +1026,10 @@ class CodeGen:
             "declare void @festina_sb_append_json_bool64(ptr, i64)",
             "declare void @festina_sb_append_handle(ptr, ptr, ptr)",
             "declare ptr @festina_sb_finish(ptr)",
+            # claude.md #116: split and join.
+            "declare ptr @festina_text_split(ptr, ptr)",
+            "declare ptr @festina_regex_split(ptr, ptr)",
+            "declare ptr @festina_arr_join(ptr, ptr, ptr)",
             "declare void @festina_sqlite_bind_int(ptr, i32, i64)",
             "declare void @festina_sqlite_bind_float(ptr, i32, double)",
             "declare void @festina_sqlite_bind_text(ptr, i32, ptr)",
@@ -5597,6 +5601,45 @@ class CodeGen:
                     self._release_member_receiver_temp(callee.obj, val, vtype,
                                                        TEXT, lines)
                     return out, TEXT
+            # claude.md #116: sentence.split(sep) -> arr[text]. The
+            # result is a fresh refcounted array the runtime built, so
+            # it is exactly as "owning" a source as an array literal --
+            # binding it needs no retain, and scope exit reclaims it
+            # (elements included) through the ordinary arr[text] release.
+            if callee.prop == "split":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if obj_type == TEXT:
+                    sep_val, sep_type = self._emit_expr(expr.args[0], env, lines)
+                    out = self.tmp()
+                    if sep_type == REGEX:
+                        lines.append(f"  {out} = call ptr @festina_regex_split("
+                                     f"ptr {sep_val}, ptr {obj_val})")
+                    else:
+                        lines.append(f"  {out} = call ptr @festina_text_split("
+                                     f"ptr {obj_val}, ptr {sep_val})")
+                    self._free_text_temp(callee.obj, obj_val, obj_type, lines)
+                    self._free_text_temp(expr.args[0], sep_val, sep_type, lines)
+                    self._free_regex_temp(expr.args[0], sep_val, sep_type, lines)
+                    return out, types_mod.ArrayType(TEXT)
+            # claude.md #116: words.join(sep) -> text. One runtime
+            # function; the element KIND rides along as a constant,
+            # since only the compiler knows an arr[T]'s T (the same
+            # reason the JSON render functions are generated per type).
+            if callee.prop == "join":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.ArrayType):
+                    kind = {INT: "int", FLOAT: "float", BOOL: "bool",
+                            TEXT: "text"}.get(obj_type.element)
+                    if kind is not None:
+                        sep_val, sep_type = self._emit_expr(expr.args[0], env, lines)
+                        out = self.tmp()
+                        lines.append(f"  {out} = call ptr @festina_arr_join("
+                                     f"ptr {obj_val}, ptr {sep_val}, "
+                                     f"ptr {self.string_const(kind)})")
+                        self._free_text_temp(expr.args[0], sep_val, sep_type, lines)
+                        self._release_member_receiver_temp(callee.obj, obj_val,
+                                                           obj_type, TEXT, lines)
+                        return out, TEXT
             # claude.md #67: pattern.test(value:text) -> bool
             if callee.prop == "test":
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
