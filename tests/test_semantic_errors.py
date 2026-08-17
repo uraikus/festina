@@ -143,8 +143,7 @@ class TestErrorCategories:
             semantic.analyze(program)
 
     @pytest.mark.parametrize("name", [
-        "drawRect", "drawCircle", "drawText", "drawImage",
-        "loadImage", "loadAudio", "regex",
+        "drawRect", "drawCircle", "drawText", "drawImage", "regex",
         "setTimeout", "setInterval", "clearTimeout", "clearInterval",
     ])
     def test_declaring_a_function_named_like_a_builtin_is_rejected(self, parser, semantic, errors, name):
@@ -158,6 +157,22 @@ class TestErrorCategories:
         program = parser.parse(f"void func {name}() {{\n    log(1)\n}}")
         with pytest.raises(errors.CompileError, match=name):
             semantic.analyze(program)
+
+    @pytest.mark.parametrize("name", [
+        "loadImage", "loadAudio", "readFile", "writeFile", "appendFile",
+        "fileExists", "deleteFile",
+    ])
+    def test_a_removed_builtin_name_is_free_to_declare_again(
+            self, parser, semantic, name):
+        # claude.md #109: these are no longer builtins, so nothing
+        # reserves the names any more -- declaring a function called
+        # `readFile` is now ordinary and it is genuinely reachable,
+        # unlike before, when every call resolved to the builtin. The
+        # helpful "this was removed, use X instead" message only fires
+        # when nothing else in scope answers to the name (see
+        # _REMOVED_BUILTINS' own note).
+        program = parser.parse(f"void func {name}() {{\n    log(1)\n}}\n{name}()")
+        semantic.analyze(program)
 
     @pytest.mark.parametrize("index_expr", ["1.5", "'x'", "true"])
     def test_non_int_array_index_is_rejected(self, parser, semantic, errors, index_expr):

@@ -107,7 +107,7 @@ class TestLeakStress:
         # leave a whole class of leak unwatched.
         assert set(_stress_programs()) == {
             "collections_churn.f",      # arr[T]/map[T], nested and aliased
-            "media_churn.f",            # img/aud handles, incl. BLOB round trips
+            "media_churn.f",            # img/aud/blob handles, incl. BLOB round trips
             "regex_and_files_churn.f",  # regex compilation, file and time text
             "structs_and_rows_churn.f", # structs, query rows, scope exits
             "text_churn.f",             # text, the copy-managed one

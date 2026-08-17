@@ -580,17 +580,24 @@ int64_t festina_get_max_audio_players(void) {
  * because the four differ only in these two flags -- everything about
  * claiming a channel, opening a device and spawning a thread is
  * identical. */
-void festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel,
-                            int8_t looping) {
+/* claude.md #109: returns the channel it actually played on, so a
+ * program can address the playback it just started -- `int ch =
+ * gunshot.play()` then `stopAudioPlayer(ch)`. Automatic assignment
+ * chooses a channel the caller cannot otherwise learn, which made the
+ * pool addressable only by re-specifying a channel by hand and so
+ * defeating the pool. -1 means nothing was played: a null clip, or
+ * every channel reserved by playLoop with none left to claim. */
+int64_t festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel,
+                               int8_t looping) {
     FestinaAudio *a = (FestinaAudio *)audio;
-    if (!a) return;
+    if (!a) return -1;
 
     pthread_mutex_lock(&g_audio_lock);
     FestinaChannel *ch = festina_audio_claim_channel(channel, explicit_channel);
     if (!ch) {
         /* Every channel is reserved -- see festina_audio_claim_channel. */
         pthread_mutex_unlock(&g_audio_lock);
-        return;
+        return -1;
     }
 
     /* Opened here, synchronously, rather than inside the background
@@ -627,7 +634,7 @@ void festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel
                  "could not open an audio output device: %s (is any audio device available?)",
                  snd_strerror(rc));
         festina_fail(msg);
-        return; /* unreachable -- festina_fail() calls exit() */
+        return -1; /* unreachable -- festina_fail() calls exit() */
     }
 
     ch->clip = a;
@@ -651,9 +658,50 @@ void festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel
         ch->locked = 0;
         pthread_mutex_unlock(&g_audio_lock);
         festina_fail("could not start an audio playback thread");
-        return;
+        return -1; /* unreachable -- festina_fail() calls exit() */
     }
     ch->joinable = 1;
+    int64_t chosen = (int64_t)(ch - g_channels);
+    pthread_mutex_unlock(&g_audio_lock);
+    return chosen;
+}
+
+/* claude.md #109: aud.stop() is BACK, and means what claude.md #100
+ * said its only honest reading was -- stop every channel playing this
+ * clip. #100 removed it on the grounds that this is almost never what
+ * a program firing overlapping effects wants, which is true and is
+ * also not a reason to withhold it: "silence this sound, wherever it
+ * is" is a real thing to want (a looping engine hum, a dialogue line,
+ * a music bed on more than one channel), and the alternative was
+ * tracking channel numbers by hand for something the runtime already
+ * knows. play()/playLoop() returning their channel is what covers the
+ * other case, so the two now sit side by side rather than one
+ * standing in for the other.
+ *
+ * Joins rather than merely signalling, exactly like
+ * festina_stop_audio_player, so every voice of this clip is
+ * guaranteed idle the instant this returns. Stopping a clip that is
+ * not playing is a safe no-op. */
+void festina_audio_stop_clip(void *audio) {
+    FestinaAudio *a = (FestinaAudio *)audio;
+    if (!a) return;
+    pthread_mutex_lock(&g_audio_lock);
+    int busy = 0;
+    for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+        if (g_channels[i].clip == a && g_channels[i].active) {
+            g_channels[i].stop_requested = 1;
+            busy = 1;
+        }
+    }
+    if (busy) {
+        for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+            /* release=1: a channel this clip had RESERVED via playLoop
+             * goes back to the pool, the same as stopAudioPlayer(n)
+             * would do for it. Stopping the sound and leaving its
+             * reservation standing would quietly shrink the pool. */
+            if (g_channels[i].clip == a) festina_audio_halt_locked(&g_channels[i], 1);
+        }
+    }
     pthread_mutex_unlock(&g_audio_lock);
 }
 

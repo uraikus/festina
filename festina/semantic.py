@@ -37,10 +37,45 @@ from .errors import CompileError
 # ever reaching the BUILTIN_FUNCTIONS check below, since setTimeout/
 # setInterval's first argument (a callback) needs structural handling
 # no other builtin needs -- see the comment there.
+# claude.md #109: names that used to be builtins, each mapped to the
+# sentence that says what replaced it. Checked before "unknown
+# function" so a program written against the old surface gets told what
+# to write instead of being told the name does not exist -- the same
+# treatment claude.md #100 gave aud.stop() and #107 gave replaceAll().
+# Every one of these was removed because the language had grown a
+# better way to say the same thing and keeping both was the only thing
+# making either confusing.
+# claude.md #109: blob's methods -- name -> (argument types, return
+# type). A blob is a file's bytes plus the path they came from, so
+# these are exactly the five things claude.md #93's free functions did
+# with a path, asked of the value that already holds one.
+#
+# toText() returns the bytes as text; the other four act on the file.
+# write/append/delete return bool rather than failing the program,
+# preserving claude.md #93's own rule that a missing or unwritable file
+# is something a program tests for rather than something that stops it.
+_REMOVED_BUILTINS = {
+    "loadImage": "loadImage() is gone -- declare the image from its path "
+                 "instead: img sprite = 'sprite.png' (the path may be any "
+                 "text expression)",
+    "loadAudio": "loadAudio() is gone -- declare the clip from its path "
+                 "instead: aud music = 'music.mp3' (the path may be any "
+                 "text expression)",
+    "readFile": "readFile() is gone -- declare a blob from the path and read "
+                "it: blob f = 'notes.txt'  text body = f.toText()",
+    "writeFile": "writeFile() is gone -- declare a blob from the path and "
+                 "write to it: blob f = 'notes.txt'  f.write('hello')",
+    "appendFile": "appendFile() is gone -- declare a blob from the path and "
+                  "append to it: blob f = 'notes.txt'  f.append(' world')",
+    "fileExists": "fileExists() is gone -- declare a blob from the path and "
+                  "ask it: blob f = 'notes.txt'  bool there = f.exists()",
+    "deleteFile": "deleteFile() is gone -- declare a blob from the path and "
+                  "delete it: blob f = 'notes.txt'  f.delete()",
+}
+
 BUILTIN_FUNCTIONS = {
     "log", "fail", "sqlite",
     "drawRect", "drawCircle", "drawText", "drawImage",
-    "loadImage", "loadAudio",
     # claude.md #98: how many channels the pool may assign automatically.
     "setMaxAudioPlayers", "maxAudioPlayers",
     # claude.md #99: stop one channel (or, with no argument, all of them).
@@ -52,9 +87,9 @@ BUILTIN_FUNCTIONS = {
     "measureTextWidth", "measureTextHeight",
     "regex",
     "setTimeout", "setInterval", "clearTimeout", "clearInterval",
-    # claude.md #93: files, time, and canvas export -- all backed by
-    # libc or by Cairo's own PNG writer, both already linked.
-    "readFile", "writeFile", "appendFile", "fileExists", "deleteFile",
+    # claude.md #93: time and canvas export -- backed by libc and by
+    # Cairo's own PNG writer, both already linked. claude.md #109 moved
+    # this section's file functions onto `blob` itself.
     "now", "formatTime", "saveCanvas",
     # claude.md #94: paths, transforms, gradients, alpha
     "render", "clearCanvas", "clearRect",
@@ -69,8 +104,6 @@ BUILTIN_FUNCTIONS = {
 }
 
 _BUILTIN_RETURN_TYPES = {
-    "loadImage": types_mod.ImageType(),
-    "loadAudio": types_mod.AudioType(),
     # claude.md #98: reads back the limit AFTER clamping, so a program
     # can see what it actually got rather than what it asked for.
     "maxAudioPlayers": types_mod.PrimitiveType("int"),
@@ -79,11 +112,6 @@ _BUILTIN_RETURN_TYPES = {
     "measureTextWidth": types_mod.PrimitiveType("int"),
     "measureTextHeight": types_mod.PrimitiveType("int"),
     # claude.md #93
-    "readFile": types_mod.PrimitiveType("text"),
-    "writeFile": types_mod.PrimitiveType("bool"),
-    "appendFile": types_mod.PrimitiveType("bool"),
-    "fileExists": types_mod.PrimitiveType("bool"),
-    "deleteFile": types_mod.PrimitiveType("bool"),
     "now": types_mod.PrimitiveType("int"),
     "formatTime": types_mod.PrimitiveType("text"),
     "saveCanvas": types_mod.PrimitiveType("bool"),
@@ -99,6 +127,17 @@ _FLOAT = types_mod.PrimitiveType("float")
 _NUMERIC_TYPES = (_INT, _FLOAT)
 _TEXT = types_mod.PrimitiveType("text")
 _BLOB = types_mod.PrimitiveType("blob")
+_BOOL = types_mod.PrimitiveType("bool")
+
+# See the placeholder above for what this is and why. Defined here
+# rather than there because it needs _TEXT/_BOOL.
+_BLOB_METHODS = {
+    "toText": ((), _TEXT),
+    "write": ((_TEXT,), _BOOL),
+    "append": ((_TEXT,), _BOOL),
+    "exists": ((), _BOOL),
+    "delete": ((), _BOOL),
+}
 
 # claude.md #37, #39: signatures for the builtins with real implementations
 # (drawCircle/drawText/drawImage/loadImage) -- matches each function's own
@@ -111,8 +150,6 @@ _BUILTIN_SIGNATURES = {
     "drawCircle": (_INT, _INT, _INT),
     "drawText": (_TEXT, _INT, _INT),
     "drawImage": (types_mod.ImageType(), _INT, _INT),
-    "loadImage": (_TEXT,),
-    "loadAudio": (_TEXT,),  # claude.md #38
     "setMaxAudioPlayers": (_INT,),  # claude.md #98
     "maxAudioPlayers": (),
     # claude.md #89: a colour is text (a name, #rgb/#rrggbb, or 'none'),
@@ -123,11 +160,6 @@ _BUILTIN_SIGNATURES = {
     "measureTextWidth": (_TEXT,),
     "measureTextHeight": (_TEXT,),
     # claude.md #93
-    "readFile": (_TEXT,),
-    "writeFile": (_TEXT, _TEXT),
-    "appendFile": (_TEXT, _TEXT),
-    "fileExists": (_TEXT,),
-    "deleteFile": (_TEXT,),
     "now": (),
     "formatTime": (_INT, _TEXT),
     "saveCanvas": (_TEXT,),
@@ -714,16 +746,20 @@ def analyze(program, filename="<string>"):
                 # mismatch here (only the text-specific branch of
                 # _emit_binop even looks at the operand types) and
                 # produced invalid LLVM IR instead of a clear compile
-                # error. NULL is valid against everything (#25); blob
-                # and text are mutually comparable since check_assignable
-                # already allows text -> blob assignment and they share
-                # the identical runtime representation (both `ptr`,
-                # compared via the same festina_str_eq either way).
+                # error. NULL is valid against everything (#25).
+                #
+                # claude.md #109 removed the blob/text exception that
+                # used to live here. It was justified by the two sharing
+                # a runtime representation -- both `ptr` to bytes,
+                # compared by festina_str_eq either way -- which stopped
+                # being true when a blob became a handle. Comparing one
+                # to a text now would compare a struct's address against
+                # a string's contents. `f.toText() == t` is the
+                # comparison that was actually meant, and it says so.
                 compatible = (
                     left is None or right is None
                     or left is NULL or right is NULL
                     or left == right
-                    or {left, right} == {_TEXT, _BLOB}
                 )
                 if not compatible:
                     raise CompileError(
@@ -1038,8 +1074,13 @@ def analyze(program, filename="<string>"):
                 return _BUILTIN_RETURN_TYPES.get(name)
             sym = scope.lookup(name)
             if sym is None or sym.kind != "function":
+                # claude.md #109: a name this language used to have gets
+                # told what replaced it, not merely that it is unknown.
+                # A user-declared function of the same name still wins,
+                # since scope.lookup ran first -- nothing here reserves
+                # the old names, it only explains them.
                 raise CompileError(
-                    f"unknown function '{name}'",
+                    _REMOVED_BUILTINS.get(name, f"unknown function '{name}'"),
                     file=filename, line=callee.line, column=callee.column,
                     category="unknown function",
                 )
@@ -1183,9 +1224,12 @@ def analyze(program, filename="<string>"):
             # generic "Member call" fallback below and fails there via
             # _infer_member's now-strict AudioType handling, the same
             # way an unknown struct field does.
-            # claude.md #99: play/playLoop take an OPTIONAL channel;
-            # stop still takes none (it names the clip, not a channel --
-            # stopAudioPlayer(n) is how a program addresses one channel).
+            # claude.md #99: play/playLoop take an OPTIONAL channel.
+            # claude.md #109: and both RETURN the channel they played
+            # on, as an int. Automatic assignment picks a channel the
+            # caller could not otherwise learn, so the pool was
+            # addressable only by naming a channel by hand -- which is
+            # to say, by not using the pool. -1 if nothing was played.
             if callee.prop in ("play", "playLoop") and infer(callee.obj, scope) == _AUDIO:
                 if len(expr.args) > 1:
                     raise CompileError(
@@ -1203,24 +1247,55 @@ def analyze(program, filename="<string>"):
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid function argument type",
                         )
-                return None
-            # claude.md #100: aud.stop() is GONE. One clip can be playing
-            # on several channels at once -- three overlapping gunshots
-            # are the ordinary case, not the exotic one -- so "stop this
-            # clip" never named one thing, and its only honest reading
-            # (stop every copy of it) is almost never what a program
-            # firing overlapping effects wants. Channels are how a
-            # program addresses playback now. Caught by name here rather
-            # than left to the generic unknown-method error so the
-            # message can say what to use instead.
+                return _INT
+            # claude.md #109: blob's five methods -- the file functions
+            # claude.md #93 spelled as free functions taking a path,
+            # moved onto the value that already knows the path. Checked
+            # by name here, like every other method on a non-struct
+            # receiver, so arity and argument types are enforced rather
+            # than left to the generic member fallback.
+            if callee.prop in _BLOB_METHODS and infer(callee.obj, scope) == _BLOB:
+                arg_types, return_type = _BLOB_METHODS[callee.prop]
+                if len(expr.args) != len(arg_types):
+                    raise CompileError(
+                        f"{callee.prop}() expects {len(arg_types)} argument"
+                        f"{'' if len(arg_types) == 1 else 's'}, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                for i, expected in enumerate(arg_types):
+                    arg_type = infer(expr.args[i], scope)
+                    if (arg_type is not None and arg_type is not NULL
+                            and arg_type != expected):
+                        raise CompileError(
+                            f"{callee.prop}()'s argument {i + 1} expects "
+                            f"{types_mod.type_name(expected)}, found "
+                            f"{types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return return_type
+            # claude.md #109: aud.stop() is back, and means the thing
+            # claude.md #100 identified as its only honest reading --
+            # stop every channel playing this clip. #100 removed it
+            # because that is almost never what a program firing
+            # overlapping effects wants, which is true and was never a
+            # reason to withhold it: "silence this sound, wherever it
+            # is" is a real thing to want, and doing it by hand meant
+            # tracking channel numbers the runtime already knows. The
+            # overlapping-effects case is covered by play() returning
+            # its channel, so the two coexist instead of one standing
+            # in for the other.
             if callee.prop == "stop" and infer(callee.obj, scope) == _AUDIO:
-                raise CompileError(
-                    "aud has no stop() -- one clip can be playing on several "
-                    "channels at once, so stop it by channel: "
-                    "stopAudioPlayer(channel), or stopAudioPlayer() for all",
-                    file=filename, line=callee.line, column=callee.column,
-                    category="unknown method",
-                )
+                if expr.args:
+                    raise CompileError(
+                        f"stop() expects no arguments, got {len(expr.args)} -- "
+                        f"it stops every channel playing this clip; to stop one "
+                        f"channel use stopAudioPlayer(channel)",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return None
             # claude.md #92: sheet.clip(x, y, w, h) -> img, and
             # image.resize(w, h) -> void (in place). Checked here rather
             # than left to the generic Member-call fallback so the arity

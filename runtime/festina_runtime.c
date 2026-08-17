@@ -221,6 +221,192 @@ int8_t festina_delete_file(const char *path) {
     return remove(path) == 0 ? 1 : 0;
 }
 
+/* ---- blob -- claude.md #36, given its real meaning by claude.md #109 ----
+ *
+ * claude.md #36's only worked example was always `blob data =
+ * 'path/to/file'`, but for a long time `blob` was implemented as a
+ * second name for `text`: the declaration stored the PATH and nothing
+ * ever read the file. #109 makes the example mean what it says. A blob
+ * is the file's BYTES, loaded at the declaration, and it keeps the path
+ * it came from so it can be written back, appended to, tested for and
+ * deleted -- the five things claude.md #93 spelled as free functions
+ * taking a path over and over.
+ *
+ * The shape is deliberately the one `img` and `aud` already have (see
+ * claude.md #101): decoded/loaded content plus the bytes it came from,
+ * so the same value serves both a program and a SQLite BLOB column and
+ * a round trip is byte-identical. `length` is a real byte count, not
+ * strlen -- a blob is binary and may contain NUL. The buffer is
+ * NUL-terminated anyway, one byte past `length`, so handing it to
+ * .toText() and to every C string function this runtime already has
+ * costs no copy.
+ *
+ * Unlike img/aud, a blob is REFERENCE COUNTED, using the same i64
+ * header immediately before the payload that structs/arrays/maps use
+ * (festina_retain/festina_release_check). `blob a = b` shares one
+ * handle rather than re-reading the file, and reassigning a blob
+ * releases whatever it held -- so the last reference to a file's
+ * contents frees them, and an earlier reference keeps them alive. That
+ * is the behavior #109 asked for and it is exactly what the existing
+ * refcount protocol provides; nothing new was needed but a destructor
+ * that also frees the two inner strings. */
+typedef struct {
+    char *path;      /* strdup'd; "" for a blob that came from a column */
+    char *bytes;     /* always NUL-terminated at [length] */
+    int64_t length;  /* real byte count -- binary content may embed NUL */
+} FestinaBlob;
+
+/* Reads a whole file and reports its real length. festina_read_file
+ * above cannot serve a blob: it hands back a NUL-terminated buffer with
+ * the length thrown away, which is fine for text and loses the tail of
+ * anything binary. */
+static char *festina_read_file_sized(const char *path, int64_t *out_len) {
+    *out_len = 0;
+    if (!path || !*path) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long size = ftell(f);
+    if (size < 0) { fclose(f); return NULL; }
+    rewind(f);
+    char *buf = malloc((size_t)size + 1);
+    if (!buf) { fclose(f); festina_fail("out of memory reading a file"); }
+    size_t got = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    buf[got] = '\0';
+    *out_len = (int64_t)got;
+    return buf;
+}
+
+static void *festina_blob_alloc(char *path, char *bytes, int64_t length) {
+    char *raw = malloc(sizeof(int64_t) + sizeof(FestinaBlob));
+    if (!raw) festina_fail("out of memory allocating a blob");
+    *(int64_t *)raw = 1;
+    FestinaBlob *b = (FestinaBlob *)(raw + sizeof(int64_t));
+    b->path = path;
+    b->bytes = bytes;
+    b->length = length;
+    return b;
+}
+
+/* An unreadable path is NOT a failure -- it yields an empty blob whose
+ * .exists() is false, matching the rule claude.md #93 set for the file
+ * functions this replaces: "nothing here fails the program". A blob
+ * declared from a path that does not exist yet is the ordinary way to
+ * create a file, since .write() only needs the path. */
+void *festina_blob_open(const char *path) {
+    if (!path) path = "";
+    int64_t len = 0;
+    char *bytes = festina_read_file_sized(path, &len);
+    if (!bytes) { bytes = strdup(""); len = 0; }
+    if (!bytes) festina_fail("out of memory allocating a blob");
+    char *copy = strdup(path);
+    if (!copy) festina_fail("out of memory allocating a blob");
+    return festina_blob_alloc(copy, bytes, len);
+}
+
+/* claude.md #109: a blob read back out of a SQLite BLOB column. It has
+ * bytes and no path, so .toText() works and .exists()/.write()/
+ * .append()/.delete() all answer false -- there is no file to act on,
+ * and inventing a temporary one would be worse than saying so. */
+void *festina_blob_from_bytes(const void *data, int64_t len) {
+    if (len < 0) len = 0;
+    char *bytes = malloc((size_t)len + 1);
+    if (!bytes) festina_fail("out of memory allocating a blob");
+    if (data && len > 0) memcpy(bytes, data, (size_t)len);
+    bytes[len] = '\0';
+    char *copy = strdup("");
+    if (!copy) festina_fail("out of memory allocating a blob");
+    return festina_blob_alloc(copy, bytes, len);
+}
+
+/* The blob counterpart of the per-struct release wrappers codegen
+ * generates (claude.md #78): decrement, and only on the last reference
+ * free the two inner strings before the storage itself. */
+void festina_blob_release(void *payload) {
+    if (!payload) return;
+    if (!festina_release_check(payload)) return;
+    FestinaBlob *b = (FestinaBlob *)payload;
+    free(b->path);
+    free(b->bytes);
+    free((char *)payload - sizeof(int64_t));
+}
+
+/* A fresh copy, because every text this runtime hands back is owned by
+ * the caller (claude.md #83) -- returning b->bytes directly would let a
+ * text binding free a buffer the blob still owns. */
+char *festina_blob_to_text(void *payload) {
+    if (!payload) return NULL;
+    FestinaBlob *b = (FestinaBlob *)payload;
+    char *out = malloc((size_t)b->length + 1);
+    if (!out) festina_fail("out of memory in blob.toText()");
+    memcpy(out, b->bytes, (size_t)b->length);
+    out[b->length] = '\0';
+    return out;
+}
+
+const void *festina_blob_bytes(void *payload, int64_t *out_len) {
+    if (out_len) *out_len = 0;
+    if (!payload) return NULL;
+    FestinaBlob *b = (FestinaBlob *)payload;
+    if (out_len) *out_len = b->length;
+    return b->bytes;
+}
+
+/* Replaces the in-memory bytes as well as the file, so .toText()
+ * immediately after .write() reports what was written rather than what
+ * the file held at declaration time. If the write fails the blob is
+ * left alone -- reporting content that never reached the disk would be
+ * worse than reporting stale content. */
+static int8_t festina_blob_store(FestinaBlob *b, const char *content,
+                                  const char *mode, int append) {
+    if (!b->path || !*b->path) return 0;
+    if (!content) content = "";
+    if (!festina_put_file(b->path, content, mode)) return 0;
+    size_t add = strlen(content);
+    if (append) {
+        char *grown = malloc((size_t)b->length + add + 1);
+        if (!grown) festina_fail("out of memory in blob.append()");
+        memcpy(grown, b->bytes, (size_t)b->length);
+        memcpy(grown + b->length, content, add);
+        grown[b->length + add] = '\0';
+        free(b->bytes);
+        b->bytes = grown;
+        b->length += (int64_t)add;
+    } else {
+        char *fresh = malloc(add + 1);
+        if (!fresh) festina_fail("out of memory in blob.write()");
+        memcpy(fresh, content, add + 1);
+        free(b->bytes);
+        b->bytes = fresh;
+        b->length = (int64_t)add;
+    }
+    return 1;
+}
+
+int8_t festina_blob_write(void *payload, const char *content) {
+    if (!payload) return 0;
+    return festina_blob_store((FestinaBlob *)payload, content, "wb", 0);
+}
+
+int8_t festina_blob_append(void *payload, const char *content) {
+    if (!payload) return 0;
+    return festina_blob_store((FestinaBlob *)payload, content, "ab", 1);
+}
+
+int8_t festina_blob_exists(void *payload) {
+    if (!payload) return 0;
+    return festina_file_exists(((FestinaBlob *)payload)->path);
+}
+
+/* Deletes the FILE. The blob itself is an ordinary reference-counted
+ * value and is unaffected -- its bytes stay readable, which is what
+ * makes "delete it but keep what it said" expressible. */
+int8_t festina_blob_delete(void *payload) {
+    if (!payload) return 0;
+    return festina_delete_file(((FestinaBlob *)payload)->path);
+}
+
 /* claude.md #93: milliseconds since the Unix epoch -- the same unit and
  * origin JavaScript's Date.now() uses, which is the convention this
  * language's timers already follow (setTimeout takes milliseconds). */
@@ -661,7 +847,31 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
                     if (blob && blob_len > 0) handle = decode(blob, blob_len, "<database>");
                 }
                 memcpy(&row[c], &handle, sizeof(void *));
-            } else if (strcmp(t, "text") == 0 || strcmp(t, "blob") == 0) {
+            } else if (strcmp(t, "blob") == 0) {
+                /* claude.md #109: a blob column round-trips its BYTES,
+                 * not its path -- a path is meaningful only on the
+                 * machine that stored it, while the contents are the
+                 * thing worth keeping. This needs no registered decoder
+                 * the way aud/img do (claude.md #101): those decoders
+                 * live in the graphics/audio translation units, which a
+                 * program only links when it uses them, whereas
+                 * festina_blob_from_bytes is right here in the core.
+                 *
+                 * Reading the BLOB rather than the text: a blob may
+                 * legitimately contain NUL, and sqlite3_column_text
+                 * would stop at the first one. That was the bug the
+                 * previous shared text/blob branch had -- it treated a
+                 * blob column as a C string, which is exactly the
+                 * truncation claude.md #101 called out for media
+                 * columns and fixed only for aud/img. */
+                void *handle = NULL;
+                if (!is_null) {
+                    const void *data = sqlite3_column_blob(stmt, c);
+                    int len = sqlite3_column_bytes(stmt, c);
+                    handle = festina_blob_from_bytes(data, len < 0 ? 0 : len);
+                }
+                memcpy(&row[c], &handle, sizeof(void *));
+            } else if (strcmp(t, "text") == 0) {
                 char *copy = NULL;
                 if (!is_null) {
                     const unsigned char *txt = sqlite3_column_text(stmt, c);

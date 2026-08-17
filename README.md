@@ -44,7 +44,8 @@ bin/festina compile examples/greet.f -o greet && ./greet
 - **Graphics and audio, no dependencies to wire up yourself.** A real
   on-screen canvas (`drawRect`, `on mouseDown`, typed `color`/`font` values,
   ...) and real audio playback
-  (`loadAudio().play()`) are just functions, backed by Cairo/X11 and
+  (`aud music = 'music.mp3'` then `music.play()`) are just declarations
+  and methods, backed by Cairo/X11 and
   ALSA under the hood.
 - **JavaScript syntax, none of the surprises.** Template strings,
   ternaries, familiar control flow — but `int`/`float` never silently
@@ -121,8 +122,13 @@ on mouseDown(x:int, y:int) { log(`pressed ${x}, ${y}`) }
 on mouseUp(x:int, y:int)   { log(`released ${x}, ${y}`) }
 
 // Audio
-aud music = loadAudio('music.wav')
+aud music = 'music.wav'
 music.play()
+
+// Files -- a blob is a file's bytes, and knows its own path
+blob notes = 'notes.txt'
+notes.write('hello')
+log(notes.toText())
 
 // Timers, JS-style
 setTimeout(showMessage, 1000)
@@ -166,7 +172,8 @@ bin/festina compile examples/tic_tac_toe.f -o tic_tac_toe && ./tic_tac_toe
 | [`regex.f`](examples/regex.f) | `/pattern/flags` literals, `.test()`, `.match()`, `.replace()`, and `/g` for every-match |
 | [`timers.f`](examples/timers.f) | `setTimeout`/`setInterval`/`clearInterval` |
 | [`graphics.f`](examples/graphics.f) | A drawn canvas, plus every `on mouseDown`/`mouseUp`/`mouse`/`key`/`resize`/`close` handler |
-| [`audio.f`](examples/audio.f) | `loadAudio()`/`.play()`/`.stop()`/`.isPlaying()`, with a tiny bundled WAV |
+| [`audio.f`](examples/audio.f) | `aud` from a path, `.play()`/`.stop()`/`.isPlaying()`, channels, with a tiny bundled WAV |
+| [`files.f`](examples/files.f) | `blob` — a file's bytes, its methods, and what sharing one means |
 | [`tic_tac_toe.f`](examples/tic_tac_toe.f) | The game above — graphics, global game state, and win-checking logic together |
 
 Every one of these is compiled and checked by the test suite on every

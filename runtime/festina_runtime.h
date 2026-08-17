@@ -610,20 +610,28 @@ void festina_run_timer_loop(void);
  * the channel over and hands it back to the pool, since a one-shot has
  * nothing to reserve it for.
  *
- * claude.md #100 REMOVED the per-clip stop. One clip can be playing on
- * several channels at once -- three overlapping gunshots are the
- * ordinary case, not the exotic one -- so "stop this clip" never named
- * one thing, and its only honest reading (stop every copy) is almost
- * never what a program firing overlapping effects wants. Channels are
- * how playback is addressed: festina_stop_audio_player(n) for one,
- * festina_stop_audio_player(-1) for all. Both *join* rather than merely
- * signalling, so a stopped channel is guaranteed idle the instant the
- * call returns, not just "idle soon"; stopping a channel with nothing
- * on it is a safe no-op.
+ * claude.md #100 removed the per-clip stop and claude.md #109 brought
+ * it back, with the meaning #100 itself identified as its only honest
+ * one: festina_audio_stop_clip() stops EVERY channel playing that
+ * clip. #100's objection -- that this is almost never what a program
+ * firing overlapping effects wants -- is true and was never a reason
+ * to withhold it, because "silence this sound wherever it is" is a
+ * real thing to want and the alternative was bookkeeping the runtime
+ * already does. What #100 was really missing is the other half:
+ * festina_audio_play_on() now RETURNS the channel it chose, so a
+ * program can address one playback without naming a channel up front.
+ * The two answer different questions and now coexist.
  *
- * festina_audio_is_playing() survives, and stays clip-wide: "is this
- * sound audible anywhere" is still a meaningful question with a single
- * answer, unlike "stop it".
+ * Channels remain how one playback is addressed:
+ * festina_stop_audio_player(n) for one, festina_stop_audio_player(-1)
+ * for all. All three *join* rather than merely signalling, so a
+ * stopped channel is guaranteed idle the instant the call returns, not
+ * just "idle soon"; stopping a channel or a clip with nothing on it is
+ * a safe no-op.
+ *
+ * festina_audio_is_playing() is clip-wide for the same reason
+ * festina_audio_stop_clip() is: "is this sound audible anywhere" and
+ * "silence it everywhere" are the same question asked two ways.
  *
  * A voice that reaches its own natural end clears itself but stays
  * *joinable*: whoever next claims that slot joins the finished thread
@@ -657,10 +665,19 @@ void festina_audio_free(void *audio);
  * and gets automatic assignment); `looping` selects playLoop() over
  * play(). One entry point rather than four, because the four differ
  * only in these two flags -- claiming a channel, opening a device and
- * spawning a thread are identical for all of them. */
-void festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel,
-                            int8_t looping);
+ * spawning a thread are identical for all of them.
+ *
+ * claude.md #109: returns the channel actually used, or -1 if nothing
+ * was played (a null clip, or every channel reserved with none left to
+ * claim). Automatic assignment picks a channel the caller could not
+ * otherwise learn, which left the pool addressable only by naming a
+ * channel by hand -- that is, by not using the pool. */
+int64_t festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel,
+                               int8_t looping);
 int8_t festina_audio_is_playing(void *audio);
+/* claude.md #109: stop every channel playing this clip. See the
+ * "claude.md #100 removed the per-clip stop" note above. */
+void festina_audio_stop_clip(void *audio);
 /* claude.md #99: stopAudioPlayer(n) -- stop one channel and release its
  * reservation. A negative channel means every channel, which is what a
  * bare stopAudioPlayer() compiles to. */
@@ -690,11 +707,11 @@ char *festina_getenv(const char *name);
  * escape analysis (claude.md #74/#75/#76) proves DO escape their
  * declaring function -- the remainder that pure escape analysis can
  * never reach on its own. Complete (not just "handles everything but
- * cycles") for Festina specifically: a struct field's type, and an
- * arr[T]/map[T]'s own element type, must always be declared *before*
- * the struct/array/map containing it (verified directly -- even
- * `struct Node { next:Node }` fails to compile), so no value can ever
- * transitively reference itself. See festina_retain/festina_release's
+ * cycles") for Festina specifically -- or so it was, until claude.md
+ * #106 allowed `struct Node { next:Node }` and made a reference cycle
+ * constructible. A cycle is now a permanent leak (see todo.md); every
+ * acyclic value is still reclaimed exactly as described.
+ * See festina_retain/festina_release's
  * own doc comment in festina_runtime.c for the full design (the
  * refcount header layout, the negative-refcount immortal sentinel used
  * for a global's own untouched static initial storage, and why no
@@ -708,6 +725,44 @@ char *festina_getenv(const char *name);
  */
 void festina_retain(void *payload);
 void festina_release(void *payload);
+/* claude.md #78: the decrement-and-check half, so a caller that owns
+ * something INSIDE the payload can free it between the decrement and
+ * the storage's own free(). Returns 1 exactly when this was the last
+ * reference. Declared here since claude.md #109, when festina_blob_
+ * release became the first in-runtime user (codegen's generated
+ * per-struct wrappers call it through their own declaration). */
+int8_t festina_release_check(void *payload);
+
+/*
+ * claude.md #36, given its real meaning by claude.md #109: a `blob` is
+ * a file's BYTES, loaded from the path it is declared with, keeping
+ * that path so the file can be written, appended to, tested for and
+ * deleted through the same value. Same content-plus-origin shape as
+ * `img` and `aud` (claude.md #101), so a blob serves both a program
+ * and a SQLite BLOB column and round-trips byte-identically.
+ *
+ * Reference counted, unlike img/aud: `blob a = b` shares one handle,
+ * reassignment releases the old one, and the last reference frees the
+ * contents. It reuses the ordinary struct/arr/map refcount header, so
+ * the only new machinery is a destructor that frees the two inner
+ * strings first. See festina_runtime.c's own doc comment.
+ *
+ * Nothing here fails the program, matching the rule claude.md #93 set
+ * for the file functions this replaces: an unreadable path yields an
+ * empty blob whose .exists() is false, which is also how a file that
+ * does not exist yet is created (.write() needs only the path). A blob
+ * from festina_blob_from_bytes has bytes and NO path, so its
+ * .exists()/.write()/.append()/.delete() all answer false.
+ */
+void *festina_blob_open(const char *path);
+void *festina_blob_from_bytes(const void *data, int64_t len);
+void festina_blob_release(void *payload);
+char *festina_blob_to_text(void *payload);   /* owned copy, per claude.md #83 */
+const void *festina_blob_bytes(void *payload, int64_t *out_len);
+int8_t festina_blob_write(void *payload, const char *content);
+int8_t festina_blob_append(void *payload, const char *content);
+int8_t festina_blob_exists(void *payload);
+int8_t festina_blob_delete(void *payload);  /* deletes the FILE, not the blob */
 
 /*
  * claude.md #72: map[T] -- { key: value, ... } literals,

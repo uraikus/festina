@@ -128,19 +128,48 @@ class TestIndividualExamples:
         result = _run_example(cli_mod, tmp_path, "audio.f", env=audio_null_env)
         lines = result.stdout.splitlines()
         assert lines[0] == "playing..."
-        assert lines[1] == "isPlaying(): true"
-        # claude.md #98: the demo now also shows the channel pool, so
-        # two more play() calls layer on top of the first instead of
-        # restarting it.
-        assert lines[2] == "pooled channels: 10"
+        # claude.md #109: play() reports the channel it chose.
+        assert lines[1] == "playing on channel 0"
+        assert lines[2] == "isPlaying(): true"
+        # claude.md #98: the demo also shows the channel pool, so two
+        # more play() calls layer on top of the first instead of
+        # restarting it -- and #109 makes each of those channels
+        # nameable, which is what lets the demo stop just one.
+        assert lines[3] == "pooled channels: 10"
+        assert lines[4] == "three channels: 0 1 2"
         # claude.md #99: a reserved, looping channel, released by name.
-        assert lines[3] == "looping on channel 0: true"
-        assert lines[4] == "after stopAudioPlayer(0): false"
-        assert lines[5].startswith("isPlaying() after 100ms: ")
-        assert lines[6] == "stopping early"
-        # claude.md #100: playback is stopped by channel; a bare
-        # stopAudioPlayer() stops every one.
-        assert lines[7] == "isPlaying() after stopAudioPlayer(): false"
+        assert lines[5] == "looping on channel 0: true"
+        assert lines[6] == "after stopAudioPlayer(0): false"
+        assert lines[7].startswith("isPlaying() after 100ms: ")
+        assert lines[8] == "stopping early"
+        # claude.md #109: stop() silences every channel playing the clip.
+        assert lines[9] == "isPlaying() after beep.stop(): false"
+
+    def test_files_demo_runs_correctly(self, cli_mod, tmp_path):
+        # claude.md #109: blob. Writes under /tmp and cleans up after
+        # itself, so this needs no fixture beyond a C compiler.
+        result = _run_example(cli_mod, tmp_path, "files.f")
+        assert result.stdout.splitlines() == [
+            "exists before writing: false",
+            "write: true",
+            "append: true",
+            "contents: hello world",
+            "exists after writing: true",
+            # write() replaces the in-memory bytes too, not just the file.
+            "after rewriting: replaced",
+            "built from a computed path",
+            # One handle under two names: written through one, read
+            # through the other.
+            "read through alias: written through notes",
+            # Rebinding `notes` released only its own reference, so
+            # `alias` still reads the first file's contents.
+            "notes now: built from a computed path",
+            "alias still: written through notes",
+            "delete: true",
+            "exists after delete: false",
+            # delete() removes the FILE; the bytes are still in hand.
+            "contents after delete: written through notes",
+        ]
 
     def test_maps_demo_runs_correctly(self, cli_mod, tmp_path):
         result = _run_example(cli_mod, tmp_path, "maps.f")

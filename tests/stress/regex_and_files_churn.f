@@ -32,17 +32,30 @@ while i < 1500 {
         log('unreachable')
     }
 
-    // File round trip: writeFile/readFile/appendFile each allocate.
-    if writeFile('churn.txt', `line ${i}`) {
+    // claude.md #109: a file round trip through a blob. Every one of
+    // these allocates -- the handle itself, its path, its byte buffer,
+    // and toText()'s owned copy -- and a fresh blob is declared each
+    // iteration, so a missed release here is one leak per pass.
+    blob f = 'churn.txt'
+    if f.write(`line ${i}`) {
         total = total + 1
     }
-    appendFile('churn.txt', '\n')
-    text back = readFile('churn.txt')
+    f.append('\n')
+    text back = f.toText()
     if back == '' {
         log('unreachable')
     }
-    if fileExists('churn.txt') {
+    if f.exists() {
         total = total + 1
+    }
+
+    // ...and aliasing one, which is what makes the refcount do work
+    // rather than just counting to one and back. `shared` is released
+    // at scope exit; `f` is released too, and only the second of those
+    // actually frees anything.
+    blob shared = f
+    if shared.toText() != back {
+        log('unreachable')
     }
 
     // Time formatting allocates too.
@@ -52,5 +65,6 @@ while i < 1500 {
     }
     i = i + 1
 }
-deleteFile('churn.txt')
+blob leftover = 'churn.txt'
+leftover.delete()
 log(total)

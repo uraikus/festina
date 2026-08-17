@@ -277,34 +277,169 @@ class TestStrings:
 
 
 class TestBlob:
-    """claude.md #36: blob. Regression coverage for two real bugs a
-    spec-compliance pass found: claude.md's own only worked example
-    ("blob data = 'path/to/file'") failed semantic analysis outright
-    (a string literal infers as `text`, and blob/text were fully
-    incompatible with no exception -- meaning blob could never
-    actually hold a value at all, since nothing else in the language
-    constructs one either), and log() on the one blob value that
-    *could* somehow exist crashed the compiler itself with a bare
-    Python KeyError (blob passed the "is this a PrimitiveType" check
-    but had no entry in log()'s dispatch dict) rather than compiling
-    or raising a clean CompileError -- previously unreachable in
-    practice for the same reason, but a real crash risk once blob
-    became constructible."""
+    """claude.md #36, given its real meaning by claude.md #109.
 
-    def test_blob_declaration_and_log_match_the_spec_example(self, compile_and_run):
-        result = compile_and_run("blob data = 'path/to/file'\nlog(data)")
-        assert result.returncode == 0
-        assert result.stdout.strip() == "path/to/file"
+    #36's only worked example was always `blob data = 'path/to/file'`,
+    and for a long time that stored the PATH and never read the file --
+    blob was a second name for `text`. #109 makes the example mean what
+    it says: a blob is the file's BYTES, loaded at the declaration,
+    keeping the path so the file can be written, appended to, tested
+    for and deleted through the same value.
+    """
 
-    def test_blob_and_text_equality(self, compile_and_run):
-        source = (
-            "blob data = 'hello'\n"
-            "text t = 'hello'\n"
-            "log(data == t)\n"
-            "log(data == 'nope')\n"
-        )
+    def test_a_blob_loads_the_bytes_at_its_path(self, compile_and_run, tmp_path):
+        path = tmp_path / "data.txt"
+        path.write_text("the contents")
+        source = f"blob data = '{path}'\nlog(data.toText())"
         result = compile_and_run(source)
-        assert result.stdout.splitlines() == ["true", "false"]
+        assert result.returncode == 0
+        assert result.stdout.strip() == "the contents"
+
+    def test_logging_a_blob_prints_its_contents_not_its_path(
+            self, compile_and_run, tmp_path):
+        # The old behavior printed the path, because the path was all
+        # there was. Printing it now would mean printing a struct's
+        # first field as if it were a string.
+        path = tmp_path / "data.txt"
+        path.write_text("the contents")
+        result = compile_and_run(f"blob data = '{path}'\nlog(data)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "the contents"
+
+    def test_a_missing_path_is_an_empty_blob_not_a_failure(self, compile_and_run):
+        # claude.md #93's rule, inherited: a missing file is something
+        # you test for, not something that stops the program. It is also
+        # how a file that does not exist yet gets created.
+        source = ("blob data = '/nonexistent/nowhere.txt'\n"
+                  "log(data.exists())\n"
+                  "log(data.toText() == '')\n")
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["false", "true"]
+
+    def test_write_append_read_exists_delete(self, compile_and_run, tmp_path):
+        path = tmp_path / "notes.txt"
+        source = f"""
+        blob f = '{path}'
+        log(f.write('hello'))
+        log(f.append(' world'))
+        log(f.toText())
+        log(f.exists())
+        log(f.delete())
+        log(f.exists())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == [
+            "true", "true", "hello world", "true", "true", "false"]
+
+    def test_the_bytes_survive_deleting_the_file(self, compile_and_run, tmp_path):
+        # .delete() removes the FILE. The blob is an ordinary value and
+        # is unaffected, which is what makes "delete it but keep what it
+        # said" expressible.
+        path = tmp_path / "notes.txt"
+        source = f"""
+        blob f = '{path}'
+        f.write('remembered')
+        f.delete()
+        log(f.exists())
+        log(f.toText())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["false", "remembered"]
+
+    def test_write_updates_what_to_text_reports(self, compile_and_run, tmp_path):
+        # Not just the file: the in-memory bytes too, so toText() after
+        # write() reports what was written rather than what the file
+        # held when the blob was declared.
+        path = tmp_path / "notes.txt"
+        path.write_text("original")
+        source = f"""
+        blob f = '{path}'
+        log(f.toText())
+        f.write('replaced')
+        log(f.toText())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["original", "replaced"]
+
+    def test_the_path_may_be_any_text_expression(self, compile_and_run, tmp_path):
+        path = tmp_path / "data.txt"
+        path.write_text("found")
+        source = f"""
+        text dir = '{tmp_path}/'
+        blob f = dir + 'data.txt'
+        log(f.toText())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "found"
+
+    def test_assigning_a_blob_shares_one_handle(self, compile_and_run, tmp_path):
+        # claude.md #109: "if a blob = another blob, have it copy the
+        # reference of that current file". Writing through one is
+        # visible through the other, which is what proves they are one
+        # handle rather than two copies.
+        path = tmp_path / "shared.txt"
+        source = f"""
+        blob a = '{path}'
+        a.write('first')
+        blob b = a
+        a.write('second')
+        log(b.toText())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "second"
+
+    def test_reassigning_leaves_an_earlier_reference_intact(
+            self, compile_and_run, tmp_path):
+        # The other half of the same rule: rebinding `a` must not
+        # disturb `keep`, which still holds the first file. Verified
+        # leak-free separately under LeakSanitizer -- this pins that the
+        # surviving reference is also still READABLE, i.e. that the
+        # release did not free a handle someone else still held.
+        p1 = tmp_path / "one.txt"
+        p2 = tmp_path / "two.txt"
+        source = f"""
+        blob a = '{p1}'
+        a.write('file one')
+        blob keep = a
+        a = '{p2}'
+        a.write('file two')
+        log(keep.toText())
+        log(a.toText())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["file one", "file two"]
+
+    def test_a_blob_is_no_longer_comparable_to_text(self, parser, semantic, errors):
+        # It used to be, because it WAS a text. A handle and a string
+        # are not the same kind of thing, and comparing them would have
+        # compared a pointer against a string's contents.
+        program = parser.parse("blob data = 'x'\ntext t = 'x'\nlog(data == t)")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_a_blob_compares_against_null(self, compile_and_run, tmp_path):
+        path = tmp_path / "data.txt"
+        path.write_text("x")
+        source = f"blob f = '{path}'\nlog(f == null)\nlog(f != null)"
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["false", "true"]
+
+    def test_an_unknown_blob_method_is_rejected(self, parser, semantic, errors):
+        program = parser.parse("blob f = 'x'\nf.slurp()")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_write_requires_exactly_one_text_argument(self, parser, semantic, errors):
+        program = parser.parse("blob f = 'x'\nf.write()")
+        with pytest.raises(errors.CompileError, match="write"):
+            semantic.analyze(program)
+
+    def test_to_text_takes_no_arguments(self, parser, semantic, errors):
+        program = parser.parse("blob f = 'x'\nlog(f.toText('extra'))")
+        with pytest.raises(errors.CompileError, match="toText"):
+            semantic.analyze(program)
 
 
 class TestStructs:
@@ -4223,7 +4358,7 @@ class TestGraphics:
         if not (shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")):
             pytest.skip("no C compiler (clang/gcc/cc) on PATH")
         source = """
-        img icon = loadImage('nonexistent.png')
+        img icon = 'nonexistent.png'
         drawRect(0, 0, 100, 100)
         drawCircle(50, 50, 25)
         drawText('Hello', 20, 20)
@@ -4796,7 +4931,7 @@ class TestAudio:
         empty_home = tmp_path / "empty_home"
         empty_home.mkdir()
         result = compile_and_run(
-            f"aud music = loadAudio('{wav_name}')\nmusic.play()\nlog('unreachable')",
+            f"aud music = '{wav_name}'\nmusic.play()\nlog('unreachable')",
             env={"HOME": str(empty_home)},
         )
         assert result.returncode == 1
@@ -4976,10 +5111,20 @@ class TestAudio:
         assert "could not open audio file" in result.stderr
         assert "unreachable" not in result.stdout
 
-    def test_stop_is_gone_from_aud(self, parser, semantic, errors):
-        # claude.md #100: one clip can be playing on several channels at
-        # once, so "stop this clip" never named one thing.
+    def test_stop_is_back_and_is_clip_wide(self, parser, semantic):
+        # claude.md #109: #100 removed stop() because "stop this clip"
+        # has only one honest reading -- every channel playing it -- and
+        # that is rarely what an overlapping-effects program wants. True,
+        # and not a reason to withhold it: silencing a looping hum or a
+        # music bed is a real thing to want, and doing it by hand meant
+        # tracking channels the runtime already knows. play() returning
+        # its channel covers the other case, so both exist now.
         program = parser.parse("aud music = 'x.wav'\nmusic.stop()", filename="main.f")
+        semantic.analyze(program, filename="main.f")
+
+    def test_stop_by_channel_is_still_how_one_playback_is_addressed(
+            self, parser, semantic, errors):
+        program = parser.parse("aud music = 'x.wav'\nmusic.stop(2)", filename="main.f")
         with pytest.raises(errors.CompileError, match="stopAudioPlayer"):
             semantic.analyze(program, filename="main.f")
 
@@ -6038,6 +6183,233 @@ class TestChainedCallResultReachedForAField:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip() == "1225"
+
+
+class TestAudioChannelReturnAndClipStop:
+    """claude.md #109: play()/playLoop() return the channel they chose,
+    and aud.stop() is back as a clip-wide stop.
+
+    These are two halves of one fix. claude.md #100 removed stop()
+    because "stop this clip" only honestly means "every channel playing
+    it", which is rarely what an overlapping-effects program wants --
+    but the alternative it pointed at, stopAudioPlayer(n), needed a
+    channel number that automatic assignment never told anyone. So the
+    pool was addressable only by naming channels by hand, which is to
+    say by not using the pool.
+    """
+
+    def test_play_returns_distinct_pooled_channels(
+            self, compile_and_run, tmp_path, audio_null_env):
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        int a = clip.play()
+        int b = clip.play()
+        int c = clip.play()
+        log(a != b)
+        log(b != c)
+        log(a >= 0)
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["true", "true", "true"]
+
+    def test_play_on_an_explicit_channel_returns_that_channel(
+            self, compile_and_run, tmp_path, audio_null_env):
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        log(clip.play(3))
+        log(clip.playLoop(5))
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.stdout.splitlines() == ["3", "5"]
+
+    def test_the_returned_channel_can_be_stopped(
+            self, compile_and_run, tmp_path, audio_null_env):
+        # The whole point: a channel chosen automatically is now
+        # addressable, without the program having picked it up front.
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        int ch = clip.playLoop()
+        log(clip.isPlaying())
+        stopAudioPlayer(ch)
+        log(clip.isPlaying())
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_stop_silences_every_channel_playing_the_clip(
+            self, compile_and_run, tmp_path, audio_null_env):
+        # Three overlapping voices of one clip, stopped by one call --
+        # the case claude.md #100 said stop() could only mean, restored
+        # because it is a real thing to want.
+        # playLoop rather than play: against ALSA's null device a
+        # one-shot drains instantly, so a finished voice would be
+        # indistinguishable from a stopped one and the test would pass
+        # for the wrong reason. A loop only ends when something stops it.
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        clip.playLoop()
+        clip.playLoop()
+        clip.playLoop()
+        log(clip.isPlaying())
+        clip.stop()
+        log(clip.isPlaying())
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_stop_leaves_another_clip_alone(
+            self, compile_and_run, tmp_path, audio_null_env):
+        # Clip-wide, not global -- the distinction between stop() and
+        # stopAudioPlayer() with no argument.
+        _write_wav(tmp_path / "a.wav", duration_s=1.0)
+        _write_wav(tmp_path / "b.wav", duration_s=1.0)
+        source = """
+        aud a = 'a.wav'
+        aud b = 'b.wav'
+        a.playLoop()
+        b.playLoop()
+        a.stop()
+        log(a.isPlaying())
+        log(b.isPlaying())
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.stdout.splitlines() == ["false", "true"]
+
+    def test_stop_returns_a_reserved_channel_to_the_pool(
+            self, compile_and_run, tmp_path, audio_null_env):
+        # A playLoop channel is reserved (claude.md #99). Stopping the
+        # clip has to release that reservation too -- silencing the
+        # sound while leaving the channel locked would quietly shrink
+        # the pool every time.
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        setMaxAudioPlayers(1)
+        int first = clip.playLoop()
+        clip.stop()
+        int second = clip.play()
+        log(first == second)
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.stdout.strip() == "true"
+
+    def test_a_play_that_finds_no_channel_returns_minus_one(
+            self, compile_and_run, tmp_path, audio_null_env):
+        # -1 means "nothing was played", and there is exactly one way to
+        # reach it from Festina: every channel in the table reserved by
+        # playLoop, with none left to claim. (A clip that failed to LOAD
+        # cannot reach it -- festina_load_audio fails the program at the
+        # declaration, long before any play() runs.) Returning a channel
+        # number here would name one this call never used.
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        setMaxAudioPlayers(64)
+        for int i = 0, i < 64, i++ {
+            clip.playLoop(i)
+        }
+        log(clip.play())
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "-1"
+
+
+class TestBlobColumns:
+    """claude.md #109: a blob column stores the file's BYTES, so it
+    round-trips. Same treatment claude.md #101 gave aud/img columns, and
+    for the same reason -- all three are content plus the bytes it came
+    from."""
+
+    def test_a_blob_column_round_trips_its_contents(
+            self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        src = tmp_path / "payload.txt"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Saves {{ name:text  data:blob }}
+        blob f = '{src}'
+        f.write('the payload')
+        sqlite('INSERT INTO Saves (name, data) VALUES (?, ?)', ['slot1', f])
+        arr[Saves] rows = sqlite('SELECT * FROM Saves')
+        log(rows.length)
+        log(rows[0].name)
+        log(rows[0].data.toText())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["1", "slot1", "the payload"]
+
+    def test_binary_content_survives_the_round_trip_intact(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        # The case a text column could never handle: a PNG is full of
+        # NUL bytes, and reading the column as a C string would stop at
+        # the first one. Checked by length, since a truncation is
+        # exactly what a length comparison catches.
+        db = tmp_path / "t.sqlite"
+        out = tmp_path / "back.png"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Assets {{ name:text  data:blob }}
+        blob png = '{sprite_sheet_png}'
+        sqlite('INSERT INTO Assets (name, data) VALUES (?, ?)', ['tiles', png])
+        arr[Assets] rows = sqlite('SELECT * FROM Assets')
+        blob back = rows[0].data
+        blob out = '{out}'
+        log(back.toText() != '')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # The real proof is byte-level and lives outside the language,
+        # which has no way to compare binary buffers: read the stored
+        # column back with Python and diff it against the source file.
+        import sqlite3
+        stored = sqlite3.connect(str(db)).execute(
+            "select data from Assets").fetchone()[0]
+        assert bytes(stored) == open(sprite_sheet_png, "rb").read()
+
+    def test_a_column_blob_has_no_path(self, compile_and_run, tmp_path):
+        # It has bytes and nowhere to put them: a path is meaningful
+        # only on the machine that stored it, so the contents are what
+        # round-trips. exists()/write()/delete() answer false rather
+        # than inventing a temporary file.
+        db = tmp_path / "t.sqlite"
+        src = tmp_path / "payload.txt"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Saves {{ name:text  data:blob }}
+        blob f = '{src}'
+        f.write('stored')
+        sqlite('INSERT INTO Saves (name, data) VALUES (?, ?)', ['s', f])
+        arr[Saves] rows = sqlite('SELECT * FROM Saves')
+        blob back = rows[0].data
+        log(back.toText())
+        log(back.exists())
+        log(back.write('nope'))
+        log(back.delete())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["stored", "false", "false", "false"]
+
+    def test_a_null_blob_column_reads_back_as_null(self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Saves {{ name:text  data:blob }}
+        sqlite('INSERT INTO Saves (name) VALUES (?)', ['empty'])
+        arr[Saves] rows = sqlite('SELECT * FROM Saves')
+        log(rows[0].data == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+
+    def test_the_column_type_is_a_sql_blob(self, sqlite_schema):
+        assert sqlite_schema.TYPE_MAP["blob"] == "BLOB"
 
 
 class TestMediaFormatsAndPaths:
@@ -7450,7 +7822,7 @@ class TestSlimBinaries:
         from festina import cli as cli_mod
 
         src = tmp_path / "main.f"
-        src.write_text("img icon = loadImage('nonexistent.png')")
+        src.write_text("img icon = 'nonexistent.png'")
         out = tmp_path / "program"
         cli_mod.compile_file(str(src), str(out), cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
         assert out.exists()
@@ -7962,9 +8334,16 @@ class TestQueryRowAndRegexReclamation:
         row_fn = ir.split("define void @__festina_release_row_People")[1].split("\n}")[0]
         assert row_fn.count("call void @free(") == 2
 
-    def test_row_release_only_frees_text_and_blob_columns(self, parser, semantic, codegen):
+    def test_row_release_frees_each_column_by_its_own_kind(
+            self, parser, semantic, codegen):
         # int/float/bool columns are plain i64 slots, never heap
         # pointers -- freeing one would be freeing an integer.
+        #
+        # claude.md #109: a blob column is a real handle now, so it goes
+        # through festina_blob_release rather than a plain @free. Doing
+        # otherwise would leak its path and byte buffer and skip its
+        # refcount entirely -- the same mistake claude.md #101 fixed for
+        # aud/img columns, arriving here by the same route.
         source = """
         table Mixed { id:int  score:float  ok:bool  name:text  data:blob }
         void func run() {
@@ -7975,8 +8354,9 @@ class TestQueryRowAndRegexReclamation:
         """
         ir = self._ir(parser, semantic, codegen, source)
         row_fn = ir.split("define void @__festina_release_row_Mixed")[1].split("\n}")[0]
-        # 2 heap columns (name, data) + the row buffer itself
-        assert row_fn.count("call void @free(") == 3
+        # The text column, plus the row buffer itself.
+        assert row_fn.count("call void @free(") == 2
+        assert row_fn.count("call void @festina_blob_release(") == 1
 
     def test_runtime_regex_temporary_is_freed(self, parser, semantic, codegen):
         source = """
@@ -8565,7 +8945,7 @@ class TestImageClipResizeAndSize:
     a spritesheet actually needs.
 
     ```festina
-    img sheet = loadImage('sheet.png')
+    img sheet = 'sheet.png'
     img grass = sheet.clip(0, 0, 64, 64)   // a new image
     grass.resize(32, 32)                    // in place
     ```
@@ -8592,7 +8972,7 @@ class TestImageClipResizeAndSize:
 
     def test_width_and_height_emit_runtime_calls(self, parser, semantic, codegen):
         source = """
-        img sheet = loadImage('s.png')
+        img sheet = 's.png'
         log(sheet.width)
         log(sheet.height)
         """
@@ -8602,7 +8982,7 @@ class TestImageClipResizeAndSize:
 
     def test_clip_and_resize_emit_runtime_calls(self, parser, semantic, codegen):
         source = """
-        img sheet = loadImage('s.png')
+        img sheet = 's.png'
         img tile = sheet.clip(0, 32, 64, 64)
         tile.resize(16, 16)
         """
@@ -8652,10 +9032,10 @@ class TestImageClipResizeAndSize:
 
     def test_wrong_arity_and_types_are_rejected(self, parser, semantic, errors):
         for source in [
-            "img s = loadImage('a.png')\ns.clip(0, 0, 64)",
-            "img s = loadImage('a.png')\ns.resize(1, 2, 3)",
-            "img s = loadImage('a.png')\ns.clip(0, 0, 64, 'x')",
-            "img s = loadImage('a.png')\ns.resize('a', 2)",
+            "img s = 'a.png'\ns.clip(0, 0, 64)",
+            "img s = 'a.png'\ns.resize(1, 2, 3)",
+            "img s = 'a.png'\ns.clip(0, 0, 64, 'x')",
+            "img s = 'a.png'\ns.resize('a', 2)",
         ]:
             program = parser.parse(source, filename="main.f")
             with pytest.raises(errors.CompileError):
@@ -8664,13 +9044,13 @@ class TestImageClipResizeAndSize:
     def test_an_unknown_img_field_is_rejected(self, parser, semantic, errors):
         # This branch used to be a permissive `return None`, which
         # silently accepted every typo on an img.
-        program = parser.parse("img s = loadImage('a.png')\nlog(s.widht)",
+        program = parser.parse("img s = 'a.png'\nlog(s.widht)",
                                 filename="main.f")
         with pytest.raises(errors.CompileError, match="img has no field"):
             semantic.analyze(program, filename="main.f")
 
     def test_a_method_referenced_without_calling_says_so(self, parser, semantic, errors):
-        program = parser.parse("img s = loadImage('a.png')\nlog(s.clip)",
+        program = parser.parse("img s = 'a.png'\nlog(s.clip)",
                                 filename="main.f")
         with pytest.raises(errors.CompileError, match="is a method on img"):
             semantic.analyze(program, filename="main.f")
@@ -8693,7 +9073,7 @@ class TestImageClipResizeAndSize:
     def test_clip_resize_and_dimensions_against_a_real_sheet(
             self, compile_and_run, sprite_sheet_png):
         source = f"""
-        img sheet = loadImage('{sprite_sheet_png}')
+        img sheet = '{sprite_sheet_png}'
         log(`${{sheet.width}}x${{sheet.height}}`)
 
         img tile = sheet.clip(32, 32, 32, 32)
@@ -8715,7 +9095,7 @@ class TestImageClipResizeAndSize:
         # An img is a shared handle, so resizing through one name is
         # visible through another -- that is what "in place" means.
         source = f"""
-        img sheet = loadImage('{sprite_sheet_png}')
+        img sheet = '{sprite_sheet_png}'
         img a = sheet.clip(0, 0, 32, 32)
         img b = a
         a.resize(4, 4)
@@ -8728,7 +9108,7 @@ class TestImageClipResizeAndSize:
     def test_a_non_positive_size_fails_clearly(self, compile_and_run, sprite_sheet_png):
         for call in ["sheet.clip(0, 0, 0, 8)", "sheet.resize(8, 0)"]:
             source = f"""
-            img sheet = loadImage('{sprite_sheet_png}')
+            img sheet = '{sprite_sheet_png}'
             {call}
             """
             result = compile_and_run(source)
@@ -8753,7 +9133,7 @@ class TestImageClipRendersRealPixels:
         # The fixture's grid: tile (col, row) -> index row*4+col.
         # (0,0) red, (1,0) green, (1,1) cyan.
         source = f"""
-        img sheet = loadImage('{sprite_sheet_png}')
+        img sheet = '{sprite_sheet_png}'
         img red = sheet.clip(0, 0, 32, 32)
         img green = sheet.clip(32, 0, 32, 32)
         img cyan = sheet.clip(32, 32, 32, 32)
@@ -8778,7 +9158,7 @@ class TestImageClipRendersRealPixels:
         if not shutil.which("xwd"):
             pytest.skip("xwd isn't installed -- needed to read real canvas pixels")
         source = f"""
-        img sheet = loadImage('{sprite_sheet_png}')
+        img sheet = '{sprite_sheet_png}'
         img big = sheet.clip(0, 0, 32, 32)
         big.resize(96, 96)
         drawImage(big, 10, 10)
@@ -8902,56 +9282,78 @@ class TestMathFileAndTime:
         assert result.returncode == 0
         assert result.stdout == "true\ntrue\n"
 
-    # ---- files ----
+    # ---- files, via blob since claude.md #109 ----
 
     def test_file_round_trip(self, compile_and_run, tmp_path):
+        # claude.md #109: the same round trip claude.md #93's five free
+        # functions did, asked of the value that already holds the path.
         path = str(tmp_path / "note.txt")
         source = f"""
-        log(writeFile('{path}', 'hello'))
-        log(appendFile('{path}', ' world'))
-        log(readFile('{path}'))
-        log(fileExists('{path}'))
-        log(deleteFile('{path}'))
-        log(fileExists('{path}'))
+        blob f = '{path}'
+        log(f.write('hello'))
+        log(f.append(' world'))
+        log(f.toText())
+        log(f.exists())
+        log(f.delete())
+        log(f.exists())
         """
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "true\ntrue\nhello world\ntrue\ntrue\nfalse\n"
 
-    def test_reading_a_missing_file_is_null_not_a_crash(
+    def test_a_missing_file_is_an_ordinary_condition_not_a_crash(
             self, compile_and_run, tmp_path):
-        # A missing file is an ordinary condition to test for, the same
-        # reasoning claude.md #57 applies to division by zero.
+        # A missing file is something to test for, the same reasoning
+        # claude.md #57 applies to division by zero. claude.md #109
+        # keeps that rule: declaring a blob on a path that is not there
+        # yields an empty blob rather than failing.
         missing = str(tmp_path / "nope.txt")
         source = f"""
-        log(readFile('{missing}') == null)
-        log(fileExists('{missing}'))
-        log(deleteFile('{missing}'))
+        blob f = '{missing}'
+        log(f.toText() == '')
+        log(f.exists())
+        log(f.delete())
         """
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "true\nfalse\nfalse\n"
 
     def test_writing_somewhere_impossible_returns_false(self, compile_and_run):
-        source = "log(writeFile('/definitely/not/a/directory/x.txt', 'hi'))"
+        source = ("blob f = '/definitely/not/a/directory/x.txt'\n"
+                  "log(f.write('hi'))")
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "false\n"
 
     def test_a_file_round_trips_through_text_operations(
             self, compile_and_run, tmp_path):
-        # The value readFile hands back is an ordinary owned text, so it
+        # The value toText() hands back is an ordinary owned text, so it
         # composes with everything else (claude.md #83).
         path = str(tmp_path / "data.txt")
         source = f"""
-        writeFile('{path}', 'a,b,c')
-        text body = readFile('{path}')
+        blob f = '{path}'
+        f.write('a,b,c')
+        text body = f.toText()
         log(body.replace(/,/g, '-'))
         log(`${{body}}!`)
         """
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "a-b-c\na,b,c!\n"
+
+    def test_the_removed_file_functions_name_their_replacement(
+            self, parser, semantic, errors):
+        # claude.md #109: removed rather than aliased, each with an
+        # error that shows the blob spelling.
+        for name, call in [("readFile", "readFile('x')"),
+                           ("writeFile", "writeFile('x', 'y')"),
+                           ("appendFile", "appendFile('x', 'y')"),
+                           ("fileExists", "fileExists('x')"),
+                           ("deleteFile", "deleteFile('x')")]:
+            program = parser.parse(f"log({call})")
+            with pytest.raises(errors.CompileError, match=name) as excinfo:
+                semantic.analyze(program)
+            assert "blob" in str(excinfo.value)
 
     # ---- time ----
 

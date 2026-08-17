@@ -64,8 +64,8 @@ int       -- 64-bit signed integer
 float     -- 64-bit floating point (IEEE 754 double)
 bool      -- true / false, no truthy/falsy coercion from anything else
 text      -- UTF-8 string
-blob      -- binary data (shares text's representation; text -> blob
-             assignment is allowed, the reverse is not)
+blob      -- a file's bytes, loaded from a path (`blob save =
+             'slot1.dat'`); see the Files section below
 arr[T]    -- homogeneous array of any of the above, a struct, or a
              declared table's row type
 map[T]    -- text-keyed map of any of the above except arr[T]/map[T]
@@ -476,9 +476,10 @@ preserved via a temp-table rebuild) to match the declaration exactly.
 literal array expression, not an arbitrary `arr[T]` value. Query result
 columns map onto a declared table's fields by position, not by name.
 
-### Storing images and audio
+### Storing images, audio and files
 
-A column may be an `img` or an `aud`. SQLite stores it as a **BLOB**:
+A column may be an `img`, an `aud` or a `blob`. SQLite stores each as a
+**BLOB**:
 
 ```festina
 table Music {
@@ -502,6 +503,11 @@ comes out behaves exactly like one loaded from a file.
 The one case with no source bytes is an image you built rather than
 loaded — a `clip()` or `resize()` result. Those are encoded as PNG on
 demand, which is lossless.
+
+A `blob` column works the same way and is the general case: any file,
+not just the two the language decodes. See
+[Blobs in the database](#blobs-in-the-database) for what a blob read back
+out of a column can and cannot do.
 
 Binding is by value: the parameter is copied into the database as the
 statement runs, so nothing is retained afterwards and the asset stays
@@ -633,7 +639,7 @@ drawRect(0, 0, 100, 100)
 drawCircle(50, 50, 25)
 drawText('Hello', 20, 20)
 
-img profile = loadImage('profile.png')    // PNG only
+img profile = 'profile.png'              // PNG or JPEG
 drawImage(profile, 0, 0)
 log(`${profile.width}x${profile.height}`)
 
@@ -685,8 +691,8 @@ frame of 2000 rectangles took ~1.6s. Behind one `render()` the same
 frame takes ~1ms.
 
 Nothing but `render()` and the event handlers needs a display —
-`saveCanvas`, `clientWidth`/`clientHeight` and `loadImage` all work
-headless.
+`saveCanvas`, `clientWidth`/`clientHeight` and loading an image all
+work headless.
 
 ### Mouse events
 
@@ -754,7 +760,6 @@ drawImage(grass, 100, 100)
 A path declares the image, the same way it declares an `aud` — and, like
 that one, it's a real load rather than a compile-time resolution, so the
 path may be any text expression (`img hero = spriteDir + 'hero.png'`).
-`loadImage('...')` still works and means exactly the same thing.
 
 **PNG and JPEG.** The format is sniffed from the file's contents, not
 its extension — an image out of a database column has no extension, and
@@ -795,7 +800,7 @@ a.resize(8, 8)
 log(b.width)      // 8 -- a and b are the same image
 ```
 
-An image created in a function (by `loadImage` or `clip`) and never
+An image created in a function (from a path, or by `clip`) and never
 stored outside it is released when that function returns, so slicing
 frames inside a loop doesn't accumulate.
 
@@ -1021,28 +1026,95 @@ descender.
 
 ## Files
 
+A file is a `blob`. Declaring one loads the bytes at that path, and
+keeps the path, so everything you can do to a file is a method on the
+value that already knows which file it is:
+
 ```festina
-writeFile('notes.txt', 'hello')       // -> bool (did it land?)
-appendFile('notes.txt', ' world')     // -> bool
-text body = readFile('notes.txt')     // -> text, or null if unreadable
-bool there = fileExists('notes.txt')  // -> bool
-deleteFile('notes.txt')               // -> bool
+blob notes = 'notes.txt'              // loads the bytes at that path
+
+notes.write('hello')                  // -> bool (did it land?)
+notes.append(' world')                // -> bool
+text body = notes.toText()            // -> the bytes, as text
+bool there = notes.exists()           // -> bool
+notes.delete()                        // -> bool; deletes the FILE
 ```
 
-Whole-file text I/O. Nothing here fails the program: `readFile` returns
-`null` for a file it can't read and the writers return `false` on
-failure, so a missing file is something you test for rather than
-something that stops you — the same treatment division by zero gets.
+The path may be any text expression, like `img` and `aud`:
+`blob save = saveDir + 'slot1.dat'`.
 
-What `readFile` returns is an ordinary `text`, so it composes with
+**Nothing here fails the program.** A path that can't be read gives you
+an empty blob, and the writers return `false` on failure — a missing
+file is something you test for rather than something that stops you, the
+same treatment division by zero gets. That is also how you create a file
+that doesn't exist yet: declare the blob and write to it.
+
+```festina
+blob fresh = 'new.txt'
+log(fresh.exists())                   // false
+fresh.write('now it does')
+log(fresh.exists())                   // true
+```
+
+`toText()` hands back an ordinary owned `text`, so it composes with
 everything else:
 
 ```festina
-text body = readFile('data.csv')
-if body != null {
-    log(body.replace(/,/g, ' | '))
-}
+blob data = 'data.csv'
+log(data.toText().replace(/,/g, ' | '))
 ```
+
+**A blob is its contents, not its path.** `write()` and `append()`
+update the bytes as well as the file, so `toText()` after a write
+reports what you wrote. And `delete()` removes the file while leaving
+the blob alone — "delete it but keep what it said" is expressible:
+
+```festina
+blob temp = 'scratch.txt'
+temp.write('remember this')
+temp.delete()
+log(temp.exists())                    // false
+log(temp.toText())                    // remember this
+```
+
+**Assigning a blob shares one handle, it does not copy.** Two names for
+one file's contents; writing through either is visible through both.
+Rebinding one of them releases its own reference, and the contents are
+freed once nothing refers to them:
+
+```festina
+blob a = 'one.txt'
+blob b = a                            // same handle, not a second load
+a.write('changed')
+log(b.toText())                       // changed
+
+a = 'two.txt'                         // `a` moves on; `b` still holds one.txt
+```
+
+### Blobs in the database
+
+A `blob` column stores the **bytes**, so binary content round-trips
+byte-identically — the same treatment `img` and `aud` columns get:
+
+```festina
+table Saves { name:text  data:blob }
+
+blob save = 'slot1.dat'
+sqlite('INSERT INTO Saves (name, data) VALUES (?, ?)', ['slot1', save])
+
+arr[Saves] rows = sqlite('SELECT * FROM Saves')
+log(rows[0].data.toText())
+```
+
+A blob that came out of a column has bytes but **no path** — a path is
+meaningful only on the machine that stored it. Its `exists()`,
+`write()`, `append()` and `delete()` all answer `false` rather than
+inventing a temporary file. `toText()` works as usual.
+
+That does mean there is currently no way to write a blob loaded from a
+database back out to disk: `toText()` stops at the first NUL byte, so it
+can't carry binary content out of the value. Reading a binary column and
+re-inserting it works; reading one and saving it as a file does not.
 
 ## Time
 
@@ -1164,18 +1236,19 @@ deadlines together so neither blocks the other.
 
 ```festina
 aud music = 'music.wav'               // WAV (16-bit PCM) or MP3
-music.play()                          // once
-music.playLoop()                      // until stopped
+int ch = music.play()                 // once  -> the channel it played on
+music.playLoop()                      // until stopped -> also returns one
 music.isPlaying()                     // true the instant play() returns
+music.stop()                          // silence this clip, everywhere
 
+stopAudioPlayer(ch)                   // stop one channel
 stopAudioPlayer()                     // stop every channel
 ```
 
 A path declares the clip, the same way `blob`, `color`, `font` and `img`
 are each written as the text that reads best. It's a real load, not a
 compile-time resolution, so the path may be any text expression
-(`aud hit = soundDir + 'hit.wav'`). `loadAudio('...')` still works and
-means exactly the same thing.
+(`aud hit = soundDir + 'hit.wav'`).
 
 **WAV (16-bit PCM) and MP3.** The format is sniffed from the file's
 contents, not its extension — a clip out of a database column has no
@@ -1186,12 +1259,35 @@ load with a message naming both supported formats.
 Plays through a real ALSA output device on a background thread, so
 playback doesn't block the rest of the program.
 
-**There is no `music.stop()`.** One clip can be playing on several
-channels at once — three overlapping gunshots are the ordinary case, not
-the exotic one — so "stop this clip" never named one thing. Playback is
-stopped by channel: `stopAudioPlayer(n)`, or `stopAudioPlayer()` for all.
-`isPlaying()` stays clip-wide, because "is this sound audible anywhere"
-does still have a single answer.
+### Stopping a sound
+
+There are two questions, and they have two answers.
+
+**`stop()` silences this clip everywhere.** One clip can be playing on
+several channels at once, so this stops all of them. That is what you
+want for a looping engine hum, a music bed or a dialogue line — anything
+where "this sound should not be audible any more" is the whole thought.
+
+**`stopAudioPlayer(n)` stops one channel.** That is what you want when
+three gunshots are overlapping and only one of them should end.
+
+Which channel? The one `play()` handed back:
+
+```festina
+aud engine = 'engine.wav'
+int hum = engine.playLoop()    // the pool picked a channel; now you know it
+// ...later...
+stopAudioPlayer(hum)           // stop exactly that one
+```
+
+`play()` and `playLoop()` both return the channel they used, or `-1` if
+nothing played (which happens only when every channel is reserved). Before
+that, a channel the pool assigned on its own was one you could not name,
+so the pool was addressable only by picking channels by hand — that is,
+by not using the pool.
+
+`isPlaying()` is clip-wide, like `stop()`: "is this sound audible
+anywhere" and "silence it everywhere" are one question asked two ways.
 
 ### Overlapping sounds
 
@@ -1201,13 +1297,13 @@ coin pickup firing in rapid succession layer instead of interrupting
 each other, which is what a game actually needs:
 
 ```festina
-aud coin = loadAudio('coin.wav')
+aud coin = 'coin.wav'
 coin.play()   // three overlapping copies, not one restarted three times
 coin.play()
 coin.play()
 ```
 
-The clip's audio is decoded once, at `loadAudio()` time; a channel costs
+The clip's audio is decoded once, at the declaration; a channel costs
 a thread and a device handle, never another copy of the samples.
 
 ```festina
@@ -1232,8 +1328,8 @@ two different clips can share one, which is what makes handing a music
 channel from one track to another expressible at all:
 
 ```festina
-aud adventureMusic = loadAudio('adventure.wav')
-aud battleMusic = loadAudio('battle.wav')
+aud adventureMusic = 'adventure.wav'
+aud battleMusic = 'battle.wav'
 
 adventureMusic.playLoop(0)          // loops on channel 0, and reserves it
 setInterval(changeMusic, 100000)

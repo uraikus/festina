@@ -9,22 +9,40 @@ import pytest
 
 
 class TestImageType:
-    """claude.md #37: img, loadImage()."""
+    """claude.md #37: img, declared from a path (claude.md #109 removed
+    loadImage(), leaving the path form as the only spelling)."""
 
     def test_img_declaration_parses(self, parser):
-        parser.parse("img profile = loadImage('profile.png')")
+        parser.parse("img profile = 'profile.png'")
 
     def test_img_is_a_valid_type(self, parser, semantic):
-        program = parser.parse("img profile = loadImage('profile.png')")
+        program = parser.parse("img profile = 'profile.png'")
         semantic.analyze(program)
 
-    def test_load_image_wrong_argument_count_is_a_compile_error(self, parser, semantic, errors):
-        program = parser.parse("img profile = loadImage()")
+    def test_the_path_may_be_any_text_expression(self, parser, semantic):
+        # claude.md #101/#109: a real load at run time, not a
+        # compile-time resolution, so this is not restricted to literals.
+        source = "text dir = 'art/'\nimg profile = dir + 'profile.png'"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_load_image_is_gone_and_says_what_to_use_instead(
+            self, parser, semantic, errors):
+        # claude.md #109: removed rather than aliased, and the error
+        # names the replacement -- there is nothing else in the language
+        # that would tell a reader where it went.
+        program = parser.parse("img profile = loadImage('profile.png')")
         with pytest.raises(errors.CompileError, match="loadImage"):
             semantic.analyze(program)
 
-    def test_load_image_non_text_argument_is_a_compile_error(self, parser, semantic, errors):
-        program = parser.parse("img profile = loadImage(5)")
+    def test_the_load_image_error_shows_the_path_form(self, parser, semantic, errors):
+        program = parser.parse("img profile = loadImage('profile.png')")
+        with pytest.raises(errors.CompileError) as excinfo:
+            semantic.analyze(program)
+        assert "img sprite = 'sprite.png'" in str(excinfo.value)
+
+    def test_a_non_text_path_is_still_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("img profile = 5")
         with pytest.raises(errors.CompileError):
             semantic.analyze(program)
 
@@ -46,7 +64,7 @@ class TestGraphicsFunctions:
         semantic.analyze(program)
 
     def test_draw_image_parses_and_analyzes(self, parser, semantic):
-        source = "img profile = loadImage('a.png')\ndrawImage(profile, 0, 0)"
+        source = "img profile = 'a.png'\ndrawImage(profile, 0, 0)"
         program = parser.parse(source)
         semantic.analyze(program)
 

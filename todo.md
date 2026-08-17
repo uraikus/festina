@@ -1499,6 +1499,21 @@ listed here only so they aren't lost:
   allocation and genuinely comparable to text globals at exit; a
   handle loaded inside a loop is an unbounded leak, and the old wording
   hid the difference.
+
+  **claude.md #109 shows what the fix looks like, on a fourth handle
+  type.** `blob` is reference counted rather than owned-or-leaked, and
+  it needed no new machinery to be: it carries the same `i64` header
+  structs have carried since #77, so `festina_retain` /
+  `festina_release_check` and the retain-before-release ordering at a
+  reassignment all worked on it unchanged. Escape analysis never enters
+  into it — a blob binding owns one reference wherever the value came
+  from, so an escaping blob is reclaimed like any other. Giving `img`
+  and `aud` the same header would close this entry outright; the reason
+  it is still open is that neither has a refcount to increment, not
+  that anything about them resists one. `regex` is the harder case, as
+  a `/pattern/` literal is a process-lifetime cached pointer that must
+  never be freed, so it would need an immortal sentinel — which #77's
+  header already has, for exactly this shape of problem.
 - **A call result reached through a chain that yields a MANAGED value
   still leaks.** Mostly closed by claude.md #108. `make().count`
   (claude.md #102), `make().inner.n`, `rows(x).length` and
@@ -1524,6 +1539,17 @@ listed here only so they aren't lost:
   compile, and acyclic linked structures are reclaimed normally. The
   cost is that reference cycles became constructible; see the tracing
   GC note above.
+- **A blob out of a database column cannot be written to a file.**
+  claude.md #109: a blob read back from a BLOB column has bytes and no
+  path — a path is meaningful only on the machine that stored it — so
+  its `exists()`/`write()`/`append()`/`delete()` all answer false. Its
+  bytes cannot be moved into a path-backed blob either, because
+  `toText()` stops at the first NUL and binary content does not
+  survive the trip. Reading a binary column and re-inserting it works;
+  reading one and saving it as a file does not. Closing this needs
+  either a bytes-preserving transfer between two blobs or a
+  `saveTo(path)` method — neither was asked for, and picking one
+  quietly would be a worse answer than recording where the edge is.
 - **Only PNG/JPEG and WAV/MP3.** claude.md #101 added JPEG and MP3, and
   drew the line there deliberately: each new format is a new
   system dependency on every machine that compiles a graphics or audio

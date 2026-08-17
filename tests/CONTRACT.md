@@ -44,10 +44,10 @@ same way `Math.floor`/`int.toFloat()` already are, and the whole feature
 is built on POSIX extended regular expressions (`<regex.h>`, already
 part of libc) rather than a bundled or external regex engine, per
 claude.md #59. A regex value was originally constructible only via a
-`regex()` builtin function call (like `sqlite()`/`loadImage()`), with no
+`regex()` builtin function call (like `sqlite()`), with no
 dedicated literal syntax at all -- see this section's later "JS-style
 regex literal syntax" paragraph below for why and how that changed.
-claude.md #37/#39/#40 (`img`/`loadImage()`, `drawRect`/`drawCircle`/
+claude.md #37/#39/#40 (`img` from a path, `drawRect`/`drawCircle`/
 `drawText`/`drawImage`, `on mouseDown`/`on mouseUp`/`on mouse`/
 `on keyDown`/`on keyUp`/
 `on resize`/`on close`, `clientWidth`/`clientHeight`) are implemented
@@ -63,7 +63,7 @@ hints), starts at 800x600, and is opened lazily -- `CodeGen.uses_graphics`
 call, a bare `clientWidth`/`clientHeight` reference, or an `on
 click`/`mouse`/`key`/`resize`/`close` handler declaration, gating
 `festina_graphics_init()`/`festina_run_event_loop()` calls in `main()` --
-*except* `loadImage()` alone, which deliberately does NOT set it: Cairo
+*except* declaring an `img` alone, which deliberately does NOT set it: Cairo
 decodes PNGs from its own in-memory decoder, needing no X server at all,
 so a program that only loads an image (never drawing it or opening a
 window) shouldn't be forced to have a display. click/mouse/key/resize/
@@ -127,7 +127,7 @@ the same window stays open) against a real (virtual) X server -- see
 "Why the tests are structured this way" below for
 `tests/test_timers.py`/`TestTimers`.
 
-claude.md #38 (aud, loadAudio(), .play()/.stop()/.isPlaying()) is
+claude.md #38 (aud from a path, .play()/.stop()/.isPlaying()) is
 implemented too -- a loaded clip is `ptr` to an opaque `FestinaAudio`
 (decoded PCM plus playback state, same lower-to-`ptr` convention as
 img/regex/table values), and play()/stop()/isPlaying() are ordinary
@@ -137,7 +137,7 @@ exactly these three methods for `aud`, so (unlike log()/fail()/
 sqlite()'s deliberately open shape) any other method call on an `aud`
 value is now a compile error rather than the permissive fallthrough
 `aud`/`img` used to share back when neither had any real methods
-modeled. `loadAudio()` only supports WAV (16-bit PCM) -- claude.md's
+modeled. Audio loading only supports WAV (16-bit PCM) -- claude.md's
 own example names a `.mp3`, but unlike Cairo (which decodes PNG on its
 own) nothing this project already depends on can decode MP3 without a
 real new library, so WAV -- parsed directly in festina_runtime.c with
@@ -241,8 +241,8 @@ the full reasoning):
   new restriction for) but is now explicitly documented as a
   considered choice in `festina/codegen.py`'s `_emit_func`, where it
   previously had no comment explaining it at all.
-- `drawRect`/`drawCircle`/`drawText`/`drawImage`/`loadImage`/
-  `loadAudio`/`regex`/`setTimeout`/`setInterval`/`clearTimeout`/
+- `drawRect`/`drawCircle`/`drawText`/`drawImage`/
+  `regex`/`setTimeout`/`setInterval`/`clearTimeout`/
   `clearInterval` aren't lexer keywords (unlike `log`/`fail`/`sqlite`),
   so a user could declare `void func drawRect(...) { ... }` -- it
   compiled fine, but every *call* to `drawRect(...)` still resolved to
@@ -331,7 +331,7 @@ unused feature's library is never on the link line to begin with, not
 merely dead-code-eliminated from it. `CodeGen.uses_graphics_code` is
 deliberately a separate, broader flag than the pre-existing
 `uses_graphics` (which still only gates lazily opening a canvas window):
-`loadImage()` alone doesn't open a window (see its own doc comment above)
+declaring an `img` alone doesn't open a window (see its own doc comment above)
 but `festina_load_image()` still lives in the graphics object file, so
 linking needs the broader signal even though window-opening doesn't. The
 previously-unified `festina_run_event_loop` (X11 `select()`-multiplexed
@@ -399,8 +399,9 @@ compiler `compile_and_run` already requires.
 
 `examples/` grew beyond the original hello/basic/arrays/geometry/
 multifile/regex set: `timers.f` (setTimeout/setInterval), `graphics.f`
-(drawing + all six event handlers), `audio.f` (loadAudio/play/stop/
-isPlaying, with a small generated `beep.wav` fixture), `fizzbuzz.f` (a
+(drawing + every event handler), `audio.f` (a clip from a path,
+play/stop/isPlaying/channels, with a small generated `beep.wav`
+fixture), `files.f` (claude.md #109's `blob`), `fizzbuzz.f` (a
 dependency-free loops/modulo tour), and `tic_tac_toe.f` -- a real,
 playable two-player game (click a cell, alternating X/O, win detection
 across all eight lines) built entirely around this runtime's actual
@@ -2289,7 +2290,15 @@ explicitly not for anything security-adjacent, and excluding 1.0 keeps
 `appendFile`/`fileExists`/`deleteFile`, none of which fails the program:
 `readFile` answers `null` and the writers `false`, the same treatment
 #57 gives division by zero (a failing `fclose` counts as a failed write,
-since a full disk can fail there after every `fwrite` succeeded). Time
+since a full disk can fail there after every `fwrite` succeeded).
+
+  > **claude.md #109 moved all five onto `blob`** -- `blob f =
+  > 'notes.txt'` then `f.write(...)`/`f.append(...)`/`f.toText()`/
+  > `f.exists()`/`f.delete()`. The C helpers are unchanged and still do
+  > the work, and the never-fail rule above is unchanged too; what went
+  > away is the free-function spelling, which threaded the same path
+  > through five separate calls. Each removed name is caught by name
+  > with an error showing its blob replacement. Time
 got `now()` (ms since epoch, matching `Date.now()` and the unit
 `setTimeout` already takes) and `formatTime`. `saveCanvas(path)` writes
 the *backing* surface, so it captures what the program drew rather than
@@ -2761,6 +2770,13 @@ be any text expression, and the conversion is a real file read wherever
 it happens. `loadAudio('...')` still works; it is the same call spelled
 longer, and breaking every program that uses it would gain nothing.
 
+  > **claude.md #109 removed `loadAudio()` and `loadImage()` after
+  > all.** "Breaking every program that uses it would gain nothing" was
+  > the right call at the time and stopped being right once the path
+  > form was the documented one everywhere: two spellings of one thing
+  > is a cost paid by every reader forever, against a one-line edit
+  > paid once. Both names now error with the path form in the message.
+
 *`aud.stop()` is removed.* **Breaking change.** It was already wrong
 when #98 gave a clip a pool of voices and #99 only made it more
 obviously so: one clip can be playing on several channels at once
@@ -2775,6 +2791,18 @@ generic unknown-method error, so the message can name the replacement.
 same problem: "is this sound audible anywhere" has one answer however
 many channels are playing it, and it is what #99's music-handover
 pattern is built on.
+
+  > **claude.md #109 brought `.stop()` back**, meaning exactly the
+  > "stop every copy" reading this paragraph identified. The reasoning
+  > above was sound and incomplete: the case it dismissed is real
+  > (silencing a looping hum, a music bed, a dialogue line), and the
+  > alternative it pointed at needed a channel number that automatic
+  > assignment never told anyone. So #109 fixed the missing half --
+  > `play()`/`playLoop()` return the channel they used -- and restored
+  > the method. `stop()` is clip-wide, `stopAudioPlayer(n)` is one
+  > channel, and `isPlaying()` is clip-wide for the same reason
+  > `stop()` is. `.stop(n)` is still caught by name, since a channel
+  > argument would mean the other thing.
 `tests/test_codegen.py::TestAudio` (4 more tests) and
 `tests/test_audio.py` (4 more).
 
