@@ -24,7 +24,7 @@ while i < 1500 {
     // runtime functions.
     text found = subject.match(/[0-9]+/)
     text swapped = subject.replace(/room/, 'suite')
-    text allSwapped = subject.replaceAll(/[0-9]/, '#')
+    text allSwapped = subject.replace(/[0-9]/g, '#')
     if found == swapped {
         log('unreachable')
     }

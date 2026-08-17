@@ -2269,3 +2269,24 @@ Both handlers take the same `(x:int, y:int)` and both report the pointer positio
 As with `on key`, the old name is removed rather than aliased. `on click` still *compiles* -- claude.md #40 never restricted event names -- but it is now ordinary dead code with no event source behind it, exactly like `on somethingElse`. This is breaking, and was asked for as such.
 
 The end-to-end test is the one worth having. A single simulated click now produces two lines in order, `down 150 220` then `up 150 220`, from one xdotool invocation -- and a separate test presses at one point, moves, and releases at another, asserting the two coordinates differ. That second test could not have been written at all before this change.
+
+
+107. THE 'g' FLAG STOPS BEING DECORATION
+
+`/pattern/g` has parsed since claude.md #67 and done nothing. The reasoning at the time is written down in the parser, and it was not unreasonable: `.replace()` and `.replaceAll()` already said "first match" and "every match" out loud, which is the distinction JS's `g` controls implicitly, so there was no behavior left for the flag to turn on. It was accepted rather than rejected purely so that JS habits would not produce a compile error.
+
+That argument has a hole in it, and the hole is `regex(pattern, flags)`. When first-vs-every is decided by *which method you call*, the compiler decides it, at the call site, from a name it can read. A pattern built at run time has flags the compiler cannot read -- so `regex(userPattern, 'g')` could parse, could pass its flags to `regcomp`, and could never once mean "replace every match". The two spellings of a regex did not have the same expressive power, and the missing half was exactly the half a program reaches for when the pattern comes from configuration or from a user.
+
+So `g` is now meaningful, `.replaceAll()` is removed, and the flag travels with the compiled pattern rather than with the call. A compiled regex is no longer a bare `regex_t` but a small struct holding the `regex_t` plus the flag, which `festina_regex_replace` reads back. Both `festina_regex_replace` and `festina_str_replace` lost their `replace_all` parameter, because there was nothing left for a caller to say: a regex knows from its own flag, and a plain-text search -- which has no flags to carry -- replaces the first match only, exactly like `String.prototype.replace` with a string argument in JS.
+
+That last part is a genuine narrowing, and it is worth being blunt about rather than filing under "JS compatibility". There is no longer any way to replace every occurrence of a literal substring without writing it as a pattern: `s.replaceAll(',', '-')` becomes `s.replace(/,/g, '-')`. For a comma that is a fair trade. For a substring containing regex metacharacters it is worse than a fair trade, because the text would have to be escaped first and this language has no escaping helper. The alternative was keeping `replaceAll` alongside `/g` -- two ways to say one thing, with the awkward follow-up question of what `s.replaceAll(/x/, 'y')` means when the pattern says first-match and the method says every-match. Removing the method makes the flag the single answer, and that was the instruction.
+
+`replaceAll` is caught by name with an error that names the flag, the same treatment claude.md #100 gave `aud.stop()`, rather than being left to a generic unknown-method message. A breaking change should explain itself at the point of breakage.
+
+Two things `g` deliberately does NOT do, both of which JS does and both of which would be worse here:
+
+`.test()` does not become stateful. In JS a `/g` regex carries a `lastIndex` that advances on every `.test()`, so testing the same string twice returns `true` and then `false`. That is a well-known bug factory and there is no reason to import it.
+
+`.match()` still returns `text`. JS's `/g` changes `.match()`'s return type from a string to an array, and a return type cannot depend on a flag that `regex(pattern, flags)` only knows at run time. This one is a real limitation rather than a preference -- there is no match-all in this language, and adding one would need a separate method with its own static return type, not a flag. Both exclusions are documented in api.md as limits, not left to be discovered.
+
+While rewriting the regex documentation, one line in api.md turned out to be simply false: "compiled fresh every time it's evaluated (both forms) -- no caching by pattern text". Literals have been cached per AST node since claude.md #85; only `regex()` recompiles. The corrected section carries the measurement, because the gap is not small: over 200,000 iterations, `/[0-9]+/.test(s)` takes 15 ms, the same pattern hoisted into a `regex` variable outside the loop takes 13 ms, and `regex('[0-9]+').test(s)` inside the loop takes 367 ms. Roughly 24x, entirely avoidable, and previously undocumented in the one place a reader would look.

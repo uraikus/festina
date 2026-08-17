@@ -104,10 +104,13 @@ class TestIndividualExamples:
             "false",       # digits.test('no numbers here')
             "42",          # 'room 42, building 7'.match(digits)
             "suite 42",    # 'room 42'.replace('room', 'suite')
-            "a-b-c-",      # 'a1b2c3'.replaceAll(/[0-9]/, '-')
+            "a-b2c3",      # 'a1b2c3'.replace(/[0-9]/, '-')   -- first only
+            "a-b-c-",      # 'a1b2c3'.replace(/[0-9]/g, '-')  -- every match
             "true",        # /^hello$/i.test('HELLO')
             "true",        # /\w+/gi.test('Hello World')
+            "x x",         # 'TEST test'.replace(/test/gi, 'x')
             "true",        # regex(userPattern).test('suite 42')
+            "a#b#c#",      # 'a1b2c3'.replace(regex('[0-9]', 'g'), '#')
         ]
 
     def test_timers_demo_runs_and_exits_on_its_own(self, cli_mod, tmp_path):

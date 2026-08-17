@@ -163,7 +163,7 @@ bin/festina compile examples/tic_tac_toe.f -o tic_tac_toe && ./tic_tac_toe
 | [`multifile.f`](examples/multifile.f) + [`geometry.f`](examples/geometry.f) | `import` across files |
 | [`maps.f`](examples/maps.f) | `map[T]` literals, indexed get/set, `.forEach()` |
 | [`config.f`](examples/config.f) | `DatabaseURL`, `environment.NAME` |
-| [`regex.f`](examples/regex.f) | `/pattern/flags` literals, `.test()`, `.match()`, `.replace()`/`.replaceAll()` |
+| [`regex.f`](examples/regex.f) | `/pattern/flags` literals, `.test()`, `.match()`, `.replace()`, and `/g` for every-match |
 | [`timers.f`](examples/timers.f) | `setTimeout`/`setInterval`/`clearInterval` |
 | [`graphics.f`](examples/graphics.f) | A drawn canvas, plus every `on mouseDown`/`mouseUp`/`mouse`/`key`/`resize`/`close` handler |
 | [`audio.f`](examples/audio.f) | `loadAudio()`/`.play()`/`.stop()`/`.isPlaying()`, with a tiny bundled WAV |

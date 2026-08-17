@@ -77,7 +77,7 @@ class TestRegexLiteral:
         semantic.analyze(program)
 
     def test_regex_literal_as_replace_search_argument(self, parser, semantic):
-        source = "text result = 'a1b2'.replaceAll(/[0-9]/, '-')"
+        source = "text result = 'a1b2'.replace(/[0-9]/g, '-')"
         program = parser.parse(source)
         semantic.analyze(program)
 
@@ -161,20 +161,35 @@ class TestStringMatch:
 
 
 class TestStringReplace:
-    """claude.md #68: value.replace(search, replacement:text) -> text,
-    value.replaceAll(search, replacement:text) -> text -- search may be
-    text (literal) or regex."""
+    """claude.md #68 (#107): value.replace(search, replacement:text) ->
+    text -- search may be text (literal) or regex. claude.md #107
+    removed .replaceAll(); how many matches are replaced is the
+    pattern's own 'g' flag now."""
 
-    @pytest.mark.parametrize("method", ["replace", "replaceAll"])
-    def test_replace_with_text_search_parses(self, parser, semantic, method):
-        program = parser.parse(f"text result = 'a-b'.{method}('-', '_')")
+    def test_replace_with_text_search_parses(self, parser, semantic):
+        program = parser.parse("text result = 'a-b'.replace('-', '_')")
         semantic.analyze(program)
 
-    @pytest.mark.parametrize("method", ["replace", "replaceAll"])
-    def test_replace_with_regex_search_parses(self, parser, semantic, method):
-        source = f"regex p = regex('[0-9]')\ntext result = 'a1b2'.{method}(p, '-')"
+    def test_replace_with_regex_search_parses(self, parser, semantic):
+        source = "regex p = regex('[0-9]')\ntext result = 'a1b2'.replace(p, '-')"
         program = parser.parse(source)
         semantic.analyze(program)
+
+    def test_replace_all_is_a_compile_error_naming_the_g_flag(
+            self, parser, semantic, errors):
+        # claude.md #107: removed rather than aliased, and the error
+        # names the replacement -- this is a breaking change and the
+        # message is the only place a reader will find out why.
+        program = parser.parse("text result = 'a-b'.replaceAll('-', '_')")
+        with pytest.raises(errors.CompileError, match="replaceAll"):
+            semantic.analyze(program)
+
+    def test_the_replace_all_error_points_at_the_g_flag(
+            self, parser, semantic, errors):
+        program = parser.parse("text result = 'a-b'.replaceAll('-', '_')")
+        with pytest.raises(errors.CompileError) as excinfo:
+            semantic.analyze(program)
+        assert "/search/g" in str(excinfo.value)
 
     def test_replace_wrong_argument_count_is_a_compile_error(self, parser, semantic, errors):
         source = "log('x'.replace('x'))"

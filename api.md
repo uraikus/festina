@@ -203,7 +203,7 @@ mutable `int` variable.
 ```festina
 text greeting = `Hello, ${name}!`     // template literals
 text a = 'room 42'.replace('room', 'suite')
-text b = 'a1b2c3'.replaceAll(/[0-9]/, '-')
+text b = 'a1b2c3'.replace(/[0-9]/g, '-')   // 'g' = every match
 bool matched = /[0-9]+/.test('room 42')
 text found = 'room 42'.match(/[0-9]+/)   // null if no match
 ```
@@ -549,22 +549,46 @@ are also compile-time errors, not runtime ones.
 
 ```festina
 regex digits = /[0-9]+/                    // JS-style literal, POSIX extended regex underneath
-regex ci = /^hello$/i                      // 'i' = case-insensitive; 'g' is also accepted (see below)
+regex ci     = /^hello$/i                  // 'i' = case-insensitive
+regex all    = /[0-9]/g                    // 'g' = replace every match
+regex both   = /test/gi                    // flags combine
+
 digits.test('room 42')                     // -> bool
 'room 42'.match(digits)                    // -> text or null
-'a1b2'.replace(digits, 'x')                // first match only
-'a1b2'.replaceAll(digits, 'x')             // every match
+'a1b2'.replace(/[0-9]/, 'x')               // 'a1b2' -> 'axb2'  (first match)
+'a1b2'.replace(/[0-9]/g, 'x')              // 'a1b2' -> 'axbx'  (every match)
 ```
 
 `flags` immediately follows the closing `/`, no space (`/pattern/flags`).
-Only `i` (case-insensitive) and `g` are accepted — `g` is recognized
-for familiarity with JavaScript but has no additional effect, since
-`.replace()`/`.replaceAll()` already say "first match" vs. "every
-match" explicitly, the same distinction `g` controls implicitly in JS.
-Any other flag letter is a compile-time error. `\w`/`\d`/`\s`/`\b` work
-as expected (glibc's `regcomp()` supports them as GNU extensions), but
-there are no capture groups, backreferences, or non-greedy quantifiers
-(POSIX ERE's own limits).
+Only `i` and `g` are accepted; any other flag letter is a compile-time
+error. `\w`/`\d`/`\s`/`\b` work as expected (glibc's `regcomp()`
+supports them as GNU extensions), but there are no capture groups,
+backreferences, or non-greedy quantifiers (POSIX ERE's own limits).
+
+### What `g` does, and what it doesn't
+
+`g` affects `.replace()` and nothing else.
+
+```festina
+'a-b-c'.replace(/-/g, '_')     // 'a_b_c'
+'a-b-c'.replace(/-/, '_')      // 'a_b-c'
+'a-b-c'.replace('-', '_')      // 'a_b-c' -- a text search has no flags
+```
+
+A plain-text search replaces the first match only, exactly like JS's
+`String.prototype.replace` with a string argument. There is no
+`.replaceAll()` — replacing every occurrence is spelled `/search/g`.
+
+It deliberately does **not** do two things JS's `g` does:
+
+- **`.test()` does not become stateful.** In JS a `/g` regex carries a
+  `lastIndex` that advances on each `.test()`, so the same test against
+  the same string returns `true`, then `false`. Here it returns the same
+  answer every time.
+- **`.match()` still returns `text`, not an array.** JS's `/g` changes
+  `.match()`'s return type. A return type can't depend on a flag that
+  `regex(pattern, flags)` only knows at run time, so `g` is ignored by
+  `.match()`.
 
 A pattern/flags that aren't known until runtime (built from a variable
 or a template) can't use the literal syntax — the global `regex(pattern,
@@ -575,10 +599,32 @@ RegExp(...)`:
 ```festina
 text userPattern = someInput()
 regex dynamic = regex(userPattern)
+regex globalDynamic = regex(userPattern, 'g')   // 'g' works here too
 ```
 
-Compiled fresh every time it's evaluated (both forms) — no caching by
-pattern text.
+The flag belongs to the compiled pattern, not to the call site, so both
+spellings behave identically.
+
+### Literals are compiled once; `regex()` is compiled per evaluation
+
+A `/pattern/` literal is compiled the first time its line is reached and
+cached for the life of the process. A `regex(pattern, flags)` call
+compiles on every evaluation, because its pattern is an arbitrary
+expression — the same call site can legitimately see a different pattern
+each time, so caching it would silently reuse the first one forever.
+
+That is a real cost in a hot loop. Measured over 200,000 iterations:
+
+| | Time |
+|---|---|
+| `/[0-9]+/.test(s)` | 15 ms |
+| `regex('[0-9]+')` hoisted to a variable outside the loop | 13 ms |
+| `regex('[0-9]+').test(s)` inside the loop | 367 ms |
+
+Roughly 24x, and entirely avoidable: binding the pattern to a variable
+outside the loop compiles it once and costs the same as a literal. Use
+the literal whenever the pattern is known, and hoist `regex()` out of
+loops when it isn't.
 
 ## Graphics
 
@@ -994,7 +1040,7 @@ everything else:
 ```festina
 text body = readFile('data.csv')
 if body != null {
-    log(body.replaceAll(',', ' | '))
+    log(body.replace(/,/g, ' | '))
 }
 ```
 

@@ -6376,17 +6376,39 @@ class TestRegex:
         result = compile_and_run("log('a-b-c'.replace('-', '_'))")
         assert result.stdout.strip() == "a_b-c"
 
-    def test_replace_all_replaces_every_occurrence(self, compile_and_run):
-        result = compile_and_run("log('a-b-c'.replaceAll('-', '_'))")
+    def test_a_text_search_never_replaces_more_than_the_first(self, compile_and_run):
+        # claude.md #107: .replaceAll() is gone and a plain-text search
+        # carries no flags, so there is no longer any way to replace
+        # every occurrence of a literal substring except by making it a
+        # /g pattern. That is a real narrowing of the text path and is
+        # pinned here so it cannot drift back silently.
+        result = compile_and_run("log('a-b-c'.replace('-', '_'))")
+        assert result.stdout.strip() == "a_b-c"
+
+    def test_a_g_pattern_is_how_every_occurrence_is_spelled_now(self, compile_and_run):
+        result = compile_and_run(r"log('a-b-c'.replace(/-/g, '_'))")
         assert result.stdout.strip() == "a_b_c"
 
     def test_replace_with_no_match_returns_original_unchanged(self, compile_and_run):
         result = compile_and_run("log('hello world'.replace('zzz', 'nope'))")
         assert result.stdout.strip() == "hello world"
 
-    def test_replace_all_with_regex_search(self, compile_and_run):
-        result = compile_and_run("log('a1b2c3'.replaceAll(regex('[0-9]'), '-'))")
+    def test_a_dynamic_regex_can_carry_the_g_flag(self, compile_and_run):
+        # claude.md #107's real gain over .replaceAll(): the flag lives
+        # on the compiled pattern, so a pattern whose flags are only
+        # known at run time can be global. The old design decided
+        # first-vs-every at the CALL SITE, which a runtime-built
+        # pattern could never influence.
+        result = compile_and_run("log('a1b2c3'.replace(regex('[0-9]', 'g'), '-'))")
         assert result.stdout.strip() == "a-b-c-"
+
+    def test_a_dynamic_regex_without_g_replaces_the_first_only(self, compile_and_run):
+        result = compile_and_run("log('a1b2c3'.replace(regex('[0-9]'), '-'))")
+        assert result.stdout.strip() == "a-b2c3"
+
+    def test_a_dynamic_regex_flag_string_may_combine_g_and_i(self, compile_and_run):
+        result = compile_and_run("log('TEST test'.replace(regex('test', 'gi'), 'x'))")
+        assert result.stdout.strip() == "x x"
 
     def test_replace_with_regex_search_first_match_only(self, compile_and_run):
         result = compile_and_run("log('a1b2c3'.replace(regex('[0-9]'), '-'))")
@@ -6397,7 +6419,7 @@ class TestRegex:
         # straightforward correctness requirement, not something to
         # leave unresolved: a pattern that can match zero-width (e.g.
         # "x*" where there's no "x") must not spin the runtime forever.
-        result = compile_and_run("log('abc'.replaceAll(regex('x*'), '-'))")
+        result = compile_and_run("log('abc'.replace(regex('x*', 'g'), '-'))")
         assert result.returncode == 0
         assert result.stdout.strip() == "-a-b-c-"
 
@@ -6472,9 +6494,44 @@ class TestRegexLiteral:
         result = compile_and_run("log('room 42, building 7'.match(/[0-9]+/))")
         assert result.stdout.strip() == "42"
 
-    def test_replace_all_with_regex_literal_search(self, compile_and_run):
-        result = compile_and_run("log('a1b2c3'.replaceAll(/[0-9]/, '-'))")
+    def test_a_g_literal_replaces_every_match(self, compile_and_run):
+        result = compile_and_run("log('a1b2c3'.replace(/[0-9]/g, '-'))")
         assert result.stdout.strip() == "a-b-c-"
+
+    def test_the_same_literal_without_g_replaces_only_the_first(self, compile_and_run):
+        result = compile_and_run("log('a1b2c3'.replace(/[0-9]/, '-'))")
+        assert result.stdout.strip() == "a-b2c3"
+
+    def test_gi_together_are_global_and_case_insensitive(self, compile_and_run):
+        # The user's own example spelling: /test/gi.
+        result = compile_and_run("log('TEST test'.replace(/test/gi, 'x'))")
+        assert result.stdout.strip() == "x x"
+
+    def test_i_alone_is_case_insensitive_but_not_global(self, compile_and_run):
+        result = compile_and_run("log('TEST test'.replace(/test/i, 'x'))")
+        assert result.stdout.strip() == "x test"
+
+    def test_g_does_not_make_test_stateful(self, compile_and_run):
+        # claude.md #107: JS's /g gives .test() a lastIndex that makes
+        # repeated calls alternate true/false. Deliberately not
+        # reproduced -- the same test against the same string is the
+        # same answer every time.
+        source = """
+        regex p = /[0-9]/g
+        log(p.test('a1'))
+        log(p.test('a1'))
+        log(p.test('a1'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true", "true"]
+
+    def test_g_does_not_change_what_match_returns(self, compile_and_run):
+        # claude.md #107: in JS, /g makes .match() return an array
+        # instead of a string. Festina's .match() returns text, and a
+        # return TYPE cannot depend on a flag that regex(p, f) only
+        # knows at run time -- so 'g' is ignored here, by design.
+        result = compile_and_run("log('a1b2c3'.match(/[0-9]/g))")
+        assert result.stdout.strip() == "1"
 
     def test_escaped_slash_in_a_literal_pattern_matches_a_literal_slash(self, compile_and_run):
         result = compile_and_run(r"log(/a\/b/.test('a/b'))")
@@ -7565,7 +7622,7 @@ class TestTextReferenceManagement:
         void func run() {
             log('room 42'.replace(/[0-9]+/, 'N'))
             log(wrap('abc').replace('b', 'Z'))
-            log(`${'hello'}`.replaceAll('l', 'L'))
+            log(`${'hello'}`.replace(/l/g, 'L'))
         }
         run()
         """
@@ -8710,7 +8767,7 @@ class TestMathFileAndTime:
         source = f"""
         writeFile('{path}', 'a,b,c')
         text body = readFile('{path}')
-        log(body.replaceAll(',', '-'))
+        log(body.replace(/,/g, '-'))
         log(`${{body}}!`)
         """
         result = compile_and_run(source)

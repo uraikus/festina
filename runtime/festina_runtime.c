@@ -690,21 +690,40 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
     *out_data = rows;
 }
 
-/* ---- regex(), .test(), .match(), .replace()/.replaceAll() -- claude.md #67-68 ---- */
+/* ---- regex(), .test(), .match(), .replace() -- claude.md #67-68, #107 ---- */
+
+/* claude.md #107: a compiled regex is no longer a bare regex_t. The 'g'
+ * flag has to travel WITH the pattern rather than with the call site,
+ * because `regex(p, f)` builds its flags from a runtime text expression
+ * the compiler cannot inspect -- so there is nothing for codegen to
+ * read at the .replace() call and the decision has to be made here.
+ * `re` is first in the struct deliberately: every regexec call below
+ * takes `&r->re`, and a bare cast would still land on the right bytes
+ * if one were ever missed. */
+typedef struct {
+    regex_t re;
+    int8_t global;
+} FestinaRegex;
 
 void *festina_regex_compile(const char *pattern, const char *flags) {
     if (!pattern) pattern = "";
     if (!flags) flags = "";
-    regex_t *compiled = malloc(sizeof(regex_t));
+    FestinaRegex *compiled = malloc(sizeof(FestinaRegex));
     if (!compiled) festina_fail("out of memory in festina_regex_compile");
 
     int cflags = REG_EXTENDED;
     if (strchr(flags, 'i')) cflags |= REG_ICASE;
+    /* claude.md #107: 'g' means "every match" for .replace(), the same
+     * thing it means in JS. POSIX has no cflag for it -- it is not a
+     * matching property at all, it is a property of what the caller
+     * wants done with the matches -- so it is recorded here and read
+     * back by festina_regex_replace. */
+    compiled->global = strchr(flags, 'g') != NULL;
 
-    int rc = regcomp(compiled, pattern, cflags);
+    int rc = regcomp(&compiled->re, pattern, cflags);
     if (rc != 0) {
         char errbuf[256];
-        regerror(rc, compiled, errbuf, sizeof(errbuf));
+        regerror(rc, &compiled->re, errbuf, sizeof(errbuf));
         char msg[512];
         snprintf(msg, sizeof(msg), "invalid regex pattern '%s': %s", pattern, errbuf);
         free(compiled);
@@ -722,20 +741,30 @@ void *festina_regex_compile(const char *pattern, const char *flags) {
  * itself was a separate malloc and needs its own free(). */
 void festina_regex_free(void *compiled) {
     if (!compiled) return;
-    regfree((regex_t *)compiled);
+    regfree(&((FestinaRegex *)compiled)->re);
     free(compiled);
 }
 
 int8_t festina_regex_test(void *compiled, const char *text) {
     if (!compiled) return 0;
     if (!text) text = "";
-    return regexec((regex_t *)compiled, text, 0, NULL, 0) == 0;
+    /* claude.md #107: 'g' is deliberately ignored here. In JS it makes
+     * .test() STATEFUL -- a /g regex carries a lastIndex that advances
+     * on every call, so the same test against the same string returns
+     * true then false -- which is a famous source of bugs and not
+     * something worth reproducing. */
+    return regexec(&((FestinaRegex *)compiled)->re, text, 0, NULL, 0) == 0;
 }
 
 char *festina_regex_match(void *compiled, const char *text) {
     if (!compiled || !text) return NULL;
     regmatch_t m;
-    if (regexec((regex_t *)compiled, text, 1, &m, 0) != 0) return NULL;
+    /* claude.md #107: 'g' is ignored here too, for a harder reason --
+     * see festina_runtime.h's doc comment. JS's /g makes .match()
+     * return an ARRAY instead of a string, and this function's return
+     * type cannot depend on a flag that `regex(p, f)` only knows at
+     * run time. */
+    if (regexec(&((FestinaRegex *)compiled)->re, text, 1, &m, 0) != 0) return NULL;
     regoff_t len = m.rm_eo - m.rm_so;
     char *out = malloc((size_t)len + 1);
     if (!out) festina_fail("out of memory in festina_regex_match");
@@ -744,8 +773,13 @@ char *festina_regex_match(void *compiled, const char *text) {
     return out;
 }
 
+/* claude.md #107: no replace_all parameter any more. `.replaceAll()`
+ * is gone, and a plain-text search carries no flags, so a text search
+ * replaces the first match and nothing else -- exactly what JS's
+ * String.prototype.replace does with a string argument. Replacing
+ * every occurrence is spelled `/search/g` now. */
 char *festina_str_replace(const char *text, const char *search,
-                           const char *replacement, int8_t replace_all) {
+                           const char *replacement) {
     if (!text) text = "";
     if (!replacement) replacement = "";
     if (!search || !*search) {
@@ -766,7 +800,7 @@ char *festina_str_replace(const char *text, const char *search,
         /* Once a single (non-"All") replacement has happened, treat
          * every further position as "no match" so the rest of `cursor`
          * gets copied through unchanged below. */
-        const char *found = (did_replace && !replace_all) ? NULL : strstr(cursor, search);
+        const char *found = did_replace ? NULL : strstr(cursor, search);
         if (!found) break;
 
         size_t prefix_len = (size_t)(found - cursor);
@@ -799,12 +833,15 @@ char *festina_str_replace(const char *text, const char *search,
     return out;
 }
 
+/* claude.md #107: how many matches to replace comes from the PATTERN's
+ * own 'g' flag now, not from which method was called. */
 char *festina_regex_replace(void *compiled, const char *text,
-                             const char *replacement, int8_t replace_all) {
+                             const char *replacement) {
     if (!text) text = "";
     if (!replacement) replacement = "";
     if (!compiled) return strdup(text);
-    regex_t *re = (regex_t *)compiled;
+    regex_t *re = &((FestinaRegex *)compiled)->re;
+    int8_t replace_all = ((FestinaRegex *)compiled)->global;
 
     size_t replacement_len = strlen(replacement);
     size_t capacity = strlen(text) + replacement_len + 1;
@@ -823,7 +860,7 @@ char *festina_regex_replace(void *compiled, const char *text,
             /* REG_NOTBOL once we're past the true start of the string --
              * otherwise a `^`-anchored pattern would incorrectly match
              * again at the start of *this* remaining substring on every
-             * later iteration of replaceAll. */
+             * later iteration of a /g replace. */
             int eflags = (cursor == text) ? 0 : REG_NOTBOL;
             no_match = regexec(re, cursor, 1, &m, eflags) != 0;
         }

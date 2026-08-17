@@ -39,7 +39,7 @@ import graph and merges every file into one compilation unit, and
 `bin/festina`/`festina.cli.compile_file` actually call it now (they
 used to only ever compile the single entry file). So is claude.md
 #67/#68 (regex, string match/replace) -- `.test()`, `.match()`, and
-`.replace()`/`.replaceAll()` are recognized Call-on-Member patterns the
+`.replace()` are recognized Call-on-Member patterns the
 same way `Math.floor`/`int.toFloat()` already are, and the whole feature
 is built on POSIX extended regular expressions (`<regex.h>`, already
 part of libc) rather than a bundled or external regex engine, per
@@ -440,9 +440,9 @@ parse) and an unterminated attempt (no closing `/` before a newline)
 falling back to plain division rather than raising. Flags are validated
 for real at parse time (`Parser.parse_primary`'s `REGEX` handling) --
 only `i` (case-insensitive, matching `regex()`'s own flag) and `g`
-(accepted for familiarity, but a deliberate no-op: `.replace()`/
-`.replaceAll()` already say first-vs-every-match explicitly, the same
-distinction JS's `g` flag controls implicitly) are accepted; any other
+(claude.md #107: replace every match rather than the first -- it used to
+be an accepted-but-inert letter, back when `.replaceAll()` was how that
+was said) are accepted; any other
 letter, or a repeated flag, is a clear compile error -- something
 `regex()`'s flags *argument* can never offer, since it's an arbitrary
 runtime `text` expression the compiler can't inspect. Escaping: `\/`
@@ -2885,8 +2885,9 @@ schema sync still firing for a table declared in an imported file.
 `tests/test_regex.py` covers claude.md #67/#68 (regex, string
 match/replace) at the parser/semantic level, same split as
 `test_loops.py`/`test_numeric_conversion.py` -- argument-count and
-argument-type checking for `.test()`/`.match()`/`.replace()`/
-`.replaceAll()`, and that calling any of them on the wrong receiver
+argument-type checking for `.test()`/`.match()`/`.replace()`, that
+`.replaceAll()` is now rejected by name with an error pointing at the
+`g` flag (claude.md #107), and that calling any of them on the wrong receiver
 type (e.g. `.match()` on `int`) is rejected the same way an undefined
 struct field access already is. `test_codegen.py`'s `TestRegex` covers
 the same feature end to end, including two cases that are easy to get
@@ -3142,8 +3143,8 @@ festina/
         # an Identifier resolving to a non-constant int. claude.md #67/
         # #68: regex() is a BUILTIN_FUNCTIONS entry (like sqlite()/
         # loadImage(), returning RegexType()); pattern.test(text)/
-        # value.match(regex)/value.replace(text-or-regex, text)/
-        # .replaceAll(...) are recognized Call-on-Member patterns, same
+        # value.match(regex)/value.replace(text-or-regex, text)
+        # are recognized Call-on-Member patterns, same
         # family as Math.floor/int.toFloat() above -- checked by name
         # against the receiver's inferred type, not a real method table
         # (Festina has no general concept of methods on primitives).
@@ -3236,9 +3237,10 @@ festina/
         # division/modulo by zero returning a reserved null sentinel
         # (INT_NULL_CONST / FLOAT_NULL_CONST) via real control flow rather
         # than a trapping instruction, and regex()/.test()/.match()/
-        # .replace()/.replaceAll() (_emit_regex_call plus the same
+        # .replace() (_emit_regex_call plus the same
         # Member-call dispatch Math.floor/int.toFloat() use -- a regex
-        # value is `ptr` to an opaque, POSIX regex_t compiled fresh at
+        # value is `ptr` to an opaque FestinaRegex (a POSIX regex_t plus
+        # claude.md #107's `g` flag), compiled fresh at
         # every regex() call site via the festina_runtime C helpers; no
         # IR-level machinery of its own, it's all in the runtime), and
         # claude.md #37/#39/#40 (image/graphics/events -- see "Status"

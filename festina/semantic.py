@@ -5,7 +5,7 @@ rules from #12-20, the struct/table distinction from #27, #28, #35, and
 int.toFloat() are the only conversions). #58 (struct/table namespace):
 struct/table names live in `structs`/`tables`, never cross-checked
 against `Scope` (variables/functions) -- separate namespaces by design.
-#67/#68 (regex(), .test(), .match(), .replace()/.replaceAll()) follow
+#67/#68/#107 (regex(), .test(), .match(), .replace()) follow
 the same "recognized Call-on-Member pattern" approach Math.floor/
 int.toFloat() already established -- Festina has no general concept of
 methods on primitive types, so each one is checked by name against the
@@ -1131,10 +1131,28 @@ def analyze(program, filename="<string>"):
                         category="invalid function argument type",
                     )
                 return _TEXT
+            # claude.md #107: .replaceAll() is GONE. How many matches a
+            # replace touches is a property of the PATTERN now, spelled
+            # with JS's own 'g' flag -- `/x/g` replaces every match,
+            # `/x/` replaces the first -- rather than a property of
+            # which method was called. Two ways to say the same thing
+            # is one too many, and the flag is the way JS says it.
+            # Caught by name here, like aud.stop() below, so the error
+            # can name the replacement instead of just failing.
+            if callee.prop == "replaceAll" and infer(callee.obj, scope) == _TEXT:
+                raise CompileError(
+                    "text has no replaceAll() -- use the 'g' flag on the "
+                    "pattern instead: value.replace(/search/g, replacement)",
+                    file=filename, line=callee.line, column=callee.column,
+                    category="unknown method",
+                )
             # claude.md #68: value.replace(search, replacement:text) -> text
-            #                value.replaceAll(search, replacement:text) -> text
             # search may be text (a literal substring match) or regex.
-            if callee.prop in ("replace", "replaceAll") and infer(callee.obj, scope) == _TEXT:
+            # claude.md #107: a text search replaces the FIRST match
+            # only, since plain text carries no flags to say otherwise
+            # -- exactly like JS's String.prototype.replace with a
+            # string argument. Every match is spelled /search/g.
+            if callee.prop == "replace" and infer(callee.obj, scope) == _TEXT:
                 if len(expr.args) != 2:
                     raise CompileError(
                         f"{callee.prop}() expects exactly 2 arguments, got {len(expr.args)}",

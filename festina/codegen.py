@@ -9,7 +9,7 @@ see the "Audio" note below), #41/#42 (log/fail), #45 (string
 interpolation), #55-57 (int.toFloat(), Math.floor/ceil/round/trunc,
 division/modulo by zero), #60/#61 (for/while loops), #63 (array
 .length), #66 (postfix ++/--), #67-68 (regex(), .test(), .match(),
-.replace()/.replaceAll() -- see _emit_regex_call and the Member-call
+.replace() -- see _emit_regex_call and the Member-call
 handling in _emit_call), #69 (setTimeout/setInterval/clearTimeout/
 clearInterval -- see the "Timers" note below), #70 (DatabaseURL -- see
 _emit_main_and_entry), #71 (environment.NAME/environment[keyExpr] --
@@ -36,7 +36,7 @@ nesting, `.length` -- see the FESTINA_ARRAY_LLVM_TYPE note below),
 automatic table schema sync against festina.sqlite via the
 festina_runtime C helpers, sqlite() queries (SELECT into arr[Table],
 parameterized INSERT/UPDATE/DELETE -- see the "Query rows" note
-below), regex()/.test()/.match()/.replace()/.replaceAll() (POSIX
+below), regex()/.test()/.match()/.replace() (POSIX
 extended regular expressions via the festina_runtime C helpers -- no
 bundled regex engine, see festina_runtime.h's doc comment on why),
 img/drawRect/drawCircle/drawText/drawImage/`on mouseDown`/`on
@@ -968,13 +968,16 @@ class CodeGen:
             "declare double @festina_sqlite_scalar_float(ptr)",
             "declare ptr @festina_sqlite_scalar_text(ptr)",
             "declare void @festina_sqlite_collect_rows(ptr, i32, ptr, ptr, ptr)",
-            # claude.md #67-68: regex(), .test(), .match(), .replace()/.replaceAll().
+            # claude.md #67-68, #107: regex(), .test(), .match(), .replace().
             "declare ptr @festina_regex_compile(ptr, ptr)",
             "declare void @festina_regex_free(ptr)",
             "declare i8 @festina_regex_test(ptr, ptr)",
             "declare ptr @festina_regex_match(ptr, ptr)",
-            "declare ptr @festina_str_replace(ptr, ptr, ptr, i8)",
-            "declare ptr @festina_regex_replace(ptr, ptr, ptr, i8)",
+            # claude.md #107: neither carries a replace-all argument any
+            # more -- a regex knows from its own 'g' flag, and a text
+            # search replaces the first match only.
+            "declare ptr @festina_str_replace(ptr, ptr, ptr)",
+            "declare ptr @festina_regex_replace(ptr, ptr, ptr)",
             # claude.md #37, #39, #40: img, graphics functions, click/mouse events.
             "declare void @festina_graphics_init()",
             "declare void @festina_run_event_loop()",
@@ -4843,18 +4846,23 @@ class CodeGen:
                     self._free_regex_temp(expr.args[0], arg_val, arg_type, lines)
                     return out, TEXT
             # claude.md #68: value.replace(search, replacement:text) -> text
-            #                value.replaceAll(search, replacement:text) -> text
-            if callee.prop in ("replace", "replaceAll"):
+            # claude.md #107: how many matches this touches is no longer
+            # decided here. A regex search carries its own 'g' flag and
+            # the runtime reads it; a text search has no flags and
+            # replaces the first match only. There is nothing left for
+            # codegen to pass, which is the point -- the old i8 argument
+            # could only ever be a compile-time constant, so a regex
+            # built by `regex(p, f)` could never have said "global".
+            if callee.prop == "replace":
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if obj_type == TEXT:
                     search_val, search_type = self._emit_expr(expr.args[0], env, lines)
                     replacement_val, replacement_type = self._emit_expr(expr.args[1], env, lines)
-                    replace_all = "1" if callee.prop == "replaceAll" else "0"
                     out = self.tmp()
                     if search_type == REGEX:
                         lines.append(
                             f"  {out} = call ptr @festina_regex_replace(ptr {search_val}, ptr {obj_val}, "
-                            f"ptr {replacement_val}, i8 {replace_all})"
+                            f"ptr {replacement_val})"
                         )
                     else:
                         # search_type is TEXT, or None from a bare `null`
@@ -4862,7 +4870,7 @@ class CodeGen:
                         # search pointer defensively -- see the runtime).
                         lines.append(
                             f"  {out} = call ptr @festina_str_replace(ptr {obj_val}, ptr {search_val}, "
-                            f"ptr {replacement_val}, i8 {replace_all})"
+                            f"ptr {replacement_val})"
                         )
                     self._free_text_temp(callee.obj, obj_val, obj_type, lines)
                     self._free_text_temp(expr.args[0], search_val, search_type, lines)
@@ -5039,7 +5047,7 @@ class CodeGen:
         lines.append(f"  {out} = phi ptr [ {loaded}, %{load_pred} ], [ {compiled}, %{compile_pred} ]")
         return out
 
-    # ---- regex() / .test() / .match() / .replace() / .replaceAll() (claude.md #67-68) ----
+    # ---- regex() / .test() / .match() / .replace() (claude.md #67-68, #107) ----
     def _emit_regex_call(self, expr, env, lines):
         """claude.md #67: regex(pattern:text) / regex(pattern:text,
         flags:text) -> regex. Compiles the pattern via POSIX regcomp()

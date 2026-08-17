@@ -17,12 +17,15 @@ _IMPORT_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+\.f$")
 # inspect), a literal's flags are plain text known at parse time, so
 # they can -- and should -- be validated right here, the same way any
 # other syntax error is. 'i' is meaningful (case-insensitive matching,
-# same as regex()'s own 'i' flag); 'g' is accepted for familiarity (real
-# JS code reaches for it out of habit) but does nothing extra here --
-# .replace() vs .replaceAll() (claude.md #68) already say "first match"
-# vs "every match" explicitly, the same distinction JS's 'g' flag
-# controls implicitly, so there's no separate behavior left for 'g' to
-# turn on. Anything else (m/s/u/y/d, JS's own further flags) isn't
+# same as regex()'s own 'i' flag); claude.md #107 made 'g' meaningful
+# too, where it used to be accepted-but-inert. It now means for
+# .replace() exactly what it means in JS -- replace every match rather
+# than just the first -- and .replaceAll(), which used to be how that
+# was said, is gone. Note that neither flag does anything HERE beyond
+# being spelled correctly: 'g' is recorded on the compiled pattern and
+# read back by the runtime, because `regex(p, f)` builds its flags from
+# a runtime expression and both spellings have to obey the same rule.
+# Anything else (m/s/u/y/d, JS's own further flags) isn't
 # supported by the POSIX-regex-backed runtime this compiles down to, so
 # it's a clear compile error rather than a silently-ignored letter.
 _SUPPORTED_REGEX_FLAGS = frozenset("gi")
@@ -501,10 +504,9 @@ class Parser:
                 if f not in _SUPPORTED_REGEX_FLAGS:
                     raise self.err(
                         t, "invalid syntax",
-                        f"unsupported regex flag '{f}' -- only 'i' (case-insensitive) "
-                        f"and 'g' (accepted for familiarity, but has no additional effect: "
-                        f"claude.md #68's replace()/replaceAll() already say first-match vs. "
-                        f"every-match explicitly) are supported")
+                        f"unsupported regex flag '{f}' -- only 'i' "
+                        f"(case-insensitive) and 'g' (replace every match, "
+                        f"not just the first) are supported")
                 if f in seen:
                     raise self.err(t, "invalid syntax", f"duplicate regex flag '{f}'")
                 seen.add(f)

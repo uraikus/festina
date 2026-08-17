@@ -6,7 +6,7 @@
 
 /* Note on what does NOT appear in this header: no Cairo, X11, ALSA, or
  * <regex.h> type ever crosses a public function's signature -- every
- * such value is opaqued to `void *` (regex_t* from festina_regex_compile,
+ * such value is opaqued to `void *` (FestinaRegex* from festina_regex_compile,
  * cairo_surface_t* from festina_load_image, ...). That's what makes it
  * possible to split the implementation (festina_runtime.c/_graphics.c/
  * _audio.c -- see each file's own top comment) into separate translation
@@ -153,7 +153,7 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
                                   int64_t *out_length, void **out_data);
 
 /*
- * claude.md #67-68: regex(), .test(), .match(), .replace()/.replaceAll().
+ * claude.md #67-68 (#107): regex(), .test(), .match(), .replace().
  *
  * Built on POSIX extended regular expressions (regcomp/regexec from
  * <regex.h>) rather than a bundled regex engine or an external library
@@ -166,8 +166,23 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
  * works around).
  *
  * festina_regex_compile compiles `pattern` once per call (REG_EXTENDED,
- * plus REG_ICASE if `flags` contains 'i') and returns the resulting
- * regex_t*, heap-allocated. claude.md #85: a regex produced by a
+ * plus REG_ICASE if `flags` contains 'i') and returns a heap-allocated
+ * FestinaRegex* -- a regex_t with claude.md #107's 'g' flag recorded
+ * alongside it. 'g' is not a matching property and POSIX has no cflag
+ * for it; it says what the caller wants done with the matches, so it
+ * has to be carried to festina_regex_replace rather than applied by
+ * regcomp. It travels with the compiled pattern rather than with the
+ * call site because `regex(p, f)` builds its flags from a runtime text
+ * expression -- codegen has nothing to inspect at the .replace() call.
+ *
+ * 'g' affects .replace() ONLY. .test() ignores it deliberately: in JS a
+ * /g regex makes .test() stateful via lastIndex, so the same test
+ * against the same string alternates true/false, which is a bug
+ * factory rather than a feature. .match() ignores it for a harder
+ * reason -- JS's /g makes .match() return an array rather than a
+ * string, and a function's return type cannot depend on a flag that
+ * `regex(p, f)` only knows at run time. Both are documented in api.md
+ * as limits rather than left to be discovered. claude.md #85: a regex produced by a
  * runtime `regex(...)` call and consumed as a temporary in the same
  * expression (`regex(p).test(s)`) is freed via festina_regex_free once
  * that expression is done with it -- previously such a regex leaked on
@@ -186,17 +201,22 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
  * value (see festina/codegen.py's "Null for int/float" docstring note:
  * text is pointer-backed, so the ordinary C NULL pointer *is* the null
  * sentinel, unlike int/float which need INT_NULL_CONST/FLOAT_NULL_CONST).
- * replace()/replaceAll() specifically return the *original* string
- * unchanged (not NULL) when there's no match, per claude.md #68.
+ * replace() specifically returns the *original* string unchanged (not
+ * NULL) when there's no match, per claude.md #68.
  */
 void *festina_regex_compile(const char *pattern, const char *flags);
 void festina_regex_free(void *compiled);  /* claude.md #85: regfree + free */
 int8_t festina_regex_test(void *compiled, const char *text);
 char *festina_regex_match(void *compiled, const char *text);
+/* claude.md #107: neither takes a replace_all argument any more.
+ * .replaceAll() is gone; a regex replaces every match iff its own
+ * pattern carries 'g', and a plain-text search -- which has no flags to
+ * carry -- replaces the first match only, exactly like JS's
+ * String.prototype.replace with a string argument. */
 char *festina_str_replace(const char *text, const char *search,
-                           const char *replacement, int8_t replace_all);
+                           const char *replacement);
 char *festina_regex_replace(void *compiled, const char *text,
-                             const char *replacement, int8_t replace_all);
+                             const char *replacement);
 
 /*
  * claude.md #37, #39, #40: img, graphics functions, click/mouse events.
