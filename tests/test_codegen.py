@@ -6357,6 +6357,73 @@ class TestAudioChannelReturnAndClipStop:
         assert result.stdout.strip() == "-1"
 
 
+class TestStatementCache:
+    """claude.md #113: literal SQL is prepared once per call site and
+    reset+reused ever after -- the sqlite counterpart of claude.md #85's
+    regex literal cache, driven by the same compile-time fact (the text
+    cannot change). Dynamic SQL keeps the per-call prepare. Measured:
+    20,000 one-row SELECTs 164ms -> 55ms; with WAL, 20,000 INSERTs
+    16.7s -> 0.3s."""
+
+    def test_a_literal_site_reuses_its_statement_across_params(
+            self, compile_and_run, tmp_path):
+        # Same call site, different bound parameters each iteration --
+        # the reset+rebind path, which is where a caching bug would
+        # show as stale results.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table T {{ id:int  v:int }}
+        for int i = 0, i < 5, i++ {{
+            sqlite('INSERT INTO T (id, v) VALUES (?, ?)', [i, i * 10])
+        }}
+        int total = 0
+        for int i = 0, i < 5, i++ {{
+            arr[T] rows = sqlite('SELECT * FROM T WHERE id = ?', [i])
+            total = total + rows[0].v
+        }}
+        log(total)
+        log(sqliteInt('SELECT count(*) FROM T'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["100", "5"]
+
+    def test_literal_sql_gets_a_cache_slot_and_dynamic_sql_does_not(
+            self, parser, semantic, codegen):
+        source = """
+        table T { id:int }
+        sqlite('INSERT INTO T (id) VALUES (1)')
+        text tbl = 'T'
+        sqlite(`DELETE FROM ${tbl}`)
+        """
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        # One literal site -> one slot; the template site stays on the
+        # per-call prepare, because its SQL can differ every evaluation.
+        assert ir.count("@__festina_stmtcache_") >= 2  # global + use
+        assert ir.count("call ptr @festina_sqlite_prepare_cached(") == 1
+        assert ir.count("call ptr @festina_sqlite_prepare(") == 1
+
+    def test_two_identical_literals_get_independent_slots(
+            self, compile_and_run, tmp_path):
+        # Per-SITE, not per-text: two textually identical queries are
+        # two statements, so one being mid-collection can never disturb
+        # the other. Cheap insurance rather than a measured need.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table T {{ id:int }}
+        sqlite('INSERT INTO T (id) VALUES (1)')
+        arr[T] a = sqlite('SELECT * FROM T')
+        arr[T] b = sqlite('SELECT * FROM T')
+        log(a[0].id + b[0].id)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "2"
+
+
 class TestStructQueryTargets:
     """claude.md #112: `arr[SomeStruct] q = sqlite(...)` -- a struct as
     the query's landing spot. A table's declared columns can never chase

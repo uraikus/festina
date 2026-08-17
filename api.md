@@ -513,6 +513,18 @@ Binding is by value: the parameter is copied into the database as the
 statement runs, so nothing is retained afterwards and the asset stays
 yours.
 
+### Query performance
+
+Two things happen automatically. A `sqlite()` call whose SQL is a
+**string literal** is prepared once and reused — parsing and planning
+happen on the first call only, so a query in a loop pays for binding and
+stepping, nothing else. (Dynamic SQL — a template or a variable — is
+prepared per call, since it can differ each time.) And the database
+opens in **WAL mode** with `synchronous=NORMAL`, the standard
+application configuration: measured, 20,000 inserts dropped from 16.7s
+to 0.3s. A transaction survives an application crash; only an OS crash
+or power loss can lose the most recent commits — never corrupt the file.
+
 ### Partial queries and `undefined()`
 
 Result columns are matched to the table's declared columns **by name**

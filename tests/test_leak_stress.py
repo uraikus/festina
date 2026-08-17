@@ -56,7 +56,233 @@ def _stress_programs():
     return sorted(f for f in os.listdir(_STRESS_DIR) if f.endswith(".f"))
 
 
+# claude.md #113: one minimal program PER DATA TYPE, in isolation. The
+# churn programs above deliberately mix types, because mixed ownership is
+# where the interesting bugs live -- but when one of them fails, the
+# report says "something in this pile leaked". These pin each type alone,
+# so a regression names the type in the test id. Every program is
+# leak-free BY DESIGN: types the compiler reclaims are exercised through
+# their ordinary lifecycle, and the two it cannot always reclaim
+# (img/aud) are freed by hand, which is what `free` is for.
+_PER_TYPE_PROGRAMS = {
+    "int": """
+int keep = 0
+for int i = 0, i < 200, i++ {
+    int a = i * 2
+    a = a + 1
+    free a
+    keep = keep + 1
+}
+log(keep)
+""",
+    "float": """
+int keep = 0
+for int i = 0, i < 200, i++ {
+    float f = 1.5
+    f = f * 2.0
+    free f
+    keep = keep + 1
+}
+log(keep)
+""",
+    "bool": """
+int keep = 0
+for int i = 0, i < 200, i++ {
+    bool b = i % 2 == 0
+    b = !b
+    free b
+    keep = keep + 1
+}
+log(keep)
+""",
+    "text": """
+text outer = ''
+for int i = 0, i < 200, i++ {
+    text a = `built ${i}`
+    text b = a + ' and more'
+    text alias = a          // copy-on-alias, both freed independently
+    a = 'reassigned'        // frees the built buffer
+    outer = b               // global reassignment frees the old global
+    free alias
+}
+log(outer)
+""",
+    "blob": """
+for int i = 0, i < 200, i++ {
+    blob a = `scratch_${i % 3}.dat`
+    a.write(`round ${i}`)
+    blob shared = a          // refcount, not a copy
+    a = 'scratch_other.dat'  // releases one reference
+    if shared.toText() != `round ${i}` { log('corrupted') }
+    free shared
+    free a
+}
+log('done')
+""",
+    "regex": """
+int hits = 0
+for int i = 0, i < 200, i++ {
+    regex lit = /[0-9]+/
+    if lit.test(`v${i}`) { hits = hits + 1 }
+    free lit                 // cached literal: free is a safe no-op
+    regex dyn = regex('[a-z]+', 'g')
+    text out = `A${i}b`.replace(dyn, '_')
+    if out == '' { log('unreachable') }
+    free dyn                 // dynamic: genuinely freed
+}
+log(hits)
+""",
+    "arr_int": """
+int total = 0
+for int i = 0, i < 200, i++ {
+    arr[int] xs = [1, 2, 3]
+    xs.push(i)
+    arr[int] alias = xs
+    alias.push(5)
+    total = total + xs.length
+    free xs                  // decrement -- alias still owns it
+    free alias
+}
+log(total)
+""",
+    "arr_text": """
+int total = 0
+for int i = 0, i < 200, i++ {
+    arr[text] xs = [`a${i}`, 'b']
+    xs.push(`c${i}`)         // owned copies, released with the array
+    total = total + xs.length
+}
+log(total)
+""",
+    "map_int": """
+int total = 0
+for int i = 0, i < 200, i++ {
+    map[int] m = {'a': 1, 'b': 2}
+    m[`k${i % 4}`] = i
+    delete m.a
+    total = total + m['b']
+    free m
+}
+log(total)
+""",
+    "map_text": """
+int total = 0
+for int i = 0, i < 200, i++ {
+    map[text] m = {'a': `v${i}`}
+    m['b'] = `w${i}`
+    delete m['a']            // releases the value it held
+    if m['b'] != `w${i}` { log('corrupted') }
+    total = total + 1
+}
+log(total)
+""",
+    "struct": """
+struct P { n:int  label:text }
+int total = 0
+for int i = 0, i < 200, i++ {
+    P p
+    p.n = i
+    p.label = `v${i}`
+    P alias = p              // refcount
+    p.label = 'reassigned'   // frees the old field buffer
+    delete p.label
+    total = total + alias.n
+    free p
+    free alias
+}
+log(total)
+""",
+    "struct_self": """
+struct Node { n:int  next:Node }
+int total = 0
+for int i = 0, i < 200, i++ {
+    Node head
+    head.n = 1
+    head.next.n = 2
+    head.next.next.n = 3
+    total = total + head.n + head.next.next.n
+}
+log(total)
+""",
+    "table_rows": """
+table People { id:int  name:text }
+sqlite('DELETE FROM People')
+sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'row'])
+int total = 0
+for int i = 0, i < 200, i++ {
+    arr[People] rows = sqlite('SELECT * FROM People')
+    People first = rows[0]   // borrowed
+    total = total + first.id
+    if rows[0].undefined('name') { log('unreachable') }
+    free first               // drops the binding only
+    free rows
+}
+log(total)
+""",
+    "struct_query": """
+table People { id:int  name:text }
+sqlite('DELETE FROM People')
+sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'row'])
+struct Landed { whatever:int  label:text }
+int total = 0
+for int i = 0, i < 200, i++ {
+    arr[Landed] q = sqlite('SELECT id AS whatever, name AS label FROM People')
+    Landed keep = q[0]
+    free q                   // element survives via its own refcount
+    total = total + keep.whatever
+    if keep.label != 'row' { log('corrupted') }
+    free keep
+}
+log(total)
+""",
+    "img": """
+int total = 0
+for int i = 0, i < 60, i++ {
+    img sheet = 'tiles.png'
+    img tile = sheet.clip(0, 0, 8, 8)
+    // Aliasing makes `sheet` escaping, which is the one img shape the
+    // compiler cannot reclaim -- exactly what free is for. img has no
+    // refcount, so the handle is freed ONCE, through one binding;
+    // freeing it through `alias` too would be the double free the
+    // documentation warns about (and ASan confirmed, when this program
+    // was first written wrong).
+    img alias = sheet
+    free sheet
+    total = total + tile.width
+    free tile
+}
+log(total)
+""",
+    "aud": """
+int total = 0
+for int i = 0, i < 40, i++ {
+    aud clip = 'beep.wav'
+    // Same shape as the img program: the alias forces `clip` escaping,
+    // the handle is freed exactly once, and the alias -- which now
+    // dangles, per the documented manual contract -- is never touched.
+    aud alias = clip
+    free clip
+    total = total + 1
+}
+log(total)
+""",
+}
+
+
 class TestLeakStress:
+    @pytest.mark.parametrize("type_name", sorted(_PER_TYPE_PROGRAMS))
+    def test_each_type_is_leak_free_in_isolation(self, type_name, tmp_path):
+        # claude.md #113: see _PER_TYPE_PROGRAMS -- a failure here names
+        # the TYPE, where a churn-program failure names a pile.
+        src = tmp_path / f"type_{type_name}.f"
+        src.write_text(_PER_TYPE_PROGRAMS[type_name])
+        result = _run_harness(str(src))
+        if result.returncode == _SKIP_EXIT:
+            pytest.skip(result.stderr.strip() or "sanitizers unavailable")
+        assert result.returncode == 0, (
+            f"the {type_name} type is not leak-free in isolation:\n"
+            f"{result.stdout}\n{result.stderr}")
+
     @pytest.mark.parametrize("program", _stress_programs())
     def test_program_is_leak_free(self, program):
         # One test per program rather than one for all of them, so a

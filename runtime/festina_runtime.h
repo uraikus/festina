@@ -113,6 +113,11 @@ void festina_sync_table(sqlite3 *db, const char *table_name,
  * festina/codegen.py's INT_NULL_CONST / FLOAT_NULL_CONST.
  */
 sqlite3_stmt *festina_sqlite_prepare(sqlite3 *db, const char *sql);
+/* claude.md #113: the literal-SQL fast path -- `slot` is a per-call-site
+ * cache (a compiler-emitted private global); the statement is prepared
+ * once and reset+reused ever after. See the .c doc comment. */
+sqlite3_stmt *festina_sqlite_prepare_cached(sqlite3 *db, const char *sql,
+                                            void **slot);
 void festina_sqlite_bind_int(sqlite3_stmt *stmt, int32_t idx, int64_t val);
 void festina_sqlite_bind_float(sqlite3_stmt *stmt, int32_t idx, double val);
 void festina_sqlite_bind_text(sqlite3_stmt *stmt, int32_t idx, const char *val);

@@ -561,7 +561,81 @@ sqlite3 *festina_db_open(const char *path) {
                  db ? sqlite3_errmsg(db) : "unknown error");
         festina_fail(msg);
     }
+    /* claude.md #113: WAL journaling with synchronous=NORMAL. SQLite's
+     * shipped defaults (rollback journal, synchronous=FULL) fsync on
+     * every autocommitted statement, which priced a plain INSERT loop
+     * at ~1ms per row -- measured: 20,000 inserts took 16.7 seconds,
+     * of which sqlite's own work was a rounding error. WAL+NORMAL is
+     * the standard application-embedded configuration: transactions
+     * survive an application crash unconditionally, and only an
+     * OS-level crash or power loss can lose the most recent commits
+     * (never corrupt the database). For the programs this language is
+     * for -- games, tools -- that is the right trade, and the same one
+     * every browser and phone OS ships sqlite with. Errors are ignored
+     * deliberately: a read-only filesystem or an exotic VFS that
+     * cannot do WAL just keeps the old defaults and still works. */
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+    sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
     return db;
+}
+
+/* claude.md #113: prepared-statement caching for LITERAL SQL.
+ *
+ * sqlite3_prepare_v2 re-parses, re-plans and re-compiles the SQL into a
+ * fresh bytecode program on every call. When the SQL is a compile-time
+ * string literal it can never change, so that work is pure waste after
+ * the first call -- the identical reasoning claude.md #85 applied to
+ * /pattern/ regex literals, arrived at the same way: the compiler knows
+ * the text is constant, so it allocates one cache slot per CALL SITE
+ * (a private global, null until first reached) and routes the call
+ * through here instead of festina_sqlite_prepare. A dynamic SQL string
+ * (a template literal, a variable) keeps the uncached path, since the
+ * same call site can legitimately see different SQL each time.
+ *
+ * The registry below is what lets every existing consumer stay
+ * oblivious: collect_rows, exec and the scalar helpers all end their
+ * statement through festina_sqlite_finish, which RESETS a registered
+ * statement (returning it to the cache slot's custody, bindings
+ * cleared) and finalizes an unregistered one exactly as before. The
+ * registry is a linear array scanned per finish -- its size is the
+ * number of distinct literal sqlite() call sites in the program, a
+ * few dozen at the outside, not a per-row or per-call quantity. */
+static sqlite3_stmt **g_cached_stmts = NULL;
+static int g_cached_stmt_count = 0;
+static int g_cached_stmt_cap = 0;
+
+sqlite3_stmt *festina_sqlite_prepare_cached(sqlite3 *db, const char *sql,
+                                            void **slot) {
+    if (*slot) {
+        sqlite3_stmt *stmt = (sqlite3_stmt *)*slot;
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        return stmt;
+    }
+    sqlite3_stmt *stmt = festina_sqlite_prepare(db, sql);
+    if (g_cached_stmt_count == g_cached_stmt_cap) {
+        g_cached_stmt_cap = g_cached_stmt_cap ? g_cached_stmt_cap * 2 : 16;
+        sqlite3_stmt **grown = realloc(g_cached_stmts,
+                                       (size_t)g_cached_stmt_cap * sizeof(*grown));
+        if (!grown) festina_fail("out of memory caching a statement");
+        g_cached_stmts = grown;
+    }
+    g_cached_stmts[g_cached_stmt_count++] = stmt;
+    *slot = stmt;
+    return stmt;
+}
+
+/* Finalize -- unless the statement is one of the cached ones, in which
+ * case reset it for its next use. Every statement consumer ends its
+ * statement through this. */
+static void festina_sqlite_finish(sqlite3_stmt *stmt) {
+    for (int i = 0; i < g_cached_stmt_count; i++) {
+        if (g_cached_stmts[i] == stmt) {
+            sqlite3_reset(stmt);
+            return;
+        }
+    }
+    sqlite3_finalize(stmt);
 }
 
 /* claude.md #30 */
@@ -848,7 +922,7 @@ int64_t festina_sqlite_scalar_int(sqlite3_stmt *stmt) {
             && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
         out = sqlite3_column_int64(stmt, 0);
     }
-    sqlite3_finalize(stmt);
+    festina_sqlite_finish(stmt);
     return out;
 }
 
@@ -858,7 +932,7 @@ double festina_sqlite_scalar_float(sqlite3_stmt *stmt) {
             && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
         out = sqlite3_column_double(stmt, 0);
     }
-    sqlite3_finalize(stmt);
+    festina_sqlite_finish(stmt);
     return out;
 }
 
@@ -872,7 +946,7 @@ char *festina_sqlite_scalar_text(sqlite3_stmt *stmt) {
          * (claude.md #83). */
         if (txt) out = strdup((const char *)txt);
     }
-    sqlite3_finalize(stmt);
+    festina_sqlite_finish(stmt);
     return out;
 }
 
@@ -885,10 +959,10 @@ void festina_sqlite_exec(sqlite3_stmt *stmt) {
         sqlite3 *db = sqlite3_db_handle(stmt);
         char msg[512];
         snprintf(msg, sizeof(msg), "sqlite error executing statement: %s", sqlite3_errmsg(db));
-        sqlite3_finalize(stmt);
+        festina_sqlite_finish(stmt);
         festina_fail(msg);
     }
-    sqlite3_finalize(stmt);
+    festina_sqlite_finish(stmt);
 }
 
 /* claude.md #34: row layout is col_count 8-byte slots per row -- see
@@ -1018,10 +1092,10 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
         sqlite3 *db = sqlite3_db_handle(stmt);
         char msg[512];
         snprintf(msg, sizeof(msg), "sqlite error reading rows: %s", sqlite3_errmsg(db));
-        sqlite3_finalize(stmt);
+        festina_sqlite_finish(stmt);
         festina_fail(msg);
     }
-    sqlite3_finalize(stmt);
+    festina_sqlite_finish(stmt);
 
     *out_length = count;
     *out_data = rows;

@@ -2661,6 +2661,29 @@ carries a presence bitmask one hidden slot past its columns; an unknown
 name in undefined() fails the program.
 `tests/test_codegen.py::TestUndefinedAndNameMatchedColumns` (6 tests).
 
+**claude.md #113**: literal-SQL statement caching, WAL, and per-type
+leak isolation.
+
+A `sqlite()`/`sqliteInt()`/... call whose SQL is a string literal gets a
+per-call-site cache slot and is prepared once, reset+reused after — the
+sqlite counterpart of #85's regex literal cache, same compile-time fact
+(the text cannot change), same shape. Consumers are oblivious: a small
+runtime registry makes the shared finish path reset cached statements
+and finalize the rest. Dynamic SQL keeps per-call prepare. The database
+opens in WAL/synchronous=NORMAL — the INSERT benchmark's 16.7s was
+fsync-per-statement, not parsing, and pretending the statement cache
+fixed it would have shipped the small fix and called it done. Measured:
+20k SELECTs 164→55ms; 20k INSERTs 16.7s→0.30s.
+`tests/test_codegen.py::TestStatementCache` (3 tests).
+
+The leak-stress suite gained one minimal program per data type (16 of
+them), each exercising create/alias/reassign/destroy for that type
+alone, so a leak regression names the TYPE in the test id instead of a
+churn pile. The img/aud programs' first drafts double-freed through an
+alias and ASan rejected them — the documented manual-free contract,
+demonstrated rather than assumed.
+`tests/test_leak_stress.py` (16 more tests).
+
 **claude.md #112**: structs as sqlite() targets.
 
 `arr[SomeStruct] q = sqlite('select id as whatever ...')` — the landing
