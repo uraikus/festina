@@ -245,7 +245,7 @@ char *festina_regex_replace(void *compiled, const char *text,
  * close handler if any, then return). festina_graphics_init is only
  * ever called by generated code when the program actually uses a
  * graphics function, references clientWidth/clientHeight, or declares
- * an `on click`/`mouse`/`key`/`resize`/`close` handler (see
+ * an `on mouseDown`/`mouseUp`/`mouse`/`key`/`resize`/`close` handler (see
  * CodeGen.uses_graphics in festina/codegen.py) -- a program that
  * doesn't never opens a window, exactly like festina_db_open() only
  * ever runs for a program that declares a `table`.
@@ -259,16 +259,16 @@ char *festina_regex_replace(void *compiled, const char *text,
  * blob out of a database column has no extension, and an extension was
  * never evidence of anything anyway.
  *
- * festina_register_click_handler/_mouse_handler take a fixed
- * `void (*)(int64_t, int64_t)` signature,
+ * festina_register_mouse_down_handler/_mouse_up_handler/_mouse_handler
+ * take a fixed `void (*)(int64_t, int64_t)` signature,
  * festina_register_key_down_handler/_key_up_handler take a fixed
  * `void (*)(const char *)` signature, and
  * festina_register_resize_handler/_close_handler take a fixed
  * `void (*)(void)` signature -- each matches the parameters claude.md
  * #40's own worked example declares for that event exactly
- * (`on click(x:int, y:int)`, `on keyDown(key:text)`, `on resize()`,
+ * (`on mouseDown(x:int, y:int)`, `on keyDown(key:text)`, `on resize()`,
  * ...); festina/semantic.py's _EVENT_SIGNATURES enforces that any
- * handler for one of these six names is actually declared that way
+ * handler for one of these seven names is actually declared that way
  * before codegen ever emits a call here, so a mismatch would otherwise
  * be a silent ABI mismatch rather than a caught compile error. Both key
  * handlers' text comes from the same festina_key_name helper --
@@ -301,7 +301,7 @@ char *festina_regex_replace(void *compiled, const char *text,
  * when graphics was the only thing that could ever block here; it now
  * also fires any pending setTimeout/setInterval callbacks (see the
  * "Timers" note below) on every pass through its select()-driven X11
- * wait, so `on click` and a setInterval callback both stay responsive
+ * wait, so `on mouseDown` and a setInterval callback both stay responsive
  * together. It lives in festina_runtime_graphics.c, not this file's .c
  * -- a program that never uses graphics calls festina_run_timer_loop
  * instead (declared alongside setTimeout/setInterval below), the same
@@ -448,7 +448,13 @@ void festina_set_line_width(int64_t width);
 void festina_set_font(int64_t px, const char *style, const char *family);
 int64_t festina_measure_text_width(const char *text);
 int64_t festina_measure_text_height(const char *text);
-void festina_register_click_handler(void (*handler)(int64_t, int64_t));
+/* claude.md #106: `on click` became `on mouseDown` + `on mouseUp`, the
+ * same split claude.md #98 made for the keyboard and for the same
+ * reason -- a click is a press and a release, and dragging needs to
+ * tell them apart. Both take the same fixed signature and both report
+ * the pointer position at the moment the button changed state. */
+void festina_register_mouse_down_handler(void (*handler)(int64_t, int64_t));
+void festina_register_mouse_up_handler(void (*handler)(int64_t, int64_t));
 void festina_register_mouse_handler(void (*handler)(int64_t, int64_t));
 /* claude.md #98: `on key` became `on keyDown` + `on keyUp`, so what
  * was one registration is now two -- both taking the same fixed
@@ -490,7 +496,7 @@ int64_t festina_client_height(void);
  * loop in main() (see festina/codegen.py's _emit_main_and_entry): with
  * graphics in use, festina_run_event_loop (festina_runtime_graphics.c)
  * fires them on every pass through its select()-driven X11/timer
- * multiplexing (so `on click` and a `setInterval` callback both stay
+ * multiplexing (so `on mouseDown` and a `setInterval` callback both stay
  * responsive together); without graphics, festina_run_timer_loop (this
  * file's .c) sleeps until the next deadline and fires it, for as long as
  * there's still an active timer to wait for -- both share the same

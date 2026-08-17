@@ -48,7 +48,8 @@ claude.md #59. A regex value was originally constructible only via a
 dedicated literal syntax at all -- see this section's later "JS-style
 regex literal syntax" paragraph below for why and how that changed.
 claude.md #37/#39/#40 (`img`/`loadImage()`, `drawRect`/`drawCircle`/
-`drawText`/`drawImage`, `on click`/`on mouse`/`on keyDown`/`on keyUp`/
+`drawText`/`drawImage`, `on mouseDown`/`on mouseUp`/`on mouse`/
+`on keyDown`/`on keyUp`/
 `on resize`/`on close`, `clientWidth`/`clientHeight`) are implemented
 too, per the
 user's own clarification that this means a real on-screen window --
@@ -112,7 +113,7 @@ gate the same call in `main()`, now named `festina_run_event_loop`
 (renamed from `festina_graphics_run`, which is what it was called back
 when graphics was the only thing that could ever block there): with
 graphics in use, it multiplexes X11 events and timer deadlines on one
-`select()` call so both an `on click` handler and a `setInterval`
+`select()` call so both an `on mouseDown` handler and a `setInterval`
 callback stay responsive together, not just one or the other; without
 graphics, it sleeps until the next timer deadline and fires it, for as
 long as there's still an active timer to wait for, exactly matching
@@ -121,7 +122,7 @@ only calls setTimeout() exits once every one-shot timeout has fired,
 while one that calls setInterval() and never clears it runs forever,
 exactly like an uncleared setInterval() would in a real JS runtime.
 Verified end to end, including the combined graphics-and-timers case
-(a `setInterval` callback and an `on click` handler both firing while
+(a `setInterval` callback and an `on mouseDown` handler both firing while
 the same window stays open) against a real (virtual) X server -- see
 "Why the tests are structured this way" below for
 `tests/test_timers.py`/`TestTimers`.
@@ -1318,6 +1319,21 @@ more bug while doing so, and deliberately did NOT attempt a third
   program -- a DAG by construction. No cycle detector, no tracing
   collector, needed at all.
 
+  > **Superseded by claude.md #106.** The declaration-order rule this
+  > paragraph rests on was an ordering accident in `analyze_struct`,
+  > not a property of the type system, and #106 removed it so linked
+  > lists and trees could be written. `struct Node { next:Node }`
+  > compiles now, so a reference cycle is constructible and refcounting
+  > does not free it -- measured under LeakSanitizer at 1,200 bytes in
+  > 50 objects over 50 iterations. Everything else above is unchanged
+  > and still correct: acyclic data, self-referencing types included,
+  > is fully reclaimed (a three-node list built and dropped 200 times
+  > leaks nothing). The cycle is a clean leak, never a double-free or
+  > use-after-free, which
+  > `TestSelfReferencingStructs::test_a_reference_cycle_runs_correctly_and_does_not_crash`
+  > pins, and clearing the back-reference (`a.next = null`) reclaims
+  > it normally -- also verified under LeakSanitizer, also pinned.
+
   **Representation:** every refcounted struct allocation has a single
   `i64` refcount immediately before the pointer Festina code itself
   sees -- a fixed 8-byte offset regardless of the struct's own field
@@ -1722,9 +1738,16 @@ more bug while doing so, and deliberately did NOT attempt a third
   field cascade between the decrement and the actual `free()` call),
   and only if it just reached zero, releases each struct-typed field
   (via *that* field's own release function, recursively) before freeing
-  its own storage -- recursion that always terminates for the identical
-  DAG reason claude.md #77 already gives for why cycles are
-  structurally impossible. Every existing release call site now
+  its own storage -- recursion that always terminates because the
+  wrapper's cache entry is written *before* the field loop recurses, so
+  a type that reaches itself gets the already-registered name back
+  instead of generating a second wrapper. (This was originally
+  justified by claude.md #77's DAG argument instead; claude.md #106
+  removed the declaration-order rule that argument depended on, and the
+  cache write turned out to be what was actually doing the work. A
+  self-referencing struct now generates exactly one wrapper, which
+  calls itself -- pinned by
+  `TestSelfReferencingStructs::test_a_self_referencing_struct_still_has_a_release_wrapper`.) Every existing release call site now
   dispatches through this instead of calling the plain
   `@festina_release` directly.
 
@@ -2977,7 +3000,7 @@ test in the class that needs a real display (`x_display`/
 `run_graphics_program`, reusing the `_find_window`/`_wait_for_output`
 helpers this file promoted from `TestGraphics` methods to module-level
 functions once `TestTimers` also needed them): it opens a window with
-both a `setInterval` and an `on click` handler, confirms the interval
+both a `setInterval` and an `on mouseDown` handler, confirms the interval
 fires on its own, then confirms a real simulated click still dispatches
 correctly *and* the interval keeps firing both before and after it --
 proving `festina_run_event_loop`'s `select()` call is genuinely
@@ -3130,11 +3153,12 @@ festina/
         # builtin dispatch branch); builtins with no entry there --
         # log/fail/sqlite/loadAudio -- stay fully permissive, unchanged
         # from before. claude.md #40: analyze_event_handler requires an
-        # `on click`/`mouse`/`key`/`resize`/`close` handler to declare
+        # `on mouseDown`/`mouseUp`/`mouse`/`key`/`resize`/`close`
+        # handler to declare
         # exactly the signature _EVENT_SIGNATURES has for it
-        # (`(x:int, y:int)` for click/mouse, `(key:text)` for key, no
-        # parameters for resize/close) -- any other event name is
-        # unconstrained, since only those five have a runtime event
+        # (`(x:int, y:int)` for the mouse events, `(key:text)` for key,
+        # no parameters for resize/close) -- any other event name is
+        # unconstrained, since only those have a runtime event
         # source at all (see codegen.py below). claude.md #39:
         # clientWidth/clientHeight (_CLIENT_SIZE_GLOBALS) are
         # pre-registered directly into global_scope as read-only `int`
@@ -3237,7 +3261,8 @@ festina/
         # festina_graphics_init()/festina_run_event_loop() calls around
         # __festina_main() in _emit_main_and_entry, and
         # self.event_handlers drives emitting
-        # festina_register_click_handler/_register_mouse_handler/
+        # festina_register_mouse_down_handler/_register_mouse_up_handler/
+        # _register_mouse_handler/
         # _register_key_handler/_register_resize_handler/
         # _register_close_handler calls there too -- loadImage() alone
         # deliberately does not set uses_graphics (see
@@ -3404,7 +3429,8 @@ byte at a time when that happens -- verified directly in
 which would time out (not just assert wrong output) if this were ever
 broken again. `festina_graphics_init`/`_run`, `festina_draw_rect`/
 `_draw_circle`/`_draw_text`/`_draw_image`, `festina_load_image`,
-`festina_register_click_handler`/`_register_mouse_handler`/
+`festina_register_mouse_down_handler`/`_register_mouse_up_handler`/
+`_register_mouse_handler`/
 `_register_key_handler`/`_register_resize_handler`/
 `_register_close_handler`, and `festina_client_width`/`_height`
 (#37/#39/#40: image/graphics/events) open a real X11 window via Xlib and

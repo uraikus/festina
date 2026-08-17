@@ -39,7 +39,8 @@ parameterized INSERT/UPDATE/DELETE -- see the "Query rows" note
 below), regex()/.test()/.match()/.replace()/.replaceAll() (POSIX
 extended regular expressions via the festina_runtime C helpers -- no
 bundled regex engine, see festina_runtime.h's doc comment on why),
-img/drawRect/drawCircle/drawText/drawImage/`on click`/`on mouse` (a
+img/drawRect/drawCircle/drawText/drawImage/`on mouseDown`/`on
+mouseUp`/`on mouse` (a
 real X11 window rendered via Cairo -- see the "Graphics" note below),
 setTimeout/setInterval/clearTimeout/clearInterval (see the "Timers"
 note below), and aud/loadAudio()/.play()/.stop()/.isPlaying() (a real
@@ -52,24 +53,25 @@ up-to-date implemented-vs-not detail.
 
 Graphics (claude.md #37, #39, #40): a real on-screen window (Xlib +
 Cairo's Xlib surface backend), not a file written to disk -- "Graphics
-are backed by Cairo" plus #40's click/mouse events firing against "the
+are backed by Cairo" plus #40's mouse events firing against "the
 canvas" only make sense together as an actual window. Opened lazily
-(CodeGen.uses_graphics, set by any draw* call or an `on click`/`on
-mouse` handler, but deliberately NOT by loadImage() alone -- decoding a
+(CodeGen.uses_graphics, set by any draw* call or an `on
+mouseDown`/`on mouseUp`/`on mouse` handler, but deliberately NOT by loadImage() alone -- decoding a
 PNG needs no window; see _emit_graphics_call's own note) in main()
 before __festina_main() runs, exactly
 the same "only pay for what you use" pattern uses_sqlite already
 follows for festina_db_open(); a program that never touches graphics
 never opens a window. After __festina_main() returns, if graphics or
 timers (see "Timers" below) were used, main() blocks in
-festina_run_event_loop() (Expose/click/mouse/key/resize/window-close,
+festina_run_event_loop() (Expose/mouse/key/resize/window-close,
 interleaved with any pending timers) until the window is closed. Canvas
 size starts at
 a fixed 800x600 and every shape/text draws in solid black -- claude.md
 has no syntax for declaring a size or a color, so both are
 implementation-defined defaults, not derived from the spec; the size
 can change afterwards, though, if the window is resized (see `on
-resize` below). `on click`/`on mouse`/`on key`/`on resize`/`on close`
+resize` below). `on mouseDown`/`on mouseUp`/`on mouse`/`on key`/`on
+resize`/`on close`
 each compile to a real function (_emit_event_handler) registered with
 the runtime as a fixed-signature function pointer (see
 _EVENT_SIGNATURES in semantic.py, and festina_runtime.h's declarations,
@@ -662,10 +664,10 @@ class CodeGen:
                                                 # schema sync and query codegen can both ask for the
                                                 # same table's column-name/type globals, and emitting
                                                 # them twice would redefine the same LLVM global names
-        self.uses_graphics = False             # any draw* call or an `on click`/`on mouse` handler
+        self.uses_graphics = False             # any draw* call or an `on mouseDown`/`on mouse` handler
                                                 # anywhere -- NOT loadImage() alone; see
                                                 # _emit_graphics_call and _emit_main_and_entry
-        self.event_handlers = {}               # "click"/"mouse" -> @__festina_on_<name> -- see
+        self.event_handlers = {}               # "mouseDown"/"mouse" -> @__festina_on_<name> -- see
                                                 # _emit_event_handler and _emit_main_and_entry
         self.uses_timers = False               # any setTimeout()/setInterval() call anywhere --
                                                 # NOT clearTimeout()/clearInterval() alone; see
@@ -1023,7 +1025,9 @@ class CodeGen:
             "declare void @festina_image_resize(ptr, i64, i64)",
             "declare void @festina_image_free(ptr)",
             "declare void @festina_draw_image(ptr, i64, i64)",
-            "declare void @festina_register_click_handler(ptr)",
+            # claude.md #106: `on click` became mouseDown + mouseUp.
+            "declare void @festina_register_mouse_down_handler(ptr)",
+            "declare void @festina_register_mouse_up_handler(ptr)",
             "declare void @festina_register_mouse_handler(ptr)",
             # claude.md #98: `on key` became `on keyDown` + `on keyUp`.
             "declare void @festina_register_key_down_handler(ptr)",
@@ -1594,9 +1598,10 @@ class CodeGen:
         ordinary callable -- an event handler is a listener, not
         something Festina code calls by name) exactly like _emit_func,
         minus a return type (event handlers never return a value).
-        click/mouse/key/resize/close additionally get registered with
-        the runtime as a function pointer (see festina_runtime.h's doc
-        comment on festina_register_click_handler/_mouse_handler/
+        mouseDown/mouseUp/mouse/key/resize/close additionally get
+        registered with the runtime as a function pointer (see
+        festina_runtime.h's doc comment on
+        festina_register_mouse_down_handler/_mouse_up_handler/_mouse_handler/
         _key_handler/_resize_handler/_close_handler) -- the only event
         sources this runtime actually generates (claude.md #40's own
         examples; semantic.py's _EVENT_SIGNATURES enforces the fixed
@@ -1630,7 +1635,8 @@ class CodeGen:
         self.func_defs.extend(func)
         self.func_defs.append("")
 
-        if decl.name in ("click", "mouse", "keyDown", "keyUp", "resize", "close"):
+        if decl.name in ("mouseDown", "mouseUp", "mouse", "keyDown", "keyUp",
+                          "resize", "close"):
             self.uses_graphics = True
             self.event_handlers[decl.name] = symbol
 
@@ -3774,28 +3780,39 @@ class CodeGen:
         why that's a separate, still-open gap.
 
         The recursion here always terminates and can never produce a
-        duplicate/infinite chain of wrapper functions, for the same
-        reason claude.md #77 already gives for why reference cycles are
-        structurally impossible in Festina: a struct field's type must
-        always be declared *before* the struct containing it (claude.md
-        #48's "declared before used" rule, the same one that already
-        governs function forward references), so the graph of "which
-        struct types reference which other struct types through their
-        own fields" is a DAG by construction, never a cycle -- a
-        struct's own release wrapper can transitively call another
-        struct's, but never, even indirectly, its own."""
+        duplicate/infinite chain of wrapper functions -- but NOT for
+        the reason this comment used to give. It said the type graph
+        was a DAG by construction, because a struct field's type had to
+        be declared before the struct containing it; claude.md #106
+        removed that ordering rule, so `struct Node { next:Node }`
+        compiles and the graph can now genuinely contain a cycle. What
+        actually guarantees termination is the cache write below, which
+        happens BEFORE the field loop recurses: a struct type that
+        reaches itself finds its own name already registered and gets
+        the name back instead of generating a second wrapper. So a
+        struct's release wrapper CAN now call itself, directly or
+        indirectly, and that is correct -- it is one function, and the
+        recursion it performs is at runtime over the actual object
+        graph, bounded by refcounts reaching zero.
+
+        Which is also where the real cost of #106 lands: a runtime
+        reference CYCLE never reaches zero, so it is never freed. See
+        todo.md's "What's still ahead" -- that needs a tracing
+        collector, and there isn't one."""
         if not self._struct_has_own_managed_field(type_.name):
             return "@festina_release"
         if type_.name in self._struct_release_fns:
             return self._struct_release_fns[type_.name]
         fn_name = f"@__festina_release_struct_{type_.name}"
-        # Registered before the field loop below (which may recurse
-        # back into this same method for a DIFFERENT struct type) so a
-        # second, unrelated caller reaching this struct type again
-        # while this one's own body is still being built -- e.g. two
-        # sibling fields of some other struct both being this same
-        # type -- gets the cached name immediately rather than
-        # triggering a second, redundant generation.
+        # Registered before the field loop below (which recurses back
+        # into this same method for every struct-typed field) so any
+        # caller reaching this struct type again while this one's own
+        # body is still being built gets the cached name immediately
+        # rather than triggering a second generation. Two cases hit
+        # this: two sibling fields of some other struct sharing this
+        # type -- a redundancy -- and, since claude.md #106, a struct
+        # that reaches ITSELF, where this write is the only thing
+        # standing between the compiler and infinite recursion.
         self._struct_release_fns[type_.name] = fn_name
         struct_ty = self.struct_llvm_name(type_.name)
         body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
@@ -4946,9 +4963,10 @@ class CodeGen:
         relying on the two shapes happening to be compatible -- the same
         "declared types must actually match at every call site" rule
         every other function-pointer registration in this file already
-        follows (e.g. festina_register_click_handler's fixed
+        follows (e.g. festina_register_mouse_down_handler's fixed
         `void(i64,i64)` signature, matched exactly by semantic.py's
-        _EVENT_SIGNATURES check on `on click`'s own declared params)."""
+        _EVENT_SIGNATURES check on `on mouseDown`'s own declared
+        params)."""
         uid = self._unique()
         trampoline_name = f"@__festina_maptrampoline_{uid}"
         value_llvm_ty = _llvm_type(value_type)
@@ -5528,7 +5546,8 @@ class CodeGen:
                 )
         if self.uses_graphics:
             main_lines.append("  call void @festina_graphics_init()")
-            register_fn = {"click": "festina_register_click_handler",
+            register_fn = {"mouseDown": "festina_register_mouse_down_handler",
+                            "mouseUp": "festina_register_mouse_up_handler",
                             "mouse": "festina_register_mouse_handler",
                             "keyDown": "festina_register_key_down_handler",
                             "keyUp": "festina_register_key_up_handler",
@@ -5541,8 +5560,8 @@ class CodeGen:
             # claude.md #40's "canvas" only means something while a
             # window is actually open -- block here, after the entry
             # function's own top-level statements have run (so anything
-            # drawn there is already visible), handling Expose/click/
-            # mouse/key/resize/close and any pending setTimeout/
+            # drawn there is already visible), handling Expose/mouse/
+            # key/resize/close and any pending setTimeout/
             # setInterval callbacks until there's nothing left to wait
             # for (see festina_run_event_loop's own doc comment in
             # festina_runtime.h/graphics.c). festina_run_event_loop lives

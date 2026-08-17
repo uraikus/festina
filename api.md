@@ -244,6 +244,49 @@ b.m['k'] = 9
 The value is created once, on first reach, and stays — the read above
 and the `push` below it are talking about the same array.
 
+### A struct can name itself
+
+A field may have the type of the struct it is declared in, or the type
+of a struct declared further down the file. Declaration order does not
+matter:
+
+```festina
+struct Node {
+    n:int
+    next:Node
+}
+
+Node head
+head.n = 1
+head.next.n = 2       // auto-vivified, same as any other struct field
+head.next.next.n = 3
+
+Node cursor = head
+for int i = 0, i < 3, i++ {
+    log(cursor.n)
+    cursor = cursor.next
+}
+```
+
+Linked lists, trees and parent pointers all work, and are reclaimed
+automatically like any other struct.
+
+**One exception, and it is a real one: a *cycle* is never freed.**
+Automatic reclamation is reference counting, and a value that points
+back at itself — directly, or around any longer loop — keeps its own
+count above zero forever:
+
+```festina
+Node a
+a.n = 7
+a.next = a      // leaks: nothing will ever free `a`
+```
+
+Nothing goes wrong at runtime; the memory is simply never returned. If
+you build a structure with back-references, break them before dropping
+it (`child.parent = null`) or accept that it lives for the life of the
+program.
+
 Memory for structs, arrays, and maps is managed automatically — no
 manual allocation or freeing. A local struct/`arr[T]`/`map[T]`
 declared in a function, event handler, `if` branch, `while` body, or
@@ -556,12 +599,13 @@ clearRect(10, 10, 40, 40)                 // erase one region
 
 log(`canvas is ${clientWidth}x${clientHeight}`)
 
-on click(x:int, y:int)  { ... }
-on mouse(x:int, y:int)  { ... }
-on keyDown(key:text)    { ... }
-on keyUp(key:text)      { ... }
-on resize()             { ... }
-on close()               { ... }
+on mouseDown(x:int, y:int) { ... }
+on mouseUp(x:int, y:int)   { ... }
+on mouse(x:int, y:int)     { ... }
+on keyDown(key:text)       { ... }
+on keyUp(key:text)         { ... }
+on resize()                { ... }
+on close()                 { ... }
 ```
 
 **Drawing is offscreen. `render()` puts it on screen.**
@@ -569,7 +613,7 @@ on close()               { ... }
 Every drawing call paints an offscreen canvas that needs no display at
 all. `render()` is the one call that shows it, opening a real X11 window
 (via Cairo's Xlib backend) the first time it runs — undecorated, 800×600.
-Declaring one of the six event handlers opens a window too, since they
+Declaring one of the seven event handlers opens a window too, since they
 can't fire without one. After the entry file's top-level code finishes,
 if a window was opened, the process blocks handling redraws/input until
 the window closes.
@@ -597,6 +641,32 @@ frame takes ~1ms.
 Nothing but `render()` and the event handlers needs a display —
 `saveCanvas`, `clientWidth`/`clientHeight` and `loadImage` all work
 headless.
+
+### Mouse events
+
+`on mouseDown` fires when a button goes down, `on mouseUp` when it comes
+back up, and `on mouse` continuously while the pointer moves. All three
+report the pointer position at the moment the event happened.
+
+A click is a press *and* a release, and they are separate events for the
+same reason `keyDown` and `keyUp` are: holding the button down and
+moving before letting go is a drag, and the only way to see one is to
+see both ends of it.
+
+```festina
+int startX = 0
+int startY = 0
+
+on mouseDown(x:int, y:int) { startX = x  startY = y }
+on mouseUp(x:int, y:int)   { log(`dragged ${x - startX}, ${y - startY}`) }
+```
+
+Press and release report *different* coordinates whenever the pointer
+moved in between — that difference is the drag. A program that only
+wants "was clicked" can just use `on mouseDown` and ignore the release.
+
+Which button was pressed is not reported; every button dispatches the
+same handler.
 
 ### Keyboard events
 

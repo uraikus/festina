@@ -221,7 +221,13 @@ MATH_CONSTANTS = {"PI": math.pi, "E": math.e}
 # tuple is empty and `param_types != sig` alone (no separate length
 # check needed) catches both "too many" and "wrong type" mistakes.
 _EVENT_SIGNATURES = {
-    "click": ((_INT, _INT), "(x:int, y:int)"),
+    # claude.md #106: `on click` split into press and release, the same
+    # way claude.md #98 split `on key`. A click is a press and a
+    # release, and dragging -- or charging a shot, or hold-to-aim --
+    # needs to tell them apart; `on click` fired on press and collapsed
+    # the two, so there was nothing to listen for on the way up.
+    "mouseDown": ((_INT, _INT), "(x:int, y:int)"),
+    "mouseUp": ((_INT, _INT), "(x:int, y:int)"),
     "mouse": ((_INT, _INT), "(x:int, y:int)"),
     # claude.md #98: one `on key` became two, so a program can tell a
     # press from a release -- holding a movement key and letting it go
@@ -1359,26 +1365,61 @@ def analyze(program, filename="<string>"):
         return None
 
     def analyze_struct(decl):
-        if decl.name in structs or decl.name in tables:
+        # claude.md #106: `structs[name]` may already hold the empty
+        # placeholder this declaration's own pre-pass entry installed,
+        # so a duplicate is a name with real FIELDS in it, or one the
+        # other namespace claimed -- not merely a name that is present.
+        if structs.get(decl.name) or tables.get(decl.name) is not None:
             raise CompileError(
                 f"'{decl.name}' is already declared",
                 file=filename, line=decl.line, column=decl.column, category="duplicate declaration",
             )
-        field_types = {}
-        for f in decl.fields:
-            field_types[f.name] = resolve(f.type_expr, decl)
+        # claude.md #106: the name is registered BEFORE its own fields
+        # resolve, which is the whole fix for `struct Node { next:Node }`.
+        # Resolving fields first meant a struct could not mention itself
+        # -- the name simply was not in `structs` yet -- and the error
+        # said "unknown type 'Node'", which reads like a typo rather
+        # than an ordering rule. Nothing about the representation ever
+        # required this: a struct-typed field is a pointer (see
+        # codegen's _llvm_type), so a self-reference is finite-sized,
+        # and claude.md #97's auto-vivification makes reaching through
+        # one work without any further machinery.
+        #
+        # The placeholder is empty and is replaced below rather than
+        # mutated in place, so a field lookup can never observe a
+        # half-built struct: resolve() only needs the NAME to exist to
+        # hand back a StructType, never the field list.
+        structs[decl.name] = {}
+        try:
+            field_types = {}
+            for f in decl.fields:
+                field_types[f.name] = resolve(f.type_expr, decl)
+        except Exception:
+            del structs[decl.name]   # leave no half-registered name behind
+            raise
         structs[decl.name] = field_types
 
     def analyze_table(decl):
-        if decl.name in structs or decl.name in tables:
+        # claude.md #106: see analyze_struct's own note on why this
+        # tests for real fields rather than for the name's presence.
+        if tables.get(decl.name) or structs.get(decl.name) is not None:
             raise CompileError(
                 f"'{decl.name}' is already declared",
                 file=filename, line=decl.line, column=decl.column, category="duplicate declaration",
             )
-        columns = {}
-        for f in decl.fields:
-            resolve(f.type_expr, decl)  # validates the type is known
-            columns[f.name] = f.type_expr
+        # claude.md #106: registered before its own fields resolve, the
+        # same way a struct is -- though a table referring to itself is
+        # far less useful, since a column's SQL type has to be one of
+        # the scalars festina_sql_type knows.
+        tables[decl.name] = {}
+        try:
+            columns = {}
+            for f in decl.fields:
+                resolve(f.type_expr, decl)  # validates the type is known
+                columns[f.name] = f.type_expr
+        except Exception:
+            del tables[decl.name]
+            raise
         tables[decl.name] = columns
 
     def analyze_var_decl(decl, scope, is_global):
@@ -1540,6 +1581,21 @@ def analyze(program, filename="<string>"):
         scope = Scope(parent_scope)
         for stmt in block.body:
             analyze_statement(stmt, scope, return_type, loop_depth)
+
+    # claude.md #106: every struct and table NAME is registered before
+    # any of their fields resolve, so declaration order stops mattering.
+    # `struct Outer { inner:Inner }` written above `struct Inner { ... }`
+    # used to fail with "unknown type 'Inner'" -- an ordering rule
+    # wearing a typo's error message, and a genuinely surprising one in
+    # a language with no forward declarations to write instead. The
+    # per-declaration registration in analyze_struct/analyze_table stays
+    # as it is: this pre-pass only guarantees the name exists, and those
+    # still fill in the real field types and still reject a duplicate.
+    for stmt in program.body:
+        if isinstance(stmt, ast.StructDecl) and stmt.name not in structs:
+            structs[stmt.name] = {}
+        elif isinstance(stmt, ast.TableDecl) and stmt.name not in tables:
+            tables[stmt.name] = {}
 
     for stmt in program.body:
         # claude.md #6: a multi-file program (festina.imports.build_program)

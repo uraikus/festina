@@ -326,6 +326,15 @@ and confirming it fails to compile, then confirming the same for two
 structs referencing each other in either declaration order. Reference
 cycles are not just rare in Festina — they are structurally impossible.
 
+> **No longer true, as of claude.md #106.** `struct Node { next:Node }`
+> and forward-referencing structs both compile now — the restriction
+> this paragraph leaned on was an ordering accident in
+> `analyze_struct`, not a property of the type system, and it was
+> removed deliberately so linked lists and trees could be written. The
+> refcounting described above is unchanged and still correct for
+> acyclic data; what changed is that a cycle is now constructible, and
+> a cycle still leaks. See the "What's still ahead" note below.
+
 **Scope, deliberately narrower than the full design originally
 sketched (at first — widened in the same stage shortly after, see
 below):** a struct-typed *global*'s value is fully reference counted
@@ -718,6 +727,12 @@ This stage is that missing piece.
    Festina: a struct field's type must always be declared *before* the
    struct containing it, so the graph of "which struct types reference
    which others through their own fields" is a DAG by construction.
+   (claude.md #106 removed that declaration-order rule, so the type
+   graph is no longer a DAG. `_release_fn_for_struct` memoizes each
+   struct type's wrapper before recursing into its fields, so a
+   self-referential type generates one wrapper and terminates; what
+   #106 genuinely broke is the *runtime* cycle case, where the release
+   counts never reach zero. See below.)
    Every existing release call site (`_emit_free_active_locals`,
    `_emit_global_struct_retain_release`, `_emit_local_struct_retain_release`,
    `return`'s own release-on-exit, the discarded-call-result release)
@@ -1429,16 +1444,22 @@ Found while ASan-verifying `indexOf`, all pre-existing:
 
 ### What's still ahead
 
-- **A real tracing GC** was never seriously considered as an
-  alternative to reference counting here, given section 77's own
-  finding that reference cycles are structurally impossible in
-  Festina's current type system (no self-referential or
-  forward-referencing struct/array/map element types) — a tracing
-  collector's main advantage over refcounting is handling cycles
-  refcounting can't, which isn't a problem this language can currently
-  produce. Worth revisiting only if a future language change
-  (closures, first-class functions, or forward-referencing types)
-  reintroduces the possibility.
+- **A real tracing GC** is now the only complete answer to one real
+  leak, where it used to be an answer to nothing. It was originally
+  ruled out on section 77's finding that reference cycles were
+  structurally impossible — no self-referential or forward-referencing
+  struct field types — so the one thing a tracing collector does that
+  refcounting cannot was not a problem this language could produce.
+  **claude.md #106 changed that**: self-referencing and
+  forward-referencing structs compile now, so `a.next = a` is
+  writable, and a cycle is exactly what refcounting cannot free.
+  Measured at 1,200 bytes over 50 iterations, growing without bound.
+  This was a deliberate trade — linked lists and trees are worth more
+  than the guarantee was — but it is a real, permanent hole in the
+  memory model until something traces. Nothing partial helps: cycle
+  detection on release, weak references, or an explicit `unlink` would
+  each address it, and each is a bigger design decision than any leak
+  fix so far.
 
 ## Smaller, not yet tracked elsewhere
 
@@ -1465,9 +1486,19 @@ listed here only so they aren't lost:
   reclaimed at scope exit, as is one held in a query row -- so what is
   left is the same conservative escape-analysis boundary a `regex` has
   had since #86: a handle that escapes its function, or one bound to a
-  global, lives for the program's lifetime. Bounded (one allocation per
-  load, not per use) and the same accepted tradeoff as text globals at
-  exit.
+  global, lives for the program's lifetime.
+
+  **Correction: this was previously described here as "bounded (one
+  allocation per load, not per use)". That is wrong, and measuring it
+  is what showed it.** The load is what escapes, and a loop that loads
+  repeatedly leaks repeatedly. An `img` aliased inside a function over
+  60 iterations leaked 1,010,906 bytes in 472 allocations; a `regex`
+  aliased over 200 iterations leaked 678,400 bytes in 4,400
+  allocations — both under LeakSanitizer, both growing with the loop
+  count. A handle loaded *once* into a global is genuinely one
+  allocation and genuinely comparable to text globals at exit; a
+  handle loaded inside a loop is an unbounded leak, and the old wording
+  hid the difference.
 - **A call result reached through a CHAIN for a managed field still
   leaks.** `makeThing().count` is reclaimed (claude.md #102), but
   `makeThing().inner.n` is not: releasing the parent there recursively

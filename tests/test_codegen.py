@@ -45,7 +45,8 @@ class TestUnrecognizedEventName:
         return codegen.generate_ir(program, analyzed, filename=filename)
 
     def test_unrecognized_event_name_still_compiles_but_is_never_called(self, parser, semantic, codegen):
-        # claude.md #40 only ever shows "click" and "mouse" -- any other
+        # claude.md #40 only ever shows mouse and keyboard events --
+        # any other
         # name still compiles (it's checked like any other code) but
         # there's no event source for it, so it's simply dead code, not
         # a compile error. See TestGraphics for the same point end to
@@ -389,6 +390,200 @@ class TestStructs:
         """
         result = compile_and_run(source)
         assert result.stdout.splitlines() == ["0", "0"]
+
+
+class TestSelfReferencingStructs:
+    """claude.md #106: a struct may name its own type in a field, and may
+    name a struct declared later in the file. Both used to be rejected
+    with "unknown type", not because the representation could not hold
+    them -- a struct-typed field is a pointer -- but because
+    analyze_struct registered the finished struct only after resolving
+    every field."""
+
+    def test_struct_may_reference_its_own_type(self, compile_and_run):
+        source = """
+        struct Node {
+            n:int
+            next:Node
+        }
+        Node head
+        head.n = 1
+        head.next.n = 2
+        log(head.n + head.next.n)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "3"
+
+    def test_a_linked_list_can_be_built_and_walked(self, compile_and_run):
+        # claude.md #97's auto-vivification is what makes the build side
+        # work with no extra machinery: reaching THROUGH a null struct
+        # field allocates it. The walk then reads back what was written.
+        source = """
+        struct Node {
+            n:int
+            next:Node
+        }
+        Node head
+        head.n = 1
+        head.next.n = 2
+        head.next.next.n = 3
+
+        int total = 0
+        Node cursor = head
+        for int i = 0, i < 3, i++ {
+            total = total + cursor.n
+            cursor = cursor.next
+        }
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "6"
+
+    def test_two_structs_may_reference_each_other(self, compile_and_run):
+        source = """
+        struct A {
+            n:int
+            b:B
+        }
+        struct B {
+            n:int
+            a:A
+        }
+        A first
+        first.n = 1
+        first.b.n = 2
+        first.b.a.n = 3
+        log(first.n + first.b.n + first.b.a.n)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "6"
+
+    def test_a_struct_may_reference_one_declared_later(self, compile_and_run):
+        # The forward-reference half of the same fix -- this failed for
+        # exactly the same reason and with the same error message.
+        source = """
+        struct Outer {
+            inner:Inner
+        }
+        struct Inner {
+            n:int
+        }
+        Outer o
+        o.inner.n = 42
+        log(o.inner.n)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "42"
+
+    def test_a_self_referencing_struct_still_has_a_release_wrapper(
+            self, parser, semantic, codegen):
+        # A struct with a struct-typed field needs the per-type release
+        # wrapper of claude.md #78, and here that field is the struct
+        # itself. The wrapper's cache entry is written before the field
+        # loop recurses, so exactly ONE wrapper is generated and it
+        # calls itself -- rather than the compiler recursing forever.
+        source = ("struct Node { n:int next:Node }\n"
+                  "Node func make(v:int) {\n"
+                  "    Node p\n"
+                  "    p.n = v\n"
+                  "    return p\n"
+                  "}\n"
+                  "Node head = make(1)\n"
+                  "head.next = make(2)\n"
+                  "log(head.n + head.next.n)\n")
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        define = "define void @__festina_release_struct_Node(ptr %payload) {"
+        assert ir.count(define) == 1
+        # ...and the one wrapper genuinely recurses into itself: the
+        # cascade over its `next` field is a call to the very function
+        # being defined, which is only well-founded because the cache
+        # entry is written before the field loop runs.
+        body = ir.split(define, 1)[1].split("\n}", 1)[0]
+        assert "call void @__festina_release_struct_Node(" in body
+
+    def test_a_reference_cycle_runs_correctly_and_does_not_crash(self, compile_and_run):
+        # claude.md #106's accepted cost, pinned as behavior rather than
+        # hidden. `a.next = a` is a reference cycle, which refcounting
+        # cannot free -- so this LEAKS, deliberately and permanently
+        # until something traces (see todo.md's "What's still ahead").
+        # What must never regress is that it stays a leak: a cycle whose
+        # counts never reach zero must not become a double-free or a
+        # use-after-free, both of which would be far worse than the
+        # leak and both of which a naive "break the cycle on release"
+        # fix would risk.
+        source = """
+        struct Node {
+            n:int
+            next:Node
+        }
+        Node a
+        a.n = 7
+        a.next = a
+        log(a.next.next.next.n)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "7"
+
+    def test_breaking_a_cycle_with_null_reclaims_it(self, compile_and_run):
+        # The workaround api.md recommends, pinned so it stays true:
+        # clearing the back-reference drops the count to zero and the
+        # value is reclaimed normally. Verified separately under
+        # LeakSanitizer (50 iterations, zero leaked bytes -- against
+        # 1,200 for the identical program without the `= null`); this
+        # test pins the behavior, since the sanitizer does not run here.
+        source = """
+        struct Node {
+            n:int
+            next:Node
+        }
+        void func build() {
+            Node a
+            a.n = 7
+            a.next = a
+            a.next = null
+        }
+        for int i = 0, i < 50, i++ {
+            build()
+        }
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_a_duplicate_struct_name_is_still_rejected(self, parser, semantic, errors):
+        # The pre-pass registers every name up front, so the duplicate
+        # check can no longer just ask whether the name is present --
+        # it has to ask whether it has real fields. Get that wrong and
+        # every struct is a duplicate of itself.
+        program = parser.parse("struct A { n:int }\nstruct A { m:int }\n")
+        with pytest.raises(errors.CompileError, match="already declared"):
+            semantic.analyze(program)
+
+    def test_a_struct_colliding_with_a_table_name_is_still_rejected(
+            self, parser, semantic, errors):
+        program = parser.parse("table A { n:int }\nstruct A { m:int }\n")
+        with pytest.raises(errors.CompileError, match="already declared"):
+            semantic.analyze(program)
+
+    def test_an_unknown_field_type_is_still_rejected(self, parser, semantic, errors):
+        # And the failed declaration must not leave a half-registered
+        # name behind for a later declaration to collide with.
+        program = parser.parse("struct A { n:Nonexistent }\n")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_a_name_left_by_a_failed_struct_does_not_become_a_duplicate(
+            self, parser, semantic, errors):
+        # The failure above must report the unknown type, not a
+        # spurious "already declared" from its own placeholder.
+        program = parser.parse("struct A { n:Nonexistent }\n")
+        with pytest.raises(errors.CompileError) as excinfo:
+            semantic.analyze(program)
+        assert "already declared" not in str(excinfo.value)
 
 
 class TestArrays:
@@ -1358,7 +1553,7 @@ class TestAutomaticMemoryReclamation:
 
     def test_event_handler_locals_are_analyzed_too(self, parser, semantic, codegen):
         source = """
-        on click(x:int, y:int) {
+        on mouseDown(x:int, y:int) {
             arr[int] p = [x]
             log(p[0])
         }
@@ -1369,7 +1564,7 @@ class TestAutomaticMemoryReclamation:
     def test_event_handler_struct_local_is_stack_allocated_too(self, parser, semantic, codegen):
         source = """
         struct Point { x:int y:int }
-        on click(x:int, y:int) {
+        on mouseDown(x:int, y:int) {
             Point p
             p.x = x
             log(p.x)
@@ -4035,8 +4230,11 @@ class TestGraphics:
         drawImage(icon, 10, 10)
         log(`${clientWidth}x${clientHeight}`)
 
-        on click(x:int, y:int) {
-            log(`click at ${x}, ${y}`)
+        on mouseDown(x:int, y:int) {
+            log(`press at ${x}, ${y}`)
+        }
+        on mouseUp(x:int, y:int) {
+            log(`release at ${x}, ${y}`)
         }
         on mouse(x:int, y:int) {
             log(`mouse at ${x}, ${y}`)
@@ -4097,7 +4295,7 @@ class TestGraphics:
     def test_program_without_graphics_never_opens_a_window(self, compile_and_run, monkeypatch):
         # self.uses_graphics gates festina_graphics_init() -- a program
         # that never calls a graphics function or declares on
-        # click/mouse must behave exactly as before: no window, no
+        # mouseDown/mouse must behave exactly as before: no window, no
         # blocking event loop, normal immediate exit. Verified here by
         # deliberately having no display available at all and
         # confirming the program still succeeds (if it tried to open a
@@ -4107,16 +4305,47 @@ class TestGraphics:
         assert result.returncode == 0
         assert result.stdout.strip() == "no graphics here"
 
-    def test_click_dispatches_to_handler_with_correct_coordinates(self, run_graphics_program, x_display):
-        source = "on click(x:int, y:int) {\n    log(`click ${x} ${y}`)\n}"
+    def test_mouse_down_and_up_dispatch_separately_with_correct_coordinates(
+            self, run_graphics_program, x_display):
+        # claude.md #106: one xdotool "click" is a press AND a release,
+        # so a program declaring both handlers sees two distinct events
+        # from it -- which is the whole point of the split. `on click`
+        # used to collapse them into the single line this once asserted.
+        source = ("on mouseDown(x:int, y:int) {\n    log(`down ${x} ${y}`)\n}\n"
+                  "on mouseUp(x:int, y:int) {\n    log(`up ${x} ${y}`)\n}\n")
         proc, stdout_path = run_graphics_program(source)
         try:
             wid = _find_window(x_display)
             env = dict(os.environ, DISPLAY=x_display)
             subprocess.run(["xdotool", "mousemove", "--window", wid, "150", "220"], env=env, check=True)
             subprocess.run(["xdotool", "click", "--window", wid, "1"], env=env, check=True)
-            text = _wait_for_output(stdout_path, lambda t: t.strip() != "")
-            assert text.strip() == "click 150 220"
+            text = _wait_for_output(stdout_path, lambda t: "up 150 220" in t)
+            # Order matters: the press has to arrive before the release.
+            assert text.splitlines() == ["down 150 220", "up 150 220"]
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_a_drag_reports_different_press_and_release_coordinates(
+            self, run_graphics_program, x_display):
+        # claude.md #106's motivating case: hold the button down, move,
+        # then let go. `on click` could not express this at all -- it
+        # only ever saw the press. Here the two events report the two
+        # ends of the drag, which is what makes it reconstructible.
+        source = ("on mouseDown(x:int, y:int) {\n    log(`down ${x} ${y}`)\n}\n"
+                  "on mouseUp(x:int, y:int) {\n    log(`up ${x} ${y}`)\n}\n")
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            subprocess.run(["xdotool", "mousemove", "--window", wid, "100", "100"], env=env, check=True)
+            subprocess.run(["xdotool", "mousedown", "--window", wid, "1"], env=env, check=True)
+            _wait_for_output(stdout_path, lambda t: "down 100 100" in t)
+            subprocess.run(["xdotool", "mousemove", "--window", wid, "400", "350"], env=env, check=True)
+            subprocess.run(["xdotool", "mouseup", "--window", wid, "1"], env=env, check=True)
+            text = _wait_for_output(stdout_path, lambda t: "up " in t)
+            assert "down 100 100" in text
+            assert "up 400 350" in text
         finally:
             proc.terminate()
             proc.wait(timeout=5)
@@ -4292,7 +4521,7 @@ class TestExampleGraphicsAndGame:
     x_display/run_graphics_program fixtures, the same as TestGraphics
     above and TestTimers's combined graphics+timers test below."""
 
-    def test_graphics_demo_dispatches_click_key_and_resize(self, run_graphics_program, x_display):
+    def test_graphics_demo_dispatches_mouse_key_and_resize(self, run_graphics_program, x_display):
         source = open(os.path.join(_EXAMPLES_DIR, "graphics.f")).read()
         proc, stdout_path = run_graphics_program(source)
         try:
@@ -4308,7 +4537,9 @@ class TestExampleGraphicsAndGame:
             subprocess.run(["xdotool", "windowsize", wid, "900", "700"], env=env, check=True)
 
             text = _wait_for_output(stdout_path, lambda t: "resized to 900x700" in t)
-            assert "clicked at 100, 100" in text
+            # claude.md #106: one xdotool click produces both halves.
+            assert "pressed at 100, 100" in text
+            assert "released at 100, 100" in text
             assert "key pressed: a" in text
             assert "resized to 900x700" in text
         finally:
@@ -4359,7 +4590,7 @@ class TestTimers:
     test_timers_and_graphics_work_together, is the one thing that
     genuinely needs a real window: proving festina_run_event_loop's
     select()-based multiplexing keeps both a `setInterval` callback and
-    `on click` responsive together, not just one or the other.
+    `on mouseDown` responsive together, not just one or the other.
     """
 
     def test_timeout_fires_once_after_the_delay(self, compile_and_run):
@@ -4478,7 +4709,7 @@ class TestTimers:
             "void func tick() {\n"
             "    log('tick')\n"
             "}\n"
-            "on click(x:int, y:int) {\n"
+            "on mouseDown(x:int, y:int) {\n"
             "    log(`click ${x} ${y}`)\n"
             "}\n"
             "drawRect(0, 0, 10, 10)\n"

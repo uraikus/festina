@@ -42,7 +42,7 @@ bin/festina compile examples/greet.f -o greet && ./greet
   `festina.sqlite` is created, migrated, and kept in sync automatically
   — no ORM, no migration scripts, no setup code.
 - **Graphics and audio, no dependencies to wire up yourself.** A real
-  on-screen canvas (`drawRect`, `on click`, typed `color`/`font` values,
+  on-screen canvas (`drawRect`, `on mouseDown`, typed `color`/`font` values,
   ...) and real audio playback
   (`loadAudio().play()`) are just functions, backed by Cairo/X11 and
   ALSA under the hood.
@@ -117,7 +117,8 @@ font  title = 'bold 24px sans-serif'
 fillStyle(brand)
 changeFont(title)
 drawRect(0, 0, 100, 100)
-on click(x:int, y:int) { log(`clicked ${x}, ${y}`) }
+on mouseDown(x:int, y:int) { log(`pressed ${x}, ${y}`) }
+on mouseUp(x:int, y:int)   { log(`released ${x}, ${y}`) }
 
 // Audio
 aud music = loadAudio('music.wav')
@@ -147,7 +148,7 @@ implementation-defined vs. spec-mandated — is in [api.md](api.md).
 whole language — from a one-liner to a real, playable two-player
 **tic-tac-toe game** ([`tic_tac_toe.f`](examples/tic_tac_toe.f), click a
 cell, alternating X/O, real win detection) built entirely in Festina
-with nothing but `drawRect`/`drawText`/`on click`:
+with nothing but `drawRect`/`drawText`/`on mouseDown`:
 
 ```bash
 bin/festina compile examples/tic_tac_toe.f -o tic_tac_toe && ./tic_tac_toe
@@ -164,7 +165,7 @@ bin/festina compile examples/tic_tac_toe.f -o tic_tac_toe && ./tic_tac_toe
 | [`config.f`](examples/config.f) | `DatabaseURL`, `environment.NAME` |
 | [`regex.f`](examples/regex.f) | `/pattern/flags` literals, `.test()`, `.match()`, `.replace()`/`.replaceAll()` |
 | [`timers.f`](examples/timers.f) | `setTimeout`/`setInterval`/`clearInterval` |
-| [`graphics.f`](examples/graphics.f) | A drawn canvas, plus all five `on click`/`mouse`/`key`/`resize`/`close` handlers |
+| [`graphics.f`](examples/graphics.f) | A drawn canvas, plus every `on mouseDown`/`mouseUp`/`mouse`/`key`/`resize`/`close` handler |
 | [`audio.f`](examples/audio.f) | `loadAudio()`/`.play()`/`.stop()`/`.isPlaying()`, with a tiny bundled WAV |
 | [`tic_tac_toe.f`](examples/tic_tac_toe.f) | The game above — graphics, global game state, and win-checking logic together |
 
