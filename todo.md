@@ -1521,25 +1521,19 @@ listed here only so they aren't lost:
   motivating case). The automatic answer above is still the right
   eventual fix; `free` on an aliased img/aud is the C contract, dangling
   alias and all, which refcounting would make safe.
-- **A call result reached through a chain that yields a MANAGED value
-  still leaks.** Mostly closed by claude.md #108. `make().count`
-  (claude.md #102), `make().inner.n`, `rows(x).length` and
-  `make().inner.items.length` are all reclaimed now -- the decision
-  moved to the outermost link of a member chain, where the type of the
-  value that actually escapes is known, and any chain yielding a plain
-  copy releases every call result it produced.
-
-  What remains is a chain whose result is itself managed or is a text:
-  `Inner got = make().inner`, `text t = make().inner.label`. Releasing
-  the parent there recursively releases its struct/arr/map fields and
-  frees its text fields, so the value just loaded would be freed before
-  the caller saw it -- a use-after-free traded for a leak, which is the
-  wrong direction. Fixing these needs a notion of an owned temporary
-  that outlives its producing expression, which this codegen does not
-  have. Tests pin that the loaded value stays intact in both shapes, so
-  the leak cannot quietly become a use-after-free. Measured: 5,520
-  bytes over 60 iterations for the text case, 5,388 for the struct
-  case.
+- ~~**A call result reached through a chain that yields a MANAGED value
+  still leaks.**~~ Closed by claude.md #117. The "owned temporary" this
+  entry said was needed turned out to be a retain: the escaping value
+  is retained (or, for text, copied) BEFORE the parent's release, whose
+  cascade decrements it back to exactly one reference — owned by the
+  expression, handed to exactly one owner because call-based chains now
+  count as owning sources. `Inner got = make().inner`,
+  `text t = make().inner.label` and `split(' ').join('-')` are all
+  reclaimed; verified at zero leaked bytes over 120-iteration churn.
+  What remains of this class: a chain passed as a function ARGUMENT
+  leaks its +1 (parameters are borrows with no releasing owner), and a
+  computed-index receiver (`getRows()[0]`) still leaks its array —
+  smaller and rarer than what closed.
 
 - ~~**A struct cannot reference its own type.**~~ Fixed by claude.md
   #106. `struct Node { n:int next:Node }` compiles, forward references

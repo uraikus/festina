@@ -6110,12 +6110,14 @@ class TestChainedCallResultReachedForAField:
         assert body.count("@__festina_release_struct_Outer(") == 1
         assert body.count("@festina_release") == 0
 
-    def test_a_chain_ending_in_a_managed_value_is_still_not_released(
+    def test_a_chain_ending_in_a_managed_value_retains_then_releases(
             self, parser, semantic, codegen):
-        # The restriction #102 identified is unchanged and still
-        # load-bearing: if the value escaping the chain is itself
-        # managed, releasing the parent would free it. Nothing is
-        # emitted, and the leak stands -- deliberately.
+        # claude.md #117 INVERTED this test, which used to pin #102/#108's
+        # deliberate leak ("releasing the parent would free the value
+        # just loaded"). The fix is retain-first: the Inner is retained,
+        # THEN the Outer released -- whose cascade decrements Inner back
+        # to exactly one reference, owned by the binding. The parent
+        # release must appear, and a retain must precede it.
         source = """
         struct Inner { n:int }
         struct Outer { inner:Inner }
@@ -6134,7 +6136,10 @@ class TestChainedCallResultReachedForAField:
         analyzed = semantic.analyze(program, filename="main.f")
         ir = codegen.generate_ir(program, analyzed, filename="main.f")
         body = ir.split("define void @use()")[1].split("\n}")[0]
-        assert "@__festina_release_struct_Outer(" not in body
+        assert "@__festina_release_struct_Outer(" in body
+        retain_at = body.index("call void @festina_retain(")
+        release_at = body.index("@__festina_release_struct_Outer(")
+        assert retain_at < release_at, "the retain must precede the parent release"
 
     def test_a_chain_ending_in_text_is_still_not_released(self, compile_and_run):
         # Same reasoning, and the same thing that must never happen:

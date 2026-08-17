@@ -2407,7 +2407,7 @@ class CodeGen:
             # Identifier, a Member read, ...) never allocates anything of
             # its own to begin with, so there is nothing to release.
             if (_is_refcounted(vtype)
-                    and isinstance(stmt.expr, (ast.Call, ast.ArrayLit, ast.MapLit))):
+                    and self._is_owning_refcounted_source(stmt.expr)):
                 # claude.md #78/#79: through _release_fn_for (which
                 # dispatches to _release_fn_for_struct for a struct, so
                 # a discarded struct-typed call result with its own
@@ -2419,7 +2419,7 @@ class CodeGen:
                 # "owning" a source as a Call is, and just as
                 # unambiguously this statement's own sole reference.
                 lines.append(f"  call void {self._release_fn_for(vtype)}(ptr {val})")
-            elif vtype == TEXT and isinstance(stmt.expr, (ast.Call, ast.TemplateLit)):
+            elif vtype == TEXT and self._is_owning_text_source(stmt.expr):
                 # claude.md #83: the text counterpart just above -- a
                 # discarded text-returning call/template result is,
                 # by the identical "owning" reasoning, provably this
@@ -2862,7 +2862,7 @@ class CodeGen:
                 # .length is read-only anyway (see semantic.py).
                 # claude.md #108: .length participates in the member
                 # chain too. It never did, which made
-                # _release_member_receiver_temp's own docstring wrong
+                # the receiver-release docstring wrong
                 # about `rowsFor(x).length` -- that shape does not reach
                 # _emit_member_load at all, so #102 never covered it and
                 # it leaked the whole array (measured: 2,880 bytes over
@@ -3852,7 +3852,8 @@ class CodeGen:
             # releasable depends on a type this frame cannot see yet.
             self._chain_pending.append((expr.obj, obj_val, obj_type))
             return out, ftype
-        self._release_member_chain(pending, expr.obj, obj_val, obj_type, ftype, lines)
+        out = self._release_member_chain(pending, expr.obj, obj_val, obj_type,
+                                         ftype, lines, out)
         return out, ftype
 
     def _begin_member_chain(self, expr):
@@ -3880,60 +3881,62 @@ class CodeGen:
         self._chain_pending = saved_pending
         return pending
 
-    def _release_member_chain(self, pending, obj_expr, obj_val, obj_type, ftype, lines):
-        """Releases every call result the chain produced, innermost
-        first, if `ftype` -- the type of the value that actually escapes
-        the whole chain -- permits it. _release_member_receiver_temp
-        makes that judgement per receiver."""
-        for parked_expr, parked_val, parked_type in pending:
-            self._release_member_receiver_temp(parked_expr, parked_val, parked_type,
-                                               ftype, lines)
-        self._release_member_receiver_temp(obj_expr, obj_val, obj_type, ftype, lines)
+    def _release_member_chain(self, pending, obj_expr, obj_val, obj_type, ftype,
+                              lines, out=None):
+        """claude.md #108 released a chain's call results only when the
+        escaping value was a plain copy; claude.md #117 closes the other
+        half. A managed escaping value is RETAINED first, then the call
+        graph released -- the parent's own cascade decrements the field
+        back, netting exactly one reference, owned by this expression
+        (the widened _is_owning_refcounted_source is what hands that +1
+        to exactly one owner). A text escaping value is COPIED first
+        (festina_text_own), since text has no count to retain, then the
+        graph -- original included -- is released. In both cases the
+        thing that made #102/#108 refuse (the loaded value dying with
+        its parent) is prevented by construction rather than avoided by
+        leaking.
 
-    def _release_member_receiver_temp(self, obj_expr, obj_val, obj_type, field_type, lines):
-        """claude.md #102 (widened by claude.md #108): releases a
-        struct/arr[T]/map[T] that a CALL produced purely to read one
-        value out of, with nothing else ever referencing it --
-        `config().retries`, `makeOuter(i).inner.n`, `rowsFor(x).length`.
+        Only receivers that are themselves Calls of refcounted type are
+        released: an intermediate link's value (`.inner` in
+        make().inner.n) is an alias INTO the base call's graph, reached
+        exactly once by the base's own cascade -- releasing it directly
+        too would double-free. Returns the (possibly replaced) result
+        value."""
+        receivers = list(pending) + [(obj_expr, obj_val, obj_type)]
+        call_receivers = [
+            (e, v, t) for e, v, t in receivers
+            if isinstance(e, ast.Call) and _is_refcounted(t)
+        ]
+        if not call_receivers:
+            return out
+        if out is not None and _is_refcounted(ftype):
+            lines.append(f"  call void @festina_retain(ptr {out})")
+        elif out is not None and ftype == TEXT:
+            owned = self.tmp()
+            lines.append(f"  {owned} = call ptr @festina_text_own(ptr {out})")
+            out = owned
+        for _, v, t in call_receivers:
+            lines.append(f"  call void {self._release_fn_for(t)}(ptr {v})")
+        return out
 
-        #102 covered only the first of those, and this docstring used to
-        claim all three. The other two did not go through here at all: a
-        chained read reaches _emit_member_load twice and neither frame
-        saw both a Call receiver and an unmanaged result, and `.length`
-        has its own branch in _emit_expr that never called this. #108
-        routes both here by deciding at the OUTERMOST link of a member
-        chain, where `field_type` is the type of the value that actually
-        escapes it -- so the parameter means "what the whole expression
-        yields", not "the field this one link loaded".
+    def _release_owned_receiver(self, obj_expr, obj_val, obj_type, lines):
+        """claude.md #102/#108/#117: releases a receiver (or argument)
+        value that the current expression OWNS and is now done with -- a
+        Call's fresh result, a literal, or a call-based member chain
+        (whose +1 _release_member_chain minted). Used by every
+        method-call site whose RESULT is a fresh value rather than an
+        alias into the receiver -- join's text, toText's rendering, a
+        blob method's answer -- which is why, unlike the field-load
+        path, no result-type judgement is needed: the result never
+        points into what is being released.
 
-        claude.md #77 already releases a call result discarded as a bare
-        statement (`someFunc();`), on the reasoning that a Call's result
-        is fresh and unshared by construction so this expression is
-        provably its only reference. Reading a field off it is the same
-        situation and was simply never covered: measured under
-        LeakSanitizer at one whole struct -- header, fields and all --
-        per evaluation, which in a loop is per iteration.
-
-        Restricted to a result whose own type is NOT managed, and that
-        restriction is load-bearing rather than conservative. Releasing
-        the parent recursively releases whatever its struct/arr/map
-        fields point at and frees its text fields outright, so for those
-        result types the value just loaded would be freed before the
-        caller ever saw it -- trading a leak for a use-after-free. Making
-        those cases work needs a notion of an owned temporary that
-        outlives its producing expression, which this codegen does not
-        have; they keep leaking, which is at least safe, and every case
-        that yields a plain copy is now fixed."""
-        if not isinstance(obj_expr, ast.Call):
-            return
-        # claude.md #109: BLOB is admitted here too. A blob is the first
-        # refcounted type with METHODS, so it is the first that can be
-        # the receiver of a call-on-member without being a struct --
-        # `make().exists()` produces a handle purely to ask it one
-        # question. Leaving it out leaked one handle per evaluation.
+        img/aud receivers are skipped even for a Call: they have no
+        refcount, and claude.md #110 records why freeing a call-result
+        img is unsafe (`img func get() { return shared }` hands back a
+        global)."""
         if not _is_refcounted(obj_type):
             return
-        if _is_refcounted(field_type) or field_type == TEXT:
+        if not self._is_owning_refcounted_source(obj_expr):
             return
         lines.append(f"  call void {self._release_fn_for(obj_type)}(ptr {obj_val})")
 
@@ -4174,7 +4177,26 @@ class CodeGen:
         own return value does (see _emit_array_lit/_emit_map_lit's own
         "fresh, uniquely-owned" comment), nothing else referencing it
         the instant it's produced."""
-        return isinstance(expr, (ast.Call, ast.ArrayLit, ast.MapLit))
+        if isinstance(expr, (ast.Call, ast.ArrayLit, ast.MapLit)):
+            return True
+        # claude.md #117: a dotted chain whose base is a Call --
+        # `make().inner`, `make().inner.items` -- yields an OWNED value
+        # now: _emit_member_load retains the result before releasing
+        # the call's own graph, so the +1 transfers to whoever binds it,
+        # exactly like a Call's own return value. A chain based on a
+        # variable stays aliasing/borrowed, unchanged.
+        return self._member_chain_call_base(expr)
+
+    def _member_chain_call_base(self, expr):
+        """claude.md #117: True for a non-computed Member chain whose
+        ultimate receiver is a Call -- the exact shape _emit_member_load
+        emits a retain (or a text copy) for. This predicate and that
+        emission MUST agree: the predicate promising ownership the load
+        never produced would drop a needed retain, and the reverse
+        would leak the one the load added."""
+        while isinstance(expr, ast.Member) and not expr.computed:
+            expr = expr.obj
+        return isinstance(expr, ast.Call)
 
     def _is_owning_media_source(self, expr):
         """claude.md #92/#101: whether an img/aud local's initializer
@@ -4251,7 +4273,13 @@ class CodeGen:
         either way."""
         if isinstance(expr, ast.BinOp):
             return expr.op == "+"
-        return isinstance(expr, (ast.Call, ast.TemplateLit))
+        if isinstance(expr, (ast.Call, ast.TemplateLit)):
+            return True
+        # claude.md #117: a call-based chain ending in a text field
+        # (`make().inner.label`) hands back a COPY -- _emit_member_load
+        # runs it through festina_text_own before releasing the graph it
+        # aliased into -- so it is exactly as owned as a concat result.
+        return self._member_chain_call_base(expr)
 
     def _free_text_temp(self, source_expr, val, vtype, lines):
         """claude.md #83: frees a text value that the expression being
@@ -5356,8 +5384,7 @@ class CodeGen:
                     rendered = self._to_text(val, vtype, lines)
                     lines.append(f"  call void @festina_log_text(ptr {rendered})")
                     lines.append(f"  call void @free(ptr {rendered})")
-                    self._release_member_receiver_temp(expr.args[0], val, vtype,
-                                                       INT, lines)
+                    self._release_owned_receiver(expr.args[0], val, vtype, lines)
                     return "0", None
                 if vtype == BLOB:
                     # claude.md #115: log(blob) prints the contents,
@@ -5366,8 +5393,7 @@ class CodeGen:
                     rendered = self._to_text(val, vtype, lines)
                     lines.append(f"  call void @festina_log_text(ptr {rendered})")
                     lines.append(f"  call void @free(ptr {rendered})")
-                    self._release_member_receiver_temp(expr.args[0], val, vtype,
-                                                       INT, lines)
+                    self._release_owned_receiver(expr.args[0], val, vtype, lines)
                     return "0", None
                 if isinstance(vtype, (types_mod.ImageType, types_mod.AudioType)):
                     raise CodegenError(
@@ -5598,8 +5624,7 @@ class CodeGen:
                 if isinstance(vtype, (types_mod.StructType, types_mod.TableType,
                                       types_mod.ArrayType, types_mod.MapType)):
                     out = self._to_text(val, vtype, lines)
-                    self._release_member_receiver_temp(callee.obj, val, vtype,
-                                                       TEXT, lines)
+                    self._release_owned_receiver(callee.obj, val, vtype, lines)
                     return out, TEXT
             # claude.md #116: sentence.split(sep) -> arr[text]. The
             # result is a fresh refcounted array the runtime built, so
@@ -5637,8 +5662,7 @@ class CodeGen:
                                      f"ptr {obj_val}, ptr {sep_val}, "
                                      f"ptr {self.string_const(kind)})")
                         self._free_text_temp(expr.args[0], sep_val, sep_type, lines)
-                        self._release_member_receiver_temp(callee.obj, obj_val,
-                                                           obj_type, TEXT, lines)
+                        self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                         return out, TEXT
             # claude.md #67: pattern.test(value:text) -> bool
             if callee.prop == "test":
@@ -5785,8 +5809,7 @@ class CodeGen:
                         f"  {out} = call i8 @{fn}(ptr {obj_val}, ptr {arg_val})")
                     if expr.args:
                         self._free_text_temp(expr.args[0], arg_val, arg_type, lines)
-                    self._release_member_receiver_temp(callee.obj, obj_val, obj_type,
-                                                      BOOL, lines)
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                     return out, BOOL
             # claude.md #109: blob's five methods. The receiver is a
             # blob handle, which already holds the path -- so these are
@@ -5815,8 +5838,7 @@ class CodeGen:
                     # same way any other member receiver is; toText()
                     # hands back an owned copy and the rest return
                     # scalars, so nothing here points into the handle.
-                    self._release_member_receiver_temp(callee.obj, obj_val, obj_type,
-                                                       ret_type, lines)
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                     return out, ret_type
             # claude.md #109: aud.stop() is back, clip-wide -- see the
             # runtime's own note on why #100 removed it and why that
