@@ -208,6 +208,45 @@ bool matched = /[0-9]+/.test('room 42')
 text found = 'room 42'.match(/[0-9]+/)   // null if no match
 ```
 
+## Logging and rendering
+
+`log()` and `${}` interpolation accept any value that has a text form —
+a non-text value compiles as its `.toText()`:
+
+- **`int` / `float` / `bool`** — the number, `true`/`false`, or `null`.
+- **structs, table rows, arrays, maps** — JSON-like:
+
+```festina
+struct P { id:int  name:text  xs:arr[int] }
+P p
+p.id = 7
+p.name = 'x'
+p.xs.push(1)
+log(p)                     // {"id":7,"name":"x","xs":[1]}
+log(`state: ${p.xs}`)      // state: [1]
+text json = p.toText()     // the explicit spelling of the same rendering
+```
+
+Text is escaped JSON-style; a `null` text/element renders as `null`; a
+table-row column the query never selected is **omitted** (what
+`JSON.stringify` does for `undefined`); a database NULL renders as
+`null`. An opaque handle inside a container (a `blob`/`img`/`aud`/`regex`
+field) renders as a placeholder like `"<blob>"`, or `null` when unset. A
+cyclic value truncates at depth 32 instead of crashing. An **unassigned**
+scalar field renders its zero value (per the zero-value rule); a field
+explicitly assigned `null` renders `null`.
+
+- **`blob`, `img`, `aud`** — a **compile error**, not an auto-render. A
+  blob's bytes may be binary garbage mid-string, and it has an explicit
+  `.toText()` for when that's genuinely wanted; `img`/`aud` have no text
+  form at all.
+
+```festina
+blob f = 'notes.txt'
+log(f)                     // compile error
+log(f.toText())            // the contents, explicitly
+```
+
 ## Structs
 
 ```festina
