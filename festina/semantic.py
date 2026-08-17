@@ -1135,9 +1135,16 @@ def analyze(program, filename="<string>"):
             # does implicitly for these three types (see codegen.py's
             # _to_text); the receiver check is against the SAME three
             # types _to_text itself handles, kept in sync deliberately.
-            if (callee.prop == "toText" and not expr.args
-                    and infer(callee.obj, scope) in (_INT, _FLOAT, types_mod.PrimitiveType("bool"))):
-                return _TEXT
+            if callee.prop == "toText" and not expr.args:
+                recv = infer(callee.obj, scope)
+                if recv in (_INT, _FLOAT, types_mod.PrimitiveType("bool")):
+                    return _TEXT
+                # claude.md #114: containers render JSON-like, so their
+                # explicit .toText() types as text too. (blob's own
+                # toText is handled with the rest of its methods.)
+                if isinstance(recv, (types_mod.StructType, types_mod.TableType,
+                                     types_mod.ArrayType, types_mod.MapType)):
+                    return _TEXT
             # claude.md #67: pattern.test(value:text) -> bool
             if callee.prop == "test" and infer(callee.obj, scope) == _REGEX:
                 if len(expr.args) != 1:

@@ -823,6 +823,10 @@ class CodeGen:
                                                 # Keyed on the RESOLVED parts rather than the source
                                                 # text, so 'bold 13px arial' and 'arial bold 13px'
                                                 # share one constant.
+        self._json_fns = {}                    # claude.md #114: type_name -> its generated JSON
+                                                # render function; registered before the body is
+                                                # generated, so a self-referencing struct recurses
+                                                # into its own function instead of generating forever
         self._row_to_struct_fns = set()        # claude.md #112: row->struct converters already
                                                 # generated, one per struct type used as a
                                                 # sqlite() target
@@ -1010,6 +1014,18 @@ class CodeGen:
             "declare void @festina_sync_table(ptr, ptr, ptr, ptr, i32)",
             # claude.md #32-34: sqlite() queries.
             "declare ptr @festina_sqlite_prepare(ptr, ptr)",
+            # claude.md #113: literal SQL is prepared once per call site.
+            "declare ptr @festina_sqlite_prepare_cached(ptr, ptr, ptr)",
+            # claude.md #114: the string builder behind JSON rendering.
+            "declare ptr @festina_sb_new()",
+            "declare void @festina_sb_append(ptr, ptr)",
+            "declare void @festina_sb_append_json_text(ptr, ptr)",
+            "declare void @festina_sb_append_json_int(ptr, i64)",
+            "declare void @festina_sb_append_json_float(ptr, double)",
+            "declare void @festina_sb_append_json_bool(ptr, i8)",
+            "declare void @festina_sb_append_json_bool64(ptr, i64)",
+            "declare void @festina_sb_append_handle(ptr, ptr, ptr)",
+            "declare ptr @festina_sb_finish(ptr)",
             "declare void @festina_sqlite_bind_int(ptr, i32, i64)",
             "declare void @festina_sqlite_bind_float(ptr, i32, double)",
             "declare void @festina_sqlite_bind_text(ptr, i32, ptr)",
@@ -2988,6 +3004,15 @@ class CodeGen:
         return result
 
     def _to_text(self, val, type_, lines):
+        """claude.md #114: every non-text value in log() or `${}`
+        compiles as its .toText() -- int/float/bool through the
+        stringifiers they always had, struct/table/arr/map through a
+        generated JSON-like render, and (claude.md #115) a blob through
+        its own toText(), because a blob is very often a text file and
+        the implicit conversion is DEFINED as the method it already
+        has. img and aud are COMPILE ERRORS: they have no text form at
+        all, and silently printing a placeholder would hide a mistake
+        the type system can catch."""
         if type_ == TEXT:
             return val
         out = self.tmp()
@@ -2997,9 +3022,274 @@ class CodeGen:
             lines.append(f"  {out} = call ptr @festina_str_from_float(double {val})")
         elif type_ == BOOL:
             lines.append(f"  {out} = call ptr @festina_str_from_bool(i8 {val})")
+        elif isinstance(type_, (types_mod.StructType, types_mod.TableType,
+                                types_mod.ArrayType, types_mod.MapType)):
+            fn = self._json_fn_for(type_)
+            sb = self.tmp()
+            lines.append(f"  {sb} = call ptr @festina_sb_new()")
+            lines.append(f"  call void {fn}(ptr {val}, ptr {sb}, i64 0)")
+            lines.append(f"  {out} = call ptr @festina_sb_finish(ptr {sb})")
+        elif type_ == BLOB:
+            # claude.md #115: the contents. A binary blob renders its
+            # bytes up to the first NUL -- which is exactly what its
+            # explicit toText() does, and the two must not disagree.
+            lines.append(f"  {out} = call ptr @festina_blob_to_text(ptr {val})")
+        elif isinstance(type_, (types_mod.ImageType, types_mod.AudioType)):
+            raise CodegenError(
+                f"a value of type {types_mod.type_name(type_)} has no text "
+                f"form and cannot appear in log() or a template",
+                file=self.filename)
         else:
             raise CodegenError(f"cannot interpolate a value of type {types_mod.type_name(type_)}")
         return out
+
+    def _json_append_slot(self, body, sb, ftype, slot_ptr, depth_val):
+        """claude.md #114: appends ONE value (stored at `slot_ptr`, of
+        festina type `ftype`) to the builder -- the shared field/element/
+        column emitter every generated render function is built from."""
+        if ftype == INT:
+            v = self.tmp()
+            body.append(f"  {v} = load i64, ptr {slot_ptr}")
+            body.append(f"  call void @festina_sb_append_json_int(ptr {sb}, i64 {v})")
+        elif ftype == FLOAT:
+            v = self.tmp()
+            body.append(f"  {v} = load double, ptr {slot_ptr}")
+            body.append(f"  call void @festina_sb_append_json_float(ptr {sb}, double {v})")
+        elif ftype == BOOL:
+            v = self.tmp()
+            body.append(f"  {v} = load i8, ptr {slot_ptr}")
+            body.append(f"  call void @festina_sb_append_json_bool(ptr {sb}, i8 {v})")
+        elif ftype == TEXT:
+            v = self.tmp()
+            body.append(f"  {v} = load ptr, ptr {slot_ptr}")
+            body.append(f"  call void @festina_sb_append_json_text(ptr {sb}, ptr {v})")
+        elif isinstance(ftype, (types_mod.StructType, types_mod.TableType,
+                                types_mod.ArrayType, types_mod.MapType)):
+            v = self.tmp()
+            body.append(f"  {v} = load ptr, ptr {slot_ptr}")
+            inner = self._json_fn_for(ftype)
+            d = self.tmp()
+            body.append(f"  {d} = add i64 {depth_val}, 1")
+            body.append(f"  call void {inner}(ptr {v}, ptr {sb}, i64 {d})")
+        else:
+            # blob/img/aud/regex/... inside a container: a labeled
+            # placeholder, or null when the handle is null. Erroring the
+            # whole container over one opaque field would make rendering
+            # useless for exactly the debugging it exists for.
+            label = self.string_const(f'"<{types_mod.type_name(ftype)}>"')
+            v = self.tmp()
+            body.append(f"  {v} = load ptr, ptr {slot_ptr}")
+            body.append(f"  call void @festina_sb_append_handle(ptr {sb}, ptr {v}, ptr {label})")
+
+    def _json_fn_for(self, type_):
+        """claude.md #114: returns (generating on first use, cached by
+        type name) `void @__festina_json_N(ptr value, ptr sb, i64 depth)`
+        -- appends the value's JSON-like form to the builder. Registered
+        BEFORE the body is generated, the same trick the release
+        wrappers use (claude.md #106's own load-bearing cache write), so
+        a self-referencing struct type generates ONE function that calls
+        itself. The runtime recursion is depth-capped at 32: a cyclic
+        value (constructible since #106) renders as null at the cap
+        instead of overflowing the stack -- JSON.stringify throws on
+        cycles, but a DEBUG rendering that can crash the program it is
+        debugging would be worse than an honest truncation."""
+        key = types_mod.type_name(type_)
+        cached = self._json_fns.get(key)
+        if cached is not None:
+            return cached
+        fn_name = f"@__festina_json_{self._unique()}"
+        self._json_fns[key] = fn_name
+
+        body = [f"define void {fn_name}(ptr %v, ptr %sb, i64 %depth) {{", "entry:"]
+        null_lbl = self.label("json.null")
+        deep_lbl = self.label("json.deep")
+        go_lbl = self.label("json.go")
+        isnull = self.tmp()
+        body.append(f"  {isnull} = icmp eq ptr %v, null")
+        body.append(f"  br i1 {isnull}, label %{null_lbl}, label %{deep_lbl}")
+        body.append(f"{null_lbl}:")
+        body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('null')})")
+        body.append("  ret void")
+        body.append(f"{deep_lbl}:")
+        toodeep = self.tmp()
+        body.append(f"  {toodeep} = icmp sgt i64 %depth, 32")
+        body.append(f"  br i1 {toodeep}, label %{null_lbl}, label %{go_lbl}")
+        body.append(f"{go_lbl}:")
+
+        if isinstance(type_, types_mod.StructType):
+            for idx, (fname, ftype) in enumerate(self.struct_fields(type_.name)):
+                prefix = '{"' if idx == 0 else ',"'
+                body.append(f"  call void @festina_sb_append(ptr %sb, "
+                            f"ptr {self.string_const(prefix + fname + chr(34) + ':')})")
+                fp = self.tmp()
+                struct_ty = self.struct_llvm_name(type_.name)
+                body.append(f"  {fp} = getelementptr {struct_ty}, ptr %v, i32 0, i32 {idx}")
+                self._json_append_slot(body, "%sb", ftype, fp, "%depth")
+            if not self.struct_fields(type_.name):
+                body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('{')})")
+            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('}')})")
+
+        elif isinstance(type_, types_mod.TableType):
+            # A row: flat 8-byte slots, plus #111's presence mask one
+            # slot past the columns. An UNDEFINED column is omitted
+            # outright -- exactly what JSON.stringify does for an
+            # undefined property, which is the analogy #111 built.
+            fields = self.table_fields(type_.name)
+            ncols = len(fields)
+            first_slot = self.tmp()
+            body.append(f"  {first_slot} = alloca i8")
+            body.append(f"  store i8 1, ptr {first_slot}")
+            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('{')})")
+            mask_ptr = self.tmp()
+            body.append(f"  {mask_ptr} = getelementptr i8, ptr %v, i64 {ncols * 8}")
+            mask = self.tmp()
+            body.append(f"  {mask} = load i64, ptr {mask_ptr}")
+            for idx, (fname, ftype) in enumerate(fields):
+                skip_lbl = self.label(f"json.skip{idx}")
+                emit_lbl = self.label(f"json.emit{idx}")
+                sep_lbl = self.label(f"json.sep{idx}")
+                key_lbl = self.label(f"json.key{idx}")
+                if idx < 64:
+                    bit = self.tmp()
+                    body.append(f"  {bit} = and i64 {mask}, {1 << idx}")
+                    present = self.tmp()
+                    body.append(f"  {present} = icmp ne i64 {bit}, 0")
+                    body.append(f"  br i1 {present}, label %{emit_lbl}, label %{skip_lbl}")
+                else:
+                    body.append(f"  br label %{emit_lbl}")
+                body.append(f"{emit_lbl}:")
+                fst = self.tmp()
+                body.append(f"  {fst} = load i8, ptr {first_slot}")
+                is_first = self.tmp()
+                body.append(f"  {is_first} = icmp ne i8 {fst}, 0")
+                body.append(f"  br i1 {is_first}, label %{key_lbl}, label %{sep_lbl}")
+                body.append(f"{sep_lbl}:")
+                body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(',')})")
+                body.append(f"  br label %{key_lbl}")
+                body.append(f"{key_lbl}:")
+                body.append(f"  store i8 0, ptr {first_slot}")
+                body.append(f"  call void @festina_sb_append(ptr %sb, "
+                            f"ptr {self.string_const(chr(34) + fname + chr(34) + ':')})")
+                slot = self.tmp()
+                body.append(f"  {slot} = getelementptr i8, ptr %v, i64 {idx * 8}")
+                if ftype == BOOL:
+                    # A row stores bool in a full i64 slot with the INT
+                    # null sentinel -- not the i8-with-2 a struct uses.
+                    v = self.tmp()
+                    body.append(f"  {v} = load i64, ptr {slot}")
+                    body.append(f"  call void @festina_sb_append_json_bool64(ptr %sb, i64 {v})")
+                else:
+                    self._json_append_slot(body, "%sb", ftype, slot, "%depth")
+                body.append(f"  br label %{skip_lbl}")
+                body.append(f"{skip_lbl}:")
+            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('}')})")
+
+        elif isinstance(type_, types_mod.ArrayType):
+            elem_type = type_.element
+            elem_llvm = _llvm_type(elem_type)
+            elem_size = _elem_size(elem_type)
+            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('[')})")
+            len_p = self.tmp()
+            body.append(f"  {len_p} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr %v, i32 0, i32 0")
+            n = self.tmp()
+            body.append(f"  {n} = load i64, ptr {len_p}")
+            data_p = self.tmp()
+            body.append(f"  {data_p} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr %v, i32 0, i32 1")
+            data = self.tmp()
+            body.append(f"  {data} = load ptr, ptr {data_p}")
+            i_slot = self.tmp()
+            body.append(f"  {i_slot} = alloca i64")
+            body.append(f"  store i64 0, ptr {i_slot}")
+            cond = self.label("json.acond")
+            loop = self.label("json.abody")
+            sep = self.label("json.asep")
+            elem_lbl = self.label("json.aelem")
+            done = self.label("json.adone")
+            body.append(f"  br label %{cond}")
+            body.append(f"{cond}:")
+            iv = self.tmp()
+            body.append(f"  {iv} = load i64, ptr {i_slot}")
+            more = self.tmp()
+            body.append(f"  {more} = icmp slt i64 {iv}, {n}")
+            body.append(f"  br i1 {more}, label %{loop}, label %{done}")
+            body.append(f"{loop}:")
+            nonfirst = self.tmp()
+            body.append(f"  {nonfirst} = icmp sgt i64 {iv}, 0")
+            body.append(f"  br i1 {nonfirst}, label %{sep}, label %{elem_lbl}")
+            body.append(f"{sep}:")
+            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(',')})")
+            body.append(f"  br label %{elem_lbl}")
+            body.append(f"{elem_lbl}:")
+            off = self.tmp()
+            body.append(f"  {off} = mul i64 {iv}, {elem_size}")
+            ep = self.tmp()
+            body.append(f"  {ep} = getelementptr i8, ptr {data}, i64 {off}")
+            self._json_append_slot(body, "%sb", elem_type, ep, "%depth")
+            nx = self.tmp()
+            body.append(f"  {nx} = add i64 {iv}, 1")
+            body.append(f"  store i64 {nx}, ptr {i_slot}")
+            body.append(f"  br label %{cond}")
+            body.append(f"{done}:")
+            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(']')})")
+
+        elif isinstance(type_, types_mod.MapType):
+            value_type = type_.value
+            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('{')})")
+            cnt_p = self.tmp()
+            body.append(f"  {cnt_p} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr %v, i32 0, i32 0")
+            n = self.tmp()
+            body.append(f"  {n} = load i64, ptr {cnt_p}")
+            ent_p = self.tmp()
+            body.append(f"  {ent_p} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr %v, i32 0, i32 1")
+            ents = self.tmp()
+            body.append(f"  {ents} = load ptr, ptr {ent_p}")
+            i_slot = self.tmp()
+            body.append(f"  {i_slot} = alloca i64")
+            body.append(f"  store i64 0, ptr {i_slot}")
+            cond = self.label("json.mcond")
+            loop = self.label("json.mbody")
+            sep = self.label("json.msep")
+            kv_lbl = self.label("json.mkv")
+            done = self.label("json.mdone")
+            body.append(f"  br label %{cond}")
+            body.append(f"{cond}:")
+            iv = self.tmp()
+            body.append(f"  {iv} = load i64, ptr {i_slot}")
+            more = self.tmp()
+            body.append(f"  {more} = icmp slt i64 {iv}, {n}")
+            body.append(f"  br i1 {more}, label %{loop}, label %{done}")
+            body.append(f"{loop}:")
+            nonfirst = self.tmp()
+            body.append(f"  {nonfirst} = icmp sgt i64 {iv}, 0")
+            body.append(f"  br i1 {nonfirst}, label %{sep}, label %{kv_lbl}")
+            body.append(f"{sep}:")
+            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(',')})")
+            body.append(f"  br label %{kv_lbl}")
+            body.append(f"{kv_lbl}:")
+            # A FestinaMapEntry is {char *key, int64_t value}: 16 bytes.
+            off = self.tmp()
+            body.append(f"  {off} = mul i64 {iv}, 16")
+            entp = self.tmp()
+            body.append(f"  {entp} = getelementptr i8, ptr {ents}, i64 {off}")
+            keyv = self.tmp()
+            body.append(f"  {keyv} = load ptr, ptr {entp}")
+            body.append(f"  call void @festina_sb_append_json_text(ptr %sb, ptr {keyv})")
+            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(':')})")
+            vslot = self.tmp()
+            body.append(f"  {vslot} = getelementptr i8, ptr {entp}, i64 8")
+            self._json_append_slot(body, "%sb", value_type, vslot, "%depth")
+            nx = self.tmp()
+            body.append(f"  {nx} = add i64 {iv}, 1")
+            body.append(f"  store i64 {nx}, ptr {i_slot}")
+            body.append(f"  br label %{cond}")
+            body.append(f"{done}:")
+            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('}')})")
+
+        body.append("  ret void")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
 
     def _emit_value_for(self, node, env, lines, expected_type):
         """Like _emit_expr, but for positions where the *declared* type is
@@ -5053,31 +5343,38 @@ class CodeGen:
             name = callee.name
             if name == "log":
                 val, vtype = self._emit_expr(expr.args[0], env, lines)
+                # claude.md #114: log(x) for a non-text x compiles as
+                # log of x.toText() -- containers render JSON-like, and
+                # blob/img/aud are compile errors (see _to_text's own
+                # comment for why they refuse rather than auto-render).
+                if isinstance(vtype, (types_mod.StructType, types_mod.TableType,
+                                      types_mod.ArrayType, types_mod.MapType)):
+                    rendered = self._to_text(val, vtype, lines)
+                    lines.append(f"  call void @festina_log_text(ptr {rendered})")
+                    lines.append(f"  call void @free(ptr {rendered})")
+                    self._release_member_receiver_temp(expr.args[0], val, vtype,
+                                                       INT, lines)
+                    return "0", None
+                if vtype == BLOB:
+                    # claude.md #115: log(blob) prints the contents,
+                    # exactly as `${blob}` renders them -- one implicit
+                    # conversion, both positions.
+                    rendered = self._to_text(val, vtype, lines)
+                    lines.append(f"  call void @festina_log_text(ptr {rendered})")
+                    lines.append(f"  call void @free(ptr {rendered})")
+                    self._release_member_receiver_temp(expr.args[0], val, vtype,
+                                                       INT, lines)
+                    return "0", None
+                if isinstance(vtype, (types_mod.ImageType, types_mod.AudioType)):
+                    raise CodegenError(
+                        f"log() cannot print a value of type "
+                        f"{types_mod.type_name(vtype)} -- it has no text form",
+                        file=self.filename, line=callee.line)
                 if not isinstance(vtype, types_mod.PrimitiveType):
                     raise CodegenError(
                         f"log() only supports primitive values right now, "
                         f"found {types_mod.type_name(vtype)}",
                         file=self.filename, line=callee.line)
-                # claude.md #10 lists blob among the five primitive
-                # types with no exception carved out for log() (#41), so
-                # log(someBlob) has to mean something. It used to route
-                # straight to festina_log_text on the grounds that blob
-                # shared text's `ptr`-to-bytes representation -- true
-                # then, and actively dangerous since claude.md #109 made
-                # a blob a HANDLE: the same code would have printed a
-                # FestinaBlob struct's first field as if it were a
-                # string. It logs the CONTENTS now, which is what a blob
-                # is, via the same accessor .toText() uses.
-                if vtype == BLOB:
-                    contents = self.tmp()
-                    lines.append(f"  {contents} = call ptr @festina_blob_to_text(ptr {val})")
-                    lines.append(f"  call void @festina_log_text(ptr {contents})")
-                    # festina_blob_to_text hands back an owned copy
-                    # (claude.md #83), so this temporary is ours to free.
-                    lines.append(f"  call void @free(ptr {contents})")
-                    self._release_member_receiver_temp(expr.args[0], val, vtype,
-                                                       INT, lines)
-                    return "0", None
                 fn = {"int": "festina_log_int", "float": "festina_log_float",
                       "bool": "festina_log_bool", "text": "festina_log_text"}[vtype.name]
                 ty = _llvm_type(vtype)
@@ -5292,6 +5589,14 @@ class CodeGen:
                 val, vtype = self._emit_expr(callee.obj, env, lines)
                 if vtype in (INT, FLOAT, BOOL):
                     return self._to_text(val, vtype, lines), TEXT
+                # claude.md #114: the explicit spelling of the rendering
+                # log()/`${}` now do implicitly for containers.
+                if isinstance(vtype, (types_mod.StructType, types_mod.TableType,
+                                      types_mod.ArrayType, types_mod.MapType)):
+                    out = self._to_text(val, vtype, lines)
+                    self._release_member_receiver_temp(callee.obj, val, vtype,
+                                                       TEXT, lines)
+                    return out, TEXT
             # claude.md #67: pattern.test(value:text) -> bool
             if callee.prop == "test":
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
@@ -5848,6 +6153,29 @@ class CodeGen:
         return "0", None
 
     # ---- sqlite() queries (claude.md #32-34) ----
+    def _emit_sqlite_prepare(self, expr, sql_val, db_val, lines):
+        """claude.md #113: chooses per call site between the one-shot
+        prepare and the cached one. A compile-time string literal can
+        never change, so re-parsing it into sqlite bytecode on every
+        call is pure waste -- the identical reasoning behind claude.md
+        #85's regex literal cache, implemented the same way: one private
+        global slot per call site, filled on first reach. Anything
+        dynamic (a template, a variable) keeps the per-call prepare,
+        because the same site can see different SQL each time. Measured:
+        20,000 one-row SELECTs went from 164ms to 106ms."""
+        stmt_val = self.tmp()
+        if isinstance(expr.args[0], ast.StringLit):
+            uid = self._unique()
+            slot = f"@__festina_stmtcache_{uid}"
+            self.extra_globals.append(f"{slot} = private global ptr null")
+            lines.append(
+                f"  {stmt_val} = call ptr @festina_sqlite_prepare_cached("
+                f"ptr {db_val}, ptr {sql_val}, ptr {slot})")
+        else:
+            lines.append(
+                f"  {stmt_val} = call ptr @festina_sqlite_prepare(ptr {db_val}, ptr {sql_val})")
+        return stmt_val
+
     def _emit_sqlite_call(self, expr, env, lines, expected_type):
         """`expected_type` is the declared type of wherever this call's
         result flows into (a var's declared type, a param type, a return
@@ -5870,8 +6198,7 @@ class CodeGen:
 
         db_val = self.tmp()
         lines.append(f"  {db_val} = load ptr, ptr @__festina_db")
-        stmt_val = self.tmp()
-        lines.append(f"  {stmt_val} = call ptr @festina_sqlite_prepare(ptr {db_val}, ptr {sql_val})")
+        stmt_val = self._emit_sqlite_prepare(expr, sql_val, db_val, lines)
         # claude.md #83: sqlite3_prepare_v2 compiles the SQL into the
         # statement rather than holding the string, so a temporary
         # (`sqlite(`SELECT ... ${n}`)`) is the caller's to free here.
@@ -5997,9 +6324,10 @@ class CodeGen:
                 file=self.filename, line=callee.line)
         db_val = self.tmp()
         lines.append(f"  {db_val} = load ptr, ptr @__festina_db")
-        stmt_val = self.tmp()
-        lines.append(
-            f"  {stmt_val} = call ptr @festina_sqlite_prepare(ptr {db_val}, ptr {sql_val})")
+        # claude.md #113: same literal-SQL statement cache the array
+        # query path uses -- sqliteInt('SELECT count(*) ...') in a loop
+        # is exactly the shape that pays for re-preparing.
+        stmt_val = self._emit_sqlite_prepare(expr, sql_val, db_val, lines)
         self._free_text_temp(expr.args[0], sql_val, sql_type, lines)
         if len(expr.args) > 1:
             self._emit_sqlite_bind_params(expr.args[1], stmt_val, env, lines)

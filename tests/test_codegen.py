@@ -296,16 +296,21 @@ class TestBlob:
         assert result.returncode == 0
         assert result.stdout.strip() == "the contents"
 
-    def test_logging_a_blob_prints_its_contents_not_its_path(
-            self, compile_and_run, tmp_path):
-        # The old behavior printed the path, because the path was all
-        # there was. Printing it now would mean printing a struct's
-        # first field as if it were a string.
+    def test_logging_a_blob_prints_its_contents(self, compile_and_run, tmp_path):
+        # claude.md #115: log(blob) and `${blob}` print the contents --
+        # the blob's own toText(), which is what the implicit conversion
+        # means. (#114 briefly made this an error; a blob is very often
+        # a text file, so the conversion it already had wins.)
         path = tmp_path / "data.txt"
         path.write_text("the contents")
-        result = compile_and_run(f"blob data = '{path}'\nlog(data)")
+        source = f"""
+        blob data = '{path}'
+        log(data)
+        log(`inline: ${{data}}`)
+        """
+        result = compile_and_run(source)
         assert result.returncode == 0
-        assert result.stdout.strip() == "the contents"
+        assert result.stdout.splitlines() == ["the contents", "inline: the contents"]
 
     def test_a_missing_path_is_an_empty_blob_not_a_failure(self, compile_and_run):
         # claude.md #93's rule, inherited: a missing file is something
@@ -6355,6 +6360,224 @@ class TestAudioChannelReturnAndClipStop:
         result = compile_and_run(source, env=audio_null_env)
         assert result.returncode == 0
         assert result.stdout.strip() == "-1"
+
+
+class TestJsonRendering:
+    '''claude.md #114: any non-text value in log() or `${}` compiles as
+    its .toText(). int/float/bool keep their stringifiers; struct/table
+    row/arr/map render JSON-like through generated per-type functions;
+    blob/img/aud are compile errors, since a blob's bytes may be binary
+    (its explicit .toText() exists for when that is wanted) and img/aud
+    have no text form at all.'''
+
+    def test_a_struct_renders_as_json(self, compile_and_run):
+        source = '''
+        struct Inner { n:int  tag:text }
+        struct P { id:int  ok:bool  name:text  inner:Inner  xs:arr[int] }
+        P p
+        p.id = 7
+        p.ok = true
+        p.name = 'x'
+        p.inner.n = 3
+        p.inner.tag = 'in'
+        p.xs.push(1)
+        p.xs.push(2)
+        log(p)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.strip() == (
+            '{"id":7,"ok":true,"name":"x",'
+            '"inner":{"n":3,"tag":"in"},"xs":[1,2]}')
+
+    def test_arrays_and_maps_render_as_json(self, compile_and_run):
+        source = '''
+        arr[int] nums = [1, 2, 3]
+        log(nums)
+        arr[text] words = ['a', null, 'c']
+        log(words)
+        map[int] m = {'one': 1}
+        log(m)
+        log(`inline: ${nums}`)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            '[1,2,3]', '["a",null,"c"]', '{"one":1}', 'inline: [1,2,3]']
+
+    def test_text_is_escaped_and_assigned_null_renders_null(self, compile_and_run):
+        # The name contains a real double quote and a real tab, which
+        # must come out as \" and \t. An UNASSIGNED scalar field renders
+        # its zero (claude.md #97: calloc'd storage reads 0, not the
+        # null sentinel); a field explicitly made null renders null.
+        source = r'''
+        struct P { name:text  score:float  missing:float }
+        P p
+        p.name = 'has "quotes" and	tab'
+        p.score = 1.0 / 0.0
+        log(p)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.strip() == (
+            '{"name":"has \\"quotes\\" and\\ttab","score":null,"missing":0}')
+
+    def test_a_table_row_renders_with_database_null_and_omits_undefined(
+            self, compile_and_run, tmp_path):
+        # A database NULL is the JSON null; a column the query never
+        # selected is OMITTED, exactly what JSON.stringify does for an
+        # undefined property -- the analogy claude.md #111 built.
+        db = tmp_path / 't.sqlite'
+        source = f'''
+        DatabaseURL = '{db}'
+        table T {{ id:int  name:text  ok:bool }}
+        sqlite('INSERT INTO T (id, name, ok) VALUES (?, ?, ?)', [1, null, 1])
+        arr[T] rows = sqlite('SELECT * FROM T')
+        log(rows[0])
+        arr[T] partial = sqlite('SELECT id FROM T')
+        log(partial[0])
+        log(rows)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            '{"id":1,"name":null,"ok":true}',
+            '{"id":1}',
+            '[{"id":1,"name":null,"ok":true}]']
+
+    def test_explicit_to_text_is_the_same_rendering(self, compile_and_run):
+        source = '''
+        arr[int] nums = [1, 2]
+        text json = nums.toText()
+        log(json)
+        struct P { n:int }
+        P p
+        p.n = 5
+        log(p.toText())
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ['[1,2]', '{"n":5}']
+
+    def test_a_null_container_renders_as_null(self, compile_and_run):
+        source = '''
+        struct P { n:int }
+        P nothing = null
+        log(nothing)
+        log(`v: ${nothing}`)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ['null', 'v: null']
+
+    def test_a_cycle_truncates_instead_of_crashing(self, compile_and_run):
+        # claude.md #106 made cycles constructible; a debug rendering
+        # that overflowed the stack on one would crash the program it
+        # exists to debug. Depth caps at 32, rendering null beyond.
+        source = '''
+        struct Node { n:int  next:Node }
+        Node a
+        a.n = 1
+        a.next = a
+        log(a)
+        '''
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().endswith('null}' + '}' * 32)
+
+    def test_an_opaque_handle_in_a_struct_renders_as_a_placeholder(
+            self, compile_and_run, tmp_path):
+        path = tmp_path / 'f.txt'
+        source = f'''
+        struct Holder {{ name:text  data:blob }}
+        Holder empty
+        empty.name = 'no file'
+        log(empty)
+        Holder full
+        full.name = 'with file'
+        full.data = '{path}'
+        log(full)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            '{"name":"no file","data":null}',
+            '{"name":"with file","data":"<blob>"}']
+
+    @pytest.mark.parametrize('decl,use', [
+        ("img v = 'x.png'", 'log(v)'),
+        ("img v = 'x.png'", 'log(`${v}`)'),
+        ("aud v = 'x.wav'", 'log(v)'),
+        ("aud v = 'x.wav'", 'log(`${v}`)'),
+    ])
+    def test_img_and_aud_in_log_or_template_are_compile_errors(
+            self, parser, semantic, codegen, decl, use):
+        # claude.md #115: blob renders (it has a text form); img and aud
+        # do not, so they refuse.
+        program = parser.parse(f'{decl}\n{use}', filename='main.f')
+        analyzed = semantic.analyze(program, filename='main.f')
+        with pytest.raises(Exception, match=r'text form'):
+            codegen.generate_ir(program, analyzed, filename='main.f')
+
+
+class TestStatementCache:
+    """claude.md #113: literal SQL is prepared once per call site and
+    reset+reused ever after -- the sqlite counterpart of claude.md #85's
+    regex literal cache, driven by the same compile-time fact (the text
+    cannot change). Dynamic SQL keeps the per-call prepare. Measured:
+    20,000 one-row SELECTs 164ms -> 55ms; with WAL, 20,000 INSERTs
+    16.7s -> 0.3s."""
+
+    def test_a_literal_site_reuses_its_statement_across_params(
+            self, compile_and_run, tmp_path):
+        # Same call site, different bound parameters each iteration --
+        # the reset+rebind path, which is where a caching bug would
+        # show as stale results.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table T {{ id:int  v:int }}
+        for int i = 0, i < 5, i++ {{
+            sqlite('INSERT INTO T (id, v) VALUES (?, ?)', [i, i * 10])
+        }}
+        int total = 0
+        for int i = 0, i < 5, i++ {{
+            arr[T] rows = sqlite('SELECT * FROM T WHERE id = ?', [i])
+            total = total + rows[0].v
+        }}
+        log(total)
+        log(sqliteInt('SELECT count(*) FROM T'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["100", "5"]
+
+    def test_literal_sql_gets_a_cache_slot_and_dynamic_sql_does_not(
+            self, parser, semantic, codegen):
+        source = """
+        table T { id:int }
+        sqlite('INSERT INTO T (id) VALUES (1)')
+        text tbl = 'T'
+        sqlite(`DELETE FROM ${tbl}`)
+        """
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        # One literal site -> one slot; the template site stays on the
+        # per-call prepare, because its SQL can differ every evaluation.
+        assert ir.count("@__festina_stmtcache_") >= 2  # global + use
+        assert ir.count("call ptr @festina_sqlite_prepare_cached(") == 1
+        assert ir.count("call ptr @festina_sqlite_prepare(") == 1
+
+    def test_two_identical_literals_get_independent_slots(
+            self, compile_and_run, tmp_path):
+        # Per-SITE, not per-text: two textually identical queries are
+        # two statements, so one being mid-collection can never disturb
+        # the other. Cheap insurance rather than a measured need.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table T {{ id:int }}
+        sqlite('INSERT INTO T (id) VALUES (1)')
+        arr[T] a = sqlite('SELECT * FROM T')
+        arr[T] b = sqlite('SELECT * FROM T')
+        log(a[0].id + b[0].id)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "2"
 
 
 class TestStructQueryTargets:

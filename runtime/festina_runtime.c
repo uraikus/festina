@@ -105,6 +105,128 @@ char *festina_str_from_bool(int8_t v) {
     return strdup(v == 2 ? "null" : (v ? "true" : "false"));
 }
 
+/* ---- JSON-ish rendering -- claude.md #114 ----
+ *
+ * `${someStruct}` and log(someArr) render containers as JSON-like text.
+ * The structure walking lives in generated IR (only the compiler knows
+ * a struct's layout); everything that touches BYTES lives here, as a
+ * small growable string builder plus append helpers that know the
+ * null sentinels. One builder per rendering, O(n) overall -- repeated
+ * festina_str_concat would have been O(n^2) and this is exactly the
+ * feature people reach for in a loop. */
+static int64_t festina_null_int(void);   /* defined with the sqlite helpers below */
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} FestinaSB;
+
+void *festina_sb_new(void) {
+    FestinaSB *sb = malloc(sizeof(FestinaSB));
+    if (!sb) festina_fail("out of memory rendering a value");
+    sb->cap = 64;
+    sb->len = 0;
+    sb->data = malloc(sb->cap);
+    if (!sb->data) festina_fail("out of memory rendering a value");
+    sb->data[0] = '\0';
+    return sb;
+}
+
+static void festina_sb_grow(FestinaSB *sb, size_t add) {
+    if (sb->len + add + 1 <= sb->cap) return;
+    while (sb->cap < sb->len + add + 1) sb->cap *= 2;
+    char *grown = realloc(sb->data, sb->cap);
+    if (!grown) festina_fail("out of memory rendering a value");
+    sb->data = grown;
+}
+
+void festina_sb_append(void *sbv, const char *s) {
+    if (!s) return;
+    FestinaSB *sb = (FestinaSB *)sbv;
+    size_t n = strlen(s);
+    festina_sb_grow(sb, n);
+    memcpy(sb->data + sb->len, s, n + 1);
+    sb->len += n;
+}
+
+/* A JSON string: quoted, with the escapes JSON requires. A NULL text
+ * renders as the JSON null literal, unquoted -- the same three-way
+ * honesty festina_str_from_bool already applies. */
+void festina_sb_append_json_text(void *sbv, const char *s) {
+    FestinaSB *sb = (FestinaSB *)sbv;
+    if (!s) { festina_sb_append(sb, "null"); return; }
+    festina_sb_grow(sb, 2);
+    sb->data[sb->len++] = '"';
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        char esc[8];
+        const char *out = esc;
+        switch (*p) {
+        case '"':  out = "\\\""; break;
+        case '\\': out = "\\\\"; break;
+        case '\n': out = "\\n"; break;
+        case '\r': out = "\\r"; break;
+        case '\t': out = "\\t"; break;
+        default:
+            if (*p < 0x20) { snprintf(esc, sizeof(esc), "\\u%04x", *p); }
+            else { esc[0] = (char)*p; esc[1] = '\0'; }
+        }
+        size_t n = strlen(out);
+        festina_sb_grow(sb, n);
+        memcpy(sb->data + sb->len, out, n);
+        sb->len += n;
+    }
+    festina_sb_grow(sb, 1);
+    sb->data[sb->len++] = '"';
+    sb->data[sb->len] = '\0';
+}
+
+void festina_sb_append_json_int(void *sbv, int64_t v) {
+    if (v == festina_null_int()) { festina_sb_append(sbv, "null"); return; }
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", (long long)v);
+    festina_sb_append(sbv, buf);
+}
+
+void festina_sb_append_json_float(void *sbv, double v) {
+    /* JSON has no NaN/Infinity, and Festina's float null IS a NaN --
+     * both render as null, which is also what JSON.stringify does. */
+    if (v != v || v > 1.7e308 || v < -1.7e308) {
+        festina_sb_append(sbv, "null");
+        return;
+    }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%g", v);
+    festina_sb_append(sbv, buf);
+}
+
+void festina_sb_append_json_bool(void *sbv, int8_t v) {
+    festina_sb_append(sbv, v == 2 ? "null" : (v ? "true" : "false"));
+}
+
+/* A bool that lives in an 8-byte slot (a table row's column), where
+ * null is the INT sentinel rather than 2. */
+void festina_sb_append_json_bool64(void *sbv, int64_t v) {
+    if (v == festina_null_int()) { festina_sb_append(sbv, "null"); return; }
+    festina_sb_append(sbv, v ? "true" : "false");
+}
+
+/* An opaque handle (blob/img/aud/regex) inside a rendered container:
+ * `null` when null, a placeholder naming the type otherwise -- its
+ * bytes have no honest JSON form, and silently dumping binary into a
+ * debug string would be worse than saying what it is. */
+void festina_sb_append_handle(void *sbv, const void *handle, const char *label) {
+    if (!handle) { festina_sb_append(sbv, "null"); return; }
+    festina_sb_append(sbv, label);
+}
+
+char *festina_sb_finish(void *sbv) {
+    FestinaSB *sb = (FestinaSB *)sbv;
+    char *out = sb->data;
+    free(sb);
+    return out;
+}
+
 char *festina_str_concat(const char *a, const char *b) {
     if (!a) a = "";
     if (!b) b = "";
@@ -561,7 +683,81 @@ sqlite3 *festina_db_open(const char *path) {
                  db ? sqlite3_errmsg(db) : "unknown error");
         festina_fail(msg);
     }
+    /* claude.md #113: WAL journaling with synchronous=NORMAL. SQLite's
+     * shipped defaults (rollback journal, synchronous=FULL) fsync on
+     * every autocommitted statement, which priced a plain INSERT loop
+     * at ~1ms per row -- measured: 20,000 inserts took 16.7 seconds,
+     * of which sqlite's own work was a rounding error. WAL+NORMAL is
+     * the standard application-embedded configuration: transactions
+     * survive an application crash unconditionally, and only an
+     * OS-level crash or power loss can lose the most recent commits
+     * (never corrupt the database). For the programs this language is
+     * for -- games, tools -- that is the right trade, and the same one
+     * every browser and phone OS ships sqlite with. Errors are ignored
+     * deliberately: a read-only filesystem or an exotic VFS that
+     * cannot do WAL just keeps the old defaults and still works. */
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+    sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
     return db;
+}
+
+/* claude.md #113: prepared-statement caching for LITERAL SQL.
+ *
+ * sqlite3_prepare_v2 re-parses, re-plans and re-compiles the SQL into a
+ * fresh bytecode program on every call. When the SQL is a compile-time
+ * string literal it can never change, so that work is pure waste after
+ * the first call -- the identical reasoning claude.md #85 applied to
+ * /pattern/ regex literals, arrived at the same way: the compiler knows
+ * the text is constant, so it allocates one cache slot per CALL SITE
+ * (a private global, null until first reached) and routes the call
+ * through here instead of festina_sqlite_prepare. A dynamic SQL string
+ * (a template literal, a variable) keeps the uncached path, since the
+ * same call site can legitimately see different SQL each time.
+ *
+ * The registry below is what lets every existing consumer stay
+ * oblivious: collect_rows, exec and the scalar helpers all end their
+ * statement through festina_sqlite_finish, which RESETS a registered
+ * statement (returning it to the cache slot's custody, bindings
+ * cleared) and finalizes an unregistered one exactly as before. The
+ * registry is a linear array scanned per finish -- its size is the
+ * number of distinct literal sqlite() call sites in the program, a
+ * few dozen at the outside, not a per-row or per-call quantity. */
+static sqlite3_stmt **g_cached_stmts = NULL;
+static int g_cached_stmt_count = 0;
+static int g_cached_stmt_cap = 0;
+
+sqlite3_stmt *festina_sqlite_prepare_cached(sqlite3 *db, const char *sql,
+                                            void **slot) {
+    if (*slot) {
+        sqlite3_stmt *stmt = (sqlite3_stmt *)*slot;
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        return stmt;
+    }
+    sqlite3_stmt *stmt = festina_sqlite_prepare(db, sql);
+    if (g_cached_stmt_count == g_cached_stmt_cap) {
+        g_cached_stmt_cap = g_cached_stmt_cap ? g_cached_stmt_cap * 2 : 16;
+        sqlite3_stmt **grown = realloc(g_cached_stmts,
+                                       (size_t)g_cached_stmt_cap * sizeof(*grown));
+        if (!grown) festina_fail("out of memory caching a statement");
+        g_cached_stmts = grown;
+    }
+    g_cached_stmts[g_cached_stmt_count++] = stmt;
+    *slot = stmt;
+    return stmt;
+}
+
+/* Finalize -- unless the statement is one of the cached ones, in which
+ * case reset it for its next use. Every statement consumer ends its
+ * statement through this. */
+static void festina_sqlite_finish(sqlite3_stmt *stmt) {
+    for (int i = 0; i < g_cached_stmt_count; i++) {
+        if (g_cached_stmts[i] == stmt) {
+            sqlite3_reset(stmt);
+            return;
+        }
+    }
+    sqlite3_finalize(stmt);
 }
 
 /* claude.md #30 */
@@ -848,7 +1044,7 @@ int64_t festina_sqlite_scalar_int(sqlite3_stmt *stmt) {
             && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
         out = sqlite3_column_int64(stmt, 0);
     }
-    sqlite3_finalize(stmt);
+    festina_sqlite_finish(stmt);
     return out;
 }
 
@@ -858,7 +1054,7 @@ double festina_sqlite_scalar_float(sqlite3_stmt *stmt) {
             && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
         out = sqlite3_column_double(stmt, 0);
     }
-    sqlite3_finalize(stmt);
+    festina_sqlite_finish(stmt);
     return out;
 }
 
@@ -872,7 +1068,7 @@ char *festina_sqlite_scalar_text(sqlite3_stmt *stmt) {
          * (claude.md #83). */
         if (txt) out = strdup((const char *)txt);
     }
-    sqlite3_finalize(stmt);
+    festina_sqlite_finish(stmt);
     return out;
 }
 
@@ -885,10 +1081,10 @@ void festina_sqlite_exec(sqlite3_stmt *stmt) {
         sqlite3 *db = sqlite3_db_handle(stmt);
         char msg[512];
         snprintf(msg, sizeof(msg), "sqlite error executing statement: %s", sqlite3_errmsg(db));
-        sqlite3_finalize(stmt);
+        festina_sqlite_finish(stmt);
         festina_fail(msg);
     }
-    sqlite3_finalize(stmt);
+    festina_sqlite_finish(stmt);
 }
 
 /* claude.md #34: row layout is col_count 8-byte slots per row -- see
@@ -1018,10 +1214,10 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
         sqlite3 *db = sqlite3_db_handle(stmt);
         char msg[512];
         snprintf(msg, sizeof(msg), "sqlite error reading rows: %s", sqlite3_errmsg(db));
-        sqlite3_finalize(stmt);
+        festina_sqlite_finish(stmt);
         festina_fail(msg);
     }
-    sqlite3_finalize(stmt);
+    festina_sqlite_finish(stmt);
 
     *out_length = count;
     *out_data = rows;
