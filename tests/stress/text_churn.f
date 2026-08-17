@@ -40,7 +40,7 @@ while i < 2000 {
 
     // Text methods on computed receivers.
     text r = (a + 'z').replace('item', 'thing')
-    text r2 = decorate(a).replaceAll('-', '_')
+    text r2 = decorate(a).replace(/-/g, '_')
     if sameish(r, r2) {
         log('unreachable')
     }

@@ -64,8 +64,8 @@ int       -- 64-bit signed integer
 float     -- 64-bit floating point (IEEE 754 double)
 bool      -- true / false, no truthy/falsy coercion from anything else
 text      -- UTF-8 string
-blob      -- binary data (shares text's representation; text -> blob
-             assignment is allowed, the reverse is not)
+blob      -- a file's bytes, loaded from a path (`blob save =
+             'slot1.dat'`); see the Files section below
 arr[T]    -- homogeneous array of any of the above, a struct, or a
              declared table's row type
 map[T]    -- text-keyed map of any of the above except arr[T]/map[T]
@@ -203,7 +203,7 @@ mutable `int` variable.
 ```festina
 text greeting = `Hello, ${name}!`     // template literals
 text a = 'room 42'.replace('room', 'suite')
-text b = 'a1b2c3'.replaceAll(/[0-9]/, '-')
+text b = 'a1b2c3'.replace(/[0-9]/g, '-')   // 'g' = every match
 bool matched = /[0-9]+/.test('room 42')
 text found = 'room 42'.match(/[0-9]+/)   // null if no match
 ```
@@ -243,6 +243,49 @@ b.m['k'] = 9
 
 The value is created once, on first reach, and stays — the read above
 and the `push` below it are talking about the same array.
+
+### A struct can name itself
+
+A field may have the type of the struct it is declared in, or the type
+of a struct declared further down the file. Declaration order does not
+matter:
+
+```festina
+struct Node {
+    n:int
+    next:Node
+}
+
+Node head
+head.n = 1
+head.next.n = 2       // auto-vivified, same as any other struct field
+head.next.next.n = 3
+
+Node cursor = head
+for int i = 0, i < 3, i++ {
+    log(cursor.n)
+    cursor = cursor.next
+}
+```
+
+Linked lists, trees and parent pointers all work, and are reclaimed
+automatically like any other struct.
+
+**One exception, and it is a real one: a *cycle* is never freed.**
+Automatic reclamation is reference counting, and a value that points
+back at itself — directly, or around any longer loop — keeps its own
+count above zero forever:
+
+```festina
+Node a
+a.n = 7
+a.next = a      // leaks: nothing will ever free `a`
+```
+
+Nothing goes wrong at runtime; the memory is simply never returned. If
+you build a structure with back-references, break them before dropping
+it (`child.parent = null`) or accept that it lives for the life of the
+program.
 
 Memory for structs, arrays, and maps is managed automatically — no
 manual allocation or freeing. A local struct/`arr[T]`/`map[T]`
@@ -433,9 +476,10 @@ preserved via a temp-table rebuild) to match the declaration exactly.
 literal array expression, not an arbitrary `arr[T]` value. Query result
 columns map onto a declared table's fields by position, not by name.
 
-### Storing images and audio
+### Storing images, audio and files
 
-A column may be an `img` or an `aud`. SQLite stores it as a **BLOB**:
+A column may be an `img`, an `aud` or a `blob`. SQLite stores each as a
+**BLOB**:
 
 ```festina
 table Music {
@@ -460,9 +504,76 @@ The one case with no source bytes is an image you built rather than
 loaded — a `clip()` or `resize()` result. Those are encoded as PNG on
 demand, which is lossless.
 
+A `blob` column works the same way and is the general case: any file,
+not just the two the language decodes. See
+[Blobs in the database](#blobs-in-the-database) for what a blob read back
+out of a column can and cannot do.
+
 Binding is by value: the parameter is copied into the database as the
 statement runs, so nothing is retained afterwards and the asset stays
 yours.
+
+### Partial queries and `undefined()`
+
+Result columns are matched to the table's declared columns **by name**
+(case-insensitively), not by position — so a query may select any
+subset of columns, in any order, and every value lands where it
+belongs. A column the query didn't mention reads as `null`.
+
+But "the query never asked" and "the database said NULL" are different
+facts, and `row.undefined('col')` tells them apart:
+
+```festina
+table examples { id:int  name:text }
+arr[examples] data = sqlite('select id from examples')
+
+if data[0].name == null && data[0].undefined('name') {
+    // name is null because it wasn't selected -- not because the
+    // database has no name for this row
+}
+```
+
+`undefined('col')` is `true` when the column wasn't in the result set
+(or was `delete`d off the row), `false` when the database genuinely
+returned a value or a NULL. Asking about a column the table doesn't
+declare fails the program — that's a typo, and `true` or `false` would
+both bury it.
+
+A `SELECT ... AS alias` renames a column *away* from its declared name,
+so an aliased column simply doesn't match; alias *to* a declared name to
+remap a computed value into a column deliberately.
+
+### Structs as query targets
+
+A query doesn't have to land in a table's row type. Any **struct** whose
+fields are queryable types (`int`/`float`/`bool`/`text`/`blob`/`img`/
+`aud`) can receive a result — name its fields after the result's own
+column names:
+
+```festina
+struct data {
+    whatever:int
+}
+arr[data] query = sqlite('select id as whatever from examples')
+log(query[0].whatever)
+```
+
+This is the shape for aliased columns, JOINs, and computed results — a
+table's declared columns can never chase a query's aliases, and a
+`table` declaration always *creates* a table, which a result-only shape
+has no business doing:
+
+```festina
+struct summary { total:int  biggest:text }
+arr[summary] agg = sqlite(
+    'select count(*) as total, max(name) as biggest from examples')
+```
+
+The elements are **ordinary structs** — refcounted, aliasable,
+`free`-able, their fields assignable and `delete`-able, exactly as if
+built by hand. A field the result didn't produce reads `null`. One
+consequence: `undefined()` is a table-row method and doesn't exist here,
+since an ordinary struct carries no record of which query it came from.
 
 ### Database configuration
 
@@ -506,22 +617,46 @@ are also compile-time errors, not runtime ones.
 
 ```festina
 regex digits = /[0-9]+/                    // JS-style literal, POSIX extended regex underneath
-regex ci = /^hello$/i                      // 'i' = case-insensitive; 'g' is also accepted (see below)
+regex ci     = /^hello$/i                  // 'i' = case-insensitive
+regex all    = /[0-9]/g                    // 'g' = replace every match
+regex both   = /test/gi                    // flags combine
+
 digits.test('room 42')                     // -> bool
 'room 42'.match(digits)                    // -> text or null
-'a1b2'.replace(digits, 'x')                // first match only
-'a1b2'.replaceAll(digits, 'x')             // every match
+'a1b2'.replace(/[0-9]/, 'x')               // 'a1b2' -> 'axb2'  (first match)
+'a1b2'.replace(/[0-9]/g, 'x')              // 'a1b2' -> 'axbx'  (every match)
 ```
 
 `flags` immediately follows the closing `/`, no space (`/pattern/flags`).
-Only `i` (case-insensitive) and `g` are accepted — `g` is recognized
-for familiarity with JavaScript but has no additional effect, since
-`.replace()`/`.replaceAll()` already say "first match" vs. "every
-match" explicitly, the same distinction `g` controls implicitly in JS.
-Any other flag letter is a compile-time error. `\w`/`\d`/`\s`/`\b` work
-as expected (glibc's `regcomp()` supports them as GNU extensions), but
-there are no capture groups, backreferences, or non-greedy quantifiers
-(POSIX ERE's own limits).
+Only `i` and `g` are accepted; any other flag letter is a compile-time
+error. `\w`/`\d`/`\s`/`\b` work as expected (glibc's `regcomp()`
+supports them as GNU extensions), but there are no capture groups,
+backreferences, or non-greedy quantifiers (POSIX ERE's own limits).
+
+### What `g` does, and what it doesn't
+
+`g` affects `.replace()` and nothing else.
+
+```festina
+'a-b-c'.replace(/-/g, '_')     // 'a_b_c'
+'a-b-c'.replace(/-/, '_')      // 'a_b-c'
+'a-b-c'.replace('-', '_')      // 'a_b-c' -- a text search has no flags
+```
+
+A plain-text search replaces the first match only, exactly like JS's
+`String.prototype.replace` with a string argument. There is no
+`.replaceAll()` — replacing every occurrence is spelled `/search/g`.
+
+It deliberately does **not** do two things JS's `g` does:
+
+- **`.test()` does not become stateful.** In JS a `/g` regex carries a
+  `lastIndex` that advances on each `.test()`, so the same test against
+  the same string returns `true`, then `false`. Here it returns the same
+  answer every time.
+- **`.match()` still returns `text`, not an array.** JS's `/g` changes
+  `.match()`'s return type. A return type can't depend on a flag that
+  `regex(pattern, flags)` only knows at run time, so `g` is ignored by
+  `.match()`.
 
 A pattern/flags that aren't known until runtime (built from a variable
 or a template) can't use the literal syntax — the global `regex(pattern,
@@ -532,10 +667,32 @@ RegExp(...)`:
 ```festina
 text userPattern = someInput()
 regex dynamic = regex(userPattern)
+regex globalDynamic = regex(userPattern, 'g')   // 'g' works here too
 ```
 
-Compiled fresh every time it's evaluated (both forms) — no caching by
-pattern text.
+The flag belongs to the compiled pattern, not to the call site, so both
+spellings behave identically.
+
+### Literals are compiled once; `regex()` is compiled per evaluation
+
+A `/pattern/` literal is compiled the first time its line is reached and
+cached for the life of the process. A `regex(pattern, flags)` call
+compiles on every evaluation, because its pattern is an arbitrary
+expression — the same call site can legitimately see a different pattern
+each time, so caching it would silently reuse the first one forever.
+
+That is a real cost in a hot loop. Measured over 200,000 iterations:
+
+| | Time |
+|---|---|
+| `/[0-9]+/.test(s)` | 15 ms |
+| `regex('[0-9]+')` hoisted to a variable outside the loop | 13 ms |
+| `regex('[0-9]+').test(s)` inside the loop | 367 ms |
+
+Roughly 24x, and entirely avoidable: binding the pattern to a variable
+outside the loop compiles it once and costs the same as a literal. Use
+the literal whenever the pattern is known, and hoist `regex()` out of
+loops when it isn't.
 
 ## Graphics
 
@@ -544,7 +701,7 @@ drawRect(0, 0, 100, 100)
 drawCircle(50, 50, 25)
 drawText('Hello', 20, 20)
 
-img profile = loadImage('profile.png')    // PNG only
+img profile = 'profile.png'              // PNG or JPEG
 drawImage(profile, 0, 0)
 log(`${profile.width}x${profile.height}`)
 
@@ -556,12 +713,13 @@ clearRect(10, 10, 40, 40)                 // erase one region
 
 log(`canvas is ${clientWidth}x${clientHeight}`)
 
-on click(x:int, y:int)  { ... }
-on mouse(x:int, y:int)  { ... }
-on keyDown(key:text)    { ... }
-on keyUp(key:text)      { ... }
-on resize()             { ... }
-on close()               { ... }
+on mouseDown(x:int, y:int) { ... }
+on mouseUp(x:int, y:int)   { ... }
+on mouse(x:int, y:int)     { ... }
+on keyDown(key:text)       { ... }
+on keyUp(key:text)         { ... }
+on resize()                { ... }
+on close()                 { ... }
 ```
 
 **Drawing is offscreen. `render()` puts it on screen.**
@@ -569,7 +727,7 @@ on close()               { ... }
 Every drawing call paints an offscreen canvas that needs no display at
 all. `render()` is the one call that shows it, opening a real X11 window
 (via Cairo's Xlib backend) the first time it runs — undecorated, 800×600.
-Declaring one of the six event handlers opens a window too, since they
+Declaring one of the seven event handlers opens a window too, since they
 can't fire without one. After the entry file's top-level code finishes,
 if a window was opened, the process blocks handling redraws/input until
 the window closes.
@@ -595,8 +753,34 @@ frame of 2000 rectangles took ~1.6s. Behind one `render()` the same
 frame takes ~1ms.
 
 Nothing but `render()` and the event handlers needs a display —
-`saveCanvas`, `clientWidth`/`clientHeight` and `loadImage` all work
-headless.
+`saveCanvas`, `clientWidth`/`clientHeight` and loading an image all
+work headless.
+
+### Mouse events
+
+`on mouseDown` fires when a button goes down, `on mouseUp` when it comes
+back up, and `on mouse` continuously while the pointer moves. All three
+report the pointer position at the moment the event happened.
+
+A click is a press *and* a release, and they are separate events for the
+same reason `keyDown` and `keyUp` are: holding the button down and
+moving before letting go is a drag, and the only way to see one is to
+see both ends of it.
+
+```festina
+int startX = 0
+int startY = 0
+
+on mouseDown(x:int, y:int) { startX = x  startY = y }
+on mouseUp(x:int, y:int)   { log(`dragged ${x - startX}, ${y - startY}`) }
+```
+
+Press and release report *different* coordinates whenever the pointer
+moved in between — that difference is the drag. A program that only
+wants "was clicked" can just use `on mouseDown` and ignore the release.
+
+Which button was pressed is not reported; every button dispatches the
+same handler.
 
 ### Keyboard events
 
@@ -633,12 +817,14 @@ log(`${sheet.width}x${sheet.height}`)
 img grass = sheet.clip(0, 0, 64, 64)     // a new 64x64 image
 grass.resize(32, 32)                      // scaled in place
 drawImage(grass, 100, 100)
+grass.save('grass.png')                   // -> bool; see Saving bytes
 ```
 
 A path declares the image, the same way it declares an `aud` — and, like
 that one, it's a real load rather than a compile-time resolution, so the
 path may be any text expression (`img hero = spriteDir + 'hero.png'`).
-`loadImage('...')` still works and means exactly the same thing.
+`save()`/`saveCopy()` write one back out; see
+[Saving bytes to a path](#saving-bytes-to-a-path).
 
 **PNG and JPEG.** The format is sniffed from the file's contents, not
 its extension — an image out of a database column has no extension, and
@@ -679,7 +865,7 @@ a.resize(8, 8)
 log(b.width)      // 8 -- a and b are the same image
 ```
 
-An image created in a function (by `loadImage` or `clip`) and never
+An image created in a function (from a path, or by `clip`) and never
 stored outside it is released when that function returns, so slicing
 frames inside a loop doesn't accumulate.
 
@@ -905,28 +1091,233 @@ descender.
 
 ## Files
 
+A file is a `blob`. Declaring one loads the bytes at that path, and
+keeps the path, so everything you can do to a file is a method on the
+value that already knows which file it is:
+
 ```festina
-writeFile('notes.txt', 'hello')       // -> bool (did it land?)
-appendFile('notes.txt', ' world')     // -> bool
-text body = readFile('notes.txt')     // -> text, or null if unreadable
-bool there = fileExists('notes.txt')  // -> bool
-deleteFile('notes.txt')               // -> bool
+blob notes = 'notes.txt'              // loads the bytes at that path
+
+notes.write('hello')                  // -> bool (did it land?)
+notes.append(' world')                // -> bool
+text body = notes.toText()            // -> the bytes, as text
+bool there = notes.exists()           // -> bool
+notes.delete()                        // -> bool; deletes the FILE
+
+notes.save()                          // -> bool; write the bytes to its path
+notes.save('other.txt')               // -> bool; adopt that path, then write
+notes.saveCopy('backup.txt')          // -> bool; write there, keep its own path
 ```
 
-Whole-file text I/O. Nothing here fails the program: `readFile` returns
-`null` for a file it can't read and the writers return `false` on
-failure, so a missing file is something you test for rather than
-something that stops you — the same treatment division by zero gets.
+The path may be any text expression, like `img` and `aud`:
+`blob save = saveDir + 'slot1.dat'`.
 
-What `readFile` returns is an ordinary `text`, so it composes with
+**Nothing here fails the program.** A path that can't be read gives you
+an empty blob, and the writers return `false` on failure — a missing
+file is something you test for rather than something that stops you, the
+same treatment division by zero gets. That is also how you create a file
+that doesn't exist yet: declare the blob and write to it.
+
+```festina
+blob fresh = 'new.txt'
+log(fresh.exists())                   // false
+fresh.write('now it does')
+log(fresh.exists())                   // true
+```
+
+`toText()` hands back an ordinary owned `text`, so it composes with
 everything else:
 
 ```festina
-text body = readFile('data.csv')
-if body != null {
-    log(body.replaceAll(',', ' | '))
-}
+blob data = 'data.csv'
+log(data.toText().replace(/,/g, ' | '))
 ```
+
+**A blob is its contents, not its path.** `write()` and `append()`
+update the bytes as well as the file, so `toText()` after a write
+reports what you wrote. And `delete()` removes the file while leaving
+the blob alone — "delete it but keep what it said" is expressible:
+
+```festina
+blob temp = 'scratch.txt'
+temp.write('remember this')
+temp.delete()
+log(temp.exists())                    // false
+log(temp.toText())                    // remember this
+```
+
+**Assigning a blob shares one handle, it does not copy.** Two names for
+one file's contents; writing through either is visible through both.
+Rebinding one of them releases its own reference, and the contents are
+freed once nothing refers to them:
+
+```festina
+blob a = 'one.txt'
+blob b = a                            // same handle, not a second load
+a.write('changed')
+log(b.toText())                       // changed
+
+a = 'two.txt'                         // `a` moves on; `b` still holds one.txt
+```
+
+### Blobs in the database
+
+A `blob` column stores the **bytes**, so binary content round-trips
+byte-identically — the same treatment `img` and `aud` columns get:
+
+```festina
+table Saves { name:text  data:blob }
+
+blob save = 'slot1.dat'
+sqlite('INSERT INTO Saves (name, data) VALUES (?, ?)', ['slot1', save])
+
+arr[Saves] rows = sqlite('SELECT * FROM Saves')
+log(rows[0].data.toText())
+```
+
+A blob that came out of a column has bytes but **no path** — a path is
+meaningful only on the machine that stored it. Its `exists()`,
+`write()`, `append()` and `delete()` all answer `false` rather than
+inventing a temporary file. `toText()` works as usual.
+
+`save(path)` is how one gets to disk — see
+[Saving bytes to a path](#saving-bytes-to-a-path) below, which is the
+same method on `img` and `aud`.
+
+```festina
+arr[Saves] rows = sqlite('SELECT * FROM Saves')
+blob back = rows[0].data
+log(back.exists())                    // false -- no path
+back.save('recovered.dat')            // now it has one
+log(back.exists())                    // true
+```
+
+## Freeing and deleting
+
+Memory is automatic — but `free` and `delete` exist for the moments you
+know better than the compiler does.
+
+### `free`
+
+```festina
+img spritesheet = 'spritesheet.png'
+img grass = spritesheet.clip(0, 0, 31, 31)
+img dirt = spritesheet.clip(32, 0, 31, 31)
+free spritesheet                       // the sheet goes now, not at exit
+```
+
+`free name` releases whatever the binding holds and sets the binding to
+`null`. It works on **every type**:
+
+- **struct / `arr[T]` / `map[T]` / `blob`** — a reference-count
+  *decrement*, not a forced free. A value something else still points at
+  survives until its last reference drops; freeing an array releases
+  each element the same way, so a shared element outlives its array.
+- **`img` / `aud`** — freed outright. These are the types the compiler
+  can't always reclaim on its own (an escaping handle lives for the
+  program's lifetime — see the note under Images), so `free` is the
+  manual escape hatch: cut your clips, then `free spritesheet`. The
+  contract is the manual one: another binding still aliasing the handle
+  is left dangling — the freed *binding* reads `null`, an alias does not.
+- **`text`** — the buffer is freed (a text is exclusively owned).
+- **`regex`** — a `regex()` result is freed; a `/pattern/` literal's
+  process-lifetime cache marks itself and survives, so `free` is safe on
+  either.
+- **a query row** — the binding is nulled *without* freeing: the row is
+  owned by the array it came from. Free the array.
+- **`int` / `float` / `bool`** — nothing to release; `free x` is `x = null`.
+
+`free` composes with automatic reclamation: freeing twice is a no-op,
+and a freed binding that scope-exit cleanup later visits is already
+`null`, which every release treats as nothing-to-do. Constants and
+parameters can't be freed (a parameter borrows its caller's value).
+
+### `delete`
+
+```festina
+map[text] example = {'data': 'some data', 'more-data': 'Some more data'}
+delete example.data
+delete example['more-data']
+```
+
+On a **map**, `delete` removes the entry, JS-style — the key stops
+existing (`forEach` no longer visits it), which setting `null` could
+never express. Deleting a missing key is a safe no-op. The key can be a
+computed expression: `delete m[`k${i}`]`.
+
+On a **struct or query-row field**, `delete` releases the value and the
+field reads `null` afterwards. On a query row it *also* marks the column
+undefined — see below. (One inherited caveat: a struct field whose own
+type is struct/arr/map auto-vivifies on the next reach-through, per the
+zero-value rule, so it re-appears empty rather than staying null.)
+
+To remove a whole *variable*, that's `free` — `delete x` says so.
+
+## Saving bytes to a path
+
+`blob`, `img` and `aud` are the same shape of value — content, plus the
+bytes it came from — so all three save the same way.
+
+```festina
+value.save()                          // write to the path it already has
+value.save(path)                      // adopt `path`, then write there
+value.saveCopy(path)                  // write there, keep its own path
+```
+
+All three return `bool`: `true` if the write landed.
+
+**`save(path)` changes the value's path; `saveCopy(path)` doesn't.** That
+is the whole difference. After `save`, everything else that acts on the
+value follows the new path — a blob's `exists()` and `delete()` included.
+After `saveCopy`, the value is still pointed at where it was:
+
+```festina
+blob f = 'one.txt'
+f.write('original')
+
+f.saveCopy('copy.txt')                // copy.txt written; f is still one.txt
+f.write('changed')                    // ...so this goes to one.txt
+
+f.save('two.txt')                     // two.txt written; f is now two.txt
+f.delete()                            // deletes two.txt, not one.txt
+```
+
+`saveCopy` requires its path — a copy to nowhere in particular isn't a
+thing to ask for, and making the argument mandatory turns "I meant
+`save()`" into a compile error rather than a silent overwrite.
+
+**A value with no path can only use `save(path)`.** An `img` from
+`clip()`, or anything read out of a database column, has never been on
+disk. Calling `save()` on one **fails the program** rather than returning
+`false` — a program asking to save something to nowhere has a bug, where
+an unwritable directory is a condition of the filesystem and still just
+answers `false`.
+
+```festina
+img spritesheet = 'spritesheet.png'
+img grass = spritesheet.clip(0, 0, 32, 32)
+
+grass.save()                          // fails: this img has no path
+grass.save('grass.png')               // fine -- and now it has one
+grass.save()                          // fine from here on
+grass.saveCopy('backup/grass.png')    // fine; grass.png stays its path
+```
+
+The path must name a **file**, not a directory. A directory would have to
+borrow a filename from somewhere, and the value that most needs saving is
+exactly the one with no filename to lend, so it would work only where it
+was least useful. Passing one answers `false`.
+
+**Formats survive.** What gets written is the value's own encoded bytes,
+so an MP3 saves as an MP3 and a JPEG as a JPEG rather than being
+re-encoded — the same property that makes a BLOB column round-trip
+byte-identically. The one exception is an image you built rather than
+loaded: a `clip()` or `resize()` result has no source bytes, so it is
+encoded as PNG, which is lossless.
+
+A failed save does **not** adopt the path. Pointing a value at a file
+that was never written would leave `exists()` answering `false` about a
+path you were just told it had.
 
 ## Time
 
@@ -1048,18 +1439,22 @@ deadlines together so neither blocks the other.
 
 ```festina
 aud music = 'music.wav'               // WAV (16-bit PCM) or MP3
-music.play()                          // once
-music.playLoop()                      // until stopped
+int ch = music.play()                 // once  -> the channel it played on
+music.playLoop()                      // until stopped -> also returns one
 music.isPlaying()                     // true the instant play() returns
+music.stop()                          // silence this clip, everywhere
 
+stopAudioPlayer(ch)                   // stop one channel
 stopAudioPlayer()                     // stop every channel
 ```
 
 A path declares the clip, the same way `blob`, `color`, `font` and `img`
 are each written as the text that reads best. It's a real load, not a
 compile-time resolution, so the path may be any text expression
-(`aud hit = soundDir + 'hit.wav'`). `loadAudio('...')` still works and
-means exactly the same thing.
+(`aud hit = soundDir + 'hit.wav'`).
+
+`save()`/`saveCopy()` write a clip back out; see
+[Saving bytes to a path](#saving-bytes-to-a-path).
 
 **WAV (16-bit PCM) and MP3.** The format is sniffed from the file's
 contents, not its extension — a clip out of a database column has no
@@ -1070,12 +1465,35 @@ load with a message naming both supported formats.
 Plays through a real ALSA output device on a background thread, so
 playback doesn't block the rest of the program.
 
-**There is no `music.stop()`.** One clip can be playing on several
-channels at once — three overlapping gunshots are the ordinary case, not
-the exotic one — so "stop this clip" never named one thing. Playback is
-stopped by channel: `stopAudioPlayer(n)`, or `stopAudioPlayer()` for all.
-`isPlaying()` stays clip-wide, because "is this sound audible anywhere"
-does still have a single answer.
+### Stopping a sound
+
+There are two questions, and they have two answers.
+
+**`stop()` silences this clip everywhere.** One clip can be playing on
+several channels at once, so this stops all of them. That is what you
+want for a looping engine hum, a music bed or a dialogue line — anything
+where "this sound should not be audible any more" is the whole thought.
+
+**`stopAudioPlayer(n)` stops one channel.** That is what you want when
+three gunshots are overlapping and only one of them should end.
+
+Which channel? The one `play()` handed back:
+
+```festina
+aud engine = 'engine.wav'
+int hum = engine.playLoop()    // the pool picked a channel; now you know it
+// ...later...
+stopAudioPlayer(hum)           // stop exactly that one
+```
+
+`play()` and `playLoop()` both return the channel they used, or `-1` if
+nothing played (which happens only when every channel is reserved). Before
+that, a channel the pool assigned on its own was one you could not name,
+so the pool was addressable only by picking channels by hand — that is,
+by not using the pool.
+
+`isPlaying()` is clip-wide, like `stop()`: "is this sound audible
+anywhere" and "silence it everywhere" are one question asked two ways.
 
 ### Overlapping sounds
 
@@ -1085,13 +1503,13 @@ coin pickup firing in rapid succession layer instead of interrupting
 each other, which is what a game actually needs:
 
 ```festina
-aud coin = loadAudio('coin.wav')
+aud coin = 'coin.wav'
 coin.play()   // three overlapping copies, not one restarted three times
 coin.play()
 coin.play()
 ```
 
-The clip's audio is decoded once, at `loadAudio()` time; a channel costs
+The clip's audio is decoded once, at the declaration; a channel costs
 a thread and a device handle, never another copy of the samples.
 
 ```festina
@@ -1116,8 +1534,8 @@ two different clips can share one, which is what makes handing a music
 channel from one track to another expressible at all:
 
 ```festina
-aud adventureMusic = loadAudio('adventure.wav')
-aud battleMusic = loadAudio('battle.wav')
+aud adventureMusic = 'adventure.wav'
+aud battleMusic = 'battle.wav'
 
 adventureMusic.playLoop(0)          // loops on channel 0, and reserves it
 setInterval(changeMusic, 100000)

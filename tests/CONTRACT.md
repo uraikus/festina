@@ -39,16 +39,17 @@ import graph and merges every file into one compilation unit, and
 `bin/festina`/`festina.cli.compile_file` actually call it now (they
 used to only ever compile the single entry file). So is claude.md
 #67/#68 (regex, string match/replace) -- `.test()`, `.match()`, and
-`.replace()`/`.replaceAll()` are recognized Call-on-Member patterns the
+`.replace()` are recognized Call-on-Member patterns the
 same way `Math.floor`/`int.toFloat()` already are, and the whole feature
 is built on POSIX extended regular expressions (`<regex.h>`, already
 part of libc) rather than a bundled or external regex engine, per
 claude.md #59. A regex value was originally constructible only via a
-`regex()` builtin function call (like `sqlite()`/`loadImage()`), with no
+`regex()` builtin function call (like `sqlite()`), with no
 dedicated literal syntax at all -- see this section's later "JS-style
 regex literal syntax" paragraph below for why and how that changed.
-claude.md #37/#39/#40 (`img`/`loadImage()`, `drawRect`/`drawCircle`/
-`drawText`/`drawImage`, `on click`/`on mouse`/`on keyDown`/`on keyUp`/
+claude.md #37/#39/#40 (`img` from a path, `drawRect`/`drawCircle`/
+`drawText`/`drawImage`, `on mouseDown`/`on mouseUp`/`on mouse`/
+`on keyDown`/`on keyUp`/
 `on resize`/`on close`, `clientWidth`/`clientHeight`) are implemented
 too, per the
 user's own clarification that this means a real on-screen window --
@@ -62,7 +63,7 @@ hints), starts at 800x600, and is opened lazily -- `CodeGen.uses_graphics`
 call, a bare `clientWidth`/`clientHeight` reference, or an `on
 click`/`mouse`/`key`/`resize`/`close` handler declaration, gating
 `festina_graphics_init()`/`festina_run_event_loop()` calls in `main()` --
-*except* `loadImage()` alone, which deliberately does NOT set it: Cairo
+*except* declaring an `img` alone, which deliberately does NOT set it: Cairo
 decodes PNGs from its own in-memory decoder, needing no X server at all,
 so a program that only loads an image (never drawing it or opening a
 window) shouldn't be forced to have a display. click/mouse/key/resize/
@@ -112,7 +113,7 @@ gate the same call in `main()`, now named `festina_run_event_loop`
 (renamed from `festina_graphics_run`, which is what it was called back
 when graphics was the only thing that could ever block there): with
 graphics in use, it multiplexes X11 events and timer deadlines on one
-`select()` call so both an `on click` handler and a `setInterval`
+`select()` call so both an `on mouseDown` handler and a `setInterval`
 callback stay responsive together, not just one or the other; without
 graphics, it sleeps until the next timer deadline and fires it, for as
 long as there's still an active timer to wait for, exactly matching
@@ -121,12 +122,12 @@ only calls setTimeout() exits once every one-shot timeout has fired,
 while one that calls setInterval() and never clears it runs forever,
 exactly like an uncleared setInterval() would in a real JS runtime.
 Verified end to end, including the combined graphics-and-timers case
-(a `setInterval` callback and an `on click` handler both firing while
+(a `setInterval` callback and an `on mouseDown` handler both firing while
 the same window stays open) against a real (virtual) X server -- see
 "Why the tests are structured this way" below for
 `tests/test_timers.py`/`TestTimers`.
 
-claude.md #38 (aud, loadAudio(), .play()/.stop()/.isPlaying()) is
+claude.md #38 (aud from a path, .play()/.stop()/.isPlaying()) is
 implemented too -- a loaded clip is `ptr` to an opaque `FestinaAudio`
 (decoded PCM plus playback state, same lower-to-`ptr` convention as
 img/regex/table values), and play()/stop()/isPlaying() are ordinary
@@ -136,7 +137,7 @@ exactly these three methods for `aud`, so (unlike log()/fail()/
 sqlite()'s deliberately open shape) any other method call on an `aud`
 value is now a compile error rather than the permissive fallthrough
 `aud`/`img` used to share back when neither had any real methods
-modeled. `loadAudio()` only supports WAV (16-bit PCM) -- claude.md's
+modeled. Audio loading only supports WAV (16-bit PCM) -- claude.md's
 own example names a `.mp3`, but unlike Cairo (which decodes PNG on its
 own) nothing this project already depends on can decode MP3 without a
 real new library, so WAV -- parsed directly in festina_runtime.c with
@@ -240,8 +241,8 @@ the full reasoning):
   new restriction for) but is now explicitly documented as a
   considered choice in `festina/codegen.py`'s `_emit_func`, where it
   previously had no comment explaining it at all.
-- `drawRect`/`drawCircle`/`drawText`/`drawImage`/`loadImage`/
-  `loadAudio`/`regex`/`setTimeout`/`setInterval`/`clearTimeout`/
+- `drawRect`/`drawCircle`/`drawText`/`drawImage`/
+  `regex`/`setTimeout`/`setInterval`/`clearTimeout`/
   `clearInterval` aren't lexer keywords (unlike `log`/`fail`/`sqlite`),
   so a user could declare `void func drawRect(...) { ... }` -- it
   compiled fine, but every *call* to `drawRect(...)` still resolved to
@@ -330,7 +331,7 @@ unused feature's library is never on the link line to begin with, not
 merely dead-code-eliminated from it. `CodeGen.uses_graphics_code` is
 deliberately a separate, broader flag than the pre-existing
 `uses_graphics` (which still only gates lazily opening a canvas window):
-`loadImage()` alone doesn't open a window (see its own doc comment above)
+declaring an `img` alone doesn't open a window (see its own doc comment above)
 but `festina_load_image()` still lives in the graphics object file, so
 linking needs the broader signal even though window-opening doesn't. The
 previously-unified `festina_run_event_loop` (X11 `select()`-multiplexed
@@ -398,8 +399,10 @@ compiler `compile_and_run` already requires.
 
 `examples/` grew beyond the original hello/basic/arrays/geometry/
 multifile/regex set: `timers.f` (setTimeout/setInterval), `graphics.f`
-(drawing + all six event handlers), `audio.f` (loadAudio/play/stop/
-isPlaying, with a small generated `beep.wav` fixture), `fizzbuzz.f` (a
+(drawing + every event handler), `audio.f` (a clip from a path,
+play/stop/isPlaying/channels, with a small generated `beep.wav`
+fixture), `files.f` (claude.md #109's `blob` and #110's save/saveCopy),
+`fizzbuzz.f` (a
 dependency-free loops/modulo tour), and `tic_tac_toe.f` -- a real,
 playable two-player game (click a cell, alternating X/O, win detection
 across all eight lines) built entirely around this runtime's actual
@@ -439,9 +442,9 @@ parse) and an unterminated attempt (no closing `/` before a newline)
 falling back to plain division rather than raising. Flags are validated
 for real at parse time (`Parser.parse_primary`'s `REGEX` handling) --
 only `i` (case-insensitive, matching `regex()`'s own flag) and `g`
-(accepted for familiarity, but a deliberate no-op: `.replace()`/
-`.replaceAll()` already say first-vs-every-match explicitly, the same
-distinction JS's `g` flag controls implicitly) are accepted; any other
+(claude.md #107: replace every match rather than the first -- it used to
+be an accepted-but-inert letter, back when `.replaceAll()` was how that
+was said) are accepted; any other
 letter, or a repeated flag, is a clear compile error -- something
 `regex()`'s flags *argument* can never offer, since it's an arbitrary
 runtime `text` expression the compiler can't inspect. Escaping: `\/`
@@ -1318,6 +1321,21 @@ more bug while doing so, and deliberately did NOT attempt a third
   program -- a DAG by construction. No cycle detector, no tracing
   collector, needed at all.
 
+  > **Superseded by claude.md #106.** The declaration-order rule this
+  > paragraph rests on was an ordering accident in `analyze_struct`,
+  > not a property of the type system, and #106 removed it so linked
+  > lists and trees could be written. `struct Node { next:Node }`
+  > compiles now, so a reference cycle is constructible and refcounting
+  > does not free it -- measured under LeakSanitizer at 1,200 bytes in
+  > 50 objects over 50 iterations. Everything else above is unchanged
+  > and still correct: acyclic data, self-referencing types included,
+  > is fully reclaimed (a three-node list built and dropped 200 times
+  > leaks nothing). The cycle is a clean leak, never a double-free or
+  > use-after-free, which
+  > `TestSelfReferencingStructs::test_a_reference_cycle_runs_correctly_and_does_not_crash`
+  > pins, and clearing the back-reference (`a.next = null`) reclaims
+  > it normally -- also verified under LeakSanitizer, also pinned.
+
   **Representation:** every refcounted struct allocation has a single
   `i64` refcount immediately before the pointer Festina code itself
   sees -- a fixed 8-byte offset regardless of the struct's own field
@@ -1722,9 +1740,16 @@ more bug while doing so, and deliberately did NOT attempt a third
   field cascade between the decrement and the actual `free()` call),
   and only if it just reached zero, releases each struct-typed field
   (via *that* field's own release function, recursively) before freeing
-  its own storage -- recursion that always terminates for the identical
-  DAG reason claude.md #77 already gives for why cycles are
-  structurally impossible. Every existing release call site now
+  its own storage -- recursion that always terminates because the
+  wrapper's cache entry is written *before* the field loop recurses, so
+  a type that reaches itself gets the already-registered name back
+  instead of generating a second wrapper. (This was originally
+  justified by claude.md #77's DAG argument instead; claude.md #106
+  removed the declaration-order rule that argument depended on, and the
+  cache write turned out to be what was actually doing the work. A
+  self-referencing struct now generates exactly one wrapper, which
+  calls itself -- pinned by
+  `TestSelfReferencingStructs::test_a_self_referencing_struct_still_has_a_release_wrapper`.) Every existing release call site now
   dispatches through this instead of calling the plain
   `@festina_release` directly.
 
@@ -2266,7 +2291,27 @@ explicitly not for anything security-adjacent, and excluding 1.0 keeps
 `appendFile`/`fileExists`/`deleteFile`, none of which fails the program:
 `readFile` answers `null` and the writers `false`, the same treatment
 #57 gives division by zero (a failing `fclose` counts as a failed write,
-since a full disk can fail there after every `fwrite` succeeded). Time
+since a full disk can fail there after every `fwrite` succeeded).
+
+  > **claude.md #109 moved all five onto `blob`** -- `blob f =
+  > 'notes.txt'` then `f.write(...)`/`f.append(...)`/`f.toText()`/
+  > `f.exists()`/`f.delete()`. The C helpers are unchanged and still do
+  > the work, and the never-fail rule above is unchanged too; what went
+  > away is the free-function spelling, which threaded the same path
+  > through five separate calls. Each removed name is caught by name
+  > with an error showing its blob replacement.
+  >
+  > **claude.md #110 added `save()`/`save(path)`/`saveCopy(path)`**, on
+  > `img` and `aud` as well as `blob`, since all three are the same
+  > content-plus-origin shape and one policy beats three that nearly
+  > agree. `save(path)` ADOPTS the path (so `exists()`/`delete()` follow
+  > it); `saveCopy(path)` does not. This closes the gap #109 shipped
+  > knowingly: a handle with no path -- a `clip()` result, anything out
+  > of a database column -- could not reach the disk at all. It is also
+  > the one place here that FAILS rather than answering false: `save()`
+  > with no path to save to is a bug in the program, where an unwritable
+  > directory is a condition of the filesystem.
+  > `tests/test_codegen.py::TestSaveAndSaveCopy` (27 tests). Time
 got `now()` (ms since epoch, matching `Date.now()` and the unit
 `setTimeout` already takes) and `formatTime`. `saveCanvas(path)` writes
 the *backing* surface, so it captures what the program drew rather than
@@ -2464,6 +2509,16 @@ finishes in 0ms), so under it there is no concurrency left to observe
 at all. The harness replaces the device layer and keeps every line
 above it real; clean under both ThreadSanitizer and AddressSanitizer.
 
+  Note for anyone touching `festina_runtime_audio.c`: these three
+  harnesses `#include` it and compile it STANDALONE, stubbing what it
+  needs from the core runtime, specifically so a test about the channel
+  pool does not have to link sqlite3. Adding a core-runtime call to
+  that translation unit therefore breaks all of them at LINK time, not
+  compile time -- which is what happened when claude.md #110 gave audio
+  a `save()` that delegates to `festina_save_bytes`. The fix is a
+  two-line stub next to the existing `festina_fail` one; recognizing
+  the failure took longer than writing it.
+
 **claude.md #99**: channels are named, and a loop reserves one.
 
 #98's pool gave a clip overlapping playback but no way to address any
@@ -2514,6 +2569,38 @@ same reasons the pool tests are), 4 end-to-end tests in `TestAudio`
 alternation), and 8 in `tests/test_audio.py` for the signatures. Clean
 under ThreadSanitizer and AddressSanitizer.
 
+**claude.md #105**: MonoGame added to the canvas benchmark.
+
+The same 20,000 rectangles and 20,000 circles through SpriteBatch into
+an offscreen RenderTarget2D. Festina 31 ms, Chromium's canvas ~60 ms,
+MonoGame ~177 ms -- and that last number is close to meaningless without
+its caveat, so the caveat is printed with it: **MonoGame is a GPU
+framework and this machine has no GPU**, so its GL context is Mesa's
+`llvmpipe`, paying in software for the whole graphics pipeline. On real
+hardware these 40,000 sprites batch into a couple of draw calls and
+finish in well under a millisecond. The row measures the headless,
+no-GPU case only.
+
+The MonoGame side is written idiomatically -- 1x1 tinted texture for
+rects, pre-rendered circle texture, one deferred SpriteBatch so the
+framework batches as designed. Defeating that would have produced a
+bigger number and a worthless one.
+
+Trustworthy timing took three attempts: the one-pixel readback that
+syncs the browser syncs only *sometimes* here (min 193, median 519, max
+553 within one run), and no readback at all is worse still (516/526/538,
+because frames queue and a timed region holds another frame's backlog).
+Reading the whole target forces a real finish and costs 0.4 ms on an
+untouched target. llvmpipe is also multithreaded and far more exposed to
+machine noise than single-threaded Cairo (176/182/513 ms across three
+invocations), so the runner launches the process several times and keeps
+the best.
+
+MonoGame's frame matches Festina's with a worst per-channel difference
+of **0.0** -- better than the browser's 0.2 -- because the circle
+texture is built with the same coverage-based antialiasing Cairo
+applies. Skips with a note when there is no .NET SDK or no network.
+
 **claude.md #104**: filled circles are stamped, not tessellated.
 
 claude.md #103 measured Festina's canvas at 1.4x *slower* than a
@@ -2539,6 +2626,53 @@ pixel by pixel: 5 pixels of 480,000 differed, all by 1/255, all inside a
 gradient (sampling rounding, not geometry). Isolated circles are
 bit-identical from r=1 to r=20.
 `tests/test_codegen.py::TestCircleMaskFastPath` (15 tests).
+
+**claude.md #111**: `free`, `delete`, `undefined()` — and columns match
+by name.
+
+`free name` releases and nulls a binding of any type — a refcount
+decrement for struct/arr/map/blob (shared values survive), an outright
+free for img/aud (the manual escape hatch for the escaping-handle leak),
+`x = null` for scalars, and a drop-without-free for a borrowed query
+row. Safe because every runtime release is null-safe and a free target
+counts as escaping (stack-allocated storage has no refcount header to
+release through — ASan caught the underflow on the first try, and the
+escape rule is the fix). A regex value carries a `cached` mark so
+freeing a /pattern/ literal binding no-ops instead of corrupting the
+line's shared cache. Constants and parameters refuse at compile time.
+Also surfaced a real latent bug: globals retained fresh values
+unconditionally (count 2), unobservable until `free` tried to drop the
+last reference; globals now use locals' freshness test.
+`tests/test_codegen.py::TestFreeStatement` (9 tests).
+
+`delete m.key`/`delete m['key']` removes a map entry outright (forEach
+skips it; missing key is a no-op); `delete s.field` releases and nulls;
+on a query row it also clears the presence bit so the column reads as
+undefined. `delete x` on a variable errors, naming `free`. blob's
+`f.delete()` method still parses — member names accept keywords.
+`tests/test_codegen.py::TestDeleteStatement` (9 tests).
+
+`row.undefined('col')` distinguishes a database NULL from a column the
+query never selected (or deleted). Building it exposed that column
+matching was POSITIONAL — `select name from t` put text bits in the id
+slot, and a test named test_columns_map_by_position_not_name pinned the
+bug as a contract. Matching is by name now (case-insensitive); each row
+carries a presence bitmask one hidden slot past its columns; an unknown
+name in undefined() fails the program.
+`tests/test_codegen.py::TestUndefinedAndNameMatchedColumns` (6 tests).
+
+**claude.md #112**: structs as sqlite() targets.
+
+`arr[SomeStruct] q = sqlite('select id as whatever ...')` — the landing
+spot for aliased columns, JOINs and computed results, which a table's
+declared columns can never chase (and which a `table` declaration would
+answer by CREATE-ing a table). Shares #111's whole pipeline; a generated
+per-struct function then converts each flat row into a real refcounted
+struct in place, transferring pointer-field ownership, so the elements
+are ordinary structs and free/delete/aliasing/release all apply
+unchanged. Non-queryable field types error naming the field; the
+presence mask is dropped, so undefined() stays a table-row method.
+`tests/test_codegen.py::TestStructQueryTargets` (7 tests).
 
 **claude.md #102**: a bug hunt, and a leak harness that can fail.
 
@@ -2577,6 +2711,22 @@ Six bugs found by deliberate probing rather than by waiting for them:
   still leaks, deliberately, with a test pinning that the value stays
   intact so a later "optimization" cannot make that trade.
   `tests/test_codegen.py::TestDiscardedCallResultReachedForAField` (3).
+
+  > **Widened by claude.md #108.** The "therefore" above does not
+  > follow. `f().inner` yields a struct and genuinely cannot be
+  > released; `f().inner.n` yields an int, a copy that owes the object
+  > nothing, and is safe once loaded. #102 could not tell them apart
+  > because it decided one link too early. The decision moved to the
+  > OUTERMOST link of a member chain, so any chain yielding a plain
+  > copy now releases every call result it produced (5,200 bytes over
+  > 100 iterations, recovered). `.length` was fixed in the same pass:
+  > it has its own branch in the expression emitter and never reached
+  > this path at all, so `rowsFor(x).length` leaked (2,880 bytes over
+  > 60 iterations) despite the code's own docstring listing it as
+  > covered. A chain ending in a managed value or a text still leaks,
+  > for #102's original reason, with tests pinning that the loaded
+  > value stays intact.
+  > `tests/test_codegen.py::TestChainedCallResultReachedForAField` (7).
 - **A literal of all nulls could not be written.** `arr[text] a = [null]`
   inferred `arr[null]` and was rejected, while `a.push(null)` and
   `[null, 'x']` were both already fine -- an inconsistency, not a
@@ -2606,7 +2756,11 @@ clang is the only one that parses `.ll` while its ASan runtime library
 ships separately and is routinely absent -- so the linking compiler is
 probed, not assumed. The only real defence against both is a canary:
 `test_the_harness_can_actually_fail` feeds it a known-leaking program
-and fails if it comes back clean.
+and fails if it comes back clean. That canary was a chained call-result
+read until claude.md #108 fixed it, at which point the test failed
+loudly -- exactly the failure mode a canary should have. It is a
+reference cycle now (claude.md #106), which needs a tracing collector
+and so should outlast anything else available to leak on purpose.
 
 **claude.md #101**: images are paths too, more formats, and both media
 types fit in a table.
@@ -2686,6 +2840,13 @@ be any text expression, and the conversion is a real file read wherever
 it happens. `loadAudio('...')` still works; it is the same call spelled
 longer, and breaking every program that uses it would gain nothing.
 
+  > **claude.md #109 removed `loadAudio()` and `loadImage()` after
+  > all.** "Breaking every program that uses it would gain nothing" was
+  > the right call at the time and stopped being right once the path
+  > form was the documented one everywhere: two spellings of one thing
+  > is a cost paid by every reader forever, against a one-line edit
+  > paid once. Both names now error with the path form in the message.
+
 *`aud.stop()` is removed.* **Breaking change.** It was already wrong
 when #98 gave a clip a pool of voices and #99 only made it more
 obviously so: one clip can be playing on several channels at once
@@ -2700,6 +2861,18 @@ generic unknown-method error, so the message can name the replacement.
 same problem: "is this sound audible anywhere" has one answer however
 many channels are playing it, and it is what #99's music-handover
 pattern is built on.
+
+  > **claude.md #109 brought `.stop()` back**, meaning exactly the
+  > "stop every copy" reading this paragraph identified. The reasoning
+  > above was sound and incomplete: the case it dismissed is real
+  > (silencing a looping hum, a music bed, a dialogue line), and the
+  > alternative it pointed at needed a channel number that automatic
+  > assignment never told anyone. So #109 fixed the missing half --
+  > `play()`/`playLoop()` return the channel they used -- and restored
+  > the method. `stop()` is clip-wide, `stopAudioPlayer(n)` is one
+  > channel, and `isPlaying()` is clip-wide for the same reason
+  > `stop()` is. `.stop(n)` is still caught by name, since a channel
+  > argument would mean the other thing.
 `tests/test_codegen.py::TestAudio` (4 more tests) and
 `tests/test_audio.py` (4 more).
 
@@ -2830,8 +3003,9 @@ schema sync still firing for a table declared in an imported file.
 `tests/test_regex.py` covers claude.md #67/#68 (regex, string
 match/replace) at the parser/semantic level, same split as
 `test_loops.py`/`test_numeric_conversion.py` -- argument-count and
-argument-type checking for `.test()`/`.match()`/`.replace()`/
-`.replaceAll()`, and that calling any of them on the wrong receiver
+argument-type checking for `.test()`/`.match()`/`.replace()`, that
+`.replaceAll()` is now rejected by name with an error pointing at the
+`g` flag (claude.md #107), and that calling any of them on the wrong receiver
 type (e.g. `.match()` on `int`) is rejected the same way an undefined
 struct field access already is. `test_codegen.py`'s `TestRegex` covers
 the same feature end to end, including two cases that are easy to get
@@ -2945,7 +3119,7 @@ test in the class that needs a real display (`x_display`/
 `run_graphics_program`, reusing the `_find_window`/`_wait_for_output`
 helpers this file promoted from `TestGraphics` methods to module-level
 functions once `TestTimers` also needed them): it opens a window with
-both a `setInterval` and an `on click` handler, confirms the interval
+both a `setInterval` and an `on mouseDown` handler, confirms the interval
 fires on its own, then confirms a real simulated click still dispatches
 correctly *and* the interval keeps firing both before and after it --
 proving `festina_run_event_loop`'s `select()` call is genuinely
@@ -3087,8 +3261,8 @@ festina/
         # an Identifier resolving to a non-constant int. claude.md #67/
         # #68: regex() is a BUILTIN_FUNCTIONS entry (like sqlite()/
         # loadImage(), returning RegexType()); pattern.test(text)/
-        # value.match(regex)/value.replace(text-or-regex, text)/
-        # .replaceAll(...) are recognized Call-on-Member patterns, same
+        # value.match(regex)/value.replace(text-or-regex, text)
+        # are recognized Call-on-Member patterns, same
         # family as Math.floor/int.toFloat() above -- checked by name
         # against the receiver's inferred type, not a real method table
         # (Festina has no general concept of methods on primitives).
@@ -3098,11 +3272,12 @@ festina/
         # builtin dispatch branch); builtins with no entry there --
         # log/fail/sqlite/loadAudio -- stay fully permissive, unchanged
         # from before. claude.md #40: analyze_event_handler requires an
-        # `on click`/`mouse`/`key`/`resize`/`close` handler to declare
+        # `on mouseDown`/`mouseUp`/`mouse`/`key`/`resize`/`close`
+        # handler to declare
         # exactly the signature _EVENT_SIGNATURES has for it
-        # (`(x:int, y:int)` for click/mouse, `(key:text)` for key, no
-        # parameters for resize/close) -- any other event name is
-        # unconstrained, since only those five have a runtime event
+        # (`(x:int, y:int)` for the mouse events, `(key:text)` for key,
+        # no parameters for resize/close) -- any other event name is
+        # unconstrained, since only those have a runtime event
         # source at all (see codegen.py below). claude.md #39:
         # clientWidth/clientHeight (_CLIENT_SIZE_GLOBALS) are
         # pre-registered directly into global_scope as read-only `int`
@@ -3180,9 +3355,10 @@ festina/
         # division/modulo by zero returning a reserved null sentinel
         # (INT_NULL_CONST / FLOAT_NULL_CONST) via real control flow rather
         # than a trapping instruction, and regex()/.test()/.match()/
-        # .replace()/.replaceAll() (_emit_regex_call plus the same
+        # .replace() (_emit_regex_call plus the same
         # Member-call dispatch Math.floor/int.toFloat() use -- a regex
-        # value is `ptr` to an opaque, POSIX regex_t compiled fresh at
+        # value is `ptr` to an opaque FestinaRegex (a POSIX regex_t plus
+        # claude.md #107's `g` flag), compiled fresh at
         # every regex() call site via the festina_runtime C helpers; no
         # IR-level machinery of its own, it's all in the runtime), and
         # claude.md #37/#39/#40 (image/graphics/events -- see "Status"
@@ -3205,7 +3381,8 @@ festina/
         # festina_graphics_init()/festina_run_event_loop() calls around
         # __festina_main() in _emit_main_and_entry, and
         # self.event_handlers drives emitting
-        # festina_register_click_handler/_register_mouse_handler/
+        # festina_register_mouse_down_handler/_register_mouse_up_handler/
+        # _register_mouse_handler/
         # _register_key_handler/_register_resize_handler/
         # _register_close_handler calls there too -- loadImage() alone
         # deliberately does not set uses_graphics (see
@@ -3372,7 +3549,8 @@ byte at a time when that happens -- verified directly in
 which would time out (not just assert wrong output) if this were ever
 broken again. `festina_graphics_init`/`_run`, `festina_draw_rect`/
 `_draw_circle`/`_draw_text`/`_draw_image`, `festina_load_image`,
-`festina_register_click_handler`/`_register_mouse_handler`/
+`festina_register_mouse_down_handler`/`_register_mouse_up_handler`/
+`_register_mouse_handler`/
 `_register_key_handler`/`_register_resize_handler`/
 `_register_close_handler`, and `festina_client_width`/`_height`
 (#37/#39/#40: image/graphics/events) open a real X11 window via Xlib and

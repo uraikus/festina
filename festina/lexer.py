@@ -22,7 +22,11 @@ SPEC_KEYWORDS = frozenset({
 # as language keywords (they're explicitly *not* part of the language --
 # claude.md #53). `return` is genuinely part of the language (#23 example
 # bodies use it) but is likewise absent from the #51 list.
-_EXTRA_KEYWORDS = frozenset({"return", "var", "let", "throw"})
+# claude.md #111 adds `free` and `delete` -- real statements, so the
+# parser needs distinct token types to dispatch on. Both remain valid
+# MEMBER names (parser.eat_name accepts keyword tokens), which is what
+# keeps blob's `f.delete()` parsing.
+_EXTRA_KEYWORDS = frozenset({"return", "var", "let", "throw", "free", "delete"})
 
 # Exposed reserved-word set used by the parser/semantic layer. A superset
 # of the spec's list is fine -- tests only check the spec words are

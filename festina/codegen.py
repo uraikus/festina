@@ -9,7 +9,7 @@ see the "Audio" note below), #41/#42 (log/fail), #45 (string
 interpolation), #55-57 (int.toFloat(), Math.floor/ceil/round/trunc,
 division/modulo by zero), #60/#61 (for/while loops), #63 (array
 .length), #66 (postfix ++/--), #67-68 (regex(), .test(), .match(),
-.replace()/.replaceAll() -- see _emit_regex_call and the Member-call
+.replace() -- see _emit_regex_call and the Member-call
 handling in _emit_call), #69 (setTimeout/setInterval/clearTimeout/
 clearInterval -- see the "Timers" note below), #70 (DatabaseURL -- see
 _emit_main_and_entry), #71 (environment.NAME/environment[keyExpr] --
@@ -36,10 +36,11 @@ nesting, `.length` -- see the FESTINA_ARRAY_LLVM_TYPE note below),
 automatic table schema sync against festina.sqlite via the
 festina_runtime C helpers, sqlite() queries (SELECT into arr[Table],
 parameterized INSERT/UPDATE/DELETE -- see the "Query rows" note
-below), regex()/.test()/.match()/.replace()/.replaceAll() (POSIX
+below), regex()/.test()/.match()/.replace() (POSIX
 extended regular expressions via the festina_runtime C helpers -- no
 bundled regex engine, see festina_runtime.h's doc comment on why),
-img/drawRect/drawCircle/drawText/drawImage/`on click`/`on mouse` (a
+img/drawRect/drawCircle/drawText/drawImage/`on mouseDown`/`on
+mouseUp`/`on mouse` (a
 real X11 window rendered via Cairo -- see the "Graphics" note below),
 setTimeout/setInterval/clearTimeout/clearInterval (see the "Timers"
 note below), and aud/loadAudio()/.play()/.stop()/.isPlaying() (a real
@@ -52,24 +53,25 @@ up-to-date implemented-vs-not detail.
 
 Graphics (claude.md #37, #39, #40): a real on-screen window (Xlib +
 Cairo's Xlib surface backend), not a file written to disk -- "Graphics
-are backed by Cairo" plus #40's click/mouse events firing against "the
+are backed by Cairo" plus #40's mouse events firing against "the
 canvas" only make sense together as an actual window. Opened lazily
-(CodeGen.uses_graphics, set by any draw* call or an `on click`/`on
-mouse` handler, but deliberately NOT by loadImage() alone -- decoding a
+(CodeGen.uses_graphics, set by any draw* call or an `on
+mouseDown`/`on mouseUp`/`on mouse` handler, but deliberately NOT by loadImage() alone -- decoding a
 PNG needs no window; see _emit_graphics_call's own note) in main()
 before __festina_main() runs, exactly
 the same "only pay for what you use" pattern uses_sqlite already
 follows for festina_db_open(); a program that never touches graphics
 never opens a window. After __festina_main() returns, if graphics or
 timers (see "Timers" below) were used, main() blocks in
-festina_run_event_loop() (Expose/click/mouse/key/resize/window-close,
+festina_run_event_loop() (Expose/mouse/key/resize/window-close,
 interleaved with any pending timers) until the window is closed. Canvas
 size starts at
 a fixed 800x600 and every shape/text draws in solid black -- claude.md
 has no syntax for declaring a size or a color, so both are
 implementation-defined defaults, not derived from the spec; the size
 can change afterwards, though, if the window is resized (see `on
-resize` below). `on click`/`on mouse`/`on key`/`on resize`/`on close`
+resize` below). `on mouseDown`/`on mouseUp`/`on mouse`/`on key`/`on
+resize`/`on close`
 each compile to a real function (_emit_event_handler) registered with
 the runtime as a fixed-signature function pointer (see
 _EVENT_SIGNATURES in semantic.py, and festina_runtime.h's declarations,
@@ -328,8 +330,36 @@ BOOL = types_mod.PrimitiveType("bool")
 INT = types_mod.PrimitiveType("int")
 FLOAT = types_mod.PrimitiveType("float")
 TEXT = types_mod.PrimitiveType("text")
+BLOB = types_mod.PrimitiveType("blob")
 REGEX = types_mod.RegexType()
 AUDIO = types_mod.AudioType()
+
+
+def _is_refcounted(t):
+    """claude.md #109: the single "does this value carry a refcount
+    header" test, replacing the struct/arr[T]/map[T] tuple that used to
+    be written out at each of the ~15 sites that ask.
+
+    `blob` joined that family when #109 gave it its real meaning -- a
+    file's bytes rather than a second spelling of `text` -- because
+    #109 also asked for `blob a = b` to SHARE one handle and for
+    reassigning a blob to free whatever the old one held if nothing
+    else wanted it. That is reference counting exactly, and a blob
+    carries the same i64 header immediately before its payload that a
+    struct does, so every generic part of the protocol
+    (festina_retain, festina_release_check, the retain-then-release
+    ordering at a reassignment) already worked on it unchanged. The
+    only blob-specific piece is its destructor, which has two inner
+    strings to free first -- dispatched through _release_fn_for the
+    same way a struct's field cascade is.
+
+    `text` is deliberately NOT here. A text is managed but not
+    refcounted: it is copied on alias (festina_text_own) and freed
+    outright, so it needs its own branch wherever ownership is decided
+    -- see claude.md #83."""
+    return (isinstance(t, (types_mod.StructType, types_mod.ArrayType,
+                           types_mod.MapType))
+            or t == BLOB)
 
 FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
 
@@ -662,10 +692,10 @@ class CodeGen:
                                                 # schema sync and query codegen can both ask for the
                                                 # same table's column-name/type globals, and emitting
                                                 # them twice would redefine the same LLVM global names
-        self.uses_graphics = False             # any draw* call or an `on click`/`on mouse` handler
+        self.uses_graphics = False             # any draw* call or an `on mouseDown`/`on mouse` handler
                                                 # anywhere -- NOT loadImage() alone; see
                                                 # _emit_graphics_call and _emit_main_and_entry
-        self.event_handlers = {}               # "click"/"mouse" -> @__festina_on_<name> -- see
+        self.event_handlers = {}               # "mouseDown"/"mouse" -> @__festina_on_<name> -- see
                                                 # _emit_event_handler and _emit_main_and_entry
         self.uses_timers = False               # any setTimeout()/setInterval() call anywhere --
                                                 # NOT clearTimeout()/clearInterval() alone; see
@@ -793,6 +823,9 @@ class CodeGen:
                                                 # Keyed on the RESOLVED parts rather than the source
                                                 # text, so 'bold 13px arial' and 'arial bold 13px'
                                                 # share one constant.
+        self._row_to_struct_fns = set()        # claude.md #112: row->struct converters already
+                                                # generated, one per struct type used as a
+                                                # sqlite() target
         self._regex_lit_cache = {}             # id(ast.RegexLit node) -> its private cache global's
                                                 # name -- see _emit_cached_regex_lit; keyed by node
                                                 # identity (not pattern text) so two textually
@@ -800,6 +833,18 @@ class CodeGen:
                                                 # source locations still each get their own slot,
                                                 # simpler than deduplicating by text and just as
                                                 # correct (each still only ever compiles once)
+        # claude.md #108: state for a MEMBER CHAIN's deferred receiver
+        # release -- see _emit_member_load. _chain_receiver holds the
+        # exact AST node the enclosing member load is about to emit as
+        # its receiver, so a nested member load can recognize, by node
+        # IDENTITY, that it is part of a chain rather than an unrelated
+        # subexpression (a call argument, an index) that merely happens
+        # to be emitted while a chain is in flight. _chain_pending
+        # collects the receivers those nested frames produced, for the
+        # outermost frame to decide about once it knows the type of the
+        # value that actually escapes the whole chain.
+        self._chain_receiver = None
+        self._chain_pending = []
 
     # ---- naming ----
     def tmp(self):
@@ -929,6 +974,25 @@ class CodeGen:
             *[f"declare double @{fn}(double)" for fn in sorted(set(MATH_FLOAT_FNS.values()))],
             *[f"declare double @{fn}(double, double)" for fn in sorted(set(MATH_FLOAT2_FNS.values()))],
             "declare double @festina_random()",
+            # claude.md #109: blob is a real handle now -- bytes loaded
+            # from a path, refcounted, with the file operations that
+            # used to be free functions hanging off it.
+            "declare ptr @festina_blob_open(ptr)",
+            "declare ptr @festina_blob_from_bytes(ptr, i64)",
+            "declare void @festina_blob_release(ptr)",
+            "declare ptr @festina_blob_to_text(ptr)",
+            "declare ptr @festina_blob_bytes(ptr, ptr)",
+            "declare i8 @festina_blob_write(ptr, ptr)",
+            "declare i8 @festina_blob_append(ptr, ptr)",
+            "declare i8 @festina_blob_exists(ptr)",
+            "declare i8 @festina_blob_delete(ptr)",
+            # claude.md #110: save()/saveCopy(), one pair per handle type.
+            "declare i8 @festina_blob_save(ptr, ptr)",
+            "declare i8 @festina_blob_save_copy(ptr, ptr)",
+            # claude.md #111: `delete m[key]`, and the guard that lets
+            # `free` work on a regex without corrupting a literal cache.
+            "declare i8 @festina_map_delete(ptr, ptr, ptr, ptr)",
+            "declare void @festina_regex_mark_cached(ptr)",
             "declare ptr @festina_read_file(ptr)",
             "declare i8 @festina_write_file(ptr, ptr)",
             "declare i8 @festina_append_file(ptr, ptr)",
@@ -965,14 +1029,21 @@ class CodeGen:
             "declare i64 @festina_sqlite_scalar_int(ptr)",
             "declare double @festina_sqlite_scalar_float(ptr)",
             "declare ptr @festina_sqlite_scalar_text(ptr)",
-            "declare void @festina_sqlite_collect_rows(ptr, i32, ptr, ptr, ptr)",
-            # claude.md #67-68: regex(), .test(), .match(), .replace()/.replaceAll().
+            # claude.md #111: collect_rows takes the declared column
+            # NAMES too (result columns are matched by name now), and
+            # row.undefined() reads the presence mask it records.
+            "declare void @festina_sqlite_collect_rows(ptr, i32, ptr, ptr, ptr, ptr)",
+            "declare i8 @festina_row_undefined(ptr, ptr, i32, ptr)",
+            # claude.md #67-68, #107: regex(), .test(), .match(), .replace().
             "declare ptr @festina_regex_compile(ptr, ptr)",
             "declare void @festina_regex_free(ptr)",
             "declare i8 @festina_regex_test(ptr, ptr)",
             "declare ptr @festina_regex_match(ptr, ptr)",
-            "declare ptr @festina_str_replace(ptr, ptr, ptr, i8)",
-            "declare ptr @festina_regex_replace(ptr, ptr, ptr, i8)",
+            # claude.md #107: neither carries a replace-all argument any
+            # more -- a regex knows from its own 'g' flag, and a text
+            # search replaces the first match only.
+            "declare ptr @festina_str_replace(ptr, ptr, ptr)",
+            "declare ptr @festina_regex_replace(ptr, ptr, ptr)",
             # claude.md #37, #39, #40: img, graphics functions, click/mouse events.
             "declare void @festina_graphics_init()",
             "declare void @festina_run_event_loop()",
@@ -1022,8 +1093,12 @@ class CodeGen:
             "declare ptr @festina_image_clip(ptr, i64, i64, i64, i64)",
             "declare void @festina_image_resize(ptr, i64, i64)",
             "declare void @festina_image_free(ptr)",
+            "declare i8 @festina_image_save(ptr, ptr)",
+            "declare i8 @festina_image_save_copy(ptr, ptr)",
             "declare void @festina_draw_image(ptr, i64, i64)",
-            "declare void @festina_register_click_handler(ptr)",
+            # claude.md #106: `on click` became mouseDown + mouseUp.
+            "declare void @festina_register_mouse_down_handler(ptr)",
+            "declare void @festina_register_mouse_up_handler(ptr)",
             "declare void @festina_register_mouse_handler(ptr)",
             # claude.md #98: `on key` became `on keyDown` + `on keyUp`.
             "declare void @festina_register_key_down_handler(ptr)",
@@ -1047,7 +1122,12 @@ class CodeGen:
             # claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying().
             "declare ptr @festina_load_audio(ptr)",
             # claude.md #99: play/playLoop, with or without a channel.
-            "declare void @festina_audio_play_on(ptr, i64, i8, i8)",
+            # claude.md #109: play/playLoop hand back the channel they
+            # chose, and aud.stop() is back as a clip-wide stop.
+            "declare i64 @festina_audio_play_on(ptr, i64, i8, i8)",
+            "declare void @festina_audio_stop_clip(ptr)",
+            "declare i8 @festina_audio_save(ptr, ptr)",
+            "declare i8 @festina_audio_save_copy(ptr, ptr)",
             "declare void @festina_stop_audio_player(i64)",
             "declare i8 @festina_audio_is_playing(ptr)",
             # claude.md #98: the per-aud voice limit.
@@ -1350,7 +1430,7 @@ class CodeGen:
                         lines.append(f"  {field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
                         data_ptr = self.tmp()
                         lines.append(f"  {data_ptr} = load ptr, ptr {field_ptr}")
-                        if (isinstance(elem_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+                        if (_is_refcounted(elem_type)
                                 or elem_type == TEXT):
                             # claude.md #80 (widened by #83 to text):
                             # this array's own elements are themselves
@@ -1381,7 +1461,7 @@ class CodeGen:
                         lines.append(f"  {field_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
                         entries_ptr = self.tmp()
                         lines.append(f"  {entries_ptr} = load ptr, ptr {field_ptr}")
-                        if (isinstance(value_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+                        if (_is_refcounted(value_type)
                                 or value_type == TEXT):
                             # claude.md #80 (widened by #83 to text):
                             # same as the array case just above, but
@@ -1393,7 +1473,7 @@ class CodeGen:
                             lines.append(
                                 f"  call void @festina_map_for_each(i64 {count_val}, ptr {entries_ptr}, ptr {trampoline_name})")
                         lines.append(f"  call void @festina_map_free_entries(i64 {count_val}, ptr {entries_ptr})")
-                elif isinstance(type_, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)) or type_ == TEXT:
+                elif _is_refcounted(type_) or type_ == TEXT:
                     # claude.md #77/#79: release (not free) -- this
                     # value is refcounted (see _emit_stmt's own VarDecl
                     # handling), so its own reference simply needs
@@ -1594,9 +1674,10 @@ class CodeGen:
         ordinary callable -- an event handler is a listener, not
         something Festina code calls by name) exactly like _emit_func,
         minus a return type (event handlers never return a value).
-        click/mouse/key/resize/close additionally get registered with
-        the runtime as a function pointer (see festina_runtime.h's doc
-        comment on festina_register_click_handler/_mouse_handler/
+        mouseDown/mouseUp/mouse/key/resize/close additionally get
+        registered with the runtime as a function pointer (see
+        festina_runtime.h's doc comment on
+        festina_register_mouse_down_handler/_mouse_up_handler/_mouse_handler/
         _key_handler/_resize_handler/_close_handler) -- the only event
         sources this runtime actually generates (claude.md #40's own
         examples; semantic.py's _EVENT_SIGNATURES enforces the fixed
@@ -1630,11 +1711,164 @@ class CodeGen:
         self.func_defs.extend(func)
         self.func_defs.append("")
 
-        if decl.name in ("click", "mouse", "keyDown", "keyUp", "resize", "close"):
+        if decl.name in ("mouseDown", "mouseUp", "mouse", "keyDown", "keyUp",
+                          "resize", "close"):
             self.uses_graphics = True
             self.event_handlers[decl.name] = symbol
 
     # ---- statements ----
+    def _emit_free(self, stmt, env, lines):
+        """claude.md #111: `free name` -- release whatever the binding
+        holds, then null the binding. The null store is half the design:
+        it is what makes `free` composable with everything the compiler
+        already does. Every release function in this runtime is
+        null-safe, so the automatic scope-exit release that may later
+        visit this same binding finds null and does nothing -- manual
+        free and automatic reclamation coexist with no bookkeeping,
+        and `free x` twice is a no-op, not a double free. It is also
+        what makes use-after-free THROUGH THIS BINDING impossible:
+        reading x afterwards reads null, the ordinary absent value.
+
+        Per type:
+        - struct/arr[T]/map[T]/blob: a refcount DECREMENT, not a forced
+          free -- an aliased value survives until its other references
+          drop, which is the "retains pointers if they have a pointer
+          elsewhere" guarantee. Freeing an array releases each element
+          the same way, so a shared element outlives its array.
+        - text: the buffer is exclusively owned (copy-on-alias,
+          claude.md #83), so freed outright.
+        - img/aud: freed outright -- these have no refcount (see
+          todo.md), which is exactly why `free` matters most here: it is
+          the manual escape hatch for the escaping-handle leak. The
+          contract is the C one: freeing a handle another binding still
+          aliases leaves that alias dangling. The binding freed here
+          reads null; an ALIAS does not.
+        - regex: freed if it was a runtime regex() result; a /pattern/
+          literal's cached compilation marks itself and
+          festina_regex_free no-ops on it, so `free` is safe on either.
+        - a query row: nulled WITHOUT freeing -- the row is owned by the
+          array it came from, and freeing it here would double-free at
+          the array's own release. Free the array.
+        - int/float/bool (and every other value type): nothing to
+          release; freeing degenerates to `x = null`.
+        """
+        found = env.lookup(stmt.name)
+        if found is None:
+            raise CodegenError(f"free: unknown variable '{stmt.name}'",
+                                file=self.filename, line=stmt.line)
+        ref, ttype = found
+        llvm_ty = _llvm_type(ttype)
+        if llvm_ty == "ptr":
+            old = self.tmp()
+            lines.append(f"  {old} = load ptr, ptr {ref}")
+            if _is_refcounted(ttype):
+                lines.append(f"  call void {self._release_fn_for(ttype)}(ptr {old})")
+            elif ttype == TEXT:
+                lines.append(f"  call void @free(ptr {old})")
+            elif isinstance(ttype, types_mod.ImageType):
+                self.uses_graphics_code = True
+                lines.append(f"  call void @festina_image_free(ptr {old})")
+            elif isinstance(ttype, types_mod.AudioType):
+                self.uses_audio = True
+                lines.append(f"  call void @festina_audio_free(ptr {old})")
+            elif ttype == REGEX:
+                lines.append(f"  call void @festina_regex_free(ptr {old})")
+            # TableType (a borrowed query row) and any other ptr-backed
+            # value: nothing released, only the binding dropped.
+            lines.append(f"  store ptr null, ptr {ref}")
+        elif llvm_ty == "i64":
+            lines.append(f"  store i64 {INT_NULL_CONST}, ptr {ref}")
+        elif llvm_ty == "double":
+            lines.append(f"  store double {FLOAT_NULL_CONST}, ptr {ref}")
+        elif llvm_ty == "i8":
+            lines.append(f"  store i8 {BOOL_NULL_CONST}, ptr {ref}")
+        else:
+            raise CodegenError(
+                f"free: cannot free a value of type {types_mod.type_name(ttype)}",
+                file=self.filename, line=stmt.line)
+
+    def _emit_delete(self, stmt, env, lines):
+        """claude.md #111: `delete`, JS-shaped. On a map the entry stops
+        existing (count drops, forEach skips it); on a struct field the
+        value is released and the field reads null afterwards; on a
+        query-row field the same, plus the row's presence bit clears so
+        undefined() reports it -- deletion and never-selected look
+        identical from then on, which is the JS behavior too.
+
+        One honest caveat, inherited from claude.md #97 rather than
+        chosen here: a struct field whose own type is struct/arr/map
+        auto-vivifies on the next reach-through, so deleting one
+        releases its contents but a later `s.field.x` builds a fresh
+        empty value rather than crashing on null. A scalar or text
+        field genuinely reads null."""
+        tgt = stmt.target
+        obj_val, obj_type = self._emit_expr(tgt.obj, env, lines)
+
+        if isinstance(obj_type, types_mod.MapType):
+            if tgt.computed:
+                key_val, key_type = self._emit_expr(tgt.prop, env, lines)
+            else:
+                key_val, key_type = self.string_const(tgt.prop), None
+            count_ptr = self.tmp()
+            lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, "
+                         f"ptr {obj_val}, i32 0, i32 0")
+            entries_ptr = self.tmp()
+            lines.append(f"  {entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, "
+                         f"ptr {obj_val}, i32 0, i32 1")
+            value_type = obj_type.value
+            if _is_refcounted(value_type) or value_type == TEXT:
+                tramp = self._emit_map_value_release_trampoline(value_type)
+            else:
+                tramp = "null"
+            lines.append(f"  call i8 @festina_map_delete(ptr {count_ptr}, "
+                         f"ptr {entries_ptr}, ptr {key_val}, ptr {tramp})")
+            if tgt.computed:
+                self._free_text_temp(tgt.prop, key_val, key_type, lines)
+            return
+
+        ptr, ftype = self._member_ptr_from(obj_val, obj_type, tgt, lines)
+        # Release what the field holds before nulling it -- the same
+        # per-type dispatch a field REASSIGNMENT already performs, since
+        # delete is a reassignment to null with one extra effect.
+        old = None
+        if _llvm_type(ftype) == "ptr":
+            old = self.tmp()
+            lines.append(f"  {old} = load ptr, ptr {ptr}")
+        if _is_refcounted(ftype):
+            lines.append(f"  call void {self._release_fn_for(ftype)}(ptr {old})")
+        elif ftype == TEXT:
+            lines.append(f"  call void @free(ptr {old})")
+        elif isinstance(ftype, types_mod.ImageType):
+            self.uses_graphics_code = True
+            lines.append(f"  call void @festina_image_free(ptr {old})")
+        elif isinstance(ftype, types_mod.AudioType):
+            self.uses_audio = True
+            lines.append(f"  call void @festina_audio_free(ptr {old})")
+        f_llvm = _llvm_type(ftype)
+        null_const = {"ptr": "null", "i64": INT_NULL_CONST,
+                      "double": FLOAT_NULL_CONST, "i8": BOOL_NULL_CONST}[f_llvm]
+        lines.append(f"  store {f_llvm} {null_const}, ptr {ptr}")
+
+        if isinstance(obj_type, types_mod.TableType):
+            # claude.md #111: clear the presence bit, so undefined()
+            # reports a deleted column exactly like one the query never
+            # selected. The mask lives one slot past the columns.
+            cols = self.tables[obj_type.name]
+            ncols = len(cols)
+            idx = self.table_field_index(obj_type.name, tgt.prop)
+            if idx < 64:
+                mask_ptr = self.tmp()
+                lines.append(f"  {mask_ptr} = getelementptr i8, ptr {obj_val}, "
+                             f"i64 {ncols * 8}")
+                mask = self.tmp()
+                lines.append(f"  {mask} = load i64, ptr {mask_ptr}")
+                cleared = self.tmp()
+                # Signed decimal form -- LLVM's i64 literal grammar is
+                # signed, so ~bit is emitted as a negative number.
+                lines.append(f"  {cleared} = and i64 {mask}, {~(1 << idx)}")
+                lines.append(f"  store i64 {cleared}, ptr {mask_ptr}")
+
+
     def _emit_block(self, block, parent_env, return_type, lines):
         """claude.md #74: this is the ONE block-body emitter used
         everywhere -- a function/event handler's own top-level body
@@ -1759,6 +1993,32 @@ class CodeGen:
                                 # comment.
                                 self._active_free_locals[-1].append(
                                     (ref, _StackStructFieldsOnly(type_)))
+                        elif type_ == BLOB:
+                            # claude.md #109: a blob local is ALWAYS
+                            # scheduled for release, with no
+                            # escaping-ness test and no
+                            # is-this-a-fresh-source test. Both tests
+                            # exist elsewhere to avoid releasing
+                            # something this scope does not own, and
+                            # neither applies here: a blob is
+                            # refcounted, so its binding owns exactly
+                            # one reference no matter where the value
+                            # came from -- a fresh festina_blob_open
+                            # starts the count at 1, and an alias of
+                            # another blob was retained on the way in
+                            # (see _emit_stmt's own VarDecl handling).
+                            # Dropping that one reference is always
+                            # correct and never frees a handle someone
+                            # else still holds, which is the whole
+                            # point of #109's "if a blob = another
+                            # blob, copy the reference".
+                            #
+                            # This is why blob is refcounted where img
+                            # and aud are merely owned-or-leaked: those
+                            # two have no way to express sharing, so
+                            # they need to PROVE sole ownership before
+                            # freeing. A blob just counts.
+                            self._active_free_locals[-1].append((ref, type_))
                         elif isinstance(type_, types_mod.ImageType):
                             # claude.md #92: same two-part ownership test
                             # #86 uses for regex -- created here (a Call:
@@ -1834,6 +2094,35 @@ class CodeGen:
         lines = ctx["lines"]
         if isinstance(stmt, ast.VarDecl):
             type_ = self._resolve(stmt.type_expr, stmt)
+            if type_ == BLOB:
+                # claude.md #109: `blob save = 'save.dat'` reads the file
+                # and hands back a fresh handle with a refcount of 1;
+                # `blob other = save` aliases the same handle and needs
+                # its own +1. _is_owning_refcounted_source cannot tell
+                # these apart on its own -- it answers "is this a Call",
+                # and the path form is a StringLit or any other text
+                # expression. What actually distinguishes them is
+                # whether a coercion happened: _coerce turns text into a
+                # festina_blob_open call, which is as fresh as any other
+                # call result, so `vtype == TEXT` before coercion IS the
+                # freshness test.
+                uid = self._unique()
+                slot = f"%{stmt.name}.{uid}"
+                lines.append(f"  {slot} = alloca ptr")
+                if stmt.init is None:
+                    lines.append(f"  store ptr null, ptr {slot}")
+                else:
+                    val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
+                    fresh = self._refcounted_source_is_fresh(stmt.init, vtype, type_)
+                    val = self._coerce(val, vtype, type_, lines, source_expr=stmt.init)
+                    if not fresh:
+                        lines.append(f"  call void @festina_retain(ptr {val})")
+                    lines.append(f"  store ptr {val}, ptr {slot}")
+                # No tracking call here: _emit_block scans each VarDecl
+                # it emits and looks the name back up, so defining it is
+                # all this branch owes the release machinery.
+                env.define(stmt.name, slot, type_)
+                return
             if isinstance(type_, types_mod.StructType):
                 # `slot` holds a *pointer* to the struct's own storage,
                 # kept uniform with every other type so Identifier lookup
@@ -1928,7 +2217,7 @@ class CodeGen:
                     # initializer -- r's own reference is now always
                     # correctly counted, whichever way it came to exist.
                     val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
-                    val = self._coerce(val, vtype, type_, lines)
+                    val = self._coerce(val, vtype, type_, lines, source_expr=stmt.init)
                     if not self._is_owning_refcounted_source(stmt.init):
                         lines.append(f"  call void @festina_retain(ptr {val})")
                     lines.append(f"  {slot} = alloca ptr")
@@ -2020,7 +2309,7 @@ class CodeGen:
                     return
                 if stmt.init is not None:
                     val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
-                    val = self._coerce(val, vtype, type_, lines)
+                    val = self._coerce(val, vtype, type_, lines, source_expr=stmt.init)
                     if not self._is_owning_refcounted_source(stmt.init):
                         lines.append(f"  call void @festina_retain(ptr {val})")
                     lines.append(f"  {slot} = alloca ptr")
@@ -2058,7 +2347,7 @@ class CodeGen:
                 lines.append(f"  {slot} = alloca ptr")
                 if stmt.init is not None:
                     val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
-                    val = self._coerce(val, vtype, type_, lines)
+                    val = self._coerce(val, vtype, type_, lines, source_expr=stmt.init)
                     if not self._is_owning_text_source(stmt.init):
                         owned = self.tmp()
                         lines.append(f"  {owned} = call ptr @festina_text_own(ptr {val})")
@@ -2074,7 +2363,7 @@ class CodeGen:
             env.define(stmt.name, slot, type_)
             if stmt.init is not None:
                 val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
-                val = self._coerce(val, vtype, type_, lines)
+                val = self._coerce(val, vtype, type_, lines, source_expr=stmt.init)
                 lines.append(f"  store {llvm_ty} {val}, ptr {slot}")
             return
         if isinstance(stmt, ast.ExprStmt):
@@ -2097,7 +2386,7 @@ class CodeGen:
             # shape -- an ExprStmt wrapping anything else (a bare
             # Identifier, a Member read, ...) never allocates anything of
             # its own to begin with, so there is nothing to release.
-            if (isinstance(vtype, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+            if (_is_refcounted(vtype)
                     and isinstance(stmt.expr, (ast.Call, ast.ArrayLit, ast.MapLit))):
                 # claude.md #78/#79: through _release_fn_for (which
                 # dispatches to _release_fn_for_struct for a struct, so
@@ -2159,7 +2448,7 @@ class CodeGen:
                 # too, the identical rule -- retain always being the
                 # same generic @festina_retain regardless of type is
                 # exactly what makes this one check cover all three.
-                if (isinstance(return_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+                if (_is_refcounted(return_type)
                         and not self._is_owning_refcounted_source(stmt.value)):
                     lines.append(f"  call void @festina_retain(ptr {val})")
                 elif return_type == TEXT and not self._is_owning_text_source(stmt.value):
@@ -2186,6 +2475,12 @@ class CodeGen:
             return
         if isinstance(stmt, ast.ForStmt):
             self._emit_for(stmt, env, return_type, ctx)
+            return
+        if isinstance(stmt, ast.FreeStmt):
+            self._emit_free(stmt, env, lines)
+            return
+        if isinstance(stmt, ast.DeleteStmt):
+            self._emit_delete(stmt, env, lines)
             return
         if isinstance(stmt, ast.BreakStmt):
             # semantic.py already rejects this outside any loop, so an
@@ -2347,7 +2642,7 @@ class CodeGen:
         return CodeGen._uid
 
     # ---- expressions ----
-    def _coerce(self, val, from_type, to_type, lines):
+    def _coerce(self, val, from_type, to_type, lines, source_expr=None):
         # claude.md #55: int and float never convert implicitly, not even
         # on assignment -- semantic.py already rejects a mismatched
         # int/float assignment before codegen ever runs, so there is no
@@ -2356,19 +2651,47 @@ class CodeGen:
         # None or NULL-ish) or an unconstrained builtin return (e.g.
         # sqlite()) flowing into a concretely-typed slot.
         #
-        # claude.md #100/#101 add the two conversions that are not free:
-        # `aud music = 'track.wav'` and `img sprite = 'sprite.png'`. blob/color/font all reach an
-        # aud-shaped allowance in semantic.py's check_assignable too, but
-        # those need nothing here -- blob shares text's representation
-        # outright, and colour/font are resolved by their own literal
-        # handling. An `aud` is a decoded clip, so the conversion is a
-        # real loadAudio() call, emitted here so that every position that
-        # accepts one (declaration, assignment, argument, field) gets it
-        # from a single place rather than four.
+        # claude.md #100/#101/#109 add the three conversions that are
+        # not free: `aud music = 'track.wav'`, `img sprite =
+        # 'sprite.png'` and `blob save = 'save.dat'`. colour and font
+        # reach the same text -> X allowance in semantic.py's
+        # check_assignable but need nothing here, being resolved by
+        # their own literal handling. These three are real file reads,
+        # emitted here so that every position that accepts one
+        # (declaration, assignment, argument, field) gets it from a
+        # single place rather than four.
+        #
+        # claude.md #109 is what put blob in this list. It used to
+        # share text's representation outright and need no conversion
+        # at all, which is precisely what made `blob data =
+        # 'path/to/file'` store the path and never read the file --
+        # claude.md #36's own example doing nothing it looked like it
+        # did.
+        # Every one of the three loaders below COPIES what it needs
+        # from the path (strdup, fopen) and keeps no pointer into it, so
+        # a path that was a temporary -- `img s = dir + 'a.png'`, or any
+        # template literal -- is dead the moment the call returns and
+        # must be freed. `source_expr` is what tells a temporary from a
+        # variable's own buffer; without it _free_text_temp is a no-op,
+        # which is why every call site that can coerce a computed path
+        # threads it through.
+        #
+        # claude.md #109: this was a real, pre-existing leak in the
+        # aud/img cases (claude.md #100/#101), not something blob
+        # introduced -- blob merely made it easy to hit, since a path
+        # built per iteration is the ordinary way to use one. Measured
+        # at 1,029 bytes over 49 iterations for `img s = `${dir}x.png``
+        # before this existed.
+        if to_type == BLOB and from_type == TEXT:
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_blob_open(ptr {val})")
+            self._free_text_temp(source_expr, val, TEXT, lines)
+            return out
         if isinstance(to_type, types_mod.AudioType) and from_type == TEXT:
             self.uses_audio = True
             out = self.tmp()
             lines.append(f"  {out} = call ptr @festina_load_audio(ptr {val})")
+            self._free_text_temp(source_expr, val, TEXT, lines)
             return out
         # claude.md #101: `img sprite = 'sprite.png'`, the exact
         # counterpart of the aud case just above. uses_graphics_CODE,
@@ -2381,6 +2704,7 @@ class CodeGen:
             self.uses_graphics_code = True
             out = self.tmp()
             lines.append(f"  {out} = call ptr @festina_load_image(ptr {val})")
+            self._free_text_temp(source_expr, val, TEXT, lines)
             return out
         return val
 
@@ -2516,12 +2840,29 @@ class CodeGen:
                 # function call's own return value), even though every
                 # one of them is now a `ptr` at the LLVM level -- and
                 # .length is read-only anyway (see semantic.py).
-                obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+                # claude.md #108: .length participates in the member
+                # chain too. It never did, which made
+                # _release_member_receiver_temp's own docstring wrong
+                # about `rowsFor(x).length` -- that shape does not reach
+                # _emit_member_load at all, so #102 never covered it and
+                # it leaked the whole array (measured: 2,880 bytes over
+                # 60 iterations). A length is an i64 copy that owes the
+                # array nothing, so the receiver is always releasable
+                # here, whether it is the call itself or the base of a
+                # longer chain (`make().inner.items.length`).
+                state = self._begin_member_chain(expr)
+                try:
+                    obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+                finally:
+                    pending = self._end_member_chain(state)
                 if isinstance(obj_type, types_mod.ArrayType):
                     len_ptr = self.tmp()
                     lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 0")
                     out = self.tmp()
                     lines.append(f"  {out} = load i64, ptr {len_ptr}")
+                    if pending is not None:
+                        self._release_member_chain(pending, expr.obj, obj_val,
+                                                   obj_type, INT, lines)
                     return out, INT
             if expr.computed:
                 # claude.md #26/#72: arr[i] / map[key] -- expr.obj is
@@ -2790,9 +3131,8 @@ class CodeGen:
 
         if name in ("push", "unshift"):
             val, vtype = self._emit_value_for(expr.args[0], env, lines, elem_type)
-            val = self._coerce(val, vtype, elem_type, lines)
-            if isinstance(elem_type, (types_mod.StructType, types_mod.ArrayType,
-                                       types_mod.MapType)):
+            val = self._coerce(val, vtype, elem_type, lines, source_expr=expr.args[0])
+            if _is_refcounted(elem_type):
                 if not self._is_owning_refcounted_source(expr.args[0]):
                     lines.append(f"  call void @festina_retain(ptr {val})")
             elif elem_type == TEXT and not self._is_owning_text_source(expr.args[0]):
@@ -2841,7 +3181,7 @@ class CodeGen:
             # also means the temporary is freed the ordinary way, exactly
             # as any other text argument at a call site would be.
             val, vtype = self._emit_value_for(expr.args[0], env, lines, elem_type)
-            val = self._coerce(val, vtype, elem_type, lines)
+            val = self._coerce(val, vtype, elem_type, lines, source_expr=expr.args[0])
             slot = self.tmp()
             lines.append(f"  {slot} = alloca {elem_ir}")
             lines.append(f"  store {elem_ir} {val}, ptr {slot}")
@@ -2936,8 +3276,7 @@ class CodeGen:
             # a text element gets the identical treatment, copying
             # (festina_text_own) instead of retaining, for the same
             # "no release-old needed, fresh malloc'd memory" reason.
-            elem_is_refcounted = isinstance(
-                elem_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+            elem_is_refcounted = _is_refcounted(elem_type)
             for i, val in enumerate(values):
                 elem_ptr = self.tmp()
                 lines.append(f"  {elem_ptr} = getelementptr {elem_llvm_ty}, ptr {data_ptr}, i64 {i}")
@@ -3123,7 +3462,7 @@ class CodeGen:
         lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 0")
         entries_ptr = self.tmp()
         lines.append(f"  {entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 1")
-        if isinstance(value_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+        if _is_refcounted(value_type):
             count_val = self.tmp()
             lines.append(f"  {count_val} = load i64, ptr {count_ptr}")
             entries_val = self.tmp()
@@ -3183,17 +3522,95 @@ class CodeGen:
         return out, TEXT
 
     def _emit_member_load(self, expr, env, lines):
-        obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
-        ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
-        out, ftype = self._load_field_value(ptr, ftype, lines)
-        self._release_member_receiver_temp(expr.obj, obj_val, obj_type, ftype, lines)
+        """claude.md #102 released the receiver of a ONE-step field read
+        off a call result (`make().n`). claude.md #108 extends that to a
+        CHAIN (`make().inner.n`), which #102 could not reach and which
+        leaked the entire object graph: `make().inner` saw a struct-typed
+        field and bailed out (correctly -- releasing there would free the
+        Inner it was about to hand back), and `.n`'s own receiver is a
+        Member rather than a Call, so nothing was left to notice the
+        call result at all.
+
+        The fix is to decide at the OUTERMOST link, where the type of
+        the value that actually escapes the chain is finally known. Each
+        nested link parks its receiver instead of releasing it; the
+        outermost link, if what it loaded is an ordinary unmanaged value
+        (an int/float/bool -- a copy that owes nothing to the object it
+        came from), releases every parked receiver. If the chain ends in
+        a managed value or a text, nothing is released and the leak
+        stands, exactly as before -- freeing the parent would free the
+        thing just loaded.
+
+        "Nested" is decided by AST node IDENTITY (_chain_receiver), not
+        by "a chain is in flight". A member load reached while emitting
+        a call ARGUMENT (`make(other.field).inner.n`) is not part of
+        this chain, and treating it as one would silently move its own
+        release to a point that may never come."""
+        state = self._begin_member_chain(expr)
+        try:
+            obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+            ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
+            out, ftype = self._load_field_value(ptr, ftype, lines)
+        finally:
+            pending = self._end_member_chain(state)
+        if pending is None:
+            # An inner link. Park the receiver -- whether it is
+            # releasable depends on a type this frame cannot see yet.
+            self._chain_pending.append((expr.obj, obj_val, obj_type))
+            return out, ftype
+        self._release_member_chain(pending, expr.obj, obj_val, obj_type, ftype, lines)
         return out, ftype
 
+    def _begin_member_chain(self, expr):
+        """claude.md #108: marks `expr.obj` as the receiver about to be
+        emitted, so that if it turns out to be another member load it
+        can recognize itself as an inner link of this same chain (see
+        _emit_member_load). Returns opaque state for _end_member_chain,
+        which must be called in a `finally`."""
+        nested = self._chain_receiver is expr
+        state = (nested, self._chain_receiver, self._chain_pending)
+        if not nested:
+            self._chain_pending = []
+        self._chain_receiver = expr.obj
+        return state
+
+    def _end_member_chain(self, state):
+        """Undoes _begin_member_chain. Returns the receivers parked by
+        inner links, or None if this frame was ITSELF an inner link and
+        so has no decision to make."""
+        nested, saved_receiver, saved_pending = state
+        self._chain_receiver = saved_receiver
+        if nested:
+            return None
+        pending = self._chain_pending
+        self._chain_pending = saved_pending
+        return pending
+
+    def _release_member_chain(self, pending, obj_expr, obj_val, obj_type, ftype, lines):
+        """Releases every call result the chain produced, innermost
+        first, if `ftype` -- the type of the value that actually escapes
+        the whole chain -- permits it. _release_member_receiver_temp
+        makes that judgement per receiver."""
+        for parked_expr, parked_val, parked_type in pending:
+            self._release_member_receiver_temp(parked_expr, parked_val, parked_type,
+                                               ftype, lines)
+        self._release_member_receiver_temp(obj_expr, obj_val, obj_type, ftype, lines)
+
     def _release_member_receiver_temp(self, obj_expr, obj_val, obj_type, field_type, lines):
-        """claude.md #102: releases a struct/arr[T]/map[T] that this
-        expression's own CALL produced purely to read one field out of,
-        with nothing else ever referencing it -- `makeOuter(i).inner.n`,
-        `rowsFor(x).length`, `config().retries`.
+        """claude.md #102 (widened by claude.md #108): releases a
+        struct/arr[T]/map[T] that a CALL produced purely to read one
+        value out of, with nothing else ever referencing it --
+        `config().retries`, `makeOuter(i).inner.n`, `rowsFor(x).length`.
+
+        #102 covered only the first of those, and this docstring used to
+        claim all three. The other two did not go through here at all: a
+        chained read reaches _emit_member_load twice and neither frame
+        saw both a Call receiver and an unmanaged result, and `.length`
+        has its own branch in _emit_expr that never called this. #108
+        routes both here by deciding at the OUTERMOST link of a member
+        chain, where `field_type` is the type of the value that actually
+        escapes it -- so the parameter means "what the whole expression
+        yields", not "the field this one link loaded".
 
         claude.md #77 already releases a call result discarded as a bare
         statement (`someFunc();`), on the reasoning that a Call's result
@@ -3203,23 +3620,26 @@ class CodeGen:
         LeakSanitizer at one whole struct -- header, fields and all --
         per evaluation, which in a loop is per iteration.
 
-        Restricted to a field whose own type is NOT managed, and that
+        Restricted to a result whose own type is NOT managed, and that
         restriction is load-bearing rather than conservative. Releasing
         the parent recursively releases whatever its struct/arr/map
         fields point at and frees its text fields outright, so for those
-        field types the value just loaded would be freed before the
+        result types the value just loaded would be freed before the
         caller ever saw it -- trading a leak for a use-after-free. Making
         those cases work needs a notion of an owned temporary that
         outlives its producing expression, which this codegen does not
-        have; they keep leaking, which is at least safe, and the far
-        commoner scalar case is fixed."""
+        have; they keep leaking, which is at least safe, and every case
+        that yields a plain copy is now fixed."""
         if not isinstance(obj_expr, ast.Call):
             return
-        if not isinstance(obj_type, (types_mod.StructType, types_mod.ArrayType,
-                                      types_mod.MapType)):
+        # claude.md #109: BLOB is admitted here too. A blob is the first
+        # refcounted type with METHODS, so it is the first that can be
+        # the receiver of a call-on-member without being a struct --
+        # `make().exists()` produces a handle purely to ask it one
+        # question. Leaving it out leaked one handle per evaluation.
+        if not _is_refcounted(obj_type):
             return
-        if isinstance(field_type, (types_mod.StructType, types_mod.ArrayType,
-                                    types_mod.MapType)) or field_type == TEXT:
+        if _is_refcounted(field_type) or field_type == TEXT:
             return
         lines.append(f"  call void {self._release_fn_for(obj_type)}(ptr {obj_val})")
 
@@ -3342,7 +3762,8 @@ class CodeGen:
         lines.append(f"  {out} = getelementptr {struct_ty}, ptr {obj_val}, i32 0, i32 {idx}")
         return out, ftype
 
-    def _emit_global_retain_release(self, ref, val, ttype, lines, source_expr=None):
+    def _emit_global_retain_release(self, ref, val, ttype, lines, source_expr=None,
+                                    source_type=None):
         """claude.md #77 (widened by claude.md #79 to arr[T]/map[T]
         globals, claude.md #83 to text globals): called immediately
         before storing `val` into a GLOBAL's own slot `ref`, whether
@@ -3403,11 +3824,20 @@ class CodeGen:
                 val = owned
             lines.append(f"  call void @free(ptr {old})")
             return val
-        if not isinstance(ttype, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+        if not _is_refcounted(ttype):
             return val
         old = self.tmp()
         lines.append(f"  {old} = load ptr, ptr {ref}")
-        lines.append(f"  call void @festina_retain(ptr {val})")
+        # claude.md #111: this used to retain UNCONDITIONALLY, on the
+        # comment's own reasoning that over-retaining "can only ever
+        # delay a free". That was true while a global lived to process
+        # exit no matter what -- the extra count was unobservable. `free`
+        # made it observable: a global bound to a fresh value carried a
+        # count of 2, so `free g` decremented to 1 and freed nothing,
+        # silently. The freshness test is the same one locals have
+        # always used (a fresh value's own +1 transfers by aliasing).
+        if not self._refcounted_source_is_fresh(source_expr, source_type, ttype):
+            lines.append(f"  call void @festina_retain(ptr {val})")
         lines.append(f"  call void {self._release_fn_for(ttype)}(ptr {old})")
         return val
 
@@ -3623,7 +4053,29 @@ class CodeGen:
         literal_cls = ast.ArrayLit if isinstance(type_, types_mod.ArrayType) else ast.MapLit
         return isinstance(stmt.init, literal_cls)
 
-    def _emit_local_retain_release(self, ref, val, source_expr, ttype, lines):
+    def _refcounted_source_is_fresh(self, source_expr, source_type, target_type):
+        """claude.md #109: _is_owning_refcounted_source asks "is this a
+        Call", which is the right question for every refcounted type
+        that existed before blob did -- those are only ever produced by
+        a call or a literal. A blob is produced by a text expression
+        too: `blob f = 'notes.txt'`, or any other text, which _coerce
+        turns into a festina_blob_open call. That result is exactly as
+        fresh as any other call result, but the AST node is a StringLit
+        (or a BinOp, or an Identifier holding a path), so asking about
+        the node alone gets it wrong -- and getting it wrong here means
+        retaining a handle whose count is already 1, which leaks it
+        permanently. Measured before this existed: one handle, its path
+        and its bytes leaked per reassignment.
+
+        So the freshness test for a blob is whether a COERCION
+        happened, which `source_type` records: text in, blob out means
+        _coerce emitted the open call itself."""
+        if target_type == BLOB and source_type == TEXT:
+            return True
+        return self._is_owning_refcounted_source(source_expr)
+
+    def _emit_local_retain_release(self, ref, val, source_expr, ttype, lines,
+                                   source_type=None):
         """claude.md #77 (widened; claude.md #79 widens it again to
         arr[T]/map[T] locals): the local-variable counterpart to
         _emit_global_retain_release, called from _emit_assign's
@@ -3655,7 +4107,7 @@ class CodeGen:
         explains."""
         old = self.tmp()
         lines.append(f"  {old} = load ptr, ptr {ref}")
-        if not self._is_owning_refcounted_source(source_expr):
+        if not self._refcounted_source_is_fresh(source_expr, source_type, ttype):
             lines.append(f"  call void @festina_retain(ptr {val})")
         lines.append(f"  call void {self._release_fn_for(ttype)}(ptr {old})")
 
@@ -3712,6 +4164,14 @@ class CodeGen:
             return self._release_fn_for_array(type_)
         if isinstance(type_, types_mod.MapType):
             return self._release_fn_for_map(type_)
+        if type_ == BLOB:
+            # claude.md #109: a blob carries the ordinary refcount
+            # header, so the only thing generic @festina_release cannot
+            # do for it is free the path and byte buffer hanging off
+            # the payload -- which is exactly the shape of a per-struct
+            # cascade wrapper, except the runtime can write this one
+            # once instead of codegen generating it per type.
+            return "@festina_blob_release"
         if type_ == TEXT:
             # claude.md #83: text has no refcount header to dispatch
             # through -- "releasing" one is always just a plain,
@@ -3741,7 +4201,7 @@ class CodeGen:
         freed. Caught by an ASan run over a struct whose text field is
         reassigned (`p.name = `tmpl ${p.name}``), which leaked the
         field's final buffer every time."""
-        return any(isinstance(t, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+        return any(_is_refcounted(t)
                    or t == TEXT
                    for _, t in self.struct_fields(name))
 
@@ -3774,28 +4234,39 @@ class CodeGen:
         why that's a separate, still-open gap.
 
         The recursion here always terminates and can never produce a
-        duplicate/infinite chain of wrapper functions, for the same
-        reason claude.md #77 already gives for why reference cycles are
-        structurally impossible in Festina: a struct field's type must
-        always be declared *before* the struct containing it (claude.md
-        #48's "declared before used" rule, the same one that already
-        governs function forward references), so the graph of "which
-        struct types reference which other struct types through their
-        own fields" is a DAG by construction, never a cycle -- a
-        struct's own release wrapper can transitively call another
-        struct's, but never, even indirectly, its own."""
+        duplicate/infinite chain of wrapper functions -- but NOT for
+        the reason this comment used to give. It said the type graph
+        was a DAG by construction, because a struct field's type had to
+        be declared before the struct containing it; claude.md #106
+        removed that ordering rule, so `struct Node { next:Node }`
+        compiles and the graph can now genuinely contain a cycle. What
+        actually guarantees termination is the cache write below, which
+        happens BEFORE the field loop recurses: a struct type that
+        reaches itself finds its own name already registered and gets
+        the name back instead of generating a second wrapper. So a
+        struct's release wrapper CAN now call itself, directly or
+        indirectly, and that is correct -- it is one function, and the
+        recursion it performs is at runtime over the actual object
+        graph, bounded by refcounts reaching zero.
+
+        Which is also where the real cost of #106 lands: a runtime
+        reference CYCLE never reaches zero, so it is never freed. See
+        todo.md's "What's still ahead" -- that needs a tracing
+        collector, and there isn't one."""
         if not self._struct_has_own_managed_field(type_.name):
             return "@festina_release"
         if type_.name in self._struct_release_fns:
             return self._struct_release_fns[type_.name]
         fn_name = f"@__festina_release_struct_{type_.name}"
-        # Registered before the field loop below (which may recurse
-        # back into this same method for a DIFFERENT struct type) so a
-        # second, unrelated caller reaching this struct type again
-        # while this one's own body is still being built -- e.g. two
-        # sibling fields of some other struct both being this same
-        # type -- gets the cached name immediately rather than
-        # triggering a second, redundant generation.
+        # Registered before the field loop below (which recurses back
+        # into this same method for every struct-typed field) so any
+        # caller reaching this struct type again while this one's own
+        # body is still being built gets the cached name immediately
+        # rather than triggering a second generation. Two cases hit
+        # this: two sibling fields of some other struct sharing this
+        # type -- a redundancy -- and, since claude.md #106, a struct
+        # that reaches ITSELF, where this write is the only thing
+        # standing between the compiler and infinite recursion.
         self._struct_release_fns[type_.name] = fn_name
         struct_ty = self.struct_llvm_name(type_.name)
         body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
@@ -3834,7 +4305,7 @@ class CodeGen:
         done with it (free it outright, or nothing at all)."""
         struct_ty = self.struct_llvm_name(type_.name)
         for i, (_, ftype) in enumerate(self.struct_fields(type_.name)):
-            if isinstance(ftype, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+            if _is_refcounted(ftype):
                 field_release_fn = self._release_fn_for(ftype)
                 fptr = self.tmp()
                 lines.append(f"  {fptr} = getelementptr {struct_ty}, ptr {obj_ptr}, i32 0, i32 {i}")
@@ -3983,9 +4454,13 @@ class CodeGen:
         self._table_row_release_fns[key] = fn_name
         cols = self.tables[table_type.name]
         body = [f"define void {fn_name}(ptr %row) {{", "entry:"]
-        media_free = {"aud": "@festina_audio_free", "img": "@festina_image_free"}
+        # claude.md #109: blob joins these -- a blob column is a real
+        # handle now, so freeing it with plain @free would leak its path
+        # and byte buffer and skip its refcount entirely.
+        media_free = {"aud": "@festina_audio_free", "img": "@festina_image_free",
+                      "blob": "@festina_blob_release"}
         for i, col_type in enumerate(cols.values()):
-            if col_type not in ("text", "blob") and col_type not in media_free:
+            if col_type != "text" and col_type not in media_free:
                 continue
             slot = self.tmp()
             body.append(f"  {slot} = getelementptr i64, ptr %row, i64 {i}")
@@ -4061,7 +4536,7 @@ class CodeGen:
         festina_release_map's own C implementation already does) and
         frees the header."""
         value_type = type_.value
-        if not (isinstance(value_type, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType))
+        if not (_is_refcounted(value_type)
                 or value_type == TEXT):
             return "@festina_release_map"
         key = types_mod.type_name(type_)
@@ -4138,12 +4613,14 @@ class CodeGen:
                                     file=self.filename, line=expr.target.line)
             ref, ttype = found
             val, vtype = self._emit_value_for(expr.value, env, lines, ttype)
-            val = self._coerce(val, vtype, ttype, lines)
-            if isinstance(ttype, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+            val = self._coerce(val, vtype, ttype, lines, source_expr=expr.value)
+            if _is_refcounted(ttype):
                 if ref.startswith("@"):
-                    val = self._emit_global_retain_release(ref, val, ttype, lines)
+                    val = self._emit_global_retain_release(ref, val, ttype, lines,
+                                                          expr.value, source_type=vtype)
                 else:
-                    self._emit_local_retain_release(ref, val, expr.value, ttype, lines)
+                    self._emit_local_retain_release(ref, val, expr.value, ttype, lines,
+                                                    source_type=vtype)
             elif ttype == TEXT:
                 if ref.startswith("@"):
                     val = self._emit_global_retain_release(ref, val, ttype, lines, expr.value)
@@ -4199,8 +4676,8 @@ class CodeGen:
             else:
                 ptr, ftype = self._member_ptr(expr.target, env, lines)
             val, vtype = self._emit_value_for(expr.value, env, lines, ftype)
-            val = self._coerce(val, vtype, ftype, lines)
-            if isinstance(ftype, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+            val = self._coerce(val, vtype, ftype, lines, source_expr=expr.value)
+            if _is_refcounted(ftype):
                 # claude.md #78 (widened by claude.md #79 to arr[T]/
                 # map[T]-typed fields, and claude.md #80 to arr[T]
                 # ELEMENTS too): `outer.field = value` / `arr[i] = value`
@@ -4582,16 +5059,27 @@ class CodeGen:
                         f"found {types_mod.type_name(vtype)}",
                         file=self.filename, line=callee.line)
                 # claude.md #10 lists blob among the five primitive
-                # types with no exception carved out for log() (#41);
-                # blob shares text's exact `ptr`-to-bytes representation
-                # (see _llvm_type), so festina_log_text handles it too --
-                # this used to be a bare KeyError (blob passed the
-                # PrimitiveType check above but had no dict entry) since
-                # nothing could actually construct a blob value before
-                # check_assignable allowed text -> blob assignment.
+                # types with no exception carved out for log() (#41), so
+                # log(someBlob) has to mean something. It used to route
+                # straight to festina_log_text on the grounds that blob
+                # shared text's `ptr`-to-bytes representation -- true
+                # then, and actively dangerous since claude.md #109 made
+                # a blob a HANDLE: the same code would have printed a
+                # FestinaBlob struct's first field as if it were a
+                # string. It logs the CONTENTS now, which is what a blob
+                # is, via the same accessor .toText() uses.
+                if vtype == BLOB:
+                    contents = self.tmp()
+                    lines.append(f"  {contents} = call ptr @festina_blob_to_text(ptr {val})")
+                    lines.append(f"  call void @festina_log_text(ptr {contents})")
+                    # festina_blob_to_text hands back an owned copy
+                    # (claude.md #83), so this temporary is ours to free.
+                    lines.append(f"  call void @free(ptr {contents})")
+                    self._release_member_receiver_temp(expr.args[0], val, vtype,
+                                                       INT, lines)
+                    return "0", None
                 fn = {"int": "festina_log_int", "float": "festina_log_float",
-                      "bool": "festina_log_bool", "text": "festina_log_text",
-                      "blob": "festina_log_text"}[vtype.name]
+                      "bool": "festina_log_bool", "text": "festina_log_text"}[vtype.name]
                 ty = _llvm_type(vtype)
                 lines.append(f"  call void @{fn}({ty} {val})")
                 self._free_text_temp(expr.args[0], val, vtype, lines)
@@ -4607,12 +5095,11 @@ class CodeGen:
             # (the file helpers read or write and close; strftime copies
             # into its own buffer; Cairo's PNG writer takes the path by
             # value).
+            # claude.md #109 moved the five file functions onto `blob`
+            # itself (see _emit_blob_method). The C helpers they called
+            # are unchanged and still do the work -- what went away is
+            # the free-function spelling, not the capability.
             _FILE_TIME_BUILTINS = {
-                "readFile": ("festina_read_file", "ptr", TEXT),
-                "writeFile": ("festina_write_file", "i8", BOOL),
-                "appendFile": ("festina_append_file", "i8", BOOL),
-                "fileExists": ("festina_file_exists", "i8", BOOL),
-                "deleteFile": ("festina_delete_file", "i8", BOOL),
                 "formatTime": ("festina_format_time", "ptr", TEXT),
                 "saveCanvas": ("festina_save_canvas", "i8", BOOL),
             }
@@ -4826,18 +5313,23 @@ class CodeGen:
                     self._free_regex_temp(expr.args[0], arg_val, arg_type, lines)
                     return out, TEXT
             # claude.md #68: value.replace(search, replacement:text) -> text
-            #                value.replaceAll(search, replacement:text) -> text
-            if callee.prop in ("replace", "replaceAll"):
+            # claude.md #107: how many matches this touches is no longer
+            # decided here. A regex search carries its own 'g' flag and
+            # the runtime reads it; a text search has no flags and
+            # replaces the first match only. There is nothing left for
+            # codegen to pass, which is the point -- the old i8 argument
+            # could only ever be a compile-time constant, so a regex
+            # built by `regex(p, f)` could never have said "global".
+            if callee.prop == "replace":
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if obj_type == TEXT:
                     search_val, search_type = self._emit_expr(expr.args[0], env, lines)
                     replacement_val, replacement_type = self._emit_expr(expr.args[1], env, lines)
-                    replace_all = "1" if callee.prop == "replaceAll" else "0"
                     out = self.tmp()
                     if search_type == REGEX:
                         lines.append(
                             f"  {out} = call ptr @festina_regex_replace(ptr {search_val}, ptr {obj_val}, "
-                            f"ptr {replacement_val}, i8 {replace_all})"
+                            f"ptr {replacement_val})"
                         )
                     else:
                         # search_type is TEXT, or None from a bare `null`
@@ -4845,7 +5337,7 @@ class CodeGen:
                         # search pointer defensively -- see the runtime).
                         lines.append(
                             f"  {out} = call ptr @festina_str_replace(ptr {obj_val}, ptr {search_val}, "
-                            f"ptr {replacement_val}, i8 {replace_all})"
+                            f"ptr {replacement_val})"
                         )
                     self._free_text_temp(callee.obj, obj_val, obj_type, lines)
                     self._free_text_temp(expr.args[0], search_val, search_type, lines)
@@ -4881,6 +5373,7 @@ class CodeGen:
             # claude.md #99: play/playLoop take an optional channel, and
             # both compile to the same runtime entry point -- the four
             # shapes differ only in two flags it already takes.
+            # claude.md #109: both now RETURN that channel as an int.
             if callee.prop in ("play", "playLoop"):
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if obj_type == AUDIO:
@@ -4894,9 +5387,96 @@ class CodeGen:
                         # readable and the call trivially verifiable.
                         chan_val, explicit = "0", 0
                     looping = 1 if callee.prop == "playLoop" else 0
+                    out = self.tmp()
                     lines.append(
-                        f"  call void @festina_audio_play_on(ptr {obj_val}, "
+                        f"  {out} = call i64 @festina_audio_play_on(ptr {obj_val}, "
                         f"i64 {chan_val}, i8 {explicit}, i8 {looping})")
+                    return out, INT
+            # claude.md #111: row.undefined('col') -- reads the presence
+            # mask festina_sqlite_collect_rows records one slot past the
+            # row's columns. The names array is the same global schema
+            # sync already uses, so an unknown name fails with a clear
+            # message at run time rather than silently answering.
+            if callee.prop == "undefined":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.TableType):
+                    names_global, _, ncols = self._table_arrays(
+                        obj_type.name, self.tables[obj_type.name])
+                    arg_val, arg_type = self._emit_expr(expr.args[0], env, lines)
+                    out = self.tmp()
+                    lines.append(
+                        f"  {out} = call i8 @festina_row_undefined(ptr {obj_val}, "
+                        f"ptr {names_global}, i32 {ncols}, ptr {arg_val})")
+                    self._free_text_temp(expr.args[0], arg_val, arg_type, lines)
+                    return out, BOOL
+            # claude.md #110: save()/saveCopy() on blob, img or aud. One
+            # branch for all three, dispatched on the receiver's type --
+            # the runtime functions differ only in which struct's path
+            # field they update, and all three share festina_save_bytes.
+            if callee.prop in ("save", "saveCopy"):
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                suffix = "_save" if callee.prop == "save" else "_save_copy"
+                fn = None
+                if obj_type == BLOB:
+                    fn = f"festina_blob{suffix}"
+                elif isinstance(obj_type, types_mod.ImageType):
+                    self.uses_graphics_code = True
+                    fn = f"festina_image{suffix}"
+                elif isinstance(obj_type, types_mod.AudioType):
+                    self.uses_audio = True
+                    fn = f"festina_audio{suffix}"
+                if fn is not None:
+                    if expr.args:
+                        arg_val, arg_type = self._emit_expr(expr.args[0], env, lines)
+                    else:
+                        # The no-argument save(): a null path is how the
+                        # runtime is told to use the handle's own.
+                        arg_val, arg_type = "null", None
+                    out = self.tmp()
+                    lines.append(
+                        f"  {out} = call i8 @{fn}(ptr {obj_val}, ptr {arg_val})")
+                    if expr.args:
+                        self._free_text_temp(expr.args[0], arg_val, arg_type, lines)
+                    self._release_member_receiver_temp(callee.obj, obj_val, obj_type,
+                                                      BOOL, lines)
+                    return out, BOOL
+            # claude.md #109: blob's five methods. The receiver is a
+            # blob handle, which already holds the path -- so these are
+            # single runtime calls with no path argument to thread
+            # through, unlike the free functions they replace.
+            if callee.prop in ("toText", "write", "append", "exists", "delete"):
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if obj_type == BLOB:
+                    fn, ret_ir, ret_type = {
+                        "toText": ("festina_blob_to_text", "ptr", TEXT),
+                        "write": ("festina_blob_write", "i8", BOOL),
+                        "append": ("festina_blob_append", "i8", BOOL),
+                        "exists": ("festina_blob_exists", "i8", BOOL),
+                        "delete": ("festina_blob_delete", "i8", BOOL),
+                    }[callee.prop]
+                    out = self.tmp()
+                    if expr.args:
+                        arg_val, arg_type = self._emit_expr(expr.args[0], env, lines)
+                        lines.append(
+                            f"  {out} = call {ret_ir} @{fn}(ptr {obj_val}, ptr {arg_val})")
+                        self._free_text_temp(expr.args[0], arg_val, arg_type, lines)
+                    else:
+                        lines.append(f"  {out} = call {ret_ir} @{fn}(ptr {obj_val})")
+                    # A blob produced purely to act on -- `blob f =
+                    # 'x'` inline, or a call result -- is released the
+                    # same way any other member receiver is; toText()
+                    # hands back an owned copy and the rest return
+                    # scalars, so nothing here points into the handle.
+                    self._release_member_receiver_temp(callee.obj, obj_val, obj_type,
+                                                       ret_type, lines)
+                    return out, ret_type
+            # claude.md #109: aud.stop() is back, clip-wide -- see the
+            # runtime's own note on why #100 removed it and why that
+            # reasoning did not survive play() returning a channel.
+            if callee.prop == "stop":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if obj_type == AUDIO:
+                    lines.append(f"  call void @festina_audio_stop_clip(ptr {obj_val})")
                     return "0", None
             if callee.prop == "isPlaying":
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
@@ -4946,9 +5526,10 @@ class CodeGen:
         relying on the two shapes happening to be compatible -- the same
         "declared types must actually match at every call site" rule
         every other function-pointer registration in this file already
-        follows (e.g. festina_register_click_handler's fixed
+        follows (e.g. festina_register_mouse_down_handler's fixed
         `void(i64,i64)` signature, matched exactly by semantic.py's
-        _EVENT_SIGNATURES check on `on click`'s own declared params)."""
+        _EVENT_SIGNATURES check on `on mouseDown`'s own declared
+        params)."""
         uid = self._unique()
         trampoline_name = f"@__festina_maptrampoline_{uid}"
         value_llvm_ty = _llvm_type(value_type)
@@ -5012,6 +5593,10 @@ class CodeGen:
         flags_val = self._const_string(expr.flags, lines)
         compiled = self.tmp()
         lines.append(f"  {compiled} = call ptr @festina_regex_compile(ptr {pattern_val}, ptr {flags_val})")
+        # claude.md #111: `free` on a regex binding must not free THIS --
+        # it is shared with every later execution of this line. The value
+        # itself carries the answer, so festina_regex_free can no-op.
+        lines.append(f"  call void @festina_regex_mark_cached(ptr {compiled})")
         lines.append(f"  store ptr {compiled}, ptr {cache_global}")
         compile_pred = self.cur_block
         lines.append(f"  br label %{done_label}")
@@ -5021,7 +5606,7 @@ class CodeGen:
         lines.append(f"  {out} = phi ptr [ {loaded}, %{load_pred} ], [ {compiled}, %{compile_pred} ]")
         return out
 
-    # ---- regex() / .test() / .match() / .replace() / .replaceAll() (claude.md #67-68) ----
+    # ---- regex() / .test() / .match() / .replace() (claude.md #67-68, #107) ----
     def _emit_regex_call(self, expr, env, lines):
         """claude.md #67: regex(pattern:text) / regex(pattern:text,
         flags:text) -> regex. Compiles the pattern via POSIX regcomp()
@@ -5299,6 +5884,15 @@ class CodeGen:
         if isinstance(table_type, types_mod.TableType):
             arr_val = self._emit_sqlite_collect(stmt_val, table_type, lines)
             return arr_val, expected_type
+        if isinstance(table_type, types_mod.StructType):
+            # claude.md #112: a STRUCT as the landing spot -- the shape
+            # for `SELECT id AS whatever`, a JOIN, or any computed
+            # column: name the fields after the result's own column
+            # names, no table (and no CREATE TABLE side effect, which a
+            # `table` declaration always carries) required.
+            arr_val = self._emit_sqlite_collect_struct(stmt_val, table_type, lines,
+                                                       line=callee.line)
+            return arr_val, expected_type
 
         lines.append(f"  call void @festina_sqlite_exec(ptr {stmt_val})")
         return "0", None
@@ -5342,18 +5936,28 @@ class CodeGen:
                 z = self.tmp()
                 lines.append(f"  {z} = zext i8 {val} to i64")
                 lines.append(f"  call void @festina_sqlite_bind_int(ptr {stmt_val}, i32 {idx}, i64 {z})")
-            elif isinstance(vtype, (types_mod.AudioType, types_mod.ImageType)):
+            elif isinstance(vtype, (types_mod.AudioType, types_mod.ImageType)) or vtype == BLOB:
                 # claude.md #101: an aud/img binds as its own encoded
                 # bytes, so `sqlite('... VALUES (?)', [track])` stores
                 # the file rather than a pointer. The accessor lives in
                 # the graphics/audio translation unit, which is linked
                 # because the program already holds one of these values.
+                #
+                # claude.md #109: a blob binds the same way, and is the
+                # reason this branch reads naturally rather than as a
+                # special case -- all three are "content plus the bytes
+                # it came from", so all three store their bytes. A blob
+                # needs no uses_* flag: its accessor is in the core
+                # runtime, always linked.
                 is_audio = isinstance(vtype, types_mod.AudioType)
-                if is_audio:
+                if vtype == BLOB:
+                    fn = "festina_blob_bytes"
+                elif is_audio:
                     self.uses_audio = True
+                    fn = "festina_audio_bytes"
                 else:
                     self.uses_graphics_code = True
-                fn = "festina_audio_bytes" if is_audio else "festina_image_bytes"
+                    fn = "festina_image_bytes"
                 len_slot = self.tmp()
                 lines.append(f"  {len_slot} = alloca i64")
                 lines.append(f"  store i64 0, ptr {len_slot}")
@@ -5366,7 +5970,7 @@ class CodeGen:
                     f"ptr {data}, i64 {blob_len})")
             else:
                 raise CodegenError(
-                    "sqlite() parameters must be int/float/bool/text/aud/img/null, "
+                    "sqlite() parameters must be int/float/bool/text/blob/aud/img/null, "
                     f"found {types_mod.type_name(vtype)}",
                     file=self.filename, line=getattr(elem, "line", 0))
 
@@ -5411,7 +6015,7 @@ class CodeGen:
     def _emit_sqlite_collect(self, stmt_val, table_type, lines):
         table_name = table_type.name
         cols = self.tables[table_name]
-        _, types_global, ncols = self._table_arrays(table_name, cols)
+        names_global, types_global, ncols = self._table_arrays(table_name, cols)
 
         n_slot = self.tmp()
         lines.append(f"  {n_slot} = alloca i64")
@@ -5419,7 +6023,7 @@ class CodeGen:
         lines.append(f"  {data_slot} = alloca ptr")
         lines.append(
             f"  call void @festina_sqlite_collect_rows(ptr {stmt_val}, i32 {ncols}, "
-            f"ptr {types_global}, ptr {n_slot}, ptr {data_slot})"
+            f"ptr {types_global}, ptr {names_global}, ptr {n_slot}, ptr {data_slot})"
         )
         n_val = self.tmp()
         lines.append(f"  {n_val} = load i64, ptr {n_slot}")
@@ -5528,7 +6132,8 @@ class CodeGen:
                 )
         if self.uses_graphics:
             main_lines.append("  call void @festina_graphics_init()")
-            register_fn = {"click": "festina_register_click_handler",
+            register_fn = {"mouseDown": "festina_register_mouse_down_handler",
+                            "mouseUp": "festina_register_mouse_up_handler",
                             "mouse": "festina_register_mouse_handler",
                             "keyDown": "festina_register_key_down_handler",
                             "keyUp": "festina_register_key_up_handler",
@@ -5541,8 +6146,8 @@ class CodeGen:
             # claude.md #40's "canvas" only means something while a
             # window is actually open -- block here, after the entry
             # function's own top-level statements have run (so anything
-            # drawn there is already visible), handling Expose/click/
-            # mouse/key/resize/close and any pending setTimeout/
+            # drawn there is already visible), handling Expose/mouse/
+            # key/resize/close and any pending setTimeout/
             # setInterval callbacks until there's nothing left to wait
             # for (see festina_run_event_loop's own doc comment in
             # festina_runtime.h/graphics.c). festina_run_event_loop lives
@@ -5584,13 +6189,185 @@ class CodeGen:
         self._table_arrays_cache[table_name] = result
         return result
 
+    def _query_struct_arrays(self, struct_type, line=0):
+        """claude.md #112: the struct counterpart of _table_arrays --
+        column-name and column-type globals derived from a STRUCT's
+        fields, so festina_sqlite_collect_rows can match result columns
+        to them by name exactly as it does for a table. This is what
+        gives an aliased or computed column a declared landing spot:
+        `SELECT id AS whatever` matches a struct field named `whatever`,
+        where a table's declared columns can never be renamed to chase
+        a query's aliases.
+
+        Field types are restricted to what a query can actually produce
+        (the same seven festina_sql_type knows); a struct with an
+        arr/map/struct field can hold one in ordinary code but not
+        receive one from sqlite, and the error says which field."""
+        name = struct_type.name
+        cached = self._table_arrays_cache.get("q$" + name)
+        if cached is not None:
+            return cached
+        type_strings = []
+        for fname, ftype in self.struct_fields(name):
+            if ftype == INT:
+                type_strings.append("int")
+            elif ftype == FLOAT:
+                type_strings.append("float")
+            elif ftype == BOOL:
+                type_strings.append("bool")
+            elif ftype == TEXT:
+                type_strings.append("text")
+            elif ftype == BLOB:
+                type_strings.append("blob")
+            elif isinstance(ftype, types_mod.ImageType):
+                # The decoder registration in main() keys on this flag,
+                # the same as it does for a media table column.
+                self.uses_graphics_code = True
+                type_strings.append("img")
+            elif isinstance(ftype, types_mod.AudioType):
+                self.uses_audio = True
+                type_strings.append("aud")
+            else:
+                raise CodegenError(
+                    f"struct '{name}' cannot receive a sqlite() result: field "
+                    f"'{fname}' is {types_mod.type_name(ftype)}, and a query "
+                    f"column can only be int/float/bool/text/blob/img/aud",
+                    file=self.filename, line=line)
+        fields = self.struct_fields(name)
+        names_arr = f"@{name}.qcols"
+        types_arr = f"@{name}.qtypes"
+        name_ptrs = ", ".join(f"ptr {self.string_const(n)}" for n, _ in fields)
+        type_ptrs = ", ".join(f"ptr {self.string_const(t)}" for t in type_strings)
+        self.extra_globals.append(
+            f"{names_arr} = private constant [{len(fields)} x ptr] [{name_ptrs}]")
+        self.extra_globals.append(
+            f"{types_arr} = private constant [{len(type_strings)} x ptr] [{type_ptrs}]")
+        result = (names_arr, types_arr, len(fields))
+        self._table_arrays_cache["q$" + name] = result
+        return result
+
+    def _emit_row_to_struct_fn(self, struct_type):
+        """claude.md #112: generates (once per struct type, cached) the
+        function that turns one of festina_sqlite_collect_rows's flat
+        rows into a real, refcounted struct instance.
+
+        The flat row is `ncols` 8-byte slots plus the presence mask; a
+        struct is an LLVM named struct with natural field offsets and a
+        refcount header. Rather than teach every downstream consumer a
+        second row layout, the row is converted ONCE, here, immediately
+        after collection: each slot is loaded at the field's own LLVM
+        type (the raw 8 bytes hold an i64, a double's bits, or a
+        pointer -- little-endian, so an i8 bool reads its low byte, the
+        same read a table-row member access does) and stored at the
+        field's real offset. Pointer fields (text/blob/img/aud) TRANSFER
+        ownership -- the struct owns them now, and only the row buffer
+        itself is freed. The struct starts at refcount 1, owned by the
+        result array, so element release, `free`, aliasing and the rest
+        of claude.md #77's machinery apply with nothing new.
+
+        The presence mask is deliberately dropped: undefined() is a
+        TABLE-ROW method, and a struct instance from a query is an
+        ordinary struct, indistinguishable from one built by hand -- an
+        unmatched column simply reads null."""
+        name = struct_type.name
+        fn_name = f"@__festina_rowtostruct_{name}"
+        if fn_name in self._row_to_struct_fns:
+            return fn_name
+        self._row_to_struct_fns.add(fn_name)
+        struct_ty = self.struct_llvm_name(name)
+        body = [f"define ptr {fn_name}(ptr %row) {{", "entry:"]
+        size_ptr = self.tmp()
+        body.append(f"  {size_ptr} = getelementptr {struct_ty}, ptr null, i64 1")
+        size_val = self.tmp()
+        body.append(f"  {size_val} = ptrtoint ptr {size_ptr} to i64")
+        total = self.tmp()
+        body.append(f"  {total} = add i64 {size_val}, 8")
+        raw = self.tmp()
+        body.append(f"  {raw} = call ptr @calloc(i64 1, i64 {total})")
+        body.append(f"  store i64 1, ptr {raw}")
+        payload = self.tmp()
+        body.append(f"  {payload} = getelementptr i8, ptr {raw}, i64 8")
+        for idx, (_, ftype) in enumerate(self.struct_fields(name)):
+            f_llvm = _llvm_type(ftype)
+            slot = self.tmp()
+            body.append(f"  {slot} = getelementptr i8, ptr %row, i64 {idx * 8}")
+            v = self.tmp()
+            body.append(f"  {v} = load {f_llvm}, ptr {slot}")
+            fp = self.tmp()
+            body.append(f"  {fp} = getelementptr {struct_ty}, ptr {payload}, i32 0, i32 {idx}")
+            body.append(f"  store {f_llvm} {v}, ptr {fp}")
+        body.append("  call void @free(ptr %row)")
+        body.append(f"  ret ptr {payload}")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _emit_sqlite_collect_struct(self, stmt_val, struct_type, lines, line=0):
+        """claude.md #112: `arr[SomeStruct] q = sqlite(...)`. Shares the
+        whole table pipeline -- prepare, bind, name-matched collection
+        (claude.md #111) -- and differs only in the last step, where each
+        flat row becomes a real struct instance in place."""
+        names_global, types_global, ncols = self._query_struct_arrays(struct_type, line)
+
+        n_slot = self.tmp()
+        lines.append(f"  {n_slot} = alloca i64")
+        data_slot = self.tmp()
+        lines.append(f"  {data_slot} = alloca ptr")
+        lines.append(
+            f"  call void @festina_sqlite_collect_rows(ptr {stmt_val}, i32 {ncols}, "
+            f"ptr {types_global}, ptr {names_global}, ptr {n_slot}, ptr {data_slot})"
+        )
+        n_val = self.tmp()
+        lines.append(f"  {n_val} = load i64, ptr {n_slot}")
+        data_val = self.tmp()
+        lines.append(f"  {data_val} = load ptr, ptr {data_slot}")
+
+        convert_fn = self._emit_row_to_struct_fn(struct_type)
+        uid = self._unique()
+        i_slot = self.tmp()
+        lines.append(f"  {i_slot} = alloca i64")
+        lines.append(f"  store i64 0, ptr {i_slot}")
+        cond = self.label(f"rowconv.cond{uid}")
+        bodyl = self.label(f"rowconv.body{uid}")
+        endl = self.label(f"rowconv.end{uid}")
+        lines.append(f"  br label %{cond}")
+        self._start_block(cond, lines)
+        i_val = self.tmp()
+        lines.append(f"  {i_val} = load i64, ptr {i_slot}")
+        more = self.tmp()
+        lines.append(f"  {more} = icmp slt i64 {i_val}, {n_val}")
+        lines.append(f"  br i1 {more}, label %{bodyl}, label %{endl}")
+        self._start_block(bodyl, lines)
+        slot_ptr = self.tmp()
+        lines.append(f"  {slot_ptr} = getelementptr ptr, ptr {data_val}, i64 {i_val}")
+        row_val = self.tmp()
+        lines.append(f"  {row_val} = load ptr, ptr {slot_ptr}")
+        converted = self.tmp()
+        lines.append(f"  {converted} = call ptr {convert_fn}(ptr {row_val})")
+        lines.append(f"  store ptr {converted}, ptr {slot_ptr}")
+        nxt = self.tmp()
+        lines.append(f"  {nxt} = add i64 {i_val}, 1")
+        lines.append(f"  store i64 {nxt}, ptr {i_slot}")
+        lines.append(f"  br label %{cond}")
+        self._start_block(endl, lines)
+
+        header = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, lines)
+        len_ptr = self.tmp()
+        lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
+        lines.append(f"  store i64 {n_val}, ptr {len_ptr}")
+        data_field_ptr = self.tmp()
+        lines.append(f"  {data_field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
+        lines.append(f"  store ptr {data_val}, ptr {data_field_ptr}")
+        return header
+
     def _emit_toplevel_stmt(self, stmt, env, ctx):
         lines = ctx["lines"]
         if isinstance(stmt, ast.VarDecl):
             ref, type_ = env.lookup(stmt.name)
             if stmt.init is not None:
                 val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
-                val = self._coerce(val, vtype, type_, lines)
+                val = self._coerce(val, vtype, type_, lines, source_expr=stmt.init)
                 # claude.md #77 (widened by #83 to text): a global's own
                 # declaration-with-initializer is just another point its
                 # value changes -- see _emit_global_retain_release's own
@@ -5599,7 +6376,8 @@ class CodeGen:
                 # ordinary `g = expr` reassignment gets (_emit_assign),
                 # not a plain store. Its own return value is what must
                 # actually be stored -- see that method's own comment.
-                val = self._emit_global_retain_release(ref, val, type_, lines, stmt.init)
+                val = self._emit_global_retain_release(ref, val, type_, lines, stmt.init,
+                                                      source_type=vtype)
                 lines.append(f"  store {_llvm_type(type_)} {val}, ptr {ref}")
             return
         self._emit_stmt(stmt, env, None, ctx)

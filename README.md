@@ -42,10 +42,14 @@ bin/festina compile examples/greet.f -o greet && ./greet
   `festina.sqlite` is created, migrated, and kept in sync automatically
   — no ORM, no migration scripts, no setup code.
 - **Graphics and audio, no dependencies to wire up yourself.** A real
-  on-screen canvas (`drawRect`, `on click`, typed `color`/`font` values,
+  on-screen canvas (`drawRect`, `on mouseDown`, typed `color`/`font` values,
   ...) and real audio playback
-  (`loadAudio().play()`) are just functions, backed by Cairo/X11 and
+  (`aud music = 'music.mp3'` then `music.play()`) are just declarations
+  and methods, backed by Cairo/X11 and
   ALSA under the hood.
+- **Automatic memory, manual override.** Values are reclaimed for you —
+  and `free spritesheet` / `delete map.key` exist for the moments you
+  know the lifetime better than the compiler does.
 - **JavaScript syntax, none of the surprises.** Template strings,
   ternaries, familiar control flow — but `int`/`float` never silently
   mix, every condition is a real `bool`, and everything is statically
@@ -117,11 +121,18 @@ font  title = 'bold 24px sans-serif'
 fillStyle(brand)
 changeFont(title)
 drawRect(0, 0, 100, 100)
-on click(x:int, y:int) { log(`clicked ${x}, ${y}`) }
+on mouseDown(x:int, y:int) { log(`pressed ${x}, ${y}`) }
+on mouseUp(x:int, y:int)   { log(`released ${x}, ${y}`) }
 
 // Audio
-aud music = loadAudio('music.wav')
+aud music = 'music.wav'
 music.play()
+
+// Files -- a blob is a file's bytes, and knows its own path
+blob notes = 'notes.txt'
+notes.write('hello')
+log(notes.toText())
+notes.saveCopy('notes.bak')           // img and aud save the same way
 
 // Timers, JS-style
 setTimeout(showMessage, 1000)
@@ -147,7 +158,7 @@ implementation-defined vs. spec-mandated — is in [api.md](api.md).
 whole language — from a one-liner to a real, playable two-player
 **tic-tac-toe game** ([`tic_tac_toe.f`](examples/tic_tac_toe.f), click a
 cell, alternating X/O, real win detection) built entirely in Festina
-with nothing but `drawRect`/`drawText`/`on click`:
+with nothing but `drawRect`/`drawText`/`on mouseDown`:
 
 ```bash
 bin/festina compile examples/tic_tac_toe.f -o tic_tac_toe && ./tic_tac_toe
@@ -162,10 +173,11 @@ bin/festina compile examples/tic_tac_toe.f -o tic_tac_toe && ./tic_tac_toe
 | [`multifile.f`](examples/multifile.f) + [`geometry.f`](examples/geometry.f) | `import` across files |
 | [`maps.f`](examples/maps.f) | `map[T]` literals, indexed get/set, `.forEach()` |
 | [`config.f`](examples/config.f) | `DatabaseURL`, `environment.NAME` |
-| [`regex.f`](examples/regex.f) | `/pattern/flags` literals, `.test()`, `.match()`, `.replace()`/`.replaceAll()` |
+| [`regex.f`](examples/regex.f) | `/pattern/flags` literals, `.test()`, `.match()`, `.replace()`, and `/g` for every-match |
 | [`timers.f`](examples/timers.f) | `setTimeout`/`setInterval`/`clearInterval` |
-| [`graphics.f`](examples/graphics.f) | A drawn canvas, plus all five `on click`/`mouse`/`key`/`resize`/`close` handlers |
-| [`audio.f`](examples/audio.f) | `loadAudio()`/`.play()`/`.stop()`/`.isPlaying()`, with a tiny bundled WAV |
+| [`graphics.f`](examples/graphics.f) | A drawn canvas, plus every `on mouseDown`/`mouseUp`/`mouse`/`key`/`resize`/`close` handler |
+| [`audio.f`](examples/audio.f) | `aud` from a path, `.play()`/`.stop()`/`.isPlaying()`, channels, with a tiny bundled WAV |
+| [`files.f`](examples/files.f) | `blob` — a file's bytes, its methods, `save`/`saveCopy`, and what sharing one means |
 | [`tic_tac_toe.f`](examples/tic_tac_toe.f) | The game above — graphics, global game state, and win-checking logic together |
 
 Every one of these is compiled and checked by the test suite on every

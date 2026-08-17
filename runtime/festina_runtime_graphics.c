@@ -47,7 +47,13 @@ static Window g_window;
 static Atom g_wm_delete_atom;
 static cairo_surface_t *g_window_surface = NULL;
 static cairo_surface_t *g_backing_surface = NULL;
-static void (*g_click_handler)(int64_t, int64_t) = NULL;
+/* claude.md #106: `on click` split into `on mouseDown` and `on mouseUp`,
+ * exactly as claude.md #98 split `on key`. A click is a press and a
+ * release, and a program that needs to tell them apart -- dragging,
+ * charging a shot, holding to aim -- could not, because the two were
+ * collapsed into one event that fired on press. */
+static void (*g_mouse_down_handler)(int64_t, int64_t) = NULL;
+static void (*g_mouse_up_handler)(int64_t, int64_t) = NULL;
 static void (*g_mouse_handler)(int64_t, int64_t) = NULL;
 /* claude.md #98: `on key` split into `on keyDown` and `on keyUp`. */
 static void (*g_key_down_handler)(const char *) = NULL;
@@ -649,7 +655,7 @@ void festina_graphics_init(void) {
 
     XStoreName(g_display, g_window, "Festina");
     XSelectInput(g_display, g_window,
-                 ExposureMask | ButtonPressMask | PointerMotionMask |
+                 ExposureMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
                  KeyPressMask | KeyReleaseMask | StructureNotifyMask);
     /* claude.md #98: ask the server to stop synthesizing a KeyRelease
      * before every auto-repeated KeyPress, so a held key produces one
@@ -907,12 +913,21 @@ typedef struct {
      * overhead rather than a doubling. */
     unsigned char *bytes;
     size_t byte_count;
+    /* claude.md #110: the path this image was loaded from, so save()
+     * with no argument has somewhere to write. Empty (never NULL, so
+     * the shared festina_save_bytes need not special-case it) for an
+     * image that never came from a file -- a clip() or resize() result,
+     * or one decoded out of a database column. That is precisely the
+     * case save(path) exists for, and the case save() refuses. */
+    char *path;
 } FestinaImageBox;
 
 static FestinaImageBox *festina_image_box(cairo_surface_t *surface) {
     FestinaImageBox *box = calloc(1, sizeof(FestinaImageBox));
     if (!box) festina_fail("out of memory creating an image");
     box->surface = surface;
+    box->path = strdup("");   /* claude.md #110: no path until one is given */
+    if (!box->path) festina_fail("out of memory creating an image");
     return box;
 }
 
@@ -1086,6 +1101,15 @@ void *festina_load_image(const char *path) {
     }
     void *box = festina_image_from_bytes(data, (int64_t)size, path);
     free(data);
+    /* claude.md #110: remember where it came from, so save() works and
+     * saveCopy() into a directory has a filename to reuse. Set here
+     * rather than inside festina_image_from_bytes, because THAT entry
+     * point is also how a database column becomes an image -- and one
+     * of those genuinely has no path. */
+    FestinaImageBox *loaded = (FestinaImageBox *)box;
+    free(loaded->path);
+    loaded->path = strdup(path);
+    if (!loaded->path) festina_fail("out of memory loading an image");
     return box;
 }
 
@@ -1122,6 +1146,27 @@ const void *festina_image_bytes(void *img, int64_t *out_len) {
     }
     if (out_len) *out_len = (int64_t)box->byte_count;
     return box->bytes;
+}
+
+/* claude.md #110: writes the image's encoded bytes to a path. Uses
+ * festina_image_bytes, so a clip()/resize() result is PNG-encoded on
+ * demand exactly as it would be for a database column -- which is why
+ * saving a clip works at all, and why it lands as a PNG whatever the
+ * sheet it came from was. */
+int8_t festina_image_save(void *img, const char *target) {
+    if (!img) return 0;
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    int64_t len = 0;
+    const void *data = festina_image_bytes(img, &len);
+    return festina_save_bytes(target, &box->path, data, len, "img", 1);
+}
+
+int8_t festina_image_save_copy(void *img, const char *target) {
+    if (!img) return 0;
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    int64_t len = 0;
+    const void *data = festina_image_bytes(img, &len);
+    return festina_save_bytes(target, &box->path, data, len, "img", 0);
 }
 
 int64_t festina_image_width(void *img) {
@@ -1195,6 +1240,7 @@ void festina_image_free(void *img) {
     FestinaImageBox *box = (FestinaImageBox *)img;
     if (box->surface) cairo_surface_destroy(box->surface);
     free(box->bytes);   /* claude.md #101 */
+    free(box->path);    /* claude.md #110 */
     free(box);
 }
 
@@ -1207,8 +1253,12 @@ void festina_draw_image(void *img, int64_t x, int64_t y) {
     cairo_destroy(cr);
 }
 
-void festina_register_click_handler(void (*handler)(int64_t, int64_t)) {
-    g_click_handler = handler;
+void festina_register_mouse_down_handler(void (*handler)(int64_t, int64_t)) {
+    g_mouse_down_handler = handler;
+}
+
+void festina_register_mouse_up_handler(void (*handler)(int64_t, int64_t)) {
+    g_mouse_up_handler = handler;
 }
 
 void festina_register_mouse_handler(void (*handler)(int64_t, int64_t)) {
@@ -1306,8 +1356,14 @@ static int festina_key_event_is_autorepeat(XEvent *ev) {
 static int festina_handle_graphics_event(XEvent *ev) {
     if (ev->type == Expose) {
         festina_graphics_present();
-    } else if (ev->type == ButtonPress) {
-        if (g_click_handler) g_click_handler(ev->xbutton.x, ev->xbutton.y);
+    } else if (ev->type == ButtonPress || ev->type == ButtonRelease) {
+        /* claude.md #106: both carry the pointer position at the moment
+         * they happened, which is what makes a drag expressible -- press
+         * and release report different coordinates when the pointer
+         * moved in between. */
+        void (*handler)(int64_t, int64_t) =
+            ev->type == ButtonPress ? g_mouse_down_handler : g_mouse_up_handler;
+        if (handler) handler(ev->xbutton.x, ev->xbutton.y);
     } else if (ev->type == MotionNotify) {
         if (g_mouse_handler) g_mouse_handler(ev->xmotion.x, ev->xmotion.y);
     } else if (ev->type == KeyPress || ev->type == KeyRelease) {
@@ -1363,7 +1419,7 @@ static void festina_graphics_teardown(void) {
  * a program uses graphics -- see festina_runtime.h's doc comment.
  * Multiplexes X11 events and timer deadlines on the same select() call
  * (via ConnectionNumber(g_display)) rather than picking one or the
- * other, so `on click`/timers both stay responsive at once; exits when
+ * other, so `on mouseDown`/timers both stay responsive at once; exits when
  * the window closes (timers, if any, are simply abandoned -- matching a
  * browser tab unloading). Timer state itself lives in
  * festina_runtime.c, reached only through

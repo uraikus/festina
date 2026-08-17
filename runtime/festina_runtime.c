@@ -221,6 +221,279 @@ int8_t festina_delete_file(const char *path) {
     return remove(path) == 0 ? 1 : 0;
 }
 
+/* ---- blob -- claude.md #36, given its real meaning by claude.md #109 ----
+ *
+ * claude.md #36's only worked example was always `blob data =
+ * 'path/to/file'`, but for a long time `blob` was implemented as a
+ * second name for `text`: the declaration stored the PATH and nothing
+ * ever read the file. #109 makes the example mean what it says. A blob
+ * is the file's BYTES, loaded at the declaration, and it keeps the path
+ * it came from so it can be written back, appended to, tested for and
+ * deleted -- the five things claude.md #93 spelled as free functions
+ * taking a path over and over.
+ *
+ * The shape is deliberately the one `img` and `aud` already have (see
+ * claude.md #101): decoded/loaded content plus the bytes it came from,
+ * so the same value serves both a program and a SQLite BLOB column and
+ * a round trip is byte-identical. `length` is a real byte count, not
+ * strlen -- a blob is binary and may contain NUL. The buffer is
+ * NUL-terminated anyway, one byte past `length`, so handing it to
+ * .toText() and to every C string function this runtime already has
+ * costs no copy.
+ *
+ * Unlike img/aud, a blob is REFERENCE COUNTED, using the same i64
+ * header immediately before the payload that structs/arrays/maps use
+ * (festina_retain/festina_release_check). `blob a = b` shares one
+ * handle rather than re-reading the file, and reassigning a blob
+ * releases whatever it held -- so the last reference to a file's
+ * contents frees them, and an earlier reference keeps them alive. That
+ * is the behavior #109 asked for and it is exactly what the existing
+ * refcount protocol provides; nothing new was needed but a destructor
+ * that also frees the two inner strings. */
+typedef struct {
+    char *path;      /* strdup'd; "" for a blob that came from a column */
+    char *bytes;     /* always NUL-terminated at [length] */
+    int64_t length;  /* real byte count -- binary content may embed NUL */
+} FestinaBlob;
+
+/* Reads a whole file and reports its real length. festina_read_file
+ * above cannot serve a blob: it hands back a NUL-terminated buffer with
+ * the length thrown away, which is fine for text and loses the tail of
+ * anything binary. */
+static char *festina_read_file_sized(const char *path, int64_t *out_len) {
+    *out_len = 0;
+    if (!path || !*path) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long size = ftell(f);
+    if (size < 0) { fclose(f); return NULL; }
+    rewind(f);
+    char *buf = malloc((size_t)size + 1);
+    if (!buf) { fclose(f); festina_fail("out of memory reading a file"); }
+    size_t got = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    buf[got] = '\0';
+    *out_len = (int64_t)got;
+    return buf;
+}
+
+static void *festina_blob_alloc(char *path, char *bytes, int64_t length) {
+    char *raw = malloc(sizeof(int64_t) + sizeof(FestinaBlob));
+    if (!raw) festina_fail("out of memory allocating a blob");
+    *(int64_t *)raw = 1;
+    FestinaBlob *b = (FestinaBlob *)(raw + sizeof(int64_t));
+    b->path = path;
+    b->bytes = bytes;
+    b->length = length;
+    return b;
+}
+
+/* An unreadable path is NOT a failure -- it yields an empty blob whose
+ * .exists() is false, matching the rule claude.md #93 set for the file
+ * functions this replaces: "nothing here fails the program". A blob
+ * declared from a path that does not exist yet is the ordinary way to
+ * create a file, since .write() only needs the path. */
+void *festina_blob_open(const char *path) {
+    if (!path) path = "";
+    int64_t len = 0;
+    char *bytes = festina_read_file_sized(path, &len);
+    if (!bytes) { bytes = strdup(""); len = 0; }
+    if (!bytes) festina_fail("out of memory allocating a blob");
+    char *copy = strdup(path);
+    if (!copy) festina_fail("out of memory allocating a blob");
+    return festina_blob_alloc(copy, bytes, len);
+}
+
+/* claude.md #109: a blob read back out of a SQLite BLOB column. It has
+ * bytes and no path, so .toText() works and .exists()/.write()/
+ * .append()/.delete() all answer false -- there is no file to act on,
+ * and inventing a temporary one would be worse than saying so. */
+void *festina_blob_from_bytes(const void *data, int64_t len) {
+    if (len < 0) len = 0;
+    char *bytes = malloc((size_t)len + 1);
+    if (!bytes) festina_fail("out of memory allocating a blob");
+    if (data && len > 0) memcpy(bytes, data, (size_t)len);
+    bytes[len] = '\0';
+    char *copy = strdup("");
+    if (!copy) festina_fail("out of memory allocating a blob");
+    return festina_blob_alloc(copy, bytes, len);
+}
+
+/* The blob counterpart of the per-struct release wrappers codegen
+ * generates (claude.md #78): decrement, and only on the last reference
+ * free the two inner strings before the storage itself. */
+void festina_blob_release(void *payload) {
+    if (!payload) return;
+    if (!festina_release_check(payload)) return;
+    FestinaBlob *b = (FestinaBlob *)payload;
+    free(b->path);
+    free(b->bytes);
+    free((char *)payload - sizeof(int64_t));
+}
+
+/* A fresh copy, because every text this runtime hands back is owned by
+ * the caller (claude.md #83) -- returning b->bytes directly would let a
+ * text binding free a buffer the blob still owns. */
+char *festina_blob_to_text(void *payload) {
+    if (!payload) return NULL;
+    FestinaBlob *b = (FestinaBlob *)payload;
+    char *out = malloc((size_t)b->length + 1);
+    if (!out) festina_fail("out of memory in blob.toText()");
+    memcpy(out, b->bytes, (size_t)b->length);
+    out[b->length] = '\0';
+    return out;
+}
+
+const void *festina_blob_bytes(void *payload, int64_t *out_len) {
+    if (out_len) *out_len = 0;
+    if (!payload) return NULL;
+    FestinaBlob *b = (FestinaBlob *)payload;
+    if (out_len) *out_len = b->length;
+    return b->bytes;
+}
+
+/* Replaces the in-memory bytes as well as the file, so .toText()
+ * immediately after .write() reports what was written rather than what
+ * the file held at declaration time. If the write fails the blob is
+ * left alone -- reporting content that never reached the disk would be
+ * worse than reporting stale content. */
+static int8_t festina_blob_store(FestinaBlob *b, const char *content,
+                                  const char *mode, int append) {
+    if (!b->path || !*b->path) return 0;
+    if (!content) content = "";
+    if (!festina_put_file(b->path, content, mode)) return 0;
+    size_t add = strlen(content);
+    if (append) {
+        char *grown = malloc((size_t)b->length + add + 1);
+        if (!grown) festina_fail("out of memory in blob.append()");
+        memcpy(grown, b->bytes, (size_t)b->length);
+        memcpy(grown + b->length, content, add);
+        grown[b->length + add] = '\0';
+        free(b->bytes);
+        b->bytes = grown;
+        b->length += (int64_t)add;
+    } else {
+        char *fresh = malloc(add + 1);
+        if (!fresh) festina_fail("out of memory in blob.write()");
+        memcpy(fresh, content, add + 1);
+        free(b->bytes);
+        b->bytes = fresh;
+        b->length = (int64_t)add;
+    }
+    return 1;
+}
+
+int8_t festina_blob_write(void *payload, const char *content) {
+    if (!payload) return 0;
+    return festina_blob_store((FestinaBlob *)payload, content, "wb", 0);
+}
+
+int8_t festina_blob_append(void *payload, const char *content) {
+    if (!payload) return 0;
+    return festina_blob_store((FestinaBlob *)payload, content, "ab", 1);
+}
+
+int8_t festina_blob_exists(void *payload) {
+    if (!payload) return 0;
+    return festina_file_exists(((FestinaBlob *)payload)->path);
+}
+
+/* Deletes the FILE. The blob itself is an ordinary reference-counted
+ * value and is unaffected -- its bytes stay readable, which is what
+ * makes "delete it but keep what it said" expressible. */
+int8_t festina_blob_delete(void *payload) {
+    if (!payload) return 0;
+    return festina_delete_file(((FestinaBlob *)payload)->path);
+}
+
+/* ---- saving a handle's bytes -- claude.md #110 ----
+ *
+ * One policy, shared by blob, img and aud, because all three are the
+ * same shape of value (claude.md #101/#109: content plus the bytes it
+ * came from) and "write those bytes somewhere" should not mean three
+ * slightly different things.
+ *
+ *   save()           -- write to the path this handle already has.
+ *   save(path)       -- adopt `path`, then write there. The handle's own
+ *                       path CHANGES, so everything else that acts on it
+ *                       (a blob's exists()/delete()) follows it.
+ *   saveCopy(path)   -- write to `path` and leave the handle's own path
+ *                       alone. The argument is required, enforced in the
+ *                       compiler rather than here, so omitting it is a
+ *                       compile error rather than a runtime surprise.
+ *
+ * `target` is always a complete FILE path -- there is no directory
+ * shorthand. A directory would have to borrow a filename from
+ * somewhere, and the one handle that most needs saving (a clip, a
+ * database column) is exactly the one with no filename to borrow, so
+ * the shorthand would work only where it was least useful. Passing one
+ * anyway answers false, like any other unwritable target.
+ *
+ * A handle with no path is the case this exists for. An `img` from
+ * clip(), an `aud` or `blob` out of a database column -- none has ever
+ * been on disk, so save() with no argument has nothing to write to and
+ * FAILS the program rather than returning false. That is a bug in the
+ * program, not a condition of the filesystem, and the two deserve
+ * different treatment: an I/O failure (full disk, unwritable directory)
+ * still returns false the way every other file operation here does. */
+
+int8_t festina_save_bytes(const char *target, char **own_path,
+                          const void *data, int64_t len,
+                          const char *what, int8_t adopt) {
+    const char *current = (own_path && *own_path) ? *own_path : "";
+    char *resolved = NULL;
+
+    if (!target || !*target) {
+        /* The no-argument save(). */
+        if (!*current) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "this %s has no path to save() to -- it did not come from a "
+                     "file (a clip, or a database column), so pass one: "
+                     "save('path/to/file')", what);
+            festina_fail(msg);
+        }
+        resolved = strdup(current);
+    } else {
+        resolved = strdup(target);
+    }
+    if (!resolved) festina_fail("out of memory resolving a save path");
+
+    FILE *f = fopen(resolved, "wb");
+    if (!f) { free(resolved); return 0; }
+    size_t want = len > 0 ? (size_t)len : 0;
+    size_t wrote = want ? fwrite(data, 1, want, f) : 0;
+    /* fclose can fail on a full disk after every fwrite succeeded, so it
+     * is part of "did this write actually land" -- same rule
+     * festina_put_file already follows. */
+    int closed = fclose(f);
+    int8_t ok = (wrote == want && closed == 0) ? 1 : 0;
+
+    /* The path is adopted only on SUCCESS. Pointing a handle at a file
+     * that was never written would leave exists() answering false about
+     * a path the program was just told it now has. */
+    if (ok && adopt && own_path) {
+        free(*own_path);
+        *own_path = resolved;
+    } else {
+        free(resolved);
+    }
+    return ok;
+}
+
+int8_t festina_blob_save(void *payload, const char *target) {
+    if (!payload) return 0;
+    FestinaBlob *b = (FestinaBlob *)payload;
+    return festina_save_bytes(target, &b->path, b->bytes, b->length, "blob", 1);
+}
+
+int8_t festina_blob_save_copy(void *payload, const char *target) {
+    if (!payload) return 0;
+    FestinaBlob *b = (FestinaBlob *)payload;
+    return festina_save_bytes(target, &b->path, b->bytes, b->length, "blob", 0);
+}
+
 /* claude.md #93: milliseconds since the Unix epoch -- the same unit and
  * origin JavaScript's Date.now() uses, which is the convention this
  * language's timers already follow (setTimeout takes milliseconds). */
@@ -621,9 +894,38 @@ void festina_sqlite_exec(sqlite3_stmt *stmt) {
 /* claude.md #34: row layout is col_count 8-byte slots per row -- see
  * this function's doc comment in festina_runtime.h for the full
  * rationale (matches how festina/codegen.py reads a row back). */
+/* claude.md #111: result columns are matched to declared columns BY
+ * NAME, not by position. Positional matching was a real bug hiding
+ * behind the `SELECT *` habit: `SELECT name FROM t` against
+ * `table t { id:int name:text }` used to read the name's text into the
+ * id slot as an integer, and `SELECT id` read a result column that did
+ * not exist for `name` (formally undefined behavior in sqlite). Names
+ * are compared case-insensitively, matching SQL's own treatment of
+ * identifiers.
+ *
+ * Each row also carries one extra hidden slot after the columns: a
+ * presence BITMASK, bit c set when declared column c appeared in the
+ * result set at all. That is what festina_row_undefined reads -- the
+ * difference between "the database said NULL" and "the query never
+ mentioned this column" is real (a program deciding whether to trust a
+ * value needs it) and nothing else records it. Columns past the 64th
+ * are always reported as present; a table that wide has other
+ * problems first. */
 void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
-                                  const char **col_types,
+                                  const char **col_types, const char **col_names,
                                   int64_t *out_length, void **out_data) {
+    /* Which RESULT column serves each declared column, or -1. Computed
+     * once -- the mapping is a property of the statement, not the row. */
+    int32_t *src = malloc((size_t)(col_count > 0 ? col_count : 1) * sizeof(int32_t));
+    if (!src) festina_fail("out of memory in festina_sqlite_collect_rows");
+    int result_cols = sqlite3_column_count(stmt);
+    for (int32_t c = 0; c < col_count; c++) {
+        src[c] = -1;
+        for (int r = 0; r < result_cols; r++) {
+            const char *rn = sqlite3_column_name(stmt, r);
+            if (rn && sqlite3_stricmp(rn, col_names[c]) == 0) { src[c] = r; break; }
+        }
+    }
     int64_t capacity = 8;
     void **rows = malloc(capacity * sizeof(void *));
     if (!rows) festina_fail("out of memory in festina_sqlite_collect_rows");
@@ -638,14 +940,21 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
             rows = grown;
         }
 
-        int64_t *row = malloc(col_count * sizeof(int64_t));
+        /* +1: the presence mask lives after the columns, so every
+         * existing field offset is untouched. */
+        int64_t *row = malloc(((size_t)col_count + 1) * sizeof(int64_t));
         if (!row) festina_fail("out of memory in festina_sqlite_collect_rows");
+        uint64_t present = 0;
 
         for (int32_t c = 0; c < col_count; c++) {
             const char *t = col_types[c];
-            int is_null = sqlite3_column_type(stmt, c) == SQLITE_NULL;
+            int32_t rc_col = src[c];
+            if (rc_col >= 0 && c < 64) present |= ((uint64_t)1 << c);
+            int is_null = rc_col < 0
+                || sqlite3_column_type(stmt, rc_col) == SQLITE_NULL;
+            int c_ = rc_col < 0 ? 0 : rc_col;  /* never read when is_null */
             if (strcmp(t, "float") == 0) {
-                double d = is_null ? festina_null_float() : sqlite3_column_double(stmt, c);
+                double d = is_null ? festina_null_float() : sqlite3_column_double(stmt, c_);
                 memcpy(&row[c], &d, sizeof(double));
             } else if (strcmp(t, "aud") == 0 || strcmp(t, "img") == 0) {
                 /* claude.md #101: rebuild the asset from the stored
@@ -656,26 +965,54 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
                 void *(*decode)(const void *, int64_t, const char *) =
                     strcmp(t, "aud") == 0 ? g_audio_decoder : g_image_decoder;
                 if (!is_null && decode) {
-                    const void *blob = sqlite3_column_blob(stmt, c);
-                    int blob_len = sqlite3_column_bytes(stmt, c);
+                    const void *blob = sqlite3_column_blob(stmt, c_);
+                    int blob_len = sqlite3_column_bytes(stmt, c_);
                     if (blob && blob_len > 0) handle = decode(blob, blob_len, "<database>");
                 }
                 memcpy(&row[c], &handle, sizeof(void *));
-            } else if (strcmp(t, "text") == 0 || strcmp(t, "blob") == 0) {
+            } else if (strcmp(t, "blob") == 0) {
+                /* claude.md #109: a blob column round-trips its BYTES,
+                 * not its path -- a path is meaningful only on the
+                 * machine that stored it, while the contents are the
+                 * thing worth keeping. This needs no registered decoder
+                 * the way aud/img do (claude.md #101): those decoders
+                 * live in the graphics/audio translation units, which a
+                 * program only links when it uses them, whereas
+                 * festina_blob_from_bytes is right here in the core.
+                 *
+                 * Reading the BLOB rather than the text: a blob may
+                 * legitimately contain NUL, and sqlite3_column_text
+                 * would stop at the first one. That was the bug the
+                 * previous shared text/blob branch had -- it treated a
+                 * blob column as a C string, which is exactly the
+                 * truncation claude.md #101 called out for media
+                 * columns and fixed only for aud/img. */
+                void *handle = NULL;
+                if (!is_null) {
+                    const void *data = sqlite3_column_blob(stmt, c_);
+                    int len = sqlite3_column_bytes(stmt, c_);
+                    handle = festina_blob_from_bytes(data, len < 0 ? 0 : len);
+                }
+                memcpy(&row[c], &handle, sizeof(void *));
+            } else if (strcmp(t, "text") == 0) {
                 char *copy = NULL;
                 if (!is_null) {
-                    const unsigned char *txt = sqlite3_column_text(stmt, c);
+                    const unsigned char *txt = sqlite3_column_text(stmt, c_);
                     copy = strdup(txt ? (const char *)txt : "");
                 }
                 memcpy(&row[c], &copy, sizeof(char *));
             } else {
                 /* int, bool -- claude.md #30 maps bool to SQLite INTEGER too */
-                row[c] = is_null ? festina_null_int() : sqlite3_column_int64(stmt, c);
+                row[c] = is_null ? festina_null_int() : sqlite3_column_int64(stmt, c_);
             }
         }
 
+        /* Columns past 64 report as present -- see the doc comment. */
+        if (col_count > 64) present = ~(uint64_t)0;
+        memcpy(&row[col_count], &present, sizeof(uint64_t));
         rows[count++] = row;
     }
+    free(src);
 
     if (rc != SQLITE_DONE) {
         sqlite3 *db = sqlite3_db_handle(stmt);
@@ -690,21 +1027,74 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
     *out_data = rows;
 }
 
-/* ---- regex(), .test(), .match(), .replace()/.replaceAll() -- claude.md #67-68 ---- */
+/* claude.md #111: row.undefined('name') -- true when the named declared
+ * column was NOT in the query's result set (or was `delete`d, which
+ * clears its presence bit), distinguishing that from a column the
+ * database genuinely returned as NULL. An unknown column name fails the
+ * program: asking about a column the table does not have is a typo, and
+ * answering true or false would bury it. */
+int8_t festina_row_undefined(void *row, const char **col_names,
+                             int32_t col_count, const char *name) {
+    if (!row) return 1;
+    if (!name) name = "";
+    for (int32_t c = 0; c < col_count; c++) {
+        if (sqlite3_stricmp(col_names[c], name) == 0) {
+            if (c >= 64) return 0;
+            uint64_t present;
+            memcpy(&present, &((int64_t *)row)[col_count], sizeof(uint64_t));
+            return (present & ((uint64_t)1 << c)) ? 0 : 1;
+        }
+    }
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "undefined('%s'): this table has no column by that name", name);
+    festina_fail(msg);
+    return 1; /* unreachable */
+}
+
+/* ---- regex(), .test(), .match(), .replace() -- claude.md #67-68, #107 ---- */
+
+/* claude.md #107: a compiled regex is no longer a bare regex_t. The 'g'
+ * flag has to travel WITH the pattern rather than with the call site,
+ * because `regex(p, f)` builds its flags from a runtime text expression
+ * the compiler cannot inspect -- so there is nothing for codegen to
+ * read at the .replace() call and the decision has to be made here.
+ * `re` is first in the struct deliberately: every regexec call below
+ * takes `&r->re`, and a bare cast would still land on the right bytes
+ * if one were ever missed. */
+typedef struct {
+    regex_t re;
+    int8_t global;
+    /* claude.md #111: set for a /pattern/ literal's process-lifetime
+     * cached compilation (see codegen's _emit_cached_regex_lit). `free`
+     * works on every type, and a regex BINDING cannot know at compile
+     * time whether it holds a runtime regex() result (freeable) or the
+     * shared cached literal (freeing it would leave the cache dangling
+     * for every later execution of that line) -- so the value itself
+     * carries the answer and festina_regex_free consults it. */
+    int8_t cached;
+} FestinaRegex;
 
 void *festina_regex_compile(const char *pattern, const char *flags) {
     if (!pattern) pattern = "";
     if (!flags) flags = "";
-    regex_t *compiled = malloc(sizeof(regex_t));
+    FestinaRegex *compiled = malloc(sizeof(FestinaRegex));
     if (!compiled) festina_fail("out of memory in festina_regex_compile");
 
     int cflags = REG_EXTENDED;
     if (strchr(flags, 'i')) cflags |= REG_ICASE;
+    /* claude.md #107: 'g' means "every match" for .replace(), the same
+     * thing it means in JS. POSIX has no cflag for it -- it is not a
+     * matching property at all, it is a property of what the caller
+     * wants done with the matches -- so it is recorded here and read
+     * back by festina_regex_replace. */
+    compiled->global = strchr(flags, 'g') != NULL;
+    compiled->cached = 0;
 
-    int rc = regcomp(compiled, pattern, cflags);
+    int rc = regcomp(&compiled->re, pattern, cflags);
     if (rc != 0) {
         char errbuf[256];
-        regerror(rc, compiled, errbuf, sizeof(errbuf));
+        regerror(rc, &compiled->re, errbuf, sizeof(errbuf));
         char msg[512];
         snprintf(msg, sizeof(msg), "invalid regex pattern '%s': %s", pattern, errbuf);
         free(compiled);
@@ -722,20 +1112,41 @@ void *festina_regex_compile(const char *pattern, const char *flags) {
  * itself was a separate malloc and needs its own free(). */
 void festina_regex_free(void *compiled) {
     if (!compiled) return;
-    regfree((regex_t *)compiled);
+    /* claude.md #111: a cached literal is shared by every future
+     * execution of its source line -- freeing it here would be a
+     * use-after-free later, so `free` on one is a safe no-op. */
+    if (((FestinaRegex *)compiled)->cached) return;
+    regfree(&((FestinaRegex *)compiled)->re);
     free(compiled);
+}
+
+/* claude.md #111: marks a compiled regex as the process-lifetime cached
+ * form -- called by generated code right after the literal cache is
+ * first filled. */
+void festina_regex_mark_cached(void *compiled) {
+    if (compiled) ((FestinaRegex *)compiled)->cached = 1;
 }
 
 int8_t festina_regex_test(void *compiled, const char *text) {
     if (!compiled) return 0;
     if (!text) text = "";
-    return regexec((regex_t *)compiled, text, 0, NULL, 0) == 0;
+    /* claude.md #107: 'g' is deliberately ignored here. In JS it makes
+     * .test() STATEFUL -- a /g regex carries a lastIndex that advances
+     * on every call, so the same test against the same string returns
+     * true then false -- which is a famous source of bugs and not
+     * something worth reproducing. */
+    return regexec(&((FestinaRegex *)compiled)->re, text, 0, NULL, 0) == 0;
 }
 
 char *festina_regex_match(void *compiled, const char *text) {
     if (!compiled || !text) return NULL;
     regmatch_t m;
-    if (regexec((regex_t *)compiled, text, 1, &m, 0) != 0) return NULL;
+    /* claude.md #107: 'g' is ignored here too, for a harder reason --
+     * see festina_runtime.h's doc comment. JS's /g makes .match()
+     * return an ARRAY instead of a string, and this function's return
+     * type cannot depend on a flag that `regex(p, f)` only knows at
+     * run time. */
+    if (regexec(&((FestinaRegex *)compiled)->re, text, 1, &m, 0) != 0) return NULL;
     regoff_t len = m.rm_eo - m.rm_so;
     char *out = malloc((size_t)len + 1);
     if (!out) festina_fail("out of memory in festina_regex_match");
@@ -744,8 +1155,13 @@ char *festina_regex_match(void *compiled, const char *text) {
     return out;
 }
 
+/* claude.md #107: no replace_all parameter any more. `.replaceAll()`
+ * is gone, and a plain-text search carries no flags, so a text search
+ * replaces the first match and nothing else -- exactly what JS's
+ * String.prototype.replace does with a string argument. Replacing
+ * every occurrence is spelled `/search/g` now. */
 char *festina_str_replace(const char *text, const char *search,
-                           const char *replacement, int8_t replace_all) {
+                           const char *replacement) {
     if (!text) text = "";
     if (!replacement) replacement = "";
     if (!search || !*search) {
@@ -766,7 +1182,7 @@ char *festina_str_replace(const char *text, const char *search,
         /* Once a single (non-"All") replacement has happened, treat
          * every further position as "no match" so the rest of `cursor`
          * gets copied through unchanged below. */
-        const char *found = (did_replace && !replace_all) ? NULL : strstr(cursor, search);
+        const char *found = did_replace ? NULL : strstr(cursor, search);
         if (!found) break;
 
         size_t prefix_len = (size_t)(found - cursor);
@@ -799,12 +1215,15 @@ char *festina_str_replace(const char *text, const char *search,
     return out;
 }
 
+/* claude.md #107: how many matches to replace comes from the PATTERN's
+ * own 'g' flag now, not from which method was called. */
 char *festina_regex_replace(void *compiled, const char *text,
-                             const char *replacement, int8_t replace_all) {
+                             const char *replacement) {
     if (!text) text = "";
     if (!replacement) replacement = "";
     if (!compiled) return strdup(text);
-    regex_t *re = (regex_t *)compiled;
+    regex_t *re = &((FestinaRegex *)compiled)->re;
+    int8_t replace_all = ((FestinaRegex *)compiled)->global;
 
     size_t replacement_len = strlen(replacement);
     size_t capacity = strlen(text) + replacement_len + 1;
@@ -823,7 +1242,7 @@ char *festina_regex_replace(void *compiled, const char *text,
             /* REG_NOTBOL once we're past the true start of the string --
              * otherwise a `^`-anchored pattern would incorrectly match
              * again at the start of *this* remaining substring on every
-             * later iteration of replaceAll. */
+             * later iteration of a /g replace. */
             int eflags = (cursor == text) ? 0 : REG_NOTBOL;
             no_match = regexec(re, cursor, 1, &m, eflags) != 0;
         }
@@ -1193,6 +1612,34 @@ void festina_map_set(int64_t *count, void **entries, const char *key, int64_t va
     grown[*count].value = value;
     *entries = grown;
     (*count)++;
+}
+
+/* claude.md #111: `delete m.key` / `delete m['key']` -- remove the
+ * entry outright, JS-style, rather than setting it to null: a deleted
+ * key stops existing (forEach no longer visits it, count drops), which
+ * null could never express. `release` is the same per-value-type
+ * trampoline festina_map_for_each already uses for whole-map release
+ * (codegen's _emit_map_value_release_trampoline), or NULL for a value
+ * type with nothing to release. The hole is closed by shifting the
+ * tail down one slot -- keeping entry order, which forEach's
+ * unspecified-order contract doesn't require but which costs the same
+ * as the swap-with-last alternative at these sizes and never surprises
+ * anyone. Returns whether the key existed; deleting a missing key is a
+ * safe no-op, exactly like JS. */
+int8_t festina_map_delete(int64_t *count, void **entries, const char *key,
+                          void (*release)(int64_t, const char *)) {
+    if (!key) key = "";
+    FestinaMapEntry *arr = (FestinaMapEntry *)*entries;
+    for (int64_t i = 0; i < *count; i++) {
+        if (!festina_str_eq(arr[i].key, key)) continue;
+        if (release) release(arr[i].value, arr[i].key);
+        free(arr[i].key);
+        memmove(&arr[i], &arr[i + 1],
+                (size_t)(*count - i - 1) * sizeof(FestinaMapEntry));
+        (*count)--;
+        return 1;
+    }
+    return 0;
 }
 
 /* claude.md #72: npcHealths['npc1'] -- "if the key is not present, the

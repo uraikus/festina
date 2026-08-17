@@ -519,7 +519,7 @@ def _doctor_report():
           _PKG_INSTALL_HINTS["sqlite3"])
 
     check(_pkg_config_has("cairo-xlib"), False,
-          "cairo-xlib dev headers (optional -- only used by graphics: drawRect, on click, img, ...)",
+          "cairo-xlib dev headers (optional -- only used by graphics: drawRect, on mouseDown, img, ...)",
           _PKG_INSTALL_HINTS["cairo-xlib"])
     # claude.md #101: JPEG/MP3 decoding. Grouped with their own feature
     # rather than listed as separate tiers -- a program that uses
@@ -585,7 +585,7 @@ def _run_doctor():
     print()
     if all_ok:
         print("All required dependencies are installed. The optional ones (graphics/audio) "
-              "only matter for a program that actually uses drawRect/on click/img/loadAudio/etc.")
+              "only matter for a program that actually uses drawRect/on mouseDown/img/loadAudio/etc.")
         return 0
     print("One or more REQUIRED dependencies are missing -- see the MISSING lines above.")
     return 1
