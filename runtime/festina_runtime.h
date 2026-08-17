@@ -341,6 +341,12 @@ void *festina_load_image(const char *path);
  * (a clip() or resize() result) has no source bytes, so
  * festina_image_bytes encodes PNG on demand and caches it. */
 void *festina_image_from_bytes(const void *data, int64_t len, const char *label);
+/* claude.md #110: the image's own path, so save() has somewhere to go.
+ * Empty for an image that never came from a file -- a clip() or resize()
+ * result, or one decoded out of a database column -- which is exactly
+ * the case save(path) exists to serve. */
+int8_t festina_image_save(void *img, const char *target);
+int8_t festina_image_save_copy(void *img, const char *target);
 const void *festina_image_bytes(void *img, int64_t *out_len);
 /* claude.md #92: img methods and properties. An `img` value is a
  * pointer to a small box holding the Cairo surface, not the surface
@@ -647,6 +653,10 @@ void festina_run_timer_loop(void);
  * closes), it does not wait for playback to finish.
  */
 void *festina_load_audio(const char *path);
+/* claude.md #110: the clip's own path, so save() has somewhere to go.
+ * Empty for a clip decoded from bytes (a database column). */
+int8_t festina_audio_save(void *audio, const char *target);
+int8_t festina_audio_save_copy(void *audio, const char *target);
 /* claude.md #101: decoding from memory is the primitive; loading a path
  * is "read the file, then decode the bytes". `label` only names the
  * source in an error message. festina_audio_bytes hands back the bytes
@@ -763,6 +773,47 @@ int8_t festina_blob_write(void *payload, const char *content);
 int8_t festina_blob_append(void *payload, const char *content);
 int8_t festina_blob_exists(void *payload);
 int8_t festina_blob_delete(void *payload);  /* deletes the FILE, not the blob */
+
+/*
+ * claude.md #110: writing a handle's bytes back out. One policy shared
+ * by blob, img and aud, since all three are the same shape of value
+ * (content plus the bytes it came from) and "save this somewhere" should
+ * not mean three slightly different things.
+ *
+ *   save()          -- write to the path the handle already has.
+ *   save(path)      -- adopt `path`, then write there; the handle's own
+ *                      path CHANGES, so a blob's exists()/delete()
+ *                      follow it afterwards.
+ *   saveCopy(path)  -- write there and leave the handle's path alone.
+ *                      The argument is required (enforced in semantic.py,
+ *                      so it is a compile error rather than a runtime one).
+ *
+ * `target` NULL/empty is the no-argument save(). `adopt` selects save()
+ * over saveCopy(). `what` names the type in an error message.
+ *
+ * A handle with NO path is what this exists for: an img from clip(), or
+ * anything out of a database column, has never been on disk. save() with
+ * no argument then FAILS the program rather than returning false -- a
+ * program asking to save something to nowhere has a bug, where an
+ * unwritable directory is a condition of the filesystem and still
+ * answers false, the same as every other file operation here.
+ *
+ * `target` is always a complete FILE path -- there is no directory
+ * shorthand. One would have to borrow a filename from somewhere, and the
+ * handle that most needs saving (a clip, a database column) is exactly
+ * the one with no filename to borrow, so the shorthand would work only
+ * where it was least useful. Passing a directory answers false, like any
+ * other unwritable target.
+ *
+ * The path is adopted only on SUCCESS: pointing a handle at a file that
+ * was never written would leave exists() answering false about a path
+ * the program was just told it has.
+ */
+int8_t festina_save_bytes(const char *target, char **own_path,
+                          const void *data, int64_t len,
+                          const char *what, int8_t adopt);
+int8_t festina_blob_save(void *payload, const char *target);
+int8_t festina_blob_save_copy(void *payload, const char *target);
 
 /*
  * claude.md #72: map[T] -- { key: value, ... } literals,

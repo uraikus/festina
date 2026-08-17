@@ -54,6 +54,11 @@ typedef struct FestinaAudio {
      * an MP3 rather than becoming a much larger WAV. */
     unsigned char *bytes;
     size_t byte_count;
+    /* claude.md #110: the path this clip was loaded from, so save() with
+     * no argument has somewhere to write. Empty (never NULL) for a clip
+     * decoded from bytes rather than a file -- a database column -- which
+     * is the case save(path) exists for and save() refuses. */
+    char *path;
 } FestinaAudio;
 
 typedef struct FestinaChannel {
@@ -395,6 +400,11 @@ void *festina_audio_from_bytes(const void *data, int64_t len, const char *label)
     if (!a->bytes) festina_fail("out of memory loading audio");
     memcpy(a->bytes, bytes, (size_t)len);
     a->byte_count = (size_t)len;
+    /* claude.md #110: empty rather than NULL, so the shared
+     * festina_save_bytes never has to special-case it. festina_load_audio
+     * replaces this with the real path. */
+    a->path = strdup("");
+    if (!a->path) festina_fail("out of memory loading audio");
     return a;
 }
 
@@ -422,7 +432,25 @@ void festina_audio_free(void *audio) {
     pthread_mutex_unlock(&g_audio_lock);
     free(a->samples);
     free(a->bytes);
+    free(a->path);   /* claude.md #110 */
     free(a);
+}
+
+/* claude.md #110: writes the clip's own encoded bytes -- so an MP3 saves
+ * as an MP3 rather than being re-encoded, the same property that makes
+ * a `file:aud` column round-trip byte for byte (claude.md #101). */
+int8_t festina_audio_save(void *audio, const char *target) {
+    if (!audio) return 0;
+    FestinaAudio *a = (FestinaAudio *)audio;
+    return festina_save_bytes(target, &a->path, a->bytes,
+                              (int64_t)a->byte_count, "aud", 1);
+}
+
+int8_t festina_audio_save_copy(void *audio, const char *target) {
+    if (!audio) return 0;
+    FestinaAudio *a = (FestinaAudio *)audio;
+    return festina_save_bytes(target, &a->path, a->bytes,
+                              (int64_t)a->byte_count, "aud", 0);
 }
 
 const void *festina_audio_bytes(void *audio, int64_t *out_len) {
@@ -457,6 +485,13 @@ void *festina_load_audio(const char *path) {
     }
     void *clip = festina_audio_from_bytes(data, (int64_t)size, path);
     free(data);
+    /* claude.md #110: set here rather than in festina_audio_from_bytes,
+     * because that entry point is also how a database column becomes a
+     * clip -- and one of those genuinely has no path. */
+    FestinaAudio *loaded = (FestinaAudio *)clip;
+    free(loaded->path);
+    loaded->path = strdup(path);
+    if (!loaded->path) festina_fail("out of memory loading audio");
     return clip;
 }
 

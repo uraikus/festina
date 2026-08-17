@@ -913,12 +913,21 @@ typedef struct {
      * overhead rather than a doubling. */
     unsigned char *bytes;
     size_t byte_count;
+    /* claude.md #110: the path this image was loaded from, so save()
+     * with no argument has somewhere to write. Empty (never NULL, so
+     * the shared festina_save_bytes need not special-case it) for an
+     * image that never came from a file -- a clip() or resize() result,
+     * or one decoded out of a database column. That is precisely the
+     * case save(path) exists for, and the case save() refuses. */
+    char *path;
 } FestinaImageBox;
 
 static FestinaImageBox *festina_image_box(cairo_surface_t *surface) {
     FestinaImageBox *box = calloc(1, sizeof(FestinaImageBox));
     if (!box) festina_fail("out of memory creating an image");
     box->surface = surface;
+    box->path = strdup("");   /* claude.md #110: no path until one is given */
+    if (!box->path) festina_fail("out of memory creating an image");
     return box;
 }
 
@@ -1092,6 +1101,15 @@ void *festina_load_image(const char *path) {
     }
     void *box = festina_image_from_bytes(data, (int64_t)size, path);
     free(data);
+    /* claude.md #110: remember where it came from, so save() works and
+     * saveCopy() into a directory has a filename to reuse. Set here
+     * rather than inside festina_image_from_bytes, because THAT entry
+     * point is also how a database column becomes an image -- and one
+     * of those genuinely has no path. */
+    FestinaImageBox *loaded = (FestinaImageBox *)box;
+    free(loaded->path);
+    loaded->path = strdup(path);
+    if (!loaded->path) festina_fail("out of memory loading an image");
     return box;
 }
 
@@ -1128,6 +1146,27 @@ const void *festina_image_bytes(void *img, int64_t *out_len) {
     }
     if (out_len) *out_len = (int64_t)box->byte_count;
     return box->bytes;
+}
+
+/* claude.md #110: writes the image's encoded bytes to a path. Uses
+ * festina_image_bytes, so a clip()/resize() result is PNG-encoded on
+ * demand exactly as it would be for a database column -- which is why
+ * saving a clip works at all, and why it lands as a PNG whatever the
+ * sheet it came from was. */
+int8_t festina_image_save(void *img, const char *target) {
+    if (!img) return 0;
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    int64_t len = 0;
+    const void *data = festina_image_bytes(img, &len);
+    return festina_save_bytes(target, &box->path, data, len, "img", 1);
+}
+
+int8_t festina_image_save_copy(void *img, const char *target) {
+    if (!img) return 0;
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    int64_t len = 0;
+    const void *data = festina_image_bytes(img, &len);
+    return festina_save_bytes(target, &box->path, data, len, "img", 0);
 }
 
 int64_t festina_image_width(void *img) {
@@ -1201,6 +1240,7 @@ void festina_image_free(void *img) {
     FestinaImageBox *box = (FestinaImageBox *)img;
     if (box->surface) cairo_surface_destroy(box->surface);
     free(box->bytes);   /* claude.md #101 */
+    free(box->path);    /* claude.md #110 */
     free(box);
 }
 

@@ -129,6 +129,7 @@ music.play()
 blob notes = 'notes.txt'
 notes.write('hello')
 log(notes.toText())
+notes.saveCopy('notes.bak')           // img and aud save the same way
 
 // Timers, JS-style
 setTimeout(showMessage, 1000)
@@ -173,7 +174,7 @@ bin/festina compile examples/tic_tac_toe.f -o tic_tac_toe && ./tic_tac_toe
 | [`timers.f`](examples/timers.f) | `setTimeout`/`setInterval`/`clearInterval` |
 | [`graphics.f`](examples/graphics.f) | A drawn canvas, plus every `on mouseDown`/`mouseUp`/`mouse`/`key`/`resize`/`close` handler |
 | [`audio.f`](examples/audio.f) | `aud` from a path, `.play()`/`.stop()`/`.isPlaying()`, channels, with a tiny bundled WAV |
-| [`files.f`](examples/files.f) | `blob` — a file's bytes, its methods, and what sharing one means |
+| [`files.f`](examples/files.f) | `blob` — a file's bytes, its methods, `save`/`saveCopy`, and what sharing one means |
 | [`tic_tac_toe.f`](examples/tic_tac_toe.f) | The game above — graphics, global game state, and win-checking logic together |
 
 Every one of these is compiled and checked by the test suite on every

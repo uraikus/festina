@@ -755,11 +755,14 @@ log(`${sheet.width}x${sheet.height}`)
 img grass = sheet.clip(0, 0, 64, 64)     // a new 64x64 image
 grass.resize(32, 32)                      // scaled in place
 drawImage(grass, 100, 100)
+grass.save('grass.png')                   // -> bool; see Saving bytes
 ```
 
 A path declares the image, the same way it declares an `aud` — and, like
 that one, it's a real load rather than a compile-time resolution, so the
 path may be any text expression (`img hero = spriteDir + 'hero.png'`).
+`save()`/`saveCopy()` write one back out; see
+[Saving bytes to a path](#saving-bytes-to-a-path).
 
 **PNG and JPEG.** The format is sniffed from the file's contents, not
 its extension — an image out of a database column has no extension, and
@@ -1038,6 +1041,10 @@ notes.append(' world')                // -> bool
 text body = notes.toText()            // -> the bytes, as text
 bool there = notes.exists()           // -> bool
 notes.delete()                        // -> bool; deletes the FILE
+
+notes.save()                          // -> bool; write the bytes to its path
+notes.save('other.txt')               // -> bool; adopt that path, then write
+notes.saveCopy('backup.txt')          // -> bool; write there, keep its own path
 ```
 
 The path may be any text expression, like `img` and `aud`:
@@ -1111,10 +1118,83 @@ meaningful only on the machine that stored it. Its `exists()`,
 `write()`, `append()` and `delete()` all answer `false` rather than
 inventing a temporary file. `toText()` works as usual.
 
-That does mean there is currently no way to write a blob loaded from a
-database back out to disk: `toText()` stops at the first NUL byte, so it
-can't carry binary content out of the value. Reading a binary column and
-re-inserting it works; reading one and saving it as a file does not.
+`save(path)` is how one gets to disk — see
+[Saving bytes to a path](#saving-bytes-to-a-path) below, which is the
+same method on `img` and `aud`.
+
+```festina
+arr[Saves] rows = sqlite('SELECT * FROM Saves')
+blob back = rows[0].data
+log(back.exists())                    // false -- no path
+back.save('recovered.dat')            // now it has one
+log(back.exists())                    // true
+```
+
+## Saving bytes to a path
+
+`blob`, `img` and `aud` are the same shape of value — content, plus the
+bytes it came from — so all three save the same way.
+
+```festina
+value.save()                          // write to the path it already has
+value.save(path)                      // adopt `path`, then write there
+value.saveCopy(path)                  // write there, keep its own path
+```
+
+All three return `bool`: `true` if the write landed.
+
+**`save(path)` changes the value's path; `saveCopy(path)` doesn't.** That
+is the whole difference. After `save`, everything else that acts on the
+value follows the new path — a blob's `exists()` and `delete()` included.
+After `saveCopy`, the value is still pointed at where it was:
+
+```festina
+blob f = 'one.txt'
+f.write('original')
+
+f.saveCopy('copy.txt')                // copy.txt written; f is still one.txt
+f.write('changed')                    // ...so this goes to one.txt
+
+f.save('two.txt')                     // two.txt written; f is now two.txt
+f.delete()                            // deletes two.txt, not one.txt
+```
+
+`saveCopy` requires its path — a copy to nowhere in particular isn't a
+thing to ask for, and making the argument mandatory turns "I meant
+`save()`" into a compile error rather than a silent overwrite.
+
+**A value with no path can only use `save(path)`.** An `img` from
+`clip()`, or anything read out of a database column, has never been on
+disk. Calling `save()` on one **fails the program** rather than returning
+`false` — a program asking to save something to nowhere has a bug, where
+an unwritable directory is a condition of the filesystem and still just
+answers `false`.
+
+```festina
+img spritesheet = 'spritesheet.png'
+img grass = spritesheet.clip(0, 0, 32, 32)
+
+grass.save()                          // fails: this img has no path
+grass.save('grass.png')               // fine -- and now it has one
+grass.save()                          // fine from here on
+grass.saveCopy('backup/grass.png')    // fine; grass.png stays its path
+```
+
+The path must name a **file**, not a directory. A directory would have to
+borrow a filename from somewhere, and the value that most needs saving is
+exactly the one with no filename to lend, so it would work only where it
+was least useful. Passing one answers `false`.
+
+**Formats survive.** What gets written is the value's own encoded bytes,
+so an MP3 saves as an MP3 and a JPEG as a JPEG rather than being
+re-encoded — the same property that makes a BLOB column round-trip
+byte-identically. The one exception is an image you built rather than
+loaded: a `clip()` or `resize()` result has no source bytes, so it is
+encoded as PNG, which is lossless.
+
+A failed save does **not** adopt the path. Pointing a value at a file
+that was never written would leave `exists()` answering `false` about a
+path you were just told it had.
 
 ## Time
 
@@ -1249,6 +1329,9 @@ A path declares the clip, the same way `blob`, `color`, `font` and `img`
 are each written as the text that reads best. It's a real load, not a
 compile-time resolution, so the path may be any text expression
 (`aud hit = soundDir + 'hit.wav'`).
+
+`save()`/`saveCopy()` write a clip back out; see
+[Saving bytes to a path](#saving-bytes-to-a-path).
 
 **WAV (16-bit PCM) and MP3.** The format is sniffed from the file's
 contents, not its extension — a clip out of a database column has no

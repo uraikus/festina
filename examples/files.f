@@ -56,4 +56,28 @@ log(`delete: ${alias.delete()}`)
 log(`exists after delete: ${alias.exists()}`)
 log(`contents after delete: ${alias.toText()}`)
 
+// claude.md #110: save() writes the bytes back out. With a path it
+// ADOPTS that path first, so everything else follows it; saveCopy()
+// writes elsewhere and leaves the path alone. Both answer bool.
+blob log1 = '/tmp/festina_files_demo_3.txt'
+log1.write('entry one')
+log(`saveCopy: ${log1.saveCopy('/tmp/festina_files_demo_backup.txt')}`)
+
+// The copy exists, but log1 still points where it did -- so this write
+// lands in the original, not the backup.
+log1.write('entry two')
+log(`original after the copy: ${log1.toText()}`)
+
+blob backup = '/tmp/festina_files_demo_backup.txt'
+log(`the backup kept the older text: ${backup.toText()}`)
+
+// save(path) is the other half: it moves where this value writes.
+log(`save to a new path: ${log1.save('/tmp/festina_files_demo_4.txt')}`)
+log1.delete()          // deletes the NEW path -- save() adopted it
+
+blob three = '/tmp/festina_files_demo_3.txt'
+log(`the old path survived the move: ${three.exists()}`)
+
+three.delete()
+backup.delete()
 second.delete()

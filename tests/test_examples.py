@@ -169,6 +169,16 @@ class TestIndividualExamples:
             "exists after delete: false",
             # delete() removes the FILE; the bytes are still in hand.
             "contents after delete: written through notes",
+            # claude.md #110: saveCopy() writes elsewhere and leaves the
+            # value's own path alone, so the next write goes to the
+            # original -- which is the whole difference from save().
+            "saveCopy: true",
+            "original after the copy: entry two",
+            "the backup kept the older text: entry one",
+            # save(path) moves where the value writes, so the delete
+            # below it takes the NEW path and the old one survives.
+            "save to a new path: true",
+            "the old path survived the move: true",
         ]
 
     def test_maps_demo_runs_correctly(self, cli_mod, tmp_path):

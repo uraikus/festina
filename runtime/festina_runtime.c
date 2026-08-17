@@ -407,6 +407,93 @@ int8_t festina_blob_delete(void *payload) {
     return festina_delete_file(((FestinaBlob *)payload)->path);
 }
 
+/* ---- saving a handle's bytes -- claude.md #110 ----
+ *
+ * One policy, shared by blob, img and aud, because all three are the
+ * same shape of value (claude.md #101/#109: content plus the bytes it
+ * came from) and "write those bytes somewhere" should not mean three
+ * slightly different things.
+ *
+ *   save()           -- write to the path this handle already has.
+ *   save(path)       -- adopt `path`, then write there. The handle's own
+ *                       path CHANGES, so everything else that acts on it
+ *                       (a blob's exists()/delete()) follows it.
+ *   saveCopy(path)   -- write to `path` and leave the handle's own path
+ *                       alone. The argument is required, enforced in the
+ *                       compiler rather than here, so omitting it is a
+ *                       compile error rather than a runtime surprise.
+ *
+ * `target` is always a complete FILE path -- there is no directory
+ * shorthand. A directory would have to borrow a filename from
+ * somewhere, and the one handle that most needs saving (a clip, a
+ * database column) is exactly the one with no filename to borrow, so
+ * the shorthand would work only where it was least useful. Passing one
+ * anyway answers false, like any other unwritable target.
+ *
+ * A handle with no path is the case this exists for. An `img` from
+ * clip(), an `aud` or `blob` out of a database column -- none has ever
+ * been on disk, so save() with no argument has nothing to write to and
+ * FAILS the program rather than returning false. That is a bug in the
+ * program, not a condition of the filesystem, and the two deserve
+ * different treatment: an I/O failure (full disk, unwritable directory)
+ * still returns false the way every other file operation here does. */
+
+int8_t festina_save_bytes(const char *target, char **own_path,
+                          const void *data, int64_t len,
+                          const char *what, int8_t adopt) {
+    const char *current = (own_path && *own_path) ? *own_path : "";
+    char *resolved = NULL;
+
+    if (!target || !*target) {
+        /* The no-argument save(). */
+        if (!*current) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "this %s has no path to save() to -- it did not come from a "
+                     "file (a clip, or a database column), so pass one: "
+                     "save('path/to/file')", what);
+            festina_fail(msg);
+        }
+        resolved = strdup(current);
+    } else {
+        resolved = strdup(target);
+    }
+    if (!resolved) festina_fail("out of memory resolving a save path");
+
+    FILE *f = fopen(resolved, "wb");
+    if (!f) { free(resolved); return 0; }
+    size_t want = len > 0 ? (size_t)len : 0;
+    size_t wrote = want ? fwrite(data, 1, want, f) : 0;
+    /* fclose can fail on a full disk after every fwrite succeeded, so it
+     * is part of "did this write actually land" -- same rule
+     * festina_put_file already follows. */
+    int closed = fclose(f);
+    int8_t ok = (wrote == want && closed == 0) ? 1 : 0;
+
+    /* The path is adopted only on SUCCESS. Pointing a handle at a file
+     * that was never written would leave exists() answering false about
+     * a path the program was just told it now has. */
+    if (ok && adopt && own_path) {
+        free(*own_path);
+        *own_path = resolved;
+    } else {
+        free(resolved);
+    }
+    return ok;
+}
+
+int8_t festina_blob_save(void *payload, const char *target) {
+    if (!payload) return 0;
+    FestinaBlob *b = (FestinaBlob *)payload;
+    return festina_save_bytes(target, &b->path, b->bytes, b->length, "blob", 1);
+}
+
+int8_t festina_blob_save_copy(void *payload, const char *target) {
+    if (!payload) return 0;
+    FestinaBlob *b = (FestinaBlob *)payload;
+    return festina_save_bytes(target, &b->path, b->bytes, b->length, "blob", 0);
+}
+
 /* claude.md #93: milliseconds since the Unix epoch -- the same unit and
  * origin JavaScript's Date.now() uses, which is the convention this
  * language's timers already follow (setTimeout takes milliseconds). */

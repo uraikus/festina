@@ -924,7 +924,7 @@ def analyze(program, filename="<string>"):
             # silently accepted every typo.
             if expr.prop in ("width", "height"):
                 return types_mod.PrimitiveType("int")
-            if expr.prop in ("clip", "resize"):
+            if expr.prop in ("clip", "resize", "save", "saveCopy"):
                 raise CompileError(
                     f"'{expr.prop}' is a method on img -- call it, "
                     f"e.g. `sheet.{expr.prop}(...)`",
@@ -1248,6 +1248,48 @@ def analyze(program, filename="<string>"):
                             category="invalid function argument type",
                         )
                 return _INT
+            # claude.md #110: save()/saveCopy() -- shared by blob, img and
+            # aud, because all three are the same shape of value
+            # (claude.md #101/#109: content plus the bytes it came from)
+            # and one policy for "write those bytes somewhere" is worth
+            # more than three that almost agree.
+            #
+            # save() takes an OPTIONAL path: with one it adopts that path
+            # and writes there, without one it writes to the path it
+            # already has. saveCopy() REQUIRES one -- a copy to nowhere
+            # in particular is not a thing to ask for, and making the
+            # argument mandatory turns "I meant save()" into a compile
+            # error rather than a silent overwrite of the original.
+            if callee.prop in ("save", "saveCopy"):
+                obj_type = infer(callee.obj, scope)
+                if (obj_type == _BLOB
+                        or isinstance(obj_type, (types_mod.ImageType,
+                                                 types_mod.AudioType))):
+                    lo = 0 if callee.prop == "save" else 1
+                    if not (lo <= len(expr.args) <= 1):
+                        if callee.prop == "saveCopy":
+                            detail = ("saveCopy() expects exactly 1 argument (the "
+                                      "path to copy to) -- use save() to write to "
+                                      "this value's own path")
+                        else:
+                            detail = ("save() expects 0 or 1 argument (an optional "
+                                      "path to save to, and adopt)")
+                        raise CompileError(
+                            f"{detail}, got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    if expr.args:
+                        arg_type = infer(expr.args[0], scope)
+                        if (arg_type is not None and arg_type is not NULL
+                                and arg_type != _TEXT):
+                            raise CompileError(
+                                f"{callee.prop}()'s path must be text, found "
+                                f"{types_mod.type_name(arg_type)}",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
+                    return _BOOL
             # claude.md #109: blob's five methods -- the file functions
             # claude.md #93 spelled as free functions taking a path,
             # moved onto the value that already knows the path. Checked

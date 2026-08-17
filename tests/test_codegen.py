@@ -19,6 +19,7 @@ Two kinds of tests here:
 import os
 import shutil
 import sqlite3
+import struct
 import subprocess
 import time
 import wave
@@ -5298,6 +5299,18 @@ void festina_fail(const char *msg) {
     exit(1);
 }
 
+/* claude.md #110: the audio unit's save()/saveCopy() delegate the shared
+ * write-and-maybe-adopt-the-path policy to the core runtime. Stubbed
+ * rather than linked for the same reason festina_fail is: these
+ * harnesses are entirely about the channel pool, and pulling in
+ * festina_runtime.c would drag sqlite3 along with it. */
+int8_t festina_save_bytes(const char *target, char **own_path,
+                          const void *data, int64_t len,
+                          const char *what, int8_t adopt) {
+    (void)target; (void)own_path; (void)data; (void)len; (void)what; (void)adopt;
+    return 0;
+}
+
 static int active_voices(void *audio) {
     int n = 0;
     pthread_mutex_lock(&g_audio_lock);
@@ -5409,6 +5422,18 @@ void festina_fail(const char *msg) {
     exit(1);
 }
 
+/* claude.md #110: the audio unit's save()/saveCopy() delegate the shared
+ * write-and-maybe-adopt-the-path policy to the core runtime. Stubbed
+ * rather than linked for the same reason festina_fail is: these
+ * harnesses are entirely about the channel pool, and pulling in
+ * festina_runtime.c would drag sqlite3 along with it. */
+int8_t festina_save_bytes(const char *target, char **own_path,
+                          const void *data, int64_t len,
+                          const char *what, int8_t adopt) {
+    (void)target; (void)own_path; (void)data; (void)len; (void)what; (void)adopt;
+    return 0;
+}
+
 static int active_voices(void *audio) {
     int n = 0;
     pthread_mutex_lock(&g_audio_lock);
@@ -5468,6 +5493,18 @@ static long harness_pcm_writei(snd_pcm_t *pcm, const void *buf, unsigned long fr
 void festina_fail(const char *msg) {
     fprintf(stderr, "fail: %s\n", msg ? msg : "");
     exit(1);
+}
+
+/* claude.md #110: the audio unit's save()/saveCopy() delegate the shared
+ * write-and-maybe-adopt-the-path policy to the core runtime. Stubbed
+ * rather than linked for the same reason festina_fail is: these
+ * harnesses are entirely about the channel pool, and pulling in
+ * festina_runtime.c would drag sqlite3 along with it. */
+int8_t festina_save_bytes(const char *target, char **own_path,
+                          const void *data, int64_t len,
+                          const char *what, int8_t adopt) {
+    (void)target; (void)own_path; (void)data; (void)len; (void)what; (void)adopt;
+    return 0;
 }
 
 /* Which channel index a clip is playing on, or -1. */
@@ -6318,6 +6355,321 @@ class TestAudioChannelReturnAndClipStop:
         result = compile_and_run(source, env=audio_null_env)
         assert result.returncode == 0
         assert result.stdout.strip() == "-1"
+
+
+class TestSaveAndSaveCopy:
+    """claude.md #110: save()/saveCopy() on blob, img and aud.
+
+    One policy for all three, because all three are the same shape of
+    value (claude.md #101/#109: content plus the bytes it came from).
+    save() writes to the path the handle already has; save(path) adopts
+    that path first; saveCopy(path) writes elsewhere and leaves the
+    handle's own path alone.
+
+    This is what closes the gap claude.md #109 shipped knowingly: a
+    handle with no path -- an img from clip(), anything out of a
+    database column -- could not reach the disk at all.
+    """
+
+    # ---- blob ----
+
+    def test_blob_save_writes_to_its_own_path(self, compile_and_run, tmp_path):
+        path = tmp_path / "notes.txt"
+        source = f"""
+        blob f = '{path}'
+        f.write('written')
+        f.delete()
+        log(f.exists())
+        log(f.save())
+        log(f.exists())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["false", "true", "true"]
+        assert path.read_text() == "written"
+
+    def test_blob_save_with_a_path_adopts_it(self, compile_and_run, tmp_path):
+        first = tmp_path / "one.txt"
+        second = tmp_path / "two.txt"
+        source = f"""
+        blob f = '{first}'
+        f.write('content')
+        log(f.save('{second}'))
+        // the path CHANGED, so everything else follows it
+        log(f.delete())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true"]
+        assert second.exists() is False, "delete() should have followed the new path"
+        assert first.read_text() == "content", "the original must be untouched"
+
+    def test_blob_save_copy_leaves_the_path_alone(self, compile_and_run, tmp_path):
+        first = tmp_path / "one.txt"
+        copy = tmp_path / "copy.txt"
+        source = f"""
+        blob f = '{first}'
+        f.write('original')
+        log(f.saveCopy('{copy}'))
+        f.write('changed after the copy')
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+        # The later write went to the ORIGINAL path, not the copy --
+        # which is the whole difference between save and saveCopy.
+        assert first.read_text() == "changed after the copy"
+        assert copy.read_text() == "original"
+
+    def test_a_pathless_blob_save_fails_and_says_why(self, compile_and_run, tmp_path):
+        # claude.md #110: a program asking to save something to nowhere
+        # has a bug, so this fails rather than answering false. An
+        # unwritable directory is a condition of the filesystem and
+        # still answers false -- see the test below.
+        db = tmp_path / "t.sqlite"
+        src = tmp_path / "payload.txt"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Saves {{ name:text  data:blob }}
+        blob f = '{src}'
+        f.write('stored')
+        sqlite('INSERT INTO Saves (name, data) VALUES (?, ?)', ['s', f])
+        arr[Saves] rows = sqlite('SELECT * FROM Saves')
+        log(rows[0].data.save())
+        """
+        result = compile_and_run(source)
+        assert result.returncode != 0
+        assert "no path to save() to" in result.stderr
+        assert "blob" in result.stderr
+
+    def test_saving_somewhere_impossible_returns_false(self, compile_and_run, tmp_path):
+        path = tmp_path / "notes.txt"
+        source = f"""
+        blob f = '{path}'
+        f.write('x')
+        log(f.saveCopy('/definitely/not/a/directory/x.txt'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "false"
+
+    def test_a_failed_save_does_not_adopt_the_path(self, compile_and_run, tmp_path):
+        # Adopting a path the write never reached would leave exists()
+        # answering false about a path the program was just told it has.
+        path = tmp_path / "notes.txt"
+        source = f"""
+        blob f = '{path}'
+        f.write('x')
+        log(f.save('/definitely/not/a/directory/x.txt'))
+        log(f.exists())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["false", "true"]
+
+    def test_a_database_blob_reaches_the_disk_byte_identically(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        # The gap claude.md #109 recorded as open, closed. A blob out of
+        # a column has bytes and no path; save(path) gives it one.
+        db = tmp_path / "t.sqlite"
+        out = tmp_path / "recovered.png"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Assets {{ name:text  data:blob }}
+        blob png = '{sprite_sheet_png}'
+        sqlite('INSERT INTO Assets (name, data) VALUES (?, ?)', ['tiles', png])
+        arr[Assets] rows = sqlite('SELECT * FROM Assets')
+        blob back = rows[0].data
+        log(back.exists())
+        log(back.save('{out}'))
+        log(back.exists())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["false", "true", "true"]
+        assert out.read_bytes() == open(sprite_sheet_png, "rb").read()
+
+    # ---- img ----
+
+    def test_a_clipped_image_can_be_saved_to_a_path(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        # claude.md #110's motivating case, and #109's other open gap: a
+        # clip() result has never been on disk, so save(path) is the only
+        # way it ever gets there.
+        out = tmp_path / "grass.png"
+        source = f"""
+        img spritesheet = '{sprite_sheet_png}'
+        img grass = spritesheet.clip(0, 0, 32, 32)
+        log(grass.save('{out}'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+        data = out.read_bytes()
+        assert data[:8] == b"\x89PNG\r\n\x1a\n", "a clip encodes as PNG"
+        width, height = struct.unpack(">II", data[16:24])
+        assert (width, height) == (32, 32)
+
+    def test_saving_a_clip_then_saving_again_with_no_argument(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        # save(path) adopted the path, so the bare save() now works on a
+        # value that had none a moment ago.
+        out = tmp_path / "grass.png"
+        source = f"""
+        img spritesheet = '{sprite_sheet_png}'
+        img grass = spritesheet.clip(0, 0, 32, 32)
+        log(grass.save('{out}'))
+        log(grass.save())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true"]
+
+    def test_a_pathless_image_save_fails_and_names_img(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        source = f"""
+        img spritesheet = '{sprite_sheet_png}'
+        img grass = spritesheet.clip(0, 0, 32, 32)
+        log(grass.save())
+        """
+        result = compile_and_run(source)
+        assert result.returncode != 0
+        assert "this img has no path to save() to" in result.stderr
+
+    def test_an_image_save_copy_preserves_its_source_bytes(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        # claude.md #101 keeps the bytes an image was loaded from, so a
+        # copy is byte-identical rather than re-encoded.
+        out = tmp_path / "copy.png"
+        source = f"""
+        img sheet = '{sprite_sheet_png}'
+        log(sheet.saveCopy('{out}'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+        assert out.read_bytes() == open(sprite_sheet_png, "rb").read()
+
+    def test_a_jpeg_stays_a_jpeg(self, compile_and_run, tmp_path):
+        src = os.path.join(_FIXTURES_DIR, "gradient.jpg")
+        out = tmp_path / "copy.jpg"
+        source = f"""
+        img grad = '{src}'
+        log(grad.saveCopy('{out}'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+        assert out.read_bytes() == open(src, "rb").read()
+
+    # ---- aud ----
+
+    def test_an_mp3_stays_an_mp3(self, compile_and_run, tmp_path):
+        # Not re-encoded as WAV, for the same reason claude.md #101's
+        # aud columns round-trip: the clip keeps its own encoded bytes.
+        src = os.path.join(_FIXTURES_DIR, "tone.mp3")
+        out = tmp_path / "copy.mp3"
+        source = f"""
+        aud tone = '{src}'
+        log(tone.saveCopy('{out}'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+        assert out.read_bytes() == open(src, "rb").read()
+
+    def test_an_audio_save_with_a_path_adopts_it(self, compile_and_run, tmp_path):
+        src = os.path.join(_FIXTURES_DIR, "beep.wav")
+        first = tmp_path / "a.wav"
+        second = tmp_path / "b.wav"
+        source = f"""
+        aud clip = '{src}'
+        log(clip.save('{first}'))
+        log(clip.save('{second}'))
+        log(clip.save())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true", "true"]
+        original = open(src, "rb").read()
+        assert first.read_bytes() == original
+        assert second.read_bytes() == original
+
+    def test_a_resized_image_keeps_its_path_and_saves_at_the_new_size(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        # resize() mutates in place (claude.md #92), so the path survives
+        # it -- save() with no argument overwrites the file the image came
+        # from, with the resized version. That follows from what save()
+        # means rather than being a special case, and is worth pinning
+        # because it is destructive.
+        src = tmp_path / "sheet.png"
+        src.write_bytes(open(sprite_sheet_png, "rb").read())
+        source = f"""
+        img sheet = '{src}'
+        sheet.resize(16, 16)
+        log(sheet.save())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+        data = src.read_bytes()
+        width, height = struct.unpack(">II", data[16:24])
+        assert (width, height) == (16, 16)
+
+    def test_an_audio_column_reaches_the_disk_byte_identically(
+            self, compile_and_run, tmp_path):
+        src = os.path.join(_FIXTURES_DIR, "tone.mp3")
+        db = tmp_path / "t.sqlite"
+        out = tmp_path / "recovered.mp3"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Tracks {{ name:text  clip:aud }}
+        aud tone = '{src}'
+        sqlite('INSERT INTO Tracks (name, clip) VALUES (?, ?)', ['tone', tone])
+        arr[Tracks] rows = sqlite('SELECT * FROM Tracks')
+        log(rows[0].clip.save('{out}'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+        assert out.read_bytes() == open(src, "rb").read()
+
+    # ---- the surface itself ----
+
+    @pytest.mark.parametrize("decl", [
+        "blob v = 'x'",
+        "img v = 'x.png'",
+        "aud v = 'x.wav'",
+    ])
+    def test_save_copy_requires_its_path(self, parser, semantic, errors, decl):
+        program = parser.parse(f"{decl}\nlog(v.saveCopy())")
+        with pytest.raises(errors.CompileError, match="saveCopy"):
+            semantic.analyze(program)
+
+    @pytest.mark.parametrize("decl", [
+        "blob v = 'x'",
+        "img v = 'x.png'",
+        "aud v = 'x.wav'",
+    ])
+    def test_save_takes_at_most_one_path(self, parser, semantic, errors, decl):
+        program = parser.parse(f"{decl}\nlog(v.save('a', 'b'))")
+        with pytest.raises(errors.CompileError, match="save"):
+            semantic.analyze(program)
+
+    @pytest.mark.parametrize("decl", [
+        "blob v = 'x'",
+        "img v = 'x.png'",
+        "aud v = 'x.wav'",
+    ])
+    def test_the_path_must_be_text(self, parser, semantic, errors, decl):
+        program = parser.parse(f"{decl}\nlog(v.save(5))")
+        with pytest.raises(errors.CompileError, match="must be text"):
+            semantic.analyze(program)
+
+    @pytest.mark.parametrize("decl,method", [
+        ("blob v = 'x'", "save"),
+        ("img v = 'x.png'", "saveCopy"),
+        ("aud v = 'x.wav'", "save"),
+    ])
+    def test_both_return_bool(self, parser, semantic, decl, method):
+        arg = "'p'" if method == "saveCopy" else ""
+        program = parser.parse(f"{decl}\nbool ok = v.{method}({arg})")
+        semantic.analyze(program)
+
+    def test_saving_is_not_offered_on_a_type_that_has_no_bytes(
+            self, parser, semantic, errors):
+        # text has no path and no bytes-plus-origin shape, so this is an
+        # ordinary unknown-method error rather than a save it cannot do.
+        program = parser.parse("text t = 'x'\nlog(t.save('p'))")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
 
 
 class TestBlobColumns:

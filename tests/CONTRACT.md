@@ -401,7 +401,8 @@ compiler `compile_and_run` already requires.
 multifile/regex set: `timers.f` (setTimeout/setInterval), `graphics.f`
 (drawing + every event handler), `audio.f` (a clip from a path,
 play/stop/isPlaying/channels, with a small generated `beep.wav`
-fixture), `files.f` (claude.md #109's `blob`), `fizzbuzz.f` (a
+fixture), `files.f` (claude.md #109's `blob` and #110's save/saveCopy),
+`fizzbuzz.f` (a
 dependency-free loops/modulo tour), and `tic_tac_toe.f` -- a real,
 playable two-player game (click a cell, alternating X/O, win detection
 across all eight lines) built entirely around this runtime's actual
@@ -2298,7 +2299,19 @@ since a full disk can fail there after every `fwrite` succeeded).
   > the work, and the never-fail rule above is unchanged too; what went
   > away is the free-function spelling, which threaded the same path
   > through five separate calls. Each removed name is caught by name
-  > with an error showing its blob replacement. Time
+  > with an error showing its blob replacement.
+  >
+  > **claude.md #110 added `save()`/`save(path)`/`saveCopy(path)`**, on
+  > `img` and `aud` as well as `blob`, since all three are the same
+  > content-plus-origin shape and one policy beats three that nearly
+  > agree. `save(path)` ADOPTS the path (so `exists()`/`delete()` follow
+  > it); `saveCopy(path)` does not. This closes the gap #109 shipped
+  > knowingly: a handle with no path -- a `clip()` result, anything out
+  > of a database column -- could not reach the disk at all. It is also
+  > the one place here that FAILS rather than answering false: `save()`
+  > with no path to save to is a bug in the program, where an unwritable
+  > directory is a condition of the filesystem.
+  > `tests/test_codegen.py::TestSaveAndSaveCopy` (27 tests). Time
 got `now()` (ms since epoch, matching `Date.now()` and the unit
 `setTimeout` already takes) and `formatTime`. `saveCanvas(path)` writes
 the *backing* surface, so it captures what the program drew rather than
@@ -2495,6 +2508,16 @@ audio tests use consumes PCM instantly (measured: a 2-second clip
 finishes in 0ms), so under it there is no concurrency left to observe
 at all. The harness replaces the device layer and keeps every line
 above it real; clean under both ThreadSanitizer and AddressSanitizer.
+
+  Note for anyone touching `festina_runtime_audio.c`: these three
+  harnesses `#include` it and compile it STANDALONE, stubbing what it
+  needs from the core runtime, specifically so a test about the channel
+  pool does not have to link sqlite3. Adding a core-runtime call to
+  that translation unit therefore breaks all of them at LINK time, not
+  compile time -- which is what happened when claude.md #110 gave audio
+  a `save()` that delegates to `festina_save_bytes`. The fix is a
+  two-line stub next to the existing `festina_fail` one; recognizing
+  the failure took longer than writing it.
 
 **claude.md #99**: channels are named, and a loop reserves one.
 

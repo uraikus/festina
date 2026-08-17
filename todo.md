@@ -1539,17 +1539,14 @@ listed here only so they aren't lost:
   compile, and acyclic linked structures are reclaimed normally. The
   cost is that reference cycles became constructible; see the tracing
   GC note above.
-- **A blob out of a database column cannot be written to a file.**
-  claude.md #109: a blob read back from a BLOB column has bytes and no
-  path — a path is meaningful only on the machine that stored it — so
-  its `exists()`/`write()`/`append()`/`delete()` all answer false. Its
-  bytes cannot be moved into a path-backed blob either, because
-  `toText()` stops at the first NUL and binary content does not
-  survive the trip. Reading a binary column and re-inserting it works;
-  reading one and saving it as a file does not. Closing this needs
-  either a bytes-preserving transfer between two blobs or a
-  `saveTo(path)` method — neither was asked for, and picking one
-  quietly would be a worse answer than recording where the edge is.
+- ~~**A blob out of a database column cannot be written to a file.**~~
+  Fixed by claude.md #110. `save(path)` writes a handle's bytes to a
+  path and adopts it, `saveCopy(path)` writes without adopting, and
+  both work on `img` and `aud` as well as `blob` — so a `clip()` result
+  and a database column both reach the disk now. A pathless `save()`
+  with no argument fails the program rather than answering false, since
+  that is a bug rather than a filesystem condition. Verified
+  byte-identical for a stored PNG, an MP3 and a JPEG.
 - **Only PNG/JPEG and WAV/MP3.** claude.md #101 added JPEG and MP3, and
   drew the line there deliberately: each new format is a new
   system dependency on every machine that compiles a graphics or audio

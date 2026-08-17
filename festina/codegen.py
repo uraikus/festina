@@ -983,6 +983,9 @@ class CodeGen:
             "declare i8 @festina_blob_append(ptr, ptr)",
             "declare i8 @festina_blob_exists(ptr)",
             "declare i8 @festina_blob_delete(ptr)",
+            # claude.md #110: save()/saveCopy(), one pair per handle type.
+            "declare i8 @festina_blob_save(ptr, ptr)",
+            "declare i8 @festina_blob_save_copy(ptr, ptr)",
             "declare ptr @festina_read_file(ptr)",
             "declare i8 @festina_write_file(ptr, ptr)",
             "declare i8 @festina_append_file(ptr, ptr)",
@@ -1079,6 +1082,8 @@ class CodeGen:
             "declare ptr @festina_image_clip(ptr, i64, i64, i64, i64)",
             "declare void @festina_image_resize(ptr, i64, i64)",
             "declare void @festina_image_free(ptr)",
+            "declare i8 @festina_image_save(ptr, ptr)",
+            "declare i8 @festina_image_save_copy(ptr, ptr)",
             "declare void @festina_draw_image(ptr, i64, i64)",
             # claude.md #106: `on click` became mouseDown + mouseUp.
             "declare void @festina_register_mouse_down_handler(ptr)",
@@ -1110,6 +1115,8 @@ class CodeGen:
             # chose, and aud.stop() is back as a clip-wide stop.
             "declare i64 @festina_audio_play_on(ptr, i64, i8, i8)",
             "declare void @festina_audio_stop_clip(ptr)",
+            "declare i8 @festina_audio_save(ptr, ptr)",
+            "declare i8 @festina_audio_save_copy(ptr, ptr)",
             "declare void @festina_stop_audio_player(i64)",
             "declare i8 @festina_audio_is_playing(ptr)",
             # claude.md #98: the per-aud voice limit.
@@ -5205,6 +5212,37 @@ class CodeGen:
                         f"  {out} = call i64 @festina_audio_play_on(ptr {obj_val}, "
                         f"i64 {chan_val}, i8 {explicit}, i8 {looping})")
                     return out, INT
+            # claude.md #110: save()/saveCopy() on blob, img or aud. One
+            # branch for all three, dispatched on the receiver's type --
+            # the runtime functions differ only in which struct's path
+            # field they update, and all three share festina_save_bytes.
+            if callee.prop in ("save", "saveCopy"):
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                suffix = "_save" if callee.prop == "save" else "_save_copy"
+                fn = None
+                if obj_type == BLOB:
+                    fn = f"festina_blob{suffix}"
+                elif isinstance(obj_type, types_mod.ImageType):
+                    self.uses_graphics_code = True
+                    fn = f"festina_image{suffix}"
+                elif isinstance(obj_type, types_mod.AudioType):
+                    self.uses_audio = True
+                    fn = f"festina_audio{suffix}"
+                if fn is not None:
+                    if expr.args:
+                        arg_val, arg_type = self._emit_expr(expr.args[0], env, lines)
+                    else:
+                        # The no-argument save(): a null path is how the
+                        # runtime is told to use the handle's own.
+                        arg_val, arg_type = "null", None
+                    out = self.tmp()
+                    lines.append(
+                        f"  {out} = call i8 @{fn}(ptr {obj_val}, ptr {arg_val})")
+                    if expr.args:
+                        self._free_text_temp(expr.args[0], arg_val, arg_type, lines)
+                    self._release_member_receiver_temp(callee.obj, obj_val, obj_type,
+                                                      BOOL, lines)
+                    return out, BOOL
             # claude.md #109: blob's five methods. The receiver is a
             # blob handle, which already holds the path -- so these are
             # single runtime calls with no path argument to thread

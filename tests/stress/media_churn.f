@@ -58,6 +58,33 @@ while i < 120 {
     save = 'save_other.dat'          // releases the old handle
     save.write('other')
 
+    // claude.md #110: save()/saveCopy() on all three handle types. Each
+    // resolves a path, may adopt it (freeing the old one), and for a
+    // clip encodes a PNG on demand -- three allocations a leak could
+    // hide in, per call.
+    if tile.save(`tile_${i % 3}.png`) {
+        total = total + 1
+    }
+    if tile.save() {                     // now that it has a path
+        total = total + 1
+    }
+    if tile.saveCopy(`tile_copy_${i % 3}.png`) {
+        total = total + 1
+    }
+    if mp3.saveCopy(`clip_${i % 3}.mp3`) {
+        total = total + 1
+    }
+    if save.saveCopy(`save_copy_${i % 3}.dat`) {
+        total = total + 1
+    }
+    // ...and one straight out of a database column, which is the case
+    // that had no path at all until #110.
+    if rows[0].save != null {
+        if rows[0].save.save(`fromdb_${i % 3}.dat`) {
+            total = total + 1
+        }
+    }
+
     // Playback through the channel pool, including a reserved channel.
     // claude.md #109: play/playLoop hand back their channel, and
     // stop() silences every voice of one clip.
