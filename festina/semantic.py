@@ -1145,6 +1145,58 @@ def analyze(program, filename="<string>"):
                 if isinstance(recv, (types_mod.StructType, types_mod.TableType,
                                      types_mod.ArrayType, types_mod.MapType)):
                     return _TEXT
+            # claude.md #116: sentence.split(sep) -> arr[text]; sep is a
+            # text (literal substring) or a regex, the same pair
+            # .replace() already accepts.
+            if callee.prop == "split" and infer(callee.obj, scope) == _TEXT:
+                if len(expr.args) != 1:
+                    raise CompileError(
+                        f"split() expects exactly 1 argument (a text or regex "
+                        f"separator), got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                sep_type = infer(expr.args[0], scope)
+                if (sep_type is not None and sep_type is not NULL
+                        and sep_type not in (_TEXT, _REGEX)):
+                    raise CompileError(
+                        f"split()'s separator must be text or regex, found "
+                        f"{types_mod.type_name(sep_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return types_mod.ArrayType(_TEXT)
+            # claude.md #116: words.join(sep) -> text, on an array of
+            # text/int/float/bool -- element kinds with a text form of
+            # their own. A null element joins as '', JS's choice.
+            if callee.prop == "join":
+                obj_type = infer(callee.obj, scope)
+                if isinstance(obj_type, types_mod.ArrayType):
+                    if obj_type.element not in (_TEXT, _INT, _FLOAT,
+                                                 types_mod.PrimitiveType("bool")):
+                        raise CompileError(
+                            f"join() works on an array of text/int/float/bool, "
+                            f"found {types_mod.type_name(obj_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    if len(expr.args) != 1:
+                        raise CompileError(
+                            f"join() expects exactly 1 argument (a text "
+                            f"separator), got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    sep_type = infer(expr.args[0], scope)
+                    if (sep_type is not None and sep_type is not NULL
+                            and sep_type != _TEXT):
+                        raise CompileError(
+                            f"join()'s separator must be text, found "
+                            f"{types_mod.type_name(sep_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    return _TEXT
             # claude.md #67: pattern.test(value:text) -> bool
             if callee.prop == "test" and infer(callee.obj, scope) == _REGEX:
                 if len(expr.args) != 1:

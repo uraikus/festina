@@ -206,7 +206,17 @@ text a = 'room 42'.replace('room', 'suite')
 text b = 'a1b2c3'.replace(/[0-9]/g, '-')   // 'g' = every match
 bool matched = /[0-9]+/.test('room 42')
 text found = 'room 42'.match(/[0-9]+/)   // null if no match
+
+arr[text] words = sentence.split(' ')    // or a regex: .split(/\s+/g)
+sentence = words.join('\t')              // join works on text/int/float/bool arrays
 ```
+
+`split` follows JS: empty pieces between adjacent separators are kept
+(`'a,,b'.split(',')` has three pieces), a separator at the edge yields
+an edge empty, an empty-match regex splits between characters, and an
+empty text separator splits per UTF-8 code point. `join` renders a
+`null` element as an empty string (`[1, null, 3].join('-')` is
+`'1--3'`), also JS's choice.
 
 ## Logging and rendering
 

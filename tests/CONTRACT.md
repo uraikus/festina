@@ -2661,6 +2661,32 @@ carries a presence bitmask one hidden slot past its columns; an unknown
 name in undefined() fails the program.
 `tests/test_codegen.py::TestUndefinedAndNameMatchedColumns` (6 tests).
 
+**claude.md #117**: chained extraction stops leaking — retain first.
+
+#102/#108's deliberate leak (a chain yielding a managed value or text
+could not release its parent without freeing the value being handed
+out) is closed by ordering, not machinery: retain the escaping value
+(copy, for text), THEN release the parent, whose cascade nets the
+result to exactly one reference. Call-based chains are owning sources
+now, so the +1 lands with exactly one owner in every position a fresh
+Call result already could (binding, return, global, push, discard).
+Method receivers with fresh results (join/toText/blob methods) release
+whenever owned, ending the result-type judgement that made
+split(' ').join('-') leak. The #108 test pinning the leak inverted, and
+now asserts retain-precedes-release in the IR — the order IS the safety
+argument. Remaining, recorded in todo.md: argument-position chains and
+computed-index receivers.
+`tests/test_codegen.py::TestChainedCallResultReachedForAField` (updated).
+
+**claude.md #116**: text.split(text|regex) -> arr[text] and
+arr.join(text) -> text, on text/int/float/bool element types. JS
+semantics in full (kept empties, edge empties, empty-match regex splits
+between characters, empty text separator splits per UTF-8 code point,
+null joins as ''), each pinned as its own test since each is a
+decision. The split result is a runtime-built refcounted arr[text], so
+every existing array mechanism applies unchanged.
+`tests/test_codegen.py::TestSplitAndJoin` (11 tests).
+
 **claude.md #115**: log(blob)/`${blob}` render the contents after all —
 #114 had put blob in the refuse list; a blob is very often a text file
 and already carries the method the implicit conversion is defined as,
