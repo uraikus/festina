@@ -208,6 +208,51 @@ bool matched = /[0-9]+/.test('room 42')
 text found = 'room 42'.match(/[0-9]+/)   // null if no match
 ```
 
+## Logging and rendering
+
+`log()` and `${}` interpolation accept any value that has a text form —
+a non-text value compiles as its `.toText()`:
+
+- **`int` / `float` / `bool`** — the number, `true`/`false`, or `null`.
+- **structs, table rows, arrays, maps** — JSON-like:
+
+```festina
+struct P { id:int  name:text  xs:arr[int] }
+P p
+p.id = 7
+p.name = 'x'
+p.xs.push(1)
+log(p)                     // {"id":7,"name":"x","xs":[1]}
+log(`state: ${p.xs}`)      // state: [1]
+text json = p.toText()     // the explicit spelling of the same rendering
+```
+
+Text is escaped JSON-style; a `null` text/element renders as `null`; a
+table-row column the query never selected is **omitted** (what
+`JSON.stringify` does for `undefined`); a database NULL renders as
+`null`. An opaque handle inside a container (a `blob`/`img`/`aud`/`regex`
+field) renders as a placeholder like `"<blob>"`, or `null` when unset. A
+cyclic value truncates at depth 32 instead of crashing. An **unassigned**
+scalar field renders its zero value (per the zero-value rule); a field
+explicitly assigned `null` renders `null`.
+
+- **`blob`** — the contents, via its own `.toText()`: a blob is very
+  often a text file. (A binary blob renders its bytes up to the first
+  NUL — the same thing its explicit `.toText()` does.) A blob *field
+  inside a rendered container* still shows as the `"<blob>"`
+  placeholder, since embedding a whole file mid-JSON would drown the
+  structure the rendering exists to show.
+
+```festina
+blob f = 'notes.txt'
+log(f)                     // the contents
+log(`config: ${f}`)        // interpolates the contents
+```
+
+- **`img`, `aud`** — a **compile error**: neither has a text form, and
+  silently printing a placeholder would hide a mistake the type system
+  can catch.
+
 ## Structs
 
 ```festina
@@ -512,6 +557,18 @@ out of a column can and cannot do.
 Binding is by value: the parameter is copied into the database as the
 statement runs, so nothing is retained afterwards and the asset stays
 yours.
+
+### Query performance
+
+Two things happen automatically. A `sqlite()` call whose SQL is a
+**string literal** is prepared once and reused — parsing and planning
+happen on the first call only, so a query in a loop pays for binding and
+stepping, nothing else. (Dynamic SQL — a template or a variable — is
+prepared per call, since it can differ each time.) And the database
+opens in **WAL mode** with `synchronous=NORMAL`, the standard
+application configuration: measured, 20,000 inserts dropped from 16.7s
+to 0.3s. A transaction survives an application crash; only an OS crash
+or power loss can lose the most recent commits — never corrupt the file.
 
 ### Partial queries and `undefined()`
 

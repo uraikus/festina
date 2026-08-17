@@ -32,6 +32,18 @@ char *festina_str_from_int(int64_t v);
 char *festina_str_from_float(double v);
 char *festina_str_from_bool(int8_t v);
 char *festina_str_concat(const char *a, const char *b);
+/* claude.md #114: the string builder behind JSON-like rendering of
+ * structs/rows/arrays/maps in log() and `${}`. Structure walking lives
+ * in generated IR; byte handling lives here. See the .c doc comment. */
+void *festina_sb_new(void);
+void festina_sb_append(void *sb, const char *s);
+void festina_sb_append_json_text(void *sb, const char *s);
+void festina_sb_append_json_int(void *sb, int64_t v);
+void festina_sb_append_json_float(void *sb, double v);
+void festina_sb_append_json_bool(void *sb, int8_t v);
+void festina_sb_append_json_bool64(void *sb, int64_t v);
+void festina_sb_append_handle(void *sb, const void *handle, const char *label);
+char *festina_sb_finish(void *sb);
 char *festina_text_own(const char *s);  /* claude.md #83: NULL-safe strdup */
 
 /* claude.md #93: math, files and time -- all libc/libm, both already on
@@ -113,6 +125,11 @@ void festina_sync_table(sqlite3 *db, const char *table_name,
  * festina/codegen.py's INT_NULL_CONST / FLOAT_NULL_CONST.
  */
 sqlite3_stmt *festina_sqlite_prepare(sqlite3 *db, const char *sql);
+/* claude.md #113: the literal-SQL fast path -- `slot` is a per-call-site
+ * cache (a compiler-emitted private global); the statement is prepared
+ * once and reset+reused ever after. See the .c doc comment. */
+sqlite3_stmt *festina_sqlite_prepare_cached(sqlite3 *db, const char *sql,
+                                            void **slot);
 void festina_sqlite_bind_int(sqlite3_stmt *stmt, int32_t idx, int64_t val);
 void festina_sqlite_bind_float(sqlite3_stmt *stmt, int32_t idx, double val);
 void festina_sqlite_bind_text(sqlite3_stmt *stmt, int32_t idx, const char *val);
