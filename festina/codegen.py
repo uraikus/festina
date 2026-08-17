@@ -823,6 +823,9 @@ class CodeGen:
                                                 # Keyed on the RESOLVED parts rather than the source
                                                 # text, so 'bold 13px arial' and 'arial bold 13px'
                                                 # share one constant.
+        self._row_to_struct_fns = set()        # claude.md #112: row->struct converters already
+                                                # generated, one per struct type used as a
+                                                # sqlite() target
         self._regex_lit_cache = {}             # id(ast.RegexLit node) -> its private cache global's
                                                 # name -- see _emit_cached_regex_lit; keyed by node
                                                 # identity (not pattern text) so two textually
@@ -5881,6 +5884,15 @@ class CodeGen:
         if isinstance(table_type, types_mod.TableType):
             arr_val = self._emit_sqlite_collect(stmt_val, table_type, lines)
             return arr_val, expected_type
+        if isinstance(table_type, types_mod.StructType):
+            # claude.md #112: a STRUCT as the landing spot -- the shape
+            # for `SELECT id AS whatever`, a JOIN, or any computed
+            # column: name the fields after the result's own column
+            # names, no table (and no CREATE TABLE side effect, which a
+            # `table` declaration always carries) required.
+            arr_val = self._emit_sqlite_collect_struct(stmt_val, table_type, lines,
+                                                       line=callee.line)
+            return arr_val, expected_type
 
         lines.append(f"  call void @festina_sqlite_exec(ptr {stmt_val})")
         return "0", None
@@ -6176,6 +6188,178 @@ class CodeGen:
         result = (names_arr, types_arr, len(names))
         self._table_arrays_cache[table_name] = result
         return result
+
+    def _query_struct_arrays(self, struct_type, line=0):
+        """claude.md #112: the struct counterpart of _table_arrays --
+        column-name and column-type globals derived from a STRUCT's
+        fields, so festina_sqlite_collect_rows can match result columns
+        to them by name exactly as it does for a table. This is what
+        gives an aliased or computed column a declared landing spot:
+        `SELECT id AS whatever` matches a struct field named `whatever`,
+        where a table's declared columns can never be renamed to chase
+        a query's aliases.
+
+        Field types are restricted to what a query can actually produce
+        (the same seven festina_sql_type knows); a struct with an
+        arr/map/struct field can hold one in ordinary code but not
+        receive one from sqlite, and the error says which field."""
+        name = struct_type.name
+        cached = self._table_arrays_cache.get("q$" + name)
+        if cached is not None:
+            return cached
+        type_strings = []
+        for fname, ftype in self.struct_fields(name):
+            if ftype == INT:
+                type_strings.append("int")
+            elif ftype == FLOAT:
+                type_strings.append("float")
+            elif ftype == BOOL:
+                type_strings.append("bool")
+            elif ftype == TEXT:
+                type_strings.append("text")
+            elif ftype == BLOB:
+                type_strings.append("blob")
+            elif isinstance(ftype, types_mod.ImageType):
+                # The decoder registration in main() keys on this flag,
+                # the same as it does for a media table column.
+                self.uses_graphics_code = True
+                type_strings.append("img")
+            elif isinstance(ftype, types_mod.AudioType):
+                self.uses_audio = True
+                type_strings.append("aud")
+            else:
+                raise CodegenError(
+                    f"struct '{name}' cannot receive a sqlite() result: field "
+                    f"'{fname}' is {types_mod.type_name(ftype)}, and a query "
+                    f"column can only be int/float/bool/text/blob/img/aud",
+                    file=self.filename, line=line)
+        fields = self.struct_fields(name)
+        names_arr = f"@{name}.qcols"
+        types_arr = f"@{name}.qtypes"
+        name_ptrs = ", ".join(f"ptr {self.string_const(n)}" for n, _ in fields)
+        type_ptrs = ", ".join(f"ptr {self.string_const(t)}" for t in type_strings)
+        self.extra_globals.append(
+            f"{names_arr} = private constant [{len(fields)} x ptr] [{name_ptrs}]")
+        self.extra_globals.append(
+            f"{types_arr} = private constant [{len(type_strings)} x ptr] [{type_ptrs}]")
+        result = (names_arr, types_arr, len(fields))
+        self._table_arrays_cache["q$" + name] = result
+        return result
+
+    def _emit_row_to_struct_fn(self, struct_type):
+        """claude.md #112: generates (once per struct type, cached) the
+        function that turns one of festina_sqlite_collect_rows's flat
+        rows into a real, refcounted struct instance.
+
+        The flat row is `ncols` 8-byte slots plus the presence mask; a
+        struct is an LLVM named struct with natural field offsets and a
+        refcount header. Rather than teach every downstream consumer a
+        second row layout, the row is converted ONCE, here, immediately
+        after collection: each slot is loaded at the field's own LLVM
+        type (the raw 8 bytes hold an i64, a double's bits, or a
+        pointer -- little-endian, so an i8 bool reads its low byte, the
+        same read a table-row member access does) and stored at the
+        field's real offset. Pointer fields (text/blob/img/aud) TRANSFER
+        ownership -- the struct owns them now, and only the row buffer
+        itself is freed. The struct starts at refcount 1, owned by the
+        result array, so element release, `free`, aliasing and the rest
+        of claude.md #77's machinery apply with nothing new.
+
+        The presence mask is deliberately dropped: undefined() is a
+        TABLE-ROW method, and a struct instance from a query is an
+        ordinary struct, indistinguishable from one built by hand -- an
+        unmatched column simply reads null."""
+        name = struct_type.name
+        fn_name = f"@__festina_rowtostruct_{name}"
+        if fn_name in self._row_to_struct_fns:
+            return fn_name
+        self._row_to_struct_fns.add(fn_name)
+        struct_ty = self.struct_llvm_name(name)
+        body = [f"define ptr {fn_name}(ptr %row) {{", "entry:"]
+        size_ptr = self.tmp()
+        body.append(f"  {size_ptr} = getelementptr {struct_ty}, ptr null, i64 1")
+        size_val = self.tmp()
+        body.append(f"  {size_val} = ptrtoint ptr {size_ptr} to i64")
+        total = self.tmp()
+        body.append(f"  {total} = add i64 {size_val}, 8")
+        raw = self.tmp()
+        body.append(f"  {raw} = call ptr @calloc(i64 1, i64 {total})")
+        body.append(f"  store i64 1, ptr {raw}")
+        payload = self.tmp()
+        body.append(f"  {payload} = getelementptr i8, ptr {raw}, i64 8")
+        for idx, (_, ftype) in enumerate(self.struct_fields(name)):
+            f_llvm = _llvm_type(ftype)
+            slot = self.tmp()
+            body.append(f"  {slot} = getelementptr i8, ptr %row, i64 {idx * 8}")
+            v = self.tmp()
+            body.append(f"  {v} = load {f_llvm}, ptr {slot}")
+            fp = self.tmp()
+            body.append(f"  {fp} = getelementptr {struct_ty}, ptr {payload}, i32 0, i32 {idx}")
+            body.append(f"  store {f_llvm} {v}, ptr {fp}")
+        body.append("  call void @free(ptr %row)")
+        body.append(f"  ret ptr {payload}")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _emit_sqlite_collect_struct(self, stmt_val, struct_type, lines, line=0):
+        """claude.md #112: `arr[SomeStruct] q = sqlite(...)`. Shares the
+        whole table pipeline -- prepare, bind, name-matched collection
+        (claude.md #111) -- and differs only in the last step, where each
+        flat row becomes a real struct instance in place."""
+        names_global, types_global, ncols = self._query_struct_arrays(struct_type, line)
+
+        n_slot = self.tmp()
+        lines.append(f"  {n_slot} = alloca i64")
+        data_slot = self.tmp()
+        lines.append(f"  {data_slot} = alloca ptr")
+        lines.append(
+            f"  call void @festina_sqlite_collect_rows(ptr {stmt_val}, i32 {ncols}, "
+            f"ptr {types_global}, ptr {names_global}, ptr {n_slot}, ptr {data_slot})"
+        )
+        n_val = self.tmp()
+        lines.append(f"  {n_val} = load i64, ptr {n_slot}")
+        data_val = self.tmp()
+        lines.append(f"  {data_val} = load ptr, ptr {data_slot}")
+
+        convert_fn = self._emit_row_to_struct_fn(struct_type)
+        uid = self._unique()
+        i_slot = self.tmp()
+        lines.append(f"  {i_slot} = alloca i64")
+        lines.append(f"  store i64 0, ptr {i_slot}")
+        cond = self.label(f"rowconv.cond{uid}")
+        bodyl = self.label(f"rowconv.body{uid}")
+        endl = self.label(f"rowconv.end{uid}")
+        lines.append(f"  br label %{cond}")
+        self._start_block(cond, lines)
+        i_val = self.tmp()
+        lines.append(f"  {i_val} = load i64, ptr {i_slot}")
+        more = self.tmp()
+        lines.append(f"  {more} = icmp slt i64 {i_val}, {n_val}")
+        lines.append(f"  br i1 {more}, label %{bodyl}, label %{endl}")
+        self._start_block(bodyl, lines)
+        slot_ptr = self.tmp()
+        lines.append(f"  {slot_ptr} = getelementptr ptr, ptr {data_val}, i64 {i_val}")
+        row_val = self.tmp()
+        lines.append(f"  {row_val} = load ptr, ptr {slot_ptr}")
+        converted = self.tmp()
+        lines.append(f"  {converted} = call ptr {convert_fn}(ptr {row_val})")
+        lines.append(f"  store ptr {converted}, ptr {slot_ptr}")
+        nxt = self.tmp()
+        lines.append(f"  {nxt} = add i64 {i_val}, 1")
+        lines.append(f"  store i64 {nxt}, ptr {i_slot}")
+        lines.append(f"  br label %{cond}")
+        self._start_block(endl, lines)
+
+        header = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, lines)
+        len_ptr = self.tmp()
+        lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
+        lines.append(f"  store i64 {n_val}, ptr {len_ptr}")
+        data_field_ptr = self.tmp()
+        lines.append(f"  {data_field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
+        lines.append(f"  store ptr {data_val}, ptr {data_field_ptr}")
+        return header
 
     def _emit_toplevel_stmt(self, stmt, env, ctx):
         lines = ctx["lines"]

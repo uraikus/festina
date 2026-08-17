@@ -543,6 +543,38 @@ A `SELECT ... AS alias` renames a column *away* from its declared name,
 so an aliased column simply doesn't match; alias *to* a declared name to
 remap a computed value into a column deliberately.
 
+### Structs as query targets
+
+A query doesn't have to land in a table's row type. Any **struct** whose
+fields are queryable types (`int`/`float`/`bool`/`text`/`blob`/`img`/
+`aud`) can receive a result — name its fields after the result's own
+column names:
+
+```festina
+struct data {
+    whatever:int
+}
+arr[data] query = sqlite('select id as whatever from examples')
+log(query[0].whatever)
+```
+
+This is the shape for aliased columns, JOINs, and computed results — a
+table's declared columns can never chase a query's aliases, and a
+`table` declaration always *creates* a table, which a result-only shape
+has no business doing:
+
+```festina
+struct summary { total:int  biggest:text }
+arr[summary] agg = sqlite(
+    'select count(*) as total, max(name) as biggest from examples')
+```
+
+The elements are **ordinary structs** — refcounted, aliasable,
+`free`-able, their fields assignable and `delete`-able, exactly as if
+built by hand. A field the result didn't produce reads `null`. One
+consequence: `undefined()` is a table-row method and doesn't exist here,
+since an ordinary struct carries no record of which query it came from.
+
 ### Database configuration
 
 `festina.sqlite` is the default, but the entry file's very first line

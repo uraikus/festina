@@ -10,6 +10,7 @@ table Person {
 }
 
 struct Inner { n:int label:text }
+struct Summary { total:int  biggest:text }
 struct Outer { count:int inner:Inner xs:arr[int] m:map[int] }
 
 Outer func makeOuter(n:int) {
@@ -85,6 +86,17 @@ while i < 400 {
     }
     Person first = rows[0]
     total = total + first.id
+
+    // claude.md #112: a struct as the query target -- aliased and
+    // computed columns land in struct fields, each row converted into a
+    // real refcounted struct whose text fields the conversion now owns.
+    arr[Summary] sums = sqlite(
+        "SELECT count(*) AS total, max(name) AS biggest FROM Person")
+    total = total + sums[0].total
+    if sums[0].biggest == null { log('unreachable') }
+    Summary keepSum = sums[0]
+    free sums
+    if keepSum.biggest == null { log('unreachable') }
 
     // Scalar queries have their own path.
     total = total + sqliteInt('SELECT count(*) FROM Person')

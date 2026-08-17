@@ -2661,6 +2661,19 @@ carries a presence bitmask one hidden slot past its columns; an unknown
 name in undefined() fails the program.
 `tests/test_codegen.py::TestUndefinedAndNameMatchedColumns` (6 tests).
 
+**claude.md #112**: structs as sqlite() targets.
+
+`arr[SomeStruct] q = sqlite('select id as whatever ...')` — the landing
+spot for aliased columns, JOINs and computed results, which a table's
+declared columns can never chase (and which a `table` declaration would
+answer by CREATE-ing a table). Shares #111's whole pipeline; a generated
+per-struct function then converts each flat row into a real refcounted
+struct in place, transferring pointer-field ownership, so the elements
+are ordinary structs and free/delete/aliasing/release all apply
+unchanged. Non-queryable field types error naming the field; the
+presence mask is dropped, so undefined() stays a table-row method.
+`tests/test_codegen.py::TestStructQueryTargets` (7 tests).
+
 **claude.md #102**: a bug hunt, and a leak harness that can fail.
 
 Six bugs found by deliberate probing rather than by waiting for them:

@@ -6357,6 +6357,128 @@ class TestAudioChannelReturnAndClipStop:
         assert result.stdout.strip() == "-1"
 
 
+class TestStructQueryTargets:
+    """claude.md #112: `arr[SomeStruct] q = sqlite(...)` -- a struct as
+    the query's landing spot. A table's declared columns can never chase
+    a query's aliases, so `SELECT id AS whatever`, a JOIN, or a computed
+    column had nowhere typed to land; a struct names its fields after
+    the result's own column names, and -- unlike declaring a table --
+    carries no CREATE TABLE side effect. Collection shares claude.md
+    #111's name matching; each row then becomes a real refcounted
+    struct, indistinguishable from one built by hand."""
+
+    def test_the_spec_example(self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table examples {{ id:int  name:text }}
+        sqlite('INSERT INTO examples (id, name) VALUES (?, ?)', [7, 'seven'])
+        struct data {{
+          whatever:int
+        }}
+        arr[data] query = sqlite('select id as whatever from examples')
+        log(query.length)
+        log(query[0].whatever)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["1", "7"]
+
+    def test_computed_columns_land_by_alias(self, compile_and_run, tmp_path):
+        # The case a table can never express: the column does not exist
+        # anywhere in the schema, only in the query.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table examples {{ id:int  name:text }}
+        sqlite('INSERT INTO examples (id, name) VALUES (?, ?)', [7, 'seven'])
+        sqlite('INSERT INTO examples (id, name) VALUES (?, ?)', [8, 'eight'])
+        struct summary {{ total:int  biggest:text }}
+        arr[summary] agg = sqlite(
+            "select count(*) as total, max(name) as biggest from examples")
+        log(agg[0].total)
+        log(agg[0].biggest)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["2", "seven"]
+
+    def test_an_unmatched_field_reads_null(self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table examples {{ id:int }}
+        sqlite('INSERT INTO examples (id) VALUES (1)')
+        struct wide {{ whatever:int  missing:text }}
+        arr[wide] w = sqlite('select id as whatever from examples')
+        log(w[0].missing == null)
+        log(w[0].whatever)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "1"]
+
+    def test_the_result_is_an_ordinary_struct(self, compile_and_run, tmp_path):
+        # Refcounted like any other: an element aliased out of the array
+        # survives freeing the array, fields can be reassigned and
+        # deleted, and the whole thing can be freed by hand.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table examples {{ id:int  name:text }}
+        sqlite('INSERT INTO examples (id, name) VALUES (?, ?)', [7, 'seven'])
+        struct data {{ whatever:int  label:text }}
+        arr[data] q = sqlite('select id as whatever, name as label from examples')
+        data keep = q[0]
+        free q
+        log(q == null)
+        log(keep.label)
+        keep.label = 'renamed'
+        log(keep.label)
+        delete keep.label
+        log(keep.label == null)
+        free keep
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            "true", "seven", "renamed", "true"]
+
+    def test_a_blob_column_lands_in_a_struct_field(self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        src = tmp_path / "payload.txt"
+        source = f"""
+        DatabaseURL = '{db}'
+        table examples {{ id:int  pic:blob }}
+        blob payload = '{src}'
+        payload.write('the bytes')
+        sqlite('INSERT INTO examples (id, pic) VALUES (?, ?)', [1, payload])
+        struct data {{ pic:blob }}
+        arr[data] q = sqlite('select pic from examples')
+        log(q[0].pic.toText())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "the bytes"
+
+    def test_a_non_queryable_field_is_a_clear_error(self, parser, semantic, codegen):
+        source = (
+            "struct bad { xs:arr[int] }\n"
+            "arr[bad] q = sqlite('select 1')\n"
+        )
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        with pytest.raises(Exception, match="xs"):
+            codegen.generate_ir(program, analyzed, filename="main.f")
+
+    def test_undefined_stays_a_table_row_method(self, parser, semantic, errors):
+        # A struct instance from a query is an ordinary struct -- the
+        # presence mask is a row concept, deliberately dropped in the
+        # conversion, so undefined() is not offered.
+        program = parser.parse(
+            "struct data { whatever:int }\n"
+            "arr[data] q = sqlite('select 1 as whatever')\n"
+            "log(q[0].undefined('whatever'))")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+
 class TestFreeStatement:
     """claude.md #111: `free name` -- release what the binding holds,
     null the binding. For refcounted types it is a DECREMENT, so a value
