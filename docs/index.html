@@ -635,17 +635,13 @@ npcHealths[<span class="str">'npc1'</span>] = 30
         </table>
       </div>
       <p class="section-intro" style="margin:16px 0 0;">
-        It didn't start there — the first version of this benchmark had
-        Festina 1.4x <em>slower</em>. Splitting the frame by shape type
-        found the reason: Cairo tessellates every circle into fresh
-        Beziers on every single draw, 76 ms of the 90 ms frame. Caching
-        one alpha mask per radius and stamping it thereafter took circles
-        to 20 ms and the frame from 90 ms to 31 ms — turning a 1.4x
-        deficit into a 2.1x lead. Festina also wins startup by more than
-        an order of magnitude and wins on variance — the browser's frame
-        time swings 20+ ms between runs, Festina's two numbers sit right
-        on top of each other, and for a frame budget that's not a
-        footnote.
+        Circles are drawn from a cached alpha mask per radius, stamped
+        rather than re-tessellated on every call — the reason Festina
+        stays ahead on this workload. Festina also wins startup by more
+        than an order of magnitude and wins on variance — the browser's
+        frame time swings 20+ ms between runs, while Festina's two
+        numbers sit right on top of each other, and for a frame budget
+        that's not a footnote.
       </p>
     </div>
 
@@ -653,12 +649,9 @@ npcHealths[<span class="str">'npc1'</span>] = 30
       Short version: Festina holds its own against Rust and Go on
       compute-bound native code and lands right at them on
       allocation-heavy work too, comfortably outruns a JIT on cold
-      single-shot execution — and <code>string_concat</code>, once the
-      sharpest divergence in the suite, closed from a 140ms leak-driven
-      gap down to 3.6ms once <code>text</code> values were made
-      genuinely owned and freed, landing Festina second place overall,
-      ahead of both Go and Bun and within ~2.4x of Rust's
-      spare-capacity-reusing <code>String</code> — the one gap left that's
+      single-shot execution, and sits second on <code>string_concat</code>
+      — ahead of both Go and Bun and within ~2.4x of Rust's
+      spare-capacity-reusing <code>String</code>, the one gap here that's
       genuinely algorithmic, not an allocator artifact.
     </p>
   </div>

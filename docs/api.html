@@ -714,7 +714,7 @@ b.m[<span class="str">'k'</span>] = 9</pre>
           means every iteration; <code>break</code>/<code>continue</code>
           reclaim it too. A non-escaping struct is a real stack
           allocation, not a heap allocation freed afterward. Passing one
-          to another function no longer forces it to escape either — if
+          to another function doesn't force it to escape either — if
           that function's own body never lets the value outlive the
           call, the original is still reclaimed the same way.
         </div>
@@ -730,14 +730,9 @@ b.m[<span class="str">'k'</span>] = 9</pre>
           <code>arr[T]</code>/<code>map[T]</code>'s own elements/values
           — however many levels deep a program nests them. Two
           variables made to alias each other
-          (<code>map[T] b = a</code>) now correctly share one underlying
+          (<code>map[T] b = a</code>) correctly share one underlying
           value rather than silently diverging.
         </div>
-        <p class="muted">
-          Every gap this used to leave open is now closed — see
-          <a href="https://github.com/uraikus/festina/blob/main/todo.md#memory-management">todo.md</a>
-          for the full seven-stage history.
-        </p>
         <div class="callout">
           <strong><code>text</code>, reclaimed a different way.</strong>
           Rather than being reference counted, every text-typed binding
@@ -757,7 +752,7 @@ b.m[<span class="str">'k'</span>] = 9</pre>
           Query results are reclaimed too: the rows an
           <code>arr[Table]</code> holds, and each row's own text columns,
           are freed when that array is — so a program that queries
-          repeatedly no longer grows without bound. A single row read out
+          repeatedly stays bounded. A single row read out
           of one (<code>People p = rows[0]</code>) borrows from the array
           rather than owning a copy, so it stays valid exactly as long as
           the array does. A regex compiled at runtime and used straight
@@ -1012,9 +1007,8 @@ clearCanvas()
 drawSprites()
 render()</pre>
         <p class="muted">
-          Batching matters — drawing used to blit the whole canvas per
-          call, so a frame of 2000 rectangles took ~1.6s. Behind one
-          <code>render()</code> the same frame takes ~1ms. Nothing but
+          Batching matters — a frame of 2000 rectangles behind one
+          <code>render()</code> call takes ~1ms. Nothing but
           <code>render()</code> and the event handlers needs a display —
           <code>saveCanvas</code>, <code>clientWidth</code>/<code>clientHeight</code>
           and <code>loadImage</code> all work headless.
