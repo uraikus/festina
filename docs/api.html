@@ -401,6 +401,7 @@
         <a href="#control-flow">Control flow</a>
         <a href="#strings">Strings</a>
         <a href="#structs">Structs</a>
+        <a class="sub" href="#a-struct-can-name-itself">A struct can name itself</a>
         <a href="#arrays">Arrays</a>
         <a class="sub" href="#indexing-is-not-bounds-checked">Indexing is not bounds-checked</a>
         <a href="#maps">Maps</a>
@@ -408,11 +409,16 @@
       <div class="nav-group">
         <div class="nav-group-title">Standard library</div>
         <a href="#built-in-sqlite">Built-in SQLite</a>
-        <a class="sub" href="#storing-images-and-audio">Storing images and audio</a>
+        <a class="sub" href="#storing-images-audio-and-files">Storing images, audio and files</a>
+        <a class="sub" href="#partial-queries-and-undefined">Partial queries and undefined()</a>
+        <a class="sub" href="#structs-as-query-targets">Structs as query targets</a>
         <a class="sub" href="#database-configuration">Database configuration</a>
         <a href="#environment-variables">Environment variables</a>
         <a href="#regex">Regex</a>
+        <a class="sub" href="#what-g-does">What g does</a>
+        <a class="sub" href="#literals-vs-regex-function">Literals vs regex()</a>
         <a href="#graphics">Graphics</a>
+        <a class="sub" href="#mouse-events">Mouse events</a>
         <a class="sub" href="#keyboard-events">Keyboard events</a>
         <a class="sub" href="#images">Images</a>
         <a class="sub" href="#drawing-style">Drawing style</a>
@@ -422,12 +428,18 @@
         <a class="sub" href="#gradients-and-transparency">Gradients and transparency</a>
         <a class="sub" href="#text-metrics">Text metrics</a>
         <a href="#files">Files</a>
+        <a class="sub" href="#blobs-in-the-database">Blobs in the database</a>
+        <a href="#freeing-and-deleting">Freeing and deleting</a>
+        <a class="sub" href="#free">free</a>
+        <a class="sub" href="#delete">delete</a>
+        <a href="#saving-bytes-to-a-path">Saving bytes to a path</a>
         <a href="#time">Time</a>
         <a class="sub" href="#single-value-queries">Single-value queries</a>
         <a class="sub" href="#json-and-full-text-search">JSON and full-text search</a>
         <a href="#growing-arrays">Growing arrays</a>
         <a href="#timers">Timers</a>
         <a href="#audio">Audio</a>
+        <a class="sub" href="#stopping-a-sound">Stopping a sound</a>
         <a class="sub" href="#overlapping-sounds">Overlapping sounds</a>
         <a class="sub" href="#channels-and-looping">Channels and looping</a>
       </div>
@@ -514,8 +526,8 @@
 <span class="kw">float</span>     -- 64-bit floating point (IEEE 754 double)
 <span class="kw">bool</span>      -- true / false, no truthy/falsy coercion from anything else
 <span class="kw">text</span>      -- UTF-8 string
-<span class="kw">blob</span>      -- binary data (shares text's representation; text -&gt; blob
-             assignment is allowed, the reverse is not)
+<span class="kw">blob</span>      -- a file's bytes, loaded from a path (blob save = 'slot1.dat');
+             see the Files section below
 <span class="kw">arr[T]</span>    -- homogeneous array of any of the above, a struct, or a
              declared table's row type
 <span class="kw">map[T]</span>    -- text-keyed map of any of the above except arr[T]/map[T]
@@ -659,7 +671,7 @@ log(count.toText())   <span class="cm">// "5" -- identical to log(`${count}`)</s
         <h2>Strings <a class="anchor" href="#strings">#</a></h2>
         <pre class="code"><span class="kw">text</span> greeting = <span class="str">`Hello, ${name}!`</span>     <span class="cm">// template literals</span>
 <span class="kw">text</span> a = <span class="str">'room 42'</span>.replace(<span class="str">'room'</span>, <span class="str">'suite'</span>)
-<span class="kw">text</span> b = <span class="str">'a1b2c3'</span>.replaceAll(<span class="re">/[0-9]/</span>, <span class="str">'-'</span>)
+<span class="kw">text</span> b = <span class="str">'a1b2c3'</span>.replace(<span class="re">/[0-9]/g</span>, <span class="str">'-'</span>)   <span class="cm">// 'g' = every match</span>
 <span class="kw">bool</span> matched = <span class="re">/[0-9]+/</span>.test(<span class="str">'room 42'</span>)
 <span class="kw">text</span> found = <span class="str">'room 42'</span>.match(<span class="re">/[0-9]+/</span>)   <span class="cm">// null if no match</span></pre>
       </section>
@@ -699,6 +711,47 @@ b.m[<span class="str">'k'</span>] = 9</pre>
           read above and the <code>push</code> below it are talking
           about the same array.
         </p>
+
+        <h3 id="a-struct-can-name-itself">A struct can name itself <a class="anchor" href="#a-struct-can-name-itself">#</a></h3>
+        <p>
+          A field may have the type of the struct it is declared in, or
+          the type of a struct declared further down the file.
+          Declaration order does not matter:
+        </p>
+        <pre class="code"><span class="kw">struct</span> Node {
+    n:<span class="kw">int</span>
+    next:Node
+}
+
+<span class="kw">Node</span> head
+head.n = 1
+head.next.n = 2       <span class="cm">// auto-vivified, same as any other struct field</span>
+head.next.next.n = 3
+
+<span class="kw">Node</span> cursor = head
+<span class="kw">for int</span> i = 0, i &lt; 3, i++ {
+    log(cursor.n)
+    cursor = cursor.next
+}</pre>
+        <p class="muted">
+          Linked lists, trees and parent pointers all work, and are
+          reclaimed automatically like any other struct.
+        </p>
+        <div class="callout">
+          <strong>One exception, and it is a real one: a <em>cycle</em>
+          is never freed.</strong> Automatic reclamation is reference
+          counting, and a value that points back at itself — directly,
+          or around any longer loop — keeps its own count above zero
+          forever:
+          <pre class="code" style="margin:10px 0 6px;"><span class="kw">Node</span> a
+a.n = 7
+a.next = a      <span class="cm">// leaks: nothing will ever free `a`</span></pre>
+          Nothing goes wrong at runtime; the memory is simply never
+          returned. A structure with back-references needs them broken
+          before it's dropped (<code>child.parent = null</code>), or to
+          be accepted as living for the life of the program.
+        </div>
+
         <p class="muted">
           Memory for structs, arrays, and maps is managed automatically
           — no manual allocation or freeing, anywhere:
@@ -853,11 +906,13 @@ sqlite(<span class="str">'INSERT INTO People (id, name) VALUES (?, ?)'</span>, [
           <code>sqlite()</code>'s optional second argument (bound
           parameters) must be a literal array expression, not an
           arbitrary <code>arr[T]</code> value. Query result columns map
-          onto a declared table's fields by position, not by name.
+          onto a declared table's fields by name — see
+          <a href="#partial-queries-and-undefined">Partial queries and undefined()</a>
+          below.
         </p>
 
-        <h3 id="storing-images-and-audio">Storing images and audio <a class="anchor" href="#storing-images-and-audio">#</a></h3>
-        <p>A column may be an <code>img</code> or an <code>aud</code>. SQLite stores it as a <strong>BLOB</strong>:</p>
+        <h3 id="storing-images-audio-and-files">Storing images, audio and files <a class="anchor" href="#storing-images-audio-and-files">#</a></h3>
+        <p>A column may be an <code>img</code>, an <code>aud</code> or a <code>blob</code>. SQLite stores each as a <strong>BLOB</strong>:</p>
         <pre class="code"><span class="kw">table</span> Music {
     name:<span class="kw">text</span>
     file:<span class="kw">aud</span>
@@ -880,9 +935,79 @@ rows[0].file.playLoop(0)          <span class="cm">// straight out of the databa
           The one case with no source bytes is an image you built rather
           than loaded — a <code>clip()</code> or <code>resize()</code>
           result. Those are encoded as PNG on demand, which is lossless.
+          A <code>blob</code> column works the same way and is the
+          general case: any file, not just the two the language decodes
+          — see <a href="#blobs-in-the-database">Blobs in the database</a>
+          for what a blob read back out of a column can and cannot do.
           Binding is by value: the parameter is copied into the database
           as the statement runs, so nothing is retained afterwards and
           the asset stays yours.
+        </p>
+
+        <h3 id="partial-queries-and-undefined">Partial queries and undefined() <a class="anchor" href="#partial-queries-and-undefined">#</a></h3>
+        <p>
+          Result columns are matched to the table's declared columns
+          <strong>by name</strong> (case-insensitively), not by
+          position — so a query may select any subset of columns, in
+          any order, and every value lands where it belongs. A column
+          the query didn't mention reads as <code>null</code>.
+        </p>
+        <p>
+          But "the query never asked" and "the database said NULL" are
+          different facts, and <code>row.undefined('col')</code> tells
+          them apart:
+        </p>
+        <pre class="code"><span class="kw">table</span> examples { id:<span class="kw">int</span>  name:<span class="kw">text</span> }
+<span class="kw">arr[examples]</span> data = sqlite(<span class="str">'select id from examples'</span>)
+
+<span class="kw">if</span> data[0].name == <span class="kw">null</span> &amp;&amp; data[0].undefined(<span class="str">'name'</span>) {
+    <span class="cm">// name is null because it wasn't selected -- not because the</span>
+    <span class="cm">// database has no name for this row</span>
+}</pre>
+        <p class="muted">
+          <code>undefined('col')</code> is <code>true</code> when the
+          column wasn't in the result set (or was <code>delete</code>d
+          off the row), <code>false</code> when the database genuinely
+          returned a value or a NULL. Asking about a column the table
+          doesn't declare fails the program — that's a typo, and
+          <code>true</code> or <code>false</code> would both bury it. A
+          <code>SELECT ... AS alias</code> renames a column
+          <em>away</em> from its declared name, so an aliased column
+          simply doesn't match; alias <em>to</em> a declared name to
+          remap a computed value into a column deliberately.
+        </p>
+
+        <h3 id="structs-as-query-targets">Structs as query targets <a class="anchor" href="#structs-as-query-targets">#</a></h3>
+        <p>
+          A query doesn't have to land in a table's row type. Any
+          <strong>struct</strong> whose fields are queryable types
+          (<code>int</code>/<code>float</code>/<code>bool</code>/<code>text</code>/<code>blob</code>/<code>img</code>/<code>aud</code>)
+          can receive a result — name its fields after the result's own
+          column names:
+        </p>
+        <pre class="code"><span class="kw">struct</span> data {
+    whatever:<span class="kw">int</span>
+}
+<span class="kw">arr[data]</span> query = sqlite(<span class="str">'select id as whatever from examples'</span>)
+log(query[0].whatever)</pre>
+        <p>
+          This is the shape for aliased columns, JOINs, and computed
+          results — a table's declared columns can never chase a
+          query's aliases, and a <code>table</code> declaration always
+          <em>creates</em> a table, which a result-only shape has no
+          business doing:
+        </p>
+        <pre class="code"><span class="kw">struct</span> summary { total:<span class="kw">int</span>  biggest:<span class="kw">text</span> }
+<span class="kw">arr[summary]</span> agg = sqlite(
+    <span class="str">'select count(*) as total, max(name) as biggest from examples'</span>)</pre>
+        <p class="muted">
+          The elements are <strong>ordinary structs</strong> — refcounted,
+          aliasable, <code>free</code>-able, their fields assignable and
+          <code>delete</code>-able, exactly as if built by hand. A field
+          the result didn't produce reads <code>null</code>. One
+          consequence: <code>undefined()</code> is a table-row method and
+          doesn't exist here, since an ordinary struct carries no record
+          of which query it came from.
         </p>
 
         <h3 id="database-configuration">Database configuration <a class="anchor" href="#database-configuration">#</a></h3>
@@ -929,25 +1054,42 @@ rows[0].file.playLoop(0)          <span class="cm">// straight out of the databa
       <section class="doc-section" id="regex">
         <h2>Regex <a class="anchor" href="#regex">#</a></h2>
         <pre class="code"><span class="kw">regex</span> digits = <span class="re">/[0-9]+/</span>                    <span class="cm">// literal syntax, POSIX extended regex underneath</span>
-<span class="kw">regex</span> ci = <span class="re">/^hello$/i</span>                      <span class="cm">// 'i' = case-insensitive; 'g' is also accepted (see below)</span>
+<span class="kw">regex</span> ci     = <span class="re">/^hello$/i</span>                  <span class="cm">// 'i' = case-insensitive</span>
+<span class="kw">regex</span> all    = <span class="re">/[0-9]/g</span>                    <span class="cm">// 'g' = replace every match</span>
+<span class="kw">regex</span> both   = <span class="re">/test/gi</span>                    <span class="cm">// flags combine</span>
+
 digits.test(<span class="str">'room 42'</span>)                     <span class="cm">// -&gt; bool</span>
 <span class="str">'room 42'</span>.match(digits)                     <span class="cm">// -&gt; text or null</span>
-<span class="str">'a1b2'</span>.replace(digits, <span class="str">'x'</span>)                <span class="cm">// first match only</span>
-<span class="str">'a1b2'</span>.replaceAll(digits, <span class="str">'x'</span>)             <span class="cm">// every match</span></pre>
+<span class="str">'a1b2'</span>.replace(<span class="re">/[0-9]/</span>, <span class="str">'x'</span>)                <span class="cm">// 'a1b2' -&gt; 'axb2'  (first match)</span>
+<span class="str">'a1b2'</span>.replace(<span class="re">/[0-9]/g</span>, <span class="str">'x'</span>)               <span class="cm">// 'a1b2' -&gt; 'axbx'  (every match)</span></pre>
         <p>
           <code>flags</code> immediately follows the closing
           <code>/</code>, no space (<code>/pattern/flags</code>). Only
-          <code>i</code> (case-insensitive) and <code>g</code> are
-          accepted — <code>g</code> is accepted but has no additional
-          effect, since <code>.replace()</code>/<code>.replaceAll()</code>
-          already say "first match" vs. "every match" explicitly instead
-          of relying on a flag to control that. Any other flag letter is
-          a compile-time error.
+          <code>i</code> and <code>g</code> are accepted; any other flag
+          letter is a compile-time error.
           <code>\w</code>/<code>\d</code>/<code>\s</code>/<code>\b</code>
           work as expected (glibc's <code>regcomp()</code> supports them
           as GNU extensions), but there are no capture groups,
           backreferences, or non-greedy quantifiers (POSIX ERE's own
           limits).
+        </p>
+
+        <h3 id="what-g-does">What <code>g</code> does, and what it doesn't <a class="anchor" href="#what-g-does">#</a></h3>
+        <p><code>g</code> affects <code>.replace()</code> and nothing else.</p>
+        <pre class="code"><span class="str">'a-b-c'</span>.replace(<span class="re">/-/g</span>, <span class="str">'_'</span>)     <span class="cm">// 'a_b_c'</span>
+<span class="str">'a-b-c'</span>.replace(<span class="re">/-/</span>, <span class="str">'_'</span>)      <span class="cm">// 'a_b-c'</span>
+<span class="str">'a-b-c'</span>.replace(<span class="str">'-'</span>, <span class="str">'_'</span>)      <span class="cm">// 'a_b-c' -- a text search has no flags</span></pre>
+        <p class="muted">
+          A plain-text search replaces the first match only. Replacing
+          every occurrence is spelled <code>/search/g</code> — there is
+          no separate all-matches method. <code>g</code> is scoped
+          narrowly on purpose: <code>.test()</code> returns the same
+          answer every time against the same string rather than carrying
+          match-position state across calls, and <code>.match()</code>
+          always returns <code>text</code> (or <code>null</code>) — a
+          return type can't depend on a flag that
+          <code>regex(pattern, flags)</code> only knows at run time, so
+          <code>g</code> has no effect there.
         </p>
         <p>
           A pattern/flags that aren't known until runtime (built from a
@@ -958,8 +1100,34 @@ digits.test(<span class="str">'room 42'</span>)                     <span class=
           assembled dynamically:
         </p>
         <pre class="code"><span class="kw">text</span> userPattern = someInput()
-<span class="kw">regex</span> dynamic = regex(userPattern)</pre>
-        <p class="muted">Compiled fresh every time it's evaluated (both forms) — no caching by pattern text.</p>
+<span class="kw">regex</span> dynamic = regex(userPattern)
+<span class="kw">regex</span> globalDynamic = regex(userPattern, <span class="str">'g'</span>)   <span class="cm">// 'g' works here too</span></pre>
+        <p class="muted">The flag belongs to the compiled pattern, not to the call site, so both spellings behave identically.</p>
+
+        <h3 id="literals-vs-regex-function">Literals are compiled once; <code>regex()</code> is compiled per evaluation <a class="anchor" href="#literals-vs-regex-function">#</a></h3>
+        <p>
+          A <code>/pattern/</code> literal is compiled the first time
+          its line is reached and cached for the life of the process. A
+          <code>regex(pattern, flags)</code> call compiles on every
+          evaluation, because its pattern is an arbitrary expression —
+          the same call site can legitimately see a different pattern
+          each time, so caching it would silently reuse the first one
+          forever.
+        </p>
+        <p>That is a real cost in a hot loop. Measured over 200,000 iterations:</p>
+        <div class="table-wrap">
+          <table class="sig-table">
+            <tr><td>/[0-9]+/.test(s)</td><td>15 ms</td></tr>
+            <tr><td>regex('[0-9]+') hoisted outside the loop</td><td>13 ms</td></tr>
+            <tr><td>regex('[0-9]+').test(s) inside the loop</td><td>367 ms</td></tr>
+          </table>
+        </div>
+        <p class="muted">
+          Roughly 24x, and entirely avoidable: binding the pattern to a
+          variable outside the loop compiles it once and costs the same
+          as a literal. Use the literal whenever the pattern is known,
+          and hoist <code>regex()</code> out of loops when it isn't.
+        </p>
       </section>
 
       <section class="doc-section" id="graphics">
@@ -968,7 +1136,7 @@ digits.test(<span class="str">'room 42'</span>)                     <span class=
 drawCircle(50, 50, 25)
 drawText(<span class="str">'Hello'</span>, 20, 20)
 
-<span class="kw">img</span> profile = loadImage(<span class="str">'profile.png'</span>)    <span class="cm">// PNG only</span>
+<span class="kw">img</span> profile = <span class="str">'profile.png'</span>              <span class="cm">// PNG or JPEG</span>
 drawImage(profile, 0, 0)
 log(<span class="str">`${profile.width}x${profile.height}`</span>)
 
@@ -980,19 +1148,20 @@ clearRect(10, 10, 40, 40)                 <span class="cm">// erase one region</
 
 log(<span class="str">`canvas is ${clientWidth}x${clientHeight}`</span>)
 
-<span class="kw">on</span> click(x:<span class="kw">int</span>, y:<span class="kw">int</span>)  { ... }
-<span class="kw">on</span> mouse(x:<span class="kw">int</span>, y:<span class="kw">int</span>)  { ... }
-<span class="kw">on</span> keyDown(key:<span class="kw">text</span>)    { ... }
-<span class="kw">on</span> keyUp(key:<span class="kw">text</span>)      { ... }
-<span class="kw">on</span> resize()             { ... }
-<span class="kw">on</span> close()               { ... }</pre>
+<span class="kw">on</span> mouseDown(x:<span class="kw">int</span>, y:<span class="kw">int</span>) { ... }
+<span class="kw">on</span> mouseUp(x:<span class="kw">int</span>, y:<span class="kw">int</span>)   { ... }
+<span class="kw">on</span> mouse(x:<span class="kw">int</span>, y:<span class="kw">int</span>)     { ... }
+<span class="kw">on</span> keyDown(key:<span class="kw">text</span>)       { ... }
+<span class="kw">on</span> keyUp(key:<span class="kw">text</span>)         { ... }
+<span class="kw">on</span> resize()                { ... }
+<span class="kw">on</span> close()                 { ... }</pre>
         <div class="callout">
           <strong>Drawing is offscreen. <code>render()</code> puts it on
           screen.</strong> Every drawing call paints an offscreen canvas
           that needs no display at all. <code>render()</code> is the one
           call that shows it, opening a real X11 window (via Cairo's
           Xlib backend) the first time it runs — undecorated, 800×600.
-          Declaring one of the six event handlers opens a window too,
+          Declaring one of the seven event handlers opens a window too,
           since they can't fire without one. After the entry file's
           top-level code finishes, if a window was opened, the process
           blocks handling redraws/input until the window closes.
@@ -1011,7 +1180,36 @@ render()</pre>
           <code>render()</code> call takes ~1ms. Nothing but
           <code>render()</code> and the event handlers needs a display —
           <code>saveCanvas</code>, <code>clientWidth</code>/<code>clientHeight</code>
-          and <code>loadImage</code> all work headless.
+          and loading an image all work headless.
+        </p>
+
+        <h3 id="mouse-events">Mouse events <a class="anchor" href="#mouse-events">#</a></h3>
+        <p>
+          <code>on mouseDown</code> fires when a button goes down,
+          <code>on mouseUp</code> when it comes back up, and
+          <code>on mouse</code> continuously while the pointer moves. All
+          three report the pointer position at the moment the event
+          happened.
+        </p>
+        <p>
+          A click is a press <em>and</em> a release, and they are
+          separate events for the same reason <code>keyDown</code> and
+          <code>keyUp</code> are: holding the button down and moving
+          before letting go is a drag, and the only way to see one is to
+          see both ends of it.
+        </p>
+        <pre class="code"><span class="kw">int</span> startX = 0
+<span class="kw">int</span> startY = 0
+
+<span class="kw">on</span> mouseDown(x:<span class="kw">int</span>, y:<span class="kw">int</span>) { startX = x  startY = y }
+<span class="kw">on</span> mouseUp(x:<span class="kw">int</span>, y:<span class="kw">int</span>)   { log(<span class="str">`dragged ${x - startX}, ${y - startY}`</span>) }</pre>
+        <p class="muted">
+          Press and release report <em>different</em> coordinates
+          whenever the pointer moved in between — that difference is the
+          drag. A program that only wants "was clicked" can just use
+          <code>on mouseDown</code> and ignore the release. Which button
+          was pressed is not reported; every button dispatches the same
+          handler.
         </p>
 
         <h3 id="keyboard-events">Keyboard events <a class="anchor" href="#keyboard-events">#</a></h3>
@@ -1048,14 +1246,15 @@ log(<span class="str">`${sheet.width}x${sheet.height}`</span>)
 
 <span class="kw">img</span> grass = sheet.clip(0, 0, 64, 64)     <span class="cm">// a new 64x64 image</span>
 grass.resize(32, 32)                      <span class="cm">// scaled in place</span>
-drawImage(grass, 100, 100)</pre>
+drawImage(grass, 100, 100)
+grass.save(<span class="str">'grass.png'</span>)                   <span class="cm">// -&gt; bool; see Saving bytes</span></pre>
         <p>
           A path declares the image, the same way it declares an
           <code>aud</code> — and, like that one, it's a real load rather
           than a compile-time resolution, so the path may be any text
           expression (<code>img hero = spriteDir + 'hero.png'</code>).
-          <code>loadImage('...')</code> still works and means exactly the
-          same thing.
+          <code>save()</code>/<code>saveCopy()</code> write one back out;
+          see <a href="#saving-bytes-to-a-path">Saving bytes to a path</a>.
         </p>
         <p class="muted">
           <strong>PNG and JPEG.</strong> The format is sniffed from the
@@ -1092,7 +1291,7 @@ drawImage(grass, 100, 100)</pre>
 a.resize(8, 8)
 log(b.width)      <span class="cm">// 8 -- a and b are the same image</span></pre>
         <p class="muted">
-          An image created in a function (by <code>loadImage</code> or
+          An image created in a function (from a path, or by
           <code>clip</code>) and never stored outside it is released when
           that function returns, so slicing frames inside a loop doesn't
           accumulate.
@@ -1311,24 +1510,231 @@ fillAlpha(0.5)                                 <span class="cm">// 0.0 transpare
 
       <section class="doc-section" id="files">
         <h2>Files <a class="anchor" href="#files">#</a></h2>
-        <pre class="code">writeFile(<span class="str">'notes.txt'</span>, <span class="str">'hello'</span>)       <span class="cm">// -&gt; bool (did it land?)</span>
-appendFile(<span class="str">'notes.txt'</span>, <span class="str">' world'</span>)     <span class="cm">// -&gt; bool</span>
-<span class="kw">text</span> body = readFile(<span class="str">'notes.txt'</span>)     <span class="cm">// -&gt; text, or null if unreadable</span>
-<span class="kw">bool</span> there = fileExists(<span class="str">'notes.txt'</span>)  <span class="cm">// -&gt; bool</span>
-deleteFile(<span class="str">'notes.txt'</span>)                    <span class="cm">// -&gt; bool</span></pre>
-        <p class="muted">
-          Whole-file text I/O. Nothing here fails the program:
-          <code>readFile</code> returns <code>null</code> for a file it
-          can't read and the writers return <code>false</code> on
-          failure, so a missing file is something you test for rather
-          than something that stops you — the same treatment division by
-          zero gets.
+        <p>
+          A file is a <code>blob</code>. Declaring one loads the bytes at
+          that path, and keeps the path, so everything you can do to a
+          file is a method on the value that already knows which file it
+          is:
         </p>
-        <p>What <code>readFile</code> returns is an ordinary <code>text</code>, so it composes with everything else:</p>
-        <pre class="code"><span class="kw">text</span> body = readFile(<span class="str">'data.csv'</span>)
-<span class="kw">if</span> body != <span class="kw">null</span> {
-    log(body.replaceAll(<span class="str">','</span>, <span class="str">' | '</span>))
-}</pre>
+        <pre class="code"><span class="kw">blob</span> notes = <span class="str">'notes.txt'</span>              <span class="cm">// loads the bytes at that path</span>
+
+notes.write(<span class="str">'hello'</span>)                  <span class="cm">// -&gt; bool (did it land?)</span>
+notes.append(<span class="str">' world'</span>)                <span class="cm">// -&gt; bool</span>
+<span class="kw">text</span> body = notes.toText()            <span class="cm">// -&gt; the bytes, as text</span>
+<span class="kw">bool</span> there = notes.exists()           <span class="cm">// -&gt; bool</span>
+notes.delete()                        <span class="cm">// -&gt; bool; deletes the FILE</span>
+
+notes.save()                          <span class="cm">// -&gt; bool; write the bytes to its path</span>
+notes.save(<span class="str">'other.txt'</span>)               <span class="cm">// -&gt; bool; adopt that path, then write</span>
+notes.saveCopy(<span class="str">'backup.txt'</span>)          <span class="cm">// -&gt; bool; write there, keep its own path</span></pre>
+        <p class="muted">
+          The path may be any text expression, like <code>img</code> and
+          <code>aud</code>: <code>blob save = saveDir + 'slot1.dat'</code>.
+        </p>
+        <div class="callout">
+          <strong>Nothing here fails the program.</strong> A path that
+          can't be read gives you an empty blob, and the writers return
+          <code>false</code> on failure — a missing file is something you
+          test for rather than something that stops you, the same
+          treatment division by zero gets. That is also how you create a
+          file that doesn't exist yet: declare the blob and write to it.
+        </div>
+        <pre class="code"><span class="kw">blob</span> fresh = <span class="str">'new.txt'</span>
+log(fresh.exists())                   <span class="cm">// false</span>
+fresh.write(<span class="str">'now it does'</span>)
+log(fresh.exists())                   <span class="cm">// true</span></pre>
+        <p><code>toText()</code> hands back an ordinary owned <code>text</code>, so it composes with everything else:</p>
+        <pre class="code"><span class="kw">blob</span> data = <span class="str">'data.csv'</span>
+log(data.toText().replace(<span class="re">/,/g</span>, <span class="str">' | '</span>))</pre>
+        <p>
+          <strong>A blob is its contents, not its path.</strong>
+          <code>write()</code> and <code>append()</code> update the bytes
+          as well as the file, so <code>toText()</code> after a write
+          reports what you wrote. And <code>delete()</code> removes the
+          file while leaving the blob alone — "delete it but keep what
+          it said" is expressible:
+        </p>
+        <pre class="code"><span class="kw">blob</span> temp = <span class="str">'scratch.txt'</span>
+temp.write(<span class="str">'remember this'</span>)
+temp.delete()
+log(temp.exists())                    <span class="cm">// false</span>
+log(temp.toText())                    <span class="cm">// remember this</span></pre>
+        <p>
+          <strong>Assigning a blob shares one handle, it does not
+          copy.</strong> Two names for one file's contents; writing
+          through either is visible through both. Rebinding one of them
+          releases its own reference, and the contents are freed once
+          nothing refers to them:
+        </p>
+        <pre class="code"><span class="kw">blob</span> a = <span class="str">'one.txt'</span>
+<span class="kw">blob</span> b = a                            <span class="cm">// same handle, not a second load</span>
+a.write(<span class="str">'changed'</span>)
+log(b.toText())                       <span class="cm">// changed</span>
+
+a = <span class="str">'two.txt'</span>                         <span class="cm">// `a` moves on; `b` still holds one.txt</span></pre>
+
+        <h3 id="blobs-in-the-database">Blobs in the database <a class="anchor" href="#blobs-in-the-database">#</a></h3>
+        <p>
+          A <code>blob</code> column stores the <strong>bytes</strong>,
+          so binary content round-trips byte-identically — the same
+          treatment <code>img</code> and <code>aud</code> columns get:
+        </p>
+        <pre class="code"><span class="kw">table</span> Saves { name:<span class="kw">text</span>  data:<span class="kw">blob</span> }
+
+<span class="kw">blob</span> save = <span class="str">'slot1.dat'</span>
+sqlite(<span class="str">'INSERT INTO Saves (name, data) VALUES (?, ?)'</span>, [<span class="str">'slot1'</span>, save])
+
+<span class="kw">arr[Saves]</span> rows = sqlite(<span class="str">'SELECT * FROM Saves'</span>)
+log(rows[0].data.toText())</pre>
+        <p class="muted">
+          A blob that came out of a column has bytes but
+          <strong>no path</strong> — a path is meaningful only on the
+          machine that stored it. Its <code>exists()</code>,
+          <code>write()</code>, <code>append()</code> and
+          <code>delete()</code> all answer <code>false</code> rather than
+          inventing a temporary file. <code>toText()</code> works as
+          usual. <code>save(path)</code> is how one gets to disk — see
+          <a href="#saving-bytes-to-a-path">Saving bytes to a path</a>
+          below, which is the same method on <code>img</code> and
+          <code>aud</code>.
+        </p>
+        <pre class="code"><span class="kw">arr[Saves]</span> rows = sqlite(<span class="str">'SELECT * FROM Saves'</span>)
+<span class="kw">blob</span> back = rows[0].data
+log(back.exists())                    <span class="cm">// false -- no path</span>
+back.save(<span class="str">'recovered.dat'</span>)            <span class="cm">// now it has one</span>
+log(back.exists())                    <span class="cm">// true</span></pre>
+      </section>
+
+      <section class="doc-section" id="freeing-and-deleting">
+        <h2>Freeing and deleting <a class="anchor" href="#freeing-and-deleting">#</a></h2>
+        <p>
+          Memory is automatic — but <code>free</code> and
+          <code>delete</code> exist for the moments you know better than
+          the compiler does.
+        </p>
+
+        <h3 id="free">free <a class="anchor" href="#free">#</a></h3>
+        <pre class="code"><span class="kw">img</span> spritesheet = <span class="str">'spritesheet.png'</span>
+<span class="kw">img</span> grass = spritesheet.clip(0, 0, 31, 31)
+<span class="kw">img</span> dirt = spritesheet.clip(32, 0, 31, 31)
+<span class="kw">free</span> spritesheet                       <span class="cm">// the sheet goes now, not at exit</span></pre>
+        <p>
+          <code>free name</code> releases whatever the binding holds and
+          sets the binding to <code>null</code>. It works on
+          <strong>every type</strong>:
+        </p>
+        <ul>
+          <li><strong>struct / <code>arr[T]</code> / <code>map[T]</code> / <code>blob</code></strong> — a reference-count <em>decrement</em>, not a forced free. A value something else still points at survives until its last reference drops; freeing an array releases each element the same way, so a shared element outlives its array.</li>
+          <li><strong><code>img</code> / <code>aud</code></strong> — freed outright. These are the types the compiler can't always reclaim on its own (an escaping handle lives for the program's lifetime — see the note under Images), so <code>free</code> is the manual escape hatch: cut your clips, then <code>free spritesheet</code>. The contract is the manual one: another binding still aliasing the handle is left dangling — the freed <em>binding</em> reads <code>null</code>, an alias does not.</li>
+          <li><strong><code>text</code></strong> — the buffer is freed (a text is exclusively owned).</li>
+          <li><strong><code>regex</code></strong> — a <code>regex()</code> result is freed; a <code>/pattern/</code> literal's process-lifetime cache marks itself and survives, so <code>free</code> is safe on either.</li>
+          <li><strong>a query row</strong> — the binding is nulled <em>without</em> freeing: the row is owned by the array it came from. Free the array.</li>
+          <li><strong><code>int</code> / <code>float</code> / <code>bool</code></strong> — nothing to release; <code>free x</code> is <code>x = null</code>.</li>
+        </ul>
+        <p class="muted">
+          <code>free</code> composes with automatic reclamation: freeing
+          twice is a no-op, and a freed binding that scope-exit cleanup
+          later visits is already <code>null</code>, which every release
+          treats as nothing-to-do. Constants and parameters can't be
+          freed (a parameter borrows its caller's value).
+        </p>
+
+        <h3 id="delete">delete <a class="anchor" href="#delete">#</a></h3>
+        <pre class="code"><span class="kw">map[text]</span> example = {<span class="str">'data'</span>: <span class="str">'some data'</span>, <span class="str">'more-data'</span>: <span class="str">'Some more data'</span>}
+<span class="kw">delete</span> example.data
+<span class="kw">delete</span> example[<span class="str">'more-data'</span>]</pre>
+        <p>
+          On a <strong>map</strong>, <code>delete</code> removes the
+          entry — the key stops existing (<code>forEach</code> skips
+          it), which setting <code>null</code> could never express.
+          Deleting a missing key is a safe no-op. The key can be
+          a computed expression: <code>delete m[`k${i}`]</code>.
+        </p>
+        <p class="muted">
+          On a <strong>struct or query-row field</strong>,
+          <code>delete</code> releases the value and the field reads
+          <code>null</code> afterwards. On a query row it <em>also</em>
+          marks the column undefined. (One inherited caveat: a struct
+          field whose own type is struct/arr/map auto-vivifies on the
+          next reach-through, per the zero-value rule, so it re-appears
+          empty rather than staying null.) To remove a whole
+          <em>variable</em>, that's <code>free</code> —
+          <code>delete x</code> says so.
+        </p>
+      </section>
+
+      <section class="doc-section" id="saving-bytes-to-a-path">
+        <h2>Saving bytes to a path <a class="anchor" href="#saving-bytes-to-a-path">#</a></h2>
+        <p>
+          <code>blob</code>, <code>img</code> and <code>aud</code> are
+          the same shape of value — content, plus the bytes it came from
+          — so all three save the same way.
+        </p>
+        <pre class="code">value.save()                          <span class="cm">// write to the path it already has</span>
+value.save(path)                      <span class="cm">// adopt `path`, then write there</span>
+value.saveCopy(path)                  <span class="cm">// write there, keep its own path</span></pre>
+        <p>All three return <code>bool</code>: <code>true</code> if the write landed.</p>
+        <p>
+          <strong><code>save(path)</code> changes the value's path;
+          <code>saveCopy(path)</code> doesn't.</strong> That is the whole
+          difference. After <code>save</code>, everything else that acts
+          on the value follows the new path — a blob's
+          <code>exists()</code> and <code>delete()</code> included. After
+          <code>saveCopy</code>, the value is still pointed at where it
+          was:
+        </p>
+        <pre class="code"><span class="kw">blob</span> f = <span class="str">'one.txt'</span>
+f.write(<span class="str">'original'</span>)
+
+f.saveCopy(<span class="str">'copy.txt'</span>)                <span class="cm">// copy.txt written; f is still one.txt</span>
+f.write(<span class="str">'changed'</span>)                    <span class="cm">// ...so this goes to one.txt</span>
+
+f.save(<span class="str">'two.txt'</span>)                     <span class="cm">// two.txt written; f is now two.txt</span>
+f.delete()                            <span class="cm">// deletes two.txt, not one.txt</span></pre>
+        <p class="muted">
+          <code>saveCopy</code> requires its path — a copy to nowhere in
+          particular isn't a thing to ask for, and making the argument
+          mandatory turns "I meant <code>save()</code>" into a compile
+          error rather than a silent overwrite.
+        </p>
+        <div class="callout">
+          <strong>A value with no path can only use
+          <code>save(path)</code>.</strong> An <code>img</code> from
+          <code>clip()</code>, or anything read out of a database
+          column, has never been on disk. Calling <code>save()</code> on
+          one <strong>fails the program</strong> rather than returning
+          <code>false</code> — a program asking to save something to
+          nowhere has a bug, where an unwritable directory is a
+          condition of the filesystem and still just answers
+          <code>false</code>.
+        </div>
+        <pre class="code"><span class="kw">img</span> spritesheet = <span class="str">'spritesheet.png'</span>
+<span class="kw">img</span> grass = spritesheet.clip(0, 0, 32, 32)
+
+grass.save()                          <span class="cm">// fails: this img has no path</span>
+grass.save(<span class="str">'grass.png'</span>)               <span class="cm">// fine -- and now it has one</span>
+grass.save()                          <span class="cm">// fine from here on</span>
+grass.saveCopy(<span class="str">'backup/grass.png'</span>)    <span class="cm">// fine; grass.png stays its path</span></pre>
+        <p class="muted">
+          The path must name a <strong>file</strong>, not a directory. A
+          directory would have to borrow a filename from somewhere, and
+          the value that most needs saving is exactly the one with no
+          filename to lend, so it would work only where it was least
+          useful. Passing one answers <code>false</code>.
+        </p>
+        <p class="muted">
+          <strong>Formats survive.</strong> What gets written is the
+          value's own encoded bytes, so an MP3 saves as an MP3 and a
+          JPEG as a JPEG rather than being re-encoded — the same
+          property that makes a BLOB column round-trip byte-identically.
+          The one exception is an image you built rather than loaded: a
+          <code>clip()</code> or <code>resize()</code> result has no
+          source bytes, so it is encoded as PNG, which is lossless. A
+          failed save does <strong>not</strong> adopt the path —
+          pointing a value at a file that was never written would leave
+          <code>exists()</code> answering <code>false</code> about a path
+          you were just told it had.
+        </p>
       </section>
 
       <section class="doc-section" id="time">
@@ -1336,10 +1742,9 @@ deleteFile(<span class="str">'notes.txt'</span>)                    <span class=
         <pre class="code"><span class="kw">int</span> ms = now()                        <span class="cm">// milliseconds since the Unix epoch</span>
 log(formatTime(ms, <span class="str">'%Y-%m-%d %H:%M'</span>)) <span class="cm">// strftime, local time -&gt; text</span></pre>
         <p class="muted">
-          <code>now()</code> uses the same unit and origin as
-          JavaScript's <code>Date.now()</code>, and the same unit
-          <code>setTimeout</code> already takes, so timing a block is
-          just subtraction:
+          <code>now()</code> returns milliseconds since the Unix epoch —
+          the same unit <code>setTimeout</code> already takes, so timing
+          a block is just subtraction:
         </p>
         <pre class="code"><span class="kw">int</span> started = now()
 doTheWork()
@@ -1383,12 +1788,11 @@ xs.unshift(0)       <span class="cm">// -&gt; new length</span>
 <span class="kw">arr[int]</span> cut = xs.splice(1, 2)   <span class="cm">// remove 2 from index 1, return them</span>
 xs.indexOf(3)       <span class="cm">// -&gt; first index holding 3, or -1</span></pre>
         <p class="muted">
-          All six behave as their JavaScript namesakes do, including
-          <code>splice</code>'s clamping — a negative start counts back
-          from the end, and an oversized range clamps rather than
-          failing, so <code>splice(i, 1)</code> at a boundary is a no-op.
-          (<code>splice</code>'s variadic insert has no spelling here;
-          Festina has no variadic calls.)
+          <code>splice</code> clamps rather than failing — a negative
+          start counts back from the end, and an oversized range clamps
+          to what's actually there, so <code>splice(i, 1)</code> at a
+          boundary is a no-op. (There's no variadic insert spelling
+          here; Festina has no variadic calls.)
         </p>
         <p>
           <code>pop()</code>/<code>shift()</code> on an empty array
@@ -1444,10 +1848,12 @@ clearInterval(id)          <span class="cm">// clearTimeout()/clearInterval() ar
       <section class="doc-section" id="audio">
         <h2>Audio <a class="anchor" href="#audio">#</a></h2>
         <pre class="code"><span class="kw">aud</span> music = <span class="str">'music.wav'</span>               <span class="cm">// WAV (16-bit PCM) or MP3</span>
-music.play()                          <span class="cm">// once</span>
-music.playLoop()                      <span class="cm">// until stopped</span>
+<span class="kw">int</span> ch = music.play()                 <span class="cm">// once  -&gt; the channel it played on</span>
+music.playLoop()                      <span class="cm">// until stopped -&gt; also returns one</span>
 music.isPlaying()                     <span class="cm">// true the instant play() returns</span>
+music.stop()                          <span class="cm">// silence this clip, everywhere</span>
 
+stopAudioPlayer(ch)                   <span class="cm">// stop one channel</span>
 stopAudioPlayer()                     <span class="cm">// stop every channel</span></pre>
         <p>
           A path declares the clip, the same way <code>blob</code>,
@@ -1455,8 +1861,8 @@ stopAudioPlayer()                     <span class="cm">// stop every channel</sp
           each written as the text that reads best. It's a real load, not
           a compile-time resolution, so the path may be any text
           expression (<code>aud hit = soundDir + 'hit.wav'</code>).
-          <code>loadAudio('...')</code> still works and means exactly the
-          same thing.
+          <code>save()</code>/<code>saveCopy()</code> write a clip back
+          out; see <a href="#saving-bytes-to-a-path">Saving bytes to a path</a>.
         </p>
         <p class="muted">
           <strong>WAV (16-bit PCM) and MP3.</strong> The format is
@@ -1468,16 +1874,35 @@ stopAudioPlayer()                     <span class="cm">// stop every channel</sp
           device on a background thread, so playback doesn't block the
           rest of the program.
         </p>
+
+        <h3 id="stopping-a-sound">Stopping a sound <a class="anchor" href="#stopping-a-sound">#</a></h3>
+        <p>There are two questions, and they have two answers.</p>
         <div class="callout">
-          <strong>There is no <code>music.stop()</code>.</strong> One
-          clip can be playing on several channels at once — three
-          overlapping gunshots are the ordinary case, not the exotic one
-          — so "stop this clip" never named one thing. Playback is
-          stopped by channel: <code>stopAudioPlayer(n)</code>, or
-          <code>stopAudioPlayer()</code> for all. <code>isPlaying()</code>
-          stays clip-wide, because "is this sound audible anywhere" does
-          still have a single answer.
+          <strong><code>stop()</code> silences this clip everywhere.</strong>
+          One clip can be playing on several channels at once, so this
+          stops all of them. That is what you want for a looping engine
+          hum, a music bed or a dialogue line — anything where "this
+          sound should not be audible any more" is the whole thought.
         </div>
+        <div class="callout">
+          <strong><code>stopAudioPlayer(n)</code> stops one
+          channel.</strong> That is what you want when three gunshots
+          are overlapping and only one of them should end.
+        </div>
+        <p>Which channel? The one <code>play()</code> handed back:</p>
+        <pre class="code"><span class="kw">aud</span> engine = <span class="str">'engine.wav'</span>
+<span class="kw">int</span> hum = engine.playLoop()    <span class="cm">// the pool picked a channel; now you know it</span>
+<span class="cm">// ...later...</span>
+stopAudioPlayer(hum)           <span class="cm">// stop exactly that one</span></pre>
+        <p class="muted">
+          <code>play()</code> and <code>playLoop()</code> both return the
+          channel they used, or <code>-1</code> if nothing played (which
+          happens only when every channel is reserved) — so a channel
+          the pool picks on its own is just as addressable afterward as
+          one you name by hand. <code>isPlaying()</code> is clip-wide,
+          like <code>stop()</code>: "is this sound audible anywhere" and
+          "silence it everywhere" are one question asked two ways.
+        </p>
 
         <h3 id="overlapping-sounds">Overlapping sounds <a class="anchor" href="#overlapping-sounds">#</a></h3>
         <p>
@@ -1487,14 +1912,14 @@ stopAudioPlayer()                     <span class="cm">// stop every channel</sp
           pickup firing in rapid succession layer instead of interrupting
           each other, which is what a game actually needs:
         </p>
-        <pre class="code"><span class="kw">aud</span> coin = loadAudio(<span class="str">'coin.wav'</span>)
+        <pre class="code"><span class="kw">aud</span> coin = <span class="str">'coin.wav'</span>
 coin.play()   <span class="cm">// three overlapping copies, not one restarted three times</span>
 coin.play()
 coin.play()</pre>
         <p class="muted">
-          The clip's audio is decoded once, at <code>loadAudio()</code>
-          time; a channel costs a thread and a device handle, never
-          another copy of the samples.
+          The clip's audio is decoded once, at the declaration; a
+          channel costs a thread and a device handle, never another copy
+          of the samples.
         </p>
         <pre class="code">setMaxAudioPlayers(4)          <span class="cm">// channels the pool may assign on its own</span>
 log(maxAudioPlayers())         <span class="cm">// -&gt; 4, i.e. what was actually applied</span></pre>
@@ -1518,8 +1943,8 @@ log(maxAudioPlayers())         <span class="cm">// -&gt; 4, i.e. what was actual
           what makes handing a music channel from one track to another
           expressible at all:
         </p>
-        <pre class="code"><span class="kw">aud</span> adventureMusic = loadAudio(<span class="str">'adventure.wav'</span>)
-<span class="kw">aud</span> battleMusic = loadAudio(<span class="str">'battle.wav'</span>)
+        <pre class="code"><span class="kw">aud</span> adventureMusic = <span class="str">'adventure.wav'</span>
+<span class="kw">aud</span> battleMusic = <span class="str">'battle.wav'</span>
 
 adventureMusic.playLoop(0)          <span class="cm">// loops on channel 0, and reserves it</span>
 setInterval(changeMusic, 100000)

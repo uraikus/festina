@@ -419,7 +419,7 @@ Hello, Festina!</pre>
 <section id="why">
   <div class="wrap">
     <h2>Why Festina</h2>
-    <p class="section-intro">Six decisions that shape everything else about the language.</p>
+    <p class="section-intro">Decisions that shape everything else about the language.</p>
     <div class="grid">
       <div class="card">
         <h3>Native compilation, not a VM</h3>
@@ -431,7 +431,11 @@ Hello, Festina!</pre>
       </div>
       <div class="card">
         <h3>Graphics and audio, wired in</h3>
-        <p>A real canvas (<code>drawRect</code>, <code>on click</code>, paths, gradients, typed <code>color</code>/<code>font</code> values, …) and layered audio playback with channels (<code>music.playLoop()</code>), backed by Cairo/X11 and ALSA.</p>
+        <p>A real canvas (<code>drawRect</code>, <code>on mouseDown</code>, paths, gradients, typed <code>color</code>/<code>font</code> values, …) and layered audio playback with channels (<code>aud music = 'music.mp3'</code>, then <code>music.play()</code>), backed by Cairo/X11 and ALSA.</p>
+      </div>
+      <div class="card">
+        <h3>Automatic memory, manual override</h3>
+        <p>Values are reclaimed for you — and <code>free spritesheet</code> / <code>delete map.key</code> exist for the moments you know the lifetime better than the compiler does.</p>
       </div>
       <div class="card">
         <h3>Familiar syntax, none of the surprises</h3>
@@ -510,11 +514,18 @@ Hello, Festina!</pre>
 fillStyle(brand)
 changeFont(title)
 drawRect(0, 0, 100, 100)
-<span class="kw">on</span> click(x:<span class="kw">int</span>, y:<span class="kw">int</span>) { log(<span class="str">`clicked ${x}, ${y}`</span>) }
+<span class="kw">on</span> mouseDown(x:<span class="kw">int</span>, y:<span class="kw">int</span>) { log(<span class="str">`pressed ${x}, ${y}`</span>) }
+<span class="kw">on</span> mouseUp(x:<span class="kw">int</span>, y:<span class="kw">int</span>)   { log(<span class="str">`released ${x}, ${y}`</span>) }
 
 <span class="cm">// Audio</span>
-<span class="kw">aud</span> music = loadAudio(<span class="str">'music.wav'</span>)
+<span class="kw">aud</span> music = <span class="str">'music.wav'</span>
 music.play()
+
+<span class="cm">// Files -- a blob is a file's bytes, and knows its own path</span>
+<span class="kw">blob</span> notes = <span class="str">'notes.txt'</span>
+notes.write(<span class="str">'hello'</span>)
+log(notes.toText())
+notes.saveCopy(<span class="str">'notes.bak'</span>)           <span class="cm">// img and aud save the same way</span>
 
 <span class="cm">// Timers</span>
 setTimeout(showMessage, 1000)
@@ -523,7 +534,7 @@ setInterval(tick, 500)
 <span class="cm">// Regex, literal syntax</span>
 <span class="str">'room 42'</span>.replace(<span class="re">/[0-9]+/</span>, <span class="str">'N'</span>)
 
-<span class="cm">// Maps -- text-keyed, JS-object-literal-flavored</span>
+<span class="cm">// Maps -- text-keyed, object-literal-flavored</span>
 <span class="kw">map[int]</span> npcHealths = { <span class="str">'npc1'</span>: 10, <span class="str">'npc2'</span>: 15 }
 npcHealths[<span class="str">'npc1'</span>] = 30
 
@@ -614,7 +625,7 @@ npcHealths[<span class="str">'npc1'</span>] = 30
 
     <div class="canvas-highlight">
       <div class="canvas-highlight-head">
-        <span class="canvas-stat">2.1x faster</span>
+        <span class="canvas-stat">1.9x faster</span>
         <h3>than an HTML &lt;canvas&gt;, drawing the same scene</h3>
       </div>
       <p class="section-intro" style="margin:0 0 16px;">
@@ -629,19 +640,30 @@ npcHealths[<span class="str">'npc1'</span>] = 30
             <tr><th>Canvas</th><th class="num">Frame (min)</th><th class="num">Frame (median)</th><th class="num">First frame</th></tr>
           </thead>
           <tbody>
-            <tr class="row-festina"><td>Festina (Cairo)</td><td class="num">31 ms</td><td class="num">32 ms</td><td class="num">17 ms</td></tr>
-            <tr><td>HTML &lt;canvas&gt; (Chromium/Skia)</td><td class="num">64 ms</td><td class="num">83 ms</td><td class="num">224 ms</td></tr>
+            <tr class="row-festina"><td>Festina (Cairo)</td><td class="num">31 ms</td><td class="num">32 ms</td><td class="num">16 ms</td></tr>
+            <tr><td>HTML &lt;canvas&gt; (Chromium/Skia)</td><td class="num">60 ms</td><td class="num">62 ms</td><td class="num">240 ms</td></tr>
+            <tr><td>MonoGame (software GL)</td><td class="num">181 ms</td><td class="num">410 ms</td><td class="num">166 ms</td></tr>
           </tbody>
         </table>
       </div>
       <p class="section-intro" style="margin:16px 0 0;">
         Circles are drawn from a cached alpha mask per radius, stamped
         rather than re-tessellated on every call — the reason Festina
-        stays ahead on this workload. Festina also wins startup by more
-        than an order of magnitude and wins on variance — the browser's
-        frame time swings 20+ ms between runs, while Festina's two
-        numbers sit right on top of each other, and for a frame budget
-        that's not a footnote.
+        stays ahead of the browser on this workload. Festina also wins
+        startup by more than an order of magnitude and wins on variance
+        — the browser's frame time swings between runs, while Festina's
+        two numbers sit right on top of each other, and for a frame
+        budget that's not a footnote.
+      </p>
+      <p class="section-intro" style="margin:12px 0 0; font-size:0.85rem;">
+        <strong>Read the MonoGame row with its caveat:</strong> MonoGame
+        is a GPU framework, measured here with no GPU present — its
+        graphics context is a software rasterizer doing in CPU cycles
+        what real hardware does for free. On actual GPU hardware these
+        40,000 sprites batch into a couple of draw calls and finish in
+        well under a millisecond. The row measures the headless,
+        no-GPU case (CI, a build server, a container), not GPU-accelerated
+        performance.
       </p>
     </div>
 
