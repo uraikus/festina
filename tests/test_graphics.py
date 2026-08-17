@@ -3,28 +3,46 @@
 Lexer/parser/semantic-level tests only -- see tests/test_codegen.py's
 TestGraphics for the real compile-and-run end-to-end coverage,
 including tests that actually open a window against a virtual X server
-and verify click/mouse dispatch.
+and verify mouseDown/mouseUp/mouse dispatch.
 """
 import pytest
 
 
 class TestImageType:
-    """claude.md #37: img, loadImage()."""
+    """claude.md #37: img, declared from a path (claude.md #109 removed
+    loadImage(), leaving the path form as the only spelling)."""
 
     def test_img_declaration_parses(self, parser):
-        parser.parse("img profile = loadImage('profile.png')")
+        parser.parse("img profile = 'profile.png'")
 
     def test_img_is_a_valid_type(self, parser, semantic):
-        program = parser.parse("img profile = loadImage('profile.png')")
+        program = parser.parse("img profile = 'profile.png'")
         semantic.analyze(program)
 
-    def test_load_image_wrong_argument_count_is_a_compile_error(self, parser, semantic, errors):
-        program = parser.parse("img profile = loadImage()")
+    def test_the_path_may_be_any_text_expression(self, parser, semantic):
+        # claude.md #101/#109: a real load at run time, not a
+        # compile-time resolution, so this is not restricted to literals.
+        source = "text dir = 'art/'\nimg profile = dir + 'profile.png'"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_load_image_is_gone_and_says_what_to_use_instead(
+            self, parser, semantic, errors):
+        # claude.md #109: removed rather than aliased, and the error
+        # names the replacement -- there is nothing else in the language
+        # that would tell a reader where it went.
+        program = parser.parse("img profile = loadImage('profile.png')")
         with pytest.raises(errors.CompileError, match="loadImage"):
             semantic.analyze(program)
 
-    def test_load_image_non_text_argument_is_a_compile_error(self, parser, semantic, errors):
-        program = parser.parse("img profile = loadImage(5)")
+    def test_the_load_image_error_shows_the_path_form(self, parser, semantic, errors):
+        program = parser.parse("img profile = loadImage('profile.png')")
+        with pytest.raises(errors.CompileError) as excinfo:
+            semantic.analyze(program)
+        assert "img sprite = 'sprite.png'" in str(excinfo.value)
+
+    def test_a_non_text_path_is_still_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("img profile = 5")
         with pytest.raises(errors.CompileError):
             semantic.analyze(program)
 
@@ -46,7 +64,7 @@ class TestGraphicsFunctions:
         semantic.analyze(program)
 
     def test_draw_image_parses_and_analyzes(self, parser, semantic):
-        source = "img profile = loadImage('a.png')\ndrawImage(profile, 0, 0)"
+        source = "img profile = 'a.png'\ndrawImage(profile, 0, 0)"
         program = parser.parse(source)
         semantic.analyze(program)
 
@@ -77,14 +95,27 @@ class TestGraphicsFunctions:
 
 
 class TestEventHandlers:
-    """claude.md #40: `on eventName(arguments) { }` -- click/mouse/key/
-    resize/close specifically must each declare a fixed signature
+    """claude.md #40: `on eventName(arguments) { }` -- mouseDown/mouseUp/
+    mouse/key/resize/close specifically must each declare a fixed signature
     matching claude.md's own examples exactly (the runtime registers
     each one as a fixed-signature function pointer -- see
     festina_runtime.h's doc comment)."""
 
-    def test_click_handler_parses_and_analyzes(self, parser, semantic):
-        source = "on click(x:int, y:int) {\n    log(x)\n}"
+    @pytest.mark.parametrize("name", ["mouseDown", "mouseUp"])
+    def test_mouse_button_handlers_parse_and_analyze(self, parser, semantic, name):
+        # claude.md #106: `on click` split into two, the same way
+        # claude.md #98 split `on key`.
+        source = f"on {name}(x:int, y:int) {{\n    log(x)\n}}"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_click_is_no_longer_a_constrained_event(self, parser, semantic):
+        # claude.md #106 removed `on click` outright rather than keeping
+        # it as an alias. The name is not reserved any more, so it falls
+        # through to the unconstrained case below: it analyzes fine with
+        # any signature and simply never fires, because nothing in the
+        # runtime registers it.
+        source = "on click(a:text) {\n    log(a)\n}"
         program = parser.parse(source)
         semantic.analyze(program)
 
@@ -112,20 +143,20 @@ class TestEventHandlers:
 
     def test_unrecognized_event_name_is_unconstrained(self, parser, semantic):
         # claude.md #40 never restricts event names to a fixed set --
-        # only click/mouse/key/resize/close get a signature requirement,
-        # because only those five have a runtime event source at all.
+        # only mouseDown/mouseUp/mouse/key/resize/close get a signature
+        # requirement, because only those have a runtime event source.
         source = "on somethingElse(a:text, b:bool) {\n    log(a)\n}"
         program = parser.parse(source)
         semantic.analyze(program)
 
-    @pytest.mark.parametrize("name", ["click", "mouse"])
+    @pytest.mark.parametrize("name", ["mouseDown", "mouseUp", "mouse"])
     def test_wrong_parameter_count_is_a_compile_error(self, parser, semantic, errors, name):
         source = f"on {name}(x:int) {{\n    log(x)\n}}"
         program = parser.parse(source)
         with pytest.raises(errors.CompileError, match=name):
             semantic.analyze(program)
 
-    @pytest.mark.parametrize("name", ["click", "mouse"])
+    @pytest.mark.parametrize("name", ["mouseDown", "mouseUp", "mouse"])
     def test_wrong_parameter_type_is_a_compile_error(self, parser, semantic, errors, name):
         source = f"on {name}(x:text, y:int) {{\n    log(x)\n}}"
         program = parser.parse(source)

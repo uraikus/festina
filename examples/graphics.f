@@ -80,10 +80,21 @@ render()
 
 log(`canvas started at ${clientWidth}x${clientHeight}`)
 
-on click(x:int, y:int) {
-    log(`clicked at ${x}, ${y}`)
-    drawCircle(x, y, 5)   // a small dot marking every click
+// claude.md #106: a click is a press and a release, and they are two
+// separate events -- the same split claude.md #98 made for the keyboard.
+// Holding the button down and moving before letting go is a drag, and
+// the only way to express one is to see both ends of it: mouseDown
+// reports where the button went down, mouseUp where it came back up.
+on mouseDown(x:int, y:int) {
+    log(`pressed at ${x}, ${y}`)
+    drawCircle(x, y, 5)   // a small dot marking where the press landed
     render()              // show it
+}
+
+on mouseUp(x:int, y:int) {
+    // The coordinates differ from the press above whenever the pointer
+    // moved in between, which is exactly what makes a drag visible.
+    log(`released at ${x}, ${y}`)
 }
 
 on mouse(x:int, y:int) {

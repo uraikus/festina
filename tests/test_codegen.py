@@ -19,6 +19,7 @@ Two kinds of tests here:
 import os
 import shutil
 import sqlite3
+import struct
 import subprocess
 import time
 import wave
@@ -45,7 +46,8 @@ class TestUnrecognizedEventName:
         return codegen.generate_ir(program, analyzed, filename=filename)
 
     def test_unrecognized_event_name_still_compiles_but_is_never_called(self, parser, semantic, codegen):
-        # claude.md #40 only ever shows "click" and "mouse" -- any other
+        # claude.md #40 only ever shows mouse and keyboard events --
+        # any other
         # name still compiles (it's checked like any other code) but
         # there's no event source for it, so it's simply dead code, not
         # a compile error. See TestGraphics for the same point end to
@@ -276,34 +278,169 @@ class TestStrings:
 
 
 class TestBlob:
-    """claude.md #36: blob. Regression coverage for two real bugs a
-    spec-compliance pass found: claude.md's own only worked example
-    ("blob data = 'path/to/file'") failed semantic analysis outright
-    (a string literal infers as `text`, and blob/text were fully
-    incompatible with no exception -- meaning blob could never
-    actually hold a value at all, since nothing else in the language
-    constructs one either), and log() on the one blob value that
-    *could* somehow exist crashed the compiler itself with a bare
-    Python KeyError (blob passed the "is this a PrimitiveType" check
-    but had no entry in log()'s dispatch dict) rather than compiling
-    or raising a clean CompileError -- previously unreachable in
-    practice for the same reason, but a real crash risk once blob
-    became constructible."""
+    """claude.md #36, given its real meaning by claude.md #109.
 
-    def test_blob_declaration_and_log_match_the_spec_example(self, compile_and_run):
-        result = compile_and_run("blob data = 'path/to/file'\nlog(data)")
-        assert result.returncode == 0
-        assert result.stdout.strip() == "path/to/file"
+    #36's only worked example was always `blob data = 'path/to/file'`,
+    and for a long time that stored the PATH and never read the file --
+    blob was a second name for `text`. #109 makes the example mean what
+    it says: a blob is the file's BYTES, loaded at the declaration,
+    keeping the path so the file can be written, appended to, tested
+    for and deleted through the same value.
+    """
 
-    def test_blob_and_text_equality(self, compile_and_run):
-        source = (
-            "blob data = 'hello'\n"
-            "text t = 'hello'\n"
-            "log(data == t)\n"
-            "log(data == 'nope')\n"
-        )
+    def test_a_blob_loads_the_bytes_at_its_path(self, compile_and_run, tmp_path):
+        path = tmp_path / "data.txt"
+        path.write_text("the contents")
+        source = f"blob data = '{path}'\nlog(data.toText())"
         result = compile_and_run(source)
-        assert result.stdout.splitlines() == ["true", "false"]
+        assert result.returncode == 0
+        assert result.stdout.strip() == "the contents"
+
+    def test_logging_a_blob_prints_its_contents_not_its_path(
+            self, compile_and_run, tmp_path):
+        # The old behavior printed the path, because the path was all
+        # there was. Printing it now would mean printing a struct's
+        # first field as if it were a string.
+        path = tmp_path / "data.txt"
+        path.write_text("the contents")
+        result = compile_and_run(f"blob data = '{path}'\nlog(data)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "the contents"
+
+    def test_a_missing_path_is_an_empty_blob_not_a_failure(self, compile_and_run):
+        # claude.md #93's rule, inherited: a missing file is something
+        # you test for, not something that stops the program. It is also
+        # how a file that does not exist yet gets created.
+        source = ("blob data = '/nonexistent/nowhere.txt'\n"
+                  "log(data.exists())\n"
+                  "log(data.toText() == '')\n")
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["false", "true"]
+
+    def test_write_append_read_exists_delete(self, compile_and_run, tmp_path):
+        path = tmp_path / "notes.txt"
+        source = f"""
+        blob f = '{path}'
+        log(f.write('hello'))
+        log(f.append(' world'))
+        log(f.toText())
+        log(f.exists())
+        log(f.delete())
+        log(f.exists())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == [
+            "true", "true", "hello world", "true", "true", "false"]
+
+    def test_the_bytes_survive_deleting_the_file(self, compile_and_run, tmp_path):
+        # .delete() removes the FILE. The blob is an ordinary value and
+        # is unaffected, which is what makes "delete it but keep what it
+        # said" expressible.
+        path = tmp_path / "notes.txt"
+        source = f"""
+        blob f = '{path}'
+        f.write('remembered')
+        f.delete()
+        log(f.exists())
+        log(f.toText())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["false", "remembered"]
+
+    def test_write_updates_what_to_text_reports(self, compile_and_run, tmp_path):
+        # Not just the file: the in-memory bytes too, so toText() after
+        # write() reports what was written rather than what the file
+        # held when the blob was declared.
+        path = tmp_path / "notes.txt"
+        path.write_text("original")
+        source = f"""
+        blob f = '{path}'
+        log(f.toText())
+        f.write('replaced')
+        log(f.toText())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["original", "replaced"]
+
+    def test_the_path_may_be_any_text_expression(self, compile_and_run, tmp_path):
+        path = tmp_path / "data.txt"
+        path.write_text("found")
+        source = f"""
+        text dir = '{tmp_path}/'
+        blob f = dir + 'data.txt'
+        log(f.toText())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "found"
+
+    def test_assigning_a_blob_shares_one_handle(self, compile_and_run, tmp_path):
+        # claude.md #109: "if a blob = another blob, have it copy the
+        # reference of that current file". Writing through one is
+        # visible through the other, which is what proves they are one
+        # handle rather than two copies.
+        path = tmp_path / "shared.txt"
+        source = f"""
+        blob a = '{path}'
+        a.write('first')
+        blob b = a
+        a.write('second')
+        log(b.toText())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "second"
+
+    def test_reassigning_leaves_an_earlier_reference_intact(
+            self, compile_and_run, tmp_path):
+        # The other half of the same rule: rebinding `a` must not
+        # disturb `keep`, which still holds the first file. Verified
+        # leak-free separately under LeakSanitizer -- this pins that the
+        # surviving reference is also still READABLE, i.e. that the
+        # release did not free a handle someone else still held.
+        p1 = tmp_path / "one.txt"
+        p2 = tmp_path / "two.txt"
+        source = f"""
+        blob a = '{p1}'
+        a.write('file one')
+        blob keep = a
+        a = '{p2}'
+        a.write('file two')
+        log(keep.toText())
+        log(a.toText())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["file one", "file two"]
+
+    def test_a_blob_is_no_longer_comparable_to_text(self, parser, semantic, errors):
+        # It used to be, because it WAS a text. A handle and a string
+        # are not the same kind of thing, and comparing them would have
+        # compared a pointer against a string's contents.
+        program = parser.parse("blob data = 'x'\ntext t = 'x'\nlog(data == t)")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_a_blob_compares_against_null(self, compile_and_run, tmp_path):
+        path = tmp_path / "data.txt"
+        path.write_text("x")
+        source = f"blob f = '{path}'\nlog(f == null)\nlog(f != null)"
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["false", "true"]
+
+    def test_an_unknown_blob_method_is_rejected(self, parser, semantic, errors):
+        program = parser.parse("blob f = 'x'\nf.slurp()")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_write_requires_exactly_one_text_argument(self, parser, semantic, errors):
+        program = parser.parse("blob f = 'x'\nf.write()")
+        with pytest.raises(errors.CompileError, match="write"):
+            semantic.analyze(program)
+
+    def test_to_text_takes_no_arguments(self, parser, semantic, errors):
+        program = parser.parse("blob f = 'x'\nlog(f.toText('extra'))")
+        with pytest.raises(errors.CompileError, match="toText"):
+            semantic.analyze(program)
 
 
 class TestStructs:
@@ -389,6 +526,200 @@ class TestStructs:
         """
         result = compile_and_run(source)
         assert result.stdout.splitlines() == ["0", "0"]
+
+
+class TestSelfReferencingStructs:
+    """claude.md #106: a struct may name its own type in a field, and may
+    name a struct declared later in the file. Both used to be rejected
+    with "unknown type", not because the representation could not hold
+    them -- a struct-typed field is a pointer -- but because
+    analyze_struct registered the finished struct only after resolving
+    every field."""
+
+    def test_struct_may_reference_its_own_type(self, compile_and_run):
+        source = """
+        struct Node {
+            n:int
+            next:Node
+        }
+        Node head
+        head.n = 1
+        head.next.n = 2
+        log(head.n + head.next.n)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "3"
+
+    def test_a_linked_list_can_be_built_and_walked(self, compile_and_run):
+        # claude.md #97's auto-vivification is what makes the build side
+        # work with no extra machinery: reaching THROUGH a null struct
+        # field allocates it. The walk then reads back what was written.
+        source = """
+        struct Node {
+            n:int
+            next:Node
+        }
+        Node head
+        head.n = 1
+        head.next.n = 2
+        head.next.next.n = 3
+
+        int total = 0
+        Node cursor = head
+        for int i = 0, i < 3, i++ {
+            total = total + cursor.n
+            cursor = cursor.next
+        }
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "6"
+
+    def test_two_structs_may_reference_each_other(self, compile_and_run):
+        source = """
+        struct A {
+            n:int
+            b:B
+        }
+        struct B {
+            n:int
+            a:A
+        }
+        A first
+        first.n = 1
+        first.b.n = 2
+        first.b.a.n = 3
+        log(first.n + first.b.n + first.b.a.n)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "6"
+
+    def test_a_struct_may_reference_one_declared_later(self, compile_and_run):
+        # The forward-reference half of the same fix -- this failed for
+        # exactly the same reason and with the same error message.
+        source = """
+        struct Outer {
+            inner:Inner
+        }
+        struct Inner {
+            n:int
+        }
+        Outer o
+        o.inner.n = 42
+        log(o.inner.n)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "42"
+
+    def test_a_self_referencing_struct_still_has_a_release_wrapper(
+            self, parser, semantic, codegen):
+        # A struct with a struct-typed field needs the per-type release
+        # wrapper of claude.md #78, and here that field is the struct
+        # itself. The wrapper's cache entry is written before the field
+        # loop recurses, so exactly ONE wrapper is generated and it
+        # calls itself -- rather than the compiler recursing forever.
+        source = ("struct Node { n:int next:Node }\n"
+                  "Node func make(v:int) {\n"
+                  "    Node p\n"
+                  "    p.n = v\n"
+                  "    return p\n"
+                  "}\n"
+                  "Node head = make(1)\n"
+                  "head.next = make(2)\n"
+                  "log(head.n + head.next.n)\n")
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        define = "define void @__festina_release_struct_Node(ptr %payload) {"
+        assert ir.count(define) == 1
+        # ...and the one wrapper genuinely recurses into itself: the
+        # cascade over its `next` field is a call to the very function
+        # being defined, which is only well-founded because the cache
+        # entry is written before the field loop runs.
+        body = ir.split(define, 1)[1].split("\n}", 1)[0]
+        assert "call void @__festina_release_struct_Node(" in body
+
+    def test_a_reference_cycle_runs_correctly_and_does_not_crash(self, compile_and_run):
+        # claude.md #106's accepted cost, pinned as behavior rather than
+        # hidden. `a.next = a` is a reference cycle, which refcounting
+        # cannot free -- so this LEAKS, deliberately and permanently
+        # until something traces (see todo.md's "What's still ahead").
+        # What must never regress is that it stays a leak: a cycle whose
+        # counts never reach zero must not become a double-free or a
+        # use-after-free, both of which would be far worse than the
+        # leak and both of which a naive "break the cycle on release"
+        # fix would risk.
+        source = """
+        struct Node {
+            n:int
+            next:Node
+        }
+        Node a
+        a.n = 7
+        a.next = a
+        log(a.next.next.next.n)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "7"
+
+    def test_breaking_a_cycle_with_null_reclaims_it(self, compile_and_run):
+        # The workaround api.md recommends, pinned so it stays true:
+        # clearing the back-reference drops the count to zero and the
+        # value is reclaimed normally. Verified separately under
+        # LeakSanitizer (50 iterations, zero leaked bytes -- against
+        # 1,200 for the identical program without the `= null`); this
+        # test pins the behavior, since the sanitizer does not run here.
+        source = """
+        struct Node {
+            n:int
+            next:Node
+        }
+        void func build() {
+            Node a
+            a.n = 7
+            a.next = a
+            a.next = null
+        }
+        for int i = 0, i < 50, i++ {
+            build()
+        }
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_a_duplicate_struct_name_is_still_rejected(self, parser, semantic, errors):
+        # The pre-pass registers every name up front, so the duplicate
+        # check can no longer just ask whether the name is present --
+        # it has to ask whether it has real fields. Get that wrong and
+        # every struct is a duplicate of itself.
+        program = parser.parse("struct A { n:int }\nstruct A { m:int }\n")
+        with pytest.raises(errors.CompileError, match="already declared"):
+            semantic.analyze(program)
+
+    def test_a_struct_colliding_with_a_table_name_is_still_rejected(
+            self, parser, semantic, errors):
+        program = parser.parse("table A { n:int }\nstruct A { m:int }\n")
+        with pytest.raises(errors.CompileError, match="already declared"):
+            semantic.analyze(program)
+
+    def test_an_unknown_field_type_is_still_rejected(self, parser, semantic, errors):
+        # And the failed declaration must not leave a half-registered
+        # name behind for a later declaration to collide with.
+        program = parser.parse("struct A { n:Nonexistent }\n")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_a_name_left_by_a_failed_struct_does_not_become_a_duplicate(
+            self, parser, semantic, errors):
+        # The failure above must report the unknown type, not a
+        # spurious "already declared" from its own placeholder.
+        program = parser.parse("struct A { n:Nonexistent }\n")
+        with pytest.raises(errors.CompileError) as excinfo:
+            semantic.analyze(program)
+        assert "already declared" not in str(excinfo.value)
 
 
 class TestArrays:
@@ -1358,7 +1689,7 @@ class TestAutomaticMemoryReclamation:
 
     def test_event_handler_locals_are_analyzed_too(self, parser, semantic, codegen):
         source = """
-        on click(x:int, y:int) {
+        on mouseDown(x:int, y:int) {
             arr[int] p = [x]
             log(p[0])
         }
@@ -1369,7 +1700,7 @@ class TestAutomaticMemoryReclamation:
     def test_event_handler_struct_local_is_stack_allocated_too(self, parser, semantic, codegen):
         source = """
         struct Point { x:int y:int }
-        on click(x:int, y:int) {
+        on mouseDown(x:int, y:int) {
             Point p
             p.x = x
             log(p.x)
@@ -4028,15 +4359,18 @@ class TestGraphics:
         if not (shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")):
             pytest.skip("no C compiler (clang/gcc/cc) on PATH")
         source = """
-        img icon = loadImage('nonexistent.png')
+        img icon = 'nonexistent.png'
         drawRect(0, 0, 100, 100)
         drawCircle(50, 50, 25)
         drawText('Hello', 20, 20)
         drawImage(icon, 10, 10)
         log(`${clientWidth}x${clientHeight}`)
 
-        on click(x:int, y:int) {
-            log(`click at ${x}, ${y}`)
+        on mouseDown(x:int, y:int) {
+            log(`press at ${x}, ${y}`)
+        }
+        on mouseUp(x:int, y:int) {
+            log(`release at ${x}, ${y}`)
         }
         on mouse(x:int, y:int) {
             log(`mouse at ${x}, ${y}`)
@@ -4097,7 +4431,7 @@ class TestGraphics:
     def test_program_without_graphics_never_opens_a_window(self, compile_and_run, monkeypatch):
         # self.uses_graphics gates festina_graphics_init() -- a program
         # that never calls a graphics function or declares on
-        # click/mouse must behave exactly as before: no window, no
+        # mouseDown/mouse must behave exactly as before: no window, no
         # blocking event loop, normal immediate exit. Verified here by
         # deliberately having no display available at all and
         # confirming the program still succeeds (if it tried to open a
@@ -4107,16 +4441,47 @@ class TestGraphics:
         assert result.returncode == 0
         assert result.stdout.strip() == "no graphics here"
 
-    def test_click_dispatches_to_handler_with_correct_coordinates(self, run_graphics_program, x_display):
-        source = "on click(x:int, y:int) {\n    log(`click ${x} ${y}`)\n}"
+    def test_mouse_down_and_up_dispatch_separately_with_correct_coordinates(
+            self, run_graphics_program, x_display):
+        # claude.md #106: one xdotool "click" is a press AND a release,
+        # so a program declaring both handlers sees two distinct events
+        # from it -- which is the whole point of the split. `on click`
+        # used to collapse them into the single line this once asserted.
+        source = ("on mouseDown(x:int, y:int) {\n    log(`down ${x} ${y}`)\n}\n"
+                  "on mouseUp(x:int, y:int) {\n    log(`up ${x} ${y}`)\n}\n")
         proc, stdout_path = run_graphics_program(source)
         try:
             wid = _find_window(x_display)
             env = dict(os.environ, DISPLAY=x_display)
             subprocess.run(["xdotool", "mousemove", "--window", wid, "150", "220"], env=env, check=True)
             subprocess.run(["xdotool", "click", "--window", wid, "1"], env=env, check=True)
-            text = _wait_for_output(stdout_path, lambda t: t.strip() != "")
-            assert text.strip() == "click 150 220"
+            text = _wait_for_output(stdout_path, lambda t: "up 150 220" in t)
+            # Order matters: the press has to arrive before the release.
+            assert text.splitlines() == ["down 150 220", "up 150 220"]
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_a_drag_reports_different_press_and_release_coordinates(
+            self, run_graphics_program, x_display):
+        # claude.md #106's motivating case: hold the button down, move,
+        # then let go. `on click` could not express this at all -- it
+        # only ever saw the press. Here the two events report the two
+        # ends of the drag, which is what makes it reconstructible.
+        source = ("on mouseDown(x:int, y:int) {\n    log(`down ${x} ${y}`)\n}\n"
+                  "on mouseUp(x:int, y:int) {\n    log(`up ${x} ${y}`)\n}\n")
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            subprocess.run(["xdotool", "mousemove", "--window", wid, "100", "100"], env=env, check=True)
+            subprocess.run(["xdotool", "mousedown", "--window", wid, "1"], env=env, check=True)
+            _wait_for_output(stdout_path, lambda t: "down 100 100" in t)
+            subprocess.run(["xdotool", "mousemove", "--window", wid, "400", "350"], env=env, check=True)
+            subprocess.run(["xdotool", "mouseup", "--window", wid, "1"], env=env, check=True)
+            text = _wait_for_output(stdout_path, lambda t: "up " in t)
+            assert "down 100 100" in text
+            assert "up 400 350" in text
         finally:
             proc.terminate()
             proc.wait(timeout=5)
@@ -4292,7 +4657,7 @@ class TestExampleGraphicsAndGame:
     x_display/run_graphics_program fixtures, the same as TestGraphics
     above and TestTimers's combined graphics+timers test below."""
 
-    def test_graphics_demo_dispatches_click_key_and_resize(self, run_graphics_program, x_display):
+    def test_graphics_demo_dispatches_mouse_key_and_resize(self, run_graphics_program, x_display):
         source = open(os.path.join(_EXAMPLES_DIR, "graphics.f")).read()
         proc, stdout_path = run_graphics_program(source)
         try:
@@ -4308,7 +4673,9 @@ class TestExampleGraphicsAndGame:
             subprocess.run(["xdotool", "windowsize", wid, "900", "700"], env=env, check=True)
 
             text = _wait_for_output(stdout_path, lambda t: "resized to 900x700" in t)
-            assert "clicked at 100, 100" in text
+            # claude.md #106: one xdotool click produces both halves.
+            assert "pressed at 100, 100" in text
+            assert "released at 100, 100" in text
             assert "key pressed: a" in text
             assert "resized to 900x700" in text
         finally:
@@ -4359,7 +4726,7 @@ class TestTimers:
     test_timers_and_graphics_work_together, is the one thing that
     genuinely needs a real window: proving festina_run_event_loop's
     select()-based multiplexing keeps both a `setInterval` callback and
-    `on click` responsive together, not just one or the other.
+    `on mouseDown` responsive together, not just one or the other.
     """
 
     def test_timeout_fires_once_after_the_delay(self, compile_and_run):
@@ -4478,7 +4845,7 @@ class TestTimers:
             "void func tick() {\n"
             "    log('tick')\n"
             "}\n"
-            "on click(x:int, y:int) {\n"
+            "on mouseDown(x:int, y:int) {\n"
             "    log(`click ${x} ${y}`)\n"
             "}\n"
             "drawRect(0, 0, 10, 10)\n"
@@ -4565,7 +4932,7 @@ class TestAudio:
         empty_home = tmp_path / "empty_home"
         empty_home.mkdir()
         result = compile_and_run(
-            f"aud music = loadAudio('{wav_name}')\nmusic.play()\nlog('unreachable')",
+            f"aud music = '{wav_name}'\nmusic.play()\nlog('unreachable')",
             env={"HOME": str(empty_home)},
         )
         assert result.returncode == 1
@@ -4745,10 +5112,20 @@ class TestAudio:
         assert "could not open audio file" in result.stderr
         assert "unreachable" not in result.stdout
 
-    def test_stop_is_gone_from_aud(self, parser, semantic, errors):
-        # claude.md #100: one clip can be playing on several channels at
-        # once, so "stop this clip" never named one thing.
+    def test_stop_is_back_and_is_clip_wide(self, parser, semantic):
+        # claude.md #109: #100 removed stop() because "stop this clip"
+        # has only one honest reading -- every channel playing it -- and
+        # that is rarely what an overlapping-effects program wants. True,
+        # and not a reason to withhold it: silencing a looping hum or a
+        # music bed is a real thing to want, and doing it by hand meant
+        # tracking channels the runtime already knows. play() returning
+        # its channel covers the other case, so both exist now.
         program = parser.parse("aud music = 'x.wav'\nmusic.stop()", filename="main.f")
+        semantic.analyze(program, filename="main.f")
+
+    def test_stop_by_channel_is_still_how_one_playback_is_addressed(
+            self, parser, semantic, errors):
+        program = parser.parse("aud music = 'x.wav'\nmusic.stop(2)", filename="main.f")
         with pytest.raises(errors.CompileError, match="stopAudioPlayer"):
             semantic.analyze(program, filename="main.f")
 
@@ -4922,6 +5299,18 @@ void festina_fail(const char *msg) {
     exit(1);
 }
 
+/* claude.md #110: the audio unit's save()/saveCopy() delegate the shared
+ * write-and-maybe-adopt-the-path policy to the core runtime. Stubbed
+ * rather than linked for the same reason festina_fail is: these
+ * harnesses are entirely about the channel pool, and pulling in
+ * festina_runtime.c would drag sqlite3 along with it. */
+int8_t festina_save_bytes(const char *target, char **own_path,
+                          const void *data, int64_t len,
+                          const char *what, int8_t adopt) {
+    (void)target; (void)own_path; (void)data; (void)len; (void)what; (void)adopt;
+    return 0;
+}
+
 static int active_voices(void *audio) {
     int n = 0;
     pthread_mutex_lock(&g_audio_lock);
@@ -5033,6 +5422,18 @@ void festina_fail(const char *msg) {
     exit(1);
 }
 
+/* claude.md #110: the audio unit's save()/saveCopy() delegate the shared
+ * write-and-maybe-adopt-the-path policy to the core runtime. Stubbed
+ * rather than linked for the same reason festina_fail is: these
+ * harnesses are entirely about the channel pool, and pulling in
+ * festina_runtime.c would drag sqlite3 along with it. */
+int8_t festina_save_bytes(const char *target, char **own_path,
+                          const void *data, int64_t len,
+                          const char *what, int8_t adopt) {
+    (void)target; (void)own_path; (void)data; (void)len; (void)what; (void)adopt;
+    return 0;
+}
+
 static int active_voices(void *audio) {
     int n = 0;
     pthread_mutex_lock(&g_audio_lock);
@@ -5092,6 +5493,18 @@ static long harness_pcm_writei(snd_pcm_t *pcm, const void *buf, unsigned long fr
 void festina_fail(const char *msg) {
     fprintf(stderr, "fail: %s\n", msg ? msg : "");
     exit(1);
+}
+
+/* claude.md #110: the audio unit's save()/saveCopy() delegate the shared
+ * write-and-maybe-adopt-the-path policy to the core runtime. Stubbed
+ * rather than linked for the same reason festina_fail is: these
+ * harnesses are entirely about the channel pool, and pulling in
+ * festina_runtime.c would drag sqlite3 along with it. */
+int8_t festina_save_bytes(const char *target, char **own_path,
+                          const void *data, int64_t len,
+                          const char *what, int8_t adopt) {
+    (void)target; (void)own_path; (void)data; (void)len; (void)what; (void)adopt;
+    return 0;
 }
 
 /* Which channel index a clip is playing on, or -1. */
@@ -5630,6 +6043,1172 @@ class TestDiscardedCallResultReachedForAField:
         assert result.stdout.strip() == "intact"
 
 
+class TestChainedCallResultReachedForAField:
+    """claude.md #108: `make().inner.n` -- a call result reached through
+    a CHAIN of fields, which claude.md #102 could not cover.
+
+    #102 released the receiver of a one-step read (`make().n`) and had
+    to give up on `make().inner`, because releasing the parent there
+    frees the Inner it is about to hand back. But that left the longer
+    chain leaking the entire object graph: at `.inner` the field type is
+    managed so nothing is released, and at `.n` the receiver is a Member
+    rather than a Call so nothing notices the call result exists.
+    Measured under LeakSanitizer at 5,200 bytes over 100 iterations.
+
+    The decision now happens at the outermost link, where the type of
+    the value that actually escapes the chain is known.
+    """
+
+    def test_a_chained_read_produces_the_right_value(self, compile_and_run):
+        source = """
+        struct Inner { n:int label:text }
+        struct Outer { inner:Inner tag:text }
+        Outer func make(v:int) {
+            Outer o
+            o.inner.n = v
+            o.inner.label = 'L'
+            o.tag = 'T'
+            return o
+        }
+        int total = 0
+        for int i = 0, i < 100, i++ {
+            total = total + make(i).inner.n
+        }
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "4950"
+
+    def test_the_chain_releases_the_call_result_exactly_once(
+            self, parser, semantic, codegen):
+        source = """
+        struct Inner { n:int }
+        struct Outer { inner:Inner }
+        Outer func make() {
+            Outer o
+            o.inner.n = 3
+            return o
+        }
+        void func use() {
+            log(make().inner.n)
+        }
+        use()
+        """
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        body = ir.split("define void @use()")[1].split("\n}")[0]
+        # Exactly one release, of the Outer -- Outer has a struct-typed
+        # field so it gets #78's per-type wrapper rather than the plain
+        # runtime function, and the wrapper cascades into Inner itself.
+        assert body.count("@__festina_release_struct_Outer(") == 1
+        assert body.count("@festina_release") == 0
+
+    def test_a_chain_ending_in_a_managed_value_is_still_not_released(
+            self, parser, semantic, codegen):
+        # The restriction #102 identified is unchanged and still
+        # load-bearing: if the value escaping the chain is itself
+        # managed, releasing the parent would free it. Nothing is
+        # emitted, and the leak stands -- deliberately.
+        source = """
+        struct Inner { n:int }
+        struct Outer { inner:Inner }
+        Outer func make() {
+            Outer o
+            o.inner.n = 3
+            return o
+        }
+        void func use() {
+            Inner got = make().inner
+            log(got.n)
+        }
+        use()
+        """
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        body = ir.split("define void @use()")[1].split("\n}")[0]
+        assert "@__festina_release_struct_Outer(" not in body
+
+    def test_a_chain_ending_in_text_is_still_not_released(self, compile_and_run):
+        # Same reasoning, and the same thing that must never happen:
+        # the text read back must be intact, not freed out from under
+        # the binding.
+        source = """
+        struct Inner { n:int label:text }
+        struct Outer { inner:Inner }
+        Outer func make(v:int) {
+            Outer o
+            o.inner.n = v
+            o.inner.label = `label ${v}`
+            return o
+        }
+        for int i = 0, i < 20, i++ {
+            text got = make(i).inner.label
+            if got != `label ${i}` {
+                log('corrupted')
+            }
+        }
+        log('intact')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "intact"
+
+    def test_length_off_a_call_result_is_released(self, parser, semantic, codegen):
+        # claude.md #108: .length never reached _emit_member_load at all,
+        # so #102 never covered `rowsFor(x).length` even though its own
+        # docstring claimed it did. A length is an i64 copy that owes the
+        # array nothing, so the receiver is always releasable.
+        source = """
+        arr[int] func rows(v:int) {
+            arr[int] a = [v, v, v]
+            return a
+        }
+        void func use() {
+            log(rows(1).length)
+        }
+        use()
+        """
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        body = ir.split("define void @use()")[1].split("\n}")[0]
+        assert body.count("@festina_release") == 1
+
+    def test_length_reached_through_a_chain_is_released(self, compile_and_run):
+        source = """
+        struct Inner { items:arr[int] }
+        struct Outer { inner:Inner }
+        Outer func make(v:int) {
+            Outer o
+            o.inner.items.push(v)
+            o.inner.items.push(v)
+            return o
+        }
+        int total = 0
+        for int i = 0, i < 50, i++ {
+            total = total + make(i).inner.items.length
+        }
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "100"
+
+    def test_a_member_load_in_a_call_argument_is_not_swallowed_by_the_chain(
+            self, compile_and_run):
+        # "Part of this chain" is decided by AST node identity, not by
+        # "a chain is in flight". A member load reached while emitting a
+        # call ARGUMENT belongs to no chain, and treating it as one
+        # would move its release to a point that may never arrive.
+        source = """
+        struct Inner { n:int }
+        struct Outer { inner:Inner }
+        Outer func make(v:int) {
+            Outer o
+            o.inner.n = v
+            return o
+        }
+        int total = 0
+        for int i = 0, i < 50, i++ {
+            total = total + make(make(i).inner.n).inner.n
+        }
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "1225"
+
+
+class TestAudioChannelReturnAndClipStop:
+    """claude.md #109: play()/playLoop() return the channel they chose,
+    and aud.stop() is back as a clip-wide stop.
+
+    These are two halves of one fix. claude.md #100 removed stop()
+    because "stop this clip" only honestly means "every channel playing
+    it", which is rarely what an overlapping-effects program wants --
+    but the alternative it pointed at, stopAudioPlayer(n), needed a
+    channel number that automatic assignment never told anyone. So the
+    pool was addressable only by naming channels by hand, which is to
+    say by not using the pool.
+    """
+
+    def test_play_returns_distinct_pooled_channels(
+            self, compile_and_run, tmp_path, audio_null_env):
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        int a = clip.play()
+        int b = clip.play()
+        int c = clip.play()
+        log(a != b)
+        log(b != c)
+        log(a >= 0)
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["true", "true", "true"]
+
+    def test_play_on_an_explicit_channel_returns_that_channel(
+            self, compile_and_run, tmp_path, audio_null_env):
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        log(clip.play(3))
+        log(clip.playLoop(5))
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.stdout.splitlines() == ["3", "5"]
+
+    def test_the_returned_channel_can_be_stopped(
+            self, compile_and_run, tmp_path, audio_null_env):
+        # The whole point: a channel chosen automatically is now
+        # addressable, without the program having picked it up front.
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        int ch = clip.playLoop()
+        log(clip.isPlaying())
+        stopAudioPlayer(ch)
+        log(clip.isPlaying())
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_stop_silences_every_channel_playing_the_clip(
+            self, compile_and_run, tmp_path, audio_null_env):
+        # Three overlapping voices of one clip, stopped by one call --
+        # the case claude.md #100 said stop() could only mean, restored
+        # because it is a real thing to want.
+        # playLoop rather than play: against ALSA's null device a
+        # one-shot drains instantly, so a finished voice would be
+        # indistinguishable from a stopped one and the test would pass
+        # for the wrong reason. A loop only ends when something stops it.
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        clip.playLoop()
+        clip.playLoop()
+        clip.playLoop()
+        log(clip.isPlaying())
+        clip.stop()
+        log(clip.isPlaying())
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_stop_leaves_another_clip_alone(
+            self, compile_and_run, tmp_path, audio_null_env):
+        # Clip-wide, not global -- the distinction between stop() and
+        # stopAudioPlayer() with no argument.
+        _write_wav(tmp_path / "a.wav", duration_s=1.0)
+        _write_wav(tmp_path / "b.wav", duration_s=1.0)
+        source = """
+        aud a = 'a.wav'
+        aud b = 'b.wav'
+        a.playLoop()
+        b.playLoop()
+        a.stop()
+        log(a.isPlaying())
+        log(b.isPlaying())
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.stdout.splitlines() == ["false", "true"]
+
+    def test_stop_returns_a_reserved_channel_to_the_pool(
+            self, compile_and_run, tmp_path, audio_null_env):
+        # A playLoop channel is reserved (claude.md #99). Stopping the
+        # clip has to release that reservation too -- silencing the
+        # sound while leaving the channel locked would quietly shrink
+        # the pool every time.
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        setMaxAudioPlayers(1)
+        int first = clip.playLoop()
+        clip.stop()
+        int second = clip.play()
+        log(first == second)
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.stdout.strip() == "true"
+
+    def test_a_play_that_finds_no_channel_returns_minus_one(
+            self, compile_and_run, tmp_path, audio_null_env):
+        # -1 means "nothing was played", and there is exactly one way to
+        # reach it from Festina: every channel in the table reserved by
+        # playLoop, with none left to claim. (A clip that failed to LOAD
+        # cannot reach it -- festina_load_audio fails the program at the
+        # declaration, long before any play() runs.) Returning a channel
+        # number here would name one this call never used.
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        setMaxAudioPlayers(64)
+        for int i = 0, i < 64, i++ {
+            clip.playLoop(i)
+        }
+        log(clip.play())
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "-1"
+
+
+class TestStructQueryTargets:
+    """claude.md #112: `arr[SomeStruct] q = sqlite(...)` -- a struct as
+    the query's landing spot. A table's declared columns can never chase
+    a query's aliases, so `SELECT id AS whatever`, a JOIN, or a computed
+    column had nowhere typed to land; a struct names its fields after
+    the result's own column names, and -- unlike declaring a table --
+    carries no CREATE TABLE side effect. Collection shares claude.md
+    #111's name matching; each row then becomes a real refcounted
+    struct, indistinguishable from one built by hand."""
+
+    def test_the_spec_example(self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table examples {{ id:int  name:text }}
+        sqlite('INSERT INTO examples (id, name) VALUES (?, ?)', [7, 'seven'])
+        struct data {{
+          whatever:int
+        }}
+        arr[data] query = sqlite('select id as whatever from examples')
+        log(query.length)
+        log(query[0].whatever)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["1", "7"]
+
+    def test_computed_columns_land_by_alias(self, compile_and_run, tmp_path):
+        # The case a table can never express: the column does not exist
+        # anywhere in the schema, only in the query.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table examples {{ id:int  name:text }}
+        sqlite('INSERT INTO examples (id, name) VALUES (?, ?)', [7, 'seven'])
+        sqlite('INSERT INTO examples (id, name) VALUES (?, ?)', [8, 'eight'])
+        struct summary {{ total:int  biggest:text }}
+        arr[summary] agg = sqlite(
+            "select count(*) as total, max(name) as biggest from examples")
+        log(agg[0].total)
+        log(agg[0].biggest)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["2", "seven"]
+
+    def test_an_unmatched_field_reads_null(self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table examples {{ id:int }}
+        sqlite('INSERT INTO examples (id) VALUES (1)')
+        struct wide {{ whatever:int  missing:text }}
+        arr[wide] w = sqlite('select id as whatever from examples')
+        log(w[0].missing == null)
+        log(w[0].whatever)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "1"]
+
+    def test_the_result_is_an_ordinary_struct(self, compile_and_run, tmp_path):
+        # Refcounted like any other: an element aliased out of the array
+        # survives freeing the array, fields can be reassigned and
+        # deleted, and the whole thing can be freed by hand.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table examples {{ id:int  name:text }}
+        sqlite('INSERT INTO examples (id, name) VALUES (?, ?)', [7, 'seven'])
+        struct data {{ whatever:int  label:text }}
+        arr[data] q = sqlite('select id as whatever, name as label from examples')
+        data keep = q[0]
+        free q
+        log(q == null)
+        log(keep.label)
+        keep.label = 'renamed'
+        log(keep.label)
+        delete keep.label
+        log(keep.label == null)
+        free keep
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            "true", "seven", "renamed", "true"]
+
+    def test_a_blob_column_lands_in_a_struct_field(self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        src = tmp_path / "payload.txt"
+        source = f"""
+        DatabaseURL = '{db}'
+        table examples {{ id:int  pic:blob }}
+        blob payload = '{src}'
+        payload.write('the bytes')
+        sqlite('INSERT INTO examples (id, pic) VALUES (?, ?)', [1, payload])
+        struct data {{ pic:blob }}
+        arr[data] q = sqlite('select pic from examples')
+        log(q[0].pic.toText())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "the bytes"
+
+    def test_a_non_queryable_field_is_a_clear_error(self, parser, semantic, codegen):
+        source = (
+            "struct bad { xs:arr[int] }\n"
+            "arr[bad] q = sqlite('select 1')\n"
+        )
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        with pytest.raises(Exception, match="xs"):
+            codegen.generate_ir(program, analyzed, filename="main.f")
+
+    def test_undefined_stays_a_table_row_method(self, parser, semantic, errors):
+        # A struct instance from a query is an ordinary struct -- the
+        # presence mask is a row concept, deliberately dropped in the
+        # conversion, so undefined() is not offered.
+        program = parser.parse(
+            "struct data { whatever:int }\n"
+            "arr[data] q = sqlite('select 1 as whatever')\n"
+            "log(q[0].undefined('whatever'))")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+
+class TestFreeStatement:
+    """claude.md #111: `free name` -- release what the binding holds,
+    null the binding. For refcounted types it is a DECREMENT, so a value
+    something else still references survives; for img/aud it is the
+    manual escape hatch for the escaping-handle leak; for value types it
+    degenerates to `x = null`. Composable with automatic reclamation
+    because every release in the runtime is null-safe and a free target
+    counts as escaping (see escape_analysis's own comment)."""
+
+    def test_freeing_nulls_the_binding(self, compile_and_run, tmp_path):
+        path = tmp_path / "b.txt"
+        source = f"""
+        blob b = '{path}'
+        free b
+        log(b == null)
+        int n = 5
+        free n
+        log(n == null)
+        text t = 'x'
+        free t
+        log(t == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true", "true"]
+
+    def test_freeing_twice_is_a_no_op(self, compile_and_run):
+        source = """
+        struct P { n:int }
+        P p
+        p.n = 1
+        free p
+        free p
+        log('survived')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "survived"
+
+    def test_a_shared_value_survives_freeing_one_reference(self, compile_and_run):
+        # The user-facing half of "free is a decrement": the array is
+        # freed, the element it shared with `keep` is not. Verified
+        # leak-free AND corruption-free under ASan separately; this pins
+        # the visible behavior.
+        source = """
+        struct P { n:int  label:text }
+        P keep
+        keep.n = 7
+        keep.label = 'held'
+        arr[P] xs = [keep, keep]
+        free xs
+        log(xs == null)
+        log(keep.label)
+        free keep
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "held"]
+
+    def test_freeing_a_clip_source_leaves_its_clips_alone(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        # The motivating example: clips carry their own surfaces, so the
+        # sheet can go the moment the clips are cut.
+        source = f"""
+        img spritesheet = '{sprite_sheet_png}'
+        img grass = spritesheet.clip(0, 0, 31, 31)
+        img dirt = spritesheet.clip(32, 0, 31, 31)
+        free spritesheet
+        log(spritesheet == null)
+        log(grass.width)
+        log(dirt.width)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "31", "31"]
+
+    def test_freeing_a_regex_literal_binding_keeps_the_cache_intact(
+            self, compile_and_run):
+        # A /pattern/ literal is compiled once and cached for the whole
+        # process (claude.md #85); the value carries a `cached` mark and
+        # festina_regex_free no-ops on it, so free is safe on a regex
+        # binding whichever way it was produced.
+        source = """
+        for int i = 0, i < 3, i++ {
+            regex r = /a+/i
+            log(r.test('AAA'))
+            free r
+        }
+        regex dyn = regex('[0-9]+')
+        free dyn
+        log(dyn == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true", "true", "true"]
+
+    def test_freeing_a_query_row_drops_the_binding_without_freeing(
+            self, compile_and_run, tmp_path):
+        # A row is owned by the array it came from -- freeing it here
+        # would double-free at the array's own release, so `free row`
+        # only nulls the binding. Freeing the ARRAY is the real release.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table T {{ id:int }}
+        sqlite('INSERT INTO T (id) VALUES (1)')
+        arr[T] rows = sqlite('SELECT * FROM T')
+        T first = rows[0]
+        free first
+        log(first == null)
+        log(rows[0].id)
+        free rows
+        log(rows == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "1", "true"]
+
+    def test_free_on_an_unknown_name_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("free nothing")
+        with pytest.raises(errors.CompileError, match="unknown variable"):
+            semantic.analyze(program)
+
+    def test_free_on_a_constant_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("const int N = 5\nfree N")
+        with pytest.raises(errors.CompileError, match="constant"):
+            semantic.analyze(program)
+
+    def test_free_on_a_parameter_is_a_compile_error(self, parser, semantic, errors):
+        # A parameter borrows its caller's value (claude.md #84).
+        program = parser.parse(
+            "void func f(t:text) {\n    free t\n}\nf('x')")
+        with pytest.raises(errors.CompileError, match="parameter"):
+            semantic.analyze(program)
+
+
+class TestDeleteStatement:
+    """claude.md #111: `delete`, JS-shaped. A map entry stops existing;
+    a struct field reads null afterwards; a query-row field reads null
+    AND its presence bit clears, so undefined() reports it like a column
+    the query never selected."""
+
+    def test_both_map_forms_from_the_spec_example(self, compile_and_run):
+        source = """
+        map[text] example = {'data': 'some data', 'more-data': 'Some more data'}
+        delete example.data
+        delete example['more-data']
+        log(example['data'] == null)
+        log(example['more-data'] == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true"]
+
+    def test_a_deleted_key_stops_existing_for_for_each(self, compile_and_run):
+        # Removal, not set-to-null: forEach never visits the deleted key,
+        # which null could not express.
+        source = """
+        void func show(v:int, k:text) {
+            log(`${k}=${v}`)
+        }
+        map[int] m = {'a': 1, 'b': 2, 'c': 3}
+        delete m.b
+        m.forEach(show)
+        """
+        result = compile_and_run(source)
+        assert sorted(result.stdout.splitlines()) == ["a=1", "c=3"]
+
+    def test_deleting_a_missing_key_is_a_no_op(self, compile_and_run):
+        source = """
+        map[int] m = {'a': 1}
+        delete m.nothing
+        delete m['also-nothing']
+        log(m['a'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "1"
+
+    def test_a_computed_key_expression_works(self, compile_and_run):
+        source = """
+        map[int] m = {'k1': 10, 'k2': 20}
+        int i = 1
+        delete m[`k${i}`]
+        log(m['k1'] == null)
+        log(m['k2'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "20"]
+
+    def test_a_deleted_struct_field_reads_null(self, compile_and_run):
+        source = """
+        struct P { n:int  label:text }
+        P p
+        p.n = 5
+        p.label = 'x'
+        delete p.label
+        delete p.n
+        log(p.label == null)
+        log(p.n == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true"]
+
+    def test_delete_on_a_non_container_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("int x = 5\nint y = 1\ndelete y.something")
+        with pytest.raises(errors.CompileError, match="delete"):
+            semantic.analyze(program)
+
+    def test_delete_of_a_whole_variable_says_to_use_free(self, parser, errors):
+        with pytest.raises(errors.CompileError, match="free"):
+            parser.parse("int x = 5\ndelete x")
+
+    def test_deleting_an_unknown_struct_field_is_a_compile_error(
+            self, parser, semantic, errors):
+        program = parser.parse("struct P { n:int }\nP p\ndelete p.missing")
+        with pytest.raises(errors.CompileError, match="missing"):
+            semantic.analyze(program)
+
+    def test_blob_delete_method_still_works(self, compile_and_run, tmp_path):
+        # `delete` became a keyword; member names accept keywords
+        # (parser.eat_name), so blob's method is untouched.
+        path = tmp_path / "f.txt"
+        source = f"""
+        blob f = '{path}'
+        f.write('x')
+        log(f.delete())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+
+
+class TestUndefinedAndNameMatchedColumns:
+    """claude.md #111: result columns match declared columns by NAME
+    (positional matching silently misaligned every partial or reordered
+    SELECT), and each row records which declared columns the result set
+    actually contained -- read by row.undefined('col'), which is the
+    difference between "the database said NULL" and "the query never
+    asked"."""
+
+    def test_the_spec_example(self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table examples {{ id:int  name:text }}
+        sqlite('INSERT INTO examples (id, name) VALUES (?, ?)', [1, null])
+        arr[examples] data = sqlite('select id from examples')
+        if data[0] != null {{
+          log('should log')
+          if data[0].name == null && data[0].undefined('name') {{
+            log('should also log')
+          }}
+        }}
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["should log", "should also log"]
+
+    def test_a_genuine_database_null_is_not_undefined(self, compile_and_run, tmp_path):
+        # The whole point of the distinction: NULL that came from the
+        # database is a VALUE, and undefined() says so.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table examples {{ id:int  name:text }}
+        sqlite('INSERT INTO examples (id, name) VALUES (?, ?)', [1, null])
+        arr[examples] data = sqlite('select * from examples')
+        log(data[0].name == null)
+        log(data[0].undefined('name'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false"]
+
+    def test_a_deleted_row_column_becomes_undefined(self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table examples {{ id:int  name:text }}
+        sqlite('INSERT INTO examples (id, name) VALUES (?, ?)', [1, 'x'])
+        arr[examples] data = sqlite('select * from examples')
+        log(data[0].undefined('name'))
+        delete data[0].name
+        log(data[0].name == null)
+        log(data[0].undefined('name'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["false", "true", "true"]
+
+    def test_a_reordered_select_lands_by_name(self, compile_and_run, tmp_path):
+        # The bug the name matching fixes: this used to read name's text
+        # into the id slot as an integer.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table T {{ id:int  name:text  score:float }}
+        sqlite('INSERT INTO T (id, name, score) VALUES (?, ?, ?)', [7, 'seven', 1.5])
+        arr[T] rows = sqlite('select score, name from T')
+        log(rows[0].name)
+        log(rows[0].score)
+        log(rows[0].id == null)
+        log(rows[0].undefined('id'))
+        log(rows[0].undefined('score'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            "seven", "1.5", "true", "true", "false"]
+
+    def test_an_unknown_column_name_fails_clearly(self, compile_and_run, tmp_path):
+        # Asking about a column the table does not have is a typo, and
+        # true or false would both bury it.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table T {{ id:int }}
+        sqlite('INSERT INTO T (id) VALUES (1)')
+        arr[T] rows = sqlite('SELECT * FROM T')
+        log(rows[0].undefined('nmae'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode != 0
+        assert "no column by that name" in result.stderr
+
+    def test_undefined_requires_one_text_argument(self, parser, semantic, errors):
+        program = parser.parse(
+            "table T { id:int }\n"
+            "arr[T] rows = sqlite('SELECT * FROM T')\n"
+            "log(rows[0].undefined(5))")
+        with pytest.raises(errors.CompileError, match="must be text"):
+            semantic.analyze(program)
+
+
+class TestSaveAndSaveCopy:
+    """claude.md #110: save()/saveCopy() on blob, img and aud.
+
+    One policy for all three, because all three are the same shape of
+    value (claude.md #101/#109: content plus the bytes it came from).
+    save() writes to the path the handle already has; save(path) adopts
+    that path first; saveCopy(path) writes elsewhere and leaves the
+    handle's own path alone.
+
+    This is what closes the gap claude.md #109 shipped knowingly: a
+    handle with no path -- an img from clip(), anything out of a
+    database column -- could not reach the disk at all.
+    """
+
+    # ---- blob ----
+
+    def test_blob_save_writes_to_its_own_path(self, compile_and_run, tmp_path):
+        path = tmp_path / "notes.txt"
+        source = f"""
+        blob f = '{path}'
+        f.write('written')
+        f.delete()
+        log(f.exists())
+        log(f.save())
+        log(f.exists())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["false", "true", "true"]
+        assert path.read_text() == "written"
+
+    def test_blob_save_with_a_path_adopts_it(self, compile_and_run, tmp_path):
+        first = tmp_path / "one.txt"
+        second = tmp_path / "two.txt"
+        source = f"""
+        blob f = '{first}'
+        f.write('content')
+        log(f.save('{second}'))
+        // the path CHANGED, so everything else follows it
+        log(f.delete())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true"]
+        assert second.exists() is False, "delete() should have followed the new path"
+        assert first.read_text() == "content", "the original must be untouched"
+
+    def test_blob_save_copy_leaves_the_path_alone(self, compile_and_run, tmp_path):
+        first = tmp_path / "one.txt"
+        copy = tmp_path / "copy.txt"
+        source = f"""
+        blob f = '{first}'
+        f.write('original')
+        log(f.saveCopy('{copy}'))
+        f.write('changed after the copy')
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+        # The later write went to the ORIGINAL path, not the copy --
+        # which is the whole difference between save and saveCopy.
+        assert first.read_text() == "changed after the copy"
+        assert copy.read_text() == "original"
+
+    def test_a_pathless_blob_save_fails_and_says_why(self, compile_and_run, tmp_path):
+        # claude.md #110: a program asking to save something to nowhere
+        # has a bug, so this fails rather than answering false. An
+        # unwritable directory is a condition of the filesystem and
+        # still answers false -- see the test below.
+        db = tmp_path / "t.sqlite"
+        src = tmp_path / "payload.txt"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Saves {{ name:text  data:blob }}
+        blob f = '{src}'
+        f.write('stored')
+        sqlite('INSERT INTO Saves (name, data) VALUES (?, ?)', ['s', f])
+        arr[Saves] rows = sqlite('SELECT * FROM Saves')
+        log(rows[0].data.save())
+        """
+        result = compile_and_run(source)
+        assert result.returncode != 0
+        assert "no path to save() to" in result.stderr
+        assert "blob" in result.stderr
+
+    def test_saving_somewhere_impossible_returns_false(self, compile_and_run, tmp_path):
+        path = tmp_path / "notes.txt"
+        source = f"""
+        blob f = '{path}'
+        f.write('x')
+        log(f.saveCopy('/definitely/not/a/directory/x.txt'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "false"
+
+    def test_a_failed_save_does_not_adopt_the_path(self, compile_and_run, tmp_path):
+        # Adopting a path the write never reached would leave exists()
+        # answering false about a path the program was just told it has.
+        path = tmp_path / "notes.txt"
+        source = f"""
+        blob f = '{path}'
+        f.write('x')
+        log(f.save('/definitely/not/a/directory/x.txt'))
+        log(f.exists())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["false", "true"]
+
+    def test_a_database_blob_reaches_the_disk_byte_identically(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        # The gap claude.md #109 recorded as open, closed. A blob out of
+        # a column has bytes and no path; save(path) gives it one.
+        db = tmp_path / "t.sqlite"
+        out = tmp_path / "recovered.png"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Assets {{ name:text  data:blob }}
+        blob png = '{sprite_sheet_png}'
+        sqlite('INSERT INTO Assets (name, data) VALUES (?, ?)', ['tiles', png])
+        arr[Assets] rows = sqlite('SELECT * FROM Assets')
+        blob back = rows[0].data
+        log(back.exists())
+        log(back.save('{out}'))
+        log(back.exists())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["false", "true", "true"]
+        assert out.read_bytes() == open(sprite_sheet_png, "rb").read()
+
+    # ---- img ----
+
+    def test_a_clipped_image_can_be_saved_to_a_path(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        # claude.md #110's motivating case, and #109's other open gap: a
+        # clip() result has never been on disk, so save(path) is the only
+        # way it ever gets there.
+        out = tmp_path / "grass.png"
+        source = f"""
+        img spritesheet = '{sprite_sheet_png}'
+        img grass = spritesheet.clip(0, 0, 32, 32)
+        log(grass.save('{out}'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+        data = out.read_bytes()
+        assert data[:8] == b"\x89PNG\r\n\x1a\n", "a clip encodes as PNG"
+        width, height = struct.unpack(">II", data[16:24])
+        assert (width, height) == (32, 32)
+
+    def test_saving_a_clip_then_saving_again_with_no_argument(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        # save(path) adopted the path, so the bare save() now works on a
+        # value that had none a moment ago.
+        out = tmp_path / "grass.png"
+        source = f"""
+        img spritesheet = '{sprite_sheet_png}'
+        img grass = spritesheet.clip(0, 0, 32, 32)
+        log(grass.save('{out}'))
+        log(grass.save())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true"]
+
+    def test_a_pathless_image_save_fails_and_names_img(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        source = f"""
+        img spritesheet = '{sprite_sheet_png}'
+        img grass = spritesheet.clip(0, 0, 32, 32)
+        log(grass.save())
+        """
+        result = compile_and_run(source)
+        assert result.returncode != 0
+        assert "this img has no path to save() to" in result.stderr
+
+    def test_an_image_save_copy_preserves_its_source_bytes(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        # claude.md #101 keeps the bytes an image was loaded from, so a
+        # copy is byte-identical rather than re-encoded.
+        out = tmp_path / "copy.png"
+        source = f"""
+        img sheet = '{sprite_sheet_png}'
+        log(sheet.saveCopy('{out}'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+        assert out.read_bytes() == open(sprite_sheet_png, "rb").read()
+
+    def test_a_jpeg_stays_a_jpeg(self, compile_and_run, tmp_path):
+        src = os.path.join(_FIXTURES_DIR, "gradient.jpg")
+        out = tmp_path / "copy.jpg"
+        source = f"""
+        img grad = '{src}'
+        log(grad.saveCopy('{out}'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+        assert out.read_bytes() == open(src, "rb").read()
+
+    # ---- aud ----
+
+    def test_an_mp3_stays_an_mp3(self, compile_and_run, tmp_path):
+        # Not re-encoded as WAV, for the same reason claude.md #101's
+        # aud columns round-trip: the clip keeps its own encoded bytes.
+        src = os.path.join(_FIXTURES_DIR, "tone.mp3")
+        out = tmp_path / "copy.mp3"
+        source = f"""
+        aud tone = '{src}'
+        log(tone.saveCopy('{out}'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+        assert out.read_bytes() == open(src, "rb").read()
+
+    def test_an_audio_save_with_a_path_adopts_it(self, compile_and_run, tmp_path):
+        src = os.path.join(_FIXTURES_DIR, "beep.wav")
+        first = tmp_path / "a.wav"
+        second = tmp_path / "b.wav"
+        source = f"""
+        aud clip = '{src}'
+        log(clip.save('{first}'))
+        log(clip.save('{second}'))
+        log(clip.save())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true", "true"]
+        original = open(src, "rb").read()
+        assert first.read_bytes() == original
+        assert second.read_bytes() == original
+
+    def test_a_resized_image_keeps_its_path_and_saves_at_the_new_size(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        # resize() mutates in place (claude.md #92), so the path survives
+        # it -- save() with no argument overwrites the file the image came
+        # from, with the resized version. That follows from what save()
+        # means rather than being a special case, and is worth pinning
+        # because it is destructive.
+        src = tmp_path / "sheet.png"
+        src.write_bytes(open(sprite_sheet_png, "rb").read())
+        source = f"""
+        img sheet = '{src}'
+        sheet.resize(16, 16)
+        log(sheet.save())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+        data = src.read_bytes()
+        width, height = struct.unpack(">II", data[16:24])
+        assert (width, height) == (16, 16)
+
+    def test_an_audio_column_reaches_the_disk_byte_identically(
+            self, compile_and_run, tmp_path):
+        src = os.path.join(_FIXTURES_DIR, "tone.mp3")
+        db = tmp_path / "t.sqlite"
+        out = tmp_path / "recovered.mp3"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Tracks {{ name:text  clip:aud }}
+        aud tone = '{src}'
+        sqlite('INSERT INTO Tracks (name, clip) VALUES (?, ?)', ['tone', tone])
+        arr[Tracks] rows = sqlite('SELECT * FROM Tracks')
+        log(rows[0].clip.save('{out}'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+        assert out.read_bytes() == open(src, "rb").read()
+
+    # ---- the surface itself ----
+
+    @pytest.mark.parametrize("decl", [
+        "blob v = 'x'",
+        "img v = 'x.png'",
+        "aud v = 'x.wav'",
+    ])
+    def test_save_copy_requires_its_path(self, parser, semantic, errors, decl):
+        program = parser.parse(f"{decl}\nlog(v.saveCopy())")
+        with pytest.raises(errors.CompileError, match="saveCopy"):
+            semantic.analyze(program)
+
+    @pytest.mark.parametrize("decl", [
+        "blob v = 'x'",
+        "img v = 'x.png'",
+        "aud v = 'x.wav'",
+    ])
+    def test_save_takes_at_most_one_path(self, parser, semantic, errors, decl):
+        program = parser.parse(f"{decl}\nlog(v.save('a', 'b'))")
+        with pytest.raises(errors.CompileError, match="save"):
+            semantic.analyze(program)
+
+    @pytest.mark.parametrize("decl", [
+        "blob v = 'x'",
+        "img v = 'x.png'",
+        "aud v = 'x.wav'",
+    ])
+    def test_the_path_must_be_text(self, parser, semantic, errors, decl):
+        program = parser.parse(f"{decl}\nlog(v.save(5))")
+        with pytest.raises(errors.CompileError, match="must be text"):
+            semantic.analyze(program)
+
+    @pytest.mark.parametrize("decl,method", [
+        ("blob v = 'x'", "save"),
+        ("img v = 'x.png'", "saveCopy"),
+        ("aud v = 'x.wav'", "save"),
+    ])
+    def test_both_return_bool(self, parser, semantic, decl, method):
+        arg = "'p'" if method == "saveCopy" else ""
+        program = parser.parse(f"{decl}\nbool ok = v.{method}({arg})")
+        semantic.analyze(program)
+
+    def test_saving_is_not_offered_on_a_type_that_has_no_bytes(
+            self, parser, semantic, errors):
+        # text has no path and no bytes-plus-origin shape, so this is an
+        # ordinary unknown-method error rather than a save it cannot do.
+        program = parser.parse("text t = 'x'\nlog(t.save('p'))")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+
+class TestBlobColumns:
+    """claude.md #109: a blob column stores the file's BYTES, so it
+    round-trips. Same treatment claude.md #101 gave aud/img columns, and
+    for the same reason -- all three are content plus the bytes it came
+    from."""
+
+    def test_a_blob_column_round_trips_its_contents(
+            self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        src = tmp_path / "payload.txt"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Saves {{ name:text  data:blob }}
+        blob f = '{src}'
+        f.write('the payload')
+        sqlite('INSERT INTO Saves (name, data) VALUES (?, ?)', ['slot1', f])
+        arr[Saves] rows = sqlite('SELECT * FROM Saves')
+        log(rows.length)
+        log(rows[0].name)
+        log(rows[0].data.toText())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["1", "slot1", "the payload"]
+
+    def test_binary_content_survives_the_round_trip_intact(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        # The case a text column could never handle: a PNG is full of
+        # NUL bytes, and reading the column as a C string would stop at
+        # the first one. Checked by length, since a truncation is
+        # exactly what a length comparison catches.
+        db = tmp_path / "t.sqlite"
+        out = tmp_path / "back.png"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Assets {{ name:text  data:blob }}
+        blob png = '{sprite_sheet_png}'
+        sqlite('INSERT INTO Assets (name, data) VALUES (?, ?)', ['tiles', png])
+        arr[Assets] rows = sqlite('SELECT * FROM Assets')
+        blob back = rows[0].data
+        blob out = '{out}'
+        log(back.toText() != '')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # The real proof is byte-level and lives outside the language,
+        # which has no way to compare binary buffers: read the stored
+        # column back with Python and diff it against the source file.
+        import sqlite3
+        stored = sqlite3.connect(str(db)).execute(
+            "select data from Assets").fetchone()[0]
+        assert bytes(stored) == open(sprite_sheet_png, "rb").read()
+
+    def test_a_column_blob_has_no_path(self, compile_and_run, tmp_path):
+        # It has bytes and nowhere to put them: a path is meaningful
+        # only on the machine that stored it, so the contents are what
+        # round-trips. exists()/write()/delete() answer false rather
+        # than inventing a temporary file.
+        db = tmp_path / "t.sqlite"
+        src = tmp_path / "payload.txt"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Saves {{ name:text  data:blob }}
+        blob f = '{src}'
+        f.write('stored')
+        sqlite('INSERT INTO Saves (name, data) VALUES (?, ?)', ['s', f])
+        arr[Saves] rows = sqlite('SELECT * FROM Saves')
+        blob back = rows[0].data
+        log(back.toText())
+        log(back.exists())
+        log(back.write('nope'))
+        log(back.delete())
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["stored", "false", "false", "false"]
+
+    def test_a_null_blob_column_reads_back_as_null(self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Saves {{ name:text  data:blob }}
+        sqlite('INSERT INTO Saves (name) VALUES (?)', ['empty'])
+        arr[Saves] rows = sqlite('SELECT * FROM Saves')
+        log(rows[0].data == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+
+    def test_the_column_type_is_a_sql_blob(self, sqlite_schema):
+        assert sqlite_schema.TYPE_MAP["blob"] == "BLOB"
+
+
 class TestMediaFormatsAndPaths:
     """claude.md #101: `img sprite = 'sprite.png'` alongside claude.md
     #100's `aud`, JPEG and MP3 decoding, and both types as sqlite BLOB
@@ -6145,17 +7724,39 @@ class TestRegex:
         result = compile_and_run("log('a-b-c'.replace('-', '_'))")
         assert result.stdout.strip() == "a_b-c"
 
-    def test_replace_all_replaces_every_occurrence(self, compile_and_run):
-        result = compile_and_run("log('a-b-c'.replaceAll('-', '_'))")
+    def test_a_text_search_never_replaces_more_than_the_first(self, compile_and_run):
+        # claude.md #107: .replaceAll() is gone and a plain-text search
+        # carries no flags, so there is no longer any way to replace
+        # every occurrence of a literal substring except by making it a
+        # /g pattern. That is a real narrowing of the text path and is
+        # pinned here so it cannot drift back silently.
+        result = compile_and_run("log('a-b-c'.replace('-', '_'))")
+        assert result.stdout.strip() == "a_b-c"
+
+    def test_a_g_pattern_is_how_every_occurrence_is_spelled_now(self, compile_and_run):
+        result = compile_and_run(r"log('a-b-c'.replace(/-/g, '_'))")
         assert result.stdout.strip() == "a_b_c"
 
     def test_replace_with_no_match_returns_original_unchanged(self, compile_and_run):
         result = compile_and_run("log('hello world'.replace('zzz', 'nope'))")
         assert result.stdout.strip() == "hello world"
 
-    def test_replace_all_with_regex_search(self, compile_and_run):
-        result = compile_and_run("log('a1b2c3'.replaceAll(regex('[0-9]'), '-'))")
+    def test_a_dynamic_regex_can_carry_the_g_flag(self, compile_and_run):
+        # claude.md #107's real gain over .replaceAll(): the flag lives
+        # on the compiled pattern, so a pattern whose flags are only
+        # known at run time can be global. The old design decided
+        # first-vs-every at the CALL SITE, which a runtime-built
+        # pattern could never influence.
+        result = compile_and_run("log('a1b2c3'.replace(regex('[0-9]', 'g'), '-'))")
         assert result.stdout.strip() == "a-b-c-"
+
+    def test_a_dynamic_regex_without_g_replaces_the_first_only(self, compile_and_run):
+        result = compile_and_run("log('a1b2c3'.replace(regex('[0-9]'), '-'))")
+        assert result.stdout.strip() == "a-b2c3"
+
+    def test_a_dynamic_regex_flag_string_may_combine_g_and_i(self, compile_and_run):
+        result = compile_and_run("log('TEST test'.replace(regex('test', 'gi'), 'x'))")
+        assert result.stdout.strip() == "x x"
 
     def test_replace_with_regex_search_first_match_only(self, compile_and_run):
         result = compile_and_run("log('a1b2c3'.replace(regex('[0-9]'), '-'))")
@@ -6166,7 +7767,7 @@ class TestRegex:
         # straightforward correctness requirement, not something to
         # leave unresolved: a pattern that can match zero-width (e.g.
         # "x*" where there's no "x") must not spin the runtime forever.
-        result = compile_and_run("log('abc'.replaceAll(regex('x*'), '-'))")
+        result = compile_and_run("log('abc'.replace(regex('x*', 'g'), '-'))")
         assert result.returncode == 0
         assert result.stdout.strip() == "-a-b-c-"
 
@@ -6241,9 +7842,44 @@ class TestRegexLiteral:
         result = compile_and_run("log('room 42, building 7'.match(/[0-9]+/))")
         assert result.stdout.strip() == "42"
 
-    def test_replace_all_with_regex_literal_search(self, compile_and_run):
-        result = compile_and_run("log('a1b2c3'.replaceAll(/[0-9]/, '-'))")
+    def test_a_g_literal_replaces_every_match(self, compile_and_run):
+        result = compile_and_run("log('a1b2c3'.replace(/[0-9]/g, '-'))")
         assert result.stdout.strip() == "a-b-c-"
+
+    def test_the_same_literal_without_g_replaces_only_the_first(self, compile_and_run):
+        result = compile_and_run("log('a1b2c3'.replace(/[0-9]/, '-'))")
+        assert result.stdout.strip() == "a-b2c3"
+
+    def test_gi_together_are_global_and_case_insensitive(self, compile_and_run):
+        # The user's own example spelling: /test/gi.
+        result = compile_and_run("log('TEST test'.replace(/test/gi, 'x'))")
+        assert result.stdout.strip() == "x x"
+
+    def test_i_alone_is_case_insensitive_but_not_global(self, compile_and_run):
+        result = compile_and_run("log('TEST test'.replace(/test/i, 'x'))")
+        assert result.stdout.strip() == "x test"
+
+    def test_g_does_not_make_test_stateful(self, compile_and_run):
+        # claude.md #107: JS's /g gives .test() a lastIndex that makes
+        # repeated calls alternate true/false. Deliberately not
+        # reproduced -- the same test against the same string is the
+        # same answer every time.
+        source = """
+        regex p = /[0-9]/g
+        log(p.test('a1'))
+        log(p.test('a1'))
+        log(p.test('a1'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true", "true"]
+
+    def test_g_does_not_change_what_match_returns(self, compile_and_run):
+        # claude.md #107: in JS, /g makes .match() return an array
+        # instead of a string. Festina's .match() returns text, and a
+        # return TYPE cannot depend on a flag that regex(p, f) only
+        # knows at run time -- so 'g' is ignored here, by design.
+        result = compile_and_run("log('a1b2c3'.match(/[0-9]/g))")
+        assert result.stdout.strip() == "1"
 
     def test_escaped_slash_in_a_literal_pattern_matches_a_literal_slash(self, compile_and_run):
         result = compile_and_run(r"log(/a\/b/.test('a/b'))")
@@ -6817,23 +8453,36 @@ class TestSqliteQueries:
         assert result.returncode == 0
         assert result.stdout.strip() == "nan"
 
-    def test_columns_map_by_position_not_name(self, compile_and_run):
-        # claude.md #34: "The table declaration defines the expected
-        # fields and their types" -- a query returning the same columns
-        # in the same order (even via a differently-aliased SELECT) still
-        # maps positionally onto the declared table.
+    def test_columns_map_by_name_not_position(self, compile_and_run):
+        # claude.md #111 INVERTED this test, which used to pin positional
+        # mapping (and was named test_columns_map_by_position_not_name).
+        # Positional mapping was a bug hiding behind the SELECT * habit:
+        # `SELECT name FROM People` read the name's text into the id slot
+        # as an integer, and `SELECT id` read a result column that did
+        # not exist. Matching is by name now, case-insensitively, so a
+        # REORDERED select lands every value in its declared column --
+        # and an alias renames a column away from its declared name, so
+        # aliased columns are simply not matched (they read as null and
+        # undefined()). Alias TO a declared name to remap deliberately.
         source = """
         table People {
             id:int
             name:text
         }
         sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'Patrick'])
-        arr[People] people = sqlite('SELECT id AS whatever, name AS anything FROM People')
+        arr[People] people = sqlite('SELECT name, id FROM People')
+        log(people[0].id)
         log(people[0].name)
+        arr[People] aliased = sqlite('SELECT id AS whatever FROM People')
+        log(aliased[0].id == null)
+        log(aliased[0].undefined('id'))
+        arr[People] remapped = sqlite("SELECT 'Renamed' AS name FROM People")
+        log(remapped[0].name)
         """
         result = compile_and_run(source)
         assert result.returncode == 0
-        assert result.stdout.strip() == "Patrick"
+        assert result.stdout.splitlines() == [
+            "1", "Patrick", "true", "true", "Renamed"]
 
     def test_exec_only_query_discards_result(self, compile_and_run):
         # A statement whose result isn't captured into an arr[Table]
@@ -6983,7 +8632,7 @@ class TestSlimBinaries:
         from festina import cli as cli_mod
 
         src = tmp_path / "main.f"
-        src.write_text("img icon = loadImage('nonexistent.png')")
+        src.write_text("img icon = 'nonexistent.png'")
         out = tmp_path / "program"
         cli_mod.compile_file(str(src), str(out), cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
         assert out.exists()
@@ -7334,7 +8983,7 @@ class TestTextReferenceManagement:
         void func run() {
             log('room 42'.replace(/[0-9]+/, 'N'))
             log(wrap('abc').replace('b', 'Z'))
-            log(`${'hello'}`.replaceAll('l', 'L'))
+            log(`${'hello'}`.replace(/l/g, 'L'))
         }
         run()
         """
@@ -7495,9 +9144,16 @@ class TestQueryRowAndRegexReclamation:
         row_fn = ir.split("define void @__festina_release_row_People")[1].split("\n}")[0]
         assert row_fn.count("call void @free(") == 2
 
-    def test_row_release_only_frees_text_and_blob_columns(self, parser, semantic, codegen):
+    def test_row_release_frees_each_column_by_its_own_kind(
+            self, parser, semantic, codegen):
         # int/float/bool columns are plain i64 slots, never heap
         # pointers -- freeing one would be freeing an integer.
+        #
+        # claude.md #109: a blob column is a real handle now, so it goes
+        # through festina_blob_release rather than a plain @free. Doing
+        # otherwise would leak its path and byte buffer and skip its
+        # refcount entirely -- the same mistake claude.md #101 fixed for
+        # aud/img columns, arriving here by the same route.
         source = """
         table Mixed { id:int  score:float  ok:bool  name:text  data:blob }
         void func run() {
@@ -7508,8 +9164,9 @@ class TestQueryRowAndRegexReclamation:
         """
         ir = self._ir(parser, semantic, codegen, source)
         row_fn = ir.split("define void @__festina_release_row_Mixed")[1].split("\n}")[0]
-        # 2 heap columns (name, data) + the row buffer itself
-        assert row_fn.count("call void @free(") == 3
+        # The text column, plus the row buffer itself.
+        assert row_fn.count("call void @free(") == 2
+        assert row_fn.count("call void @festina_blob_release(") == 1
 
     def test_runtime_regex_temporary_is_freed(self, parser, semantic, codegen):
         source = """
@@ -8098,7 +9755,7 @@ class TestImageClipResizeAndSize:
     a spritesheet actually needs.
 
     ```festina
-    img sheet = loadImage('sheet.png')
+    img sheet = 'sheet.png'
     img grass = sheet.clip(0, 0, 64, 64)   // a new image
     grass.resize(32, 32)                    // in place
     ```
@@ -8125,7 +9782,7 @@ class TestImageClipResizeAndSize:
 
     def test_width_and_height_emit_runtime_calls(self, parser, semantic, codegen):
         source = """
-        img sheet = loadImage('s.png')
+        img sheet = 's.png'
         log(sheet.width)
         log(sheet.height)
         """
@@ -8135,7 +9792,7 @@ class TestImageClipResizeAndSize:
 
     def test_clip_and_resize_emit_runtime_calls(self, parser, semantic, codegen):
         source = """
-        img sheet = loadImage('s.png')
+        img sheet = 's.png'
         img tile = sheet.clip(0, 32, 64, 64)
         tile.resize(16, 16)
         """
@@ -8185,10 +9842,10 @@ class TestImageClipResizeAndSize:
 
     def test_wrong_arity_and_types_are_rejected(self, parser, semantic, errors):
         for source in [
-            "img s = loadImage('a.png')\ns.clip(0, 0, 64)",
-            "img s = loadImage('a.png')\ns.resize(1, 2, 3)",
-            "img s = loadImage('a.png')\ns.clip(0, 0, 64, 'x')",
-            "img s = loadImage('a.png')\ns.resize('a', 2)",
+            "img s = 'a.png'\ns.clip(0, 0, 64)",
+            "img s = 'a.png'\ns.resize(1, 2, 3)",
+            "img s = 'a.png'\ns.clip(0, 0, 64, 'x')",
+            "img s = 'a.png'\ns.resize('a', 2)",
         ]:
             program = parser.parse(source, filename="main.f")
             with pytest.raises(errors.CompileError):
@@ -8197,13 +9854,13 @@ class TestImageClipResizeAndSize:
     def test_an_unknown_img_field_is_rejected(self, parser, semantic, errors):
         # This branch used to be a permissive `return None`, which
         # silently accepted every typo on an img.
-        program = parser.parse("img s = loadImage('a.png')\nlog(s.widht)",
+        program = parser.parse("img s = 'a.png'\nlog(s.widht)",
                                 filename="main.f")
         with pytest.raises(errors.CompileError, match="img has no field"):
             semantic.analyze(program, filename="main.f")
 
     def test_a_method_referenced_without_calling_says_so(self, parser, semantic, errors):
-        program = parser.parse("img s = loadImage('a.png')\nlog(s.clip)",
+        program = parser.parse("img s = 'a.png'\nlog(s.clip)",
                                 filename="main.f")
         with pytest.raises(errors.CompileError, match="is a method on img"):
             semantic.analyze(program, filename="main.f")
@@ -8226,7 +9883,7 @@ class TestImageClipResizeAndSize:
     def test_clip_resize_and_dimensions_against_a_real_sheet(
             self, compile_and_run, sprite_sheet_png):
         source = f"""
-        img sheet = loadImage('{sprite_sheet_png}')
+        img sheet = '{sprite_sheet_png}'
         log(`${{sheet.width}}x${{sheet.height}}`)
 
         img tile = sheet.clip(32, 32, 32, 32)
@@ -8248,7 +9905,7 @@ class TestImageClipResizeAndSize:
         # An img is a shared handle, so resizing through one name is
         # visible through another -- that is what "in place" means.
         source = f"""
-        img sheet = loadImage('{sprite_sheet_png}')
+        img sheet = '{sprite_sheet_png}'
         img a = sheet.clip(0, 0, 32, 32)
         img b = a
         a.resize(4, 4)
@@ -8261,7 +9918,7 @@ class TestImageClipResizeAndSize:
     def test_a_non_positive_size_fails_clearly(self, compile_and_run, sprite_sheet_png):
         for call in ["sheet.clip(0, 0, 0, 8)", "sheet.resize(8, 0)"]:
             source = f"""
-            img sheet = loadImage('{sprite_sheet_png}')
+            img sheet = '{sprite_sheet_png}'
             {call}
             """
             result = compile_and_run(source)
@@ -8286,7 +9943,7 @@ class TestImageClipRendersRealPixels:
         # The fixture's grid: tile (col, row) -> index row*4+col.
         # (0,0) red, (1,0) green, (1,1) cyan.
         source = f"""
-        img sheet = loadImage('{sprite_sheet_png}')
+        img sheet = '{sprite_sheet_png}'
         img red = sheet.clip(0, 0, 32, 32)
         img green = sheet.clip(32, 0, 32, 32)
         img cyan = sheet.clip(32, 32, 32, 32)
@@ -8311,7 +9968,7 @@ class TestImageClipRendersRealPixels:
         if not shutil.which("xwd"):
             pytest.skip("xwd isn't installed -- needed to read real canvas pixels")
         source = f"""
-        img sheet = loadImage('{sprite_sheet_png}')
+        img sheet = '{sprite_sheet_png}'
         img big = sheet.clip(0, 0, 32, 32)
         big.resize(96, 96)
         drawImage(big, 10, 10)
@@ -8435,56 +10092,78 @@ class TestMathFileAndTime:
         assert result.returncode == 0
         assert result.stdout == "true\ntrue\n"
 
-    # ---- files ----
+    # ---- files, via blob since claude.md #109 ----
 
     def test_file_round_trip(self, compile_and_run, tmp_path):
+        # claude.md #109: the same round trip claude.md #93's five free
+        # functions did, asked of the value that already holds the path.
         path = str(tmp_path / "note.txt")
         source = f"""
-        log(writeFile('{path}', 'hello'))
-        log(appendFile('{path}', ' world'))
-        log(readFile('{path}'))
-        log(fileExists('{path}'))
-        log(deleteFile('{path}'))
-        log(fileExists('{path}'))
+        blob f = '{path}'
+        log(f.write('hello'))
+        log(f.append(' world'))
+        log(f.toText())
+        log(f.exists())
+        log(f.delete())
+        log(f.exists())
         """
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "true\ntrue\nhello world\ntrue\ntrue\nfalse\n"
 
-    def test_reading_a_missing_file_is_null_not_a_crash(
+    def test_a_missing_file_is_an_ordinary_condition_not_a_crash(
             self, compile_and_run, tmp_path):
-        # A missing file is an ordinary condition to test for, the same
-        # reasoning claude.md #57 applies to division by zero.
+        # A missing file is something to test for, the same reasoning
+        # claude.md #57 applies to division by zero. claude.md #109
+        # keeps that rule: declaring a blob on a path that is not there
+        # yields an empty blob rather than failing.
         missing = str(tmp_path / "nope.txt")
         source = f"""
-        log(readFile('{missing}') == null)
-        log(fileExists('{missing}'))
-        log(deleteFile('{missing}'))
+        blob f = '{missing}'
+        log(f.toText() == '')
+        log(f.exists())
+        log(f.delete())
         """
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "true\nfalse\nfalse\n"
 
     def test_writing_somewhere_impossible_returns_false(self, compile_and_run):
-        source = "log(writeFile('/definitely/not/a/directory/x.txt', 'hi'))"
+        source = ("blob f = '/definitely/not/a/directory/x.txt'\n"
+                  "log(f.write('hi'))")
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "false\n"
 
     def test_a_file_round_trips_through_text_operations(
             self, compile_and_run, tmp_path):
-        # The value readFile hands back is an ordinary owned text, so it
+        # The value toText() hands back is an ordinary owned text, so it
         # composes with everything else (claude.md #83).
         path = str(tmp_path / "data.txt")
         source = f"""
-        writeFile('{path}', 'a,b,c')
-        text body = readFile('{path}')
-        log(body.replaceAll(',', '-'))
+        blob f = '{path}'
+        f.write('a,b,c')
+        text body = f.toText()
+        log(body.replace(/,/g, '-'))
         log(`${{body}}!`)
         """
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "a-b-c\na,b,c!\n"
+
+    def test_the_removed_file_functions_name_their_replacement(
+            self, parser, semantic, errors):
+        # claude.md #109: removed rather than aliased, each with an
+        # error that shows the blob spelling.
+        for name, call in [("readFile", "readFile('x')"),
+                           ("writeFile", "writeFile('x', 'y')"),
+                           ("appendFile", "appendFile('x', 'y')"),
+                           ("fileExists", "fileExists('x')"),
+                           ("deleteFile", "deleteFile('x')")]:
+            program = parser.parse(f"log({call})")
+            with pytest.raises(errors.CompileError, match=name) as excinfo:
+                semantic.analyze(program)
+            assert "blob" in str(excinfo.value)
 
     # ---- time ----
 

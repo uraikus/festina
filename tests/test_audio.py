@@ -9,7 +9,8 @@ import pytest
 
 
 class TestAudioType:
-    """claude.md #38: aud, loadAudio()."""
+    """claude.md #38: aud, declared from a path (claude.md #109 removed
+    loadAudio(), leaving the path form as the only spelling)."""
 
     def test_aud_declaration_parses(self, parser):
         parser.parse("aud music = 'music.wav'")
@@ -18,15 +19,18 @@ class TestAudioType:
         program = parser.parse("aud music = 'music.wav'")
         semantic.analyze(program)
 
-    def test_load_audio_wrong_argument_count_is_a_compile_error(self, parser, semantic, errors):
-        program = parser.parse("aud music = loadAudio()")
+    def test_load_audio_is_gone_and_says_what_to_use_instead(
+            self, parser, semantic, errors):
+        # claude.md #109: removed rather than aliased.
+        program = parser.parse("aud music = loadAudio('music.wav')")
         with pytest.raises(errors.CompileError, match="loadAudio"):
             semantic.analyze(program)
 
-    def test_load_audio_non_text_argument_is_a_compile_error(self, parser, semantic, errors):
-        program = parser.parse("aud music = loadAudio(5)")
-        with pytest.raises(errors.CompileError):
+    def test_the_load_audio_error_shows_the_path_form(self, parser, semantic, errors):
+        program = parser.parse("aud music = loadAudio('music.wav')")
+        with pytest.raises(errors.CompileError) as excinfo:
             semantic.analyze(program)
+        assert "aud music = 'music.mp3'" in str(excinfo.value)
 
 
 class TestAudioMethods:
@@ -41,10 +45,20 @@ class TestAudioMethods:
         program = parser.parse(source)
         semantic.analyze(program)
 
-    def test_stop_is_gone_and_says_what_to_use_instead(self, parser, semantic, errors):
-        # claude.md #100: one clip can be playing on several channels at
-        # once, so "stop this clip" never named one thing.
+    def test_stop_is_back_and_takes_no_arguments(self, parser, semantic):
+        # claude.md #109: stop() returned, meaning the thing claude.md
+        # #100 named as its only honest reading -- stop every channel
+        # playing this clip. #100 removed it because that is rarely what
+        # an overlapping-effects program wants; #109 covers that case by
+        # having play() return its channel, so the two coexist.
         source = "aud music = 'music.wav'\nmusic.stop()"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_stop_rejects_a_channel_argument(self, parser, semantic, errors):
+        # It names the CLIP, not a channel. stopAudioPlayer(n) is how
+        # one channel is addressed, and the error says so.
+        source = "aud music = 'music.wav'\nmusic.stop(0)"
         program = parser.parse(source)
         with pytest.raises(errors.CompileError, match="stopAudioPlayer"):
             semantic.analyze(program)
@@ -71,12 +85,12 @@ class TestAudioMethods:
         program = parser.parse(source)
         semantic.analyze(program)
 
-    @pytest.mark.parametrize("method", ["isPlaying"])
+    @pytest.mark.parametrize("method", ["isPlaying", "stop"])
     def test_takes_no_arguments(self, parser, semantic, errors, method):
-        # claude.md #99/#100: play/playLoop take an optional channel and
-        # stop() is gone, so isPlaying is the only argument-free method
-        # left. It stays clip-wide: "is this sound audible anywhere" has
-        # a single answer even when several channels are playing it.
+        # claude.md #99/#109: play/playLoop take an optional channel;
+        # isPlaying and stop take none. Both are clip-wide, which is the
+        # same question asked two ways -- "is this sound audible
+        # anywhere" and "silence it everywhere".
         source = f"aud music = 'music.wav'\nmusic.{method}(1)"
         program = parser.parse(source)
         with pytest.raises(errors.CompileError, match="no arguments"):

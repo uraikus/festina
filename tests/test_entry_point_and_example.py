@@ -24,8 +24,8 @@ text func greet(user:User) {
     return message
 }
 
-on click(x:int, y:int) {
-    log(`Clicked at ${x}, ${y}`)
+on mouseDown(x:int, y:int) {
+    log(`Pressed at ${x}, ${y}`)
 }
 
 drawRect(0, 0, 100, 100)

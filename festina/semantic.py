@@ -5,7 +5,7 @@ rules from #12-20, the struct/table distinction from #27, #28, #35, and
 int.toFloat() are the only conversions). #58 (struct/table namespace):
 struct/table names live in `structs`/`tables`, never cross-checked
 against `Scope` (variables/functions) -- separate namespaces by design.
-#67/#68 (regex(), .test(), .match(), .replace()/.replaceAll()) follow
+#67/#68/#107 (regex(), .test(), .match(), .replace()) follow
 the same "recognized Call-on-Member pattern" approach Math.floor/
 int.toFloat() already established -- Festina has no general concept of
 methods on primitive types, so each one is checked by name against the
@@ -37,10 +37,45 @@ from .errors import CompileError
 # ever reaching the BUILTIN_FUNCTIONS check below, since setTimeout/
 # setInterval's first argument (a callback) needs structural handling
 # no other builtin needs -- see the comment there.
+# claude.md #109: names that used to be builtins, each mapped to the
+# sentence that says what replaced it. Checked before "unknown
+# function" so a program written against the old surface gets told what
+# to write instead of being told the name does not exist -- the same
+# treatment claude.md #100 gave aud.stop() and #107 gave replaceAll().
+# Every one of these was removed because the language had grown a
+# better way to say the same thing and keeping both was the only thing
+# making either confusing.
+# claude.md #109: blob's methods -- name -> (argument types, return
+# type). A blob is a file's bytes plus the path they came from, so
+# these are exactly the five things claude.md #93's free functions did
+# with a path, asked of the value that already holds one.
+#
+# toText() returns the bytes as text; the other four act on the file.
+# write/append/delete return bool rather than failing the program,
+# preserving claude.md #93's own rule that a missing or unwritable file
+# is something a program tests for rather than something that stops it.
+_REMOVED_BUILTINS = {
+    "loadImage": "loadImage() is gone -- declare the image from its path "
+                 "instead: img sprite = 'sprite.png' (the path may be any "
+                 "text expression)",
+    "loadAudio": "loadAudio() is gone -- declare the clip from its path "
+                 "instead: aud music = 'music.mp3' (the path may be any "
+                 "text expression)",
+    "readFile": "readFile() is gone -- declare a blob from the path and read "
+                "it: blob f = 'notes.txt'  text body = f.toText()",
+    "writeFile": "writeFile() is gone -- declare a blob from the path and "
+                 "write to it: blob f = 'notes.txt'  f.write('hello')",
+    "appendFile": "appendFile() is gone -- declare a blob from the path and "
+                  "append to it: blob f = 'notes.txt'  f.append(' world')",
+    "fileExists": "fileExists() is gone -- declare a blob from the path and "
+                  "ask it: blob f = 'notes.txt'  bool there = f.exists()",
+    "deleteFile": "deleteFile() is gone -- declare a blob from the path and "
+                  "delete it: blob f = 'notes.txt'  f.delete()",
+}
+
 BUILTIN_FUNCTIONS = {
     "log", "fail", "sqlite",
     "drawRect", "drawCircle", "drawText", "drawImage",
-    "loadImage", "loadAudio",
     # claude.md #98: how many channels the pool may assign automatically.
     "setMaxAudioPlayers", "maxAudioPlayers",
     # claude.md #99: stop one channel (or, with no argument, all of them).
@@ -52,9 +87,9 @@ BUILTIN_FUNCTIONS = {
     "measureTextWidth", "measureTextHeight",
     "regex",
     "setTimeout", "setInterval", "clearTimeout", "clearInterval",
-    # claude.md #93: files, time, and canvas export -- all backed by
-    # libc or by Cairo's own PNG writer, both already linked.
-    "readFile", "writeFile", "appendFile", "fileExists", "deleteFile",
+    # claude.md #93: time and canvas export -- backed by libc and by
+    # Cairo's own PNG writer, both already linked. claude.md #109 moved
+    # this section's file functions onto `blob` itself.
     "now", "formatTime", "saveCanvas",
     # claude.md #94: paths, transforms, gradients, alpha
     "render", "clearCanvas", "clearRect",
@@ -69,8 +104,6 @@ BUILTIN_FUNCTIONS = {
 }
 
 _BUILTIN_RETURN_TYPES = {
-    "loadImage": types_mod.ImageType(),
-    "loadAudio": types_mod.AudioType(),
     # claude.md #98: reads back the limit AFTER clamping, so a program
     # can see what it actually got rather than what it asked for.
     "maxAudioPlayers": types_mod.PrimitiveType("int"),
@@ -79,11 +112,6 @@ _BUILTIN_RETURN_TYPES = {
     "measureTextWidth": types_mod.PrimitiveType("int"),
     "measureTextHeight": types_mod.PrimitiveType("int"),
     # claude.md #93
-    "readFile": types_mod.PrimitiveType("text"),
-    "writeFile": types_mod.PrimitiveType("bool"),
-    "appendFile": types_mod.PrimitiveType("bool"),
-    "fileExists": types_mod.PrimitiveType("bool"),
-    "deleteFile": types_mod.PrimitiveType("bool"),
     "now": types_mod.PrimitiveType("int"),
     "formatTime": types_mod.PrimitiveType("text"),
     "saveCanvas": types_mod.PrimitiveType("bool"),
@@ -99,6 +127,17 @@ _FLOAT = types_mod.PrimitiveType("float")
 _NUMERIC_TYPES = (_INT, _FLOAT)
 _TEXT = types_mod.PrimitiveType("text")
 _BLOB = types_mod.PrimitiveType("blob")
+_BOOL = types_mod.PrimitiveType("bool")
+
+# See the placeholder above for what this is and why. Defined here
+# rather than there because it needs _TEXT/_BOOL.
+_BLOB_METHODS = {
+    "toText": ((), _TEXT),
+    "write": ((_TEXT,), _BOOL),
+    "append": ((_TEXT,), _BOOL),
+    "exists": ((), _BOOL),
+    "delete": ((), _BOOL),
+}
 
 # claude.md #37, #39: signatures for the builtins with real implementations
 # (drawCircle/drawText/drawImage/loadImage) -- matches each function's own
@@ -111,8 +150,6 @@ _BUILTIN_SIGNATURES = {
     "drawCircle": (_INT, _INT, _INT),
     "drawText": (_TEXT, _INT, _INT),
     "drawImage": (types_mod.ImageType(), _INT, _INT),
-    "loadImage": (_TEXT,),
-    "loadAudio": (_TEXT,),  # claude.md #38
     "setMaxAudioPlayers": (_INT,),  # claude.md #98
     "maxAudioPlayers": (),
     # claude.md #89: a colour is text (a name, #rgb/#rrggbb, or 'none'),
@@ -123,11 +160,6 @@ _BUILTIN_SIGNATURES = {
     "measureTextWidth": (_TEXT,),
     "measureTextHeight": (_TEXT,),
     # claude.md #93
-    "readFile": (_TEXT,),
-    "writeFile": (_TEXT, _TEXT),
-    "appendFile": (_TEXT, _TEXT),
-    "fileExists": (_TEXT,),
-    "deleteFile": (_TEXT,),
     "now": (),
     "formatTime": (_INT, _TEXT),
     "saveCanvas": (_TEXT,),
@@ -221,7 +253,13 @@ MATH_CONSTANTS = {"PI": math.pi, "E": math.e}
 # tuple is empty and `param_types != sig` alone (no separate length
 # check needed) catches both "too many" and "wrong type" mistakes.
 _EVENT_SIGNATURES = {
-    "click": ((_INT, _INT), "(x:int, y:int)"),
+    # claude.md #106: `on click` split into press and release, the same
+    # way claude.md #98 split `on key`. A click is a press and a
+    # release, and dragging -- or charging a shot, or hold-to-aim --
+    # needs to tell them apart; `on click` fired on press and collapsed
+    # the two, so there was nothing to listen for on the way up.
+    "mouseDown": ((_INT, _INT), "(x:int, y:int)"),
+    "mouseUp": ((_INT, _INT), "(x:int, y:int)"),
     "mouse": ((_INT, _INT), "(x:int, y:int)"),
     # claude.md #98: one `on key` became two, so a program can tell a
     # press from a release -- holding a movement key and letting it go
@@ -708,16 +746,20 @@ def analyze(program, filename="<string>"):
                 # mismatch here (only the text-specific branch of
                 # _emit_binop even looks at the operand types) and
                 # produced invalid LLVM IR instead of a clear compile
-                # error. NULL is valid against everything (#25); blob
-                # and text are mutually comparable since check_assignable
-                # already allows text -> blob assignment and they share
-                # the identical runtime representation (both `ptr`,
-                # compared via the same festina_str_eq either way).
+                # error. NULL is valid against everything (#25).
+                #
+                # claude.md #109 removed the blob/text exception that
+                # used to live here. It was justified by the two sharing
+                # a runtime representation -- both `ptr` to bytes,
+                # compared by festina_str_eq either way -- which stopped
+                # being true when a blob became a handle. Comparing one
+                # to a text now would compare a struct's address against
+                # a string's contents. `f.toText() == t` is the
+                # comparison that was actually meant, and it says so.
                 compatible = (
                     left is None or right is None
                     or left is NULL or right is NULL
                     or left == right
-                    or {left, right} == {_TEXT, _BLOB}
                 )
                 if not compatible:
                     raise CompileError(
@@ -882,7 +924,7 @@ def analyze(program, filename="<string>"):
             # silently accepted every typo.
             if expr.prop in ("width", "height"):
                 return types_mod.PrimitiveType("int")
-            if expr.prop in ("clip", "resize"):
+            if expr.prop in ("clip", "resize", "save", "saveCopy"):
                 raise CompileError(
                     f"'{expr.prop}' is a method on img -- call it, "
                     f"e.g. `sheet.{expr.prop}(...)`",
@@ -1032,8 +1074,13 @@ def analyze(program, filename="<string>"):
                 return _BUILTIN_RETURN_TYPES.get(name)
             sym = scope.lookup(name)
             if sym is None or sym.kind != "function":
+                # claude.md #109: a name this language used to have gets
+                # told what replaced it, not merely that it is unknown.
+                # A user-declared function of the same name still wins,
+                # since scope.lookup ran first -- nothing here reserves
+                # the old names, it only explains them.
                 raise CompileError(
-                    f"unknown function '{name}'",
+                    _REMOVED_BUILTINS.get(name, f"unknown function '{name}'"),
                     file=filename, line=callee.line, column=callee.column,
                     category="unknown function",
                 )
@@ -1125,10 +1172,28 @@ def analyze(program, filename="<string>"):
                         category="invalid function argument type",
                     )
                 return _TEXT
+            # claude.md #107: .replaceAll() is GONE. How many matches a
+            # replace touches is a property of the PATTERN now, spelled
+            # with JS's own 'g' flag -- `/x/g` replaces every match,
+            # `/x/` replaces the first -- rather than a property of
+            # which method was called. Two ways to say the same thing
+            # is one too many, and the flag is the way JS says it.
+            # Caught by name here, like aud.stop() below, so the error
+            # can name the replacement instead of just failing.
+            if callee.prop == "replaceAll" and infer(callee.obj, scope) == _TEXT:
+                raise CompileError(
+                    "text has no replaceAll() -- use the 'g' flag on the "
+                    "pattern instead: value.replace(/search/g, replacement)",
+                    file=filename, line=callee.line, column=callee.column,
+                    category="unknown method",
+                )
             # claude.md #68: value.replace(search, replacement:text) -> text
-            #                value.replaceAll(search, replacement:text) -> text
             # search may be text (a literal substring match) or regex.
-            if callee.prop in ("replace", "replaceAll") and infer(callee.obj, scope) == _TEXT:
+            # claude.md #107: a text search replaces the FIRST match
+            # only, since plain text carries no flags to say otherwise
+            # -- exactly like JS's String.prototype.replace with a
+            # string argument. Every match is spelled /search/g.
+            if callee.prop == "replace" and infer(callee.obj, scope) == _TEXT:
                 if len(expr.args) != 2:
                     raise CompileError(
                         f"{callee.prop}() expects exactly 2 arguments, got {len(expr.args)}",
@@ -1159,9 +1224,12 @@ def analyze(program, filename="<string>"):
             # generic "Member call" fallback below and fails there via
             # _infer_member's now-strict AudioType handling, the same
             # way an unknown struct field does.
-            # claude.md #99: play/playLoop take an OPTIONAL channel;
-            # stop still takes none (it names the clip, not a channel --
-            # stopAudioPlayer(n) is how a program addresses one channel).
+            # claude.md #99: play/playLoop take an OPTIONAL channel.
+            # claude.md #109: and both RETURN the channel they played
+            # on, as an int. Automatic assignment picks a channel the
+            # caller could not otherwise learn, so the pool was
+            # addressable only by naming a channel by hand -- which is
+            # to say, by not using the pool. -1 if nothing was played.
             if callee.prop in ("play", "playLoop") and infer(callee.obj, scope) == _AUDIO:
                 if len(expr.args) > 1:
                     raise CompileError(
@@ -1179,24 +1247,121 @@ def analyze(program, filename="<string>"):
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid function argument type",
                         )
-                return None
-            # claude.md #100: aud.stop() is GONE. One clip can be playing
-            # on several channels at once -- three overlapping gunshots
-            # are the ordinary case, not the exotic one -- so "stop this
-            # clip" never named one thing, and its only honest reading
-            # (stop every copy of it) is almost never what a program
-            # firing overlapping effects wants. Channels are how a
-            # program addresses playback now. Caught by name here rather
-            # than left to the generic unknown-method error so the
-            # message can say what to use instead.
+                return _INT
+            # claude.md #111: row.undefined('col') -- true when the named
+            # column was not in the query's result set, or was deleted;
+            # false when the database genuinely returned NULL (or a
+            # value). The distinction null alone cannot carry.
+            if callee.prop == "undefined":
+                obj_type = infer(callee.obj, scope)
+                if isinstance(obj_type, types_mod.TableType):
+                    if len(expr.args) != 1:
+                        raise CompileError(
+                            f"undefined() expects exactly 1 argument (a column "
+                            f"name), got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    arg_type = infer(expr.args[0], scope)
+                    if (arg_type is not None and arg_type is not NULL
+                            and arg_type != _TEXT):
+                        raise CompileError(
+                            f"undefined()'s column name must be text, found "
+                            f"{types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    return _BOOL
+            # claude.md #110: save()/saveCopy() -- shared by blob, img and
+            # aud, because all three are the same shape of value
+            # (claude.md #101/#109: content plus the bytes it came from)
+            # and one policy for "write those bytes somewhere" is worth
+            # more than three that almost agree.
+            #
+            # save() takes an OPTIONAL path: with one it adopts that path
+            # and writes there, without one it writes to the path it
+            # already has. saveCopy() REQUIRES one -- a copy to nowhere
+            # in particular is not a thing to ask for, and making the
+            # argument mandatory turns "I meant save()" into a compile
+            # error rather than a silent overwrite of the original.
+            if callee.prop in ("save", "saveCopy"):
+                obj_type = infer(callee.obj, scope)
+                if (obj_type == _BLOB
+                        or isinstance(obj_type, (types_mod.ImageType,
+                                                 types_mod.AudioType))):
+                    lo = 0 if callee.prop == "save" else 1
+                    if not (lo <= len(expr.args) <= 1):
+                        if callee.prop == "saveCopy":
+                            detail = ("saveCopy() expects exactly 1 argument (the "
+                                      "path to copy to) -- use save() to write to "
+                                      "this value's own path")
+                        else:
+                            detail = ("save() expects 0 or 1 argument (an optional "
+                                      "path to save to, and adopt)")
+                        raise CompileError(
+                            f"{detail}, got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    if expr.args:
+                        arg_type = infer(expr.args[0], scope)
+                        if (arg_type is not None and arg_type is not NULL
+                                and arg_type != _TEXT):
+                            raise CompileError(
+                                f"{callee.prop}()'s path must be text, found "
+                                f"{types_mod.type_name(arg_type)}",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
+                    return _BOOL
+            # claude.md #109: blob's five methods -- the file functions
+            # claude.md #93 spelled as free functions taking a path,
+            # moved onto the value that already knows the path. Checked
+            # by name here, like every other method on a non-struct
+            # receiver, so arity and argument types are enforced rather
+            # than left to the generic member fallback.
+            if callee.prop in _BLOB_METHODS and infer(callee.obj, scope) == _BLOB:
+                arg_types, return_type = _BLOB_METHODS[callee.prop]
+                if len(expr.args) != len(arg_types):
+                    raise CompileError(
+                        f"{callee.prop}() expects {len(arg_types)} argument"
+                        f"{'' if len(arg_types) == 1 else 's'}, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                for i, expected in enumerate(arg_types):
+                    arg_type = infer(expr.args[i], scope)
+                    if (arg_type is not None and arg_type is not NULL
+                            and arg_type != expected):
+                        raise CompileError(
+                            f"{callee.prop}()'s argument {i + 1} expects "
+                            f"{types_mod.type_name(expected)}, found "
+                            f"{types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return return_type
+            # claude.md #109: aud.stop() is back, and means the thing
+            # claude.md #100 identified as its only honest reading --
+            # stop every channel playing this clip. #100 removed it
+            # because that is almost never what a program firing
+            # overlapping effects wants, which is true and was never a
+            # reason to withhold it: "silence this sound, wherever it
+            # is" is a real thing to want, and doing it by hand meant
+            # tracking channel numbers the runtime already knows. The
+            # overlapping-effects case is covered by play() returning
+            # its channel, so the two coexist instead of one standing
+            # in for the other.
             if callee.prop == "stop" and infer(callee.obj, scope) == _AUDIO:
-                raise CompileError(
-                    "aud has no stop() -- one clip can be playing on several "
-                    "channels at once, so stop it by channel: "
-                    "stopAudioPlayer(channel), or stopAudioPlayer() for all",
-                    file=filename, line=callee.line, column=callee.column,
-                    category="unknown method",
-                )
+                if expr.args:
+                    raise CompileError(
+                        f"stop() expects no arguments, got {len(expr.args)} -- "
+                        f"it stops every channel playing this clip; to stop one "
+                        f"channel use stopAudioPlayer(channel)",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return None
             # claude.md #92: sheet.clip(x, y, w, h) -> img, and
             # image.resize(w, h) -> void (in place). Checked here rather
             # than left to the generic Member-call fallback so the arity
@@ -1359,26 +1524,61 @@ def analyze(program, filename="<string>"):
         return None
 
     def analyze_struct(decl):
-        if decl.name in structs or decl.name in tables:
+        # claude.md #106: `structs[name]` may already hold the empty
+        # placeholder this declaration's own pre-pass entry installed,
+        # so a duplicate is a name with real FIELDS in it, or one the
+        # other namespace claimed -- not merely a name that is present.
+        if structs.get(decl.name) or tables.get(decl.name) is not None:
             raise CompileError(
                 f"'{decl.name}' is already declared",
                 file=filename, line=decl.line, column=decl.column, category="duplicate declaration",
             )
-        field_types = {}
-        for f in decl.fields:
-            field_types[f.name] = resolve(f.type_expr, decl)
+        # claude.md #106: the name is registered BEFORE its own fields
+        # resolve, which is the whole fix for `struct Node { next:Node }`.
+        # Resolving fields first meant a struct could not mention itself
+        # -- the name simply was not in `structs` yet -- and the error
+        # said "unknown type 'Node'", which reads like a typo rather
+        # than an ordering rule. Nothing about the representation ever
+        # required this: a struct-typed field is a pointer (see
+        # codegen's _llvm_type), so a self-reference is finite-sized,
+        # and claude.md #97's auto-vivification makes reaching through
+        # one work without any further machinery.
+        #
+        # The placeholder is empty and is replaced below rather than
+        # mutated in place, so a field lookup can never observe a
+        # half-built struct: resolve() only needs the NAME to exist to
+        # hand back a StructType, never the field list.
+        structs[decl.name] = {}
+        try:
+            field_types = {}
+            for f in decl.fields:
+                field_types[f.name] = resolve(f.type_expr, decl)
+        except Exception:
+            del structs[decl.name]   # leave no half-registered name behind
+            raise
         structs[decl.name] = field_types
 
     def analyze_table(decl):
-        if decl.name in structs or decl.name in tables:
+        # claude.md #106: see analyze_struct's own note on why this
+        # tests for real fields rather than for the name's presence.
+        if tables.get(decl.name) or structs.get(decl.name) is not None:
             raise CompileError(
                 f"'{decl.name}' is already declared",
                 file=filename, line=decl.line, column=decl.column, category="duplicate declaration",
             )
-        columns = {}
-        for f in decl.fields:
-            resolve(f.type_expr, decl)  # validates the type is known
-            columns[f.name] = f.type_expr
+        # claude.md #106: registered before its own fields resolve, the
+        # same way a struct is -- though a table referring to itself is
+        # far less useful, since a column's SQL type has to be one of
+        # the scalars festina_sql_type knows.
+        tables[decl.name] = {}
+        try:
+            columns = {}
+            for f in decl.fields:
+                resolve(f.type_expr, decl)  # validates the type is known
+                columns[f.name] = f.type_expr
+        except Exception:
+            del tables[decl.name]
+            raise
         tables[decl.name] = columns
 
     def analyze_var_decl(decl, scope, is_global):
@@ -1489,6 +1689,88 @@ def analyze(program, filename="<string>"):
             check_condition_bool(cond_type, stmt)
             infer(stmt.update, loop_scope)
             analyze_block(stmt.body, loop_scope, return_type, loop_depth + 1)
+        elif isinstance(stmt, ast.FreeStmt):
+            # claude.md #111: `free name`. Any declared variable of any
+            # type -- releasing is type-dispatched in codegen, and for a
+            # type with nothing to release (int, a borrowed query row)
+            # freeing degenerates to nulling the binding, which is still
+            # a coherent thing to ask for.
+            sym = scope.lookup(stmt.name)
+            if sym is None or sym.kind not in ("variable", "constant", "parameter"):
+                raise CompileError(
+                    f"free: unknown variable '{stmt.name}'",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="unknown variable",
+                )
+            if sym.kind == "constant":
+                raise CompileError(
+                    f"cannot free the constant '{stmt.name}'",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="invalid statement",
+                )
+            if sym.kind == "parameter":
+                # A parameter is a BORROWED reference (claude.md #84) --
+                # the caller's value, which the caller will release.
+                raise CompileError(
+                    f"cannot free the parameter '{stmt.name}' -- a parameter "
+                    f"borrows its caller's value; free it in the caller",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="invalid statement",
+                )
+        elif isinstance(stmt, ast.DeleteStmt):
+            # claude.md #111: `delete m.key` / `delete m['key']` /
+            # `delete s.field`. The target's OBJECT decides the meaning:
+            # a map loses the entry, a struct/table field becomes null
+            # (a row also clears its presence bit -- see undefined()).
+            tgt = stmt.target
+            obj_type = infer(tgt.obj, scope)
+            if isinstance(obj_type, types_mod.MapType):
+                if tgt.computed:
+                    key_type = infer(tgt.prop, scope)
+                    if (key_type is not None and key_type is not NULL
+                            and key_type != _TEXT):
+                        raise CompileError(
+                            f"delete on a map takes a text key, found "
+                            f"{types_mod.type_name(key_type)}",
+                            file=filename, line=stmt.line, column=stmt.column,
+                            category="invalid statement",
+                        )
+            elif isinstance(obj_type, types_mod.StructType):
+                if tgt.computed:
+                    raise CompileError(
+                        "a struct field is deleted by name (delete s.field), "
+                        "not by a computed key",
+                        file=filename, line=stmt.line, column=stmt.column,
+                        category="invalid statement",
+                    )
+                if tgt.prop not in structs.get(obj_type.name, {}):
+                    raise CompileError(
+                        f"struct '{obj_type.name}' has no field '{tgt.prop}'",
+                        file=filename, line=stmt.line, column=stmt.column,
+                        category="invalid field access",
+                    )
+            elif isinstance(obj_type, types_mod.TableType):
+                if tgt.computed:
+                    raise CompileError(
+                        "a row field is deleted by name (delete row.field), "
+                        "not by a computed key",
+                        file=filename, line=stmt.line, column=stmt.column,
+                        category="invalid statement",
+                    )
+                cols = tables.get(obj_type.name) or {}
+                if tgt.prop not in cols:
+                    raise CompileError(
+                        f"table '{obj_type.name}' has no column '{tgt.prop}'",
+                        file=filename, line=stmt.line, column=stmt.column,
+                        category="invalid field access",
+                    )
+            elif obj_type is not None:
+                raise CompileError(
+                    f"delete works on a map key or a struct/row field, not on "
+                    f"{types_mod.type_name(obj_type)}",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="invalid statement",
+                )
         elif isinstance(stmt, ast.BreakStmt):
             if loop_depth == 0:
                 raise CompileError(
@@ -1540,6 +1822,21 @@ def analyze(program, filename="<string>"):
         scope = Scope(parent_scope)
         for stmt in block.body:
             analyze_statement(stmt, scope, return_type, loop_depth)
+
+    # claude.md #106: every struct and table NAME is registered before
+    # any of their fields resolve, so declaration order stops mattering.
+    # `struct Outer { inner:Inner }` written above `struct Inner { ... }`
+    # used to fail with "unknown type 'Inner'" -- an ordering rule
+    # wearing a typo's error message, and a genuinely surprising one in
+    # a language with no forward declarations to write instead. The
+    # per-declaration registration in analyze_struct/analyze_table stays
+    # as it is: this pre-pass only guarantees the name exists, and those
+    # still fill in the real field types and still reject a duplicate.
+    for stmt in program.body:
+        if isinstance(stmt, ast.StructDecl) and stmt.name not in structs:
+            structs[stmt.name] = {}
+        elif isinstance(stmt, ast.TableDecl) and stmt.name not in tables:
+            tables[stmt.name] = {}
 
     for stmt in program.body:
         # claude.md #6: a multi-file program (festina.imports.build_program)

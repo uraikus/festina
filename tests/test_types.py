@@ -148,12 +148,20 @@ class TestBlobImgAud:
         program = parser.parse("blob data = 'path/to/file'")
         semantic.analyze(program)
 
-    def test_blob_and_text_are_mutually_comparable(self, parser, semantic):
-        # blob and text share the identical runtime representation
-        # (both `ptr` -- see codegen.py's _llvm_type), so == between
-        # them is allowed, unlike a genuine type mismatch (e.g. int
-        # vs. text).
-        source = "blob data = 'x'\ntext t = 'x'\nlog(data == t)\nlog(data == 'x')"
+    def test_blob_and_text_are_no_longer_comparable(self, parser, semantic, errors):
+        # They used to be, because they shared a runtime representation
+        # -- both `ptr` to bytes, compared by festina_str_eq either way.
+        # claude.md #109 made a blob a handle, so that stopped being
+        # true: == would compare a struct's address against a string's
+        # contents. `data.toText() == t` is the comparison meant.
+        source = "blob data = 'x'\ntext t = 'x'\nlog(data == t)"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match="cannot compare"):
+            semantic.analyze(program)
+
+    def test_a_blob_compares_against_its_own_contents_via_to_text(
+            self, parser, semantic):
+        source = "blob data = 'x'\ntext t = 'x'\nlog(data.toText() == t)"
         program = parser.parse(source)
         semantic.analyze(program)
 
@@ -172,11 +180,11 @@ class TestBlobImgAud:
             semantic.analyze(program)
 
     def test_img_declaration_parses(self, parser):
-        parser.parse("img profile = loadImage('path/to/profile.png')")
+        parser.parse("img profile = 'path/to/profile.png'")
 
     def test_img_passed_to_graphics_function_parses(self, parser):
         source = (
-            "img profile = loadImage('path/to/profile.png')\n"
+            "img profile = 'path/to/profile.png'\n"
             "drawImage(profile, 0, 0)"
         )
         parser.parse(source)

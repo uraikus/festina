@@ -54,6 +54,11 @@ typedef struct FestinaAudio {
      * an MP3 rather than becoming a much larger WAV. */
     unsigned char *bytes;
     size_t byte_count;
+    /* claude.md #110: the path this clip was loaded from, so save() with
+     * no argument has somewhere to write. Empty (never NULL) for a clip
+     * decoded from bytes rather than a file -- a database column -- which
+     * is the case save(path) exists for and save() refuses. */
+    char *path;
 } FestinaAudio;
 
 typedef struct FestinaChannel {
@@ -395,6 +400,11 @@ void *festina_audio_from_bytes(const void *data, int64_t len, const char *label)
     if (!a->bytes) festina_fail("out of memory loading audio");
     memcpy(a->bytes, bytes, (size_t)len);
     a->byte_count = (size_t)len;
+    /* claude.md #110: empty rather than NULL, so the shared
+     * festina_save_bytes never has to special-case it. festina_load_audio
+     * replaces this with the real path. */
+    a->path = strdup("");
+    if (!a->path) festina_fail("out of memory loading audio");
     return a;
 }
 
@@ -422,7 +432,25 @@ void festina_audio_free(void *audio) {
     pthread_mutex_unlock(&g_audio_lock);
     free(a->samples);
     free(a->bytes);
+    free(a->path);   /* claude.md #110 */
     free(a);
+}
+
+/* claude.md #110: writes the clip's own encoded bytes -- so an MP3 saves
+ * as an MP3 rather than being re-encoded, the same property that makes
+ * a `file:aud` column round-trip byte for byte (claude.md #101). */
+int8_t festina_audio_save(void *audio, const char *target) {
+    if (!audio) return 0;
+    FestinaAudio *a = (FestinaAudio *)audio;
+    return festina_save_bytes(target, &a->path, a->bytes,
+                              (int64_t)a->byte_count, "aud", 1);
+}
+
+int8_t festina_audio_save_copy(void *audio, const char *target) {
+    if (!audio) return 0;
+    FestinaAudio *a = (FestinaAudio *)audio;
+    return festina_save_bytes(target, &a->path, a->bytes,
+                              (int64_t)a->byte_count, "aud", 0);
 }
 
 const void *festina_audio_bytes(void *audio, int64_t *out_len) {
@@ -457,6 +485,13 @@ void *festina_load_audio(const char *path) {
     }
     void *clip = festina_audio_from_bytes(data, (int64_t)size, path);
     free(data);
+    /* claude.md #110: set here rather than in festina_audio_from_bytes,
+     * because that entry point is also how a database column becomes a
+     * clip -- and one of those genuinely has no path. */
+    FestinaAudio *loaded = (FestinaAudio *)clip;
+    free(loaded->path);
+    loaded->path = strdup(path);
+    if (!loaded->path) festina_fail("out of memory loading audio");
     return clip;
 }
 
@@ -580,17 +615,24 @@ int64_t festina_get_max_audio_players(void) {
  * because the four differ only in these two flags -- everything about
  * claiming a channel, opening a device and spawning a thread is
  * identical. */
-void festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel,
-                            int8_t looping) {
+/* claude.md #109: returns the channel it actually played on, so a
+ * program can address the playback it just started -- `int ch =
+ * gunshot.play()` then `stopAudioPlayer(ch)`. Automatic assignment
+ * chooses a channel the caller cannot otherwise learn, which made the
+ * pool addressable only by re-specifying a channel by hand and so
+ * defeating the pool. -1 means nothing was played: a null clip, or
+ * every channel reserved by playLoop with none left to claim. */
+int64_t festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel,
+                               int8_t looping) {
     FestinaAudio *a = (FestinaAudio *)audio;
-    if (!a) return;
+    if (!a) return -1;
 
     pthread_mutex_lock(&g_audio_lock);
     FestinaChannel *ch = festina_audio_claim_channel(channel, explicit_channel);
     if (!ch) {
         /* Every channel is reserved -- see festina_audio_claim_channel. */
         pthread_mutex_unlock(&g_audio_lock);
-        return;
+        return -1;
     }
 
     /* Opened here, synchronously, rather than inside the background
@@ -627,7 +669,7 @@ void festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel
                  "could not open an audio output device: %s (is any audio device available?)",
                  snd_strerror(rc));
         festina_fail(msg);
-        return; /* unreachable -- festina_fail() calls exit() */
+        return -1; /* unreachable -- festina_fail() calls exit() */
     }
 
     ch->clip = a;
@@ -651,9 +693,50 @@ void festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel
         ch->locked = 0;
         pthread_mutex_unlock(&g_audio_lock);
         festina_fail("could not start an audio playback thread");
-        return;
+        return -1; /* unreachable -- festina_fail() calls exit() */
     }
     ch->joinable = 1;
+    int64_t chosen = (int64_t)(ch - g_channels);
+    pthread_mutex_unlock(&g_audio_lock);
+    return chosen;
+}
+
+/* claude.md #109: aud.stop() is BACK, and means what claude.md #100
+ * said its only honest reading was -- stop every channel playing this
+ * clip. #100 removed it on the grounds that this is almost never what
+ * a program firing overlapping effects wants, which is true and is
+ * also not a reason to withhold it: "silence this sound, wherever it
+ * is" is a real thing to want (a looping engine hum, a dialogue line,
+ * a music bed on more than one channel), and the alternative was
+ * tracking channel numbers by hand for something the runtime already
+ * knows. play()/playLoop() returning their channel is what covers the
+ * other case, so the two now sit side by side rather than one
+ * standing in for the other.
+ *
+ * Joins rather than merely signalling, exactly like
+ * festina_stop_audio_player, so every voice of this clip is
+ * guaranteed idle the instant this returns. Stopping a clip that is
+ * not playing is a safe no-op. */
+void festina_audio_stop_clip(void *audio) {
+    FestinaAudio *a = (FestinaAudio *)audio;
+    if (!a) return;
+    pthread_mutex_lock(&g_audio_lock);
+    int busy = 0;
+    for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+        if (g_channels[i].clip == a && g_channels[i].active) {
+            g_channels[i].stop_requested = 1;
+            busy = 1;
+        }
+    }
+    if (busy) {
+        for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
+            /* release=1: a channel this clip had RESERVED via playLoop
+             * goes back to the pool, the same as stopAudioPlayer(n)
+             * would do for it. Stopping the sound and leaving its
+             * reservation standing would quietly shrink the pool. */
+            if (g_channels[i].clip == a) festina_audio_halt_locked(&g_channels[i], 1);
+        }
+    }
     pthread_mutex_unlock(&g_audio_lock);
 }
 

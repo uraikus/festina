@@ -1,8 +1,8 @@
 // A simple two-player tic-tac-toe game -- click a cell to place a mark,
 // players alternate X/O, first three in a row/column/diagonal wins.
-// Demonstrates claude.md #37/#39/#40 (graphics, on click, on close),
+// Demonstrates claude.md #37/#39/#40 (graphics, mouse events, on close),
 // global mutable state shared between top-level code and event handlers
-// (arr[int]/int/bool declared here, read and written from `on click`),
+// (arr[int]/int/bool declared here, read and written from `on mouseDown`),
 // arrays, functions, and control flow together in one program.
 //
 // Build and run with:
@@ -75,7 +75,11 @@ bool func boardFull() {
     return true
 }
 
-on click(x:int, y:int) {
+// claude.md #106: `on mouseDown` is where `on click` used to be -- it
+// fires on the press, which is when this game has always placed a mark.
+// A board game wants the press; something draggable would want the
+// matching `on mouseUp` too.
+on mouseDown(x:int, y:int) {
     if gameOver {
         return
     }

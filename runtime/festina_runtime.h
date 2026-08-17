@@ -6,7 +6,7 @@
 
 /* Note on what does NOT appear in this header: no Cairo, X11, ALSA, or
  * <regex.h> type ever crosses a public function's signature -- every
- * such value is opaqued to `void *` (regex_t* from festina_regex_compile,
+ * such value is opaqued to `void *` (FestinaRegex* from festina_regex_compile,
  * cairo_surface_t* from festina_load_image, ...). That's what makes it
  * possible to split the implementation (festina_runtime.c/_graphics.c/
  * _audio.c -- see each file's own top comment) into separate translation
@@ -148,12 +148,29 @@ char *festina_sqlite_scalar_text(sqlite3_stmt *stmt);
 /* Steps a prepared statement to completion, collecting each row per the
  * layout above, then finalizes it. col_types has col_count entries,
  * one per declared table field in order ("int"/"float"/"bool"/"text"). */
+/* claude.md #111: takes the declared column NAMES too, because result
+ * columns are matched by name rather than position now (partial and
+ * reordered SELECTs used to silently misalign), and each row carries a
+ * hidden presence bitmask one slot past its columns, read by
+ * festina_row_undefined. */
 void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
-                                  const char **col_types,
+                                  const char **col_types, const char **col_names,
                                   int64_t *out_length, void **out_data);
+int8_t festina_row_undefined(void *row, const char **col_names,
+                             int32_t col_count, const char *name);
+/* claude.md #111: `delete m[key]` -- removes the entry, releasing its
+ * value through the same per-type trampoline whole-map release uses.
+ * Returns whether the key existed; a missing key is a safe no-op. */
+int8_t festina_map_delete(int64_t *count, void **entries, const char *key,
+                          void (*release)(int64_t, const char *));
+/* claude.md #111: `free` on a regex -- frees a runtime regex() result,
+ * but a /pattern/ literal's cached compilation is shared with every
+ * later execution of its line, so the value carries a `cached` flag and
+ * festina_regex_free no-ops on it. Set by generated code. */
+void festina_regex_mark_cached(void *compiled);
 
 /*
- * claude.md #67-68: regex(), .test(), .match(), .replace()/.replaceAll().
+ * claude.md #67-68 (#107): regex(), .test(), .match(), .replace().
  *
  * Built on POSIX extended regular expressions (regcomp/regexec from
  * <regex.h>) rather than a bundled regex engine or an external library
@@ -166,8 +183,23 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
  * works around).
  *
  * festina_regex_compile compiles `pattern` once per call (REG_EXTENDED,
- * plus REG_ICASE if `flags` contains 'i') and returns the resulting
- * regex_t*, heap-allocated. claude.md #85: a regex produced by a
+ * plus REG_ICASE if `flags` contains 'i') and returns a heap-allocated
+ * FestinaRegex* -- a regex_t with claude.md #107's 'g' flag recorded
+ * alongside it. 'g' is not a matching property and POSIX has no cflag
+ * for it; it says what the caller wants done with the matches, so it
+ * has to be carried to festina_regex_replace rather than applied by
+ * regcomp. It travels with the compiled pattern rather than with the
+ * call site because `regex(p, f)` builds its flags from a runtime text
+ * expression -- codegen has nothing to inspect at the .replace() call.
+ *
+ * 'g' affects .replace() ONLY. .test() ignores it deliberately: in JS a
+ * /g regex makes .test() stateful via lastIndex, so the same test
+ * against the same string alternates true/false, which is a bug
+ * factory rather than a feature. .match() ignores it for a harder
+ * reason -- JS's /g makes .match() return an array rather than a
+ * string, and a function's return type cannot depend on a flag that
+ * `regex(p, f)` only knows at run time. Both are documented in api.md
+ * as limits rather than left to be discovered. claude.md #85: a regex produced by a
  * runtime `regex(...)` call and consumed as a temporary in the same
  * expression (`regex(p).test(s)`) is freed via festina_regex_free once
  * that expression is done with it -- previously such a regex leaked on
@@ -186,17 +218,22 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
  * value (see festina/codegen.py's "Null for int/float" docstring note:
  * text is pointer-backed, so the ordinary C NULL pointer *is* the null
  * sentinel, unlike int/float which need INT_NULL_CONST/FLOAT_NULL_CONST).
- * replace()/replaceAll() specifically return the *original* string
- * unchanged (not NULL) when there's no match, per claude.md #68.
+ * replace() specifically returns the *original* string unchanged (not
+ * NULL) when there's no match, per claude.md #68.
  */
 void *festina_regex_compile(const char *pattern, const char *flags);
 void festina_regex_free(void *compiled);  /* claude.md #85: regfree + free */
 int8_t festina_regex_test(void *compiled, const char *text);
 char *festina_regex_match(void *compiled, const char *text);
+/* claude.md #107: neither takes a replace_all argument any more.
+ * .replaceAll() is gone; a regex replaces every match iff its own
+ * pattern carries 'g', and a plain-text search -- which has no flags to
+ * carry -- replaces the first match only, exactly like JS's
+ * String.prototype.replace with a string argument. */
 char *festina_str_replace(const char *text, const char *search,
-                           const char *replacement, int8_t replace_all);
+                           const char *replacement);
 char *festina_regex_replace(void *compiled, const char *text,
-                             const char *replacement, int8_t replace_all);
+                             const char *replacement);
 
 /*
  * claude.md #37, #39, #40: img, graphics functions, click/mouse events.
@@ -245,7 +282,7 @@ char *festina_regex_replace(void *compiled, const char *text,
  * close handler if any, then return). festina_graphics_init is only
  * ever called by generated code when the program actually uses a
  * graphics function, references clientWidth/clientHeight, or declares
- * an `on click`/`mouse`/`key`/`resize`/`close` handler (see
+ * an `on mouseDown`/`mouseUp`/`mouse`/`key`/`resize`/`close` handler (see
  * CodeGen.uses_graphics in festina/codegen.py) -- a program that
  * doesn't never opens a window, exactly like festina_db_open() only
  * ever runs for a program that declares a `table`.
@@ -259,16 +296,16 @@ char *festina_regex_replace(void *compiled, const char *text,
  * blob out of a database column has no extension, and an extension was
  * never evidence of anything anyway.
  *
- * festina_register_click_handler/_mouse_handler take a fixed
- * `void (*)(int64_t, int64_t)` signature,
+ * festina_register_mouse_down_handler/_mouse_up_handler/_mouse_handler
+ * take a fixed `void (*)(int64_t, int64_t)` signature,
  * festina_register_key_down_handler/_key_up_handler take a fixed
  * `void (*)(const char *)` signature, and
  * festina_register_resize_handler/_close_handler take a fixed
  * `void (*)(void)` signature -- each matches the parameters claude.md
  * #40's own worked example declares for that event exactly
- * (`on click(x:int, y:int)`, `on keyDown(key:text)`, `on resize()`,
+ * (`on mouseDown(x:int, y:int)`, `on keyDown(key:text)`, `on resize()`,
  * ...); festina/semantic.py's _EVENT_SIGNATURES enforces that any
- * handler for one of these six names is actually declared that way
+ * handler for one of these seven names is actually declared that way
  * before codegen ever emits a call here, so a mismatch would otherwise
  * be a silent ABI mismatch rather than a caught compile error. Both key
  * handlers' text comes from the same festina_key_name helper --
@@ -301,7 +338,7 @@ char *festina_regex_replace(void *compiled, const char *text,
  * when graphics was the only thing that could ever block here; it now
  * also fires any pending setTimeout/setInterval callbacks (see the
  * "Timers" note below) on every pass through its select()-driven X11
- * wait, so `on click` and a setInterval callback both stay responsive
+ * wait, so `on mouseDown` and a setInterval callback both stay responsive
  * together. It lives in festina_runtime_graphics.c, not this file's .c
  * -- a program that never uses graphics calls festina_run_timer_loop
  * instead (declared alongside setTimeout/setInterval below), the same
@@ -321,6 +358,12 @@ void *festina_load_image(const char *path);
  * (a clip() or resize() result) has no source bytes, so
  * festina_image_bytes encodes PNG on demand and caches it. */
 void *festina_image_from_bytes(const void *data, int64_t len, const char *label);
+/* claude.md #110: the image's own path, so save() has somewhere to go.
+ * Empty for an image that never came from a file -- a clip() or resize()
+ * result, or one decoded out of a database column -- which is exactly
+ * the case save(path) exists to serve. */
+int8_t festina_image_save(void *img, const char *target);
+int8_t festina_image_save_copy(void *img, const char *target);
 const void *festina_image_bytes(void *img, int64_t *out_len);
 /* claude.md #92: img methods and properties. An `img` value is a
  * pointer to a small box holding the Cairo surface, not the surface
@@ -448,7 +491,13 @@ void festina_set_line_width(int64_t width);
 void festina_set_font(int64_t px, const char *style, const char *family);
 int64_t festina_measure_text_width(const char *text);
 int64_t festina_measure_text_height(const char *text);
-void festina_register_click_handler(void (*handler)(int64_t, int64_t));
+/* claude.md #106: `on click` became `on mouseDown` + `on mouseUp`, the
+ * same split claude.md #98 made for the keyboard and for the same
+ * reason -- a click is a press and a release, and dragging needs to
+ * tell them apart. Both take the same fixed signature and both report
+ * the pointer position at the moment the button changed state. */
+void festina_register_mouse_down_handler(void (*handler)(int64_t, int64_t));
+void festina_register_mouse_up_handler(void (*handler)(int64_t, int64_t));
 void festina_register_mouse_handler(void (*handler)(int64_t, int64_t));
 /* claude.md #98: `on key` became `on keyDown` + `on keyUp`, so what
  * was one registration is now two -- both taking the same fixed
@@ -490,7 +539,7 @@ int64_t festina_client_height(void);
  * loop in main() (see festina/codegen.py's _emit_main_and_entry): with
  * graphics in use, festina_run_event_loop (festina_runtime_graphics.c)
  * fires them on every pass through its select()-driven X11/timer
- * multiplexing (so `on click` and a `setInterval` callback both stay
+ * multiplexing (so `on mouseDown` and a `setInterval` callback both stay
  * responsive together); without graphics, festina_run_timer_loop (this
  * file's .c) sleeps until the next deadline and fires it, for as long as
  * there's still an active timer to wait for -- both share the same
@@ -584,20 +633,28 @@ void festina_run_timer_loop(void);
  * the channel over and hands it back to the pool, since a one-shot has
  * nothing to reserve it for.
  *
- * claude.md #100 REMOVED the per-clip stop. One clip can be playing on
- * several channels at once -- three overlapping gunshots are the
- * ordinary case, not the exotic one -- so "stop this clip" never named
- * one thing, and its only honest reading (stop every copy) is almost
- * never what a program firing overlapping effects wants. Channels are
- * how playback is addressed: festina_stop_audio_player(n) for one,
- * festina_stop_audio_player(-1) for all. Both *join* rather than merely
- * signalling, so a stopped channel is guaranteed idle the instant the
- * call returns, not just "idle soon"; stopping a channel with nothing
- * on it is a safe no-op.
+ * claude.md #100 removed the per-clip stop and claude.md #109 brought
+ * it back, with the meaning #100 itself identified as its only honest
+ * one: festina_audio_stop_clip() stops EVERY channel playing that
+ * clip. #100's objection -- that this is almost never what a program
+ * firing overlapping effects wants -- is true and was never a reason
+ * to withhold it, because "silence this sound wherever it is" is a
+ * real thing to want and the alternative was bookkeeping the runtime
+ * already does. What #100 was really missing is the other half:
+ * festina_audio_play_on() now RETURNS the channel it chose, so a
+ * program can address one playback without naming a channel up front.
+ * The two answer different questions and now coexist.
  *
- * festina_audio_is_playing() survives, and stays clip-wide: "is this
- * sound audible anywhere" is still a meaningful question with a single
- * answer, unlike "stop it".
+ * Channels remain how one playback is addressed:
+ * festina_stop_audio_player(n) for one, festina_stop_audio_player(-1)
+ * for all. All three *join* rather than merely signalling, so a
+ * stopped channel is guaranteed idle the instant the call returns, not
+ * just "idle soon"; stopping a channel or a clip with nothing on it is
+ * a safe no-op.
+ *
+ * festina_audio_is_playing() is clip-wide for the same reason
+ * festina_audio_stop_clip() is: "is this sound audible anywhere" and
+ * "silence it everywhere" are the same question asked two ways.
  *
  * A voice that reaches its own natural end clears itself but stays
  * *joinable*: whoever next claims that slot joins the finished thread
@@ -613,6 +670,10 @@ void festina_run_timer_loop(void);
  * closes), it does not wait for playback to finish.
  */
 void *festina_load_audio(const char *path);
+/* claude.md #110: the clip's own path, so save() has somewhere to go.
+ * Empty for a clip decoded from bytes (a database column). */
+int8_t festina_audio_save(void *audio, const char *target);
+int8_t festina_audio_save_copy(void *audio, const char *target);
 /* claude.md #101: decoding from memory is the primitive; loading a path
  * is "read the file, then decode the bytes". `label` only names the
  * source in an error message. festina_audio_bytes hands back the bytes
@@ -631,10 +692,19 @@ void festina_audio_free(void *audio);
  * and gets automatic assignment); `looping` selects playLoop() over
  * play(). One entry point rather than four, because the four differ
  * only in these two flags -- claiming a channel, opening a device and
- * spawning a thread are identical for all of them. */
-void festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel,
-                            int8_t looping);
+ * spawning a thread are identical for all of them.
+ *
+ * claude.md #109: returns the channel actually used, or -1 if nothing
+ * was played (a null clip, or every channel reserved with none left to
+ * claim). Automatic assignment picks a channel the caller could not
+ * otherwise learn, which left the pool addressable only by naming a
+ * channel by hand -- that is, by not using the pool. */
+int64_t festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_channel,
+                               int8_t looping);
 int8_t festina_audio_is_playing(void *audio);
+/* claude.md #109: stop every channel playing this clip. See the
+ * "claude.md #100 removed the per-clip stop" note above. */
+void festina_audio_stop_clip(void *audio);
 /* claude.md #99: stopAudioPlayer(n) -- stop one channel and release its
  * reservation. A negative channel means every channel, which is what a
  * bare stopAudioPlayer() compiles to. */
@@ -664,11 +734,11 @@ char *festina_getenv(const char *name);
  * escape analysis (claude.md #74/#75/#76) proves DO escape their
  * declaring function -- the remainder that pure escape analysis can
  * never reach on its own. Complete (not just "handles everything but
- * cycles") for Festina specifically: a struct field's type, and an
- * arr[T]/map[T]'s own element type, must always be declared *before*
- * the struct/array/map containing it (verified directly -- even
- * `struct Node { next:Node }` fails to compile), so no value can ever
- * transitively reference itself. See festina_retain/festina_release's
+ * cycles") for Festina specifically -- or so it was, until claude.md
+ * #106 allowed `struct Node { next:Node }` and made a reference cycle
+ * constructible. A cycle is now a permanent leak (see todo.md); every
+ * acyclic value is still reclaimed exactly as described.
+ * See festina_retain/festina_release's
  * own doc comment in festina_runtime.c for the full design (the
  * refcount header layout, the negative-refcount immortal sentinel used
  * for a global's own untouched static initial storage, and why no
@@ -682,6 +752,85 @@ char *festina_getenv(const char *name);
  */
 void festina_retain(void *payload);
 void festina_release(void *payload);
+/* claude.md #78: the decrement-and-check half, so a caller that owns
+ * something INSIDE the payload can free it between the decrement and
+ * the storage's own free(). Returns 1 exactly when this was the last
+ * reference. Declared here since claude.md #109, when festina_blob_
+ * release became the first in-runtime user (codegen's generated
+ * per-struct wrappers call it through their own declaration). */
+int8_t festina_release_check(void *payload);
+
+/*
+ * claude.md #36, given its real meaning by claude.md #109: a `blob` is
+ * a file's BYTES, loaded from the path it is declared with, keeping
+ * that path so the file can be written, appended to, tested for and
+ * deleted through the same value. Same content-plus-origin shape as
+ * `img` and `aud` (claude.md #101), so a blob serves both a program
+ * and a SQLite BLOB column and round-trips byte-identically.
+ *
+ * Reference counted, unlike img/aud: `blob a = b` shares one handle,
+ * reassignment releases the old one, and the last reference frees the
+ * contents. It reuses the ordinary struct/arr/map refcount header, so
+ * the only new machinery is a destructor that frees the two inner
+ * strings first. See festina_runtime.c's own doc comment.
+ *
+ * Nothing here fails the program, matching the rule claude.md #93 set
+ * for the file functions this replaces: an unreadable path yields an
+ * empty blob whose .exists() is false, which is also how a file that
+ * does not exist yet is created (.write() needs only the path). A blob
+ * from festina_blob_from_bytes has bytes and NO path, so its
+ * .exists()/.write()/.append()/.delete() all answer false.
+ */
+void *festina_blob_open(const char *path);
+void *festina_blob_from_bytes(const void *data, int64_t len);
+void festina_blob_release(void *payload);
+char *festina_blob_to_text(void *payload);   /* owned copy, per claude.md #83 */
+const void *festina_blob_bytes(void *payload, int64_t *out_len);
+int8_t festina_blob_write(void *payload, const char *content);
+int8_t festina_blob_append(void *payload, const char *content);
+int8_t festina_blob_exists(void *payload);
+int8_t festina_blob_delete(void *payload);  /* deletes the FILE, not the blob */
+
+/*
+ * claude.md #110: writing a handle's bytes back out. One policy shared
+ * by blob, img and aud, since all three are the same shape of value
+ * (content plus the bytes it came from) and "save this somewhere" should
+ * not mean three slightly different things.
+ *
+ *   save()          -- write to the path the handle already has.
+ *   save(path)      -- adopt `path`, then write there; the handle's own
+ *                      path CHANGES, so a blob's exists()/delete()
+ *                      follow it afterwards.
+ *   saveCopy(path)  -- write there and leave the handle's path alone.
+ *                      The argument is required (enforced in semantic.py,
+ *                      so it is a compile error rather than a runtime one).
+ *
+ * `target` NULL/empty is the no-argument save(). `adopt` selects save()
+ * over saveCopy(). `what` names the type in an error message.
+ *
+ * A handle with NO path is what this exists for: an img from clip(), or
+ * anything out of a database column, has never been on disk. save() with
+ * no argument then FAILS the program rather than returning false -- a
+ * program asking to save something to nowhere has a bug, where an
+ * unwritable directory is a condition of the filesystem and still
+ * answers false, the same as every other file operation here.
+ *
+ * `target` is always a complete FILE path -- there is no directory
+ * shorthand. One would have to borrow a filename from somewhere, and the
+ * handle that most needs saving (a clip, a database column) is exactly
+ * the one with no filename to borrow, so the shorthand would work only
+ * where it was least useful. Passing a directory answers false, like any
+ * other unwritable target.
+ *
+ * The path is adopted only on SUCCESS: pointing a handle at a file that
+ * was never written would leave exists() answering false about a path
+ * the program was just told it has.
+ */
+int8_t festina_save_bytes(const char *target, char **own_path,
+                          const void *data, int64_t len,
+                          const char *what, int8_t adopt);
+int8_t festina_blob_save(void *payload, const char *target);
+int8_t festina_blob_save_copy(void *payload, const char *target);
 
 /*
  * claude.md #72: map[T] -- { key: value, ... } literals,

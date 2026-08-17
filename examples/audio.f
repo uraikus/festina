@@ -1,25 +1,30 @@
-// claude.md #38/#99/#100: aud, .play()/.playLoop()/.isPlaying(),
-// and stopAudioPlayer(). Build
+// claude.md #38/#99/#100/#109: aud, .play()/.playLoop()/.isPlaying()/
+// .stop(), and stopAudioPlayer(). Build
 // and run with:
 //
 //   ./bin/festina examples/audio.f -o audio_demo
 //   ./audio_demo
 //
 // Needs a working ALSA "default" output device. examples/beep.wav is a
-// short (0.35s, 440Hz) generated tone -- loadAudio() only supports WAV
-// (16-bit PCM), not claude.md's own .mp3 example; see api.md's Audio
-// section for why. Run from the repository root so the relative path
+// short (0.35s, 440Hz) generated tone. WAV (16-bit PCM) and MP3 are
+// both supported; see api.md's Audio section. Run from the repository
+// root so the relative path
 // below resolves (or edit it to point at any 16-bit PCM WAV file).
 
 // claude.md #100/#101: a path declares the clip -- the same way a
 // blob, a color, a font and an img are each written as the text
-// that reads best. loadAudio('...') still works and means the
-// same. WAV (16-bit PCM) and MP3 are both decoded, sniffed from
-// the file's contents rather than its extension.
+// that reads best. claude.md #109 removed loadAudio(), so this is
+// now the only spelling. WAV (16-bit PCM) and MP3 are both decoded,
+// sniffed from the file's contents rather than its extension.
 aud beep = 'examples/beep.wav'
 
 log('playing...')
-beep.play()
+
+// claude.md #109: play() hands back the channel it chose. Automatic
+// assignment picks one the program could not otherwise learn, which
+// used to leave the pool addressable only by naming channels by hand.
+int first = beep.play()
+log(`playing on channel ${first}`)
 log(`isPlaying(): ${beep.isPlaying()}`)   // true immediately -- see api.md
 
 // claude.md #98: play() does NOT cut off a playback already running --
@@ -28,8 +33,13 @@ log(`isPlaying(): ${beep.isPlaying()}`)   // true immediately -- see api.md
 // what makes a rapid-fire sound effect work: the faster it fires, the
 // more copies overlap, rather than each one silencing the last.
 log(`pooled channels: ${maxAudioPlayers()}`)
-beep.play()
-beep.play()
+int second = beep.play()
+int third = beep.play()
+log(`three channels: ${first} ${second} ${third}`)
+
+// ...and any one of them can be stopped on its own, now that its
+// number is known.
+stopAudioPlayer(third)
 
 // setMaxAudioPlayers(1) is how to ask for the old behaviour back: one
 // channel, restarted from the beginning on every play().
@@ -54,13 +64,15 @@ void func checkStillPlaying() {
 }
 
 void func stopEarly() {
-    // claude.md #100: there is no beep.stop() -- one clip can be on
-    // several channels at once (three overlapping gunshots are the
-    // ordinary case), so playback is stopped BY CHANNEL. A bare
-    // stopAudioPlayer() stops every channel.
+    // claude.md #109: beep.stop() is back, and stops every channel
+    // playing THIS clip -- which is the right tool for "silence this
+    // sound" and the wrong one for "end just that gunshot", where
+    // stopAudioPlayer(channel) is what the number above is for. A bare
+    // stopAudioPlayer() stops every channel of every clip.
     log('stopping early')
+    beep.stop()
+    log(`isPlaying() after beep.stop(): ${beep.isPlaying()}`)   // false immediately
     stopAudioPlayer()
-    log(`isPlaying() after stopAudioPlayer(): ${beep.isPlaying()}`)   // false immediately
 }
 
 setTimeout(checkStillPlaying, 100)
