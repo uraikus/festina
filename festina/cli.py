@@ -214,7 +214,29 @@ _PKG_INSTALL_HINTS = {
 def _run_tool(cmd, **kwargs):
     """subprocess.run, but a missing executable becomes a clear
     CompileError naming the tool and how to install it, instead of a raw
-    FileNotFoundError."""
+    FileNotFoundError.
+
+    claude.md #126 round eight, found by real Windows CI: this used to
+    let subprocess.run resolve cmd[0] itself, which is NOT the same
+    search PATH-only tools like shutil.which perform on Windows --
+    Win32's CreateProcess (what subprocess.run calls into with no
+    executable= override) additionally searches the calling process's
+    OWN directory before it ever looks at PATH, per Microsoft's own
+    documented search order. On a Windows CI runner where Python itself
+    is an MSYS2 UCRT64 package, that directory is the SAME bin/ pkg-
+    config and the C toolchain also live in -- so a test that hides a
+    tool by restricting PATH (tests/conftest.py's path_without) fooled
+    shutil.which-based checks (festina doctor) but not an actual
+    subprocess.run call, which found the tool anyway via that extra
+    search location and silently succeeded where it should have raised
+    "missing dependency". Resolving explicitly via shutil.which FIRST
+    makes every tool invocation PATH-only and deterministic on every
+    platform, closing that gap rather than working around it in tests."""
+    if shutil.which(cmd[0]) is None:
+        tool = cmd[0]
+        hint = _INSTALL_HINTS.get(tool, "install it and make sure it's on PATH")
+        raise CompileError(f"'{tool}' is not installed or not on PATH -- {hint}",
+                            category="missing dependency")
     try:
         return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
     except FileNotFoundError:

@@ -147,7 +147,14 @@ class TestDoctor:
         lines, _ = cli_mod._doctor_report()
         joined = "\n".join(lines)
         assert "resolves to" in joined
-        assert str(fake) in joined
+        # claude.md #126 round eight: shutil.which's Windows PATHEXT
+        # search returns the extension it matched (".EXE", uppercase,
+        # from PATHEXT itself) rather than preserving this fake file's
+        # own on-disk case -- an exact string match failed on real
+        # Windows CI even though the right file was genuinely found.
+        # os.path.normcase makes the comparison match Windows' own
+        # case/separator insensitivity (a no-op on POSIX).
+        assert os.path.normcase(str(fake)) in os.path.normcase(joined)
 
     def test_reports_how_to_add_festina_to_path_when_it_is_missing(self, cli_mod, path_without):
         # path_without's curated tool set never includes "festina"

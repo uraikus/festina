@@ -1,60 +1,53 @@
 # Windows support — the plan
 
-> **Status: Phase 0 is built; seven real CI rounds on the same PR, each
+> **Status: Phase 0 is built; eight real CI rounds on the same PR, each
 > finding something the last one missed** (claude.md #126 has the full
-> account — this is the short version). Every Python-side toolchain
+> account — this is the short version, condensed again since the
+> per-round narrative was getting long). Every Python-side toolchain
 > seam this section lists was in fact already covered by claude.md
 > #39's shared work (`.exe` naming, the libLLVM DLL candidates, the
 > GNU-ld static-sqlite path). What was still missing and has now
-> landed: the regex decision (`_core_pkgs` installs `libsystre` but
-> asks pkg-config for `gnurx` — its own PKGBUILD declares `Provides`/
-> `Conflicts`/`Replaces` against the originally-preferred `libgnurx`,
-> which is why they conflict at package-manager level and why
-> pkg-config answers to the old name instead), `festina doctor`'s
-> Windows-specific hints, a `windows-latest` CI job, a `#ifdef _WIN32`
-> branch for `localtime_r` (POSIX, not ISO C, missing from MinGW's
-> UCRT — the one gap the original "core is pure POSIX" audit missed),
-> a new `festina_runtime_init()` fixing the MinGW/UCRT C runtime's
-> default text-mode stdout (which silently turns every `\n` a compiled
-> program prints into `\r\n`), a post-link rename fixing MinGW's
-> linker appending `.exe` to an explicit `-o name` that lacks one (the
-> exact behavior `_default_output_name`'s own docstring already
-> documented, but had only ever guarded the *default*-name case, not
-> an explicit one), and a fix scoping the "offscreen drawing never hits
-> the platform gate" exemption (built for darwin, where it's genuinely
-> true) away from win32, where it had accidentally been universal --
-> an offscreen-only program there was reaching real pkg-config/linking
-> code with no window backend behind it at all instead of the clean
-> "windows.md Phase 2" error every other graphics use already got, and
-> that gate's own error message still claimed offscreen drawing "works
-> today", which is no longer true on win32 specifically (round six
-> fixed the message; still true on darwin). `_check_feature_supported`
-> gives graphics/audio a clean "not implemented yet, windows.md Phase
-> N" error on win32 (unconditional, unlike macOS's real-hardware-
-> verification gate — there is no backend at all yet to unlock), now
-> genuinely unconditional for graphics too. Two doctor-report test
-> bugs also traced to real causes rather than staying a mystery: a fake
-> `festina` executable with no `.exe` extension is simply unfindable by
-> `shutil.which` on Windows (the same shell-needs-an-extension fact
-> `_default_output_name` already encodes), and a doctor test's mocked
-> "which pkg-config packages exist" function didn't know win32's own
-> required package (`gnurx`) is different from every other platform's
-> (`sqlite3` alone), so it correctly-but-unintentionally reported a
-> REQUIRED dependency missing on the one platform the test's own setup
-> never accounted for. What is NOT yet confirmed: that this fixed state
-> is itself green on real Windows CI — this project still has no
-> Windows/MSYS2 access, so every fix here was verified by reasoning
-> from each run's actual log output, the full Linux suite, and (for one
-> Python-version-specific test bug) a real 3.12.3 venv — never by
-> re-running on Windows itself. Still open, left for the next real run
-> rather than guessed at blind: two SQLite schema-sync tests reporting
-> a column type/shape mismatch after a second compile+run against an
-> already-populated database (plausibly a WAL-checkpoint-on-exit or
-> cross-process-visibility difference, but unconfirmed), a timer test
-> seeing zero ticks, `test_files_demo_runs_correctly`'s output not
-> matching, and two `TestMissingDependencyErrors` tests that still
-> don't raise when pkg-config/cc are hidden from PATH. Phases 1–3 are
-> open.
+> landed: the regex decision (`_core_pkgs` installs `libsystre`, asks
+> pkg-config for `gnurx` — its own PKGBUILD conflicts with the
+> originally-preferred `libgnurx` and ships under that old pkg-config
+> name instead), `festina doctor`'s Windows hints, a `windows-latest`
+> CI job, `#ifdef _WIN32` branches for `localtime_r`→`localtime_s`
+> (POSIX, missing from MinGW's UCRT) and for `festina_runtime_init()`
+> (the UCRT's default text-mode stdout silently turning every `\n` a
+> compiled program prints into `\r\n`), a post-link rename fixing
+> MinGW's linker appending `.exe` to an explicit `-o name` lacking one,
+> and `_check_feature_supported` now unconditionally gating graphics on
+> win32 — offscreen included, since there is no window backend at all
+> yet for even that to link against, unlike darwin where offscreen
+> genuinely works. Round eight's own finding is the most structural:
+> `_run_tool` handed commands straight to `subprocess.run`, trusting it
+> to fail the same way `shutil.which`-based checks do when a tool is
+> hidden from PATH — but Win32's `CreateProcess` searches several
+> locations BEFORE PATH (the calling process's own directory among
+> them), so on a runner where Python is an MSYS2 UCRT64 package
+> sharing a `bin/` with pkg-config and the whole toolchain, a test that
+> only edits `PATH` never actually hid anything from an executed
+> subprocess, just from `shutil.which`. Fixed by resolving `cmd[0]`
+> through `shutil.which` explicitly before ever calling
+> `subprocess.run`, making every tool invocation PATH-only everywhere.
+> Also fixed: two doctor-test setup bugs (a fake executable missing its
+> `.exe` extension; a mocked required-package set that didn't know
+> win32's own required package differs from every other platform's)
+> and a real bug in `examples/files.f` itself — hardcoded `/tmp/...`
+> paths that a native Windows binary resolves under the current
+> drive's root, not MSYS2's own `/tmp` mapping, since a compiled
+> program never runs inside MSYS2's POSIX emulation layer at all; fixed
+> to use portable relative paths. What is NOT yet confirmed: that this
+> fixed state is itself green on real Windows CI — this project still
+> has no Windows/MSYS2 access, so every fix here was verified by
+> reasoning from each run's actual log output, the full Linux suite,
+> and (for one Python-version-specific test bug) a real 3.12.3 venv —
+> never by re-running on Windows itself. Still open, left for the next
+> real run rather than guessed at blind: two SQLite schema-sync tests
+> reporting a column type/shape mismatch after a second compile+run
+> against an already-populated database (plausibly a
+> WAL-checkpoint-on-exit or cross-process-visibility difference, but
+> unconfirmed) and a timer test seeing zero ticks. Phases 1–3 are open.
 
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,
@@ -149,28 +142,19 @@ whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
    note lives in setup.md's own Windows section (todo, tracked
    separately from this phase's own scope).
 5. **CI: a `windows-latest` job via the `msys2/setup-msys2` action**,
-   built, and now run for real FOUR times: runs the whole suite headless
-   the same way the macOS job does, with no `FESTINA_STRICT_DEPS`
-   (audio/graphics have no Windows backend yet at all, so those tiers
-   shed as skips via the same conftest mechanism, not a parallel
-   test-selection list), plus compiling and running the four
-   windowless examples as real `.exe`s. The sanitizer leak tier stays
-   Linux-only, same reasoning as macOS. Those four runs are what caught
-   the libgnurx/libsystre package conflict, the libsystre/gnurx
-   pkg-config name mismatch, a `shutil.which`-on-Python-3.12 crash in
-   the fix's own new tests, the missing `localtime_r`/`localtime_s`
-   branch, the MinGW/UCRT text-mode stdout CRLF translation, and the
-   MinGW linker appending `.exe` to an explicit `-o` name that lacked
-   one (all claude.md #126) plus two small, independent test-harness
-   bugs from round one (non-UTF-8 locale defaults on Windows corrupting
-   a non-ASCII literal; a file-path assertion breaking on a
-   drive-letter colon) — all fixed, but a FIFTH real run is still what's
-   needed to confirm this round's own fixes land clean, plus two
-   still-unexplained "DID NOT RAISE CompileError" failures
-   (`test_missing_pkg_config_gives_actionable_error`,
-   `test_missing_cc_gives_actionable_error`) noticed in round four's log
-   but not yet chased — round five will show whether they're downstream
-   of this round's fixes or a separate issue.
+   built, and now run for real EIGHT times: runs the whole suite
+   headless the same way the macOS job does, with no
+   `FESTINA_STRICT_DEPS` (audio/graphics have no Windows backend yet at
+   all, so those tiers shed as skips via the same conftest mechanism,
+   not a parallel test-selection list), plus compiling and running the
+   four windowless examples as real `.exe`s. The sanitizer leak tier
+   stays Linux-only, same reasoning as macOS. Those eight rounds are
+   what caught every fix summarized in the status block above (claude.md
+   #126 has the full blow-by-blow) — down to 2 confirmed-open failures
+   (a SQLite schema-sync mismatch, a timer test) as of round eight,
+   from 26 in round one. A ninth real run is what's needed to confirm
+   round eight's own fixes land clean and to make progress on what's
+   still open.
 6. **Filesystem semantics, verified not assumed**: already covered
    before this phase began by `tests/test_platform.py::TestBinaryFidelity`,
    which runs on every platform's CI — every runtime `fopen` is
