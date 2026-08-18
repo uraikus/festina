@@ -4390,7 +4390,15 @@ class TestGraphics:
         src_path = tmp_path / "main.f"
         src_path.write_text(source)
         out_path = tmp_path / "program"
-        result_path = cli_mod.compile_file(str(src_path), str(out_path))
+        # claude.md #126 round six: this program opens a real window
+        # (on mouseDown/mouseUp/mouse/key/resize/close), so on darwin it
+        # must hit the real-hardware-verification gate (macos.md Phase
+        # 2) same as TestAudio's own compile_file_or_skip use right
+        # below -- calling compile_file directly meant that gate's
+        # CompileError surfaced as a raw macOS CI failure instead of the
+        # skip every other platform-conditional test gets.
+        from tests.conftest import compile_file_or_skip
+        result_path = compile_file_or_skip(cli_mod, str(src_path), str(out_path))
         assert result_path == str(out_path)
         assert out_path.exists()
 

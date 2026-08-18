@@ -71,6 +71,18 @@
 > Linux cairo-xlib pkg-config flags and the full suite; still only real
 > macOS CI can compile this file at all, so this too awaits a run that
 > gets all the way through.
+>
+> **Round five's push (a separate, unrelated bug in the fallback
+> compile path — see windows.md, since it affects Windows too) got a
+> real macOS run down to ONE failure, out of the whole suite**
+> (claude.md #126, round six): `TestGraphics::test_compiles_and_links_successfully`
+> opens a real window (`on mouseDown`/`mouse`/`key`/`resize`/`close`),
+> so on darwin it correctly hits the real-hardware-verification gate —
+> but called `compile_file` directly instead of through
+> `compile_file_or_skip`, the same gap `TestAudio`'s own analogous test
+> already avoided. Fixed to match. Linux and CodeQL were both green on
+> this same run — the first genuinely green non-macOS-graphics result
+> across six rounds.
 
 A concrete, phased plan for bringing Festina to macOS. The premise
 (from [todo.md](todo.md#platforms)) holds up under audit: **porting is
