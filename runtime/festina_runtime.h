@@ -187,11 +187,19 @@ int8_t festina_row_undefined(void *row, const char **col_names,
  * Returns whether the key existed; a missing key is a safe no-op. */
 int8_t festina_map_delete(int64_t *count, void **entries, const char *key,
                           void (*release)(int64_t, const char *));
-/* claude.md #111: `free` on a regex -- frees a runtime regex() result,
- * but a /pattern/ literal's cached compilation is shared with every
- * later execution of its line, so the value carries a `cached` flag and
- * festina_regex_free no-ops on it. Set by generated code. */
+/* claude.md #111/#118: marks a /pattern/ literal's cached compilation
+ * as immortal (the same negative-header sentinel every other immortal
+ * value uses), so retain/release/`free` on it are all safe no-ops. Set
+ * by generated code right after the literal cache is first filled. */
 void festina_regex_mark_cached(void *compiled);
+/* claude.md #118: the per-call-site memo for the dynamic regex()
+ * builtin -- `slot` is a private [3 x ptr] global codegen emits per
+ * call site ({pattern copy, flags copy, compiled}). Same pattern+flags
+ * as last time answers the cached compilation; a change releases the
+ * slot's reference (safe: regex is refcounted now) and recompiles. The
+ * caller always receives its own +1. */
+void *festina_regex_compile_memo(const char *pattern, const char *flags,
+                                 void **slot);
 
 /*
  * claude.md #67-68 (#107): regex(), .test(), .match(), .replace().
@@ -223,15 +231,13 @@ void festina_regex_mark_cached(void *compiled);
  * reason -- JS's /g makes .match() return an array rather than a
  * string, and a function's return type cannot depend on a flag that
  * `regex(p, f)` only knows at run time. Both are documented in api.md
- * as limits rather than left to be discovered. claude.md #85: a regex produced by a
- * runtime `regex(...)` call and consumed as a temporary in the same
- * expression (`regex(p).test(s)`) is freed via festina_regex_free once
- * that expression is done with it -- previously such a regex leaked on
- * every evaluation, which a `regex(...)` inside a loop turned into an
- * unbounded leak. A /pattern/ literal is compiled once and cached for
- * the life of the process (see _emit_cached_regex_lit) and so is
- * deliberately never freed, as is a regex bound to a variable. An
- * invalid
+ * as limits rather than left to be discovered. claude.md #85/#118: a
+ * compiled regex is refcounted (i64 header before the payload), so a
+ * `regex(...)` temporary, a bound regex's scope exit, and `free` on an
+ * aliased binding all go through festina_regex_free's decrement, and
+ * only the last reference regfrees. A /pattern/ literal is compiled
+ * once, cached for the life of the process, and marked immortal (see
+ * festina_regex_mark_cached above). An invalid
  * pattern calls festina_fail() with regerror()'s message -- claude.md
  * #67: pattern validity is a runtime concern, the Python compiler
  * doesn't parse regex syntax itself.
@@ -246,7 +252,7 @@ void festina_regex_mark_cached(void *compiled);
  * NULL) when there's no match, per claude.md #68.
  */
 void *festina_regex_compile(const char *pattern, const char *flags);
-void festina_regex_free(void *compiled);  /* claude.md #85: regfree + free */
+void festina_regex_free(void *compiled);  /* claude.md #85/#118: release; regfree on last ref */
 int8_t festina_regex_test(void *compiled, const char *text);
 char *festina_regex_match(void *compiled, const char *text);
 /* claude.md #107: neither takes a replace_all argument any more.

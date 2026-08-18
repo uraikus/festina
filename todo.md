@@ -32,13 +32,11 @@ language work — the compiler and core runtime are portable C/LLVM.
 
 ## Memory model
 
-Automatic reclamation is escape analysis plus reference counting, with
-`free`/`delete` as the manual override (claude.md #74–#83, #111). What
-remains:
+Automatic reclamation is escape analysis plus reference counting —
+every managed type carries the same refcount header since claude.md
+#118 gave `img`/`aud`/`regex` theirs — with `free`/`delete` as the
+manual override (claude.md #74–#83, #111, #118). What remains:
 
-- **`img`/`aud` have no refcount header**, so an *escaping* handle
-  leaks unless the program `free`s it by hand. `blob` (claude.md #109)
-  is the template for the fix — same header structs already carry.
 - **Reference cycles leak** (`a.next = a`; constructible since
   claude.md #106). Refcounting cannot free a cycle; the complete answer
   is a tracing collector or weak references. Until then, break cycles
@@ -59,7 +57,9 @@ remains:
 - **`keyDown` auto-repeats while held** (that is how text entry works);
   a held key still fires exactly one `keyUp`. Track held keys yourself
   for edge-triggered input (claude.md #98).
-- **`regex(pattern, flags)` compiles per evaluation** — a dynamic
-  pattern can differ per call, so caching would be a correctness bug.
-  Hoist it out of loops; measured ~24x — see
-  [api.md](api.md#literals-are-compiled-once-regex-is-compiled-per-evaluation).
+- **`regex(pattern, flags)` is memoized per call site** (claude.md
+  #118) — the runtime compares the actual pattern+flags against the
+  site's last compilation, so a repeated pattern costs what a literal
+  does (~24x cheaper than recompiling) and a changed one recompiles.
+  One site *alternating* patterns still recompiles per change — see
+  [api.md](api.md#literals-are-compiled-once-regex-is-memoized-per-call-site).

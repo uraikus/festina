@@ -2661,6 +2661,33 @@ carries a presence bitmask one hidden slot past its columns; an unknown
 name in undefined() fails the program.
 `tests/test_codegen.py::TestUndefinedAndNameMatchedColumns` (6 tests).
 
+**claude.md #118**: refcount headers for img/aud/regex; regex() memoized.
+
+The three types outside the refcount protocol joined it — the same i64
+header blob carries, allocated in each type's constructor, with the
+free functions becoming releases (decrement; destroy on last
+reference). The _Owned* ownership proofs and every img/aud special
+case in free/delete/receiver-release/field-cascade collapsed into the
+one _is_refcounted dispatch. The regex literal cache's `cached` flag
+became the standard immortal sentinel. Three tests pinning the old
+proofs ("a borrowed/escaping img is not freed", "a literal regex is
+never freed") failed exactly as pinned tradeoffs should and were
+INVERTED: the release is emitted, and the retain precedes it — order
+is the safety argument, as in #117. The per-type img/aud leak
+programs were rewritten from "free exactly once, the alias dangles"
+to freeing through both bindings — the ordinary shape now. Dynamic
+regex() compiles through a per-call-site memo
+(festina_regex_compile_memo, one {pattern, flags, compiled} slot per
+site) — safe only because eviction of a superseded compilation is a
+decrement now; measured 200k evals ~367ms → ~15ms, and an
+alternating-pattern site recompiles per change rather than serving a
+stale automaton (pinned). Harness lesson, third application: the
+audio white-box harnesses gained a festina_release_check stub with
+real header semantics, since the audio TU now calls into the core
+runtime's refcount protocol.
+`tests/test_codegen.py::TestRefcountedHandles` (6 tests), plus the
+inverted tests in TestOwnedRegexLocals/TestImageClipResizeAndSize.
+
 **claude.md #117**: chained extraction stops leaking — retain first.
 
 #102/#108's deliberate leak (a chain yielding a managed value or text

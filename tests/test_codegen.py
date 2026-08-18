@@ -5316,6 +5316,19 @@ int8_t festina_save_bytes(const char *target, char **own_path,
     return 0;
 }
 
+/* claude.md #118: aud carries a refcount header now, and
+ * festina_audio_free consults the core runtime's decrement-and-check.
+ * Stubbed with the real semantics (these harnesses free clips whose
+ * header festina_audio_from_bytes genuinely allocated) rather than
+ * linked, for the same no-sqlite3 reason as the two stubs above. */
+int8_t festina_release_check(void *payload) {
+    if (!payload) return 0;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return 0;
+    (*header)--;
+    return *header == 0;
+}
+
 static int active_voices(void *audio) {
     int n = 0;
     pthread_mutex_lock(&g_audio_lock);
@@ -5439,6 +5452,19 @@ int8_t festina_save_bytes(const char *target, char **own_path,
     return 0;
 }
 
+/* claude.md #118: aud carries a refcount header now, and
+ * festina_audio_free consults the core runtime's decrement-and-check.
+ * Stubbed with the real semantics (these harnesses free clips whose
+ * header festina_audio_from_bytes genuinely allocated) rather than
+ * linked, for the same no-sqlite3 reason as the two stubs above. */
+int8_t festina_release_check(void *payload) {
+    if (!payload) return 0;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return 0;
+    (*header)--;
+    return *header == 0;
+}
+
 static int active_voices(void *audio) {
     int n = 0;
     pthread_mutex_lock(&g_audio_lock);
@@ -5510,6 +5536,19 @@ int8_t festina_save_bytes(const char *target, char **own_path,
                           const char *what, int8_t adopt) {
     (void)target; (void)own_path; (void)data; (void)len; (void)what; (void)adopt;
     return 0;
+}
+
+/* claude.md #118: aud carries a refcount header now, and
+ * festina_audio_free consults the core runtime's decrement-and-check.
+ * Stubbed with the real semantics (these harnesses free clips whose
+ * header festina_audio_from_bytes genuinely allocated) rather than
+ * linked, for the same no-sqlite3 reason as the two stubs above. */
+int8_t festina_release_check(void *payload) {
+    if (!payload) return 0;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return 0;
+    (*header)--;
+    return *header == 0;
 }
 
 /* Which channel index a clip is playing on, or -1. */
@@ -9560,24 +9599,16 @@ class TestQueryRowAndRegexReclamation:
 
 
 class TestOwnedRegexLocals:
-    """claude.md #86: a `regex` local this scope provably owns outright
-    -- one whose initializer is a `regex(...)` Call (freshly compiled by
-    festina_regex_compile, so nothing else can reference it yet) and
-    whose name escape analysis proves never leaves the function -- is
-    freed at scope exit. Before this, `regex r = regex(p)` inside a loop
-    leaked a full compiled automaton (several KB) per iteration; #85 had
-    only closed the case where the regex is used as a temporary in the
-    same expression that compiled it.
-
-    Both halves of the ownership test are load-bearing, and relaxing
-    either frees something still in use. A `/pattern/` literal
-    initializer is a pointer into a process-lifetime cache, so freeing
-    it would leave every later evaluation of that literal running
-    regexec against freed memory. An escaping regex has no equivalent of
-    text's copy-on-alias escape hatch -- a regex "copy" would mean
-    recompiling, and the pattern string isn't retained to recompile
-    from -- so it is left to leak exactly as before rather than freed
-    while another binding may still point at it."""
+    """claude.md #86/#118: a `regex` local is released at scope exit --
+    EVERY regex local, not just one this scope could prove it owned.
+    #86's created-here + never-escaping ownership proof existed because
+    a regex had no refcount: freeing was final, so freeing anything
+    possibly shared was a use-after-free. #118 gave regex the standard
+    i64 header, so a binding always owns exactly one countable
+    reference and releasing it is always safe -- a /pattern/ literal's
+    cached compilation is immortal (festina_regex_mark_cached sets the
+    negative-header sentinel) and no-ops through the very same release
+    call, and an escaping regex no longer leaks."""
 
     def _ir(self, parser, semantic, codegen, source, filename="main.f"):
         program = parser.parse(source, filename=filename)
@@ -9596,7 +9627,14 @@ class TestOwnedRegexLocals:
         body = ir.split("define void @f()")[1].split("\n}")[0]
         assert "call void @festina_regex_free(" in body
 
-    def test_regex_local_from_a_literal_is_never_freed(self, parser, semantic, codegen):
+    def test_regex_local_from_a_literal_is_released_and_the_cache_is_immortal(
+            self, parser, semantic, codegen):
+        # claude.md #118 INVERTED this test: it used to assert the
+        # release was absent, because releasing the shared literal cache
+        # would have freed it under every later execution of the line.
+        # The safety argument moved into the value itself -- the cache
+        # is marked immortal at first compile, so the scope-exit release
+        # (present, like every other regex local's) is a no-op on it.
         source = """
         void func f() {
             regex r = /[0-9]+/
@@ -9605,9 +9643,16 @@ class TestOwnedRegexLocals:
         f()
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @festina_regex_free(" not in ir
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        assert "call void @festina_regex_free(" in body
+        assert "call void @festina_regex_mark_cached(" in body
 
-    def test_escaping_regex_local_is_not_freed(self, parser, semantic, codegen):
+    def test_escaping_regex_local_is_released_too(self, parser, semantic, codegen):
+        # claude.md #118 INVERTED this test: an escaping regex used to
+        # be left to leak (no copy-on-alias escape hatch, no count to
+        # decrement). With the header, `g = r` retains for the global
+        # and the local's own release at scope exit is an ordinary
+        # decrement -- the global keeps the compilation alive.
         source = """
         regex g = /[a-z]+/
         void func f() {
@@ -9618,7 +9663,9 @@ class TestOwnedRegexLocals:
         """
         ir = self._ir(parser, semantic, codegen, source)
         body = ir.split("define void @f()")[1].split("\n}")[0]
-        assert "call void @festina_regex_free(" not in body
+        retain_at = body.index("call void @festina_retain(ptr")
+        release_at = body.index("call void @festina_regex_free(")
+        assert retain_at < release_at
 
     def test_owned_literal_and_escaping_regexes_stay_correct_together(self, compile_and_run):
         source = """
@@ -9646,6 +9693,115 @@ class TestOwnedRegexLocals:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "true\n" * 53
+
+
+class TestRefcountedHandles:
+    """claude.md #118: img, aud and regex carry the same i64 refcount
+    header struct/arr/map/blob do, so every binding owns exactly one
+    countable reference and `free`/scope exit/reassignment are always a
+    safe decrement. This retired two documented gaps at once -- an
+    escaping img/aud handle leaked, and `free` on an aliased one left
+    the alias dangling -- and made the dynamic regex() memo possible
+    (evicting a superseded compilation is only safe when a binding that
+    still aliases it keeps it alive)."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    # ---- the regex() memo ----
+
+    def test_dynamic_regex_compiles_through_a_per_site_memo(
+            self, parser, semantic, codegen):
+        # Not plain @festina_regex_compile any more: the memo compares
+        # the actual pattern+flags against the site's last compilation
+        # at run time, which is what per-AST-node caching (the literal
+        # scheme) could never do safely for a runtime pattern.
+        source = "regex r = regex('[0-9]+', 'i')\nlog(r.test('42'))"
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call ptr @festina_regex_compile_memo(" in ir
+        assert "@.regex.memo.0 = private global [3 x ptr] zeroinitializer" in ir
+
+    def test_each_regex_call_site_gets_its_own_memo_slot(
+            self, parser, semantic, codegen):
+        source = """
+        regex a = regex('[0-9]+')
+        regex b = regex('[a-z]+')
+        log(a.test('1'))
+        log(b.test('x'))
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "@.regex.memo.0 = private global [3 x ptr] zeroinitializer" in ir
+        assert "@.regex.memo.1 = private global [3 x ptr] zeroinitializer" in ir
+
+    def test_a_changed_pattern_is_recompiled_not_served_stale(
+            self, compile_and_run):
+        # The memo's one correctness hazard, pinned: the same call site
+        # fed a DIFFERENT pattern must recompile, never answer with the
+        # previous automaton. Alternating patterns through one site
+        # exercises the miss path on every iteration after the first.
+        source = """
+        arr[text] pats = ['[0-9]+', '[a-z]+']
+        for int i = 0, i < 6, i++ {
+            regex r = regex(pats[i % 2])
+            log(r.test('42'))
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false"] * 3
+
+    # ---- free on an alias is a decrement ----
+
+    def test_free_on_an_aliased_img_leaves_the_alias_usable(
+            self, compile_and_run, sprite_sheet_png):
+        # The exact shape security.md used to document as the dangling-
+        # alias hazard, now safe: the alias holds its own reference.
+        source = f"""
+        img sheet = '{sprite_sheet_png}'
+        img tile = sheet.clip(0, 0, 8, 8)
+        img alias = tile
+        free tile
+        log(alias.width)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "8"
+
+    def test_releasing_a_call_result_aliasing_a_shared_img_is_safe(
+            self, compile_and_run, sprite_sheet_png):
+        # claude.md #110 recorded why call-result img receivers could
+        # not be released: `img func get() { return shared }` handed
+        # back the global itself. The Return path retains an aliased
+        # value now, so the temporary's release is a decrement and the
+        # global survives it.
+        source = f"""
+        img shared = '{sprite_sheet_png}'
+        img func getShared() {{
+            return shared
+        }}
+        img c = getShared()
+        free c
+        log(shared.width)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "128"
+
+    def test_free_on_an_aliased_aud_leaves_the_alias_playable(
+            self, compile_and_run, audio_null_env):
+        src = os.path.join(_FIXTURES_DIR, "beep.wav")
+        source = f"""
+        aud clip = '{src}'
+        aud alias = clip
+        free clip
+        int ch = alias.play()
+        log(ch >= 0)
+        alias.stop()
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
 
 
 class TestStructTextFieldReclamation:
@@ -10099,10 +10255,12 @@ class TestImageClipResizeAndSize:
     can't be resized in place, and boxing it means every binding
     sharing an image sees the new one.
 
-    That box is also why img now has an ownership story (`_OwnedImage`,
-    the same shape claude.md #86 uses for regex): clip() exists to be
-    called repeatedly, so without scope-exit reclamation, extracting
-    frames in a loop would leak a whole surface per iteration."""
+    That box is also what carries claude.md #118's refcount header:
+    clip() exists to be called repeatedly, so without scope-exit
+    reclamation, extracting frames in a loop would leak a whole surface
+    per iteration -- and counting (rather than #92's created-here +
+    never-escaping ownership proof) is what lets EVERY img binding be
+    released, aliases and escapers included."""
 
     def _ir(self, parser, semantic, codegen, source, filename="main.f"):
         program = parser.parse(source, filename=filename)
@@ -10144,9 +10302,15 @@ class TestImageClipResizeAndSize:
         body = ir.split("define void @f(ptr %arg.sheet)")[1].split("\n}")[0]
         assert "call void @festina_image_free(ptr" in body
 
-    def test_a_borrowed_image_is_not_freed(self, parser, semantic, codegen):
-        # `other` merely aliases an image the caller owns -- freeing it
-        # here would destroy a surface still in use.
+    def test_an_aliasing_image_binding_retains_before_its_release(
+            self, parser, semantic, codegen):
+        # claude.md #118 INVERTED this test: `other` used to be left
+        # unreleased because it merely aliased the caller's image and a
+        # free was final. With the refcount header the binding takes its
+        # own +1 at the declaration and drops exactly that +1 at scope
+        # exit -- the caller's surface survives because the count says
+        # so, not because the release was skipped. The order is the
+        # safety argument: retain first, release later.
         source = """
         void func f(sheet:img) {
             img other = sheet
@@ -10155,9 +10319,17 @@ class TestImageClipResizeAndSize:
         """
         ir = self._ir(parser, semantic, codegen, source)
         body = ir.split("define void @f(ptr %arg.sheet)")[1].split("\n}")[0]
-        assert "call void @festina_image_free(ptr" not in body
+        retain_at = body.index("call void @festina_retain(ptr")
+        release_at = body.index("call void @festina_image_free(ptr")
+        assert retain_at < release_at
 
-    def test_an_escaping_image_is_not_freed(self, parser, semantic, codegen):
+    def test_an_escaping_image_is_released_and_the_global_retains(
+            self, parser, semantic, codegen):
+        # claude.md #118 INVERTED this test: an escaping img used to be
+        # left to leak (releasing it would have dangled the global).
+        # Now `kept = tile` retains for the global before the local's
+        # own scope-exit release decrements -- the clip survives through
+        # `kept`, and nothing leaks.
         source = """
         img kept
         void func f(sheet:img) {
@@ -10167,7 +10339,9 @@ class TestImageClipResizeAndSize:
         """
         ir = self._ir(parser, semantic, codegen, source)
         body = ir.split("define void @f(ptr %arg.sheet)")[1].split("\n}")[0]
-        assert "call void @festina_image_free(ptr" not in body
+        retain_at = body.index("call void @festina_retain(ptr")
+        release_at = body.index("call void @festina_image_free(ptr")
+        assert retain_at < release_at
 
     # ---- type checking ----
 

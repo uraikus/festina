@@ -83,15 +83,17 @@ corruption**:
   compiled program. This is the one place where a bug in *your* Festina
   code has C-like consequences; the index is never attacker-supplied
   unless your program makes it so.
-- **`free` on an aliased `img`/`aud` dangles the alias** — the manual
-  contract, stated at the feature (claude.md #111): those two handle
-  types have no refcount, so `free` frees outright. The freed *binding*
-  reads null; a second binding does not. No other type has this hazard:
-  refcounted values (`struct`, `arr`, `map`, `blob`) treat `free` as a
-  decrement, so a shared value survives, and a `text` binding always
-  owns its buffer exclusively (copy-on-alias). Every runtime release is
-  null-safe, so double-`free` through a binding is a no-op.
-- **Reference cycles and escaping `img`/`aud` handles leak** — see
+- **`free` is a decrement on every managed pointer type** — `struct`,
+  `arr`, `map`, `blob`, and (since claude.md #118) `img`, `aud` and
+  `regex` all carry the same refcount header, so a shared value
+  survives a `free` through one binding and an alias never dangles. (A
+  `text` binding always owns its buffer exclusively — copy-on-alias —
+  so freeing it outright is equally safe.) Every runtime release is
+  null-safe, so double-`free` through a binding is a no-op. This
+  retired the one documented dangling-alias hazard the language had:
+  before #118, `free` on an aliased `img`/`aud` freed outright and the
+  alias dangled, as a stated manual contract.
+- **Reference cycles and two chain shapes leak** — see
   [todo.md](todo.md#memory-model). Leaks, never use-after-free; tests
   pin that distinction so an "optimization" cannot silently trade one
   for the other.

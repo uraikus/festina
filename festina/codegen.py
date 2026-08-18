@@ -353,12 +353,27 @@ def _is_refcounted(t):
     strings to free first -- dispatched through _release_fn_for the
     same way a struct's field cascade is.
 
+    claude.md #118: img, aud and regex joined the family too, for the
+    same reason blob did -- each now carries the identical i64 header
+    (allocated by festina_image_box / festina_audio_from_bytes /
+    festina_regex_compile) and each has a destructor with contents of
+    its own to free, dispatched through _release_fn_for exactly like
+    blob's. That closed the "escaping img/aud handle leaks" and
+    "`free` on an aliased img/aud dangles" gaps in one move: every
+    binding owns exactly one countable reference, wherever the value
+    came from, so releasing at scope exit / reassignment / `free` is
+    always a safe decrement. A /pattern/ regex literal's process-
+    lifetime cache is the standard immortal sentinel (negative
+    header), so it flows through every one of these paths as a no-op
+    with no special case left in this file.
+
     `text` is deliberately NOT here. A text is managed but not
     refcounted: it is copied on alias (festina_text_own) and freed
     outright, so it needs its own branch wherever ownership is decided
     -- see claude.md #83."""
     return (isinstance(t, (types_mod.StructType, types_mod.ArrayType,
-                           types_mod.MapType))
+                           types_mod.MapType, types_mod.ImageType,
+                           types_mod.AudioType, types_mod.RegexType))
             or t == BLOB)
 
 FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
@@ -590,58 +605,6 @@ class _StackArrayOrMap:
         self.type_ = type_
 
 
-class _OwnedImage:
-    """claude.md #92: marks, in CodeGen._active_free_locals, an `img`
-    local this scope provably owns -- one whose initializer is a Call
-    (`loadImage(...)` or `sheet.clip(...)`, both of which hand back a
-    freshly created image nothing else references yet) and whose name
-    escape analysis proves never leaves the declaring function.
-
-    Exactly the shape claude.md #86 already uses for regex, and here for
-    a sharper reason: clip() exists to be called repeatedly -- one per
-    sprite -- so without this, extracting frames inside a loop would
-    leak a whole Cairo surface every iteration. An `img` bound from
-    anything else (another img binding, a struct field) is only
-    borrowing, and an escaping one may still be referenced after this
-    scope ends; neither is freed here."""
-
-    def __init__(self):
-        pass
-
-
-class _OwnedAudio:
-    """claude.md #101: the aud counterpart of _OwnedImage below --
-    marks, in CodeGen._active_free_locals, an `aud` local this scope
-    created itself and that escape analysis proves never leaves the
-    function, so scope exit can free it. Audio handles were never freed
-    at all before this; a clip loaded inside a loop leaked one decoded
-    buffer per iteration, which the `aud x = 'path'` short form made
-    easy to write by accident."""
-
-
-class _OwnedRegex:
-    """claude.md #86: marks, in CodeGen._active_free_locals, a `regex`
-    local this scope provably owns outright -- one whose initializer is
-    a `regex(...)` Call (freshly compiled by festina_regex_compile, so
-    nothing else can reference it yet) and whose name escape analysis
-    proves never escapes the declaring function.
-
-    Both halves are load-bearing, and getting either wrong frees
-    something still in use. A regex whose initializer is a /pattern/
-    literal is NOT owned: that pointer comes from a process-lifetime
-    cache (see _emit_cached_regex_lit), and freeing it would leave every
-    later evaluation of that literal running regexec against a freed
-    regex_t. A regex that escapes is not owned either: `text`'s trick of
-    copying at each consuming site to guarantee exclusivity has no
-    regex equivalent (a "copy" would mean recompiling, and the pattern
-    string isn't retained to recompile from), so an escaping regex is
-    left to leak exactly as it did before, rather than freed while
-    another binding may still be pointing at it."""
-
-    def __init__(self):
-        pass
-
-
 class CodeGen:
     def __init__(self, analyzed, filename="main.f"):
         self.analyzed = analyzed
@@ -837,6 +800,10 @@ class CodeGen:
                                                 # source locations still each get their own slot,
                                                 # simpler than deduplicating by text and just as
                                                 # correct (each still only ever compiles once)
+        self._regex_memo_slots = {}            # claude.md #118: id(regex() Call node) -> its private
+                                                # [3 x ptr] memo slot global ({pattern copy, flags
+                                                # copy, compiled}) -- see _emit_regex_call /
+                                                # festina_regex_compile_memo
         # claude.md #108: state for a MEMBER CHAIN's deferred receiver
         # release -- see _emit_member_load. _chain_receiver holds the
         # exact AST node the enclosing member load is about to emit as
@@ -1056,6 +1023,8 @@ class CodeGen:
             "declare i8 @festina_row_undefined(ptr, ptr, i32, ptr)",
             # claude.md #67-68, #107: regex(), .test(), .match(), .replace().
             "declare ptr @festina_regex_compile(ptr, ptr)",
+            # claude.md #118: the per-call-site memo for dynamic regex().
+            "declare ptr @festina_regex_compile_memo(ptr, ptr, ptr)",
             "declare void @festina_regex_free(ptr)",
             "declare i8 @festina_regex_test(ptr, ptr)",
             "declare ptr @festina_regex_match(ptr, ptr)",
@@ -1401,31 +1370,6 @@ class CodeGen:
                     # retained a reference nothing else will ever
                     # release otherwise.
                     self._emit_release_nested_fields_only(ref, type_.struct_type, lines)
-                elif isinstance(type_, _OwnedImage):
-                    # claude.md #92: destroys the Cairo surface and the
-                    # box holding it. Never reached for a borrowed or
-                    # escaping img; see _OwnedImage's own comment.
-                    image = self.tmp()
-                    lines.append(f"  {image} = load ptr, ptr {ref}")
-                    lines.append(f"  call void @festina_image_free(ptr {image})")
-                elif isinstance(type_, _OwnedAudio):
-                    # claude.md #101: frees the decoded PCM, the stored
-                    # source bytes and the clip itself, stopping any
-                    # channel still playing it first. Never reached for
-                    # a borrowed or escaping aud, exactly as _OwnedImage
-                    # above.
-                    clip = self.tmp()
-                    lines.append(f"  {clip} = load ptr, ptr {ref}")
-                    lines.append(f"  call void @festina_audio_free(ptr {clip})")
-                elif isinstance(type_, _OwnedRegex):
-                    # claude.md #86: a regex this scope compiled itself
-                    # and provably never shared -- regfree + free, via
-                    # the same helper #85 already uses for a regex
-                    # temporary. Never reached for a /pattern/ literal
-                    # or an escaping binding; see _OwnedRegex's comment.
-                    compiled = self.tmp()
-                    lines.append(f"  {compiled} = load ptr, ptr {ref}")
-                    lines.append(f"  call void @festina_regex_free(ptr {compiled})")
                 elif isinstance(type_, _StackArrayOrMap):
                     # claude.md #79: a stack-allocated arr[T]/map[T]
                     # local (see _emit_block's own tracking comment) --
@@ -1618,8 +1562,12 @@ class CodeGen:
             slot = f"%{p.name}"
             body_lines.append(f"  {slot} = alloca {_llvm_type(t)}")
             arg_ref = f"%arg.{p.name}"
-            if p.name in escaping and isinstance(
-                    t, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+            if p.name in escaping and _is_refcounted(t):
+                # claude.md #118: _is_refcounted rather than the
+                # struct/arr/map tuple, so a blob/img/aud/regex
+                # parameter that escapes (is reassigned, say) carries
+                # its own +1 here too -- otherwise the reassignment's
+                # release would drop a reference the CALLER still owns.
                 body_lines.append(f"  call void @festina_retain(ptr {arg_ref})")
                 self._active_free_locals[-1].append((slot, t))
             elif p.name in escaping and t == TEXT:
@@ -1750,22 +1698,19 @@ class CodeGen:
         reading x afterwards reads null, the ordinary absent value.
 
         Per type:
-        - struct/arr[T]/map[T]/blob: a refcount DECREMENT, not a forced
-          free -- an aliased value survives until its other references
-          drop, which is the "retains pointers if they have a pointer
-          elsewhere" guarantee. Freeing an array releases each element
-          the same way, so a shared element outlives its array.
+        - struct/arr[T]/map[T]/blob/img/aud/regex: a refcount
+          DECREMENT, not a forced free -- an aliased value survives
+          until its other references drop, which is the "retains
+          pointers if they have a pointer elsewhere" guarantee.
+          Freeing an array releases each element the same way, so a
+          shared element outlives its array. (claude.md #118: img/aud
+          used to be the exception here -- freed outright, alias left
+          dangling -- and regex needed a runtime flag to protect the
+          literal cache; the refcount header retired both special
+          cases. A /pattern/ literal's cached compilation is immortal,
+          so `free` on a binding aliasing one is a safe no-op.)
         - text: the buffer is exclusively owned (copy-on-alias,
           claude.md #83), so freed outright.
-        - img/aud: freed outright -- these have no refcount (see
-          todo.md), which is exactly why `free` matters most here: it is
-          the manual escape hatch for the escaping-handle leak. The
-          contract is the C one: freeing a handle another binding still
-          aliases leaves that alias dangling. The binding freed here
-          reads null; an ALIAS does not.
-        - regex: freed if it was a runtime regex() result; a /pattern/
-          literal's cached compilation marks itself and
-          festina_regex_free no-ops on it, so `free` is safe on either.
         - a query row: nulled WITHOUT freeing -- the row is owned by the
           array it came from, and freeing it here would double-free at
           the array's own release. Free the array.
@@ -1785,14 +1730,6 @@ class CodeGen:
                 lines.append(f"  call void {self._release_fn_for(ttype)}(ptr {old})")
             elif ttype == TEXT:
                 lines.append(f"  call void @free(ptr {old})")
-            elif isinstance(ttype, types_mod.ImageType):
-                self.uses_graphics_code = True
-                lines.append(f"  call void @festina_image_free(ptr {old})")
-            elif isinstance(ttype, types_mod.AudioType):
-                self.uses_audio = True
-                lines.append(f"  call void @festina_audio_free(ptr {old})")
-            elif ttype == REGEX:
-                lines.append(f"  call void @festina_regex_free(ptr {old})")
             # TableType (a borrowed query row) and any other ptr-backed
             # value: nothing released, only the binding dropped.
             lines.append(f"  store ptr null, ptr {ref}")
@@ -1855,15 +1792,11 @@ class CodeGen:
             old = self.tmp()
             lines.append(f"  {old} = load ptr, ptr {ptr}")
         if _is_refcounted(ftype):
+            # claude.md #118: covers img/aud fields too now -- one
+            # release dispatch, no media special case left.
             lines.append(f"  call void {self._release_fn_for(ftype)}(ptr {old})")
         elif ftype == TEXT:
             lines.append(f"  call void @free(ptr {old})")
-        elif isinstance(ftype, types_mod.ImageType):
-            self.uses_graphics_code = True
-            lines.append(f"  call void @festina_image_free(ptr {old})")
-        elif isinstance(ftype, types_mod.AudioType):
-            self.uses_audio = True
-            lines.append(f"  call void @festina_audio_free(ptr {old})")
         f_llvm = _llvm_type(ftype)
         null_const = {"ptr": "null", "i64": INT_NULL_CONST,
                       "double": FLOAT_NULL_CONST, "i8": BOOL_NULL_CONST}[f_llvm]
@@ -2013,7 +1946,8 @@ class CodeGen:
                                 # comment.
                                 self._active_free_locals[-1].append(
                                     (ref, _StackStructFieldsOnly(type_)))
-                        elif type_ == BLOB:
+                        elif type_ == BLOB or type_ == REGEX or isinstance(
+                                type_, (types_mod.ImageType, types_mod.AudioType)):
                             # claude.md #109: a blob local is ALWAYS
                             # scheduled for release, with no
                             # escaping-ness test and no
@@ -2033,55 +1967,19 @@ class CodeGen:
                             # point of #109's "if a blob = another
                             # blob, copy the reference".
                             #
-                            # This is why blob is refcounted where img
-                            # and aud are merely owned-or-leaked: those
-                            # two have no way to express sharing, so
-                            # they need to PROVE sole ownership before
-                            # freeing. A blob just counts.
+                            # claude.md #118: img/aud/regex carry the
+                            # same header now, so the ownership proofs
+                            # this branch used to demand for them
+                            # (_OwnedImage/_OwnedAudio/_OwnedRegex's
+                            # created-here + never-escaping tests) are
+                            # gone along with those marker classes:
+                            # counting replaced proving, for exactly the
+                            # reason blob's own comment above gives. An
+                            # escaping handle no longer leaks, and a
+                            # /re/ literal's immortal header makes its
+                            # release here a no-op rather than a
+                            # use-after-free hazard.
                             self._active_free_locals[-1].append((ref, type_))
-                        elif isinstance(type_, types_mod.ImageType):
-                            # claude.md #92: same two-part ownership test
-                            # #86 uses for regex -- created here (a Call:
-                            # loadImage or clip) and provably never
-                            # escaping. See _OwnedImage's own comment.
-                            #
-                            # claude.md #101: `img sprite = 'path.png'`
-                            # counts as "created here" too. It compiles
-                            # to a real festina_load_image call (see
-                            # _coerce), so the value is exactly as fresh
-                            # and unshared as loadImage()'s -- but the
-                            # AST node is a StringLit, so testing for a
-                            # Call alone silently stopped reclaiming
-                            # these the moment the short form existed.
-                            # Confirmed under LeakSanitizer: one handle
-                            # per loop iteration.
-                            if (self._is_owning_media_source(stmt.init)
-                                    and stmt.name not in self._current_escaping_names):
-                                self._active_free_locals[-1].append((ref, _OwnedImage()))
-                        elif isinstance(type_, types_mod.AudioType):
-                            # claude.md #101: `aud` gets the reclamation
-                            # `img` has had since #92 -- the two are the
-                            # same shape of handle and there was never a
-                            # reason for one to be freed and the other
-                            # not. Same two-part test.
-                            if (self._is_owning_media_source(stmt.init)
-                                    and stmt.name not in self._current_escaping_names):
-                                self._active_free_locals[-1].append((ref, _OwnedAudio()))
-                        elif type_ == REGEX:
-                            # claude.md #86: only a regex this scope
-                            # compiled itself (a `regex(...)` Call, so
-                            # freshly allocated and unshared) and that
-                            # escape analysis proves never leaves this
-                            # function is freed here. A /pattern/
-                            # literal initializer is a process-lifetime
-                            # cached pointer that must never be freed,
-                            # and an escaping regex has no copy-on-alias
-                            # escape hatch the way text does -- both are
-                            # left to leak, exactly as before. See
-                            # _OwnedRegex's own comment.
-                            if (isinstance(stmt.init, ast.Call)
-                                    and stmt.name not in self._current_escaping_names):
-                                self._active_free_locals[-1].append((ref, _OwnedRegex()))
                         elif type_ == TEXT:
                             # claude.md #83: unlike the other three
                             # types, a text local is ALWAYS scheduled
@@ -2114,7 +2012,8 @@ class CodeGen:
         lines = ctx["lines"]
         if isinstance(stmt, ast.VarDecl):
             type_ = self._resolve(stmt.type_expr, stmt)
-            if type_ == BLOB:
+            if type_ == BLOB or type_ == REGEX or isinstance(
+                    type_, (types_mod.ImageType, types_mod.AudioType)):
                 # claude.md #109: `blob save = 'save.dat'` reads the file
                 # and hands back a fresh handle with a refcount of 1;
                 # `blob other = save` aliases the same handle and needs
@@ -2126,6 +2025,15 @@ class CodeGen:
                 # festina_blob_open call, which is as fresh as any other
                 # call result, so `vtype == TEXT` before coercion IS the
                 # freshness test.
+                #
+                # claude.md #118: img/aud/regex take this exact branch
+                # now that they carry the same header -- `img s =
+                # 'x.png'` is the same coercion shape as the blob path
+                # form, `img b = a` is the same alias-needs-a-retain
+                # shape, and a /re/ literal initializer is immortal, so
+                # the retain the freshness test emits for it, or skips,
+                # is a no-op either way (it is classified fresh, so it
+                # is skipped -- see _refcounted_source_is_fresh).
                 uid = self._unique()
                 slot = f"%{stmt.name}.{uid}"
                 lines.append(f"  {slot} = alloca ptr")
@@ -2468,8 +2376,14 @@ class CodeGen:
                 # too, the identical rule -- retain always being the
                 # same generic @festina_retain regardless of type is
                 # exactly what makes this one check cover all three.
+                # claude.md #118: through _refcounted_source_is_fresh
+                # rather than _is_owning_refcounted_source directly, so
+                # `return 'x.png'` in an img/aud/blob function -- where
+                # _coerce just emitted the load call, a fresh +1 --
+                # is not retained a second time.
                 if (_is_refcounted(return_type)
-                        and not self._is_owning_refcounted_source(stmt.value)):
+                        and not self._refcounted_source_is_fresh(
+                            stmt.value, vtype, return_type)):
                     lines.append(f"  call void @festina_retain(ptr {val})")
                 elif return_type == TEXT and not self._is_owning_text_source(stmt.value):
                     # claude.md #83: the text counterpart just above --
@@ -3513,14 +3427,19 @@ class CodeGen:
 
         values = []
         sources = []
+        pre_coerce_types = []   # claude.md #118: pre-coercion types, for
+                                # the freshness test below (a text path
+                                # coerced into a blob/img/aud element is
+                                # already a fresh +1)
         elem_type = expected_elem
         for e in expr.elements:
             if isinstance(e, ast.ArrayLit) and isinstance(expected_elem, types_mod.ArrayType):
                 val, vtype = self._emit_array_lit(e, env, lines, expected_elem)
             else:
                 val, vtype = self._emit_value_for(e, env, lines, expected_elem)
+            pre_coerce_types.append(vtype)
             if expected_elem is not None:
-                val = self._coerce(val, vtype, expected_elem, lines)
+                val = self._coerce(val, vtype, expected_elem, lines, source_expr=e)
                 vtype = expected_elem
             values.append(val)
             sources.append(e)
@@ -3574,7 +3493,8 @@ class CodeGen:
             for i, val in enumerate(values):
                 elem_ptr = self.tmp()
                 lines.append(f"  {elem_ptr} = getelementptr {elem_llvm_ty}, ptr {data_ptr}, i64 {i}")
-                if elem_is_refcounted and not self._is_owning_refcounted_source(sources[i]):
+                if elem_is_refcounted and not self._refcounted_source_is_fresh(
+                        sources[i], pre_coerce_types[i], elem_type):
                     lines.append(f"  call void @festina_retain(ptr {val})")
                 elif elem_type == TEXT and not self._is_owning_text_source(sources[i]):
                     owned = self.tmp()
@@ -3620,12 +3540,15 @@ class CodeGen:
             # as an empty string, same as everywhere else text does).
             key_val, _ = self._emit_value_for(key_expr, env, lines, TEXT)
             val_val, vtype = self._emit_value_for(val_expr, env, lines, expected_value)
+            pre_coerce_type = vtype   # claude.md #118: for the freshness test
             if expected_value is not None:
-                val_val = self._coerce(val_val, vtype, expected_value, lines)
+                val_val = self._coerce(val_val, vtype, expected_value, lines,
+                                       source_expr=val_expr)
                 vtype = expected_value
             value_type = value_type or vtype
             self._emit_map_set(header, value_type, key_val, val_val, val_expr, lines,
-                                key_source_expr=key_expr)
+                                key_source_expr=key_expr,
+                                value_pre_coerce_type=pre_coerce_type)
 
         if value_type is None:
             raise CodegenError(
@@ -3716,7 +3639,7 @@ class CodeGen:
         return self._i64_to_map_value(raw, value_type, lines), value_type
 
     def _emit_map_set(self, map_ptr, value_type, key_val, value_val, value_source_expr, lines,
-                       key_source_expr=None):
+                       key_source_expr=None, value_pre_coerce_type=None):
         """claude.md #72: npcHealths['npc1'] = 30 (and the equivalent
         per-entry calls a map literal builds itself out of -- see
         _emit_map_lit). Unlike a read, this needs the map's own actual
@@ -3765,7 +3688,11 @@ class CodeGen:
             lines.append(f"  {old_raw} = call i64 @festina_map_get(i64 {count_val}, ptr {entries_val}, ptr {key_val}, i64 0)")
             old_ptr = self.tmp()
             lines.append(f"  {old_ptr} = inttoptr i64 {old_raw} to ptr")
-            if not self._is_owning_refcounted_source(value_source_expr):
+            # claude.md #118: the freshness test (with the caller's
+            # pre-coercion type, when it passes one) so a text value
+            # coerced into a blob/img/aud entry is not over-retained.
+            if not self._refcounted_source_is_fresh(
+                    value_source_expr, value_pre_coerce_type, value_type):
                 lines.append(f"  call void @festina_retain(ptr {value_val})")
             lines.append(f"  call void {self._release_fn_for(value_type)}(ptr {old_ptr})")
         elif value_type == TEXT:
@@ -3930,10 +3857,13 @@ class CodeGen:
         path, no result-type judgement is needed: the result never
         points into what is being released.
 
-        img/aud receivers are skipped even for a Call: they have no
-        refcount, and claude.md #110 records why freeing a call-result
-        img is unsafe (`img func get() { return shared }` hands back a
-        global)."""
+        claude.md #118: img/aud receivers are no longer skipped. #110
+        skipped them because freeing a call-result img could free
+        something shared (`img func get() { return shared }` hands back
+        an alias); with the refcount header, the Return path retains an
+        aliased value on the way out, so the call result always owns
+        its own +1 and releasing it here is a decrement, never a
+        premature destroy."""
         if not _is_refcounted(obj_type):
             return
         if not self._is_owning_refcounted_source(obj_expr):
@@ -4198,25 +4128,6 @@ class CodeGen:
             expr = expr.obj
         return isinstance(expr, ast.Call)
 
-    def _is_owning_media_source(self, expr):
-        """claude.md #92/#101: whether an img/aud local's initializer
-        produced a FRESH handle this scope owns outright.
-
-        A Call is owning -- loadImage/loadAudio, or clip() -- for the
-        same reason it is for every other type: it allocates something
-        nothing else references yet.
-
-        A StringLit (or any text-typed expression) is owning too, and
-        that case is the whole reason this is a function rather than an
-        isinstance check. `img sprite = 'sprite.png'` compiles to a real
-        load call (see _coerce), so the handle is exactly as fresh as
-        loadImage()'s -- but the AST node is not a Call, so the
-        Call-only test #92 used silently stopped reclaiming these the
-        moment claude.md #101 added the short form. A bare Identifier
-        stays non-owning: that is an alias of a handle someone else
-        owns, and freeing it would leave them dangling."""
-        return isinstance(expr, (ast.Call, ast.StringLit, ast.TemplateLit, ast.BinOp))
-
     def _is_owning_text_source(self, expr):
         """claude.md #83: the text counterpart to
         _is_owning_refcounted_source -- "owning" here means "already a
@@ -4317,13 +4228,13 @@ class CodeGen:
 
         The owning test is `isinstance(source_expr, ast.Call)`, which
         cleanly separates the two ways a regex value is produced: only
-        `regex(...)` is a Call, while a /pattern/ literal is an
-        ast.RegexLit compiled once into a process-lifetime cache (see
-        _emit_cached_regex_lit) that must never be freed. A regex bound
-        to a variable is an Identifier at its use sites and so is
-        likewise never freed here -- it still leaks, as it did before,
-        since regex has no binding-level ownership story the way text
-        now does (see todo.md)."""
+        `regex(...)` is a Call (whose memoized result carries this
+        expression's own +1 -- see festina_regex_compile_memo), while a
+        /pattern/ literal is an ast.RegexLit whose cached compilation
+        is immortal, so releasing it here would be a harmless no-op
+        anyway. A regex bound to a variable is an Identifier at its use
+        sites and is not released here -- its own binding's scope-exit
+        release owns that reference (claude.md #118)."""
         if vtype == REGEX and isinstance(source_expr, ast.Call):
             lines.append(f"  call void @festina_regex_free(ptr {val})")
 
@@ -4391,8 +4302,20 @@ class CodeGen:
 
         So the freshness test for a blob is whether a COERCION
         happened, which `source_type` records: text in, blob out means
-        _coerce emitted the open call itself."""
-        if target_type == BLOB and source_type == TEXT:
+        _coerce emitted the open call itself.
+
+        claude.md #118: img and aud have the identical short form
+        (`img s = 'x.png'` -> festina_load_image via _coerce), so the
+        same text-in/handle-out test covers them. A /re/ literal is
+        "fresh" too, on different grounds: its cached compilation is
+        immortal, so retain and release are both no-ops on it and the
+        cheaper answer (skip the retain) is the right one."""
+        if source_type == TEXT and (
+                target_type == BLOB
+                or isinstance(target_type, (types_mod.ImageType,
+                                            types_mod.AudioType))):
+            return True
+        if isinstance(source_expr, ast.RegexLit):
             return True
         return self._is_owning_refcounted_source(source_expr)
 
@@ -4494,6 +4417,23 @@ class CodeGen:
             # cascade wrapper, except the runtime can write this one
             # once instead of codegen generating it per type.
             return "@festina_blob_release"
+        if isinstance(type_, types_mod.ImageType):
+            # claude.md #118: same shape as blob -- release semantics
+            # with a runtime-written destructor (surface, bytes, path).
+            # uses_graphics_CODE, not uses_graphics: releasing an image
+            # needs no X server, same distinction the loading coercion
+            # already draws.
+            self.uses_graphics_code = True
+            return "@festina_image_free"
+        if isinstance(type_, types_mod.AudioType):
+            # claude.md #118: destruction stops every channel still
+            # playing the clip first -- see festina_audio_free.
+            self.uses_audio = True
+            return "@festina_audio_free"
+        if type_ == REGEX:
+            # claude.md #118: regfree on the last reference; a cached
+            # /pattern/ literal is immortal and no-ops through here.
+            return "@festina_regex_free"
         if type_ == TEXT:
             # claude.md #83: text has no refcount header to dispatch
             # through -- "releasing" one is always just a plain,
@@ -4986,9 +4926,11 @@ class CodeGen:
                             file=self.filename, line=getattr(expr.target, "line", 0))
                     key_val, _ = self._emit_expr(expr.target.prop, env, lines)
                     val, vtype = self._emit_value_for(expr.value, env, lines, obj_type.value)
-                    val = self._coerce(val, vtype, obj_type.value, lines)
+                    val = self._coerce(val, vtype, obj_type.value, lines,
+                                       source_expr=expr.value)
                     self._emit_map_set(obj_val, obj_type.value, key_val, val, expr.value, lines,
-                                        key_source_expr=expr.target.prop)
+                                        key_source_expr=expr.target.prop,
+                                        value_pre_coerce_type=vtype)
                     return val, obj_type.value
                 if not isinstance(obj_type, types_mod.ArrayType):
                     raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",
@@ -5022,9 +4964,13 @@ class CodeGen:
                 # time computed-Member reaches this shared code with
                 # `ftype` set, it's already provably the array-element
                 # case (the map one returns earlier, above).
+                # claude.md #118: the freshness test (not the bare
+                # owning-source one) so a text initializer coerced into
+                # a blob/img/aud field -- a fresh handle from _coerce's
+                # own load call -- is not retained a second time.
                 old = self.tmp()
                 lines.append(f"  {old} = load ptr, ptr {ptr}")
-                if not self._is_owning_refcounted_source(expr.value):
+                if not self._refcounted_source_is_fresh(expr.value, vtype, ftype):
                     lines.append(f"  call void @festina_retain(ptr {val})")
                 lines.append(f"  call void {self._release_fn_for(ftype)}(ptr {old})")
             elif ftype == TEXT:
@@ -5979,22 +5925,29 @@ class CodeGen:
     # ---- regex() / .test() / .match() / .replace() (claude.md #67-68, #107) ----
     def _emit_regex_call(self, expr, env, lines):
         """claude.md #67: regex(pattern:text) / regex(pattern:text,
-        flags:text) -> regex. Compiles the pattern via POSIX regcomp()
-        at the call site, every time it's evaluated -- no caching across
-        calls, the same tradeoff already accepted for sqlite()'s
-        prepared statements (see _emit_sqlite_call). Unlike a /pattern/
-        flags literal (see _emit_cached_regex_lit above), pattern here
-        is an arbitrary runtime expression, so the same call site can
-        legitimately see a different pattern on different calls (e.g.
-        regex(userPattern) inside a loop) -- caching by call site would
-        be a correctness bug, not just a missed optimization, so a
-        regex() call inside a hot loop still recompiles every iteration;
-        documented as a known gap rather than solved here (claude.md
-        #54's ambiguity rule -- correctness over micro-optimizing
-        something #67 doesn't ask for). An invalid pattern fails at
-        runtime (festina_fail(), via the C runtime's regcomp() error
-        handling), not at compile time -- the Python compiler doesn't
-        itself validate regex syntax (claude.md #67's own words)."""
+        flags:text) -> regex.
+
+        claude.md #118: compiled through a per-call-site MEMO
+        (festina_regex_compile_memo) rather than a bare recompile per
+        evaluation. The pattern is an arbitrary runtime expression, so
+        the same call site can legitimately see a different pattern on
+        different calls -- which is why plain per-AST-node caching (what
+        /pattern/ literals get, see _emit_cached_regex_lit above) would
+        have been a correctness bug, and why this stayed uncached for so
+        long. The memo closes the gap from the other side: the runtime
+        compares the ACTUAL pattern+flags against what this site
+        compiled last time, reuses the compilation on a match (the
+        common case -- a fixed pattern built from config, evaluated in a
+        loop; measured ~24x cheaper than recompiling) and recompiles on
+        a mismatch, so a genuinely varying pattern is never served a
+        stale automaton. Evicting the superseded compilation is only
+        safe because regex is refcounted now (#118): a binding still
+        aliasing the old one keeps it alive.
+
+        An invalid pattern fails at runtime (festina_fail(), via the C
+        runtime's regcomp() error handling), not at compile time -- the
+        Python compiler doesn't itself validate regex syntax (claude.md
+        #67's own words)."""
         callee = expr.callee
         if not expr.args:
             raise CodegenError("regex() requires at least a pattern argument",
@@ -6012,10 +5965,22 @@ class CodeGen:
                     file=self.filename, line=callee.line)
         else:
             flags_val = self.string_const("")
+        # claude.md #118: one private {pattern copy, flags copy,
+        # compiled} slot per regex() call site -- the runtime memo's
+        # working storage. Keyed by AST node identity, the same scheme
+        # _regex_lit_cache uses for literals.
+        key = id(expr)
+        memo_global = self._regex_memo_slots.get(key)
+        if memo_global is None:
+            memo_global = f"@.regex.memo.{len(self._regex_memo_slots)}"
+            self._regex_memo_slots[key] = memo_global
+            self.extra_globals.append(
+                f"{memo_global} = private global [3 x ptr] zeroinitializer")
         out = self.tmp()
-        lines.append(f"  {out} = call ptr @festina_regex_compile(ptr {pattern_val}, ptr {flags_val})")
-        # claude.md #83: regcomp() compiles the pattern into its own
-        # regex_t and reads the flags inline -- neither pointer is
+        lines.append(f"  {out} = call ptr @festina_regex_compile_memo("
+                     f"ptr {pattern_val}, ptr {flags_val}, ptr {memo_global})")
+        # claude.md #83: the memo strdups the pattern/flags it keeps and
+        # regcomp() reads them inline -- neither caller pointer is
         # retained past this call, so a temporary passed for either is
         # the caller's to free.
         self._free_text_temp(expr.args[0], pattern_val, pattern_type, lines)

@@ -1387,21 +1387,27 @@ int8_t festina_row_undefined(void *row, const char **col_names,
 typedef struct {
     regex_t re;
     int8_t global;
-    /* claude.md #111: set for a /pattern/ literal's process-lifetime
-     * cached compilation (see codegen's _emit_cached_regex_lit). `free`
-     * works on every type, and a regex BINDING cannot know at compile
-     * time whether it holds a runtime regex() result (freeable) or the
-     * shared cached literal (freeing it would leave the cache dangling
-     * for every later execution of that line) -- so the value itself
-     * carries the answer and festina_regex_free consults it. */
-    int8_t cached;
 } FestinaRegex;
 
+/* claude.md #118: a regex is REFERENCE COUNTED now, carrying the same
+ * i64 header immediately before the payload that structs/arrays/maps/
+ * blobs use. Two things needed it at once: `free` on an aliased regex
+ * binding had to become a safe decrement like every other refcounted
+ * type's, and festina_regex_compile_memo below can only evict a
+ * superseded compilation safely if a binding that still aliases it
+ * keeps it alive. A /pattern/ literal's process-lifetime cached form
+ * uses the standard immortal sentinel (a NEGATIVE header, see
+ * festina_retain's own comment) instead of the separate `cached` flag
+ * it used to carry -- retain/release/free on one are all no-ops through
+ * the exact same check every other immortal value already goes
+ * through. */
 void *festina_regex_compile(const char *pattern, const char *flags) {
     if (!pattern) pattern = "";
     if (!flags) flags = "";
-    FestinaRegex *compiled = malloc(sizeof(FestinaRegex));
-    if (!compiled) festina_fail("out of memory in festina_regex_compile");
+    char *raw = malloc(sizeof(int64_t) + sizeof(FestinaRegex));
+    if (!raw) festina_fail("out of memory in festina_regex_compile");
+    *(int64_t *)raw = 1;
+    FestinaRegex *compiled = (FestinaRegex *)(raw + sizeof(int64_t));
 
     int cflags = REG_EXTENDED;
     if (strchr(flags, 'i')) cflags |= REG_ICASE;
@@ -1411,7 +1417,6 @@ void *festina_regex_compile(const char *pattern, const char *flags) {
      * wants done with the matches -- so it is recorded here and read
      * back by festina_regex_replace. */
     compiled->global = strchr(flags, 'g') != NULL;
-    compiled->cached = 0;
 
     int rc = regcomp(&compiled->re, pattern, cflags);
     if (rc != 0) {
@@ -1419,34 +1424,71 @@ void *festina_regex_compile(const char *pattern, const char *flags) {
         regerror(rc, &compiled->re, errbuf, sizeof(errbuf));
         char msg[512];
         snprintf(msg, sizeof(msg), "invalid regex pattern '%s': %s", pattern, errbuf);
-        free(compiled);
+        free(raw);
         festina_fail(msg);
     }
     return compiled;
 }
 
-/* claude.md #85: releases a regex_t compiled by festina_regex_compile.
- * Only ever called for a regex produced by a runtime `regex(...)` call
- * and consumed as a temporary in the same expression -- a /pattern/
- * literal is compiled once and cached for the life of the process (see
- * _emit_cached_regex_lit), so it is deliberately never freed. regfree()
- * releases what regcomp() allocated INSIDE the regex_t; the regex_t
- * itself was a separate malloc and needs its own free(). */
+/* claude.md #85/#118: the regex counterpart of festina_blob_release --
+ * decrement, and only on the last reference regfree() what regcomp()
+ * allocated inside the regex_t before freeing the storage. A cached
+ * /pattern/ literal's immortal header makes festina_release_check
+ * answer 0, so `free` on one is a safe no-op with no flag to consult. */
 void festina_regex_free(void *compiled) {
     if (!compiled) return;
-    /* claude.md #111: a cached literal is shared by every future
-     * execution of its source line -- freeing it here would be a
-     * use-after-free later, so `free` on one is a safe no-op. */
-    if (((FestinaRegex *)compiled)->cached) return;
+    if (!festina_release_check(compiled)) return;
     regfree(&((FestinaRegex *)compiled)->re);
-    free(compiled);
+    free((char *)compiled - sizeof(int64_t));
 }
 
-/* claude.md #111: marks a compiled regex as the process-lifetime cached
- * form -- called by generated code right after the literal cache is
- * first filled. */
+/* claude.md #111/#118: marks a compiled regex as the process-lifetime
+ * cached form -- called by generated code right after the literal cache
+ * is first filled. Sets the standard immortal sentinel, so every
+ * retain/release path (including `free` on a binding that aliases the
+ * literal) no-ops on it without a special case. */
 void festina_regex_mark_cached(void *compiled) {
-    if (compiled) ((FestinaRegex *)compiled)->cached = 1;
+    if (compiled) *(int64_t *)((char *)compiled - sizeof(int64_t)) = -1;
+}
+
+/* claude.md #118: the per-call-site memo for the dynamic regex(pattern,
+ * flags) builtin. `slot` is a private [3 x ptr] global codegen emits
+ * for each regex() call site: {pattern copy, flags copy, compiled}.
+ * The same pattern+flags as last time answers the cached compilation
+ * (~24x cheaper than recompiling, measured in api.md); a different
+ * pattern releases the slot's reference to the old one and compiles
+ * fresh. That release is what the refcount header makes safe: a
+ * binding that still aliases the superseded regex keeps it alive, and
+ * only the last reference regfrees it -- without the header this
+ * eviction was a use-after-free waiting to happen, which is why
+ * regex() recompiled per evaluation until now.
+ *
+ * The caller always receives its own +1 (retained here on a hit, the
+ * fresh count on a miss -- where the slot takes an extra retain for
+ * itself), so a memoized result is released by exactly the same
+ * scope-exit/temporary machinery a festina_regex_compile result always
+ * was. The slot's own reference intentionally lives until the pattern
+ * changes or the process exits -- the same reachable-until-exit rule
+ * the literal cache follows. */
+void *festina_regex_compile_memo(const char *pattern, const char *flags,
+                                 void **slot) {
+    if (!pattern) pattern = "";
+    if (!flags) flags = "";
+    if (slot[2] && strcmp((const char *)slot[0], pattern) == 0
+            && strcmp((const char *)slot[1], flags) == 0) {
+        festina_retain(slot[2]);
+        return slot[2];
+    }
+    festina_regex_free(slot[2]);
+    free(slot[0]);
+    free(slot[1]);
+    slot[0] = strdup(pattern);
+    slot[1] = strdup(flags);
+    if (!slot[0] || !slot[1]) festina_fail("out of memory in regex()");
+    void *compiled = festina_regex_compile(pattern, flags);
+    slot[2] = compiled;
+    festina_retain(compiled);
+    return compiled;
 }
 
 /* claude.md #116: the regex half of split() -- lives here with the

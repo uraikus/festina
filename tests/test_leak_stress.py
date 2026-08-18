@@ -240,15 +240,15 @@ int total = 0
 for int i = 0, i < 60, i++ {
     img sheet = 'tiles.png'
     img tile = sheet.clip(0, 0, 8, 8)
-    // Aliasing makes `sheet` escaping, which is the one img shape the
-    // compiler cannot reclaim -- exactly what free is for. img has no
-    // refcount, so the handle is freed ONCE, through one binding;
-    // freeing it through `alias` too would be the double free the
-    // documentation warns about (and ASan confirmed, when this program
-    // was first written wrong).
+    // claude.md #118: img is refcounted -- the alias holds its own
+    // reference, so `free sheet` is a decrement and reading through
+    // `alias` afterwards is SAFE, not the dangling-pointer hazard this
+    // program used to document. Freeing through both bindings is the
+    // ordinary shape now, and scope exit reclaims what free missed.
     img alias = sheet
     free sheet
-    total = total + tile.width
+    total = total + alias.width + tile.width
+    free alias
     free tile
 }
 log(total)
@@ -257,11 +257,12 @@ log(total)
 int total = 0
 for int i = 0, i < 40, i++ {
     aud clip = 'beep.wav'
-    // Same shape as the img program: the alias forces `clip` escaping,
-    // the handle is freed exactly once, and the alias -- which now
-    // dangles, per the documented manual contract -- is never touched.
+    // Same shape as the img program: refcounted since claude.md #118,
+    // so the alias survives `free clip` and is freed through its own
+    // binding (or scope exit) without double-free.
     aud alias = clip
     free clip
+    free alias
     total = total + 1
 }
 log(total)
