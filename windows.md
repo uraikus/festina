@@ -1,25 +1,33 @@
 # Windows support — the plan
 
-> **Status: Phase 0 is built, unverified on real hardware** — every
-> Python-side toolchain seam this section lists was in fact already
-> covered by claude.md #39's shared work (`.exe` naming, the libLLVM
-> DLL candidates, the GNU-ld static-sqlite path, `TestOnWindows`'s
+> **Status: Phase 0 is built; its first real CI run happened and found
+> a real bug, now fixed** (claude.md #126) — every Python-side
+> toolchain seam this section lists was in fact already covered by
+> claude.md #39's shared work (`.exe` naming, the libLLVM DLL
+> candidates, the GNU-ld static-sqlite path, `TestOnWindows`'s
 > skipif-gated exit-criteria tests). What was still missing: the regex
-> decision (MSYS2's `libgnurx` package, wired into the core link line
-> as `_core_pkgs`), `festina doctor`'s Windows-specific hints (rather
-> than wrongly probing for Linux packages like `alsa`/`cairo-xlib`),
-> and a `windows-latest` CI job via `msys2/setup-msys2`. All three are
-> now in place, and `_check_feature_supported` gives graphics/audio a
-> clean "not implemented yet, windows.md Phase N" error on win32
-> (unconditional, unlike macOS's real-hardware-verification gate --
-> there is no backend at all yet to unlock). Unlike macOS, none of
-> this has run on real Windows CI even once: this project has no
-> Windows or MSYS2 access, so the `windows-latest` job is this
-> session's best-effort reading of `msys2/setup-msys2`'s documented
-> usage, not something exercised locally. Its first real run is
-> expected to surface real bugs, the same way macOS Phase 0's first
-> hardware rounds did (claude.md #122) — that is exactly what it is
-> for. Phases 1–3 are open.
+> decision, `festina doctor`'s Windows-specific hints (rather than
+> wrongly probing for Linux packages like `alsa`/`cairo-xlib`), and a
+> `windows-latest` CI job via `msys2/setup-msys2`. All three landed —
+> and the regex decision's first real answer was wrong in a small,
+> instructive way: `mingw-w64-ucrt-x86_64-libgnurx`, this section's
+> originally preferred package, IS installable, but `pacman
+> --noconfirm` silently drops it because it conflicts with
+> `mingw-w64-ucrt-x86_64-libsystre` (already pulled in transitively by
+> the rest of the UCRT64 toolchain) rather than erroring — so
+> `_core_pkgs` now asks pkg-config for `libsystre` instead, the
+> package that's actually present. `_check_feature_supported` gives
+> graphics/audio a clean "not implemented yet, windows.md Phase N"
+> error on win32 (unconditional, unlike macOS's real-hardware-
+> verification gate — there is no backend at all yet to unlock). That
+> first CI run also surfaced two small, independent test-harness bugs
+> (Windows' non-UTF-8 locale default corrupting a non-ASCII literal;
+> a file-path assertion breaking on a Windows drive-letter colon),
+> both fixed the same round. What is NOT yet confirmed: that this
+> fixed state is itself green on real Windows CI — this project still
+> has no Windows/MSYS2 access, so every fix here was verified by
+> reasoning from the first run's actual log output plus the full Linux
+> suite, not by re-running on Windows. Phases 1–3 are open.
 
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,
@@ -59,15 +67,23 @@ are ordinary, dependency-light PE executables any Windows runs).
 Goal: `festina compile hello.f` produces a runnable `.exe` and the
 whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
 
-1. **Regex.** The one core gap. Landed as planned: MSYS2's POSIX regex
-   package (`libgnurx` — the standard `regex.h`/`libregex` shim for
-   MinGW) is now a per-platform pkg-config addition to cli.py's core
-   link line (`_core_pkgs`, win32-only; empty everywhere else, where
-   `<regex.h>` is already part of libc). Whether libgnurx's ERE
-   behavior actually matches glibc's under the existing regex test
-   suite — the fallback this item reserves, vendoring musl's
-   `regcomp/regexec/regfree` — is exactly what the first real
-   `windows-latest` CI run decides; nothing about that suite is
+1. **Regex.** The one core gap, and the item with a real story now:
+   landed first as planned, with MSYS2's `libgnurx` package as the
+   per-platform pkg-config addition to cli.py's core link line
+   (`_core_pkgs`, win32-only; empty everywhere else, where `<regex.h>`
+   is already part of libc) — then corrected the moment the first real
+   `windows-latest` run tried it. `libgnurx` genuinely installs, but
+   `pacman --noconfirm` silently drops it from the install set because
+   it CONFLICTS with `libsystre` (already present, pulled in
+   transitively by the rest of the UCRT64 toolchain), so `pkg-config
+   --cflags libgnurx` came up empty two steps later with no error at
+   the install step to explain why. `_core_pkgs` now names `libsystre`
+   instead — a real, already-installed POSIX regex.h/regcomp/regexec
+   wrapper around TRE, not the divergent-ERE fallback this item
+   originally reserved (vendoring musl's `regcomp/regexec/regfree`),
+   which never became necessary. Whether libsystre's ERE behavior
+   actually matches glibc's under the existing regex test suite is
+   what the NEXT real Windows run decides; nothing about that suite is
    platform-specific, so it remains the referee.
 2. **`.exe` awareness in `festina/cli.py`.** Already done before this
    phase began — `_default_output_name` appends `.exe` on `win32` (and
@@ -81,23 +97,28 @@ whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
    `.ll` directly) covers the gap regardless, exactly as on macOS.
 4. **`festina doctor` — Windows hints**: done. The Windows-specific
    report lines (rather than wrongly checking for Linux packages like
-   `alsa`/`cairo-xlib`): `libgnurx` as a REQUIRED line (like sqlite3),
+   `alsa`/`cairo-xlib`): `libsystre` as a REQUIRED line (like sqlite3),
    graphics/audio as "not yet implemented, windows.md Phase 1/2"
    lines, and detection of the plain `MSYS` shell (as opposed to
    UCRT64/MINGW64/CLANG64) via `$MSYSTEM`. The pacman one-liner
-   (`pacman -S mingw-w64-ucrt-x86_64-{clang,sqlite3,pkgconf,libgnurx}`)
+   (`pacman -S mingw-w64-ucrt-x86_64-{clang,sqlite3,pkgconf,libsystre}`)
    is now that hint's actual text, and the plain `cmd.exe` + MSVC
    note lives in setup.md's own Windows section (todo, tracked
    separately from this phase's own scope).
 5. **CI: a `windows-latest` job via the `msys2/setup-msys2` action**,
-   done: runs the whole suite headless the same way the macOS job
-   does, with no `FESTINA_STRICT_DEPS` (audio/graphics have no
-   Windows backend yet at all, so those tiers shed as skips via the
-   same conftest mechanism, not a parallel test-selection list), plus
-   compiling and running the four windowless examples as real `.exe`s.
-   The sanitizer leak tier stays Linux-only, same reasoning as macOS.
-   Unlike the macOS job's history, this has never actually run on real
-   Windows — see the status note at the top of this file.
+   built, and now run for real once: runs the whole suite headless the
+   same way the macOS job does, with no `FESTINA_STRICT_DEPS`
+   (audio/graphics have no Windows backend yet at all, so those tiers
+   shed as skips via the same conftest mechanism, not a parallel
+   test-selection list), plus compiling and running the four
+   windowless examples as real `.exe`s. The sanitizer leak tier stays
+   Linux-only, same reasoning as macOS. That first run is what caught
+   the libgnurx/libsystre conflict (claude.md #126) plus two small,
+   independent test-harness bugs (non-UTF-8 locale defaults on
+   Windows corrupting a non-ASCII literal; a file-path assertion
+   breaking on a drive-letter colon) — all fixed, but not yet
+   confirmed by a SECOND real run, which is the next thing this job
+   needs.
 6. **Filesystem semantics, verified not assumed**: already covered
    before this phase began by `tests/test_platform.py::TestBinaryFidelity`,
    which runs on every platform's CI — every runtime `fopen` is

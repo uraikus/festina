@@ -2717,16 +2717,22 @@ run `scripts/package_compiler.sh` for real as a dedicated step, then
 compile and run `examples/hello.f` with the freshly packaged binary —
 on the `macos-14` job specifically that produces and validates a real
 Apple Silicon (arm64) `festina` binary on every push, ad-hoc codesigned
-by the script's own new Darwin branch (`codesign -s -`, guarded on
+by the script's own new Darwin branch (`codesign -f -s -`, guarded on
 `uname -s` and on `codesign` being present) and re-verified with
 `codesign -v` in the CI step rather than trusting a zero exit code
-alone.
+alone. The `-f`/`--force` was added after the first real macOS CI run
+(claude.md #126) found recent PyInstaller already ad-hoc-signs the EXE
+itself, and codesign refuses to resign an already-signed binary
+without it.
 
 windows.md Phase 0 fills the one core-runtime gap the platform seams
 paragraph above didn't yet: `<regex.h>` isn't part of MinGW-w64's libc,
 so `_core_pkgs` (win32-only; empty everywhere else) pulls in MSYS2's
-`libgnurx` package via pkg-config on `festina_runtime.c`'s cflags AND
-the final link line -- unlike graphics/audio, this isn't an optional
+`libsystre` package via pkg-config on `festina_runtime.c`'s cflags AND
+the final link line -- not `libgnurx`, windows.md's originally
+preferred answer, which the first real Windows CI run (claude.md #126)
+found `pacman --noconfirm` silently drops due to a package conflict.
+Unlike graphics/audio, this isn't an optional
 feature tier, it's core, so `festina doctor` reports it as REQUIRED
 (like sqlite3) rather than optional. `_check_feature_supported` gives
 graphics/audio a clean "not implemented yet, windows.md Phase 1/2"

@@ -172,12 +172,20 @@ _PKG_INSTALL_HINTS = {
             "on Debian/Ubuntu -- needed for claude.md #38's aud/loadAudio()",
     # windows.md Phase 0: the one core-runtime addition on Windows, not
     # an optional feature tier like the others above -- every program
-    # needs it, the same way every program needs sqlite3.
-    "libgnurx": "install MSYS2's POSIX regex package from a UCRT64 shell, e.g. "
-                "`pacman -S mingw-w64-ucrt-x86_64-libgnurx` -- needed for "
-                "claude.md #67/#68's regex()/.test()/.match()/.replace(), which "
-                "every compiled program links whether it uses regex or not "
-                "(see windows.md Phase 0)",
+    # needs it, the same way every program needs sqlite3. libsystre,
+    # not libgnurx: the first real Windows CI run (claude.md #126) found
+    # that pacman drops mingw-w64-ucrt-x86_64-libgnurx from the install
+    # set because it CONFLICTS with mingw-w64-ucrt-x86_64-libsystre --
+    # already present as a transitive dependency of the UCRT64
+    # toolchain -- and silently installs neither with --noconfirm.
+    # libsystre (a POSIX regex.h/regcomp/regexec wrapper around TRE) is
+    # the package that actually ends up on the system, so it's the one
+    # cli.py should ask pkg-config for.
+    "libsystre": "install MSYS2's POSIX regex package from a UCRT64 shell, e.g. "
+                 "`pacman -S mingw-w64-ucrt-x86_64-libsystre` -- needed for "
+                 "claude.md #67/#68's regex()/.test()/.match()/.replace(), which "
+                 "every compiled program links whether it uses regex or not "
+                 "(see windows.md Phase 0)",
 }
 
 
@@ -334,17 +342,22 @@ def _core_pkgs(platform_name=None):
     linked into every program -- see that file's own top comment) is
     part of libc on Linux and BSD/macOS libc alike, so core needs no
     pkg-config package of its own there. MinGW-w64 doesn't ship a POSIX
-    regex implementation at all, so on win32 this pulls in MSYS2's
-    `mingw-w64-*-libgnurx` package (the standard regex.h/libregex shim
-    for MinGW, windows.md's own preferred answer) -- the fallback named
-    there (vendoring musl's regcomp/regexec/regfree) only becomes
-    necessary if a real Windows CI run finds libgnurx's ERE behavior
-    diverging from glibc's under the existing regex suite; nothing
-    about that suite is platform-specific, so it is the referee either
-    way. Injectable platform_name for the unit tests, exactly like
+    regex implementation at all, so on win32 this pulls in a package
+    that provides one -- `libsystre`, not windows.md's originally
+    preferred `libgnurx`. The first real Windows CI run (claude.md
+    #126) found libgnurx CONFLICTS with libsystre (a POSIX regex.h/
+    regcomp/regexec wrapper around TRE) and pacman silently drops
+    libgnurx from the install set rather than erroring, since libsystre
+    is already pulled in as a transitive dependency of the UCRT64
+    toolchain -- so libsystre is what's actually on the system, and
+    the one to ask pkg-config for. windows.md's fallback for this exact
+    kind of surprise (vendoring musl's regcomp/regexec/regfree) turned
+    out not to be needed: libsystre is a real, already-present POSIX
+    regex.h implementation, not a divergent one. Injectable
+    platform_name for the unit tests, exactly like
     _static_sqlite_attempt/_feature_pkgs_and_flags above."""
     platform_name = platform_name or sys.platform
-    return ["libgnurx"] if platform_name == "win32" else []
+    return ["libsystre"] if platform_name == "win32" else []
 
 
 def _feature_pkgs_and_flags(name, platform_name=None):
@@ -536,7 +549,7 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
     `uses_graphics` (broad) is true, gate or no gate."""
     # core needs no pkg-config package of its own beyond sqlite3 (always
     # included by _ensure_runtime_object itself) on Linux/macOS;
-    # windows.md Phase 0 adds libgnurx on win32 for <regex.h> -- see
+    # windows.md Phase 0 adds libsystre on win32 for <regex.h> -- see
     # _core_pkgs's own docstring.
     core_pkgs = _core_pkgs()
     objects = [_ensure_runtime_object(cc, "core", _RUNTIME_C, core_pkgs)]
@@ -781,9 +794,9 @@ def _doctor_report():
     # loop is a no-op there.
     for pkg in _core_pkgs():
         check(_pkg_config_has(pkg), True,
-              "libgnurx (required on Windows -- <regex.h> isn't part of MinGW's libc, "
+              "libsystre (required on Windows -- <regex.h> isn't part of MinGW's libc, "
               "claude.md #67/#68's regex()/.test()/.match()/.replace())",
-              _PKG_INSTALL_HINTS["libgnurx"])
+              _PKG_INSTALL_HINTS["libsystre"])
 
     # claude.md #123: platform-aware, like audio just below -- darwin's
     # graphics runtime carries zero X11 code (guarded `#ifndef

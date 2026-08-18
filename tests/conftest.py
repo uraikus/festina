@@ -154,14 +154,22 @@ def compile_and_run(tmp_path, codegen, cli_mod):
 
     def _run(source, filename="main.f", args=None, env=None):
         src_path = tmp_path / filename
-        src_path.write_text(source)
+        # Explicit UTF-8 both ways -- festina/imports.py reads source
+        # files as UTF-8 (festina/cli.py's own open() calls), and the
+        # compiled program's stdout is UTF-8 too. Without it, Python's
+        # locale-default encoding is used instead, which is NOT UTF-8
+        # on Windows -- confirmed by real Windows CI (claude.md #126):
+        # a non-ASCII literal got mis-encoded on write, and decoding
+        # the program's real UTF-8 stdout under the wrong codec crashed
+        # the test outright rather than merely rendering it wrong.
+        src_path.write_text(source, encoding="utf-8")
         out_path = tmp_path / "program"
         compile_file_or_skip(cli_mod, str(src_path), str(out_path), cc=cc)
         run_env = dict(os.environ, **env) if env else None
         result = subprocess.run(
             [str(out_path), *(args or [])],
             cwd=tmp_path, capture_output=True, text=True, timeout=15,
-            env=run_env,
+            env=run_env, encoding="utf-8",
         )
         return result
 
@@ -243,7 +251,10 @@ def write_source(tmp_path):
         for relpath, content in files.items():
             p = tmp_path / relpath
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(content)
+            # Explicit UTF-8 -- see compile_and_run's own write_text
+            # call for why the locale default (not UTF-8 on Windows)
+            # is the wrong choice here.
+            p.write_text(content, encoding="utf-8")
         return tmp_path
 
     return _write
@@ -264,6 +275,7 @@ def compile_multi_and_run(tmp_path, codegen, cli_mod, write_source):
         result = subprocess.run(
             [str(out_path), *(args or [])],
             cwd=tmp_path, capture_output=True, text=True, timeout=15,
+            encoding="utf-8",
         )
         return result
 
@@ -379,7 +391,7 @@ def run_graphics_program(tmp_path, codegen, cli_mod, x_display):
 
     def _run(source, filename="main.f", display=None):
         src_path = tmp_path / filename
-        src_path.write_text(source)
+        src_path.write_text(source, encoding="utf-8")
         out_path = tmp_path / "program"
         cli_mod.compile_file(str(src_path), str(out_path), cc=cc)
 

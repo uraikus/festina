@@ -90,14 +90,21 @@ class TestCorePkgs:
     everywhere except MinGW -- so this is the one core pkg-config
     ADDITION win32 needs, not a feature tier like graphics/audio."""
 
-    def test_win32_needs_libgnurx(self, cli_mod):
-        assert cli_mod._core_pkgs("win32") == ["libgnurx"]
+    def test_win32_needs_libsystre(self, cli_mod):
+        # claude.md #126 INVERTED this test: the first real Windows CI
+        # run found mingw-w64-ucrt-x86_64-libgnurx conflicts with
+        # mingw-w64-ucrt-x86_64-libsystre (already pulled in
+        # transitively) and pacman silently drops the conflicting
+        # package rather than erroring -- libsystre is the POSIX
+        # regex.h provider actually present, so it's the one to ask
+        # pkg-config for.
+        assert cli_mod._core_pkgs("win32") == ["libsystre"]
 
     def test_linux_and_darwin_need_nothing_extra(self, cli_mod):
         assert cli_mod._core_pkgs("linux") == []
         assert cli_mod._core_pkgs("darwin") == []
 
-    def test_core_object_and_link_libs_pick_up_libgnurx_on_windows(
+    def test_core_object_and_link_libs_pick_up_libsystre_on_windows(
             self, cli_mod, monkeypatch):
         # _runtime_objects_and_link_libs must actually pass _core_pkgs()
         # through to both the cached object's own cflags and the final
@@ -116,8 +123,8 @@ class TestCorePkgs:
         _, link_libs = cli_mod._runtime_objects_and_link_libs(
             "clang", uses_graphics=False, uses_audio=False)
 
-        assert ensure_calls[0] == ("core", ["libgnurx"])
-        assert "--libgnurx-libs" in link_libs
+        assert ensure_calls[0] == ("core", ["libsystre"])
+        assert "--libsystre-libs" in link_libs
 
 
 class TestLibllvmCandidatePaths:
@@ -232,13 +239,13 @@ class TestFeatureGating:
         assert "cairo-xlib" not in report and "alsa" not in report, (
             "doctor must not tell a Windows user to install Linux packages")
 
-    def test_doctor_on_windows_reports_libgnurx_as_required(
+    def test_doctor_on_windows_reports_libsystre_as_required(
             self, cli_mod, monkeypatch):
         monkeypatch.setattr(sys, "platform", "win32")
         monkeypatch.setattr(cli_mod, "_pkg_config_has", lambda pkg: False)
         lines, all_ok = cli_mod._doctor_report()
         report = "\n".join(lines)
-        assert "libgnurx" in report
+        assert "libsystre" in report
         assert "MISSING" in report
         assert all_ok is False
 
@@ -498,8 +505,8 @@ class TestOnWindows:
 
     def test_posix_regex_is_linked_and_answers(self, compile_and_run):
         # The one core-runtime gap windows.md names: <regex.h> via
-        # libgnurx or vendored musl. Whichever answer landed, the
-        # language surface must behave identically.
+        # libsystre (claude.md #126). The language surface must behave
+        # identically regardless of which provider is behind it.
         result = compile_and_run("log(/[0-9]+/.test('v42'))")
         assert result.returncode == 0
         assert result.stdout.strip() == "true"

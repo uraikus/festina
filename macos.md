@@ -26,11 +26,28 @@
 > mouse/keyboard/window behavior is verified on hardware
 > (`FESTINA_ENABLE_MACOS_GRAPHICS=1` to try it on a Mac); offscreen
 > drawing is never gated. Phase 3 is done: `scripts/package_compiler.sh`
-> ad-hoc codesigns the binary it produces on darwin, the macos-14 CI job
-> packages, codesigns, and smoke-tests a real arm64 `festina` binary on
-> every push, and [setup.md](setup.md) has a real macOS section. Full
-> Developer-ID signing/notarization remains deliberately out of scope
-> until there's an actual distribution channel.
+> ad-hoc codesigns the binary it produces on darwin (`codesign -f -s -`
+> — the `-f` matters, since recent PyInstaller already self-signs, see
+> below), the macos-14 CI job packages, codesigns, and smoke-tests a
+> real arm64 `festina` binary on every push, and [setup.md](setup.md)
+> has a real macOS section. Full Developer-ID signing/notarization
+> remains deliberately out of scope until there's an actual
+> distribution channel.
+>
+> **The offscreen-graphics claim above got its first real test and
+> initially failed** (claude.md #126): `festina_runtime_graphics.c` had
+> never actually compiled on real macOS hardware before Phase 2 swapped
+> cairo-xlib for plain `cairo` (every earlier CI round skipped it as a
+> missing dependency), and the very first time it did, `#include
+> <cairo/cairo.h>` in the new windowing seam header couldn't find the
+> file — Homebrew's cairo pkg-config `-I` flag points directly into the
+> headers directory, unlike the implicit `/usr/include` search that
+> quietly made the same include style work on Linux. Fixed to the
+> portable `#include <cairo.h>`; the packaging codesign step needed
+> `-f`/`--force` for the unrelated PyInstaller self-signing reason
+> above. Both fixes are one line each, verified against the real Linux
+> cairo-xlib pkg-config flags and the full suite, but not yet
+> reconfirmed by a second real macOS CI run.
 
 A concrete, phased plan for bringing Festina to macOS. The premise
 (from [todo.md](todo.md#platforms)) holds up under audit: **porting is

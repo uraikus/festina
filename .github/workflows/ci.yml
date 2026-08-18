@@ -130,16 +130,21 @@ jobs:
     # windows.md Phase 0. MSYS2's UCRT64 environment is the one
     # supported toolchain (windows.md's own toolchain decision --
     # MSVC is explicitly out of scope). Python, clang, sqlite3,
-    # pkg-config and libgnurx all come from that one MSYS2 environment
+    # pkg-config and libsystre all come from that one MSYS2 environment
     # rather than mixing a native Windows Python with MSYS2's C
-    # toolchain, so there's exactly one PATH to reason about. This is
-    # the first real run of any of this on real Windows; expect it to
-    # surface real bugs the way macOS Phase 0's first hardware rounds
-    # did (claude.md #122) -- that is what this job is for. Audio and
-    # windowed graphics (windows.md Phases 1-2) have no backend in the
-    # runtime yet at all, so those tiers shed as skips via the same
-    # conftest mechanism macOS Phase 0 built -- no parallel
-    # test-selection list, same as the macOS job above.
+    # toolchain, so there's exactly one PATH to reason about. This was
+    # the first real run of any of this on real Windows, and it did
+    # surface a real bug (claude.md #126), the way macOS Phase 0's
+    # first hardware rounds did (claude.md #122): the originally
+    # requested mingw-w64-ucrt-x86_64-libgnurx conflicts with
+    # mingw-w64-ucrt-x86_64-libsystre (already pulled in transitively)
+    # and pacman --noconfirm silently drops the conflicting package
+    # instead of erroring, so libsystre -- not libgnurx -- is the real
+    # regex.h provider here. Audio and windowed graphics (windows.md
+    # Phases 1-2) have no backend in the runtime yet at all, so those
+    # tiers shed as skips via the same conftest mechanism macOS Phase 0
+    # built -- no parallel test-selection list, same as the macOS job
+    # above.
     runs-on: windows-latest
     timeout-minutes: 30
     defaults:
@@ -157,7 +162,7 @@ jobs:
             mingw-w64-ucrt-x86_64-python-pip
             mingw-w64-ucrt-x86_64-sqlite3
             mingw-w64-ucrt-x86_64-pkgconf
-            mingw-w64-ucrt-x86_64-libgnurx
+            mingw-w64-ucrt-x86_64-libsystre
       - name: Install Python test dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Run the test suite
