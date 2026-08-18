@@ -22,24 +22,24 @@ void func showMessage() {
     log('one second has passed')
 }
 
+// A program keeps running as long as it has a pending setTimeout() or
+// an uncleared setInterval() -- so this interval needs to be cleared
+// somewhere, or the process would run forever, exactly like an
+// uncleared JS interval would. It clears ITSELF after five ticks:
+// counting inside the callback is deterministic on any scheduler,
+// where racing a second setTimeout against the fifth tick is not --
+// the first macOS CI run caught exactly that race (a loaded runner
+// fired the stop after only four ticks).
 void func tick() {
     tickCount = tickCount + 1
     log(`tick ${tickCount}`)
-}
-
-void func stopTicking() {
-    log('stopping the interval')
-    clearInterval(intervalId)
+    if tickCount == 5 {
+        log('stopping the interval')
+        clearInterval(intervalId)
+    }
 }
 
 log('scheduling a one-shot timeout and a repeating interval...')
 
 setTimeout(showMessage, 1000)
-
-// A program keeps running as long as it has a pending setTimeout() or
-// an uncleared setInterval() -- so this interval needs to be cleared
-// somewhere, or the process would run forever, exactly like an
-// uncleared JS interval would. It's cleared below via its own
-// setTimeout, once 500ms (five ticks) have had a chance to fire.
 intervalId = setInterval(tick, 100)
-setTimeout(stopTicking, 550)

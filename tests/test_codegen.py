@@ -4828,16 +4828,24 @@ class TestTimers:
         out_path = tmp_path / "program"
         cli_mod.compile_file(str(src_path), str(out_path))
         stdout_path = tmp_path / "stdout.log"
+        # stdbuf (GNU coreutils) forces line buffering so the log file
+        # has lines mid-run; macOS has no stdbuf, so there the test
+        # keeps its actual contract -- an uncleared interval keeps the
+        # process alive -- and drops only the mid-run line inspection
+        # (macos.md Phase 0's first CI run is what found this).
+        have_stdbuf = shutil.which("stdbuf") is not None
+        cmd = (["stdbuf", "-oL"] if have_stdbuf else []) + [str(out_path)]
         proc = subprocess.Popen(
-            ["stdbuf", "-oL", str(out_path)],
+            cmd,
             cwd=tmp_path, stdout=open(stdout_path, "w"), stderr=subprocess.STDOUT,
         )
         try:
             time.sleep(0.3)
             assert proc.poll() is None, "an uncleared setInterval should keep the program running"
-            lines = stdout_path.read_text().splitlines()
-            assert len(lines) >= 2, f"expected multiple 'tick's by now, got {lines!r}"
-            assert all(line == "tick" for line in lines)
+            if have_stdbuf:
+                lines = stdout_path.read_text().splitlines()
+                assert len(lines) >= 2, f"expected multiple 'tick's by now, got {lines!r}"
+                assert all(line == "tick" for line in lines)
         finally:
             proc.terminate()
             proc.wait(timeout=5)
@@ -4919,7 +4927,8 @@ class TestAudio:
         src_path = tmp_path / "main.f"
         src_path.write_text(source)
         out_path = tmp_path / "program"
-        result_path = cli_mod.compile_file(str(src_path), str(out_path))
+        from tests.conftest import compile_file_or_skip
+        result_path = compile_file_or_skip(cli_mod, str(src_path), str(out_path))
         assert result_path == str(out_path)
         assert out_path.exists()
 
