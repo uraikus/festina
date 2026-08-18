@@ -1,5 +1,12 @@
 # macOS support — the plan
 
+> **Status:** Phase 0 is implemented — libLLVM discovery, the ld64
+> sqlite strategy, the platform-aware doctor, the audio gating error,
+> and the `macos-14` CI job (`.github/workflows/ci.yml`) all exist,
+> with the darwin branches unit-tested from every platform
+> (`tests/test_platform.py`) and the missing-dependency skip letting
+> the full suite run on macOS CI. Phases 1–3 are open.
+
 A concrete, phased plan for bringing Festina to macOS. The premise
 (from [todo.md](todo.md#platforms)) holds up under audit: **porting is
 backend work, not language work.** The compiler is pure Python, the
@@ -42,11 +49,14 @@ toolchain seams.
    archive path (`pkg-config --variable=libdir sqlite3` +
    `/libsqlite3.a`, which brew's sqlite provides); fall back to
    `-lsqlite3` (the OS-shipped dylib) as now.
-3. **`festina doctor` — macOS install hints.** The hint table already
-   says `brew install pkg-config`; extend it to name the full set per
-   feature (`brew install llvm sqlite pkg-config`, later `cairo jpeg
-   mpg123`) and to detect the missing-CommandLineTools case (`xcrun
-   --show-sdk-path` failing) with a `xcode-select --install` hint.
+3. **`festina doctor` — macOS install hints.** *(Done, with one
+   refinement over the original sketch: on darwin the audio lines
+   report "no macOS backend yet — planned as macos.md Phase 1" instead
+   of ALSA checks, and compiling an audio program fails with the same
+   message — `_check_feature_supported` — rather than a pkg-config
+   error naming a library that does not exist on macOS.)* Still open
+   here: the missing-CommandLineTools detection (`xcrun
+   --show-sdk-path` failing → `xcode-select --install` hint).
 4. **CI: a `macos-14` (arm64) GitHub Actions job** running everything
    that needs no display and no audio device: the full
    lexer/parser/semantic/IR suites, `compile_and_run` tests for

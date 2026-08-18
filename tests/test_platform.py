@@ -122,6 +122,39 @@ class TestLibllvmCandidatePaths:
         assert paths and all("\\msys64\\" in p for p in paths)
 
 
+class TestFeatureGating:
+    """macos.md Phase 0: a feature with no backend on this platform
+    fails saying exactly that -- audio on darwin points at macos.md
+    Phase 1 instead of telling a Mac user to apt-install ALSA. The
+    same category drives the conftest skip, which is what lets the
+    macOS CI job run the full suite and shed the audio tier as skips."""
+
+    def test_audio_on_darwin_names_the_plan(self, cli_mod, errors):
+        with pytest.raises(errors.CompileError) as excinfo:
+            cli_mod._check_feature_supported("audio", "darwin")
+        assert "macos.md Phase 1" in str(excinfo.value)
+        assert excinfo.value.category == "unsupported platform feature"
+
+    def test_audio_on_linux_and_windows_is_not_gated(self, cli_mod):
+        cli_mod._check_feature_supported("audio", "linux")
+        cli_mod._check_feature_supported("audio", "win32")
+
+    def test_graphics_is_not_gated_anywhere(self, cli_mod):
+        # Phase 2a's XQuartz route means graphics LINKS on darwin today
+        # (cairo-xlib from brew); only audio lacks a backend entirely.
+        for platform_name in ("linux", "darwin", "win32"):
+            cli_mod._check_feature_supported("graphics", platform_name)
+
+    def test_doctor_on_darwin_reports_audio_as_planned_not_missing(
+            self, cli_mod, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        lines, _ = cli_mod._doctor_report()
+        report = "\n".join(lines)
+        assert "macos.md Phase 1" in report
+        assert "alsa" not in report, (
+            "doctor must not tell a Mac user to install ALSA")
+
+
 class TestKeyNameVocabulary:
     """runtime/festina_key_names.h -- the pinned artifact behind the
     plans' "key-name parity" requirement. The names are X11's keysym

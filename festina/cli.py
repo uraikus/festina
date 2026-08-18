@@ -155,7 +155,9 @@ _PKG_INSTALL_HINTS = {
     "sqlite3": "install its development package, e.g. `apt install libsqlite3-dev` "
                "on Debian/Ubuntu or `brew install sqlite` on macOS",
     "cairo-xlib": "install Cairo's and X11's development packages, e.g. "
-                  "`apt install libcairo2-dev libx11-dev` on Debian/Ubuntu -- "
+                  "`apt install libcairo2-dev libx11-dev` on Debian/Ubuntu, or "
+                  "`brew install cairo` on macOS (plus XQuartz to open windows "
+                  "-- see macos.md Phase 2) -- "
                   "needed for claude.md #37/#39's img/graphics functions",
     "libjpeg": "install libjpeg's development package, e.g. "
                 "`apt install libjpeg-dev` (Debian/Ubuntu) or "
@@ -340,6 +342,23 @@ def _ensure_runtime_object(cc, name, source, pkg_config_packages):
     return obj_path
 
 
+def _check_feature_supported(feature, platform_name=None):
+    """macos.md Phase 0: a feature whose backend does not exist yet on
+    this platform fails with a message that says exactly that -- and
+    where the work is planned -- instead of a pkg-config error telling
+    a Mac user to `apt install libasound2-dev` for a library that does
+    not exist on their OS. `platform_name` is injectable so both
+    branches are unit-testable from any platform
+    (tests/test_platform.py)."""
+    platform_name = platform_name or sys.platform
+    if feature == "audio" and platform_name == "darwin":
+        raise CompileError(
+            "audio is not supported on macOS yet -- the runtime's device "
+            "layer is ALSA (Linux); the CoreAudio backend is planned as "
+            "macos.md Phase 1. Everything except aud/play() works today.",
+            category="unsupported platform feature")
+
+
 def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio):
     """Every program links core (log/fail/sqlite/regex/timers -- see
     festina_runtime.c's top comment) plus -lm (claude.md #56's
@@ -358,6 +377,7 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio):
     for name, wants in (("graphics", uses_graphics), ("audio", uses_audio)):
         if not wants:
             continue
+        _check_feature_supported(name)
         feature = _RUNTIME_FEATURES[name]
         objects.append(_ensure_runtime_object(cc, name, feature["source"], feature["pkgs"]))
         for pkg in feature["pkgs"]:
@@ -574,12 +594,20 @@ def _doctor_report():
           "libjpeg dev headers (optional -- only used by graphics: JPEG images)",
           _PKG_INSTALL_HINTS["libjpeg"])
 
-    check(_pkg_config_has("libmpg123"), False,
-          "libmpg123 dev headers (optional -- only used by audio: MP3 clips)",
-          _PKG_INSTALL_HINTS["libmpg123"])
-    check(_pkg_config_has("alsa"), False,
-          "alsa dev headers (optional -- only used by audio: loadAudio(), .play(), ...)",
-          _PKG_INSTALL_HINTS["alsa"])
+    # macos.md Phase 0: the audio lines are platform-aware -- on macOS
+    # there is no ALSA to install, and telling a Mac user to go get it
+    # would be worse than saying the true thing: the CoreAudio backend
+    # is planned (macos.md Phase 1) and everything else works today.
+    if sys.platform == "darwin":
+        lines.append("  [   not yet       ] audio (aud/.play()) -- no macOS "
+                     "backend yet; planned as macos.md Phase 1")
+    else:
+        check(_pkg_config_has("libmpg123"), False,
+              "libmpg123 dev headers (optional -- only used by audio: MP3 clips)",
+              _PKG_INSTALL_HINTS["libmpg123"])
+        check(_pkg_config_has("alsa"), False,
+              "alsa dev headers (optional -- only used by audio: loadAudio(), .play(), ...)",
+              _PKG_INSTALL_HINTS["alsa"])
 
     llvm_ok = llvm_backend.available()
     has_clang = shutil.which("clang") is not None

@@ -1,0 +1,71 @@
+# CI for the compiler and runtime -- and macos.md Phase 0's exit
+# criterion made mechanical: the macOS job runs the WHOLE suite and
+# relies on the conftest missing-dependency skip to shed exactly the
+# tiers that platform doesn't have yet (audio until macos.md Phase 1,
+# windowed graphics until Phase 2), while the Linux job sets
+# FESTINA_STRICT_DEPS=1 so those same skips are forbidden where every
+# dependency is expected -- coverage cannot silently shrink on the
+# primary platform. The sanitizer leak tier runs only on Linux by the
+# plans' standing decision (LeakSanitizer is unreliable on darwin).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FESTINA_STRICT_DEPS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang pkg-config libsqlite3-dev \
+            libcairo2-dev libx11-dev libjpeg-dev \
+            libasound2-dev libmpg123-dev \
+            xvfb xdotool openbox fonts-dejavu-core
+          pip install -r requirements-dev.txt
+      - name: Run the test suite
+        run: python -m pytest tests/ -q
+
+  macos:
+    # macos.md Phase 0. arm64; Apple clang from the preinstalled
+    # CommandLineTools consumes the generated .ll directly, so brew's
+    # (very large) llvm bottle is deliberately not installed here --
+    # the libLLVM fast path is exercised by the Linux job.
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          brew install pkg-config sqlite cairo jpeg-turbo mpg123
+          pip install -r requirements-dev.txt
+      - name: Run the test suite
+        # brew's sqlite is keg-only -- its .pc file is invisible
+        # without PKG_CONFIG_PATH, which is precisely the kind of
+        # macOS-shaped seam this job exists to keep honest.
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix sqlite)/lib/pkgconfig:$PKG_CONFIG_PATH"
+          python -m pytest tests/ -q
+      - name: Compile and run the core examples
+        # macos.md Phase 0's exit criteria, verbatim: the four
+        # windowless examples build and run natively.
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix sqlite)/lib/pkgconfig:$PKG_CONFIG_PATH"
+          for ex in hello fizzbuzz config files; do
+            python -m festina.cli compile "examples/$ex.f" -o "/tmp/$ex"
+            "/tmp/$ex"
+          done
