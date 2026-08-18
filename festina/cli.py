@@ -297,6 +297,9 @@ _RUNTIME_FEATURES = {
         # claude.md #101: libmpg123 is the MP3 counterpart to libjpeg
         # above -- the WAV parser is hand-written (a container simple
         # enough to walk directly), MP3 is not.
+        # claude.md #121: the DEVICE half is per-platform now (see
+        # _feature_pkgs_and_flags) -- ALSA on Linux, AudioToolbox on
+        # darwin -- while libmpg123 and the channel pool are shared.
         "pkgs": ["alsa", "libmpg123"],
         # claude.md #38's audio playback runs on a background thread
         # (see festina_runtime.h's doc comment on festina_audio_play) --
@@ -305,6 +308,24 @@ _RUNTIME_FEATURES = {
         "extra_link_flags": ["-pthread"],
     },
 }
+
+
+def _feature_pkgs_and_flags(name, platform_name=None):
+    """claude.md #121 / macos.md Phase 1: a feature's pkg-config
+    packages and extra link flags, per platform. The table above holds
+    the Linux answer (the platform everything was built on); this
+    adjusts it where another platform's device layer differs -- on
+    darwin the audio device is AudioToolbox (a system framework, no
+    pkg-config file), so `alsa` drops out and `-framework AudioToolbox`
+    comes in. Injectable platform_name for the unit tests."""
+    platform_name = platform_name or sys.platform
+    feature = _RUNTIME_FEATURES[name]
+    pkgs = list(feature["pkgs"])
+    flags = list(feature["extra_link_flags"])
+    if name == "audio" and platform_name == "darwin":
+        pkgs.remove("alsa")
+        flags += ["-framework", "AudioToolbox"]
+    return pkgs, flags
 
 
 def _ensure_runtime_object(cc, name, source, pkg_config_packages):
@@ -352,10 +373,17 @@ def _check_feature_supported(feature, platform_name=None):
     (tests/test_platform.py)."""
     platform_name = platform_name or sys.platform
     if feature == "audio" and platform_name == "darwin":
+        # claude.md #121: the AudioQueue backend EXISTS (compiled and
+        # null-shim-tested by macOS CI) but has not been verified
+        # against a real output device on hardware, so the gate stays
+        # until it has -- overridable for exactly that verification.
+        if os.environ.get("FESTINA_ENABLE_MACOS_AUDIO"):
+            return
         raise CompileError(
-            "audio is not supported on macOS yet -- the runtime's device "
-            "layer is ALSA (Linux); the CoreAudio backend is planned as "
-            "macos.md Phase 1. Everything except aud/play() works today.",
+            "audio is not yet verified on macOS -- the AudioQueue "
+            "backend is built (macos.md Phase 1) but awaits real-"
+            "hardware verification; set FESTINA_ENABLE_MACOS_AUDIO=1 "
+            "to try it. Everything except aud/play() works today.",
             category="unsupported platform feature")
 
 
@@ -379,10 +407,11 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio):
             continue
         _check_feature_supported(name)
         feature = _RUNTIME_FEATURES[name]
-        objects.append(_ensure_runtime_object(cc, name, feature["source"], feature["pkgs"]))
-        for pkg in feature["pkgs"]:
+        pkgs, extra_flags = _feature_pkgs_and_flags(name)
+        objects.append(_ensure_runtime_object(cc, name, feature["source"], pkgs))
+        for pkg in pkgs:
             link_libs += _pkg_config("--libs", pkg)
-        link_libs += feature["extra_link_flags"]
+        link_libs += extra_flags
 
     return objects, link_libs
 

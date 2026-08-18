@@ -5261,37 +5261,39 @@ _VOICE_POOL_HARNESS = r"""
  * directly, which gives it FestinaAudio/FestinaVoice (both file-local
  * types) and lets it count active voices for real.
  *
- * Second, the ALSA device layer is REPLACED here, via the macros
- * below, and that is not a shortcut -- it is the only way this test
- * can exist. The null ALSA device the rest of the audio tests use
- * consumes PCM instantly (measured: a 2-second clip finishes in 0ms),
- * so under it every voice is finished before the next play() begins
- * and there is no concurrency left to observe. A stub that sleeps per
- * chunk gives playback real duration under the harness's own control,
- * and needs no sound hardware, no ALSA config, and no device at all.
- * Everything above the device -- the pool, the stealing, the slot
- * reuse, the joining -- is the genuine runtime code.
+ * Second, the DEVICE layer is replaced here -- claude.md #121's
+ * festina_pcm_dev_* seam, supplied by this harness instead of any
+ * platform backend (FESTINA_AUDIO_DEVICE_EXTERNAL), which is also
+ * what lets this harness build on a machine with no audio stack at
+ * all, ALSA headers included. That is not a shortcut -- it is the
+ * only way this test can exist. The null device the rest of the audio
+ * tests use consumes PCM instantly (measured: a 2-second clip
+ * finishes in 0ms), so under it every voice is finished before the
+ * next play() begins and there is no concurrency left to observe. A
+ * stub that sleeps per chunk gives playback real duration under the
+ * harness's own control. Everything above the device -- the pool, the
+ * stealing, the slot reuse, the joining -- is the genuine runtime
+ * code.
  */
-#include <alsa/asoundlib.h>
+#define FESTINA_AUDIO_DEVICE_EXTERNAL 1
 #include <time.h>
 
-static int harness_pcm_open(snd_pcm_t **out) { *out = (snd_pcm_t *)1; return 0; }
-static long harness_pcm_writei(snd_pcm_t *pcm, const void *buf, unsigned long frames) {
-    (void)pcm; (void)buf;
+#include "festina_runtime_audio.c"
+
+void *festina_pcm_dev_open(int channels, unsigned int rate,
+                           char *errbuf, size_t errbuf_size) {
+    (void)channels; (void)rate; (void)errbuf; (void)errbuf_size;
+    return (void *)1;
+}
+long festina_pcm_dev_write(void *dev, const int16_t *frames, size_t frame_count) {
+    (void)dev; (void)frames;
     /* ~10ms per 4096-frame chunk, so a clip of a few chunks plays for
      * long enough that back-to-back play() calls genuinely overlap. */
     struct timespec ts = { 0, 10L * 1000L * 1000L };
     nanosleep(&ts, NULL);
-    return (long)frames;
+    return (long)frame_count;
 }
-
-#define snd_pcm_open(pcmp, name, stream, mode) harness_pcm_open(pcmp)
-#define snd_pcm_set_params(pcm, f, a, c, r, s, l) 0
-#define snd_pcm_writei(pcm, buf, frames) harness_pcm_writei(pcm, buf, frames)
-#define snd_pcm_recover(pcm, err, silent) (-1)
-#define snd_pcm_close(pcm) 0
-
-#include "festina_runtime_audio.c"
+void festina_pcm_dev_close(void *dev) { (void)dev; }
 
 /* The only thing the audio unit needs from the core runtime, supplied
  * here so this harness does not have to link festina_runtime.c (and
@@ -5406,31 +5408,32 @@ _SINGLE_STREAM_HARNESS = r"""
  * each other off, which is exactly what they did before there was a
  * pool at all.
  */
-#include <alsa/asoundlib.h>
+#define FESTINA_AUDIO_DEVICE_EXTERNAL 1
 #include <time.h>
 
+#include "festina_runtime_audio.c"
+
+/* claude.md #121: the single-stream device, expressed at the seam --
+ * the second concurrent open fails, exactly as a dmix-less hw: device
+ * refuses a second stream. */
 static int g_open_count = 0;
-static int lim_open(snd_pcm_t **p) {
-    if (g_open_count >= 1) return -EBUSY;
+void *festina_pcm_dev_open(int channels, unsigned int rate,
+                           char *errbuf, size_t errbuf_size) {
+    (void)channels; (void)rate;
+    if (g_open_count >= 1) {
+        snprintf(errbuf, errbuf_size, "device busy (harness single-stream limit)");
+        return NULL;
+    }
     g_open_count++;
-    *p = (snd_pcm_t *)(long)g_open_count;
-    return 0;
+    return (void *)(long)g_open_count;
 }
-static int lim_close(snd_pcm_t *p) { (void)p; g_open_count--; return 0; }
-static long lim_writei(snd_pcm_t *p, const void *b, unsigned long f) {
-    (void)p; (void)b;
+void festina_pcm_dev_close(void *dev) { (void)dev; g_open_count--; }
+long festina_pcm_dev_write(void *dev, const int16_t *frames, size_t frame_count) {
+    (void)dev; (void)frames;
     struct timespec ts = { 0, 10L * 1000L * 1000L };
     nanosleep(&ts, NULL);
-    return (long)f;
+    return (long)frame_count;
 }
-
-#define snd_pcm_open(pcmp, name, stream, mode) lim_open(pcmp)
-#define snd_pcm_set_params(pcm, f, a, c, r, s, l) 0
-#define snd_pcm_writei(pcm, buf, frames) lim_writei(pcm, buf, frames)
-#define snd_pcm_recover(pcm, err, silent) (-1)
-#define snd_pcm_close(pcm) lim_close(pcm)
-
-#include "festina_runtime_audio.c"
 
 void festina_fail(const char *msg) {
     fprintf(stderr, "fail: %s\n", msg ? msg : "");
@@ -5495,28 +5498,28 @@ _CHANNEL_HARNESS = r"""
  *
  * White-box for the same two reasons the pool harness is (see
  * _VOICE_POOL_HARNESS): a Festina program cannot see which channel a
- * clip landed on, and the null ALSA device consumes PCM instantly so
- * there is no concurrency to observe under it. The device layer is
- * stubbed; the channel table is the real one.
+ * clip landed on, and a null device consumes PCM instantly so there
+ * is no concurrency to observe under it. The device layer is supplied
+ * at claude.md #121's festina_pcm_dev_* seam; the channel table is
+ * the real one.
  */
-#include <alsa/asoundlib.h>
+#define FESTINA_AUDIO_DEVICE_EXTERNAL 1
 #include <time.h>
 
-static int harness_pcm_open(snd_pcm_t **out) { *out = (snd_pcm_t *)1; return 0; }
-static long harness_pcm_writei(snd_pcm_t *pcm, const void *buf, unsigned long frames) {
-    (void)pcm; (void)buf;
+#include "festina_runtime_audio.c"
+
+void *festina_pcm_dev_open(int channels, unsigned int rate,
+                           char *errbuf, size_t errbuf_size) {
+    (void)channels; (void)rate; (void)errbuf; (void)errbuf_size;
+    return (void *)1;
+}
+long festina_pcm_dev_write(void *dev, const int16_t *frames, size_t frame_count) {
+    (void)dev; (void)frames;
     struct timespec ts = { 0, 10L * 1000L * 1000L };
     nanosleep(&ts, NULL);
-    return (long)frames;
+    return (long)frame_count;
 }
-
-#define snd_pcm_open(pcmp, name, stream, mode) harness_pcm_open(pcmp)
-#define snd_pcm_set_params(pcm, f, a, c, r, s, l) 0
-#define snd_pcm_writei(pcm, buf, frames) harness_pcm_writei(pcm, buf, frames)
-#define snd_pcm_recover(pcm, err, silent) (-1)
-#define snd_pcm_close(pcm) 0
-
-#include "festina_runtime_audio.c"
+void festina_pcm_dev_close(void *dev) { (void)dev; }
 
 void festina_fail(const char *msg) {
     fprintf(stderr, "fail: %s\n", msg ? msg : "");
@@ -8115,11 +8118,14 @@ class TestAudioChannels:
         cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
         if not cc:
             pytest.skip("no C compiler (clang/gcc/cc) on PATH")
-        # claude.md #101: the audio unit needs libmpg123 too now.
-        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa", "libmpg123"],
+        # claude.md #101: the audio unit needs libmpg123 for decoding.
+        # claude.md #121: and ONLY libmpg123 -- the harness supplies the
+        # device layer at the festina_pcm_dev_* seam, so no ALSA headers
+        # (or any platform audio stack) are needed to build it.
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "libmpg123"],
                                capture_output=True, text=True)
         if alsa.returncode != 0:
-            pytest.skip("alsa/libmpg123 dev headers are not installed")
+            pytest.skip("libmpg123 dev headers are not installed")
         runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
         harness = tmp_path / "channel_harness.c"
         harness.write_text(_CHANNEL_HARNESS)
@@ -8214,11 +8220,14 @@ class TestAudioOnANonMixingDevice:
         cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
         if not cc:
             pytest.skip("no C compiler (clang/gcc/cc) on PATH")
-        # claude.md #101: the audio unit needs libmpg123 too now.
-        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa", "libmpg123"],
+        # claude.md #101: the audio unit needs libmpg123 for decoding.
+        # claude.md #121: and ONLY libmpg123 -- the harness supplies the
+        # device layer at the festina_pcm_dev_* seam, so no ALSA headers
+        # (or any platform audio stack) are needed to build it.
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "libmpg123"],
                                capture_output=True, text=True)
         if alsa.returncode != 0:
-            pytest.skip("alsa/libmpg123 dev headers are not installed")
+            pytest.skip("libmpg123 dev headers are not installed")
         runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
         harness = tmp_path / "single_stream_harness.c"
         harness.write_text(_SINGLE_STREAM_HARNESS)
@@ -8271,11 +8280,14 @@ class TestAudioVoicePool:
         cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
         if not cc:
             pytest.skip("no C compiler (clang/gcc/cc) on PATH")
-        # claude.md #101: the audio unit needs libmpg123 too now.
-        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa", "libmpg123"],
+        # claude.md #101: the audio unit needs libmpg123 for decoding.
+        # claude.md #121: and ONLY libmpg123 -- the harness supplies the
+        # device layer at the festina_pcm_dev_* seam, so no ALSA headers
+        # (or any platform audio stack) are needed to build it.
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "libmpg123"],
                                capture_output=True, text=True)
         if alsa.returncode != 0:
-            pytest.skip("alsa/libmpg123 dev headers are not installed")
+            pytest.skip("libmpg123 dev headers are not installed")
 
         runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
         harness = tmp_path / "voice_pool_harness.c"

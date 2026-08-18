@@ -5,7 +5,14 @@
 > and the `macos-14` CI job (`.github/workflows/ci.yml`) all exist,
 > with the darwin branches unit-tested from every platform
 > (`tests/test_platform.py`) and the missing-dependency skip letting
-> the full suite run on macOS CI. Phases 1–3 are open.
+> the full suite run on macOS CI. Phase 1 is built (claude.md #121):
+> the `festina_pcm_*` device seam is cut, the AudioQueue backend
+> exists and is compiled/type-checked by macOS CI, the white-box
+> harnesses are re-seated at the seam (no ALSA headers needed), and
+> `FESTINA_AUDIO_NULL=1` is the cross-platform test sink. The darwin
+> audio gate stays until real-hardware playback is verified
+> (`FESTINA_ENABLE_MACOS_AUDIO=1` to try it on a Mac). Phases 2–3 are
+> open.
 
 A concrete, phased plan for bringing Festina to macOS. The premise
 (from [todo.md](todo.md#platforms)) holds up under audit: **porting is

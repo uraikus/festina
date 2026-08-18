@@ -155,6 +155,77 @@ class TestFeatureGating:
             "doctor must not tell a Mac user to install ALSA")
 
 
+class TestAudioFeatureConfig:
+    """claude.md #121: the audio feature's device half is per-platform
+    -- ALSA via pkg-config on Linux, the AudioToolbox framework on
+    darwin -- while libmpg123 and -pthread are shared. Pure function of
+    the platform name, tested for all of them from any of them."""
+
+    def test_linux_links_alsa_via_pkg_config(self, cli_mod):
+        pkgs, flags = cli_mod._feature_pkgs_and_flags("audio", "linux")
+        assert pkgs == ["alsa", "libmpg123"]
+        assert flags == ["-pthread"]
+
+    def test_darwin_swaps_alsa_for_the_audiotoolbox_framework(self, cli_mod):
+        pkgs, flags = cli_mod._feature_pkgs_and_flags("audio", "darwin")
+        assert pkgs == ["libmpg123"]
+        assert flags == ["-pthread", "-framework", "AudioToolbox"]
+
+    def test_graphics_is_unchanged_per_platform_for_now(self, cli_mod):
+        # Phase 2a: darwin graphics goes through cairo-xlib under
+        # XQuartz, deliberately identical to Linux until the windowing
+        # seam lands.
+        assert (cli_mod._feature_pkgs_and_flags("graphics", "linux")
+                == cli_mod._feature_pkgs_and_flags("graphics", "darwin"))
+
+    def test_the_darwin_gate_is_overridable_for_hardware_verification(
+            self, cli_mod, errors, monkeypatch):
+        monkeypatch.setenv("FESTINA_ENABLE_MACOS_AUDIO", "1")
+        cli_mod._check_feature_supported("audio", "darwin")   # no raise
+        monkeypatch.delenv("FESTINA_ENABLE_MACOS_AUDIO")
+        with pytest.raises(errors.CompileError):
+            cli_mod._check_feature_supported("audio", "darwin")
+
+
+class TestNullAudioDevice:
+    """claude.md #121: FESTINA_AUDIO_NULL=1 turns the device seam into
+    an instant sink -- the cross-platform replacement for the
+    ALSA-only ~/.asoundrc null-plugin trick, and what lets audio
+    end-to-end tests run on machines with no audio stack (macOS CI,
+    containers). Verified here on Linux, where a real backend also
+    exists, so the shim's behavior is pinned against the real one."""
+
+    def _write_wav(self, path, seconds=0.3, rate=8000):
+        import math
+        import wave
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            n = int(seconds * rate)
+            frames = bytearray()
+            for i in range(n):
+                v = int(3000 * math.sin(2 * math.pi * 440 * i / rate))
+                frames += v.to_bytes(2, "little", signed=True)
+            w.writeframes(bytes(frames))
+
+    def test_play_stop_isplaying_work_with_no_audio_device(
+            self, compile_and_run, tmp_path):
+        wav = tmp_path / "beep.wav"
+        self._write_wav(wav)
+        source = f"""
+        aud clip = '{wav}'
+        int ch = clip.playLoop()
+        log(ch >= 0)
+        log(clip.isPlaying())
+        clip.stop()
+        log(clip.isPlaying())
+        """
+        result = compile_and_run(source, env={"FESTINA_AUDIO_NULL": "1"})
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["true", "true", "false"]
+
+
 class TestKeyNameVocabulary:
     """runtime/festina_key_names.h -- the pinned artifact behind the
     plans' "key-name parity" requirement. The names are X11's keysym

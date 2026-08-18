@@ -69,3 +69,14 @@ jobs:
             python -m festina.cli compile "examples/$ex.f" -o "/tmp/$ex"
             "/tmp/$ex"
           done
+      - name: Compile the audio runtime (AudioQueue backend)
+        # macos.md Phase 1 / claude.md #121: the audio translation
+        # unit's __APPLE__ branch is the AudioQueue device layer --
+        # compiling it here is what type-checks that code against the
+        # real AudioToolbox headers on every push, even while the
+        # darwin audio gate keeps it out of user programs pending
+        # real-hardware playback verification.
+        run: |
+          clang -c -O2 -I runtime \
+            $(pkg-config --cflags libmpg123) \
+            runtime/festina_runtime_audio.c -o /tmp/festina_audio_mac.o
