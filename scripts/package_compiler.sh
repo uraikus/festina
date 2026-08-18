@@ -42,8 +42,10 @@ pyinstaller \
     --add-data "$REPO_ROOT/runtime/festina_runtime.c:runtime" \
     --add-data "$REPO_ROOT/runtime/festina_runtime_graphics.c:runtime" \
     --add-data "$REPO_ROOT/runtime/festina_runtime_audio.c:runtime" \
+    --add-data "$REPO_ROOT/runtime/festina_runtime_window_mac.m:runtime" \
     --add-data "$REPO_ROOT/runtime/festina_runtime.h:runtime" \
     --add-data "$REPO_ROOT/runtime/festina_runtime_internal.h:runtime" \
+    --add-data "$REPO_ROOT/runtime/festina_runtime_window.h:runtime" \
     --paths . \
     packaging/festina_entry.py
 

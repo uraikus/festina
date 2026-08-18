@@ -2675,7 +2675,37 @@ as the contract), binary-fidelity round trips (CRLF + NUL bytes
 through a blob — the fact that makes Windows text-mode mangling
 impossible to reintroduce silently), and skipif-gated
 TestOnMacOS/TestOnWindows exit-criteria tests that go live with each
-platform's CI job. (21 tests + 7 platform-gated.)
+platform's CI job. The `macos-14` CI job is green on real hardware
+(claude.md #121-122).
+
+macos.md Phases 1 and 2 (claude.md #121, #123) each cut a small
+device seam out of a shared, portable core and gate the darwin backend
+behind a real-hardware-verification env var until confirmed on a Mac,
+rather than shipping it silently untested: `festina_pcm_open/write/
+close` (`runtime/festina_runtime_audio.c`'s AudioQueue branch) behind
+`FESTINA_ENABLE_MACOS_AUDIO=1`, and `festina_window_open/close/
+present/events_wait/events_drain` (the new `runtime/
+festina_runtime_window.h` seam, implemented by the existing X11
+backend on Linux and a new native Cocoa backend,
+`runtime/festina_runtime_window_mac.m`, on macOS) behind
+`FESTINA_ENABLE_MACOS_GRAPHICS=1`. Both darwin backends are compiled
+and type-checked against their real system headers
+(AudioToolbox/AppKit+Foundation+CoreGraphics) by a dedicated
+compile-only step on every `macos-14` CI push, so a header-level
+regression is caught immediately even though the gate keeps either
+backend out of a user program until manually verified. The graphics
+gate is narrow on purpose: it only applies to programs that actually
+open a window (`gen.uses_graphics`, e.g. declaring `render()` or a
+window event handler) — offscreen-only drawing (`saveCanvas`, the
+broader `gen.uses_graphics_code`) is never gated on any platform,
+pinned by `test_offscreen_graphics_never_reaches_the_darwin_gate`.
+`_check_feature_supported`/`_feature_pkgs_and_flags`/
+`_feature_extra_object` in `festina/cli.py` are each parameterized by
+`platform_name` so every darwin branch is unit-tested from Linux, the
+same pattern Phase 0 established. (35 tests across
+`TestFeatureGating`, `TestAudioFeatureConfig`, and
+`TestKeyNameVocabulary` combined, plus 7 platform-gated
+`TestOnMacOS`/`TestOnWindows` tests.)
 
 **claude.md #120**: reference cycles collect — trial deletion in the
 release wrappers.

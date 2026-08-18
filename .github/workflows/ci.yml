@@ -80,3 +80,15 @@ jobs:
           clang -c -O2 -I runtime \
             $(pkg-config --cflags libmpg123) \
             runtime/festina_runtime_audio.c -o /tmp/festina_audio_mac.o
+      - name: Compile the windowing backend (Cocoa)
+        # macos.md Phase 2 / claude.md #123: festina_runtime_window_mac.m
+        # is the native Cocoa windowing device layer -- compiling it
+        # here type-checks it against the real AppKit/Foundation/
+        # CoreGraphics headers on every push, the same way the audio
+        # step above does for AudioToolbox, even while the darwin
+        # graphics gate keeps windowed use out of user programs
+        # pending real-hardware mouse/keyboard verification.
+        run: |
+          clang -c -O2 -I runtime \
+            $(pkg-config --cflags cairo) \
+            runtime/festina_runtime_window_mac.m -o /tmp/festina_window_mac.o

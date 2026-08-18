@@ -25,27 +25,24 @@
 #include <math.h>       /* floor -- claude.md #104's transform check */
 #include <setjmp.h>     /* libjpeg reports errors by longjmp -- claude.md #101 */
 #include <jpeglib.h>    /* claude.md #101: JPEG decoding */
-#include <sys/select.h> /* select() -- multiplexes X11 events with timers */
-#include <time.h>       /* nanosleep -- festina_graphics_init's connect retry */
-#include <X11/Xlib.h>
-#include <X11/Xutil.h> /* XLookupString/XKeysymToString -- `on keyDown`/`on keyUp` */
-#include <X11/XKBlib.h> /* XkbSetDetectableAutoRepeat -- claude.md #98 */
-#include <cairo/cairo-xlib.h>
+#include <sys/select.h> /* select() -- the X11 window backend's events_wait */
+#include <time.h>       /* nanosleep -- the X11 backend's connect retry */
 #include "festina_runtime.h"
 #include "festina_runtime_internal.h"
+#include "festina_runtime_window.h" /* claude.md #123: the windowing device seam --
+                                     * see its own doc comment for the full design.
+                                     * Everything in THIS file is now portable: the
+                                     * X11 implementation of the seam lives at the
+                                     * bottom of this file, guarded `#ifndef __APPLE__`;
+                                     * the macOS implementation is a separate
+                                     * Objective-C translation unit
+                                     * (festina_runtime_window_mac.m), since Cocoa
+                                     * cannot be compiled as part of a plain .c file. */
 
-/* Motif WM hints -- the widely-honored (if not core-protocol) X11
- * convention for requesting a window with no title bar/border/menu. */
-typedef struct {
-    unsigned long flags, functions, decorations;
-    long input_mode;
-    unsigned long status;
-} FestinaMotifWmHints;
-
-static Display *g_display = NULL;
-static Window g_window;
-static Atom g_wm_delete_atom;
-static cairo_surface_t *g_window_surface = NULL;
+static int g_window_open = 0;      /* claude.md #123: portable stand-in for "is
+                                     * there a live platform window" -- the shared
+                                     * code's own guard, since g_display/g_window
+                                     * no longer exist here at all. */
 static cairo_surface_t *g_backing_surface = NULL;
 /* claude.md #106: `on click` split into `on mouseDown` and `on mouseUp`,
  * exactly as claude.md #98 split `on key`. A click is a press and a
@@ -58,15 +55,6 @@ static void (*g_mouse_handler)(int64_t, int64_t) = NULL;
 /* claude.md #98: `on key` split into `on keyDown` and `on keyUp`. */
 static void (*g_key_down_handler)(const char *) = NULL;
 static void (*g_key_up_handler)(const char *) = NULL;
-/* Whether the X server could turn on detectable auto-repeat (XKB). When
- * it can, a held key produces a single KeyPress and one KeyRelease when
- * it is finally let go. When it cannot, X synthesizes a
- * KeyRelease/KeyPress PAIR per repeat, and this file filters them out
- * by hand -- see festina_key_event_is_autorepeat. Without either, a
- * held key would fire keyUp/keyDown dozens of times a second, which is
- * exactly the bug splitting the event apart is meant to let a program
- * avoid. */
-static int g_detectable_autorepeat = 0;
 static void (*g_resize_handler)(void) = NULL;
 static void (*g_close_handler)(void) = NULL;
 /* The canvas's *current* size -- starts at FESTINA_CANVAS_WIDTH/HEIGHT
@@ -170,7 +158,7 @@ static void festina_backing_require(void) {
 }
 
 static void festina_graphics_require_init(void) {
-    if (!g_display) {
+    if (!g_window_open) {
         festina_fail("a graphics function was called but the canvas window "
                       "was never created (internal compiler error)");
     }
@@ -579,118 +567,15 @@ static void festina_fill_and_border(cairo_t *cr) {
     }
 }
 
-/* Swallows exactly the failure mode festina_graphics_init's own
- * best-effort XSetInputFocus call can trigger: under a *real* window
- * manager (unlike the bare Xvfb instance tests/test_codegen.py's
- * TestGraphics runs against, which has no WM to race with at all), the
- * WM can still be reparenting/managing the just-mapped window at the
- * moment this call reaches the server, so the window is transiently not
- * yet "viewable" -- a real, reproduced BadMatch (X_SetInputFocus, opcode
- * 42), confirmed directly by running a compiled Festina graphics program
- * under `twm`, not a hypothetical race. Xlib's *default* error handler
- * prints this and then calls exit(), which would otherwise take the
- * whole program down over a focus request that was already documented
- * as harmless-if-it-fails. Installed only around that one call (see its
- * own call site) -- every other X11 error the program might hit still
- * goes through Xlib's default handler and is treated as fatal, exactly
- * as before this existed. */
-static int festina_ignore_focus_error(Display *display, XErrorEvent *error) {
-    (void)display;
-    (void)error;
-    return 0;
-}
-
+/* claude.md #123: opens the platform window through the seam, exactly
+ * once. Portable now -- every platform-specific concern (connect
+ * retries, decorations, input focus, ...) lives in that platform's own
+ * festina_window_open implementation; see festina_runtime_window.h. */
 void festina_graphics_init(void) {
-    /* claude.md #87: retried, not a single attempt. XOpenDisplay does no
-     * retrying of its own, so ONE transient failure to connect -- a full
-     * listen backlog on the X server's socket under load, or a server
-     * that is accepting connections but momentarily not completing them
-     * -- used to kill the whole program with a fatal "is $DISPLAY set?"
-     * error that named entirely the wrong cause.
-     *
-     * Confirmed as a real, reproducible transient rather than a
-     * misdiagnosed dead server: instrumenting the failure showed the
-     * Xvfb process still alive, /tmp/.X11-unix/X<n> and /tmp/.X<n>-lock
-     * both present with the lock file naming that same live server's own
-     * pid (so not a display-number collision either), and `xdotool`
-     * connecting to that exact display successfully both immediately
-     * before and immediately after the failed attempt. The connection
-     * was simply refused once, under load.
-     *
-     * This was also the entire cause of tests/test_codegen.py's
-     * TestGraphics being intermittently flaky -- roughly a third of
-     * full-suite runs, essentially never when run in isolation, which
-     * had previously been attributed to slow window startup and
-     * "fixed" by raising the test-side polling timeout to 20s. That
-     * diagnosis was wrong: the window appears in ~0.2s consistently,
-     * and no timeout could ever have helped, because the program had
-     * already exited by then.
-     *
-     * Ten attempts, 100ms apart, so a genuinely absent X server still
-     * fails with the same clear message in about a second. */
-    for (int attempt = 0; attempt < 10; attempt++) {
-        g_display = XOpenDisplay(NULL);
-        if (g_display) break;
-        struct timespec pause = {0, 100L * 1000L * 1000L}; /* 100ms */
-        nanosleep(&pause, NULL);
-    }
-    if (!g_display) {
-        festina_fail("could not open the X display -- claude.md #39's graphics "
-                      "functions need a running X server (is $DISPLAY set?)");
-    }
-
-    int screen = DefaultScreen(g_display);
-    g_window = XCreateSimpleWindow(g_display, RootWindow(g_display, screen), 0, 0,
-                                    FESTINA_CANVAS_WIDTH, FESTINA_CANVAS_HEIGHT, 0,
-                                    BlackPixel(g_display, screen), WhitePixel(g_display, screen));
-
-    Atom mwm_hints_atom = XInternAtom(g_display, "_MOTIF_WM_HINTS", False);
-    FestinaMotifWmHints hints;
-    memset(&hints, 0, sizeof(hints));
-    hints.flags = 2; /* MWM_HINTS_DECORATIONS */
-    hints.decorations = 0;
-    XChangeProperty(g_display, g_window, mwm_hints_atom, mwm_hints_atom, 32,
-                     PropModeReplace, (unsigned char *)&hints,
-                     sizeof(hints) / sizeof(long));
-
-    XStoreName(g_display, g_window, "Festina");
-    XSelectInput(g_display, g_window,
-                 ExposureMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
-                 KeyPressMask | KeyReleaseMask | StructureNotifyMask);
-    /* claude.md #98: ask the server to stop synthesizing a KeyRelease
-     * before every auto-repeated KeyPress, so a held key produces one
-     * keyDown and one keyUp when it is actually let go. Part of libX11
-     * itself (XKB), not a separate dependency. Not every server
-     * supports it, so the result is recorded and a hand-rolled filter
-     * covers the ones that do not -- see festina_key_event_is_autorepeat. */
-    Bool detectable = False;
-    XkbSetDetectableAutoRepeat(g_display, True, &detectable);
-    g_detectable_autorepeat = detectable ? 1 : 0;
-    g_wm_delete_atom = XInternAtom(g_display, "WM_DELETE_WINDOW", False);
-    XSetWMProtocols(g_display, g_window, &g_wm_delete_atom, 1);
-
-    XMapWindow(g_display, g_window);
-    XSync(g_display, False); /* the map must reach the server before ... */
-    /* ... this: with no window manager to hand focus over (as under a
-     * bare Xvfb instance -- see tests/test_codegen.py's TestGraphics),
-     * nothing else would ever give this window keyboard focus, and `on
-     * key` would never fire. A real desktop's WM normally does this on
-     * click/map; asking directly is harmless either way -- and, under a
-     * real WM, can genuinely fail (BadMatch, if the WM is still
-     * reparenting the window at this exact moment), so this one call is
-     * wrapped in a lenient handler that tolerates it rather than letting
-     * Xlib's own default handler exit() the whole program over it; see
-     * festina_ignore_focus_error's own comment. */
-    int (*prev_error_handler)(Display *, XErrorEvent *) = XSetErrorHandler(festina_ignore_focus_error);
-    XSetInputFocus(g_display, g_window, RevertToParent, CurrentTime);
-    XSync(g_display, False); /* force any BadMatch to arrive before the handler is restored */
-    XSetErrorHandler(prev_error_handler);
-    XFlush(g_display);
-
+    festina_window_open(FESTINA_CANVAS_WIDTH, FESTINA_CANVAS_HEIGHT, "Festina");
+    g_window_open = 1;
     g_canvas_width = FESTINA_CANVAS_WIDTH;
     g_canvas_height = FESTINA_CANVAS_HEIGHT;
-    g_window_surface = cairo_xlib_surface_create(g_display, g_window, DefaultVisual(g_display, screen),
-                                                  FESTINA_CANVAS_WIDTH, FESTINA_CANVAS_HEIGHT);
     /* claude.md #95: whatever was already drawn headlessly is kept --
      * a program may well have drawn before its first render(). */
     festina_backing_require();
@@ -725,7 +610,7 @@ int8_t festina_save_canvas(const char *path) {
  * canvas round trips. Now a frame is however many draw calls it takes,
  * plus one render(). */
 void festina_render(void) {
-    if (!g_display) festina_graphics_init();
+    if (!g_window_open) festina_graphics_init();
     festina_backing_require();
     festina_graphics_present();
 }
@@ -758,19 +643,17 @@ void festina_clear_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
 }
 
 /* Blits the backing store (source of truth for what's been drawn) onto
- * the visible window -- called after every draw call for immediate
- * feedback, and on every Expose event to repaint correctly. */
+ * the visible window, through the seam -- called after every draw call
+ * for immediate feedback. A backend's own redraw-on-expose (an X11
+ * Expose event, an NSView drawRect:) never comes back through here; it
+ * repaints from the surface festina_window_present last remembered,
+ * entirely inside that backend -- see festina_runtime_window.h. */
 static void festina_graphics_present(void) {
     /* claude.md #95: nothing to present to until render() has opened a
      * window -- drawing headlessly is not an error, it just has no
      * screen to reach. */
-    if (!g_window_surface || !g_backing_surface) return;
-    cairo_t *cr = cairo_create(g_window_surface);
-    cairo_set_source_surface(cr, g_backing_surface, 0, 0);
-    cairo_paint(cr);
-    cairo_destroy(cr);
-    cairo_surface_flush(g_window_surface);
-    XFlush(g_display);
+    if (!g_window_open || !g_backing_surface) return;
+    festina_window_present(g_backing_surface);
 }
 
 void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
@@ -1307,11 +1190,267 @@ int64_t festina_client_height(void) {
     return g_canvas_height;
 }
 
-/* Handles one already-read X11 event. Returns 0 if this was the
- * window-close request (the caller should stop looping and tear down),
- * 1 otherwise. Factored out of what used to be festina_graphics_run's
- * own while(1) loop body so festina_run_event_loop (below) can drive
- * it either as-is or interleaved with timer processing. */
+/* claude.md #123: handles one already-NORMALIZED window event -- the
+ * portable dispatch every backend's festina_window_events_drain calls
+ * into, unchanged regardless of which platform produced the event.
+ * Returns 0 if this was the window-close request (the caller should
+ * stop looping and tear down), 1 otherwise. */
+static int g_should_stop_looping = 0;
+
+static void festina_handle_window_event(const FestinaWindowEvent *ev) {
+    switch (ev->kind) {
+    case FESTINA_WEVENT_MOUSE_DOWN:
+        /* claude.md #106: both carry the pointer position at the
+         * moment they happened, which is what makes a drag
+         * expressible -- press and release report different
+         * coordinates when the pointer moved in between. */
+        if (g_mouse_down_handler) g_mouse_down_handler(ev->x, ev->y);
+        break;
+    case FESTINA_WEVENT_MOUSE_UP:
+        if (g_mouse_up_handler) g_mouse_up_handler(ev->x, ev->y);
+        break;
+    case FESTINA_WEVENT_MOUSE_MOVE:
+        if (g_mouse_handler) g_mouse_handler(ev->x, ev->y);
+        break;
+    case FESTINA_WEVENT_KEY_DOWN:
+        if (g_key_down_handler) g_key_down_handler(ev->key_name);
+        break;
+    case FESTINA_WEVENT_KEY_UP:
+        if (g_key_up_handler) g_key_up_handler(ev->key_name);
+        break;
+    case FESTINA_WEVENT_RESIZE:
+        /* claude.md #39's own examples never draw relative to a canvas
+         * size (there's no syntax for one), so there's no spec-defined
+         * way to preserve old content sanely across a resize -- clear
+         * back to white at the new size, the same behavior resizing a
+         * browser's <canvas> element has, which clientWidth/
+         * clientHeight are named after. The window's own on-screen
+         * surface is already the new size by the time this fires --
+         * each backend resizes its own before emitting RESIZE (see
+         * festina_runtime_window.h) -- so only the portable backing
+         * store needs rebuilding here. */
+        g_canvas_width = ev->width;
+        g_canvas_height = ev->height;
+        cairo_surface_destroy(g_backing_surface);
+        g_backing_surface = cairo_image_surface_create(
+            CAIRO_FORMAT_ARGB32, (int)ev->width, (int)ev->height);
+        cairo_t *cr = cairo_create(g_backing_surface);
+        cairo_set_source_rgb(cr, 1, 1, 1);
+        cairo_paint(cr);
+        cairo_destroy(cr);
+        festina_graphics_present();
+        if (g_resize_handler) g_resize_handler();
+        break;
+    case FESTINA_WEVENT_CLOSE:
+        if (g_close_handler) g_close_handler();
+        g_should_stop_looping = 1;
+        break;
+    }
+}
+
+/* The blocking loop main() enters (via festina_run_event_loop) whenever
+ * a program uses graphics -- see festina_runtime.h's doc comment.
+ * claude.md #123: portable now -- festina_window_events_wait is each
+ * backend's own analog of the X11 original's select() on
+ * ConnectionNumber(g_display), so `on mouseDown`/timers both stay
+ * responsive at once exactly as before; exits when the window closes
+ * (timers, if any, are simply abandoned -- matching a browser tab
+ * unloading). Timer state itself lives in festina_runtime.c, reached
+ * only through festina_next_timer_deadline()/festina_fire_expired_timers()
+ * (festina_runtime_internal.h) -- this file owns no timer bookkeeping
+ * of its own. */
+void festina_run_event_loop(void) {
+    g_should_stop_looping = 0;
+    while (!g_should_stop_looping) {
+        double earliest = festina_next_timer_deadline();
+        double timeout = -1.0;
+        if (earliest >= 0.0) {
+            timeout = earliest - festina_now_seconds();
+            if (timeout < 0.0) timeout = 0.0;
+        }
+        festina_window_events_wait(timeout);
+        festina_window_events_drain(festina_handle_window_event);
+        festina_fire_expired_timers();
+    }
+    cairo_surface_destroy(g_backing_surface);
+    g_backing_surface = NULL;
+    festina_window_close();
+    g_window_open = 0;
+}
+
+/* ---- the X11 window backend -- claude.md #123's seam, implemented ----
+ *
+ * Everything in this block is the ORIGINAL X11 code, moved verbatim
+ * behind festina_runtime_window.h's five functions -- verified
+ * zero-regression against the full Xvfb-backed TestGraphics/
+ * TestExampleGraphics/TestExampleTicTacToe suite. Compiled only on
+ * non-Apple platforms; macOS gets festina_runtime_window_mac.m instead
+ * (a separate Objective-C translation unit -- Cocoa cannot be part of
+ * a plain .c file). */
+#ifndef __APPLE__
+#include <X11/Xlib.h>
+#include <X11/Xutil.h> /* XLookupString/XKeysymToString -- `on keyDown`/`on keyUp` */
+#include <X11/XKBlib.h> /* XkbSetDetectableAutoRepeat -- claude.md #98 */
+#include <cairo/cairo-xlib.h>
+
+/* Motif WM hints -- the widely-honored (if not core-protocol) X11
+ * convention for requesting a window with no title bar/border/menu. */
+typedef struct {
+    unsigned long flags, functions, decorations;
+    long input_mode;
+    unsigned long status;
+} FestinaMotifWmHints;
+
+static Display *g_display = NULL;
+static Window g_window;
+static Atom g_wm_delete_atom;
+static cairo_surface_t *g_window_surface = NULL;
+/* Whether the X server could turn on detectable auto-repeat (XKB). When
+ * it can, a held key produces a single KeyPress and one KeyRelease when
+ * it is finally let go. When it cannot, X synthesizes a
+ * KeyRelease/KeyPress PAIR per repeat, and this backend filters them
+ * out by hand -- see festina_x11_key_is_autorepeat. Without either, a
+ * held key would fire keyUp/keyDown dozens of times a second, which is
+ * exactly the bug splitting the event apart is meant to let a program
+ * avoid. */
+static int g_detectable_autorepeat = 0;
+
+/* Swallows exactly the failure mode festina_window_open's own
+ * best-effort XSetInputFocus call can trigger: under a *real* window
+ * manager (unlike the bare Xvfb instance tests/test_codegen.py's
+ * TestGraphics runs against, which has no WM to race with at all), the
+ * WM can still be reparenting/managing the just-mapped window at the
+ * moment this call reaches the server, so the window is transiently not
+ * yet "viewable" -- a real, reproduced BadMatch (X_SetInputFocus, opcode
+ * 42), confirmed directly by running a compiled Festina graphics program
+ * under `twm`, not a hypothetical race. Xlib's *default* error handler
+ * prints this and then calls exit(), which would otherwise take the
+ * whole program down over a focus request that was already documented
+ * as harmless-if-it-fails. Installed only around that one call (see its
+ * own call site) -- every other X11 error the program might hit still
+ * goes through Xlib's default handler and is treated as fatal, exactly
+ * as before this existed. */
+static int festina_ignore_focus_error(Display *display, XErrorEvent *error) {
+    (void)display;
+    (void)error;
+    return 0;
+}
+
+void festina_window_open(int64_t width, int64_t height, const char *title) {
+    /* claude.md #87: retried, not a single attempt. XOpenDisplay does no
+     * retrying of its own, so ONE transient failure to connect -- a full
+     * listen backlog on the X server's socket under load, or a server
+     * that is accepting connections but momentarily not completing them
+     * -- used to kill the whole program with a fatal "is $DISPLAY set?"
+     * error that named entirely the wrong cause.
+     *
+     * Confirmed as a real, reproducible transient rather than a
+     * misdiagnosed dead server: instrumenting the failure showed the
+     * Xvfb process still alive, /tmp/.X11-unix/X<n> and /tmp/.X<n>-lock
+     * both present with the lock file naming that same live server's own
+     * pid (so not a display-number collision either), and `xdotool`
+     * connecting to that exact display successfully both immediately
+     * before and immediately after the failed attempt. The connection
+     * was simply refused once, under load.
+     *
+     * Ten attempts, 100ms apart, so a genuinely absent X server still
+     * fails with the same clear message in about a second. */
+    for (int attempt = 0; attempt < 10; attempt++) {
+        g_display = XOpenDisplay(NULL);
+        if (g_display) break;
+        struct timespec pause = {0, 100L * 1000L * 1000L}; /* 100ms */
+        nanosleep(&pause, NULL);
+    }
+    if (!g_display) {
+        festina_fail("could not open the X display -- claude.md #39's graphics "
+                      "functions need a running X server (is $DISPLAY set?)");
+    }
+
+    int screen = DefaultScreen(g_display);
+    g_window = XCreateSimpleWindow(g_display, RootWindow(g_display, screen), 0, 0,
+                                    (unsigned int)width, (unsigned int)height, 0,
+                                    BlackPixel(g_display, screen), WhitePixel(g_display, screen));
+
+    Atom mwm_hints_atom = XInternAtom(g_display, "_MOTIF_WM_HINTS", False);
+    FestinaMotifWmHints hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.flags = 2; /* MWM_HINTS_DECORATIONS */
+    hints.decorations = 0;
+    XChangeProperty(g_display, g_window, mwm_hints_atom, mwm_hints_atom, 32,
+                     PropModeReplace, (unsigned char *)&hints,
+                     sizeof(hints) / sizeof(long));
+
+    XStoreName(g_display, g_window, title);
+    XSelectInput(g_display, g_window,
+                 ExposureMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
+                 KeyPressMask | KeyReleaseMask | StructureNotifyMask);
+    /* claude.md #98: ask the server to stop synthesizing a KeyRelease
+     * before every auto-repeated KeyPress, so a held key produces one
+     * keyDown and one keyUp when it is actually let go. Part of libX11
+     * itself (XKB), not a separate dependency. Not every server
+     * supports it, so the result is recorded and a hand-rolled filter
+     * covers the ones that do not -- see festina_x11_key_is_autorepeat. */
+    Bool detectable = False;
+    XkbSetDetectableAutoRepeat(g_display, True, &detectable);
+    g_detectable_autorepeat = detectable ? 1 : 0;
+    g_wm_delete_atom = XInternAtom(g_display, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(g_display, g_window, &g_wm_delete_atom, 1);
+
+    XMapWindow(g_display, g_window);
+    XSync(g_display, False); /* the map must reach the server before ... */
+    /* ... this: with no window manager to hand focus over (as under a
+     * bare Xvfb instance -- see tests/test_codegen.py's TestGraphics),
+     * nothing else would ever give this window keyboard focus, and `on
+     * key` would never fire. A real desktop's WM normally does this on
+     * click/map; asking directly is harmless either way -- and, under a
+     * real WM, can genuinely fail (BadMatch, if the WM is still
+     * reparenting the window at this exact moment), so this one call is
+     * wrapped in a lenient handler that tolerates it rather than letting
+     * Xlib's own default handler exit() the whole program over it; see
+     * festina_ignore_focus_error's own comment. */
+    int (*prev_error_handler)(Display *, XErrorEvent *) = XSetErrorHandler(festina_ignore_focus_error);
+    XSetInputFocus(g_display, g_window, RevertToParent, CurrentTime);
+    XSync(g_display, False); /* force any BadMatch to arrive before the handler is restored */
+    XSetErrorHandler(prev_error_handler);
+    XFlush(g_display);
+
+    g_window_surface = cairo_xlib_surface_create(g_display, g_window, DefaultVisual(g_display, screen),
+                                                  (int)width, (int)height);
+}
+
+void festina_window_close(void) {
+    cairo_surface_destroy(g_window_surface);
+    g_window_surface = NULL;
+    XDestroyWindow(g_display, g_window);
+    XCloseDisplay(g_display);
+    g_display = NULL;
+}
+
+void festina_window_present(cairo_surface_t *backing) {
+    cairo_t *cr = cairo_create(g_window_surface);
+    cairo_set_source_surface(cr, backing, 0, 0);
+    cairo_paint(cr);
+    cairo_destroy(cr);
+    cairo_surface_flush(g_window_surface);
+    XFlush(g_display);
+}
+
+void festina_window_events_wait(double timeout_seconds) {
+    if (XPending(g_display)) return;
+    int xfd = ConnectionNumber(g_display);
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(xfd, &fds);
+    struct timeval tv;
+    struct timeval *tvp = NULL;
+    if (timeout_seconds >= 0.0) {
+        tv.tv_sec = (long)timeout_seconds;
+        tv.tv_usec = (long)((timeout_seconds - (double)tv.tv_sec) * 1e6);
+        tvp = &tv;
+    }
+    select(xfd + 1, &fds, NULL, NULL, tvp);
+}
+
 /* claude.md #40's key NAME, shared by keyDown and keyUp so the two
  * events can never disagree about what to call the same physical key.
  *
@@ -1322,13 +1461,13 @@ int64_t festina_client_height(void) {
  * control character (e.g. 0x1B for Escape, 0x0D for Return), neither
  * of which is a useful `text` value, so those fall back to
  * XKeysymToString's X11 key name instead (e.g. "Return", "Escape",
- * "Left") -- there's no claude.md-defined naming scheme for these, so
- * this is simply X11's own.
+ * "Left") -- exactly runtime/festina_key_names.h's own vocabulary,
+ * since that header's names were measured from this call.
  *
  * XLookupString is given the event by address rather than a copy: it
  * takes an XKeyEvent* and reads the modifier state out of it, which is
  * what makes a shifted "a" arrive as "A". */
-static void festina_key_name(XKeyEvent *ev, char *out, size_t out_size) {
+static void festina_x11_key_name(XKeyEvent *ev, char *out, size_t out_size) {
     char buf[32];
     KeySym keysym;
     int len = XLookupString(ev, buf, sizeof(buf) - 1, &keysym, NULL);
@@ -1344,19 +1483,12 @@ static void festina_key_name(XKeyEvent *ev, char *out, size_t out_size) {
 }
 
 /* claude.md #98: true for the KeyRelease half of an auto-repeat pair.
- *
- * Only needed when the server could not give us detectable auto-repeat
- * (see g_detectable_autorepeat). Without XKB, holding a key produces a
- * stream of KeyRelease/KeyPress pairs with IDENTICAL timestamps and
- * keycodes -- so peeking at the next queued event and dropping the
- * release when its partner is already sitting behind it turns the
- * stream back into the one-down-many-repeats shape a program expects.
- * The repeated KeyPress events are deliberately left alone: a held key
- * legitimately repeating `keyDown` is how text entry works, and a
- * program that only wants the first can compare against the key it
- * last saw go up. What it must NOT see is a phantom keyUp while the
- * key is still physically down. */
-static int festina_key_event_is_autorepeat(XEvent *ev) {
+ * See g_detectable_autorepeat's own comment for the full reasoning --
+ * peeking at the next queued event and dropping the release when its
+ * partner is already sitting behind it turns the synthesized
+ * KeyRelease/KeyPress stream back into the one-down-many-repeats shape
+ * a program expects. */
+static int festina_x11_key_is_autorepeat(XEvent *ev) {
     if (g_detectable_autorepeat || ev->type != KeyRelease) return 0;
     if (!XPending(g_display)) return 0;
     XEvent next;
@@ -1366,112 +1498,64 @@ static int festina_key_event_is_autorepeat(XEvent *ev) {
            next.xkey.keycode == ev->xkey.keycode;
 }
 
-static int festina_handle_graphics_event(XEvent *ev) {
-    if (ev->type == Expose) {
-        festina_graphics_present();
-    } else if (ev->type == ButtonPress || ev->type == ButtonRelease) {
-        /* claude.md #106: both carry the pointer position at the moment
-         * they happened, which is what makes a drag expressible -- press
-         * and release report different coordinates when the pointer
-         * moved in between. */
-        void (*handler)(int64_t, int64_t) =
-            ev->type == ButtonPress ? g_mouse_down_handler : g_mouse_up_handler;
-        if (handler) handler(ev->xbutton.x, ev->xbutton.y);
-    } else if (ev->type == MotionNotify) {
-        if (g_mouse_handler) g_mouse_handler(ev->xmotion.x, ev->xmotion.y);
-    } else if (ev->type == KeyPress || ev->type == KeyRelease) {
-        void (*handler)(const char *) =
-            ev->type == KeyPress ? g_key_down_handler : g_key_up_handler;
-        if (handler && !festina_key_event_is_autorepeat(ev)) {
+void festina_window_events_drain(void (*handler)(const FestinaWindowEvent *event)) {
+    while (XPending(g_display)) {
+        XEvent ev;
+        XNextEvent(g_display, &ev);
+        FestinaWindowEvent wev;
+        memset(&wev, 0, sizeof(wev));
+
+        if (ev.type == Expose) {
+            /* claude.md #123: redraw-on-expose is entirely this
+             * backend's own concern now -- see
+             * festina_runtime_window.h's own note. The X11 window
+             * surface still holds whatever was last painted onto it
+             * (Cairo/X11 own the pixels), so simply flushing it again
+             * is enough; there is no "last backing surface" to
+             * re-fetch here since nothing about it changed. */
+            cairo_surface_flush(g_window_surface);
+            XFlush(g_display);
+            continue;
+        } else if (ev.type == ButtonPress || ev.type == ButtonRelease) {
+            wev.kind = ev.type == ButtonPress ? FESTINA_WEVENT_MOUSE_DOWN : FESTINA_WEVENT_MOUSE_UP;
+            wev.x = ev.xbutton.x;
+            wev.y = ev.xbutton.y;
+            handler(&wev);
+        } else if (ev.type == MotionNotify) {
+            wev.kind = FESTINA_WEVENT_MOUSE_MOVE;
+            wev.x = ev.xmotion.x;
+            wev.y = ev.xmotion.y;
+            handler(&wev);
+        } else if (ev.type == KeyPress || ev.type == KeyRelease) {
+            if (festina_x11_key_is_autorepeat(&ev)) continue;
             char name[32];
-            festina_key_name(&ev->xkey, name, sizeof(name));
-            handler(name);
-        }
-    } else if (ev->type == ConfigureNotify) {
-        /* ConfigureNotify fires on more than just a resize (e.g. a
-         * move), so only treat it as `on resize` when the size
-         * genuinely changed. */
-        int64_t new_w = ev->xconfigure.width;
-        int64_t new_h = ev->xconfigure.height;
-        if (new_w != g_canvas_width || new_h != g_canvas_height) {
-            g_canvas_width = new_w;
-            g_canvas_height = new_h;
-            cairo_xlib_surface_set_size(g_window_surface, new_w, new_h);
-            /* claude.md #39's own examples never draw relative to a
-             * canvas size (there's no syntax for one), so there's no
-             * spec-defined way to preserve old content sanely across
-             * a resize -- clear back to white at the new size, the
-             * same behavior resizing a browser's <canvas> element
-             * has, which clientWidth/clientHeight are named after. */
-            cairo_surface_destroy(g_backing_surface);
-            g_backing_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, new_w, new_h);
-            cairo_t *cr = cairo_create(g_backing_surface);
-            cairo_set_source_rgb(cr, 1, 1, 1);
-            cairo_paint(cr);
-            cairo_destroy(cr);
-            festina_graphics_present();
-            if (g_resize_handler) g_resize_handler();
-        }
-    } else if (ev->type == ClientMessage) {
-        if ((Atom)ev->xclient.data.l[0] == g_wm_delete_atom) {
-            if (g_close_handler) g_close_handler();
-            return 0;
-        }
-    }
-    return 1;
-}
-
-static void festina_graphics_teardown(void) {
-    cairo_surface_destroy(g_backing_surface);
-    cairo_surface_destroy(g_window_surface);
-    XDestroyWindow(g_display, g_window);
-    XCloseDisplay(g_display);
-}
-
-/* The blocking loop main() enters (via festina_run_event_loop) whenever
- * a program uses graphics -- see festina_runtime.h's doc comment.
- * Multiplexes X11 events and timer deadlines on the same select() call
- * (via ConnectionNumber(g_display)) rather than picking one or the
- * other, so `on mouseDown`/timers both stay responsive at once; exits when
- * the window closes (timers, if any, are simply abandoned -- matching a
- * browser tab unloading). Timer state itself lives in
- * festina_runtime.c, reached only through
- * festina_next_timer_deadline()/festina_fire_expired_timers()
- * (festina_runtime_internal.h) -- this file owns no timer bookkeeping
- * of its own. */
-void festina_run_event_loop(void) {
-    while (1) {
-        double earliest = festina_next_timer_deadline();
-
-        if (!XPending(g_display)) {
-            int xfd = ConnectionNumber(g_display);
-            fd_set fds;
-            FD_ZERO(&fds);
-            FD_SET(xfd, &fds);
-            struct timeval tv;
-            struct timeval *tvp = NULL;
-            if (earliest >= 0.0) {
-                double remaining = earliest - festina_now_seconds();
-                if (remaining < 0.0) remaining = 0.0;
-                tv.tv_sec = (long)remaining;
-                tv.tv_usec = (long)((remaining - (double)tv.tv_sec) * 1e6);
-                tvp = &tv;
+            festina_x11_key_name(&ev.xkey, name, sizeof(name));
+            wev.kind = ev.type == KeyPress ? FESTINA_WEVENT_KEY_DOWN : FESTINA_WEVENT_KEY_UP;
+            wev.key_name = name;
+            handler(&wev);
+        } else if (ev.type == ConfigureNotify) {
+            /* ConfigureNotify fires on more than just a resize (e.g. a
+             * move); the shared dispatcher only needs to hear about a
+             * GENUINE size change, so only that case is translated. */
+            int64_t new_w = ev.xconfigure.width;
+            int64_t new_h = ev.xconfigure.height;
+            if (new_w != g_canvas_width || new_h != g_canvas_height) {
+                /* claude.md #123: resize THIS backend's own on-screen
+                 * surface before handing the event to shared code --
+                 * see festina_runtime_window.h's own note on why. */
+                cairo_xlib_surface_set_size(g_window_surface, new_w, new_h);
+                wev.kind = FESTINA_WEVENT_RESIZE;
+                wev.width = new_w;
+                wev.height = new_h;
+                handler(&wev);
             }
-            select(xfd + 1, &fds, NULL, NULL, tvp);
-        }
-        int keep_going = 1;
-        while (XPending(g_display)) {
-            XEvent ev;
-            XNextEvent(g_display, &ev);
-            if (!festina_handle_graphics_event(&ev)) {
-                keep_going = 0;
-                break; /* stop on window-close, same as the old loop did */
+        } else if (ev.type == ClientMessage) {
+            if ((Atom)ev.xclient.data.l[0] == g_wm_delete_atom) {
+                wev.kind = FESTINA_WEVENT_CLOSE;
+                handler(&wev);
+                return; /* the window is going away -- nothing queued after this matters */
             }
-        }
-        festina_fire_expired_timers();
-        if (!keep_going) {
-            festina_graphics_teardown();
-            return;
         }
     }
 }
+#endif /* !__APPLE__ */

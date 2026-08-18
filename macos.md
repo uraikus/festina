@@ -13,7 +13,19 @@
 > real AudioToolbox headers, `FESTINA_AUDIO_NULL=1` as the
 > cross-platform test sink); the darwin audio gate stays until
 > real-hardware playback is verified (`FESTINA_ENABLE_MACOS_AUDIO=1`
-> to try it on a Mac). Phases 2–3 are open.
+> to try it on a Mac). Phase 2 is built and CI-compiled the same way
+> (claude.md #123): the `festina_window_*` seam, a native Cocoa
+> backend (`festina_runtime_window_mac.m`, type-checked against real
+> AppKit/Foundation/CoreGraphics headers on every push), and offscreen
+> graphics (`saveCanvas`, no window) unblocked on darwin with no
+> XQuartz dependency at all — 2a's XQuartz stage turned out to be
+> unnecessary and was skipped in favor of going straight to 2b, since
+> the X11 backend's own real (Linux, Xvfb-based) test suite already
+> gives 2b's design a verified behavioral reference to implement
+> against. The darwin *windowed*-graphics gate stays until real
+> mouse/keyboard/window behavior is verified on hardware
+> (`FESTINA_ENABLE_MACOS_GRAPHICS=1` to try it on a Mac); offscreen
+> drawing is never gated. Phase 3 is open.
 
 A concrete, phased plan for bringing Festina to macOS. The premise
 (from [todo.md](todo.md#platforms)) holds up under audit: **porting is
@@ -125,70 +137,100 @@ Exit criteria: `examples/audio.f` plays on a Mac; channel-pool
 white-box suite and play/stop/isPlaying end-to-end tests green on
 macOS CI under the null shim.
 
-## Phase 2 — Graphics: portable canvas + a narrow windowing seam
+## Phase 2 — Graphics: portable canvas + a narrow windowing seam *(built, CI-compiled; native-hardware verification open)*
 
-The 1,477-line graphics TU is mostly portable already: all drawing
+The 1,477-line graphics TU was mostly portable already: all drawing
 (rects, circles, text, paths, transforms, gradients, images, clips,
 resizes, `saveCanvas`) targets an offscreen Cairo image surface, and
-libjpeg decoding is platform-free. What is X11-specific is exactly the
-windowing layer. Two stages:
+libjpeg decoding is platform-free. What was X11-specific was exactly
+the windowing layer, now cut behind `runtime/festina_runtime_window.h`:
 
-**2a — Validation under XQuartz (near-zero code).** brew's cairo links
-against XQuartz's X11; the existing `cairo-xlib` backend runs
-unmodified. Not the shipping answer (XQuartz install, alien window
-chrome), but it proves decoding/drawing/event handling on macOS before
-any new code exists, and it gives Phase 2b a behavioral reference on
-the same machine.
+   - `festina_window_open(width, height, title)` / `festina_window_close(void)`
+   - `festina_window_present(cairo_surface_t *backing)` — hand the offscreen backing surface to the platform to blit
+   - `festina_window_events_wait(double timeout_seconds)` — block for at most one OS-native event, bounded by the next timer deadline (as before, the caller — not the backend — computes the deadline)
+   - `festina_window_events_drain(void (*handler)(const FestinaWindowEvent *))` — pump every pending OS event, calling `handler` once per **normalized event**: `MOUSE_DOWN`/`MOUSE_UP`/`MOUSE_MOVE` (x, y), `KEY_DOWN`/`KEY_UP` (key_name), `RESIZE` (width, height), `CLOSE`
 
-**2b — Native Cocoa backend behind a seam.** Extract the platform
-interface the X11 code already implies (each item maps to specific
-existing calls):
+   One simplification found during extraction that the sketch above
+   didn't anticipate: there is no `window_client_size` accessor and no
+   synthetic redraw event. Each backend already knows the window's
+   current size (it's an open-time parameter, kept current by RESIZE),
+   and each backend independently remembers the last surface handed to
+   `festina_window_present` and repaints from it on its own
+   expose/`drawRect:` callback — a plain platform responsibility, not
+   something the seam needs to broker.
 
-   - `window_open(w, h, title)` / `window_close()` — XCreateSimpleWindow/XMapWindow/XStoreName/XDestroyWindow, incl. the 10×100ms connect retry
-   - `window_present(cairo_image_surface)` — the render() blit (today `cairo_xlib_surface_create/set_size` + paint)
-   - `window_client_size(&w, &h)` — clientWidth/clientHeight
-   - `events_wait(timeout_seconds)` — today `select()` on `ConnectionNumber` bounded by the next timer deadline
-   - `events_drain(handler)` — XPending/XNextEvent loop, emitting **normalized events**: mouseDown/mouseUp/mouse(x,y), keyDown/keyUp(name), resize(w,h), close
+   Linux implementation: the existing X11/Xlib code, moved into this
+   file unchanged in behavior (XCreateSimpleWindow/XMapWindow/
+   XStoreName/XDestroyWindow, the 10×100ms connect retry, `select()`
+   on `ConnectionNumber`, XPending/XNextEvent translated into
+   `FestinaWindowEvent`s). macOS implementation: one Objective-C file,
+   `festina_runtime_window_mac.m` — a separate translation unit
+   (Cocoa cannot live in a plain `.c` file), compiled by the same
+   clang via its `.m` extension and linked `-framework Cocoa` — NSWindow
+   plus an NSView whose `drawRect:` blits the Cairo image surface via
+   CGImage (`CAIRO_FORMAT_ARGB32` maps exactly onto
+   `kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst` on
+   any little-endian Mac). `_RUNTIME_FEATURES["graphics"]` grows
+   per-platform `pkgs`/`extra_link_flags` (darwin: plain `cairo` +
+   `libjpeg`, `-framework Cocoa`; no `cairo-xlib`, no XQuartz — 2a was
+   skipped entirely, see the status note above).
 
-   Linux implementation: the existing code, moved. macOS
-   implementation: one Objective-C file (`festina_runtime_window_mac.m`,
-   compiled by the same clang, linked `-framework Cocoa`) — NSWindow +
-   an NSView whose `drawRect:` blits the Cairo image surface via
-   CGImage. `_RUNTIME_FEATURES["graphics"]` grows per-platform
-   `source`/`pkgs`/`extra_link_flags` (darwin: `cairo` + `libjpeg`,
-   no `cairo-xlib`).
-
-   The three genuinely hard points, named now:
+   The three genuinely hard points, as they actually shook out:
    - **Event-loop inversion.** Cocoa requires UI on the main thread
      and prefers owning the loop. Festina's model is compatible —
      top-level code runs, then `festina_run_event_loop()` blocks on
-     the main thread — so implement `events_wait` with
-     `nextEventMatchingMask:untilDate:` (the timeout carries the timer
-     deadline, exactly like the `select` timeout today) rather than
-     `[NSApp run]`. Timers keep firing from the same loop, unchanged.
-   - **Key-name parity.** `on keyDown(key:text)` currently reports X
-     keysym names (`a`, `Return`, `space`, `Left`...). Cocoa reports
-     characters/keyCodes. Ship a mapping table in the mac layer to the
-     *same* names, and pin the shared vocabulary in a
-     platform-independent test list — otherwise every keyboard-driven
-     program silently breaks on one platform. Autorepeat semantics
-     (`keyDown` repeats while held, exactly one `keyUp`) map cleanly:
-     NSEvent's `isARepeat` is the DetectableAutoRepeat equivalent.
+     the main thread — so `festina_window_events_wait` uses
+     `nextEventMatchingMask:untilDate:...dequeue:NO` (a peek, timeout
+     carries the timer deadline exactly like `select`'s timeout on
+     Linux) and `festina_window_events_drain` fully pumps the queue
+     (`dequeue:YES` + `sendEvent:` + `updateWindows`) into a small
+     ring buffer that window/view delegate callbacks (resize, close)
+     also push into, then drains that buffer through the caller's
+     handler. No `[NSApp run]` anywhere. Timers keep firing from the
+     same loop, unchanged.
+   - **Key-name parity.** `on keyDown(key:text)` reports X keysym
+     names on Linux (`a`, `Return`, `space`, `Left`...). Cocoa reports
+     characters/keyCodes. The mac layer maps both onto the same names
+     via a small keyCode table, and the shared vocabulary is pinned in
+     `runtime/festina_key_names.h`, guarded by
+     `tests/test_platform.py::TestKeyNameVocabulary` — otherwise every
+     keyboard-driven program would silently break on one platform.
+     Autorepeat maps cleanly: NSEvent's `isARepeat` is the
+     DetectableAutoRepeat equivalent.
    - **What drops out.** The X error handler around `XSetInputFocus`
      (a WM race) and the WM_DELETE_WINDOW protocol are X-specific;
      their jobs (focus, the close button) are ordinary NSWindow
      behavior — `windowShouldClose:` feeds the normalized close event.
 
-   CI honesty: there is no Xvfb equivalent on macOS runners, so
-   windowed end-to-end tests (mouse dispatch under a real server)
-   remain Linux-CI-only; macOS CI covers the full offscreen suite plus
-   the seam's Linux-verified contract, and windowed behavior is
-   verified manually per release on real hardware. Say so in
-   tests/CONTRACT.md rather than pretending coverage.
+   Real-hardware-verification gating, same shape as Phase 1's audio
+   gate: `festina_runtime_window_mac.m` is compiled and type-checked
+   against the real AppKit/Foundation/CoreGraphics headers on every
+   `macos-14` CI push (a dedicated compile-only step, mirroring the
+   audio one), but a Festina program that would actually *open a
+   window* (declares `render()` or any window event handler — the
+   narrow `gen.uses_graphics` flag, as opposed to the broad
+   `gen.uses_graphics_code` flag that only means "draws something,
+   possibly only offscreen") still hits `_check_feature_supported` and
+   fails to compile on darwin unless `FESTINA_ENABLE_MACOS_GRAPHICS=1`
+   is set, until confirmed against a real window, mouse, and keyboard.
+   Offscreen-only programs (`saveCanvas`, no `render()`) are never
+   gated on any platform — that distinction is itself covered by a
+   dedicated unit test (`test_offscreen_graphics_never_reaches_the_darwin_gate`).
 
-Exit criteria: `examples/graphics.f`, `tic_tac_toe.f`, `timers.f` run
-in native windows on a Mac; keyboard/mouse/resize/close behave
-identically to Linux against the pinned event vocabulary.
+   CI honesty, unchanged from the original plan: there is no Xvfb
+   equivalent on macOS runners, so windowed end-to-end tests (mouse
+   dispatch under a real server) remain Linux-CI-only, verified there
+   against a real Xvfb + xdotool + openbox window manager; macOS CI
+   covers the full offscreen suite plus the compile-only Cocoa
+   type-check, and windowed behavior awaits manual verification on
+   real hardware. See tests/CONTRACT.md for the exact split.
+
+Exit criteria (open until real-hardware verification):
+`examples/graphics.f`, `tic_tac_toe.f`, `timers.f` run in native
+windows on a Mac with `FESTINA_ENABLE_MACOS_GRAPHICS=1`;
+keyboard/mouse/resize/close behave identically to Linux against the
+pinned event vocabulary. Everything up to that point — the seam, both
+backends, the gating, the tests, the packaging — is done.
 
 ## Phase 3 — Packaging and distribution
 
@@ -216,10 +258,14 @@ platform implementations are independent and parallelizable:
    re-seating of the white-box harness stubs at it. Both platform
    files then use the same N-buffers-plus-semaphore blocking-push
    design (AudioQueue / waveOut).
-2. **The windowing seam** (`window_open/close/present/client_size/
-   events_wait/events_drain` + normalized events), including the
-   decision that `present` takes the Cairo *image surface* everywhere
-   (xlib surface / CGImage / DIB are per-platform blits of one thing).
+2. **The windowing seam** (`festina_window_open/close/present/
+   events_wait/events_drain` + normalized events, `runtime/
+   festina_runtime_window.h`) *(done for macOS — Linux (X11) and macOS
+   (Cocoa) backends both implement it; a Windows (Win32/D2D) backend
+   is the remaining consumer)*, including the decision that `present`
+   takes the Cairo *image surface* everywhere (xlib surface / CGImage
+   / DIB are per-platform blits of one thing), and that redraw-on-expose
+   is each backend's own job rather than a seam-level event.
 3. **The key-name vocabulary** — `runtime/festina_key_names.h`, the
    pinned list both mapping tables target, with
    `tests/test_platform.py::TestKeyNameVocabulary` guarding it.
@@ -248,12 +294,14 @@ run-loop inversion has no Win32 counterpart.
 
 ## Order, size, and what is deliberately not planned
 
-Phases land independently and in order — 0 (small: two Python files, a
-CI job), 1 (medium: one seam refactor + ~200 lines of AudioQueue), 2b
-(the largest: the seam extraction plus one Objective-C file, with 2a
-as its cheap rehearsal), 3 (small). Windows is out of scope here but
+Phases landed independently and in order — 0 (small: two Python
+files, a CI job), 1 (medium: one seam refactor + ~200 lines of
+AudioQueue), 2 (the largest: the seam extraction plus one
+Objective-C file — landed as a single native-Cocoa pass, skipping the
+originally-sketched 2a XQuartz rehearsal since it turned out not to be
+needed), 3 (small, still open). Windows is out of scope here but
 constrained: the Phase 1/2 seams are the same ones a Windows port
 needs (WASAPI, Win32/D2D or the same Cairo blit), so cutting them
-platform-shaped rather than macOS-shaped is part of the work. The
+platform-shaped rather than macOS-shaped was part of the work. The
 `<regex.h>` and `select()` dependencies that todo.md flags as Windows
 problems are non-issues on macOS and stay untouched.

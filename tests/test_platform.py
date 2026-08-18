@@ -139,11 +139,24 @@ class TestFeatureGating:
         cli_mod._check_feature_supported("audio", "linux")
         cli_mod._check_feature_supported("audio", "win32")
 
-    def test_graphics_is_not_gated_anywhere(self, cli_mod):
-        # Phase 2a's XQuartz route means graphics LINKS on darwin today
-        # (cairo-xlib from brew); only audio lacks a backend entirely.
-        for platform_name in ("linux", "darwin", "win32"):
+    def test_graphics_is_not_gated_on_linux_or_windows(self, cli_mod):
+        for platform_name in ("linux", "win32"):
             cli_mod._check_feature_supported("graphics", platform_name)
+
+    def test_windowed_graphics_is_gated_on_darwin(self, cli_mod, errors):
+        # claude.md #123 INVERTED this test: the windowing seam +
+        # Cocoa backend landed, and -- exactly like #121's audio gate
+        # -- being BUILT and CI-compiled is not the same claim as being
+        # verified against a real window/mouse/keyboard, so windowed
+        # use stays gated until it has been.
+        with pytest.raises(errors.CompileError) as excinfo:
+            cli_mod._check_feature_supported("graphics", "darwin")
+        assert "macos.md Phase 2" in str(excinfo.value)
+        assert excinfo.value.category == "unsupported platform feature"
+
+    def test_the_darwin_graphics_gate_is_overridable(self, cli_mod, monkeypatch):
+        monkeypatch.setenv("FESTINA_ENABLE_MACOS_GRAPHICS", "1")
+        cli_mod._check_feature_supported("graphics", "darwin")   # no raise
 
     def test_doctor_on_darwin_reports_audio_as_planned_not_missing(
             self, cli_mod, monkeypatch):
@@ -171,12 +184,52 @@ class TestAudioFeatureConfig:
         assert pkgs == ["libmpg123"]
         assert flags == ["-pthread", "-framework", "AudioToolbox"]
 
-    def test_graphics_is_unchanged_per_platform_for_now(self, cli_mod):
-        # Phase 2a: darwin graphics goes through cairo-xlib under
-        # XQuartz, deliberately identical to Linux until the windowing
-        # seam lands.
-        assert (cli_mod._feature_pkgs_and_flags("graphics", "linux")
-                == cli_mod._feature_pkgs_and_flags("graphics", "darwin"))
+    def test_darwin_graphics_swaps_cairo_xlib_for_plain_cairo(self, cli_mod):
+        # claude.md #123 INVERTED this test: festina_runtime_graphics.c
+        # has zero X11 code compiled into it on darwin (guarded
+        # `#ifndef __APPLE__`), so it needs only Cairo's own core
+        # package -- the xlib backend, and XQuartz along with it, are
+        # no longer needed at all, not even for offscreen drawing.
+        pkgs, flags = cli_mod._feature_pkgs_and_flags("graphics", "darwin")
+        assert pkgs == ["libjpeg", "cairo"]
+        assert flags == ["-framework", "Cocoa"]
+
+    def test_linux_graphics_is_unchanged(self, cli_mod):
+        pkgs, flags = cli_mod._feature_pkgs_and_flags("graphics", "linux")
+        assert pkgs == ["cairo-xlib", "libjpeg"]
+        assert flags == []
+
+    def test_the_darwin_window_backend_extra_object_is_only_for_graphics(
+            self, cli_mod):
+        assert cli_mod._feature_extra_object("clang", "audio", "darwin") is None
+        assert cli_mod._feature_extra_object("clang", "graphics", "linux") is None
+
+    def test_offscreen_graphics_never_reaches_the_darwin_gate(
+            self, cli_mod, monkeypatch):
+        # claude.md #123: _runtime_objects_and_link_libs's own
+        # wants_window parameter is the narrow question -- a program
+        # that only draws to an offscreen canvas (uses_graphics_code,
+        # not the real-window uses_graphics) must never hit
+        # _check_feature_supported at all, on darwin or anywhere else,
+        # since it never touches the windowing seam. Verified by
+        # recording calls rather than actually linking (which needs
+        # real toolchain state this test doesn't have on Linux).
+        monkeypatch.setattr(sys, "platform", "darwin")
+        calls = []
+        monkeypatch.setattr(cli_mod, "_check_feature_supported",
+                            lambda name, platform_name=None: calls.append(name))
+        monkeypatch.setattr(cli_mod, "_ensure_runtime_object", lambda *a, **k: "/tmp/fake.o")
+        monkeypatch.setattr(cli_mod, "_feature_extra_object", lambda *a, **k: None)
+        monkeypatch.setattr(cli_mod, "_pkg_config", lambda *a, **k: [])
+        monkeypatch.setattr(cli_mod, "_sqlite_link_flags", lambda cc: ([], False))
+
+        cli_mod._runtime_objects_and_link_libs(
+            "clang", uses_graphics=True, uses_audio=False, wants_window=False)
+        assert calls == [], "an offscreen-only program must never hit the gate"
+
+        cli_mod._runtime_objects_and_link_libs(
+            "clang", uses_graphics=True, uses_audio=False, wants_window=True)
+        assert calls == ["graphics"], "a windowed program must hit the gate"
 
     def test_the_darwin_gate_is_overridable_for_hardware_verification(
             self, cli_mod, errors, monkeypatch):
