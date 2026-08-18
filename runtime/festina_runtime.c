@@ -1387,21 +1387,27 @@ int8_t festina_row_undefined(void *row, const char **col_names,
 typedef struct {
     regex_t re;
     int8_t global;
-    /* claude.md #111: set for a /pattern/ literal's process-lifetime
-     * cached compilation (see codegen's _emit_cached_regex_lit). `free`
-     * works on every type, and a regex BINDING cannot know at compile
-     * time whether it holds a runtime regex() result (freeable) or the
-     * shared cached literal (freeing it would leave the cache dangling
-     * for every later execution of that line) -- so the value itself
-     * carries the answer and festina_regex_free consults it. */
-    int8_t cached;
 } FestinaRegex;
 
+/* claude.md #118: a regex is REFERENCE COUNTED now, carrying the same
+ * i64 header immediately before the payload that structs/arrays/maps/
+ * blobs use. Two things needed it at once: `free` on an aliased regex
+ * binding had to become a safe decrement like every other refcounted
+ * type's, and festina_regex_compile_memo below can only evict a
+ * superseded compilation safely if a binding that still aliases it
+ * keeps it alive. A /pattern/ literal's process-lifetime cached form
+ * uses the standard immortal sentinel (a NEGATIVE header, see
+ * festina_retain's own comment) instead of the separate `cached` flag
+ * it used to carry -- retain/release/free on one are all no-ops through
+ * the exact same check every other immortal value already goes
+ * through. */
 void *festina_regex_compile(const char *pattern, const char *flags) {
     if (!pattern) pattern = "";
     if (!flags) flags = "";
-    FestinaRegex *compiled = malloc(sizeof(FestinaRegex));
-    if (!compiled) festina_fail("out of memory in festina_regex_compile");
+    char *raw = malloc(sizeof(int64_t) + sizeof(FestinaRegex));
+    if (!raw) festina_fail("out of memory in festina_regex_compile");
+    *(int64_t *)raw = 1;
+    FestinaRegex *compiled = (FestinaRegex *)(raw + sizeof(int64_t));
 
     int cflags = REG_EXTENDED;
     if (strchr(flags, 'i')) cflags |= REG_ICASE;
@@ -1411,7 +1417,6 @@ void *festina_regex_compile(const char *pattern, const char *flags) {
      * wants done with the matches -- so it is recorded here and read
      * back by festina_regex_replace. */
     compiled->global = strchr(flags, 'g') != NULL;
-    compiled->cached = 0;
 
     int rc = regcomp(&compiled->re, pattern, cflags);
     if (rc != 0) {
@@ -1419,34 +1424,71 @@ void *festina_regex_compile(const char *pattern, const char *flags) {
         regerror(rc, &compiled->re, errbuf, sizeof(errbuf));
         char msg[512];
         snprintf(msg, sizeof(msg), "invalid regex pattern '%s': %s", pattern, errbuf);
-        free(compiled);
+        free(raw);
         festina_fail(msg);
     }
     return compiled;
 }
 
-/* claude.md #85: releases a regex_t compiled by festina_regex_compile.
- * Only ever called for a regex produced by a runtime `regex(...)` call
- * and consumed as a temporary in the same expression -- a /pattern/
- * literal is compiled once and cached for the life of the process (see
- * _emit_cached_regex_lit), so it is deliberately never freed. regfree()
- * releases what regcomp() allocated INSIDE the regex_t; the regex_t
- * itself was a separate malloc and needs its own free(). */
+/* claude.md #85/#118: the regex counterpart of festina_blob_release --
+ * decrement, and only on the last reference regfree() what regcomp()
+ * allocated inside the regex_t before freeing the storage. A cached
+ * /pattern/ literal's immortal header makes festina_release_check
+ * answer 0, so `free` on one is a safe no-op with no flag to consult. */
 void festina_regex_free(void *compiled) {
     if (!compiled) return;
-    /* claude.md #111: a cached literal is shared by every future
-     * execution of its source line -- freeing it here would be a
-     * use-after-free later, so `free` on one is a safe no-op. */
-    if (((FestinaRegex *)compiled)->cached) return;
+    if (!festina_release_check(compiled)) return;
     regfree(&((FestinaRegex *)compiled)->re);
-    free(compiled);
+    free((char *)compiled - sizeof(int64_t));
 }
 
-/* claude.md #111: marks a compiled regex as the process-lifetime cached
- * form -- called by generated code right after the literal cache is
- * first filled. */
+/* claude.md #111/#118: marks a compiled regex as the process-lifetime
+ * cached form -- called by generated code right after the literal cache
+ * is first filled. Sets the standard immortal sentinel, so every
+ * retain/release path (including `free` on a binding that aliases the
+ * literal) no-ops on it without a special case. */
 void festina_regex_mark_cached(void *compiled) {
-    if (compiled) ((FestinaRegex *)compiled)->cached = 1;
+    if (compiled) *(int64_t *)((char *)compiled - sizeof(int64_t)) = -1;
+}
+
+/* claude.md #118: the per-call-site memo for the dynamic regex(pattern,
+ * flags) builtin. `slot` is a private [3 x ptr] global codegen emits
+ * for each regex() call site: {pattern copy, flags copy, compiled}.
+ * The same pattern+flags as last time answers the cached compilation
+ * (~24x cheaper than recompiling, measured in api.md); a different
+ * pattern releases the slot's reference to the old one and compiles
+ * fresh. That release is what the refcount header makes safe: a
+ * binding that still aliases the superseded regex keeps it alive, and
+ * only the last reference regfrees it -- without the header this
+ * eviction was a use-after-free waiting to happen, which is why
+ * regex() recompiled per evaluation until now.
+ *
+ * The caller always receives its own +1 (retained here on a hit, the
+ * fresh count on a miss -- where the slot takes an extra retain for
+ * itself), so a memoized result is released by exactly the same
+ * scope-exit/temporary machinery a festina_regex_compile result always
+ * was. The slot's own reference intentionally lives until the pattern
+ * changes or the process exits -- the same reachable-until-exit rule
+ * the literal cache follows. */
+void *festina_regex_compile_memo(const char *pattern, const char *flags,
+                                 void **slot) {
+    if (!pattern) pattern = "";
+    if (!flags) flags = "";
+    if (slot[2] && strcmp((const char *)slot[0], pattern) == 0
+            && strcmp((const char *)slot[1], flags) == 0) {
+        festina_retain(slot[2]);
+        return slot[2];
+    }
+    festina_regex_free(slot[2]);
+    free(slot[0]);
+    free(slot[1]);
+    slot[0] = strdup(pattern);
+    slot[1] = strdup(flags);
+    if (!slot[0] || !slot[1]) festina_fail("out of memory in regex()");
+    void *compiled = festina_regex_compile(pattern, flags);
+    slot[2] = compiled;
+    festina_retain(compiled);
+    return compiled;
 }
 
 /* claude.md #116: the regex half of split() -- lives here with the
@@ -1902,6 +1944,7 @@ void festina_release(void *payload) {
     }
 }
 
+
 /* ---- maps -- claude.md #72 ---- */
 
 /* One key/value pair -- `value` is a raw 8-byte payload meaning
@@ -1999,11 +2042,19 @@ int8_t festina_map_delete(int64_t *count, void **entries, const char *key,
     FestinaMapEntry *arr = (FestinaMapEntry *)*entries;
     for (int64_t i = 0; i < *count; i++) {
         if (!festina_str_eq(arr[i].key, key)) continue;
-        if (release) release(arr[i].value, arr[i].key);
-        free(arr[i].key);
+        /* claude.md #120: the entry is REMOVED before its value is
+         * released. The release may run a cycle trial that traverses
+         * this very map, and an entry still pointing at a value whose
+         * count the release just dropped would be double-counted by
+         * markGray -- the same store-before-release rule every field
+         * write follows now (see codegen's _emit_assign). */
+        int64_t value = arr[i].value;
+        char *owned_key = arr[i].key;
         memmove(&arr[i], &arr[i + 1],
                 (size_t)(*count - i - 1) * sizeof(FestinaMapEntry));
         (*count)--;
+        if (release) release(value, owned_key);
+        free(owned_key);
         return 1;
     }
     return 0;
@@ -2263,5 +2314,154 @@ void festina_release_map(void *payload) {
     int64_t count = *(int64_t *)payload;
     void *entries = *(void **)((char *)payload + sizeof(int64_t));
     festina_map_free_entries(count, entries);
+    free((char *)payload - sizeof(int64_t));
+}
+
+/* ---- cycle collection -- claude.md #120 ----
+ *
+ * Reference counting cannot free a cycle (`a.next = a` holds itself at
+ * count 1 forever), so releases of values whose TYPE can participate in
+ * a cycle run a synchronous trial deletion (the classic Bacon-Rajan
+ * test, single-rooted): tentatively remove every reference internal to
+ * the subgraph (markGray), see which nodes still have references from
+ * outside it (scan restores those and everything they reach --
+ * scanBlack), and free what nothing external reaches (collectWhite).
+ * The compiler generates the per-type traversal functions -- only it
+ * knows a struct's field layout -- and they drive the small,
+ * type-blind state helpers here.
+ *
+ * The trial's color state lives in bits 61-62 of the same i64 header
+ * the refcount occupies (black=0, gray=1, white=2): outside a trial
+ * every header is a plain count (black), and a trial always ends with
+ * every surviving node black again, so festina_retain /
+ * festina_release_check never need masking. The count occupies the low
+ * 61 bits during a trial; markGray's decrements can never underflow
+ * into the color bits, because a node's internal in-edges never exceed
+ * its count (each is a counted reference). A NEGATIVE header is the
+ * immortal sentinel exactly as everywhere else: an immortal value is
+ * never colored, decremented, traversed, or freed -- anything an
+ * immortal anchors is reachable by definition, and every helper here
+ * checks for it before touching anything. */
+
+#define FESTINA_COLOR_SHIFT 61
+#define FESTINA_COLOR_MASK (3LL << FESTINA_COLOR_SHIFT)
+#define FESTINA_COUNT_MASK (~FESTINA_COLOR_MASK)
+#define FESTINA_GRAY 1LL
+#define FESTINA_WHITE 2LL
+
+static int64_t *festina_cycle_header(void *p) {
+    return (int64_t *)((char *)p - sizeof(int64_t));
+}
+
+/* Whether a just-released-but-still-referenced value should be tried
+ * as a cycle root: non-null with a positive header (positive rules out
+ * both immortal and colored -- outside a trial, color bits are 0). */
+int8_t festina_cycle_candidate(void *p) {
+    if (!p) return 0;
+    return *festina_cycle_header(p) > 0;
+}
+
+/* markGray's node half: claim the node for the gray traversal. The
+ * caller (generated code) then decrements and grays each child edge --
+ * exactly once per parent, which with the once-per-node claim here is
+ * what bounds the walk on a cyclic graph. */
+int8_t festina_cycle_begin_gray(void *p) {
+    if (!p) return 0;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return 0;
+    if (((*h & FESTINA_COLOR_MASK) >> FESTINA_COLOR_SHIFT) == FESTINA_GRAY) return 0;
+    *h = (*h & FESTINA_COUNT_MASK) | (FESTINA_GRAY << FESTINA_COLOR_SHIFT);
+    return 1;
+}
+
+/* markGray's edge half: tentatively remove one internal reference. */
+void festina_cycle_dec(void *p) {
+    if (!p) return;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return;
+    (*h)--;
+}
+
+/* scanBlack's edge half: restore one tentatively-removed reference. */
+void festina_cycle_inc(void *p) {
+    if (!p) return;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return;
+    (*h)++;
+}
+
+/* scan's node decision. 0: nothing to do here (null, immortal, or not
+ * gray -- already decided). 1: external references remain, the caller
+ * must scanBlack from this node. 2: no external references -- the node
+ * is tentatively garbage (now white); the caller scans its children. */
+int64_t festina_cycle_begin_scan(void *p) {
+    if (!p) return 0;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return 0;
+    if (((*h & FESTINA_COLOR_MASK) >> FESTINA_COLOR_SHIFT) != FESTINA_GRAY) return 0;
+    if ((*h & FESTINA_COUNT_MASK) > 0) return 1;
+    *h = (*h & FESTINA_COUNT_MASK) | (FESTINA_WHITE << FESTINA_COLOR_SHIFT);
+    return 2;
+}
+
+void festina_cycle_set_black(void *p) {
+    if (!p) return;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return;
+    *h &= FESTINA_COUNT_MASK;
+}
+
+/* scanBlack's recursion guard: a child that is not yet black still
+ * needs its own subtree's counts restored. */
+int8_t festina_cycle_needs_black(void *p) {
+    if (!p) return 0;
+    int64_t h = *festina_cycle_header(p);
+    if (h < 0) return 0;
+    return (h & FESTINA_COLOR_MASK) != 0;
+}
+
+/* collectWhite's node claim: only a white node is freed, and it is
+ * recolored black first so a cyclic graph frees each node exactly
+ * once. */
+int8_t festina_cycle_begin_white(void *p) {
+    if (!p) return 0;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return 0;
+    if (((*h & FESTINA_COLOR_MASK) >> FESTINA_COLOR_SHIFT) != FESTINA_WHITE) return 0;
+    *h &= FESTINA_COUNT_MASK;
+    return 1;
+}
+
+/* The container traversal loops, type-blind: hand every element/value
+ * pointer of an arr[T]/map[T]-of-managed-T to the generated per-type
+ * edge function. */
+void festina_cycle_visit_array(void *payload, void (*fn)(void *)) {
+    int64_t length = *(int64_t *)payload;
+    void **data = *(void ***)((char *)payload + sizeof(int64_t));
+    for (int64_t i = 0; i < length; i++) fn(data[i]);
+}
+
+void festina_cycle_visit_map(void *payload, void (*fn)(void *)) {
+    int64_t count = *(int64_t *)payload;
+    FestinaMapEntry *entries = *(FestinaMapEntry **)((char *)payload + sizeof(int64_t));
+    for (int64_t i = 0; i < count; i++) fn((void *)(intptr_t)entries[i].value);
+}
+
+/* collectWhite's container disposal: free the container's own storage
+ * WITHOUT releasing its elements -- markGray already removed those
+ * counts, and collectWhite's own recursion frees whichever of them are
+ * garbage. Mirrors festina_release_array/_map's free logic minus the
+ * refcount check the trial has already superseded. */
+void festina_cycle_dispose_array(void *payload) {
+    void *data = *(void **)((char *)payload + sizeof(int64_t));
+    free(data);
+    free((char *)payload - sizeof(int64_t));
+}
+
+void festina_cycle_dispose_map(void *payload) {
+    int64_t count = *(int64_t *)payload;
+    FestinaMapEntry *entries = *(FestinaMapEntry **)((char *)payload + sizeof(int64_t));
+    for (int64_t i = 0; i < count; i++) free(entries[i].key);
+    free(entries);
     free((char *)payload - sizeof(int64_t));
 }

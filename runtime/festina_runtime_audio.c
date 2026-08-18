@@ -387,8 +387,15 @@ void *festina_audio_from_bytes(const void *data, int64_t len, const char *label)
         }
     }
 
-    FestinaAudio *a = calloc(1, sizeof(FestinaAudio));
-    if (!a) festina_fail("out of memory loading audio");
+    /* claude.md #118: the clip is REFERENCE COUNTED now, behind the
+     * same i64 header immediately before the payload that structs/
+     * arrays/maps/blobs carry (festina_retain/festina_release_check in
+     * the core runtime) -- see festina_audio_free below for what that
+     * bought. */
+    char *raw = calloc(1, sizeof(int64_t) + sizeof(FestinaAudio));
+    if (!raw) festina_fail("out of memory loading audio");
+    *(int64_t *)raw = 1;
+    FestinaAudio *a = (FestinaAudio *)(raw + sizeof(int64_t));
     a->samples = samples;
     a->frame_count = frames;
     a->channels = channels;
@@ -408,17 +415,16 @@ void *festina_audio_from_bytes(const void *data, int64_t len, const char *label)
     return a;
 }
 
-/* claude.md #101: `img` has had scope-exit reclamation since claude.md
- * #92 and `aud` never did, for no reason beyond nobody having written
- * it -- a clip loaded inside a loop leaked one decoded buffer per
- * iteration. Only ever called for a clip codegen has proven this scope
- * created and never shared, so stopping every channel playing it first
- * is a safety net rather than a likely case; it costs nothing and
- * turns "freed while a thread is still streaming it" from a crash into
- * an impossibility. */
+/* claude.md #101/#118: the aud counterpart of festina_blob_release --
+ * decrement, and only on the last reference destroy the clip. A clip
+ * that other bindings still reference keeps playing untouched; only
+ * genuine destruction stops every channel still streaming it first,
+ * which costs nothing and turns "freed while a thread is still
+ * streaming it" from a crash into an impossibility. */
 void festina_audio_free(void *audio) {
     FestinaAudio *a = (FestinaAudio *)audio;
     if (!a) return;
+    if (!festina_release_check(audio)) return;
     pthread_mutex_lock(&g_audio_lock);
     int busy = 0;
     for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
@@ -433,7 +439,7 @@ void festina_audio_free(void *audio) {
     free(a->samples);
     free(a->bytes);
     free(a->path);   /* claude.md #110 */
-    free(a);
+    free((char *)audio - sizeof(int64_t));
 }
 
 /* claude.md #110: writes the clip's own encoded bytes -- so an MP3 saves

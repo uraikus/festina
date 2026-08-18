@@ -324,23 +324,25 @@ for int i = 0, i < 3, i++ {
 ```
 
 Linked lists, trees and parent pointers all work, and are reclaimed
-automatically like any other struct.
-
-**One exception, and it is a real one: a *cycle* is never freed.**
-Automatic reclamation is reference counting, and a value that points
-back at itself — directly, or around any longer loop — keeps its own
-count above zero forever:
+automatically like any other struct — **including cycles**. Reference
+counting alone can never free a value that points back at itself (the
+loop keeps its own count above zero forever), so for types that *can*
+form a cycle the compiler adds a cycle detector: when such a value is
+released but still referenced, the runtime checks whether what remains
+is only the cycle holding itself, and frees it if so.
 
 ```festina
 Node a
 a.n = 7
-a.next = a      // leaks: nothing will ever free `a`
+a.next = a      // reclaimed when `a` goes away, cycle and all
 ```
 
-Nothing goes wrong at runtime; the memory is simply never returned. If
-you build a structure with back-references, break them before dropping
-it (`child.parent = null`) or accept that it lives for the life of the
-program.
+A cycle something still points at is never touched — parent pointers,
+rings and doubly-linked structures stay valid for exactly as long as
+anything outside them can reach them. Cycles through containers
+(`kids:arr[Tree]` with a `parent:Tree` back-pointer, a `map` of peers)
+collect the same way. Programs whose types cannot form a cycle carry
+none of this machinery.
 
 Memory for structs, arrays, and maps is managed automatically — no
 manual allocation or freeing. A local struct/`arr[T]`/`map[T]`
@@ -423,13 +425,15 @@ each row's own text columns, are freed when that array is — so a
 program that queries repeatedly no longer grows without bound. A single
 row read out of one (`People p = rows[0]`) borrows from the array
 rather than owning a copy, so it stays valid exactly as long as the
-array does. A regex compiled at runtime and used straight away
-(`regex(p).test(s)`) is freed after use, while a `/pattern/` literal is
-compiled once and kept for the life of the process. A regex bound to a variable is reclaimed too, when the
-compiler can prove it safe — one compiled by `regex(...)` and never
-shared outside the function it was declared in. A regex that escapes,
-and one bound from a `/pattern/` literal (which is compiled once and
-shared for the life of the process), are both deliberately left alone.
+array does.
+
+`img`, `aud` and `regex` handles are reference counted exactly like
+structs: every binding — aliased, escaping, or a `/pattern/` literal's
+— is released when it goes away, and the surface, decoded clip, or
+compiled automaton is destroyed when the last reference drops. `img b
+= a` shares one handle; `free a` afterwards is a decrement and `b`
+stays usable. A `/pattern/` literal's process-lifetime compilation is
+immortal, so every release that reaches it is a safe no-op.
 The one thing not reclaimed is text globals at process exit, where the
 operating system reclaims everything anyway.
 
@@ -740,26 +744,23 @@ regex globalDynamic = regex(userPattern, 'g')   // 'g' works here too
 The flag belongs to the compiled pattern, not to the call site, so both
 spellings behave identically.
 
-### Literals are compiled once; `regex()` is compiled per evaluation
+### Literals are compiled once; `regex()` is memoized per call site
 
 A `/pattern/` literal is compiled the first time its line is reached and
-cached for the life of the process. A `regex(pattern, flags)` call
-compiles on every evaluation, because its pattern is an arbitrary
-expression — the same call site can legitimately see a different pattern
-each time, so caching it would silently reuse the first one forever.
+cached for the life of the process. A `regex(pattern, flags)` call is
+**memoized per call site**: each call compares its actual pattern and
+flags against what that site compiled last time, reuses the compilation
+when they match, and recompiles when they differ. A pattern that varies
+per call is never served a stale automaton — the check is against the
+runtime strings, not the source location.
 
-That is a real cost in a hot loop. Measured over 200,000 iterations:
-
-| | Time |
-|---|---|
-| `/[0-9]+/.test(s)` | 15 ms |
-| `regex('[0-9]+')` hoisted to a variable outside the loop | 13 ms |
-| `regex('[0-9]+').test(s)` inside the loop | 367 ms |
-
-Roughly 24x, and entirely avoidable: binding the pattern to a variable
-outside the loop compiles it once and costs the same as a literal. Use
-the literal whenever the pattern is known, and hoist `regex()` out of
-loops when it isn't.
+So the steady-state cost matches the literal's. Measured over 200,000
+iterations, `regex('[0-9]+').test(s)` inside a loop runs in ~15 ms, the
+same as `/[0-9]+/.test(s)` — before the memo it was ~367 ms (one full
+`regcomp()` per iteration, roughly 24x). A loop that genuinely
+*alternates* patterns through one call site still pays a recompile per
+change, since the memo keeps only the most recent compilation per site;
+bind each pattern to its own variable outside the loop if that matters.
 
 ## Graphics
 
@@ -1276,20 +1277,17 @@ free spritesheet                       // the sheet goes now, not at exit
 `free name` releases whatever the binding holds and sets the binding to
 `null`. It works on **every type**:
 
-- **struct / `arr[T]` / `map[T]` / `blob`** — a reference-count
-  *decrement*, not a forced free. A value something else still points at
-  survives until its last reference drops; freeing an array releases
-  each element the same way, so a shared element outlives its array.
-- **`img` / `aud`** — freed outright. These are the types the compiler
-  can't always reclaim on its own (an escaping handle lives for the
-  program's lifetime — see the note under Images), so `free` is the
-  manual escape hatch: cut your clips, then `free spritesheet`. The
-  contract is the manual one: another binding still aliasing the handle
-  is left dangling — the freed *binding* reads `null`, an alias does not.
+- **struct / `arr[T]` / `map[T]` / `blob` / `img` / `aud` / `regex`** —
+  a reference-count *decrement*, not a forced free. A value something
+  else still points at survives until its last reference drops; freeing
+  an array releases each element the same way, so a shared element
+  outlives its array. An alias of a freed `img`/`aud` stays fully
+  usable — the freed *binding* reads `null`, the alias does not, and the
+  surface or clip goes away when the last reference does. Freeing an
+  `aud` that was the last reference stops every channel still playing
+  it. A `/pattern/` literal's process-lifetime cache is immortal, so
+  `free` on a binding aliasing one is a safe no-op.
 - **`text`** — the buffer is freed (a text is exclusively owned).
-- **`regex`** — a `regex()` result is freed; a `/pattern/` literal's
-  process-lifetime cache marks itself and survives, so `free` is safe on
-  either.
 - **a query row** — the binding is nulled *without* freeing: the row is
   owned by the array it came from. Free the array.
 - **`int` / `float` / `bool`** — nothing to release; `free x` is `x = null`.

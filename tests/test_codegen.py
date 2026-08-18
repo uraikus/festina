@@ -645,15 +645,12 @@ class TestSelfReferencingStructs:
         assert "call void @__festina_release_struct_Node(" in body
 
     def test_a_reference_cycle_runs_correctly_and_does_not_crash(self, compile_and_run):
-        # claude.md #106's accepted cost, pinned as behavior rather than
-        # hidden. `a.next = a` is a reference cycle, which refcounting
-        # cannot free -- so this LEAKS, deliberately and permanently
-        # until something traces (see todo.md's "What's still ahead").
-        # What must never regress is that it stays a leak: a cycle whose
-        # counts never reach zero must not become a double-free or a
-        # use-after-free, both of which would be far worse than the
-        # leak and both of which a naive "break the cycle on release"
-        # fix would risk.
+        # claude.md #106 made `a.next = a` constructible and accepted
+        # the leak; claude.md #120's trial deletion now reclaims a
+        # GARBAGE cycle. What this test pins is the other half: a
+        # cycle that is still externally held (the global binding here)
+        # keeps working -- reads through it stay valid, the trial run
+        # by each release must never free a reachable cycle.
         source = """
         struct Node {
             n:int
@@ -5316,6 +5313,19 @@ int8_t festina_save_bytes(const char *target, char **own_path,
     return 0;
 }
 
+/* claude.md #118: aud carries a refcount header now, and
+ * festina_audio_free consults the core runtime's decrement-and-check.
+ * Stubbed with the real semantics (these harnesses free clips whose
+ * header festina_audio_from_bytes genuinely allocated) rather than
+ * linked, for the same no-sqlite3 reason as the two stubs above. */
+int8_t festina_release_check(void *payload) {
+    if (!payload) return 0;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return 0;
+    (*header)--;
+    return *header == 0;
+}
+
 static int active_voices(void *audio) {
     int n = 0;
     pthread_mutex_lock(&g_audio_lock);
@@ -5439,6 +5449,19 @@ int8_t festina_save_bytes(const char *target, char **own_path,
     return 0;
 }
 
+/* claude.md #118: aud carries a refcount header now, and
+ * festina_audio_free consults the core runtime's decrement-and-check.
+ * Stubbed with the real semantics (these harnesses free clips whose
+ * header festina_audio_from_bytes genuinely allocated) rather than
+ * linked, for the same no-sqlite3 reason as the two stubs above. */
+int8_t festina_release_check(void *payload) {
+    if (!payload) return 0;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return 0;
+    (*header)--;
+    return *header == 0;
+}
+
 static int active_voices(void *audio) {
     int n = 0;
     pthread_mutex_lock(&g_audio_lock);
@@ -5510,6 +5533,19 @@ int8_t festina_save_bytes(const char *target, char **own_path,
                           const char *what, int8_t adopt) {
     (void)target; (void)own_path; (void)data; (void)len; (void)what; (void)adopt;
     return 0;
+}
+
+/* claude.md #118: aud carries a refcount header now, and
+ * festina_audio_free consults the core runtime's decrement-and-check.
+ * Stubbed with the real semantics (these harnesses free clips whose
+ * header festina_audio_from_bytes genuinely allocated) rather than
+ * linked, for the same no-sqlite3 reason as the two stubs above. */
+int8_t festina_release_check(void *payload) {
+    if (!payload) return 0;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return 0;
+    (*header)--;
+    return *header == 0;
 }
 
 /* Which channel index a clip is playing on, or -1. */
@@ -6230,6 +6266,299 @@ class TestChainedCallResultReachedForAField:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip() == "1225"
+
+
+class TestComputedIndexAndArgumentOwnership:
+    """claude.md #119: the two chain shapes #117 left leaking, closed
+    by the same retain-first argument. A computed-index element off an
+    owning receiver (`getRows()[0]`, `getMap()['k']`) is minted its own
+    ownership (retain for a refcounted element, copy for a text one)
+    and the container released; an owning refcounted ARGUMENT to a user
+    function (`f(make())`, `f(getRows()[0])`) is released after the
+    call, exactly like a text temporary. Whether an emission minted a
+    +1 is recorded (_minted_values) rather than re-derived from syntax,
+    because the one shape syntax cannot classify -- a table-row element
+    is borrowed where a struct element is retained -- is exactly where
+    a predicate/emission disagreement would corrupt memory."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_a_computed_element_retains_before_the_container_release(
+            self, parser, semantic, codegen):
+        source = """
+        arr[arr[int]] func matrix() {
+            arr[arr[int]] m = [[1, 2], [3, 4]]
+            return m
+        }
+        void func use() {
+            arr[int] row = matrix()[0]
+            log(row.length)
+        }
+        use()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @use()")[1].split("\n}")[0]
+        retain_at = body.index("call void @festina_retain(")
+        release_at = body.index("@__festina_release_array_")
+        assert retain_at < release_at, "the element retain must precede the container release"
+
+    def test_computed_index_values_survive_their_container(self, compile_and_run):
+        source = """
+        arr[arr[int]] func matrix() {
+            arr[arr[int]] m = [[1, 2], [3, 4]]
+            return m
+        }
+        map[text] func conf() {
+            map[text] m = {'k': 'value'}
+            return m
+        }
+        arr[text] func names() {
+            arr[text] t = ['alpha', 'beta']
+            return t
+        }
+        int total = 0
+        for int i = 0, i < 60, i++ {
+            arr[int] row = matrix()[1]
+            total = total + row[0] + matrix()[0][1]
+            if conf()['k'] != 'value' { log('corrupted') }
+            if names()[0] != 'alpha' { log('corrupted') }
+        }
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "300"
+
+    def test_an_owning_argument_is_released_after_the_call(
+            self, parser, semantic, codegen):
+        source = """
+        int func total(xs:arr[int]) {
+            return xs.length
+        }
+        void func use() {
+            log(total([1, 2, 3]))
+        }
+        use()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @use()")[1].split("\n}")[0]
+        call_at = body.index("call i64 @total(")
+        release_at = body.index("@festina_release")
+        assert call_at < release_at, "the argument release must come after the call"
+
+    def test_owning_arguments_reach_the_callee_intact(self, compile_and_run):
+        # The callee stores, reads and returns through the borrowed
+        # argument; anything it KEEps takes its own retain, so the
+        # caller's post-call release never pulls memory out from under
+        # a kept reference.
+        source = """
+        struct Box { n:int }
+        arr[Box] kept
+        Box func makeBox(v:int) {
+            Box b
+            b.n = v
+            return b
+        }
+        void func keep(b:Box) {
+            kept.push(b)
+        }
+        int func readThrough(b:Box) {
+            return b.n
+        }
+        int total = 0
+        for int i = 0, i < 50, i++ {
+            keep(makeBox(i))
+            total = total + readThrough(makeBox(i))
+        }
+        total = total + kept[10].n + kept.length
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == str(sum(range(50)) + 10 + 50)
+
+    def test_a_table_row_element_stays_borrowed(self, compile_and_run, tmp_path):
+        # The one computed-index shape that deliberately does NOT mint:
+        # rows have no refcount header (the array owns them outright),
+        # so the container is left alive -- leaked, per todo.md -- and
+        # a column read off the row is still copied at its binding.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table People {{ id:int  name:text }}
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'row'])
+        arr[People] func rows() {{
+            arr[People] r = sqlite('SELECT * FROM People')
+            return r
+        }}
+        text got = rows()[0].name
+        log(got)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "row"
+
+
+class TestCycleCollection:
+    """claude.md #120: reference cycles are collected, not leaked. A
+    release of a value whose TYPE can reach itself (struct fields, arr
+    elements, map values) that leaves the count above zero runs a
+    synchronous trial deletion -- markGray / scan / collectWhite over
+    generated per-type traversals -- freeing a cycle no external
+    reference holds and restoring, exactly, one that something still
+    does. Acyclic types generate none of it and pay nothing. The
+    leak-freedom half is verified under ASan/LeakSanitizer by the
+    struct_self per-type program (now a genuine cycle) and was measured
+    directly for self-cycles, pair cycles, array-routed parent pointers
+    and map-routed rings; these tests pin the structure and the
+    reachability behavior."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_a_cyclic_type_release_wrapper_runs_a_trial(
+            self, parser, semantic, codegen):
+        source = """
+        struct Node { n:int next:Node }
+        void func f() {
+            Node a
+            a.n = 1
+            a.next = a
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        wrapper = ir.split("define void @__festina_release_struct_Node(")[1].split("\n}")[0]
+        assert "call i8 @festina_cycle_candidate(" in wrapper
+        assert "@__festina_cycle_gray_" in wrapper
+        assert "@__festina_cycle_scan_" in wrapper
+        assert "@__festina_cycle_white_" in wrapper
+
+    def test_an_acyclic_type_generates_no_cycle_machinery(
+            self, parser, semantic, codegen):
+        # The gate: a program whose types cannot form a cycle carries
+        # zero collector code and zero trial calls.
+        source = """
+        struct Inner { n:int }
+        struct Outer { inner:Inner }
+        void func f() {
+            Outer o
+            o.inner.n = 1
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "festina_cycle_candidate" not in ir.replace(
+            "declare i8 @festina_cycle_candidate(ptr)", "")
+        assert "@__festina_cycle_" not in ir
+
+    def test_garbage_cycles_are_reclaimed_and_reused_memory_stays_sane(
+            self, compile_and_run):
+        # 300 dropped cycles; correctness of everything built afterwards
+        # is the observable half (the zero-leaked-bytes half runs under
+        # the sanitizer harness in test_leak_stress).
+        source = """
+        struct Node { n:int next:Node label:text }
+        void func cycle(v:int) {
+            Node a
+            Node b
+            a.n = v
+            a.label = `n${v}`
+            b.n = v + 1
+            a.next = b
+            b.next = a
+        }
+        int total = 0
+        for int i = 0, i < 300, i++ {
+            cycle(i)
+            total = total + i
+        }
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == str(sum(range(300)))
+
+    def test_a_reachable_cycle_survives_its_trial_intact(self, compile_and_run):
+        # The safety half: a trial on a cycle something still holds
+        # must restore every count and free nothing.
+        source = """
+        struct Node { n:int next:Node }
+        Node keep
+        void func build() {
+            Node a
+            Node b
+            a.n = 10
+            b.n = 20
+            a.next = b
+            b.next = a
+            keep = b
+        }
+        build()
+        log(keep.n)
+        log(keep.next.n)
+        log(keep.next.next.n)
+        keep.next = null
+        log('broken')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["20", "10", "20", "broken"]
+
+    def test_cycles_through_arrays_and_maps_are_collected(self, compile_and_run):
+        source = """
+        struct Tree { n:int kids:arr[Tree] parent:Tree }
+        void func family() {
+            Tree root
+            root.n = 1
+            Tree kid
+            kid.n = 2
+            kid.parent = root
+            root.kids.push(kid)
+        }
+        struct Ring { name:text peers:map[Ring] }
+        void func ring() {
+            Ring a
+            Ring b
+            a.name = 'a'
+            b.name = 'b'
+            a.peers['b'] = b
+            b.peers['a'] = a
+        }
+        for int i = 0, i < 200, i++ {
+            family()
+            ring()
+        }
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_field_stores_land_before_the_old_values_release(
+            self, parser, semantic, codegen):
+        # claude.md #120's ordering rule: with trials traversing the
+        # object graph, a field must never still point at a value whose
+        # count the in-flight release already dropped -- markGray would
+        # double-count the edge and could free something a real
+        # external reference holds. The store must precede the release
+        # in the emitted IR.
+        source = """
+        struct Node { n:int next:Node }
+        void func f(a:Node, b:Node) {
+            a.next = b
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f(")[1].split("\n}")[0]
+        store_at = body.index("store ptr")
+        release_at = body.index("call void @__festina_release_struct_Node(")
+        assert store_at < release_at, "the field store must precede the old value's release"
 
 
 class TestAudioChannelReturnAndClipStop:
@@ -9560,24 +9889,16 @@ class TestQueryRowAndRegexReclamation:
 
 
 class TestOwnedRegexLocals:
-    """claude.md #86: a `regex` local this scope provably owns outright
-    -- one whose initializer is a `regex(...)` Call (freshly compiled by
-    festina_regex_compile, so nothing else can reference it yet) and
-    whose name escape analysis proves never leaves the function -- is
-    freed at scope exit. Before this, `regex r = regex(p)` inside a loop
-    leaked a full compiled automaton (several KB) per iteration; #85 had
-    only closed the case where the regex is used as a temporary in the
-    same expression that compiled it.
-
-    Both halves of the ownership test are load-bearing, and relaxing
-    either frees something still in use. A `/pattern/` literal
-    initializer is a pointer into a process-lifetime cache, so freeing
-    it would leave every later evaluation of that literal running
-    regexec against freed memory. An escaping regex has no equivalent of
-    text's copy-on-alias escape hatch -- a regex "copy" would mean
-    recompiling, and the pattern string isn't retained to recompile
-    from -- so it is left to leak exactly as before rather than freed
-    while another binding may still point at it."""
+    """claude.md #86/#118: a `regex` local is released at scope exit --
+    EVERY regex local, not just one this scope could prove it owned.
+    #86's created-here + never-escaping ownership proof existed because
+    a regex had no refcount: freeing was final, so freeing anything
+    possibly shared was a use-after-free. #118 gave regex the standard
+    i64 header, so a binding always owns exactly one countable
+    reference and releasing it is always safe -- a /pattern/ literal's
+    cached compilation is immortal (festina_regex_mark_cached sets the
+    negative-header sentinel) and no-ops through the very same release
+    call, and an escaping regex no longer leaks."""
 
     def _ir(self, parser, semantic, codegen, source, filename="main.f"):
         program = parser.parse(source, filename=filename)
@@ -9596,7 +9917,14 @@ class TestOwnedRegexLocals:
         body = ir.split("define void @f()")[1].split("\n}")[0]
         assert "call void @festina_regex_free(" in body
 
-    def test_regex_local_from_a_literal_is_never_freed(self, parser, semantic, codegen):
+    def test_regex_local_from_a_literal_is_released_and_the_cache_is_immortal(
+            self, parser, semantic, codegen):
+        # claude.md #118 INVERTED this test: it used to assert the
+        # release was absent, because releasing the shared literal cache
+        # would have freed it under every later execution of the line.
+        # The safety argument moved into the value itself -- the cache
+        # is marked immortal at first compile, so the scope-exit release
+        # (present, like every other regex local's) is a no-op on it.
         source = """
         void func f() {
             regex r = /[0-9]+/
@@ -9605,9 +9933,16 @@ class TestOwnedRegexLocals:
         f()
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @festina_regex_free(" not in ir
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        assert "call void @festina_regex_free(" in body
+        assert "call void @festina_regex_mark_cached(" in body
 
-    def test_escaping_regex_local_is_not_freed(self, parser, semantic, codegen):
+    def test_escaping_regex_local_is_released_too(self, parser, semantic, codegen):
+        # claude.md #118 INVERTED this test: an escaping regex used to
+        # be left to leak (no copy-on-alias escape hatch, no count to
+        # decrement). With the header, `g = r` retains for the global
+        # and the local's own release at scope exit is an ordinary
+        # decrement -- the global keeps the compilation alive.
         source = """
         regex g = /[a-z]+/
         void func f() {
@@ -9618,7 +9953,9 @@ class TestOwnedRegexLocals:
         """
         ir = self._ir(parser, semantic, codegen, source)
         body = ir.split("define void @f()")[1].split("\n}")[0]
-        assert "call void @festina_regex_free(" not in body
+        retain_at = body.index("call void @festina_retain(ptr")
+        release_at = body.index("call void @festina_regex_free(")
+        assert retain_at < release_at
 
     def test_owned_literal_and_escaping_regexes_stay_correct_together(self, compile_and_run):
         source = """
@@ -9646,6 +9983,115 @@ class TestOwnedRegexLocals:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "true\n" * 53
+
+
+class TestRefcountedHandles:
+    """claude.md #118: img, aud and regex carry the same i64 refcount
+    header struct/arr/map/blob do, so every binding owns exactly one
+    countable reference and `free`/scope exit/reassignment are always a
+    safe decrement. This retired two documented gaps at once -- an
+    escaping img/aud handle leaked, and `free` on an aliased one left
+    the alias dangling -- and made the dynamic regex() memo possible
+    (evicting a superseded compilation is only safe when a binding that
+    still aliases it keeps it alive)."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    # ---- the regex() memo ----
+
+    def test_dynamic_regex_compiles_through_a_per_site_memo(
+            self, parser, semantic, codegen):
+        # Not plain @festina_regex_compile any more: the memo compares
+        # the actual pattern+flags against the site's last compilation
+        # at run time, which is what per-AST-node caching (the literal
+        # scheme) could never do safely for a runtime pattern.
+        source = "regex r = regex('[0-9]+', 'i')\nlog(r.test('42'))"
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call ptr @festina_regex_compile_memo(" in ir
+        assert "@.regex.memo.0 = private global [3 x ptr] zeroinitializer" in ir
+
+    def test_each_regex_call_site_gets_its_own_memo_slot(
+            self, parser, semantic, codegen):
+        source = """
+        regex a = regex('[0-9]+')
+        regex b = regex('[a-z]+')
+        log(a.test('1'))
+        log(b.test('x'))
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "@.regex.memo.0 = private global [3 x ptr] zeroinitializer" in ir
+        assert "@.regex.memo.1 = private global [3 x ptr] zeroinitializer" in ir
+
+    def test_a_changed_pattern_is_recompiled_not_served_stale(
+            self, compile_and_run):
+        # The memo's one correctness hazard, pinned: the same call site
+        # fed a DIFFERENT pattern must recompile, never answer with the
+        # previous automaton. Alternating patterns through one site
+        # exercises the miss path on every iteration after the first.
+        source = """
+        arr[text] pats = ['[0-9]+', '[a-z]+']
+        for int i = 0, i < 6, i++ {
+            regex r = regex(pats[i % 2])
+            log(r.test('42'))
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false"] * 3
+
+    # ---- free on an alias is a decrement ----
+
+    def test_free_on_an_aliased_img_leaves_the_alias_usable(
+            self, compile_and_run, sprite_sheet_png):
+        # The exact shape security.md used to document as the dangling-
+        # alias hazard, now safe: the alias holds its own reference.
+        source = f"""
+        img sheet = '{sprite_sheet_png}'
+        img tile = sheet.clip(0, 0, 8, 8)
+        img alias = tile
+        free tile
+        log(alias.width)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "8"
+
+    def test_releasing_a_call_result_aliasing_a_shared_img_is_safe(
+            self, compile_and_run, sprite_sheet_png):
+        # claude.md #110 recorded why call-result img receivers could
+        # not be released: `img func get() { return shared }` handed
+        # back the global itself. The Return path retains an aliased
+        # value now, so the temporary's release is a decrement and the
+        # global survives it.
+        source = f"""
+        img shared = '{sprite_sheet_png}'
+        img func getShared() {{
+            return shared
+        }}
+        img c = getShared()
+        free c
+        log(shared.width)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "128"
+
+    def test_free_on_an_aliased_aud_leaves_the_alias_playable(
+            self, compile_and_run, audio_null_env):
+        src = os.path.join(_FIXTURES_DIR, "beep.wav")
+        source = f"""
+        aud clip = '{src}'
+        aud alias = clip
+        free clip
+        int ch = alias.play()
+        log(ch >= 0)
+        alias.stop()
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
 
 
 class TestStructTextFieldReclamation:
@@ -10099,10 +10545,12 @@ class TestImageClipResizeAndSize:
     can't be resized in place, and boxing it means every binding
     sharing an image sees the new one.
 
-    That box is also why img now has an ownership story (`_OwnedImage`,
-    the same shape claude.md #86 uses for regex): clip() exists to be
-    called repeatedly, so without scope-exit reclamation, extracting
-    frames in a loop would leak a whole surface per iteration."""
+    That box is also what carries claude.md #118's refcount header:
+    clip() exists to be called repeatedly, so without scope-exit
+    reclamation, extracting frames in a loop would leak a whole surface
+    per iteration -- and counting (rather than #92's created-here +
+    never-escaping ownership proof) is what lets EVERY img binding be
+    released, aliases and escapers included."""
 
     def _ir(self, parser, semantic, codegen, source, filename="main.f"):
         program = parser.parse(source, filename=filename)
@@ -10144,9 +10592,15 @@ class TestImageClipResizeAndSize:
         body = ir.split("define void @f(ptr %arg.sheet)")[1].split("\n}")[0]
         assert "call void @festina_image_free(ptr" in body
 
-    def test_a_borrowed_image_is_not_freed(self, parser, semantic, codegen):
-        # `other` merely aliases an image the caller owns -- freeing it
-        # here would destroy a surface still in use.
+    def test_an_aliasing_image_binding_retains_before_its_release(
+            self, parser, semantic, codegen):
+        # claude.md #118 INVERTED this test: `other` used to be left
+        # unreleased because it merely aliased the caller's image and a
+        # free was final. With the refcount header the binding takes its
+        # own +1 at the declaration and drops exactly that +1 at scope
+        # exit -- the caller's surface survives because the count says
+        # so, not because the release was skipped. The order is the
+        # safety argument: retain first, release later.
         source = """
         void func f(sheet:img) {
             img other = sheet
@@ -10155,9 +10609,17 @@ class TestImageClipResizeAndSize:
         """
         ir = self._ir(parser, semantic, codegen, source)
         body = ir.split("define void @f(ptr %arg.sheet)")[1].split("\n}")[0]
-        assert "call void @festina_image_free(ptr" not in body
+        retain_at = body.index("call void @festina_retain(ptr")
+        release_at = body.index("call void @festina_image_free(ptr")
+        assert retain_at < release_at
 
-    def test_an_escaping_image_is_not_freed(self, parser, semantic, codegen):
+    def test_an_escaping_image_is_released_and_the_global_retains(
+            self, parser, semantic, codegen):
+        # claude.md #118 INVERTED this test: an escaping img used to be
+        # left to leak (releasing it would have dangled the global).
+        # Now `kept = tile` retains for the global before the local's
+        # own scope-exit release decrements -- the clip survives through
+        # `kept`, and nothing leaks.
         source = """
         img kept
         void func f(sheet:img) {
@@ -10167,7 +10629,9 @@ class TestImageClipResizeAndSize:
         """
         ir = self._ir(parser, semantic, codegen, source)
         body = ir.split("define void @f(ptr %arg.sheet)")[1].split("\n}")[0]
-        assert "call void @festina_image_free(ptr" not in body
+        retain_at = body.index("call void @festina_retain(ptr")
+        release_at = body.index("call void @festina_image_free(ptr")
+        assert retain_at < release_at
 
     # ---- type checking ----
 

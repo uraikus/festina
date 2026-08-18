@@ -2661,6 +2661,73 @@ carries a presence bitmask one hidden slot past its columns; an unknown
 name in undefined() fails the program.
 `tests/test_codegen.py::TestUndefinedAndNameMatchedColumns` (6 tests).
 
+**claude.md #120**: reference cycles collect — trial deletion in the
+release wrappers.
+
+A release of a value whose TYPE can reach itself (computed over the
+declared type graph, cached; acyclic programs generate nothing) that
+leaves the count positive runs a synchronous Bacon-Rajan trial:
+markGray removes the subgraph's internal counts, scan/scanBlack
+restore what external references prove alive, collectWhite frees the
+rest. Runtime holds the type-blind color/count helpers (color bits
+61-62 of the ordinary header; black = 0, so nothing masks outside a
+trial; immortal composes untouched); codegen generates the four
+per-type traversals, registered-before-generated like the release
+wrappers. The exposed invariant, pinned by its own IR test: every
+traversable location now STORES before it releases (field/element
+writes, map sets, delete, festina_map_delete's C-side entry removal)
+— a stale edge would let markGray double-remove a count and free a
+value still held. The struct_self leak program closes into a real
+cycle and runs leak-free every test run; the harness canary, formerly
+a cycle, is now the #119 row-array residual — the one deliberate leak
+left. Verified under ASan: self/pair/array-routed/map-routed cycles
+reclaimed, held cycles intact; ~34ms for 20k dropped 21-node cycles.
+`tests/test_codegen.py::TestCycleCollection` (6 tests).
+
+**claude.md #119**: the last two chain shapes; ownership recorded, not
+guessed.
+
+A computed-index element off an owning receiver (`matrix()[0]`,
+`conf()['k']`) is minted its own ownership (retain/copy) before the
+container is released — #117 one level down — and an owning refcounted
+argument to a user function is released after the call, exactly where
+text temporaries were already freed (anything the callee kept took its
+own retain). Because a computed member's ownership depends on its
+element TYPE (a struct element retains; a table row cannot — the array
+owns its rows), the emission records what it minted (_minted_values)
+and the predicates read that back instead of walking syntax — the
+predicate/emission agreement #117 demanded, made structural. The row
+case stays borrowed and its array-leak residual is renamed in todo.md
+to its true size; the row's columns verified intact under ASan.
+`tests/test_codegen.py::TestComputedIndexAndArgumentOwnership` (5 tests).
+
+**claude.md #118**: refcount headers for img/aud/regex; regex() memoized.
+
+The three types outside the refcount protocol joined it — the same i64
+header blob carries, allocated in each type's constructor, with the
+free functions becoming releases (decrement; destroy on last
+reference). The _Owned* ownership proofs and every img/aud special
+case in free/delete/receiver-release/field-cascade collapsed into the
+one _is_refcounted dispatch. The regex literal cache's `cached` flag
+became the standard immortal sentinel. Three tests pinning the old
+proofs ("a borrowed/escaping img is not freed", "a literal regex is
+never freed") failed exactly as pinned tradeoffs should and were
+INVERTED: the release is emitted, and the retain precedes it — order
+is the safety argument, as in #117. The per-type img/aud leak
+programs were rewritten from "free exactly once, the alias dangles"
+to freeing through both bindings — the ordinary shape now. Dynamic
+regex() compiles through a per-call-site memo
+(festina_regex_compile_memo, one {pattern, flags, compiled} slot per
+site) — safe only because eviction of a superseded compilation is a
+decrement now; measured 200k evals ~367ms → ~15ms, and an
+alternating-pattern site recompiles per change rather than serving a
+stale automaton (pinned). Harness lesson, third application: the
+audio white-box harnesses gained a festina_release_check stub with
+real header semantics, since the audio TU now calls into the core
+runtime's refcount protocol.
+`tests/test_codegen.py::TestRefcountedHandles` (6 tests), plus the
+inverted tests in TestOwnedRegexLocals/TestImageClipResizeAndSize.
+
 **claude.md #117**: chained extraction stops leaking — retain first.
 
 #102/#108's deliberate leak (a chain yielding a managed value or text

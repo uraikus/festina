@@ -32,22 +32,26 @@ language work — the compiler and core runtime are portable C/LLVM.
 
 ## Memory model
 
-Automatic reclamation is escape analysis plus reference counting, with
-`free`/`delete` as the manual override (claude.md #74–#83, #111). What
+Automatic reclamation is escape analysis plus reference counting —
+every managed type carries the same refcount header since claude.md
+#118 gave `img`/`aud`/`regex` theirs, and reference cycles are
+collected by trial deletion since claude.md #120 — with `free`/`delete`
+as the manual override (claude.md #74–#83, #111, #118–#120). What
 remains:
 
-- **`img`/`aud` have no refcount header**, so an *escaping* handle
-  leaks unless the program `free`s it by hand. `blob` (claude.md #109)
-  is the template for the fix — same header structs already carry.
-- **Reference cycles leak** (`a.next = a`; constructible since
-  claude.md #106). Refcounting cannot free a cycle; the complete answer
-  is a tracing collector or weak references. Until then, break cycles
-  by hand (`child.parent = null` — verified to reclaim fully).
-- **Two chain shapes still leak** (claude.md #117 closed the rest): a
-  call-based chain passed directly as a function *argument* leaks its
-  +1 (parameters are borrows, so nobody owns the release), and a
-  computed-index receiver (`getRows()[0]`) leaks its array. Bind to a
-  name first and both reclaim normally.
+- **Cycle trials are synchronous and per-release** — every
+  still-referenced release of a cycle-capable type walks the value's
+  reachable subgraph. Correct, and measured fast for ordinary object
+  graphs (20k dropped 21-node cycles in ~34 ms), but a very large,
+  heavily-aliased cyclic structure could feel it; the classic
+  deferred-root buffer is the known optimization if a real program
+  ever does.
+- **A table-row element off a call-result array leaks the array**
+  (`rows()[0]` where the elements are query rows; claude.md #119
+  closed every other computed-index and argument-position chain
+  shape). Rows have no refcount header — the array owns them outright
+  — so the element cannot be retained past its container. Bind the
+  array to a name first and it reclaims normally.
 - **Text globals are not freed at process exit** — deliberate: they are
   reachable until exit, LeakSanitizer agrees, and freeing them would be
   exit-time busywork.
@@ -59,7 +63,9 @@ remains:
 - **`keyDown` auto-repeats while held** (that is how text entry works);
   a held key still fires exactly one `keyUp`. Track held keys yourself
   for edge-triggered input (claude.md #98).
-- **`regex(pattern, flags)` compiles per evaluation** — a dynamic
-  pattern can differ per call, so caching would be a correctness bug.
-  Hoist it out of loops; measured ~24x — see
-  [api.md](api.md#literals-are-compiled-once-regex-is-compiled-per-evaluation).
+- **`regex(pattern, flags)` is memoized per call site** (claude.md
+  #118) — the runtime compares the actual pattern+flags against the
+  site's last compilation, so a repeated pattern costs what a literal
+  does (~24x cheaper than recompiling) and a changed one recompiles.
+  One site *alternating* patterns still recompiles per change — see
+  [api.md](api.md#literals-are-compiled-once-regex-is-memoized-per-call-site).

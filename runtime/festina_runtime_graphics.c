@@ -922,9 +922,18 @@ typedef struct {
     char *path;
 } FestinaImageBox;
 
+/* claude.md #118: the box is REFERENCE COUNTED now, behind the same
+ * i64 header immediately before the payload that structs/arrays/maps/
+ * blobs carry (festina_retain/festina_release_check in the core
+ * runtime). That is what turned `free` on an aliased img from the
+ * documented dangling-alias hazard into an ordinary decrement, and
+ * what lets an escaping handle be released by every binding that held
+ * it instead of leaking. */
 static FestinaImageBox *festina_image_box(cairo_surface_t *surface) {
-    FestinaImageBox *box = calloc(1, sizeof(FestinaImageBox));
-    if (!box) festina_fail("out of memory creating an image");
+    char *raw = calloc(1, sizeof(int64_t) + sizeof(FestinaImageBox));
+    if (!raw) festina_fail("out of memory creating an image");
+    *(int64_t *)raw = 1;
+    FestinaImageBox *box = (FestinaImageBox *)(raw + sizeof(int64_t));
     box->surface = surface;
     box->path = strdup("");   /* claude.md #110: no path until one is given */
     if (!box->path) festina_fail("out of memory creating an image");
@@ -1232,16 +1241,20 @@ void festina_image_resize(void *img, int64_t w, int64_t h) {
     box->byte_count = 0;
 }
 
-/* claude.md #92: releases an image and the surface it holds. Reached
- * only from the scope-exit path for a non-escaping `img` local whose
- * initializer was a call -- see _OwnedImage in festina/codegen.py. */
+/* claude.md #92/#118: the img counterpart of festina_blob_release --
+ * decrement, and only on the last reference destroy the surface and
+ * free everything hanging off the box before the storage itself.
+ * Reached from every place codegen releases an img value: scope exit,
+ * reassignment, `free`/`delete`, a struct's field cascade, a query
+ * result array's row release. */
 void festina_image_free(void *img) {
     if (!img) return;
+    if (!festina_release_check(img)) return;
     FestinaImageBox *box = (FestinaImageBox *)img;
     if (box->surface) cairo_surface_destroy(box->surface);
     free(box->bytes);   /* claude.md #101 */
     free(box->path);    /* claude.md #110 */
-    free(box);
+    free((char *)img - sizeof(int64_t));
 }
 
 void festina_draw_image(void *img, int64_t x, int64_t y) {

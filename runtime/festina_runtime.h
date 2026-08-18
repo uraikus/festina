@@ -187,11 +187,19 @@ int8_t festina_row_undefined(void *row, const char **col_names,
  * Returns whether the key existed; a missing key is a safe no-op. */
 int8_t festina_map_delete(int64_t *count, void **entries, const char *key,
                           void (*release)(int64_t, const char *));
-/* claude.md #111: `free` on a regex -- frees a runtime regex() result,
- * but a /pattern/ literal's cached compilation is shared with every
- * later execution of its line, so the value carries a `cached` flag and
- * festina_regex_free no-ops on it. Set by generated code. */
+/* claude.md #111/#118: marks a /pattern/ literal's cached compilation
+ * as immortal (the same negative-header sentinel every other immortal
+ * value uses), so retain/release/`free` on it are all safe no-ops. Set
+ * by generated code right after the literal cache is first filled. */
 void festina_regex_mark_cached(void *compiled);
+/* claude.md #118: the per-call-site memo for the dynamic regex()
+ * builtin -- `slot` is a private [3 x ptr] global codegen emits per
+ * call site ({pattern copy, flags copy, compiled}). Same pattern+flags
+ * as last time answers the cached compilation; a change releases the
+ * slot's reference (safe: regex is refcounted now) and recompiles. The
+ * caller always receives its own +1. */
+void *festina_regex_compile_memo(const char *pattern, const char *flags,
+                                 void **slot);
 
 /*
  * claude.md #67-68 (#107): regex(), .test(), .match(), .replace().
@@ -223,15 +231,13 @@ void festina_regex_mark_cached(void *compiled);
  * reason -- JS's /g makes .match() return an array rather than a
  * string, and a function's return type cannot depend on a flag that
  * `regex(p, f)` only knows at run time. Both are documented in api.md
- * as limits rather than left to be discovered. claude.md #85: a regex produced by a
- * runtime `regex(...)` call and consumed as a temporary in the same
- * expression (`regex(p).test(s)`) is freed via festina_regex_free once
- * that expression is done with it -- previously such a regex leaked on
- * every evaluation, which a `regex(...)` inside a loop turned into an
- * unbounded leak. A /pattern/ literal is compiled once and cached for
- * the life of the process (see _emit_cached_regex_lit) and so is
- * deliberately never freed, as is a regex bound to a variable. An
- * invalid
+ * as limits rather than left to be discovered. claude.md #85/#118: a
+ * compiled regex is refcounted (i64 header before the payload), so a
+ * `regex(...)` temporary, a bound regex's scope exit, and `free` on an
+ * aliased binding all go through festina_regex_free's decrement, and
+ * only the last reference regfrees. A /pattern/ literal is compiled
+ * once, cached for the life of the process, and marked immortal (see
+ * festina_regex_mark_cached above). An invalid
  * pattern calls festina_fail() with regerror()'s message -- claude.md
  * #67: pattern validity is a runtime concern, the Python compiler
  * doesn't parse regex syntax itself.
@@ -246,7 +252,7 @@ void festina_regex_mark_cached(void *compiled);
  * NULL) when there's no match, per claude.md #68.
  */
 void *festina_regex_compile(const char *pattern, const char *flags);
-void festina_regex_free(void *compiled);  /* claude.md #85: regfree + free */
+void festina_regex_free(void *compiled);  /* claude.md #85/#118: release; regfree on last ref */
 int8_t festina_regex_test(void *compiled, const char *text);
 char *festina_regex_match(void *compiled, const char *text);
 /* claude.md #107: neither takes a replace_all argument any more.
@@ -757,16 +763,14 @@ char *festina_getenv(const char *name);
  * claude.md #77: reference counting for struct/arr[T]/map[T] values
  * escape analysis (claude.md #74/#75/#76) proves DO escape their
  * declaring function -- the remainder that pure escape analysis can
- * never reach on its own. Complete (not just "handles everything but
- * cycles") for Festina specifically -- or so it was, until claude.md
- * #106 allowed `struct Node { next:Node }` and made a reference cycle
- * constructible. A cycle is now a permanent leak (see todo.md); every
- * acyclic value is still reclaimed exactly as described.
- * See festina_retain/festina_release's
- * own doc comment in festina_runtime.c for the full design (the
- * refcount header layout, the negative-refcount immortal sentinel used
- * for a global's own untouched static initial storage, and why no
- * cycle-breaking machinery is needed at all).
+ * never reach on its own. claude.md #106 allowed `struct Node
+ * { next:Node }` and made a reference cycle constructible; claude.md
+ * #120 answers it with trial deletion (the festina_cycle_* helpers
+ * below), so a garbage cycle is collected rather than leaked. See
+ * festina_retain/festina_release's own doc comment in
+ * festina_runtime.c for the full design (the refcount header layout
+ * and the negative-refcount immortal sentinel used for a global's own
+ * untouched static initial storage).
  *
  * `payload` is the pointer Festina code itself sees (past the hidden
  * header) -- both functions are always safe to call on any struct
@@ -783,6 +787,26 @@ void festina_release(void *payload);
  * release became the first in-runtime user (codegen's generated
  * per-struct wrappers call it through their own declaration). */
 int8_t festina_release_check(void *payload);
+
+/* claude.md #120: the type-blind state half of cycle collection --
+ * synchronous single-root trial deletion (Bacon-Rajan), driven by
+ * compiler-generated per-type traversal functions whenever a value of
+ * a possibly-cyclic TYPE is released but still referenced. Color state
+ * lives in bits 61-62 of the ordinary refcount header (black=0
+ * outside every trial), and every helper is null- and immortal-safe.
+ * See the block comment in festina_runtime.c. */
+int8_t festina_cycle_candidate(void *p);
+int8_t festina_cycle_begin_gray(void *p);
+void festina_cycle_dec(void *p);
+void festina_cycle_inc(void *p);
+int64_t festina_cycle_begin_scan(void *p);
+void festina_cycle_set_black(void *p);
+int8_t festina_cycle_needs_black(void *p);
+int8_t festina_cycle_begin_white(void *p);
+void festina_cycle_visit_array(void *payload, void (*fn)(void *));
+void festina_cycle_visit_map(void *payload, void (*fn)(void *));
+void festina_cycle_dispose_array(void *payload);
+void festina_cycle_dispose_map(void *payload);
 
 /*
  * claude.md #36, given its real meaning by claude.md #109: a `blob` is
