@@ -52,9 +52,38 @@ sudo apt install clang libsqlite3-dev libcairo2-dev libx11-dev libjpeg-dev \
 `clang` conveniently pulls in `libLLVM` as a dependency, covering both
 the fast path and its fallback in one line. (`gcc` works too for the
 fast path, but only if `libLLVM` is separately present — `clang` is the
-simpler single recommendation.) macOS (Homebrew) should be similar in
-spirit — `brew install llvm sqlite pkg-config` — though native macOS
-support isn't there yet; see [todo.md](todo.md).
+simpler single recommendation.)
+
+macOS (Homebrew), verified on real Apple Silicon CI (`macos-14`,
+`macos.md` Phases 0–2):
+
+```bash
+xcode-select --install                                # Xcode >= 15 -- the floor
+brew install pkg-config sqlite cairo jpeg-turbo mpg123 # graphics + audio tiers
+```
+
+There's no `llvm` line: Apple clang, from the CommandLineTools Xcode
+already installs, consumes the generated LLVM IR (`.ll`) directly,
+including its opaque-`ptr` form — brew's own (very large) `llvm` bottle
+is unnecessary here, and the libLLVM fast path is a Linux-only
+convenience covered by the Debian/Ubuntu line above. brew's `sqlite` is
+keg-only, so its `.pc` file needs `PKG_CONFIG_PATH` set explicitly:
+
+```bash
+export PKG_CONFIG_PATH="$(brew --prefix sqlite)/lib/pkgconfig:$PKG_CONFIG_PATH"
+```
+
+No `XQuartz` and no X11 of any kind: graphics on macOS is a native
+Cocoa window (`runtime/festina_runtime_window_mac.m`, macos.md Phase
+2), not an X11 server running under emulation, so there's nothing X11
+to install and no window server other than the one macOS already
+runs. Both the audio (AudioQueue) and graphics (Cocoa) backends are
+built and CI-compiled on every push, but stay gated behind
+`FESTINA_ENABLE_MACOS_AUDIO=1` / `FESTINA_ENABLE_MACOS_GRAPHICS=1`
+until confirmed on real hardware — compiling an audio- or
+window-opening program on darwin without the relevant env var fails
+with a specific error naming the gate, exactly like the missing-tool
+errors above; `festina doctor` reports the same status.
 
 ## To *use* a packaged `festina` binary
 
@@ -71,6 +100,14 @@ pip install -r requirements-build.txt  # pyinstaller
 ./scripts/package_compiler.sh          # -> ./dist/festina
 ./dist/festina compile examples/hello.f -o hello
 ```
+
+On macOS the script also ad-hoc codesigns the result (`codesign -s -`,
+macos.md Phase 3) so Gatekeeper allows running it locally without a
+prompt — a self-signature, not an identity; it doesn't make the binary
+trusted on anyone else's machine. Distributing to other people's Macs
+is a separate, deliberately out-of-scope decision (real Developer-ID
+signing + notarization) that only matters once there's an actual
+distribution channel.
 
 ## To *run* a program someone already compiled with Festina
 

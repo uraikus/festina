@@ -1,12 +1,16 @@
 # CI for the compiler and runtime -- and macos.md Phase 0's exit
 # criterion made mechanical: the macOS job runs the WHOLE suite and
 # relies on the conftest missing-dependency skip to shed exactly the
-# tiers that platform doesn't have yet (audio until macos.md Phase 1,
-# windowed graphics until Phase 2), while the Linux job sets
+# tiers that platform doesn't have yet, while the Linux job sets
 # FESTINA_STRICT_DEPS=1 so those same skips are forbidden where every
 # dependency is expected -- coverage cannot silently shrink on the
 # primary platform. The sanitizer leak tier runs only on Linux by the
 # plans' standing decision (LeakSanitizer is unreliable on darwin).
+# Audio (Phase 1) and windowed graphics (Phase 2) backends are both
+# built and compiled/type-checked here on every push, but stay behind
+# their own real-hardware-verification env vars (FESTINA_ENABLE_MACOS_
+# AUDIO/GRAPHICS) until confirmed on a real Mac, so the conftest skip
+# still sheds those two tiers' end-to-end runs.
 name: CI
 
 on:
@@ -33,9 +37,20 @@ jobs:
             libcairo2-dev libx11-dev libjpeg-dev \
             libasound2-dev libmpg123-dev \
             xvfb xdotool openbox fonts-dejavu-core
-          pip install -r requirements-dev.txt
+          pip install -r requirements-dev.txt -r requirements-build.txt
       - name: Run the test suite
         run: python -m pytest tests/ -q
+      - name: Package and smoke-test the standalone compiler binary
+        # claude.md #59 stage 2 / macos.md Phase 3: pyinstaller is an
+        # opt-in, build-time-only dependency (not in requirements-dev.txt,
+        # so tests/test_packaging.py skips without it) -- installing it
+        # here, once, gives the packaging path real CI coverage instead
+        # of running untested until someone happens to package a release
+        # by hand.
+        run: |
+          ./scripts/package_compiler.sh /tmp/festina-dist
+          /tmp/festina-dist/festina compile examples/hello.f -o /tmp/festina-dist/hello
+          /tmp/festina-dist/hello
 
   macos:
     # macos.md Phase 0. arm64; Apple clang from the preinstalled
@@ -52,7 +67,7 @@ jobs:
       - name: Install dependencies
         run: |
           brew install pkg-config sqlite cairo jpeg-turbo mpg123
-          pip install -r requirements-dev.txt
+          pip install -r requirements-dev.txt -r requirements-build.txt
       - name: Run the test suite
         # brew's sqlite is keg-only -- its .pc file is invisible
         # without PKG_CONFIG_PATH, which is precisely the kind of
@@ -92,3 +107,18 @@ jobs:
           clang -c -O2 -I runtime \
             $(pkg-config --cflags cairo) \
             runtime/festina_runtime_window_mac.m -o /tmp/festina_window_mac.o
+      - name: Package, codesign, and smoke-test the standalone compiler binary
+        # macos.md Phase 3 item 1+2: this is what "add an arm64 build to
+        # the release flow" cashes out to today -- macos-14 runners are
+        # arm64, so a real Apple Silicon binary is produced, ad-hoc
+        # codesigned (package_compiler.sh's own Darwin branch), and run
+        # on every push, rather than only whenever someone packages a
+        # release by hand. `codesign -v` re-verifies the signature
+        # package_compiler.sh applied is actually valid, not just that
+        # the codesign command exited zero.
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix sqlite)/lib/pkgconfig:$PKG_CONFIG_PATH"
+          ./scripts/package_compiler.sh /tmp/festina-dist
+          codesign -v /tmp/festina-dist/festina
+          /tmp/festina-dist/festina compile examples/hello.f -o /tmp/festina-dist/hello
+          /tmp/festina-dist/hello

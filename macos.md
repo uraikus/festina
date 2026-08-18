@@ -25,7 +25,12 @@
 > against. The darwin *windowed*-graphics gate stays until real
 > mouse/keyboard/window behavior is verified on hardware
 > (`FESTINA_ENABLE_MACOS_GRAPHICS=1` to try it on a Mac); offscreen
-> drawing is never gated. Phase 3 is open.
+> drawing is never gated. Phase 3 is done: `scripts/package_compiler.sh`
+> ad-hoc codesigns the binary it produces on darwin, the macos-14 CI job
+> packages, codesigns, and smoke-tests a real arm64 `festina` binary on
+> every push, and [setup.md](setup.md) has a real macOS section. Full
+> Developer-ID signing/notarization remains deliberately out of scope
+> until there's an actual distribution channel.
 
 A concrete, phased plan for bringing Festina to macOS. The premise
 (from [todo.md](todo.md#platforms)) holds up under audit: **porting is
@@ -232,20 +237,36 @@ keyboard/mouse/resize/close behave identically to Linux against the
 pinned event vocabulary. Everything up to that point — the seam, both
 backends, the gating, the tests, the packaging — is done.
 
-## Phase 3 — Packaging and distribution
+## Phase 3 — Packaging and distribution *(done)*
 
-1. `scripts/package_compiler.sh` already works per-platform
-   (PyInstaller emits a Mach-O binary on macOS); add an arm64 build to
-   the release flow. Universal binaries are a non-goal initially —
-   ship arm64, document Rosetta-free x86_64 as build-from-source.
-2. Ad-hoc codesign the packaged binary (`codesign -s -`) so Gatekeeper
-   allows local runs; full Developer-ID signing + notarization is a
-   distribution decision to take only when there is a distribution
-   channel, and is deliberately out of scope here.
-3. `setup.md`: a real macOS section replacing today's "should be
-   similar in spirit" — the exact brew line per feature tier, the
-   Xcode ≥ 15 floor, and the XQuartz note for anyone on Phase-2a-era
-   builds.
+1. `scripts/package_compiler.sh` already worked per-platform
+   (PyInstaller emits a Mach-O binary on macOS unchanged); what it
+   lacked was verification. The macos-14 CI job now installs
+   PyInstaller and runs it for real on every push — since macos-14
+   runners are Apple Silicon, that CI step *is* the arm64 build,
+   ad-hoc-codesigned and smoke-tested (compiles and runs
+   `examples/hello.f`) exactly as a maintainer packaging a release by
+   hand would do it, rather than a path nothing but a human ever
+   exercised. The Linux job got the same packaging+smoke-test step for
+   the same reason — it was equally unverified in CI before this.
+   Universal binaries remain a non-goal — ship arm64, document
+   Rosetta-free x86_64 as build-from-source.
+2. `scripts/package_compiler.sh` now ad-hoc codesigns the binary it
+   just built whenever it's running on Darwin (`codesign -s -`,
+   guarded on `uname -s` and on `codesign` being on PATH), so
+   Gatekeeper allows local runs with no prompt. The CI step above
+   re-verifies the signature with `codesign -v` rather than only
+   checking that `codesign` exited zero. Full Developer-ID signing +
+   notarization is a distribution decision to take only when there is
+   a distribution channel, and stays deliberately out of scope here.
+3. [setup.md](setup.md) has a real macOS section now: the exact brew
+   line (`pkg-config sqlite cairo jpeg-turbo mpg123`, no `llvm` — Apple
+   clang consumes the generated IR directly), the `xcode-select
+   --install` / Xcode ≥ 15 floor, brew sqlite's keg-only
+   `PKG_CONFIG_PATH` requirement, and — since Phase 2 shipped native
+   Cocoa windowing rather than the originally-sketched XQuartz path —
+   an explicit "no XQuartz, no X11 at all" note instead of the
+   XQuartz-era caveat this bullet originally expected to write.
 
 ## Shared work — cut once, both ports consume it
 
@@ -299,7 +320,10 @@ files, a CI job), 1 (medium: one seam refactor + ~200 lines of
 AudioQueue), 2 (the largest: the seam extraction plus one
 Objective-C file — landed as a single native-Cocoa pass, skipping the
 originally-sketched 2a XQuartz rehearsal since it turned out not to be
-needed), 3 (small, still open). Windows is out of scope here but
+needed), 3 (small — a CI step, a shell-script guard, a docs section).
+All four are done; real-hardware verification of the audio/graphics
+gates is the one item macOS support has left. Windows is out of scope
+here but
 constrained: the Phase 1/2 seams are the same ones a Windows port
 needs (WASAPI, Win32/D2D or the same Cairo blit), so cutting them
 platform-shaped rather than macOS-shaped was part of the work. The
