@@ -6271,6 +6271,140 @@ class TestChainedCallResultReachedForAField:
         assert result.stdout.strip() == "1225"
 
 
+class TestComputedIndexAndArgumentOwnership:
+    """claude.md #119: the two chain shapes #117 left leaking, closed
+    by the same retain-first argument. A computed-index element off an
+    owning receiver (`getRows()[0]`, `getMap()['k']`) is minted its own
+    ownership (retain for a refcounted element, copy for a text one)
+    and the container released; an owning refcounted ARGUMENT to a user
+    function (`f(make())`, `f(getRows()[0])`) is released after the
+    call, exactly like a text temporary. Whether an emission minted a
+    +1 is recorded (_minted_values) rather than re-derived from syntax,
+    because the one shape syntax cannot classify -- a table-row element
+    is borrowed where a struct element is retained -- is exactly where
+    a predicate/emission disagreement would corrupt memory."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_a_computed_element_retains_before_the_container_release(
+            self, parser, semantic, codegen):
+        source = """
+        arr[arr[int]] func matrix() {
+            arr[arr[int]] m = [[1, 2], [3, 4]]
+            return m
+        }
+        void func use() {
+            arr[int] row = matrix()[0]
+            log(row.length)
+        }
+        use()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @use()")[1].split("\n}")[0]
+        retain_at = body.index("call void @festina_retain(")
+        release_at = body.index("@__festina_release_array_")
+        assert retain_at < release_at, "the element retain must precede the container release"
+
+    def test_computed_index_values_survive_their_container(self, compile_and_run):
+        source = """
+        arr[arr[int]] func matrix() {
+            arr[arr[int]] m = [[1, 2], [3, 4]]
+            return m
+        }
+        map[text] func conf() {
+            map[text] m = {'k': 'value'}
+            return m
+        }
+        arr[text] func names() {
+            arr[text] t = ['alpha', 'beta']
+            return t
+        }
+        int total = 0
+        for int i = 0, i < 60, i++ {
+            arr[int] row = matrix()[1]
+            total = total + row[0] + matrix()[0][1]
+            if conf()['k'] != 'value' { log('corrupted') }
+            if names()[0] != 'alpha' { log('corrupted') }
+        }
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "300"
+
+    def test_an_owning_argument_is_released_after_the_call(
+            self, parser, semantic, codegen):
+        source = """
+        int func total(xs:arr[int]) {
+            return xs.length
+        }
+        void func use() {
+            log(total([1, 2, 3]))
+        }
+        use()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @use()")[1].split("\n}")[0]
+        call_at = body.index("call i64 @total(")
+        release_at = body.index("@festina_release")
+        assert call_at < release_at, "the argument release must come after the call"
+
+    def test_owning_arguments_reach_the_callee_intact(self, compile_and_run):
+        # The callee stores, reads and returns through the borrowed
+        # argument; anything it KEEps takes its own retain, so the
+        # caller's post-call release never pulls memory out from under
+        # a kept reference.
+        source = """
+        struct Box { n:int }
+        arr[Box] kept
+        Box func makeBox(v:int) {
+            Box b
+            b.n = v
+            return b
+        }
+        void func keep(b:Box) {
+            kept.push(b)
+        }
+        int func readThrough(b:Box) {
+            return b.n
+        }
+        int total = 0
+        for int i = 0, i < 50, i++ {
+            keep(makeBox(i))
+            total = total + readThrough(makeBox(i))
+        }
+        total = total + kept[10].n + kept.length
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == str(sum(range(50)) + 10 + 50)
+
+    def test_a_table_row_element_stays_borrowed(self, compile_and_run, tmp_path):
+        # The one computed-index shape that deliberately does NOT mint:
+        # rows have no refcount header (the array owns them outright),
+        # so the container is left alive -- leaked, per todo.md -- and
+        # a column read off the row is still copied at its binding.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table People {{ id:int  name:text }}
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'row'])
+        arr[People] func rows() {{
+            arr[People] r = sqlite('SELECT * FROM People')
+            return r
+        }}
+        text got = rows()[0].name
+        log(got)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "row"
+
+
 class TestAudioChannelReturnAndClipStop:
     """claude.md #109: play()/playLoop() return the channel they chose,
     and aud.stop() is back as a clip-wide stop.

@@ -41,11 +41,12 @@ manual override (claude.md #74–#83, #111, #118). What remains:
   claude.md #106). Refcounting cannot free a cycle; the complete answer
   is a tracing collector or weak references. Until then, break cycles
   by hand (`child.parent = null` — verified to reclaim fully).
-- **Two chain shapes still leak** (claude.md #117 closed the rest): a
-  call-based chain passed directly as a function *argument* leaks its
-  +1 (parameters are borrows, so nobody owns the release), and a
-  computed-index receiver (`getRows()[0]`) leaks its array. Bind to a
-  name first and both reclaim normally.
+- **A table-row element off a call-result array leaks the array**
+  (`rows()[0]` where the elements are query rows; claude.md #119
+  closed every other computed-index and argument-position chain
+  shape). Rows have no refcount header — the array owns them outright
+  — so the element cannot be retained past its container. Bind the
+  array to a name first and it reclaims normally.
 - **Text globals are not freed at process exit** — deliberate: they are
   reachable until exit, LeakSanitizer agrees, and freeing them would be
   exit-time busywork.

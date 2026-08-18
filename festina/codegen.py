@@ -804,6 +804,17 @@ class CodeGen:
                                                 # [3 x ptr] memo slot global ({pattern copy, flags
                                                 # copy, compiled}) -- see _emit_regex_call /
                                                 # festina_regex_compile_memo
+        self._minted_values = set()            # claude.md #119: id(expr) of every emitted expression
+                                                # whose EMISSION minted its own +1 (a retained
+                                                # computed-index element, or a chain whose escaping
+                                                # value _release_member_chain retained/copied) --
+                                                # consulted by the ownership predicates so they and
+                                                # the emission can never disagree about shapes syntax
+                                                # alone cannot classify (a computed member over an
+                                                # owning receiver mints for a refcounted/text element
+                                                # but NOT for a borrowed table row). Recording happens
+                                                # during emission, and every predicate consumer runs
+                                                # after the value it asks about was emitted.
         # claude.md #108: state for a MEMBER CHAIN's deferred receiver
         # release -- see _emit_member_load. _chain_receiver holds the
         # exact AST node the enclosing member load is about to emit as
@@ -2754,6 +2765,10 @@ class CodeGen:
                           else "festina_image_height")
                     out = self.tmp()
                     lines.append(f"  {out} = call i64 @{fn}(ptr {obj_val})")
+                    # claude.md #119: the int is independent of the
+                    # image, so an owning receiver (`sheet.clip(...)
+                    # .width`) is released here rather than leaked.
+                    self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
                     return out, INT
                 # A struct/table field genuinely named "width" or
                 # "height" is perfectly legal, so it still resolves the
@@ -2815,7 +2830,9 @@ class CodeGen:
                     # key this expression allocated -- `m[`k${i}`]` --
                     # is finished the moment the lookup returns.
                     self._free_text_temp(expr.prop, key_val, key_type, lines)
-                    return out
+                    out = self._mint_and_release_computed(
+                        expr, out[0], obj_val, obj_type, obj_type.value, lines)
+                    return out, obj_type.value
                 if not isinstance(obj_type, types_mod.ArrayType):
                     raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",
                                         file=self.filename, line=getattr(expr, "line", 0))
@@ -2823,6 +2840,8 @@ class CodeGen:
                 ptr, elem_type = self._array_elem_ptr(obj_val, obj_type, idx_val, lines)
                 out = self.tmp()
                 lines.append(f"  {out} = load {_llvm_type(elem_type)}, ptr {ptr}")
+                out = self._mint_and_release_computed(
+                    expr, out, obj_val, obj_type, elem_type, lines)
                 return out, elem_type
             return self._emit_member_load(expr, env, lines)
         if isinstance(expr, ast.ArrayLit):
@@ -3780,7 +3799,7 @@ class CodeGen:
             self._chain_pending.append((expr.obj, obj_val, obj_type))
             return out, ftype
         out = self._release_member_chain(pending, expr.obj, obj_val, obj_type,
-                                         ftype, lines, out)
+                                         ftype, lines, out, chain_expr=expr)
         return out, ftype
 
     def _begin_member_chain(self, expr):
@@ -3809,7 +3828,7 @@ class CodeGen:
         return pending
 
     def _release_member_chain(self, pending, obj_expr, obj_val, obj_type, ftype,
-                              lines, out=None):
+                              lines, out=None, chain_expr=None):
         """claude.md #108 released a chain's call results only when the
         escaping value was a plain copy; claude.md #117 closes the other
         half. A managed escaping value is RETAINED first, then the call
@@ -3823,27 +3842,84 @@ class CodeGen:
         its parent) is prevented by construction rather than avoided by
         leaking.
 
-        Only receivers that are themselves Calls of refcounted type are
-        released: an intermediate link's value (`.inner` in
-        make().inner.n) is an alias INTO the base call's graph, reached
-        exactly once by the base's own cascade -- releasing it directly
-        too would double-free. Returns the (possibly replaced) result
-        value."""
+        Only receivers whose emission MINTED ownership, of refcounted
+        type, are released: a Call's fresh result, or (claude.md #119)
+        a computed-index member the computed branch retained -- read
+        off _minted_values, filled before this runs. An intermediate
+        link's value (`.inner` in make().inner.n) is an alias INTO the
+        base call's graph, reached exactly once by the base's own
+        cascade -- releasing it directly too would double-free.
+
+        claude.md #119: when the escaping value is retained/copied
+        here, the CHAIN expression itself (`chain_expr`) is recorded as
+        minted, so the ownership predicates report the +1 this emission
+        just created -- previously that role fell to the syntax-only
+        Call-base walk, which computed bases made insufficient.
+        Returns the (possibly replaced) result value."""
         receivers = list(pending) + [(obj_expr, obj_val, obj_type)]
         call_receivers = [
             (e, v, t) for e, v, t in receivers
-            if isinstance(e, ast.Call) and _is_refcounted(t)
+            if (isinstance(e, ast.Call) or id(e) in self._minted_values)
+            and _is_refcounted(t)
         ]
         if not call_receivers:
             return out
         if out is not None and _is_refcounted(ftype):
             lines.append(f"  call void @festina_retain(ptr {out})")
+            if chain_expr is not None:
+                self._minted_values.add(id(chain_expr))
         elif out is not None and ftype == TEXT:
             owned = self.tmp()
             lines.append(f"  {owned} = call ptr @festina_text_own(ptr {out})")
             out = owned
+            if chain_expr is not None:
+                self._minted_values.add(id(chain_expr))
         for _, v, t in call_receivers:
             lines.append(f"  call void {self._release_fn_for(t)}(ptr {v})")
+        return out
+
+    def _mint_and_release_computed(self, expr, out, obj_val, obj_type,
+                                   elem_type, lines):
+        """claude.md #119: closes the computed-index half of #117's two
+        leftover chain leaks. `getRows()[0]`, `getMap()['k']` -- a
+        computed Member whose RECEIVER this expression owns (a Call's
+        fresh result, a literal, an owning chain, or another minted
+        computed index) used to leak the whole container: nothing ever
+        released it, because releasing it before the element escaped
+        would free the element too. Same dilemma as #117's field loads,
+        same one-instruction answer: mint the element's own ownership
+        FIRST (retain a refcounted one, copy a text one), then release
+        the container, whose element-release cascade decrements the
+        just-retained value back to a net of exactly one reference --
+        owned by this expression, recorded in _minted_values so every
+        ownership predicate downstream agrees the +1 exists.
+
+        A scalar element needs no minting (its loaded value survives
+        the container by copy), so the container is simply released. A
+        TABLE-ROW element is the one shape that still cannot be fixed
+        this way: a row has no refcount header of its own -- the array
+        owns its rows outright (#85) -- so there is nothing to retain,
+        and releasing the array would free the row out from under the
+        expression. That case deliberately keeps #117's documented
+        leak (todo.md), and stays UNRECORDED here so the predicates
+        keep treating the row as borrowed -- a text column read off it
+        is still copied at its binding, exactly as before.
+
+        Returns the (possibly replaced) element value."""
+        if not (_is_refcounted(obj_type)
+                and self._is_owning_refcounted_source(expr.obj)):
+            return out
+        if isinstance(elem_type, types_mod.TableType):
+            return out
+        if _is_refcounted(elem_type):
+            lines.append(f"  call void @festina_retain(ptr {out})")
+            self._minted_values.add(id(expr))
+        elif elem_type == TEXT:
+            owned = self.tmp()
+            lines.append(f"  {owned} = call ptr @festina_text_own(ptr {out})")
+            out = owned
+            self._minted_values.add(id(expr))
+        lines.append(f"  call void {self._release_fn_for(obj_type)}(ptr {obj_val})")
         return out
 
     def _release_owned_receiver(self, obj_expr, obj_val, obj_type, lines):
@@ -4109,6 +4185,14 @@ class CodeGen:
         the instant it's produced."""
         if isinstance(expr, (ast.Call, ast.ArrayLit, ast.MapLit)):
             return True
+        # claude.md #119: an expression whose own emission minted a +1
+        # -- a retained computed-index element (`getRows()[0]`), or a
+        # chain whose escaping value _release_member_chain retained --
+        # is owned by exactly the same argument a fresh Call result is.
+        # The set is filled during emission, so this can never promise
+        # a +1 the emitted IR does not contain.
+        if id(expr) in self._minted_values:
+            return True
         # claude.md #117: a dotted chain whose base is a Call --
         # `make().inner`, `make().inner.items` -- yields an OWNED value
         # now: _emit_member_load retains the result before releasing
@@ -4123,9 +4207,19 @@ class CodeGen:
         emits a retain (or a text copy) for. This predicate and that
         emission MUST agree: the predicate promising ownership the load
         never produced would drop a needed retain, and the reverse
-        would leak the one the load added."""
+        would leak the one the load added.
+
+        claude.md #119: a chain may also bottom out on a COMPUTED
+        member (`getRows()[0].name`). Whether that base owns its value
+        is not decidable from syntax -- a retained struct element does,
+        a borrowed table row does not -- so the answer is read off
+        _minted_values, which the computed-index emission filled before
+        this walk could ever run (the chain's own emission emits its
+        receiver first)."""
         while isinstance(expr, ast.Member) and not expr.computed:
             expr = expr.obj
+        if isinstance(expr, ast.Member) and expr.computed:
+            return id(expr) in self._minted_values
         return isinstance(expr, ast.Call)
 
     def _is_owning_text_source(self, expr):
@@ -5492,13 +5586,13 @@ class CodeGen:
             if name in self.func_decls:
                 decl = self.func_decls[name]
                 arg_vals = []
-                text_temps = []
+                arg_temps = []
                 for arg_expr, param in zip(expr.args, decl.params):
                     ptype = self._resolve(param.type_expr, decl)
                     val, vtype = self._emit_value_for(arg_expr, env, lines, ptype)
                     val = self._coerce(val, vtype, ptype, lines)
                     arg_vals.append(f"{_llvm_type(ptype)} {val}")
-                    text_temps.append((arg_expr, val, vtype))
+                    arg_temps.append((arg_expr, val, vtype, ptype))
                 ret_ref, ret_type = env.lookup(name)
                 args_ir = ", ".join(arg_vals)
                 if ret_type is None:
@@ -5509,8 +5603,26 @@ class CodeGen:
                     lines.append(f"  {out} = call {_llvm_type(ret_type)} @{name}({args_ir})")
                 # claude.md #83: after the call, not before -- the callee
                 # borrows every text argument for the duration of the call.
-                for arg_expr, val, vtype in text_temps:
-                    self._free_text_temp(arg_expr, val, vtype, lines)
+                #
+                # claude.md #119: an OWNING refcounted argument -- a
+                # Call's fresh result, a literal, an owned chain
+                # (`f(make().inner)`, `f(getRows()[0])`) -- is released
+                # after the call the same way, closing the
+                # argument-position half of #117's leftovers. Sound for
+                # the same reason the text free is: parameters are
+                # borrows, and anything the callee KEPT took its own
+                # retain on the way to wherever it was stored (an
+                # escaping param retains at binding; a global/field
+                # store retains; a returned alias is retained by the
+                # Return path) -- so the caller's +1 is provably the
+                # last reference nothing else will ever drop.
+                for arg_expr, val, vtype, ptype in arg_temps:
+                    if (_is_refcounted(ptype)
+                            and self._is_owning_refcounted_source(arg_expr)):
+                        lines.append(
+                            f"  call void {self._release_fn_for(ptype)}(ptr {val})")
+                    else:
+                        self._free_text_temp(arg_expr, val, vtype, lines)
                 return out, ret_type
             raise CodegenError(f"unknown function '{name}'", file=self.filename, line=callee.line)
         if isinstance(callee, ast.Member) and not callee.computed:
@@ -5667,8 +5779,15 @@ class CodeGen:
                                "indexOf"):
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if isinstance(obj_type, types_mod.ArrayType):
-                    return self._emit_array_method(
+                    result = self._emit_array_method(
                         callee.prop, obj_val, obj_type, expr, env, lines)
+                    # claude.md #119: an owning receiver (a call/chain
+                    # temporary) is released once the method is done
+                    # with it -- safe even for pop/shift/splice, whose
+                    # removed elements were transferred OUT of the
+                    # array before this release could cascade to them.
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                    return result
             # claude.md #92: sheet.clip(x, y, w, h) -> img (a new image,
             # leaving the sheet untouched) and image.resize(w, h) -> void
             # (in place, so every binding holding it sees the new size).
@@ -5682,10 +5801,15 @@ class CodeGen:
                             f"  {out} = call ptr @festina_image_clip(ptr {obj_val}, "
                             f"i64 {arg_vals[0]}, i64 {arg_vals[1]}, "
                             f"i64 {arg_vals[2]}, i64 {arg_vals[3]})")
+                        # claude.md #118/#119: a clip is an independent
+                        # new surface, so an owning receiver (another
+                        # clip, a call result) is done with here.
+                        self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                         return out, types_mod.ImageType()
                     lines.append(
                         f"  call void @festina_image_resize(ptr {obj_val}, "
                         f"i64 {arg_vals[0]}, i64 {arg_vals[1]})")
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                     return "0", None
             # claude.md #38: music.play() / music.stop() / music.isPlaying()
             # claude.md #99: play/playLoop take an optional channel, and

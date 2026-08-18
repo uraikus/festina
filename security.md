@@ -93,7 +93,7 @@ corruption**:
   retired the one documented dangling-alias hazard the language had:
   before #118, `free` on an aliased `img`/`aud` freed outright and the
   alias dangled, as a stated manual contract.
-- **Reference cycles and two chain shapes leak** — see
+- **Reference cycles (and one row-array chain shape) leak** — see
   [todo.md](todo.md#memory-model). Leaks, never use-after-free; tests
   pin that distinction so an "optimization" cannot silently trade one
   for the other.
