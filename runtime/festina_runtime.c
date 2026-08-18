@@ -65,8 +65,30 @@ void festina_runtime_init(void) {
 
 /* ---- log() / fail() -- claude.md #41, #42 ---- */
 
-void festina_log_int(int64_t v) { printf("%lld\n", (long long)v); }
-void festina_log_float(double v) { printf("%g\n", v); }
+/* claude.md #126 round nine: every log() call flushes explicitly
+ * rather than trusting stdout's own default buffering mode. Once
+ * stdout is redirected to a file or pipe (as any subprocess-captured
+ * or piped program's is), the C runtime switches from line-buffered to
+ * fully block-buffered by default -- a handful of short log() lines
+ * can sit unflushed in that buffer for a long time, invisible to
+ * anything reading the file/pipe concurrently rather than after the
+ * process exits. `stdbuf -oL` (the usual fix -- force line buffering
+ * from outside the process) works on Linux/macOS because it's an
+ * LD_PRELOAD/DYLD_INSERT_LIBRARIES interposition trick against the
+ * SAME libc the target binary links -- it can't do anything for a
+ * compiled Festina program on Windows, which is a plain native UCRT64
+ * PE binary, not something built against MSYS2's own runtime the way
+ * MSYS2's own `stdbuf` is. Real Windows CI's timer test (an uncleared
+ * setInterval, read from a still-running process's stdout after a
+ * short wait) is a direct, real-world instance of exactly the
+ * consequence any log()-heavy long-running program's redirected
+ * output would have without this -- not just a test artifact. An
+ * explicit fflush after each call is small, portable, and correct
+ * everywhere, unlike relying on `setvbuf(..., _IOLBF, ...)`, which
+ * Microsoft's own C runtime has long treated the same as full
+ * buffering rather than true line buffering. */
+void festina_log_int(int64_t v) { printf("%lld\n", (long long)v); fflush(stdout); }
+void festina_log_float(double v) { printf("%g\n", v); fflush(stdout); }
 /* claude.md #97: bool's null is the reserved third bit pattern 2 (see
  * codegen's BOOL_NULL_CONST), and printing it with a plain `v ? true :
  * false` rendered it as "true" -- indistinguishable from a genuine
@@ -75,8 +97,9 @@ void festina_log_float(double v) { printf("%g\n", v); }
  * sentinel takes this branch, so no real boolean's output changes. */
 void festina_log_bool(int8_t v) {
     printf("%s\n", v == 2 ? "null" : (v ? "true" : "false"));
+    fflush(stdout);
 }
-void festina_log_text(const char *v) { printf("%s\n", v ? v : ""); }
+void festina_log_text(const char *v) { printf("%s\n", v ? v : ""); fflush(stdout); }
 
 void festina_fail(const char *msg) {
     fprintf(stderr, "fail: %s\n", msg ? msg : "");
