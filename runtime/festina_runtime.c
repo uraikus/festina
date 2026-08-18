@@ -1944,6 +1944,7 @@ void festina_release(void *payload) {
     }
 }
 
+
 /* ---- maps -- claude.md #72 ---- */
 
 /* One key/value pair -- `value` is a raw 8-byte payload meaning
@@ -2041,11 +2042,19 @@ int8_t festina_map_delete(int64_t *count, void **entries, const char *key,
     FestinaMapEntry *arr = (FestinaMapEntry *)*entries;
     for (int64_t i = 0; i < *count; i++) {
         if (!festina_str_eq(arr[i].key, key)) continue;
-        if (release) release(arr[i].value, arr[i].key);
-        free(arr[i].key);
+        /* claude.md #120: the entry is REMOVED before its value is
+         * released. The release may run a cycle trial that traverses
+         * this very map, and an entry still pointing at a value whose
+         * count the release just dropped would be double-counted by
+         * markGray -- the same store-before-release rule every field
+         * write follows now (see codegen's _emit_assign). */
+        int64_t value = arr[i].value;
+        char *owned_key = arr[i].key;
         memmove(&arr[i], &arr[i + 1],
                 (size_t)(*count - i - 1) * sizeof(FestinaMapEntry));
         (*count)--;
+        if (release) release(value, owned_key);
+        free(owned_key);
         return 1;
     }
     return 0;
@@ -2305,5 +2314,154 @@ void festina_release_map(void *payload) {
     int64_t count = *(int64_t *)payload;
     void *entries = *(void **)((char *)payload + sizeof(int64_t));
     festina_map_free_entries(count, entries);
+    free((char *)payload - sizeof(int64_t));
+}
+
+/* ---- cycle collection -- claude.md #120 ----
+ *
+ * Reference counting cannot free a cycle (`a.next = a` holds itself at
+ * count 1 forever), so releases of values whose TYPE can participate in
+ * a cycle run a synchronous trial deletion (the classic Bacon-Rajan
+ * test, single-rooted): tentatively remove every reference internal to
+ * the subgraph (markGray), see which nodes still have references from
+ * outside it (scan restores those and everything they reach --
+ * scanBlack), and free what nothing external reaches (collectWhite).
+ * The compiler generates the per-type traversal functions -- only it
+ * knows a struct's field layout -- and they drive the small,
+ * type-blind state helpers here.
+ *
+ * The trial's color state lives in bits 61-62 of the same i64 header
+ * the refcount occupies (black=0, gray=1, white=2): outside a trial
+ * every header is a plain count (black), and a trial always ends with
+ * every surviving node black again, so festina_retain /
+ * festina_release_check never need masking. The count occupies the low
+ * 61 bits during a trial; markGray's decrements can never underflow
+ * into the color bits, because a node's internal in-edges never exceed
+ * its count (each is a counted reference). A NEGATIVE header is the
+ * immortal sentinel exactly as everywhere else: an immortal value is
+ * never colored, decremented, traversed, or freed -- anything an
+ * immortal anchors is reachable by definition, and every helper here
+ * checks for it before touching anything. */
+
+#define FESTINA_COLOR_SHIFT 61
+#define FESTINA_COLOR_MASK (3LL << FESTINA_COLOR_SHIFT)
+#define FESTINA_COUNT_MASK (~FESTINA_COLOR_MASK)
+#define FESTINA_GRAY 1LL
+#define FESTINA_WHITE 2LL
+
+static int64_t *festina_cycle_header(void *p) {
+    return (int64_t *)((char *)p - sizeof(int64_t));
+}
+
+/* Whether a just-released-but-still-referenced value should be tried
+ * as a cycle root: non-null with a positive header (positive rules out
+ * both immortal and colored -- outside a trial, color bits are 0). */
+int8_t festina_cycle_candidate(void *p) {
+    if (!p) return 0;
+    return *festina_cycle_header(p) > 0;
+}
+
+/* markGray's node half: claim the node for the gray traversal. The
+ * caller (generated code) then decrements and grays each child edge --
+ * exactly once per parent, which with the once-per-node claim here is
+ * what bounds the walk on a cyclic graph. */
+int8_t festina_cycle_begin_gray(void *p) {
+    if (!p) return 0;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return 0;
+    if (((*h & FESTINA_COLOR_MASK) >> FESTINA_COLOR_SHIFT) == FESTINA_GRAY) return 0;
+    *h = (*h & FESTINA_COUNT_MASK) | (FESTINA_GRAY << FESTINA_COLOR_SHIFT);
+    return 1;
+}
+
+/* markGray's edge half: tentatively remove one internal reference. */
+void festina_cycle_dec(void *p) {
+    if (!p) return;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return;
+    (*h)--;
+}
+
+/* scanBlack's edge half: restore one tentatively-removed reference. */
+void festina_cycle_inc(void *p) {
+    if (!p) return;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return;
+    (*h)++;
+}
+
+/* scan's node decision. 0: nothing to do here (null, immortal, or not
+ * gray -- already decided). 1: external references remain, the caller
+ * must scanBlack from this node. 2: no external references -- the node
+ * is tentatively garbage (now white); the caller scans its children. */
+int64_t festina_cycle_begin_scan(void *p) {
+    if (!p) return 0;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return 0;
+    if (((*h & FESTINA_COLOR_MASK) >> FESTINA_COLOR_SHIFT) != FESTINA_GRAY) return 0;
+    if ((*h & FESTINA_COUNT_MASK) > 0) return 1;
+    *h = (*h & FESTINA_COUNT_MASK) | (FESTINA_WHITE << FESTINA_COLOR_SHIFT);
+    return 2;
+}
+
+void festina_cycle_set_black(void *p) {
+    if (!p) return;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return;
+    *h &= FESTINA_COUNT_MASK;
+}
+
+/* scanBlack's recursion guard: a child that is not yet black still
+ * needs its own subtree's counts restored. */
+int8_t festina_cycle_needs_black(void *p) {
+    if (!p) return 0;
+    int64_t h = *festina_cycle_header(p);
+    if (h < 0) return 0;
+    return (h & FESTINA_COLOR_MASK) != 0;
+}
+
+/* collectWhite's node claim: only a white node is freed, and it is
+ * recolored black first so a cyclic graph frees each node exactly
+ * once. */
+int8_t festina_cycle_begin_white(void *p) {
+    if (!p) return 0;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return 0;
+    if (((*h & FESTINA_COLOR_MASK) >> FESTINA_COLOR_SHIFT) != FESTINA_WHITE) return 0;
+    *h &= FESTINA_COUNT_MASK;
+    return 1;
+}
+
+/* The container traversal loops, type-blind: hand every element/value
+ * pointer of an arr[T]/map[T]-of-managed-T to the generated per-type
+ * edge function. */
+void festina_cycle_visit_array(void *payload, void (*fn)(void *)) {
+    int64_t length = *(int64_t *)payload;
+    void **data = *(void ***)((char *)payload + sizeof(int64_t));
+    for (int64_t i = 0; i < length; i++) fn(data[i]);
+}
+
+void festina_cycle_visit_map(void *payload, void (*fn)(void *)) {
+    int64_t count = *(int64_t *)payload;
+    FestinaMapEntry *entries = *(FestinaMapEntry **)((char *)payload + sizeof(int64_t));
+    for (int64_t i = 0; i < count; i++) fn((void *)(intptr_t)entries[i].value);
+}
+
+/* collectWhite's container disposal: free the container's own storage
+ * WITHOUT releasing its elements -- markGray already removed those
+ * counts, and collectWhite's own recursion frees whichever of them are
+ * garbage. Mirrors festina_release_array/_map's free logic minus the
+ * refcount check the trial has already superseded. */
+void festina_cycle_dispose_array(void *payload) {
+    void *data = *(void **)((char *)payload + sizeof(int64_t));
+    free(data);
+    free((char *)payload - sizeof(int64_t));
+}
+
+void festina_cycle_dispose_map(void *payload) {
+    int64_t count = *(int64_t *)payload;
+    FestinaMapEntry *entries = *(FestinaMapEntry **)((char *)payload + sizeof(int64_t));
+    for (int64_t i = 0; i < count; i++) free(entries[i].key);
+    free(entries);
     free((char *)payload - sizeof(int64_t));
 }

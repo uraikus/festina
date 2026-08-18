@@ -324,23 +324,25 @@ for int i = 0, i < 3, i++ {
 ```
 
 Linked lists, trees and parent pointers all work, and are reclaimed
-automatically like any other struct.
-
-**One exception, and it is a real one: a *cycle* is never freed.**
-Automatic reclamation is reference counting, and a value that points
-back at itself — directly, or around any longer loop — keeps its own
-count above zero forever:
+automatically like any other struct — **including cycles**. Reference
+counting alone can never free a value that points back at itself (the
+loop keeps its own count above zero forever), so for types that *can*
+form a cycle the compiler adds a cycle detector: when such a value is
+released but still referenced, the runtime checks whether what remains
+is only the cycle holding itself, and frees it if so.
 
 ```festina
 Node a
 a.n = 7
-a.next = a      // leaks: nothing will ever free `a`
+a.next = a      // reclaimed when `a` goes away, cycle and all
 ```
 
-Nothing goes wrong at runtime; the memory is simply never returned. If
-you build a structure with back-references, break them before dropping
-it (`child.parent = null`) or accept that it lives for the life of the
-program.
+A cycle something still points at is never touched — parent pointers,
+rings and doubly-linked structures stay valid for exactly as long as
+anything outside them can reach them. Cycles through containers
+(`kids:arr[Tree]` with a `parent:Tree` back-pointer, a `map` of peers)
+collect the same way. Programs whose types cannot form a cycle carry
+none of this machinery.
 
 Memory for structs, arrays, and maps is managed automatically — no
 manual allocation or freeing. A local struct/`arr[T]`/`map[T]`

@@ -66,7 +66,9 @@ each structural rather than incidental:
 ## Memory safety
 
 The memory model is escape analysis plus reference counting, with
-`free`/`delete` as explicit overrides — built in verified stages and
+cycle collection by trial deletion for the types that can form one
+(claude.md #120) and `free`/`delete` as explicit overrides — built in
+verified stages and
 continuously exercised under AddressSanitizer, LeakSanitizer and (for
 the audio thread pool) ThreadSanitizer. `scripts/leak_stress.sh` runs
 five mixed churn programs plus one isolation program per data type on
@@ -93,10 +95,14 @@ corruption**:
   retired the one documented dangling-alias hazard the language had:
   before #118, `free` on an aliased `img`/`aud` freed outright and the
   alias dangled, as a stated manual contract.
-- **Reference cycles (and one row-array chain shape) leak** — see
-  [todo.md](todo.md#memory-model). Leaks, never use-after-free; tests
-  pin that distinction so an "optimization" cannot silently trade one
-  for the other.
+- **One row-array chain shape leaks** (`rows()[0]` on a call-result
+  array of query rows) — see [todo.md](todo.md#memory-model). A leak,
+  never use-after-free; tests pin that distinction so an
+  "optimization" cannot silently trade one for the other. Reference
+  cycles, formerly on this list, are collected by trial deletion since
+  claude.md #120 — a reachable cycle is provably restored intact
+  (verified under ASan), so the collector cannot be tricked into
+  freeing live data by a cycle that is still held.
 
 ## Slim binaries
 

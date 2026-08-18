@@ -645,15 +645,12 @@ class TestSelfReferencingStructs:
         assert "call void @__festina_release_struct_Node(" in body
 
     def test_a_reference_cycle_runs_correctly_and_does_not_crash(self, compile_and_run):
-        # claude.md #106's accepted cost, pinned as behavior rather than
-        # hidden. `a.next = a` is a reference cycle, which refcounting
-        # cannot free -- so this LEAKS, deliberately and permanently
-        # until something traces (see todo.md's "What's still ahead").
-        # What must never regress is that it stays a leak: a cycle whose
-        # counts never reach zero must not become a double-free or a
-        # use-after-free, both of which would be far worse than the
-        # leak and both of which a naive "break the cycle on release"
-        # fix would risk.
+        # claude.md #106 made `a.next = a` constructible and accepted
+        # the leak; claude.md #120's trial deletion now reclaims a
+        # GARBAGE cycle. What this test pins is the other half: a
+        # cycle that is still externally held (the global binding here)
+        # keeps working -- reads through it stay valid, the trial run
+        # by each release must never free a reachable cycle.
         source = """
         struct Node {
             n:int
@@ -6403,6 +6400,165 @@ class TestComputedIndexAndArgumentOwnership:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip() == "row"
+
+
+class TestCycleCollection:
+    """claude.md #120: reference cycles are collected, not leaked. A
+    release of a value whose TYPE can reach itself (struct fields, arr
+    elements, map values) that leaves the count above zero runs a
+    synchronous trial deletion -- markGray / scan / collectWhite over
+    generated per-type traversals -- freeing a cycle no external
+    reference holds and restoring, exactly, one that something still
+    does. Acyclic types generate none of it and pay nothing. The
+    leak-freedom half is verified under ASan/LeakSanitizer by the
+    struct_self per-type program (now a genuine cycle) and was measured
+    directly for self-cycles, pair cycles, array-routed parent pointers
+    and map-routed rings; these tests pin the structure and the
+    reachability behavior."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_a_cyclic_type_release_wrapper_runs_a_trial(
+            self, parser, semantic, codegen):
+        source = """
+        struct Node { n:int next:Node }
+        void func f() {
+            Node a
+            a.n = 1
+            a.next = a
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        wrapper = ir.split("define void @__festina_release_struct_Node(")[1].split("\n}")[0]
+        assert "call i8 @festina_cycle_candidate(" in wrapper
+        assert "@__festina_cycle_gray_" in wrapper
+        assert "@__festina_cycle_scan_" in wrapper
+        assert "@__festina_cycle_white_" in wrapper
+
+    def test_an_acyclic_type_generates_no_cycle_machinery(
+            self, parser, semantic, codegen):
+        # The gate: a program whose types cannot form a cycle carries
+        # zero collector code and zero trial calls.
+        source = """
+        struct Inner { n:int }
+        struct Outer { inner:Inner }
+        void func f() {
+            Outer o
+            o.inner.n = 1
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "festina_cycle_candidate" not in ir.replace(
+            "declare i8 @festina_cycle_candidate(ptr)", "")
+        assert "@__festina_cycle_" not in ir
+
+    def test_garbage_cycles_are_reclaimed_and_reused_memory_stays_sane(
+            self, compile_and_run):
+        # 300 dropped cycles; correctness of everything built afterwards
+        # is the observable half (the zero-leaked-bytes half runs under
+        # the sanitizer harness in test_leak_stress).
+        source = """
+        struct Node { n:int next:Node label:text }
+        void func cycle(v:int) {
+            Node a
+            Node b
+            a.n = v
+            a.label = `n${v}`
+            b.n = v + 1
+            a.next = b
+            b.next = a
+        }
+        int total = 0
+        for int i = 0, i < 300, i++ {
+            cycle(i)
+            total = total + i
+        }
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == str(sum(range(300)))
+
+    def test_a_reachable_cycle_survives_its_trial_intact(self, compile_and_run):
+        # The safety half: a trial on a cycle something still holds
+        # must restore every count and free nothing.
+        source = """
+        struct Node { n:int next:Node }
+        Node keep
+        void func build() {
+            Node a
+            Node b
+            a.n = 10
+            b.n = 20
+            a.next = b
+            b.next = a
+            keep = b
+        }
+        build()
+        log(keep.n)
+        log(keep.next.n)
+        log(keep.next.next.n)
+        keep.next = null
+        log('broken')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["20", "10", "20", "broken"]
+
+    def test_cycles_through_arrays_and_maps_are_collected(self, compile_and_run):
+        source = """
+        struct Tree { n:int kids:arr[Tree] parent:Tree }
+        void func family() {
+            Tree root
+            root.n = 1
+            Tree kid
+            kid.n = 2
+            kid.parent = root
+            root.kids.push(kid)
+        }
+        struct Ring { name:text peers:map[Ring] }
+        void func ring() {
+            Ring a
+            Ring b
+            a.name = 'a'
+            b.name = 'b'
+            a.peers['b'] = b
+            b.peers['a'] = a
+        }
+        for int i = 0, i < 200, i++ {
+            family()
+            ring()
+        }
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_field_stores_land_before_the_old_values_release(
+            self, parser, semantic, codegen):
+        # claude.md #120's ordering rule: with trials traversing the
+        # object graph, a field must never still point at a value whose
+        # count the in-flight release already dropped -- markGray would
+        # double-count the edge and could free something a real
+        # external reference holds. The store must precede the release
+        # in the emitted IR.
+        source = """
+        struct Node { n:int next:Node }
+        void func f(a:Node, b:Node) {
+            a.next = b
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f(")[1].split("\n}")[0]
+        store_at = body.index("store ptr")
+        release_at = body.index("call void @__festina_release_struct_Node(")
+        assert store_at < release_at, "the field store must precede the old value's release"
 
 
 class TestAudioChannelReturnAndClipStop:

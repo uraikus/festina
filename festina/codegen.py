@@ -804,6 +804,13 @@ class CodeGen:
                                                 # [3 x ptr] memo slot global ({pattern copy, flags
                                                 # copy, compiled}) -- see _emit_regex_call /
                                                 # festina_regex_compile_memo
+        self._cyclic_type_cache = {}           # claude.md #120: type_name -> bool ("can this type
+                                                # reach itself through managed edges") -- the gate on
+                                                # ALL cycle-collection machinery; acyclic types never
+                                                # generate or run any of it
+        self._cycle_fns = {}                   # claude.md #120: (op, type_name) -> generated cycle
+                                                # traversal function name (ops: gray/scan/black/white
+                                                # + the grayedge/blackedge container edge helpers)
         self._minted_values = set()            # claude.md #119: id(expr) of every emitted expression
                                                 # whose EMISSION minted its own +1 (a retained
                                                 # computed-index element, or a chain whose escaping
@@ -1147,6 +1154,21 @@ class CodeGen:
             # _emit_free_active_locals's own StructType branch.
             "declare void @festina_retain(ptr)",
             "declare void @festina_release(ptr)",
+            # claude.md #120: the type-blind state half of cycle
+            # collection -- see the festina_cycle_* block comment in
+            # runtime/festina_runtime.c and _cycle_fn here.
+            "declare i8 @festina_cycle_candidate(ptr)",
+            "declare i8 @festina_cycle_begin_gray(ptr)",
+            "declare void @festina_cycle_dec(ptr)",
+            "declare void @festina_cycle_inc(ptr)",
+            "declare i64 @festina_cycle_begin_scan(ptr)",
+            "declare void @festina_cycle_set_black(ptr)",
+            "declare i8 @festina_cycle_needs_black(ptr)",
+            "declare i8 @festina_cycle_begin_white(ptr)",
+            "declare void @festina_cycle_visit_array(ptr, ptr)",
+            "declare void @festina_cycle_visit_map(ptr, ptr)",
+            "declare void @festina_cycle_dispose_array(ptr)",
+            "declare void @festina_cycle_dispose_map(ptr)",
             # claude.md #78: the decrement-and-check half of
             # festina_release, split out so a struct with its own
             # struct-typed field(s) can cascade into releasing those
@@ -1798,20 +1820,25 @@ class CodeGen:
         # Release what the field holds before nulling it -- the same
         # per-type dispatch a field REASSIGNMENT already performs, since
         # delete is a reassignment to null with one extra effect.
+        #
+        # claude.md #120: the null is stored BEFORE the old value is
+        # released -- a cycle trial run by the release must never see
+        # this field still pointing at the value whose count it just
+        # dropped (see _emit_assign's store-before-release comment).
         old = None
         if _llvm_type(ftype) == "ptr":
             old = self.tmp()
             lines.append(f"  {old} = load ptr, ptr {ptr}")
+        f_llvm = _llvm_type(ftype)
+        null_const = {"ptr": "null", "i64": INT_NULL_CONST,
+                      "double": FLOAT_NULL_CONST, "i8": BOOL_NULL_CONST}[f_llvm]
+        lines.append(f"  store {f_llvm} {null_const}, ptr {ptr}")
         if _is_refcounted(ftype):
             # claude.md #118: covers img/aud fields too now -- one
             # release dispatch, no media special case left.
             lines.append(f"  call void {self._release_fn_for(ftype)}(ptr {old})")
         elif ftype == TEXT:
             lines.append(f"  call void @free(ptr {old})")
-        f_llvm = _llvm_type(ftype)
-        null_const = {"ptr": "null", "i64": INT_NULL_CONST,
-                      "double": FLOAT_NULL_CONST, "i8": BOOL_NULL_CONST}[f_llvm]
-        lines.append(f"  store {f_llvm} {null_const}, ptr {ptr}")
 
         if isinstance(obj_type, types_mod.TableType):
             # claude.md #111: clear the presence bit, so undefined()
@@ -3698,6 +3725,7 @@ class CodeGen:
         lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 0")
         entries_ptr = self.tmp()
         lines.append(f"  {entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 1")
+        deferred_release = None
         if _is_refcounted(value_type):
             count_val = self.tmp()
             lines.append(f"  {count_val} = load i64, ptr {count_ptr}")
@@ -3713,7 +3741,12 @@ class CodeGen:
             if not self._refcounted_source_is_fresh(
                     value_source_expr, value_pre_coerce_type, value_type):
                 lines.append(f"  call void @festina_retain(ptr {value_val})")
-            lines.append(f"  call void {self._release_fn_for(value_type)}(ptr {old_ptr})")
+            # claude.md #120: the release of the overwritten value is
+            # DEFERRED until after festina_map_set has stored the new
+            # one -- a cycle trial run by the release must never see the
+            # entry still pointing at the value whose count it just
+            # dropped (see _emit_assign's store-before-release comment).
+            deferred_release = (self._release_fn_for(value_type), old_ptr)
         elif value_type == TEXT:
             # claude.md #83: the text counterpart just above -- same
             # "look up whatever value the key currently maps to (if
@@ -3736,6 +3769,9 @@ class CodeGen:
             lines.append(f"  call void @free(ptr {old_ptr})")
         raw_val = self._map_value_to_i64(value_val, value_type, lines)
         lines.append(f"  call void @festina_map_set(ptr {count_ptr}, ptr {entries_ptr}, ptr {key_val}, i64 {raw_val})")
+        if deferred_release is not None:
+            release_fn, old_ptr = deferred_release
+            lines.append(f"  call void {release_fn}(ptr {old_ptr})")
         # claude.md #97: the key is strdup'd by festina_map_set (see its
         # own comment on why it never aliases the caller's pointer), so
         # a key the caller ALLOCATED -- `m[`s${i}`] = v`, `m[a + b] = v`
@@ -4625,6 +4661,7 @@ class CodeGen:
         # standing between the compiler and infinite recursion.
         self._struct_release_fns[type_.name] = fn_name
         struct_ty = self.struct_llvm_name(type_.name)
+        cyclic = self._is_cyclic_type(type_)
         body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
         should_free = self.tmp()
         body.append(f"  {should_free} = call i8 @festina_release_check(ptr %payload)")
@@ -4632,13 +4669,21 @@ class CodeGen:
         body.append(f"  {cond} = icmp ne i8 {should_free}, 0")
         free_label = self.label("relstruct.free")
         done_label = self.label("relstruct.done")
-        body.append(f"  br i1 {cond}, label %{free_label}, label %{done_label}")
+        # claude.md #120: a possibly-cyclic type's not-last-reference
+        # branch runs a trial deletion instead of doing nothing -- the
+        # released value may be the last EXTERNAL reference to a cycle
+        # whose internal edges hold every count above zero. Acyclic
+        # types keep the plain two-way branch and pay nothing.
+        alive_label = self.label("relstruct.alive") if cyclic else done_label
+        body.append(f"  br i1 {cond}, label %{free_label}, label %{alive_label}")
         body.append(f"{free_label}:")
         self._emit_release_struct_field_refs("%payload", type_, body)
         header = self.tmp()
         body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
         body.append(f"  call void @free(ptr {header})")
         body.append(f"  br label %{done_label}")
+        if cyclic:
+            self._emit_cycle_trial(body, type_, alive_label, done_label)
         body.append(f"{done_label}:")
         body.append("  ret void")
         body.append("}")
@@ -4744,6 +4789,7 @@ class CodeGen:
         else:
             elem_release_fn = self._release_fn_for(elem_type)
         elem_llvm_ty = _llvm_type(elem_type)
+        cyclic = self._is_cyclic_type(type_)
         body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
         should_free = self.tmp()
         body.append(f"  {should_free} = call i8 @festina_release_check(ptr %payload)")
@@ -4751,7 +4797,10 @@ class CodeGen:
         body.append(f"  {cond} = icmp ne i8 {should_free}, 0")
         free_label = self.label("relarr.free")
         done_label = self.label("relarr.done")
-        body.append(f"  br i1 {cond}, label %{free_label}, label %{done_label}")
+        # claude.md #120: same trial-on-survival branch the struct
+        # wrapper grows, for an arr[T] whose T sits on a cycle.
+        alive_label = self.label("relarr.alive") if cyclic else done_label
+        body.append(f"  br i1 {cond}, label %{free_label}, label %{alive_label}")
         body.append(f"{free_label}:")
         len_ptr = self.tmp()
         body.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr %payload, i32 0, i32 0")
@@ -4767,6 +4816,8 @@ class CodeGen:
         body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
         body.append(f"  call void @free(ptr {header})")
         body.append(f"  br label %{done_label}")
+        if cyclic:
+            self._emit_cycle_trial(body, type_, alive_label, done_label)
         body.append(f"{done_label}:")
         body.append("  ret void")
         body.append("}")
@@ -4901,6 +4952,7 @@ class CodeGen:
         fn_name = f"@__festina_release_map_{self._unique()}"
         self._map_release_fns[key] = fn_name
         trampoline_name = self._emit_map_value_release_trampoline(value_type)
+        cyclic = self._is_cyclic_type(type_)
         body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
         should_free = self.tmp()
         body.append(f"  {should_free} = call i8 @festina_release_check(ptr %payload)")
@@ -4908,7 +4960,10 @@ class CodeGen:
         body.append(f"  {cond} = icmp ne i8 {should_free}, 0")
         free_label = self.label("relmap.free")
         done_label = self.label("relmap.done")
-        body.append(f"  br i1 {cond}, label %{free_label}, label %{done_label}")
+        # claude.md #120: same trial-on-survival branch as the struct
+        # and array wrappers, for a map[T] whose T sits on a cycle.
+        alive_label = self.label("relmap.alive") if cyclic else done_label
+        body.append(f"  br i1 {cond}, label %{free_label}, label %{alive_label}")
         body.append(f"{free_label}:")
         count_ptr = self.tmp()
         body.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr %payload, i32 0, i32 0")
@@ -4924,6 +4979,8 @@ class CodeGen:
         body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
         body.append(f"  call void @free(ptr {header})")
         body.append(f"  br label %{done_label}")
+        if cyclic:
+            self._emit_cycle_trial(body, type_, alive_label, done_label)
         body.append(f"{done_label}:")
         body.append("  ret void")
         body.append("}")
@@ -4957,6 +5014,311 @@ class CodeGen:
         self.func_defs.extend(body)
         self.func_defs.append("")
         return trampoline_name
+
+    # ---- cycle collection -- claude.md #120 ----
+
+    def _is_cyclic_type(self, t):
+        """claude.md #120: whether values of `t` can participate in a
+        reference cycle -- i.e. whether `t` can reach itself through
+        managed edges (struct fields, arr elements, map values). This
+        is the single gate on all cycle-collection machinery: an
+        acyclic type's releases never run a trial and never generate a
+        traversal function, so a program with no self-referencing
+        types pays literally nothing for the collector's existence.
+        Purely a property of the declared TYPE GRAPH, so it is
+        computed once per type name and cached."""
+        if not isinstance(t, (types_mod.StructType, types_mod.ArrayType,
+                              types_mod.MapType)):
+            return False
+        key = types_mod.type_name(t)
+        cached = self._cyclic_type_cache.get(key)
+        if cached is not None:
+            return cached
+        result = False
+        seen = set()
+        frontier = list(self._managed_type_children(t))
+        while frontier:
+            child = frontier.pop()
+            ckey = types_mod.type_name(child)
+            if ckey == key:
+                result = True
+                break
+            if ckey in seen:
+                continue
+            seen.add(ckey)
+            frontier.extend(self._managed_type_children(child))
+        self._cyclic_type_cache[key] = result
+        return result
+
+    def _managed_type_children(self, t):
+        """The type-graph edges _is_cyclic_type walks: a struct's
+        struct/arr/map-typed fields, a container's element/value type
+        when it is one of those three. Leaf types (text, blob, img,
+        aud, regex, scalars) can never sit ON a cycle -- none of them
+        holds a reference to another managed value -- so they have no
+        outgoing edges here."""
+        kinds = (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)
+        if isinstance(t, types_mod.StructType):
+            return [ft for _, ft in self.struct_fields(t.name)
+                    if isinstance(ft, kinds)]
+        if isinstance(t, types_mod.ArrayType):
+            return [t.element] if isinstance(t.element, kinds) else []
+        if isinstance(t, types_mod.MapType):
+            return [t.value] if isinstance(t.value, kinds) else []
+        return []
+
+    def _cycle_fn(self, op, type_):
+        """claude.md #120: the generated per-type traversal functions
+        that drive a trial deletion -- `gray` (tentatively remove every
+        edge internal to the subgraph), `scan` (decide survival by the
+        counts that remain), `black` (restore a surviving region's
+        counts), `white` (free the garbage region) -- plus the
+        `grayedge`/`blackedge` per-element helpers container traversals
+        hand to festina_cycle_visit_array/_map. Registered before
+        generated, exactly like the release wrappers (claude.md #106's
+        load-bearing cache write), so a self-referencing type's
+        traversal calls itself instead of recursing the compiler."""
+        key = (op, types_mod.type_name(type_))
+        if key in self._cycle_fns:
+            return self._cycle_fns[key]
+        fn_name = f"@__festina_cycle_{op}_{self._unique()}"
+        self._cycle_fns[key] = fn_name
+        if op == "grayedge":
+            body = [f"define void {fn_name}(ptr %c) {{", "entry:"]
+            body.append("  call void @festina_cycle_dec(ptr %c)")
+            body.append(f"  call void {self._cycle_fn('gray', type_)}(ptr %c)")
+            body.append("  ret void")
+            body.append("}")
+            body.append("")
+        elif op == "blackedge":
+            rec_label = self.label("cyedge.rec")
+            done_label = self.label("cyedge.done")
+            nb = self.tmp()
+            cc = self.tmp()
+            body = [f"define void {fn_name}(ptr %c) {{", "entry:"]
+            body.append("  call void @festina_cycle_inc(ptr %c)")
+            body.append(f"  {nb} = call i8 @festina_cycle_needs_black(ptr %c)")
+            body.append(f"  {cc} = icmp ne i8 {nb}, 0")
+            body.append(f"  br i1 {cc}, label %{rec_label}, label %{done_label}")
+            body.append(f"{rec_label}:")
+            body.append(f"  call void {self._cycle_fn('black', type_)}(ptr %c)")
+            body.append(f"  br label %{done_label}")
+            body.append(f"{done_label}:")
+            body.append("  ret void")
+            body.append("}")
+            body.append("")
+        elif isinstance(type_, types_mod.StructType):
+            body = self._cycle_struct_body(op, type_, fn_name)
+        else:
+            body = self._cycle_container_body(op, type_, fn_name)
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _cycle_struct_children(self, type_):
+        """(index, field_type) for every field a trial traverses --
+        exactly the cyclic-typed ones. Everything else the struct owns
+        (text buffers, blobs, acyclic containers, ...) is handled by
+        `white`'s disposal instead, released through the ordinary
+        machinery, because it provably is not part of any cycle and
+        its counts were never touched by the trial."""
+        return [(i, ftype)
+                for i, (_, ftype) in enumerate(self.struct_fields(type_.name))
+                if self._is_cyclic_type(ftype)]
+
+    def _cycle_struct_body(self, op, type_, fn_name):
+        struct_ty = self.struct_llvm_name(type_.name)
+        children = self._cycle_struct_children(type_)
+
+        def load_field(body, i):
+            fptr = self.tmp()
+            body.append(f"  {fptr} = getelementptr {struct_ty}, ptr %p, i32 0, i32 {i}")
+            fval = self.tmp()
+            body.append(f"  {fval} = load ptr, ptr {fptr}")
+            return fval
+
+        body = [f"define void {fn_name}(ptr %p) {{", "entry:"]
+        if op == "gray":
+            go = self.tmp()
+            cond = self.tmp()
+            walk = self.label("cygray.walk")
+            done = self.label("cygray.done")
+            body.append(f"  {go} = call i8 @festina_cycle_begin_gray(ptr %p)")
+            body.append(f"  {cond} = icmp ne i8 {go}, 0")
+            body.append(f"  br i1 {cond}, label %{walk}, label %{done}")
+            body.append(f"{walk}:")
+            for i, ftype in children:
+                fval = load_field(body, i)
+                body.append(f"  call void @festina_cycle_dec(ptr {fval})")
+                body.append(f"  call void {self._cycle_fn('gray', ftype)}(ptr {fval})")
+            body.append(f"  br label %{done}")
+            body.append(f"{done}:")
+        elif op == "scan":
+            r = self.tmp()
+            is1 = self.tmp()
+            blackl = self.label("cyscan.black")
+            chk2 = self.label("cyscan.chk2")
+            walk = self.label("cyscan.walk")
+            done = self.label("cyscan.done")
+            body.append(f"  {r} = call i64 @festina_cycle_begin_scan(ptr %p)")
+            body.append(f"  {is1} = icmp eq i64 {r}, 1")
+            body.append(f"  br i1 {is1}, label %{blackl}, label %{chk2}")
+            body.append(f"{blackl}:")
+            body.append(f"  call void {self._cycle_fn('black', type_)}(ptr %p)")
+            body.append(f"  br label %{done}")
+            body.append(f"{chk2}:")
+            is2 = self.tmp()
+            body.append(f"  {is2} = icmp eq i64 {r}, 2")
+            body.append(f"  br i1 {is2}, label %{walk}, label %{done}")
+            body.append(f"{walk}:")
+            for i, ftype in children:
+                fval = load_field(body, i)
+                body.append(f"  call void {self._cycle_fn('scan', ftype)}(ptr {fval})")
+            body.append(f"  br label %{done}")
+            body.append(f"{done}:")
+        elif op == "black":
+            body.append("  call void @festina_cycle_set_black(ptr %p)")
+            for i, ftype in children:
+                fval = load_field(body, i)
+                body.append(f"  call void @festina_cycle_inc(ptr {fval})")
+                nb = self.tmp()
+                cc = self.tmp()
+                rec = self.label("cyblack.rec")
+                nxt = self.label("cyblack.next")
+                body.append(f"  {nb} = call i8 @festina_cycle_needs_black(ptr {fval})")
+                body.append(f"  {cc} = icmp ne i8 {nb}, 0")
+                body.append(f"  br i1 {cc}, label %{rec}, label %{nxt}")
+                body.append(f"{rec}:")
+                body.append(f"  call void {self._cycle_fn('black', ftype)}(ptr {fval})")
+                body.append(f"  br label %{nxt}")
+                body.append(f"{nxt}:")
+        else:  # white
+            go = self.tmp()
+            cond = self.tmp()
+            walk = self.label("cywhite.walk")
+            done = self.label("cywhite.done")
+            body.append(f"  {go} = call i8 @festina_cycle_begin_white(ptr %p)")
+            body.append(f"  {cond} = icmp ne i8 {go}, 0")
+            body.append(f"  br i1 {cond}, label %{walk}, label %{done}")
+            body.append(f"{walk}:")
+            for i, ftype in children:
+                fval = load_field(body, i)
+                body.append(f"  call void {self._cycle_fn('white', ftype)}(ptr {fval})")
+            # Dispose: everything the node owns that the trial did NOT
+            # traverse -- ordinary releases, whose counts the trial
+            # never altered. Cyclic children are NOT released here:
+            # markGray already removed those counts and the white
+            # recursion above frees whichever of them are garbage.
+            for i, (_, ftype) in enumerate(self.struct_fields(type_.name)):
+                if self._is_cyclic_type(ftype):
+                    continue
+                if _is_refcounted(ftype):
+                    fval = load_field(body, i)
+                    body.append(f"  call void {self._release_fn_for(ftype)}(ptr {fval})")
+                elif ftype == TEXT:
+                    fval = load_field(body, i)
+                    body.append(f"  call void @free(ptr {fval})")
+            hdr = self.tmp()
+            body.append(f"  {hdr} = getelementptr i8, ptr %p, i64 -8")
+            body.append(f"  call void @free(ptr {hdr})")
+            body.append(f"  br label %{done}")
+            body.append(f"{done}:")
+        body.append("  ret void")
+        body.append("}")
+        body.append("")
+        return body
+
+    def _cycle_container_body(self, op, type_, fn_name):
+        """arr[T]/map[T] with a cyclic T: same four operations, with
+        the per-element loop delegated to festina_cycle_visit_array/
+        _map handing each element pointer to the element type's own
+        function (or a grayedge/blackedge helper where the edge has
+        count work of its own). Disposal is the runtime's
+        festina_cycle_dispose_* -- the container's buffers and keys,
+        never its elements."""
+        is_map = isinstance(type_, types_mod.MapType)
+        elem = type_.value if is_map else type_.element
+        visit = "@festina_cycle_visit_map" if is_map else "@festina_cycle_visit_array"
+        dispose = ("@festina_cycle_dispose_map" if is_map
+                   else "@festina_cycle_dispose_array")
+        body = [f"define void {fn_name}(ptr %p) {{", "entry:"]
+        if op == "gray":
+            go = self.tmp()
+            cond = self.tmp()
+            walk = self.label("cygray.walk")
+            done = self.label("cygray.done")
+            body.append(f"  {go} = call i8 @festina_cycle_begin_gray(ptr %p)")
+            body.append(f"  {cond} = icmp ne i8 {go}, 0")
+            body.append(f"  br i1 {cond}, label %{walk}, label %{done}")
+            body.append(f"{walk}:")
+            body.append(f"  call void {visit}(ptr %p, "
+                        f"ptr {self._cycle_fn('grayedge', elem)})")
+            body.append(f"  br label %{done}")
+            body.append(f"{done}:")
+        elif op == "scan":
+            r = self.tmp()
+            is1 = self.tmp()
+            blackl = self.label("cyscan.black")
+            chk2 = self.label("cyscan.chk2")
+            walk = self.label("cyscan.walk")
+            done = self.label("cyscan.done")
+            body.append(f"  {r} = call i64 @festina_cycle_begin_scan(ptr %p)")
+            body.append(f"  {is1} = icmp eq i64 {r}, 1")
+            body.append(f"  br i1 {is1}, label %{blackl}, label %{chk2}")
+            body.append(f"{blackl}:")
+            body.append(f"  call void {self._cycle_fn('black', type_)}(ptr %p)")
+            body.append(f"  br label %{done}")
+            body.append(f"{chk2}:")
+            is2 = self.tmp()
+            body.append(f"  {is2} = icmp eq i64 {r}, 2")
+            body.append(f"  br i1 {is2}, label %{walk}, label %{done}")
+            body.append(f"{walk}:")
+            body.append(f"  call void {visit}(ptr %p, "
+                        f"ptr {self._cycle_fn('scan', elem)})")
+            body.append(f"  br label %{done}")
+            body.append(f"{done}:")
+        elif op == "black":
+            body.append("  call void @festina_cycle_set_black(ptr %p)")
+            body.append(f"  call void {visit}(ptr %p, "
+                        f"ptr {self._cycle_fn('blackedge', elem)})")
+        else:  # white
+            go = self.tmp()
+            cond = self.tmp()
+            walk = self.label("cywhite.walk")
+            done = self.label("cywhite.done")
+            body.append(f"  {go} = call i8 @festina_cycle_begin_white(ptr %p)")
+            body.append(f"  {cond} = icmp ne i8 {go}, 0")
+            body.append(f"  br i1 {cond}, label %{walk}, label %{done}")
+            body.append(f"{walk}:")
+            body.append(f"  call void {visit}(ptr %p, "
+                        f"ptr {self._cycle_fn('white', elem)})")
+            body.append(f"  call void {dispose}(ptr %p)")
+            body.append(f"  br label %{done}")
+            body.append(f"{done}:")
+        body.append("  ret void")
+        body.append("}")
+        body.append("")
+        return body
+
+    def _emit_cycle_trial(self, body, type_, alive_label, done_label):
+        """The still-referenced branch of a cyclic type's release
+        wrapper: when the released value remains at a positive count,
+        try it as a cycle root -- markGray / scan / collectWhite, the
+        classic synchronous trial. A candidate check keeps the trial
+        off null and immortal values; everything else is at worst
+        wasted work (an externally-reachable subgraph scans black and
+        comes out exactly as it went in), never corruption."""
+        body.append(f"{alive_label}:")
+        cand = self.tmp()
+        cc = self.tmp()
+        trial = self.label("reltrial.run")
+        body.append(f"  {cand} = call i8 @festina_cycle_candidate(ptr %payload)")
+        body.append(f"  {cc} = icmp ne i8 {cand}, 0")
+        body.append(f"  br i1 {cc}, label %{trial}, label %{done_label}")
+        body.append(f"{trial}:")
+        body.append(f"  call void {self._cycle_fn('gray', type_)}(ptr %payload)")
+        body.append(f"  call void {self._cycle_fn('scan', type_)}(ptr %payload)")
+        body.append(f"  call void {self._cycle_fn('white', type_)}(ptr %payload)")
+        body.append(f"  br label %{done_label}")
 
     def _emit_assign(self, expr, env, lines):
         # The target's declared type is resolved *before* the value, so an
@@ -5062,11 +5424,24 @@ class CodeGen:
                 # owning-source one) so a text initializer coerced into
                 # a blob/img/aud field -- a fresh handle from _coerce's
                 # own load call -- is not retained a second time.
+                #
+                # claude.md #120: the NEW value is stored BEFORE the old
+                # one is released -- load-retain-store-release, not
+                # load-retain-release-store. With cycle trials, a
+                # release may traverse the object graph, and a field
+                # still physically pointing at a value whose reference
+                # count this very release just removed would be
+                # double-counted by markGray -- enough to whiten (and
+                # free) a value a real external reference still holds.
+                # Storing first keeps the graph the trial walks
+                # consistent with the counts at every release.
                 old = self.tmp()
                 lines.append(f"  {old} = load ptr, ptr {ptr}")
                 if not self._refcounted_source_is_fresh(expr.value, vtype, ftype):
                     lines.append(f"  call void @festina_retain(ptr {val})")
+                lines.append(f"  store {_llvm_type(ftype)} {val}, ptr {ptr}")
                 lines.append(f"  call void {self._release_fn_for(ftype)}(ptr {old})")
+                return val, ftype
             elif ftype == TEXT:
                 # claude.md #83: the text counterpart to the block just
                 # above -- copies (via festina_text_own) rather than

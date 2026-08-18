@@ -2661,6 +2661,29 @@ carries a presence bitmask one hidden slot past its columns; an unknown
 name in undefined() fails the program.
 `tests/test_codegen.py::TestUndefinedAndNameMatchedColumns` (6 tests).
 
+**claude.md #120**: reference cycles collect — trial deletion in the
+release wrappers.
+
+A release of a value whose TYPE can reach itself (computed over the
+declared type graph, cached; acyclic programs generate nothing) that
+leaves the count positive runs a synchronous Bacon-Rajan trial:
+markGray removes the subgraph's internal counts, scan/scanBlack
+restore what external references prove alive, collectWhite frees the
+rest. Runtime holds the type-blind color/count helpers (color bits
+61-62 of the ordinary header; black = 0, so nothing masks outside a
+trial; immortal composes untouched); codegen generates the four
+per-type traversals, registered-before-generated like the release
+wrappers. The exposed invariant, pinned by its own IR test: every
+traversable location now STORES before it releases (field/element
+writes, map sets, delete, festina_map_delete's C-side entry removal)
+— a stale edge would let markGray double-remove a count and free a
+value still held. The struct_self leak program closes into a real
+cycle and runs leak-free every test run; the harness canary, formerly
+a cycle, is now the #119 row-array residual — the one deliberate leak
+left. Verified under ASan: self/pair/array-routed/map-routed cycles
+reclaimed, held cycles intact; ~34ms for 20k dropped 21-node cycles.
+`tests/test_codegen.py::TestCycleCollection` (6 tests).
+
 **claude.md #119**: the last two chain shapes; ownership recorded, not
 guessed.
 

@@ -34,13 +34,18 @@ language work — the compiler and core runtime are portable C/LLVM.
 
 Automatic reclamation is escape analysis plus reference counting —
 every managed type carries the same refcount header since claude.md
-#118 gave `img`/`aud`/`regex` theirs — with `free`/`delete` as the
-manual override (claude.md #74–#83, #111, #118). What remains:
+#118 gave `img`/`aud`/`regex` theirs, and reference cycles are
+collected by trial deletion since claude.md #120 — with `free`/`delete`
+as the manual override (claude.md #74–#83, #111, #118–#120). What
+remains:
 
-- **Reference cycles leak** (`a.next = a`; constructible since
-  claude.md #106). Refcounting cannot free a cycle; the complete answer
-  is a tracing collector or weak references. Until then, break cycles
-  by hand (`child.parent = null` — verified to reclaim fully).
+- **Cycle trials are synchronous and per-release** — every
+  still-referenced release of a cycle-capable type walks the value's
+  reachable subgraph. Correct, and measured fast for ordinary object
+  graphs (20k dropped 21-node cycles in ~34 ms), but a very large,
+  heavily-aliased cyclic structure could feel it; the classic
+  deferred-root buffer is the known optimization if a real program
+  ever does.
 - **A table-row element off a call-result array leaks the array**
   (`rows()[0]` where the elements are query rows; claude.md #119
   closed every other computed-index and argument-position chain

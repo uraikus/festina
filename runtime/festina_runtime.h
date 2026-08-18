@@ -763,16 +763,14 @@ char *festina_getenv(const char *name);
  * claude.md #77: reference counting for struct/arr[T]/map[T] values
  * escape analysis (claude.md #74/#75/#76) proves DO escape their
  * declaring function -- the remainder that pure escape analysis can
- * never reach on its own. Complete (not just "handles everything but
- * cycles") for Festina specifically -- or so it was, until claude.md
- * #106 allowed `struct Node { next:Node }` and made a reference cycle
- * constructible. A cycle is now a permanent leak (see todo.md); every
- * acyclic value is still reclaimed exactly as described.
- * See festina_retain/festina_release's
- * own doc comment in festina_runtime.c for the full design (the
- * refcount header layout, the negative-refcount immortal sentinel used
- * for a global's own untouched static initial storage, and why no
- * cycle-breaking machinery is needed at all).
+ * never reach on its own. claude.md #106 allowed `struct Node
+ * { next:Node }` and made a reference cycle constructible; claude.md
+ * #120 answers it with trial deletion (the festina_cycle_* helpers
+ * below), so a garbage cycle is collected rather than leaked. See
+ * festina_retain/festina_release's own doc comment in
+ * festina_runtime.c for the full design (the refcount header layout
+ * and the negative-refcount immortal sentinel used for a global's own
+ * untouched static initial storage).
  *
  * `payload` is the pointer Festina code itself sees (past the hidden
  * header) -- both functions are always safe to call on any struct
@@ -789,6 +787,26 @@ void festina_release(void *payload);
  * release became the first in-runtime user (codegen's generated
  * per-struct wrappers call it through their own declaration). */
 int8_t festina_release_check(void *payload);
+
+/* claude.md #120: the type-blind state half of cycle collection --
+ * synchronous single-root trial deletion (Bacon-Rajan), driven by
+ * compiler-generated per-type traversal functions whenever a value of
+ * a possibly-cyclic TYPE is released but still referenced. Color state
+ * lives in bits 61-62 of the ordinary refcount header (black=0
+ * outside every trial), and every helper is null- and immortal-safe.
+ * See the block comment in festina_runtime.c. */
+int8_t festina_cycle_candidate(void *p);
+int8_t festina_cycle_begin_gray(void *p);
+void festina_cycle_dec(void *p);
+void festina_cycle_inc(void *p);
+int64_t festina_cycle_begin_scan(void *p);
+void festina_cycle_set_black(void *p);
+int8_t festina_cycle_needs_black(void *p);
+int8_t festina_cycle_begin_white(void *p);
+void festina_cycle_visit_array(void *payload, void (*fn)(void *));
+void festina_cycle_visit_map(void *payload, void (*fn)(void *));
+void festina_cycle_dispose_array(void *payload);
+void festina_cycle_dispose_map(void *payload);
 
 /*
  * claude.md #36, given its real meaning by claude.md #109: a `blob` is
