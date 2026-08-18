@@ -30,12 +30,20 @@
 > Linux CI, which is safe for this project's own code but not for
 > `shutil.which` — its internal Windows branch crashes on Python 3.12+
 > when actually running on POSIX. Fixed by patching `shutil.which`
-> itself in those four tests. What is NOT yet confirmed: that this
-> fixed state is itself green on real Windows CI — this project still
-> has no Windows/MSYS2 access, so every fix here was verified by
-> reasoning from each run's actual log output, the full Linux suite,
-> and (for the Python 3.12 bug specifically) a real 3.12.3 venv — never
-> by re-running on Windows itself. Phases 1–3 are open.
+> itself in those four tests. A third real run then found one more
+> genuine core-runtime gap the original "core is pure POSIX" audit
+> missed: `localtime_r` isn't ISO C and MinGW-w64's UCRT doesn't
+> provide it, only Microsoft's own `localtime_s` (reversed argument
+> order, different success convention) — `festina_runtime.c` now
+> branches on `#ifdef _WIN32` for that one call, the exact signature
+> read off the compiler's own error output since there is no way to
+> compile-check the Windows branch without a real MinGW toolchain.
+> What is NOT yet confirmed: that this fixed state is itself green on
+> real Windows CI — this project still has no Windows/MSYS2 access, so
+> every fix here was verified by reasoning from each run's actual log
+> output, the full Linux suite, and (for the Python 3.12 `shutil.which`
+> bug specifically) a real 3.12.3 venv — never by re-running on Windows
+> itself. Phases 1–3 are open.
 
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,
@@ -45,7 +53,7 @@ fills in an implementation. What Windows adds that macOS did not is a
 
 | Area | Platform-specific surface | Windows answer |
 |---|---|---|
-| Core runtime | `<regex.h>` — 20 call sites; everything else is portable (`clock_gettime`/`nanosleep`, `strdup`, binary-mode `fopen`, `remove`, `getenv`) | POSIX regex library (Phase 0, decision below) |
+| Core runtime | `<regex.h>` — 20 call sites; `localtime_r` — 1 call site (found by real CI, claude.md #126 — MinGW-w64's UCRT doesn't provide it); everything else is portable (`clock_gettime`/`nanosleep`, `strdup`, binary-mode `fopen`, `remove`, `getenv`) | POSIX regex library (Phase 0, decision below); `#ifdef _WIN32` to `localtime_s` (reversed args, done) |
 | Windowing/events | the 5-function seam from macos.md Phase 2b | Win32 + the Cairo image-surface blit |
 | Audio device | the 3-function seam from macos.md Phase 1 | waveOut |
 

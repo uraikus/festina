@@ -34,20 +34,28 @@
 > remains deliberately out of scope until there's an actual
 > distribution channel.
 >
-> **The offscreen-graphics claim above got its first real test and
-> initially failed** (claude.md #126): `festina_runtime_graphics.c` had
-> never actually compiled on real macOS hardware before Phase 2 swapped
+> **The offscreen-graphics claim above got two real tests and failed
+> both** (claude.md #126): `festina_runtime_graphics.c` had never
+> actually compiled on real macOS hardware before Phase 2 swapped
 > cairo-xlib for plain `cairo` (every earlier CI round skipped it as a
 > missing dependency), and the very first time it did, `#include
 > <cairo/cairo.h>` in the new windowing seam header couldn't find the
 > file — Homebrew's cairo pkg-config `-I` flag points directly into the
 > headers directory, unlike the implicit `/usr/include` search that
 > quietly made the same include style work on Linux. Fixed to the
-> portable `#include <cairo.h>`; the packaging codesign step needed
+> portable `#include <cairo.h>` — except `festina_runtime_window_mac.m`
+> turned out to have the identical line, independently, and only real
+> macOS CI compiling THAT file (nothing else does) caught it on the
+> very next run; fixed the same way. The packaging codesign step needed
 > `-f`/`--force` for the unrelated PyInstaller self-signing reason
-> above. Both fixes are one line each, verified against the real Linux
-> cairo-xlib pkg-config flags and the full suite, but not yet
-> reconfirmed by a second real macOS CI run.
+> above, and that same run found `tests/test_packaging.py`'s own
+> "prove no system Python is needed" test had replaced PATH outright
+> with a hardcoded `/usr/bin:/bin`, dropping Homebrew's bin directory
+> where `pkg-config` actually lives — invisible on Linux, where
+> pkg-config already lives in `/usr/bin`. Fixed to prepend rather than
+> replace. All fixes are one or two lines each, verified against the
+> real Linux cairo-xlib pkg-config flags and the full suite, but not
+> yet reconfirmed by a real macOS CI run that gets all the way through.
 
 A concrete, phased plan for bringing Festina to macOS. The premise
 (from [todo.md](todo.md#platforms)) holds up under audit: **porting is

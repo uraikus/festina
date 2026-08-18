@@ -758,7 +758,19 @@ char *festina_format_time(int64_t ms, const char *format) {
     if (!format) format = "%Y-%m-%d %H:%M:%S";
     time_t secs = (time_t)(ms / 1000);
     struct tm parts;
+    /* windows.md Phase 0 (claude.md #126): localtime_r is POSIX, not
+     * ISO C, and MinGW-w64's UCRT headers don't provide it -- only
+     * Microsoft's own localtime_s, which is otherwise the same
+     * thread-safe idea but reverses the argument order (tm* first,
+     * time_t* second) and reports success as 0, not a non-NULL
+     * pointer. This was the one spot the "core runtime is pure POSIX,
+     * no platform branches needed" audit missed, found by the first
+     * real Windows CI run that got far enough to compile it. */
+#ifdef _WIN32
+    if (localtime_s(&parts, &secs) != 0) return NULL;
+#else
     if (!localtime_r(&secs, &parts)) return NULL;
+#endif
     char buf[512];
     size_t n = strftime(buf, sizeof(buf), format, &parts);
     if (n == 0) return NULL;
