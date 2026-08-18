@@ -102,6 +102,7 @@ _RUNTIME_AUDIO_C = os.path.join(_RUNTIME_DIR, "festina_runtime_audio.c")
 _RUNTIME_HEADERS = [
     os.path.join(_RUNTIME_DIR, "festina_runtime.h"),
     os.path.join(_RUNTIME_DIR, "festina_runtime_internal.h"),
+    os.path.join(_RUNTIME_DIR, "festina_runtime_window.h"),  # claude.md #123
 ]
 
 _sqlite_link_cache = {}
@@ -155,10 +156,12 @@ _PKG_INSTALL_HINTS = {
     "sqlite3": "install its development package, e.g. `apt install libsqlite3-dev` "
                "on Debian/Ubuntu or `brew install sqlite` on macOS",
     "cairo-xlib": "install Cairo's and X11's development packages, e.g. "
-                  "`apt install libcairo2-dev libx11-dev` on Debian/Ubuntu, or "
-                  "`brew install cairo` on macOS (plus XQuartz to open windows "
-                  "-- see macos.md Phase 2) -- "
+                  "`apt install libcairo2-dev libx11-dev` on Debian/Ubuntu -- "
                   "needed for claude.md #37/#39's img/graphics functions",
+    # claude.md #123: darwin's own package -- plain Cairo, no X11 half
+    # (the windowing backend there is native Cocoa, not cairo-xlib).
+    "cairo": "install Cairo's development package, e.g. `brew install cairo` "
+             "on macOS -- needed for claude.md #37/#39's img/graphics functions",
     "libjpeg": "install libjpeg's development package, e.g. "
                 "`apt install libjpeg-dev` (Debian/Ubuntu) or "
                 "`brew install jpeg-turbo` (macOS)",
@@ -281,6 +284,8 @@ def _sqlite_link_flags(cc):
 # compile_file below, driven by CodeGen.uses_graphics/uses_audio from
 # festina/codegen.py). "core" has no entry here since it's unconditional
 # for every program (see _ensure_runtime_object's cc_source parameter).
+_RUNTIME_WINDOW_MAC_M = os.path.join(_RUNTIME_DIR, "festina_runtime_window_mac.m")
+
 _RUNTIME_FEATURES = {
     "graphics": {
         "source": _RUNTIME_GRAPHICS_C,
@@ -289,6 +294,11 @@ _RUNTIME_FEATURES = {
         # decoder. libjpeg rather than a heavier toolkit for the same
         # reason Xlib was picked over a GUI toolkit (claude.md #59) --
         # the smallest dependency that does the job.
+        # claude.md #123: the WINDOWING half is per-platform now (see
+        # _feature_pkgs_and_flags) -- X11, compiled inline in
+        # festina_runtime_graphics.c, on Linux; Cocoa, a separate
+        # companion object (_RUNTIME_WINDOW_MAC_M), on darwin. Cairo's
+        # drawing itself and libjpeg decoding are shared everywhere.
         "pkgs": ["cairo-xlib", "libjpeg"],
         "extra_link_flags": [],
     },
@@ -325,7 +335,33 @@ def _feature_pkgs_and_flags(name, platform_name=None):
     if name == "audio" and platform_name == "darwin":
         pkgs.remove("alsa")
         flags += ["-framework", "AudioToolbox"]
+    elif name == "graphics" and platform_name == "darwin":
+        # claude.md #123: on darwin festina_runtime_graphics.c has ZERO
+        # X11 code compiled into it (guarded `#ifndef __APPLE__`), so
+        # it needs only Cairo's own core package, not the xlib backend
+        # -- and the Cocoa windowing companion object needs the Cocoa
+        # framework, a system framework with no pkg-config file of its
+        # own.
+        pkgs.remove("cairo-xlib")
+        pkgs.append("cairo")
+        flags += ["-framework", "Cocoa"]
     return pkgs, flags
+
+
+def _feature_extra_object(cc, name, platform_name=None):
+    """claude.md #123: the one companion object a feature needs beyond
+    its own `_RUNTIME_FEATURES[name]["source"]` -- today only graphics
+    on darwin, where Cocoa cannot be compiled as part of
+    festina_runtime_graphics.c's plain C translation unit at all and so
+    lives in its own Objective-C file (_RUNTIME_WINDOW_MAC_M). Returns
+    None everywhere else. Reuses _ensure_runtime_object's own cache-by-
+    mtime machinery -- clang infers Objective-C from the .m extension
+    with no extra flag needed, so compiling it is exactly the same
+    shape as any other runtime object file."""
+    platform_name = platform_name or sys.platform
+    if name == "graphics" and platform_name == "darwin":
+        return _ensure_runtime_object(cc, "window_mac", _RUNTIME_WINDOW_MAC_M, [])
+    return None
 
 
 def _ensure_runtime_object(cc, name, source, pkg_config_packages):
@@ -370,7 +406,15 @@ def _check_feature_supported(feature, platform_name=None):
     a Mac user to `apt install libasound2-dev` for a library that does
     not exist on their OS. `platform_name` is injectable so both
     branches are unit-testable from any platform
-    (tests/test_platform.py)."""
+    (tests/test_platform.py).
+
+    `feature` here is a narrower question than "is this object file
+    linked" (see needs_graphics/wants_window in compile_file): audio
+    has no OFFSCREEN mode, so its own gate covers the whole feature,
+    but graphics does -- drawing to an image surface and saveCanvas()
+    never touches the seam at all -- so the caller only invokes the
+    "graphics" gate when a program actually opens a window
+    (gen.uses_graphics, not the broader uses_graphics_code)."""
     platform_name = platform_name or sys.platform
     if feature == "audio" and platform_name == "darwin":
         # claude.md #121: the AudioQueue backend EXISTS (compiled and
@@ -385,9 +429,28 @@ def _check_feature_supported(feature, platform_name=None):
             "hardware verification; set FESTINA_ENABLE_MACOS_AUDIO=1 "
             "to try it. Everything except aud/play() works today.",
             category="unsupported platform feature")
+    if feature == "graphics" and platform_name == "darwin":
+        # claude.md #123: the Cocoa windowing backend EXISTS (compiled
+        # and type-checked by macOS CI) but, like AudioQueue before it,
+        # has not been confirmed against a real window/mouse/keyboard
+        # on real hardware -- same gate, same override, same reason.
+        # Offscreen drawing (drawRect()+saveCanvas(), no render(), no
+        # event handlers) never reaches this check at all -- see this
+        # function's own docstring.
+        if os.environ.get("FESTINA_ENABLE_MACOS_GRAPHICS"):
+            return
+        raise CompileError(
+            "windowed graphics (render(), or an on mouseDown/mouseUp/"
+            "mouse/keyDown/keyUp/resize/close handler) is not yet "
+            "verified on macOS -- the Cocoa backend is built (macos.md "
+            "Phase 2) but awaits real-hardware verification; set "
+            "FESTINA_ENABLE_MACOS_GRAPHICS=1 to try it. Drawing to an "
+            "offscreen canvas and saveCanvas() work today with no "
+            "window involved at all.",
+            category="unsupported platform feature")
 
 
-def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio):
+def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=False):
     """Every program links core (log/fail/sqlite/regex/timers -- see
     festina_runtime.c's top comment) plus -lm (claude.md #56's
     Math.floor/ceil/round/trunc lower to libm intrinsics -- round() in
@@ -395,7 +458,20 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio):
     are). graphics/audio's object files -- and only their own
     pkg-config libs -- are added on top exactly when the compiled
     program actually uses that feature, so a program that uses neither
-    never gets -lcairo/-lX11/-lasound on cc's command line at all."""
+    never gets -lcairo/-lX11/-lasound on cc's command line at all.
+
+    `wants_window` (claude.md #123) is narrower than `uses_graphics`
+    here: it is compile_file's gen.uses_graphics (a real window will
+    actually open at runtime -- render() or an event handler), not the
+    broader "the graphics object file is needed at all" this function's
+    own `uses_graphics` parameter means (which also covers a purely
+    offscreen drawRect()+saveCanvas() program). Only `wants_window`
+    reaches _check_feature_supported's platform gate -- see that
+    function's own docstring for why offscreen drawing must never hit
+    it. The graphics object (and its companion Cocoa object on darwin,
+    which the offscreen path also needs linked -- see
+    _feature_extra_object's own comment) is still linked whenever
+    `uses_graphics` (broad) is true, gate or no gate."""
     # core needs no pkg-config package of its own beyond sqlite3 (always
     # included by _ensure_runtime_object itself).
     objects = [_ensure_runtime_object(cc, "core", _RUNTIME_C, None)]
@@ -405,10 +481,14 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio):
     for name, wants in (("graphics", uses_graphics), ("audio", uses_audio)):
         if not wants:
             continue
-        _check_feature_supported(name)
+        if name != "graphics" or wants_window:
+            _check_feature_supported(name)
         feature = _RUNTIME_FEATURES[name]
         pkgs, extra_flags = _feature_pkgs_and_flags(name)
         objects.append(_ensure_runtime_object(cc, name, feature["source"], pkgs))
+        extra_object = _feature_extra_object(cc, name)
+        if extra_object:
+            objects.append(extra_object)
         for pkg in pkgs:
             link_libs += _pkg_config("--libs", pkg)
         link_libs += extra_flags
@@ -445,7 +525,8 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
     # a canvas. gen.uses_graphics_code is the superset that also covers
     # that case.
     needs_graphics = gen.uses_graphics or gen.uses_graphics_code
-    runtime_objects, link_libs = _runtime_objects_and_link_libs(cc, needs_graphics, gen.uses_audio)
+    runtime_objects, link_libs = _runtime_objects_and_link_libs(
+        cc, needs_graphics, gen.uses_audio, wants_window=gen.uses_graphics)
 
     if llvm_backend.available():
         _compile_via_libllvm(ir, entry_path, output_path, cc, runtime_objects, link_libs)
@@ -612,9 +693,18 @@ def _doctor_report():
           "sqlite3 dev headers (required -- every Festina program has SQLite built in, claude.md #10/#28-31)",
           _PKG_INSTALL_HINTS["sqlite3"])
 
-    check(_pkg_config_has("cairo-xlib"), False,
-          "cairo-xlib dev headers (optional -- only used by graphics: drawRect, on mouseDown, img, ...)",
-          _PKG_INSTALL_HINTS["cairo-xlib"])
+    # claude.md #123: platform-aware, like audio just below -- darwin's
+    # graphics runtime carries zero X11 code (guarded `#ifndef
+    # __APPLE__`), so it needs Cairo's plain core package, not the xlib
+    # backend, and needs no X11/XQuartz dev headers at all any more.
+    if sys.platform == "darwin":
+        check(_pkg_config_has("cairo"), False,
+              "cairo dev headers (optional -- only used by graphics: drawRect, on mouseDown, img, ...)",
+              _PKG_INSTALL_HINTS["cairo"])
+    else:
+        check(_pkg_config_has("cairo-xlib"), False,
+              "cairo-xlib dev headers (optional -- only used by graphics: drawRect, on mouseDown, img, ...)",
+              _PKG_INSTALL_HINTS["cairo-xlib"])
     # claude.md #101: JPEG/MP3 decoding. Grouped with their own feature
     # rather than listed as separate tiers -- a program that uses
     # graphics needs libjpeg whether or not it happens to load a .jpg,
@@ -622,14 +712,23 @@ def _doctor_report():
     check(_pkg_config_has("libjpeg"), False,
           "libjpeg dev headers (optional -- only used by graphics: JPEG images)",
           _PKG_INSTALL_HINTS["libjpeg"])
+    if sys.platform == "darwin":
+        # claude.md #123: windowed use (render(), any event handler)
+        # additionally needs the Cocoa backend's real-hardware
+        # verification pass -- see festina/cli.py's own gate.
+        lines.append("  [   not yet       ] windowed graphics (render(), on mouseDown/.../close) -- "
+                     "the Cocoa backend is built but awaits real-hardware verification, "
+                     "macos.md Phase 2 (set FESTINA_ENABLE_MACOS_GRAPHICS=1 to try it); "
+                     "offscreen drawing + saveCanvas() work today")
 
     # macos.md Phase 0: the audio lines are platform-aware -- on macOS
     # there is no ALSA to install, and telling a Mac user to go get it
-    # would be worse than saying the true thing: the CoreAudio backend
-    # is planned (macos.md Phase 1) and everything else works today.
+    # would be worse than saying the true thing: the AudioQueue backend
+    # is built but awaits real-hardware verification (macos.md Phase 1).
     if sys.platform == "darwin":
-        lines.append("  [   not yet       ] audio (aud/.play()) -- no macOS "
-                     "backend yet; planned as macos.md Phase 1")
+        lines.append("  [   not yet       ] audio (aud/.play()) -- the AudioQueue "
+                     "backend is built but awaits real-hardware verification, "
+                     "macos.md Phase 1 (set FESTINA_ENABLE_MACOS_AUDIO=1 to try it)")
     else:
         check(_pkg_config_has("libmpg123"), False,
               "libmpg123 dev headers (optional -- only used by audio: MP3 clips)",
