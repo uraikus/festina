@@ -700,9 +700,12 @@ digits.test('room 42')                     // -> bool
 
 `flags` immediately follows the closing `/`, no space (`/pattern/flags`).
 Only `i` and `g` are accepted; any other flag letter is a compile-time
-error. `\w`/`\d`/`\s`/`\b` work as expected (glibc's `regcomp()`
-supports them as GNU extensions), but there are no capture groups,
-backreferences, or non-greedy quantifiers (POSIX ERE's own limits).
+error. `\w`/`\d`/`\s` (and their negations) and `\b` work as expected
+on every platform — the runtime expands them to portable POSIX classes
+before compiling, so they no longer depend on glibc's GNU extensions —
+but there are no capture groups, backreferences, or non-greedy
+quantifiers (POSIX ERE's own limits). Inside `[...]` a backslash is a
+literal, per POSIX.
 
 ### What `g` does, and what it doesn't
 

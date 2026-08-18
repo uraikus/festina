@@ -8510,6 +8510,47 @@ class TestRegexLiteral:
         result = compile_and_run(r"log(/\w+/gi.test('Hello'))")
         assert result.stdout.strip() == "true"
 
+    def test_gnu_class_escapes_work_on_every_platform(self, compile_and_run):
+        # claude.md #122: api.md promises \w/\d/\s/\b, which are GNU
+        # extensions -- macOS's BSD regcomp treats \s as a literal 's',
+        # caught by the first real macos-14 CI run. The runtime now
+        # expands them to POSIX classes before regcomp on EVERY
+        # platform, so this test passing on both CI jobs is the
+        # portability proof.
+        source = r"""
+        log(/a\db/.test('a5b'))
+        log(/a\db/.test('axb'))
+        log(' xy '.match(/\S+/))
+        log('12ab34'.match(/\D+/))
+        log('a1 b2'.replace(/\w\d/g, '#'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false", "xy", "ab", "# #"]
+
+    def test_word_boundary_replaces_only_the_whole_word(self, compile_and_run):
+        # \b: native in glibc, translated to BSD's [[:<:]]/[[:>:]] on
+        # darwin (claude.md #122's one per-platform difference).
+        source = r"""
+        log('a word here'.replace(/\bword\b/, 'X'))
+        log('swordfish'.replace(/\bword\b/, 'X'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["a X here", "swordfish"]
+
+    def test_escapes_inside_brackets_stay_untranslated(self, compile_and_run):
+        # POSIX (and glibc): a backslash inside [...] is a literal, so
+        # the expansion must not fire there -- and a [:class:] body's
+        # ']' must not end the bracket early. Both pinned, because the
+        # translator walks brackets itself and either mistake would be
+        # silent on Linux.
+        source = r"""
+        log('x7y'.match(/[[:digit:]]+/))
+        log(/a\.b/.test('a.b'))
+        log(/a\.b/.test('axb'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["7", "true", "false"]
+
     def test_match_returns_first_match(self, compile_and_run):
         result = compile_and_run("log('room 42, building 7'.match(/[0-9]+/))")
         assert result.stdout.strip() == "42"
@@ -9285,7 +9326,10 @@ class TestSlimBinaries:
         src = tmp_path / "main.f"
         src.write_text("aud music = 'nonexistent.wav'")
         out = tmp_path / "program"
-        cli_mod.compile_file(str(src), str(out), cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
+        from tests.conftest import compile_file_or_skip
+        compile_file_or_skip(
+            cli_mod, str(src), str(out),
+            cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
         ldd_output = self._ldd(out)
         assert "libasound" in ldd_output
         assert "libcairo" not in ldd_output
