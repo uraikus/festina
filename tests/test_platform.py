@@ -28,6 +28,25 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _KEY_NAMES_H = os.path.join(_REPO_ROOT, "runtime", "festina_key_names.h")
 
 
+def _stub_which_any(cli_mod, monkeypatch):
+    """Any _doctor_report() test that monkeypatches sys.platform to
+    "win32" while actually running on real Linux/macOS CI must not let
+    ANY of _doctor_report's several real shutil.which(...) calls
+    execute (the C compiler check, the pkg-config check, the festina-
+    on-PATH check all call it directly or via _which_any) -- shutil.which
+    has its OWN internal `sys.platform == "win32"` branch (calling into
+    the Windows-only _winapi module), which the spoofed platform string
+    triggers for real, crashing with "'NoneType' object has no
+    attribute 'NeedCurrentDirectoryForExePath'" on Python 3.12+ where
+    _winapi is None on POSIX (claude.md #126, caught by real Linux CI
+    running a newer Python than this suite happened to be developed
+    against). Patching shutil.which itself, as cli.py imported it,
+    sidesteps every call site at once, the same way other
+    cross-platform-from-Linux tests here stub out real toolchain calls
+    they have no state for."""
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda cmd: f"/fake/{cmd}")
+
+
 class TestDefaultOutputName:
     """windows.md Phase 0: the default output gains `.exe` on Windows
     -- both because the shell needs the extension and because MinGW's
@@ -90,21 +109,25 @@ class TestCorePkgs:
     everywhere except MinGW -- so this is the one core pkg-config
     ADDITION win32 needs, not a feature tier like graphics/audio."""
 
-    def test_win32_needs_libsystre(self, cli_mod):
-        # claude.md #126 INVERTED this test: the first real Windows CI
-        # run found mingw-w64-ucrt-x86_64-libgnurx conflicts with
-        # mingw-w64-ucrt-x86_64-libsystre (already pulled in
-        # transitively) and pacman silently drops the conflicting
-        # package rather than erroring -- libsystre is the POSIX
-        # regex.h provider actually present, so it's the one to ask
-        # pkg-config for.
-        assert cli_mod._core_pkgs("win32") == ["libsystre"]
+    def test_win32_needs_gnurx(self, cli_mod):
+        # claude.md #126 INVERTED this test twice. Round one: the first
+        # real Windows CI run found mingw-w64-ucrt-x86_64-libgnurx
+        # conflicts with mingw-w64-ucrt-x86_64-libsystre (already
+        # pulled in transitively) and pacman silently drops the
+        # conflicting PACKAGE rather than erroring -- libsystre is the
+        # one that's actually installed. Round two: libsystre's own
+        # pkg-config name isn't "libsystre" either -- its PKGBUILD
+        # declares Provides/Conflicts/Replaces against libgnurx (a
+        # designed drop-in replacement) and ships its pkgconfig file
+        # under that OLD name, gnurx.pc, confirmed via MSYS2's package
+        # listing. Install libsystre, ask pkg-config for gnurx.
+        assert cli_mod._core_pkgs("win32") == ["gnurx"]
 
     def test_linux_and_darwin_need_nothing_extra(self, cli_mod):
         assert cli_mod._core_pkgs("linux") == []
         assert cli_mod._core_pkgs("darwin") == []
 
-    def test_core_object_and_link_libs_pick_up_libsystre_on_windows(
+    def test_core_object_and_link_libs_pick_up_gnurx_on_windows(
             self, cli_mod, monkeypatch):
         # _runtime_objects_and_link_libs must actually pass _core_pkgs()
         # through to both the cached object's own cflags and the final
@@ -123,8 +146,8 @@ class TestCorePkgs:
         _, link_libs = cli_mod._runtime_objects_and_link_libs(
             "clang", uses_graphics=False, uses_audio=False)
 
-        assert ensure_calls[0] == ("core", ["libsystre"])
-        assert "--libsystre-libs" in link_libs
+        assert ensure_calls[0] == ("core", ["gnurx"])
+        assert "--gnurx-libs" in link_libs
 
 
 class TestLibllvmCandidatePaths:
@@ -232,6 +255,7 @@ class TestFeatureGating:
         # doctor must say so rather than naming Linux-only packages
         # (cairo-xlib, alsa) a Windows user has no way to install.
         monkeypatch.setattr(sys, "platform", "win32")
+        _stub_which_any(cli_mod, monkeypatch)
         lines, _ = cli_mod._doctor_report()
         report = "\n".join(lines)
         assert "windows.md Phase 1" in report
@@ -239,24 +263,30 @@ class TestFeatureGating:
         assert "cairo-xlib" not in report and "alsa" not in report, (
             "doctor must not tell a Windows user to install Linux packages")
 
-    def test_doctor_on_windows_reports_libsystre_as_required(
+    def test_doctor_on_windows_reports_posix_regex_as_required(
             self, cli_mod, monkeypatch):
         monkeypatch.setattr(sys, "platform", "win32")
+        _stub_which_any(cli_mod, monkeypatch)
         monkeypatch.setattr(cli_mod, "_pkg_config_has", lambda pkg: False)
         lines, all_ok = cli_mod._doctor_report()
         report = "\n".join(lines)
+        # The install hint names the real package (libsystre); the
+        # pkg-config name it's actually queried under (gnurx) is an
+        # implementation detail the report doesn't need to expose.
         assert "libsystre" in report
         assert "MISSING" in report
         assert all_ok is False
 
     def test_doctor_flags_the_plain_msys_shell_as_wrong(self, cli_mod, monkeypatch):
         monkeypatch.setattr(sys, "platform", "win32")
+        _stub_which_any(cli_mod, monkeypatch)
         monkeypatch.setenv("MSYSTEM", "MSYS")
         lines, _ = cli_mod._doctor_report()
         assert "wrong shell" in "\n".join(lines)
 
     def test_doctor_says_nothing_extra_for_ucrt64(self, cli_mod, monkeypatch):
         monkeypatch.setattr(sys, "platform", "win32")
+        _stub_which_any(cli_mod, monkeypatch)
         monkeypatch.setenv("MSYSTEM", "UCRT64")
         lines, _ = cli_mod._doctor_report()
         assert "wrong shell" not in "\n".join(lines)

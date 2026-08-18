@@ -172,20 +172,24 @@ _PKG_INSTALL_HINTS = {
             "on Debian/Ubuntu -- needed for claude.md #38's aud/loadAudio()",
     # windows.md Phase 0: the one core-runtime addition on Windows, not
     # an optional feature tier like the others above -- every program
-    # needs it, the same way every program needs sqlite3. libsystre,
-    # not libgnurx: the first real Windows CI run (claude.md #126) found
-    # that pacman drops mingw-w64-ucrt-x86_64-libgnurx from the install
-    # set because it CONFLICTS with mingw-w64-ucrt-x86_64-libsystre --
-    # already present as a transitive dependency of the UCRT64
-    # toolchain -- and silently installs neither with --noconfirm.
-    # libsystre (a POSIX regex.h/regcomp/regexec wrapper around TRE) is
-    # the package that actually ends up on the system, so it's the one
-    # cli.py should ask pkg-config for.
-    "libsystre": "install MSYS2's POSIX regex package from a UCRT64 shell, e.g. "
-                 "`pacman -S mingw-w64-ucrt-x86_64-libsystre` -- needed for "
-                 "claude.md #67/#68's regex()/.test()/.match()/.replace(), which "
-                 "every compiled program links whether it uses regex or not "
-                 "(see windows.md Phase 0)",
+    # needs it, the same way every program needs sqlite3. Two real
+    # Windows CI rounds (claude.md #126) to land on this: round one's
+    # mingw-w64-ucrt-x86_64-libgnurx genuinely installs, but pacman
+    # --noconfirm silently drops it from the install set because it
+    # CONFLICTS with mingw-w64-ucrt-x86_64-libsystre (already present
+    # as a transitive dependency of the UCRT64 toolchain) -- so the
+    # PACKAGE to install is libsystre. Round two's guess that pkg-config
+    # would also answer to that same name was wrong: libsystre's own
+    # PKGBUILD declares Provides/Conflicts/Replaces against libgnurx
+    # (it's a designed drop-in replacement, which is exactly why they
+    # conflict at all) and ships its pkgconfig file under the OLD
+    # name -- gnurx.pc, not libsystre.pc -- confirmed via MSYS2's own
+    # package listing. So: install libsystre, ask pkg-config for gnurx.
+    "gnurx": "install MSYS2's POSIX regex package from a UCRT64 shell, e.g. "
+             "`pacman -S mingw-w64-ucrt-x86_64-libsystre` -- needed for "
+             "claude.md #67/#68's regex()/.test()/.match()/.replace(), which "
+             "every compiled program links whether it uses regex or not "
+             "(see windows.md Phase 0)",
 }
 
 
@@ -343,21 +347,25 @@ def _core_pkgs(platform_name=None):
     part of libc on Linux and BSD/macOS libc alike, so core needs no
     pkg-config package of its own there. MinGW-w64 doesn't ship a POSIX
     regex implementation at all, so on win32 this pulls in a package
-    that provides one -- `libsystre`, not windows.md's originally
-    preferred `libgnurx`. The first real Windows CI run (claude.md
-    #126) found libgnurx CONFLICTS with libsystre (a POSIX regex.h/
-    regcomp/regexec wrapper around TRE) and pacman silently drops
-    libgnurx from the install set rather than erroring, since libsystre
-    is already pulled in as a transitive dependency of the UCRT64
-    toolchain -- so libsystre is what's actually on the system, and
-    the one to ask pkg-config for. windows.md's fallback for this exact
+    that provides one, discovered across two real Windows CI rounds
+    (claude.md #126): windows.md's originally preferred `libgnurx`
+    genuinely installs, but pacman drops it from the install set
+    because it CONFLICTS with `libsystre` (a POSIX regex.h/regcomp/
+    regexec wrapper around TRE, already pulled in as a transitive
+    dependency of the UCRT64 toolchain) -- so `libsystre` is the
+    package to INSTALL. But libsystre's own PKGBUILD declares
+    Provides/Conflicts/Replaces against libgnurx (it's a designed
+    drop-in replacement -- exactly why they conflict) and ships its
+    pkgconfig file under the OLD name, `gnurx.pc`, not `libsystre.pc`
+    -- so `gnurx` is the name to ask pkg-config FOR, a different string
+    than the package name entirely. windows.md's fallback for this
     kind of surprise (vendoring musl's regcomp/regexec/regfree) turned
-    out not to be needed: libsystre is a real, already-present POSIX
-    regex.h implementation, not a divergent one. Injectable
+    out not to be needed either time: gnurx is a real, already-present
+    POSIX regex.h implementation, not a divergent one. Injectable
     platform_name for the unit tests, exactly like
     _static_sqlite_attempt/_feature_pkgs_and_flags above."""
     platform_name = platform_name or sys.platform
-    return ["libsystre"] if platform_name == "win32" else []
+    return ["gnurx"] if platform_name == "win32" else []
 
 
 def _feature_pkgs_and_flags(name, platform_name=None):
@@ -549,7 +557,7 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
     `uses_graphics` (broad) is true, gate or no gate."""
     # core needs no pkg-config package of its own beyond sqlite3 (always
     # included by _ensure_runtime_object itself) on Linux/macOS;
-    # windows.md Phase 0 adds libsystre on win32 for <regex.h> -- see
+    # windows.md Phase 0 adds gnurx on win32 for <regex.h> -- see
     # _core_pkgs's own docstring.
     core_pkgs = _core_pkgs()
     objects = [_ensure_runtime_object(cc, "core", _RUNTIME_C, core_pkgs)]
@@ -794,9 +802,9 @@ def _doctor_report():
     # loop is a no-op there.
     for pkg in _core_pkgs():
         check(_pkg_config_has(pkg), True,
-              "libsystre (required on Windows -- <regex.h> isn't part of MinGW's libc, "
-              "claude.md #67/#68's regex()/.test()/.match()/.replace())",
-              _PKG_INSTALL_HINTS["libsystre"])
+              "POSIX regex (required on Windows -- <regex.h> isn't part of MinGW's "
+              "libc, claude.md #67/#68's regex()/.test()/.match()/.replace())",
+              _PKG_INSTALL_HINTS["gnurx"])
 
     # claude.md #123: platform-aware, like audio just below -- darwin's
     # graphics runtime carries zero X11 code (guarded `#ifndef

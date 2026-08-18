@@ -2727,12 +2727,16 @@ without it.
 
 windows.md Phase 0 fills the one core-runtime gap the platform seams
 paragraph above didn't yet: `<regex.h>` isn't part of MinGW-w64's libc,
-so `_core_pkgs` (win32-only; empty everywhere else) pulls in MSYS2's
-`libsystre` package via pkg-config on `festina_runtime.c`'s cflags AND
-the final link line -- not `libgnurx`, windows.md's originally
-preferred answer, which the first real Windows CI run (claude.md #126)
-found `pacman --noconfirm` silently drops due to a package conflict.
-Unlike graphics/audio, this isn't an optional
+so `_core_pkgs` (win32-only; empty everywhere else) pulls in `gnurx`
+via pkg-config on `festina_runtime.c`'s cflags AND the final link
+line -- two real Windows CI rounds (claude.md #126) to land on that
+one string: `libgnurx`, windows.md's originally preferred PACKAGE,
+installs fine but `pacman --noconfirm` silently drops it due to a
+conflict with `libsystre` (round one); `libsystre`, the package that's
+actually installed, turns out to ship its pkgconfig file under
+libgnurx's own old name, `gnurx.pc`, not `libsystre.pc` (round two) --
+so `libsystre` is what cli.py tells a user to INSTALL, `gnurx` is what
+it asks pkg-config FOR. Unlike graphics/audio, this isn't an optional
 feature tier, it's core, so `festina doctor` reports it as REQUIRED
 (like sqlite3) rather than optional. `_check_feature_supported` gives
 graphics/audio a clean "not implemented yet, windows.md Phase 1/2"
