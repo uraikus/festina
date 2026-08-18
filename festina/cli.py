@@ -573,12 +573,25 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
     broader "the graphics object file is needed at all" this function's
     own `uses_graphics` parameter means (which also covers a purely
     offscreen drawRect()+saveCanvas() program). Only `wants_window`
-    reaches _check_feature_supported's platform gate -- see that
-    function's own docstring for why offscreen drawing must never hit
-    it. The graphics object (and its companion Cocoa object on darwin,
-    which the offscreen path also needs linked -- see
-    _feature_extra_object's own comment) is still linked whenever
-    `uses_graphics` (broad) is true, gate or no gate."""
+    reaches _check_feature_supported's platform gate on platforms where
+    offscreen graphics actually links -- see that function's own
+    docstring for why offscreen drawing must never hit it there. The
+    graphics object (and its companion Cocoa object on darwin, which
+    the offscreen path also needs linked -- see _feature_extra_object's
+    own comment) is still linked whenever `uses_graphics` (broad) is
+    true, gate or no gate.
+
+    claude.md #126 round four (found by real Windows CI): that
+    exemption is itself platform-scoped, not universal. Unlike darwin,
+    Windows has no window backend at all yet -- no window_win32
+    companion object exists the way window_mac.m does -- so even an
+    OFFSCREEN-only program fails at the *linker* stage with
+    `_festina_window_open` and friends undefined, since
+    festina_runtime_graphics.c references those symbols unconditionally
+    regardless of whether a given program ever calls render() or an
+    event handler. So on win32 the graphics gate must fire even when
+    wants_window is False, unlike on darwin (offscreen genuinely works
+    there) or Linux (ungated everywhere, checked directly)."""
     # core needs no pkg-config package of its own beyond sqlite3 (always
     # included by _ensure_runtime_object itself) on Linux/macOS;
     # windows.md Phase 0 adds gnurx on win32 for <regex.h> -- see
@@ -590,10 +603,12 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
     for pkg in core_pkgs:
         link_libs += _pkg_config("--libs", pkg)
 
+    offscreen_graphics_is_gate_exempt = sys.platform != "win32"
     for name, wants in (("graphics", uses_graphics), ("audio", uses_audio)):
         if not wants:
             continue
-        if name != "graphics" or wants_window:
+        skip_gate = name == "graphics" and not wants_window and offscreen_graphics_is_gate_exempt
+        if not skip_gate:
             _check_feature_supported(name)
         feature = _RUNTIME_FEATURES[name]
         pkgs, extra_flags = _feature_pkgs_and_flags(name)
@@ -703,17 +718,40 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
     than through the cached-object-file path above, same as this
     fallback always has -- still only the sources the program actually
     needs (needs_graphics/needs_audio, from compile_file), for the same
-    binary-slimming reason."""
+    binary-slimming reason.
+
+    claude.md #126 round four: this is the path macOS CI actually runs
+    (ci.yml deliberately skips installing the libLLVM bottle there --
+    the libLLVM fast path is exercised by the Linux job only), and it
+    had never been updated for _feature_pkgs_and_flags/
+    _feature_extra_object's own per-platform darwin swaps at all -- it
+    used _RUNTIME_FEATURES[name]["pkgs"] (the Linux table) directly and
+    never linked _RUNTIME_WINDOW_MAC_M in. That was invisible as long
+    as festina_runtime_window_mac.m itself never compiled (blocked by
+    the cairo.h bugs the earlier rounds fixed); the moment it did, every
+    graphics program -- offscreen ones included, since they link the
+    same object -- failed at link time with `_festina_window_open` and
+    friends undefined, the real windowing symbols only the (never
+    linked) Cocoa companion object provides."""
     runtime_sources = [_RUNTIME_C]
     pkg_configs = ["sqlite3", *_core_pkgs()]
     extra_link_flags = []
     if needs_graphics:
         runtime_sources.append(_RUNTIME_GRAPHICS_C)
-        pkg_configs += _RUNTIME_FEATURES["graphics"]["pkgs"]
+        pkgs, flags = _feature_pkgs_and_flags("graphics")
+        pkg_configs += pkgs
+        extra_link_flags += flags
+        extra_object = _feature_extra_object(cc, "graphics")
+        if extra_object:
+            runtime_sources.append(extra_object)
     if needs_audio:
         runtime_sources.append(_RUNTIME_AUDIO_C)
-        pkg_configs += _RUNTIME_FEATURES["audio"]["pkgs"]
-        extra_link_flags.append("-pthread")
+        # -pthread comes back from _feature_pkgs_and_flags itself (the
+        # audio feature's own extra_link_flags, claude.md #38) -- no
+        # need to add it again here.
+        pkgs, flags = _feature_pkgs_and_flags("audio")
+        pkg_configs += pkgs
+        extra_link_flags += flags
     cflags = []
     for pkg in pkg_configs:
         cflags += _pkg_config("--cflags", pkg)

@@ -410,8 +410,12 @@ class TestAudioFeatureConfig:
         # wants_window parameter is the narrow question -- a program
         # that only draws to an offscreen canvas (uses_graphics_code,
         # not the real-window uses_graphics) must never hit
-        # _check_feature_supported at all, on darwin or anywhere else,
-        # since it never touches the windowing seam. Verified by
+        # _check_feature_supported at all on darwin, since it never
+        # touches the windowing seam and offscreen genuinely links
+        # there (see _feature_extra_object). claude.md #126 round five:
+        # this exemption is darwin-specific, NOT universal -- see
+        # test_offscreen_graphics_still_reaches_the_windows_gate below
+        # for the platform where it must NOT apply. Verified by
         # recording calls rather than actually linking (which needs
         # real toolchain state this test doesn't have on Linux).
         monkeypatch.setattr(sys, "platform", "darwin")
@@ -430,6 +434,37 @@ class TestAudioFeatureConfig:
         cli_mod._runtime_objects_and_link_libs(
             "clang", uses_graphics=True, uses_audio=False, wants_window=True)
         assert calls == ["graphics"], "a windowed program must hit the gate"
+
+    def test_offscreen_graphics_still_reaches_the_windows_gate(
+            self, cli_mod, monkeypatch):
+        # claude.md #126 round five, found by real Windows CI: unlike
+        # darwin, Windows has no window backend at all yet -- no
+        # window_win32 companion object exists the way window_mac.m
+        # does -- so festina_runtime_graphics.c's unconditional
+        # references to _festina_window_open and friends can never
+        # resolve at link time on win32, offscreen program or not. The
+        # darwin exemption above had accidentally been written
+        # platform-agnostic, so an offscreen program on win32 reached
+        # real pkg-config/linking code (and failed there, confusingly)
+        # instead of the same clean "windows.md Phase 2" error every
+        # other graphics use already got.
+        monkeypatch.setattr(sys, "platform", "win32")
+        calls = []
+
+        def _fake_check(name, platform_name=None):
+            calls.append(name)
+            raise cli_mod.CompileError("boom", category="unsupported platform feature")
+
+        monkeypatch.setattr(cli_mod, "_check_feature_supported", _fake_check)
+        monkeypatch.setattr(cli_mod, "_ensure_runtime_object", lambda *a, **k: "/tmp/fake.o")
+        monkeypatch.setattr(cli_mod, "_feature_extra_object", lambda *a, **k: None)
+        monkeypatch.setattr(cli_mod, "_pkg_config", lambda *a, **k: [])
+        monkeypatch.setattr(cli_mod, "_sqlite_link_flags", lambda cc: ([], False))
+
+        with pytest.raises(cli_mod.CompileError):
+            cli_mod._runtime_objects_and_link_libs(
+                "clang", uses_graphics=True, uses_audio=False, wants_window=False)
+        assert calls == ["graphics"], "the gate must actually fire for offscreen use on win32"
 
     def test_the_darwin_gate_is_overridable_for_hardware_verification(
             self, cli_mod, errors, monkeypatch):

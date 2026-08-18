@@ -1,6 +1,6 @@
 # Windows support — the plan
 
-> **Status: Phase 0 is built; four real CI rounds on the same PR, each
+> **Status: Phase 0 is built; five real CI rounds on the same PR, each
 > finding something the last one missed** (claude.md #126 has the full
 > account — this is the short version). Every Python-side toolchain
 > seam this section lists was in fact already covered by claude.md
@@ -16,20 +16,34 @@
 > UCRT — the one gap the original "core is pure POSIX" audit missed),
 > a new `festina_runtime_init()` fixing the MinGW/UCRT C runtime's
 > default text-mode stdout (which silently turns every `\n` a compiled
-> program prints into `\r\n`), and a post-link rename fixing MinGW's
+> program prints into `\r\n`), a post-link rename fixing MinGW's
 > linker appending `.exe` to an explicit `-o name` that lacks one (the
 > exact behavior `_default_output_name`'s own docstring already
 > documented, but had only ever guarded the *default*-name case, not
-> an explicit one). `_check_feature_supported` gives graphics/audio a
-> clean "not implemented yet, windows.md Phase N" error on win32
-> (unconditional, unlike macOS's real-hardware-verification gate —
-> there is no backend at all yet to unlock). What is NOT yet
-> confirmed: that this fixed state is itself green on real Windows CI
-> — this project still has no Windows/MSYS2 access, so every fix here
-> was verified by reasoning from each run's actual log output, the
-> full Linux suite, and (for one Python-version-specific test bug) a
-> real 3.12.3 venv — never by re-running on Windows itself. Phases
-> 1–3 are open.
+> an explicit one), and a fifth-round fix for offscreen graphics: the
+> "offscreen drawing never hits the platform gate" exemption (built for
+> darwin, where it's genuinely true) was accidentally universal, so an
+> offscreen-only program on win32 reached real pkg-config/linking code
+> with no window backend behind it at all instead of the clean
+> "windows.md Phase 2" error every other graphics use already got.
+> `_check_feature_supported` gives graphics/audio a clean "not
+> implemented yet, windows.md Phase N" error on win32 (unconditional,
+> unlike macOS's real-hardware-verification gate — there is no backend
+> at all yet to unlock), now genuinely unconditional for graphics too.
+> What is NOT yet confirmed: that this fixed state is itself green on
+> real Windows CI — this project still has no Windows/MSYS2 access, so
+> every fix here was verified by reasoning from each run's actual log
+> output, the full Linux suite, and (for one Python-version-specific
+> test bug) a real 3.12.3 venv — never by re-running on Windows itself.
+> Round five's log also surfaced several failures not yet diagnosed:
+> two SQLite schema-sync tests reporting a column type mismatch
+> (`'REAL'` reported back as `'INTEGER'` and similar), a timer test
+> seeing zero ticks, `test_files_demo_runs_correctly`'s output not
+> matching, two `festina doctor` path-reporting tests, and two
+> `TestMissingDependencyErrors` tests that still don't raise when
+> pkg-config/cc are hidden from PATH — all left open for the next real
+> run rather than guessed at blind (diminishing returns next to this
+> round's three confirmed, log-supported bugs). Phases 1–3 are open.
 
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,
