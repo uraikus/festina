@@ -2661,6 +2661,22 @@ carries a presence bitmask one hidden slot past its columns; an unknown
 name in undefined() fails the program.
 `tests/test_codegen.py::TestUndefinedAndNameMatchedColumns` (6 tests).
 
+**Platform seams** (macos.md / windows.md Phase 0):
+`tests/test_platform.py` tests each OS's toolchain behavior FROM every
+OS — the porting plans cut their platform differences as pure
+functions of an injectable platform name (`_default_output_name`'s
+win32 `.exe`, `_static_sqlite_attempt`'s GNU-ld-vs-ld64 strategies,
+`_platform_libllvm_paths`' brew/MSYS2 candidates), so the Linux job
+verifies the darwin and win32 branches before either port has CI
+hardware. Also there: the key-name vocabulary artifact
+(runtime/festina_key_names.h — X11 keysym names measured, not
+assumed: Page Up/Down are "Prior"/"Next", and the test pins the wart
+as the contract), binary-fidelity round trips (CRLF + NUL bytes
+through a blob — the fact that makes Windows text-mode mangling
+impossible to reintroduce silently), and skipif-gated
+TestOnMacOS/TestOnWindows exit-criteria tests that go live with each
+platform's CI job. (21 tests + 7 platform-gated.)
+
 **claude.md #120**: reference cycles collect — trial deletion in the
 release wrappers.
 

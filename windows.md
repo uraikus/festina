@@ -167,9 +167,15 @@ Linux against the pinned event vocabulary.
 
 ## Order and shared work
 
-Phase 0 is independent and can start any time (small: regex package
-decision + two Python files + CI). Phases 1 and 2 each split into
-seam-cutting (shared with macOS — done once) and the Win32/waveOut
+The full shared-work list — the seams, the key-name vocabulary, the
+test shims, the per-platform cli/llvm_backend structure, and which of
+it is already done — lives in **macos.md's "Shared work" section**,
+kept in one place so the two plans cannot drift. Sequencing from the
+Windows side: Phase 0 is independent and can start any time (small:
+regex package decision + two Python files + CI — the `.exe` naming,
+libLLVM DLL candidates, and their unit tests in
+`tests/test_platform.py` are already landed). Phases 1 and 2 each
+split into seam-cutting (shared, done once) and the Win32/waveOut
 implementations (each comparable in size to their macOS twins; the
 graphics layer is if anything simpler, being plain C with no run-loop
 inversion — Win32 message pumps compose with the existing

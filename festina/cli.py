@@ -107,11 +107,22 @@ _RUNTIME_HEADERS = [
 _sqlite_link_cache = {}
 
 
-def _default_output_name(entry_path):
+def _default_output_name(entry_path, platform_name=None):
+    """windows.md Phase 0: on Windows the default output gains `.exe` --
+    both because the shell only executes files with an executable
+    extension, and because MinGW's linker appends `.exe` itself when
+    the requested name has no suffix, so asking for `program` and then
+    running `program` would miss the `program.exe` actually written.
+    `platform_name` is injectable purely so the win32/darwin branches
+    are unit-testable from any platform (tests/test_platform.py)."""
+    platform_name = platform_name or sys.platform
     base = os.path.basename(entry_path)
     if base.endswith(".f"):
         base = base[:-2]
-    return base or "a.out"
+    base = base or "a.out"
+    if platform_name == "win32" and not base.lower().endswith(".exe"):
+        base += ".exe"
+    return base
 
 
 # claude.md #59: a missing dependency must fail with a clear, actionable
@@ -196,6 +207,31 @@ def _can_link(cc, extra_flags):
         return result.returncode == 0
 
 
+def _static_sqlite_attempt(platform_name, static_libs, libdir=None):
+    """The platform-appropriate spelling of "link libsqlite3.a, not the
+    shared library" -- extracted from _sqlite_link_flags so each
+    platform's strategy is a pure, unit-testable value
+    (tests/test_platform.py; macos.md/windows.md Phase 0).
+
+    GNU ld (Linux, and MinGW on Windows -- windows.md's toolchain
+    decision keeps this branch working there unchanged) supports the
+    `-Bstatic`/`-Bdynamic` toggles, scoping "static please" to exactly
+    the -lsqlite3 between them. macOS's ld64 rejects `-Bstatic`
+    outright (previously that just made the _can_link probe fail and
+    silently forced dynamic linking -- correct, but never static), so
+    the darwin strategy names the archive by explicit path instead,
+    from pkg-config's libdir; with no libdir there is nothing to try
+    and the answer is None (caller falls back to dynamic).
+
+    Returns the flag list to probe with _can_link, or None."""
+    other_static_libs = [lib for lib in static_libs if lib != "-lsqlite3"]
+    if platform_name == "darwin":
+        if not libdir:
+            return None
+        return [os.path.join(libdir, "libsqlite3.a"), *other_static_libs]
+    return ["-Wl,-Bstatic", "-lsqlite3", "-Wl,-Bdynamic", *other_static_libs]
+
+
 def _sqlite_link_flags(cc):
     """Prefer statically linking sqlite3 into the compiled program, so it
     doesn't need libsqlite3.so present at runtime -- falls back to a
@@ -203,17 +239,22 @@ def _sqlite_link_flags(cc):
     environment. Only sqlite3 itself is pinned static; libc/libm etc.
     stay dynamic as usual (this isn't attempting a fully static binary
     the way Go produces -- see the "real compilation, minimal setup"
-    discussion this was written for)."""
+    discussion this was written for). The static ATTEMPT is
+    per-platform (_static_sqlite_attempt above); the probe-then-fall-
+    back shape is shared."""
     if cc in _sqlite_link_cache:
         return _sqlite_link_cache[cc]
 
     cflags = _pkg_config("--cflags", "sqlite3")
     dynamic_libs = _pkg_config("--libs", "sqlite3")
     static_libs = _pkg_config("--static", "--libs", "sqlite3")
-    other_static_libs = [lib for lib in static_libs if lib != "-lsqlite3"]
+    libdir = None
+    if sys.platform == "darwin":
+        libdir_tokens = _pkg_config("--variable=libdir", "sqlite3")
+        libdir = libdir_tokens[0] if libdir_tokens else None
 
-    static_attempt = ["-Wl,-Bstatic", "-lsqlite3", "-Wl,-Bdynamic", *other_static_libs]
-    if _can_link(cc, cflags + static_attempt):
+    static_attempt = _static_sqlite_attempt(sys.platform, static_libs, libdir)
+    if static_attempt is not None and _can_link(cc, cflags + static_attempt):
         flags = (cflags + static_attempt, True)
     else:
         flags = (cflags + dynamic_libs, False)
@@ -381,7 +422,11 @@ def run_program(entry_path, cc="clang"):
     success, so `festina run x.f && ...` composes the same way a real
     compile-then-execute pair would."""
     with tempfile.TemporaryDirectory(prefix="festina-run-") as d:
-        out_path = os.path.join(d, "program")
+        # windows.md Phase 0: through _default_output_name so the temp
+        # binary is `program.exe` on Windows -- MinGW's linker appends
+        # .exe itself when the name has no suffix, and running the name
+        # we ASKED for rather than the file it WROTE would fail.
+        out_path = os.path.join(d, _default_output_name("program.f"))
         compile_file(entry_path, out_path, cc=cc)
         result = subprocess.run([out_path])
         return result.returncode

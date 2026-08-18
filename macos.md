@@ -187,6 +187,47 @@ identically to Linux against the pinned event vocabulary.
    Xcode ≥ 15 floor, and the XQuartz note for anyone on Phase-2a-era
    builds.
 
+## Shared work — cut once, both ports consume it
+
+The intersection with [windows.md](windows.md), kept here as the single
+reference list. The efficient order is this package **first** — every
+item lands and is testable on Linux alone — after which the two ports'
+platform implementations are independent and parallelizable:
+
+1. **The audio device seam** (`festina_pcm_open/write/close`) and the
+   re-seating of the white-box harness stubs at it. Both platform
+   files then use the same N-buffers-plus-semaphore blocking-push
+   design (AudioQueue / waveOut).
+2. **The windowing seam** (`window_open/close/present/client_size/
+   events_wait/events_drain` + normalized events), including the
+   decision that `present` takes the Cairo *image surface* everywhere
+   (xlib surface / CGImage / DIB are per-platform blits of one thing).
+3. **The key-name vocabulary** — `runtime/festina_key_names.h`, the
+   pinned list both mapping tables target, with
+   `tests/test_platform.py::TestKeyNameVocabulary` guarding it.
+   *(Done.)*
+4. **The `FESTINA_AUDIO_NULL` test shim** at the device seam — one
+   audio-CI mechanism for all three platforms.
+5. **The headless CI tier definition** — which suites run with no
+   display/audio device; both OS jobs consume the same selection.
+6. **The sanitizer decision** — leak tier stays Linux-only; one
+   CONTRACT.md note.
+7. **Per-platform structure refactors, filled in per port**:
+   `_RUNTIME_FEATURES` (pkgs/link flags/sources by OS),
+   `_find_libllvm` candidate paths *(done —
+   `_platform_libllvm_paths`)*, `_default_output_name` *(done)*,
+   `_static_sqlite_attempt` *(done)*, `festina doctor`'s hint table,
+   and `package_compiler.sh`'s release matrix.
+8. **Cross-platform contract tests that already run everywhere** —
+   binary-fidelity round trips and forward-slash path handling
+   (`tests/test_platform.py::TestBinaryFidelity`), plus the per-OS
+   Phase-0 exit-criteria tests (`TestOnMacOS`/`TestOnWindows`),
+   skipped until each CI job exists. *(Done.)*
+
+Not shared, despite appearances: the regex gap and `.exe` mechanics
+are Windows-only, the ld64 sqlite probe is macOS-only, and Cocoa's
+run-loop inversion has no Win32 counterpart.
+
 ## Order, size, and what is deliberately not planned
 
 Phases land independently and in order — 0 (small: two Python files, a
