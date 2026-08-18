@@ -1124,6 +1124,43 @@ void festina_sync_table(sqlite3 *db, const char *table_name,
     festina_exec(db, rename_sql);
 }
 
+/* claude.md #126 round nine: no compiled program ever explicitly
+ * closed its own database handle before this -- main() just returned
+ * and let the OS reclaim the file descriptor on process exit, which
+ * WORKS (SQLite's WAL format is specifically designed to survive an
+ * unclosed/crashed writer -- the next connection recovers it) but
+ * skips SQLite's own auto-checkpoint-on-last-close, leaving the
+ * database's actual data in the WAL file rather than the main one
+ * until something else triggers a checkpoint. That's still readable by
+ * any WAL-aware SQLite build, but real Windows CI's SQLite schema-sync
+ * tests -- a second, separate process (a plain Python sqlite3
+ * connection, not necessarily even the SAME SQLite build/version this
+ * binary statically links) reading back a schema the FIRST compiled
+ * program had just committed -- kept seeing the OLD schema, exactly
+ * the symptom an unwritten-back WAL would produce for a reader that
+ * can't or doesn't perform WAL recovery identically. Explicitly
+ * closing forces SQLite's own checkpoint, leaving the main .sqlite
+ * file itself fully caught up regardless of what reads it next.
+ *
+ * sqlite3_close() (not the _v2 form) is used deliberately: unlike
+ * _v2, which silently defers to a "zombie" close if anything is still
+ * unfinalized, plain sqlite3_close() returns SQLITE_BUSY and does
+ * NOTHING if it is -- exactly the signal needed to know finalizing the
+ * statement cache below actually worked, rather than papering over a
+ * bug in it. festina_sqlite_prepare_cached's whole point is to leave
+ * cached statements alive across many calls (never finalized during
+ * normal operation, only reset) -- so at real program shutdown, unlike
+ * any other close, every one of them needs finalizing first or this
+ * close does nothing at all. */
+void festina_db_close(sqlite3 *db) {
+    if (!db) return;
+    for (int i = 0; i < g_cached_stmt_count; i++) {
+        sqlite3_finalize(g_cached_stmts[i]);
+    }
+    g_cached_stmt_count = 0;
+    sqlite3_close(db);
+}
+
 /* ---- sqlite() queries -- claude.md #32-34 ---- */
 
 /* Kept in sync with festina/codegen.py's INT_NULL_CONST / FLOAT_NULL_CONST

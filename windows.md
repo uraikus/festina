@@ -1,6 +1,6 @@
 # Windows support — the plan
 
-> **Status: Phase 0 is built; eight real CI rounds on the same PR, each
+> **Status: Phase 0 is built; nine real CI rounds on the same PR, each
 > finding something the last one missed** (claude.md #126 has the full
 > account — this is the short version, condensed again since the
 > per-round narrative was getting long). Every Python-side toolchain
@@ -16,38 +16,58 @@
 > (the UCRT's default text-mode stdout silently turning every `\n` a
 > compiled program prints into `\r\n`), a post-link rename fixing
 > MinGW's linker appending `.exe` to an explicit `-o name` lacking one,
-> and `_check_feature_supported` now unconditionally gating graphics on
+> `_check_feature_supported` now unconditionally gating graphics on
 > win32 — offscreen included, since there is no window backend at all
 > yet for even that to link against, unlike darwin where offscreen
-> genuinely works. Round eight's own finding is the most structural:
-> `_run_tool` handed commands straight to `subprocess.run`, trusting it
-> to fail the same way `shutil.which`-based checks do when a tool is
-> hidden from PATH — but Win32's `CreateProcess` searches several
-> locations BEFORE PATH (the calling process's own directory among
-> them), so on a runner where Python is an MSYS2 UCRT64 package
-> sharing a `bin/` with pkg-config and the whole toolchain, a test that
-> only edits `PATH` never actually hid anything from an executed
-> subprocess, just from `shutil.which`. Fixed by resolving `cmd[0]`
-> through `shutil.which` explicitly before ever calling
-> `subprocess.run`, making every tool invocation PATH-only everywhere.
-> Also fixed: two doctor-test setup bugs (a fake executable missing its
-> `.exe` extension; a mocked required-package set that didn't know
-> win32's own required package differs from every other platform's)
-> and a real bug in `examples/files.f` itself — hardcoded `/tmp/...`
-> paths that a native Windows binary resolves under the current
-> drive's root, not MSYS2's own `/tmp` mapping, since a compiled
-> program never runs inside MSYS2's POSIX emulation layer at all; fixed
-> to use portable relative paths. What is NOT yet confirmed: that this
+> genuinely works — and a structural fix to `_run_tool` itself: it used
+> to hand commands straight to `subprocess.run`, trusting it to fail
+> the same way `shutil.which`-based checks do when a tool is hidden
+> from PATH, but Win32's `CreateProcess` searches several locations
+> BEFORE PATH (the calling process's own directory among them), so on
+> a runner where Python is an MSYS2 UCRT64 package sharing a `bin/`
+> with pkg-config and the whole toolchain, PATH-only test isolation
+> never actually hid anything from an executed subprocess. Fixed by
+> resolving `cmd[0]` through `shutil.which` explicitly first, which in
+> turn exposed a second, pre-existing bug that fix alone couldn't have
+> found: `tests/conftest.py`'s own `path_without` fixture symlinked
+> "still resolvable" tools under their bare logical name ("pkg-config",
+> no extension) rather than their real one, and `shutil.which`'s
+> Windows PATHEXT search only ever tries name+extension candidates,
+> never the bare name — so nothing `path_without` claimed to leave
+> resolvable actually was, on Windows, until now. Also fixed: two
+> doctor-test setup bugs (a fake executable missing its `.exe`
+> extension, then a case-sensitivity mismatch once it had one; a mocked
+> required-package set that didn't know win32's own required package
+> differs from every other platform's) and a real bug in
+> `examples/files.f` itself — hardcoded `/tmp/...` paths that a native
+> Windows binary resolves under the current drive's root, not MSYS2's
+> own `/tmp` mapping, since a compiled program never runs inside
+> MSYS2's POSIX emulation layer at all; fixed to use portable relative
+> paths. The most speculative fix so far: no compiled program had ever
+> called `sqlite3_close()`, relying on the OS to reclaim the file
+> descriptor on exit — which works, but skips SQLite's own
+> auto-checkpoint-on-last-close, and every failing schema-sync test's
+> symptom (a second process reading back a schema the first compiled
+> program just committed, seeing the OLD one) fits what an unwritten-
+> back WAL file would look like to a reader that can't or doesn't
+> perform identical WAL recovery. A new `festina_db_close()`, called
+> unconditionally at the very end of every compiled program's `main()`,
+> finalizes the statement cache (the one thing that makes this
+> non-trivial: cached prepared statements are deliberately never
+> finalized during normal operation) and then closes for real. Unlike
+> every other fix here, Linux never reproduced this bug, so there is no
+> local before/after — only that it doesn't regress anything (full
+> suite clean, and critically `scripts/leak_stress.sh` clean under real
+> ASan, including the two stress programs that hammer the exact cached-
+> statement path this finalizes). What is NOT yet confirmed: that this
 > fixed state is itself green on real Windows CI — this project still
 > has no Windows/MSYS2 access, so every fix here was verified by
 > reasoning from each run's actual log output, the full Linux suite,
 > and (for one Python-version-specific test bug) a real 3.12.3 venv —
 > never by re-running on Windows itself. Still open, left for the next
-> real run rather than guessed at blind: two SQLite schema-sync tests
-> reporting a column type/shape mismatch after a second compile+run
-> against an already-populated database (plausibly a
-> WAL-checkpoint-on-exit or cross-process-visibility difference, but
-> unconfirmed) and a timer test seeing zero ticks. Phases 1–3 are open.
+> real run: the timer test seeing zero ticks, and whether the WAL-close
+> fix actually resolved the schema-sync mismatches. Phases 1–3 are
+> open.
 
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,

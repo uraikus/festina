@@ -360,7 +360,26 @@ def path_without(tmp_path, monkeypatch):
         for name in needed - set(hidden_tools):
             found = shutil.which(name)
             if found:
-                (bin_dir / name).symlink_to(found)
+                # claude.md #126 round nine, found by real Windows CI:
+                # symlinking under the bare logical NAME ("pkg-config",
+                # no extension) left every "still resolvable" tool
+                # actually unresolvable by shutil.which on Windows --
+                # its PATHEXT search only ever tries name+ext
+                # candidates ("pkg-config.EXE", ...), never the bare
+                # name itself, so a symlink literally named "pkg-config"
+                # was invisible to it. This went unnoticed as long as
+                # festina/cli.py's own _run_tool handed commands
+                # straight to subprocess.run, which resolves executables
+                # via Win32's own broader CreateProcess search (see
+                # _run_tool's docstring) rather than shutil.which's
+                # PATH-only one -- fixing _run_tool to gate through
+                # shutil.which first (this same round) is what exposed
+                # this pre-existing fixture bug for the first time.
+                # os.path.basename(found) preserves whatever real
+                # extension `found` actually has (".exe" on Windows,
+                # none on POSIX), so the symlink's own name is exactly
+                # what shutil.which's search will look for.
+                (bin_dir / os.path.basename(found)).symlink_to(found)
         monkeypatch.setenv("PATH", str(bin_dir))
         return str(bin_dir)
     return _make

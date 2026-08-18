@@ -109,6 +109,16 @@ void festina_sync_table(sqlite3 *db, const char *table_name,
                          const char **col_names, const char **col_types,
                          int32_t ncols);
 
+/* claude.md #126 round nine: called once, unconditionally, as
+ * literally the last thing every compiled program's main() does
+ * (mirroring festina_runtime_init() at the start) -- finalizes every
+ * cached prepared statement and closes the database, forcing SQLite's
+ * own checkpoint-on-last-close rather than leaving committed data
+ * sitting in the WAL file for whatever reads it next to sort out. A
+ * NULL db (a program with no `table` declarations at all -- see
+ * @__festina_db's own default in codegen.py) is a safe no-op. */
+void festina_db_close(sqlite3 *db);
+
 /*
  * claude.md #32-34: sqlite() queries.
  *
