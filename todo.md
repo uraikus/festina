@@ -9,14 +9,15 @@ item lives in [claude.md](claude.md) (the numbered decision log) and
 Linux is the supported platform today. Porting is backend work, not
 language work — the compiler and core runtime are portable C/LLVM.
 
-- **macOS** — planned in full in [macos.md](macos.md). Toolchain
-  bring-up (Phase 0), the audio device seam with an AudioQueue backend
-  (Phase 1), and the windowing seam with a native Cocoa backend
-  (Phase 2, no XQuartz needed after all) are built and CI-compiled;
-  both the audio and windowed-graphics gates stay closed on darwin
-  (`FESTINA_ENABLE_MACOS_AUDIO=1` / `FESTINA_ENABLE_MACOS_GRAPHICS=1`
-  to try either) until verified on real hardware. Open: that
-  real-hardware verification, then Phase 3 packaging.
+- **macOS** — planned in full in [macos.md](macos.md). All four
+  phases are built: toolchain bring-up (Phase 0), the audio device
+  seam with an AudioQueue backend (Phase 1), the windowing seam with a
+  native Cocoa backend (Phase 2, no XQuartz needed after all), and
+  packaging — an ad-hoc-codesigned arm64 binary, built and smoke-tested
+  by CI on every push (Phase 3). Both the audio and windowed-graphics
+  gates stay closed on darwin (`FESTINA_ENABLE_MACOS_AUDIO=1` /
+  `FESTINA_ENABLE_MACOS_GRAPHICS=1` to try either) until verified on
+  real hardware — the one thing left.
 - **Windows** — planned in full in [windows.md](windows.md): MSYS2 /
   MinGW-w64 as the one supported toolchain (which dissolves every
   POSIX seam except `<regex.h>` — a packaged POSIX regex or vendored

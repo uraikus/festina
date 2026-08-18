@@ -15,6 +15,13 @@
 # either festina/ or the binary it produces):
 #   pip install -r requirements-build.txt
 #
+# On macOS (macos.md Phase 3) the binary is also ad-hoc codesigned
+# (`codesign -s -`) after packaging, so Gatekeeper allows running it
+# locally without prompting -- a self-signature, not an identity;
+# it proves nothing to anyone the binary is handed to. Full Developer-ID
+# signing + notarization is a distribution decision, deliberately out
+# of scope until there is an actual distribution channel to justify it.
+#
 # Usage: ./scripts/package_compiler.sh [output_dir]
 #   -> writes <output_dir>/festina (default: ./dist/festina)
 set -euo pipefail
@@ -48,5 +55,10 @@ pyinstaller \
     --add-data "$REPO_ROOT/runtime/festina_runtime_window.h:runtime" \
     --paths . \
     packaging/festina_entry.py
+
+if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+    codesign -s - "$OUT_DIR/festina"
+    echo "ad-hoc codesigned $OUT_DIR/festina"
+fi
 
 echo "wrote $OUT_DIR/festina"

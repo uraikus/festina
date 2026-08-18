@@ -2707,6 +2707,21 @@ same pattern Phase 0 established. (35 tests across
 `TestKeyNameVocabulary` combined, plus 7 platform-gated
 `TestOnMacOS`/`TestOnWindows` tests.)
 
+macos.md Phase 3 (packaging) is real CI coverage, not new pytest
+tests: `tests/test_packaging.py` already built and smoke-tested a
+packaged binary (2 tests) but pyinstaller's own opt-in,
+build-time-only status (`requirements-build.txt`, not
+`requirements-dev.txt`) meant CI never actually installed it, so that
+path had only ever been run by hand. Both CI jobs now install it and
+run `scripts/package_compiler.sh` for real as a dedicated step, then
+compile and run `examples/hello.f` with the freshly packaged binary —
+on the `macos-14` job specifically that produces and validates a real
+Apple Silicon (arm64) `festina` binary on every push, ad-hoc codesigned
+by the script's own new Darwin branch (`codesign -s -`, guarded on
+`uname -s` and on `codesign` being present) and re-verified with
+`codesign -v` in the CI step rather than trusting a zero exit code
+alone.
+
 **claude.md #120**: reference cycles collect — trial deletion in the
 release wrappers.
 
