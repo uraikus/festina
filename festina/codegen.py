@@ -938,6 +938,7 @@ class CodeGen:
 
     def _runtime_declares(self):
         return [
+            "declare void @festina_runtime_init()",
             "declare void @festina_log_int(i64)",
             "declare void @festina_log_float(double)",
             # i8, not i1 -- see the module docstring's "Null for bool"
@@ -6941,6 +6942,10 @@ class CodeGen:
         entry_func.append("}")
 
         main_lines = ["define i32 @main() {", "entry:"]
+        # windows.md Phase 0 (claude.md #126): unconditional, first
+        # thing main() does, before even the database/graphics setup
+        # below -- see festina_runtime_init's own comment for why.
+        main_lines.append("  call void @festina_runtime_init()")
         # self.uses_sqlite/self.uses_graphics are only reliably set by
         # this point because every function body (self.func_defs) and
         # every entry statement (the loop above) has already been

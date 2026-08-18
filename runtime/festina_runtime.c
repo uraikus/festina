@@ -43,6 +43,25 @@
 #include <time.h>       /* clock_gettime/nanosleep -- setTimeout/setInterval */
 #include "festina_runtime.h"
 #include "festina_runtime_internal.h"
+#ifdef _WIN32
+#include <fcntl.h> /* _O_BINARY -- festina_runtime_init's stdout/stderr fix */
+#include <io.h>    /* _setmode/_fileno -- MSVCRT/UCRT, not POSIX unistd.h */
+#endif
+
+/* windows.md Phase 0 (claude.md #126): the MinGW/UCRT C runtime opens
+ * stdout/stderr in TEXT mode by default, which silently rewrites every
+ * '\n' a program prints to '\r\n' at the point of the write -- found
+ * by real Windows CI comparing a compiled program's actual output
+ * against a plain "\n"-terminated expectation. Every other platform's
+ * libc has no such translation to begin with, so this is a no-op
+ * everywhere but win32. Called once, unconditionally, as literally the
+ * first thing every compiled program's main() does (see codegen.py). */
+void festina_runtime_init(void) {
+#ifdef _WIN32
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+#endif
+}
 
 /* ---- log() / fail() -- claude.md #41, #42 ---- */
 

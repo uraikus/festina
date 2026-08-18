@@ -2760,6 +2760,37 @@ bug-finding exercise macOS Phase 0's real hardware rounds were
 (claude.md #122). (9 new tests: `TestCorePkgs`, plus additions to
 `TestFeatureGating`/`TestAudioFeatureConfig`.)
 
+Windows Phase 0 has since run for real four times (claude.md #126),
+each finding something the last one missed. Round three found the one
+core-runtime gap the "POSIX only" audit above had missed:
+`localtime_r` is POSIX, not ISO C, and MinGW-w64's UCRT doesn't
+provide it -- only Microsoft's own `localtime_s`, which reverses the
+argument order (`tm*` first, `time_t*` second) and reports success as
+`0` rather than a non-NULL return, so `festina_format_time` gets a
+`#ifdef _WIN32` branch calling it correctly. Round four got a compiled
+program actually RUNNING on Windows for the first time, which surfaced
+two bugs no source read could have: the MinGW/UCRT CRT opens stdout in
+TEXT mode by default, independent of any `fopen` flag, silently
+rewriting every `\n` a program prints to `\r\n` -- fixed with a new
+`festina_runtime_init()` (`_setmode(_fileno(stdout), _O_BINARY)` under
+`#ifdef _WIN32`, a no-op elsewhere) that `festina/codegen.py` now
+calls unconditionally as the first statement of every generated
+`main()`, ahead of even database/graphics setup. And MinGW's linker
+appends `.exe` to a `-o` name lacking one regardless of whether that
+name was `_default_output_name`'s own choice or an explicit caller
+request -- `_default_output_name`'s docstring already said so, but the
+actual guard only ever covered the former, so an explicit `-o program`
+silently linked to `program.exe` while `compile_file` kept insisting
+`program` was the output. `_rename_if_linker_appended_exe` runs after
+linking and renames the linker's real output back to the caller's
+exact requested name, deliberately choosing not to rewrite their
+request into `.exe` instead. The same round also found that macOS's
+own `festina_runtime_window_mac.m` cairo.h fix (two paragraphs above)
+had been incomplete for an unrelated reason -- see macos.md's status
+block. Honesty note updated: real Windows CI has now compiled AND run
+programs successfully across these fixes, but a run with none of
+these four rounds' bugs left to find has not happened yet.
+
 **claude.md #120**: reference cycles collect — trial deletion in the
 release wrappers.
 

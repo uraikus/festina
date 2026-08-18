@@ -18,6 +18,14 @@
  * one exception (sqlite3* and sqlite3_stmt* appear directly below) since
  * it's a permanent, always-linked core dependency, never an optional one. */
 
+/* windows.md Phase 0 (claude.md #126): called once, unconditionally,
+ * as literally the first thing main() does in every compiled program
+ * -- currently just the Windows stdout/stderr text-mode fix (see the
+ * .c file), but the natural place for any future "before anything
+ * else runs" platform setup, so it exists even though today only one
+ * platform needs it to do anything. */
+void festina_runtime_init(void);
+
 /* claude.md #41: log() */
 void festina_log_int(int64_t v);
 void festina_log_float(double v);

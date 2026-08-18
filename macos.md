@@ -56,6 +56,21 @@
 > replace. All fixes are one or two lines each, verified against the
 > real Linux cairo-xlib pkg-config flags and the full suite, but not
 > yet reconfirmed by a real macOS CI run that gets all the way through.
+>
+> **The `festina_runtime_window_mac.m` include fix above was itself
+> incomplete** (claude.md #126, round four): the file's `#include
+> <cairo.h>` now resolved as a bare filename, but the file still
+> failed to compile, because `_feature_extra_object` — the function
+> that compiles this one Objective-C companion object — had always
+> passed it an EMPTY pkg-config package list, on every round, so it
+> never received cairo's `-I` cflags at all regardless of how the
+> `#include` was spelled. The include-spelling fix was necessary but
+> not sufficient; the real root cause was one function call away the
+> whole time. Fixed by passing `["cairo"]`, the same package
+> `festina_runtime_graphics.c` itself gets. Verified against the real
+> Linux cairo-xlib pkg-config flags and the full suite; still only real
+> macOS CI can compile this file at all, so this too awaits a run that
+> gets all the way through.
 
 A concrete, phased plan for bringing Festina to macOS. The premise
 (from [todo.md](todo.md#platforms)) holds up under audit: **porting is

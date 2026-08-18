@@ -1,49 +1,35 @@
 # Windows support — the plan
 
-> **Status: Phase 0 is built; two real CI rounds found real bugs, both
-> now fixed** (claude.md #126) — every Python-side toolchain seam this
-> section lists was in fact already covered by claude.md #39's shared
-> work (`.exe` naming, the libLLVM DLL candidates, the GNU-ld
-> static-sqlite path, `TestOnWindows`'s skipif-gated exit-criteria
-> tests). What was still missing: the regex decision, `festina
-> doctor`'s Windows-specific hints (rather than wrongly probing for
-> Linux packages like `alsa`/`cairo-xlib`), and a `windows-latest` CI
-> job via `msys2/setup-msys2`. All three landed — and the regex
-> decision took two real rounds to get right. Round one:
-> `mingw-w64-ucrt-x86_64-libgnurx`, this section's originally preferred
-> package, IS installable, but `pacman --noconfirm` silently drops it
-> because it conflicts with `mingw-w64-ucrt-x86_64-libsystre` (already
-> pulled in transitively by the rest of the UCRT64 toolchain) rather
-> than erroring — so `libsystre` is the package to install. Round two,
-> on the very next real CI run: pkg-config doesn't answer to
-> `libsystre` either — its own PKGBUILD declares `Provides`/
-> `Conflicts`/`Replaces` against `libgnurx` (a designed drop-in
-> replacement, which is why they conflict at all) and ships its
-> pkgconfig file under THAT old name, `gnurx.pc`, confirmed via MSYS2's
-> own package listing rather than guessed again. `_core_pkgs` now
-> installs `libsystre`, asks pkg-config for `gnurx`. `_check_feature_supported`
-> gives graphics/audio a clean "not implemented yet, windows.md Phase
-> N" error on win32 (unconditional, unlike macOS's real-hardware-
-> verification gate — there is no backend at all yet to unlock). That
-> same second CI run also caught a bug in round one's OWN fix: four new
-> `_doctor_report()` tests spoof `sys.platform` to `"win32"` from real
-> Linux CI, which is safe for this project's own code but not for
-> `shutil.which` — its internal Windows branch crashes on Python 3.12+
-> when actually running on POSIX. Fixed by patching `shutil.which`
-> itself in those four tests. A third real run then found one more
-> genuine core-runtime gap the original "core is pure POSIX" audit
-> missed: `localtime_r` isn't ISO C and MinGW-w64's UCRT doesn't
-> provide it, only Microsoft's own `localtime_s` (reversed argument
-> order, different success convention) — `festina_runtime.c` now
-> branches on `#ifdef _WIN32` for that one call, the exact signature
-> read off the compiler's own error output since there is no way to
-> compile-check the Windows branch without a real MinGW toolchain.
-> What is NOT yet confirmed: that this fixed state is itself green on
-> real Windows CI — this project still has no Windows/MSYS2 access, so
-> every fix here was verified by reasoning from each run's actual log
-> output, the full Linux suite, and (for the Python 3.12 `shutil.which`
-> bug specifically) a real 3.12.3 venv — never by re-running on Windows
-> itself. Phases 1–3 are open.
+> **Status: Phase 0 is built; four real CI rounds on the same PR, each
+> finding something the last one missed** (claude.md #126 has the full
+> account — this is the short version). Every Python-side toolchain
+> seam this section lists was in fact already covered by claude.md
+> #39's shared work (`.exe` naming, the libLLVM DLL candidates, the
+> GNU-ld static-sqlite path). What was still missing and has now
+> landed: the regex decision (`_core_pkgs` installs `libsystre` but
+> asks pkg-config for `gnurx` — its own PKGBUILD declares `Provides`/
+> `Conflicts`/`Replaces` against the originally-preferred `libgnurx`,
+> which is why they conflict at package-manager level and why
+> pkg-config answers to the old name instead), `festina doctor`'s
+> Windows-specific hints, a `windows-latest` CI job, a `#ifdef _WIN32`
+> branch for `localtime_r` (POSIX, not ISO C, missing from MinGW's
+> UCRT — the one gap the original "core is pure POSIX" audit missed),
+> a new `festina_runtime_init()` fixing the MinGW/UCRT C runtime's
+> default text-mode stdout (which silently turns every `\n` a compiled
+> program prints into `\r\n`), and a post-link rename fixing MinGW's
+> linker appending `.exe` to an explicit `-o name` that lacks one (the
+> exact behavior `_default_output_name`'s own docstring already
+> documented, but had only ever guarded the *default*-name case, not
+> an explicit one). `_check_feature_supported` gives graphics/audio a
+> clean "not implemented yet, windows.md Phase N" error on win32
+> (unconditional, unlike macOS's real-hardware-verification gate —
+> there is no backend at all yet to unlock). What is NOT yet
+> confirmed: that this fixed state is itself green on real Windows CI
+> — this project still has no Windows/MSYS2 access, so every fix here
+> was verified by reasoning from each run's actual log output, the
+> full Linux suite, and (for one Python-version-specific test bug) a
+> real 3.12.3 venv — never by re-running on Windows itself. Phases
+> 1–3 are open.
 
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,
@@ -107,11 +93,20 @@ whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
    matches glibc's under the existing regex test suite is what the
    NEXT real Windows run decides; nothing about that suite is
    platform-specific, so it remains the referee.
-2. **`.exe` awareness in `festina/cli.py`.** Already done before this
-   phase began — `_default_output_name` appends `.exe` on `win32` (and
-   `festina run` invokes it accordingly); everything else in the
+2. **`.exe` awareness in `festina/cli.py`.** Mostly already done before
+   this phase began — `_default_output_name` appends `.exe` on `win32`
+   (and `festina run` invokes it accordingly); everything else in the
    driver — the runtime-object cache in the temp dir, the `_can_link`
-   probe, per-feature link flags — was already path-library-clean.
+   probe, per-feature link flags — was already path-library-clean. One
+   real gap a fourth real CI round found: `_default_output_name`'s own
+   docstring already documented that MinGW's linker appends `.exe` to
+   a `-o` name that lacks one, but the actual protection only covered
+   the *default*-name case (the only caller of that function) — an
+   explicit `-o program` still silently linked to `program.exe` while
+   `compile_file` kept claiming `program` was the output.
+   `_rename_if_linker_appended_exe` now runs after linking and renames
+   the linker's real output back to the exact name the caller asked
+   for, rather than silently substituting `.exe` into their request.
 3. **`festina/llvm_backend.py` — find libLLVM's DLL.** Already done
    before this phase began — `_platform_libllvm_paths` covers the
    MSYS2 candidates (`$MSYSTEM_PREFIX`, the UCRT64/MinGW64/CLANG64
@@ -129,27 +124,43 @@ whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
    note lives in setup.md's own Windows section (todo, tracked
    separately from this phase's own scope).
 5. **CI: a `windows-latest` job via the `msys2/setup-msys2` action**,
-   built, and now run for real TWICE: runs the whole suite headless
+   built, and now run for real FOUR times: runs the whole suite headless
    the same way the macOS job does, with no `FESTINA_STRICT_DEPS`
    (audio/graphics have no Windows backend yet at all, so those tiers
    shed as skips via the same conftest mechanism, not a parallel
    test-selection list), plus compiling and running the four
    windowless examples as real `.exe`s. The sanitizer leak tier stays
-   Linux-only, same reasoning as macOS. Those two runs are what caught
+   Linux-only, same reasoning as macOS. Those four runs are what caught
    the libgnurx/libsystre package conflict, the libsystre/gnurx
-   pkg-config name mismatch, and a `shutil.which`-on-Python-3.12 crash
-   in the fix's own new tests (all claude.md #126) plus two small,
-   independent test-harness bugs from round one (non-UTF-8 locale
-   defaults on Windows corrupting a non-ASCII literal; a file-path
-   assertion breaking on a drive-letter colon) — all fixed, but a
-   THIRD real run is still what's needed to confirm this round's own
-   fixes land clean.
+   pkg-config name mismatch, a `shutil.which`-on-Python-3.12 crash in
+   the fix's own new tests, the missing `localtime_r`/`localtime_s`
+   branch, the MinGW/UCRT text-mode stdout CRLF translation, and the
+   MinGW linker appending `.exe` to an explicit `-o` name that lacked
+   one (all claude.md #126) plus two small, independent test-harness
+   bugs from round one (non-UTF-8 locale defaults on Windows corrupting
+   a non-ASCII literal; a file-path assertion breaking on a
+   drive-letter colon) — all fixed, but a FIFTH real run is still what's
+   needed to confirm this round's own fixes land clean, plus two
+   still-unexplained "DID NOT RAISE CompileError" failures
+   (`test_missing_pkg_config_gives_actionable_error`,
+   `test_missing_cc_gives_actionable_error`) noticed in round four's log
+   but not yet chased — round five will show whether they're downstream
+   of this round's fixes or a separate issue.
 6. **Filesystem semantics, verified not assumed**: already covered
    before this phase began by `tests/test_platform.py::TestBinaryFidelity`,
    which runs on every platform's CI — every runtime `fopen` is
    binary-mode (`"rb"`/`"wb"`/`"ab"`), so blobs and `save()` round-trip
    byte-identically with no CRLF hazard, and the CRT accepts the
-   forward-slash paths the examples use.
+   forward-slash paths the examples use. What that audit didn't cover,
+   because it isn't a file-open-mode property at all, is `stdout`: the
+   MinGW/UCRT CRT opens the standard streams in TEXT mode by default,
+   independently of any `fopen` flag, silently rewriting every `\n` a
+   compiled program prints to `\r\n`. Round four's first real run of a
+   compiled program on Windows caught this directly (`capfd` showed
+   `"hello from run\r\n"` against an expected plain `\n`); fixed with
+   `festina_runtime_init()` (`_setmode(_fileno(stdout), _O_BINARY)`,
+   `#ifdef _WIN32`, a no-op everywhere else), called unconditionally as
+   the first thing every compiled program's `main()` does.
 
 Exit criteria (open until a real Windows CI run happens): Windows CI
 green on the suites above; `hello.f`, `fizzbuzz.f`, `config.f`,

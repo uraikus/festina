@@ -126,6 +126,24 @@ def _default_output_name(entry_path, platform_name=None):
     return base
 
 
+def _rename_if_linker_appended_exe(output_path):
+    """windows.md Phase 0 (claude.md #126): MinGW's linker appends
+    `.exe` to a `-o` path that doesn't already end in one regardless
+    of whether that path was _default_output_name's own choice or an
+    EXPLICIT caller request -- only the former was actually accounted
+    for (that path always already ends in `.exe`, so the linker's
+    auto-append never fires). An explicit `-o program` (no suffix)
+    silently linked to `program.exe` while `compile_file` kept
+    claiming `program` was the output, so the caller's own exact
+    request should win: if the linker wrote `output_path + ".exe"`
+    instead of `output_path` itself, rename it back."""
+    if sys.platform != "win32" or output_path.lower().endswith(".exe"):
+        return
+    exe_path = output_path + ".exe"
+    if os.path.exists(exe_path) and not os.path.exists(output_path):
+        os.replace(exe_path, output_path)
+
+
 # claude.md #59: a missing dependency must fail with a clear, actionable
 # error naming it and how to get it -- not a raw exception. Centralized
 # here since every external-tool invocation in this module (pkg-config,
@@ -408,7 +426,13 @@ def _feature_extra_object(cc, name, platform_name=None):
     shape as any other runtime object file."""
     platform_name = platform_name or sys.platform
     if name == "graphics" and platform_name == "darwin":
-        return _ensure_runtime_object(cc, "window_mac", _RUNTIME_WINDOW_MAC_M, [])
+        # claude.md #126: this file #includes <cairo.h> (CGImage/cairo
+        # interop in drawRect:) same as festina_runtime_graphics.c
+        # does, so it needs cairo's own pkg-config cflags too -- an
+        # empty list here meant it silently never got them, and this
+        # translation unit is the ONE place real macOS CI could ever
+        # catch that, since nothing else on any platform compiles it.
+        return _ensure_runtime_object(cc, "window_mac", _RUNTIME_WINDOW_MAC_M, ["cairo"])
     return None
 
 
@@ -620,6 +644,7 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
         _compile_via_libllvm(ir, entry_path, output_path, cc, runtime_objects, link_libs)
     else:
         _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio, link_libs)
+    _rename_if_linker_appended_exe(output_path)
     return output_path
 
 

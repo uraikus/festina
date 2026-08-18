@@ -75,6 +75,63 @@ class TestDefaultOutputName:
         assert cli_mod._default_output_name("src/deep/game.f", "win32") == "game.exe"
 
 
+class TestRenameIfLinkerAppendedExe:
+    """claude.md #126 round four: _default_output_name's own docstring
+    already said MinGW's linker appends `.exe` to a `-o` name lacking
+    one, but the actual guard only ever covered the *default*-name
+    path (which already ends in `.exe`, so the append never fires
+    there) -- an explicit `-o program` still silently linked to
+    `program.exe` while compile_file kept insisting `program` was the
+    output. _rename_if_linker_appended_exe runs after linking and
+    restores the caller's exact requested name."""
+
+    def test_non_windows_is_always_a_no_op(self, cli_mod, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        out = tmp_path / "program"
+        (tmp_path / "program.exe").write_bytes(b"fake")
+        cli_mod._rename_if_linker_appended_exe(str(out))
+        assert not out.exists()
+        assert (tmp_path / "program.exe").exists()
+
+    def test_a_request_that_already_ends_in_exe_is_left_alone(
+            self, cli_mod, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        out = tmp_path / "program.exe"
+        out.write_bytes(b"real")
+        cli_mod._rename_if_linker_appended_exe(str(out))
+        assert out.read_bytes() == b"real"
+
+    def test_windows_renames_the_linkers_exe_back_to_the_exact_request(
+            self, cli_mod, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        out = tmp_path / "program"
+        (tmp_path / "program.exe").write_bytes(b"linked")
+        cli_mod._rename_if_linker_appended_exe(str(out))
+        assert out.read_bytes() == b"linked"
+        assert not (tmp_path / "program.exe").exists()
+
+    def test_windows_does_nothing_if_the_linker_never_appended_exe(
+            self, cli_mod, tmp_path, monkeypatch):
+        # Nothing to rename -- e.g. a caller who never actually linked.
+        monkeypatch.setattr(sys, "platform", "win32")
+        out = tmp_path / "program"
+        cli_mod._rename_if_linker_appended_exe(str(out))
+        assert not out.exists()
+        assert not (tmp_path / "program.exe").exists()
+
+    def test_windows_never_clobbers_an_existing_exact_name(
+            self, cli_mod, tmp_path, monkeypatch):
+        # Both exist -- the exact-named file already present wins, and
+        # the stray .exe is left alone rather than overwriting it.
+        monkeypatch.setattr(sys, "platform", "win32")
+        out = tmp_path / "program"
+        out.write_bytes(b"already there")
+        (tmp_path / "program.exe").write_bytes(b"linked")
+        cli_mod._rename_if_linker_appended_exe(str(out))
+        assert out.read_bytes() == b"already there"
+        assert (tmp_path / "program.exe").exists()
+
+
 class TestStaticSqliteAttempt:
     """The per-platform "link libsqlite3.a" strategy extracted from
     _sqlite_link_flags (macos.md/windows.md Phase 0). GNU ld's
@@ -327,6 +384,25 @@ class TestAudioFeatureConfig:
             self, cli_mod):
         assert cli_mod._feature_extra_object("clang", "audio", "darwin") is None
         assert cli_mod._feature_extra_object("clang", "graphics", "linux") is None
+
+    def test_the_darwin_window_backend_extra_object_gets_cairo_cflags(
+            self, cli_mod, monkeypatch):
+        # claude.md #126 round four: festina_runtime_window_mac.m
+        # #includes <cairo.h> same as festina_runtime_graphics.c does,
+        # but _feature_extra_object passed _ensure_runtime_object an
+        # EMPTY pkg-config package list on every round before this one
+        # -- the file never got cairo's -I cflags at all, regardless of
+        # how the #include was spelled, and only real macOS CI (nothing
+        # else compiles this file) could ever have caught it. Verified
+        # here by recording the exact call rather than actually
+        # compiling, which needs real macOS toolchain state this test
+        # doesn't have on Linux.
+        calls = []
+        monkeypatch.setattr(
+            cli_mod, "_ensure_runtime_object",
+            lambda cc, name, source, pkgs: calls.append((name, pkgs)) or "/tmp/fake.o")
+        cli_mod._feature_extra_object("clang", "graphics", "darwin")
+        assert calls == [("window_mac", ["cairo"])]
 
     def test_offscreen_graphics_never_reaches_the_darwin_gate(
             self, cli_mod, monkeypatch):
