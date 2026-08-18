@@ -1,5 +1,26 @@
 # Windows support — the plan
 
+> **Status: Phase 0 is built, unverified on real hardware** — every
+> Python-side toolchain seam this section lists was in fact already
+> covered by claude.md #39's shared work (`.exe` naming, the libLLVM
+> DLL candidates, the GNU-ld static-sqlite path, `TestOnWindows`'s
+> skipif-gated exit-criteria tests). What was still missing: the regex
+> decision (MSYS2's `libgnurx` package, wired into the core link line
+> as `_core_pkgs`), `festina doctor`'s Windows-specific hints (rather
+> than wrongly probing for Linux packages like `alsa`/`cairo-xlib`),
+> and a `windows-latest` CI job via `msys2/setup-msys2`. All three are
+> now in place, and `_check_feature_supported` gives graphics/audio a
+> clean "not implemented yet, windows.md Phase N" error on win32
+> (unconditional, unlike macOS's real-hardware-verification gate --
+> there is no backend at all yet to unlock). Unlike macOS, none of
+> this has run on real Windows CI even once: this project has no
+> Windows or MSYS2 access, so the `windows-latest` job is this
+> session's best-effort reading of `msys2/setup-msys2`'s documented
+> usage, not something exercised locally. Its first real run is
+> expected to surface real bugs, the same way macOS Phase 0's first
+> hardware rounds did (claude.md #122) — that is exactly what it is
+> for. Phases 1–3 are open.
+
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,
 windowing), so whichever lands first cuts them and the second only
@@ -33,49 +54,60 @@ driver dialect, no pkg-config culture, and a second CI matrix — all
 cost, no user-visible gain over shipping MinGW-built binaries (which
 are ordinary, dependency-light PE executables any Windows runs).
 
-## Phase 0 — Toolchain bring-up: core-only programs compile and run
+## Phase 0 — Toolchain bring-up: core-only programs compile and run *(built, unverified on real hardware)*
 
 Goal: `festina compile hello.f` produces a runnable `.exe` and the
 whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
 
-1. **Regex.** The one core gap. Preferred: MSYS2's POSIX regex
-   package (`mingw-w64-*-libgnurx` — the standard `regex.h`/`libregex`
-   shim for MinGW), added as a per-platform pkg/lib in cli.py's core
-   link line. Fallback, if its ERE behavior diverges from glibc's
-   under the existing regex test suite (the suite decides — it pins
-   `[0-9]+`, flags, `/g` replace-all, split-on-empty-match, and error
-   messages): vendor musl's self-contained `regcomp/regexec/regfree`
-   (~3k lines, MIT) into `runtime/`, used on Windows only. Either way
-   the language surface stays POSIX ERE everywhere, which api.md
-   already promises.
-2. **`.exe` awareness in `festina/cli.py`.** `_default_output_name`
-   appends `.exe` on `win32` (and `festina run` invokes it
-   accordingly); everything else in the driver — the runtime-object
-   cache in the temp dir, the `_can_link` probe, per-feature link
-   flags — is path-library-clean already.
-3. **`festina/llvm_backend.py` — find libLLVM's DLL.** Add MSYS2
-   candidates (`libLLVM-*.dll` on the MinGW bin path) next to the
-   existing lookup; the clang fallback (MSYS2 clang consumes the
-   generated `.ll` directly) covers the gap regardless, exactly as on
-   macOS.
-4. **`festina doctor` — Windows hints**: the one-line MSYS2 install
-   (`pacman -S mingw-w64-ucrt-x86_64-{clang,sqlite3,pkgconf,libgnurx}`),
-   detection of being in the wrong MSYS2 environment (MSYS vs
-   UCRT64), and a note that plain `cmd.exe` + MSVC is unsupported.
+1. **Regex.** The one core gap. Landed as planned: MSYS2's POSIX regex
+   package (`libgnurx` — the standard `regex.h`/`libregex` shim for
+   MinGW) is now a per-platform pkg-config addition to cli.py's core
+   link line (`_core_pkgs`, win32-only; empty everywhere else, where
+   `<regex.h>` is already part of libc). Whether libgnurx's ERE
+   behavior actually matches glibc's under the existing regex test
+   suite — the fallback this item reserves, vendoring musl's
+   `regcomp/regexec/regfree` — is exactly what the first real
+   `windows-latest` CI run decides; nothing about that suite is
+   platform-specific, so it remains the referee.
+2. **`.exe` awareness in `festina/cli.py`.** Already done before this
+   phase began — `_default_output_name` appends `.exe` on `win32` (and
+   `festina run` invokes it accordingly); everything else in the
+   driver — the runtime-object cache in the temp dir, the `_can_link`
+   probe, per-feature link flags — was already path-library-clean.
+3. **`festina/llvm_backend.py` — find libLLVM's DLL.** Already done
+   before this phase began — `_platform_libllvm_paths` covers the
+   MSYS2 candidates (`$MSYSTEM_PREFIX`, the UCRT64/MinGW64/CLANG64
+   roots); the clang fallback (MSYS2 clang consumes the generated
+   `.ll` directly) covers the gap regardless, exactly as on macOS.
+4. **`festina doctor` — Windows hints**: done. The Windows-specific
+   report lines (rather than wrongly checking for Linux packages like
+   `alsa`/`cairo-xlib`): `libgnurx` as a REQUIRED line (like sqlite3),
+   graphics/audio as "not yet implemented, windows.md Phase 1/2"
+   lines, and detection of the plain `MSYS` shell (as opposed to
+   UCRT64/MINGW64/CLANG64) via `$MSYSTEM`. The pacman one-liner
+   (`pacman -S mingw-w64-ucrt-x86_64-{clang,sqlite3,pkgconf,libgnurx}`)
+   is now that hint's actual text, and the plain `cmd.exe` + MSVC
+   note lives in setup.md's own Windows section (todo, tracked
+   separately from this phase's own scope).
 5. **CI: a `windows-latest` job via the `msys2/setup-msys2` action**,
-   running everything headless: full lexer/parser/semantic/IR suites,
-   compile_and_run for core/sqlite/timers/regex/text/blob, and the
-   offscreen graphics suite once Phase 2's cairo package is in
-   (`saveCanvas` needs no window on any platform). The
-   sanitizer leak tier stays Linux-only, same reasoning as macOS.
-6. **Filesystem semantics, verified not assumed**: every runtime
-   `fopen` is already binary-mode (`"rb"`/`"wb"`/`"ab"` — checked), so
-   blobs and `save()` round-trip byte-identically with no CRLF
-   hazard; the CRT accepts the forward-slash paths the examples use.
-   One test pins each of those two facts on the Windows job.
+   done: runs the whole suite headless the same way the macOS job
+   does, with no `FESTINA_STRICT_DEPS` (audio/graphics have no
+   Windows backend yet at all, so those tiers shed as skips via the
+   same conftest mechanism, not a parallel test-selection list), plus
+   compiling and running the four windowless examples as real `.exe`s.
+   The sanitizer leak tier stays Linux-only, same reasoning as macOS.
+   Unlike the macOS job's history, this has never actually run on real
+   Windows — see the status note at the top of this file.
+6. **Filesystem semantics, verified not assumed**: already covered
+   before this phase began by `tests/test_platform.py::TestBinaryFidelity`,
+   which runs on every platform's CI — every runtime `fopen` is
+   binary-mode (`"rb"`/`"wb"`/`"ab"`), so blobs and `save()` round-trip
+   byte-identically with no CRLF hazard, and the CRT accepts the
+   forward-slash paths the examples use.
 
-Exit criteria: Windows CI green on the suites above; `hello.f`,
-`fizzbuzz.f`, `config.f`, `files.f` run natively as `.exe`s.
+Exit criteria (open until a real Windows CI run happens): Windows CI
+green on the suites above; `hello.f`, `fizzbuzz.f`, `config.f`,
+`files.f` run natively as `.exe`s.
 
 ## Phase 1 — Audio: the shared device seam, then waveOut
 
@@ -171,14 +203,16 @@ The full shared-work list — the seams, the key-name vocabulary, the
 test shims, the per-platform cli/llvm_backend structure, and which of
 it is already done — lives in **macos.md's "Shared work" section**,
 kept in one place so the two plans cannot drift. Sequencing from the
-Windows side: Phase 0 is independent and can start any time (small:
-regex package decision + two Python files + CI — the `.exe` naming,
-libLLVM DLL candidates, and their unit tests in
-`tests/test_platform.py` are already landed). Phases 1 and 2 each
-split into seam-cutting (shared, done once) and the Win32/waveOut
+Windows side: Phase 0 is done (small, as expected: the regex package
+decision plus doctor hints and a CI job — the `.exe` naming and
+libLLVM DLL candidates were already landed by claude.md #39, before
+this phase even began). Phases 1 and 2 each split into seam-cutting
+(shared with macOS, already done — both seams exist and have a Linux
++ macOS implementation apiece) and the still-open Win32/waveOut
 implementations (each comparable in size to their macOS twins; the
 graphics layer is if anything simpler, being plain C with no run-loop
 inversion — Win32 message pumps compose with the existing
 block-with-timeout loop directly). Phase 3 is small. The regex
-decision is the only Phase 0 item with real uncertainty, and the
-existing regex suite — not judgement — settles it.
+decision is the only Phase 0 item with real uncertainty left, and
+it's not yet settled: the existing regex suite is the referee, but
+only a real Windows CI run can put the question to it.

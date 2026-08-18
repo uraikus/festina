@@ -2722,6 +2722,34 @@ by the script's own new Darwin branch (`codesign -s -`, guarded on
 `codesign -v` in the CI step rather than trusting a zero exit code
 alone.
 
+windows.md Phase 0 fills the one core-runtime gap the platform seams
+paragraph above didn't yet: `<regex.h>` isn't part of MinGW-w64's libc,
+so `_core_pkgs` (win32-only; empty everywhere else) pulls in MSYS2's
+`libgnurx` package via pkg-config on `festina_runtime.c`'s cflags AND
+the final link line -- unlike graphics/audio, this isn't an optional
+feature tier, it's core, so `festina doctor` reports it as REQUIRED
+(like sqlite3) rather than optional. `_check_feature_supported` gives
+graphics/audio a clean "not implemented yet, windows.md Phase 1/2"
+CompileError on win32, the same `category="unsupported platform
+feature"` the darwin gates use, and the SAME conftest skip mechanism
+macOS Phase 0 built picks it up automatically -- no new test-skip
+logic needed for a third platform, which is the whole point of that
+mechanism being written generically the first time. `festina doctor`
+also gets a `$MSYSTEM` check: `MSYS` (the plain POSIX-emulation shell)
+is flagged as the wrong environment, since only its UCRT64/MINGW64/
+CLANG64 subsystems produce the ordinary Windows PE executables
+windows.md's toolchain decision is about. A `windows-latest` CI job
+(`msys2/setup-msys2`, UCRT64) runs the whole suite the same shape as
+the macOS job, with no `FESTINA_STRICT_DEPS` since audio/graphics have
+no Windows backend at all yet. Honesty note pinned in windows.md's own
+status block: unlike every macOS claim in this file, NONE of this has
+run on real Windows even once -- this project has no Windows/MSYS2
+access, so the CI job is a best-effort reading of documented usage,
+and its first real run is expected to be exactly the kind of
+bug-finding exercise macOS Phase 0's real hardware rounds were
+(claude.md #122). (9 new tests: `TestCorePkgs`, plus additions to
+`TestFeatureGating`/`TestAudioFeatureConfig`.)
+
 **claude.md #120**: reference cycles collect — trial deletion in the
 release wrappers.
 

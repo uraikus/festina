@@ -1,16 +1,19 @@
-# CI for the compiler and runtime -- and macos.md Phase 0's exit
-# criterion made mechanical: the macOS job runs the WHOLE suite and
-# relies on the conftest missing-dependency skip to shed exactly the
-# tiers that platform doesn't have yet, while the Linux job sets
-# FESTINA_STRICT_DEPS=1 so those same skips are forbidden where every
-# dependency is expected -- coverage cannot silently shrink on the
-# primary platform. The sanitizer leak tier runs only on Linux by the
-# plans' standing decision (LeakSanitizer is unreliable on darwin).
-# Audio (Phase 1) and windowed graphics (Phase 2) backends are both
+# CI for the compiler and runtime -- and macos.md/windows.md Phase 0's
+# exit criterion made mechanical: the macOS and Windows jobs each run
+# the WHOLE suite and rely on the conftest missing-dependency skip to
+# shed exactly the tiers that platform doesn't have yet, while the
+# Linux job sets FESTINA_STRICT_DEPS=1 so those same skips are
+# forbidden where every dependency is expected -- coverage cannot
+# silently shrink on the primary platform. The sanitizer leak tier
+# runs only on Linux by the plans' standing decision (LeakSanitizer is
+# unreliable on darwin, and simply unavailable under MinGW). macOS's
+# audio (Phase 1) and windowed graphics (Phase 2) backends are both
 # built and compiled/type-checked here on every push, but stay behind
 # their own real-hardware-verification env vars (FESTINA_ENABLE_MACOS_
-# AUDIO/GRAPHICS) until confirmed on a real Mac, so the conftest skip
-# still sheds those two tiers' end-to-end runs.
+# AUDIO/GRAPHICS) until confirmed on a real Mac; Windows has no audio
+# or graphics backend in the runtime at all yet (windows.md Phases
+# 1-2 are still open), so those tiers shed as skips there too, for a
+# different and more literal reason.
 name: CI
 
 on:
@@ -122,3 +125,48 @@ jobs:
           codesign -v /tmp/festina-dist/festina
           /tmp/festina-dist/festina compile examples/hello.f -o /tmp/festina-dist/hello
           /tmp/festina-dist/hello
+
+  windows:
+    # windows.md Phase 0. MSYS2's UCRT64 environment is the one
+    # supported toolchain (windows.md's own toolchain decision --
+    # MSVC is explicitly out of scope). Python, clang, sqlite3,
+    # pkg-config and libgnurx all come from that one MSYS2 environment
+    # rather than mixing a native Windows Python with MSYS2's C
+    # toolchain, so there's exactly one PATH to reason about. This is
+    # the first real run of any of this on real Windows; expect it to
+    # surface real bugs the way macOS Phase 0's first hardware rounds
+    # did (claude.md #122) -- that is what this job is for. Audio and
+    # windowed graphics (windows.md Phases 1-2) have no backend in the
+    # runtime yet at all, so those tiers shed as skips via the same
+    # conftest mechanism macOS Phase 0 built -- no parallel
+    # test-selection list, same as the macOS job above.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-pip
+            mingw-w64-ucrt-x86_64-sqlite3
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-libgnurx
+      - name: Install Python test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run the test suite
+        run: python -m pytest tests/ -q
+      - name: Compile and run the core examples
+        # windows.md Phase 0's exit criteria, verbatim: the four
+        # windowless examples build and run natively as .exe.
+        run: |
+          for ex in hello fizzbuzz config files; do
+            python -m festina.cli compile "examples/$ex.f" -o "/tmp/$ex.exe"
+            "/tmp/$ex.exe"
+          done

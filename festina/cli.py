@@ -170,6 +170,14 @@ _PKG_INSTALL_HINTS = {
                   "`brew install mpg123` (macOS)",
     "alsa": "install ALSA's development package, e.g. `apt install libasound2-dev` "
             "on Debian/Ubuntu -- needed for claude.md #38's aud/loadAudio()",
+    # windows.md Phase 0: the one core-runtime addition on Windows, not
+    # an optional feature tier like the others above -- every program
+    # needs it, the same way every program needs sqlite3.
+    "libgnurx": "install MSYS2's POSIX regex package from a UCRT64 shell, e.g. "
+                "`pacman -S mingw-w64-ucrt-x86_64-libgnurx` -- needed for "
+                "claude.md #67/#68's regex()/.test()/.match()/.replace(), which "
+                "every compiled program links whether it uses regex or not "
+                "(see windows.md Phase 0)",
 }
 
 
@@ -320,6 +328,25 @@ _RUNTIME_FEATURES = {
 }
 
 
+def _core_pkgs(platform_name=None):
+    """windows.md Phase 0: the one core-runtime dependency ADDITION on
+    Windows. `<regex.h>` (festina_runtime.c's regex()/`.test()`/etc,
+    linked into every program -- see that file's own top comment) is
+    part of libc on Linux and BSD/macOS libc alike, so core needs no
+    pkg-config package of its own there. MinGW-w64 doesn't ship a POSIX
+    regex implementation at all, so on win32 this pulls in MSYS2's
+    `mingw-w64-*-libgnurx` package (the standard regex.h/libregex shim
+    for MinGW, windows.md's own preferred answer) -- the fallback named
+    there (vendoring musl's regcomp/regexec/regfree) only becomes
+    necessary if a real Windows CI run finds libgnurx's ERE behavior
+    diverging from glibc's under the existing regex suite; nothing
+    about that suite is platform-specific, so it is the referee either
+    way. Injectable platform_name for the unit tests, exactly like
+    _static_sqlite_attempt/_feature_pkgs_and_flags above."""
+    platform_name = platform_name or sys.platform
+    return ["libgnurx"] if platform_name == "win32" else []
+
+
 def _feature_pkgs_and_flags(name, platform_name=None):
     """claude.md #121 / macos.md Phase 1: a feature's pkg-config
     packages and extra link flags, per platform. The table above holds
@@ -400,13 +427,21 @@ def _ensure_runtime_object(cc, name, source, pkg_config_packages):
 
 
 def _check_feature_supported(feature, platform_name=None):
-    """macos.md Phase 0: a feature whose backend does not exist yet on
-    this platform fails with a message that says exactly that -- and
-    where the work is planned -- instead of a pkg-config error telling
-    a Mac user to `apt install libasound2-dev` for a library that does
-    not exist on their OS. `platform_name` is injectable so both
-    branches are unit-testable from any platform
-    (tests/test_platform.py).
+    """macos.md/windows.md Phase 0: a feature whose backend does not
+    exist yet on this platform fails with a message that says exactly
+    that -- and where the work is planned -- instead of a pkg-config
+    error telling a Mac or Windows user to install a library that does
+    not exist on their OS. `platform_name` is injectable so every
+    branch is unit-testable from any platform (tests/test_platform.py).
+
+    Two different shades of "not supported" live here, both raising the
+    same category so the conftest skip picks up either uniformly: the
+    darwin branches gate a backend that EXISTS (built, CI-compiled)
+    but awaits real-hardware verification, overridable via an env var
+    for exactly that verification; the win32 branches gate a backend
+    that does not exist in the runtime AT ALL yet (windows.md Phases
+    1-2 are still open), so they raise unconditionally -- there is
+    nothing to unlock.
 
     `feature` here is a narrower question than "is this object file
     linked" (see needs_graphics/wants_window in compile_file): audio
@@ -429,6 +464,17 @@ def _check_feature_supported(feature, platform_name=None):
             "hardware verification; set FESTINA_ENABLE_MACOS_AUDIO=1 "
             "to try it. Everything except aud/play() works today.",
             category="unsupported platform feature")
+    if feature == "audio" and platform_name == "win32":
+        # windows.md Phase 1: unlike the darwin case above, there is no
+        # waveOut backend in the runtime yet at all -- no env var to
+        # unlock, because there is nothing built yet to unlock. This
+        # becomes the same real-hardware-verification gate the darwin
+        # branch above uses once Phase 1 lands.
+        raise CompileError(
+            "audio is not yet implemented on Windows -- planned as "
+            "windows.md Phase 1 (waveOut). Everything except aud/play() "
+            "works today.",
+            category="unsupported platform feature")
     if feature == "graphics" and platform_name == "darwin":
         # claude.md #123: the Cocoa windowing backend EXISTS (compiled
         # and type-checked by macOS CI) but, like AudioQueue before it,
@@ -447,6 +493,22 @@ def _check_feature_supported(feature, platform_name=None):
             "FESTINA_ENABLE_MACOS_GRAPHICS=1 to try it. Drawing to an "
             "offscreen canvas and saveCanvas() work today with no "
             "window involved at all.",
+            category="unsupported platform feature")
+    if feature == "graphics" and platform_name == "win32":
+        # windows.md Phase 2: same "nothing built yet" honesty as the
+        # audio branch above -- no Win32 windowing backend exists in
+        # the runtime yet, so this fires unconditionally rather than
+        # gating a real backend behind an env var. Offscreen drawing
+        # never reaches this at all -- see this function's own
+        # docstring (the "graphics" question here is always the narrow,
+        # window-opening one).
+        raise CompileError(
+            "windowed graphics (render(), or an on mouseDown/mouseUp/"
+            "mouse/keyDown/keyUp/resize/close handler) is not yet "
+            "implemented on Windows -- planned as windows.md Phase 2 "
+            "(Win32 + the shared Cairo blit). Drawing to an offscreen "
+            "canvas and saveCanvas() work today with no window "
+            "involved at all.",
             category="unsupported platform feature")
 
 
@@ -473,10 +535,15 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
     _feature_extra_object's own comment) is still linked whenever
     `uses_graphics` (broad) is true, gate or no gate."""
     # core needs no pkg-config package of its own beyond sqlite3 (always
-    # included by _ensure_runtime_object itself).
-    objects = [_ensure_runtime_object(cc, "core", _RUNTIME_C, None)]
+    # included by _ensure_runtime_object itself) on Linux/macOS;
+    # windows.md Phase 0 adds libgnurx on win32 for <regex.h> -- see
+    # _core_pkgs's own docstring.
+    core_pkgs = _core_pkgs()
+    objects = [_ensure_runtime_object(cc, "core", _RUNTIME_C, core_pkgs)]
     sqlite_link_flags, _ = _sqlite_link_flags(cc)
     link_libs = [*sqlite_link_flags, "-lm"]
+    for pkg in core_pkgs:
+        link_libs += _pkg_config("--libs", pkg)
 
     for name, wants in (("graphics", uses_graphics), ("audio", uses_audio)):
         if not wants:
@@ -592,7 +659,7 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
     needs (needs_graphics/needs_audio, from compile_file), for the same
     binary-slimming reason."""
     runtime_sources = [_RUNTIME_C]
-    pkg_configs = ["sqlite3"]
+    pkg_configs = ["sqlite3", *_core_pkgs()]
     extra_link_flags = []
     if needs_graphics:
         runtime_sources.append(_RUNTIME_GRAPHICS_C)
@@ -684,6 +751,20 @@ def _doctor_report():
           f"C compiler ({cc_name} at {cc_path})" if cc_name else "C compiler (clang, gcc, or cc)",
           "install one, e.g. `apt install clang` on Debian/Ubuntu, or `brew install llvm` on macOS -- see setup.md")
 
+    if sys.platform == "win32" and os.environ.get("MSYSTEM") == "MSYS":
+        # windows.md Phase 0 item 4: `MSYSTEM=MSYS` is the plain
+        # POSIX-emulation shell itself, not one of MSYS2's MinGW-w64
+        # subsystems -- clang/gcc there (if present at all) produce
+        # binaries linked against MSYS2's own runtime DLL, not the
+        # ordinary Windows PE executables windows.md's toolchain
+        # decision is about. Only fires when MSYSTEM is actually set to
+        # the wrong value; unset (not running inside an MSYS2 shell at
+        # all) is a different situation doctor has nothing extra to say
+        # about.
+        lines.append("  [   wrong shell   ] MSYS2 environment is MSYS, not UCRT64/MINGW64/CLANG64")
+        lines.append(f"  {'':19} -> run from a UCRT64 shell instead -- look for \"UCRT64\" in your "
+                      f"terminal's title/prompt, or launch \"MSYS2 UCRT64\" from the Start menu")
+
     pkgconf_path = shutil.which("pkg-config")
     check(pkgconf_path is not None, True,
           f"pkg-config (at {pkgconf_path})" if pkgconf_path else "pkg-config",
@@ -693,25 +774,47 @@ def _doctor_report():
           "sqlite3 dev headers (required -- every Festina program has SQLite built in, claude.md #10/#28-31)",
           _PKG_INSTALL_HINTS["sqlite3"])
 
+    # windows.md Phase 0: also required, like sqlite3 just above -- not
+    # an optional feature tier at all, since festina_runtime.c's regex
+    # support is unconditional core (see _core_pkgs). Empty on every
+    # other platform, where <regex.h> is already part of libc, so the
+    # loop is a no-op there.
+    for pkg in _core_pkgs():
+        check(_pkg_config_has(pkg), True,
+              "libgnurx (required on Windows -- <regex.h> isn't part of MinGW's libc, "
+              "claude.md #67/#68's regex()/.test()/.match()/.replace())",
+              _PKG_INSTALL_HINTS["libgnurx"])
+
     # claude.md #123: platform-aware, like audio just below -- darwin's
     # graphics runtime carries zero X11 code (guarded `#ifndef
     # __APPLE__`), so it needs Cairo's plain core package, not the xlib
     # backend, and needs no X11/XQuartz dev headers at all any more.
+    # windows.md Phase 2 (Win32 windowing) doesn't exist in the runtime
+    # yet at all, unlike macOS's Cocoa backend -- so unlike the darwin
+    # "not yet" lines below, there is no real dependency to probe for
+    # here yet either; the true statement is simply that the feature
+    # isn't built.
     if sys.platform == "darwin":
         check(_pkg_config_has("cairo"), False,
               "cairo dev headers (optional -- only used by graphics: drawRect, on mouseDown, img, ...)",
               _PKG_INSTALL_HINTS["cairo"])
+    elif sys.platform == "win32":
+        lines.append("  [   not yet       ] graphics (drawRect, on mouseDown, img, ...) -- "
+                     "no Windows backend yet, planned as windows.md Phase 2")
     else:
         check(_pkg_config_has("cairo-xlib"), False,
               "cairo-xlib dev headers (optional -- only used by graphics: drawRect, on mouseDown, img, ...)",
               _PKG_INSTALL_HINTS["cairo-xlib"])
-    # claude.md #101: JPEG/MP3 decoding. Grouped with their own feature
-    # rather than listed as separate tiers -- a program that uses
-    # graphics needs libjpeg whether or not it happens to load a .jpg,
-    # since the whole translation unit is compiled either way.
-    check(_pkg_config_has("libjpeg"), False,
-          "libjpeg dev headers (optional -- only used by graphics: JPEG images)",
-          _PKG_INSTALL_HINTS["libjpeg"])
+    if sys.platform != "win32":
+        # claude.md #101: JPEG/MP3 decoding. Grouped with their own
+        # feature rather than listed as separate tiers -- a program
+        # that uses graphics needs libjpeg whether or not it happens
+        # to load a .jpg, since the whole translation unit is compiled
+        # either way. Skipped on win32 above with the rest of graphics,
+        # since there's no graphics translation unit there to need it.
+        check(_pkg_config_has("libjpeg"), False,
+              "libjpeg dev headers (optional -- only used by graphics: JPEG images)",
+              _PKG_INSTALL_HINTS["libjpeg"])
     if sys.platform == "darwin":
         # claude.md #123: windowed use (render(), any event handler)
         # additionally needs the Cocoa backend's real-hardware
@@ -725,10 +828,17 @@ def _doctor_report():
     # there is no ALSA to install, and telling a Mac user to go get it
     # would be worse than saying the true thing: the AudioQueue backend
     # is built but awaits real-hardware verification (macos.md Phase 1).
+    # windows.md Phase 1 (waveOut) doesn't exist in the runtime yet
+    # either -- same "not yet" honesty as graphics above, not audio's
+    # own real-hardware-verification gate, since there's no backend to
+    # gate at all yet.
     if sys.platform == "darwin":
         lines.append("  [   not yet       ] audio (aud/.play()) -- the AudioQueue "
                      "backend is built but awaits real-hardware verification, "
                      "macos.md Phase 1 (set FESTINA_ENABLE_MACOS_AUDIO=1 to try it)")
+    elif sys.platform == "win32":
+        lines.append("  [   not yet       ] audio (aud/.play()) -- "
+                     "no Windows backend yet, planned as windows.md Phase 1")
     else:
         check(_pkg_config_has("libmpg123"), False,
               "libmpg123 dev headers (optional -- only used by audio: MP3 clips)",

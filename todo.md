@@ -18,12 +18,17 @@ language work — the compiler and core runtime are portable C/LLVM.
   gates stay closed on darwin (`FESTINA_ENABLE_MACOS_AUDIO=1` /
   `FESTINA_ENABLE_MACOS_GRAPHICS=1` to try either) until verified on
   real hardware — the one thing left.
-- **Windows** — planned in full in [windows.md](windows.md): MSYS2 /
-  MinGW-w64 as the one supported toolchain (which dissolves every
-  POSIX seam except `<regex.h>` — a packaged POSIX regex or vendored
-  musl regex, decided by the existing test suite), then the same two
-  backend seams macos.md cuts, implemented as waveOut and Win32 +
-  the shared Cairo blit, then packaging and the DLL story.
+- **Windows** — planned in full in [windows.md](windows.md). Phase 0
+  (toolchain bring-up) is built: MSYS2/MinGW-w64 as the one supported
+  toolchain, the regex core gap filled by MSYS2's `libgnurx` package,
+  `festina doctor`'s Windows hints, and a `windows-latest` CI job.
+  Unlike macOS, none of it has run on real Windows even once yet — this
+  project has no Windows/MSYS2 access, so that first CI run (once one
+  happens) is expected to surface real bugs the way macOS Phase 0's
+  hardware rounds did. Open: that first real run, then the same two
+  backend seams macos.md already cut (audio, windowing) implemented as
+  waveOut and Win32 + the shared Cairo blit (Phases 1–2), then
+  packaging and the DLL story (Phase 3).
 - **Static sqlite3 linking** for fully self-contained binaries — see
   [setup.md](setup.md#static-linking-sqlite3).
 
