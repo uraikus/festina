@@ -29,7 +29,9 @@ not a replacement path that could regress anything.
 """
 import ctypes
 import ctypes.util
+import os
 import platform
+import sys
 
 # Reloc mode: LLVMRelocPIC. Needed to match this system's PIE-by-default
 # linking -- LLVMRelocDefault (0) produces relocations `ld` rejects when
@@ -57,10 +59,41 @@ class LLVMBackendError(Exception):
     pass
 
 
+def _platform_libllvm_paths(platform_name=None, environ=None):
+    """Explicit per-platform locations ctypes.util.find_library cannot
+    discover on its own -- macos.md/windows.md Phase 0. Homebrew's LLVM
+    is keg-only (never on the default dyld search path), and MSYS2's
+    DLLs live under the active MinGW environment's bin directory (named
+    by $MSYSTEM_PREFIX inside an MSYS2 shell) or the stock install
+    roots. Pure function of its inputs so each platform's list is
+    unit-testable from any platform (tests/test_platform.py); on Linux
+    find_library alone already works, so the list is empty."""
+    platform_name = platform_name or sys.platform
+    environ = os.environ if environ is None else environ
+    if platform_name == "darwin":
+        return [
+            "/opt/homebrew/opt/llvm/lib/libLLVM.dylib",   # arm64 brew
+            "/usr/local/opt/llvm/lib/libLLVM.dylib",      # x86_64 brew
+        ]
+    if platform_name == "win32":
+        roots = [environ.get("MSYSTEM_PREFIX"),
+                 r"C:\msys64\ucrt64", r"C:\msys64\mingw64", r"C:\msys64\clang64"]
+        paths = []
+        for root in roots:
+            if not root:
+                continue
+            paths.append(os.path.join(root, "bin", "libLLVM.dll"))
+            paths.extend(os.path.join(root, "bin", f"libLLVM-{v}.dll")
+                         for v in range(20, 12, -1))
+        return paths
+    return []
+
+
 def _find_libllvm():
     name = ctypes.util.find_library("LLVM")
     candidates = [name] if name else []
     candidates += [ctypes.util.find_library(f"LLVM-{v}") for v in range(20, 12, -1)]
+    candidates += _platform_libllvm_paths()
     for candidate in candidates:
         if not candidate:
             continue

@@ -1401,6 +1401,94 @@ typedef struct {
  * it used to carry -- retain/release/free on one are all no-ops through
  * the exact same check every other immortal value already goes
  * through. */
+/* claude.md #122 / macos.md Phase 0's first real-hardware finding:
+ * `\w`/`\d`/`\s`/`\b` are GNU extensions of glibc's regcomp(), and
+ * api.md promises them -- but macOS's BSD libc silently treats `\s` as
+ * a literal 's', so /\s+/ matched nothing and three regex tests failed
+ * on the first macos-14 CI run. The portable answer is translation,
+ * not a vendored engine: expand the GNU class escapes into the POSIX
+ * bracket classes every implementation defines, on EVERY platform, so
+ * one behavior exists and it is the one already tested. Inside a
+ * bracket expression a backslash is literal per POSIX (and glibc
+ * agrees), so translation applies outside brackets only; [:class:]
+ * bodies are walked so their ']' does not end the bracket early.
+ *
+ * `\b` has no POSIX spelling at all. glibc supports it natively, so on
+ * Linux it passes through untouched; BSD instead has the [[:<:]] and
+ * [[:>:]] word-boundary brackets, so on __APPLE__ `\b` becomes the
+ * opening form when a word character (or an escape/class/group that
+ * starts one) follows, and the closing form otherwise -- which covers
+ * the `\bword\b` shape `\b` exists for. */
+static char *festina_regex_expand_gnu(const char *pattern) {
+    size_t len = strlen(pattern);
+    char *out = malloc(len * 13 + 16);
+    if (!out) festina_fail("out of memory compiling a regex");
+    size_t o = 0, i = 0;
+    int in_bracket = 0;
+    size_t bracket_elems = 0;   /* ']' as the first element is literal */
+
+    while (i < len) {
+        char c = pattern[i];
+        if (in_bracket) {
+            if (c == '[' && i + 1 < len &&
+                    (pattern[i + 1] == ':' || pattern[i + 1] == '.' || pattern[i + 1] == '=')) {
+                char kind = pattern[i + 1];
+                out[o++] = c; out[o++] = kind; i += 2;
+                while (i + 1 < len && !(pattern[i] == kind && pattern[i + 1] == ']'))
+                    out[o++] = pattern[i++];
+                if (i + 1 < len) { out[o++] = kind; out[o++] = ']'; i += 2; }
+                bracket_elems++;
+                continue;
+            }
+            if (c == ']' && bracket_elems > 0) in_bracket = 0;
+            else if (c != '^' || bracket_elems > 0) bracket_elems++;
+            out[o++] = c; i++;
+            continue;
+        }
+        if (c == '\\' && i + 1 < len) {
+            char n = pattern[i + 1];
+            const char *rep = NULL;
+            switch (n) {
+                case 's': rep = "[[:space:]]"; break;
+                case 'S': rep = "[^[:space:]]"; break;
+                case 'd': rep = "[[:digit:]]"; break;
+                case 'D': rep = "[^[:digit:]]"; break;
+                case 'w': rep = "[[:alnum:]_]"; break;
+                case 'W': rep = "[^[:alnum:]_]"; break;
+#ifdef __APPLE__
+                case 'b': {
+                    char next = (i + 2 < len) ? pattern[i + 2] : '\0';
+                    int opening = ((next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z')
+                                   || (next >= '0' && next <= '9') || next == '_'
+                                   || next == '\\' || next == '[' || next == '(');
+                    rep = opening ? "[[:<:]]" : "[[:>:]]";
+                    break;
+                }
+#endif
+                default: break;
+            }
+            if (rep) {
+                size_t rlen = strlen(rep);
+                memcpy(out + o, rep, rlen);
+                o += rlen;
+            } else {
+                out[o++] = c;
+                out[o++] = n;
+            }
+            i += 2;
+            continue;
+        }
+        if (c == '[') {
+            in_bracket = 1;
+            bracket_elems = 0;
+        }
+        out[o++] = c;
+        i++;
+    }
+    out[o] = '\0';
+    return out;
+}
+
 void *festina_regex_compile(const char *pattern, const char *flags) {
     if (!pattern) pattern = "";
     if (!flags) flags = "";
@@ -1418,7 +1506,13 @@ void *festina_regex_compile(const char *pattern, const char *flags) {
      * back by festina_regex_replace. */
     compiled->global = strchr(flags, 'g') != NULL;
 
-    int rc = regcomp(&compiled->re, pattern, cflags);
+    /* claude.md #122: expanded form fed to regcomp; the ORIGINAL
+     * pattern in any error message, since that is what the program
+     * wrote. regcomp copies what it needs, so the expansion is freed
+     * either way. */
+    char *expanded = festina_regex_expand_gnu(pattern);
+    int rc = regcomp(&compiled->re, expanded, cflags);
+    free(expanded);
     if (rc != 0) {
         char errbuf[256];
         regerror(rc, &compiled->re, errbuf, sizeof(errbuf));

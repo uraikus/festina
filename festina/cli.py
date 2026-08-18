@@ -107,11 +107,22 @@ _RUNTIME_HEADERS = [
 _sqlite_link_cache = {}
 
 
-def _default_output_name(entry_path):
+def _default_output_name(entry_path, platform_name=None):
+    """windows.md Phase 0: on Windows the default output gains `.exe` --
+    both because the shell only executes files with an executable
+    extension, and because MinGW's linker appends `.exe` itself when
+    the requested name has no suffix, so asking for `program` and then
+    running `program` would miss the `program.exe` actually written.
+    `platform_name` is injectable purely so the win32/darwin branches
+    are unit-testable from any platform (tests/test_platform.py)."""
+    platform_name = platform_name or sys.platform
     base = os.path.basename(entry_path)
     if base.endswith(".f"):
         base = base[:-2]
-    return base or "a.out"
+    base = base or "a.out"
+    if platform_name == "win32" and not base.lower().endswith(".exe"):
+        base += ".exe"
+    return base
 
 
 # claude.md #59: a missing dependency must fail with a clear, actionable
@@ -144,7 +155,9 @@ _PKG_INSTALL_HINTS = {
     "sqlite3": "install its development package, e.g. `apt install libsqlite3-dev` "
                "on Debian/Ubuntu or `brew install sqlite` on macOS",
     "cairo-xlib": "install Cairo's and X11's development packages, e.g. "
-                  "`apt install libcairo2-dev libx11-dev` on Debian/Ubuntu -- "
+                  "`apt install libcairo2-dev libx11-dev` on Debian/Ubuntu, or "
+                  "`brew install cairo` on macOS (plus XQuartz to open windows "
+                  "-- see macos.md Phase 2) -- "
                   "needed for claude.md #37/#39's img/graphics functions",
     "libjpeg": "install libjpeg's development package, e.g. "
                 "`apt install libjpeg-dev` (Debian/Ubuntu) or "
@@ -196,6 +209,31 @@ def _can_link(cc, extra_flags):
         return result.returncode == 0
 
 
+def _static_sqlite_attempt(platform_name, static_libs, libdir=None):
+    """The platform-appropriate spelling of "link libsqlite3.a, not the
+    shared library" -- extracted from _sqlite_link_flags so each
+    platform's strategy is a pure, unit-testable value
+    (tests/test_platform.py; macos.md/windows.md Phase 0).
+
+    GNU ld (Linux, and MinGW on Windows -- windows.md's toolchain
+    decision keeps this branch working there unchanged) supports the
+    `-Bstatic`/`-Bdynamic` toggles, scoping "static please" to exactly
+    the -lsqlite3 between them. macOS's ld64 rejects `-Bstatic`
+    outright (previously that just made the _can_link probe fail and
+    silently forced dynamic linking -- correct, but never static), so
+    the darwin strategy names the archive by explicit path instead,
+    from pkg-config's libdir; with no libdir there is nothing to try
+    and the answer is None (caller falls back to dynamic).
+
+    Returns the flag list to probe with _can_link, or None."""
+    other_static_libs = [lib for lib in static_libs if lib != "-lsqlite3"]
+    if platform_name == "darwin":
+        if not libdir:
+            return None
+        return [os.path.join(libdir, "libsqlite3.a"), *other_static_libs]
+    return ["-Wl,-Bstatic", "-lsqlite3", "-Wl,-Bdynamic", *other_static_libs]
+
+
 def _sqlite_link_flags(cc):
     """Prefer statically linking sqlite3 into the compiled program, so it
     doesn't need libsqlite3.so present at runtime -- falls back to a
@@ -203,17 +241,22 @@ def _sqlite_link_flags(cc):
     environment. Only sqlite3 itself is pinned static; libc/libm etc.
     stay dynamic as usual (this isn't attempting a fully static binary
     the way Go produces -- see the "real compilation, minimal setup"
-    discussion this was written for)."""
+    discussion this was written for). The static ATTEMPT is
+    per-platform (_static_sqlite_attempt above); the probe-then-fall-
+    back shape is shared."""
     if cc in _sqlite_link_cache:
         return _sqlite_link_cache[cc]
 
     cflags = _pkg_config("--cflags", "sqlite3")
     dynamic_libs = _pkg_config("--libs", "sqlite3")
     static_libs = _pkg_config("--static", "--libs", "sqlite3")
-    other_static_libs = [lib for lib in static_libs if lib != "-lsqlite3"]
+    libdir = None
+    if sys.platform == "darwin":
+        libdir_tokens = _pkg_config("--variable=libdir", "sqlite3")
+        libdir = libdir_tokens[0] if libdir_tokens else None
 
-    static_attempt = ["-Wl,-Bstatic", "-lsqlite3", "-Wl,-Bdynamic", *other_static_libs]
-    if _can_link(cc, cflags + static_attempt):
+    static_attempt = _static_sqlite_attempt(sys.platform, static_libs, libdir)
+    if static_attempt is not None and _can_link(cc, cflags + static_attempt):
         flags = (cflags + static_attempt, True)
     else:
         flags = (cflags + dynamic_libs, False)
@@ -254,6 +297,9 @@ _RUNTIME_FEATURES = {
         # claude.md #101: libmpg123 is the MP3 counterpart to libjpeg
         # above -- the WAV parser is hand-written (a container simple
         # enough to walk directly), MP3 is not.
+        # claude.md #121: the DEVICE half is per-platform now (see
+        # _feature_pkgs_and_flags) -- ALSA on Linux, AudioToolbox on
+        # darwin -- while libmpg123 and the channel pool are shared.
         "pkgs": ["alsa", "libmpg123"],
         # claude.md #38's audio playback runs on a background thread
         # (see festina_runtime.h's doc comment on festina_audio_play) --
@@ -262,6 +308,24 @@ _RUNTIME_FEATURES = {
         "extra_link_flags": ["-pthread"],
     },
 }
+
+
+def _feature_pkgs_and_flags(name, platform_name=None):
+    """claude.md #121 / macos.md Phase 1: a feature's pkg-config
+    packages and extra link flags, per platform. The table above holds
+    the Linux answer (the platform everything was built on); this
+    adjusts it where another platform's device layer differs -- on
+    darwin the audio device is AudioToolbox (a system framework, no
+    pkg-config file), so `alsa` drops out and `-framework AudioToolbox`
+    comes in. Injectable platform_name for the unit tests."""
+    platform_name = platform_name or sys.platform
+    feature = _RUNTIME_FEATURES[name]
+    pkgs = list(feature["pkgs"])
+    flags = list(feature["extra_link_flags"])
+    if name == "audio" and platform_name == "darwin":
+        pkgs.remove("alsa")
+        flags += ["-framework", "AudioToolbox"]
+    return pkgs, flags
 
 
 def _ensure_runtime_object(cc, name, source, pkg_config_packages):
@@ -299,6 +363,30 @@ def _ensure_runtime_object(cc, name, source, pkg_config_packages):
     return obj_path
 
 
+def _check_feature_supported(feature, platform_name=None):
+    """macos.md Phase 0: a feature whose backend does not exist yet on
+    this platform fails with a message that says exactly that -- and
+    where the work is planned -- instead of a pkg-config error telling
+    a Mac user to `apt install libasound2-dev` for a library that does
+    not exist on their OS. `platform_name` is injectable so both
+    branches are unit-testable from any platform
+    (tests/test_platform.py)."""
+    platform_name = platform_name or sys.platform
+    if feature == "audio" and platform_name == "darwin":
+        # claude.md #121: the AudioQueue backend EXISTS (compiled and
+        # null-shim-tested by macOS CI) but has not been verified
+        # against a real output device on hardware, so the gate stays
+        # until it has -- overridable for exactly that verification.
+        if os.environ.get("FESTINA_ENABLE_MACOS_AUDIO"):
+            return
+        raise CompileError(
+            "audio is not yet verified on macOS -- the AudioQueue "
+            "backend is built (macos.md Phase 1) but awaits real-"
+            "hardware verification; set FESTINA_ENABLE_MACOS_AUDIO=1 "
+            "to try it. Everything except aud/play() works today.",
+            category="unsupported platform feature")
+
+
 def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio):
     """Every program links core (log/fail/sqlite/regex/timers -- see
     festina_runtime.c's top comment) plus -lm (claude.md #56's
@@ -317,11 +405,13 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio):
     for name, wants in (("graphics", uses_graphics), ("audio", uses_audio)):
         if not wants:
             continue
+        _check_feature_supported(name)
         feature = _RUNTIME_FEATURES[name]
-        objects.append(_ensure_runtime_object(cc, name, feature["source"], feature["pkgs"]))
-        for pkg in feature["pkgs"]:
+        pkgs, extra_flags = _feature_pkgs_and_flags(name)
+        objects.append(_ensure_runtime_object(cc, name, feature["source"], pkgs))
+        for pkg in pkgs:
             link_libs += _pkg_config("--libs", pkg)
-        link_libs += feature["extra_link_flags"]
+        link_libs += extra_flags
 
     return objects, link_libs
 
@@ -381,7 +471,11 @@ def run_program(entry_path, cc="clang"):
     success, so `festina run x.f && ...` composes the same way a real
     compile-then-execute pair would."""
     with tempfile.TemporaryDirectory(prefix="festina-run-") as d:
-        out_path = os.path.join(d, "program")
+        # windows.md Phase 0: through _default_output_name so the temp
+        # binary is `program.exe` on Windows -- MinGW's linker appends
+        # .exe itself when the name has no suffix, and running the name
+        # we ASKED for rather than the file it WROTE would fail.
+        out_path = os.path.join(d, _default_output_name("program.f"))
         compile_file(entry_path, out_path, cc=cc)
         result = subprocess.run([out_path])
         return result.returncode
@@ -529,12 +623,20 @@ def _doctor_report():
           "libjpeg dev headers (optional -- only used by graphics: JPEG images)",
           _PKG_INSTALL_HINTS["libjpeg"])
 
-    check(_pkg_config_has("libmpg123"), False,
-          "libmpg123 dev headers (optional -- only used by audio: MP3 clips)",
-          _PKG_INSTALL_HINTS["libmpg123"])
-    check(_pkg_config_has("alsa"), False,
-          "alsa dev headers (optional -- only used by audio: loadAudio(), .play(), ...)",
-          _PKG_INSTALL_HINTS["alsa"])
+    # macos.md Phase 0: the audio lines are platform-aware -- on macOS
+    # there is no ALSA to install, and telling a Mac user to go get it
+    # would be worse than saying the true thing: the CoreAudio backend
+    # is planned (macos.md Phase 1) and everything else works today.
+    if sys.platform == "darwin":
+        lines.append("  [   not yet       ] audio (aud/.play()) -- no macOS "
+                     "backend yet; planned as macos.md Phase 1")
+    else:
+        check(_pkg_config_has("libmpg123"), False,
+              "libmpg123 dev headers (optional -- only used by audio: MP3 clips)",
+              _PKG_INSTALL_HINTS["libmpg123"])
+        check(_pkg_config_has("alsa"), False,
+              "alsa dev headers (optional -- only used by audio: loadAudio(), .play(), ...)",
+              _PKG_INSTALL_HINTS["alsa"])
 
     llvm_ok = llvm_backend.available()
     has_clang = shutil.which("clang") is not None

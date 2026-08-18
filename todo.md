@@ -9,12 +9,18 @@ item lives in [claude.md](claude.md) (the numbered decision log) and
 Linux is the supported platform today. Porting is backend work, not
 language work — the compiler and core runtime are portable C/LLVM.
 
-- **macOS** — graphics (Cairo/X11 → Quartz, or document XQuartz), audio
-  (ALSA → CoreAudio), Homebrew dependency paths, and packaging
-  (`scripts/package_compiler.sh`).
-- **Windows** — the same two backends, plus POSIX seams in the core:
-  `<regex.h>` (regex), `<sys/select.h>`/`clock_gettime` (the timer/event
-  loop). MSYS2 or a small shim layer are the candidate routes.
+- **macOS** — planned in full in [macos.md](macos.md): toolchain
+  bring-up first (libLLVM discovery, ld64-safe sqlite linking, a
+  macos-14 CI job), then a 3-function audio device seam with an
+  AudioQueue backend, then a narrow windowing seam with a native
+  Cocoa layer (XQuartz as the interim validation path), then
+  packaging.
+- **Windows** — planned in full in [windows.md](windows.md): MSYS2 /
+  MinGW-w64 as the one supported toolchain (which dissolves every
+  POSIX seam except `<regex.h>` — a packaged POSIX regex or vendored
+  musl regex, decided by the existing test suite), then the same two
+  backend seams macos.md cuts, implemented as waveOut and Win32 +
+  the shared Cairo blit, then packaging and the DLL story.
 - **Static sqlite3 linking** for fully self-contained binaries — see
   [setup.md](setup.md#static-linking-sqlite3).
 

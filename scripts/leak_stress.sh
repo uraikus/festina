@@ -73,6 +73,18 @@ SAN_CC="$(probe_san_cc)" || {
     exit 77
 }
 
+# LeakSanitizer is a separate question from ASan: on darwin/arm64 ASan
+# links and runs fine but any binary started under
+# ASAN_OPTIONS=detect_leaks=1 aborts at startup with "detect_leaks is
+# not supported on this platform". macos.md's standing decision keeps
+# this tier Linux-only; this probe is what turns that into the skip
+# exit code instead of a wall of failures (measured on the first real
+# macos-14 CI run: 31 of them, all this).
+if ! ASAN_OPTIONS=detect_leaks=1 "$WORK/probe.bin" >/dev/null 2>&1; then
+    echo "leak_stress: LeakSanitizer (ASAN_OPTIONS=detect_leaks=1) is not supported on this platform" >&2
+    exit 77
+fi
+
 # ALSA's null plugin, so an audio program can open a "device" and stream
 # real PCM without sound hardware -- the same mechanism tests/conftest.py
 # uses. HOME is overridden because that is where ALSA looks.

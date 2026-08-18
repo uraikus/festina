@@ -93,6 +93,30 @@ def llvm_backend():
     return import_spec_module("llvm_backend")
 
 
+def compile_file_or_skip(cli_mod, *args, **kwargs):
+    """macos.md Phase 0: compile, turning "this MACHINE lacks a
+    feature's dev packages" and "this PLATFORM has no backend for the
+    feature yet" (audio on macOS until Phase 1 is hardware-verified)
+    into a pytest.skip instead of a failure. This single rule is what
+    lets a new platform's CI job run the WHOLE suite and shed exactly
+    the tiers it lacks, with no parallel test-selection list to drift.
+    The Linux CI job sets FESTINA_STRICT_DEPS=1 to forbid these skips
+    there, so a dependency quietly vanishing from the primary
+    platform's CI image fails loudly instead of shrinking coverage.
+    Shared by the compile_and_run fixture and every test that calls
+    compile_file directly (test_examples, TestSlimBinaries's audio
+    case)."""
+    try:
+        return cli_mod.compile_file(*args, **kwargs)
+    except Exception as err:
+        category = getattr(err, "category", None)
+        skippable = category in ("missing dependency",
+                                 "unsupported platform feature")
+        if skippable and not os.environ.get("FESTINA_STRICT_DEPS"):
+            pytest.skip(f"{category}: {err}")
+        raise
+
+
 def _require_c_compiler():
     """Shared by compile_and_run/compile_multi_and_run: skip with a
     clear, toolchain-specific reason if no usable C compiler is on
@@ -114,14 +138,25 @@ def _require_c_compiler():
 
 @pytest.fixture
 def compile_and_run(tmp_path, codegen, cli_mod):
-    """Compile a Festina source string to a native executable and run it."""
+    """Compile a Festina source string to a native executable and run it.
+
+    macos.md Phase 0: a compile that fails because this MACHINE lacks a
+    feature's dependencies (missing dev package) or this PLATFORM lacks
+    the feature's backend entirely (audio on macOS until Phase 1) turns
+    into a pytest.skip rather than a failure -- that is what lets the
+    macOS CI job run the WHOLE suite and degrade to skips for exactly
+    the tests a missing tier covers, instead of maintaining a parallel
+    test-selection list that would drift. The Linux CI job sets
+    FESTINA_STRICT_DEPS=1 to forbid these skips there, so a
+    dependency quietly vanishing from the primary platform's CI image
+    still fails loudly instead of shrinking coverage."""
     cc = _require_c_compiler()
 
     def _run(source, filename="main.f", args=None, env=None):
         src_path = tmp_path / filename
         src_path.write_text(source)
         out_path = tmp_path / "program"
-        cli_mod.compile_file(str(src_path), str(out_path), cc=cc)
+        compile_file_or_skip(cli_mod, str(src_path), str(out_path), cc=cc)
         run_env = dict(os.environ, **env) if env else None
         result = subprocess.run(
             [str(out_path), *(args or [])],

@@ -34,20 +34,20 @@ class TestAllExamplesCompile:
 
     @pytest.mark.parametrize("filename", ALL_EXAMPLES)
     def test_compiles(self, cli_mod, tmp_path, filename):
-        from tests.conftest import _require_c_compiler
+        from tests.conftest import _require_c_compiler, compile_file_or_skip
         cc = _require_c_compiler()
         src = os.path.join(EXAMPLES_DIR, filename)
         out = tmp_path / "program"
-        cli_mod.compile_file(src, str(out), cc=cc)
+        compile_file_or_skip(cli_mod, src, str(out), cc=cc)
         assert out.exists()
 
 
 def _run_example(cli_mod, tmp_path, filename, cwd=None, env=None, timeout=15):
-    from tests.conftest import _require_c_compiler
+    from tests.conftest import _require_c_compiler, compile_file_or_skip
     cc = _require_c_compiler()
     src = os.path.join(EXAMPLES_DIR, filename)
     out = tmp_path / "program"
-    cli_mod.compile_file(src, str(out), cc=cc)
+    compile_file_or_skip(cli_mod, src, str(out), cc=cc)
     run_env = dict(os.environ, **env) if env else None
     return subprocess.run(
         [str(out)], cwd=cwd or REPO_ROOT, capture_output=True, text=True,

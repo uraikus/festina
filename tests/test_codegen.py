@@ -4828,16 +4828,24 @@ class TestTimers:
         out_path = tmp_path / "program"
         cli_mod.compile_file(str(src_path), str(out_path))
         stdout_path = tmp_path / "stdout.log"
+        # stdbuf (GNU coreutils) forces line buffering so the log file
+        # has lines mid-run; macOS has no stdbuf, so there the test
+        # keeps its actual contract -- an uncleared interval keeps the
+        # process alive -- and drops only the mid-run line inspection
+        # (macos.md Phase 0's first CI run is what found this).
+        have_stdbuf = shutil.which("stdbuf") is not None
+        cmd = (["stdbuf", "-oL"] if have_stdbuf else []) + [str(out_path)]
         proc = subprocess.Popen(
-            ["stdbuf", "-oL", str(out_path)],
+            cmd,
             cwd=tmp_path, stdout=open(stdout_path, "w"), stderr=subprocess.STDOUT,
         )
         try:
             time.sleep(0.3)
             assert proc.poll() is None, "an uncleared setInterval should keep the program running"
-            lines = stdout_path.read_text().splitlines()
-            assert len(lines) >= 2, f"expected multiple 'tick's by now, got {lines!r}"
-            assert all(line == "tick" for line in lines)
+            if have_stdbuf:
+                lines = stdout_path.read_text().splitlines()
+                assert len(lines) >= 2, f"expected multiple 'tick's by now, got {lines!r}"
+                assert all(line == "tick" for line in lines)
         finally:
             proc.terminate()
             proc.wait(timeout=5)
@@ -4919,7 +4927,8 @@ class TestAudio:
         src_path = tmp_path / "main.f"
         src_path.write_text(source)
         out_path = tmp_path / "program"
-        result_path = cli_mod.compile_file(str(src_path), str(out_path))
+        from tests.conftest import compile_file_or_skip
+        result_path = compile_file_or_skip(cli_mod, str(src_path), str(out_path))
         assert result_path == str(out_path)
         assert out_path.exists()
 
@@ -5261,37 +5270,39 @@ _VOICE_POOL_HARNESS = r"""
  * directly, which gives it FestinaAudio/FestinaVoice (both file-local
  * types) and lets it count active voices for real.
  *
- * Second, the ALSA device layer is REPLACED here, via the macros
- * below, and that is not a shortcut -- it is the only way this test
- * can exist. The null ALSA device the rest of the audio tests use
- * consumes PCM instantly (measured: a 2-second clip finishes in 0ms),
- * so under it every voice is finished before the next play() begins
- * and there is no concurrency left to observe. A stub that sleeps per
- * chunk gives playback real duration under the harness's own control,
- * and needs no sound hardware, no ALSA config, and no device at all.
- * Everything above the device -- the pool, the stealing, the slot
- * reuse, the joining -- is the genuine runtime code.
+ * Second, the DEVICE layer is replaced here -- claude.md #121's
+ * festina_pcm_dev_* seam, supplied by this harness instead of any
+ * platform backend (FESTINA_AUDIO_DEVICE_EXTERNAL), which is also
+ * what lets this harness build on a machine with no audio stack at
+ * all, ALSA headers included. That is not a shortcut -- it is the
+ * only way this test can exist. The null device the rest of the audio
+ * tests use consumes PCM instantly (measured: a 2-second clip
+ * finishes in 0ms), so under it every voice is finished before the
+ * next play() begins and there is no concurrency left to observe. A
+ * stub that sleeps per chunk gives playback real duration under the
+ * harness's own control. Everything above the device -- the pool, the
+ * stealing, the slot reuse, the joining -- is the genuine runtime
+ * code.
  */
-#include <alsa/asoundlib.h>
+#define FESTINA_AUDIO_DEVICE_EXTERNAL 1
 #include <time.h>
 
-static int harness_pcm_open(snd_pcm_t **out) { *out = (snd_pcm_t *)1; return 0; }
-static long harness_pcm_writei(snd_pcm_t *pcm, const void *buf, unsigned long frames) {
-    (void)pcm; (void)buf;
+#include "festina_runtime_audio.c"
+
+void *festina_pcm_dev_open(int channels, unsigned int rate,
+                           char *errbuf, size_t errbuf_size) {
+    (void)channels; (void)rate; (void)errbuf; (void)errbuf_size;
+    return (void *)1;
+}
+long festina_pcm_dev_write(void *dev, const int16_t *frames, size_t frame_count) {
+    (void)dev; (void)frames;
     /* ~10ms per 4096-frame chunk, so a clip of a few chunks plays for
      * long enough that back-to-back play() calls genuinely overlap. */
     struct timespec ts = { 0, 10L * 1000L * 1000L };
     nanosleep(&ts, NULL);
-    return (long)frames;
+    return (long)frame_count;
 }
-
-#define snd_pcm_open(pcmp, name, stream, mode) harness_pcm_open(pcmp)
-#define snd_pcm_set_params(pcm, f, a, c, r, s, l) 0
-#define snd_pcm_writei(pcm, buf, frames) harness_pcm_writei(pcm, buf, frames)
-#define snd_pcm_recover(pcm, err, silent) (-1)
-#define snd_pcm_close(pcm) 0
-
-#include "festina_runtime_audio.c"
+void festina_pcm_dev_close(void *dev) { (void)dev; }
 
 /* The only thing the audio unit needs from the core runtime, supplied
  * here so this harness does not have to link festina_runtime.c (and
@@ -5406,31 +5417,32 @@ _SINGLE_STREAM_HARNESS = r"""
  * each other off, which is exactly what they did before there was a
  * pool at all.
  */
-#include <alsa/asoundlib.h>
+#define FESTINA_AUDIO_DEVICE_EXTERNAL 1
 #include <time.h>
 
+#include "festina_runtime_audio.c"
+
+/* claude.md #121: the single-stream device, expressed at the seam --
+ * the second concurrent open fails, exactly as a dmix-less hw: device
+ * refuses a second stream. */
 static int g_open_count = 0;
-static int lim_open(snd_pcm_t **p) {
-    if (g_open_count >= 1) return -EBUSY;
+void *festina_pcm_dev_open(int channels, unsigned int rate,
+                           char *errbuf, size_t errbuf_size) {
+    (void)channels; (void)rate;
+    if (g_open_count >= 1) {
+        snprintf(errbuf, errbuf_size, "device busy (harness single-stream limit)");
+        return NULL;
+    }
     g_open_count++;
-    *p = (snd_pcm_t *)(long)g_open_count;
-    return 0;
+    return (void *)(long)g_open_count;
 }
-static int lim_close(snd_pcm_t *p) { (void)p; g_open_count--; return 0; }
-static long lim_writei(snd_pcm_t *p, const void *b, unsigned long f) {
-    (void)p; (void)b;
+void festina_pcm_dev_close(void *dev) { (void)dev; g_open_count--; }
+long festina_pcm_dev_write(void *dev, const int16_t *frames, size_t frame_count) {
+    (void)dev; (void)frames;
     struct timespec ts = { 0, 10L * 1000L * 1000L };
     nanosleep(&ts, NULL);
-    return (long)f;
+    return (long)frame_count;
 }
-
-#define snd_pcm_open(pcmp, name, stream, mode) lim_open(pcmp)
-#define snd_pcm_set_params(pcm, f, a, c, r, s, l) 0
-#define snd_pcm_writei(pcm, buf, frames) lim_writei(pcm, buf, frames)
-#define snd_pcm_recover(pcm, err, silent) (-1)
-#define snd_pcm_close(pcm) lim_close(pcm)
-
-#include "festina_runtime_audio.c"
 
 void festina_fail(const char *msg) {
     fprintf(stderr, "fail: %s\n", msg ? msg : "");
@@ -5495,28 +5507,28 @@ _CHANNEL_HARNESS = r"""
  *
  * White-box for the same two reasons the pool harness is (see
  * _VOICE_POOL_HARNESS): a Festina program cannot see which channel a
- * clip landed on, and the null ALSA device consumes PCM instantly so
- * there is no concurrency to observe under it. The device layer is
- * stubbed; the channel table is the real one.
+ * clip landed on, and a null device consumes PCM instantly so there
+ * is no concurrency to observe under it. The device layer is supplied
+ * at claude.md #121's festina_pcm_dev_* seam; the channel table is
+ * the real one.
  */
-#include <alsa/asoundlib.h>
+#define FESTINA_AUDIO_DEVICE_EXTERNAL 1
 #include <time.h>
 
-static int harness_pcm_open(snd_pcm_t **out) { *out = (snd_pcm_t *)1; return 0; }
-static long harness_pcm_writei(snd_pcm_t *pcm, const void *buf, unsigned long frames) {
-    (void)pcm; (void)buf;
+#include "festina_runtime_audio.c"
+
+void *festina_pcm_dev_open(int channels, unsigned int rate,
+                           char *errbuf, size_t errbuf_size) {
+    (void)channels; (void)rate; (void)errbuf; (void)errbuf_size;
+    return (void *)1;
+}
+long festina_pcm_dev_write(void *dev, const int16_t *frames, size_t frame_count) {
+    (void)dev; (void)frames;
     struct timespec ts = { 0, 10L * 1000L * 1000L };
     nanosleep(&ts, NULL);
-    return (long)frames;
+    return (long)frame_count;
 }
-
-#define snd_pcm_open(pcmp, name, stream, mode) harness_pcm_open(pcmp)
-#define snd_pcm_set_params(pcm, f, a, c, r, s, l) 0
-#define snd_pcm_writei(pcm, buf, frames) harness_pcm_writei(pcm, buf, frames)
-#define snd_pcm_recover(pcm, err, silent) (-1)
-#define snd_pcm_close(pcm) 0
-
-#include "festina_runtime_audio.c"
+void festina_pcm_dev_close(void *dev) { (void)dev; }
 
 void festina_fail(const char *msg) {
     fprintf(stderr, "fail: %s\n", msg ? msg : "");
@@ -8115,11 +8127,14 @@ class TestAudioChannels:
         cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
         if not cc:
             pytest.skip("no C compiler (clang/gcc/cc) on PATH")
-        # claude.md #101: the audio unit needs libmpg123 too now.
-        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa", "libmpg123"],
+        # claude.md #101: the audio unit needs libmpg123 for decoding.
+        # claude.md #121: and ONLY libmpg123 -- the harness supplies the
+        # device layer at the festina_pcm_dev_* seam, so no ALSA headers
+        # (or any platform audio stack) are needed to build it.
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "libmpg123"],
                                capture_output=True, text=True)
         if alsa.returncode != 0:
-            pytest.skip("alsa/libmpg123 dev headers are not installed")
+            pytest.skip("libmpg123 dev headers are not installed")
         runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
         harness = tmp_path / "channel_harness.c"
         harness.write_text(_CHANNEL_HARNESS)
@@ -8214,11 +8229,14 @@ class TestAudioOnANonMixingDevice:
         cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
         if not cc:
             pytest.skip("no C compiler (clang/gcc/cc) on PATH")
-        # claude.md #101: the audio unit needs libmpg123 too now.
-        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa", "libmpg123"],
+        # claude.md #101: the audio unit needs libmpg123 for decoding.
+        # claude.md #121: and ONLY libmpg123 -- the harness supplies the
+        # device layer at the festina_pcm_dev_* seam, so no ALSA headers
+        # (or any platform audio stack) are needed to build it.
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "libmpg123"],
                                capture_output=True, text=True)
         if alsa.returncode != 0:
-            pytest.skip("alsa/libmpg123 dev headers are not installed")
+            pytest.skip("libmpg123 dev headers are not installed")
         runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
         harness = tmp_path / "single_stream_harness.c"
         harness.write_text(_SINGLE_STREAM_HARNESS)
@@ -8271,11 +8289,14 @@ class TestAudioVoicePool:
         cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
         if not cc:
             pytest.skip("no C compiler (clang/gcc/cc) on PATH")
-        # claude.md #101: the audio unit needs libmpg123 too now.
-        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa", "libmpg123"],
+        # claude.md #101: the audio unit needs libmpg123 for decoding.
+        # claude.md #121: and ONLY libmpg123 -- the harness supplies the
+        # device layer at the festina_pcm_dev_* seam, so no ALSA headers
+        # (or any platform audio stack) are needed to build it.
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "libmpg123"],
                                capture_output=True, text=True)
         if alsa.returncode != 0:
-            pytest.skip("alsa/libmpg123 dev headers are not installed")
+            pytest.skip("libmpg123 dev headers are not installed")
 
         runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
         harness = tmp_path / "voice_pool_harness.c"
@@ -8497,6 +8518,47 @@ class TestRegexLiteral:
     def test_combined_flags_from_the_readme_example(self, compile_and_run):
         result = compile_and_run(r"log(/\w+/gi.test('Hello'))")
         assert result.stdout.strip() == "true"
+
+    def test_gnu_class_escapes_work_on_every_platform(self, compile_and_run):
+        # claude.md #122: api.md promises \w/\d/\s/\b, which are GNU
+        # extensions -- macOS's BSD regcomp treats \s as a literal 's',
+        # caught by the first real macos-14 CI run. The runtime now
+        # expands them to POSIX classes before regcomp on EVERY
+        # platform, so this test passing on both CI jobs is the
+        # portability proof.
+        source = r"""
+        log(/a\db/.test('a5b'))
+        log(/a\db/.test('axb'))
+        log(' xy '.match(/\S+/))
+        log('12ab34'.match(/\D+/))
+        log('a1 b2'.replace(/\w\d/g, '#'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false", "xy", "ab", "# #"]
+
+    def test_word_boundary_replaces_only_the_whole_word(self, compile_and_run):
+        # \b: native in glibc, translated to BSD's [[:<:]]/[[:>:]] on
+        # darwin (claude.md #122's one per-platform difference).
+        source = r"""
+        log('a word here'.replace(/\bword\b/, 'X'))
+        log('swordfish'.replace(/\bword\b/, 'X'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["a X here", "swordfish"]
+
+    def test_escapes_inside_brackets_stay_untranslated(self, compile_and_run):
+        # POSIX (and glibc): a backslash inside [...] is a literal, so
+        # the expansion must not fire there -- and a [:class:] body's
+        # ']' must not end the bracket early. Both pinned, because the
+        # translator walks brackets itself and either mistake would be
+        # silent on Linux.
+        source = r"""
+        log('x7y'.match(/[[:digit:]]+/))
+        log(/a\.b/.test('a.b'))
+        log(/a\.b/.test('axb'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["7", "true", "false"]
 
     def test_match_returns_first_match(self, compile_and_run):
         result = compile_and_run("log('room 42, building 7'.match(/[0-9]+/))")
@@ -9273,7 +9335,10 @@ class TestSlimBinaries:
         src = tmp_path / "main.f"
         src.write_text("aud music = 'nonexistent.wav'")
         out = tmp_path / "program"
-        cli_mod.compile_file(str(src), str(out), cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
+        from tests.conftest import compile_file_or_skip
+        compile_file_or_skip(
+            cli_mod, str(src), str(out),
+            cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
         ldd_output = self._ldd(out)
         assert "libasound" in ldd_output
         assert "libcairo" not in ldd_output
