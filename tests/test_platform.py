@@ -84,6 +84,42 @@ class TestStaticSqliteAttempt:
         assert cli_mod._static_sqlite_attempt("darwin", ["-lsqlite3"]) is None
 
 
+class TestCorePkgs:
+    """windows.md Phase 0: <regex.h> is core (every program links it,
+    festina_runtime.c's own top comment), and it's part of libc
+    everywhere except MinGW -- so this is the one core pkg-config
+    ADDITION win32 needs, not a feature tier like graphics/audio."""
+
+    def test_win32_needs_libgnurx(self, cli_mod):
+        assert cli_mod._core_pkgs("win32") == ["libgnurx"]
+
+    def test_linux_and_darwin_need_nothing_extra(self, cli_mod):
+        assert cli_mod._core_pkgs("linux") == []
+        assert cli_mod._core_pkgs("darwin") == []
+
+    def test_core_object_and_link_libs_pick_up_libgnurx_on_windows(
+            self, cli_mod, monkeypatch):
+        # _runtime_objects_and_link_libs must actually pass _core_pkgs()
+        # through to both the cached object's own cflags and the final
+        # link line -- not just have the pure function return the right
+        # answer in isolation. Verified by recording calls, the same
+        # style test_offscreen_graphics_never_reaches_the_darwin_gate
+        # uses, since this needs no real toolchain state either.
+        monkeypatch.setattr(sys, "platform", "win32")
+        ensure_calls = []
+        monkeypatch.setattr(
+            cli_mod, "_ensure_runtime_object",
+            lambda cc, name, source, pkgs: ensure_calls.append((name, pkgs)) or "/tmp/fake.o")
+        monkeypatch.setattr(cli_mod, "_pkg_config", lambda action, pkg: [f"--{pkg}-{action.strip('-')}"])
+        monkeypatch.setattr(cli_mod, "_sqlite_link_flags", lambda cc: ([], False))
+
+        _, link_libs = cli_mod._runtime_objects_and_link_libs(
+            "clang", uses_graphics=False, uses_audio=False)
+
+        assert ensure_calls[0] == ("core", ["libgnurx"])
+        assert "--libgnurx-libs" in link_libs
+
+
 class TestLibllvmCandidatePaths:
     """llvm_backend's explicit per-platform libLLVM locations
     (macos.md/windows.md Phase 0): Homebrew's LLVM is keg-only and
@@ -135,13 +171,29 @@ class TestFeatureGating:
         assert "macos.md Phase 1" in str(excinfo.value)
         assert excinfo.value.category == "unsupported platform feature"
 
-    def test_audio_on_linux_and_windows_is_not_gated(self, cli_mod):
+    def test_audio_on_linux_is_not_gated(self, cli_mod):
         cli_mod._check_feature_supported("audio", "linux")
-        cli_mod._check_feature_supported("audio", "win32")
 
-    def test_graphics_is_not_gated_on_linux_or_windows(self, cli_mod):
-        for platform_name in ("linux", "win32"):
-            cli_mod._check_feature_supported("graphics", platform_name)
+    def test_graphics_is_not_gated_on_linux(self, cli_mod):
+        cli_mod._check_feature_supported("graphics", "linux")
+
+    def test_audio_on_windows_names_the_plan(self, cli_mod, errors):
+        # windows.md Phase 1 INVERTED this test the same way claude.md
+        # #123 inverted the graphics one below: there is no waveOut
+        # backend in the runtime at all yet, so -- unlike darwin's
+        # already-built-but-unverified gate above -- this fires
+        # unconditionally, with no env var to unlock it, because there
+        # is nothing built yet to unlock.
+        with pytest.raises(errors.CompileError) as excinfo:
+            cli_mod._check_feature_supported("audio", "win32")
+        assert "windows.md Phase 1" in str(excinfo.value)
+        assert excinfo.value.category == "unsupported platform feature"
+
+    def test_windowed_graphics_is_gated_on_windows(self, cli_mod, errors):
+        with pytest.raises(errors.CompileError) as excinfo:
+            cli_mod._check_feature_supported("graphics", "win32")
+        assert "windows.md Phase 2" in str(excinfo.value)
+        assert excinfo.value.category == "unsupported platform feature"
 
     def test_windowed_graphics_is_gated_on_darwin(self, cli_mod, errors):
         # claude.md #123 INVERTED this test: the windowing seam +
@@ -166,6 +218,41 @@ class TestFeatureGating:
         assert "macos.md Phase 1" in report
         assert "alsa" not in report, (
             "doctor must not tell a Mac user to install ALSA")
+
+    def test_doctor_on_windows_reports_graphics_and_audio_as_planned_not_missing(
+            self, cli_mod, monkeypatch):
+        # windows.md Phase 0 item 4: neither backend exists yet, so
+        # doctor must say so rather than naming Linux-only packages
+        # (cairo-xlib, alsa) a Windows user has no way to install.
+        monkeypatch.setattr(sys, "platform", "win32")
+        lines, _ = cli_mod._doctor_report()
+        report = "\n".join(lines)
+        assert "windows.md Phase 1" in report
+        assert "windows.md Phase 2" in report
+        assert "cairo-xlib" not in report and "alsa" not in report, (
+            "doctor must not tell a Windows user to install Linux packages")
+
+    def test_doctor_on_windows_reports_libgnurx_as_required(
+            self, cli_mod, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(cli_mod, "_pkg_config_has", lambda pkg: False)
+        lines, all_ok = cli_mod._doctor_report()
+        report = "\n".join(lines)
+        assert "libgnurx" in report
+        assert "MISSING" in report
+        assert all_ok is False
+
+    def test_doctor_flags_the_plain_msys_shell_as_wrong(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setenv("MSYSTEM", "MSYS")
+        lines, _ = cli_mod._doctor_report()
+        assert "wrong shell" in "\n".join(lines)
+
+    def test_doctor_says_nothing_extra_for_ucrt64(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setenv("MSYSTEM", "UCRT64")
+        lines, _ = cli_mod._doctor_report()
+        assert "wrong shell" not in "\n".join(lines)
 
 
 class TestAudioFeatureConfig:
