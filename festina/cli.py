@@ -543,17 +543,20 @@ def _check_feature_supported(feature, platform_name=None):
         # windows.md Phase 2: same "nothing built yet" honesty as the
         # audio branch above -- no Win32 windowing backend exists in
         # the runtime yet, so this fires unconditionally rather than
-        # gating a real backend behind an env var. Offscreen drawing
-        # never reaches this at all -- see this function's own
-        # docstring (the "graphics" question here is always the narrow,
-        # window-opening one).
+        # gating a real backend behind an env var. claude.md #126 round
+        # six: unlike darwin, this now covers OFFSCREEN drawing too --
+        # _runtime_objects_and_link_libs's own offscreen exemption is
+        # scoped away from win32 (see its docstring), precisely because
+        # there is no window_win32 companion object the way window_mac.m
+        # exists for darwin, so even drawRect()+saveCanvas() alone fails
+        # to link on win32 today, not just windowed use.
         raise CompileError(
-            "windowed graphics (render(), or an on mouseDown/mouseUp/"
-            "mouse/keyDown/keyUp/resize/close handler) is not yet "
-            "implemented on Windows -- planned as windows.md Phase 2 "
-            "(Win32 + the shared Cairo blit). Drawing to an offscreen "
-            "canvas and saveCanvas() work today with no window "
-            "involved at all.",
+            "graphics (drawRect, on mouseDown, img, saveCanvas, ...) is "
+            "not yet implemented on Windows -- planned as windows.md "
+            "Phase 2 (Win32 + the shared Cairo blit). This includes "
+            "offscreen-only drawing too, unlike on macOS: there is no "
+            "Win32 windowing backend at all yet for the shared graphics "
+            "code to link against.",
             category="unsupported platform feature")
 
 

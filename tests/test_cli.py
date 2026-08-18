@@ -10,6 +10,7 @@ design writeup.
 """
 import os
 import shutil
+import sys
 
 import pytest
 
@@ -91,10 +92,17 @@ class TestDoctor:
         _require_c_compiler()
         if not shutil.which("pkg-config"):
             pytest.skip("pkg-config not on PATH in this environment")
-        # Simulate cairo-xlib/alsa both being absent while sqlite3 (the
-        # only *required* pkg-config package) is still found, without
-        # depending on this machine's actual package set either way.
-        monkeypatch.setattr(cli_mod, "_pkg_config_has", lambda pkg: pkg == "sqlite3")
+        # Simulate cairo-xlib/alsa both being absent while every
+        # *required* pkg-config package -- sqlite3 always, plus
+        # windows.md Phase 0's gnurx on win32 (claude.md #126 round
+        # six: the plain `pkg == "sqlite3"` version of this line left
+        # gnurx REQUIRED-and-missing on real Windows CI, correctly
+        # flipping all_ok to False -- a gap in this test's own platform-
+        # blind setup, not a doctor-report bug) -- is still found,
+        # without depending on this machine's actual package set either
+        # way.
+        required = {"sqlite3", *cli_mod._core_pkgs()}
+        monkeypatch.setattr(cli_mod, "_pkg_config_has", lambda pkg: pkg in required)
         lines, all_ok = cli_mod._doctor_report()
         joined = "\n".join(lines)
         assert "missing, optional" in joined
@@ -123,7 +131,16 @@ class TestDoctor:
     def test_reports_festina_on_path_when_resolvable(self, cli_mod, tmp_path, monkeypatch):
         bin_dir = tmp_path / "fake_bin"
         bin_dir.mkdir()
-        fake = bin_dir / "festina"
+        # claude.md #126 round six: shutil.which resolves "festina" on
+        # Windows via PATHEXT extension search, not the bare name -- a
+        # file literally named "festina" with no extension (0o755 is
+        # also a no-op there, NTFS has no execute-permission bit) was
+        # never findable at all, so _doctor_report's "resolves to" line
+        # never appeared and this assertion failed, found by real
+        # Windows CI. Same shell-needs-an-executable-extension reasoning
+        # windows.md/_default_output_name already established.
+        fake_name = "festina.exe" if sys.platform == "win32" else "festina"
+        fake = bin_dir / fake_name
         fake.write_text("#!/bin/sh\n")
         fake.chmod(0o755)
         monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")

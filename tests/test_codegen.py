@@ -9466,7 +9466,14 @@ class TestMinimalBuildDependencies:
         log(saveCanvas('{out_png}'))
         """)
         out = tmp_path / "program"
-        cli_mod.compile_file(str(src), str(out), cc=clang)
+        # claude.md #126 round six: same skip-not-fail gap as
+        # TestSlimBinaries/TestGraphics fixed in the two rounds before
+        # this one -- graphics (including this offscreen-only program)
+        # is gated unconditionally on win32 (no backend at all yet), so
+        # a direct compile_file call here would fail hard there instead
+        # of skipping like every other platform-conditional test.
+        from tests.conftest import compile_file_or_skip
+        compile_file_or_skip(cli_mod, str(src), str(out), cc=clang)
         assert out.exists()
 
         result = subprocess.run([str(out)], cwd=tmp_path, env={**os.environ, "DISPLAY": ""},
