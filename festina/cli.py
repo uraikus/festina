@@ -439,6 +439,14 @@ def _feature_pkgs_and_flags(name, platform_name=None):
     if name == "audio" and platform_name == "darwin":
         pkgs.remove("alsa")
         flags += ["-framework", "AudioToolbox"]
+    elif name == "audio" and platform_name == "win32":
+        # windows.md Phase 1: the device layer is winmm's waveOut, a
+        # system DLL with no pkg-config file of its own (same shape as
+        # AudioToolbox above) -- `alsa` drops out (Linux-only) and
+        # `-lwinmm` comes in. libmpg123 stays: MSYS2 UCRT64 ships a real
+        # pkg-config package for it, same as every other platform.
+        pkgs.remove("alsa")
+        flags += ["-lwinmm"]
     elif name == "graphics" and platform_name == "darwin":
         # claude.md #123: on darwin festina_runtime_graphics.c has ZERO
         # X11 code compiled into it (guarded `#ifndef __APPLE__`), so
@@ -518,13 +526,14 @@ def _check_feature_supported(feature, platform_name=None):
     branch is unit-testable from any platform (tests/test_platform.py).
 
     Two different shades of "not supported" live here, both raising the
-    same category so the conftest skip picks up either uniformly: the
-    darwin branches gate a backend that EXISTS (built, CI-compiled)
-    but awaits real-hardware verification, overridable via an env var
-    for exactly that verification; the win32 branches gate a backend
-    that does not exist in the runtime AT ALL yet (windows.md Phases
-    1-2 are still open), so they raise unconditionally -- there is
-    nothing to unlock.
+    same category so the conftest skip picks up either uniformly: most
+    branches gate a backend that EXISTS (built, CI-compiled) but awaits
+    real-hardware verification, overridable via an env var for exactly
+    that verification -- this now includes windows.md Phase 1's audio
+    gate, alongside every darwin gate; the win32 graphics branch still
+    gates a backend that does not exist in the runtime AT ALL yet
+    (windows.md Phase 2 is still open), so it raises unconditionally --
+    there is nothing to unlock.
 
     `feature` here is a narrower question than "is this object file
     linked" (see needs_graphics/wants_window in compile_file): audio
@@ -548,15 +557,18 @@ def _check_feature_supported(feature, platform_name=None):
             "to try it. Everything except aud/play() works today.",
             category="unsupported platform feature")
     if feature == "audio" and platform_name == "win32":
-        # windows.md Phase 1: unlike the darwin case above, there is no
-        # waveOut backend in the runtime yet at all -- no env var to
-        # unlock, because there is nothing built yet to unlock. This
-        # becomes the same real-hardware-verification gate the darwin
-        # branch above uses once Phase 1 lands.
+        # windows.md Phase 1: the waveOut backend now EXISTS (built,
+        # compiled by windows CI against real <mmsystem.h> headers) but
+        # has not been verified against a real output device on real
+        # hardware -- same gate, same override, same reason as the
+        # darwin branch above.
+        if os.environ.get("FESTINA_ENABLE_WINDOWS_AUDIO"):
+            return
         raise CompileError(
-            "audio is not yet implemented on Windows -- planned as "
-            "windows.md Phase 1 (waveOut). Everything except aud/play() "
-            "works today.",
+            "audio is not yet verified on Windows -- the waveOut "
+            "backend is built (windows.md Phase 1) but awaits real-"
+            "hardware verification; set FESTINA_ENABLE_WINDOWS_AUDIO=1 "
+            "to try it. Everything except aud/play() works today.",
             category="unsupported platform feature")
     if feature == "graphics" and platform_name == "darwin":
         # claude.md #123: the Cocoa windowing backend EXISTS (compiled
@@ -578,11 +590,12 @@ def _check_feature_supported(feature, platform_name=None):
             "window involved at all.",
             category="unsupported platform feature")
     if feature == "graphics" and platform_name == "win32":
-        # windows.md Phase 2: same "nothing built yet" honesty as the
-        # audio branch above -- no Win32 windowing backend exists in
-        # the runtime yet, so this fires unconditionally rather than
-        # gating a real backend behind an env var. claude.md #126 round
-        # six: unlike darwin, this now covers OFFSCREEN drawing too --
+        # windows.md Phase 2: "nothing built yet" honesty -- unlike the
+        # audio branch above (windows.md Phase 1, now built), no Win32
+        # windowing backend exists in the runtime yet, so this fires
+        # unconditionally rather than gating a real backend behind an
+        # env var. claude.md #126 round six: unlike darwin, this now
+        # covers OFFSCREEN drawing too --
         # _runtime_objects_and_link_libs's own offscreen exemption is
         # scoped away from win32 (see its docstring), precisely because
         # there is no window_win32 companion object the way window_mac.m
@@ -953,17 +966,18 @@ def _doctor_report():
     # there is no ALSA to install, and telling a Mac user to go get it
     # would be worse than saying the true thing: the AudioQueue backend
     # is built but awaits real-hardware verification (macos.md Phase 1).
-    # windows.md Phase 1 (waveOut) doesn't exist in the runtime yet
-    # either -- same "not yet" honesty as graphics above, not audio's
-    # own real-hardware-verification gate, since there's no backend to
-    # gate at all yet.
+    # windows.md Phase 1: the waveOut backend is now the same shape --
+    # built and CI-compiled, awaiting its own real-hardware verification
+    # pass, same as graphics still isn't (that stays the "not yet built
+    # at all" honesty below, windows.md Phase 2).
     if sys.platform == "darwin":
         lines.append("  [   not yet       ] audio (aud/.play()) -- the AudioQueue "
                      "backend is built but awaits real-hardware verification, "
                      "macos.md Phase 1 (set FESTINA_ENABLE_MACOS_AUDIO=1 to try it)")
     elif sys.platform == "win32":
-        lines.append("  [   not yet       ] audio (aud/.play()) -- "
-                     "no Windows backend yet, planned as windows.md Phase 1")
+        lines.append("  [   not yet       ] audio (aud/.play()) -- the waveOut "
+                     "backend is built but awaits real-hardware verification, "
+                     "windows.md Phase 1 (set FESTINA_ENABLE_WINDOWS_AUDIO=1 to try it)")
     else:
         check(_pkg_config_has("libmpg123"), False,
               "libmpg123 dev headers (optional -- only used by audio: MP3 clips)",

@@ -273,16 +273,23 @@ class TestFeatureGating:
         cli_mod._check_feature_supported("graphics", "linux")
 
     def test_audio_on_windows_names_the_plan(self, cli_mod, errors):
-        # windows.md Phase 1 INVERTED this test the same way claude.md
-        # #123 inverted the graphics one below: there is no waveOut
-        # backend in the runtime at all yet, so -- unlike darwin's
-        # already-built-but-unverified gate above -- this fires
-        # unconditionally, with no env var to unlock it, because there
-        # is nothing built yet to unlock.
+        # windows.md Phase 1 INVERTED this test a second time: the
+        # waveOut backend now exists (built, CI-compiled), so this is
+        # the same already-built-but-unverified gate as darwin's audio
+        # branch above, not the "nothing built yet" shape graphics on
+        # windows still uses below.
         with pytest.raises(errors.CompileError) as excinfo:
             cli_mod._check_feature_supported("audio", "win32")
         assert "windows.md Phase 1" in str(excinfo.value)
         assert excinfo.value.category == "unsupported platform feature"
+
+    def test_the_windows_audio_gate_is_overridable_for_hardware_verification(
+            self, cli_mod, errors, monkeypatch):
+        monkeypatch.setenv("FESTINA_ENABLE_WINDOWS_AUDIO", "1")
+        cli_mod._check_feature_supported("audio", "win32")   # no raise
+        monkeypatch.delenv("FESTINA_ENABLE_WINDOWS_AUDIO")
+        with pytest.raises(errors.CompileError):
+            cli_mod._check_feature_supported("audio", "win32")
 
     def test_windowed_graphics_is_gated_on_windows(self, cli_mod, errors):
         with pytest.raises(errors.CompileError) as excinfo:
@@ -316,9 +323,11 @@ class TestFeatureGating:
 
     def test_doctor_on_windows_reports_graphics_and_audio_as_planned_not_missing(
             self, cli_mod, monkeypatch):
-        # windows.md Phase 0 item 4: neither backend exists yet, so
-        # doctor must say so rather than naming Linux-only packages
-        # (cairo-xlib, alsa) a Windows user has no way to install.
+        # windows.md Phase 0 item 4 / Phase 1: graphics has no backend
+        # at all yet, and audio's waveOut backend is built but awaits
+        # real-hardware verification -- either way doctor must say so
+        # rather than naming Linux-only packages (cairo-xlib, alsa) a
+        # Windows user has no way to install.
         monkeypatch.setattr(sys, "platform", "win32")
         _stub_which_any(cli_mod, monkeypatch)
         lines, _ = cli_mod._doctor_report()
@@ -372,6 +381,15 @@ class TestAudioFeatureConfig:
         pkgs, flags = cli_mod._feature_pkgs_and_flags("audio", "darwin")
         assert pkgs == ["libmpg123"]
         assert flags == ["-pthread", "-framework", "AudioToolbox"]
+
+    def test_windows_swaps_alsa_for_winmm(self, cli_mod):
+        # windows.md Phase 1: winmm's waveOut is a system DLL with no
+        # pkg-config file, same shape as AudioToolbox above -- `alsa`
+        # drops out, `-lwinmm` comes in, libmpg123 and -pthread stay
+        # (MSYS2 UCRT64 ships a real libmpg123 pkg-config package).
+        pkgs, flags = cli_mod._feature_pkgs_and_flags("audio", "win32")
+        assert pkgs == ["libmpg123"]
+        assert flags == ["-pthread", "-lwinmm"]
 
     def test_darwin_graphics_swaps_cairo_xlib_for_plain_cairo(self, cli_mod):
         # claude.md #123 INVERTED this test: festina_runtime_graphics.c

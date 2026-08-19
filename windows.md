@@ -43,7 +43,14 @@
 > from each run's actual log output, the full Linux suite, and (for one
 > Python-version-specific test bug) a real 3.12.3 venv, until the
 > twelfth round's own real CI result confirmed all of it at once.
-> Phases 1–3 are open.
+> Phase 1 is now built and CI-compiled (claude.md #127): the waveOut
+> backend behind the shared `festina_pcm_*` seam, type-checked against
+> real `<mmsystem.h>` headers on every Windows CI push, `-lwinmm` wired
+> into `_feature_pkgs_and_flags`, and `FESTINA_AUDIO_NULL=1` covering
+> end-to-end play/stop/isPlaying tests with no audio device -- same
+> shape as macOS Phase 1. The windows audio gate stays until real-
+> hardware playback is verified (`FESTINA_ENABLE_WINDOWS_AUDIO=1` to
+> try it on a Windows machine). Phases 2–3 are open.
 
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,
@@ -182,7 +189,7 @@ Exit criteria: Windows CI green on the suites above (confirmed, round
 twelve); `hello.f`, `fizzbuzz.f`, `config.f`, `files.f` run natively
 as `.exe`s (confirmed).
 
-## Phase 1 — Audio: the shared device seam, then waveOut
+## Phase 1 — Audio: the shared device seam, then waveOut *(built, CI-compiled; native-hardware verification open)*
 
 Prerequisite: the 3-function device seam from macos.md Phase 1
 (`festina_pcm_open/write/close`) — cut once, whichever port gets there
@@ -191,19 +198,36 @@ all compile under MinGW unchanged.
 
 The Windows implementation is **waveOut** (winmm — plain C, shipped
 with Windows since forever, no COM): `waveOutOpen` per channel,
-`waveOutWrite` of prepared `WAVEHDR` blocks, and a semaphore counting
-free blocks reproduces ALSA's blocking push exactly — the same
-N-buffers-plus-semaphore shape the macOS AudioQueue shim uses. WASAPI
-is deliberately not the first target: it is COM-based, event-driven,
-and buys latency Festina's `play()/stop()` surface doesn't expose.
-Link: `-lwinmm` as the darwin/linux-conditional in
-`_RUNTIME_FEATURES["audio"]` (no pkg-config package needed).
+`waveOutWrite` of prepared `WAVEHDR` blocks, and a condition variable
+counting free blocks reproduces ALSA's blocking push exactly — the
+same N-buffers-plus-condvar shape the macOS AudioQueue shim uses
+(claude.md #127: a `pthread_cond_t`, not a semaphore — MinGW-w64's
+UCRT pthreads already ship, `-pthread` was already unconditionally
+linked for audio, and a condvar is the more direct match for the
+"wait until `free_count > 0`" shape the AudioQueue and ALSA backends
+both already use). WASAPI is deliberately not the first target: it is
+COM-based, event-driven, and buys latency Festina's `play()/stop()`
+surface doesn't expose. Link: `-lwinmm`, added to `_feature_pkgs_and_
+flags`'s win32 branch (no pkg-config package needed).
 
 Windows always software-mixes, so — like CoreAudio — the EBUSY
 `free_oldest` retry loop simply never fires. The white-box harnesses,
 re-seated at the seam by the macOS plan, run on Windows CI as-is; the
 `FESTINA_AUDIO_NULL=1` shim from that plan covers end-to-end
 play/stop/isPlaying tests with no audio device.
+
+**Status (claude.md #127):** the `FestinaWoDev`/`festina_wo_proc`/
+`festina_pcm_dev_open/write/close` implementation is written, mirrors
+the AudioQueue backend's own error-path cleanup symmetry and
+`waveOutReset`'s synchronous "every pending buffer's callback fires
+before this returns" semantics (the same guarantee `AudioQueueStop(...,
+true)` gives), and is compiled (not linked — this translation unit
+depends on symbols from `festina_runtime.c`) against real
+`<mmsystem.h>` headers by a dedicated windows CI step, the same way the
+macOS job type-checks the AudioQueue backend. The gate stays up
+(`FESTINA_ENABLE_WINDOWS_AUDIO=1` to try it) pending real-hardware
+playback verification — this project has no Windows machine of its
+own to do that on.
 
 Exit criteria: `examples/audio.f` plays on Windows; channel-pool
 white-box and null-shim end-to-end tests green on Windows CI.

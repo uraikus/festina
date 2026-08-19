@@ -140,11 +140,14 @@ jobs:
     # mingw-w64-ucrt-x86_64-libsystre (already pulled in transitively)
     # and pacman --noconfirm silently drops the conflicting package
     # instead of erroring, so libsystre -- not libgnurx -- is the real
-    # regex.h provider here. Audio and windowed graphics (windows.md
-    # Phases 1-2) have no backend in the runtime yet at all, so those
-    # tiers shed as skips via the same conftest mechanism macOS Phase 0
-    # built -- no parallel test-selection list, same as the macOS job
-    # above.
+    # regex.h provider here. windows.md Phase 1: audio now has a real
+    # waveOut backend (built, compiled below against real <mmsystem.h>
+    # headers), but -- same as macOS Phase 1's AudioQueue backend --
+    # stays gated pending real-hardware playback verification. Windowed
+    # graphics (windows.md Phase 2) still has no backend in the runtime
+    # at all. Either way both tiers shed as skips via the same conftest
+    # mechanism macOS Phase 0 built -- no parallel test-selection list,
+    # same as the macOS job above.
     runs-on: windows-latest
     timeout-minutes: 30
     defaults:
@@ -163,6 +166,7 @@ jobs:
             mingw-w64-ucrt-x86_64-sqlite3
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-libsystre
+            mingw-w64-ucrt-x86_64-libmpg123
       - name: Install Python test dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Run the test suite
@@ -175,3 +179,23 @@ jobs:
             python -m festina.cli compile "examples/$ex.f" -o "/tmp/$ex.exe"
             "/tmp/$ex.exe"
           done
+      - name: Compile the audio runtime (waveOut backend)
+        # windows.md Phase 1 / claude.md #127: the audio translation
+        # unit's _WIN32 branch is the waveOut device layer -- compiling
+        # it here type-checks it against the real <mmsystem.h> headers
+        # on every push, the same way the macOS job does for
+        # AudioToolbox, even while the windows audio gate keeps it out
+        # of user programs pending real-hardware playback verification.
+        # Compile-only (not linked), same as the macOS step: this file
+        # calls festina_fail/festina_retain/festina_release_check/
+        # festina_save_bytes, defined in festina_runtime.c, so a
+        # standalone link would fail on those, not on anything this
+        # step actually exists to catch. The Compile-and-run-the-core-
+        # examples step above already exercises the full link -- with
+        # -lwinmm now in _feature_pkgs_and_flags's win32 audio branch --
+        # for any program that actually uses aud/play() (once the gate
+        # is unlocked).
+        run: |
+          clang -c -O2 -I runtime \
+            $(pkg-config --cflags libmpg123) \
+            runtime/festina_runtime_audio.c -o /tmp/festina_audio_win.o
