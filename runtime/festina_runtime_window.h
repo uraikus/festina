@@ -54,7 +54,17 @@
 #define FESTINA_RUNTIME_WINDOW_H
 
 #include <stdint.h>
-#include <cairo/cairo.h>
+/* Bare <cairo.h>, not <cairo/cairo.h>: pkg-config's Cflags for both
+ * cairo-xlib (Linux) and cairo (darwin) point -I directly at the
+ * cairo headers directory itself (e.g. -I/usr/include/cairo,
+ * -I/opt/homebrew/opt/cairo/include/cairo), so <cairo.h> is the form
+ * that resolves via the explicit -I flag on every platform. The
+ * <cairo/cairo-xlib.h> spelling elsewhere in the X11-only backend
+ * block happens to also work on Linux, but only because /usr/include
+ * is always on clang/gcc's own default search path there -- a
+ * coincidence Homebrew's non-default install prefix doesn't share,
+ * confirmed by real macOS CI (claude.md #126). */
+#include <cairo.h>
 
 typedef enum {
     FESTINA_WEVENT_MOUSE_DOWN,

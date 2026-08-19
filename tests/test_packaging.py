@@ -71,7 +71,14 @@ class TestPackagedCompilerBinary:
         src.write_text("log('packaged binary works')")
         out = tmp_path / "hello"
 
-        env = {"PATH": f"{fake_bin}:/usr/bin:/bin"}
+        # Prepend fake_bin rather than replacing PATH outright: the
+        # fake python/python3/pythonX.Y entries shadow the real ones
+        # (found first), while everything else the compile pipeline
+        # needs (pkg-config, in particular -- Homebrew-installed on
+        # macOS, so never under a hardcoded /usr/bin:/bin, which is
+        # what broke this test the first time it ran on real macOS
+        # CI, claude.md #126) still resolves from the real PATH after it.
+        env = {"PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"}
         result = subprocess.run(
             [packaged_binary, "compile", str(src), "-o", str(out)],
             cwd=tmp_path, capture_output=True, text=True, env=env, timeout=60,

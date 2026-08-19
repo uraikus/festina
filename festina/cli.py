@@ -126,6 +126,40 @@ def _default_output_name(entry_path, platform_name=None):
     return base
 
 
+def _rename_if_linker_appended_exe(output_path):
+    """windows.md Phase 0 (claude.md #126): MinGW's linker appends
+    `.exe` to a `-o` path that doesn't already end in one regardless
+    of whether that path was _default_output_name's own choice or an
+    EXPLICIT caller request -- only the former was actually accounted
+    for (that path always already ends in `.exe`, so the linker's
+    auto-append never fires). An explicit `-o program` (no suffix)
+    silently linked to `program.exe` while `compile_file` kept
+    claiming `program` was the output, so the caller's own exact
+    request should win: if the linker wrote `output_path + ".exe"`
+    instead of `output_path` itself, rename it back.
+
+    claude.md #126 round twelve: this used to skip the rename whenever
+    `output_path` already existed -- meaning a SECOND compile to the
+    same explicit path (recompiling `program` after changing the
+    source, exactly what every one of tests/test_codegen.py's
+    TestAutomaticSqliteSchemaSync tests does via compile_and_run's
+    reused `tmp_path / "program"`) left the first compile's stale
+    binary sitting at `output_path` untouched, while the fresh build
+    sat next to it at `output_path + ".exe"`, never picked up. Real
+    Windows CI's own diagnostics caught this directly: the "second"
+    compiled program's captured stdout was the FIRST program's own
+    output verbatim. `os.replace` already atomically overwrites an
+    existing destination on Windows -- the `not os.path.exists(...)`
+    check was actively wrong, not a needed safety guard, since the
+    whole point of this function is putting the just-linked binary at
+    the caller's exact requested path, past compile or not."""
+    if sys.platform != "win32" or output_path.lower().endswith(".exe"):
+        return
+    exe_path = output_path + ".exe"
+    if os.path.exists(exe_path):
+        os.replace(exe_path, output_path)
+
+
 # claude.md #59: a missing dependency must fail with a clear, actionable
 # error naming it and how to get it -- not a raw exception. Centralized
 # here since every external-tool invocation in this module (pkg-config,
@@ -172,19 +206,53 @@ _PKG_INSTALL_HINTS = {
             "on Debian/Ubuntu -- needed for claude.md #38's aud/loadAudio()",
     # windows.md Phase 0: the one core-runtime addition on Windows, not
     # an optional feature tier like the others above -- every program
-    # needs it, the same way every program needs sqlite3.
-    "libgnurx": "install MSYS2's POSIX regex package from a UCRT64 shell, e.g. "
-                "`pacman -S mingw-w64-ucrt-x86_64-libgnurx` -- needed for "
-                "claude.md #67/#68's regex()/.test()/.match()/.replace(), which "
-                "every compiled program links whether it uses regex or not "
-                "(see windows.md Phase 0)",
+    # needs it, the same way every program needs sqlite3. Two real
+    # Windows CI rounds (claude.md #126) to land on this: round one's
+    # mingw-w64-ucrt-x86_64-libgnurx genuinely installs, but pacman
+    # --noconfirm silently drops it from the install set because it
+    # CONFLICTS with mingw-w64-ucrt-x86_64-libsystre (already present
+    # as a transitive dependency of the UCRT64 toolchain) -- so the
+    # PACKAGE to install is libsystre. Round two's guess that pkg-config
+    # would also answer to that same name was wrong: libsystre's own
+    # PKGBUILD declares Provides/Conflicts/Replaces against libgnurx
+    # (it's a designed drop-in replacement, which is exactly why they
+    # conflict at all) and ships its pkgconfig file under the OLD
+    # name -- gnurx.pc, not libsystre.pc -- confirmed via MSYS2's own
+    # package listing. So: install libsystre, ask pkg-config for gnurx.
+    "gnurx": "install MSYS2's POSIX regex package from a UCRT64 shell, e.g. "
+             "`pacman -S mingw-w64-ucrt-x86_64-libsystre` -- needed for "
+             "claude.md #67/#68's regex()/.test()/.match()/.replace(), which "
+             "every compiled program links whether it uses regex or not "
+             "(see windows.md Phase 0)",
 }
 
 
 def _run_tool(cmd, **kwargs):
     """subprocess.run, but a missing executable becomes a clear
     CompileError naming the tool and how to install it, instead of a raw
-    FileNotFoundError."""
+    FileNotFoundError.
+
+    claude.md #126 round eight, found by real Windows CI: this used to
+    let subprocess.run resolve cmd[0] itself, which is NOT the same
+    search PATH-only tools like shutil.which perform on Windows --
+    Win32's CreateProcess (what subprocess.run calls into with no
+    executable= override) additionally searches the calling process's
+    OWN directory before it ever looks at PATH, per Microsoft's own
+    documented search order. On a Windows CI runner where Python itself
+    is an MSYS2 UCRT64 package, that directory is the SAME bin/ pkg-
+    config and the C toolchain also live in -- so a test that hides a
+    tool by restricting PATH (tests/conftest.py's path_without) fooled
+    shutil.which-based checks (festina doctor) but not an actual
+    subprocess.run call, which found the tool anyway via that extra
+    search location and silently succeeded where it should have raised
+    "missing dependency". Resolving explicitly via shutil.which FIRST
+    makes every tool invocation PATH-only and deterministic on every
+    platform, closing that gap rather than working around it in tests."""
+    if shutil.which(cmd[0]) is None:
+        tool = cmd[0]
+        hint = _INSTALL_HINTS.get(tool, "install it and make sure it's on PATH")
+        raise CompileError(f"'{tool}' is not installed or not on PATH -- {hint}",
+                            category="missing dependency")
     try:
         return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
     except FileNotFoundError:
@@ -334,17 +402,26 @@ def _core_pkgs(platform_name=None):
     linked into every program -- see that file's own top comment) is
     part of libc on Linux and BSD/macOS libc alike, so core needs no
     pkg-config package of its own there. MinGW-w64 doesn't ship a POSIX
-    regex implementation at all, so on win32 this pulls in MSYS2's
-    `mingw-w64-*-libgnurx` package (the standard regex.h/libregex shim
-    for MinGW, windows.md's own preferred answer) -- the fallback named
-    there (vendoring musl's regcomp/regexec/regfree) only becomes
-    necessary if a real Windows CI run finds libgnurx's ERE behavior
-    diverging from glibc's under the existing regex suite; nothing
-    about that suite is platform-specific, so it is the referee either
-    way. Injectable platform_name for the unit tests, exactly like
+    regex implementation at all, so on win32 this pulls in a package
+    that provides one, discovered across two real Windows CI rounds
+    (claude.md #126): windows.md's originally preferred `libgnurx`
+    genuinely installs, but pacman drops it from the install set
+    because it CONFLICTS with `libsystre` (a POSIX regex.h/regcomp/
+    regexec wrapper around TRE, already pulled in as a transitive
+    dependency of the UCRT64 toolchain) -- so `libsystre` is the
+    package to INSTALL. But libsystre's own PKGBUILD declares
+    Provides/Conflicts/Replaces against libgnurx (it's a designed
+    drop-in replacement -- exactly why they conflict) and ships its
+    pkgconfig file under the OLD name, `gnurx.pc`, not `libsystre.pc`
+    -- so `gnurx` is the name to ask pkg-config FOR, a different string
+    than the package name entirely. windows.md's fallback for this
+    kind of surprise (vendoring musl's regcomp/regexec/regfree) turned
+    out not to be needed either time: gnurx is a real, already-present
+    POSIX regex.h implementation, not a divergent one. Injectable
+    platform_name for the unit tests, exactly like
     _static_sqlite_attempt/_feature_pkgs_and_flags above."""
     platform_name = platform_name or sys.platform
-    return ["libgnurx"] if platform_name == "win32" else []
+    return ["gnurx"] if platform_name == "win32" else []
 
 
 def _feature_pkgs_and_flags(name, platform_name=None):
@@ -387,7 +464,13 @@ def _feature_extra_object(cc, name, platform_name=None):
     shape as any other runtime object file."""
     platform_name = platform_name or sys.platform
     if name == "graphics" and platform_name == "darwin":
-        return _ensure_runtime_object(cc, "window_mac", _RUNTIME_WINDOW_MAC_M, [])
+        # claude.md #126: this file #includes <cairo.h> (CGImage/cairo
+        # interop in drawRect:) same as festina_runtime_graphics.c
+        # does, so it needs cairo's own pkg-config cflags too -- an
+        # empty list here meant it silently never got them, and this
+        # translation unit is the ONE place real macOS CI could ever
+        # catch that, since nothing else on any platform compiles it.
+        return _ensure_runtime_object(cc, "window_mac", _RUNTIME_WINDOW_MAC_M, ["cairo"])
     return None
 
 
@@ -498,17 +581,20 @@ def _check_feature_supported(feature, platform_name=None):
         # windows.md Phase 2: same "nothing built yet" honesty as the
         # audio branch above -- no Win32 windowing backend exists in
         # the runtime yet, so this fires unconditionally rather than
-        # gating a real backend behind an env var. Offscreen drawing
-        # never reaches this at all -- see this function's own
-        # docstring (the "graphics" question here is always the narrow,
-        # window-opening one).
+        # gating a real backend behind an env var. claude.md #126 round
+        # six: unlike darwin, this now covers OFFSCREEN drawing too --
+        # _runtime_objects_and_link_libs's own offscreen exemption is
+        # scoped away from win32 (see its docstring), precisely because
+        # there is no window_win32 companion object the way window_mac.m
+        # exists for darwin, so even drawRect()+saveCanvas() alone fails
+        # to link on win32 today, not just windowed use.
         raise CompileError(
-            "windowed graphics (render(), or an on mouseDown/mouseUp/"
-            "mouse/keyDown/keyUp/resize/close handler) is not yet "
-            "implemented on Windows -- planned as windows.md Phase 2 "
-            "(Win32 + the shared Cairo blit). Drawing to an offscreen "
-            "canvas and saveCanvas() work today with no window "
-            "involved at all.",
+            "graphics (drawRect, on mouseDown, img, saveCanvas, ...) is "
+            "not yet implemented on Windows -- planned as windows.md "
+            "Phase 2 (Win32 + the shared Cairo blit). This includes "
+            "offscreen-only drawing too, unlike on macOS: there is no "
+            "Win32 windowing backend at all yet for the shared graphics "
+            "code to link against.",
             category="unsupported platform feature")
 
 
@@ -528,15 +614,28 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
     broader "the graphics object file is needed at all" this function's
     own `uses_graphics` parameter means (which also covers a purely
     offscreen drawRect()+saveCanvas() program). Only `wants_window`
-    reaches _check_feature_supported's platform gate -- see that
-    function's own docstring for why offscreen drawing must never hit
-    it. The graphics object (and its companion Cocoa object on darwin,
-    which the offscreen path also needs linked -- see
-    _feature_extra_object's own comment) is still linked whenever
-    `uses_graphics` (broad) is true, gate or no gate."""
+    reaches _check_feature_supported's platform gate on platforms where
+    offscreen graphics actually links -- see that function's own
+    docstring for why offscreen drawing must never hit it there. The
+    graphics object (and its companion Cocoa object on darwin, which
+    the offscreen path also needs linked -- see _feature_extra_object's
+    own comment) is still linked whenever `uses_graphics` (broad) is
+    true, gate or no gate.
+
+    claude.md #126 round four (found by real Windows CI): that
+    exemption is itself platform-scoped, not universal. Unlike darwin,
+    Windows has no window backend at all yet -- no window_win32
+    companion object exists the way window_mac.m does -- so even an
+    OFFSCREEN-only program fails at the *linker* stage with
+    `_festina_window_open` and friends undefined, since
+    festina_runtime_graphics.c references those symbols unconditionally
+    regardless of whether a given program ever calls render() or an
+    event handler. So on win32 the graphics gate must fire even when
+    wants_window is False, unlike on darwin (offscreen genuinely works
+    there) or Linux (ungated everywhere, checked directly)."""
     # core needs no pkg-config package of its own beyond sqlite3 (always
     # included by _ensure_runtime_object itself) on Linux/macOS;
-    # windows.md Phase 0 adds libgnurx on win32 for <regex.h> -- see
+    # windows.md Phase 0 adds gnurx on win32 for <regex.h> -- see
     # _core_pkgs's own docstring.
     core_pkgs = _core_pkgs()
     objects = [_ensure_runtime_object(cc, "core", _RUNTIME_C, core_pkgs)]
@@ -545,10 +644,12 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
     for pkg in core_pkgs:
         link_libs += _pkg_config("--libs", pkg)
 
+    offscreen_graphics_is_gate_exempt = sys.platform != "win32"
     for name, wants in (("graphics", uses_graphics), ("audio", uses_audio)):
         if not wants:
             continue
-        if name != "graphics" or wants_window:
+        skip_gate = name == "graphics" and not wants_window and offscreen_graphics_is_gate_exempt
+        if not skip_gate:
             _check_feature_supported(name)
         feature = _RUNTIME_FEATURES[name]
         pkgs, extra_flags = _feature_pkgs_and_flags(name)
@@ -599,6 +700,7 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
         _compile_via_libllvm(ir, entry_path, output_path, cc, runtime_objects, link_libs)
     else:
         _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio, link_libs)
+    _rename_if_linker_appended_exe(output_path)
     return output_path
 
 
@@ -657,17 +759,40 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
     than through the cached-object-file path above, same as this
     fallback always has -- still only the sources the program actually
     needs (needs_graphics/needs_audio, from compile_file), for the same
-    binary-slimming reason."""
+    binary-slimming reason.
+
+    claude.md #126 round four: this is the path macOS CI actually runs
+    (ci.yml deliberately skips installing the libLLVM bottle there --
+    the libLLVM fast path is exercised by the Linux job only), and it
+    had never been updated for _feature_pkgs_and_flags/
+    _feature_extra_object's own per-platform darwin swaps at all -- it
+    used _RUNTIME_FEATURES[name]["pkgs"] (the Linux table) directly and
+    never linked _RUNTIME_WINDOW_MAC_M in. That was invisible as long
+    as festina_runtime_window_mac.m itself never compiled (blocked by
+    the cairo.h bugs the earlier rounds fixed); the moment it did, every
+    graphics program -- offscreen ones included, since they link the
+    same object -- failed at link time with `_festina_window_open` and
+    friends undefined, the real windowing symbols only the (never
+    linked) Cocoa companion object provides."""
     runtime_sources = [_RUNTIME_C]
     pkg_configs = ["sqlite3", *_core_pkgs()]
     extra_link_flags = []
     if needs_graphics:
         runtime_sources.append(_RUNTIME_GRAPHICS_C)
-        pkg_configs += _RUNTIME_FEATURES["graphics"]["pkgs"]
+        pkgs, flags = _feature_pkgs_and_flags("graphics")
+        pkg_configs += pkgs
+        extra_link_flags += flags
+        extra_object = _feature_extra_object(cc, "graphics")
+        if extra_object:
+            runtime_sources.append(extra_object)
     if needs_audio:
         runtime_sources.append(_RUNTIME_AUDIO_C)
-        pkg_configs += _RUNTIME_FEATURES["audio"]["pkgs"]
-        extra_link_flags.append("-pthread")
+        # -pthread comes back from _feature_pkgs_and_flags itself (the
+        # audio feature's own extra_link_flags, claude.md #38) -- no
+        # need to add it again here.
+        pkgs, flags = _feature_pkgs_and_flags("audio")
+        pkg_configs += pkgs
+        extra_link_flags += flags
     cflags = []
     for pkg in pkg_configs:
         cflags += _pkg_config("--cflags", pkg)
@@ -781,9 +906,9 @@ def _doctor_report():
     # loop is a no-op there.
     for pkg in _core_pkgs():
         check(_pkg_config_has(pkg), True,
-              "libgnurx (required on Windows -- <regex.h> isn't part of MinGW's libc, "
-              "claude.md #67/#68's regex()/.test()/.match()/.replace())",
-              _PKG_INSTALL_HINTS["libgnurx"])
+              "POSIX regex (required on Windows -- <regex.h> isn't part of MinGW's "
+              "libc, claude.md #67/#68's regex()/.test()/.match()/.replace())",
+              _PKG_INSTALL_HINTS["gnurx"])
 
     # claude.md #123: platform-aware, like audio just below -- darwin's
     # graphics runtime carries zero X11 code (guarded `#ifndef

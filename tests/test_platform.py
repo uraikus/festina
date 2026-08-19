@@ -28,6 +28,25 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _KEY_NAMES_H = os.path.join(_REPO_ROOT, "runtime", "festina_key_names.h")
 
 
+def _stub_which_any(cli_mod, monkeypatch):
+    """Any _doctor_report() test that monkeypatches sys.platform to
+    "win32" while actually running on real Linux/macOS CI must not let
+    ANY of _doctor_report's several real shutil.which(...) calls
+    execute (the C compiler check, the pkg-config check, the festina-
+    on-PATH check all call it directly or via _which_any) -- shutil.which
+    has its OWN internal `sys.platform == "win32"` branch (calling into
+    the Windows-only _winapi module), which the spoofed platform string
+    triggers for real, crashing with "'NoneType' object has no
+    attribute 'NeedCurrentDirectoryForExePath'" on Python 3.12+ where
+    _winapi is None on POSIX (claude.md #126, caught by real Linux CI
+    running a newer Python than this suite happened to be developed
+    against). Patching shutil.which itself, as cli.py imported it,
+    sidesteps every call site at once, the same way other
+    cross-platform-from-Linux tests here stub out real toolchain calls
+    they have no state for."""
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda cmd: f"/fake/{cmd}")
+
+
 class TestDefaultOutputName:
     """windows.md Phase 0: the default output gains `.exe` on Windows
     -- both because the shell needs the extension and because MinGW's
@@ -54,6 +73,71 @@ class TestDefaultOutputName:
 
     def test_a_directory_prefix_is_stripped_on_every_platform(self, cli_mod):
         assert cli_mod._default_output_name("src/deep/game.f", "win32") == "game.exe"
+
+
+class TestRenameIfLinkerAppendedExe:
+    """claude.md #126 round four: _default_output_name's own docstring
+    already said MinGW's linker appends `.exe` to a `-o` name lacking
+    one, but the actual guard only ever covered the *default*-name
+    path (which already ends in `.exe`, so the append never fires
+    there) -- an explicit `-o program` still silently linked to
+    `program.exe` while compile_file kept insisting `program` was the
+    output. _rename_if_linker_appended_exe runs after linking and
+    restores the caller's exact requested name."""
+
+    def test_non_windows_is_always_a_no_op(self, cli_mod, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        out = tmp_path / "program"
+        (tmp_path / "program.exe").write_bytes(b"fake")
+        cli_mod._rename_if_linker_appended_exe(str(out))
+        assert not out.exists()
+        assert (tmp_path / "program.exe").exists()
+
+    def test_a_request_that_already_ends_in_exe_is_left_alone(
+            self, cli_mod, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        out = tmp_path / "program.exe"
+        out.write_bytes(b"real")
+        cli_mod._rename_if_linker_appended_exe(str(out))
+        assert out.read_bytes() == b"real"
+
+    def test_windows_renames_the_linkers_exe_back_to_the_exact_request(
+            self, cli_mod, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        out = tmp_path / "program"
+        (tmp_path / "program.exe").write_bytes(b"linked")
+        cli_mod._rename_if_linker_appended_exe(str(out))
+        assert out.read_bytes() == b"linked"
+        assert not (tmp_path / "program.exe").exists()
+
+    def test_windows_does_nothing_if_the_linker_never_appended_exe(
+            self, cli_mod, tmp_path, monkeypatch):
+        # Nothing to rename -- e.g. a caller who never actually linked.
+        monkeypatch.setattr(sys, "platform", "win32")
+        out = tmp_path / "program"
+        cli_mod._rename_if_linker_appended_exe(str(out))
+        assert not out.exists()
+        assert not (tmp_path / "program.exe").exists()
+
+    def test_windows_overwrites_a_stale_exact_name_from_an_earlier_compile(
+            self, cli_mod, tmp_path, monkeypatch):
+        # claude.md #126 round twelve: the earlier version of this
+        # function skipped the rename whenever `out` already existed --
+        # meaning a SECOND compile to the same explicit path (exactly
+        # what recompiling `program` after a source change does) left
+        # the FIRST compile's stale binary in place forever, while the
+        # fresh build sat unused at `program.exe`. Real Windows CI
+        # caught this directly: a "second" compiled program's own
+        # captured stdout was the first program's output verbatim.
+        # os.replace already overwrites atomically -- the freshly
+        # linked binary must always win.
+        monkeypatch.setattr(sys, "platform", "win32")
+        out = tmp_path / "program"
+        out.write_bytes(b"stale, from an earlier compile")
+        (tmp_path / "program.exe").write_bytes(b"freshly linked")
+        cli_mod._rename_if_linker_appended_exe(str(out))
+        assert out.read_bytes() == b"freshly linked"
+        assert not (tmp_path / "program.exe").exists()
 
 
 class TestStaticSqliteAttempt:
@@ -90,14 +174,25 @@ class TestCorePkgs:
     everywhere except MinGW -- so this is the one core pkg-config
     ADDITION win32 needs, not a feature tier like graphics/audio."""
 
-    def test_win32_needs_libgnurx(self, cli_mod):
-        assert cli_mod._core_pkgs("win32") == ["libgnurx"]
+    def test_win32_needs_gnurx(self, cli_mod):
+        # claude.md #126 INVERTED this test twice. Round one: the first
+        # real Windows CI run found mingw-w64-ucrt-x86_64-libgnurx
+        # conflicts with mingw-w64-ucrt-x86_64-libsystre (already
+        # pulled in transitively) and pacman silently drops the
+        # conflicting PACKAGE rather than erroring -- libsystre is the
+        # one that's actually installed. Round two: libsystre's own
+        # pkg-config name isn't "libsystre" either -- its PKGBUILD
+        # declares Provides/Conflicts/Replaces against libgnurx (a
+        # designed drop-in replacement) and ships its pkgconfig file
+        # under that OLD name, gnurx.pc, confirmed via MSYS2's package
+        # listing. Install libsystre, ask pkg-config for gnurx.
+        assert cli_mod._core_pkgs("win32") == ["gnurx"]
 
     def test_linux_and_darwin_need_nothing_extra(self, cli_mod):
         assert cli_mod._core_pkgs("linux") == []
         assert cli_mod._core_pkgs("darwin") == []
 
-    def test_core_object_and_link_libs_pick_up_libgnurx_on_windows(
+    def test_core_object_and_link_libs_pick_up_gnurx_on_windows(
             self, cli_mod, monkeypatch):
         # _runtime_objects_and_link_libs must actually pass _core_pkgs()
         # through to both the cached object's own cflags and the final
@@ -116,8 +211,8 @@ class TestCorePkgs:
         _, link_libs = cli_mod._runtime_objects_and_link_libs(
             "clang", uses_graphics=False, uses_audio=False)
 
-        assert ensure_calls[0] == ("core", ["libgnurx"])
-        assert "--libgnurx-libs" in link_libs
+        assert ensure_calls[0] == ("core", ["gnurx"])
+        assert "--gnurx-libs" in link_libs
 
 
 class TestLibllvmCandidatePaths:
@@ -225,6 +320,7 @@ class TestFeatureGating:
         # doctor must say so rather than naming Linux-only packages
         # (cairo-xlib, alsa) a Windows user has no way to install.
         monkeypatch.setattr(sys, "platform", "win32")
+        _stub_which_any(cli_mod, monkeypatch)
         lines, _ = cli_mod._doctor_report()
         report = "\n".join(lines)
         assert "windows.md Phase 1" in report
@@ -232,24 +328,30 @@ class TestFeatureGating:
         assert "cairo-xlib" not in report and "alsa" not in report, (
             "doctor must not tell a Windows user to install Linux packages")
 
-    def test_doctor_on_windows_reports_libgnurx_as_required(
+    def test_doctor_on_windows_reports_posix_regex_as_required(
             self, cli_mod, monkeypatch):
         monkeypatch.setattr(sys, "platform", "win32")
+        _stub_which_any(cli_mod, monkeypatch)
         monkeypatch.setattr(cli_mod, "_pkg_config_has", lambda pkg: False)
         lines, all_ok = cli_mod._doctor_report()
         report = "\n".join(lines)
-        assert "libgnurx" in report
+        # The install hint names the real package (libsystre); the
+        # pkg-config name it's actually queried under (gnurx) is an
+        # implementation detail the report doesn't need to expose.
+        assert "libsystre" in report
         assert "MISSING" in report
         assert all_ok is False
 
     def test_doctor_flags_the_plain_msys_shell_as_wrong(self, cli_mod, monkeypatch):
         monkeypatch.setattr(sys, "platform", "win32")
+        _stub_which_any(cli_mod, monkeypatch)
         monkeypatch.setenv("MSYSTEM", "MSYS")
         lines, _ = cli_mod._doctor_report()
         assert "wrong shell" in "\n".join(lines)
 
     def test_doctor_says_nothing_extra_for_ucrt64(self, cli_mod, monkeypatch):
         monkeypatch.setattr(sys, "platform", "win32")
+        _stub_which_any(cli_mod, monkeypatch)
         monkeypatch.setenv("MSYSTEM", "UCRT64")
         lines, _ = cli_mod._doctor_report()
         assert "wrong shell" not in "\n".join(lines)
@@ -291,14 +393,37 @@ class TestAudioFeatureConfig:
         assert cli_mod._feature_extra_object("clang", "audio", "darwin") is None
         assert cli_mod._feature_extra_object("clang", "graphics", "linux") is None
 
+    def test_the_darwin_window_backend_extra_object_gets_cairo_cflags(
+            self, cli_mod, monkeypatch):
+        # claude.md #126 round four: festina_runtime_window_mac.m
+        # #includes <cairo.h> same as festina_runtime_graphics.c does,
+        # but _feature_extra_object passed _ensure_runtime_object an
+        # EMPTY pkg-config package list on every round before this one
+        # -- the file never got cairo's -I cflags at all, regardless of
+        # how the #include was spelled, and only real macOS CI (nothing
+        # else compiles this file) could ever have caught it. Verified
+        # here by recording the exact call rather than actually
+        # compiling, which needs real macOS toolchain state this test
+        # doesn't have on Linux.
+        calls = []
+        monkeypatch.setattr(
+            cli_mod, "_ensure_runtime_object",
+            lambda cc, name, source, pkgs: calls.append((name, pkgs)) or "/tmp/fake.o")
+        cli_mod._feature_extra_object("clang", "graphics", "darwin")
+        assert calls == [("window_mac", ["cairo"])]
+
     def test_offscreen_graphics_never_reaches_the_darwin_gate(
             self, cli_mod, monkeypatch):
         # claude.md #123: _runtime_objects_and_link_libs's own
         # wants_window parameter is the narrow question -- a program
         # that only draws to an offscreen canvas (uses_graphics_code,
         # not the real-window uses_graphics) must never hit
-        # _check_feature_supported at all, on darwin or anywhere else,
-        # since it never touches the windowing seam. Verified by
+        # _check_feature_supported at all on darwin, since it never
+        # touches the windowing seam and offscreen genuinely links
+        # there (see _feature_extra_object). claude.md #126 round five:
+        # this exemption is darwin-specific, NOT universal -- see
+        # test_offscreen_graphics_still_reaches_the_windows_gate below
+        # for the platform where it must NOT apply. Verified by
         # recording calls rather than actually linking (which needs
         # real toolchain state this test doesn't have on Linux).
         monkeypatch.setattr(sys, "platform", "darwin")
@@ -317,6 +442,37 @@ class TestAudioFeatureConfig:
         cli_mod._runtime_objects_and_link_libs(
             "clang", uses_graphics=True, uses_audio=False, wants_window=True)
         assert calls == ["graphics"], "a windowed program must hit the gate"
+
+    def test_offscreen_graphics_still_reaches_the_windows_gate(
+            self, cli_mod, monkeypatch):
+        # claude.md #126 round five, found by real Windows CI: unlike
+        # darwin, Windows has no window backend at all yet -- no
+        # window_win32 companion object exists the way window_mac.m
+        # does -- so festina_runtime_graphics.c's unconditional
+        # references to _festina_window_open and friends can never
+        # resolve at link time on win32, offscreen program or not. The
+        # darwin exemption above had accidentally been written
+        # platform-agnostic, so an offscreen program on win32 reached
+        # real pkg-config/linking code (and failed there, confusingly)
+        # instead of the same clean "windows.md Phase 2" error every
+        # other graphics use already got.
+        monkeypatch.setattr(sys, "platform", "win32")
+        calls = []
+
+        def _fake_check(name, platform_name=None):
+            calls.append(name)
+            raise cli_mod.CompileError("boom", category="unsupported platform feature")
+
+        monkeypatch.setattr(cli_mod, "_check_feature_supported", _fake_check)
+        monkeypatch.setattr(cli_mod, "_ensure_runtime_object", lambda *a, **k: "/tmp/fake.o")
+        monkeypatch.setattr(cli_mod, "_feature_extra_object", lambda *a, **k: None)
+        monkeypatch.setattr(cli_mod, "_pkg_config", lambda *a, **k: [])
+        monkeypatch.setattr(cli_mod, "_sqlite_link_flags", lambda cc: ([], False))
+
+        with pytest.raises(cli_mod.CompileError):
+            cli_mod._runtime_objects_and_link_libs(
+                "clang", uses_graphics=True, uses_audio=False, wants_window=False)
+        assert calls == ["graphics"], "the gate must actually fire for offscreen use on win32"
 
     def test_the_darwin_gate_is_overridable_for_hardware_verification(
             self, cli_mod, errors, monkeypatch):
@@ -498,8 +654,8 @@ class TestOnWindows:
 
     def test_posix_regex_is_linked_and_answers(self, compile_and_run):
         # The one core-runtime gap windows.md names: <regex.h> via
-        # libgnurx or vendored musl. Whichever answer landed, the
-        # language surface must behave identically.
+        # libsystre (claude.md #126). The language surface must behave
+        # identically regardless of which provider is behind it.
         result = compile_and_run("log(/[0-9]+/.test('v42'))")
         assert result.returncode == 0
         assert result.stdout.strip() == "true"

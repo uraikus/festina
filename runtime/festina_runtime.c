@@ -43,11 +43,52 @@
 #include <time.h>       /* clock_gettime/nanosleep -- setTimeout/setInterval */
 #include "festina_runtime.h"
 #include "festina_runtime_internal.h"
+#ifdef _WIN32
+#include <fcntl.h> /* _O_BINARY -- festina_runtime_init's stdout/stderr fix */
+#include <io.h>    /* _setmode/_fileno -- MSVCRT/UCRT, not POSIX unistd.h */
+#endif
+
+/* windows.md Phase 0 (claude.md #126): the MinGW/UCRT C runtime opens
+ * stdout/stderr in TEXT mode by default, which silently rewrites every
+ * '\n' a program prints to '\r\n' at the point of the write -- found
+ * by real Windows CI comparing a compiled program's actual output
+ * against a plain "\n"-terminated expectation. Every other platform's
+ * libc has no such translation to begin with, so this is a no-op
+ * everywhere but win32. Called once, unconditionally, as literally the
+ * first thing every compiled program's main() does (see codegen.py). */
+void festina_runtime_init(void) {
+#ifdef _WIN32
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+#endif
+}
 
 /* ---- log() / fail() -- claude.md #41, #42 ---- */
 
-void festina_log_int(int64_t v) { printf("%lld\n", (long long)v); }
-void festina_log_float(double v) { printf("%g\n", v); }
+/* claude.md #126 round nine: every log() call flushes explicitly
+ * rather than trusting stdout's own default buffering mode. Once
+ * stdout is redirected to a file or pipe (as any subprocess-captured
+ * or piped program's is), the C runtime switches from line-buffered to
+ * fully block-buffered by default -- a handful of short log() lines
+ * can sit unflushed in that buffer for a long time, invisible to
+ * anything reading the file/pipe concurrently rather than after the
+ * process exits. `stdbuf -oL` (the usual fix -- force line buffering
+ * from outside the process) works on Linux/macOS because it's an
+ * LD_PRELOAD/DYLD_INSERT_LIBRARIES interposition trick against the
+ * SAME libc the target binary links -- it can't do anything for a
+ * compiled Festina program on Windows, which is a plain native UCRT64
+ * PE binary, not something built against MSYS2's own runtime the way
+ * MSYS2's own `stdbuf` is. Real Windows CI's timer test (an uncleared
+ * setInterval, read from a still-running process's stdout after a
+ * short wait) is a direct, real-world instance of exactly the
+ * consequence any log()-heavy long-running program's redirected
+ * output would have without this -- not just a test artifact. An
+ * explicit fflush after each call is small, portable, and correct
+ * everywhere, unlike relying on `setvbuf(..., _IOLBF, ...)`, which
+ * Microsoft's own C runtime has long treated the same as full
+ * buffering rather than true line buffering. */
+void festina_log_int(int64_t v) { printf("%lld\n", (long long)v); fflush(stdout); }
+void festina_log_float(double v) { printf("%g\n", v); fflush(stdout); }
 /* claude.md #97: bool's null is the reserved third bit pattern 2 (see
  * codegen's BOOL_NULL_CONST), and printing it with a plain `v ? true :
  * false` rendered it as "true" -- indistinguishable from a genuine
@@ -56,8 +97,9 @@ void festina_log_float(double v) { printf("%g\n", v); }
  * sentinel takes this branch, so no real boolean's output changes. */
 void festina_log_bool(int8_t v) {
     printf("%s\n", v == 2 ? "null" : (v ? "true" : "false"));
+    fflush(stdout);
 }
-void festina_log_text(const char *v) { printf("%s\n", v ? v : ""); }
+void festina_log_text(const char *v) { printf("%s\n", v ? v : ""); fflush(stdout); }
 
 void festina_fail(const char *msg) {
     fprintf(stderr, "fail: %s\n", msg ? msg : "");
@@ -758,7 +800,19 @@ char *festina_format_time(int64_t ms, const char *format) {
     if (!format) format = "%Y-%m-%d %H:%M:%S";
     time_t secs = (time_t)(ms / 1000);
     struct tm parts;
+    /* windows.md Phase 0 (claude.md #126): localtime_r is POSIX, not
+     * ISO C, and MinGW-w64's UCRT headers don't provide it -- only
+     * Microsoft's own localtime_s, which is otherwise the same
+     * thread-safe idea but reverses the argument order (tm* first,
+     * time_t* second) and reports success as 0, not a non-NULL
+     * pointer. This was the one spot the "core runtime is pure POSIX,
+     * no platform branches needed" audit missed, found by the first
+     * real Windows CI run that got far enough to compile it. */
+#ifdef _WIN32
+    if (localtime_s(&parts, &secs) != 0) return NULL;
+#else
     if (!localtime_r(&secs, &parts)) return NULL;
+#endif
     char buf[512];
     size_t n = strftime(buf, sizeof(buf), format, &parts);
     if (n == 0) return NULL;
@@ -1091,6 +1145,59 @@ void festina_sync_table(sqlite3 *db, const char *table_name,
     char rename_sql[256];
     snprintf(rename_sql, sizeof(rename_sql), "ALTER TABLE %s RENAME TO %s;", new_table, table_name);
     festina_exec(db, rename_sql);
+}
+
+/* claude.md #126 round nine: no compiled program ever explicitly
+ * closed its own database handle before this -- main() just returned
+ * and let the OS reclaim the file descriptor on process exit, which
+ * WORKS (SQLite's WAL format is specifically designed to survive an
+ * unclosed/crashed writer -- the next connection recovers it) but
+ * skips SQLite's own auto-checkpoint-on-last-close, leaving the
+ * database's actual data in the WAL file rather than the main one
+ * until something else triggers a checkpoint. That's still readable by
+ * any WAL-aware SQLite build, but real Windows CI's SQLite schema-sync
+ * tests -- a second, separate process (a plain Python sqlite3
+ * connection, not necessarily even the SAME SQLite build/version this
+ * binary statically links) reading back a schema the FIRST compiled
+ * program had just committed -- kept seeing the OLD schema, exactly
+ * the symptom an unwritten-back WAL would produce for a reader that
+ * can't or doesn't perform WAL recovery identically. Explicitly
+ * closing forces SQLite's own checkpoint, leaving the main .sqlite
+ * file itself fully caught up regardless of what reads it next.
+ *
+ * sqlite3_close() (not the _v2 form) is used deliberately: unlike
+ * _v2, which silently defers to a "zombie" close if anything is still
+ * unfinalized, plain sqlite3_close() returns SQLITE_BUSY and does
+ * NOTHING if it is -- exactly the signal needed to know finalizing the
+ * statement cache below actually worked, rather than papering over a
+ * bug in it. festina_sqlite_prepare_cached's whole point is to leave
+ * cached statements alive across many calls (never finalized during
+ * normal operation, only reset) -- so at real program shutdown, unlike
+ * any other close, every one of them needs finalizing first or this
+ * close does nothing at all. */
+void festina_db_close(sqlite3 *db) {
+    if (!db) return;
+    for (int i = 0; i < g_cached_stmt_count; i++) {
+        sqlite3_finalize(g_cached_stmts[i]);
+    }
+    g_cached_stmt_count = 0;
+    /* claude.md #126 round eleven: round nine's own bet that this
+     * function would fix the still-open SQLite schema-sync mismatches
+     * was refuted by round ten's real Windows log -- unchanged,
+     * identical failures with this fix already in place. The finalize
+     * loop above was reasoned to be the one thing that could make
+     * sqlite3_close return anything other than SQLITE_OK, but that was
+     * never actually confirmed on the platform where it matters --
+     * this call was, and still is, best-effort. Surfacing a non-OK
+     * result to stderr costs nothing (never changes program behavior
+     * or the exit code) and gives the next real log a concrete answer
+     * instead of another silent maybe, should the tests calling this
+     * out in their own failure diagnostics need it. */
+    int rc = sqlite3_close(db);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "festina_db_close: sqlite3_close returned %d (%s) -- "
+                "a statement or blob handle was still open\n", rc, sqlite3_errmsg(db));
+    }
 }
 
 /* ---- sqlite() queries -- claude.md #32-34 ---- */

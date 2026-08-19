@@ -938,6 +938,7 @@ class CodeGen:
 
     def _runtime_declares(self):
         return [
+            "declare void @festina_runtime_init()",
             "declare void @festina_log_int(i64)",
             "declare void @festina_log_float(double)",
             # i8, not i1 -- see the module docstring's "Null for bool"
@@ -997,6 +998,9 @@ class CodeGen:
             # itself somehow evaluates to a null text value at runtime).
             "declare ptr @festina_db_open(ptr)",
             "declare void @festina_sync_table(ptr, ptr, ptr, ptr, i32)",
+            # claude.md #126 round nine: called unconditionally at the
+            # very end of main() -- see festina_db_close's own comment.
+            "declare void @festina_db_close(ptr)",
             # claude.md #32-34: sqlite() queries.
             "declare ptr @festina_sqlite_prepare(ptr, ptr)",
             # claude.md #113: literal SQL is prepared once per call site.
@@ -6941,6 +6945,10 @@ class CodeGen:
         entry_func.append("}")
 
         main_lines = ["define i32 @main() {", "entry:"]
+        # windows.md Phase 0 (claude.md #126): unconditional, first
+        # thing main() does, before even the database/graphics setup
+        # below -- see festina_runtime_init's own comment for why.
+        main_lines.append("  call void @festina_runtime_init()")
         # self.uses_sqlite/self.uses_graphics are only reliably set by
         # this point because every function body (self.func_defs) and
         # every entry statement (the loop above) has already been
@@ -7021,6 +7029,15 @@ class CodeGen:
             # program never needs to link the graphics object file just
             # to wait for its callbacks.
             main_lines.append("  call void @festina_run_timer_loop()")
+        # claude.md #126 round nine: unconditional, last thing main()
+        # does -- @__festina_db defaults to (and stays) null for a
+        # program with no `table` declarations, which festina_db_close
+        # treats as a no-op, so this is safe to call every time rather
+        # than gated on self.uses_sqlite. See that function's own
+        # comment for why an explicit close (not just letting the OS
+        # reclaim the fd on exit) matters.
+        main_lines.append("  %final_db = load ptr, ptr @__festina_db")
+        main_lines.append("  call void @festina_db_close(ptr %final_db)")
         main_lines.append("  ret i32 0")
         main_lines.append("}")
 

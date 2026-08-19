@@ -16,11 +16,15 @@
 #   pip install -r requirements-build.txt
 #
 # On macOS (macos.md Phase 3) the binary is also ad-hoc codesigned
-# (`codesign -s -`) after packaging, so Gatekeeper allows running it
+# (`codesign -f -s -`) after packaging, so Gatekeeper allows running it
 # locally without prompting -- a self-signature, not an identity;
 # it proves nothing to anyone the binary is handed to. Full Developer-ID
 # signing + notarization is a distribution decision, deliberately out
 # of scope until there is an actual distribution channel to justify it.
+# The -f/--force matters: recent PyInstaller versions already ad-hoc
+# sign the EXE themselves as part of building it (confirmed on real
+# macOS CI, claude.md #126), and codesign refuses to resign an
+# already-signed binary without it ("is already signed", nonzero exit).
 #
 # Usage: ./scripts/package_compiler.sh [output_dir]
 #   -> writes <output_dir>/festina (default: ./dist/festina)
@@ -57,7 +61,7 @@ pyinstaller \
     packaging/festina_entry.py
 
 if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
-    codesign -s - "$OUT_DIR/festina"
+    codesign -f -s - "$OUT_DIR/festina"
     echo "ad-hoc codesigned $OUT_DIR/festina"
 fi
 

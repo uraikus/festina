@@ -26,11 +26,63 @@
 > mouse/keyboard/window behavior is verified on hardware
 > (`FESTINA_ENABLE_MACOS_GRAPHICS=1` to try it on a Mac); offscreen
 > drawing is never gated. Phase 3 is done: `scripts/package_compiler.sh`
-> ad-hoc codesigns the binary it produces on darwin, the macos-14 CI job
-> packages, codesigns, and smoke-tests a real arm64 `festina` binary on
-> every push, and [setup.md](setup.md) has a real macOS section. Full
-> Developer-ID signing/notarization remains deliberately out of scope
-> until there's an actual distribution channel.
+> ad-hoc codesigns the binary it produces on darwin (`codesign -f -s -`
+> — the `-f` matters, since recent PyInstaller already self-signs, see
+> below), the macos-14 CI job packages, codesigns, and smoke-tests a
+> real arm64 `festina` binary on every push, and [setup.md](setup.md)
+> has a real macOS section. Full Developer-ID signing/notarization
+> remains deliberately out of scope until there's an actual
+> distribution channel.
+>
+> **The offscreen-graphics claim above got two real tests and failed
+> both** (claude.md #126): `festina_runtime_graphics.c` had never
+> actually compiled on real macOS hardware before Phase 2 swapped
+> cairo-xlib for plain `cairo` (every earlier CI round skipped it as a
+> missing dependency), and the very first time it did, `#include
+> <cairo/cairo.h>` in the new windowing seam header couldn't find the
+> file — Homebrew's cairo pkg-config `-I` flag points directly into the
+> headers directory, unlike the implicit `/usr/include` search that
+> quietly made the same include style work on Linux. Fixed to the
+> portable `#include <cairo.h>` — except `festina_runtime_window_mac.m`
+> turned out to have the identical line, independently, and only real
+> macOS CI compiling THAT file (nothing else does) caught it on the
+> very next run; fixed the same way. The packaging codesign step needed
+> `-f`/`--force` for the unrelated PyInstaller self-signing reason
+> above, and that same run found `tests/test_packaging.py`'s own
+> "prove no system Python is needed" test had replaced PATH outright
+> with a hardcoded `/usr/bin:/bin`, dropping Homebrew's bin directory
+> where `pkg-config` actually lives — invisible on Linux, where
+> pkg-config already lives in `/usr/bin`. Fixed to prepend rather than
+> replace. All fixes are one or two lines each, verified against the
+> real Linux cairo-xlib pkg-config flags and the full suite, but not
+> yet reconfirmed by a real macOS CI run that gets all the way through.
+>
+> **The `festina_runtime_window_mac.m` include fix above was itself
+> incomplete** (claude.md #126, round four): the file's `#include
+> <cairo.h>` now resolved as a bare filename, but the file still
+> failed to compile, because `_feature_extra_object` — the function
+> that compiles this one Objective-C companion object — had always
+> passed it an EMPTY pkg-config package list, on every round, so it
+> never received cairo's `-I` cflags at all regardless of how the
+> `#include` was spelled. The include-spelling fix was necessary but
+> not sufficient; the real root cause was one function call away the
+> whole time. Fixed by passing `["cairo"]`, the same package
+> `festina_runtime_graphics.c` itself gets. Verified against the real
+> Linux cairo-xlib pkg-config flags and the full suite; still only real
+> macOS CI can compile this file at all, so this too awaits a run that
+> gets all the way through.
+>
+> **Round five's push (a separate, unrelated bug in the fallback
+> compile path — see windows.md, since it affects Windows too) got a
+> real macOS run down to ONE failure, out of the whole suite**
+> (claude.md #126, round six): `TestGraphics::test_compiles_and_links_successfully`
+> opens a real window (`on mouseDown`/`mouse`/`key`/`resize`/`close`),
+> so on darwin it correctly hits the real-hardware-verification gate —
+> but called `compile_file` directly instead of through
+> `compile_file_or_skip`, the same gap `TestAudio`'s own analogous test
+> already avoided. Fixed to match. Linux and CodeQL were both green on
+> this same run — the first genuinely green non-macOS-graphics result
+> across six rounds.
 
 A concrete, phased plan for bringing Festina to macOS. The premise
 (from [todo.md](todo.md#platforms)) holds up under audit: **porting is

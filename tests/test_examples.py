@@ -146,9 +146,12 @@ class TestIndividualExamples:
         assert lines[9] == "isPlaying() after beep.stop(): false"
 
     def test_files_demo_runs_correctly(self, cli_mod, tmp_path):
-        # claude.md #109: blob. Writes under /tmp and cleans up after
-        # itself, so this needs no fixture beyond a C compiler.
-        result = _run_example(cli_mod, tmp_path, "files.f")
+        # claude.md #109: blob. Writes to relative paths and cleans up
+        # after itself (claude.md #126 round eight: no longer hardcoded
+        # /tmp -- see examples/files.f's own comment), so this needs an
+        # isolated cwd (tmp_path, not _run_example's REPO_ROOT default)
+        # rather than any fixture beyond a C compiler.
+        result = _run_example(cli_mod, tmp_path, "files.f", cwd=tmp_path)
         assert result.stdout.splitlines() == [
             "exists before writing: false",
             "write: true",

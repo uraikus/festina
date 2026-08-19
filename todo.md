@@ -20,12 +20,15 @@ language work — the compiler and core runtime are portable C/LLVM.
   real hardware — the one thing left.
 - **Windows** — planned in full in [windows.md](windows.md). Phase 0
   (toolchain bring-up) is built: MSYS2/MinGW-w64 as the one supported
-  toolchain, the regex core gap filled by MSYS2's `libgnurx` package,
-  `festina doctor`'s Windows hints, and a `windows-latest` CI job.
-  Unlike macOS, none of it has run on real Windows even once yet — this
-  project has no Windows/MSYS2 access, so that first CI run (once one
-  happens) is expected to surface real bugs the way macOS Phase 0's
-  hardware rounds did. Open: that first real run, then the same two
+  toolchain, the regex core gap filled by installing MSYS2's
+  `libsystre` package and asking pkg-config for `gnurx` (not
+  `libgnurx` — two real CI rounds found it conflicts with libsystre
+  and gets silently dropped, then that pkg-config's own name doesn't
+  match the package name either, claude.md #126), `festina doctor`'s
+  Windows hints, and a `windows-latest` CI job. This project still has
+  no Windows/MSYS2 access, so the fix for those two rounds' findings
+  is itself unconfirmed by a third real run — that's the next thing
+  needed. Open: that confirmation, then the same two
   backend seams macos.md already cut (audio, windowing) implemented as
   waveOut and Win32 + the shared Cairo blit (Phases 1–2), then
   packaging and the DLL story (Phase 3).

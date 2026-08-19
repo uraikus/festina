@@ -42,7 +42,15 @@
 #import <Cocoa/Cocoa.h>
 #include <stdio.h>
 #include <string.h>
-#include <cairo/cairo.h>
+/* Bare <cairo.h>, not <cairo/cairo.h> -- same fix as
+ * festina_runtime_window.h, and the same real bug: pkg-config's
+ * Cflags for darwin's `cairo` package point -I directly at the cairo
+ * headers directory, and Homebrew's non-default prefix has no
+ * implicit default search path to fall back on (claude.md #126). This
+ * file has its own separate #include line, so it needed the same fix
+ * applied twice -- missed the first time because nothing compiles
+ * this translation unit but real macOS CI. */
+#include <cairo.h>
 #include "festina_runtime.h"          /* festina_fail */
 #include "festina_runtime_window.h"
 

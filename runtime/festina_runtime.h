@@ -18,6 +18,14 @@
  * one exception (sqlite3* and sqlite3_stmt* appear directly below) since
  * it's a permanent, always-linked core dependency, never an optional one. */
 
+/* windows.md Phase 0 (claude.md #126): called once, unconditionally,
+ * as literally the first thing main() does in every compiled program
+ * -- currently just the Windows stdout/stderr text-mode fix (see the
+ * .c file), but the natural place for any future "before anything
+ * else runs" platform setup, so it exists even though today only one
+ * platform needs it to do anything. */
+void festina_runtime_init(void);
+
 /* claude.md #41: log() */
 void festina_log_int(int64_t v);
 void festina_log_float(double v);
@@ -100,6 +108,16 @@ sqlite3 *festina_db_open(const char *path);
 void festina_sync_table(sqlite3 *db, const char *table_name,
                          const char **col_names, const char **col_types,
                          int32_t ncols);
+
+/* claude.md #126 round nine: called once, unconditionally, as
+ * literally the last thing every compiled program's main() does
+ * (mirroring festina_runtime_init() at the start) -- finalizes every
+ * cached prepared statement and closes the database, forcing SQLite's
+ * own checkpoint-on-last-close rather than leaving committed data
+ * sitting in the WAL file for whatever reads it next to sort out. A
+ * NULL db (a program with no `table` declarations at all -- see
+ * @__festina_db's own default in codegen.py) is a safe no-op. */
+void festina_db_close(sqlite3 *db);
 
 /*
  * claude.md #32-34: sqlite() queries.

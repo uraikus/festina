@@ -2717,16 +2717,26 @@ run `scripts/package_compiler.sh` for real as a dedicated step, then
 compile and run `examples/hello.f` with the freshly packaged binary —
 on the `macos-14` job specifically that produces and validates a real
 Apple Silicon (arm64) `festina` binary on every push, ad-hoc codesigned
-by the script's own new Darwin branch (`codesign -s -`, guarded on
+by the script's own new Darwin branch (`codesign -f -s -`, guarded on
 `uname -s` and on `codesign` being present) and re-verified with
 `codesign -v` in the CI step rather than trusting a zero exit code
-alone.
+alone. The `-f`/`--force` was added after the first real macOS CI run
+(claude.md #126) found recent PyInstaller already ad-hoc-signs the EXE
+itself, and codesign refuses to resign an already-signed binary
+without it.
 
 windows.md Phase 0 fills the one core-runtime gap the platform seams
 paragraph above didn't yet: `<regex.h>` isn't part of MinGW-w64's libc,
-so `_core_pkgs` (win32-only; empty everywhere else) pulls in MSYS2's
-`libgnurx` package via pkg-config on `festina_runtime.c`'s cflags AND
-the final link line -- unlike graphics/audio, this isn't an optional
+so `_core_pkgs` (win32-only; empty everywhere else) pulls in `gnurx`
+via pkg-config on `festina_runtime.c`'s cflags AND the final link
+line -- two real Windows CI rounds (claude.md #126) to land on that
+one string: `libgnurx`, windows.md's originally preferred PACKAGE,
+installs fine but `pacman --noconfirm` silently drops it due to a
+conflict with `libsystre` (round one); `libsystre`, the package that's
+actually installed, turns out to ship its pkgconfig file under
+libgnurx's own old name, `gnurx.pc`, not `libsystre.pc` (round two) --
+so `libsystre` is what cli.py tells a user to INSTALL, `gnurx` is what
+it asks pkg-config FOR. Unlike graphics/audio, this isn't an optional
 feature tier, it's core, so `festina doctor` reports it as REQUIRED
 (like sqlite3) rather than optional. `_check_feature_supported` gives
 graphics/audio a clean "not implemented yet, windows.md Phase 1/2"
@@ -2749,6 +2759,37 @@ and its first real run is expected to be exactly the kind of
 bug-finding exercise macOS Phase 0's real hardware rounds were
 (claude.md #122). (9 new tests: `TestCorePkgs`, plus additions to
 `TestFeatureGating`/`TestAudioFeatureConfig`.)
+
+Windows Phase 0 has since run for real four times (claude.md #126),
+each finding something the last one missed. Round three found the one
+core-runtime gap the "POSIX only" audit above had missed:
+`localtime_r` is POSIX, not ISO C, and MinGW-w64's UCRT doesn't
+provide it -- only Microsoft's own `localtime_s`, which reverses the
+argument order (`tm*` first, `time_t*` second) and reports success as
+`0` rather than a non-NULL return, so `festina_format_time` gets a
+`#ifdef _WIN32` branch calling it correctly. Round four got a compiled
+program actually RUNNING on Windows for the first time, which surfaced
+two bugs no source read could have: the MinGW/UCRT CRT opens stdout in
+TEXT mode by default, independent of any `fopen` flag, silently
+rewriting every `\n` a program prints to `\r\n` -- fixed with a new
+`festina_runtime_init()` (`_setmode(_fileno(stdout), _O_BINARY)` under
+`#ifdef _WIN32`, a no-op elsewhere) that `festina/codegen.py` now
+calls unconditionally as the first statement of every generated
+`main()`, ahead of even database/graphics setup. And MinGW's linker
+appends `.exe` to a `-o` name lacking one regardless of whether that
+name was `_default_output_name`'s own choice or an explicit caller
+request -- `_default_output_name`'s docstring already said so, but the
+actual guard only ever covered the former, so an explicit `-o program`
+silently linked to `program.exe` while `compile_file` kept insisting
+`program` was the output. `_rename_if_linker_appended_exe` runs after
+linking and renames the linker's real output back to the caller's
+exact requested name, deliberately choosing not to rewrite their
+request into `.exe` instead. The same round also found that macOS's
+own `festina_runtime_window_mac.m` cairo.h fix (two paragraphs above)
+had been incomplete for an unrelated reason -- see macos.md's status
+block. Honesty note updated: real Windows CI has now compiled AND run
+programs successfully across these fixes, but a run with none of
+these four rounds' bugs left to find has not happened yet.
 
 **claude.md #120**: reference cycles collect — trial deletion in the
 release wrappers.
