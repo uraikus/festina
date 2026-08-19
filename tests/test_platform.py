@@ -119,17 +119,25 @@ class TestRenameIfLinkerAppendedExe:
         assert not out.exists()
         assert not (tmp_path / "program.exe").exists()
 
-    def test_windows_never_clobbers_an_existing_exact_name(
+    def test_windows_overwrites_a_stale_exact_name_from_an_earlier_compile(
             self, cli_mod, tmp_path, monkeypatch):
-        # Both exist -- the exact-named file already present wins, and
-        # the stray .exe is left alone rather than overwriting it.
+        # claude.md #126 round twelve: the earlier version of this
+        # function skipped the rename whenever `out` already existed --
+        # meaning a SECOND compile to the same explicit path (exactly
+        # what recompiling `program` after a source change does) left
+        # the FIRST compile's stale binary in place forever, while the
+        # fresh build sat unused at `program.exe`. Real Windows CI
+        # caught this directly: a "second" compiled program's own
+        # captured stdout was the first program's output verbatim.
+        # os.replace already overwrites atomically -- the freshly
+        # linked binary must always win.
         monkeypatch.setattr(sys, "platform", "win32")
         out = tmp_path / "program"
-        out.write_bytes(b"already there")
-        (tmp_path / "program.exe").write_bytes(b"linked")
+        out.write_bytes(b"stale, from an earlier compile")
+        (tmp_path / "program.exe").write_bytes(b"freshly linked")
         cli_mod._rename_if_linker_appended_exe(str(out))
-        assert out.read_bytes() == b"already there"
-        assert (tmp_path / "program.exe").exists()
+        assert out.read_bytes() == b"freshly linked"
+        assert not (tmp_path / "program.exe").exists()
 
 
 class TestStaticSqliteAttempt:

@@ -1,56 +1,55 @@
 # Windows support — the plan
 
-> **Status: Phase 0 is built; eleven real CI rounds on the same PR —
-> Linux, macOS, and CodeQL are now all GREEN, and Windows is down to
-> ONE remaining failure class** (claude.md #126 has the full account —
-> this is the short version, condensed again since the per-round
-> narrative was getting long). Every Python-side toolchain seam this
-> section lists was in fact already covered by claude.md #39's shared
-> work (`.exe` naming, the libLLVM DLL candidates, the GNU-ld
-> static-sqlite path). Landed across the eleven rounds: the regex
-> decision (`_core_pkgs` installs `libsystre`, asks pkg-config for
-> `gnurx`), `festina doctor`'s Windows hints, a `windows-latest` CI
-> job, `#ifdef _WIN32` branches for `localtime_r`→`localtime_s` and for
-> `festina_runtime_init()` (default text-mode stdout turning `\n` into
-> `\r\n`), a post-link rename fixing MinGW's linker appending `.exe` to
-> an explicit `-o name`, unconditional graphics gating on win32
-> (offscreen included — no window backend exists there at all yet),
-> `_run_tool` resolving every command through `shutil.which` first
-> rather than trusting `subprocess.run`'s broader Win32 `CreateProcess`
-> search (which checks the calling process's own directory before
-> PATH, silently defeating `tests/conftest.py`'s `path_without` PATH-
-> only test isolation — which in turn had its own bug, symlinking tools
-> under their bare name rather than their real one, invisible to
-> `shutil.which`'s Windows PATHEXT search either way), two doctor-test
-> setup bugs, a real bug in `examples/files.f` (hardcoded `/tmp/...`
-> paths a native Windows binary resolves under the current drive's
-> root, not MSYS2's own `/tmp` mapping), and a genuine `festina_log_*`
-> bug — no explicit `fflush(stdout)`, so a redirected/piped program's
-> output can sit in the C runtime's default block buffer indefinitely,
-> since `stdbuf -oL` (the usual workaround) can't interpose on a native
-> UCRT64 binary the way it can on a binary sharing MSYS2's own libc.
-> **The one thing that has resisted two real, reasoned fix attempts**:
-> four SQLite schema-sync tests report an unaltered schema after a
-> second compile+run, unchanged since they first appeared, and
-> unmoved by either an explicit `sqlite3_close()`/checkpoint (round
-> nine, refuted by round ten's identical failures) or the unrelated
-> stdout-flush fix. That both attempts left these four byte-for-byte
-> identical is itself informative — it points away from "the migration
-> ran but wasn't durably visible" and toward "the migration never ran
-> against the file being read back from at all." Round eleven adds
-> instrumentation instead of a third guess: the four tests now report
-> an mtime-before/after comparison on `festina.sqlite` (unchanged means
-> the second compiled program never touched it) plus its captured
-> stdout/stderr, and `festina_db_close` now logs to stderr on a non-OK
-> `sqlite3_close` result rather than ignoring it — both purely
-> additive, aimed at giving the next real log enough to actually
-> distinguish the failure mode rather than repeat it with no new
-> information. What is NOT yet confirmed: green Windows CI — this
-> project still has no Windows/MSYS2 access, so every fix here was
-> verified by reasoning from each run's actual log output, the full
-> Linux suite, and (for one Python-version-specific test bug) a real
-> 3.12.3 venv — never by re-running on Windows itself. Phases 1–3 are
-> open.
+> **Status: Phase 0 is built; twelve real CI rounds on the same PR —
+> Linux, macOS, and CodeQL are all GREEN, and the root cause behind
+> Windows' last real failure class is now found and fixed** (claude.md
+> #126 has the full account — this is the short version, condensed
+> again since the per-round narrative was getting long). Every
+> Python-side toolchain seam this section lists was in fact already
+> covered by claude.md #39's shared work (`.exe` naming, the libLLVM
+> DLL candidates, the GNU-ld static-sqlite path). Landed across the
+> twelve rounds: the regex decision (`_core_pkgs` installs `libsystre`,
+> asks pkg-config for `gnurx`), `festina doctor`'s Windows hints, a
+> `windows-latest` CI job, `#ifdef _WIN32` branches for
+> `localtime_r`→`localtime_s` and for `festina_runtime_init()` (default
+> text-mode stdout turning `\n` into `\r\n`), unconditional graphics
+> gating on win32 (offscreen included — no window backend exists there
+> at all yet), `_run_tool` resolving every command through
+> `shutil.which` first rather than trusting `subprocess.run`'s broader
+> Win32 `CreateProcess` search (which checks the calling process's own
+> directory before PATH, silently defeating `tests/conftest.py`'s
+> `path_without` PATH-only test isolation — which in turn had its own
+> bug, symlinking tools under their bare name, invisible to
+> `shutil.which`'s Windows PATHEXT search), two doctor-test setup bugs,
+> a real bug in `examples/files.f` (hardcoded `/tmp/...` paths a native
+> Windows binary resolves under the current drive's root, not MSYS2's
+> own `/tmp` mapping), and a genuine `festina_log_*` bug — no explicit
+> `fflush(stdout)`, so a redirected/piped program's output could sit in
+> the C runtime's default block buffer indefinitely, since `stdbuf -oL`
+> can't interpose on a native UCRT64 binary the way it can on a binary
+> sharing MSYS2's own libc. **The stubborn one, found in round twelve**:
+> four SQLite schema-sync tests kept reporting an unaltered schema
+> after a second compile+run, resisting two real fix attempts (an
+> explicit `sqlite3_close()`/checkpoint; a stdout-flush fix, unrelated)
+> that both left the failures byte-for-byte identical. Round eleven's
+> instrumentation (an mtime check plus captured program output on
+> assertion failure) caught the real cause directly: the "second"
+> compiled program's own printed output was the FIRST program's,
+> verbatim — it was never recompiled at all. `_rename_if_linker_
+> appended_exe`'s guard (`if os.path.exists(exe_path) and not
+> os.path.exists(output_path)`) skipped the post-link rename whenever
+> the target path already existed from an earlier compile — which
+> `compile_and_run`'s own reused `tmp_path / "program"` guarantees on
+> any SECOND compile within a test, exactly what every schema-sync test
+> does. The freshly linked `program.exe` sat right next to the stale
+> binary, never picked up; `os.replace` already overwrites atomically
+> on Windows, so the exists-check was never a needed safety guard, just
+> a bug. Fixed by dropping it. What is NOT yet confirmed: green Windows
+> CI — this project still has no Windows/MSYS2 access, so every fix
+> here was verified by reasoning from each run's actual log output, the
+> full Linux suite, and (for one Python-version-specific test bug) a
+> real 3.12.3 venv — never by re-running on Windows itself. Phases 1–3
+> are open.
 
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,
@@ -128,6 +127,20 @@ whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
    `_rename_if_linker_appended_exe` now runs after linking and renames
    the linker's real output back to the exact name the caller asked
    for, rather than silently substituting `.exe` into their request.
+   That function's own guard had a SECOND bug, found in round twelve:
+   it skipped the rename whenever the target path already existed
+   from an earlier compile, which is exactly what recompiling to the
+   same explicit path (as any "change the source, compile again" test
+   or workflow does) triggers on the second and every later compile.
+   The freshly linked `program.exe` sat unused next to the untouched,
+   stale first binary; `_run_tool` and everything downstream reported
+   success because nothing had actually failed, it just quietly kept
+   running the old program. Real Windows CI's own instrumentation (an
+   added mtime check plus the compiled program's captured stdout) is
+   what surfaced this directly -- a "second" test run's own program
+   printed the FIRST run's output verbatim. Fixed by dropping the
+   exists-check; `os.replace` already overwrites atomically on
+   Windows, so it was never a needed guard.
 3. **`festina/llvm_backend.py` — find libLLVM's DLL.** Already done
    before this phase began — `_platform_libllvm_paths` covers the
    MSYS2 candidates (`$MSYSTEM_PREFIX`, the UCRT64/MinGW64/CLANG64
@@ -145,19 +158,18 @@ whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
    note lives in setup.md's own Windows section (todo, tracked
    separately from this phase's own scope).
 5. **CI: a `windows-latest` job via the `msys2/setup-msys2` action**,
-   built, and now run for real EIGHT times: runs the whole suite
+   built, and now run for real TWELVE times: runs the whole suite
    headless the same way the macOS job does, with no
    `FESTINA_STRICT_DEPS` (audio/graphics have no Windows backend yet at
    all, so those tiers shed as skips via the same conftest mechanism,
    not a parallel test-selection list), plus compiling and running the
    four windowless examples as real `.exe`s. The sanitizer leak tier
-   stays Linux-only, same reasoning as macOS. Those eight rounds are
+   stays Linux-only, same reasoning as macOS. Those twelve rounds are
    what caught every fix summarized in the status block above (claude.md
-   #126 has the full blow-by-blow) — down to 2 confirmed-open failures
-   (a SQLite schema-sync mismatch, a timer test) as of round eight,
-   from 26 in round one. A ninth real run is what's needed to confirm
-   round eight's own fixes land clean and to make progress on what's
-   still open.
+   #126 has the full blow-by-blow) — from 26 failures in round one down
+   to a root-cause fix (item 2 above) for the one class that survived
+   to round twelve. A thirteenth real run is what's needed to confirm
+   it actually lands green.
 6. **Filesystem semantics, verified not assumed**: already covered
    before this phase began by `tests/test_platform.py::TestBinaryFidelity`,
    which runs on every platform's CI — every runtime `fopen` is

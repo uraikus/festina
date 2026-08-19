@@ -136,11 +136,27 @@ def _rename_if_linker_appended_exe(output_path):
     silently linked to `program.exe` while `compile_file` kept
     claiming `program` was the output, so the caller's own exact
     request should win: if the linker wrote `output_path + ".exe"`
-    instead of `output_path` itself, rename it back."""
+    instead of `output_path` itself, rename it back.
+
+    claude.md #126 round twelve: this used to skip the rename whenever
+    `output_path` already existed -- meaning a SECOND compile to the
+    same explicit path (recompiling `program` after changing the
+    source, exactly what every one of tests/test_codegen.py's
+    TestAutomaticSqliteSchemaSync tests does via compile_and_run's
+    reused `tmp_path / "program"`) left the first compile's stale
+    binary sitting at `output_path` untouched, while the fresh build
+    sat next to it at `output_path + ".exe"`, never picked up. Real
+    Windows CI's own diagnostics caught this directly: the "second"
+    compiled program's captured stdout was the FIRST program's own
+    output verbatim. `os.replace` already atomically overwrites an
+    existing destination on Windows -- the `not os.path.exists(...)`
+    check was actively wrong, not a needed safety guard, since the
+    whole point of this function is putting the just-linked binary at
+    the caller's exact requested path, past compile or not."""
     if sys.platform != "win32" or output_path.lower().endswith(".exe"):
         return
     exe_path = output_path + ".exe"
-    if os.path.exists(exe_path) and not os.path.exists(output_path):
+    if os.path.exists(exe_path):
         os.replace(exe_path, output_path)
 
 
