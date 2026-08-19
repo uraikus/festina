@@ -26,8 +26,22 @@
 # macOS CI, claude.md #126), and codesign refuses to resign an
 # already-signed binary without it ("is already signed", nonzero exit).
 #
+# windows.md Phase 3 (claude.md #129): runs under MSYS2 bash on Windows
+# (the windows CI job's own shell, and the only supported toolchain --
+# windows.md's own decision, MSVC out of scope) via bash's own OSTYPE
+# variable, set to "msys" there and nothing else this script needs to
+# special-case for -- PyInstaller itself already emits `festina.exe`
+# there with no extra flag, exactly like MinGW's linker already appends
+# `.exe` to every OTHER compiled Festina program (windows.md Phase 0).
+# The one real platform difference is `--add-data`'s SRC:DEST separator:
+# PyInstaller's own documented spelling is `;` on Windows and `:`
+# everywhere else -- a real `:` would be read as part of a Windows path
+# instead (`C:\...`), not a separator, so this can't share one spelling
+# across platforms the way every other flag here does.
+#
 # Usage: ./scripts/package_compiler.sh [output_dir]
-#   -> writes <output_dir>/festina (default: ./dist/festina)
+#   -> writes <output_dir>/festina (default: ./dist/festina), or
+#      <output_dir>/festina.exe on Windows
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,6 +57,13 @@ fi
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
+ADD_DATA_SEP=":"
+FESTINA_BIN="$OUT_DIR/festina"
+if [[ "${OSTYPE:-}" == "msys" ]]; then
+    ADD_DATA_SEP=";"
+    FESTINA_BIN="$OUT_DIR/festina.exe"
+fi
+
 cd "$REPO_ROOT"
 pyinstaller \
     --onefile \
@@ -50,20 +71,20 @@ pyinstaller \
     --distpath "$OUT_DIR" \
     --workpath "$WORK_DIR/build" \
     --specpath "$WORK_DIR" \
-    --add-data "$REPO_ROOT/runtime/festina_runtime.c:runtime" \
-    --add-data "$REPO_ROOT/runtime/festina_runtime_graphics.c:runtime" \
-    --add-data "$REPO_ROOT/runtime/festina_runtime_audio.c:runtime" \
-    --add-data "$REPO_ROOT/runtime/festina_runtime_window_mac.m:runtime" \
-    --add-data "$REPO_ROOT/runtime/festina_runtime_window_win32.c:runtime" \
-    --add-data "$REPO_ROOT/runtime/festina_runtime.h:runtime" \
-    --add-data "$REPO_ROOT/runtime/festina_runtime_internal.h:runtime" \
-    --add-data "$REPO_ROOT/runtime/festina_runtime_window.h:runtime" \
+    --add-data "$REPO_ROOT/runtime/festina_runtime.c${ADD_DATA_SEP}runtime" \
+    --add-data "$REPO_ROOT/runtime/festina_runtime_graphics.c${ADD_DATA_SEP}runtime" \
+    --add-data "$REPO_ROOT/runtime/festina_runtime_audio.c${ADD_DATA_SEP}runtime" \
+    --add-data "$REPO_ROOT/runtime/festina_runtime_window_mac.m${ADD_DATA_SEP}runtime" \
+    --add-data "$REPO_ROOT/runtime/festina_runtime_window_win32.c${ADD_DATA_SEP}runtime" \
+    --add-data "$REPO_ROOT/runtime/festina_runtime.h${ADD_DATA_SEP}runtime" \
+    --add-data "$REPO_ROOT/runtime/festina_runtime_internal.h${ADD_DATA_SEP}runtime" \
+    --add-data "$REPO_ROOT/runtime/festina_runtime_window.h${ADD_DATA_SEP}runtime" \
     --paths . \
     packaging/festina_entry.py
 
 if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
-    codesign -f -s - "$OUT_DIR/festina"
-    echo "ad-hoc codesigned $OUT_DIR/festina"
+    codesign -f -s - "$FESTINA_BIN"
+    echo "ad-hoc codesigned $FESTINA_BIN"
 fi
 
-echo "wrote $OUT_DIR/festina"
+echo "wrote $FESTINA_BIN"
