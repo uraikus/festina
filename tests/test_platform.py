@@ -292,10 +292,21 @@ class TestFeatureGating:
             cli_mod._check_feature_supported("audio", "win32")
 
     def test_windowed_graphics_is_gated_on_windows(self, cli_mod, errors):
+        # windows.md Phase 2 / claude.md #128 INVERTED this test the
+        # same way claude.md #123 inverted the darwin one below: the
+        # Win32 windowing seam + backend landed, and -- exactly like
+        # every other gate in this class -- being BUILT and CI-compiled
+        # is not the same claim as being verified against a real
+        # window/mouse/keyboard, so windowed use stays gated until it
+        # has been.
         with pytest.raises(errors.CompileError) as excinfo:
             cli_mod._check_feature_supported("graphics", "win32")
         assert "windows.md Phase 2" in str(excinfo.value)
         assert excinfo.value.category == "unsupported platform feature"
+
+    def test_the_windows_graphics_gate_is_overridable(self, cli_mod, monkeypatch):
+        monkeypatch.setenv("FESTINA_ENABLE_WINDOWS_GRAPHICS", "1")
+        cli_mod._check_feature_supported("graphics", "win32")   # no raise
 
     def test_windowed_graphics_is_gated_on_darwin(self, cli_mod, errors):
         # claude.md #123 INVERTED this test: the windowing seam +
@@ -323,11 +334,11 @@ class TestFeatureGating:
 
     def test_doctor_on_windows_reports_graphics_and_audio_as_planned_not_missing(
             self, cli_mod, monkeypatch):
-        # windows.md Phase 0 item 4 / Phase 1: graphics has no backend
-        # at all yet, and audio's waveOut backend is built but awaits
-        # real-hardware verification -- either way doctor must say so
-        # rather than naming Linux-only packages (cairo-xlib, alsa) a
-        # Windows user has no way to install.
+        # windows.md Phase 1 / Phase 2 (claude.md #128): both audio's
+        # waveOut backend and graphics' Win32 backend are now built but
+        # await real-hardware verification -- doctor must say so rather
+        # than naming Linux-only packages (cairo-xlib, alsa) a Windows
+        # user has no way to install.
         monkeypatch.setattr(sys, "platform", "win32")
         _stub_which_any(cli_mod, monkeypatch)
         lines, _ = cli_mod._doctor_report()
@@ -406,6 +417,30 @@ class TestAudioFeatureConfig:
         assert pkgs == ["cairo-xlib", "libjpeg"]
         assert flags == []
 
+    def test_windows_graphics_swaps_cairo_xlib_for_plain_cairo(self, cli_mod):
+        # windows.md Phase 2: same shape as the darwin test above --
+        # festina_runtime_graphics.c has zero X11 code compiled into it
+        # on win32 either (guarded `#if !defined(__APPLE__) &&
+        # !defined(_WIN32)`), so `cairo-xlib` drops out for plain
+        # `cairo`; -lgdi32/-luser32 are the Win32 windowing companion
+        # object's own system-DLL link flags, the counterpart to
+        # darwin's `-framework Cocoa`.
+        pkgs, flags = cli_mod._feature_pkgs_and_flags("graphics", "win32")
+        assert pkgs == ["libjpeg", "cairo"]
+        assert flags == ["-lgdi32", "-luser32"]
+
+    def test_windows_graphics_extra_object_is_the_win32_companion(self, cli_mod, monkeypatch):
+        # windows.md Phase 2: the win32 counterpart to
+        # test_the_darwin_window_backend_extra_object_gets_cairo_cflags
+        # above -- festina_runtime_window_win32.c #includes <cairo.h>
+        # for the same StretchDIBits blit reason.
+        calls = []
+        monkeypatch.setattr(
+            cli_mod, "_ensure_runtime_object",
+            lambda cc, name, source, pkgs: calls.append((name, pkgs)) or "/tmp/fake.o")
+        cli_mod._feature_extra_object("clang", "graphics", "win32")
+        assert calls == [("window_win32", ["cairo"])]
+
     def test_the_darwin_window_backend_extra_object_is_only_for_graphics(
             self, cli_mod):
         assert cli_mod._feature_extra_object("clang", "audio", "darwin") is None
@@ -461,36 +496,39 @@ class TestAudioFeatureConfig:
             "clang", uses_graphics=True, uses_audio=False, wants_window=True)
         assert calls == ["graphics"], "a windowed program must hit the gate"
 
-    def test_offscreen_graphics_still_reaches_the_windows_gate(
+    def test_offscreen_graphics_never_reaches_the_windows_gate_either(
             self, cli_mod, monkeypatch):
-        # claude.md #126 round five, found by real Windows CI: unlike
-        # darwin, Windows has no window backend at all yet -- no
-        # window_win32 companion object exists the way window_mac.m
-        # does -- so festina_runtime_graphics.c's unconditional
-        # references to _festina_window_open and friends can never
-        # resolve at link time on win32, offscreen program or not. The
-        # darwin exemption above had accidentally been written
-        # platform-agnostic, so an offscreen program on win32 reached
-        # real pkg-config/linking code (and failed there, confusingly)
-        # instead of the same clean "windows.md Phase 2" error every
-        # other graphics use already got.
+        # windows.md Phase 2 / claude.md #128 INVERTED this test a
+        # second time. claude.md #126 round five (found by real Windows
+        # CI) had made this the one platform-specific exception to the
+        # darwin test above: at that point Windows had no window
+        # backend at all -- no window_win32 companion object existed
+        # the way window_mac.m did -- so festina_runtime_graphics.c's
+        # unconditional references to _festina_window_open and friends
+        # could never resolve at link time on win32, offscreen program
+        # or not, and the gate had to fire even for wants_window=False
+        # just to give a clean error instead of a confusing linker
+        # failure. Now that festina_runtime_window_win32.c provides
+        # those symbols for real, win32 needs no special case any
+        # more -- offscreen use is exempt from the gate exactly like
+        # every other platform, verified identically to the darwin
+        # test just above.
         monkeypatch.setattr(sys, "platform", "win32")
         calls = []
-
-        def _fake_check(name, platform_name=None):
-            calls.append(name)
-            raise cli_mod.CompileError("boom", category="unsupported platform feature")
-
-        monkeypatch.setattr(cli_mod, "_check_feature_supported", _fake_check)
+        monkeypatch.setattr(cli_mod, "_check_feature_supported",
+                            lambda name, platform_name=None: calls.append(name))
         monkeypatch.setattr(cli_mod, "_ensure_runtime_object", lambda *a, **k: "/tmp/fake.o")
         monkeypatch.setattr(cli_mod, "_feature_extra_object", lambda *a, **k: None)
         monkeypatch.setattr(cli_mod, "_pkg_config", lambda *a, **k: [])
         monkeypatch.setattr(cli_mod, "_sqlite_link_flags", lambda cc: ([], False))
 
-        with pytest.raises(cli_mod.CompileError):
-            cli_mod._runtime_objects_and_link_libs(
-                "clang", uses_graphics=True, uses_audio=False, wants_window=False)
-        assert calls == ["graphics"], "the gate must actually fire for offscreen use on win32"
+        cli_mod._runtime_objects_and_link_libs(
+            "clang", uses_graphics=True, uses_audio=False, wants_window=False)
+        assert calls == [], "an offscreen-only program must never hit the gate on win32 either"
+
+        cli_mod._runtime_objects_and_link_libs(
+            "clang", uses_graphics=True, uses_audio=False, wants_window=True)
+        assert calls == ["graphics"], "a windowed program must still hit the gate"
 
     def test_the_darwin_gate_is_overridable_for_hardware_verification(
             self, cli_mod, errors, monkeypatch):
