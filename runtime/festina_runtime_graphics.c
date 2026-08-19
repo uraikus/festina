@@ -25,19 +25,39 @@
 #include <math.h>       /* floor -- claude.md #104's transform check */
 #include <setjmp.h>     /* libjpeg reports errors by longjmp -- claude.md #101 */
 #include <jpeglib.h>    /* claude.md #101: JPEG decoding */
+/* windows.md Phase 2 / claude.md #128: <sys/select.h> and the connect-
+ * retry loop's <time.h> use (nanosleep) are needed only by the X11
+ * backend at the bottom of this file -- neither exists on Windows, so
+ * they must stay conditional on the exact same platforms that backend
+ * itself compiles on, not just "not Apple" (see that guard's own note
+ * below for why "not Apple" alone used to be wrong here). */
+#if !defined(__APPLE__) && !defined(_WIN32)
 #include <sys/select.h> /* select() -- the X11 window backend's events_wait */
 #include <time.h>       /* nanosleep -- the X11 backend's connect retry */
+#endif
 #include "festina_runtime.h"
 #include "festina_runtime_internal.h"
 #include "festina_runtime_window.h" /* claude.md #123: the windowing device seam --
                                      * see its own doc comment for the full design.
                                      * Everything in THIS file is now portable: the
                                      * X11 implementation of the seam lives at the
-                                     * bottom of this file, guarded `#ifndef __APPLE__`;
-                                     * the macOS implementation is a separate
+                                     * bottom of this file, guarded
+                                     * `#if !defined(__APPLE__) && !defined(_WIN32)`
+                                     * -- claude.md #128: this used to read
+                                     * `#ifndef __APPLE__` alone, which is also true
+                                     * on Windows, so before windows.md Phase 2 had
+                                     * anywhere else for Windows to go, this file
+                                     * would have tried to compile the X11 backend
+                                     * (<X11/Xlib.h> and friends, none of which exist
+                                     * under MinGW) the moment anything ever asked it
+                                     * to -- invisible until now because nothing did.
+                                     * The macOS implementation is a separate
                                      * Objective-C translation unit
-                                     * (festina_runtime_window_mac.m), since Cocoa
-                                     * cannot be compiled as part of a plain .c file. */
+                                     * (festina_runtime_window_mac.m, Cocoa cannot be
+                                     * compiled as part of a plain .c file); the
+                                     * Windows implementation is plain C
+                                     * (festina_runtime_window_win32.c), wired in by
+                                     * festina/cli.py exactly like the other two. */
 
 static int g_window_open = 0;      /* claude.md #123: portable stand-in for "is
                                      * there a live platform window" -- the shared
@@ -1284,10 +1304,15 @@ void festina_run_event_loop(void) {
  * behind festina_runtime_window.h's five functions -- verified
  * zero-regression against the full Xvfb-backed TestGraphics/
  * TestExampleGraphics/TestExampleTicTacToe suite. Compiled only on
- * non-Apple platforms; macOS gets festina_runtime_window_mac.m instead
- * (a separate Objective-C translation unit -- Cocoa cannot be part of
- * a plain .c file). */
-#ifndef __APPLE__
+ * Linux (and any other non-Apple, non-Windows platform); macOS gets
+ * festina_runtime_window_mac.m instead (a separate Objective-C
+ * translation unit -- Cocoa cannot be part of a plain .c file) and
+ * Windows gets festina_runtime_window_win32.c (windows.md Phase 2 /
+ * claude.md #128) -- plain C, but still its own file, since none of
+ * this block's X11 headers exist under MinGW. See this file's own
+ * top-of-file comment on festina_runtime_window.h's #include for why
+ * the guard below is no longer simply `#ifndef __APPLE__`. */
+#if !defined(__APPLE__) && !defined(_WIN32)
 #include <X11/Xlib.h>
 #include <X11/Xutil.h> /* XLookupString/XKeysymToString -- `on keyDown`/`on keyUp` */
 #include <X11/XKBlib.h> /* XkbSetDetectableAutoRepeat -- claude.md #98 */
@@ -1558,4 +1583,4 @@ void festina_window_events_drain(void (*handler)(const FestinaWindowEvent *event
         }
     }
 }
-#endif /* !__APPLE__ */
+#endif /* !__APPLE__ && !_WIN32 */

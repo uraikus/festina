@@ -43,7 +43,23 @@
 > from each run's actual log output, the full Linux suite, and (for one
 > Python-version-specific test bug) a real 3.12.3 venv, until the
 > twelfth round's own real CI result confirmed all of it at once.
-> Phases 1–3 are open.
+> Phase 1 is now built and CI-compiled (claude.md #127): the waveOut
+> backend behind the shared `festina_pcm_*` seam, type-checked against
+> real `<mmsystem.h>` headers on every Windows CI push, `-lwinmm` wired
+> into `_feature_pkgs_and_flags`, and `FESTINA_AUDIO_NULL=1` covering
+> end-to-end play/stop/isPlaying tests with no audio device -- same
+> shape as macOS Phase 1. The windows audio gate stays until real-
+> hardware playback is verified (`FESTINA_ENABLE_WINDOWS_AUDIO=1` to
+> try it on a Windows machine). Phase 2 is now built and CI-compiled
+> too (claude.md #128): `festina_runtime_window_win32.c`, the Win32
+> counterpart to the Cocoa/X11 backends, type-checked against real
+> `<windows.h>` headers on every Windows CI push -- this also retired
+> Phase 0's own "unconditional graphics gating on win32, offscreen
+> included" line above, since a real window_win32 companion object now
+> exists for offscreen use to link against, exactly like darwin. The
+> windows graphics gate (windowed use only, same as darwin's) stays
+> until real-hardware verification (`FESTINA_ENABLE_WINDOWS_GRAPHICS=1`
+> to try it). Phase 3 is open.
 
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,
@@ -154,12 +170,15 @@ whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
 5. **CI: a `windows-latest` job via the `msys2/setup-msys2` action**,
    built, and now run for real TWELVE times: runs the whole suite
    headless the same way the macOS job does, with no
-   `FESTINA_STRICT_DEPS` (audio/graphics have no Windows backend yet at
-   all, so those tiers shed as skips via the same conftest mechanism,
-   not a parallel test-selection list), plus compiling and running the
-   four windowless examples as real `.exe`s. The sanitizer leak tier
-   stays Linux-only, same reasoning as macOS. Those twelve rounds are
-   what caught every fix summarized in the status block above (claude.md
+   `FESTINA_STRICT_DEPS` (at Phase 0 landing, audio/graphics had no
+   Windows backend at all; Phases 1 and 2 have since built both, but
+   real-hardware verification is still open for each -- claude.md
+   #127/#128 -- so those tiers still shed as skips via the same
+   conftest mechanism, not a parallel test-selection list, just for a
+   different reason now), plus compiling and running the four
+   windowless examples as real `.exe`s. The sanitizer leak tier stays
+   Linux-only, same reasoning as macOS. Those twelve rounds are what
+   caught every fix summarized in the status block above (claude.md
    #126 has the full blow-by-blow) — from 26 failures in round one down
    to zero, confirmed green on round twelve's own real Windows CI run.
 6. **Filesystem semantics, verified not assumed**: already covered
@@ -182,7 +201,7 @@ Exit criteria: Windows CI green on the suites above (confirmed, round
 twelve); `hello.f`, `fizzbuzz.f`, `config.f`, `files.f` run natively
 as `.exe`s (confirmed).
 
-## Phase 1 — Audio: the shared device seam, then waveOut
+## Phase 1 — Audio: the shared device seam, then waveOut *(built, CI-compiled; native-hardware verification open)*
 
 Prerequisite: the 3-function device seam from macos.md Phase 1
 (`festina_pcm_open/write/close`) — cut once, whichever port gets there
@@ -191,13 +210,17 @@ all compile under MinGW unchanged.
 
 The Windows implementation is **waveOut** (winmm — plain C, shipped
 with Windows since forever, no COM): `waveOutOpen` per channel,
-`waveOutWrite` of prepared `WAVEHDR` blocks, and a semaphore counting
-free blocks reproduces ALSA's blocking push exactly — the same
-N-buffers-plus-semaphore shape the macOS AudioQueue shim uses. WASAPI
-is deliberately not the first target: it is COM-based, event-driven,
-and buys latency Festina's `play()/stop()` surface doesn't expose.
-Link: `-lwinmm` as the darwin/linux-conditional in
-`_RUNTIME_FEATURES["audio"]` (no pkg-config package needed).
+`waveOutWrite` of prepared `WAVEHDR` blocks, and a condition variable
+counting free blocks reproduces ALSA's blocking push exactly — the
+same N-buffers-plus-condvar shape the macOS AudioQueue shim uses
+(claude.md #127: a `pthread_cond_t`, not a semaphore — MinGW-w64's
+UCRT pthreads already ship, `-pthread` was already unconditionally
+linked for audio, and a condvar is the more direct match for the
+"wait until `free_count > 0`" shape the AudioQueue and ALSA backends
+both already use). WASAPI is deliberately not the first target: it is
+COM-based, event-driven, and buys latency Festina's `play()/stop()`
+surface doesn't expose. Link: `-lwinmm`, added to `_feature_pkgs_and_
+flags`'s win32 branch (no pkg-config package needed).
 
 Windows always software-mixes, so — like CoreAudio — the EBUSY
 `free_oldest` retry loop simply never fires. The white-box harnesses,
@@ -205,47 +228,122 @@ re-seated at the seam by the macOS plan, run on Windows CI as-is; the
 `FESTINA_AUDIO_NULL=1` shim from that plan covers end-to-end
 play/stop/isPlaying tests with no audio device.
 
+**Status (claude.md #127):** the `FestinaWoDev`/`festina_wo_proc`/
+`festina_pcm_dev_open/write/close` implementation is written, mirrors
+the AudioQueue backend's own error-path cleanup symmetry and
+`waveOutReset`'s synchronous "every pending buffer's callback fires
+before this returns" semantics (the same guarantee `AudioQueueStop(...,
+true)` gives), and is compiled (not linked — this translation unit
+depends on symbols from `festina_runtime.c`) against real
+`<mmsystem.h>` headers by a dedicated windows CI step, the same way the
+macOS job type-checks the AudioQueue backend. The gate stays up
+(`FESTINA_ENABLE_WINDOWS_AUDIO=1` to try it) pending real-hardware
+playback verification — this project has no Windows machine of its
+own to do that on.
+
 Exit criteria: `examples/audio.f` plays on Windows; channel-pool
 white-box and null-shim end-to-end tests green on Windows CI.
 
-## Phase 2 — Graphics: the shared windowing seam, then Win32
+## Phase 2 — Graphics: the shared windowing seam, then Win32 *(built, CI-compiled; native-hardware verification open)*
 
-Prerequisite: the 5-function windowing seam from macos.md Phase 2b
-(`window_open/close`, `window_present`, `window_client_size`,
-`events_wait(timeout)`, `events_drain(handler)` emitting normalized
-events). All drawing stays in portable Cairo (MSYS2's cairo package),
-libjpeg decoding is unchanged.
+Prerequisite: the windowing seam from macos.md Phase 2b
+(`festina_window_open/close`, `festina_window_present`,
+`festina_window_events_wait(timeout)`,
+`festina_window_events_drain(handler)` emitting normalized events --
+five functions, but no separate `window_client_size` accessor: macOS
+Phase 2's own extraction found none was needed, since each backend
+already knows the window's current size and independently repaints
+from the last surface `present` handed it on its own expose/paint
+callback, so windows.md inherits that same simplification rather than
+the original 4-function-plus-accessor sketch). All drawing stays in
+portable Cairo (MSYS2's `cairo` package), libjpeg decoding unchanged
+(`libjpeg-turbo`).
 
 The Windows layer is one C file (`festina_runtime_window_win32.c` —
-no Objective-C-style split needed here, Win32 is plain C):
+no Objective-C-style split needed here, Win32 is plain C, so unlike
+darwin's `.m` file this one compiles as an ordinary translation unit):
 
-- **Window**: `RegisterClassEx`/`CreateWindowEx`/`ShowWindow`;
-  `WM_CLOSE` feeds the normalized close event (the WM_DELETE_WINDOW
-  analog); title via `CreateWindowEx`'s name; client size from
-  `GetClientRect`.
+- **Window**: `RegisterClassEx`/`CreateWindowEx`/`ShowWindow`, a
+  borderless `WS_POPUP` window (no title bar/border/system menu --
+  the same "canvas, nothing else" look the X11 backend's Motif
+  no-decorations hint and the Cocoa backend's
+  `NSWindowStyleMaskBorderless` both already request, so the
+  requested width/height is the client size directly on every
+  platform); `WM_CLOSE` feeds the normalized close event (the
+  WM_DELETE_WINDOW/`windowShouldClose:` analog) by pushing CLOSE and
+  returning 0 without calling `DefWindowProc`, letting shared code
+  decide via `on close` and then `festina_window_close()`, exactly
+  like the other two backends.
 - **Present**: the Cairo ARGB32 image surface is exactly a 32bpp
-  top-down DIB — `StretchDIBits`/`SetDIBitsToDevice` from `WM_PAINT`,
-  no cairo-win32 backend needed (same blit shape as the mac CGImage
-  path, on purpose: the seam's `present` takes the image surface on
-  every platform).
+  top-down DIB — `StretchDIBits` from `WM_PAINT`, no cairo-win32
+  backend needed (same blit shape as the mac CGImage path, on
+  purpose: the seam's `present` takes the image surface on every
+  platform). A 32bpp DIB's scanline stride is always exactly
+  width×4 bytes, which is also cairo's own ARGB32 stride for every
+  width, so no separate stride parameter is needed the way the
+  CGImage path's data provider needed one.
 - **Event loop**: `events_wait(timeout)` is
   `MsgWaitForMultipleObjects` with the timer deadline as its
   millisecond timeout — the precise Win32 analog of today's `select`
-  on the X connection fd — and `events_drain` is the
-  `PeekMessage`/`TranslateMessage`/`DispatchMessage` pump.
-- **Input**: `WM_LBUTTONDOWN/UP`, `WM_MOUSEMOVE`, `WM_KEYDOWN/UP` +
-  `WM_CHAR`. Key names map from virtual-key codes to the **shared
-  key-name vocabulary** the macOS plan pins (`a`, `Return`, `space`,
-  `Left`, ...) — the vocabulary test is cross-platform property
-  number one. Autorepeat matches natively: `WM_KEYDOWN` repeats
-  while held (bit 30 distinguishes repeats if ever needed), one
-  `WM_KEYUP` — exactly claude.md #98's contract.
+  on the X connection fd and the Cocoa backend's own peek-with-
+  timeout — and `events_drain` is the
+  `PeekMessage`/`TranslateMessage`/`DispatchMessage` pump, which is
+  what actually invokes the WndProc callback that pushes input into
+  a small ring buffer (the same push-then-drain shape the Cocoa
+  backend uses, and for the identical reason: Win32 input, like
+  Cocoa's, is callback-driven, not a flat stream `events_drain` could
+  translate directly the way Xlib's `XNextEvent` loop can).
+- **Input**: `WM_LBUTTONDOWN/UP`, `WM_MOUSEMOVE`, `WM_KEYDOWN/UP`.
+  Built without a separate `WM_CHAR` handler, unlike this section's
+  original sketch: `WM_CHAR` only ever fires for the down half of a
+  press, which would leave `keyUp` unable to report the same text a
+  matching `keyDown` did. `ToUnicode` (virtual-key code + scancode +
+  current keyboard state) computes the identical shift-aware
+  character synchronously, for both halves, mirroring how X11's
+  `XLookupString` and Cocoa's `charactersIgnoringModifiers` are each
+  called directly inside their own key handlers rather than out of a
+  separate follow-up message. Key names map from virtual-key codes to
+  the **shared key-name vocabulary** the macOS plan pins (`a`,
+  `Return`, `space`, `Left`, ...) — the vocabulary test is
+  cross-platform property number one. Autorepeat matches natively:
+  `WM_KEYDOWN` repeats while held (bit 30 of `lParam` distinguishes a
+  repeat, unused since a program wants exactly this shape for text
+  entry), one `WM_KEYUP` — exactly claude.md #98's contract. Left/
+  right Shift/Control/Alt need their own scancode-based
+  disambiguation (`WM_KEYDOWN`/`WM_KEYUP` report only the generic
+  VK_SHIFT/VK_CONTROL/VK_MENU otherwise) — a standard, well-documented
+  Win32 technique, not a Festina-specific guess, but along with the
+  virtual-key → vocabulary table itself, one of the two pieces still
+  awaiting the real-hardware verification pass this phase's status
+  note calls out below.
 
 CI note, opposite of macOS: GitHub's Windows runners **can create
 real Win32 windows** (no Xvfb equivalent needed), so the windowed
 end-to-end tier — window opens, resize/close dispatch — is expected
 to run on Windows CI; verify early in the phase and record the
 outcome in tests/CONTRACT.md either way.
+
+**Status (claude.md #128):** the seam implementation
+(`FestinaWoDev`-style event queue, WndProc, `festina_window_open/
+close/present/events_wait/events_drain`) is written, mirrors the
+Cocoa backend's own push-then-drain event shape and
+error-path/cleanup conventions, and is compiled (not linked -- this
+translation unit, like `festina_runtime_graphics.c` itself, depends
+on symbols from `festina_runtime.c`) against real `<windows.h>`
+headers by a dedicated windows CI step, the same way the macOS job
+type-checks the Cocoa backend. `festina_runtime_graphics.c`'s own
+`#ifndef __APPLE__` guard around the X11 backend turned out to be
+wrong the moment Windows had anywhere else to go: it is also true on
+Windows, so before this phase that file would have tried (and failed)
+to compile the X11 backend the moment anything asked it to -- fixed
+to `#if !defined(__APPLE__) && !defined(_WIN32)`, and CI now compiles
+that file standalone on Windows too, the one platform-specific check
+this file itself had never had. The gate stays up
+(`FESTINA_ENABLE_WINDOWS_GRAPHICS=1` to try it) pending real-hardware
+window/mouse/keyboard verification -- this project has no Windows
+machine of its own to do that on. Offscreen drawing (`saveCanvas`, no
+`render()`) is not gated on any platform, including Windows now that
+a real `window_win32` companion object exists to link against for it.
 
 Exit criteria: `examples/graphics.f`, `tic_tac_toe.f`, `timers.f` run
 in native windows; keyboard/mouse/resize/close behave identically to

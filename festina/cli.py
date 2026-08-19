@@ -192,13 +192,18 @@ _PKG_INSTALL_HINTS = {
     "cairo-xlib": "install Cairo's and X11's development packages, e.g. "
                   "`apt install libcairo2-dev libx11-dev` on Debian/Ubuntu -- "
                   "needed for claude.md #37/#39's img/graphics functions",
-    # claude.md #123: darwin's own package -- plain Cairo, no X11 half
-    # (the windowing backend there is native Cocoa, not cairo-xlib).
+    # claude.md #123/#128: darwin's and windows' own package -- plain
+    # Cairo, no X11 half (the windowing backend there is native Cocoa/
+    # Win32, not cairo-xlib).
     "cairo": "install Cairo's development package, e.g. `brew install cairo` "
-             "on macOS -- needed for claude.md #37/#39's img/graphics functions",
+             "on macOS or `pacman -S mingw-w64-ucrt-x86_64-cairo` from a "
+             "UCRT64 shell on Windows -- needed for claude.md #37/#39's "
+             "img/graphics functions",
     "libjpeg": "install libjpeg's development package, e.g. "
-                "`apt install libjpeg-dev` (Debian/Ubuntu) or "
-                "`brew install jpeg-turbo` (macOS)",
+                "`apt install libjpeg-dev` (Debian/Ubuntu), "
+                "`brew install jpeg-turbo` (macOS), or "
+                "`pacman -S mingw-w64-ucrt-x86_64-libjpeg-turbo` from a "
+                "UCRT64 shell (Windows)",
     "libmpg123": "install mpg123's development package, e.g. "
                   "`apt install libmpg123-dev` (Debian/Ubuntu) or "
                   "`brew install mpg123` (macOS)",
@@ -361,6 +366,11 @@ def _sqlite_link_flags(cc):
 # festina/codegen.py). "core" has no entry here since it's unconditional
 # for every program (see _ensure_runtime_object's cc_source parameter).
 _RUNTIME_WINDOW_MAC_M = os.path.join(_RUNTIME_DIR, "festina_runtime_window_mac.m")
+# windows.md Phase 2 / claude.md #128: the Win32 counterpart to
+# _RUNTIME_WINDOW_MAC_M -- unlike Cocoa, plain C, but still its own
+# companion object, since none of festina_runtime_graphics.c's X11
+# headers exist under MinGW (see that file's own top comment).
+_RUNTIME_WINDOW_WIN32_C = os.path.join(_RUNTIME_DIR, "festina_runtime_window_win32.c")
 
 _RUNTIME_FEATURES = {
     "graphics": {
@@ -439,6 +449,14 @@ def _feature_pkgs_and_flags(name, platform_name=None):
     if name == "audio" and platform_name == "darwin":
         pkgs.remove("alsa")
         flags += ["-framework", "AudioToolbox"]
+    elif name == "audio" and platform_name == "win32":
+        # windows.md Phase 1: the device layer is winmm's waveOut, a
+        # system DLL with no pkg-config file of its own (same shape as
+        # AudioToolbox above) -- `alsa` drops out (Linux-only) and
+        # `-lwinmm` comes in. libmpg123 stays: MSYS2 UCRT64 ships a real
+        # pkg-config package for it, same as every other platform.
+        pkgs.remove("alsa")
+        flags += ["-lwinmm"]
     elif name == "graphics" and platform_name == "darwin":
         # claude.md #123: on darwin festina_runtime_graphics.c has ZERO
         # X11 code compiled into it (guarded `#ifndef __APPLE__`), so
@@ -449,19 +467,38 @@ def _feature_pkgs_and_flags(name, platform_name=None):
         pkgs.remove("cairo-xlib")
         pkgs.append("cairo")
         flags += ["-framework", "Cocoa"]
+    elif name == "graphics" and platform_name == "win32":
+        # windows.md Phase 2: same shape as darwin above -- on win32
+        # festina_runtime_graphics.c also has ZERO X11 code compiled
+        # into it (guarded `#if !defined(__APPLE__) && !defined(_WIN32)`),
+        # so `cairo-xlib` drops out in favor of plain `cairo` (MSYS2
+        # UCRT64 ships a real pkg-config package for it, same as
+        # darwin's Homebrew). The Win32 windowing companion object
+        # (_RUNTIME_WINDOW_WIN32_C) needs GDI (StretchDIBits, window
+        # creation) and USER32 (RegisterClassEx/CreateWindowEx/message
+        # pump) -- system DLLs with import libraries but no pkg-config
+        # file, the same shape winmm was for Phase 1's audio.
+        pkgs.remove("cairo-xlib")
+        pkgs.append("cairo")
+        flags += ["-lgdi32", "-luser32"]
     return pkgs, flags
 
 
 def _feature_extra_object(cc, name, platform_name=None):
-    """claude.md #123: the one companion object a feature needs beyond
-    its own `_RUNTIME_FEATURES[name]["source"]` -- today only graphics
-    on darwin, where Cocoa cannot be compiled as part of
+    """claude.md #123 / #128: the one companion object a feature needs
+    beyond its own `_RUNTIME_FEATURES[name]["source"]` -- graphics on
+    darwin, where Cocoa cannot be compiled as part of
     festina_runtime_graphics.c's plain C translation unit at all and so
-    lives in its own Objective-C file (_RUNTIME_WINDOW_MAC_M). Returns
-    None everywhere else. Reuses _ensure_runtime_object's own cache-by-
-    mtime machinery -- clang infers Objective-C from the .m extension
-    with no extra flag needed, so compiling it is exactly the same
-    shape as any other runtime object file."""
+    lives in its own Objective-C file (_RUNTIME_WINDOW_MAC_M); and
+    graphics on win32, where the Win32 windowing backend COULD in
+    principle share festina_runtime_graphics.c's own translation unit
+    (it is plain C too, unlike Cocoa) but stays a separate file anyway,
+    matching darwin's shape one-for-one rather than inventing a second
+    convention for exactly one platform. Returns None everywhere else.
+    Reuses _ensure_runtime_object's own cache-by-mtime machinery --
+    clang infers Objective-C from the .m extension with no extra flag
+    needed, so compiling either companion object is the same shape as
+    any other runtime object file."""
     platform_name = platform_name or sys.platform
     if name == "graphics" and platform_name == "darwin":
         # claude.md #126: this file #includes <cairo.h> (CGImage/cairo
@@ -471,6 +508,13 @@ def _feature_extra_object(cc, name, platform_name=None):
         # translation unit is the ONE place real macOS CI could ever
         # catch that, since nothing else on any platform compiles it.
         return _ensure_runtime_object(cc, "window_mac", _RUNTIME_WINDOW_MAC_M, ["cairo"])
+    if name == "graphics" and platform_name == "win32":
+        # windows.md Phase 2: same cairo-cflags need as window_mac.m
+        # above, for the same reason -- festina_runtime_window_win32.c
+        # #includes <cairo.h> directly (the StretchDIBits blit reads
+        # cairo_image_surface_get_data/width/height straight off the
+        # backing surface).
+        return _ensure_runtime_object(cc, "window_win32", _RUNTIME_WINDOW_WIN32_C, ["cairo"])
     return None
 
 
@@ -517,14 +561,14 @@ def _check_feature_supported(feature, platform_name=None):
     not exist on their OS. `platform_name` is injectable so every
     branch is unit-testable from any platform (tests/test_platform.py).
 
-    Two different shades of "not supported" live here, both raising the
-    same category so the conftest skip picks up either uniformly: the
-    darwin branches gate a backend that EXISTS (built, CI-compiled)
-    but awaits real-hardware verification, overridable via an env var
-    for exactly that verification; the win32 branches gate a backend
-    that does not exist in the runtime AT ALL yet (windows.md Phases
-    1-2 are still open), so they raise unconditionally -- there is
-    nothing to unlock.
+    Every branch here now gates a backend that EXISTS (built,
+    CI-compiled) but awaits real-hardware verification, overridable via
+    an env var for exactly that verification -- windows.md Phase 2's
+    graphics gate joined this shape alongside Phase 1's own audio gate
+    and every darwin gate (claude.md #128); there is no remaining
+    "nothing built yet, raises unconditionally" branch left on any
+    platform. All raise the same category so the conftest skip picks
+    them up uniformly.
 
     `feature` here is a narrower question than "is this object file
     linked" (see needs_graphics/wants_window in compile_file): audio
@@ -548,15 +592,18 @@ def _check_feature_supported(feature, platform_name=None):
             "to try it. Everything except aud/play() works today.",
             category="unsupported platform feature")
     if feature == "audio" and platform_name == "win32":
-        # windows.md Phase 1: unlike the darwin case above, there is no
-        # waveOut backend in the runtime yet at all -- no env var to
-        # unlock, because there is nothing built yet to unlock. This
-        # becomes the same real-hardware-verification gate the darwin
-        # branch above uses once Phase 1 lands.
+        # windows.md Phase 1: the waveOut backend now EXISTS (built,
+        # compiled by windows CI against real <mmsystem.h> headers) but
+        # has not been verified against a real output device on real
+        # hardware -- same gate, same override, same reason as the
+        # darwin branch above.
+        if os.environ.get("FESTINA_ENABLE_WINDOWS_AUDIO"):
+            return
         raise CompileError(
-            "audio is not yet implemented on Windows -- planned as "
-            "windows.md Phase 1 (waveOut). Everything except aud/play() "
-            "works today.",
+            "audio is not yet verified on Windows -- the waveOut "
+            "backend is built (windows.md Phase 1) but awaits real-"
+            "hardware verification; set FESTINA_ENABLE_WINDOWS_AUDIO=1 "
+            "to try it. Everything except aud/play() works today.",
             category="unsupported platform feature")
     if feature == "graphics" and platform_name == "darwin":
         # claude.md #123: the Cocoa windowing backend EXISTS (compiled
@@ -578,23 +625,28 @@ def _check_feature_supported(feature, platform_name=None):
             "window involved at all.",
             category="unsupported platform feature")
     if feature == "graphics" and platform_name == "win32":
-        # windows.md Phase 2: same "nothing built yet" honesty as the
-        # audio branch above -- no Win32 windowing backend exists in
-        # the runtime yet, so this fires unconditionally rather than
-        # gating a real backend behind an env var. claude.md #126 round
-        # six: unlike darwin, this now covers OFFSCREEN drawing too --
-        # _runtime_objects_and_link_libs's own offscreen exemption is
-        # scoped away from win32 (see its docstring), precisely because
-        # there is no window_win32 companion object the way window_mac.m
-        # exists for darwin, so even drawRect()+saveCanvas() alone fails
-        # to link on win32 today, not just windowed use.
+        # windows.md Phase 2 / claude.md #128: the Win32 windowing
+        # backend now EXISTS (built, compiled by windows CI against
+        # real <windows.h> headers) -- same shape as the darwin
+        # graphics gate above, INVERTED from the "nothing built yet"
+        # unconditional raise this branch used to be (claude.md #126
+        # round six). Because a real window_win32 companion object now
+        # provides festina_window_open and friends, offscreen-only use
+        # (drawRect()+saveCanvas(), no render(), no event handler) also
+        # links again on win32 -- _runtime_objects_and_link_libs's
+        # win32-only offscreen-gate-exemption carve-out is retired
+        # along with this branch's old unconditional raise; see that
+        # function's own updated docstring.
+        if os.environ.get("FESTINA_ENABLE_WINDOWS_GRAPHICS"):
+            return
         raise CompileError(
-            "graphics (drawRect, on mouseDown, img, saveCanvas, ...) is "
-            "not yet implemented on Windows -- planned as windows.md "
-            "Phase 2 (Win32 + the shared Cairo blit). This includes "
-            "offscreen-only drawing too, unlike on macOS: there is no "
-            "Win32 windowing backend at all yet for the shared graphics "
-            "code to link against.",
+            "windowed graphics (render(), or an on mouseDown/mouseUp/"
+            "mouse/keyDown/keyUp/resize/close handler) is not yet "
+            "verified on Windows -- the Win32 backend is built "
+            "(windows.md Phase 2) but awaits real-hardware verification; "
+            "set FESTINA_ENABLE_WINDOWS_GRAPHICS=1 to try it. Drawing to "
+            "an offscreen canvas and saveCanvas() work today with no "
+            "window involved at all.",
             category="unsupported platform feature")
 
 
@@ -614,25 +666,26 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
     broader "the graphics object file is needed at all" this function's
     own `uses_graphics` parameter means (which also covers a purely
     offscreen drawRect()+saveCanvas() program). Only `wants_window`
-    reaches _check_feature_supported's platform gate on platforms where
-    offscreen graphics actually links -- see that function's own
-    docstring for why offscreen drawing must never hit it there. The
-    graphics object (and its companion Cocoa object on darwin, which
-    the offscreen path also needs linked -- see _feature_extra_object's
-    own comment) is still linked whenever `uses_graphics` (broad) is
-    true, gate or no gate.
+    reaches _check_feature_supported's platform gate -- offscreen
+    drawing must never hit it, on any platform, since it never touches
+    the windowing seam at all (see that function's own docstring). The
+    graphics object -- and its companion windowing object on darwin/
+    win32, which the offscreen path also needs linked (see
+    _feature_extra_object's own comment) -- is still linked whenever
+    `uses_graphics` (broad) is true, gate or no gate.
 
-    claude.md #126 round four (found by real Windows CI): that
-    exemption is itself platform-scoped, not universal. Unlike darwin,
-    Windows has no window backend at all yet -- no window_win32
-    companion object exists the way window_mac.m does -- so even an
-    OFFSCREEN-only program fails at the *linker* stage with
-    `_festina_window_open` and friends undefined, since
+    claude.md #126 round four (found by real Windows CI) added a win32-
+    only carve-out here: at that point Windows had no window backend at
+    all -- no window_win32 companion object existed the way window_mac.m
+    did -- so even an OFFSCREEN-only program failed at the *linker*
+    stage with `_festina_window_open` and friends undefined, since
     festina_runtime_graphics.c references those symbols unconditionally
     regardless of whether a given program ever calls render() or an
-    event handler. So on win32 the graphics gate must fire even when
-    wants_window is False, unlike on darwin (offscreen genuinely works
-    there) or Linux (ungated everywhere, checked directly)."""
+    event handler. windows.md Phase 2 / claude.md #128 retires that
+    carve-out: festina_runtime_window_win32.c now provides those
+    symbols, so offscreen use links -- and is gate-exempt -- on win32
+    exactly like every other platform, checked identically rather than
+    with a platform-specific branch here."""
     # core needs no pkg-config package of its own beyond sqlite3 (always
     # included by _ensure_runtime_object itself) on Linux/macOS;
     # windows.md Phase 0 adds gnurx on win32 for <regex.h> -- see
@@ -644,11 +697,10 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
     for pkg in core_pkgs:
         link_libs += _pkg_config("--libs", pkg)
 
-    offscreen_graphics_is_gate_exempt = sys.platform != "win32"
     for name, wants in (("graphics", uses_graphics), ("audio", uses_audio)):
         if not wants:
             continue
-        skip_gate = name == "graphics" and not wants_window and offscreen_graphics_is_gate_exempt
+        skip_gate = name == "graphics" and not wants_window
         if not skip_gate:
             _check_feature_supported(name)
         feature = _RUNTIME_FEATURES[name]
@@ -910,36 +962,30 @@ def _doctor_report():
               "libc, claude.md #67/#68's regex()/.test()/.match()/.replace())",
               _PKG_INSTALL_HINTS["gnurx"])
 
-    # claude.md #123: platform-aware, like audio just below -- darwin's
-    # graphics runtime carries zero X11 code (guarded `#ifndef
-    # __APPLE__`), so it needs Cairo's plain core package, not the xlib
-    # backend, and needs no X11/XQuartz dev headers at all any more.
-    # windows.md Phase 2 (Win32 windowing) doesn't exist in the runtime
-    # yet at all, unlike macOS's Cocoa backend -- so unlike the darwin
-    # "not yet" lines below, there is no real dependency to probe for
-    # here yet either; the true statement is simply that the feature
-    # isn't built.
-    if sys.platform == "darwin":
+    # claude.md #123/#128: platform-aware, like audio just below --
+    # darwin's and windows' graphics runtimes both carry zero X11 code
+    # (guarded `#if !defined(__APPLE__) && !defined(_WIN32)`), so both
+    # need Cairo's plain core package, not the xlib backend, and need
+    # no X11/XQuartz dev headers at all.
+    if sys.platform in ("darwin", "win32"):
         check(_pkg_config_has("cairo"), False,
               "cairo dev headers (optional -- only used by graphics: drawRect, on mouseDown, img, ...)",
               _PKG_INSTALL_HINTS["cairo"])
-    elif sys.platform == "win32":
-        lines.append("  [   not yet       ] graphics (drawRect, on mouseDown, img, ...) -- "
-                     "no Windows backend yet, planned as windows.md Phase 2")
     else:
         check(_pkg_config_has("cairo-xlib"), False,
               "cairo-xlib dev headers (optional -- only used by graphics: drawRect, on mouseDown, img, ...)",
               _PKG_INSTALL_HINTS["cairo-xlib"])
-    if sys.platform != "win32":
-        # claude.md #101: JPEG/MP3 decoding. Grouped with their own
-        # feature rather than listed as separate tiers -- a program
-        # that uses graphics needs libjpeg whether or not it happens
-        # to load a .jpg, since the whole translation unit is compiled
-        # either way. Skipped on win32 above with the rest of graphics,
-        # since there's no graphics translation unit there to need it.
-        check(_pkg_config_has("libjpeg"), False,
-              "libjpeg dev headers (optional -- only used by graphics: JPEG images)",
-              _PKG_INSTALL_HINTS["libjpeg"])
+    # claude.md #101: JPEG/MP3 decoding. Grouped with their own feature
+    # rather than listed as separate tiers -- a program that uses
+    # graphics needs libjpeg whether or not it happens to load a .jpg,
+    # since the whole translation unit is compiled either way. windows.md
+    # Phase 2 (claude.md #128): this now runs on win32 too, since there
+    # IS a graphics translation unit there now that needs it, same as
+    # every other platform -- it used to be skipped here specifically
+    # because there was not yet anything on win32 to need it.
+    check(_pkg_config_has("libjpeg"), False,
+          "libjpeg dev headers (optional -- only used by graphics: JPEG images)",
+          _PKG_INSTALL_HINTS["libjpeg"])
     if sys.platform == "darwin":
         # claude.md #123: windowed use (render(), any event handler)
         # additionally needs the Cocoa backend's real-hardware
@@ -948,22 +994,32 @@ def _doctor_report():
                      "the Cocoa backend is built but awaits real-hardware verification, "
                      "macos.md Phase 2 (set FESTINA_ENABLE_MACOS_GRAPHICS=1 to try it); "
                      "offscreen drawing + saveCanvas() work today")
+    elif sys.platform == "win32":
+        # windows.md Phase 2 (claude.md #128): the Win32 counterpart --
+        # built and CI-compiled, same shape as darwin's line above, no
+        # longer the "not yet built at all" honesty this used to be.
+        lines.append("  [   not yet       ] windowed graphics (render(), on mouseDown/.../close) -- "
+                     "the Win32 backend is built but awaits real-hardware verification, "
+                     "windows.md Phase 2 (set FESTINA_ENABLE_WINDOWS_GRAPHICS=1 to try it); "
+                     "offscreen drawing + saveCanvas() work today")
 
     # macos.md Phase 0: the audio lines are platform-aware -- on macOS
     # there is no ALSA to install, and telling a Mac user to go get it
     # would be worse than saying the true thing: the AudioQueue backend
     # is built but awaits real-hardware verification (macos.md Phase 1).
-    # windows.md Phase 1 (waveOut) doesn't exist in the runtime yet
-    # either -- same "not yet" honesty as graphics above, not audio's
-    # own real-hardware-verification gate, since there's no backend to
-    # gate at all yet.
+    # windows.md Phase 1: the waveOut backend is now the same shape --
+    # built and CI-compiled, awaiting its own real-hardware verification
+    # pass, same as graphics now is too (windows.md Phase 2, claude.md
+    # #128 -- both windows lines follow the identical built-but-gated
+    # pattern now, nothing left in the "not yet built at all" shape).
     if sys.platform == "darwin":
         lines.append("  [   not yet       ] audio (aud/.play()) -- the AudioQueue "
                      "backend is built but awaits real-hardware verification, "
                      "macos.md Phase 1 (set FESTINA_ENABLE_MACOS_AUDIO=1 to try it)")
     elif sys.platform == "win32":
-        lines.append("  [   not yet       ] audio (aud/.play()) -- "
-                     "no Windows backend yet, planned as windows.md Phase 1")
+        lines.append("  [   not yet       ] audio (aud/.play()) -- the waveOut "
+                     "backend is built but awaits real-hardware verification, "
+                     "windows.md Phase 1 (set FESTINA_ENABLE_WINDOWS_AUDIO=1 to try it)")
     else:
         check(_pkg_config_has("libmpg123"), False,
               "libmpg123 dev headers (optional -- only used by audio: MP3 clips)",

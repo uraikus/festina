@@ -27,6 +27,9 @@
 #if !defined(FESTINA_AUDIO_DEVICE_EXTERNAL)
 #  if defined(__APPLE__)
 #    include <AudioToolbox/AudioToolbox.h>
+#  elif defined(_WIN32)
+#    include <windows.h>
+#    include <mmsystem.h>    /* windows.md Phase 1: waveOut -- winmm, no COM */
 #  else
 #    include <alsa/asoundlib.h>
 #  endif
@@ -225,6 +228,156 @@ static void festina_pcm_dev_close(void *dev) {
      * this returns, so disposing afterwards races nothing. */
     AudioQueueStop(d->queue, true);
     AudioQueueDispose(d->queue, true);
+    pthread_mutex_destroy(&d->lock);
+    pthread_cond_destroy(&d->cond);
+    free(d);
+}
+
+#elif defined(_WIN32)
+/* Windows (windows.md Phase 1): winmm's waveOut, not WASAPI -- WASAPI is
+ * COM-based and event-driven, and buys latency we don't need for a
+ * demo-scale runtime. This reproduces the AudioQueue shim just above:
+ * a fixed pool of buffers, a completion callback that returns buffers to
+ * a free list, and a condition variable so festina_pcm_dev_write blocks
+ * exactly like ALSA's snd_pcm_writei does when the device has no room. */
+#define FESTINA_WO_BUFFERS 4
+#define FESTINA_WO_CHUNK_FRAMES 4096
+
+typedef struct {
+    HWAVEOUT hwo;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    WAVEHDR *bufs[FESTINA_WO_BUFFERS];
+    WAVEHDR *free_bufs[FESTINA_WO_BUFFERS];
+    int free_count;
+    int channels;
+} FestinaWoDev;
+
+/* waveOutOpen's CALLBACK_FUNCTION contract: this runs on some internal
+ * thread, not ours, and may only touch a short allow-list of Win32 APIs --
+ * no blocking calls. Storing the freed header and signalling our own
+ * condition variable is exactly the AudioQueue callback's shape. */
+static void CALLBACK festina_wo_proc(HWAVEOUT hwo, UINT msg, DWORD_PTR instance,
+                                      DWORD_PTR param1, DWORD_PTR param2) {
+    (void)hwo; (void)param2;
+    if (msg != WOM_DONE) return;
+    FestinaWoDev *d = (FestinaWoDev *)instance;
+    WAVEHDR *hdr = (WAVEHDR *)param1;
+    pthread_mutex_lock(&d->lock);
+    d->free_bufs[d->free_count++] = hdr;
+    pthread_cond_signal(&d->cond);
+    pthread_mutex_unlock(&d->lock);
+}
+
+static void *festina_pcm_dev_open(int channels, unsigned int rate,
+                                  char *errbuf, size_t errbuf_size) {
+    FestinaWoDev *d = calloc(1, sizeof(FestinaWoDev));
+    if (!d) {
+        snprintf(errbuf, errbuf_size, "out of memory opening a waveOut device");
+        return NULL;
+    }
+    d->channels = channels;
+    pthread_mutex_init(&d->lock, NULL);
+    pthread_cond_init(&d->cond, NULL);
+
+    WAVEFORMATEX fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.wFormatTag = WAVE_FORMAT_PCM;
+    fmt.nChannels = (WORD)channels;
+    fmt.nSamplesPerSec = rate;
+    fmt.wBitsPerSample = 16;
+    fmt.nBlockAlign = (WORD)(channels * 2);
+    fmt.nAvgBytesPerSec = rate * fmt.nBlockAlign;
+
+    MMRESULT rc = waveOutOpen(&d->hwo, WAVE_MAPPER, &fmt,
+                               (DWORD_PTR)festina_wo_proc, (DWORD_PTR)d,
+                               CALLBACK_FUNCTION);
+    if (rc != MMSYSERR_NOERROR) {
+        snprintf(errbuf, errbuf_size, "waveOutOpen failed (MMRESULT %u)", (unsigned)rc);
+        pthread_mutex_destroy(&d->lock);
+        pthread_cond_destroy(&d->cond);
+        free(d);
+        return NULL;
+    }
+
+    size_t buf_bytes = (size_t)FESTINA_WO_CHUNK_FRAMES * 2 * (size_t)channels;
+    for (int i = 0; i < FESTINA_WO_BUFFERS; i++) {
+        WAVEHDR *hdr = calloc(1, sizeof(WAVEHDR));
+        char *data = malloc(buf_bytes);
+        if (!hdr || !data) {
+            snprintf(errbuf, errbuf_size, "out of memory allocating waveOut buffers");
+            free(hdr); free(data);
+            for (int j = 0; j < i; j++) {
+                waveOutUnprepareHeader(d->hwo, d->bufs[j], sizeof(WAVEHDR));
+                free(d->bufs[j]->lpData);
+                free(d->bufs[j]);
+            }
+            waveOutClose(d->hwo);
+            pthread_mutex_destroy(&d->lock);
+            pthread_cond_destroy(&d->cond);
+            free(d);
+            return NULL;
+        }
+        hdr->lpData = data;
+        hdr->dwBufferLength = (DWORD)buf_bytes;
+        rc = waveOutPrepareHeader(d->hwo, hdr, sizeof(WAVEHDR));
+        if (rc != MMSYSERR_NOERROR) {
+            snprintf(errbuf, errbuf_size, "waveOutPrepareHeader failed (MMRESULT %u)", (unsigned)rc);
+            free(data); free(hdr);
+            for (int j = 0; j < i; j++) {
+                waveOutUnprepareHeader(d->hwo, d->bufs[j], sizeof(WAVEHDR));
+                free(d->bufs[j]->lpData);
+                free(d->bufs[j]);
+            }
+            waveOutClose(d->hwo);
+            pthread_mutex_destroy(&d->lock);
+            pthread_cond_destroy(&d->cond);
+            free(d);
+            return NULL;
+        }
+        d->bufs[i] = hdr;
+        d->free_bufs[d->free_count++] = hdr;
+    }
+    return d;
+}
+
+static long festina_pcm_dev_write(void *dev, const int16_t *frames, size_t frame_count) {
+    FestinaWoDev *d = (FestinaWoDev *)dev;
+    if (frame_count > FESTINA_WO_CHUNK_FRAMES) frame_count = FESTINA_WO_CHUNK_FRAMES;
+
+    pthread_mutex_lock(&d->lock);
+    while (d->free_count == 0) pthread_cond_wait(&d->cond, &d->lock);
+    WAVEHDR *hdr = d->free_bufs[--d->free_count];
+    pthread_mutex_unlock(&d->lock);
+
+    size_t bytes = frame_count * 2 * (size_t)d->channels;
+    memcpy(hdr->lpData, frames, bytes);
+    hdr->dwBufferLength = (DWORD)bytes;
+    MMRESULT rc = waveOutWrite(d->hwo, hdr, sizeof(WAVEHDR));
+    if (rc != MMSYSERR_NOERROR) {
+        /* waveOutWrite failed outright -- it will never call us back for
+         * this header, so return it to the free list ourselves instead
+         * of leaking it out of the pool. */
+        pthread_mutex_lock(&d->lock);
+        d->free_bufs[d->free_count++] = hdr;
+        pthread_mutex_unlock(&d->lock);
+        return -1;
+    }
+    return (long)frame_count;
+}
+
+static void festina_pcm_dev_close(void *dev) {
+    FestinaWoDev *d = (FestinaWoDev *)dev;
+    /* waveOutReset is the synchronous counterpart to AudioQueueStop(...,
+     * true) above: every pending buffer's WOM_DONE fires before this
+     * returns, so unpreparing/freeing them right after races nothing. */
+    waveOutReset(d->hwo);
+    for (int i = 0; i < FESTINA_WO_BUFFERS; i++) {
+        waveOutUnprepareHeader(d->hwo, d->bufs[i], sizeof(WAVEHDR));
+        free(d->bufs[i]->lpData);
+        free(d->bufs[i]);
+    }
+    waveOutClose(d->hwo);
     pthread_mutex_destroy(&d->lock);
     pthread_cond_destroy(&d->cond);
     free(d);

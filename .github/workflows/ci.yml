@@ -140,9 +140,13 @@ jobs:
     # mingw-w64-ucrt-x86_64-libsystre (already pulled in transitively)
     # and pacman --noconfirm silently drops the conflicting package
     # instead of erroring, so libsystre -- not libgnurx -- is the real
-    # regex.h provider here. Audio and windowed graphics (windows.md
-    # Phases 1-2) have no backend in the runtime yet at all, so those
-    # tiers shed as skips via the same conftest mechanism macOS Phase 0
+    # regex.h provider here. windows.md Phase 1: audio has a real
+    # waveOut backend (built, compiled below against real <mmsystem.h>
+    # headers). windows.md Phase 2 (claude.md #128): graphics now has a
+    # real Win32 windowing backend too, compiled below the same way.
+    # Both stay gated pending real-hardware verification, same as macOS
+    # Phase 1/2's own AudioQueue/Cocoa backends, so both tiers still
+    # shed as skips via the same conftest mechanism macOS Phase 0
     # built -- no parallel test-selection list, same as the macOS job
     # above.
     runs-on: windows-latest
@@ -163,6 +167,9 @@ jobs:
             mingw-w64-ucrt-x86_64-sqlite3
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-libsystre
+            mingw-w64-ucrt-x86_64-mpg123
+            mingw-w64-ucrt-x86_64-cairo
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
       - name: Install Python test dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Run the test suite
@@ -175,3 +182,52 @@ jobs:
             python -m festina.cli compile "examples/$ex.f" -o "/tmp/$ex.exe"
             "/tmp/$ex.exe"
           done
+      - name: Compile the audio runtime (waveOut backend)
+        # windows.md Phase 1 / claude.md #127: the audio translation
+        # unit's _WIN32 branch is the waveOut device layer -- compiling
+        # it here type-checks it against the real <mmsystem.h> headers
+        # on every push, the same way the macOS job does for
+        # AudioToolbox, even while the windows audio gate keeps it out
+        # of user programs pending real-hardware playback verification.
+        # Compile-only (not linked), same as the macOS step: this file
+        # calls festina_fail/festina_retain/festina_release_check/
+        # festina_save_bytes, defined in festina_runtime.c, so a
+        # standalone link would fail on those, not on anything this
+        # step actually exists to catch. The Compile-and-run-the-core-
+        # examples step above already exercises the full link -- with
+        # -lwinmm now in _feature_pkgs_and_flags's win32 audio branch --
+        # for any program that actually uses aud/play() (once the gate
+        # is unlocked).
+        run: |
+          clang -c -O2 -I runtime \
+            $(pkg-config --cflags libmpg123) \
+            runtime/festina_runtime_audio.c -o /tmp/festina_audio_win.o
+      - name: Compile the graphics runtime (Cairo/libjpeg)
+        # windows.md Phase 2 / claude.md #128: festina_runtime_graphics.c
+        # compiles a DIFFERENT subset of itself on win32 than it always
+        # has on Linux/macOS -- the `#if !defined(__APPLE__) &&
+        # !defined(_WIN32)` guard now excludes its X11 block here too,
+        # which nothing had ever type-checked before this (the file's
+        # portable Cairo/libjpeg code was already known-portable from
+        # every other platform, but the guard itself, and the real
+        # MSYS2 <cairo.h>/<jpeglib.h> headers, had not been). Compile-
+        # only, same reasoning as the audio step just above: this file
+        # calls into festina_runtime.c's core symbols, so a standalone
+        # link would fail on those, not on anything this step exists
+        # to catch.
+        run: |
+          clang -c -O2 -I runtime \
+            $(pkg-config --cflags cairo) $(pkg-config --cflags libjpeg) \
+            runtime/festina_runtime_graphics.c -o /tmp/festina_graphics_win.o
+      - name: Compile the windowing backend (Win32)
+        # windows.md Phase 2 / claude.md #128: festina_runtime_window_win32.c
+        # is the native Win32 windowing device layer -- compiling it
+        # here type-checks it against the real <windows.h> headers on
+        # every push, the same way the macOS job's own step does for
+        # festina_runtime_window_mac.m, even while the windows graphics
+        # gate keeps windowed use out of user programs pending real-
+        # hardware mouse/keyboard verification.
+        run: |
+          clang -c -O2 -I runtime \
+            $(pkg-config --cflags cairo) \
+            runtime/festina_runtime_window_win32.c -o /tmp/festina_window_win32.o
