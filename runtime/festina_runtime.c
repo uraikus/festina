@@ -1181,7 +1181,23 @@ void festina_db_close(sqlite3 *db) {
         sqlite3_finalize(g_cached_stmts[i]);
     }
     g_cached_stmt_count = 0;
-    sqlite3_close(db);
+    /* claude.md #126 round eleven: round nine's own bet that this
+     * function would fix the still-open SQLite schema-sync mismatches
+     * was refuted by round ten's real Windows log -- unchanged,
+     * identical failures with this fix already in place. The finalize
+     * loop above was reasoned to be the one thing that could make
+     * sqlite3_close return anything other than SQLITE_OK, but that was
+     * never actually confirmed on the platform where it matters --
+     * this call was, and still is, best-effort. Surfacing a non-OK
+     * result to stderr costs nothing (never changes program behavior
+     * or the exit code) and gives the next real log a concrete answer
+     * instead of another silent maybe, should the tests calling this
+     * out in their own failure diagnostics need it. */
+    int rc = sqlite3_close(db);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "festina_db_close: sqlite3_close returned %d (%s) -- "
+                "a statement or blob handle was still open\n", rc, sqlite3_errmsg(db));
+    }
 }
 
 /* ---- sqlite() queries -- claude.md #32-34 ---- */

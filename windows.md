@@ -1,57 +1,56 @@
 # Windows support — the plan
 
-> **Status: Phase 0 is built; ten real CI rounds on the same PR, each
-> finding something the last one missed** (claude.md #126 has the full
-> account — this is the short version, condensed again since the
-> per-round narrative was getting long). Every Python-side toolchain
-> seam this section lists was in fact already covered by claude.md
-> #39's shared work (`.exe` naming, the libLLVM DLL candidates, the
-> GNU-ld static-sqlite path). What was still missing and has now
-> landed: the regex decision (`_core_pkgs` installs `libsystre`, asks
-> pkg-config for `gnurx` — its own PKGBUILD conflicts with the
-> originally-preferred `libgnurx` and ships under that old pkg-config
-> name instead), `festina doctor`'s Windows hints, a `windows-latest`
-> CI job, `#ifdef _WIN32` branches for `localtime_r`→`localtime_s`
-> and for `festina_runtime_init()` (the UCRT's default text-mode stdout
-> silently turning every `\n` a compiled program prints into `\r\n`), a
-> post-link rename fixing MinGW's linker appending `.exe` to an
-> explicit `-o name` lacking one, `_check_feature_supported` now
-> unconditionally gating graphics on win32 (offscreen included — there
-> is no window backend at all yet for even that to link against), and
-> `_run_tool` now resolving every command through `shutil.which` first
-> rather than trusting `subprocess.run`'s own broader Win32
-> `CreateProcess` search (which checks the calling process's own
-> directory before PATH, silently defeating `tests/conftest.py`'s
-> `path_without` PATH-only test isolation) — which in turn exposed
-> `path_without` itself symlinking tools under their bare logical name
-> rather than their real one, invisible to `shutil.which`'s Windows
-> PATHEXT search either way. Also fixed: two doctor-test setup bugs (a
-> fake executable missing its `.exe` extension, then a case-sensitivity
-> mismatch once it had one; a mocked required-package set that didn't
-> know win32's own required package differs from every other
-> platform's), a real bug in `examples/files.f` itself (hardcoded
-> `/tmp/...` paths a native Windows binary resolves under the current
-> drive's root, not MSYS2's own `/tmp` mapping, since a compiled
-> program never runs inside MSYS2's POSIX emulation layer at all), and
-> a genuine `festina_log_*` bug: no explicit `fflush(stdout)`, so a
-> redirected/piped program's output can sit in the C runtime's default
-> block buffer indefinitely — `stdbuf -oL` (the usual workaround) can't
-> help here since its interposition trick only works against a binary
-> sharing the SAME libc it's linked against, which a native UCRT64
-> Festina binary and MSYS2's own `stdbuf` never do. A new
-> `festina_db_close()` (finalizing the statement cache, then closing
-> for real, forcing SQLite's checkpoint-on-close) was ALSO added on the
-> theory it would fix the SQLite schema-sync mismatches -- confirmed
-> by round ten's own log to be wrong, or at least insufficient; kept as
-> a genuine hygiene improvement, no longer claimed as the fix for
-> anything. What is NOT yet confirmed: that this fixed state is itself
-> green on real Windows CI — this project still has no Windows/MSYS2
-> access, so every fix here was verified by reasoning from each run's
-> actual log output, the full Linux suite, and (for one Python-version-
-> specific test bug) a real 3.12.3 venv — never by re-running on
-> Windows itself. Still open, left for the next real run: the SQLite
-> schema-sync mismatches, now with one theory eliminated. Phases 1–3
-> are open.
+> **Status: Phase 0 is built; eleven real CI rounds on the same PR —
+> Linux, macOS, and CodeQL are now all GREEN, and Windows is down to
+> ONE remaining failure class** (claude.md #126 has the full account —
+> this is the short version, condensed again since the per-round
+> narrative was getting long). Every Python-side toolchain seam this
+> section lists was in fact already covered by claude.md #39's shared
+> work (`.exe` naming, the libLLVM DLL candidates, the GNU-ld
+> static-sqlite path). Landed across the eleven rounds: the regex
+> decision (`_core_pkgs` installs `libsystre`, asks pkg-config for
+> `gnurx`), `festina doctor`'s Windows hints, a `windows-latest` CI
+> job, `#ifdef _WIN32` branches for `localtime_r`→`localtime_s` and for
+> `festina_runtime_init()` (default text-mode stdout turning `\n` into
+> `\r\n`), a post-link rename fixing MinGW's linker appending `.exe` to
+> an explicit `-o name`, unconditional graphics gating on win32
+> (offscreen included — no window backend exists there at all yet),
+> `_run_tool` resolving every command through `shutil.which` first
+> rather than trusting `subprocess.run`'s broader Win32 `CreateProcess`
+> search (which checks the calling process's own directory before
+> PATH, silently defeating `tests/conftest.py`'s `path_without` PATH-
+> only test isolation — which in turn had its own bug, symlinking tools
+> under their bare name rather than their real one, invisible to
+> `shutil.which`'s Windows PATHEXT search either way), two doctor-test
+> setup bugs, a real bug in `examples/files.f` (hardcoded `/tmp/...`
+> paths a native Windows binary resolves under the current drive's
+> root, not MSYS2's own `/tmp` mapping), and a genuine `festina_log_*`
+> bug — no explicit `fflush(stdout)`, so a redirected/piped program's
+> output can sit in the C runtime's default block buffer indefinitely,
+> since `stdbuf -oL` (the usual workaround) can't interpose on a native
+> UCRT64 binary the way it can on a binary sharing MSYS2's own libc.
+> **The one thing that has resisted two real, reasoned fix attempts**:
+> four SQLite schema-sync tests report an unaltered schema after a
+> second compile+run, unchanged since they first appeared, and
+> unmoved by either an explicit `sqlite3_close()`/checkpoint (round
+> nine, refuted by round ten's identical failures) or the unrelated
+> stdout-flush fix. That both attempts left these four byte-for-byte
+> identical is itself informative — it points away from "the migration
+> ran but wasn't durably visible" and toward "the migration never ran
+> against the file being read back from at all." Round eleven adds
+> instrumentation instead of a third guess: the four tests now report
+> an mtime-before/after comparison on `festina.sqlite` (unchanged means
+> the second compiled program never touched it) plus its captured
+> stdout/stderr, and `festina_db_close` now logs to stderr on a non-OK
+> `sqlite3_close` result rather than ignoring it — both purely
+> additive, aimed at giving the next real log enough to actually
+> distinguish the failure mode rather than repeat it with no new
+> information. What is NOT yet confirmed: green Windows CI — this
+> project still has no Windows/MSYS2 access, so every fix here was
+> verified by reasoning from each run's actual log output, the full
+> Linux suite, and (for one Python-version-specific test bug) a real
+> 3.12.3 venv — never by re-running on Windows itself. Phases 1–3 are
+> open.
 
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,

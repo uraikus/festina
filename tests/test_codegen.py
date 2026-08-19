@@ -8948,6 +8948,26 @@ class TestAutomaticSqliteSchemaSync:
         cols = {row[1]: row[2] for row in self._schema(db, "People")}
         assert cols == {"id": "INTEGER", "name": "TEXT"}
 
+    def _diag(self, db, result, mtime_before):
+        # claude.md #126 round eleven: every one of this class's real
+        # Windows CI failures reports an unaltered schema with no error
+        # at all (returncode 0), which is also exactly what a SECOND
+        # compiled program touching a DIFFERENT actual database file
+        # would produce -- the original tmp_path/"festina.sqlite" the
+        # test itself reads back from would simply never have been
+        # written to. Two prior rounds' fixes (an explicit
+        # sqlite3_close/checkpoint, a stdout-flush fix for an unrelated
+        # bug) didn't move this one at all, so this diagnostic -- an
+        # mtime check plus the compiled program's own captured output
+        # -- is what the NEXT real Windows log needs to actually
+        # distinguish "wrote the right file, wrong contents" from
+        # "never touched this file at all" instead of guessing again.
+        mtime_after = db.stat().st_mtime if db.exists() else None
+        return (f"mtime before second run: {mtime_before}, after: {mtime_after} "
+                f"(unchanged means the second compiled program's own "
+                f"festina.sqlite was never touched at all)\n"
+                f"second run stdout: {result.stdout!r}\nstderr: {result.stderr!r}")
+
     def test_missing_column_is_added_and_data_preserved(self, compile_and_run, tmp_path):
         compile_and_run("table People {\n    id:int\n    name:text\n}\nlog('v1')")
         db = tmp_path / "festina.sqlite"
@@ -8955,14 +8975,16 @@ class TestAutomaticSqliteSchemaSync:
         conn.execute("INSERT INTO People (id, name) VALUES (1, 'Patrick')")
         conn.commit()
         conn.close()
+        mtime_before = db.stat().st_mtime
 
         result = compile_and_run(
             "table People {\n    id:int\n    name:text\n    age:int\n}\nlog('v2')",
             filename="v2.f",
         )
-        assert result.returncode == 0
+        assert result.returncode == 0, self._diag(db, result, mtime_before)
         cols = {row[1]: row[2] for row in self._schema(db, "People")}
-        assert cols == {"id": "INTEGER", "name": "TEXT", "age": "INTEGER"}
+        assert cols == {"id": "INTEGER", "name": "TEXT", "age": "INTEGER"}, \
+            self._diag(db, result, mtime_before)
         rows = sqlite3.connect(db).execute("SELECT id, name FROM People").fetchall()
         assert rows == [(1, "Patrick")]
 
@@ -8976,13 +8998,14 @@ class TestAutomaticSqliteSchemaSync:
         conn.execute("INSERT INTO People (id, name, obsolete) VALUES (1, 'Patrick', 'junk')")
         conn.commit()
         conn.close()
+        mtime_before = db.stat().st_mtime
 
         result = compile_and_run(
             "table People {\n    id:int\n    name:text\n}\nlog('v2')", filename="v2.f",
         )
-        assert result.returncode == 0
+        assert result.returncode == 0, self._diag(db, result, mtime_before)
         cols = {row[1] for row in self._schema(db, "People")}
-        assert cols == {"id", "name"}
+        assert cols == {"id", "name"}, self._diag(db, result, mtime_before)
         rows = sqlite3.connect(db).execute("SELECT id, name FROM People").fetchall()
         assert rows == [(1, "Patrick")]
 
@@ -8994,13 +9017,14 @@ class TestAutomaticSqliteSchemaSync:
         conn.execute("INSERT INTO People (id, name) VALUES (1, 'Patrick')")
         conn.commit()
         conn.close()
+        mtime_before = db.stat().st_mtime
 
         result = compile_and_run(
             "table People {\n    id:int\n    full_name:text\n}\nlog('v2')", filename="v2.f",
         )
-        assert result.returncode == 0
+        assert result.returncode == 0, self._diag(db, result, mtime_before)
         cols = {row[1] for row in self._schema(db, "People")}
-        assert cols == {"id", "full_name"}
+        assert cols == {"id", "full_name"}, self._diag(db, result, mtime_before)
         rows = sqlite3.connect(db).execute("SELECT id FROM People").fetchall()
         assert rows == [(1,)]  # id survives the rebuild; the old `name` data does not
 
@@ -9011,13 +9035,14 @@ class TestAutomaticSqliteSchemaSync:
         conn.execute("INSERT INTO Items (id, price) VALUES (1, 100)")
         conn.commit()
         conn.close()
+        mtime_before = db.stat().st_mtime
 
         result = compile_and_run(
             "table Items {\n    id:int\n    price:float\n}\nlog('v2')", filename="v2.f",
         )
-        assert result.returncode == 0
+        assert result.returncode == 0, self._diag(db, result, mtime_before)
         cols = {row[1]: row[2] for row in self._schema(db, "Items")}
-        assert cols == {"id": "INTEGER", "price": "REAL"}
+        assert cols == {"id": "INTEGER", "price": "REAL"}, self._diag(db, result, mtime_before)
         rows = sqlite3.connect(db).execute("SELECT id, price FROM Items").fetchall()
         assert rows == [(1, 100.0)]
 
