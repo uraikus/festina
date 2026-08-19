@@ -166,7 +166,7 @@ jobs:
             mingw-w64-ucrt-x86_64-sqlite3
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-libsystre
-            mingw-w64-ucrt-x86_64-libmpg123
+            mingw-w64-ucrt-x86_64-mpg123
       - name: Install Python test dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Run the test suite
