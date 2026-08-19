@@ -168,6 +168,58 @@ class TestStaticSqliteAttempt:
         assert cli_mod._static_sqlite_attempt("darwin", ["-lsqlite3"]) is None
 
 
+class TestWindowsStaticRuntimeFlags:
+    """windows.md Phase 3 item 2 (claude.md #129): the "copy-anywhere"
+    DLL story for core/graphics-only compiled programs -- -static-libgcc
+    unconditionally (a plain compiler-driver flag, no probe needed) plus
+    a probed, -Bstatic/-Bdynamic-scoped -lwinpthread, skipped whenever
+    audio is in play since audio already links winpthread dynamically
+    via its own unconditional -pthread flag and this project has no
+    Windows machine to confirm the two combine safely."""
+
+    def test_non_windows_gets_nothing(self, cli_mod):
+        assert cli_mod._windows_static_runtime_flags("clang", False, "linux") == []
+        assert cli_mod._windows_static_runtime_flags("clang", False, "darwin") == []
+
+    def test_windows_core_only_gets_static_libgcc_always(self, cli_mod, monkeypatch):
+        # _can_link isn't real MinGW toolchain state this test has on
+        # Linux -- stubbed True so the winpthread probe is exercised
+        # deterministically, the same style TestStaticSqliteAttempt's
+        # own callers use elsewhere in this file.
+        monkeypatch.setattr(cli_mod, "_can_link", lambda cc, flags: False)
+        flags = cli_mod._windows_static_runtime_flags("clang", False, "win32")
+        assert flags == ["-static-libgcc"]
+
+    def test_windows_core_only_adds_static_winpthread_when_available(
+            self, cli_mod, monkeypatch):
+        calls = []
+        monkeypatch.setattr(cli_mod, "_can_link",
+                            lambda cc, flags: calls.append(flags) or True)
+        flags = cli_mod._windows_static_runtime_flags("clang", False, "win32")
+        assert flags == ["-static-libgcc", "-Wl,-Bstatic", "-lwinpthread", "-Wl,-Bdynamic"]
+        assert calls == [["-Wl,-Bstatic", "-lwinpthread", "-Wl,-Bdynamic"]]
+
+    def test_windows_audio_program_skips_the_winpthread_probe_entirely(
+            self, cli_mod, monkeypatch):
+        # Audio already links winpthread dynamically via its own
+        # unconditional -pthread flag (_RUNTIME_FEATURES["audio"]) --
+        # adding a second, statically-scoped -lwinpthread on top risks
+        # a link-order conflict this project cannot test for real, so
+        # this must not even ATTEMPT the probe when audio is in play.
+        calls = []
+        monkeypatch.setattr(cli_mod, "_can_link", lambda cc, flags: calls.append(flags) or True)
+        flags = cli_mod._windows_static_runtime_flags("clang", True, "win32")
+        assert flags == ["-static-libgcc"]
+        assert calls == [], "the winpthread probe must never run when audio is in play"
+
+    def test_windows_falls_back_to_dynamic_winpthread_if_unavailable(
+            self, cli_mod, monkeypatch):
+        monkeypatch.setattr(cli_mod, "_can_link", lambda cc, flags: False)
+        flags = cli_mod._windows_static_runtime_flags("clang", False, "win32")
+        assert flags == ["-static-libgcc"]
+        assert not any("winpthread" in f for f in flags)
+
+
 class TestCorePkgs:
     """windows.md Phase 0: <regex.h> is core (every program links it,
     festina_runtime.c's own top comment), and it's part of libc
@@ -207,6 +259,11 @@ class TestCorePkgs:
             lambda cc, name, source, pkgs: ensure_calls.append((name, pkgs)) or "/tmp/fake.o")
         monkeypatch.setattr(cli_mod, "_pkg_config", lambda action, pkg: [f"--{pkg}-{action.strip('-')}"])
         monkeypatch.setattr(cli_mod, "_sqlite_link_flags", lambda cc: ([], False))
+        # windows.md Phase 3 (claude.md #129): _runtime_objects_and_link_libs
+        # now also probes for a static winpthread on win32 -- stub it out
+        # here too, same reason as every other toolchain call this test
+        # already stubs.
+        monkeypatch.setattr(cli_mod, "_can_link", lambda cc, flags: False)
 
         _, link_libs = cli_mod._runtime_objects_and_link_libs(
             "clang", uses_graphics=False, uses_audio=False)
@@ -521,6 +578,7 @@ class TestAudioFeatureConfig:
         monkeypatch.setattr(cli_mod, "_feature_extra_object", lambda *a, **k: None)
         monkeypatch.setattr(cli_mod, "_pkg_config", lambda *a, **k: [])
         monkeypatch.setattr(cli_mod, "_sqlite_link_flags", lambda cc: ([], False))
+        monkeypatch.setattr(cli_mod, "_can_link", lambda cc, flags: False)  # claude.md #129
 
         cli_mod._runtime_objects_and_link_libs(
             "clang", uses_graphics=True, uses_audio=False, wants_window=False)
@@ -715,3 +773,22 @@ class TestOnWindows:
         result = compile_and_run("log(/[0-9]+/.test('v42'))")
         assert result.returncode == 0
         assert result.stdout.strip() == "true"
+
+    def test_core_only_binary_has_no_msys2_runtime_dll_dependency(
+            self, cli_mod, tmp_path):
+        # windows.md Phase 3 item 2 (claude.md #129): pins the
+        # "copy-anywhere" claim -static-libgcc/static winpthread make
+        # for a core-only program against the real linked binary's own
+        # import table -- the Windows analog of TestSlimBinaries's
+        # ldd-based checks on Linux, using objdump -p (windows.md's own
+        # named tool: `objdump -p | grep 'DLL Name'`) since ldd itself
+        # isn't a MinGW/Windows concept.
+        src = tmp_path / "hello.f"
+        src.write_text("log('hello from windows')")
+        out = cli_mod.compile_file(str(src), str(tmp_path / "hello.exe"))
+        result = subprocess.run(["objdump", "-p", out], capture_output=True,
+                                text=True, timeout=15)
+        dll_names = "\n".join(
+            line for line in result.stdout.splitlines() if "DLL Name" in line)
+        assert "libgcc" not in dll_names.lower()
+        assert "libwinpthread" not in dll_names.lower()
