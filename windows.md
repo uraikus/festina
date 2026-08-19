@@ -1,55 +1,49 @@
 # Windows support — the plan
 
-> **Status: Phase 0 is built; twelve real CI rounds on the same PR —
-> Linux, macOS, and CodeQL are all GREEN, and the root cause behind
-> Windows' last real failure class is now found and fixed** (claude.md
-> #126 has the full account — this is the short version, condensed
-> again since the per-round narrative was getting long). Every
-> Python-side toolchain seam this section lists was in fact already
-> covered by claude.md #39's shared work (`.exe` naming, the libLLVM
-> DLL candidates, the GNU-ld static-sqlite path). Landed across the
-> twelve rounds: the regex decision (`_core_pkgs` installs `libsystre`,
-> asks pkg-config for `gnurx`), `festina doctor`'s Windows hints, a
-> `windows-latest` CI job, `#ifdef _WIN32` branches for
-> `localtime_r`→`localtime_s` and for `festina_runtime_init()` (default
-> text-mode stdout turning `\n` into `\r\n`), unconditional graphics
-> gating on win32 (offscreen included — no window backend exists there
-> at all yet), `_run_tool` resolving every command through
-> `shutil.which` first rather than trusting `subprocess.run`'s broader
-> Win32 `CreateProcess` search (which checks the calling process's own
-> directory before PATH, silently defeating `tests/conftest.py`'s
-> `path_without` PATH-only test isolation — which in turn had its own
-> bug, symlinking tools under their bare name, invisible to
-> `shutil.which`'s Windows PATHEXT search), two doctor-test setup bugs,
-> a real bug in `examples/files.f` (hardcoded `/tmp/...` paths a native
-> Windows binary resolves under the current drive's root, not MSYS2's
-> own `/tmp` mapping), and a genuine `festina_log_*` bug — no explicit
-> `fflush(stdout)`, so a redirected/piped program's output could sit in
-> the C runtime's default block buffer indefinitely, since `stdbuf -oL`
-> can't interpose on a native UCRT64 binary the way it can on a binary
-> sharing MSYS2's own libc. **The stubborn one, found in round twelve**:
-> four SQLite schema-sync tests kept reporting an unaltered schema
-> after a second compile+run, resisting two real fix attempts (an
-> explicit `sqlite3_close()`/checkpoint; a stdout-flush fix, unrelated)
-> that both left the failures byte-for-byte identical. Round eleven's
-> instrumentation (an mtime check plus captured program output on
-> assertion failure) caught the real cause directly: the "second"
-> compiled program's own printed output was the FIRST program's,
-> verbatim — it was never recompiled at all. `_rename_if_linker_
-> appended_exe`'s guard (`if os.path.exists(exe_path) and not
-> os.path.exists(output_path)`) skipped the post-link rename whenever
-> the target path already existed from an earlier compile — which
-> `compile_and_run`'s own reused `tmp_path / "program"` guarantees on
-> any SECOND compile within a test, exactly what every schema-sync test
-> does. The freshly linked `program.exe` sat right next to the stale
-> binary, never picked up; `os.replace` already overwrites atomically
-> on Windows, so the exists-check was never a needed safety guard, just
-> a bug. Fixed by dropping it. What is NOT yet confirmed: green Windows
-> CI — this project still has no Windows/MSYS2 access, so every fix
-> here was verified by reasoning from each run's actual log output, the
-> full Linux suite, and (for one Python-version-specific test bug) a
-> real 3.12.3 venv — never by re-running on Windows itself. Phases 1–3
-> are open.
+> **Status: Phase 0 is DONE and confirmed green on real Windows CI** —
+> twelve real rounds on the same PR (claude.md #126 has the full
+> account — this is the short version, condensed since the per-round
+> narrative was getting long), from 26 failures in round one down to a
+> fully green run — linux, macOS, windows, and every CodeQL analyzer —
+> on round twelve's push. Every Python-side toolchain seam this
+> section lists was in fact already covered by claude.md #39's shared
+> work (`.exe` naming, the libLLVM DLL candidates, the GNU-ld
+> static-sqlite path). Landed across the twelve rounds: the regex
+> decision (`_core_pkgs` installs `libsystre`, asks pkg-config for
+> `gnurx`), `festina doctor`'s Windows hints, a `windows-latest` CI
+> job, `#ifdef _WIN32` branches for `localtime_r`→`localtime_s` and for
+> `festina_runtime_init()` (default text-mode stdout turning `\n` into
+> `\r\n`), unconditional graphics gating on win32 (offscreen included —
+> no window backend exists there at all yet), `_run_tool` resolving
+> every command through `shutil.which` first rather than trusting
+> `subprocess.run`'s broader Win32 `CreateProcess` search (which checks
+> the calling process's own directory before PATH, silently defeating
+> `tests/conftest.py`'s `path_without` PATH-only test isolation — which
+> in turn had its own bug, symlinking tools under their bare name,
+> invisible to `shutil.which`'s Windows PATHEXT search), two doctor-test
+> setup bugs, a real bug in `examples/files.f` (hardcoded `/tmp/...`
+> paths a native Windows binary resolves under the current drive's
+> root, not MSYS2's own `/tmp` mapping), a genuine `festina_log_*` bug
+> — no explicit `fflush(stdout)`, so a redirected/piped program's
+> output could sit in the C runtime's default block buffer indefinitely
+> — and, the one that took longest to pin down: `_rename_if_linker_
+> appended_exe`'s guard skipped the post-link rename whenever the
+> target path already existed from an earlier compile, so recompiling
+> to the same explicit output path (exactly what `TestAutomaticSqlite
+> SchemaSync`'s tests do, twice, in every test) silently kept running
+> the FIRST compile's stale binary instead of the fresh one — found via
+> round eleven's own instrumentation (an mtime check plus captured
+> program output), which caught the "second" program printing the
+> first program's own output verbatim. Fixed by dropping the
+> exists-check; `os.replace` already overwrites atomically on Windows,
+> so it was never a needed guard. Verified: real Windows CI, not just
+> reasoning from a log — the one thing every prior round's status block
+> here had to leave open, since this project has no Windows/MSYS2
+> access of its own; every fix along the way was verified by reasoning
+> from each run's actual log output, the full Linux suite, and (for one
+> Python-version-specific test bug) a real 3.12.3 venv, until the
+> twelfth round's own real CI result confirmed all of it at once.
+> Phases 1–3 are open.
 
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,
@@ -84,7 +78,7 @@ driver dialect, no pkg-config culture, and a second CI matrix — all
 cost, no user-visible gain over shipping MinGW-built binaries (which
 are ordinary, dependency-light PE executables any Windows runs).
 
-## Phase 0 — Toolchain bring-up: core-only programs compile and run *(built, unverified on real hardware)*
+## Phase 0 — Toolchain bring-up: core-only programs compile and run *(built and confirmed green on real Windows CI)*
 
 Goal: `festina compile hello.f` produces a runnable `.exe` and the
 whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
@@ -167,9 +161,7 @@ whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
    stays Linux-only, same reasoning as macOS. Those twelve rounds are
    what caught every fix summarized in the status block above (claude.md
    #126 has the full blow-by-blow) — from 26 failures in round one down
-   to a root-cause fix (item 2 above) for the one class that survived
-   to round twelve. A thirteenth real run is what's needed to confirm
-   it actually lands green.
+   to zero, confirmed green on round twelve's own real Windows CI run.
 6. **Filesystem semantics, verified not assumed**: already covered
    before this phase began by `tests/test_platform.py::TestBinaryFidelity`,
    which runs on every platform's CI — every runtime `fopen` is
@@ -186,9 +178,9 @@ whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
    `#ifdef _WIN32`, a no-op everywhere else), called unconditionally as
    the first thing every compiled program's `main()` does.
 
-Exit criteria (open until a real Windows CI run happens): Windows CI
-green on the suites above; `hello.f`, `fizzbuzz.f`, `config.f`,
-`files.f` run natively as `.exe`s.
+Exit criteria: Windows CI green on the suites above (confirmed, round
+twelve); `hello.f`, `fizzbuzz.f`, `config.f`, `files.f` run natively
+as `.exe`s (confirmed).
 
 ## Phase 1 — Audio: the shared device seam, then waveOut
 
