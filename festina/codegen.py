@@ -545,6 +545,15 @@ def _llvm_type(t):
         # reasoning, FESTINA_MAP_LLVM_TYPE's own `{i64, ptr}` shape
         # still describes the storage this points at.
         return "ptr"
+    if isinstance(t, types_mod.FuncType):
+        # claude.md #141: a bare LLVM function pointer -- like
+        # FontType's static constant pointer just above, this is never
+        # allocated or freed (a declared function is immortal for the
+        # process's whole lifetime), so it rides every generic scalar-
+        # shaped code path (VarDecl, struct field, array element, map
+        # value, argument passing) unchanged, the identical way
+        # ColorType/FontType already do.
+        return "ptr"
     raise CodegenError(f"cannot generate code for type {t!r}")
 
 
@@ -2982,9 +2991,23 @@ class CodeGen:
                 lines.append(f"  {out} = call i64 @{fn}()")
                 return out, INT
             if expr.name in self.func_decls:
-                raise CodegenError("functions are not first-class values yet "
-                                    f"(found bare reference to '{expr.name}')",
-                                    file=self.filename, line=expr.line, column=expr.column)
+                # claude.md #141: a bare reference to a function's own
+                # NAME, not immediately called -- the function's own
+                # global symbol (@name) IS its first-class VALUE, no
+                # separate "address-of" step needed the way a local
+                # variable's own storage would need a load: LLVM already
+                # treats a function symbol as a plain `ptr` constant.
+                # Mirrors semantic.py's own infer() special-case for
+                # ast.Identifier -- same "build the FuncType fresh from
+                # the FuncDecl every time" choice, for the identical
+                # reason (self.func_decls stores raw AST, not a cached
+                # resolved signature, and _register_func_signature
+                # already proved this resolve() is cheap and repeatable).
+                decl = self.func_decls[expr.name]
+                param_types = tuple(self._resolve(p.type_expr, decl) for p in decl.params)
+                ret_type = (None if decl.return_type == "void"
+                            else self._resolve(decl.return_type, decl))
+                return f"@{expr.name}", types_mod.FuncType(param_types, ret_type)
             found = env.lookup(expr.name)
             if found is None:
                 raise CodegenError(f"unknown variable '{expr.name}'",
@@ -6317,6 +6340,51 @@ class CodeGen:
                 # claude.md #83: the path is only fopen()'d, never kept.
                 self._free_text_temp(expr.args[0], path_val, path_type, lines)
                 return out, AUDIO
+            found = env.lookup(name)
+            if found is not None and isinstance(found[1], types_mod.FuncType):
+                # claude.md #141: an INDIRECT call, through a
+                # func[...]:...-typed variable/parameter/field/element
+                # rather than a plain declared function's own name --
+                # checked (and env.lookup'd) BEFORE self.func_decls
+                # below, mirroring semantic.py's own dispatch order, so
+                # a local variable that shadows a real global function
+                # of the same name resolves to ITS OWN signature here
+                # too, never silently falling through to a direct call
+                # against the shadowed global instead. A real global
+                # function's own env entry (registered by
+                # _register_func_signature) is never mistaken for this:
+                # it stores its RETURN type there, not a FuncType, so
+                # only a genuine func-typed value ever takes this
+                # branch.
+                fn_ref, fn_type = found
+                fn_ptr = self.tmp()
+                lines.append(f"  {fn_ptr} = load ptr, ptr {fn_ref}")
+                arg_vals = []
+                arg_temps = []
+                for arg_expr, ptype in zip(expr.args, fn_type.param_types):
+                    val, vtype = self._emit_value_for(arg_expr, env, lines, ptype)
+                    val = self._coerce(val, vtype, ptype, lines)
+                    arg_vals.append(f"{_llvm_type(ptype)} {val}")
+                    arg_temps.append((arg_expr, val, vtype, ptype))
+                args_ir = ", ".join(arg_vals)
+                ret_type = fn_type.return_type
+                if ret_type is None:
+                    lines.append(f"  call void {fn_ptr}({args_ir})")
+                    out = "0"
+                else:
+                    out = self.tmp()
+                    lines.append(f"  {out} = call {_llvm_type(ret_type)} {fn_ptr}({args_ir})")
+                # claude.md #83/#119: identical post-call argument
+                # cleanup to the direct-call path just below -- see its
+                # own comment for the full reasoning.
+                for arg_expr, val, vtype, ptype in arg_temps:
+                    if (_is_refcounted(ptype)
+                            and self._is_owning_refcounted_source(arg_expr)):
+                        lines.append(
+                            f"  call void {self._release_fn_for(ptype)}(ptr {val})")
+                    else:
+                        self._free_text_temp(arg_expr, val, vtype, lines)
+                return out, ret_type
             if name in self.func_decls:
                 decl = self.func_decls[name]
                 arg_vals = []
@@ -6729,6 +6797,54 @@ class CodeGen:
                     lines.append(
                         f"  call void @festina_map_for_each(i64 {count}, ptr {entries}, ptr {trampoline_name})")
                     return "0", None
+        if isinstance(callee, ast.Member):
+            # claude.md #141: an indirect call through a func[...]:...
+            # -typed struct field (h.cb(...)), array element
+            # (fns[i](...)), or map value (handlers[key](...)) --
+            # covers BOTH computed (bracket) and non-computed (dot)
+            # member access, neither of which was specially dispatched
+            # above for a callee that turns out to be a stored function
+            # VALUE rather than one of this file's own recognized
+            # method names. Checked LAST, right before the final "only
+            # calls to named functions" fallback below (never reached
+            # by a computed Member at all, since every branch above
+            # this one is gated `and not callee.computed`) -- an
+            # established special method name (img.drawRect,
+            # Math.floor, ...) is never shadowed by this generic path.
+            # _emit_expr on the whole Member node reads the callee's
+            # VALUE exactly the same way any other expression position
+            # would (`func[text]:void tmp = h.cb` uses the identical
+            # code path) -- no special-casing needed for struct/array/
+            # map access specifically, since they're already ordinary,
+            # type-generic reads.
+            callee_val, callee_type = self._emit_expr(callee, env, lines)
+            if isinstance(callee_type, types_mod.FuncType):
+                fn_type = callee_type
+                arg_vals = []
+                arg_temps = []
+                for arg_expr, ptype in zip(expr.args, fn_type.param_types):
+                    val, vtype = self._emit_value_for(arg_expr, env, lines, ptype)
+                    val = self._coerce(val, vtype, ptype, lines)
+                    arg_vals.append(f"{_llvm_type(ptype)} {val}")
+                    arg_temps.append((arg_expr, val, vtype, ptype))
+                args_ir = ", ".join(arg_vals)
+                ret_type = fn_type.return_type
+                if ret_type is None:
+                    lines.append(f"  call void {callee_val}({args_ir})")
+                    out = "0"
+                else:
+                    out = self.tmp()
+                    lines.append(f"  {out} = call {_llvm_type(ret_type)} {callee_val}({args_ir})")
+                # claude.md #83/#119: identical post-call argument
+                # cleanup to the other two call forms above.
+                for arg_expr, val, vtype, ptype in arg_temps:
+                    if (_is_refcounted(ptype)
+                            and self._is_owning_refcounted_source(arg_expr)):
+                        lines.append(
+                            f"  call void {self._release_fn_for(ptype)}(ptr {val})")
+                    else:
+                        self._free_text_temp(arg_expr, val, vtype, lines)
+                return out, ret_type
         raise CodegenError("only calls to named functions are implemented",
                             file=self.filename, line=getattr(expr, "line", 0))
 

@@ -431,6 +431,21 @@ class AnalyzedProgram:
 def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None):
     if isinstance(type_expr, ast.ArrayTypeExpr):
         return types_mod.ArrayType(resolve_type_name(type_expr.element, structs, tables, filename, node))
+    if isinstance(type_expr, ast.FuncTypeExpr):
+        # claude.md #141: func[T, T, ...]:R -- a first-class function
+        # type. Resolved recursively the same way ArrayTypeExpr/
+        # MapTypeExpr are, just over a LIST of param type expressions
+        # instead of one. `"void"` is the same string sentinel
+        # FuncDecl.return_type already uses for a void-returning
+        # function, so this reads it the identical way analyze_func
+        # does (`!= "void"` gates the resolve() call).
+        param_types = tuple(
+            resolve_type_name(p, structs, tables, filename, node)
+            for p in type_expr.param_types
+        )
+        return_type = (None if type_expr.return_type == "void"
+                        else resolve_type_name(type_expr.return_type, structs, tables, filename, node))
+        return types_mod.FuncType(param_types, return_type)
     if isinstance(type_expr, ast.MapTypeExpr):
         value_type = resolve_type_name(type_expr.value, structs, tables, filename, node)
         # claude.md #72: a map value is stored in one fixed 8-byte slot
@@ -715,6 +730,24 @@ def analyze(program, filename="<string>"):
                     file=filename, line=expr.line, column=expr.column,
                     category="unknown variable",
                 )
+            if sym.kind == "function":
+                # claude.md #141: a bare reference to a function's own
+                # NAME -- not immediately called -- is a first-class
+                # function VALUE now, typed func[paramTypes]:returnType.
+                # Built fresh from the FuncDecl every time (never cached
+                # on the Symbol itself), so `sym.type` keeps meaning
+                # exactly what it always has everywhere else this Symbol
+                # is read: the RETURN type of a CALL to this function
+                # (_infer_call's own Identifier-callee branch, just
+                # below, still reads sym.type directly for that, unaware
+                # this branch even exists -- the two paths are told
+                # apart structurally, by whether the Identifier is the
+                # callee of an immediately-enclosing Call or not, not by
+                # anything stored on the Symbol).
+                decl = sym.node
+                param_types = tuple(resolve(p.type_expr, decl) for p in decl.params)
+                ret_type = resolve(decl.return_type, decl) if decl.return_type != "void" else None
+                return types_mod.FuncType(param_types, ret_type)
             return sym.type
         if isinstance(expr, ast.Member):
             return _infer_member(expr, scope)
@@ -1196,6 +1229,38 @@ def analyze(program, filename="<string>"):
                             )
                 return _BUILTIN_RETURN_TYPES.get(name)
             sym = scope.lookup(name)
+            if (sym is not None and sym.kind != "function"
+                    and isinstance(sym.type, types_mod.FuncType)):
+                # claude.md #141: an INDIRECT call, through a func[...]:...
+                # -typed variable/parameter/constant/field/element rather
+                # than a plain declared function's own name -- checked
+                # before the "not a function at all" rejection just
+                # below, since a func-typed local is exactly as callable
+                # as a real function, just via a different Symbol.kind.
+                # A local shadowing a real global function of the same
+                # name (Scope.define permits it -- see its own comment)
+                # is handled automatically here too: scope.lookup always
+                # resolves to the innermost binding, so the shadowing
+                # local's own FuncType signature is what a call is
+                # checked against, never the shadowed global function's.
+                fn_type = sym.type
+                if len(expr.args) != len(fn_type.param_types):
+                    raise CompileError(
+                        f"'{name}' expects {len(fn_type.param_types)} argument(s), "
+                        f"got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                for i, (arg_expr, expected) in enumerate(zip(expr.args, fn_type.param_types)):
+                    arg_type = infer(arg_expr, scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != expected:
+                        raise CompileError(
+                            f"argument {i + 1} of '{name}' expects "
+                            f"{types_mod.type_name(expected)}, found {types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return fn_type.return_type
             if sym is None or sym.kind != "function":
                 # claude.md #109: a name this language used to have gets
                 # told what replaced it, not merely that it is unknown.
@@ -1756,7 +1821,35 @@ def analyze(program, filename="<string>"):
         # receiver -- validates the member access itself (so an unknown
         # method on a real type still fails with a specific message
         # rather than silently passing through as untyped).
-        infer(callee, scope)
+        callee_type = infer(callee, scope)
+        if isinstance(callee_type, types_mod.FuncType):
+            # claude.md #141: an INDIRECT call through a func[...]:...
+            # -typed STRUCT FIELD (h.cb(...)), ARRAY ELEMENT (fns[i](...)),
+            # or MAP VALUE (handlers[key](...)) -- every shape this
+            # fallback's own generic `infer(callee, scope)` just above
+            # already resolves correctly (Member/computed-Member
+            # inference doesn't care whether it's reached from a Call or
+            # anywhere else), so the only thing left is the same arity/
+            # argument-type validation the bare-Identifier indirect-call
+            # branch above already does, checked against callee_type's
+            # own signature rather than a Symbol's.
+            if len(expr.args) != len(callee_type.param_types):
+                raise CompileError(
+                    f"expects {len(callee_type.param_types)} argument(s), "
+                    f"got {len(expr.args)}",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid function argument type",
+                )
+            for i, (arg_expr, expected) in enumerate(zip(expr.args, callee_type.param_types)):
+                arg_type = infer(arg_expr, scope)
+                if arg_type is not None and arg_type is not NULL and arg_type != expected:
+                    raise CompileError(
+                        f"argument {i + 1} expects {types_mod.type_name(expected)}, "
+                        f"found {types_mod.type_name(arg_type)}",
+                        file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                        category="invalid function argument type",
+                    )
+            return callee_type.return_type
         for a in expr.args:
             infer(a, scope)
         return None

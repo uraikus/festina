@@ -116,12 +116,39 @@ class Parser:
             inner = self.parse_type()
             self.eat("RBRACK")
             return ast.MapTypeExpr(inner)
+        if self.at("func"):
+            return self.parse_func_type()
         if self.peek().type in TYPE_KEYWORDS:
             return self.eat().type
         if self.at("IDENT"):
             return self.eat().value
         t = self.peek()
         raise self.err(t, "invalid syntax", f"expected a type, found {t.type}({t.value!r})")
+
+    def parse_func_type(self):
+        """claude.md #141: `func[T, T, ...]:R` as a TYPE (not a
+        declaration -- see parse_statement's own `func` handling for how
+        the two are told apart: this form's `func` is always
+        immediately followed by `[`, a declaration's is always followed
+        by a name). `func[]:void` is a zero-argument, void-returning
+        function type -- the empty-brackets case is handled the same
+        way arr[T]/map[T]'s own bracket pair is, just with zero or more
+        comma-separated types instead of exactly one."""
+        self.eat("func")
+        self.eat("LBRACK")
+        param_types = []
+        while not self.at("RBRACK"):
+            param_types.append(self.parse_type())
+            if self.at_op(","):
+                self.eat()
+        self.eat("RBRACK")
+        self.eat_op(":")
+        if self.at("void"):
+            self.eat("void")
+            return_type = "void"
+        else:
+            return_type = self.parse_type()
+        return ast.FuncTypeExpr(param_types, return_type)
 
     def parse_typed_params(self):
         params = []
@@ -206,7 +233,13 @@ class Parser:
             return self.parse_break()
         if t.type == "continue":
             return self.parse_continue()
-        if t.type == "func":
+        if t.type == "func" and self.peek(1).type != "LBRACK":
+            # claude.md #141: `func[...]:...` (a first-class function
+            # TYPE, always immediately followed by `[`) falls through to
+            # _looks_like_declaration below instead of landing here --
+            # only a bare `func name(...)` (missing its return type, the
+            # one pre-existing case this guards) is still unconditionally
+            # rejected.
             raise self.err(t, "invalid function declaration",
                             "functions require an explicit return type, e.g. 'text func name() { }'")
         if self._starts_func_decl():
@@ -223,7 +256,13 @@ class Parser:
     def _looks_like_declaration(self):
         t0 = self.peek(0)
         t1 = self.peek(1)
-        if t0.type in TYPE_KEYWORDS or t0.type in ("arr", "map"):
+        # claude.md #141: `func[...]:...` starts a declaration too (a
+        # func-typed variable/constant) -- reached only once
+        # parse_statement's own dedicated `func` check has already ruled
+        # out the bare-`func`-with-no-`[`-following case (the "missing
+        # return type" mistake, still always an error), so any `func`
+        # reaching here is unambiguously the type-expression form.
+        if t0.type in TYPE_KEYWORDS or t0.type in ("arr", "map", "func"):
             return True
         if t0.type == "IDENT" and t1.type == "IDENT":
             return True

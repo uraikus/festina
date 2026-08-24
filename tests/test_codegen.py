@@ -4455,6 +4455,149 @@ class TestFunctionHoisting:
         assert result.stdout.splitlines() == ["i=0 helper=1", "i=2 helper=1", "after loop"]
 
 
+class TestFirstClassFunctions:
+    """claude.md #141: func[T, T, ...]:R -- a first-class function
+    value, usable as an argument, struct property, map value, or array
+    value. tests/test_syntax_declarations.py's own TestFuncTypeSyntax/
+    TestFirstClassFunctions cover parsing and semantic analysis; these
+    compile and RUN the equivalent programs, since the actual codegen
+    mechanism (a bare function symbol as a `ptr` value, an indirect
+    `call` through it) needed its own real verification -- a pre-
+    existing placeholder in codegen.py (`raise CodegenError("functions
+    are not first-class values yet"...)`) shows this was anticipated
+    but never implemented before this entry, and a SEPARATE, real gap
+    (`raise CodegenError("only calls to named functions are
+    implemented"...)`) covered calling through a struct field/array
+    element/map value specifically."""
+
+    def test_assigning_a_function_by_name_and_calling_through_the_variable(self, compile_and_run):
+        source = """
+        void func greet(name:text) { log(name) }
+        func[text]:void cb = greet
+        cb('world')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "world"
+
+    def test_passing_a_function_as_an_argument(self, compile_and_run):
+        source = """
+        void func greet(name:text) { log(name) }
+        void func apply(fn:func[text]:void, arg:text) { fn(arg) }
+        apply(greet, 'hi')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "hi"
+
+    def test_storing_in_a_struct_field_and_calling_through_it(self, compile_and_run):
+        source = """
+        void func greet(name:text) { log(name) }
+        struct Holder { cb:func[text]:void }
+        Holder h
+        h.cb = greet
+        h.cb('yo')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "yo"
+
+    def test_storing_in_an_array_and_calling_by_index(self, compile_and_run):
+        source = """
+        int func inc(x:int) { return x + 1 }
+        int func dec(x:int) { return x - 1 }
+        arr[func[int]:int] fns = [inc, dec]
+        log(fns[0](5))
+        log(fns[1](5))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["6", "4"]
+
+    def test_storing_in_a_map_and_calling_by_key(self, compile_and_run):
+        source = """
+        void func greet(name:text) { log(name) }
+        map[func[text]:void] handlers
+        handlers['g'] = greet
+        handlers['g']('map-call')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "map-call"
+
+    def test_a_zero_argument_void_function_value_works(self, compile_and_run):
+        source = """
+        void func tick() { log('ticked') }
+        func[]:void cb = tick
+        cb()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "ticked"
+
+    def test_a_function_value_with_a_non_void_return_type_works(self, compile_and_run):
+        source = """
+        int func square(x:int) { return x * x }
+        func[int]:int f = square
+        log(f(7))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "49"
+
+    def test_local_variable_shadowing_a_global_function_calls_the_local(self, compile_and_run):
+        # claude.md #141: Scope.define permits a local to reuse a
+        # global name -- calling `greet` inside the shadowing scope
+        # must resolve to the LOCAL func-typed variable's own target
+        # (`other`), never silently fall back to the shadowed global
+        # `greet` itself.
+        source = """
+        void func greet(name:text) { log(`global greet: ${name}`) }
+        void func other(name:text) { log(`shadowed target: ${name}`) }
+
+        void func useShadowed() {
+            func[text]:void greet = other
+            greet('x')
+        }
+
+        useShadowed()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "shadowed target: x"
+
+    def test_null_func_value_is_a_valid_declaration(self, compile_and_run):
+        source = """
+        func[text]:void cb = null
+        log('ok')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "ok"
+
+    def test_a_struct_holding_a_func_field_survives_scope_exit_and_a_free(self, compile_and_run):
+        # claude.md #141: a func-typed field must be correctly skipped
+        # by the struct's own release/free cascade (never mistaken for
+        # a refcounted or stack-cascaded field) -- run under
+        # AddressSanitizer via leak_stress.sh separately for the
+        # thousands-of-iterations version of this; this is the plain
+        # correctness check that the VALUE itself still reads right
+        # after a `free`.
+        source = """
+        int func doubleIt(x:int) { return x * 2 }
+        struct Callback { fn:func[int]:int  label:text }
+        Callback cbk
+        cbk.fn = doubleIt
+        cbk.label = 'd'
+        log(cbk.fn(21))
+        free cbk
+        log('freed ok')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["42", "freed ok"]
+
+
 def _find_window(display, timeout=20):
     # A window actually appears in ~0.2s, measured, consistently -- this
     # timeout is generous insurance, not a figure anything is expected

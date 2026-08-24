@@ -38,6 +38,20 @@ class MapTypeExpr(Node):
         self.value = value
 
 
+class FuncTypeExpr(Node):
+    """`func[T, T, ...]:R` as it appears in a type position -- claude.md
+    #141. `param_types` is a list of type expressions (possibly empty);
+    `return_type` is either the literal string `"void"` or another type
+    expression -- the identical "void" string sentinel FuncDecl.
+    return_type already uses, so resolve_type_name's own void check
+    (`type_expr.return_type != "void"`) reads the same way in both
+    places."""
+
+    def __init__(self, param_types, return_type):
+        self.param_types = param_types
+        self.return_type = return_type
+
+
 class Param(Node):
     def __init__(self, name, type_expr):
         self.name = name

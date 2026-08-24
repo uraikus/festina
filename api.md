@@ -160,11 +160,43 @@ void func log_it() {
 }
 ```
 
-No `var`/`let` — every declaration states its type. Functions are not
-first-class values (no closures, no passing a function as a value) —
-this is why `setTimeout`/`setInterval`'s callback argument must be the
-bare name of a zero-parameter, `void`-returning function, not an
-arbitrary expression.
+No `var`/`let` — every declaration states its type.
+
+**Functions are first-class values** — a bare function name (not
+called) is a value of type `func[paramTypes]:returnType`, usable
+anywhere a value can go: a variable, a function argument, a struct
+field, an array element, a map value. Calling THROUGH one of those —
+not just the function's own original name — works exactly like calling
+the function directly:
+
+```festina
+void func greet(name:text) { log(name) }
+
+func[text]:void cb = greet
+cb('world')                              // "world"
+
+void func apply(fn:func[text]:void, arg:text) { fn(arg) }
+apply(greet, 'hi')                       // "hi"
+
+struct Handler { onEvent:func[text]:void }
+Handler h
+h.onEvent = greet
+h.onEvent('yo')                          // "yo"
+
+int func inc(x:int) { return x + 1 }
+arr[func[int]:int] transforms = [inc]
+log(transforms[0](5))                    // 6
+```
+
+`func[]:void` is a zero-argument, void-returning function type; `null`
+is a valid value of any func type too. There are no closures — a
+function's own type never captures anything from where it's declared,
+so a `func[...]:...` value is always just a plain reference to one of
+this program's own top-level (or nested, see below) function
+declarations, nothing more. `setTimeout`/`setInterval`'s own callback
+argument is unaffected by any of this: it's still the bare name of a
+zero-parameter, `void`-returning function specifically, not an
+arbitrary `func[...]:...`-typed expression.
 
 **Functions are hoisted** — every function's name and signature exists
 everywhere in the program, so calling one from above its own

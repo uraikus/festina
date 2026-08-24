@@ -15,6 +15,15 @@ arr[int] func squares(n:int) {
     return out
 }
 
+// claude.md #141: first-class function values -- an array and a map
+// of func[...]:... entries, called through indirectly (via array index
+// / map key), the plain pointer this represents holding no allocation
+// of its own to leak, but exercised alongside genuinely managed
+// arr[T]/map[T] storage to prove that storage's own release logic
+// correctly skips a func-typed slot rather than mishandling it.
+int func inc(x:int) { return x + 1 }
+int func dec(x:int) { return x - 1 }
+
 int total = 0
 int i = 0
 while i < 1500 {
@@ -58,6 +67,12 @@ while i < 1500 {
         k = k + 1
     }
     total = total + counts['c9']
+
+    arr[func[int]:int] fns = [inc, dec]
+    map[func[int]:int] fnMap = {}
+    fnMap['inc'] = inc
+    fnMap['dec'] = dec
+    total = total + fns[0](i) + fns[1](i) + fnMap['inc'](i) + fnMap['dec'](i)
 
     // Structs holding managed fields, including an auto-vivified one.
     Item it

@@ -119,6 +119,38 @@ class MapType:
         return f"MapType({self.value!r})"
 
 
+@dataclass(frozen=True)
+class FuncType:
+    """claude.md #141: func[T, T, ...]:R -- a first-class reference to a
+    FUNCTION, not a call to one. `param_types` is a tuple of Type
+    instances (empty for a zero-argument function); `return_type` is
+    another Type instance, or None for a void-returning function
+    (mirroring how a plain FuncDecl's own `return_type` is represented
+    as None internally everywhere else in this compiler, e.g.
+    semantic.py's Symbol / codegen's Env entries for a function name).
+
+    Two FuncType instances are equal (via the generated dataclass
+    __eq__, since `param_types`/`return_type` are themselves ordinary
+    hashable/comparable Type values or None) exactly when their whole
+    signatures match -- the same "structural, not nominal" equality
+    every other parametrized type (ArrayType, MapType) already has, so
+    `check_assignable`'s generic `declared != actual` fallback needs no
+    FuncType-specific branch at all.
+
+    The runtime VALUE behind a FuncType is a bare function pointer --
+    an LLVM `ptr` holding a real `@name` global-function address, never
+    allocated, never freed, immortal for the life of the process (a
+    declared function itself never goes away) -- so, exactly like
+    ColorType/FontType, this never interacts with the reference-
+    counting or text-ownership machinery: _is_refcounted (codegen.py)
+    deliberately does not list it."""
+    param_types: tuple
+    return_type: object  # another Type instance, or None (void)
+
+    def __repr__(self):
+        return f"FuncType({self.param_types!r}, {self.return_type!r})"
+
+
 def type_name(t):
     """Readable name for error messages, e.g. `arr[int]`, `User`, `int`."""
     if t is None:
@@ -143,4 +175,8 @@ def type_name(t):
         return "font"
     if isinstance(t, MapType):
         return f"map[{type_name(t.value)}]"
+    if isinstance(t, FuncType):
+        params = ",".join(type_name(p) for p in t.param_types)
+        ret = "void" if t.return_type is None else type_name(t.return_type)
+        return f"func[{params}]:{ret}"
     return str(t)

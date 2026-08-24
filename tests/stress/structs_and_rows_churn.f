@@ -28,6 +28,15 @@ Inner func pick(a:Inner, b:Inner, useA:bool) {
     return b
 }
 
+// claude.md #141: a struct field holding a first-class function value
+// -- a plain pointer, nothing to leak on its own, but exercised inside
+// this file's own struct-release-heavy loop to prove a func-typed
+// field is correctly skipped (not mishandled as a refcounted or
+// stack-cascaded field) by the struct's own release/free machinery.
+struct Callback { fn:func[int]:int  label:text }
+
+int func doubleIt(x:int) { return x * 2 }
+
 // claude.md #140: a FuncDecl nested INSIDE this function's own body,
 // declared after o's own struct-typed fields are already in use --
 // exercises the real bug hoisting's own implementation found (a
@@ -100,6 +109,16 @@ while i < 400 {
     // a nested FuncDecl, in a hot loop, under ASan/LeakSanitizer.
     Outer viaNested = makeOuterViaNestedHelper(i)
     total = total + viaNested.inner.n + viaNested.xs.length + viaNested.m[`k${i}`]
+
+    // claude.md #141: a struct field holding a first-class function
+    // value, called through indirectly (h.fn(...)) and stored inside
+    // an arr[Callback] the same way any other struct-holding array is.
+    Callback cbk
+    cbk.fn = doubleIt
+    cbk.label = `cb${i}`
+    arr[Callback] cbks = []
+    cbks.push(cbk)
+    total = total + cbk.fn(i) + cbks[0].fn(i)
 
     // Query rows: text columns, null columns, and the whole array
     // released together at scope exit.
