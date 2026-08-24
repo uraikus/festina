@@ -39,23 +39,26 @@
 # instead (`C:\...`), not a separator, so this can't share one spelling
 # across platforms the way every other flag here does.
 #
-# A second, real MSYS2 gotcha (found by real Windows CI): PyInstaller
-# there is a NATIVE (non-MSYS) Windows executable, so MSYS2's bash
-# automatically rewrites any argument that looks like a POSIX path
-# (e.g. `/d/a/festina/festina/...`, what `pwd` returns under MSYS2)
-# into its real Windows form before the native process ever sees it --
-# ordinarily transparent, but that auto-conversion gets confused by a
-# COMPOUND `SRC;DEST` argument (`--add-data`'s own required shape) and
-# mis-converts it, observed producing a doubled, broken path
-# (`D:/d/a/festina/festina/...` -- the drive letter prepended to the
-# ALREADY-POSIX path rather than replacing its `/d` prefix). The fix is
-# converting each SRC to its native form ourselves via `cygpath -m`
-# (an MSYS2 core utility, always present -- the `-m` "mixed" form is a
-# real absolute Windows path, drive letter and all, just with forward
-# slashes, so it concatenates cleanly with the `/festina_runtime.c`
-# suffix below without a stray backslash) before it ever reaches a
-# compound argument, sidestepping automatic conversion entirely rather
-# than fighting its compound-argument blind spot.
+# A second, real MSYS2 gotcha (found by real Windows CI, across two
+# separate rounds): PyInstaller there is a NATIVE (non-MSYS) Windows
+# executable, and MSYS2's bash automatically rewrites path-shaped
+# arguments before such a process ever sees them -- ordinarily
+# transparent, but it mishandles a COMPOUND `SRC;DEST` argument
+# (`--add-data`'s own required shape), observed producing a doubled,
+# broken path (`D:/d/a/festina/festina/...`). Round one tried
+# converting SRC to its real Windows form first via `cygpath -m` (an
+# MSYS2 core utility, `-m` for the forward-slash "mixed" form so it
+# concatenates cleanly onto the compound argument's suffix with no
+# backslash to escape) -- that alone was NOT enough: the identical
+# doubled path came back regardless, meaning the automatic conversion
+# re-mangles even an already-correct Windows path sitting inside a
+# compound argument, not only a raw POSIX one. `cygpath -m` stays
+# (still the correct value to hand it), paired now with
+# `MSYS2_ARG_CONV_EXCL="*"` -- the standard, documented way to tell
+# MSYS2's runtime to leave EVERY argument of the next command alone,
+# no automatic conversion attempted at all, since this script is
+# already supplying a correct native path itself and the automatic
+# "help" is exactly what breaks it.
 #
 # Usage: ./scripts/package_compiler.sh [output_dir]
 #   -> writes <output_dir>/festina (default: ./dist/festina), or
@@ -78,24 +81,46 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 ADD_DATA_SEP=":"
 FESTINA_BIN="$OUT_DIR/festina"
 RUNTIME_DIR="$REPO_ROOT/runtime"
+DISTPATH="$OUT_DIR"
+WORKPATH="$WORK_DIR/build"
+SPECPATH="$WORK_DIR"
 if [[ "${OSTYPE:-}" == "msys" ]]; then
     ADD_DATA_SEP=";"
     FESTINA_BIN="$OUT_DIR/festina.exe"
-    # -m (not -w): forward-slash Windows form -- still a real, absolute
-    # Windows path (so MSYS2's auto-conversion leaves it alone), but
-    # avoids a backslash immediately butting up against the
-    # concatenated "/festina_runtime.c" suffix below, which `-w`'s
-    # backslash form would.
+    # -m (not -w): forward-slash Windows form, so RUNTIME_DIR
+    # concatenates cleanly with the "/festina_runtime.c" suffix below
+    # with no backslash to escape.
     RUNTIME_DIR="$(cygpath -m "$RUNTIME_DIR")"
+    DISTPATH="$(cygpath -m "$DISTPATH")"
+    WORKPATH="$(cygpath -m "$WORKPATH")"
+    SPECPATH="$(cygpath -m "$SPECPATH")"
+    # Real Windows CI proved cygpath's own correct output alone is not
+    # enough for --add-data specifically: MSYS2's automatic argv path
+    # "conversion" re-mangles it anyway at exec time, producing the
+    # identical broken doubled path (D:/d/a/...) whether or not this
+    # file did its own conversion first -- the heuristic apparently
+    # reprocesses an ALREADY-correct Windows path sitting inside a
+    # compound SRC;DEST argument, not only a raw POSIX one.
+    # MSYS2_ARG_CONV_EXCL="*" is the standard, documented escape hatch:
+    # it tells MSYS2's runtime to leave every argument of the next
+    # command alone, no automatic conversion at all. Scoped to this one
+    # `pyinstaller` invocation, and paired with converting EVERY
+    # absolute path handed to it above (not just RUNTIME_DIR) --
+    # --distpath/--workpath/--specpath had been relying on that same
+    # automatic conversion working correctly for their own single,
+    # non-compound path arguments (and it does, there), so disabling it
+    # wholesale without also pre-converting those would trade one
+    # broken path for three different ones.
+    export MSYS2_ARG_CONV_EXCL="*"
 fi
 
 cd "$REPO_ROOT"
 pyinstaller \
     --onefile \
     --name festina \
-    --distpath "$OUT_DIR" \
-    --workpath "$WORK_DIR/build" \
-    --specpath "$WORK_DIR" \
+    --distpath "$DISTPATH" \
+    --workpath "$WORKPATH" \
+    --specpath "$SPECPATH" \
     --add-data "$RUNTIME_DIR/festina_runtime.c${ADD_DATA_SEP}runtime" \
     --add-data "$RUNTIME_DIR/festina_runtime_graphics.c${ADD_DATA_SEP}runtime" \
     --add-data "$RUNTIME_DIR/festina_runtime_audio.c${ADD_DATA_SEP}runtime" \
