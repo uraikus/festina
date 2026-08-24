@@ -318,6 +318,49 @@ def _static_sqlite_attempt(platform_name, static_libs, libdir=None):
     return ["-Wl,-Bstatic", "-lsqlite3", "-Wl,-Bdynamic", *other_static_libs]
 
 
+def _windows_static_runtime_flags(cc, uses_audio, platform_name=None):
+    """windows.md Phase 3 item 2 (claude.md #129): the "copy-anywhere"
+    half of the DLL story for compiled programs -- a MinGW-built binary
+    otherwise depends on a handful of MSYS2 runtime DLLs
+    (`libgcc_s_seh-1.dll`, `libwinpthread-1.dll`) that are not part of
+    a bare Windows install, unlike sqlite3 (already statically linked
+    by _sqlite_link_flags above, windows.md Phase 0's own toolchain
+    decision keeping the same `-Bstatic`/`-Bdynamic` GNU ld toggles
+    working on both Linux and MinGW-on-Windows).
+
+    `-static-libgcc` is a standard, universally-understood GCC/Clang
+    driver flag -- no probe needed, and harmless to pass even when a
+    program never actually needs anything from libgcc_s. Winpthread is
+    different: only audio actually calls pthread_* (the channel pool's
+    own background-playback threads, festina_runtime.h's doc comment
+    on festina_audio_play), reached today only via the ALREADY-linked
+    dynamic `-pthread` flag in `_RUNTIME_FEATURES["audio"]`
+    ["extra_link_flags"] -- adding a SECOND, statically-scoped
+    `-lwinpthread` on top of that flag's own implicit linking for the
+    same program risks a link-order conflict this project has no
+    Windows machine to test, so this only ever applies when audio is
+    NOT in play, exactly matching windows.md's own "core-only programs"
+    framing for this trick (core and offscreen-only graphics both
+    qualify -- neither needs pthread at all).
+
+    Probed the same way _sqlite_link_flags probes -lsqlite3's static
+    archive (_can_link, reused verbatim) rather than assumed, since
+    this project has no Windows machine to confirm mingw-w64-ucrt-
+    x86_64-winpthreads ships libwinpthread.a and not only the shared
+    libwinpthread-1.dll -- if it doesn't, this silently falls back to
+    the ordinary dynamic dependency instead of a hard link error,
+    exactly like the sqlite3 case."""
+    platform_name = platform_name or sys.platform
+    if platform_name != "win32":
+        return []
+    flags = ["-static-libgcc"]
+    if not uses_audio:
+        winpthread_static = ["-Wl,-Bstatic", "-lwinpthread", "-Wl,-Bdynamic"]
+        if _can_link(cc, winpthread_static):
+            flags += winpthread_static
+    return flags
+
+
 def _sqlite_link_flags(cc):
     """Prefer statically linking sqlite3 into the compiled program, so it
     doesn't need libsqlite3.so present at runtime -- falls back to a
@@ -713,6 +756,7 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
             link_libs += _pkg_config("--libs", pkg)
         link_libs += extra_flags
 
+    link_libs += _windows_static_runtime_flags(cc, uses_audio)
     return objects, link_libs
 
 

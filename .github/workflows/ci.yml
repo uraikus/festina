@@ -6,14 +6,16 @@
 # forbidden where every dependency is expected -- coverage cannot
 # silently shrink on the primary platform. The sanitizer leak tier
 # runs only on Linux by the plans' standing decision (LeakSanitizer is
-# unreliable on darwin, and simply unavailable under MinGW). macOS's
-# audio (Phase 1) and windowed graphics (Phase 2) backends are both
-# built and compiled/type-checked here on every push, but stay behind
-# their own real-hardware-verification env vars (FESTINA_ENABLE_MACOS_
-# AUDIO/GRAPHICS) until confirmed on a real Mac; Windows has no audio
-# or graphics backend in the runtime at all yet (windows.md Phases
-# 1-2 are still open), so those tiers shed as skips there too, for a
-# different and more literal reason.
+# unreliable on darwin, and simply unavailable under MinGW). Both
+# macOS's (Phase 1/2) and Windows's (Phase 1/2, claude.md #127-128)
+# audio and windowed-graphics backends are built and compiled/type-
+# checked here on every push, but stay behind their own real-hardware-
+# verification env vars (FESTINA_ENABLE_MACOS_AUDIO/GRAPHICS,
+# FESTINA_ENABLE_WINDOWS_AUDIO/GRAPHICS) until confirmed on real
+# hardware, so those tiers shed as skips on both platforms for the
+# identical reason. windows.md Phase 3 (claude.md #129) added the
+# windows job's own packaging+smoke-test step, mirroring the macOS/
+# Linux jobs' own.
 name: CI
 
 on:
@@ -231,3 +233,17 @@ jobs:
           clang -c -O2 -I runtime \
             $(pkg-config --cflags cairo) \
             runtime/festina_runtime_window_win32.c -o /tmp/festina_window_win32.o
+      - name: Package and smoke-test the standalone compiler binary
+        # windows.md Phase 3 item 1 (claude.md #129): the same
+        # verification-not-just-hoping-it-works step the linux/macos
+        # jobs already have -- package_compiler.sh's Windows branch
+        # (the `;`-separated --add-data flag PyInstaller requires
+        # there, detected via bash's own OSTYPE, and the resulting
+        # festina.exe name) had never run for real before this. No
+        # codesign step here, unlike the macOS job -- Windows has no
+        # Gatekeeper-equivalent local-run prompt to route around.
+        run: |
+          python -m pip install -r requirements-build.txt
+          ./scripts/package_compiler.sh /tmp/festina-dist
+          /tmp/festina-dist/festina.exe compile examples/hello.f -o /tmp/festina-dist/hello.exe
+          /tmp/festina-dist/hello.exe

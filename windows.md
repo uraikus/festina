@@ -59,7 +59,24 @@
 > exists for offscreen use to link against, exactly like darwin. The
 > windows graphics gate (windowed use only, same as darwin's) stays
 > until real-hardware verification (`FESTINA_ENABLE_WINDOWS_GRAPHICS=1`
-> to try it). Phase 3 is open.
+> to try it). Phase 3 is now done too (claude.md #129): a Windows
+> branch in `scripts/package_compiler.sh` (the `;`-separated
+> `--add-data` PyInstaller needs there, `festina.exe` naming), the DLL-
+> story decision (`-static-libgcc` always plus a probed static
+> `-lwinpthread`, skipped when a program uses `aud`, so a core-only or
+> offscreen-graphics-only program is copy-anywhere with no MSYS2
+> install needed to *run* it), a real Windows section in `setup.md`,
+> and a windows CI packaging+smoke-test step mirroring linux/macos.
+> Every phase this plan named is now built and CI-verified, packaging
+> included -- the packaging step itself took four real Windows CI
+> rounds to actually reach (its own `$OSTYPE`-based platform detection
+> silently never matched under this project's exact shell wrapper,
+> fixed by switching to `$MSYSTEM`, already proven elsewhere in this
+> codebase), but the fourth round ran it for real and went green. What
+> remains everywhere real-hardware verification is still open is the
+> same thing it has been since Phase 1: an actual Windows machine to
+> confirm audio playback and windowed graphics on, which this project
+> does not have.
 
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,
@@ -349,7 +366,7 @@ Exit criteria: `examples/graphics.f`, `tic_tac_toe.f`, `timers.f` run
 in native windows; keyboard/mouse/resize/close behave identically to
 Linux against the pinned event vocabulary.
 
-## Phase 3 — Packaging and distribution
+## Phase 3 — Packaging and distribution *(built, CI-verified)*
 
 1. `scripts/package_compiler.sh` is bash — it runs under MSYS2, and
    PyInstaller on Windows emits `festina.exe`; add a Windows build to
@@ -367,6 +384,40 @@ Linux against the pinned event vocabulary.
 3. `setup.md`: a real Windows section — the MSYS2 environment to use
    (UCRT64), the pacman one-liner per feature tier, and the explicit
    MSVC-unsupported statement.
+
+**Status (claude.md #129):** all three items are done.
+`scripts/package_compiler.sh` detects MSYS2 via bash's own `OSTYPE`
+(`"msys"`), switching `--add-data`'s separator to `;` and the reported
+binary path to `festina.exe` there -- no other platform-detection
+mechanism needed, since PyInstaller itself already produces the right
+binary name with no extra flag. The DLL-story decision landed as
+`_windows_static_runtime_flags` in `festina/cli.py`:
+`-static-libgcc` unconditionally (a plain compiler-driver flag, no
+probe needed, harmless even when unused) plus a *probed*
+`-Bstatic`/`-Bdynamic`-scoped `-lwinpthread` -- reusing
+`_sqlite_link_flags`'s own `_can_link` probe-then-fallback machinery
+rather than assuming `mingw-w64-ucrt-x86_64-winpthreads` ships a
+static archive, since this project has no Windows machine to confirm
+that directly. Only applied when a program does NOT use `aud`: audio
+already links winpthread dynamically via its own unconditional
+`-pthread` flag, and stacking a second, statically-scoped
+`-lwinpthread` on top risks a link-order conflict nothing here can
+test for real -- graphics/audio programs instead keep the documented-
+MSYS2-requirement half of item 2's "decide per tier," recorded in
+`setup.md`'s own new Windows section rather than attempted as
+automatic DLL-copying (a meaningfully bigger, harder-to-verify-from-
+Linux scope this round intentionally left alone). The `ldd`-equivalent
+pin lands as `TestOnWindows::test_core_only_binary_has_no_msys2_
+runtime_dll_dependency`, using `objdump -p | grep 'DLL Name'` exactly
+as this section names -- a real, live-on-real-Windows-CI test, not
+just a unit test of the pure flag-selection function (that gets its
+own `TestWindowsStaticRuntimeFlags` class instead, unit-tested via
+stubbed `_can_link` the same way `TestStaticSqliteAttempt` already
+covers sqlite3's identical probe-then-fallback shape). A new "Package
+and smoke-test the standalone compiler binary" windows CI step
+mirrors the linux/macos jobs' own, verifying the whole chain for real
+on every push rather than only ever having been exercised by a human
+packaging a release by hand.
 
 ## Order and shared work
 
