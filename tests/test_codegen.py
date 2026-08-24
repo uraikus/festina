@@ -10947,6 +10947,101 @@ class TestImageClipResizeAndSize:
             assert "must both be positive" in result.stdout + result.stderr
 
 
+class TestImageDrawMethods:
+    """claude.md #134: drawRect/drawPixel/drawCircle/drawText as methods
+    on img -- the same four canvas-level drawing builtins (claude.md
+    #37/#39/#133), retargeted at the receiver image's own surface
+    instead of the canvas. Needs no display or window at all -- an
+    image's surface already exists in full the moment the image does,
+    same as saveCanvas() needing none (claude.md #95) -- verified here
+    the same way, with DISPLAY explicitly unset."""
+
+    def test_draw_methods_paint_onto_the_images_own_surface(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        # sheet.png's own layout (conftest.py's sprite_sheet_png
+        # fixture): tile (0,0), the top-left 32x32, is solid red.
+        out = str(tmp_path / "drawn.png")
+        source = f"""
+        color blue = 'blue'
+        img sheet = '{sprite_sheet_png}'
+        sheet.drawRect(0, 0, 5, 5, blue)
+        sheet.drawPixel(10, 0, blue)
+        log(sheet.save('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(2, 2) == (0, 0, 255), "drawRect's color override should have painted"
+        assert pixel(10, 0) == (0, 0, 255), "drawPixel's color override should have painted"
+        assert pixel(20, 20) == (255, 0, 0), "untouched red tile should be unaffected"
+
+    def test_draw_methods_use_the_current_fill_style_by_default(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        out = str(tmp_path / "drawn.png")
+        source = f"""
+        color blue = 'blue'
+        fillStyle(blue)
+        img sheet = '{sprite_sheet_png}'
+        sheet.drawCircle(16, 16, 4)
+        sheet.drawPixel(0, 0)
+        log(sheet.save('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(16, 16) == (0, 0, 255)
+        assert pixel(0, 0) == (0, 0, 255)
+
+    def test_draw_text_writes_onto_the_image(self, compile_and_run, tmp_path, sprite_sheet_png):
+        out = str(tmp_path / "drawn.png")
+        source = f"""
+        color black = 'black'
+        fillStyle(black)
+        img sheet = '{sprite_sheet_png}'
+        sheet.drawText('hi', 4, 40)
+        log(sheet.save('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        # Just confirms it wrote a valid, readable PNG at the same size
+        # -- glyph rasterization details aren't this test's concern
+        # (see TestSaveCanvas for the equivalent canvas-level choice).
+        width, height, _pixel = _decode_png(out)
+        assert (width, height) == (128, 64)
+
+    def test_a_clipped_images_own_drawing_does_not_affect_its_source(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        out = str(tmp_path / "drawn.png")
+        source = f"""
+        color blue = 'blue'
+        img sheet = '{sprite_sheet_png}'
+        img tile = sheet.clip(0, 0, 32, 32)
+        tile.drawRect(0, 0, 32, 32, blue)
+        log(sheet.save('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(5, 5) == (255, 0, 0), "the clip's own drawing must not leak into its source"
+
+    def test_wrong_arity_and_types_are_rejected(self, parser, semantic, errors):
+        for source in [
+            "img sheet = 's.png'\nsheet.drawRect(0, 0, 10)",
+            "img sheet = 's.png'\nsheet.drawRect(0, 0, 10, 10, 10, 10)",
+            "img sheet = 's.png'\nsheet.drawPixel(0)",
+            "img sheet = 's.png'\nsheet.drawPixel(0, 0, 0, 0)",
+            "img sheet = 's.png'\nsheet.drawCircle(0, 0)",
+            "img sheet = 's.png'\nsheet.drawText(0, 0, 0)",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
 class TestImageClipRendersRealPixels:
     """claude.md #92, the tier the rest can't reach: that clip() lifts
     the region it was actually asked for. Asserting the runtime call was

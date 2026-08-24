@@ -1256,6 +1256,117 @@ void festina_image_resize(void *img, int64_t w, int64_t h) {
     box->byte_count = 0;
 }
 
+/* claude.md #134: drawRect/drawPixel/drawCircle/drawText as methods on
+ * img -- the same four canvas-level drawing functions above, retargeted
+ * at an image's OWN surface instead of the canvas backing store. No
+ * window or festina_backing_require() needed at all: an img's surface
+ * already exists in full the moment the image itself does (loaded,
+ * clipped, resized, or decoded from bytes), unlike the canvas's own
+ * lazily-created backing store. Deliberately does NOT apply the
+ * canvas's global transform (translate/rotate/scale, claude.md #94) --
+ * an image is a portable asset with its own local pixel coordinates,
+ * independent of whatever the canvas's own transform happens to be set
+ * to when a program draws onto one. Still reads the SAME global
+ * fillStyle/borderColor/lineWidth/font state every canvas draw call
+ * does, since claude.md #133's own "otherwise uses fillColor" default
+ * makes the most sense as one shared style, not a second one to
+ * configure separately per image.
+ *
+ * `festina_check_image_bytes_stale`-equivalent bookkeeping (claude.md
+ * #101's cached-PNG-bytes invalidation, see festina_image_resize just
+ * above) applies here too: any of these mutates the surface's actual
+ * pixels, so the cached encoded bytes (if any) are stale the moment
+ * this returns. */
+static void festina_image_bytes_now_stale(void *img) {
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    free(box->bytes);
+    box->bytes = NULL;
+    box->byte_count = 0;
+}
+
+void festina_image_draw_rect(void *img, int64_t x, int64_t y, int64_t w, int64_t h) {
+    if (!img) return;
+    cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
+    cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
+    festina_fill_and_border(cr);
+    cairo_destroy(cr);
+    festina_image_bytes_now_stale(img);
+}
+
+void festina_image_draw_rect_color(void *img, int64_t x, int64_t y, int64_t w, int64_t h, int64_t color) {
+    if (!img) return;
+    cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
+    cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
+    festina_fill_and_border_with_color(cr, color);
+    cairo_destroy(cr);
+    festina_image_bytes_now_stale(img);
+}
+
+/* See festina_draw_pixel's own comment (just above festina_draw_circle
+ * in this file) for why antialiasing is disabled around the fill. */
+void festina_image_draw_pixel(void *img, int64_t x, int64_t y) {
+    if (!img) return;
+    cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
+    cairo_antialias_t save_aa = cairo_get_antialias(cr);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
+    cairo_rectangle(cr, (double)x, (double)y, 1, 1);
+    if (!g_fill_none) {
+        festina_set_fill_source(cr);
+        cairo_fill(cr);
+    } else {
+        cairo_new_path(cr);
+    }
+    cairo_set_antialias(cr, save_aa);
+    cairo_destroy(cr);
+    festina_image_bytes_now_stale(img);
+}
+
+void festina_image_draw_pixel_color(void *img, int64_t x, int64_t y, int64_t color) {
+    if (!img) return;
+    cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
+    cairo_antialias_t save_aa = cairo_get_antialias(cr);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
+    cairo_rectangle(cr, (double)x, (double)y, 1, 1);
+    if (color >= 0) {
+        double r, g, b;
+        festina_unpack_rgb(color, &r, &g, &b);
+        cairo_set_source_rgba(cr, r, g, b, g_fill_alpha);
+        cairo_fill(cr);
+    } else {
+        cairo_new_path(cr);
+    }
+    cairo_set_antialias(cr, save_aa);
+    cairo_destroy(cr);
+    festina_image_bytes_now_stale(img);
+}
+
+/* No circle-mask fast path here (unlike the canvas's own drawCircle,
+ * claude.md #104) -- that cache is keyed on the CANVAS's own transform
+ * state, which images deliberately do not use (see this section's own
+ * comment above), and drawing onto an image is a far rarer, less
+ * hot-path call than drawing a frame's worth of shapes onto the canvas
+ * every tick. */
+void festina_image_draw_circle(void *img, int64_t x, int64_t y, int64_t r) {
+    if (!img) return;
+    cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
+    cairo_arc(cr, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0.0, 2.0 * 3.14159265358979323846);
+    festina_fill_and_border(cr);
+    cairo_destroy(cr);
+    festina_image_bytes_now_stale(img);
+}
+
+void festina_image_draw_text(void *img, const char *text, int64_t x, int64_t y) {
+    if (!img || !text) return;
+    cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
+    if (g_fill_none) { cairo_destroy(cr); return; }
+    cairo_set_source_rgba(cr, g_fill_r, g_fill_g, g_fill_b, g_fill_alpha);
+    festina_apply_font(cr);
+    cairo_move_to(cr, (double)x, (double)y);
+    cairo_show_text(cr, text);
+    cairo_destroy(cr);
+    festina_image_bytes_now_stale(img);
+}
+
 /* claude.md #92/#118: the img counterpart of festina_blob_release --
  * decrement, and only on the last reference destroy the surface and
  * free everything hanging off the box before the storage itself.

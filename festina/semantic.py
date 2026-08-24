@@ -1555,6 +1555,50 @@ def analyze(program, filename="<string>"):
                             category="invalid function argument type",
                         )
                 return types_mod.ImageType() if callee.prop == "clip" else None
+            # claude.md #134: drawRect/drawPixel/drawCircle/drawText as
+            # methods on img -- the same four canvas-level drawing
+            # builtins claude.md #37/#39/#133 already give, now also
+            # callable on an image's OWN surface instead of the canvas.
+            # drawRect/drawPixel keep their own optional trailing
+            # `color` (claude.md #133); coordinates are always in the
+            # image's own pixel space, with no window/canvas needed at
+            # all -- see codegen.py's _emit_image_draw_method.
+            if (callee.prop in ("drawRect", "drawPixel", "drawCircle", "drawText")
+                    and infer(callee.obj, scope) == _IMAGE):
+                alternates = {
+                    "drawRect": [(_INT, _INT, _INT, _INT), (_INT, _INT, _INT, _INT, _COLOR)],
+                    "drawPixel": [(_INT, _INT), (_INT, _INT, _COLOR)],
+                }.get(callee.prop)
+                if alternates is not None:
+                    sig = next((a for a in alternates if len(a) == len(expr.args)), None)
+                    if sig is None:
+                        shapes = " or ".join(str(len(a)) for a in alternates)
+                        raise CompileError(
+                            f"{callee.prop}() expects {shapes} argument(s), "
+                            f"got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                else:
+                    sig = {"drawCircle": (_INT, _INT, _INT),
+                           "drawText": (_TEXT, _INT, _INT)}[callee.prop]
+                    if len(expr.args) != len(sig):
+                        raise CompileError(
+                            f"{callee.prop}() expects {len(sig)} argument(s), "
+                            f"got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                for i, (arg, expected) in enumerate(zip(expr.args, sig)):
+                    arg_type = infer(arg, scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != expected:
+                        raise CompileError(
+                            f"{callee.prop}()'s argument {i + 1} expects "
+                            f"{types_mod.type_name(expected)}, found {types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return None
             if callee.prop == "isPlaying" and infer(callee.obj, scope) == _AUDIO:
                 if expr.args:
                     raise CompileError(

@@ -28,6 +28,25 @@ while i < 120 {
     shrunk.resize(8, 8)
     total = total + tile.width + shrunk.height + jpg.width
 
+    // claude.md #134: drawRect/drawPixel/drawCircle as img methods --
+    // both the plain and the color-override forms, plus one through a
+    // CHAINED call (an owning receiver, released right after the draw,
+    // unlike `tile` above which stays alive under its own binding).
+    // drawText deliberately not exercised here: it's the one drawing
+    // call that reaches cairo_select_font_face/fontconfig, which caches
+    // font-matching state for the whole PROCESS's lifetime with no
+    // teardown API -- a real, one-time, non-growing cost LeakSanitizer
+    // still flags, and no other stress file exercises text-drawing for
+    // the same reason (this is a pre-existing gap, not one this round
+    // introduced or needs to close).
+    color blue = 'blue'
+    tile.drawRect(0, 0, 4, 4)
+    tile.drawRect(4, 4, 4, 4, blue)
+    tile.drawPixel(8, 8)
+    tile.drawPixel(9, 9, blue)
+    tile.drawCircle(16, 16, 3)
+    png.clip(0, 0, 8, 8).drawRect(0, 0, 4, 4, blue)
+
     // Stored as BLOBs and read back as freshly decoded handles. The
     // clipped tile has no source bytes, so this also exercises the
     // encode-on-demand path.

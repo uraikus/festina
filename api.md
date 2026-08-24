@@ -913,6 +913,7 @@ clip, resize and `saveCanvas` without an X server.
 | `img.width` / `img.height` | Current size in pixels, as `int`. |
 | `img.clip(x, y, w, h)` | A **new** `img` holding that rectangle. The source is untouched, so one sheet can be clipped as many times as you like. |
 | `img.resize(w, h)` | Scales the image **in place** — it changes the image itself, so every name for it sees the new size. |
+| `img.drawRect(x, y, w, h[, color])` / `img.drawPixel(x, y[, color])` / `img.drawCircle(x, y, r)` / `img.drawText(text, x, y)` | The same four canvas-level drawing calls, painting onto **this image's own surface** instead. |
 
 `clip` is the spritesheet operation: one PNG holding a grid of frames,
 sliced into the individual images you draw.
@@ -930,6 +931,25 @@ overlapping part is copied and the rest stays transparent, which is
 normal at a sheet's right or bottom margin. A zero or negative width or
 height *is* an error, since it could only ever produce an image nothing
 can draw.
+
+**Drawing onto an image** uses the same style state as the canvas
+(`fillStyle`, `borderColor`, `lineWidth`, `changeFont`) and the same
+optional trailing `color` on `drawRect`/`drawPixel` — but nothing else
+about the canvas. No window is needed (an image's surface already
+exists in full the moment the image does), and the canvas's own
+`translate`/`rotate`/`scale` transform is never applied — an image is a
+portable asset with its own local pixel coordinates, independent of
+whatever the canvas's transform happens to be set to:
+
+```festina
+color red = 'red'
+color blue = 'blue'
+img icon = 'blank.png'
+fillStyle(red)
+icon.drawRect(0, 0, 16, 16)
+icon.drawPixel(24, 8, blue)      // this pixel only -- fillStyle stays red after
+icon.save('icon-with-border.png')
+```
 
 Because `resize` changes the image itself, two names for one image stay
 in step:

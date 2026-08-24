@@ -529,6 +529,17 @@ int64_t festina_image_width(void *img);
 int64_t festina_image_height(void *img);
 void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
 void festina_image_resize(void *img, int64_t w, int64_t h);
+/* claude.md #134: drawRect/drawPixel/drawCircle/drawText as methods on
+ * img -- the same four canvas-level functions above, retargeted at an
+ * image's own surface, its own local pixel coordinates (no canvas
+ * transform applied), but still the same global fillStyle/borderColor/
+ * lineWidth/font state every canvas draw call reads. */
+void festina_image_draw_rect(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
+void festina_image_draw_rect_color(void *img, int64_t x, int64_t y, int64_t w, int64_t h, int64_t color);
+void festina_image_draw_pixel(void *img, int64_t x, int64_t y);
+void festina_image_draw_pixel_color(void *img, int64_t x, int64_t y, int64_t color);
+void festina_image_draw_circle(void *img, int64_t x, int64_t y, int64_t r);
+void festina_image_draw_text(void *img, const char *text, int64_t x, int64_t y);
 void festina_image_free(void *img);
 void festina_draw_image(void *img, int64_t x, int64_t y);
 /* claude.md #89/#90: canvas drawing style -- process-global state set by

@@ -1117,6 +1117,13 @@ class CodeGen:
             "declare i64 @festina_image_height(ptr)",
             "declare ptr @festina_image_clip(ptr, i64, i64, i64, i64)",
             "declare void @festina_image_resize(ptr, i64, i64)",
+            # claude.md #134: drawRect/drawPixel/drawCircle/drawText as img methods.
+            "declare void @festina_image_draw_rect(ptr, i64, i64, i64, i64)",
+            "declare void @festina_image_draw_rect_color(ptr, i64, i64, i64, i64, i64)",
+            "declare void @festina_image_draw_pixel(ptr, i64, i64)",
+            "declare void @festina_image_draw_pixel_color(ptr, i64, i64, i64)",
+            "declare void @festina_image_draw_circle(ptr, i64, i64, i64)",
+            "declare void @festina_image_draw_text(ptr, ptr, i64, i64)",
             "declare void @festina_image_free(ptr)",
             "declare i8 @festina_image_save(ptr, ptr)",
             "declare i8 @festina_image_save_copy(ptr, ptr)",
@@ -6327,6 +6334,52 @@ class CodeGen:
                     lines.append(
                         f"  call void @festina_image_resize(ptr {obj_val}, "
                         f"i64 {arg_vals[0]}, i64 {arg_vals[1]})")
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                    return "0", None
+            # claude.md #134: drawRect/drawPixel/drawCircle/drawText as
+            # methods on img -- the same four canvas-level drawing
+            # builtins (claude.md #37/#39/#133), retargeted at the
+            # receiver image's own surface. semantic.py has already
+            # checked argument count/types, including drawRect/
+            # drawPixel's own optional trailing `color`, dispatched here
+            # purely by arity exactly like the canvas-level forms are.
+            if callee.prop in ("drawRect", "drawPixel", "drawCircle", "drawText"):
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.ImageType):
+                    emitted = [self._emit_expr(a, env, lines) for a in expr.args]
+                    arg_vals = [v for v, _ in emitted]
+                    if callee.prop == "drawRect":
+                        if len(arg_vals) == 5:
+                            x, y, w, h, color = arg_vals
+                            lines.append(
+                                f"  call void @festina_image_draw_rect_color(ptr {obj_val}, "
+                                f"i64 {x}, i64 {y}, i64 {w}, i64 {h}, i64 {color})")
+                        else:
+                            x, y, w, h = arg_vals
+                            lines.append(
+                                f"  call void @festina_image_draw_rect(ptr {obj_val}, "
+                                f"i64 {x}, i64 {y}, i64 {w}, i64 {h})")
+                    elif callee.prop == "drawPixel":
+                        if len(arg_vals) == 3:
+                            x, y, color = arg_vals
+                            lines.append(
+                                f"  call void @festina_image_draw_pixel_color(ptr {obj_val}, "
+                                f"i64 {x}, i64 {y}, i64 {color})")
+                        else:
+                            x, y = arg_vals
+                            lines.append(
+                                f"  call void @festina_image_draw_pixel(ptr {obj_val}, i64 {x}, i64 {y})")
+                    elif callee.prop == "drawCircle":
+                        x, y, r = arg_vals
+                        lines.append(
+                            f"  call void @festina_image_draw_circle(ptr {obj_val}, "
+                            f"i64 {x}, i64 {y}, i64 {r})")
+                    else:  # drawText
+                        text, x, y = arg_vals
+                        lines.append(
+                            f"  call void @festina_image_draw_text(ptr {obj_val}, "
+                            f"ptr {text}, i64 {x}, i64 {y})")
+                        self._free_text_temp(expr.args[0], text, emitted[0][1], lines)
                     self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                     return "0", None
             # claude.md #38: music.play() / music.stop() / music.isPlaying()
