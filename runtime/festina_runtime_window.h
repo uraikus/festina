@@ -89,4 +89,24 @@ void festina_window_present(cairo_surface_t *backing);
 void festina_window_events_wait(double timeout_seconds);
 void festina_window_events_drain(void (*handler)(const FestinaWindowEvent *event));
 
+/* claude.md #139: screenWidth/screenHeight and setClientWidth/
+ * setClientHeight.
+ *
+ * festina_window_screen_size reports the PHYSICAL display's own
+ * resolution, independent of whether a window is currently open --
+ * unlike every other seam function above, which all require one. A
+ * backend with no window open yet must still answer this (a headless
+ * program asking "how big is the screen" before ever drawing anything
+ * is a real, intended use), so each implementation connects/queries/
+ * disconnects on its own if it has to, invisibly to the caller.
+ *
+ * festina_window_resize resizes the OPEN window to exactly (width,
+ * height) content pixels -- a no-op if none is open, since portable
+ * code (festina_set_client_size in festina_runtime_graphics.c) already
+ * handles the "no window yet" case entirely on its own by updating the
+ * canvas's own size for whenever one opens. This function's only job
+ * is the native OS resize call. */
+void festina_window_screen_size(int64_t *out_width, int64_t *out_height);
+void festina_window_resize(int64_t width, int64_t height);
+
 #endif /* FESTINA_RUNTIME_WINDOW_H */

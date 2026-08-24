@@ -115,6 +115,10 @@ BUILTIN_FUNCTIONS = {
     # file is something a program tests for" rule, extended to
     # directories), ls() answers arr[text] of entry names.
     "mkdir", "ls",
+    # claude.md #139: the setters for clientWidth/clientHeight --
+    # screenWidth/screenHeight have no setter, since a program cannot
+    # resize the physical display it's running on.
+    "setClientWidth", "setClientHeight",
 }
 
 _BUILTIN_RETURN_TYPES = {
@@ -211,6 +215,9 @@ _BUILTIN_SIGNATURES = {
     # claude.md #132
     "mkdir": (_TEXT,),
     "ls": (_TEXT,),
+    # claude.md #139
+    "setClientWidth": (_INT,),
+    "setClientHeight": (_INT,),
 }
 
 # claude.md #90: three builtins accept two different shapes. The
@@ -318,6 +325,18 @@ _EVENT_SIGNATURES = {
 # "already declared" check rejects a user var/function/struct/table
 # with either name for free, with no extra machinery here.
 _CLIENT_SIZE_GLOBALS = ("clientWidth", "clientHeight")
+
+# claude.md #139: screenWidth/screenHeight -- the PHYSICAL display's own
+# resolution, not the window's content size (that's clientWidth/
+# clientHeight just above). Same read-only global-int registration
+# shape, kept as its own tuple rather than folded into
+# _CLIENT_SIZE_GLOBALS since the two answer genuinely different
+# questions (a window can be smaller than the screen it's on).
+_SCREEN_SIZE_GLOBALS = ("screenWidth", "screenHeight")
+# Both size-global families are read-only the identical way and share
+# every touch point below; combined once here so those touch points
+# don't need to know there happen to be two separate families.
+_SIZE_GLOBALS = _CLIENT_SIZE_GLOBALS + _SCREEN_SIZE_GLOBALS
 
 # claude.md #71: `environment` -- unlike clientWidth/clientHeight above,
 # this is never a valid *value* on its own (only environment.NAME or
@@ -454,8 +473,9 @@ def analyze(program, filename="<string>"):
     imports = []
     entry_filename = filename  # see the DatabaseURL check at the bottom
 
-    # claude.md #39: clientWidth/clientHeight, see _CLIENT_SIZE_GLOBALS above.
-    for _name in _CLIENT_SIZE_GLOBALS:
+    # claude.md #39/#139: clientWidth/clientHeight/screenWidth/screenHeight,
+    # see _SIZE_GLOBALS above.
+    for _name in _SIZE_GLOBALS:
         global_scope.define(_name, Symbol(_name, _INT, "constant", None), None, filename)
     # claude.md #71: environment, see _ENVIRONMENT_NAME above -- type is
     # irrelevant (never consulted), only here so redeclaring it is a
@@ -677,12 +697,12 @@ def analyze(program, filename="<string>"):
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid assignment",
                 )
-            # claude.md #39: clientWidth/clientHeight are read-only too --
-            # same reasoning and same "catch it before the generic
-            # target_type/value_type check below" placement as .length
-            # above, since that check alone has no way to tell a read
-            # from a write target.
-            if isinstance(expr.target, ast.Identifier) and expr.target.name in _CLIENT_SIZE_GLOBALS:
+            # claude.md #39/#139: clientWidth/clientHeight/screenWidth/
+            # screenHeight are read-only too -- same reasoning and same
+            # "catch it before the generic target_type/value_type check
+            # below" placement as .length above, since that check alone
+            # has no way to tell a read from a write target.
+            if isinstance(expr.target, ast.Identifier) and expr.target.name in _SIZE_GLOBALS:
                 raise CompileError(
                     f"'{expr.target.name}' is read-only and cannot be assigned to",
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),

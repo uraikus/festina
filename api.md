@@ -802,6 +802,10 @@ clearPixel(10, 10)                        // erase one pixel to transparent
 
 log(`canvas is ${clientWidth}x${clientHeight}`)
 
+log(`screen is ${screenWidth}x${screenHeight}`)  // the physical display, read-only
+setClientWidth(1024)                             // resizes the canvas (and window, if open)
+setClientHeight(768)
+
 on mouseDown(x:int, y:int) { ... }
 on mouseUp(x:int, y:int)   { ... }
 on mouse(x:int, y:int)     { ... }
@@ -872,6 +876,28 @@ snap.save('before-clear.png')   // still has the rectangle
 Nothing but `render()` and the event handlers needs a display —
 `saveCanvas`, `clientWidth`/`clientHeight` and loading an image all
 work headless.
+
+**`screenWidth`/`screenHeight`** report the physical display's own
+resolution — not the window's content size (that's `clientWidth`/
+`clientHeight`), a window can be, and usually is, smaller than the
+screen it's on. Both are read-only. Unlike `clientWidth`/`clientHeight`,
+reading them still needs an X server (there's no window yet to answer
+from, and no other way to ask "how big is the screen"), so this is one
+of the few graphics reads that fails without a display.
+
+**`setClientWidth(int)`/`setClientHeight(int)`** resize the canvas —
+and the real OS window too, if one is already open. Both apply
+immediately: `setClientWidth(400)` is followed by `clientWidth` already
+reading `400`, not whatever it was a moment before. A non-positive size
+is silently ignored. If a window is open, the resized content is
+cleared to transparent (matching `clearCanvas`'s own behavior) and `on
+resize` fires once per call:
+
+```festina
+render()
+setClientWidth(1024)   // window resizes; on resize fires once
+setClientHeight(768)   // fires again
+```
 
 ### Mouse events
 

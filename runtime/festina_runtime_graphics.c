@@ -1485,6 +1485,103 @@ int64_t festina_client_height(void) {
     return g_canvas_height;
 }
 
+/* claude.md #139: screenWidth/screenHeight -- the physical display's
+ * own resolution, through the seam (festina_window_screen_size), since
+ * only a platform backend knows how to ask its own OS that. Two thin
+ * wrappers rather than one two-out-param function reaching all the way
+ * up to codegen, matching festina_client_width/_height's own shape
+ * immediately above -- each is one global property, one call. */
+int64_t festina_screen_width(void) {
+    int64_t w = 0, h = 0;
+    festina_window_screen_size(&w, &h);
+    return w;
+}
+
+int64_t festina_screen_height(void) {
+    int64_t w = 0, h = 0;
+    festina_window_screen_size(&w, &h);
+    return h;
+}
+
+/* claude.md #139: setClientWidth/setClientHeight's shared portable
+ * core -- everything about "what changing the canvas size MEANS" lives
+ * here, once, regardless of which of the two axes changed and whether
+ * a window is even open yet. A non-positive size is silently ignored
+ * (matching festina_check_image_size's own "no image nothing could
+ * ever draw to" reasoning, applied to the canvas itself) rather than
+ * failing the program.
+ *
+ * Deliberately synchronous and self-contained, not "resize the OS
+ * window and wait for its own resize event to come back around": every
+ * Festina-visible piece of state (clientWidth/clientHeight, the
+ * backing surface) changes immediately, in this call, so
+ * `setClientWidth(400) log(clientWidth)` reads 400 right away rather
+ * than whatever stale value was true before the native window manager
+ * gets around to confirming it asynchronously. festina_window_resize
+ * (the seam call at the end) still asks the OS window to match, for
+ * when one is open -- but the real ConfigureNotify/native resize event
+ * that eventually arrives from THAT call is a trailing echo of a
+ * change already applied here, not a second one: see
+ * festina_handle_window_event's own RESIZE case, which skips its
+ * rebuild-and-fire entirely when the event's size already matches what
+ * this function already set, so one logical resize never fires `on
+ * resize` twice. */
+/* claude.md #139: counts native resize echoes still owed back to us
+ * from calls to festina_window_resize below, one per call -- NOT a
+ * size comparison. X11 (and presumably every other backend) does not
+ * coalesce ConfigureNotify-equivalents across back-to-back resize
+ * calls: two setClientWidth/setClientHeight calls in a row produce two
+ * separate native resize requests and, later, two separate echoes,
+ * each carrying whatever geometry was current AT THE TIME the OS
+ * finally got around to it -- which can be a stale intermediate size,
+ * not the final one. A "does this echo's size match current state"
+ * guard (the first approach tried here) is fooled by exactly that: the
+ * first stale echo still passes because current state hasn't been
+ * touched yet, and processing it clobbers g_canvas_width/height away
+ * from the size festina_set_client_size already committed, so the
+ * SECOND echo then also looks "new" and fires `on resize` again too --
+ * confirmed by a real back-to-back setClientWidth/setClientHeight
+ * Xvfb repro that produced 4 firings instead of 2. Counting owed
+ * echoes sidesteps geometry entirely: every echo genuinely caused by
+ * this function is swallowed regardless of what stale size it reports,
+ * while a real window-manager-driven resize (dragging an edge) never
+ * increments this counter at all, so it always falls through and
+ * fires normally. */
+static int g_pending_self_resizes = 0;
+
+static void festina_set_client_size(int64_t width, int64_t height) {
+    if (width <= 0 || height <= 0) return;
+    if (width == g_canvas_width && height == g_canvas_height) return;
+    g_canvas_width = width;
+    g_canvas_height = height;
+    if (g_backing_surface) {
+        cairo_surface_destroy(g_backing_surface);
+        g_backing_surface = cairo_image_surface_create(
+            CAIRO_FORMAT_ARGB32, (int)width, (int)height);
+        /* claude.md #136: fresh canvas state is transparent, not white
+         * -- see festina_backing_require's own identical block. */
+        cairo_t *cr = cairo_create(g_backing_surface);
+        cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+        cairo_set_source_rgba(cr, 0, 0, 0, 0);
+        cairo_paint(cr);
+        cairo_destroy(cr);
+    }
+    if (g_window_open) {
+        festina_graphics_present();
+        if (g_resize_handler) g_resize_handler();
+        g_pending_self_resizes++;
+        festina_window_resize(width, height);
+    }
+}
+
+void festina_set_client_width(int64_t width) {
+    festina_set_client_size(width, g_canvas_height);
+}
+
+void festina_set_client_height(int64_t height) {
+    festina_set_client_size(g_canvas_width, height);
+}
+
 /* claude.md #123: handles one already-NORMALIZED window event -- the
  * portable dispatch every backend's festina_window_events_drain calls
  * into, unchanged regardless of which platform produced the event.
@@ -1524,7 +1621,32 @@ static void festina_handle_window_event(const FestinaWindowEvent *ev) {
          * own on-screen surface is already the new size by the time
          * this fires -- each backend resizes its own before emitting
          * RESIZE (see festina_runtime_window.h) -- so only the
-         * portable backing store needs rebuilding here. */
+         * portable backing store needs rebuilding here.
+         *
+         * claude.md #139: skipped entirely while g_pending_self_resizes
+         * is nonzero -- setClientWidth/setClientHeight (festina_set_
+         * client_size) apply the identical rebuild SYNCHRONOUSLY, then
+         * ask the OS window to match via festina_window_resize, which
+         * increments that counter once per call. That native resize
+         * still generates its own RESIZE event later (a
+         * ConfigureNotify/equivalent), arriving here as the trailing
+         * echo of a change already applied, not a new one -- without
+         * this guard, one logical resize would rebuild the backing
+         * store and fire `on resize` again. This is deliberately a
+         * COUNT, not a size comparison: back-to-back calls (e.g.
+         * setClientWidth then setClientHeight) produce two separate,
+         * non-coalesced echoes, and the first echo can carry a stale
+         * intermediate geometry that doesn't match either the size
+         * before or after -- a size-comparison guard is fooled by that
+         * (confirmed by a real Xvfb repro that mis-fired twice), while
+         * counting owed echoes swallows both regardless of what
+         * geometry each one happens to report. A genuine window-
+         * manager-driven resize (dragging an edge) never increments
+         * this counter, so it always falls through and fires. */
+        if (g_pending_self_resizes > 0) {
+            g_pending_self_resizes--;
+            break;
+        }
         g_canvas_width = ev->width;
         g_canvas_height = ev->height;
         cairo_surface_destroy(g_backing_surface);
@@ -1726,6 +1848,49 @@ void festina_window_close(void) {
     XDestroyWindow(g_display, g_window);
     XCloseDisplay(g_display);
     g_display = NULL;
+}
+
+/* claude.md #139: reuses the already-open connection if a window is
+ * open; otherwise opens a throwaway one just long enough to ask, and
+ * closes it again -- no retry loop the way festina_window_open's own
+ * XOpenDisplay has one, since this is a read-only property query a
+ * program can call as often as it likes, not a one-time hard
+ * requirement worth stalling up to a second for. Fails clearly (the
+ * identical message render() itself uses) rather than silently
+ * answering 0x0, which would look like a real, if degenerate, screen
+ * size instead of "no display at all". */
+void festina_window_screen_size(int64_t *out_width, int64_t *out_height) {
+    if (g_display) {
+        int screen = DefaultScreen(g_display);
+        *out_width = DisplayWidth(g_display, screen);
+        *out_height = DisplayHeight(g_display, screen);
+        return;
+    }
+    Display *tmp = XOpenDisplay(NULL);
+    if (!tmp) {
+        festina_fail("could not open the X display -- claude.md #39's graphics "
+                      "functions need a running X server (is $DISPLAY set?)");
+        return;
+    }
+    int screen = DefaultScreen(tmp);
+    *out_width = DisplayWidth(tmp, screen);
+    *out_height = DisplayHeight(tmp, screen);
+    XCloseDisplay(tmp);
+}
+
+/* claude.md #139: a no-op with no window open -- festina_set_client_
+ * size (festina_runtime_graphics.c's own portable half) already
+ * updates the canvas's own size for whenever one does; this function's
+ * only job is telling the ALREADY-open native window to match.
+ * cairo_xlib_surface_set_size keeps the Cairo-side surface's own
+ * cached dimensions in step with the just-resized drawable -- without
+ * it, festina_window_present would keep blitting at the OLD size into
+ * a window that has already changed underneath it. */
+void festina_window_resize(int64_t width, int64_t height) {
+    if (!g_display) return;
+    XResizeWindow(g_display, g_window, (unsigned int)width, (unsigned int)height);
+    cairo_xlib_surface_set_size(g_window_surface, (int)width, (int)height);
+    XFlush(g_display);
 }
 
 void festina_window_present(cairo_surface_t *backing) {

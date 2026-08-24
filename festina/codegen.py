@@ -1146,6 +1146,11 @@ class CodeGen:
             "declare void @festina_program_exit(i64)",
             "declare i64 @festina_client_width()",
             "declare i64 @festina_client_height()",
+            # claude.md #139
+            "declare i64 @festina_screen_width()",
+            "declare i64 @festina_screen_height()",
+            "declare void @festina_set_client_width(i64)",
+            "declare void @festina_set_client_height(i64)",
             # claude.md #69: setTimeout/setInterval/clearTimeout/clearInterval
             # -- see the module docstring's "Timers" note.
             "declare i64 @festina_set_timeout(ptr, i64)",
@@ -2786,6 +2791,26 @@ class CodeGen:
             if expr.name in ("clientWidth", "clientHeight"):
                 self.uses_graphics_code = True
                 fn = "festina_client_width" if expr.name == "clientWidth" else "festina_client_height"
+                out = self.tmp()
+                lines.append(f"  {out} = call i64 @{fn}()")
+                return out, INT
+            # claude.md #139: screenWidth/screenHeight -- the PHYSICAL
+            # display's resolution, unlike clientWidth/clientHeight's
+            # in-memory canvas size. This genuinely cannot be answered
+            # without a live connection to the display server (there is
+            # no "headless" answer to "how big is the screen"), so
+            # unlike clientWidth/clientHeight this sets uses_graphics_
+            # CODE only (link the graphics backend) rather than the
+            # stronger uses_graphics (which would force a window open
+            # and block in the event loop afterward) -- the connect/
+            # query/disconnect-if-newly-opened dance happens entirely
+            # inside festina_screen_width/_height themselves, invisible
+            # here, the same "only pay for what you use" split
+            # loadImage()/img-from-path already established for
+            # graphics code that needs no window.
+            if expr.name in ("screenWidth", "screenHeight"):
+                self.uses_graphics_code = True
+                fn = "festina_screen_width" if expr.name == "screenWidth" else "festina_screen_height"
                 out = self.tmp()
                 lines.append(f"  {out} = call i64 @{fn}()")
                 return out, INT
@@ -6002,6 +6027,9 @@ class CodeGen:
                 # claude.md #133
                 "clearCircle": ("festina_clear_circle", ["i64"] * 3),
                 "clearPixel": ("festina_clear_pixel", ["i64"] * 2),
+                # claude.md #139
+                "setClientWidth": ("festina_set_client_width", ["i64"]),
+                "setClientHeight": ("festina_set_client_height", ["i64"]),
                 "beginPath": ("festina_begin_path", []),
                 "moveTo": ("festina_move_to", ["i64", "i64"]),
                 "lineTo": ("festina_line_to", ["i64", "i64"]),

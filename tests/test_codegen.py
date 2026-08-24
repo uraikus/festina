@@ -4712,6 +4712,108 @@ class TestGraphics:
             proc.wait(timeout=5)
 
 
+class TestScreenSizeAndSetClientSize:
+    """claude.md #139: screenWidth/screenHeight -- the physical
+    display's own resolution, read-only, answerable with or without a
+    window open -- and setClientWidth/setClientHeight, which resize the
+    canvas synchronously (and the real OS window too, when one is
+    open)."""
+
+    def test_screen_size_without_any_display_is_a_clear_runtime_error(
+            self, compile_and_run, monkeypatch):
+        # festina_window_screen_size answers even with no window open,
+        # but it still needs SOME X server to ask -- with none available
+        # at all it reports the identical "no X display" failure
+        # render() itself reports (both go through the same X11
+        # festina_fail call -- see festina_window_screen_size's own
+        # XOpenDisplay fallback in festina_runtime_graphics.c).
+        monkeypatch.delenv("DISPLAY", raising=False)
+        result = compile_and_run("log(screenWidth)")
+        assert result.returncode == 1
+        assert "X display" in result.stderr
+
+    def test_screen_size_matches_the_real_display_resolution(self, compile_and_run, x_display):
+        # Queried independently via xdotool rather than hardcoded, since
+        # x_display can be a caller-provided real DISPLAY as well as the
+        # throwaway 1024x768 Xvfb this fixture spins up itself -- see
+        # conftest.py's own x_display fixture.
+        env = dict(os.environ, DISPLAY=x_display)
+        probe = subprocess.run(["xdotool", "getdisplaygeometry"], env=env,
+                                capture_output=True, text=True, check=True)
+        expected = "x".join(probe.stdout.split())
+        result = compile_and_run("log(`${screenWidth}x${screenHeight}`)", env={"DISPLAY": x_display})
+        assert result.returncode == 0
+        assert result.stdout.strip() == expected
+
+    def test_set_client_size_updates_client_size_headlessly(self, compile_and_run, monkeypatch):
+        # No window needed at all -- setClientWidth/setClientHeight
+        # update the canvas's own size synchronously regardless of
+        # whether a window even exists yet (claude.md #139's own
+        # "deliberately synchronous and self-contained" design note).
+        monkeypatch.delenv("DISPLAY", raising=False)
+        source = ("log(`${clientWidth}x${clientHeight}`)\n"
+                   "setClientWidth(400)\nsetClientHeight(300)\n"
+                   "log(`${clientWidth}x${clientHeight}`)")
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["800x600", "400x300"]
+
+    def test_set_client_size_ignores_non_positive_values(self, compile_and_run, monkeypatch):
+        # Matches festina_check_image_size's own "no image nothing could
+        # ever draw to" reasoning, applied to the canvas itself -- a
+        # non-positive size is silently ignored, not a runtime failure.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        source = ("setClientWidth(0)\nsetClientHeight(-5)\n"
+                   "log(`${clientWidth}x${clientHeight}`)")
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "800x600"
+
+    def test_set_client_size_resizes_the_open_window_and_fires_on_resize_exactly_once_each(
+            self, run_graphics_program, x_display):
+        # claude.md #139's own regression: two setClientWidth/
+        # setClientHeight calls back-to-back on an open window must fire
+        # `on resize` exactly twice (once per call), not four times --
+        # which is what a naive "does the incoming event's size match
+        # current state" dedup guard actually produced against real X11
+        # (two separate, non-coalesced ConfigureNotify echoes, the first
+        # carrying a stale intermediate geometry that fooled the size
+        # check into treating the second echo as novel too). Confirmed
+        # via a real Xvfb run before landing the fix -- see
+        # festina_handle_window_event's g_pending_self_resizes counter
+        # in festina_runtime_graphics.c, which counts owed echoes rather
+        # than comparing geometry.
+        source = (
+            "int resizeCount = 0\n"
+            "on resize() {\n"
+            "    resizeCount = resizeCount + 1\n"
+            "    log(`resized to ${clientWidth}x${clientHeight}, count=${resizeCount}`)\n"
+            "}\n"
+            "render()\n"
+            "setClientWidth(500)\n"
+            "setClientHeight(350)\n"
+            "log(`after: ${clientWidth}x${clientHeight}`)\n"
+        )
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            _find_window(x_display)
+            text = _wait_for_output(stdout_path, lambda t: "after:" in t)
+            expected = [
+                "resized to 500x600, count=1",
+                "resized to 500x350, count=2",
+                "after: 500x350",
+            ]
+            assert text.splitlines() == expected
+            # Give any spurious extra echo (the regression this guards
+            # against) a real chance to arrive before declaring victory.
+            time.sleep(0.5)
+            with open(stdout_path) as f:
+                assert f.read().splitlines() == expected, "a spurious extra `on resize` fired"
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
 class TestExampleGraphicsAndGame:
     """Interactive regression coverage for examples/graphics.f and
     examples/tic_tac_toe.f -- the two examples that need a real (or

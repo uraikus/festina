@@ -418,3 +418,52 @@ void festina_window_events_drain(void (*handler)(const FestinaWindowEvent *event
         }
     }
 }
+
+/* claude.md #139: screenWidth/screenHeight and setClientWidth/
+ * setClientHeight's macOS half of the seam -- see
+ * festina_runtime_window.h's own doc comment for what each function
+ * is responsible for. Built the same way the rest of this file's
+ * Cocoa backend was: real X11 code ported to the equivalent Cocoa
+ * call, unverified on real macOS hardware yet (see macos.md's own
+ * "verify later on real hardware" note, which this inherits). */
+void festina_window_screen_size(int64_t *out_width, int64_t *out_height) {
+    @autoreleasepool {
+        /* mainScreen -- the screen actually holding the active window,
+         * or the system's designated primary screen if nothing is key
+         * yet, matching the "just tell me the display's resolution"
+         * intent this call exists for. Reported in POINTS, not backing
+         * pixels, consistent with every other size this backend already
+         * hands to/from Festina code (festina_window_open's own width/
+         * height are points too -- there's no backingScaleFactor
+         * handling anywhere in this file), so a Retina display's
+         * doubled pixel density doesn't leak through as a mismatched
+         * unit here. */
+        NSScreen *screen = [NSScreen mainScreen];
+        if (!screen) {
+            *out_width = 0;
+            *out_height = 0;
+            return;
+        }
+        NSRect frame = [screen frame];
+        *out_width = (int64_t)frame.size.width;
+        *out_height = (int64_t)frame.size.height;
+    }
+}
+
+void festina_window_resize(int64_t width, int64_t height) {
+    @autoreleasepool {
+        if (!g_window) return;
+        NSSize size;
+        size.width = (CGFloat)width;
+        size.height = (CGFloat)height;
+        /* display:YES -- forces the resize (and the windowDidResize:
+         * delegate callback it triggers, which is what actually
+         * produces the RESIZE event -- see the delegate method above)
+         * to take effect synchronously here, rather than coalescing
+         * into AppKit's next natural display pass, matching the
+         * synchronous XFlush-after-resize behavior the X11
+         * implementation of this same function already has. */
+        [g_window setContentSize:size];
+        [g_window displayIfNeeded];
+    }
+}

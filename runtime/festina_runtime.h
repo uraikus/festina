@@ -609,6 +609,16 @@ void festina_register_resize_handler(void (*handler)(void));
 void festina_register_close_handler(void (*handler)(void));
 int64_t festina_client_width(void);
 int64_t festina_client_height(void);
+/* claude.md #139: screenWidth/screenHeight -- the physical display's
+ * own resolution (through the windowing seam, festina_window_screen_
+ * size), and setClientWidth/setClientHeight -- resizes the canvas
+ * (and, if a window is open, the real OS window too), synchronously,
+ * whether or not a window exists yet. See festina_runtime_graphics.c's
+ * own comments on festina_set_client_size for the full design. */
+int64_t festina_screen_width(void);
+int64_t festina_screen_height(void);
+void festina_set_client_width(int64_t width);
+void festina_set_client_height(int64_t height);
 
 /*
  * setTimeout/setInterval/clearTimeout/clearInterval -- claude.md #69.
