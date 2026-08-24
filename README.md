@@ -193,9 +193,10 @@ bin/festina compile examples/tic_tac_toe.f -o tic_tac_toe && ./tic_tac_toe
 | [`audio.f`](examples/audio.f) | `aud` from a path, `.play()`/`.stop()`/`.isPlaying()`, channels, with a tiny bundled WAV |
 | [`files.f`](examples/files.f) | `blob` — a file's bytes, its methods, `save`/`saveCopy`, and what sharing one means |
 | [`tic_tac_toe.f`](examples/tic_tac_toe.f) | The game above — graphics, global game state, and win-checking logic together |
+| [`layers.f`](examples/layers.f) | `arr[img]` as a layer stack — each layer modified by its own drawing methods, one function compositing all of them every frame |
 
 Every one of these is compiled and checked by the test suite on every
-change (`tests/test_examples.py` and, for the two needing a display,
+change (`tests/test_examples.py` and, for the three needing a display,
 `tests/test_codegen.py::TestExampleGraphicsAndGame`) — they're not just
 snippets that happened to work once.
 
@@ -213,7 +214,7 @@ frame about twice as fast as Chromium's.
 ## Project status
 
 The compiler frontend, LLVM codegen backend, and native C runtime are
-real and tested: **1543 tests, 0 failures** (8 more skip cleanly when
+real and tested: **1545 tests, 0 failures** (8 more skip cleanly when
 their optional tooling isn't installed — see
 [setup.md](setup.md#running-the-test-suite)). Every language construct
 in the [specification](claude.md) is implemented end to end, not just

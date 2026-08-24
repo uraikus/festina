@@ -67,52 +67,52 @@ failing — see [setup.md](setup.md) for what each one needs.
 ## Results
 
 <!-- BENCHMARK_RESULTS_START -->
-_Last run: 2026-08-16 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
+_Last run: 2026-08-24 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
 
 ### `hello`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 1.2 ms | 65.3 ms | 1.45 MB |
-| Rust | 1.4 ms | 73.1 ms | 3.77 MB |
-| Go | 1.3 ms | 147.5 ms | 2.11 MB |
-| Bun | 9.3 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 1.4 ms | 70.9 ms | 1.46 MB |
+| Rust | 1.5 ms | 97.0 ms | 3.77 MB |
+| Go | 1.3 ms | 320.1 ms | 2.11 MB |
+| Bun | 10.6 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `fib`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 7.2 ms | 71.5 ms | 1.45 MB |
-| Rust | 8.8 ms | 83.3 ms | 3.77 MB |
-| Go | 13.7 ms | 131.7 ms | 2.11 MB |
-| Bun | 28.0 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 7.6 ms | 76.5 ms | 1.46 MB |
+| Rust | 8.1 ms | 105.6 ms | 3.77 MB |
+| Go | 14.5 ms | 241.9 ms | 2.11 MB |
+| Bun | 28.5 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `loop_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 551.1 ms | 80.1 ms | 1.45 MB |
-| Rust | 582.0 ms | 85.9 ms | 3.77 MB |
-| Go | 533.2 ms | 138.3 ms | 2.11 MB |
-| Bun | 10474.8 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 518.4 ms | 161.2 ms | 1.46 MB |
+| Rust | 525.0 ms | 132.1 ms | 3.77 MB |
+| Go | 460.5 ms | 483.8 ms | 2.11 MB |
+| Bun | 9082.7 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `array_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 98.5 ms | 87.7 ms | 1.45 MB |
-| Rust | 98.7 ms | 101.5 ms | 3.77 MB |
-| Go | 98.7 ms | 134.4 ms | 2.11 MB |
-| Bun | 2455.5 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 92.2 ms | 344.7 ms | 1.47 MB |
+| Rust | 90.3 ms | 234.0 ms | 3.77 MB |
+| Go | 87.9 ms | 167.9 ms | 2.11 MB |
+| Bun | 2393.8 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `string_concat`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 3.5 ms | 73.8 ms | 1.45 MB |
-| Rust | 1.3 ms | 99.4 ms | 3.77 MB |
-| Go | 28.2 ms | 129.5 ms | 2.11 MB |
-| Bun | 11.3 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 3.6 ms | 73.3 ms | 1.46 MB |
+| Rust | 1.7 ms | 182.6 ms | 3.77 MB |
+| Go | 30.2 ms | 151.0 ms | 2.11 MB |
+| Bun | 12.7 ms | n/a (JIT, no separate build step) | n/a |
 
 <!-- BENCHMARK_RESULTS_END -->
 
@@ -206,7 +206,7 @@ _Last run: 2026-08-16 on this machine -- see benchmark.md's "Methodology" sectio
 ## Canvas: Festina vs an HTML `<canvas>` vs MonoGame
 
 <!-- CANVAS_RESULTS_START -->
-_Last run: 2026-08-16 on this machine. Chromium 141.0.7390.37._
+_Last run: 2026-08-24 on this machine. Chromium 141.0.7390.37._
 
 20,000 filled rectangles and 20,000 filled circles, fill colour changed
 between every shape, into an 800x600 surface. Both sides draw
@@ -218,9 +218,9 @@ which documents what each one cost when it was measured the other way.
 
 | | Frame (min) | Frame (median) | First frame |
 |---|---|---|---|
-| Festina (Cairo) | 31 ms | 32 ms | 16 ms (process start + PNG encode) |
-| HTML `<canvas>` (Chromium/Skia) | 60 ms | 62 ms | 240 ms (browser launch) |
-| MonoGame (SpriteBatch, **software** GL) | 181 ms | 410 ms | 166 ms (.NET runtime + GL context) |
+| Festina (Cairo) | 37 ms | 39 ms | 24 ms (process start + PNG encode) |
+| HTML `<canvas>` (Chromium/Skia) | 97 ms | 110 ms | 429 ms (browser launch) |
+| MonoGame (SpriteBatch, **software** GL) | 252 ms | 270 ms | 181 ms (.NET runtime + GL context) |
 
 > **The MonoGame row needs its caveat read before its number.**
 > MonoGame is a GPU framework, and this machine has no GPU — its GL
@@ -242,7 +242,7 @@ which documents what each one cost when it was measured the other way.
 > not as a figure precise to the millisecond the way the other two
 > rows are.
 
-On this workload **Festina draws it 1.9x faster**.
+On this workload **Festina draws it 2.6x faster**.
 
 That took one change, and finding it took measuring rather than
 guessing. The first version of this benchmark had Festina 1.4x SLOWER,
@@ -258,19 +258,25 @@ frame from 90 ms to 31 ms (claude.md #104). The remaining split is
 20,000 times is too cheap to measure.
 
 Two things are worth reading alongside the headline. The browser's frame
-time is far noisier -- 60 ms at best against a 62 ms median here, and
+time is far noisier -- 97 ms at best against a 110 ms median here, and
 the median moves by 20+ ms between runs of this same script, while
-Festina's two numbers (31 and 32 ms) sit on top of each other. For a
+Festina's two numbers (37 and 39 ms) sit on top of each other. For a
 frame budget, predictability is not a footnote. And getting to the
 *first* frame differs by more than an order of magnitude in the same
 direction, because one side starts a process and the other starts a
 browser.
 
 Both outputs were compared cell-by-cell over a 16x16 grid to confirm
-they drew the same scene -- worst per-channel difference 0.2 out of 255.
-Not byte-for-byte: Cairo and Skia disagree about antialiasing on every
-curve, and demanding identical bytes would only prove the two
-rasterizers are the same program. The check has already earned itself
-once, catching a bug in this very script that left one side comparing a
-blank canvas.
+they drew the same scene -- worst per-channel difference 0.2 out
+of 255. Not byte-for-byte: Cairo and Skia disagree about antialiasing on
+every curve, and demanding identical bytes would only prove the two
+rasterizers are the same program. The check has earned itself twice
+now: once catching a bug in this very script that left one side
+comparing a blank canvas, and again catching itself comparing raw RGB
+without accounting for alpha -- Festina's own offscreen canvas starts
+transparent (api.md's own "a fresh or cleared canvas is transparent,
+not white"), so a background pixel neither side actually drew on read
+as black here against the browser harness's own opaque white fill,
+which the comparison mistook for a real rendering difference until it
+started compositing both sides onto the same white background first.
 <!-- CANVAS_RESULTS_END -->
