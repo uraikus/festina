@@ -67,7 +67,12 @@
 > offscreen-graphics-only program is copy-anywhere with no MSYS2
 > install needed to *run* it), a real Windows section in `setup.md`,
 > and a windows CI packaging+smoke-test step mirroring linux/macos.
-> Every phase this plan named is now built and CI-verified -- what
+> Every phase this plan named is now built and CI-verified, packaging
+> included -- the packaging step itself took four real Windows CI
+> rounds to actually reach (its own `$OSTYPE`-based platform detection
+> silently never matched under this project's exact shell wrapper,
+> fixed by switching to `$MSYSTEM`, already proven elsewhere in this
+> codebase), but the fourth round ran it for real and went green. What
 > remains everywhere real-hardware verification is still open is the
 > same thing it has been since Phase 1: an actual Windows machine to
 > confirm audio playback and windowed graphics on, which this project
