@@ -120,6 +120,17 @@ while i < 400 {
     cbks.push(cbk)
     total = total + cbk.fn(i) + cbks[0].fn(i)
 
+    // claude.md #142: the same struct field, this time holding an
+    // ARROW function's own synthesized function -- one Callback per
+    // iteration, each pointing at the SAME underlying synthesized
+    // function (there's only ever one, compiled once; see codegen.py's
+    // own `decl.name not in self.func_decls` guard), so this also
+    // proves re-storing the identical func value thousands of times
+    // never double-registers or double-emits it.
+    Callback arrowCbk
+    arrowCbk.fn = int (x:int) => x + 1
+    total = total + arrowCbk.fn(i)
+
     // Query rows: text columns, null columns, and the whole array
     // released together at scope exit.
     arr[Person] rows = sqlite('SELECT * FROM Person LIMIT 20')

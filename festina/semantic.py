@@ -524,6 +524,18 @@ def analyze(program, filename="<string>"):
     tables = {}
     imports = []
     entry_filename = filename  # see the DatabaseURL check at the bottom
+    # claude.md #142: one monotonic counter for every arrow-function
+    # expression's own synthesized name (__festina_arrow_N) -- a plain
+    # int, not a list-wrapped closure cell, since every read/increment
+    # happens through the single next_arrow_name() closure below rather
+    # than needing `nonlocal` at each call site.
+    _arrow_counter = 0
+
+    def next_arrow_name():
+        nonlocal _arrow_counter
+        name = f"__festina_arrow_{_arrow_counter}"
+        _arrow_counter += 1
+        return name
 
     # claude.md #39/#139: clientWidth/clientHeight/screenWidth/screenHeight,
     # see _SIZE_GLOBALS above.
@@ -708,6 +720,48 @@ def analyze(program, filename="<string>"):
                     seen_literal_keys[key_expr.value] = key_expr
                 value_type = infer(val_expr, scope)
             return types_mod.MapType(value_type) if value_type is not None else None
+        if isinstance(expr, ast.ArrowFuncExpr):
+            # claude.md #142: `void (arg:text) => log(arg)` compiles to
+            # an ordinary, synthesized top-level function
+            # (__festina_arrow_N(arg:text) { log(arg) }), with the
+            # arrow expression itself evaluating to a func[...]:...
+            # VALUE referring to it -- "arrow functions compile to
+            # regular functions," the request's own framing. Built and
+            # analyzed HERE, once, synchronously -- NOT through claude.md
+            # #140's whole-program hoisting pre-pass, which an arrow
+            # function has no use for at all: it has no name a forward
+            # reference could ever spell (its synthesized name is
+            # invisible to Festina source), so the synthesized FuncDecl
+            # only ever needs to exist by the time this expression
+            # itself is reached, never any earlier.
+            param_types = tuple(resolve(p.type_expr, expr) for p in expr.params)
+            return_type = None if expr.return_type == "void" else resolve(expr.return_type, expr)
+            # claude.md #23's own void-vs-non-void rules already reject
+            # `return <value>` inside a void function -- so a void arrow
+            # function's body expression becomes a bare ExprStmt
+            # (evaluated for its side effects, result discarded), not
+            # literally `return <expr>` the way the request's own
+            # comment shows it (a simplification in the request's own
+            # wording that would not actually typecheck as written --
+            # see claude.md #142's own log entry). A non-void arrow
+            # function's body IS `return <expr>`, matching the
+            # request's example exactly for that case.
+            if return_type is None:
+                body_block = ast.Block([ast.ExprStmt(expr.body)])
+            else:
+                body_block = ast.Block([ast.Return(expr.body, expr.line, expr.column)])
+            decl = ast.FuncDecl(next_arrow_name(), expr.return_type, expr.params,
+                                 body_block, expr.line, expr.column)
+            register_func_signature(decl)
+            analyze_func(decl)
+            # claude.md #142: codegen.py re-walks this SAME AST object
+            # (see festina/cli.py's compile_file) -- stashing the
+            # synthesized FuncDecl here is what lets it emit the exact
+            # same function codegen needs, rather than re-synthesizing
+            # an independent (and, absent careful coordination,
+            # possibly desynced) name of its own.
+            expr.decl = decl
+            return types_mod.FuncType(param_types, return_type)
         if isinstance(expr, ast.Identifier):
             # claude.md #71: `environment` alone means nothing -- only
             # environment.NAME/environment[keyExpr] do (see

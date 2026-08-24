@@ -278,6 +278,22 @@ def _walk_expr(expr, escaping, escaping_params):
                     continue
             _walk_expr(a, escaping, escaping_params)
         return
+    if isinstance(expr, ast.ArrowFuncExpr):
+        # claude.md #142: a deliberate no-op, not an oversight -- unlike
+        # every other expression kind here, this one has NOTHING to
+        # contribute to the ENCLOSING function's own escaping-names set.
+        # Its body is analyzed and emitted in a completely separate
+        # scope (semantic.py's analyze_func always parents a function's
+        # own scope at global_scope, regardless of how deeply that
+        # function is nested or where it's declared from -- claude.md
+        # #140/#141's own "no closures" design), so no name inside an
+        # arrow function's body could ever alias one of THIS function's
+        # own local candidates -- there is no lexical connection between
+        # the two scopes at all. The arrow function's OWN body gets its
+        # OWN, entirely separate find_escaping_names call, the same way
+        # any other nested FuncDecl's body does (see codegen.py's
+        # _emit_analyzed_func_body).
+        return
     raise AssertionError(
         f"escape_analysis: unhandled expression node {type(expr).__name__} -- "
         f"every ast.py expression type must be taught to this module (see its "

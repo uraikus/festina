@@ -4598,6 +4598,104 @@ class TestFirstClassFunctions:
         assert result.stdout.splitlines() == ["42", "freed ok"]
 
 
+class TestArrowFunctions:
+    """claude.md #142: `returnType (params) => expr` -- an arrow
+    function expression, desugaring to a synthesized, uniquely-named
+    top-level function (compiling to a regular function, per the
+    request's own framing) whose func[...]:... value is the arrow
+    expression's own result. tests/test_syntax_declarations.py's own
+    TestArrowFunctionSyntax/TestArrowFunctions cover parsing and
+    semantic analysis; these compile and RUN the equivalent programs."""
+
+    def test_a_void_arrow_function_assigned_and_called(self, compile_and_run):
+        source = """
+        func[text]:void cb = void (arg:text) => log(arg)
+        cb('hello arrow')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "hello arrow"
+
+    def test_a_non_void_arrow_functions_body_expression_is_its_return_value(self, compile_and_run):
+        source = """
+        func[int]:int sq = int (x:int) => x * x
+        log(sq(7))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "49"
+
+    def test_an_arrow_function_used_directly_as_a_call_argument(self, compile_and_run):
+        source = """
+        void func apply(fn:func[text]:void, arg:text) { fn(arg) }
+        apply(void (arg:text) => log(arg), 'inline arrow')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "inline arrow"
+
+    def test_arrow_functions_in_a_struct_field_array_and_map(self, compile_and_run):
+        source = """
+        struct Holder { cb:func[text]:void }
+        Holder h
+        h.cb = void (arg:text) => log(`struct: ${arg}`)
+        h.cb('via struct')
+
+        arr[func[int]:int] fns = [int (x:int) => x + 1, int (x:int) => x - 1]
+        log(fns[0](10))
+        log(fns[1](10))
+
+        map[func[text]:void] handlers
+        handlers['a'] = void (arg:text) => log(`map: ${arg}`)
+        handlers['a']('via map')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == [
+            "struct: via struct", "11", "9", "map: via map",
+        ]
+
+    def test_two_arrow_functions_at_different_expression_positions_stay_independent(self, compile_and_run):
+        # Each arrow expression synthesizes its own uniquely-named
+        # function -- calling one must never reach the other's body.
+        source = """
+        func[int]:int inc = int (x:int) => x + 1
+        func[int]:int dec = int (x:int) => x - 1
+        log(inc(10))
+        log(dec(10))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["11", "9"]
+
+    def test_referencing_an_enclosing_functions_local_variable_is_a_compile_error(
+            self, parser, semantic, errors):
+        # claude.md #142: no closures -- a CompileError, raised during
+        # semantic analysis itself, so this is checked the same way
+        # every other compile-time rejection in this file is (not via
+        # compile_and_run, which expects the compile to succeed).
+        source = """
+        void func outer() {
+            int localVar = 42
+            func[text]:void cb = void (arg:text) => log(`${arg} ${localVar}`)
+        }
+        outer()
+        """
+        program = parser.parse(source, filename="main.f")
+        with pytest.raises(errors.CompileError, match="unknown variable"):
+            semantic.analyze(program, filename="main.f")
+
+    def test_referencing_a_top_level_global_variable_works(self, compile_and_run):
+        source = """
+        int globalCount = 42
+        func[text]:void cb = void (arg:text) => log(`${arg} ${globalCount}`)
+        cb('x')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "x 42"
+
+
 def _find_window(display, timeout=20):
     # A window actually appears in ~0.2s, measured, consistently -- this
     # timeout is generous insurance, not a figure anything is expected

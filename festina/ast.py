@@ -345,3 +345,31 @@ class Call(Node):
         self.args = args
         self.line = line
         self.column = column
+
+
+class ArrowFuncExpr(Node):
+    """`returnType (params) => expr` -- claude.md #142. `params` is a
+    list of ast.Param, the identical shape a FuncDecl's own params
+    list already is; `return_type` is either the literal string
+    "void" or a type expression, the same convention FuncDecl.
+    return_type already uses. `body` is a single EXPRESSION (not a
+    Block/statement list) -- the whole point of the arrow spelling.
+
+    `decl` starts as None and is filled in by semantic.py's analyze()
+    the first (and only) time this node is analyzed: a synthesized,
+    uniquely-named ast.FuncDecl wrapping `body` in a Block (`return
+    body` for a non-void return type, a bare ExprStmt for void --
+    see analyze()'s own comment on why "void" doesn't literally do
+    `return <void-typed-expr>`, which claude.md #23's existing rules
+    already reject). codegen.py re-walks this SAME AST object (see
+    festina/cli.py's compile_file), so it reads `decl` back directly
+    rather than re-synthesizing an independent (and, absent careful
+    coordination, possibly desynced) name of its own."""
+
+    def __init__(self, params, return_type, body, line=0, column=0):
+        self.params = params
+        self.return_type = return_type
+        self.body = body
+        self.decl = None
+        self.line = line
+        self.column = column

@@ -2949,6 +2949,27 @@ class CodeGen:
             return out, REGEX
         if isinstance(expr, ast.TemplateLit):
             return self._emit_template(expr, env, lines), TEXT
+        if isinstance(expr, ast.ArrowFuncExpr):
+            # claude.md #142: semantic.py's own ArrowFuncExpr handling
+            # already built and fully analyzed `expr.decl` (a
+            # synthesized, uniquely-named ast.FuncDecl) and stashed it
+            # on this SAME AST node -- codegen re-walks the identical
+            # object (see festina/cli.py's compile_file), so this reads
+            # it back directly rather than re-synthesizing an
+            # independent name. Registered and emitted HERE, once
+            # (guarded by self.func_decls, the same "already emitted?"
+            # check every other synthesized-function site in this file
+            # already uses), rather than through generate()'s own
+            # whole-program pre-pass -- an arrow function has no name
+            # anything could forward-reference, so it only ever needs
+            # to exist by the time this expression itself is emitted.
+            decl = expr.decl
+            if decl.name not in self.func_decls:
+                self._register_func_signature(decl)
+                self._emit_func(decl)
+            param_types = tuple(self._resolve(p.type_expr, decl) for p in decl.params)
+            ret_type = None if decl.return_type == "void" else self._resolve(decl.return_type, decl)
+            return f"@{decl.name}", types_mod.FuncType(param_types, ret_type)
         if isinstance(expr, ast.Identifier):
             # claude.md #39: clientWidth/clientHeight -- a bare
             # identifier, not a Call, so this can't go through the usual

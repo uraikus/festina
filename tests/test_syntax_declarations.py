@@ -126,6 +126,68 @@ class TestFuncTypeSyntax:
             parser.parse("func sayHello() { log(1) }")
 
 
+class TestArrowFunctionSyntax:
+    """claude.md #142: `returnType (params) => expr` -- an anonymous
+    function expression, usable wherever a func[...]:... value is
+    expected. Parser-level only; tests/test_syntax_declarations.py's
+    own TestArrowFunctions covers semantic analysis and tests/
+    test_codegen.py's covers compiling and running programs that use
+    one."""
+
+    def test_void_arrow_function_parses(self, parser):
+        parser.parse("func[text]:void cb = void (arg:text) => log(arg)")
+
+    def test_typed_return_arrow_function_parses(self, parser):
+        parser.parse("func[int]:int sq = int (x:int) => x * x")
+
+    def test_zero_argument_arrow_function_parses(self, parser):
+        parser.parse("func[]:void cb = void () => log('hi')")
+
+    def test_multi_argument_arrow_function_parses(self, parser):
+        parser.parse("func[int, int]:int add = int (a:int, b:int) => a + b")
+
+    def test_as_a_call_argument_parses(self, parser):
+        source = """
+        void func apply(fn:func[text]:void, arg:text) { fn(arg) }
+        apply(void (arg:text) => log(arg), 'hi')
+        """
+        parser.parse(source)
+
+    def test_as_an_array_element_parses(self, parser):
+        parser.parse("arr[func[int]:int] fns = [int (x:int) => x + 1]")
+
+    def test_a_struct_return_type_is_still_unambiguous_with_a_call(self, parser):
+        # claude.md #142's own real bug, caught directly: an
+        # unconditional _type_expr_end lookahead misidentified `log(x)`
+        # itself as an arrow-function start (the `log` keyword token
+        # isn't `IDENT`, so a naive "return type followed by LPAREN"
+        # check alone let it through) -- this guards the fix, and the
+        # struct-return-type-vs-plain-call ambiguity right below it
+        # guards the OTHER direction (an IDENT return type genuinely IS
+        # ambiguous with an ordinary call, so that path needs real
+        # lookahead, not just a token-type exemption).
+        source = """
+        struct Point { x:int, y:int }
+        Point func makePoint(x:int, y:int) { Point p  p.x = x  p.y = y  return p }
+        log(makePoint(1, 2).x)
+        func[int]:Point make1D = Point (x:int) => makePoint(x, x)
+        """
+        parser.parse(source)
+
+    def test_ordinary_builtin_and_function_calls_are_unaffected(self, parser):
+        # claude.md #142's own regression guard, directly: log(x) (and
+        # every other ordinary call) must keep parsing as a call, not
+        # get misidentified as an arrow-function start.
+        source = """
+        void func greet(name:text) { log(name) }
+        log('hi')
+        log(greet('x'))
+        int func add(a:int, b:int) { return a + b }
+        int y = add(1, 2)
+        """
+        parser.parse(source)
+
+
 class TestFunctionHoisting:
     """claude.md #140: a function is registered (name and signature)
     everywhere in the program before the real analysis pass ever checks
@@ -385,6 +447,99 @@ class TestFirstClassFunctions:
             func[text]:text greet = other
             log(greet('shadowed'))
         }
+        """
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+
+class TestArrowFunctions:
+    """claude.md #142: `returnType (params) => expr` compiles to an
+    ordinary, synthesized function -- the arrow expression itself
+    evaluates to a func[...]:... value referring to it, reusing claude.md
+    #141's entire first-class-function machinery (assignability,
+    indirect calls, argument passing) with no special-casing."""
+
+    def test_assigning_a_matching_arrow_function_is_valid(self, parser, semantic):
+        source = "func[text]:void cb = void (arg:text) => log(arg)"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_calling_through_the_variable_is_valid(self, parser, semantic):
+        source = """
+        func[text]:void cb = void (arg:text) => log(arg)
+        cb('world')
+        """
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_a_non_void_arrow_functions_body_is_its_return_value(self, parser, semantic):
+        source = """
+        func[int]:int sq = int (x:int) => x * x
+        log(sq(7))
+        """
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_passing_an_arrow_function_as_an_argument_is_valid(self, parser, semantic):
+        source = """
+        void func apply(fn:func[text]:void, arg:text) { fn(arg) }
+        apply(void (arg:text) => log(arg), 'hi')
+        """
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_storing_in_a_struct_field_is_valid(self, parser, semantic):
+        source = """
+        struct Holder { cb:func[text]:void }
+        Holder h
+        h.cb = void (arg:text) => log(arg)
+        h.cb('yo')
+        """
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_a_mismatched_signature_is_rejected(self, parser, semantic, errors):
+        source = "func[int]:void cb = void (arg:text) => log(arg)"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match="cannot assign"):
+            semantic.analyze(program)
+
+    def test_a_mismatched_body_return_type_is_rejected(self, parser, semantic, errors):
+        # Reuses analyze_func's own existing Return-checking machinery
+        # unchanged -- no arrow-specific type-checking code exists at
+        # all for this.
+        source = "func[int]:int f = int (x:int) => 'nope'"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match="cannot assign return value"):
+            semantic.analyze(program)
+
+    def test_referencing_an_enclosing_functions_local_variable_is_rejected(self, parser, semantic, errors):
+        # claude.md #142: no closures -- an arrow function's own body is
+        # analyzed in a scope parented at global_scope, exactly like
+        # analyze_func already does for every function regardless of
+        # nesting (claude.md #140/#141), so a TRUE local (as opposed to
+        # a top-level global, which every function -- arrow or not --
+        # can already see) from an enclosing function is unreachable.
+        source = """
+        void func outer() {
+            int localVar = 42
+            func[text]:void cb = void (arg:text) => log(`${arg} ${localVar}`)
+        }
+        """
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match="unknown variable"):
+            semantic.analyze(program)
+
+    def test_referencing_a_top_level_global_variable_is_valid(self, parser, semantic):
+        # Unlike the local-variable case just above: a top-level
+        # declaration is a genuine GLOBAL (its own LLVM @name), visible
+        # to any function at all, arrow or ordinary -- this isn't a
+        # closure, it's the same visibility any named function already
+        # has into a top-level variable.
+        source = """
+        int globalCount = 42
+        func[text]:void cb = void (arg:text) => log(`${arg} ${globalCount}`)
+        cb('x')
         """
         program = parser.parse(source)
         semantic.analyze(program)

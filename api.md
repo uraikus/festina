@@ -198,6 +198,33 @@ argument is unaffected by any of this: it's still the bare name of a
 zero-parameter, `void`-returning function specifically, not an
 arbitrary `func[...]:...`-typed expression.
 
+**Arrow functions** — `returnType (params) => expr` — are an anonymous
+function VALUE, compiling to an ordinary function with a compiler-
+generated name; the arrow expression itself evaluates to a
+`func[...]:...` reference to it, usable anywhere the plain-function
+examples above are:
+
+```festina
+func[text]:void cb = void (arg:text) => log(arg)
+cb('world')                                        // "world"
+
+func[int]:int sq = int (x:int) => x * x
+log(sq(7))                                         // 49
+
+void func apply(fn:func[text]:void, arg:text) { fn(arg) }
+apply(void (arg:text) => log(arg), 'hi')           // "hi"
+```
+
+A `void`-returning arrow function's body is a plain expression, run
+for its side effects with its own value discarded (there's no `return`
+inside a void function's body to write, arrow or not); a non-void
+one's body IS its return value, no `return` keyword needed. Arrow
+functions have no closures either, for the identical reason plain
+functions don't: `void (arg:text) => log(`${arg} ${x}`)` compiles
+correctly only if `x` is a top-level global (itself visible to every
+function already) — a genuinely local variable from wherever the arrow
+expression is written is not reachable from inside it.
+
 **Functions are hoisted** — every function's name and signature exists
 everywhere in the program, so calling one from above its own
 declaration (including mutual recursion between two functions, each
