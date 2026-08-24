@@ -1263,6 +1263,34 @@ back.save('recovered.dat')            // now it has one
 log(back.exists())                    // true
 ```
 
+## Directories
+
+```festina
+bool created = mkdir('./temp')        // -> bool: true if IT created it
+arr[text] names = ls('./temp')        // -> arr[text] of entry names
+```
+
+`mkdir(path)` answers `true` only if it actually created the directory
+— `false` for every other outcome, including "it already existed", a
+missing parent, or no permission. Like the file builtins, nothing here
+fails the program:
+
+```festina
+mkdir('./temp')                       // true
+mkdir('./temp')                       // false -- already there
+```
+
+`ls(path)` answers the directory's entry names (not full paths, and
+never `.`/`..`) as `arr[text]`, in whatever order the OS hands them
+back. A missing or unreadable directory answers an empty array rather
+than failing:
+
+```festina
+arr[text] names = ls('./temp')
+log(names.length)
+log(ls('./nowhere').length)           // 0
+```
+
 ## Freeing and deleting
 
 Memory is automatic — but `free` and `delete` exist for the moments you

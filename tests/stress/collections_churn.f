@@ -1,7 +1,12 @@
-// claude.md #79/#80/#81/#96/#97/#102: arrays and maps, grown, drained,
-// nested, aliased and reclaimed thousands of times.
+// claude.md #79/#80/#81/#96/#97/#102/#132: arrays and maps, grown,
+// drained, nested, aliased and reclaimed thousands of times.
 
 struct Item { id:int name:text tags:arr[text] }
+
+// claude.md #132: mkdir() is idempotent -- calling it thousands of
+// times only ever creates the directory once, everything after answers
+// false rather than failing.
+mkdir('./stress_dir')
 
 arr[int] func squares(n:int) {
     arr[int] out = []
@@ -21,6 +26,16 @@ while i < 1500 {
     arr[int] removed = xs.splice(2, 3)
     total = total + removed.length + xs.pop() + xs.shift()
     total = total + xs.indexOf(7)
+
+    // claude.md #132: mkdir()/ls() -- a bounded working set (20 names
+    // cycled by index) so ls()'s own allocation loop runs thousands of
+    // times without the directory itself growing without bound.
+    bool alreadyThere = mkdir('./stress_dir')
+    total = total + (alreadyThere ? 1 : 0)
+    blob marker = `./stress_dir/f${i % 20}.txt`
+    marker.write(`${i}`)
+    arr[text] listed = ls('./stress_dir')
+    total = total + listed.length
 
     // A returned array: ownership transfers out of the function.
     arr[int] sq = squares(8)

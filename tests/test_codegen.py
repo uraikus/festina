@@ -11186,6 +11186,64 @@ class TestMathFileAndTime:
                 semantic.analyze(program)
             assert "blob" in str(excinfo.value)
 
+    # ---- filesystem: claude.md #132 ----
+
+    def test_mkdir_reports_creation_versus_already_exists(self, compile_and_run, tmp_path):
+        target = tmp_path / "sub"
+        source = f"""
+        log(mkdir('{target.as_posix()}'))
+        log(mkdir('{target.as_posix()}'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\nfalse\n"
+        assert target.is_dir()
+
+    def test_mkdir_on_an_impossible_path_returns_false_not_a_crash(self, compile_and_run, tmp_path):
+        # No parent directory -- mkdir() is a test, not a failure, the
+        # same claude.md #93 rule blob's own write()/append()/delete()
+        # already follow.
+        target = tmp_path / "missing_parent" / "sub"
+        result = compile_and_run(f"log(mkdir('{target.as_posix()}'))")
+        assert result.returncode == 0
+        assert result.stdout == "false\n"
+        assert not target.exists()
+
+    def test_ls_lists_entry_names_not_full_paths(self, compile_and_run, tmp_path):
+        # A dedicated subdirectory, not tmp_path itself -- compile_and_run
+        # writes main.f/program straight into tmp_path, which would
+        # otherwise show up in the listing too.
+        listed = tmp_path / "listed"
+        listed.mkdir()
+        (listed / "a.txt").write_text("x")
+        (listed / "b.txt").write_text("y")
+        (listed / "sub").mkdir()
+        source = f"""
+        arr[text] names = ls('{listed.as_posix()}')
+        log(names.length)
+        log(names.indexOf('a.txt') >= 0)
+        log(names.indexOf('b.txt') >= 0)
+        log(names.indexOf('sub') >= 0)
+        log(names.indexOf('.') >= 0)
+        log(names.indexOf('..') >= 0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "3\ntrue\ntrue\ntrue\nfalse\nfalse\n"
+
+    def test_ls_on_a_missing_directory_is_an_empty_array_not_a_crash(self, compile_and_run, tmp_path):
+        missing = tmp_path / "does_not_exist"
+        result = compile_and_run(f"log(ls('{missing.as_posix()}').length)")
+        assert result.returncode == 0
+        assert result.stdout == "0\n"
+
+    def test_mkdir_and_ls_require_exactly_one_text_argument(self, parser, semantic, errors):
+        for source in ["mkdir()", "mkdir('a', 'b')", "mkdir(5)",
+                       "ls()", "ls('a', 'b')", "ls(5)"]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
     # ---- time ----
 
     def test_now_and_formatTime(self, compile_and_run):

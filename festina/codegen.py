@@ -994,6 +994,9 @@ class CodeGen:
             "declare i8 @festina_delete_file(ptr)",
             "declare i64 @festina_now_ms()",
             "declare ptr @festina_format_time(i64, ptr)",
+            # claude.md #132
+            "declare i8 @festina_mkdir(ptr)",
+            "declare ptr @festina_ls(ptr)",
             "declare i8 @festina_str_eq(ptr, ptr)",
             # claude.md #70: DatabaseURL -- path is festina.sqlite's
             # location, NULL/empty meaning "use the default" (a plain
@@ -5960,9 +5963,19 @@ class CodeGen:
             # itself (see _emit_blob_method). The C helpers they called
             # are unchanged and still do the work -- what went away is
             # the free-function spelling, not the capability.
+            # claude.md #132: mkdir()/ls() are the identical "one text
+            # arg, one runtime call" shape formatTime/saveCanvas already
+            # are -- mkdir answers bool (claude.md #93's own "a program
+            # tests for this, it doesn't stop the program" rule, same as
+            # a blob's write/append/delete), ls answers a fresh arr[text]
+            # (festina_ls builds it exactly like festina_text_split
+            # does -- see that function's own comment in
+            # festina_runtime.c).
             _FILE_TIME_BUILTINS = {
                 "formatTime": ("festina_format_time", "ptr", TEXT),
                 "saveCanvas": ("festina_save_canvas", "i8", BOOL),
+                "mkdir": ("festina_mkdir", "i8", BOOL),
+                "ls": ("festina_ls", "ptr", types_mod.ArrayType(TEXT)),
             }
             # claude.md #94: paths, transforms, gradients and alpha.
             # All draw onto (or configure) the canvas, so all of them

@@ -41,11 +41,27 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>       /* clock_gettime/nanosleep -- setTimeout/setInterval */
+#include <dirent.h>     /* opendir/readdir/closedir -- claude.md #132's ls().
+                          * POSIX; MinGW-w64 ships its own real <dirent.h>
+                          * providing the identical opendir/readdir/closedir
+                          * shape (a long-standing, widely-relied-on part of
+                          * its POSIX compatibility layer), so this is used
+                          * unconditionally rather than #ifdef'd like
+                          * festina_mkdir below -- unconfirmed by real
+                          * Windows CI yet, same open item every other
+                          * blind-written win32 piece of this runtime has
+                          * had since windows.md Phase 0. */
 #include "festina_runtime.h"
 #include "festina_runtime_internal.h"
 #ifdef _WIN32
+#include <direct.h> /* _mkdir -- claude.md #132's mkdir(), MSVCRT/UCRT's
+                      * own single-argument spelling (no mode bits -- NTFS
+                      * permissions aren't POSIX mode bits, so there is
+                      * nothing a second argument would mean) */
 #include <fcntl.h> /* _O_BINARY -- festina_runtime_init's stdout/stderr fix */
 #include <io.h>    /* _setmode/_fileno -- MSVCRT/UCRT, not POSIX unistd.h */
+#else
+#include <sys/stat.h> /* mkdir(path, mode) -- POSIX */
 #endif
 
 /* windows.md Phase 0 (claude.md #126): the MinGW/UCRT C runtime opens
@@ -372,6 +388,49 @@ void *festina_text_split(const char *s, const char *sep) {
         }
         festina_pieces_push(&p, cursor, (size_t)(found - cursor));
         cursor = found + sep_len;
+    }
+    return festina_pieces_finish(&p);
+}
+
+/* ---- claude.md #132: mkdir()/ls() ----
+ *
+ * mkdir(path) answers a bool -- true if it created the directory, false
+ * for every other outcome (already exists, a missing parent, no
+ * permission, ...), never failing the program. The same "a program
+ * tests for this, it doesn't stop the program over it" choice claude.md
+ * #93 made for the file builtins blob's own methods replaced (claude.md
+ * #109) -- extended here to directories rather than files. */
+int8_t festina_mkdir(const char *path) {
+    if (!path || !*path) return 0;
+#ifdef _WIN32
+    return _mkdir(path) == 0 ? 1 : 0;
+#else
+    return mkdir(path, 0777) == 0 ? 1 : 0;
+#endif
+}
+
+/* ls(path) answers arr[text] of the directory's own entry NAMES (not
+ * full paths, and not "." or ".." -- neither is useful to a program
+ * that wants to iterate what a directory holds), built exactly like
+ * festina_text_split above: the same FestinaPieces accumulator, wrapped
+ * in the same fresh refcounted arr[text] by festina_pieces_finish. A
+ * missing or unreadable directory answers an EMPTY array rather than
+ * failing the program -- the same test-don't-fail choice mkdir() just
+ * above makes, and blob.exists() made before it. */
+void *festina_ls(const char *path) {
+    FestinaPieces p = {NULL, 0, 0};
+    if (path && *path) {
+        DIR *dir = opendir(path);
+        if (dir) {
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != NULL) {
+                if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                    continue;
+                }
+                festina_pieces_push(&p, entry->d_name, strlen(entry->d_name));
+            }
+            closedir(dir);
+        }
     }
     return festina_pieces_finish(&p);
 }

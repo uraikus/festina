@@ -71,6 +71,14 @@ void *festina_regex_split(void *compiled, const char *s);
 char *festina_arr_join(void *arr, const char *sep, const char *kind);
 char *festina_text_own(const char *s);  /* claude.md #83: NULL-safe strdup */
 
+/* claude.md #132: mkdir(path) -> bool (true if IT created the
+ * directory, false for every other outcome, including "already
+ * exists"); ls(path) -> arr[text] of entry names (built exactly like
+ * festina_text_split -- a fresh refcounted array of owned pieces),
+ * empty for a missing/unreadable directory rather than failing. */
+int8_t festina_mkdir(const char *path);
+void *festina_ls(const char *path);
+
 /* claude.md #93: math, files and time -- all libc/libm, both already on
  * every link line, so none of this costs a new dependency.
  *

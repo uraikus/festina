@@ -106,6 +106,11 @@ BUILTIN_FUNCTIONS = {
     # works with or without a window, unlike mouseDown/.../close's on-
     # screen-only handlers.
     "close",
+    # claude.md #132: filesystem builtins -- mkdir() answers a bool
+    # rather than failing (claude.md #93's own "a missing/unwritable
+    # file is something a program tests for" rule, extended to
+    # directories), ls() answers arr[text] of entry names.
+    "mkdir", "ls",
 }
 
 _BUILTIN_RETURN_TYPES = {
@@ -124,6 +129,9 @@ _BUILTIN_RETURN_TYPES = {
     "sqliteInt": types_mod.PrimitiveType("int"),
     "sqliteFloat": types_mod.PrimitiveType("float"),
     "sqliteText": types_mod.PrimitiveType("text"),
+    # claude.md #132
+    "mkdir": types_mod.PrimitiveType("bool"),
+    "ls": types_mod.ArrayType(types_mod.PrimitiveType("text")),
 }
 
 # claude.md #55: int and float never mix directly in a binary operator.
@@ -190,6 +198,9 @@ _BUILTIN_SIGNATURES = {
     "fillRadialGradient": (_INT, _INT, _INT, types_mod.ColorType(), types_mod.ColorType()),
     # claude.md #131
     "close": (_INT,),
+    # claude.md #132
+    "mkdir": (_TEXT,),
+    "ls": (_TEXT,),
 }
 
 # claude.md #90: three builtins accept two different shapes. The
