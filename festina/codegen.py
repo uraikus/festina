@@ -6031,20 +6031,41 @@ class CodeGen:
                 lines.append(f"  {out} = zext i1 {cmp_out} to i8")
                 return out, BOOL
 
-        # claude.md #55: int and float never mix directly -- semantic.py
-        # already rejected a genuine mismatch before codegen ever runs, so
-        # reaching here with different numeric types is a compiler bug,
-        # not a user error; this is a consistency check, not a promotion
-        # (there's no implicit numeric conversion left in this codegen).
-        if left_type in (INT, FLOAT) and right_type in (INT, FLOAT) and left_type != right_type:
-            raise CodegenError(
-                f"internal error: mismatched numeric operands ({left_type!r}, {right_type!r}) "
-                "reached codegen -- semantic analysis should have rejected this",
-                file=self.filename, line=expr.line,
-            )
+        # claude.md #143: int and float now mix freely in any binary
+        # operator -- superseded claude.md #55's old "never mix
+        # directly" rule, and with it this branch's old job (rejecting
+        # a mismatch semantic.py was supposed to have already caught).
+        # A mismatched INT/FLOAT pair reaching here is now the ordinary,
+        # expected case: whichever side is INT gets an implicit sitofp
+        # (the exact same conversion instruction int.toFloat() itself
+        # emits, see just below), "as though .toFloat() had been
+        # written" -- the request's own framing for this whole feature.
+        if left_type == INT and right_type == FLOAT:
+            coerced = self.tmp()
+            lines.append(f"  {coerced} = sitofp i64 {left_val} to double")
+            left_val, left_type = coerced, FLOAT
+        elif left_type == FLOAT and right_type == INT:
+            coerced = self.tmp()
+            lines.append(f"  {coerced} = sitofp i64 {right_val} to double")
+            right_val, right_type = coerced, FLOAT
         use_float = left_type == FLOAT
 
-        if expr.op in ("/", "%"):
+        if expr.op == "/":
+            # claude.md #143: division always returns float, even for
+            # two ints -- coerce BOTH operands to float unconditionally
+            # (the mixing coercion just above only fires when the two
+            # operand types actually differ, which two ints never do)
+            # before handing off to the identical _emit_divmod every
+            # other float division already goes through.
+            if not use_float:
+                left_coerced = self.tmp()
+                lines.append(f"  {left_coerced} = sitofp i64 {left_val} to double")
+                right_coerced = self.tmp()
+                lines.append(f"  {right_coerced} = sitofp i64 {right_val} to double")
+                left_val, right_val = left_coerced, right_coerced
+            out = self._emit_divmod(expr.op, left_val, right_val, True, lines)
+            return out, FLOAT
+        if expr.op == "%":
             out = self._emit_divmod(expr.op, left_val, right_val, use_float, lines)
             return out, (FLOAT if use_float else INT)
 

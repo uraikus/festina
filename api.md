@@ -91,13 +91,43 @@ with `==`/`!=` works as expected, but a null `float` never compares
 equal to `null` via `==`, even to itself — it's a real NaN under the
 hood, and IEEE-754 NaN comparisons are always false).
 
-`int`/`float` never mix implicitly, in arithmetic or comparisons:
+`int` and `float` mix freely in any binary operator — arithmetic,
+comparison, or equality — with the `int` side implicitly promoted to
+`float`, as though `.toFloat()` had been written on it:
 
 ```festina
 int a = 5
 float b = 2.5
-float c = a.toFloat() + b        // int.toFloat() is the only int->float conversion
+float c = a + b          // 7.5 -- a is promoted to float automatically
+bool less = a < b         // false
 ```
+
+`/` (division) always returns `float`, even when both operands are
+`int` — the one operator that promotes unconditionally, not just when
+mixed:
+
+```festina
+int x = 10
+int y = 3
+float z = x / y           // 3.33333 -- not 3
+```
+
+Every other arithmetic operator (`+`, `-`, `*`, `%`) only promotes when
+the two operands actually differ — `int + int` still returns `int`.
+Declaring a variable as `int` from a genuinely `float`-typed expression
+(mixed or from `/`) is still an ordinary type mismatch — the promotion
+changes what an expression evaluates to, not what a declared type
+accepts:
+
+```festina
+int bad = a + b            // compile error -- a + b is float
+```
+
+The only way back from a `float` to an `int` is still the rounding
+four (`Math.floor`/`ceil`/`round`/`trunc`) — `int.toFloat()` is still
+the one-directional `int` → `float` conversion, now mostly redundant
+with the implicit promotion above but still useful for forcing a
+result to `float` explicitly, e.g. inside a template literal.
 
 ```text
 // float -> int (the rounding four)
@@ -132,7 +162,8 @@ Division/modulo by zero return `null` (for both `int` and `float`)
 rather than crashing:
 
 ```festina
-int result = 10 / 0   // null
+float divided = 10 / 0   // null -- / always returns float
+int remainder = 10 % 0    // null -- % still returns int for two ints
 ```
 
 `int`/`float`/`bool` also each have `.toText()`, returning the same

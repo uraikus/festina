@@ -932,11 +932,14 @@ class TestMaps:
 
     def test_missing_key_on_int_map_returns_the_int_null_sentinel(self, compile_and_run):
         # Same null representation int already uses everywhere else
-        # (e.g. division by zero -- claude.md #57) -- not a special
-        # case invented for maps.
-        div_by_zero = compile_and_run("int a = 1\nint b = 0\nlog(a / b)")
+        # (e.g. modulo by zero -- claude.md #57) -- not a special case
+        # invented for maps. claude.md #143: division by zero is no
+        # longer a source of an INT null value (/ always returns float
+        # now), so % -- still int-returning for two ints -- is the
+        # comparison source instead.
+        int_null = compile_and_run("int a = 1\nint b = 0\nlog(a % b)")
         missing_key = compile_and_run("map[int] m = {'a': 1}\nlog(m['missing'])")
-        assert missing_key.stdout == div_by_zero.stdout
+        assert missing_key.stdout == int_null.stdout
 
     def test_empty_map_literal(self, compile_and_run):
         result = compile_and_run("map[int] m = {}\nlog(m['x'])")
@@ -9326,10 +9329,12 @@ class TestRegexLiteral:
 
 
 class TestNumericConversion:
-    """claude.md #55 (no implicit int/float conversion), #56 (Math),
-    #57 (division/modulo by zero returns null). See
-    tests/test_numeric_conversion.py for the parser/semantic-only tests;
-    these check the actual runtime behavior of a compiled program."""
+    """claude.md #56 (Math), #57 (division/modulo by zero returns
+    null), #143 (int/float mixing always promotes to float -- see
+    TestNumericCoercion below for its own dedicated runtime coverage).
+    See tests/test_numeric_conversion.py for the parser/semantic-only
+    tests; these check the actual runtime behavior of a compiled
+    program."""
 
     @pytest.mark.parametrize("fn,expected", [
         ("floor", "19"), ("ceil", "20"), ("round", "20"), ("trunc", "19"),
@@ -9365,23 +9370,25 @@ class TestNumericConversion:
         lines = result.stdout.splitlines()
         assert lines[0] == lines[1]
 
-    def test_mixed_int_float_rejected_end_to_end(self, compile_and_run, errors):
-        # Confirms the whole pipeline (not just semantic.py in isolation)
-        # rejects this -- semantic analysis raises before ever reaching
-        # a linker, so this is a CompileError, not a nonzero exit code.
-        with pytest.raises(errors.CompileError, match="int and float"):
-            compile_and_run("int a = 5\nfloat b = 2.5\nfloat c = a + b")
+    def test_mixed_int_float_produces_float_end_to_end(self, compile_and_run):
+        # claude.md #143: confirms the whole pipeline (not just
+        # semantic.py in isolation) auto-coerces the int side to float,
+        # rather than rejecting the mix the way it used to.
+        result = compile_and_run("int a = 5\nfloat b = 2.5\nfloat c = a + b\nlog(c)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "7.5"
 
     def test_int_division_by_zero_returns_null(self, compile_and_run):
         # claude.md #57: must not crash (SIGFPE) and must not silently
         # compute garbage -- the sentinel is intentionally an
         # implementation detail (see codegen.py's module docstring), so
         # this only checks the process survives and produces *a* value,
-        # not the exact sentinel bit pattern.
+        # not the exact sentinel bit pattern. claude.md #143: `result`
+        # is float now -- / always returns float, even for two ints.
         source = """
         int a = 10
         int b = 0
-        int result = a / b
+        float result = a / b
         log('survived')
         """
         result = compile_and_run(source)
@@ -9400,9 +9407,11 @@ class TestNumericConversion:
         assert result.returncode == 0
         assert result.stdout.strip() == "survived"
 
-    def test_int_division_by_nonzero_is_unaffected(self, compile_and_run):
+    def test_division_and_modulo_by_nonzero(self, compile_and_run):
+        # claude.md #143: / is now float even for two ints; % is
+        # unaffected (still int, unchanged).
         result = compile_and_run("int a = 10\nint b = 4\nlog(a / b)\nlog(a % b)")
-        assert result.stdout.splitlines() == ["2", "2"]
+        assert result.stdout.splitlines() == ["2.5", "2"]
 
     def test_null_int_and_float_assignment(self, compile_and_run):
         # Regression test: `null` used to lower to the LLVM keyword
@@ -9427,7 +9436,10 @@ class TestNumericConversion:
         # for a concretely-typed int/float/bool operand used to reach
         # codegen as `icmp eq i64 %x, null` -- also invalid IR (null is
         # only valid for a pointer type), independent of bool at all.
-        result = compile_and_run("int a = 1 / 0\nlog(a == null)")
+        # claude.md #143: `1 / 0` no longer produces an int (/ always
+        # returns float now) -- `%` still does, so it's the source of a
+        # genuine int null value here instead.
+        result = compile_and_run("int a = 1 % 0\nlog(a == null)")
         assert result.stdout.strip() == "true"
 
     def test_comparing_a_non_null_int_against_the_null_literal(self, compile_and_run):
@@ -9502,6 +9514,90 @@ class TestNumericConversion:
         result = compile_and_run("float tiny = 0.0000001\nlog('compiled fine')")
         assert result.returncode == 0
         assert result.stdout.strip() == "compiled fine"
+
+
+class TestNumericCoercion:
+    """claude.md #143: int and float mix freely in any binary operator
+    now -- the int side implicitly coerced to float, "as though
+    int.toFloat() had been written" -- and division always returns
+    float, even for two ints. Supersedes claude.md #55's old "int and
+    float never mix directly" rule; see tests/test_numeric_conversion.py
+    for the parser/semantic-only coverage of the same rule."""
+
+    @pytest.mark.parametrize("op,expected", [
+        ("+", "7.5"), ("-", "2.5"), ("*", "12.5"), ("%", "0"),
+    ])
+    def test_mixed_arithmetic_coerces_the_int_side(self, compile_and_run, op, expected):
+        result = compile_and_run(f"int a = 5\nfloat b = 2.5\nlog(a {op} b)")
+        assert result.stdout.strip() == expected
+
+    @pytest.mark.parametrize("op,expected", [
+        ("<", "false"), (">", "true"), ("<=", "false"), (">=", "true"),
+        ("==", "false"), ("!=", "true"),
+    ])
+    def test_mixed_comparison_coerces_the_int_side(self, compile_and_run, op, expected):
+        result = compile_and_run(f"int a = 5\nfloat b = 2.5\nlog(a {op} b)")
+        assert result.stdout.strip() == expected
+
+    def test_division_always_returns_float_even_for_two_ints(self, compile_and_run):
+        result = compile_and_run("int a = 10\nint b = 3\nfloat c = a / b\nlog(c)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "3.33333"
+
+    def test_division_between_two_floats_is_unaffected(self, compile_and_run):
+        result = compile_and_run("float a = 10.0\nfloat b = 4.0\nlog(a / b)")
+        assert result.stdout.strip() == "2.5"
+
+    def test_mixed_division_is_float(self, compile_and_run):
+        result = compile_and_run("int a = 10\nfloat b = 4.0\nlog(a / b)")
+        assert result.stdout.strip() == "2.5"
+
+    def test_modulo_between_two_ints_is_still_int(self, compile_and_run):
+        # claude.md #143's own "division always returns float" is
+        # specific to /, not modulo -- confirmed here at runtime (the
+        # 3 is a genuine int, not e.g. "3.0").
+        result = compile_and_run("int a = 10\nint b = 3\nlog(a % b)")
+        assert result.stdout.strip() == "1"
+
+    def test_only_math_methods_convert_a_float_result_back_to_int(self, compile_and_run):
+        # The request's own closing line: "the only way to get back an
+        # int from an operation that makes a float is using the Math
+        # methods." int.toFloat() is the one-directional int->float
+        # conversion; Math.floor/ceil/round/trunc are the only float->int
+        # ones -- both already existed (claude.md #55/#56), unchanged by
+        # this feature, just now the ONLY way back once an operator has
+        # already promoted to float.
+        source = """
+        int a = 10
+        int b = 3
+        float divided = a / b
+        int backToInt = Math.floor(divided)
+        log(backToInt)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "3"
+
+    def test_mixed_operand_in_a_struct_field_assignment(self, compile_and_run):
+        source = """
+        struct Box { total:float }
+        Box b
+        int count = 4
+        float price = 2.5
+        b.total = count * price
+        log(b.total)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "10"
+
+    def test_mixed_operand_as_a_function_argument(self, compile_and_run):
+        source = """
+        float func scaleUp(x:float) { return x * 2 }
+        int n = 5
+        log(scaleUp(n.toFloat()))
+        log(n * 1.5)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["10", "7.5"]
 
 
 class TestFail:

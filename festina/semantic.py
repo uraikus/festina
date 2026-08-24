@@ -1,10 +1,13 @@
 """Semantic analysis -- claude.md #48 (error categories), #49 (symbol
 table), #50 (type checking), plus the type-resolution/truthiness/equality
 rules from #12-20, the struct/table distinction from #27, #28, #35, and
-#55/#56 (int/float never mix directly; Math.floor/ceil/round/trunc and
-int.toFloat() are the only conversions). #58 (struct/table namespace):
-struct/table names live in `structs`/`tables`, never cross-checked
-against `Scope` (variables/functions) -- separate namespaces by design.
+#56 (Math.floor/ceil/round/trunc and int.toFloat() are the ONLY ways to
+turn a float back into an int -- claude.md #143 superseded #55's own
+"int and float never mix directly" half of this entry: int/float mix
+freely now, in any binary operator, the int side implicitly coerced to
+float). #58 (struct/table namespace): struct/table names live in
+`structs`/`tables`, never cross-checked against `Scope` (variables/
+functions) -- separate namespaces by design.
 #67/#68/#107 (regex(), .test(), .match(), .replace()) follow
 the same "recognized Call-on-Member pattern" approach Math.floor/
 int.toFloat() already established -- Festina has no general concept of
@@ -910,15 +913,16 @@ def analyze(program, filename="<string>"):
         if isinstance(expr, ast.BinOp):
             left = infer(expr.left, scope)
             right = infer(expr.right, scope)
-            # claude.md #55: int and float never mix directly, in any
-            # binary operator -- arithmetic, comparison, or equality.
-            if left in _NUMERIC_TYPES and right in _NUMERIC_TYPES and left != right:
-                raise CompileError(
-                    f"cannot use {expr.op} directly between int and float; "
-                    "convert one side first (int.toFloat(), or Math.floor/ceil/round/trunc for float -> int)",
-                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
-                    category="invalid operand type",
-                )
+            # claude.md #143: superseded claude.md #55's old "int and
+            # float never mix directly" rule -- int/float now mix
+            # freely in any binary operator (arithmetic, comparison, or
+            # equality), the int side implicitly coerced to float, as
+            # though int.toFloat() had been written explicitly. Nothing
+            # is checked or rejected here for it any more; see
+            # codegen.py's own comment on _emit_binop for where the
+            # actual sitofp conversion is emitted, and the arithmetic-
+            # result-type branch further down for what type this whole
+            # expression itself infers as.
             if expr.op in ("==", "!="):
                 # claude.md #18 shows == / != between two values of the
                 # same type; it never shows (and #2's "no implicit
@@ -943,6 +947,10 @@ def analyze(program, filename="<string>"):
                     left is None or right is None
                     or left is NULL or right is NULL
                     or left == right
+                    # claude.md #143: int/float mix freely now, == / !=
+                    # included -- the int side is coerced to float, the
+                    # same as every other binary operator.
+                    or (left in _NUMERIC_TYPES and right in _NUMERIC_TYPES)
                 )
                 if not compatible:
                     raise CompileError(
@@ -971,6 +979,14 @@ def analyze(program, filename="<string>"):
                         category="invalid operand type",
                     )
                 return types_mod.PrimitiveType("bool")
+            if expr.op == "/":
+                # claude.md #143: division always returns float,
+                # unconditionally -- the one arithmetic operator that's
+                # float-returning even when BOTH operands are int
+                # (every other arithmetic operator here -- +, -, *, %
+                # -- only promotes to float when the two operands
+                # actually differ, via the generic check just below).
+                return types_mod.PrimitiveType("float")
             if left == types_mod.PrimitiveType("float") or right == types_mod.PrimitiveType("float"):
                 return types_mod.PrimitiveType("float")
             return left if left is not None else right
