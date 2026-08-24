@@ -231,6 +231,46 @@ _PKG_INSTALL_HINTS = {
              "(see windows.md Phase 0)",
 }
 
+# `festina doctor --fix`: the same dependencies as _INSTALL_HINTS/
+# _PKG_INSTALL_HINTS above, but as literal package names per package
+# manager instead of prose a human has to read and copy-paste from.
+# Deliberately narrow -- only the three package managers setup.md
+# itself documents and actually tests against (apt on Debian/Ubuntu,
+# Homebrew on macOS, MSYS2's pacman on Windows). A key with no entry
+# for the detected manager (or a manager --fix doesn't recognize at
+# all, e.g. dnf/pacman-on-Arch/zypper) means "print the hint above and
+# let the person install it by hand" rather than guessing a command
+# that might be wrong -- the same "fail loudly and clearly" preference
+# claude.md #59 already applies to a missing dependency itself.
+#
+# "cc" has no "brew" entry on purpose: the actual macOS fix is Xcode
+# Command Line Tools (`xcode-select --install`, setup.md's own
+# recommendation -- Apple's clang already works, brew's own llvm
+# formula is unnecessary and keg-only besides), which pops a GUI
+# installer --fix cannot drive non-interactively. _run_doctor_fix
+# special-cases that one dependency with its own printed note instead
+# of a package list.
+_PKG_MANAGER_PACKAGES = {
+    "cc": {"apt": ["clang"], "msys2": ["mingw-w64-ucrt-x86_64-clang"]},
+    "pkg-config": {"apt": ["pkg-config"], "brew": ["pkg-config"],
+                   "msys2": ["mingw-w64-ucrt-x86_64-pkgconf"]},
+    "sqlite3": {"apt": ["libsqlite3-dev"], "brew": ["sqlite"],
+                "msys2": ["mingw-w64-ucrt-x86_64-sqlite3"]},
+    "cairo-xlib": {"apt": ["libcairo2-dev", "libx11-dev"]},  # linux-only check
+    "cairo": {"brew": ["cairo"], "msys2": ["mingw-w64-ucrt-x86_64-cairo"]},  # mac/win-only check
+    "libjpeg": {"apt": ["libjpeg-dev"], "brew": ["jpeg-turbo"],
+                "msys2": ["mingw-w64-ucrt-x86_64-libjpeg-turbo"]},
+    "libmpg123": {"apt": ["libmpg123-dev"], "brew": ["mpg123"]},  # linux/mac-only check
+    "alsa": {"apt": ["libasound2-dev"]},  # linux-only check
+    "gnurx": {"msys2": ["mingw-w64-ucrt-x86_64-libsystre"]},  # windows-only check
+    # Optional speed win, not a blocker -- see the check() call site's
+    # own "not required(has_clang)" logic. brew/msys2 need nothing
+    # separate here: brew's "llvm" formula is the same one "cc"'s fix
+    # already covers, and clang alone is enough on Windows too (see
+    # setup.md's "no llvm line here either" note).
+    "llvm": {"apt": ["llvm"]},
+}
+
 
 def _run_tool(cmd, **kwargs):
     """subprocess.run, but a missing executable becomes a clear
@@ -945,13 +985,18 @@ def _doctor_report():
     slimming split means a compiler that can't build a graphics program
     is still a fully working compiler for everything else; a program
     that never uses graphics/audio never even asks for cairo-xlib/alsa's
-    flags (see _RUNTIME_FEATURES above). Returns (lines, all_required_ok)
-    so main() can turn the second value into an exit code without
-    re-parsing the printed text."""
+    flags (see _RUNTIME_FEATURES above). Returns (lines, all_required_ok,
+    missing) so main() can turn the second value into an exit code
+    without re-parsing the printed text, and `festina doctor --fix`
+    (_run_doctor_fix) can turn the third -- a list of (key, required)
+    pairs, one per failed check that named a key -- into real install
+    commands via _PKG_MANAGER_PACKAGES, without re-deriving what's
+    missing by re-parsing the printed text either."""
     lines = []
     all_ok = True
+    missing = []
 
-    def check(ok, required, label, hint=None):
+    def check(ok, required, label, hint=None, key=None):
         nonlocal all_ok
         if ok:
             status = "OK"
@@ -963,6 +1008,8 @@ def _doctor_report():
         lines.append(f"  [{status:^17}] {label}")
         if not ok and hint:
             lines.append(f"  {'':19} -> {hint}")
+        if not ok and key:
+            missing.append((key, required))
 
     lines.append("Festina compiler dependencies")
     lines.append("==============================")
@@ -970,7 +1017,8 @@ def _doctor_report():
     cc_name, cc_path = _which_any("clang", "gcc", "cc")
     check(cc_name is not None, True,
           f"C compiler ({cc_name} at {cc_path})" if cc_name else "C compiler (clang, gcc, or cc)",
-          "install one, e.g. `apt install clang` on Debian/Ubuntu, or `brew install llvm` on macOS -- see setup.md")
+          "install one, e.g. `apt install clang` on Debian/Ubuntu, or `brew install llvm` on macOS -- see setup.md",
+          key="cc")
 
     if sys.platform == "win32" and os.environ.get("MSYSTEM") == "MSYS":
         # windows.md Phase 0 item 4: `MSYSTEM=MSYS` is the plain
@@ -989,11 +1037,11 @@ def _doctor_report():
     pkgconf_path = shutil.which("pkg-config")
     check(pkgconf_path is not None, True,
           f"pkg-config (at {pkgconf_path})" if pkgconf_path else "pkg-config",
-          _INSTALL_HINTS["pkg-config"])
+          _INSTALL_HINTS["pkg-config"], key="pkg-config")
 
     check(_pkg_config_has("sqlite3"), True,
           "sqlite3 dev headers (required -- every Festina program has SQLite built in, claude.md #10/#28-31)",
-          _PKG_INSTALL_HINTS["sqlite3"])
+          _PKG_INSTALL_HINTS["sqlite3"], key="sqlite3")
 
     # windows.md Phase 0: also required, like sqlite3 just above -- not
     # an optional feature tier at all, since festina_runtime.c's regex
@@ -1004,7 +1052,7 @@ def _doctor_report():
         check(_pkg_config_has(pkg), True,
               "POSIX regex (required on Windows -- <regex.h> isn't part of MinGW's "
               "libc, claude.md #67/#68's regex()/.test()/.match()/.replace())",
-              _PKG_INSTALL_HINTS["gnurx"])
+              _PKG_INSTALL_HINTS["gnurx"], key="gnurx")
 
     # claude.md #123/#128: platform-aware, like audio just below --
     # darwin's and windows' graphics runtimes both carry zero X11 code
@@ -1014,11 +1062,11 @@ def _doctor_report():
     if sys.platform in ("darwin", "win32"):
         check(_pkg_config_has("cairo"), False,
               "cairo dev headers (optional -- only used by graphics: drawRect, on mouseDown, img, ...)",
-              _PKG_INSTALL_HINTS["cairo"])
+              _PKG_INSTALL_HINTS["cairo"], key="cairo")
     else:
         check(_pkg_config_has("cairo-xlib"), False,
               "cairo-xlib dev headers (optional -- only used by graphics: drawRect, on mouseDown, img, ...)",
-              _PKG_INSTALL_HINTS["cairo-xlib"])
+              _PKG_INSTALL_HINTS["cairo-xlib"], key="cairo-xlib")
     # claude.md #101: JPEG/MP3 decoding. Grouped with their own feature
     # rather than listed as separate tiers -- a program that uses
     # graphics needs libjpeg whether or not it happens to load a .jpg,
@@ -1029,7 +1077,7 @@ def _doctor_report():
     # because there was not yet anything on win32 to need it.
     check(_pkg_config_has("libjpeg"), False,
           "libjpeg dev headers (optional -- only used by graphics: JPEG images)",
-          _PKG_INSTALL_HINTS["libjpeg"])
+          _PKG_INSTALL_HINTS["libjpeg"], key="libjpeg")
     if sys.platform == "darwin":
         # claude.md #123: windowed use (render(), any event handler)
         # additionally needs the Cocoa backend's real-hardware
@@ -1067,10 +1115,10 @@ def _doctor_report():
     else:
         check(_pkg_config_has("libmpg123"), False,
               "libmpg123 dev headers (optional -- only used by audio: MP3 clips)",
-              _PKG_INSTALL_HINTS["libmpg123"])
+              _PKG_INSTALL_HINTS["libmpg123"], key="libmpg123")
         check(_pkg_config_has("alsa"), False,
               "alsa dev headers (optional -- only used by audio: loadAudio(), .play(), ...)",
-              _PKG_INSTALL_HINTS["alsa"])
+              _PKG_INSTALL_HINTS["alsa"], key="alsa")
 
     llvm_ok = llvm_backend.available()
     has_clang = shutil.which("clang") is not None
@@ -1085,7 +1133,8 @@ def _doctor_report():
               "libLLVM (not found -- falls back to handing LLVM IR text to clang directly)",
               None if has_clang else
               "clang was not found either, and only clang can parse the raw IR text that fallback "
-              "needs -- install `llvm` (e.g. `apt install llvm` on Debian/Ubuntu) or clang itself")
+              "needs -- install `llvm` (e.g. `apt install llvm` on Debian/Ubuntu) or clang itself",
+              key="llvm")
 
     lines.append("")
     lines.append("festina on PATH")
@@ -1112,11 +1161,11 @@ def _doctor_report():
                           f"startup file) to keep it, then restart your shell -- or run "
                           f"scripts/package_compiler.sh and put the resulting standalone binary "
                           f"somewhere already on PATH instead (see setup.md)")
-    return lines, all_ok
+    return lines, all_ok, missing
 
 
 def _run_doctor():
-    lines, all_ok = _doctor_report()
+    lines, all_ok, _missing = _doctor_report()
     print("\n".join(lines))
     print()
     if all_ok:
@@ -1124,6 +1173,132 @@ def _run_doctor():
               "only matter for a program that actually uses drawRect/on mouseDown/img/loadAudio/etc.")
         return 0
     print("One or more REQUIRED dependencies are missing -- see the MISSING lines above.")
+    print("Run `festina doctor --fix` to try installing them automatically.")
+    return 1
+
+
+def _detect_package_manager():
+    """Which of the three package managers `doctor --fix` knows how to
+    drive, based on what setup.md itself documents per platform --
+    apt on Linux, Homebrew on macOS, MSYS2's pacman on Windows. None of
+    the others (dnf, Arch's pacman, zypper, ...) are covered: guessing
+    a plausible-looking command for a manager this project has never
+    actually run against risks confidently telling someone to run
+    something wrong, which is worse than not offering to fix it at all.
+    Returns None if no supported manager is found."""
+    if sys.platform == "win32":
+        return "msys2" if shutil.which("pacman") else None
+    if sys.platform == "darwin":
+        return "brew" if shutil.which("brew") else None
+    if shutil.which("apt") or shutil.which("apt-get"):
+        return "apt"
+    return None
+
+
+def _doctor_fix_install_command(manager, packages):
+    """The actual command to run for this manager, given a deduplicated
+    package list. Prepends `sudo` for apt only when not already root
+    (hasattr guard: os.geteuid doesn't exist on Windows) -- brew
+    actively refuses to run as root, and MSYS2's pacman needs no
+    elevation at all since it manages its own user-writable prefix, not
+    the host Windows installation. `-y`/`--noconfirm` on the package
+    manager itself is safe to pass unconditionally here: by the time
+    this is called, _run_doctor_fix has already gotten the person's own
+    confirmation (or --yes) once, so a second manager-level prompt would
+    be redundant, not an extra safety check."""
+    if manager == "apt":
+        apt = "apt" if shutil.which("apt") else "apt-get"
+        cmd = [apt, "install", "-y", *packages]
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            cmd = ["sudo", *cmd]
+        return cmd
+    if manager == "brew":
+        return ["brew", "install", *packages]
+    if manager == "msys2":
+        return ["pacman", "-S", "--noconfirm", *packages]
+    return None
+
+
+def _run_doctor_fix(assume_yes=False):
+    """`festina doctor --fix`: run the same report doctor always does,
+    then -- if anything required OR optional is missing -- try to
+    actually install it via the detected package manager instead of
+    just printing the hint and leaving the copy-pasting to the person
+    running it. Confirms before running anything (skippable with
+    --yes), and refuses to guess when no supported manager is found or
+    when running non-interactively without --yes, rather than silently
+    doing nothing or silently running an install nobody agreed to."""
+    lines, all_ok, missing = _doctor_report()
+    print("\n".join(lines))
+    print()
+    if not missing:
+        print("All required dependencies are already installed -- nothing to fix.")
+        return 0
+
+    manager = _detect_package_manager()
+    if manager is None:
+        print("doctor --fix only knows how to drive apt (Debian/Ubuntu), Homebrew "
+              "(macOS), and MSYS2's pacman (Windows) -- none of those were found "
+              "on PATH here. Install the missing dependencies by hand using the "
+              "hints above.")
+        return 1 if not all_ok else 0
+
+    missing_keys = {key for key, _required in missing}
+    if manager == "brew" and "cc" in missing_keys:
+        print("Note: the actual macOS fix for a missing C compiler is Xcode "
+              "Command Line Tools (`xcode-select --install`) -- that pops a GUI "
+              "installer doctor --fix can't drive non-interactively, so run it "
+              "yourself if clang is still missing after this.")
+
+    packages = []
+    seen = set()
+    unfixable_required = []
+    for key, required in missing:
+        pkgs = _PKG_MANAGER_PACKAGES.get(key, {}).get(manager, [])
+        if not pkgs:
+            if required:
+                unfixable_required.append(key)
+            continue
+        for pkg in pkgs:
+            if pkg not in seen:
+                seen.add(pkg)
+                packages.append(pkg)
+
+    if not packages:
+        print(f"Nothing doctor --fix knows how to install for {manager} here -- "
+              "see the hints above and install by hand.")
+        return 1 if not all_ok else 0
+
+    cmd = _doctor_fix_install_command(manager, packages)
+    print(f"About to run: {' '.join(cmd)}")
+    if unfixable_required:
+        print(f"(this still won't cover: {', '.join(unfixable_required)} -- see the hints above for those)")
+
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            print("Not running interactively and --yes wasn't passed -- re-run with "
+                  "`festina doctor --fix --yes` to install without confirming.")
+            return 1
+        answer = input("Proceed? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Not installing anything.")
+            return 1
+
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        print(f"\n'{' '.join(cmd)}' exited with status {result.returncode}.")
+        return result.returncode
+
+    print()
+    print("Re-checking...")
+    print()
+    lines2, all_ok2, _missing2 = _doctor_report()
+    print("\n".join(lines2))
+    print()
+    if all_ok2:
+        print("All required dependencies are now installed.")
+        return 0
+    print("Some required dependencies are still missing -- see above.")
     return 1
 
 
@@ -1148,7 +1323,12 @@ def _build_arg_parser():
     run_p.add_argument("input", help="entry .f file")
     run_p.add_argument("--cc", default=default_cc, help=cc_help)
 
-    sub.add_parser("doctor", help="check whether the compiler's own dependencies are installed")
+    doctor_p = sub.add_parser("doctor", help="check whether the compiler's own dependencies are installed")
+    doctor_p.add_argument("--fix", action="store_true",
+                           help="try to auto-install missing dependencies via the detected "
+                                "package manager (apt/Homebrew/MSYS2 pacman)")
+    doctor_p.add_argument("--yes", "-y", action="store_true",
+                           help="with --fix, don't prompt for confirmation before installing")
     sub.add_parser("help", help="show this help message")
     return ap
 
@@ -1166,6 +1346,8 @@ def main(argv=None):
         return 0 if args.command == "help" else 1
 
     if args.command == "doctor":
+        if args.fix:
+            return _run_doctor_fix(assume_yes=args.yes)
         return _run_doctor()
 
     if args.command == "run":

@@ -12,7 +12,9 @@ the runtime dependency list below is now conditional per program).
 program.f` to skip the intermediate binary and just run it -- see
 [api.md](api.md#cli) for the full command list, including `festina
 doctor`, which checks every dependency below for you and tells you
-exactly what's missing):
+exactly what's missing -- and `festina doctor --fix`, which installs
+it for you via whichever of `apt`/Homebrew/MSYS2's `pacman` this
+machine has, after confirming the exact command with you first):
 
 | Dependency | Why | Required? |
 |---|---|---|

@@ -78,6 +78,8 @@ bin/festina run examples/hello.f
 Not sure your machine has everything Festina needs? `bin/festina doctor`
 checks every dependency above and tells you exactly what's missing and
 how to install it — including whether `festina` itself is on `PATH` yet.
+Add `--fix` and it installs whatever's missing for you, via `apt`/
+Homebrew/MSYS2's `pacman` (whichever this machine has).
 
 That's the whole loop — see [setup.md](setup.md) for the full dependency
 breakdown (what's required vs. only-if-you-use-it), packaged-binary
