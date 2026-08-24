@@ -527,6 +527,71 @@ class TestDoctorFixInstallCommand:
         assert cmd == ["pacman", "-S", "--noconfirm", "mingw-w64-ucrt-x86_64-clang"]
 
 
+class TestFestinaPathFixPlan:
+    """_festina_path_fix_plan: what `doctor --fix` could do about
+    'festina' not resolving on PATH, as a pure function of injectable
+    state -- the same reason _default_output_name takes a `platform_name`
+    parameter, extended here to every other real-world input this
+    decision depends on (whether festina already resolves, whether this
+    is the packaged binary, and which shell is running), so each branch
+    is testable from any one OS without touching this machine's real
+    environment at all."""
+
+    def test_already_on_path_is_nothing_to_fix(self, cli_mod):
+        assert cli_mod._festina_path_fix_plan(
+            festina_path="/usr/local/bin/festina") is None
+
+    def test_packaged_binary_plans_a_symlink(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(cli_mod.sys, "executable", "/tmp/dist/festina")
+        plan = cli_mod._festina_path_fix_plan(
+            platform_name="linux", festina_path=None, meipass="/tmp/_MEIxyz")
+        assert plan == {"kind": "symlink", "source": "/tmp/dist/festina",
+                         "target": "/usr/local/bin/festina"}
+
+    def test_bash_checkout_plans_a_bashrc_append(self, cli_mod):
+        plan = cli_mod._festina_path_fix_plan(
+            platform_name="linux", festina_path=None, meipass=None,
+            shell_env="/bin/bash", bin_dir="/repo/bin")
+        assert plan["kind"] == "shell_rc"
+        assert plan["rc_file"].endswith(".bashrc")
+        assert plan["line"] == 'export PATH="$PATH:/repo/bin"'
+
+    def test_zsh_checkout_plans_a_zshrc_append(self, cli_mod):
+        plan = cli_mod._festina_path_fix_plan(
+            platform_name="darwin", festina_path=None, meipass=None,
+            shell_env="/bin/zsh", bin_dir="/repo/bin")
+        assert plan["kind"] == "shell_rc"
+        assert plan["rc_file"].endswith(".zshrc")
+
+    def test_unrecognized_shell_is_unsupported(self, cli_mod):
+        plan = cli_mod._festina_path_fix_plan(
+            platform_name="linux", festina_path=None, meipass=None,
+            shell_env="/usr/bin/fish", bin_dir="/repo/bin")
+        assert plan == {"kind": "unsupported_shell", "bin_dir": "/repo/bin", "shell": "fish"}
+
+    def test_unset_shell_is_unsupported_not_a_crash(self, cli_mod):
+        plan = cli_mod._festina_path_fix_plan(
+            platform_name="linux", festina_path=None, meipass=None,
+            shell_env="", bin_dir="/repo/bin")
+        assert plan["kind"] == "unsupported_shell"
+        assert plan["shell"] == "unknown"
+
+    def test_windows_checkout_plans_a_setx(self, cli_mod):
+        plan = cli_mod._festina_path_fix_plan(
+            platform_name="win32", festina_path=None, meipass=None, bin_dir="C:\\repo\\bin")
+        assert plan == {"kind": "windows_path", "bin_dir": "C:\\repo\\bin"}
+
+    def test_windows_packaged_binary_still_plans_a_symlink_not_setx(self, cli_mod, monkeypatch):
+        # _MEIPASS takes precedence over platform -- the packaged-binary
+        # case looks identical everywhere (there's no bin/ checkout
+        # directory to add to PATH at all once running is via the
+        # bundled --onefile executable).
+        monkeypatch.setattr(cli_mod.sys, "executable", "C:\\dist\\festina.exe")
+        plan = cli_mod._festina_path_fix_plan(
+            platform_name="win32", festina_path=None, meipass="C:\\_MEIxyz")
+        assert plan["kind"] == "symlink"
+
+
 class TestAudioFeatureConfig:
     """claude.md #121: the audio feature's device half is per-platform
     -- ALSA via pkg-config on Linux, the AudioToolbox framework on

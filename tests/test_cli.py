@@ -190,13 +190,19 @@ class TestDoctorFix:
     _run_doctor_fix's own decision logic -- confirm, build and dedupe
     the package list, run, re-check -- independent of this machine's
     real dependency state (TestDoctor above already covers
-    _doctor_report itself producing that list correctly)."""
+    _doctor_report itself producing that list correctly). Every test
+    here also stubs _festina_path_fix_plan to None -- these are
+    specifically about the DEPENDENCY-fixing half; TestDoctorFixPath
+    below covers the PATH-fixing half, which would otherwise interfere
+    here since this sandbox's own real 'festina' genuinely isn't on
+    PATH and _run_doctor_fix always checks both."""
 
     def _stub_report(self, cli_mod, monkeypatch, missing, all_ok=None):
         if all_ok is None:
             all_ok = not any(required for _key, required in missing)
         monkeypatch.setattr(cli_mod, "_doctor_report",
                              lambda: (["Festina compiler dependencies"], all_ok, missing))
+        monkeypatch.setattr(cli_mod, "_festina_path_fix_plan", lambda: None)
 
     def test_nothing_to_fix_when_nothing_is_missing(self, cli_mod, monkeypatch, capsys):
         self._stub_report(cli_mod, monkeypatch, [])
@@ -259,6 +265,7 @@ class TestDoctorFix:
             (["Festina compiler dependencies"], True, []),
         ])
         monkeypatch.setattr(cli_mod, "_doctor_report", lambda: next(reports))
+        monkeypatch.setattr(cli_mod, "_festina_path_fix_plan", lambda: None)
         monkeypatch.setattr(cli_mod, "_detect_package_manager", lambda: "apt")
 
         def _unexpected_input(prompt=""):
@@ -347,6 +354,179 @@ class TestDoctorFix:
         # "cc" has no brew package mapping at all -- nothing to install,
         # even though the note above was printed.
         assert code == 1
+
+
+class TestApplyFestinaPathFix:
+    """_apply_festina_path_fix: actually executing one of
+    _festina_path_fix_plan's four plans. subprocess.run/input are
+    monkeypatched throughout so nothing here ever touches a real
+    shell rc file outside tmp_path, runs a real `sudo`/`ln`/`setx`, or
+    reads real stdin."""
+
+    def test_unsupported_shell_prints_manual_instructions_and_does_nothing(
+            self, cli_mod, capsys):
+        plan = {"kind": "unsupported_shell", "bin_dir": "/repo/bin", "shell": "fish"}
+        assert cli_mod._apply_festina_path_fix(plan, assume_yes=True) is False
+        out = capsys.readouterr().out
+        assert "fish" in out
+        assert 'export PATH="$PATH:/repo/bin"' in out
+
+    def test_shell_rc_appends_the_line_when_confirmed(self, cli_mod, monkeypatch, tmp_path):
+        rc = tmp_path / ".bashrc"
+        rc.write_text("# existing content\n")
+        plan = {"kind": "shell_rc", "rc_file": str(rc), "bin_dir": "/repo/bin",
+                "line": 'export PATH="$PATH:/repo/bin"'}
+        assert cli_mod._apply_festina_path_fix(plan, assume_yes=True) is True
+        content = rc.read_text()
+        assert "# existing content" in content  # not clobbered
+        assert 'export PATH="$PATH:/repo/bin"' in content
+
+    def test_shell_rc_creates_the_file_if_it_does_not_exist_yet(self, cli_mod, tmp_path):
+        rc = tmp_path / ".zshrc"
+        plan = {"kind": "shell_rc", "rc_file": str(rc), "bin_dir": "/repo/bin",
+                "line": 'export PATH="$PATH:/repo/bin"'}
+        assert cli_mod._apply_festina_path_fix(plan, assume_yes=True) is True
+        assert 'export PATH="$PATH:/repo/bin"' in rc.read_text()
+
+    def test_shell_rc_declining_leaves_the_file_untouched(self, cli_mod, monkeypatch, tmp_path):
+        rc = tmp_path / ".bashrc"
+        rc.write_text("# untouched\n")
+        plan = {"kind": "shell_rc", "rc_file": str(rc), "bin_dir": "/repo/bin",
+                "line": 'export PATH="$PATH:/repo/bin"'}
+        monkeypatch.setattr(cli_mod.sys, "stdin", _FakeStdin())
+        monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+        assert cli_mod._apply_festina_path_fix(plan, assume_yes=False) is False
+        assert rc.read_text() == "# untouched\n"
+
+    def test_shell_rc_already_containing_bin_dir_is_a_noop(self, cli_mod, monkeypatch, tmp_path):
+        rc = tmp_path / ".bashrc"
+        rc.write_text('export PATH="$PATH:/repo/bin"\n')
+
+        def _unexpected_input(prompt=""):
+            raise AssertionError("must not prompt when there is nothing to add")
+        monkeypatch.setattr("builtins.input", _unexpected_input)
+        plan = {"kind": "shell_rc", "rc_file": str(rc), "bin_dir": "/repo/bin",
+                "line": 'export PATH="$PATH:/repo/bin"'}
+        assert cli_mod._apply_festina_path_fix(plan, assume_yes=False) is True
+
+    def test_symlink_runs_ln_when_confirmed_and_writable(self, cli_mod, monkeypatch):
+        plan = {"kind": "symlink", "source": "/dist/festina", "target": "/usr/local/bin/festina"}
+        monkeypatch.setattr(cli_mod.os.path, "exists", lambda p: False)
+        monkeypatch.setattr(cli_mod.os, "access", lambda p, mode: True)
+        calls = []
+
+        def _fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return type("Result", (), {"returncode": 0})()
+        monkeypatch.setattr(cli_mod.subprocess, "run", _fake_run)
+        assert cli_mod._apply_festina_path_fix(plan, assume_yes=True) is True
+        assert calls == [["ln", "-sf", "/dist/festina", "/usr/local/bin/festina"]]
+
+    def test_symlink_adds_sudo_when_target_dir_is_not_writable(self, cli_mod, monkeypatch):
+        plan = {"kind": "symlink", "source": "/dist/festina", "target": "/usr/local/bin/festina"}
+        monkeypatch.setattr(cli_mod.os.path, "exists", lambda p: False)
+        monkeypatch.setattr(cli_mod.os, "access", lambda p, mode: False)
+        calls = []
+        monkeypatch.setattr(cli_mod.subprocess, "run",
+                             lambda cmd, **k: calls.append(cmd) or type("R", (), {"returncode": 0})())
+        cli_mod._apply_festina_path_fix(plan, assume_yes=True)
+        assert calls[0][0] == "sudo"
+
+    def test_symlink_refuses_to_overwrite_something_unrelated(self, cli_mod, monkeypatch):
+        plan = {"kind": "symlink", "source": "/dist/festina", "target": "/usr/local/bin/festina"}
+        monkeypatch.setattr(cli_mod.os.path, "exists", lambda p: True)
+        monkeypatch.setattr(cli_mod.os.path, "islink", lambda p: False)
+        ran = []
+        monkeypatch.setattr(cli_mod.subprocess, "run", lambda cmd, **k: ran.append(cmd))
+        assert cli_mod._apply_festina_path_fix(plan, assume_yes=True) is False
+        assert ran == []
+
+    def test_windows_path_runs_setx_when_confirmed(self, cli_mod, monkeypatch):
+        plan = {"kind": "windows_path", "bin_dir": "C:\\repo\\bin"}
+        calls = []
+        monkeypatch.setattr(cli_mod.subprocess, "run",
+                             lambda cmd, **k: calls.append(cmd) or type("R", (), {"returncode": 0})())
+        assert cli_mod._apply_festina_path_fix(plan, assume_yes=True) is True
+        assert calls == [["setx", "PATH", "%PATH%;C:\\repo\\bin"]]
+
+    def test_windows_path_declining_runs_nothing(self, cli_mod, monkeypatch):
+        plan = {"kind": "windows_path", "bin_dir": "C:\\repo\\bin"}
+        monkeypatch.setattr(cli_mod.sys, "stdin", _FakeStdin())
+        monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+        ran = []
+        monkeypatch.setattr(cli_mod.subprocess, "run", lambda cmd, **k: ran.append(cmd))
+        assert cli_mod._apply_festina_path_fix(plan, assume_yes=False) is False
+        assert ran == []
+
+
+class TestDoctorFixPath:
+    """_run_doctor_fix's own PATH-fixing half, end to end -- both
+    _doctor_report and _festina_path_fix_plan are monkeypatched so
+    these focus on how _run_doctor_fix WIRES the two fixes together
+    (dependencies always attempted first, PATH-fix outcome never
+    changing the dependency-driven exit code), not on
+    _festina_path_fix_plan/_apply_festina_path_fix's own internals
+    (covered separately above and in test_platform.py)."""
+
+    def test_nothing_missing_and_already_on_path_is_reported_as_nothing_to_fix(
+            self, cli_mod, monkeypatch, capsys):
+        monkeypatch.setattr(cli_mod, "_doctor_report",
+                             lambda: (["Festina compiler dependencies"], True, []))
+        monkeypatch.setattr(cli_mod, "_festina_path_fix_plan", lambda: None)
+        assert cli_mod._run_doctor_fix() == 0
+        assert "nothing to fix" in capsys.readouterr().out
+
+    def test_path_fix_is_attempted_even_when_no_dependency_is_missing(
+            self, cli_mod, monkeypatch, tmp_path):
+        monkeypatch.setattr(cli_mod, "_doctor_report",
+                             lambda: (["Festina compiler dependencies"], True, []))
+        rc = tmp_path / ".bashrc"
+        rc.write_text("")
+        monkeypatch.setattr(
+            cli_mod, "_festina_path_fix_plan",
+            lambda: {"kind": "shell_rc", "rc_file": str(rc), "bin_dir": "/repo/bin",
+                      "line": 'export PATH="$PATH:/repo/bin"'})
+        assert cli_mod._run_doctor_fix(assume_yes=True) == 0
+        assert 'export PATH="$PATH:/repo/bin"' in rc.read_text()
+
+    def test_exit_code_reflects_dependencies_not_a_declined_path_fix(
+            self, cli_mod, monkeypatch, capsys):
+        # A required dependency install succeeds (exit 0), but the
+        # PATH-fix prompt is declined -- overall exit code must still
+        # be 0, since PATH has never been a `required` doctor check.
+        # Stateful stub (missing before the install, fixed after) for
+        # the same reason TestDoctorFix's own --yes test needs one --
+        # a static stub could never actually reflect a real fix
+        # happening between _run_doctor_fix's two _doctor_report calls.
+        reports = iter([
+            (["Festina compiler dependencies"], False, [("cc", True)]),
+            (["Festina compiler dependencies"], True, []),
+        ])
+        monkeypatch.setattr(cli_mod, "_doctor_report", lambda: next(reports))
+        monkeypatch.setattr(cli_mod, "_detect_package_manager", lambda: "apt")
+        monkeypatch.setattr(cli_mod, "_festina_path_fix_plan",
+                             lambda: {"kind": "unsupported_shell", "bin_dir": "/x", "shell": "fish"})
+        monkeypatch.setattr(cli_mod.subprocess, "run",
+                             lambda cmd, **k: type("R", (), {"returncode": 0})())
+        assert cli_mod._run_doctor_fix(assume_yes=True) == 0
+
+    def test_path_fix_runs_after_a_failed_dependency_install_too(
+            self, cli_mod, monkeypatch, tmp_path):
+        # A failed/declined dependency step shouldn't skip attempting
+        # the independent PATH fix -- the two are unrelated concerns.
+        monkeypatch.setattr(
+            cli_mod, "_doctor_report",
+            lambda: (["Festina compiler dependencies"], False, [("cc", True)]))
+        monkeypatch.setattr(cli_mod, "_detect_package_manager", lambda: None)
+        rc = tmp_path / ".bashrc"
+        rc.write_text("")
+        monkeypatch.setattr(
+            cli_mod, "_festina_path_fix_plan",
+            lambda: {"kind": "shell_rc", "rc_file": str(rc), "bin_dir": "/repo/bin",
+                      "line": 'export PATH="$PATH:/repo/bin"'})
+        code = cli_mod._run_doctor_fix(assume_yes=True)
+        assert code == 1  # no supported manager -> dependency side failed
+        assert 'export PATH="$PATH:/repo/bin"' in rc.read_text()  # PATH fix still ran
 
 
 class TestMainDispatchDoctorFix:

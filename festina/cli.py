@@ -107,6 +107,15 @@ _RUNTIME_HEADERS = [
 
 _sqlite_link_cache = {}
 
+# A real sentinel, not None -- _festina_path_fix_plan's own injectable
+# parameters (festina_path, meipass, shell_env) each have a legitimate
+# "explicitly absent" value of None/"" that a test needs to be able to
+# pass in on purpose (e.g. "PATH genuinely doesn't resolve festina" or
+# "$SHELL genuinely isn't set"), which None-as-default can't tell apart
+# from "the caller didn't pass this argument at all, so go compute the
+# real one."
+_UNSET = object()
+
 
 def _default_output_name(entry_path, platform_name=None):
     """windows.md Phase 0: on Windows the default output gains `.exe` --
@@ -1219,20 +1228,42 @@ def _doctor_fix_install_command(manager, packages):
     return None
 
 
-def _run_doctor_fix(assume_yes=False):
-    """`festina doctor --fix`: run the same report doctor always does,
-    then -- if anything required OR optional is missing -- try to
-    actually install it via the detected package manager instead of
-    just printing the hint and leaving the copy-pasting to the person
-    running it. Confirms before running anything (skippable with
-    --yes), and refuses to guess when no supported manager is found or
-    when running non-interactively without --yes, rather than silently
-    doing nothing or silently running an install nobody agreed to."""
-    lines, all_ok, missing = _doctor_report()
-    print("\n".join(lines))
-    print()
+def _confirm(assume_yes, prompt="Proceed? [y/N] "):
+    """Shared confirmation gate for both of `festina doctor --fix`'s
+    kinds of system change (installing packages, editing PATH) --
+    refuses outright when running non-interactively without --yes,
+    rather than either hanging on a read that will never come or
+    silently proceeding without real consent. `input()` itself has no
+    such guard built in, so this enforces it explicitly, the same
+    two-sided caution git/npm-style installers apply."""
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print("Not running interactively and --yes wasn't passed -- re-run with "
+              "`festina doctor --fix --yes` to proceed without confirming.")
+        return False
+    answer = input(prompt).strip().lower()
+    if answer not in ("y", "yes"):
+        print("Not proceeding.")
+        return False
+    return True
+
+
+def _fix_missing_dependencies(missing, all_ok, assume_yes):
+    """The dependency-installing half of `doctor --fix`: builds one
+    deduplicated install command across every missing key for the
+    detected package manager, confirms, runs it, and re-checks.
+    Returns 0 if every REQUIRED dependency is now present (or already
+    was -- `missing` may hold only optional ones), else a nonzero exit
+    code -- the install command's own exact returncode when that's
+    specifically what failed, 1 for every other kind of failure (no
+    supported manager, nothing installable, declined, still missing
+    after a successful-exit install). `all_ok` is _doctor_report's own
+    already-computed answer for "nothing required missing to begin
+    with," passed in rather than re-derived so the early-exit paths
+    below don't need their own copy of that logic."""
     if not missing:
-        print("All required dependencies are already installed -- nothing to fix.")
+        print("All dependencies are already installed.")
         return 0
 
     manager = _detect_package_manager()
@@ -1241,7 +1272,7 @@ def _run_doctor_fix(assume_yes=False):
               "(macOS), and MSYS2's pacman (Windows) -- none of those were found "
               "on PATH here. Install the missing dependencies by hand using the "
               "hints above.")
-        return 1 if not all_ok else 0
+        return 0 if all_ok else 1
 
     missing_keys = {key for key, _required in missing}
     if manager == "brew" and "cc" in missing_keys:
@@ -1267,22 +1298,15 @@ def _run_doctor_fix(assume_yes=False):
     if not packages:
         print(f"Nothing doctor --fix knows how to install for {manager} here -- "
               "see the hints above and install by hand.")
-        return 1 if not all_ok else 0
+        return 0 if all_ok else 1
 
     cmd = _doctor_fix_install_command(manager, packages)
     print(f"About to run: {' '.join(cmd)}")
     if unfixable_required:
         print(f"(this still won't cover: {', '.join(unfixable_required)} -- see the hints above for those)")
 
-    if not assume_yes:
-        if not sys.stdin.isatty():
-            print("Not running interactively and --yes wasn't passed -- re-run with "
-                  "`festina doctor --fix --yes` to install without confirming.")
-            return 1
-        answer = input("Proceed? [y/N] ").strip().lower()
-        if answer not in ("y", "yes"):
-            print("Not installing anything.")
-            return 1
+    if not _confirm(assume_yes):
+        return 1
 
     result = subprocess.run(cmd)
     if result.returncode != 0:
@@ -1300,6 +1324,180 @@ def _run_doctor_fix(assume_yes=False):
         return 0
     print("Some required dependencies are still missing -- see above.")
     return 1
+
+
+# `festina doctor --fix` (part two): the same treatment for `festina`
+# itself not being resolvable on PATH -- _doctor_report has always
+# diagnosed this and printed the fix, this is what actually DOES it.
+# A plain-data plan (_festina_path_fix_plan) separate from the code
+# that executes it (_apply_festina_path_fix), the same split
+# _doctor_fix_install_command/_fix_missing_dependencies already use
+# for package installs, and for the identical reason
+# _default_output_name takes an injectable platform_name: every branch
+# here is a pure function of state the caller can substitute, so each
+# platform's plan is unit-testable from any one OS, not just whichever
+# one the suite happens to run on.
+def _festina_path_fix_plan(platform_name=None, festina_path=_UNSET, meipass=_UNSET,
+                            shell_env=_UNSET, bin_dir=None):
+    """What doctor --fix could do about `festina` not resolving on
+    PATH. Returns None if it already resolves (nothing to fix) or a
+    dict describing one of four plans:
+
+    - "symlink": running the packaged binary directly (PyInstaller
+      --onefile, sys._MEIPASS set) -- symlink it onto PATH at
+      /usr/local/bin/festina, mirroring the hint _doctor_report
+      already prints for this exact case.
+    - "shell_rc": running from a checkout, on a POSIX shell doctor
+      --fix knows how to edit (bash or zsh, the two setup.md's own
+      "add that line to ~/.bashrc / ~/.zshrc" hint names) -- append an
+      export line to that shell's own startup file.
+    - "windows_path": running from a checkout on win32 -- `setx` the
+      user's PATH environment variable (best-effort: this project has
+      no Windows machine to confirm setx's own well-known PATH-length
+      truncation risk isn't hit here, the same "no hardware to test
+      against" honesty windows.md/macos.md already apply elsewhere).
+    - "unsupported_shell": running from a checkout on a POSIX shell
+      doctor --fix does NOT know how to edit (fish, csh, an unset
+      $SHELL, ...) -- nothing to automate, same manual instructions
+      _doctor_report already prints."""
+    platform_name = platform_name or sys.platform
+    if festina_path is _UNSET:
+        festina_path = shutil.which("festina")
+    if festina_path:
+        return None
+
+    if meipass is _UNSET:
+        meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return {"kind": "symlink", "source": sys.executable, "target": "/usr/local/bin/festina"}
+
+    if bin_dir is None:
+        bin_dir = os.path.join(_data_root(), "bin")
+
+    if platform_name == "win32":
+        return {"kind": "windows_path", "bin_dir": bin_dir}
+
+    if shell_env is _UNSET:
+        shell_env = os.environ.get("SHELL", "")
+    shell = os.path.basename(shell_env)
+    rc_by_shell = {"bash": "~/.bashrc", "zsh": "~/.zshrc"}
+    if shell not in rc_by_shell:
+        return {"kind": "unsupported_shell", "bin_dir": bin_dir, "shell": shell or "unknown"}
+    rc_file = os.path.expanduser(rc_by_shell[shell])
+    return {"kind": "shell_rc", "rc_file": rc_file, "bin_dir": bin_dir,
+            "line": f'export PATH="$PATH:{bin_dir}"'}
+
+
+def _apply_festina_path_fix(plan, assume_yes):
+    """Executes a plan from _festina_path_fix_plan. Returns True if
+    `festina` should resolve from a NEW shell/session afterward (never
+    the current process -- nothing can retroactively change a PATH a
+    process already inherited at startup), False if skipped, declined,
+    or unsupported."""
+    kind = plan["kind"]
+
+    if kind == "unsupported_shell":
+        print(f"'festina' is not on PATH, and doctor --fix doesn't know how to edit "
+              f"a '{plan['shell']}' startup file automatically -- add this line to "
+              f"your shell's own startup file yourself:")
+        print(f'  export PATH="$PATH:{plan["bin_dir"]}"')
+        return False
+
+    if kind == "symlink":
+        source, target = plan["source"], plan["target"]
+        # Refuses to clobber something already at that path that ISN'T
+        # already this exact symlink -- claude.md #59's own "fail
+        # loudly" preference applies here just as much as to guessing a
+        # wrong install command: overwriting an unrelated program a
+        # person put at /usr/local/bin/festina themselves would be a
+        # much worse surprise than just not automating this one case.
+        if os.path.exists(target) and not (
+                os.path.islink(target) and os.path.realpath(target) == os.path.realpath(source)):
+            print(f"Something already exists at {target} that isn't already a symlink "
+                  f"to this binary -- not overwriting it. Add {source} to PATH by hand instead.")
+            return False
+        print(f"About to run: ln -sf {source} {target}")
+        if not _confirm(assume_yes):
+            return False
+        cmd = ["ln", "-sf", source, target]
+        if not os.access(os.path.dirname(target), os.W_OK):
+            cmd = ["sudo", *cmd]
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            print(f"'{' '.join(cmd)}' exited with status {result.returncode}.")
+            return False
+        print(f"'festina' now resolves to {target}.")
+        return True
+
+    if kind == "shell_rc":
+        rc_file, line, bin_dir = plan["rc_file"], plan["line"], plan["bin_dir"]
+        try:
+            with open(rc_file, encoding="utf-8") as f:
+                already_there = bin_dir in f.read()
+        except FileNotFoundError:
+            already_there = False
+        if already_there:
+            print(f"{rc_file} already references this checkout's bin/ directory -- "
+                  f"nothing to add. Restart your shell (or `source {rc_file}`) if it "
+                  f"still isn't picking it up.")
+            return True
+        print(f"About to append to {rc_file}:")
+        print(f"  {line}")
+        if not _confirm(assume_yes):
+            return False
+        with open(rc_file, "a", encoding="utf-8") as f:
+            f.write(f"\n# Added by `festina doctor --fix`\n{line}\n")
+        print(f"Added. Restart your shell (or run `source {rc_file}`) to pick it up.")
+        return True
+
+    if kind == "windows_path":
+        bin_dir = plan["bin_dir"]
+        print(f'About to run: setx PATH "%PATH%;{bin_dir}"')
+        if not _confirm(assume_yes):
+            return False
+        result = subprocess.run(["setx", "PATH", f"%PATH%;{bin_dir}"])
+        if result.returncode != 0:
+            print(f"'setx' exited with status {result.returncode}.")
+            return False
+        print("Added -- this only affects NEW terminal sessions (Windows environment "
+              "variables aren't retroactive), and setx has a known ~1024-character PATH "
+              "truncation limit, so double-check with `echo %PATH%` in a fresh terminal "
+              "if `festina` still doesn't resolve there.")
+        return True
+
+    return False
+
+
+def _run_doctor_fix(assume_yes=False):
+    """`festina doctor --fix`: run the same report doctor always does,
+    then try to actually FIX what it found instead of just printing
+    hints for a human to act on by hand -- both installing whatever
+    dependencies are missing (_fix_missing_dependencies) and, if
+    `festina` itself isn't resolving on PATH, doing whatever this
+    platform's own fix for that is too (_festina_path_fix_plan/
+    _apply_festina_path_fix). Confirms before making either kind of
+    change (skippable with --yes); the exit code reflects the
+    dependency side only, exactly like plain `festina doctor` itself
+    -- not being on PATH has never been a `required`-flagged doctor
+    check (see _doctor_report), so fixing or not fixing it here
+    shouldn't change what this command's own success/failure means."""
+    lines, all_ok, missing = _doctor_report()
+    print("\n".join(lines))
+    print()
+
+    path_plan = _festina_path_fix_plan()
+    if not missing and path_plan is None:
+        print("Everything required is already installed and 'festina' is already "
+              "on PATH -- nothing to fix.")
+        return 0
+
+    deps_code = _fix_missing_dependencies(missing, all_ok, assume_yes)
+
+    if path_plan is not None:
+        print()
+        _apply_festina_path_fix(path_plan, assume_yes)
+
+    return deps_code
 
 
 def _build_arg_parser():

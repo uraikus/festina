@@ -63,6 +63,16 @@ bin/festina compile examples/greet.f -o greet && ./greet
 
 ## Get started
 
+One line, on Linux/macOS/MSYS2 UCRT64 bash on Windows (no prebuilt binary
+to trust — it clones the source and checks/installs build dependencies
+for you; see [setup.md](setup.md) for what it actually does):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/uraikus/festina/main/install.sh | sh
+```
+
+Or from an existing checkout:
+
 ```bash
 sudo apt install clang libsqlite3-dev libcairo2-dev libx11-dev libasound2-dev pkg-config
 bin/festina compile examples/hello.f -o hello
@@ -78,8 +88,9 @@ bin/festina run examples/hello.f
 Not sure your machine has everything Festina needs? `bin/festina doctor`
 checks every dependency above and tells you exactly what's missing and
 how to install it — including whether `festina` itself is on `PATH` yet.
-Add `--fix` and it installs whatever's missing for you, via `apt`/
-Homebrew/MSYS2's `pacman` (whichever this machine has).
+Add `--fix` and it installs whatever's missing for you (via `apt`/
+Homebrew/MSYS2's `pacman`, whichever this machine has) and adds
+`festina` to `PATH` too.
 
 That's the whole loop — see [setup.md](setup.md) for the full dependency
 breakdown (what's required vs. only-if-you-use-it), packaged-binary

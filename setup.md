@@ -6,6 +6,25 @@ plan (`claude.md #59`; see [api.md](api.md#compilation-pipeline) for the
 pipeline itself, and [security.md](security.md#slim-binaries) for why
 the runtime dependency list below is now conditional per program).
 
+## Installing with one command
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/uraikus/festina/main/install.sh | sh
+```
+
+`install.sh` (Linux, macOS, and MSYS2 UCRT64 bash on Windows --
+windows.md's own one supported Windows toolchain/shell; a native
+PowerShell installer would first need to bootstrap MSYS2 itself, out
+of scope for the same reason windows.md keeps MSVC out of scope)
+clones a fresh checkout into `$FESTINA_INSTALL_DIR` (default
+`~/.festina`; re-running it updates an existing one in place), then
+hands off entirely to `festina doctor --fix` below for both dependency
+checking/installing and adding `festina` to `PATH` -- there's no
+prebuilt binary to download here, since this repository has no release
+pipeline yet, so "install from source" is what a one-line install
+actually means today. `--yes`/`-y` as a script argument skips every
+confirmation prompt, for a fully non-interactive install.
+
 ## To *use* the compiler from a checkout
 
 `bin/festina compile program.f` on a fresh system (or `bin/festina run
@@ -14,7 +33,8 @@ program.f` to skip the intermediate binary and just run it -- see
 doctor`, which checks every dependency below for you and tells you
 exactly what's missing -- and `festina doctor --fix`, which installs
 it for you via whichever of `apt`/Homebrew/MSYS2's `pacman` this
-machine has, after confirming the exact command with you first):
+machine has and adds `festina` to `PATH` too, after confirming each
+change with you first):
 
 | Dependency | Why | Required? |
 |---|---|---|
