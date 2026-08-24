@@ -783,10 +783,10 @@ saveCanvas('screenshot.png')             // -> bool; writes what you drew
 img snap = saveCanvas()                  // -> img; a snapshot, no file written
 
 render()                                  // put the canvas on screen
-clearCanvas()                             // erase everything
-clearRect(10, 10, 40, 40)                 // erase one region
-clearCircle(50, 50, 25)                   // erase a circular region
-clearPixel(10, 10)                        // erase one pixel
+clearCanvas()                             // erase everything to transparent
+clearRect(10, 10, 40, 40)                 // erase one region to transparent
+clearCircle(50, 50, 25)                   // erase a circular region to transparent
+clearPixel(10, 10)                        // erase one pixel to transparent
 
 log(`canvas is ${clientWidth}x${clientHeight}`)
 
@@ -828,6 +828,22 @@ render()
 Batching matters — drawing used to blit the whole canvas per call, so a
 frame of 2000 rectangles took ~1.6s. Behind one `render()` the same
 frame takes ~1ms.
+
+**A fresh or cleared canvas is transparent, not white** — matching the
+HTML5 `<canvas>` model this otherwise mirrors. `clearCanvas`/`clearRect`/
+`clearCircle`/`clearPixel` all clear to fully transparent, and a canvas
+that's never been drawn on starts that way too:
+
+```festina
+drawRect(0, 0, 100, 100)
+clearRect(20, 20, 20, 20)   // that region is now transparent
+saveCanvas('sprite.png')    // a real alpha channel, usable as an asset
+```
+
+That transparency is real alpha in whatever `saveCanvas()` produces
+(a file or the `img` snapshot both), not something flattened to a
+solid colour — useful for drawing a sprite or icon with a transparent
+background to compose elsewhere.
 
 **`saveCanvas()` with no argument returns an `img` instead of writing a
 file** — a snapshot of the canvas at that instant, not a live view of

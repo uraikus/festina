@@ -171,8 +171,20 @@ static void festina_backing_require(void) {
     if (g_backing_surface) return;
     g_backing_surface = cairo_image_surface_create(
         CAIRO_FORMAT_ARGB32, (int)g_canvas_width, (int)g_canvas_height);
+    /* claude.md #136: a fresh canvas starts fully transparent, not
+     * opaque white -- the same blank state every clear* function now
+     * fills back to (see their own shared comment). Explicit rather
+     * than relying on cairo_image_surface_create's own zero-
+     * initialization to already mean this, the same "state what this
+     * needs, don't assume a library default" choice this codebase
+     * already makes elsewhere (e.g. windows.md's own history of
+     * exactly this kind of assumption going wrong). CAIRO_OPERATOR_
+     * SOURCE for the same reason every clear* function needs it: a
+     * transparent source under the default OVER operator would be a
+     * no-op, not a real clear. */
     cairo_t *cr = cairo_create(g_backing_surface);
-    cairo_set_source_rgb(cr, 1, 1, 1); /* white canvas background */
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
     cairo_paint(cr);
     cairo_destroy(cr);
 }
@@ -661,35 +673,50 @@ void festina_render(void) {
     festina_graphics_present();
 }
 
-/* claude.md #95: erases the whole canvas to opaque white -- the missing
- * half of animation. Without it a canvas could only ever accumulate, so
- * nothing could move: every frame painted on top of every frame before
- * it. */
+/* claude.md #136: every clear* function below fills with FULLY
+ * TRANSPARENT pixels, not opaque white -- matching the HTML5 canvas
+ * model these calls otherwise already mirror (a fresh or cleared
+ * <canvas> is transparent, not white), and carrying through to
+ * saveCanvas()'s real alpha channel (claude.md #93's own PNG writer
+ * already round-trips ARGB32 faithfully; nothing there needed to
+ * change for this).
+ *
+ * Cairo's DEFAULT compositing operator (CAIRO_OPERATOR_OVER) treats a
+ * fully-transparent source as a no-op: result = src*alpha + dst*(1-
+ * alpha), which is just `dst` unchanged when alpha is 0 -- painting
+ * "nothing" over existing content does not erase it. Genuinely
+ * replacing pixels with transparent ones needs CAIRO_OPERATOR_SOURCE,
+ * which replaces the destination outright regardless of source alpha.
+ * Scoped to each function's own short-lived `cr` (created and
+ * destroyed within it, same as every other draw/clear function here),
+ * so there is nothing to restore afterward. */
 void festina_clear_canvas(void) {
     festina_backing_require();
     cairo_t *cr = cairo_create(g_backing_surface);
     /* Deliberately NOT the current transform: clearing is about the
      * canvas itself, and a rotated "clear everything" that leaves
      * wedges behind would be a trap rather than a feature. */
-    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
     cairo_paint(cr);
     cairo_destroy(cr);
 }
 
-/* Erases one rectangle back to white. Unlike clearCanvas this DOES
+/* Erases one rectangle to transparent. Unlike clearCanvas this DOES
  * honour the current transform, since it names a region in the same
  * coordinates the drawing calls around it use. */
 void festina_clear_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
     festina_backing_require();
     cairo_t *cr = festina_canvas_context();
-    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     cairo_fill(cr);
     cairo_destroy(cr);
 }
 
 /* claude.md #133: clearRect()'s own circle-shaped counterpart -- erases
- * back to white, honouring the current transform exactly as clearRect
+ * to transparent, honouring the current transform exactly as clearRect
  * does. No fast-path mask cache the way drawCircle has one: clearing is
  * a far rarer call than drawing, so the extra machinery would cost more
  * to maintain than it would ever save here. */
@@ -697,7 +724,8 @@ void festina_clear_circle(int64_t x, int64_t y, int64_t r) {
     festina_backing_require();
     cairo_t *cr = festina_canvas_context();
     if (r < 0) r = 0;
-    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
     cairo_arc(cr, (double)x, (double)y, (double)r, 0.0, 2.0 * 3.14159265358979323846);
     cairo_fill(cr);
     cairo_destroy(cr);
@@ -711,7 +739,8 @@ void festina_clear_pixel(int64_t x, int64_t y) {
     cairo_t *cr = festina_canvas_context();
     cairo_antialias_t save_aa = cairo_get_antialias(cr);
     cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
-    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
     cairo_rectangle(cr, (double)x, (double)y, 1, 1);
     cairo_fill(cr);
     cairo_set_antialias(cr, save_aa);
@@ -1488,20 +1517,22 @@ static void festina_handle_window_event(const FestinaWindowEvent *ev) {
         /* claude.md #39's own examples never draw relative to a canvas
          * size (there's no syntax for one), so there's no spec-defined
          * way to preserve old content sanely across a resize -- clear
-         * back to white at the new size, the same behavior resizing a
-         * browser's <canvas> element has, which clientWidth/
-         * clientHeight are named after. The window's own on-screen
-         * surface is already the new size by the time this fires --
-         * each backend resizes its own before emitting RESIZE (see
-         * festina_runtime_window.h) -- so only the portable backing
-         * store needs rebuilding here. */
+         * to transparent at the new size (claude.md #136), the same
+         * behavior resizing a browser's <canvas> element actually has
+         * (a resized/recreated canvas is transparent, not white),
+         * which clientWidth/clientHeight are named after. The window's
+         * own on-screen surface is already the new size by the time
+         * this fires -- each backend resizes its own before emitting
+         * RESIZE (see festina_runtime_window.h) -- so only the
+         * portable backing store needs rebuilding here. */
         g_canvas_width = ev->width;
         g_canvas_height = ev->height;
         cairo_surface_destroy(g_backing_surface);
         g_backing_surface = cairo_image_surface_create(
             CAIRO_FORMAT_ARGB32, (int)ev->width, (int)ev->height);
         cairo_t *cr = cairo_create(g_backing_surface);
-        cairo_set_source_rgb(cr, 1, 1, 1);
+        cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+        cairo_set_source_rgba(cr, 0, 0, 0, 0);
         cairo_paint(cr);
         cairo_destroy(cr);
         festina_graphics_present();

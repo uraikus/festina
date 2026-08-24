@@ -5763,10 +5763,12 @@ class TestCircleMaskFastPath:
         self._canvas(compile_and_run, monkeypatch,
                       "fillStyle(200, 30, 30)\ndrawCircle(60, 60, 20)")
         _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        _, _, pixel_rgba = _decode_png_rgba(str(tmp_path / "out.png"))
         assert pixel(60, 60) == (200, 30, 30)      # centre
         assert pixel(60, 45) == (200, 30, 30)      # inside, near the top edge
-        assert pixel(60, 20) == (255, 255, 255)    # well outside
-        assert pixel(95, 60) == (255, 255, 255)
+        # claude.md #136: the canvas clears to transparent, not white.
+        assert pixel_rgba(60, 20) == (0, 0, 0, 0)  # well outside
+        assert pixel_rgba(95, 60) == (0, 0, 0, 0)
 
     @pytest.mark.parametrize("radius", [1, 2, 3, 4, 8, 16, 32])
     def test_every_radius_covers_the_right_extent(self, compile_and_run, tmp_path,
@@ -5776,6 +5778,7 @@ class TestCircleMaskFastPath:
         self._canvas(compile_and_run, monkeypatch,
                       f"fillStyle(0, 0, 0)\ndrawCircle(100, 100, {radius})")
         _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        _, _, pixel_rgba = _decode_png_rgba(str(tmp_path / "out.png"))
         # Inked, not necessarily SOLID: a radius-1 circle does not fully
         # cover even its own centre pixel, so Cairo antialiases it to
         # grey -- in the fallback exactly as much as in the fast path
@@ -5783,9 +5786,11 @@ class TestCircleMaskFastPath:
         # pure black here would be testing Cairo's coverage arithmetic
         # rather than this cache.
         assert pixel(100, 100)[0] < 200, (radius, pixel(100, 100))
-        # Just outside the circle in each direction is untouched white.
+        # Just outside the circle in each direction is untouched
+        # transparent (claude.md #136: the canvas clears to transparent,
+        # not white).
         for dx, dy in ((radius + 2, 0), (-radius - 2, 0), (0, radius + 2), (0, -radius - 2)):
-            assert pixel(100 + dx, 100 + dy) == (255, 255, 255), (radius, dx, dy)
+            assert pixel_rgba(100 + dx, 100 + dy) == (0, 0, 0, 0), (radius, dx, dy)
 
     def test_a_bordered_circle_still_gets_its_border(self, compile_and_run, tmp_path,
                                                       monkeypatch):
@@ -5810,9 +5815,11 @@ class TestCircleMaskFastPath:
         self._canvas(compile_and_run, monkeypatch,
                       "fillStyle(0, 0, 0)\nscale(2.0, 2.0)\ndrawCircle(50, 50, 10)")
         _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        _, _, pixel_rgba = _decode_png_rgba(str(tmp_path / "out.png"))
         assert pixel(100, 100) == (0, 0, 0)
         assert pixel(100, 84) == (0, 0, 0)         # 16px out, inside a radius-20 circle
-        assert pixel(100, 78) == (255, 255, 255)   # 22px out, beyond it
+        # claude.md #136: the canvas clears to transparent, not white.
+        assert pixel_rgba(100, 78) == (0, 0, 0, 0)   # 22px out, beyond it
 
     def test_a_translated_circle_moves(self, compile_and_run, tmp_path, monkeypatch):
         # A whole-number translation KEEPS the fast path, so this checks
@@ -5820,11 +5827,18 @@ class TestCircleMaskFastPath:
         self._canvas(compile_and_run, monkeypatch,
                       "fillStyle(0, 0, 0)\ntranslate(100, 50)\ndrawCircle(30, 30, 10)")
         _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        _, _, pixel_rgba = _decode_png_rgba(str(tmp_path / "out.png"))
         assert pixel(130, 80) == (0, 0, 0)
-        assert pixel(30, 30) == (255, 255, 255)
+        # claude.md #136: the canvas clears to transparent, not white.
+        assert pixel_rgba(30, 30) == (0, 0, 0, 0)
 
     def test_alpha_applies_to_a_circle(self, compile_and_run, tmp_path, monkeypatch):
+        # claude.md #136: the canvas itself clears to transparent now,
+        # so an opaque white backdrop is drawn explicitly here -- this
+        # test is about fillAlpha() blending, not about what the canvas
+        # happens to default to.
         self._canvas(compile_and_run, monkeypatch,
+                      "fillStyle(255, 255, 255)\ndrawRect(0, 0, 800, 600)\n"
                       "fillStyle(0, 0, 0)\nfillAlpha(0.5)\ndrawCircle(60, 60, 20)")
         _, _, pixel = _decode_png(str(tmp_path / "out.png"))
         r, g, b = pixel(60, 60)
@@ -5847,9 +5861,10 @@ class TestCircleMaskFastPath:
                                                                     tmp_path, monkeypatch):
         self._canvas(compile_and_run, monkeypatch,
                       "fillStyle(0, 0, 0)\ndrawCircle(60, 60, 0)\ndrawCircle(90, 60, -5)")
-        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
-        assert pixel(60, 60) == (255, 255, 255)
-        assert pixel(90, 60) == (255, 255, 255)
+        # claude.md #136: the canvas clears to transparent, not white.
+        _, _, pixel_rgba = _decode_png_rgba(str(tmp_path / "out.png"))
+        assert pixel_rgba(60, 60) == (0, 0, 0, 0)
+        assert pixel_rgba(90, 60) == (0, 0, 0, 0)
 
     def test_many_distinct_radii_do_not_break_the_cache(self, compile_and_run, tmp_path,
                                                           monkeypatch):
@@ -11365,17 +11380,11 @@ class TestMathFileAndTime:
         assert result.stdout == "true\ntrue\n"
 
 
-def _decode_png(path):
-    """Minimal PNG decoder -> (width, height, pixel(x, y) -> (r, g, b)).
-
-    claude.md #93's saveCanvas is only really verified by reading the
-    file back and finding the drawing in it -- "the call returned true"
-    proves the plumbing, not that the canvas was captured rather than a
-    blank surface. Written out here (zlib plus the five PNG filter
-    types) because the compiler has no image library and neither should
-    its tests; the same reasoning as the sprite_sheet_png fixture, which
-    encodes rather than decodes.
-    """
+def _png_raw(path):
+    """Shared decode step behind _decode_png/_decode_png_rgba below --
+    -> (width, height, stride, bpp, out), `out` the fully unfiltered
+    pixel bytes. See _decode_png's own doc comment for why this is
+    written out by hand at all."""
     import struct
     import zlib
 
@@ -11417,10 +11426,42 @@ def _decode_png(path):
                 line[x] = (line[x] + pred) & 255
         out += line
         prev = line
+    return width, height, stride, bpp, out
+
+
+def _decode_png(path):
+    """Minimal PNG decoder -> (width, height, pixel(x, y) -> (r, g, b)).
+
+    claude.md #93's saveCanvas is only really verified by reading the
+    file back and finding the drawing in it -- "the call returned true"
+    proves the plumbing, not that the canvas was captured rather than a
+    blank surface. Written out here (zlib plus the five PNG filter
+    types) because the compiler has no image library and neither should
+    its tests; the same reasoning as the sprite_sheet_png fixture, which
+    encodes rather than decodes.
+    """
+    width, height, stride, bpp, out = _png_raw(path)
 
     def pixel(x, y):
         off = y * stride + x * bpp
         return tuple(out[off:off + 3])
+
+    return width, height, pixel
+
+
+def _decode_png_rgba(path):
+    """claude.md #136: _decode_png's own RGBA sibling -- (width, height,
+    pixel(x, y) -> (r, g, b, a)), for the transparent-clear tests that
+    need to see the alpha channel _decode_png's plain RGB deliberately
+    drops (every other caller only ever cares about drawn colour, never
+    transparency, so changing _decode_png's own return shape would be
+    pure risk to ~20 existing assertions for no benefit to them)."""
+    width, height, stride, bpp, out = _png_raw(path)
+
+    def pixel(x, y):
+        off = y * stride + x * bpp
+        vals = tuple(out[off:off + bpp])
+        return vals if bpp == 4 else vals + (255,)
 
     return width, height, pixel
 
@@ -11460,7 +11501,10 @@ class TestSaveCanvas:
         assert (width, height) == (800, 600)
         assert pixel(20, 20) == (255, 0, 0), "the red rect is missing"
         assert pixel(60, 20) == (0, 0, 255), "the blue rect is missing"
-        assert pixel(400, 300) == (255, 255, 255), "background should be white"
+        # claude.md #136: the canvas is transparent, not white, wherever
+        # nothing was drawn.
+        _, _, pixel_rgba = _decode_png_rgba(out)
+        assert pixel_rgba(400, 300) == (0, 0, 0, 0), "background should be transparent"
 
     def test_an_unwritable_path_returns_false(self, compile_and_run):
         source = """
@@ -11536,9 +11580,11 @@ class TestDrawPixelClearCircleAndColorOverrides:
         assert result.returncode == 0
         assert result.stdout == "true\n"
         _, _, pixel = _decode_png(out)
+        _, _, pixel_rgba = _decode_png_rgba(out)
         assert pixel(10, 10) == (255, 0, 0)
-        assert pixel(11, 10) == (255, 255, 255), "only the one pixel should be painted"
-        assert pixel(10, 11) == (255, 255, 255), "only the one pixel should be painted"
+        # claude.md #136: the canvas clears to transparent, not white.
+        assert pixel_rgba(11, 10) == (0, 0, 0, 0), "only the one pixel should be painted"
+        assert pixel_rgba(10, 11) == (0, 0, 0, 0), "only the one pixel should be painted"
 
     def test_draw_rect_and_pixel_color_override_does_not_change_fill_style(
             self, compile_and_run, tmp_path):
@@ -11572,10 +11618,12 @@ class TestDrawPixelClearCircleAndColorOverrides:
         result = compile_and_run(source, env={"DISPLAY": ""})
         assert result.returncode == 0
         assert result.stdout == "true\n"
-        _, _, pixel = _decode_png(out)
-        assert pixel(10, 10) == (255, 255, 255)
+        # claude.md #136: the canvas clears to transparent, not white --
+        # painting nothing leaves it transparent, not opaque.
+        _, _, pixel_rgba = _decode_png_rgba(out)
+        assert pixel_rgba(10, 10) == (0, 0, 0, 0)
 
-    def test_clear_pixel_erases_one_pixel_back_to_white(self, compile_and_run, tmp_path):
+    def test_clear_pixel_erases_one_pixel_to_transparent(self, compile_and_run, tmp_path):
         out = str(tmp_path / "canvas.png")
         source = f"""
         color red = 'red'
@@ -11588,10 +11636,11 @@ class TestDrawPixelClearCircleAndColorOverrides:
         assert result.returncode == 0
         assert result.stdout == "true\n"
         _, _, pixel = _decode_png(out)
-        assert pixel(5, 5) == (255, 255, 255)
+        _, _, pixel_rgba = _decode_png_rgba(out)
+        assert pixel_rgba(5, 5) == (0, 0, 0, 0)
         assert pixel(4, 4) == (255, 0, 0), "only the one pixel should be erased"
 
-    def test_clear_circle_erases_a_circular_region_back_to_white(self, compile_and_run, tmp_path):
+    def test_clear_circle_erases_a_circular_region_to_transparent(self, compile_and_run, tmp_path):
         out = str(tmp_path / "canvas.png")
         source = f"""
         color red = 'red'
@@ -11604,7 +11653,8 @@ class TestDrawPixelClearCircleAndColorOverrides:
         assert result.returncode == 0
         assert result.stdout == "true\n"
         _, _, pixel = _decode_png(out)
-        assert pixel(50, 50) == (255, 255, 255), "circle center should be cleared"
+        _, _, pixel_rgba = _decode_png_rgba(out)
+        assert pixel_rgba(50, 50) == (0, 0, 0, 0), "circle center should be cleared"
         assert pixel(1, 1) == (255, 0, 0), "far corner should still be red"
 
     def test_wrong_arity_and_types_are_rejected(self, parser, semantic, errors):
@@ -11937,6 +11987,7 @@ class TestRenderClearAndHeadless:
         assert result.stdout == "true\nexited on its own\n"
 
     def test_clear_canvas_erases_everything(self, compile_and_run, tmp_path):
+        # claude.md #136: clears to fully TRANSPARENT, not opaque white.
         out = str(tmp_path / "cleared.png")
         source = f"""
         color red = 'red'
@@ -11947,8 +11998,8 @@ class TestRenderClearAndHeadless:
         """
         result = compile_and_run(source, env={"DISPLAY": ""})
         assert result.returncode == 0
-        _w, _h, pixel = _decode_png(out)
-        assert pixel(50, 50) == (255, 255, 255), "clearCanvas() left the rect behind"
+        _w, _h, pixel = _decode_png_rgba(out)
+        assert pixel(50, 50) == (0, 0, 0, 0), "clearCanvas() left the rect behind"
 
     def test_clear_rect_erases_only_its_region(self, compile_and_run, tmp_path):
         out = str(tmp_path / "partial.png")
@@ -11961,10 +12012,10 @@ class TestRenderClearAndHeadless:
         """
         result = compile_and_run(source, env={"DISPLAY": ""})
         assert result.returncode == 0
-        _w, _h, pixel = _decode_png(out)
-        assert pixel(60, 60) == (255, 255, 255), "clearRect() did not erase its region"
-        assert pixel(150, 150) == (255, 0, 0), "clearRect() erased outside its region"
-        assert pixel(10, 10) == (255, 0, 0), "clearRect() erased outside its region"
+        _w, _h, pixel = _decode_png_rgba(out)
+        assert pixel(60, 60) == (0, 0, 0, 0), "clearRect() did not erase its region"
+        assert pixel(150, 150) == (255, 0, 0, 255), "clearRect() erased outside its region"
+        assert pixel(10, 10) == (255, 0, 0, 255), "clearRect() erased outside its region"
 
     def test_drawing_survives_until_render(self, run_graphics_program, x_display):
         # Drawing before the window exists is not an error -- the canvas
