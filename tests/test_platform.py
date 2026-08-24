@@ -383,7 +383,7 @@ class TestFeatureGating:
     def test_doctor_on_darwin_reports_audio_as_planned_not_missing(
             self, cli_mod, monkeypatch):
         monkeypatch.setattr(sys, "platform", "darwin")
-        lines, _ = cli_mod._doctor_report()
+        lines, _, _missing = cli_mod._doctor_report()
         report = "\n".join(lines)
         assert "macos.md Phase 1" in report
         assert "alsa" not in report, (
@@ -398,7 +398,7 @@ class TestFeatureGating:
         # user has no way to install.
         monkeypatch.setattr(sys, "platform", "win32")
         _stub_which_any(cli_mod, monkeypatch)
-        lines, _ = cli_mod._doctor_report()
+        lines, _, _missing = cli_mod._doctor_report()
         report = "\n".join(lines)
         assert "windows.md Phase 1" in report
         assert "windows.md Phase 2" in report
@@ -410,7 +410,7 @@ class TestFeatureGating:
         monkeypatch.setattr(sys, "platform", "win32")
         _stub_which_any(cli_mod, monkeypatch)
         monkeypatch.setattr(cli_mod, "_pkg_config_has", lambda pkg: False)
-        lines, all_ok = cli_mod._doctor_report()
+        lines, all_ok, _missing = cli_mod._doctor_report()
         report = "\n".join(lines)
         # The install hint names the real package (libsystre); the
         # pkg-config name it's actually queried under (gnurx) is an
@@ -423,15 +423,108 @@ class TestFeatureGating:
         monkeypatch.setattr(sys, "platform", "win32")
         _stub_which_any(cli_mod, monkeypatch)
         monkeypatch.setenv("MSYSTEM", "MSYS")
-        lines, _ = cli_mod._doctor_report()
+        lines, _, _missing = cli_mod._doctor_report()
         assert "wrong shell" in "\n".join(lines)
 
     def test_doctor_says_nothing_extra_for_ucrt64(self, cli_mod, monkeypatch):
         monkeypatch.setattr(sys, "platform", "win32")
         _stub_which_any(cli_mod, monkeypatch)
         monkeypatch.setenv("MSYSTEM", "UCRT64")
-        lines, _ = cli_mod._doctor_report()
+        lines, _, _missing = cli_mod._doctor_report()
         assert "wrong shell" not in "\n".join(lines)
+
+
+class TestDetectPackageManager:
+    """`festina doctor --fix`: which of the three package managers
+    setup.md documents (apt/Debian-Ubuntu, Homebrew/macOS, MSYS2's
+    pacman/Windows) it should drive -- one per platform, by design
+    (see _PKG_MANAGER_PACKAGES' own docstring for why this doesn't try
+    to guess for dnf/Arch's pacman/zypper/etc). Same sys.platform-spoof
+    pattern as TestDoctor above, and the same reason _stub_which_any
+    exists: shutil.which has its own real win32 branch that a spoofed
+    platform string on real POSIX CI would otherwise crash into."""
+
+    def test_linux_detects_apt(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(cli_mod.shutil, "which",
+                             lambda cmd: "/usr/bin/apt" if cmd == "apt" else None)
+        assert cli_mod._detect_package_manager() == "apt"
+
+    def test_linux_falls_back_to_apt_get(self, cli_mod, monkeypatch):
+        # Some Debian/Ubuntu images ship apt-get without the newer apt
+        # frontend -- doctor --fix should still recognize the family.
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(cli_mod.shutil, "which",
+                             lambda cmd: "/usr/bin/apt-get" if cmd == "apt-get" else None)
+        assert cli_mod._detect_package_manager() == "apt"
+
+    def test_linux_without_apt_is_unsupported(self, cli_mod, monkeypatch):
+        # dnf/Arch pacman/zypper -- deliberately not guessed at, see
+        # _PKG_MANAGER_PACKAGES' own docstring.
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(cli_mod.shutil, "which", lambda cmd: None)
+        assert cli_mod._detect_package_manager() is None
+
+    def test_darwin_detects_brew(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(cli_mod.shutil, "which",
+                             lambda cmd: "/opt/homebrew/bin/brew" if cmd == "brew" else None)
+        assert cli_mod._detect_package_manager() == "brew"
+
+    def test_darwin_without_brew_is_unsupported(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(cli_mod.shutil, "which", lambda cmd: None)
+        assert cli_mod._detect_package_manager() is None
+
+    def test_windows_detects_msys2_pacman(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(cli_mod.shutil, "which",
+                             lambda cmd: "/usr/bin/pacman" if cmd == "pacman" else None)
+        assert cli_mod._detect_package_manager() == "msys2"
+
+    def test_windows_without_pacman_is_unsupported(self, cli_mod, monkeypatch):
+        # Not running inside an MSYS2 shell at all.
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(cli_mod.shutil, "which", lambda cmd: None)
+        assert cli_mod._detect_package_manager() is None
+
+
+class TestDoctorFixInstallCommand:
+    """_doctor_fix_install_command: the exact command line for each
+    manager, given an already-deduplicated package list -- pure
+    function, no subprocess involved, so every branch is checked
+    directly rather than through a real (or even faked) install."""
+
+    def test_apt_as_root_has_no_sudo_prefix(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(cli_mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+        monkeypatch.setattr(cli_mod.os, "geteuid", lambda: 0, raising=False)
+        cmd = cli_mod._doctor_fix_install_command("apt", ["clang", "pkg-config"])
+        assert cmd == ["apt", "install", "-y", "clang", "pkg-config"]
+
+    def test_apt_as_non_root_is_prefixed_with_sudo(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(cli_mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+        monkeypatch.setattr(cli_mod.os, "geteuid", lambda: 1000, raising=False)
+        cmd = cli_mod._doctor_fix_install_command("apt", ["clang"])
+        assert cmd == ["sudo", "apt", "install", "-y", "clang"]
+
+    def test_apt_falls_back_to_apt_get_when_apt_is_absent(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(cli_mod.shutil, "which",
+                             lambda cmd: None if cmd == "apt" else f"/usr/bin/{cmd}")
+        monkeypatch.setattr(cli_mod.os, "geteuid", lambda: 0, raising=False)
+        cmd = cli_mod._doctor_fix_install_command("apt", ["clang"])
+        assert cmd[0:2] == ["apt-get", "install"]
+
+    def test_brew_never_gets_a_sudo_prefix(self, cli_mod, monkeypatch):
+        # Homebrew actively refuses to run as root -- confirming this
+        # never accidentally inherits apt's sudo logic.
+        monkeypatch.setattr(cli_mod.os, "geteuid", lambda: 0, raising=False)
+        cmd = cli_mod._doctor_fix_install_command("brew", ["sqlite", "cairo"])
+        assert cmd == ["brew", "install", "sqlite", "cairo"]
+
+    def test_msys2_uses_noconfirm_pacman(self, cli_mod):
+        cmd = cli_mod._doctor_fix_install_command(
+            "msys2", ["mingw-w64-ucrt-x86_64-clang"])
+        assert cmd == ["pacman", "-S", "--noconfirm", "mingw-w64-ucrt-x86_64-clang"]
 
 
 class TestAudioFeatureConfig:
