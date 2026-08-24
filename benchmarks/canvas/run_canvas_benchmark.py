@@ -165,7 +165,23 @@ def _decode_png(path):
 def _tile_means(path, grid=16):
     """Mean RGB per cell of a grid x grid downsample -- coarse enough to
     ignore antialiasing differences between rasterizers, fine enough to
-    notice one side drawing nothing."""
+    notice one side drawing nothing.
+
+    Composites onto white first when the source has an alpha channel
+    (Festina's own saveCanvas() output does; the browser side never
+    does, since _BROWSER_HARNESS fills white before drawing at all --
+    see draw_shapes.js/the harness's own ctx.fillStyle='white' line).
+    Comparing raw, un-composited RGB used to read a fully-transparent
+    Festina pixel as (0,0,0) -- api.md's own "a fresh or cleared canvas
+    is transparent, not white" -- against the browser's opaque
+    (255,255,255) at the same spot: a real, maximal 255-per-channel
+    "difference" that had nothing to do with either rasterizer's actual
+    drawing, only with the two harnesses starting from different
+    backgrounds. compare_images is supposed to answer "did both sides
+    draw the same scene", and a viewer looking at either PNG on an
+    ordinary (white) page would see the same thing -- so compositing
+    both onto the same white background before comparing is what
+    actually answers that question, not an approximation of it."""
     width, height, bpp, pixels = _decode_png(path)
     cells = []
     for gy in range(grid):
@@ -177,7 +193,13 @@ def _tile_means(path, grid=16):
                 row = y * width * bpp
                 for x in range(x0, x1, 4):
                     o = row + x * bpp
-                    totals[0] += pixels[o]; totals[1] += pixels[o + 1]; totals[2] += pixels[o + 2]
+                    if bpp == 4:
+                        a = pixels[o + 3] / 255.0
+                        totals[0] += pixels[o] * a + 255 * (1 - a)
+                        totals[1] += pixels[o + 1] * a + 255 * (1 - a)
+                        totals[2] += pixels[o + 2] * a + 255 * (1 - a)
+                    else:
+                        totals[0] += pixels[o]; totals[1] += pixels[o + 1]; totals[2] += pixels[o + 2]
                     count += 1
             cells.append(tuple(t / max(count, 1) for t in totals))
     return cells
@@ -400,8 +422,8 @@ def main():
         print(f"Browser  drawing min {browser['draw_s']*1000:6.1f} ms  median "
               f"{browser['draw_median_s']*1000:6.1f} ms  "
               f"(browser startup {browser['startup_s']*1000:.0f} ms)")
-        worst, same = compare_images(fest["png"], browser["png"])
-        print(f"Output   worst per-channel difference over a 16x16 grid: {worst:.1f} "
+        browser_worst, same = compare_images(fest["png"], browser["png"])
+        print(f"Output   worst per-channel difference over a 16x16 grid: {browser_worst:.1f} "
               f"({'same scene' if same else 'DIFFERENT -- results not comparable'})")
         if not same:
             sys.exit(1)
@@ -419,12 +441,12 @@ def main():
             sys.exit(1)
 
     if args.update_doc and browser:
-        _update_doc(fest, fest_baseline, fest_draw, browser, chromium, monogame)
+        _update_doc(fest, fest_baseline, fest_draw, browser, chromium, browser_worst, monogame)
         print(f"wrote {BENCHMARK_MD}")
     return 0
 
 
-def _update_doc(fest, baseline, fest_draw, browser, chromium, monogame=None):
+def _update_doc(fest, baseline, fest_draw, browser, chromium, browser_worst, monogame=None):
     fmin, fmed = fest["draw_s"] * 1000, fest["draw_median_s"] * 1000
     bmin, bmed = browser["draw_s"] * 1000, browser["draw_median_s"] * 1000
     mg_row, mg_note = "", ""
@@ -505,12 +527,18 @@ direction, because one side starts a process and the other starts a
 browser.
 
 Both outputs were compared cell-by-cell over a 16x16 grid to confirm
-they drew the same scene -- worst per-channel difference 0.2 out of 255.
-Not byte-for-byte: Cairo and Skia disagree about antialiasing on every
-curve, and demanding identical bytes would only prove the two
-rasterizers are the same program. The check has already earned itself
-once, catching a bug in this very script that left one side comparing a
-blank canvas.
+they drew the same scene -- worst per-channel difference {browser_worst:.1f} out
+of 255. Not byte-for-byte: Cairo and Skia disagree about antialiasing on
+every curve, and demanding identical bytes would only prove the two
+rasterizers are the same program. The check has earned itself twice
+now: once catching a bug in this very script that left one side
+comparing a blank canvas, and again catching itself comparing raw RGB
+without accounting for alpha -- Festina's own offscreen canvas starts
+transparent (api.md's own "a fresh or cleared canvas is transparent,
+not white"), so a background pixel neither side actually drew on read
+as black here against the browser harness's own opaque white fill,
+which the comparison mistook for a real rendering difference until it
+started compositing both sides onto the same white background first.
 <!-- CANVAS_RESULTS_END -->"""
 
     with open(BENCHMARK_MD) as f:

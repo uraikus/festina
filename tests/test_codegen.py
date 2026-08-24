@@ -5247,13 +5247,41 @@ class TestScreenSizeAndSetClientSize:
 
 
 class TestExampleGraphicsAndGame:
-    """Interactive regression coverage for examples/graphics.f and
-    examples/tic_tac_toe.f -- the two examples that need a real (or
-    virtual) X server, so they can't join tests/test_examples.py's
-    plain compile-and-check-stdout sweep. Lives here, not there, so it
-    can reuse this file's own _find_window/_wait_for_output helpers and
-    x_display/run_graphics_program fixtures, the same as TestGraphics
-    above and TestTimers's combined graphics+timers test below."""
+    """Interactive regression coverage for examples/graphics.f,
+    examples/tic_tac_toe.f, and examples/layers.f -- the examples that
+    need a real (or virtual) X server, so they can't join
+    tests/test_examples.py's plain compile-and-check-stdout sweep.
+    Lives here, not there, so it can reuse this file's own
+    _find_window/_wait_for_output helpers and x_display/
+    run_graphics_program fixtures, the same as TestGraphics above and
+    TestTimers's combined graphics+timers test below."""
+
+    def test_layers_demo_renders_all_layers_and_stops_on_its_own(self, run_graphics_program, x_display):
+        # claude.md #149: arr[img] as a layer stack, composited by one
+        # renderFrame() every setInterval tick. Like timers.f, the demo
+        # clears its own interval and logs a final line once it's done
+        # (200 frames), rather than needing this test to be the one that
+        # decides when to stop it -- so this only needs to wait for that
+        # line, the same pattern TestIndividualExamples.
+        # test_timers_demo_runs_and_exits_on_its_own already uses for a
+        # non-graphics example. Manually verified beyond what's
+        # automated here (same "high confidence, not worth a netpbm
+        # test dependency" call TestGraphics's own docstring makes):
+        # captured the real rendered window via xwd and visually
+        # confirmed all four layers actually composite -- the sky/ground
+        # background, the scattered stars (plus one added mid-run), the
+        # bouncing ball's accumulated trail (including a real bounce off
+        # an edge), and the "Frame N/200" HUD text on top.
+        source = open(os.path.join(_EXAMPLES_DIR, "layers.f")).read()
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            _find_window(x_display)
+            text = _wait_for_output(stdout_path, lambda t: "rendered 200 frames" in t, timeout=30)
+            assert "opening the canvas -- close the window to exit" in text
+            assert "rendered 200 frames -- stopping (close the window to exit)" in text
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
 
     def test_graphics_demo_dispatches_mouse_key_and_resize(self, run_graphics_program, x_display):
         source = open(os.path.join(_EXAMPLES_DIR, "graphics.f")).read()
