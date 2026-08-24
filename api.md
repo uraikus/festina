@@ -17,7 +17,7 @@ flag to distinguish them:
 |---|---|
 | `festina compile entry.f -o out` | Compile to a native executable at `out` (default: `entry`'s own filename without `.f`). `--emit-llvm` prints LLVM IR to stdout instead of linking. `--cc` picks the C compiler/linker (default: whichever of `clang`/`gcc`/`cc` is found first). |
 | `festina run entry.f` | Compile to a throwaway temp executable and run it immediately — stdin/stdout/stderr inherited directly (not captured), so an interactive program (graphics/audio/timers) behaves exactly like a normal compile-then-run. Exits with the *compiled program's own* exit code, so `festina run x.f && ...` composes the same way `go run`/`cargo run` do. The temp binary is always cleaned up afterward. |
-| `festina doctor` | Checks every dependency the compiler itself needs (a C compiler, `pkg-config`, sqlite3/cairo-xlib/alsa dev headers, `libLLVM`) and reports what's missing and how to install it — the same install hints a real compile failure would give (`claude.md #59`), just checked proactively instead of only on failure. Also reports whether `festina` itself is resolvable on `PATH`, and if not, exactly how to add it (the checkout's `bin/` directory, or a packaged binary — see [setup.md](setup.md)). Exits 0 if every *required* dependency is present — graphics/audio are optional, since a compiler that can't build a graphics program is still a fully working compiler for everything else (see [security.md](security.md#binary-slimming)). |
+| `festina doctor` | Checks every dependency the compiler itself needs (a C compiler, `pkg-config`, sqlite3/cairo-xlib/alsa dev headers, `libLLVM`) and reports what's missing and how to install it — the same install hints a real compile failure would give (`claude.md #59`), just checked proactively instead of only on failure. Also reports whether `festina` itself is resolvable on `PATH`, and if not, exactly how to add it (the checkout's `bin/` directory, or a packaged binary — see [setup.md](setup.md)). Exits 0 if every *required* dependency is present — graphics/audio are optional, since a compiler that can't build a graphics program is still a fully working compiler for everything else (see [security.md](security.md#slim-binaries)). |
 | `festina help` | Prints this same command list. |
 
 ```bash
@@ -52,7 +52,7 @@ Festina source (.f)
 A compiled program only links what it actually uses: the graphics
 (Cairo/X11) and audio (ALSA) runtime object files are only passed to the
 linker when the program calls something from them (see
-[security.md](security.md#binary-slimming)). `libsqlite3` is always
+[security.md](security.md#slim-binaries)). `libsqlite3` is always
 available (statically linked when possible — see
 [setup.md](setup.md#static-linking-sqlite3)), since automatic database
 support (`table`, `sqlite()`) is always on.

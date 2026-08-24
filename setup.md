@@ -3,7 +3,7 @@
 Three different dependency lists, and they're not the same size — this
 is the practical payoff of the staged "real compilation, minimal setup"
 plan (`claude.md #59`; see [api.md](api.md#compilation-pipeline) for the
-pipeline itself, and [security.md](security.md#binary-slimming) for why
+pipeline itself, and [security.md](security.md#slim-binaries) for why
 the runtime dependency list below is now conditional per program).
 
 ## To *use* the compiler from a checkout
@@ -30,7 +30,7 @@ If you don't know ahead of time whether every program you'll ever
 compile needs graphics/audio, the simplest move is installing all
 seven system packages up front (below) — a *compiled program* only ends up
 depending on the ones it actually uses (that's the whole point of
-[security.md](security.md#binary-slimming)'s binary-slimming split);
+[security.md](security.md#slim-binaries)'s binary-slimming split);
 it's only the *compiler's own build-time* dependency list that's
 conditional per program.
 
@@ -178,7 +178,7 @@ links `libcairo.so`/`libX11.so` and their own transitive dependencies
 and one that never uses `claude.md #38`'s audio never links
 `libasound.so` — confirmed directly with `ldd` on real compiled
 binaries, not just reasoned about (see
-[security.md](security.md#binary-slimming) for the full story, including
+[security.md](security.md#slim-binaries) for the full story, including
 why this needed the runtime split into separate translation units rather
 than just optimizer flags). Check any specific binary with `ldd` to see
 exactly what it needs:
@@ -213,7 +213,7 @@ in any requirements file:
 |---|---|---|
 | `pyinstaller` | `tests/test_packaging.py` (2 tests) | `pip install -r requirements-build.txt` |
 | `Xvfb` + `xdotool` + `xwd` | Interactive graphics tests — clicking, moving the mouse, pressing keys, resizing a real (virtual) window, and reading canvas pixels back to check `claude.md #89`'s colours and fonts actually render (`TestGraphics`, `TestCanvasStyleRendersRealPixels`, plus `TestTimers`'s combined graphics+timers case) | `sudo apt install xvfb xdotool x11-apps` on Debian/Ubuntu (`xwd` ships in `x11-apps`) — a real `$DISPLAY` works too, if one is already available |
-| `openbox` (+ optional `xprop`, from `x11-utils`) | One regression test for a real window-manager crash (see [security.md](security.md#graphics-a-real-window-manager-crash-badmatch-on-xsetinputfocus)) that a bare Xvfb instance (no WM at all) can never reproduce (`TestGraphics::test_graphics_init_does_not_crash_under_a_real_window_manager`; 1 test) | `sudo apt install openbox x11-utils` on Debian/Ubuntu — `xprop` is only used to poll for the WM's own readiness signal instead of a fixed sleep; the test still runs (with a fixed sleep instead) without it |
+| `openbox` (+ optional `xprop`, from `x11-utils`) | One regression test for a real window-manager crash (see [security.md](security.md#notable-fixed-findings)) that a bare Xvfb instance (no WM at all) can never reproduce (`TestGraphics::test_graphics_init_does_not_crash_under_a_real_window_manager`; 1 test) | `sudo apt install openbox x11-utils` on Debian/Ubuntu — `xprop` is only used to poll for the WM's own readiness signal instead of a fixed sleep; the test still runs (with a fixed sleep instead) without it |
 
 Every one of those skips cleanly and independently when its tool isn't
 present — the suite still passes, just with fewer tests run. Audio's
