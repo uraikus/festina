@@ -7,7 +7,7 @@ overhead, and the boilerplate. Festina compiles through LLVM to a real,
 standalone executable — with SQLite, graphics, audio, and JS-style
 timers built directly into the language, not bolted on as libraries.
 
-[![Tests](https://img.shields.io/badge/tests-1296%20passing-brightgreen)](tests/CONTRACT.md)
+[![Tests](https://img.shields.io/badge/tests-1462%20passing-brightgreen)](tests/CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ```festina
@@ -51,12 +51,12 @@ bin/festina compile examples/greet.f -o greet && ./greet
   and `free spritesheet` / `delete map.key` exist for the moments you
   know the lifetime better than the compiler does.
 - **JavaScript syntax, none of the surprises.** Template strings,
-  ternaries, familiar control flow — but `int`/`float` never silently
-  mix, every condition is a real `bool`, and everything is statically
-  typed and checked before it runs.
+  ternaries, familiar control flow — but every condition is a real
+  `bool`, and everything is statically typed and checked before it
+  runs.
 - **Slim by default.** A compiled program only links what it actually
   uses — skip graphics and audio in your source, and the binary skips
-  Cairo, X11, and ALSA too. See [security.md](security.md#binary-slimming).
+  Cairo, X11, and ALSA too. See [security.md](security.md#slim-binaries).
 - **Minimal setup, by design.** The fewest dependencies that get the
   job done, failing loudly and clearly the moment one is actually
   missing. See [setup.md](setup.md).
@@ -103,10 +103,11 @@ for int i = 0, i < 10, i++ {
 }
 ```
 
-`int` and `float` never mix implicitly — convert explicitly with
-`.toFloat()` or `Math.floor/ceil/round/trunc`. Division and modulo by
-zero return `null` instead of crashing. See [api.md](api.md) for the
-full language and standard library reference.
+`int` and `float` mix freely — the `int` side is promoted to `float`
+automatically, and `/` always returns `float`. The only way back to
+`int` is `Math.floor/ceil/round/trunc`. Division and modulo by zero
+return `null` instead of crashing. See [api.md](api.md) for the full
+language and standard library reference.
 
 ## Built in, not bolted on
 
@@ -199,7 +200,9 @@ frame about twice as fast as Chromium's.
 ## Project status
 
 The compiler frontend, LLVM codegen backend, and native C runtime are
-real and tested: **1296 tests, 0 failures.** Every language construct
+real and tested: **1462 tests, 0 failures** (8 more skip cleanly when
+their optional tooling isn't installed — see
+[setup.md](setup.md#running-the-test-suite)). Every language construct
 in the [specification](claude.md) is implemented end to end, not just
 parsed. That includes a leak stress suite —
 [`scripts/leak_stress.sh`](scripts/leak_stress.sh) runs mixed churn
