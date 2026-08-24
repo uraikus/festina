@@ -92,6 +92,10 @@ BUILTIN_FUNCTIONS = {
     "setMaxAudioPlayers", "maxAudioPlayers",
     # claude.md #99: stop one channel (or, with no argument, all of them).
     "stopAudioPlayer",
+    # claude.md #146: true while that channel is playing anything,
+    # regardless of clip -- the per-CHANNEL counterpart to aud's own
+    # clip-wide isPlaying() method.
+    "isAudioPlayerPlaying",
     # claude.md #89/#91: canvas drawing style + text metrics. `font` is
     # NOT here -- claude.md #91 turned it into a type name, so the
     # setter is changeFont().
@@ -150,6 +154,8 @@ _BUILTIN_RETURN_TYPES = {
     # claude.md #132
     "mkdir": types_mod.PrimitiveType("bool"),
     "ls": types_mod.ArrayType(types_mod.PrimitiveType("text")),
+    # claude.md #146
+    "isAudioPlayerPlaying": types_mod.PrimitiveType("bool"),
 }
 
 # claude.md #55: int and float never mix directly in a binary operator.
@@ -226,6 +232,10 @@ _BUILTIN_SIGNATURES = {
     # claude.md #139
     "setClientWidth": (_INT,),
     "setClientHeight": (_INT,),
+    # claude.md #146: the channel argument is required, unlike
+    # stopAudioPlayer's optional one (see _BUILTIN_SIGNATURE_ALTERNATES
+    # below) -- there's no sensible "any channel" reading for a query.
+    "isAudioPlayerPlaying": (_INT,),
 }
 
 # claude.md #90: three builtins accept two different shapes. The

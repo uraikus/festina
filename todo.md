@@ -28,16 +28,11 @@ real hardware to confirm on, which this project doesn't have:
   windowed-graphics gate has just never actually been lifted for a CI
   run to try it (see [windows.md](windows.md)'s "genuine opportunity,
   not yet taken" note) — the cheapest open item on either platform.
-- **Static sqlite3 linking** for fully self-contained binaries — see
-  [setup.md](setup.md#static-linking-sqlite3).
 
 ## Language & standard library
 
 - **HTTP / networking** — the largest missing capability, and the one
   that will most reshape [security.md](security.md) when it lands.
-- **Per-playback audio addressing** — `play()` returns its channel and
-  `stop()` is clip-wide (claude.md #109), but there is still no
-  `isPlaying(channel)`.
 - **Media formats** stay PNG/JPEG + WAV/MP3, deliberately (claude.md
   #101): each new format is a new system dependency for every machine
   that compiles a media-using program. Revisit only with a concrete

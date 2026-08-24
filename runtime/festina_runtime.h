@@ -819,6 +819,12 @@ void festina_audio_stop_clip(void *audio);
  * reservation. A negative channel means every channel, which is what a
  * bare stopAudioPlayer() compiles to. */
 void festina_stop_audio_player(int64_t channel);
+/* isAudioPlayerPlaying(channel): true while that CHANNEL is playing
+ * anything, regardless of clip -- the counterpart festina_audio_
+ * is_playing (above) can't stand in for, since that one only ever
+ * answers about a clip whose value the caller still has in hand.
+ * Clamped into [0, 64) exactly like festina_stop_audio_player. */
+int8_t festina_channel_is_playing(int64_t channel);
 /* claude.md #98: the channel-pool limit. Clamped into [1, 64] rather
  * than rejected -- this is a tuning knob, and failing a program over a
  * number that is merely unreasonable would be a worse trade than
