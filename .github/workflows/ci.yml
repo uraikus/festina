@@ -15,7 +15,13 @@
 # hardware, so those tiers shed as skips on both platforms for the
 # identical reason. windows.md Phase 3 (claude.md #129) added the
 # windows job's own packaging+smoke-test step, mirroring the macOS/
-# Linux jobs' own.
+# Linux jobs' own. claude.md #148 (wasm.md): WASM export is Linux-only
+# for now (wasi-libc/libclang-rt-*-dev-wasm32 are apt packages this
+# project has only verified there), so the Linux job alone installs
+# that toolchain plus Node (the WASI host tests/test_wasm.py and
+# benchmarks/run_wasm_benchmarks.py both run compiled .wasm binaries
+# through) -- FESTINA_STRICT_DEPS=1 means that tier can't silently skip
+# there either, same as every other tier this job is strict about.
 name: CI
 
 on:
@@ -34,6 +40,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v4
+        # claude.md #148: the WASI host every wasm32-wasi test/benchmark
+        # here runs a compiled .wasm through (node:wasi) -- explicit,
+        # like setup-python above, rather than relying on whatever
+        # Node version ubuntu-latest happens to preinstall.
+        with:
+          node-version: "22"
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -41,10 +54,20 @@ jobs:
             clang pkg-config libsqlite3-dev \
             libcairo2-dev libx11-dev libjpeg-dev \
             libasound2-dev libmpg123-dev \
+            wasi-libc libclang-rt-18-dev-wasm32 \
             xvfb xdotool openbox fonts-dejavu-core
           pip install -r requirements-dev.txt -r requirements-build.txt
       - name: Run the test suite
         run: python -m pytest tests/ -q
+      - name: Compile and run a WASM example
+        # claude.md #148/wasm.md's own exit criterion: a real .wasm
+        # binary, built via `festina compile --target=wasm32-wasi`,
+        # actually running via Node's WASI support on every push --
+        # not just compiling. examples/hello.f is windowless/audioless
+        # (see wasm.md's Limitations section for why that matters).
+        run: |
+          python -m festina.cli compile --target=wasm32-wasi examples/hello.f -o /tmp/hello.wasm
+          node --no-warnings runtime/wasm/run_wasi.mjs /tmp/hello.wasm /tmp
       - name: Package and smoke-test the standalone compiler binary
         # claude.md #59 stage 2 / macos.md Phase 3: pyinstaller is an
         # opt-in, build-time-only dependency (not in requirements-dev.txt,

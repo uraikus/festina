@@ -213,7 +213,7 @@ frame about twice as fast as Chromium's.
 ## Project status
 
 The compiler frontend, LLVM codegen backend, and native C runtime are
-real and tested: **1462 tests, 0 failures** (8 more skip cleanly when
+real and tested: **1543 tests, 0 failures** (8 more skip cleanly when
 their optional tooling isn't installed — see
 [setup.md](setup.md#running-the-test-suite)). Every language construct
 in the [specification](claude.md) is implemented end to end, not just
@@ -222,9 +222,10 @@ parsed. That includes a leak stress suite —
 programs plus one isolation program per data type under
 AddressSanitizer and LeakSanitizer — because "the answers are right"
 and "nothing accumulates while producing them" are different claims.
-See [`tests/CONTRACT.md`](tests/CONTRACT.md) for exactly what's covered
-and how, and [todo.md](todo.md) for what's next (macOS, Windows,
-HTTP).
+Native builds on Linux, macOS, and Windows, plus cross-compiling to
+`wasm32-wasi` (see [wasm.md](wasm.md)), are all supported today. See
+[`tests/CONTRACT.md`](tests/CONTRACT.md) for exactly what's covered
+and how, and [todo.md](todo.md) for what's next.
 
 ```bash
 python3 -m pytest            # the whole suite

@@ -10,6 +10,10 @@ catch regressions and track progress over time, run against the same
 few workloads on every change that plausibly affects performance
 (codegen, runtime, or the standard library), not as a marketing claim.
 
+These same five programs are also benchmarked cross-compiled to
+`wasm32-wasi` (against C and Go, also compiled to wasm) — see
+[wasm.md](wasm.md#benchmarks).
+
 ## Methodology
 
 Five programs, each implemented equivalently in Festina, Rust, Go, and

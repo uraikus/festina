@@ -615,10 +615,29 @@ class _StackArrayOrMap:
 
 
 class CodeGen:
-    def __init__(self, analyzed, filename="main.f"):
+    def __init__(self, analyzed, filename="main.f", target="native"):
         self.analyzed = analyzed
         self.entry_filename = filename         # the file actually passed to the compiler -- see generate()
         self.filename = filename               # mutated per top-level statement (see generate()); used by every error site
+        # claude.md #148: WASM export. Every native target festina/cli.py
+        # builds for (x86_64/aarch64 Linux/macOS/Windows) is 64-bit, so
+        # nothing before this needed to track pointer width at all --
+        # wasm32-wasi is the first 32-bit target, and its libc declares
+        # calloc/malloc/etc. with a genuinely 32-bit size_t. LLVM
+        # requires a call site to match its callee's declared signature
+        # EXACTLY (no implicit truncation the way a real C compiler
+        # would insert one), so passing Festina's own internal i64 size
+        # arithmetic straight through produced a real link-time
+        # "function signature mismatch: calloc" trap on real wasm32-wasi
+        # -- confirmed directly, not just reasoned about. self.pointer_bits
+        # is consulted only at the small handful of external-libc-call
+        # sites that actually need it (_emit_calloc/_emit_malloc below);
+        # every internal ptrtoint/inttoptr Festina already does to
+        # compute its own struct/array sizes needs no change at all,
+        # since LLVM defines those conversions to correctly zero-extend/
+        # truncate against whatever the target's real pointer width is.
+        self.target = target
+        self.pointer_bits = 32 if target == "wasm32-wasi" else 64
         self.structs = analyzed.structs       # name -> {field: Type}
         self.struct_order = list(analyzed.structs.keys())
         self.tables = analyzed.tables          # name -> {field: festina-type-name}
@@ -1224,8 +1243,11 @@ class CodeGen:
             # claude.md #98: the per-aud voice limit.
             "declare void @festina_set_max_audio_players(i64)",
             "declare i64 @festina_get_max_audio_players()",
-            "declare ptr @malloc(i64)",
-            "declare ptr @calloc(i64, i64)",
+            # claude.md #148: size_t's real width on the target being
+            # linked against -- see __init__'s own note on
+            # self.pointer_bits for why this can't just always be i64.
+            f"declare ptr @malloc(i{self.pointer_bits})",
+            f"declare ptr @calloc(i{self.pointer_bits}, i{self.pointer_bits})",
             # claude.md #74: automatic reclamation of provably non-
             # escaping struct/arr[T]/map[T] locals -- see
             # _emit_free_active_locals.
@@ -2426,7 +2448,10 @@ class CodeGen:
                     total_size = self.tmp()
                     lines.append(f"  {total_size} = add i64 {size_val}, 8")
                     raw = f"%{stmt.name}.raw.{uid}"
-                    lines.append(f"  {raw} = call ptr @calloc(i64 1, i64 {total_size})")
+                    count_arg = self._size_arg("1", lines)
+                    size_arg = self._size_arg(total_size, lines)
+                    lines.append(f"  {raw} = call ptr @calloc(i{self.pointer_bits} {count_arg}, "
+                                  f"i{self.pointer_bits} {size_arg})")
                     lines.append(f"  store i64 1, ptr {raw}")
                     lines.append(f"  {backing} = getelementptr i8, ptr {raw}, i64 8")
                 lines.append(f"  {slot} = alloca ptr")
@@ -3609,6 +3634,46 @@ class CodeGen:
         lines.append(f"  {size_val} = ptrtoint ptr {ptr_val} to i64")
         return size_val
 
+    def _size_arg(self, i64_val, lines):
+        """An i64 size/count value, narrowed to whatever width
+        self.pointer_bits actually needs to call calloc/malloc with --
+        see __init__'s own note. A plain `trunc` on a value that's
+        already the right width would be invalid IR, so native (64)
+        just passes the value through unchanged; only wasm32 (32)
+        inserts the trunc. Every caller already has its size computed
+        in i64 (Festina's own internal size arithmetic never needs to
+        change -- see _sizeof above), so this is the one narrowing
+        point, not a change scattered across every call site's own
+        computation."""
+        if self.pointer_bits == 64:
+            return i64_val
+        out = self.tmp()
+        lines.append(f"  {out} = trunc i64 {i64_val} to i{self.pointer_bits}")
+        return out
+
+    def _emit_calloc(self, count_i64, size_i64, lines):
+        """calloc(count, size), both operands narrowed to the real
+        size_t width first -- see _size_arg. Every call site already
+        passes count=1 (the total byte count folded into `size`
+        instead), so calloc's own overflow-checking multiply stays
+        meaningful rather than being defeated by a genuine element
+        count."""
+        ir_ty = f"i{self.pointer_bits}"
+        count = self._size_arg(count_i64, lines)
+        size = self._size_arg(size_i64, lines)
+        out = self.tmp()
+        lines.append(f"  {out} = call ptr @calloc({ir_ty} {count}, {ir_ty} {size})")
+        return out
+
+    def _emit_malloc(self, size_i64, lines):
+        """malloc(size), narrowed the same way _emit_calloc's own
+        operands are."""
+        ir_ty = f"i{self.pointer_bits}"
+        size = self._size_arg(size_i64, lines)
+        out = self.tmp()
+        lines.append(f"  {out} = call ptr @malloc({ir_ty} {size})")
+        return out
+
     def _emit_fresh_heap_header(self, payload_llvm_ty, lines):
         """claude.md #79: allocates a fresh, uniquely-owned (refcount=1)
         heap block for a refcounted value's own header -- an escaping
@@ -3626,8 +3691,7 @@ class CodeGen:
         size_val = self._sizeof(payload_llvm_ty, lines)
         total_size = self.tmp()
         lines.append(f"  {total_size} = add i64 {size_val}, 8")
-        raw = self.tmp()
-        lines.append(f"  {raw} = call ptr @calloc(i64 1, i64 {total_size})")
+        raw = self._emit_calloc("1", total_size, lines)
         lines.append(f"  store i64 1, ptr {raw}")
         payload = self.tmp()
         lines.append(f"  {payload} = getelementptr i8, ptr {raw}, i64 8")
@@ -3883,14 +3947,13 @@ class CodeGen:
         lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
         lines.append(f"  store i64 {n}, ptr {len_ptr}")
 
-        data_ptr = self.tmp()
         if n == 0:
-            lines.append(f"  {data_ptr} = call ptr @malloc(i64 0)")
+            data_ptr = self._emit_malloc("0", lines)
         else:
             elem_size = self._sizeof(elem_llvm_ty, lines)
             total_size = self.tmp()
             lines.append(f"  {total_size} = mul i64 {elem_size}, {n}")
-            lines.append(f"  {data_ptr} = call ptr @malloc(i64 {total_size})")
+            data_ptr = self._emit_malloc(total_size, lines)
             # claude.md #80: retain a struct/arr/map-typed element
             # whenever its own source isn't "owning" -- the identical
             # rule every other binding site in this stage uses. No
@@ -7760,8 +7823,7 @@ class CodeGen:
         body.append(f"  {size_val} = ptrtoint ptr {size_ptr} to i64")
         total = self.tmp()
         body.append(f"  {total} = add i64 {size_val}, 8")
-        raw = self.tmp()
-        body.append(f"  {raw} = call ptr @calloc(i64 1, i64 {total})")
+        raw = self._emit_calloc("1", total, body)
         body.append(f"  store i64 1, ptr {raw}")
         payload = self.tmp()
         body.append(f"  {payload} = getelementptr i8, ptr {raw}, i64 8")
