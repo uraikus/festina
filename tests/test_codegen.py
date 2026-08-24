@@ -60,6 +60,59 @@ class TestUnrecognizedEventName:
 
 # ---- end-to-end: real compiled, real executed programs ----
 
+class TestCloseAndExitHandler:
+    """claude.md #131: close(code) exits the program with `code`,
+    running a declared `on exit(code:int)` handler first if there is
+    one. Deliberately NOT a graphics feature -- close()/`on exit` work
+    in a program that never opens a window, unlike `on close` (the
+    existing window-close-button event), which this is not the same
+    thing as."""
+
+    def test_close_exits_with_the_given_code_and_runs_no_handler_by_default(self, compile_and_run):
+        result = compile_and_run("log('before')\nclose(7)\nlog('unreachable')")
+        assert result.returncode == 7
+        assert result.stdout == "before\n"
+
+    def test_on_exit_runs_before_the_program_actually_exits(self, compile_and_run):
+        source = """
+        on exit(code:int) {
+            log(`exiting with ${code}`)
+        }
+        log('before')
+        close(42)
+        log('unreachable')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 42
+        assert result.stdout == "before\nexiting with 42\n"
+
+    def test_close_with_no_on_exit_handler_declared_works_fine(self, compile_and_run):
+        result = compile_and_run("close(0)")
+        assert result.returncode == 0
+        assert result.stdout == ""
+
+    def test_close_requires_exactly_one_int_argument(self, parser, semantic, errors):
+        for source in ["close()", "close(1, 2)", "close('a')", "close(1.5)"]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+    def test_on_exit_requires_exactly_one_int_parameter(self, parser, semantic, errors):
+        for source in [
+            "on exit() { }",
+            "on exit(code:text) { }",
+            "on exit(a:int, b:int) { }",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+    def test_a_user_function_cannot_shadow_close(self, parser, semantic, errors):
+        program = parser.parse("void func close(x:int) { }", filename="main.f")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program, filename="main.f")
+
+
 class TestArithmeticAndControlFlow:
     """claude.md #14-16, #18-20, #23-24: functions, expressions, if/else,
     ternary all produce correct runtime behavior, not just valid IR."""

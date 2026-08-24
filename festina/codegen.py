@@ -660,6 +660,10 @@ class CodeGen:
                                                 # _emit_graphics_call and _emit_main_and_entry
         self.event_handlers = {}               # "mouseDown"/"mouse" -> @__festina_on_<name> -- see
                                                 # _emit_event_handler and _emit_main_and_entry
+        self.exit_handler_symbol = None        # claude.md #131: @__festina_on_exit if `on exit(code:int)`
+                                                # was declared, else None -- registered unconditionally
+                                                # in main() (close() works with or without a window), so
+                                                # tracked separately from event_handlers' graphics-only six.
         self.uses_timers = False               # any setTimeout()/setInterval() call anywhere --
                                                 # NOT clearTimeout()/clearInterval() alone; see
                                                 # _emit_timer_call and _emit_main_and_entry
@@ -1116,6 +1120,12 @@ class CodeGen:
             "declare void @festina_register_key_up_handler(ptr)",
             "declare void @festina_register_resize_handler(ptr)",
             "declare void @festina_register_close_handler(ptr)",
+            # claude.md #131: unlike the six handlers just above, these
+            # two live in the CORE runtime translation unit (not
+            # graphics) -- close(code)/`on exit` work in every program,
+            # windowed or not.
+            "declare void @festina_register_exit_handler(ptr)",
+            "declare void @festina_program_exit(i64)",
             "declare i64 @festina_client_width()",
             "declare i64 @festina_client_height()",
             # claude.md #69: setTimeout/setInterval/clearTimeout/clearInterval
@@ -1689,9 +1699,14 @@ class CodeGen:
         sources this runtime actually generates (claude.md #40's own
         examples; semantic.py's _EVENT_SIGNATURES enforces the fixed
         signature each one needs, matching the runtime's fixed function
-        pointer type for it). Any other declared name still compiles (so
-        a typo/bug in its body is still caught) but is simply dead code:
-        nothing ever calls it."""
+        pointer type for it). claude.md #131: `exit` is a seventh
+        recognized name, but not a graphics event -- it fires from the
+        close(code) builtin (see _emit_call's own "close" branch),
+        which works with or without a window, so its registration is
+        unconditional in _emit_main_and_entry rather than joining the
+        other six's graphics-gated loop. Any OTHER declared name still
+        compiles (so a typo/bug in its body is still caught) but is
+        simply dead code: nothing ever calls it."""
         symbol = f"@__festina_on_{decl.name}"
         param_types = [self._resolve(p.type_expr, decl) for p in decl.params]
         params_ir = ", ".join(f"{_llvm_type(t)} %arg.{p.name}" for t, p in zip(param_types, decl.params))
@@ -1722,6 +1737,12 @@ class CodeGen:
                           "resize", "close"):
             self.uses_graphics = True
             self.event_handlers[decl.name] = symbol
+        elif decl.name == "exit":
+            # claude.md #131: NOT a graphics event -- registered
+            # unconditionally in main() below, so this deliberately does
+            # not set self.uses_graphics or join event_handlers (whose
+            # own registration loop is graphics-gated).
+            self.exit_handler_symbol = symbol
 
     # ---- statements ----
     def _emit_free(self, stmt, env, lines):
@@ -5919,6 +5940,16 @@ class CodeGen:
                 text_val = self._to_text(val, vtype, lines)
                 lines.append(f"  call void @festina_fail(ptr {text_val})")
                 return "0", None
+            if name == "close":
+                # claude.md #131: exits the program with `code`, running
+                # a declared `on exit(code:int)` handler first --
+                # festina_program_exit does both (see festina_runtime.c),
+                # since the registered handler (if any) is a runtime
+                # concern, not something codegen calls directly here.
+                val, vtype = self._emit_expr(expr.args[0], env, lines)
+                val = self._coerce(val, vtype, INT, lines, source_expr=expr.args[0])
+                lines.append(f"  call void @festina_program_exit(i64 {val})")
+                return "0", None
             # claude.md #93: files, time and canvas export. Each frees
             # any text temporary it was handed once the call returns --
             # none of these runtime functions keeps a pointer past it
@@ -7033,6 +7064,12 @@ class CodeGen:
         # thing main() does, before even the database/graphics setup
         # below -- see festina_runtime_init's own comment for why.
         main_lines.append("  call void @festina_runtime_init()")
+        # claude.md #131: `on exit(code:int)` registers unconditionally
+        # (with or without graphics) and before anything else runs, so
+        # close(code) can fire the handler even from code that executes
+        # before a window would otherwise be set up.
+        if self.exit_handler_symbol is not None:
+            main_lines.append(f"  call void @festina_register_exit_handler(ptr {self.exit_handler_symbol})")
         # self.uses_sqlite/self.uses_graphics are only reliably set by
         # this point because every function body (self.func_defs) and
         # every entry statement (the loop above) has already been

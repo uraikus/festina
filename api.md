@@ -1669,12 +1669,30 @@ unit; a file is never imported more than once even if multiple files
 depend on it; errors still point at the file a statement actually came
 from.
 
-## `log()` / `fail()`
+## `log()` / `fail()` / `close()`
 
 ```festina
 log(value)     // prints any primitive to stdout, newline-terminated
 fail('message')  // prints to stderr, exits(1)
+close(code)    // exits(code), running `on exit` first if declared
 ```
+
+`close(code)` exits the program with the given exit code — it works in
+every program, with or without a window, unlike the graphics-only `on
+close` handler under [Graphics](#graphics) above (which fires on the
+window's own close button and is a different thing with a similar
+name). If a program declares `on exit(code:int) { ... }`, `close(code)`
+runs it — passed the same code — before the process actually exits:
+
+```festina
+on exit(code:int) {
+    log(`exiting with ${code}`)
+}
+log('working...')
+close(1)          // prints "exiting with 1", then exits with status 1
+```
+
+With no `on exit` handler declared, `close(code)` just exits.
 
 ## Error format
 

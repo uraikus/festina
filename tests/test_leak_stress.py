@@ -349,4 +349,9 @@ class TestLeakStress:
             "regex_and_files_churn.f",  # regex compilation, file and time text
             "structs_and_rows_churn.f", # structs, query rows, scope exits
             "text_churn.f",             # text, the copy-managed one
+            # claude.md #130: splice's own 3rd-argument insertion --
+            # element-range retain/copy into a SEPARATE array's buffer,
+            # a genuinely different ownership shape than push/unshift's
+            # single-value one collections_churn.f already covers.
+            "splice_insert_churn.f",
         }

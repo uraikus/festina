@@ -101,6 +101,11 @@ BUILTIN_FUNCTIONS = {
     # claude.md #94: single-value queries, so a scalar result needs no
     # throwaway `table` declaration (which would create a real table).
     "sqliteInt", "sqliteFloat", "sqliteText",
+    # claude.md #131: exits the program with `code`, running a declared
+    # `on exit(code:int)` handler first (see _EVENT_SIGNATURES below) --
+    # works with or without a window, unlike mouseDown/.../close's on-
+    # screen-only handlers.
+    "close",
 }
 
 _BUILTIN_RETURN_TYPES = {
@@ -183,6 +188,8 @@ _BUILTIN_SIGNATURES = {
     "fillAlpha": (_FLOAT,),
     "fillLinearGradient": (_INT, _INT, types_mod.ColorType(), _INT, _INT, types_mod.ColorType()),
     "fillRadialGradient": (_INT, _INT, _INT, types_mod.ColorType(), types_mod.ColorType()),
+    # claude.md #131
+    "close": (_INT,),
 }
 
 # claude.md #90: three builtins accept two different shapes. The
@@ -268,6 +275,12 @@ _EVENT_SIGNATURES = {
     "keyUp": ((_TEXT,), "(key:text)"),
     "resize": ((), "no parameters"),
     "close": ((), "no parameters"),
+    # claude.md #131: NOT a graphics event -- fires from the close(code)
+    # builtin, which works with or without a window. Kept in this same
+    # table since the shape (a fixed, enforced signature) is identical;
+    # analyze_event_handler and _emit_event_handler both special-case it
+    # away from the other six's window-only registration.
+    "exit": ((_INT,), "(code:int)"),
 }
 
 # claude.md #39: clientWidth/clientHeight report the canvas window's

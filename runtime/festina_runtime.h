@@ -35,6 +35,16 @@ void festina_log_text(const char *v);
 /* claude.md #42: fail() -- prints to stderr and exits(1). */
 void festina_fail(const char *msg);
 
+/* claude.md #131: close(code) -- runs a declared `on exit(code:int)`
+ * handler (if any), then exits with `code`. Lives in the core runtime
+ * so it works in every program, windowed or not -- unlike
+ * festina_register_close_handler/festina_run_event_loop's own window-
+ * close event in festina_runtime_graphics.c, which only ever fires
+ * from an actual window. festina_register_exit_handler is called at
+ * most once, unconditionally, near the top of main(). */
+void festina_register_exit_handler(void (*handler)(int64_t));
+void festina_program_exit(int64_t code);
+
 /* claude.md #9, #45: string interpolation support. */
 char *festina_str_from_int(int64_t v);
 char *festina_str_from_float(double v);

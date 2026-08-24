@@ -106,6 +106,29 @@ void festina_fail(const char *msg) {
     exit(1);
 }
 
+/* claude.md #131: close(code)/`on exit(code:int)`. Lives in the CORE
+ * runtime (not festina_runtime_graphics.c, where g_close_handler and
+ * the window-close event live) precisely because close() has to work
+ * in every program, windowed or not -- unlike g_close_handler, which
+ * only ever fires from an X11/Cocoa/Win32 window-close event and so
+ * can only exist in a program that already links a graphics backend.
+ * festina_register_exit_handler is called at most once, unconditionally,
+ * near the very top of main() (see codegen.py's _emit_main_and_entry)
+ * whenever the program declares one; festina_program_exit runs it (if
+ * registered) and then exits -- the two are kept as separate functions,
+ * matching every other register_*_handler/fire-the-handler pair in this
+ * runtime, rather than folding registration into the exit call itself. */
+static void (*g_exit_handler)(int64_t) = NULL;
+
+void festina_register_exit_handler(void (*handler)(int64_t)) {
+    g_exit_handler = handler;
+}
+
+void festina_program_exit(int64_t code) {
+    if (g_exit_handler) g_exit_handler(code);
+    exit((int)code);
+}
+
 /* ---- environment variables -- claude.md #71 ---- */
 
 char *festina_getenv(const char *name) {
