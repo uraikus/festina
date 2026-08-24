@@ -1765,8 +1765,46 @@ def analyze(program, filename="<string>"):
     def analyze_var_decl(decl, scope, is_global):
         declared_type = resolve(decl.type_expr, decl)
         if decl.init is not None:
-            actual_type = infer(decl.init, scope)
-            check_assignable(declared_type, actual_type, decl)
+            # claude.md #137: arr[img]/arr[aud]/arr[blob] declared
+            # directly from a literal of paths -- `arr[img] brushes =
+            # ['./brush1.png', './brush2.png']` -- the array-typed
+            # counterpart of `img sprite = 'sprite.png'` (claude.md
+            # #100/#101/#109's own one-directional text -> media
+            # allowance, handled just below in check_assignable for a
+            # single value). ArrayLit's own generic inference (just
+            # above) has no notion of an "expected" element type -- it
+            # only ever infers each element's OWN type and demands they
+            # all agree, so `['a.png', 'b.png']` infers as arr[text]
+            # regardless of what it's being declared into, and
+            # check_assignable's array/map case never had a "text
+            # element coerces to media element" rule (only the
+            # all-null case) -- so this needs its own check here,
+            # bypassing the generic infer()+check_assignable() path
+            # for exactly this one shape. Every element must be EITHER
+            # a path (text) or already the declared media type itself
+            # (e.g. an existing img being reused in the literal) --
+            # codegen's own _emit_array_lit/_coerce already do the
+            # per-element text -> media loading generically once the
+            # expected element type reaches them; the gap was only
+            # ever here, in what semantic.py would let through.
+            if (isinstance(declared_type, types_mod.ArrayType)
+                    and declared_type.element in (_IMAGE, _AUDIO, _BLOB)
+                    and isinstance(decl.init, ast.ArrayLit)):
+                elem = declared_type.element
+                for e in decl.init.elements:
+                    etype = infer(e, scope)
+                    if etype is not None and etype is not NULL and etype != elem and etype != _TEXT:
+                        raise CompileError(
+                            f"array literal element expects "
+                            f"{types_mod.type_name(elem)} (or text, naming a "
+                            f"path), found {types_mod.type_name(etype)}",
+                            file=filename, line=getattr(e, "line", 0),
+                            column=getattr(e, "column", 0),
+                            category="invalid operand type",
+                        )
+            else:
+                actual_type = infer(decl.init, scope)
+                check_assignable(declared_type, actual_type, decl)
         kind = "constant" if decl.is_const else "variable"
         scope.define(decl.name, Symbol(decl.name, declared_type, kind, decl), decl, filename)
 

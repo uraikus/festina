@@ -21,6 +21,16 @@ while i < 120 {
     aud mp3 = 'tone.mp3'
     aud wav = 'beep.wav'
 
+    // claude.md #137: arr[img]/arr[blob] declared directly from a
+    // literal of paths -- each element loaded exactly like a single
+    // `img x = path` declaration, through the same array-literal
+    // retain path claude.md #79/#80 already cover for every other
+    // element type.
+    arr[img] gallery = ['tiles.png', 'gradient.jpg']
+    arr[blob] docs = ['tiles.png']
+    total = total + gallery.length + gallery[0].width
+    if docs[0].exists() { total = total + 1 }
+
     // Derived images: clip() allocates a new surface, resize() replaces
     // one in place and drops the source bytes with it.
     img tile = png.clip(0, 0, 32, 32)

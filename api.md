@@ -450,6 +450,18 @@ Memory is reclaimed automatically — see "Structs" above for the full
 picture (non-escaping locals reclaimed at scope-exit, escaping values
 reference counted).
 
+**`arr[img]`/`arr[blob]`/`arr[aud]` load each element from a path**,
+the array-typed counterpart of `img sprite = 'sprite.png'`:
+
+```festina
+arr[img] brushes = ['./brush1.png', './brush2.png']
+arr[blob] saves = ['slot1.dat', 'slot2.dat']
+```
+
+An element may also already be a value of the array's own media type
+(reusing an existing `img`/`blob`/`aud`, aliased rather than reloaded) —
+mixing the two in one literal is fine.
+
 ### Indexing is not bounds-checked
 
 **`numbers[i]` is a raw memory access, and keeping `i` in range is

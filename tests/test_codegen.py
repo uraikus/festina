@@ -8044,6 +8044,101 @@ class TestMediaFormatsAndPaths:
         assert result.stdout.strip() == "16"
 
 
+class TestTypedMediaArrayLiterals:
+    """claude.md #137: arr[img]/arr[aud]/arr[blob] declared directly
+    from a literal of paths -- `arr[img] brushes = ['a.png', 'b.png']`
+    -- the array-typed counterpart of `img sprite = 'sprite.png'`
+    (claude.md #100/#101/#109's own text -> media declaration
+    shorthand), now also allowed element-by-element inside a literal
+    the array is declared from."""
+
+    def test_an_image_array_literal_loads_each_path(self, compile_and_run, tmp_path,
+                                                      monkeypatch, sprite_sheet_png):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        name = os.path.basename(sprite_sheet_png)
+        shutil.copy(sprite_sheet_png, tmp_path / "other.png")
+        source = f"""
+        arr[img] sheets = ['{name}', 'other.png']
+        log(sheets.length)
+        log(`${{sheets[0].width}}x${{sheets[0].height}}`)
+        log(`${{sheets[1].width}}x${{sheets[1].height}}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\n128x64\n128x64\n"
+
+    def test_a_blob_array_literal_loads_each_path(self, compile_and_run, tmp_path):
+        (tmp_path / "a.txt").write_text("first")
+        (tmp_path / "b.txt").write_text("second")
+        source = """
+        arr[blob] files = ['a.txt', 'b.txt']
+        log(files.length)
+        log(files[0].toText())
+        log(files[1].toText())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\nfirst\nsecond\n"
+
+    def test_an_audio_array_literal_loads_each_path(self, compile_and_run, tmp_path,
+                                                      audio_null_env):
+        shutil.copy(_MP3_FIXTURE, tmp_path / "tone.mp3")
+        result = compile_and_run(
+            "arr[aud] clips = ['tone.mp3']\nlog(clips.length)\nlog(clips[0] == null)",
+            env=audio_null_env,
+        )
+        assert result.returncode == 0
+        assert result.stdout == "1\nfalse\n"
+
+    def test_an_element_may_already_be_the_media_type_not_just_a_path(
+            self, compile_and_run, tmp_path, monkeypatch, sprite_sheet_png):
+        # A mix: one path, one already-declared img reused by reference.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        name = os.path.basename(sprite_sheet_png)
+        shutil.copy(sprite_sheet_png, tmp_path / "second.png")
+        source = f"""
+        img second = 'second.png'
+        arr[img] sheets = ['{name}', second]
+        log(sheets.length)
+        log(sheets[1] == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\nfalse\n"
+
+    def test_a_clipped_images_own_array_literal_does_not_alias_its_source(
+            self, compile_and_run, tmp_path, monkeypatch, sprite_sheet_png):
+        # The array literal path (_emit_array_lit) has to retain a
+        # reused element the same way push()/a plain array literal
+        # already do (claude.md #80) -- reusing `second` here must not
+        # leave sheets[1] silently sharing ownership incorrectly.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        name = os.path.basename(sprite_sheet_png)
+        source = f"""
+        img second = '{name}'
+        arr[img] sheets = [second]
+        second.resize(4, 4)
+        log(`${{sheets[0].width}}x${{sheets[0].height}}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # Aliased, not copied -- resizing through `second` is visible
+        # through `sheets[0]` too, same as any other img alias.
+        assert result.stdout.strip() == "4x4"
+
+    def test_wrong_element_type_is_rejected(self, parser, semantic, errors):
+        for source in [
+            "arr[img] brushes = [5]",
+            "arr[img] brushes = [true]",
+            "aud a = 'x.wav'\narr[img] brushes = [a]",
+            "arr[blob] files = [3.5]",
+            "arr[aud] clips = [null, 7]",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
 class TestMediaColumnsInTables:
     """claude.md #101: `file:aud` / `pic:img` table columns, stored as
     SQLite BLOBs.
