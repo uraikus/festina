@@ -28,37 +28,47 @@
 #
 # windows.md Phase 3 (claude.md #129): runs under MSYS2 bash on Windows
 # (the windows CI job's own shell, and the only supported toolchain --
-# windows.md's own decision, MSVC out of scope) via bash's own OSTYPE
-# variable, set to "msys" there and nothing else this script needs to
-# special-case for -- PyInstaller itself already emits `festina.exe`
-# there with no extra flag, exactly like MinGW's linker already appends
-# `.exe` to every OTHER compiled Festina program (windows.md Phase 0).
-# The one real platform difference is `--add-data`'s SRC:DEST separator:
+# windows.md's own decision, MSVC out of scope), detected via `$MSYSTEM`
+# (set to e.g. "UCRT64" there -- this project's own already-proven
+# Windows-CI detection signal, the same one festina/cli.py's doctor
+# logic keys off) and nothing else this script needs to special-case
+# for -- PyInstaller itself already emits `festina.exe` there with no
+# extra flag, exactly like MinGW's linker already appends `.exe` to
+# every OTHER compiled Festina program (windows.md Phase 0). The one
+# real platform difference is `--add-data`'s SRC:DEST separator:
 # PyInstaller's own documented spelling is `;` on Windows and `:`
 # everywhere else -- a real `:` would be read as part of a Windows path
 # instead (`C:\...`), not a separator, so this can't share one spelling
 # across platforms the way every other flag here does.
 #
-# A second, real MSYS2 gotcha (found by real Windows CI, across two
-# separate rounds): PyInstaller there is a NATIVE (non-MSYS) Windows
-# executable, and MSYS2's bash automatically rewrites path-shaped
-# arguments before such a process ever sees them -- ordinarily
-# transparent, but it mishandles a COMPOUND `SRC;DEST` argument
-# (`--add-data`'s own required shape), observed producing a doubled,
-# broken path (`D:/d/a/festina/festina/...`). Round one tried
-# converting SRC to its real Windows form first via `cygpath -m` (an
-# MSYS2 core utility, `-m` for the forward-slash "mixed" form so it
-# concatenates cleanly onto the compound argument's suffix with no
-# backslash to escape) -- that alone was NOT enough: the identical
-# doubled path came back regardless, meaning the automatic conversion
-# re-mangles even an already-correct Windows path sitting inside a
-# compound argument, not only a raw POSIX one. `cygpath -m` stays
-# (still the correct value to hand it), paired now with
+# A second, real MSYS2 gotcha (found by real Windows CI): PyInstaller
+# there is a NATIVE (non-MSYS) Windows executable, and MSYS2's bash
+# automatically rewrites path-shaped arguments before such a process
+# ever sees them -- ordinarily transparent, but it mishandles a
+# COMPOUND `SRC;DEST` argument (`--add-data`'s own required shape).
+# Every absolute path this script hands `pyinstaller` is converted to
+# its real Windows form first via `cygpath -m` (an MSYS2 core utility,
+# `-m` for the forward-slash "mixed" form so it concatenates cleanly
+# onto a compound argument's suffix with no backslash to escape), and
 # `MSYS2_ARG_CONV_EXCL="*"` -- the standard, documented way to tell
-# MSYS2's runtime to leave EVERY argument of the next command alone,
-# no automatic conversion attempted at all, since this script is
-# already supplying a correct native path itself and the automatic
-# "help" is exactly what breaks it.
+# MSYS2's runtime to leave EVERY argument of the next command alone --
+# suppresses the automatic conversion that would otherwise re-mangle
+# an already-correct path sitting inside that compound argument.
+#
+# The detection condition itself (`$MSYSTEM`, not the more commonly
+# suggested `$OSTYPE == "msys"`) is the one thing that took four real
+# Windows CI rounds to actually pin down, all against the identical
+# symptom (`D:/d/a/festina/festina/...`, a doubled path) -- rounds one
+# through three each fixed a real, plausible MSYS2/PyInstaller
+# interaction (the `;` separator, `cygpath -m`, `MSYS2_ARG_CONV_EXCL`)
+# that could never have mattered, because the `if` guarding all of it
+# was never true in the first place: under the msys2/setup-msys2
+# action's own `shell: msys2 {0}` wrapper (a cmd.exe-launched bash, not
+# a plain interactive MSYS2 terminal), `$OSTYPE` apparently isn't the
+# compiled-in "msys" that detection technique assumes elsewhere. Found
+# by round three's own diagnostic stderr echoes -- not by what they
+# printed, but by their total ABSENCE from the next real CI log,
+# proving the whole block had never executed at all.
 #
 # Usage: ./scripts/package_compiler.sh [output_dir]
 #   -> writes <output_dir>/festina (default: ./dist/festina), or
@@ -84,7 +94,23 @@ RUNTIME_DIR="$REPO_ROOT/runtime"
 DISTPATH="$OUT_DIR"
 WORKPATH="$WORK_DIR/build"
 SPECPATH="$WORK_DIR"
-if [[ "${OSTYPE:-}" == "msys" ]]; then
+# claude.md #129 round four: the actual root cause of three straight
+# identical real-CI failures, found by what the round-three diagnostic
+# echoes did NOT show rather than by what they did -- they never
+# printed anything AT ALL, meaning this whole block, cygpath calls and
+# all, had never once executed on real Windows CI. `${OSTYPE:-}
+# == "msys"` was the wrong detection the entire time; under the
+# msys2/setup-msys2 action's own `shell: msys2 {0}` wrapper (a cmd.exe-
+# launched bash, not a plain interactive MSYS2 terminal), OSTYPE
+# apparently isn't the compiled-in "msys" this technique assumes
+# elsewhere. `$MSYSTEM`, by contrast, is directly confirmed present in
+# every single CI log line's own "env:" block (set to `UCRT64`) and is
+# already this project's own proven-working Windows-CI detection
+# signal -- festina/cli.py's doctor logic already keys off it. Every
+# fix attempted in earlier rounds (the `;` separator, `cygpath -m`,
+# `MSYS2_ARG_CONV_EXCL`) was itself sound; none of it could ever have
+# helped while the gate guarding all of it silently never opened.
+if [[ -n "${MSYSTEM:-}" ]]; then
     ADD_DATA_SEP=";"
     FESTINA_BIN="$OUT_DIR/festina.exe"
     # -m (not -w): forward-slash Windows form, so RUNTIME_DIR
@@ -94,41 +120,20 @@ if [[ "${OSTYPE:-}" == "msys" ]]; then
     DISTPATH="$(cygpath -m "$DISTPATH")"
     WORKPATH="$(cygpath -m "$WORKPATH")"
     SPECPATH="$(cygpath -m "$SPECPATH")"
-    # Real Windows CI proved cygpath's own correct output alone is not
-    # enough for --add-data specifically: MSYS2's automatic argv path
-    # "conversion" re-mangles it anyway at exec time, producing the
-    # identical broken doubled path (D:/d/a/...) whether or not this
-    # file did its own conversion first -- the heuristic apparently
-    # reprocesses an ALREADY-correct Windows path sitting inside a
-    # compound SRC;DEST argument, not only a raw POSIX one.
-    # MSYS2_ARG_CONV_EXCL="*" is the standard, documented escape hatch:
-    # it tells MSYS2's runtime to leave every argument of the next
-    # command alone, no automatic conversion at all. Scoped to this one
-    # `pyinstaller` invocation, and paired with converting EVERY
-    # absolute path handed to it above (not just RUNTIME_DIR) --
-    # --distpath/--workpath/--specpath had been relying on that same
-    # automatic conversion working correctly for their own single,
-    # non-compound path arguments (and it does, there), so disabling it
-    # wholesale without also pre-converting those would trade one
-    # broken path for three different ones.
+    # MSYS2_ARG_CONV_EXCL="*": PyInstaller under MSYS2 UCRT64 Python is
+    # a native (non-MSYS) Windows executable, so MSYS2's bash otherwise
+    # automatically rewrites path-shaped arguments before it ever sees
+    # them -- including, unpredictably, an already-correct Windows path
+    # sitting inside a compound `SRC;DEST` argument. This is the
+    # standard, documented escape hatch: leave every argument of the
+    # next command alone, no automatic conversion at all. Scoped to
+    # this one `pyinstaller` invocation, and paired with converting
+    # EVERY absolute path handed to it above (not just RUNTIME_DIR) --
+    # --distpath/--workpath/--specpath would otherwise be relying on
+    # that same automatic conversion for their own single, non-compound
+    # path arguments, so disabling it wholesale without pre-converting
+    # those too would trade one broken path for three different ones.
     export MSYS2_ARG_CONV_EXCL="*"
-    # claude.md #129 round three: two straight real-CI rounds each
-    # produced the IDENTICAL broken path (D:/d/a/festina/festina/...)
-    # despite two DIFFERENT fix attempts (cygpath -m alone, then paired
-    # with MSYS2_ARG_CONV_EXCL) -- reasoning further from here without
-    # seeing what this script actually computed would be a third guess
-    # in the dark, the same mistake claude.md #126 round eleven's own
-    # instrumentation-over-guessing precedent exists to avoid. This
-    # block is purely diagnostic, stderr-only, and never changes what
-    # gets built -- it exists to turn the next real Windows CI log into
-    # one that can actually distinguish "cygpath itself returned the
-    # broken value" from "something downstream re-mangled a correct
-    # one," which the error message alone cannot.
-    echo "debug: OSTYPE=$OSTYPE" >&2
-    echo "debug: cygpath resolves to: $(command -v cygpath || echo 'NOT FOUND')" >&2
-    echo "debug: RUNTIME_DIR (post-cygpath) = $RUNTIME_DIR" >&2
-    echo "debug: DISTPATH (post-cygpath) = $DISTPATH" >&2
-    echo "debug: first --add-data value = $RUNTIME_DIR/festina_runtime.c${ADD_DATA_SEP}runtime" >&2
 fi
 
 cd "$REPO_ROOT"
