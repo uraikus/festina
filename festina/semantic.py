@@ -12,16 +12,21 @@ methods on primitive types, so each one is checked by name against the
 receiver's inferred type in _infer_call, not looked up in some method
 table.
 
-`analyze(program)` walks the AST top to bottom. None of this repo's
-fixtures need forward references (structs/tables/functions are always
-declared before use), so a single left-to-right pass is enough. This
-also makes multi-file compilation (claude.md #5-6) work with no extra
-machinery here: festina.imports.build_program already merged every
-file's statements into one `program.body`, in dependency order, before
+`analyze(program)` walks the AST top to bottom. Struct/table names
+(claude.md #106) and function signatures (claude.md #140) are each
+pre-registered in their own dedicated pass over the whole program
+before the real left-to-right walk begins, so declaring one of those
+below where it's first used/called is never an ordering error --
+"hoisting". Variables still are declared-before-use, genuinely (there
+is no pre-pass for those, and no reasonable hoisting semantics for a
+value that has to come from somewhere at runtime). This also makes
+multi-file compilation (claude.md #5-6) work with no extra machinery
+here: festina.imports.build_program already merged every file's
+statements into one `program.body`, in dependency order, before
 analyze() ever sees it -- the only thing this module does specially for
 that is re-read each top-level statement's originating file (`.file`,
 set by build_program) into the `filename` closure variable right before
-analyzing it, so errors still name the right file (see the loop at the
+analyzing it, so errors still name the right file (see the loops at the
 bottom of analyze()).
 """
 from . import ast
@@ -464,6 +469,38 @@ def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None
         file=filename, line=getattr(node, "line", 0), column=getattr(node, "column", 0),
         category="unknown type",
     )
+
+
+def _iter_func_decls(stmts):
+    """claude.md #140: yields every ast.FuncDecl reachable from `stmts`,
+    however deeply nested -- inside a Block, either arm of an IfStmt, a
+    While/ForStmt body, an EventHandler body, or even another FuncDecl's
+    own body (a function nested inside a function, which the parser
+    already allows and analyze_func already treats as an ordinary
+    global declaration regardless of nesting -- see its own comment).
+    This traversal shape must stay in lockstep with analyze_statement/
+    analyze_block's own recursive descent -- every statement kind that
+    can hold a nested statement list is walked here the identical way,
+    since a FuncDecl analyze_statement would eventually reach but this
+    pre-pass skipped would defeat hoisting for exactly that one
+    declaration (it would still analyze fine when the real pass reaches
+    it, just too late for anything calling it earlier to see it)."""
+    for stmt in stmts:
+        if isinstance(stmt, ast.FuncDecl):
+            yield stmt
+            yield from _iter_func_decls(stmt.body.body)
+        elif isinstance(stmt, ast.EventHandler):
+            yield from _iter_func_decls(stmt.body.body)
+        elif isinstance(stmt, ast.Block):
+            yield from _iter_func_decls(stmt.body)
+        elif isinstance(stmt, ast.IfStmt):
+            yield from _iter_func_decls(stmt.then.body)
+            if isinstance(stmt.orelse, ast.IfStmt):
+                yield from _iter_func_decls([stmt.orelse])
+            elif stmt.orelse is not None:
+                yield from _iter_func_decls(stmt.orelse.body)
+        elif isinstance(stmt, (ast.WhileStmt, ast.ForStmt)):
+            yield from _iter_func_decls(stmt.body.body)
 
 
 def analyze(program, filename="<string>"):
@@ -1828,7 +1865,7 @@ def analyze(program, filename="<string>"):
         kind = "constant" if decl.is_const else "variable"
         scope.define(decl.name, Symbol(decl.name, declared_type, kind, decl), decl, filename)
 
-    def analyze_func(decl):
+    def register_func_signature(decl):
         # `log`/`fail`/`sqlite` are already lexer keywords, so a
         # function can never be declared with those names in the first
         # place -- but drawRect/drawCircle/drawText/drawImage/
@@ -1843,6 +1880,18 @@ def analyze(program, filename="<string>"):
         # security.md's audit writeup) on the reasoning that none of
         # graphics/audio/timers were implemented yet, so the collision
         # couldn't actually bite; now that they are, it can.
+        #
+        # claude.md #140: this is deliberately just the NAME/SIGNATURE
+        # half of what used to be one function (analyze_func, below) --
+        # called once per FuncDecl from the whole-program pre-pass near
+        # the bottom of analyze(), for every FuncDecl reachable anywhere
+        # in the program (however deeply nested -- see
+        # _iter_func_decls), before a single CALL anywhere gets checked.
+        # That's what makes declaration order stop mattering
+        # ("hoisting"): a call reached earlier in the real analysis pass
+        # than its own callee's textual declaration still finds the
+        # name already defined in global_scope, with its real signature,
+        # by the time _infer_call looks it up.
         if decl.name in BUILTIN_FUNCTIONS:
             raise CompileError(
                 f"'{decl.name}' is a builtin function name and cannot be used to "
@@ -1854,6 +1903,18 @@ def analyze(program, filename="<string>"):
             )
         return_type = resolve(decl.return_type, decl) if decl.return_type != "void" else None
         global_scope.define(decl.name, Symbol(decl.name, return_type, "function", decl), decl, filename)
+
+    def analyze_func(decl):
+        # claude.md #140: decl's own signature was already registered
+        # by the pre-pass above (register_func_signature) -- this only
+        # analyzes the BODY now, wherever the declaration is textually
+        # reached during the real walk. Re-resolving return_type here
+        # (rather than reading it back out of the Symbol register_func_
+        # signature already stored) is what analyze_func has always
+        # done and stays cheap and side-effect free either way --
+        # resolve() is a pure function of structs/tables, neither of
+        # which changes mid-compile.
+        return_type = resolve(decl.return_type, decl) if decl.return_type != "void" else None
         func_scope = Scope(global_scope)
         for p in decl.params:
             func_scope.define(p.name, Symbol(p.name, resolve(p.type_expr, decl), "parameter"), decl, filename)
@@ -2076,6 +2137,28 @@ def analyze(program, filename="<string>"):
             structs[stmt.name] = {}
         elif isinstance(stmt, ast.TableDecl) and stmt.name not in tables:
             tables[stmt.name] = {}
+
+    # claude.md #140: every function's NAME and SIGNATURE is registered
+    # before any CALL resolves -- "hoisting", the same declaration-
+    # order-independence claude.md #106 just gave struct/table names
+    # above, extended to functions (and, since a nested FuncDecl is
+    # already treated as an ordinary global declaration regardless of
+    # nesting -- see analyze_func's own comment -- however deeply one is
+    # nested inside blocks/loops/other functions; see _iter_func_decls).
+    # filename is threaded the identical way the real analysis loop
+    # right below threads it: reset right before each TOP-LEVEL
+    # statement, since only top-level statements carry their own
+    # `.file` (build_program) -- everything nested under one shares
+    # that statement's file. This has to run as a fully separate pass
+    # over the WHOLE program (not folded into the struct/table loop
+    # just above) because a function's return/parameter types can
+    # themselves name a struct or table, so every struct/table name
+    # must already exist before register_func_signature's own resolve()
+    # calls run.
+    for stmt in program.body:
+        filename = getattr(stmt, "file", filename)
+        for func_decl in _iter_func_decls([stmt]):
+            register_func_signature(func_decl)
 
     for stmt in program.body:
         # claude.md #6: a multi-file program (festina.imports.build_program)

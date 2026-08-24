@@ -28,6 +28,26 @@ Inner func pick(a:Inner, b:Inner, useA:bool) {
     return b
 }
 
+// claude.md #140: a FuncDecl nested INSIDE this function's own body,
+// declared after o's own struct-typed fields are already in use --
+// exercises the real bug hoisting's own implementation found (a
+// genuine LLVM verifier error, "use of undefined value"): without
+// self._current_func_frame_base, the nested function's own trivial
+// `return` incorrectly freed frames belonging to THIS enclosing
+// function's still-live struct/array/map locals, not just its own
+// (empty) one.
+Outer func makeOuterViaNestedHelper(n:int) {
+    Outer o
+    o.count = n
+    o.inner.n = n
+    o.inner.label = `label ${n}`
+    o.xs.push(n)
+    o.m[`k${n}`] = n
+    int func nestedNoOp() { return 1 }
+    o.count = o.count + nestedNoOp() - 1
+    return o
+}
+
 sqlite('DELETE FROM Person')
 int i = 0
 while i < 300 {
@@ -75,6 +95,11 @@ while i < 400 {
     // Deeply unassigned fields, reached rather than written.
     Outer fresh
     total = total + fresh.inner.n + fresh.xs.length
+
+    // claude.md #140: struct/array/map locals declared right alongside
+    // a nested FuncDecl, in a hot loop, under ASan/LeakSanitizer.
+    Outer viaNested = makeOuterViaNestedHelper(i)
+    total = total + viaNested.inner.n + viaNested.xs.length + viaNested.m[`k${i}`]
 
     // Query rows: text columns, null columns, and the whole array
     // released together at scope exit.

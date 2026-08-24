@@ -163,8 +163,29 @@ void func log_it() {
 No `var`/`let` — every declaration states its type. Functions are not
 first-class values (no closures, no passing a function as a value) —
 this is why `setTimeout`/`setInterval`'s callback argument must be the
-bare name of an already-declared, zero-parameter, `void`-returning
-function, not an arbitrary expression.
+bare name of a zero-parameter, `void`-returning function, not an
+arbitrary expression.
+
+**Functions are hoisted** — every function's name and signature exists
+everywhere in the program, so calling one from above its own
+declaration (including mutual recursion between two functions, each
+necessarily calling the other before its own declaration) is not an
+error:
+
+```festina
+log(greet('world'))    // fine -- greet is declared below
+
+text func greet(name:text) {
+    return 'Hello, ' + name
+}
+```
+
+A function can also be declared nested inside an `if`/`while`/`for`
+block, or inside another function — wherever it's written, it's still
+one single, ordinary, globally-callable function (there's no
+lexical scoping/closures for functions to begin with), so a call to it
+works regardless of where the call site sits relative to that nested
+declaration.
 
 ## Control flow
 

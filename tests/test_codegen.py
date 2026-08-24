@@ -4267,6 +4267,194 @@ class TestAutomaticMemoryReclamation:
         assert "call void @festina_release_map(" in ir
 
 
+class TestFunctionHoisting:
+    """claude.md #140: every function's name and signature is registered
+    -- both in semantic.py's own symbol table and in codegen's
+    self.func_decls/self.global_env -- in a pre-pass over the whole
+    program before any code that might call it is emitted, so a call
+    reached earlier in program order than its own callee's declaration
+    still compiles and runs correctly ("hoisting"). tests/
+    test_syntax_declarations.py's own TestFunctionHoisting covers the
+    semantic-analysis half (declaration-order stops being an error);
+    these compile-and-RUN the equivalent programs, since hoisting is a
+    codegen concern too -- a forward call has to actually resolve to the
+    right LLVM function and produce the right answer, not just pass
+    semantic analysis."""
+
+    def test_calling_a_function_declared_later_produces_the_right_answer(self, compile_and_run):
+        source = """
+        log(greet('world'))
+
+        text func greet(name:text) {
+            return concatHelper('Hello, ', name)
+        }
+
+        text func concatHelper(a:text, b:text) {
+            return a + b + '!'
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "Hello, world!"
+
+    def test_mutual_recursion_produces_the_right_answer(self, compile_and_run):
+        source = """
+        bool func isEven(n:int) {
+            if (n == 0) { return true }
+            return isOdd(n - 1)
+        }
+
+        bool func isOdd(n:int) {
+            if (n == 0) { return false }
+            return isEven(n - 1)
+        }
+
+        log(isEven(10))
+        log(isOdd(10))
+        log(isEven(7))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["true", "false", "false"]
+
+    def test_a_function_nested_inside_a_block_is_callable_from_above_it(self, compile_and_run):
+        # claude.md #140: a FuncDecl nested inside an if/while/for is
+        # already treated as an ordinary GLOBAL declaration regardless
+        # of nesting (semantic.py's analyze_func always defines into
+        # global_scope) -- this confirms codegen actually emits its
+        # body too (a real, once-crashing gap: _emit_stmt had no
+        # ast.FuncDecl branch at all before this, so a nested
+        # declaration compiled fine at the semantic-analysis stage and
+        # then crashed codegen with "cannot generate code for statement
+        # FuncDecl" the moment it was ever reached).
+        source = """
+        log(nested())
+
+        if (true) {
+            int func nested() { return 42 }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "42"
+
+    def test_a_function_nested_inside_a_never_taken_branch_still_exists(self, compile_and_run):
+        # Semantic analysis (and therefore codegen too) walks BOTH arms
+        # of an if unconditionally -- the declaration is hoisted exactly
+        # the same regardless of whether its own enclosing branch ever
+        # actually runs, matching the way JavaScript's own function
+        # declaration hoisting is unconditional too.
+        source = """
+        log(helper())
+
+        if (false) {
+            int func helper() { return 5 }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "5"
+
+    def test_a_function_nested_inside_another_function_is_globally_callable(self, compile_and_run):
+        source = """
+        void func setup() {
+            int func inner() { return 7 }
+        }
+
+        log(inner())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "7"
+
+    def test_nested_func_decl_does_not_corrupt_the_enclosing_functions_own_locals(self, compile_and_run):
+        # claude.md #140's real regression, found via a genuine LLVM
+        # verifier error ("use of undefined value"), not guessed: a
+        # nested FuncDecl re-enters _emit_func recursively while the
+        # ENCLOSING function's own struct/text/array/map locals are
+        # still tracked on the shared self._active_free_locals stack --
+        # without self._current_func_frame_base, the nested function's
+        # own trivial `return` (down_to=0, unqualified) freed the
+        # OUTER function's still-live locals instead of just its own
+        # (empty) frame. This exercises every refcounted-local shape
+        # that free/release machinery distinguishes: a struct field
+        # (p.x/p.y), a text local, and an array local, all read AFTER
+        # the nested declaration.
+        source = """
+        struct Point { x:int, y:int }
+
+        int func outer(seed:text) {
+            Point p
+            p.x = 1
+            p.y = 2
+            text local = seed + '-suffix'
+            arr[int] nums = [10, 20, 30]
+            int func inner() { return 7 }
+            int total = p.x + p.y + nums.length + inner()
+            log(local)
+            return total
+        }
+
+        log(outer('hi'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # p.x + p.y + nums.length + inner() = 1 + 2 + 3 + 7 = 13
+        assert result.stdout.splitlines() == ["hi-suffix", "13"]
+
+    def test_a_function_declared_before_its_own_struct_type_still_compiles(self, compile_and_run):
+        # claude.md #106's own struct-name pre-pass and claude.md #140's
+        # function-signature pre-pass run as two SEPARATE passes, struct
+        # names first -- this is what lets a function's own parameter/
+        # return type NAME a struct declared later than the function
+        # itself (register_func_signature's resolve() call needs
+        # `Point` to already exist as a name, even before struct
+        # Point's own fields are populated). This is deliberately NOT a
+        # claim that a struct's FIELDS are hoisted the identical way --
+        # accessing p.x before struct Point{}'s own declaration has
+        # been reached by the real analysis pass is a pre-existing,
+        # unrelated limitation claude.md #106 already has (its own
+        # pre-pass only guarantees the NAME exists, same as this one),
+        # so every field access below is deliberately placed after
+        # struct Point's own declaration in program order, isolating
+        # just the one thing actually new here: the function itself.
+        source = """
+        Point func identity(p:Point) {
+            return p
+        }
+
+        struct Point { x:int, y:int }
+
+        Point q
+        q.x = 3
+        q.y = 4
+        log(identity(q).x)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "3"
+
+    def test_break_and_continue_around_a_nested_func_decl_still_work(self, compile_and_run):
+        # self._loop_targets is untouched by this feature (it was
+        # already correctly stack-shaped and reentrant through nested
+        # loops before this), but is worth confirming directly: a
+        # nested FuncDecl's own emission must not leave a stray entry
+        # behind that would make an unrelated LATER break/continue in
+        # the ENCLOSING loop resolve to the wrong target.
+        source = """
+        for int i = 0, i < 5, i++ {
+            if (i == 3) { break }
+            if (i == 1) { continue }
+            int func helper() { return 1 }
+            log(`i=${i} helper=${helper()}`)
+        }
+        log('after loop')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["i=0 helper=1", "i=2 helper=1", "after loop"]
+
+
 def _find_window(display, timeout=20):
     # A window actually appears in ~0.2s, measured, consistently -- this
     # timeout is generous insurance, not a figure anything is expected

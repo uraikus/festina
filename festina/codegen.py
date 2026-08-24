@@ -732,10 +732,15 @@ class CodeGen:
                                                 # None outside any tracked function/handler body (e.g.
                                                 # __festina_main's own top-level statements, which
                                                 # claude.md #74 doesn't analyze at all) -- _emit_block
-                                                # skips all of #74's tracking entirely in that case. Never
-                                                # a stack: Festina has no nested function declarations
-                                                # reaching codegen (see _toplevel), so only ever one
-                                                # function/handler's body is being emitted at a time.
+                                                # skips all of #74's tracking entirely in that case.
+                                                # claude.md #140: no LONGER guaranteed only one function/
+                                                # handler body is being emitted at a time -- a nested
+                                                # FuncDecl (see _emit_stmt's own FuncDecl branch) re-
+                                                # enters _emit_analyzed_func_body recursively while an
+                                                # outer one's own body is still being walked, so this is
+                                                # save/restored around that recursive call rather than
+                                                # reset to a hardcoded None -- see that method's own
+                                                # comment.
         self.escaping_params = {}              # claude.md #74 stage 2 (interprocedural): {func_name:
                                                 # set[int]} -- for each FuncDecl already fully emitted,
                                                 # which of ITS OWN parameter positions escape_analysis
@@ -743,18 +748,17 @@ class CodeGen:
                                                 # incrementally, one entry per function, immediately
                                                 # after that function's own _emit_analyzed_func_body call
                                                 # returns (see that method) -- never all at once in a
-                                                # separate pass, because it doesn't need to be: semantic.py
-                                                # already rejects a call to a function before its own
-                                                # declaration (no forward references), so by the time any
-                                                # function F's body is being walked, every function F could
-                                                # possibly call (other than F itself, mid-recursion) is
-                                                # necessarily already a key in this dict. A self-recursive
-                                                # call inside F's own body looks up F's own name here
-                                                # *before* F's own entry has been added -- a plain,
-                                                # ordinary dict miss, correctly falling back to
-                                                # escape_analysis.py's original conservative "any call
-                                                # argument escapes" default, exactly like a call to an
-                                                # unanalyzed builtin does. Never cleared, never popped:
+                                                # separate pass. claude.md #140: hoisting means a callee
+                                                # is no longer guaranteed to already be a key here by the
+                                                # time some EARLIER-emitted function's body calls it (a
+                                                # genuine forward reference, now allowed) -- exactly like
+                                                # the self-recursive case already below, a miss here is
+                                                # always SAFE, just a missed optimization: escape_
+                                                # analysis.py's own docstring spells out why a map miss
+                                                # (self-recursion, a forward reference, a builtin, ...)
+                                                # falls back to the original conservative "any call
+                                                # argument escapes" default rather than ever being treated
+                                                # as "proven not to escape." Never cleared, never popped:
                                                 # unlike _current_escaping_names (one function at a time)
                                                 # this accumulates across the whole program, since a
                                                 # function emitted early may be called by many functions
@@ -775,16 +779,32 @@ class CodeGen:
                                                 # VarDecl in program order. Consulted by
                                                 # _emit_free_active_locals -- a Return frees every open
                                                 # frame at once (down_to=0, the whole stack, since
-                                                # returning exits every nested scope simultaneously); a
-                                                # Break/Continue frees only the frames opened since the
-                                                # nearest enclosing loop's own body began (down_to = the
-                                                # frame index recorded alongside that loop's own entry in
-                                                # self._loop_targets); a block's own natural, non-
-                                                # terminated fall-through exit frees just its own single
-                                                # (topmost) frame. Same "instance-level stack, not
-                                                # threaded through ctx" shape as _loop_targets, for the
-                                                # same reason: it needs to keep working correctly through
-                                                # arbitrary nesting depth.
+                                                # returning exits every nested scope simultaneously, down
+                                                # to self._current_func_frame_base -- see that field's own
+                                                # comment -- not literally always 0); a Break/Continue
+                                                # frees only the frames opened since the nearest enclosing
+                                                # loop's own body began (down_to = the frame index recorded
+                                                # alongside that loop's own entry in self._loop_targets); a
+                                                # block's own natural, non-terminated fall-through exit
+                                                # frees just its own single (topmost) frame. Same
+                                                # "instance-level stack, not threaded through ctx" shape as
+                                                # _loop_targets, for the same reason: it needs to keep
+                                                # working correctly through arbitrary nesting depth.
+        self._current_func_frame_base = 0      # claude.md #140: the self._active_free_locals index of
+                                                # the OUTERMOST frame belonging to the function/handler
+                                                # currently being emitted -- normally 0, since
+                                                # self._active_free_locals is always empty entering any
+                                                # top-level _emit_func/_emit_event_handler call. But a
+                                                # nested FuncDecl (see _emit_stmt's own FuncDecl branch)
+                                                # re-enters _emit_func recursively while an OUTER
+                                                # function's own frames are still open beneath it on the
+                                                # SAME shared stack -- without this, a bare `return` inside
+                                                # the nested function's own body (down_to=0, unqualified)
+                                                # would free every frame all the way down, including the
+                                                # outer function's still-live locals it has no business
+                                                # touching. Save/restored around _emit_func's own
+                                                # push/pop, exactly like self._current_escaping_names --
+                                                # see that field's own comment for the identical reasoning.
         self._font_constants = {}              # claude.md #91: (px, style, family) -> the name of the
                                                 # static %struct._FestinaFont constant holding it.
                                                 # Keyed on the RESOLVED parts rather than the source
@@ -894,6 +914,20 @@ class CodeGen:
     # ---- entry point ----
     def generate(self, program):
         self.database_url_expr = getattr(program, "database_url", None)
+        # claude.md #140: every function's signature is registered before
+        # ANY code is emitted -- "hoisting" -- so a call reached earlier
+        # in this same walk than its own callee's declaration still
+        # resolves. filename is threaded the identical way the real
+        # emission pass below threads it (reset right before each
+        # TOP-LEVEL statement, since only top-level statements carry
+        # their own `.file` -- see festina.imports.build_program --
+        # and everything nested under one shares that statement's file),
+        # even though this pre-pass itself never actually raises (a
+        # signature collision was already caught by semantic analysis,
+        # which ran first).
+        for stmt in program.body:
+            self.filename = getattr(stmt, "file", self.filename)
+            self._register_all_func_signatures([stmt])
         for stmt in program.body:
             # claude.md #6: a multi-file program (festina.imports.
             # build_program) is one merged ast.Program, but errors
@@ -1391,20 +1425,29 @@ class CodeGen:
         frame of self._active_free_locals from the top of the stack down
         to (and including) index `down_to`.
 
-        down_to=0 (the default) frees every currently open frame --
-        correct for a Return, which exits the *entire* function/handler
-        at once, so every nested block's own still-open locals need
-        freeing together, not just the innermost one (see _emit_stmt's
-        Return handling). A Break/Continue only frees frames opened
-        since the nearest enclosing loop's own body began (down_to = the
-        frame index _emit_while/_emit_for recorded when that body's
-        frame was about to be pushed -- see self._loop_targets' own
-        comment) -- an outer function-level local merely *used* inside
-        that loop, not declared inside it, must NOT be freed by the
-        loop's own break/continue, and this is what keeps that true.
-        _emit_block's own natural (non-terminated) fall-through exit
-        frees just its own single frame (down_to = that frame's own,
-        topmost, index) before popping it.
+        down_to=0 is the parameter's own default, but a Return never
+        actually relies on that default -- it passes down_to=self.
+        _current_func_frame_base explicitly (claude.md #140), which
+        frees every frame belonging to the function/handler currently
+        being emitted, all the way to (and including) ITS OWN outermost
+        one, so every nested block's own still-open locals need freeing
+        together, not just the innermost one (see _emit_stmt's Return
+        handling). That base is 0 for a top-level function/handler --
+        self._active_free_locals is always empty entering one -- but
+        NOT for a nested FuncDecl reached inside another function's own
+        body (see self._current_func_frame_base's own comment): a plain
+        hardcoded 0 there would free the ENCLOSING function's still-live
+        locals too, which are further down the SAME shared stack. A
+        Break/Continue only frees frames opened since the nearest
+        enclosing loop's own body began (down_to = the frame index
+        _emit_while/_emit_for recorded when that body's frame was about
+        to be pushed -- see self._loop_targets' own comment) -- an outer
+        function-level local merely *used* inside that loop, not
+        declared inside it, must NOT be freed by the loop's own
+        break/continue, and this is what keeps that true. _emit_block's
+        own natural (non-terminated) fall-through exit frees just its
+        own single frame (down_to = that frame's own, topmost, index)
+        before popping it.
 
         A no-op if self._active_free_locals is empty (outside any
         tracked function/handler body -- e.g. __festina_main's own
@@ -1537,12 +1580,17 @@ class CodeGen:
         one whole-function-scoped name set (a name's escaping-ness is a
         property of the whole enclosing function, not of whichever block
         it happens to be declared in -- see escape_analysis.py's own
-        module docstring). Reset back to None afterward: Festina has no
-        nested function declarations reaching codegen (a FuncDecl only
-        ever exists at a whole program's top level -- see _toplevel), so
-        this never needs to be a stack the way _active_free_locals and
-        _loop_targets are, just a single value cleared between one
-        function/handler's emission and the next.
+        module docstring). claude.md #140: restored to whatever it held
+        before (not unconditionally reset to None) afterward -- a nested
+        FuncDecl inside decl's own body (see _emit_stmt's own FuncDecl
+        branch) re-enters this method recursively one level deeper,
+        while decl's own body is still being walked, so a bare reset
+        would clobber decl's own tracking for everything left to emit
+        after that nested declaration's position. Save/restore around
+        the recursive call, using each call's own local `escaping`
+        parameter, makes this correctly reentrant to however deep
+        nesting goes with no separate explicit stack needed the way
+        _active_free_locals and _loop_targets each keep one.
 
         claude.md #74 stage 2 (interprocedural): passes self.
         escaping_params into find_escaping_names so a Call argument
@@ -1570,12 +1618,29 @@ class CodeGen:
         before its own parameter-binding loop runs -- see
         _emit_param_bindings' own comment for why binding needs it
         before this method would otherwise compute it), not
-        recomputed here -- this method just applies it."""
+        recomputed here -- this method just applies it.
+
+        claude.md #140: SAVES and RESTORES self._current_escaping_names
+        (rather than unconditionally resetting it to None afterward) --
+        a nested FuncDecl reachable from decl's own body (see
+        _emit_stmt's own FuncDecl branch) re-enters this exact method
+        recursively, one level deeper, before decl's own body is fully
+        walked. A bare reset-to-None would clobber decl's own tracking
+        for every statement still left to emit after that nested
+        declaration's position, silently turning tracked-and-safe-to-
+        free locals back into leaks for the rest of decl's own body.
+        Restoring the PREVIOUS value instead (None at the outermost
+        level, decl's own `escaping` one level inside a function nested
+        inside decl, and so on for however deep nesting goes) makes
+        this correctly reentrant with no separate explicit stack
+        needed -- each call's own local `escaping` parameter and the
+        Python call stack itself already are one."""
+        saved_escaping_names = self._current_escaping_names
         self._current_escaping_names = escaping
         try:
             block = self._emit_block(decl.body, body_env, return_type, body_lines)
         finally:
-            self._current_escaping_names = None
+            self._current_escaping_names = saved_escaping_names
         if isinstance(decl, ast.FuncDecl):
             self.escaping_params[decl.name] = {
                 i for i, p in enumerate(decl.params) if p.name in escaping
@@ -1651,11 +1716,68 @@ class CodeGen:
             body_env.define(p.name, slot, t)
         return escaping
 
-    def _emit_func(self, decl):
+    def _register_func_signature(self, decl):
+        """claude.md #140: registers decl's NAME and SIGNATURE only --
+        self.func_decls (what _emit_call looks a callee's own arg/return
+        types up from) and self.global_env (what an Identifier reference
+        to the function resolves to) -- with no body emitted yet. Called
+        once per FuncDecl, for every one reachable anywhere in the whole
+        program, from _register_all_func_signatures' own pre-pass in
+        generate(), BEFORE any code that might call it is emitted --
+        this is what makes a function's declaration ORDER stop
+        mattering (hoisting), the code-generation half of what
+        semantic.py's own register_func_signature/analyze_func split
+        already does for type-checking."""
         return_type = None if decl.return_type == "void" else self._resolve(decl.return_type, decl)
         self.func_decls[decl.name] = decl
         self.global_env.define(decl.name, f"@{decl.name}", return_type)
 
+    def _register_all_func_signatures(self, stmts):
+        """claude.md #140: recursively finds every ast.FuncDecl reachable
+        from `stmts` -- inside a Block, either arm of an IfStmt, a
+        While/ForStmt body, an EventHandler body, or even another
+        FuncDecl's own body (a function nested inside a function, which
+        semantic.py's analyze_func already treats as an ordinary global
+        declaration regardless of nesting -- see its own comment) -- and
+        registers each one's signature before generate()'s real emission
+        pass ever starts. This traversal shape must stay in lockstep
+        with _emit_stmt's own recursive descent (the shapes visitable
+        with a FuncDecl inside them are exactly what analyze_statement/
+        analyze_block descend into in semantic.py, and what _emit_stmt/
+        _emit_if/_emit_while/_emit_for descend into here) -- if a new
+        statement kind ever grows a nested body, both need to learn about
+        it together, or a FuncDecl inside it would be reachable at
+        analysis time (semantic.py's own mirror-image walker already
+        found it) but silently skipped here, leaving self.func_decls
+        without an entry _emit_call would then crash looking up."""
+        for stmt in stmts:
+            if isinstance(stmt, ast.FuncDecl):
+                self._register_func_signature(stmt)
+                self._register_all_func_signatures(stmt.body.body)
+            elif isinstance(stmt, ast.EventHandler):
+                self._register_all_func_signatures(stmt.body.body)
+            elif isinstance(stmt, ast.Block):
+                self._register_all_func_signatures(stmt.body)
+            elif isinstance(stmt, ast.IfStmt):
+                self._register_all_func_signatures(stmt.then.body)
+                if isinstance(stmt.orelse, ast.IfStmt):
+                    self._register_all_func_signatures([stmt.orelse])
+                elif stmt.orelse is not None:
+                    self._register_all_func_signatures(stmt.orelse.body)
+            elif isinstance(stmt, (ast.WhileStmt, ast.ForStmt)):
+                self._register_all_func_signatures(stmt.body.body)
+
+    def _emit_func(self, decl):
+        # claude.md #140: signature already registered by generate()'s
+        # own pre-pass (_register_all_func_signatures) before this ever
+        # runs -- re-resolving return_type here is cheap and side-effect
+        # free (resolve_type_name is a pure function of self.structs/
+        # self.tables, neither of which changes mid-compile), simpler
+        # than threading the already-resolved type back out of
+        # self.func_decls (which stores the raw ast.FuncDecl, not its
+        # resolved return type) into this still fully self-contained
+        # function.
+        return_type = None if decl.return_type == "void" else self._resolve(decl.return_type, decl)
         param_types = [self._resolve(p.type_expr, decl) for p in decl.params]
         llvm_ret = "void" if return_type is None else _llvm_type(return_type)
         params_ir = ", ".join(f"{_llvm_type(t)} %arg.{p.name}" for t, p in zip(param_types, decl.params))
@@ -1671,9 +1793,29 @@ class CodeGen:
         # after decl's own body is fully emitted, one level below the
         # body's own frame(s) (_emit_block pushes/pops its own,
         # separately) so a Return anywhere inside frees both via the
-        # same _emit_free_active_locals(down_to=0) call it already
-        # makes -- see _emit_param_bindings' own comment for why this
-        # exists at all.
+        # same _emit_free_active_locals(down_to=self._current_func_frame_base)
+        # call it already makes -- see _emit_param_bindings' own comment
+        # for why this exists at all.
+        #
+        # claude.md #140: self._current_func_frame_base is saved and
+        # restored around this push/pop (not just pushed/popped itself)
+        # -- a nested FuncDecl inside decl's own body (see _emit_stmt's
+        # own FuncDecl branch) re-enters THIS SAME _emit_func recursively
+        # one level deeper, while decl's own frame(s) are still open
+        # beneath it on the identical shared self._active_free_locals
+        # stack. Capturing the base index here, right before this
+        # function's own outermost frame is pushed, is what lets Return
+        # (inside decl's own body, OR inside a nested function's) free
+        # exactly its own frames and stop there -- see
+        # self._current_func_frame_base's own comment for the bug this
+        # fixes, confirmed with a real Xvfb-free repro (a struct/text/
+        # array/map local declared before a nested FuncDecl, in the
+        # SAME enclosing function, produced an LLVM verifier error
+        # ("use of undefined value") before this fix -- the nested
+        # function's own trivial `return` was freeing the ENCLOSING
+        # function's still-live locals, not just its own empty frame).
+        saved_func_frame_base = self._current_func_frame_base
+        self._current_func_frame_base = len(self._active_free_locals)
         self._active_free_locals.append([])
         escaping = self._emit_param_bindings(decl, param_types, body_env, body_lines)
 
@@ -1701,6 +1843,7 @@ class CodeGen:
             else:
                 block["lines"].append(f"  ret {_llvm_type(return_type)} {self._zero_value(return_type)}")
         self._active_free_locals.pop()
+        self._current_func_frame_base = saved_func_frame_base
 
         func = [f"define {llvm_ret} @{decl.name}({params_ir}) {{"]
         func.extend(block["lines"])
@@ -2436,7 +2579,13 @@ class CodeGen:
             if stmt.value is None or return_type is None:
                 if stmt.value is not None:
                     self._emit_expr(stmt.value, env, lines)  # side effects only
-                self._emit_free_active_locals(lines)
+                # claude.md #140: down_to=self._current_func_frame_base,
+                # not the implicit default of 0 -- see that field's own
+                # comment. A bare 0 here frees every frame on the shared
+                # stack, including an ENCLOSING function's still-live
+                # locals whenever this Return is inside a nested
+                # FuncDecl's own body.
+                self._emit_free_active_locals(lines, down_to=self._current_func_frame_base)
                 lines.append("  ret void")
             else:
                 val, vtype = self._emit_value_for(stmt.value, env, lines, return_type)
@@ -2485,7 +2634,10 @@ class CodeGen:
                     owned = self.tmp()
                     lines.append(f"  {owned} = call ptr @festina_text_own(ptr {val})")
                     val = owned
-                self._emit_free_active_locals(lines)
+                # claude.md #140: see the identical note on the other
+                # Return branch just above -- down_to=self.
+                # _current_func_frame_base, not an implicit 0.
+                self._emit_free_active_locals(lines, down_to=self._current_func_frame_base)
                 lines.append(f"  ret {_llvm_type(return_type)} {val}")
             ctx["terminated"] = True
             return
@@ -2544,6 +2696,21 @@ class CodeGen:
         if isinstance(stmt, ast.Block):
             inner = self._emit_block(stmt, env, return_type, lines)
             ctx["terminated"] = inner["terminated"]
+            return
+        if isinstance(stmt, ast.FuncDecl):
+            # claude.md #140: a FuncDecl nested inside an if/while/for/
+            # another function's body -- semantic.py's analyze_func
+            # already treats one exactly like a top-level declaration
+            # regardless of nesting (always global, see its own
+            # comment), so this emits the identical top-level LLVM
+            # function definition _emit_func always has (into
+            # self.func_defs, unconditionally, once, via generate()'s
+            # own pre-pass having already registered its signature) --
+            # its own textual position in `lines` gets nothing at all,
+            # the same "this position does nothing at runtime, hoisting
+            # already made the function exist" semantics a JS function
+            # declaration statement has.
+            self._emit_func(stmt)
             return
         raise CodegenError(f"cannot generate code for statement {type(stmt).__name__}",
                             file=self.filename, line=getattr(stmt, "line", 0),
