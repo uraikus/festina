@@ -376,9 +376,9 @@
 <header class="hero">
   <div class="wrap">
     <div class="badges">
-      <span class="badge">1061 tests passing</span>
+      <span class="badge">1462 tests passing</span>
       <span class="badge">MIT license</span>
-      <span class="badge">Linux</span>
+      <span class="badge">Linux · macOS · Windows</span>
     </div>
     <h1>A fast, simple language<br>that compiles to <span class="accent">native code</span>.</h1>
     <p class="lede">
@@ -439,7 +439,7 @@ Hello, Festina!</pre>
       </div>
       <div class="card">
         <h3>Familiar syntax, none of the surprises</h3>
-        <p>Template strings, ternaries, familiar control flow — but <code>int</code>/<code>float</code> never silently mix, and everything is statically typed and checked before it runs.</p>
+        <p>Template strings, ternaries, familiar control flow — but every condition is a real <code>bool</code>, and everything is statically typed and checked before it runs.</p>
       </div>
       <div class="card">
         <h3>Slim by default</h3>
@@ -471,7 +471,8 @@ Hello, Festina!</pre>
       That's the whole loop — see
       <a href="https://github.com/uraikus/festina/blob/main/setup.md">setup.md</a>
       for the full dependency breakdown, packaged-binary installs, and
-      running the test suite.
+      running the test suite. macOS and Windows are supported too, each
+      with its own CI-verified toolchain section in setup.md.
     </p>
   </div>
 </section>
@@ -495,10 +496,12 @@ Hello, Festina!</pre>
     log(i)
 }</pre>
     <p class="section-intro">
-      <code>int</code> and <code>float</code> never mix implicitly — convert
-      explicitly with <code>.toFloat()</code> or
-      <code>Math.floor/ceil/round/trunc</code>. Division and modulo by zero
-      return <code>null</code> instead of crashing. See the
+      <code>int</code> and <code>float</code> mix freely — the <code>int</code>
+      side promotes to <code>float</code> automatically, and <code>/</code>
+      always returns <code>float</code>. The only way back to
+      <code>int</code> is <code>Math.floor/ceil/round/trunc</code>.
+      Division and modulo by zero return <code>null</code> instead of
+      crashing. See the
       <a href="api.html">API reference</a>
       for the full language and standard library documentation.
     </p>
@@ -684,7 +687,7 @@ npcHealths[<span class="str">'npc1'</span>] = 30
     <h2>Project status</h2>
     <div class="status-line">
       <span class="dot"></span>
-      <span><strong>1061 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
+      <span><strong>1462 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
     </div>
     <p class="section-intro">
       The compiler frontend, LLVM codegen backend, and native C runtime are

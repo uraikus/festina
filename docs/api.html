@@ -398,6 +398,9 @@
         <div class="nav-group-title">Language</div>
         <a href="#types">Types</a>
         <a href="#variables-constants-functions">Variables, constants, functions</a>
+        <a class="sub" href="#first-class-functions">Functions are first-class values</a>
+        <a class="sub" href="#arrow-functions">Arrow functions</a>
+        <a class="sub" href="#function-hoisting">Functions are hoisted</a>
         <a href="#control-flow">Control flow</a>
         <a href="#strings">Strings</a>
         <a href="#logging-and-rendering">Logging and rendering</a>
@@ -431,6 +434,7 @@
         <a class="sub" href="#text-metrics">Text metrics</a>
         <a href="#files">Files</a>
         <a class="sub" href="#blobs-in-the-database">Blobs in the database</a>
+        <a href="#directories">Directories</a>
         <a href="#freeing-and-deleting">Freeing and deleting</a>
         <a class="sub" href="#free">free</a>
         <a class="sub" href="#delete">delete</a>
@@ -448,7 +452,7 @@
       <div class="nav-group">
         <div class="nav-group-title">Reference</div>
         <a href="#imports">Imports</a>
-        <a href="#log-fail">log() / fail()</a>
+        <a href="#log-fail">log() / fail() / close()</a>
         <a href="#error-format">Error format</a>
         <a href="#examples">Examples</a>
       </div>
@@ -515,7 +519,7 @@
           graphics (Cairo/X11) and audio (ALSA) runtime object files are
           only passed to the linker when the program calls something from
           them (see
-          <a href="https://github.com/uraikus/festina/blob/main/security.md#binary-slimming">security.md</a>).
+          <a href="https://github.com/uraikus/festina/blob/main/security.md#slim-binaries">security.md</a>).
           <code>libsqlite3</code> is always available (statically linked
           when possible), since automatic database support (<code>table</code>,
           <code>sqlite()</code>) is always on.
@@ -562,10 +566,46 @@
           always false.
         </p>
 
-        <p><code>int</code>/<code>float</code> never mix implicitly, in arithmetic or comparisons:</p>
+        <p>
+          <code>int</code> and <code>float</code> mix freely in any
+          binary operator — arithmetic, comparison, or equality — with
+          the <code>int</code> side implicitly promoted to
+          <code>float</code>, as though <code>.toFloat()</code> had
+          been written on it:
+        </p>
         <pre class="code"><span class="kw">int</span> a = 5
 <span class="kw">float</span> b = 2.5
-<span class="kw">float</span> c = a.toFloat() + b        <span class="cm">// int.toFloat() is the only int-&gt;float conversion</span></pre>
+<span class="kw">float</span> c = a + b          <span class="cm">// 7.5 -- a is promoted to float automatically</span>
+<span class="kw">bool</span> less = a &lt; b         <span class="cm">// false</span></pre>
+        <p>
+          <code>/</code> (division) always returns <code>float</code>,
+          even when both operands are <code>int</code> — the one
+          operator that promotes unconditionally, not just when mixed:
+        </p>
+        <pre class="code"><span class="kw">int</span> x = 10
+<span class="kw">int</span> y = 3
+<span class="kw">float</span> z = x / y           <span class="cm">// 3.33333 -- not 3</span></pre>
+        <p class="muted">
+          Every other arithmetic operator (<code>+</code>, <code>-</code>,
+          <code>*</code>, <code>%</code>) only promotes when the two
+          operands actually differ — <code>int + int</code> still
+          returns <code>int</code>. Declaring a variable as
+          <code>int</code> from a genuinely <code>float</code>-typed
+          expression (mixed, or from <code>/</code>) is still an
+          ordinary type mismatch — the promotion changes what an
+          expression evaluates to, not what a declared type accepts:
+        </p>
+        <pre class="code"><span class="kw">int</span> bad = a + b            <span class="cm">// compile error -- a + b is float</span></pre>
+        <p class="muted">
+          The only way back from a <code>float</code> to an
+          <code>int</code> is still the rounding four
+          (<code>Math.floor</code>/<code>ceil</code>/<code>round</code>/<code>trunc</code>)
+          — <code>int.toFloat()</code> is still the one-directional
+          <code>int</code> → <code>float</code> conversion, mostly
+          redundant with the implicit promotion above but still useful
+          for forcing a result to <code>float</code> explicitly, e.g.
+          inside a template literal.
+        </p>
 
         <pre class="code"><span class="cm">// float -&gt; int (the rounding four)</span>
 Math.floor(x)   Math.ceil(x)   Math.round(x)   Math.trunc(x)
@@ -596,8 +636,9 @@ Math.PI   Math.E</pre>
           index.
         </p>
 
-        <p>Division/modulo by zero return <code>null</code> (for both <code>int</code> and <code>float</code>) rather than crashing:</p>
-        <pre class="code"><span class="kw">int</span> result = 10 / 0   <span class="cm">// null</span></pre>
+        <p>Division/modulo by zero return <code>null</code> rather than crashing:</p>
+        <pre class="code"><span class="kw">float</span> divided = 10 / 0   <span class="cm">// null -- / always returns float</span>
+<span class="kw">int</span> remainder = 10 % 0    <span class="cm">// null -- % still returns int for two ints</span></pre>
 
         <p>
           <code>int</code>/<code>float</code>/<code>bool</code> also each
@@ -622,14 +663,98 @@ log(count.toText())   <span class="cm">// "5" -- identical to log(`${count}`)</s
 <span class="kw">void func</span> log_it() {
     log(<span class="str">'called'</span>)
 }</pre>
+        <p class="muted">No <code>var</code>/<code>let</code> — every declaration states its type.</p>
+
+        <h3 id="first-class-functions">Functions are first-class values <a class="anchor" href="#first-class-functions">#</a></h3>
         <p>
-          No <code>var</code>/<code>let</code> — every declaration states
-          its type. Functions are not first-class values (no closures, no
-          passing a function as a value) — this is why
-          <code>setTimeout</code>/<code>setInterval</code>'s callback
-          argument must be the bare name of an already-declared,
-          zero-parameter, <code>void</code>-returning function, not an
-          arbitrary expression.
+          A bare function name (not called) is a value of type
+          <code>func[paramTypes]:returnType</code>, usable anywhere a
+          value can go: a variable, a function argument, a struct field,
+          an array element, a map value. Calling through one of those —
+          not just the function's own original name — works exactly
+          like calling the function directly:
+        </p>
+        <pre class="code"><span class="kw">void func</span> greet(name:<span class="kw">text</span>) { log(name) }
+
+<span class="kw">func[text]:void</span> cb = greet
+cb(<span class="str">'world'</span>)                              <span class="cm">// "world"</span>
+
+<span class="kw">void func</span> apply(fn:func[<span class="kw">text</span>]:<span class="kw">void</span>, arg:<span class="kw">text</span>) { fn(arg) }
+apply(greet, <span class="str">'hi'</span>)                       <span class="cm">// "hi"</span>
+
+<span class="kw">struct</span> Handler { onEvent:func[<span class="kw">text</span>]:<span class="kw">void</span> }
+<span class="kw">Handler</span> h
+h.onEvent = greet
+h.onEvent(<span class="str">'yo'</span>)                          <span class="cm">// "yo"</span>
+
+<span class="kw">int func</span> inc(x:<span class="kw">int</span>) { <span class="kw">return</span> x + 1 }
+<span class="kw">arr[func[int]:int]</span> transforms = [inc]
+log(transforms[0](5))                    <span class="cm">// 6</span></pre>
+        <p class="muted">
+          <code>func[]:void</code> is a zero-argument, void-returning
+          function type; <code>null</code> is a valid value of any func
+          type too. There are no closures — a function's own type never
+          captures anything from where it's declared, so a
+          <code>func[...]:...</code> value is always just a plain
+          reference to one of this program's own function declarations,
+          nothing more. <code>setTimeout</code>/<code>setInterval</code>'s
+          own callback argument is unaffected by any of this: it's still
+          the bare name of a zero-parameter, <code>void</code>-returning
+          function specifically, not an arbitrary
+          <code>func[...]:...</code>-typed expression.
+        </p>
+
+        <h3 id="arrow-functions">Arrow functions <a class="anchor" href="#arrow-functions">#</a></h3>
+        <p>
+          <code>returnType (params) =&gt; expr</code> is an anonymous
+          function value, compiling to an ordinary function with a
+          compiler-generated name; the arrow expression itself evaluates
+          to a <code>func[...]:...</code> reference to it, usable
+          anywhere the plain-function examples above are:
+        </p>
+        <pre class="code"><span class="kw">func[text]:void</span> cb = <span class="kw">void</span> (arg:<span class="kw">text</span>) =&gt; log(arg)
+cb(<span class="str">'world'</span>)                                        <span class="cm">// "world"</span>
+
+<span class="kw">func[int]:int</span> sq = <span class="kw">int</span> (x:<span class="kw">int</span>) =&gt; x * x
+log(sq(7))                                         <span class="cm">// 49</span>
+
+<span class="kw">void func</span> apply(fn:func[<span class="kw">text</span>]:<span class="kw">void</span>, arg:<span class="kw">text</span>) { fn(arg) }
+apply(<span class="kw">void</span> (arg:<span class="kw">text</span>) =&gt; log(arg), <span class="str">'hi'</span>)           <span class="cm">// "hi"</span></pre>
+        <p class="muted">
+          A <code>void</code>-returning arrow function's body is a plain
+          expression, run for its side effects with its own value
+          discarded (there's no <code>return</code> inside a void
+          function's body to write, arrow or not); a non-void one's body
+          <em>is</em> its return value, no <code>return</code> keyword
+          needed. Arrow functions have no closures either, for the
+          identical reason plain functions don't: a variable reached
+          from inside the arrow body compiles correctly only if it's a
+          top-level global (itself visible to every function already) —
+          a genuinely local variable from wherever the arrow expression
+          is written is not reachable from inside it.
+        </p>
+
+        <h3 id="function-hoisting">Functions are hoisted <a class="anchor" href="#function-hoisting">#</a></h3>
+        <p>
+          Every function's name and signature exists everywhere in the
+          program, so calling one from above its own declaration
+          (including mutual recursion between two functions, each
+          necessarily calling the other before its own declaration) is
+          not an error:
+        </p>
+        <pre class="code">log(greet(<span class="str">'world'</span>))    <span class="cm">// fine -- greet is declared below</span>
+
+<span class="kw">text func</span> greet(name:<span class="kw">text</span>) {
+    <span class="kw">return</span> <span class="str">'Hello, '</span> + name
+}</pre>
+        <p class="muted">
+          A function can also be declared nested inside an
+          <code>if</code>/<code>while</code>/<code>for</code> block, or
+          inside another function — wherever it's written, it's still
+          one single, ordinary, globally-callable function (there's no
+          lexical scoping/closures for functions to begin with), so a
+          call to it works regardless of where the call site sits
+          relative to that nested declaration.
         </p>
       </section>
 
@@ -675,7 +800,19 @@ log(count.toText())   <span class="cm">// "5" -- identical to log(`${count}`)</s
 <span class="kw">text</span> a = <span class="str">'room 42'</span>.replace(<span class="str">'room'</span>, <span class="str">'suite'</span>)
 <span class="kw">text</span> b = <span class="str">'a1b2c3'</span>.replace(<span class="re">/[0-9]/g</span>, <span class="str">'-'</span>)   <span class="cm">// 'g' = every match</span>
 <span class="kw">bool</span> matched = <span class="re">/[0-9]+/</span>.test(<span class="str">'room 42'</span>)
-<span class="kw">text</span> found = <span class="str">'room 42'</span>.match(<span class="re">/[0-9]+/</span>)   <span class="cm">// null if no match</span></pre>
+<span class="kw">text</span> found = <span class="str">'room 42'</span>.match(<span class="re">/[0-9]+/</span>)   <span class="cm">// null if no match</span>
+
+<span class="kw">arr[text]</span> words = sentence.split(<span class="str">' '</span>)    <span class="cm">// or a regex: .split(/\s+/g)</span>
+sentence = words.join(<span class="str">'\t'</span>)              <span class="cm">// join works on text/int/float/bool arrays</span></pre>
+        <p class="muted">
+          Empty pieces between adjacent separators are kept —
+          <code>'a,,b'.split(',')</code> has three pieces, a separator
+          at the edge yields an edge empty, an empty-match regex splits
+          between characters, and an empty text separator splits per
+          UTF-8 code point. <code>join</code> renders a <code>null</code>
+          element as an empty string:
+          <code>[1, null, 3].join('-')</code> is <code>'1--3'</code>.
+        </p>
       </section>
 
       <section class="doc-section" id="logging-and-rendering">
@@ -790,21 +927,26 @@ head.next.next.n = 3
 }</pre>
         <p class="muted">
           Linked lists, trees and parent pointers all work, and are
-          reclaimed automatically like any other struct.
+          reclaimed automatically like any other struct —
+          <strong>including cycles.</strong> Reference counting alone
+          can never free a value that points back at itself (the loop
+          keeps its own count above zero forever), so for types that
+          can form a cycle the compiler adds a cycle detector: when
+          such a value is released but still referenced, the runtime
+          checks whether what remains is only the cycle holding itself,
+          and frees it if so.
         </p>
-        <div class="callout">
-          <strong>One exception, and it is a real one: a <em>cycle</em>
-          is never freed.</strong> Automatic reclamation is reference
-          counting, and a value that points back at itself — directly,
-          or around any longer loop — keeps its own count above zero
-          forever:
-          <pre class="code" style="margin:10px 0 6px;"><span class="kw">Node</span> a
+        <pre class="code"><span class="kw">Node</span> a
 a.n = 7
-a.next = a      <span class="cm">// leaks: nothing will ever free `a`</span></pre>
-          Nothing goes wrong at runtime; the memory is simply never
-          returned. A structure with back-references needs them broken
-          before it's dropped (<code>child.parent = null</code>), or to
-          be accepted as living for the life of the program.
+a.next = a      <span class="cm">// reclaimed when `a` goes away, cycle and all</span></pre>
+        <div class="callout">
+          A cycle something still points at is never touched — parent
+          pointers, rings and doubly-linked structures stay valid for
+          exactly as long as anything outside them can reach them.
+          Cycles through containers (<code>kids:arr[Tree]</code> with a
+          <code>parent:Tree</code> back-pointer, a <code>map</code> of
+          peers) collect the same way. Programs whose types cannot form
+          a cycle carry none of this machinery.
         </div>
 
         <p class="muted">
@@ -863,10 +1005,21 @@ a.next = a      <span class="cm">// leaks: nothing will ever free `a`</span></pr
           repeatedly stays bounded. A single row read out
           of one (<code>People p = rows[0]</code>) borrows from the array
           rather than owning a copy, so it stays valid exactly as long as
-          the array does. A regex compiled at runtime and used straight
-          away (<code>regex(p).test(s)</code>) is freed after use, while a
-          <code>/pattern/</code> literal is compiled once and kept for the
-          life of the process.
+          the array does.
+        </p>
+        <p class="muted">
+          <code>img</code>, <code>aud</code> and <code>regex</code>
+          handles are reference counted exactly like structs: every
+          binding — aliased, escaping, or a <code>/pattern/</code>
+          literal's — is released when it goes away, and the surface,
+          decoded clip, or compiled automaton is destroyed when the
+          last reference drops. <code>img b = a</code> shares one
+          handle; <code>free a</code> afterwards is a decrement and
+          <code>b</code> stays usable. A <code>/pattern/</code>
+          literal's process-lifetime compilation is immortal, so every
+          release that reaches it is a safe no-op. The one thing not
+          reclaimed is text globals at process exit, where the
+          operating system reclaims everything anyway.
         </p>
       </section>
 
@@ -877,6 +1030,19 @@ a.next = a      <span class="cm">// leaks: nothing will ever free `a`</span></pr
 log(numbers.length)
 numbers[0] = 10</pre>
         <p>Memory is reclaimed automatically — see <a href="#structs">Structs</a> above for the full picture (non-escaping locals reclaimed at scope-exit, escaping values reference counted).</p>
+        <p>
+          <strong><code>arr[img]</code>/<code>arr[blob]</code>/<code>arr[aud]</code>
+          load each element from a path</strong>, the array-typed
+          counterpart of <code>img sprite = 'sprite.png'</code>:
+        </p>
+        <pre class="code"><span class="kw">arr[img]</span> brushes = [<span class="str">'./brush1.png'</span>, <span class="str">'./brush2.png'</span>]
+<span class="kw">arr[blob]</span> saves = [<span class="str">'slot1.dat'</span>, <span class="str">'slot2.dat'</span>]</pre>
+        <p class="muted">
+          An element may also already be a value of the array's own
+          media type (reusing an existing <code>img</code>/<code>blob</code>/<code>aud</code>,
+          aliased rather than reloaded) — mixing the two in one literal
+          is fine.
+        </p>
 
         <h3 id="indexing-is-not-bounds-checked">Indexing is not bounds-checked <a class="anchor" href="#indexing-is-not-bounds-checked">#</a></h3>
         <div class="callout">
@@ -1138,11 +1304,13 @@ digits.test(<span class="str">'room 42'</span>)                     <span class=
           <code>/</code>, no space (<code>/pattern/flags</code>). Only
           <code>i</code> and <code>g</code> are accepted; any other flag
           letter is a compile-time error.
-          <code>\w</code>/<code>\d</code>/<code>\s</code>/<code>\b</code>
-          work as expected (glibc's <code>regcomp()</code> supports them
-          as GNU extensions), but there are no capture groups,
-          backreferences, or non-greedy quantifiers (POSIX ERE's own
-          limits).
+          <code>\w</code>/<code>\d</code>/<code>\s</code> (and their
+          negations) and <code>\b</code> work as expected on every
+          platform — the runtime expands them to portable POSIX classes
+          before compiling, not relying on any one C library's
+          extensions — but there are no capture groups, backreferences,
+          or non-greedy quantifiers (POSIX ERE's own limits). Inside
+          <code>[...]</code> a backslash is a literal, per POSIX.
         </p>
 
         <h3 id="what-g-does">What <code>g</code> does, and what it doesn't <a class="anchor" href="#what-g-does">#</a></h3>
@@ -1175,35 +1343,37 @@ digits.test(<span class="str">'room 42'</span>)                     <span class=
 <span class="kw">regex</span> globalDynamic = regex(userPattern, <span class="str">'g'</span>)   <span class="cm">// 'g' works here too</span></pre>
         <p class="muted">The flag belongs to the compiled pattern, not to the call site, so both spellings behave identically.</p>
 
-        <h3 id="literals-vs-regex-function">Literals are compiled once; <code>regex()</code> is compiled per evaluation <a class="anchor" href="#literals-vs-regex-function">#</a></h3>
+        <h3 id="literals-vs-regex-function">Literals are compiled once; <code>regex()</code> is memoized per call site <a class="anchor" href="#literals-vs-regex-function">#</a></h3>
         <p>
           A <code>/pattern/</code> literal is compiled the first time
           its line is reached and cached for the life of the process. A
-          <code>regex(pattern, flags)</code> call compiles on every
-          evaluation, because its pattern is an arbitrary expression —
-          the same call site can legitimately see a different pattern
-          each time, so caching it would silently reuse the first one
-          forever.
+          <code>regex(pattern, flags)</code> call is
+          <strong>memoized per call site</strong>: each call compares
+          its actual pattern and flags against what that site compiled
+          last time, reuses the compilation when they match, and
+          recompiles when they differ. A pattern that varies per call is
+          never served a stale automaton — the check is against the
+          runtime strings, not the source location.
         </p>
-        <p>That is a real cost in a hot loop. Measured over 200,000 iterations:</p>
-        <div class="table-wrap">
-          <table class="sig-table">
-            <tr><td>/[0-9]+/.test(s)</td><td>15 ms</td></tr>
-            <tr><td>regex('[0-9]+') hoisted outside the loop</td><td>13 ms</td></tr>
-            <tr><td>regex('[0-9]+').test(s) inside the loop</td><td>367 ms</td></tr>
-          </table>
-        </div>
         <p class="muted">
-          Roughly 24x, and entirely avoidable: binding the pattern to a
-          variable outside the loop compiles it once and costs the same
-          as a literal. Use the literal whenever the pattern is known,
-          and hoist <code>regex()</code> out of loops when it isn't.
+          So the steady-state cost matches the literal's. Measured over
+          200,000 iterations, <code>regex('[0-9]+').test(s)</code>
+          inside a loop runs in ~15 ms, the same as
+          <code>/[0-9]+/.test(s)</code> — before the memo it was ~367 ms
+          (one full compile per iteration, roughly 24x). A loop that
+          genuinely <em>alternates</em> patterns through one call site
+          still pays a recompile per change, since the memo keeps only
+          the most recent compilation per site; bind each pattern to
+          its own variable outside the loop if that matters.
         </p>
       </section>
 
       <section class="doc-section" id="graphics">
         <h2>Graphics <a class="anchor" href="#graphics">#</a></h2>
         <pre class="code">drawRect(0, 0, 100, 100)
+drawRect(0, 0, 100, 100, blue)           <span class="cm">// optional trailing color -- this call only</span>
+drawPixel(10, 10)                        <span class="cm">// one pixel, current fillStyle</span>
+drawPixel(10, 10, blue)                  <span class="cm">// one pixel, this call only</span>
 drawCircle(50, 50, 25)
 drawText(<span class="str">'Hello'</span>, 20, 20)
 
@@ -1212,12 +1382,19 @@ drawImage(profile, 0, 0)
 log(<span class="str">`${profile.width}x${profile.height}`</span>)
 
 saveCanvas(<span class="str">'screenshot.png'</span>)             <span class="cm">// -&gt; bool; writes what you drew</span>
+<span class="kw">img</span> snap = saveCanvas()                  <span class="cm">// -&gt; img; a snapshot, no file written</span>
 
 render()                                  <span class="cm">// put the canvas on screen</span>
-clearCanvas()                             <span class="cm">// erase everything</span>
-clearRect(10, 10, 40, 40)                 <span class="cm">// erase one region</span>
+clearCanvas()                             <span class="cm">// erase everything to transparent</span>
+clearRect(10, 10, 40, 40)                 <span class="cm">// erase one region to transparent</span>
+clearCircle(50, 50, 25)                   <span class="cm">// erase a circular region to transparent</span>
+clearPixel(10, 10)                        <span class="cm">// erase one pixel to transparent</span>
 
 log(<span class="str">`canvas is ${clientWidth}x${clientHeight}`</span>)
+
+log(<span class="str">`screen is ${screenWidth}x${screenHeight}`</span>)  <span class="cm">// the physical display, read-only</span>
+setClientWidth(1024)                             <span class="cm">// resizes the canvas (and window, if open)</span>
+setClientHeight(768)
 
 <span class="kw">on</span> mouseDown(x:<span class="kw">int</span>, y:<span class="kw">int</span>) { ... }
 <span class="kw">on</span> mouseUp(x:<span class="kw">int</span>, y:<span class="kw">int</span>)   { ... }
@@ -1253,6 +1430,61 @@ render()</pre>
           <code>saveCanvas</code>, <code>clientWidth</code>/<code>clientHeight</code>
           and loading an image all work headless.
         </p>
+
+        <div class="callout">
+          <strong>A fresh or cleared canvas is transparent, not
+          white</strong> — matching the HTML5 canvas model this
+          otherwise mirrors. <code>clearCanvas</code><wbr>/<code>clearRect</code><wbr>/<code>clearCircle</code><wbr>/<code>clearPixel</code>
+          all clear to fully transparent, and a canvas that's never
+          been drawn on starts that way too:
+          <pre class="code" style="margin:10px 0 6px;">drawRect(0, 0, 100, 100)
+clearRect(20, 20, 20, 20)   <span class="cm">// that region is now transparent</span>
+saveCanvas(<span class="str">'sprite.png'</span>)    <span class="cm">// a real alpha channel, usable as an asset</span></pre>
+          That transparency is real alpha in whatever
+          <code>saveCanvas()</code> produces (a file or the
+          <code>img</code> snapshot both), not something flattened to a
+          solid colour — useful for drawing a sprite or icon with a
+          transparent background to compose elsewhere.
+        </div>
+
+        <p>
+          <strong><code>saveCanvas()</code> with no argument returns an
+          <code>img</code> instead of writing a file</strong> — a
+          snapshot of the canvas at that instant, not a live view of
+          it: drawing or clearing the canvas afterward never changes
+          what the snapshot holds.
+        </p>
+        <pre class="code">drawRect(0, 0, 100, 100)
+<span class="kw">img</span> snap = saveCanvas()
+clearCanvas()
+snap.save(<span class="str">'before-clear.png'</span>)   <span class="cm">// still has the rectangle</span></pre>
+
+        <p class="muted">
+          <strong>screenWidth</strong>/<strong>screenHeight</strong>
+          report the physical display's own resolution — not the
+          window's content size (that's <code>clientWidth</code>/<code>clientHeight</code>),
+          since a window can be, and usually is, smaller than the
+          screen it's on. Both are read-only. Unlike
+          <code>clientWidth</code>/<code>clientHeight</code>, reading
+          them still needs an X server (there's no window yet to answer
+          from, and no other way to ask "how big is the screen"), so
+          this is one of the few graphics reads that fails without a
+          display.
+        </p>
+        <p class="muted">
+          <strong>setClientWidth(int)</strong>/<strong>setClientHeight(int)</strong>
+          resize the canvas — and the real OS window too, if one is
+          already open. Both apply immediately:
+          <code>setClientWidth(400)</code> is followed by
+          <code>clientWidth</code> already reading <code>400</code>,
+          not whatever it was a moment before. A non-positive size is
+          silently ignored. If a window is open, the resized content is
+          cleared to transparent (matching <code>clearCanvas</code>'s
+          own behavior) and <code>on resize</code> fires once per call:
+        </p>
+        <pre class="code">render()
+setClientWidth(1024)   <span class="cm">// window resizes; on resize fires once</span>
+setClientHeight(768)   <span class="cm">// fires again</span></pre>
 
         <h3 id="mouse-events">Mouse events <a class="anchor" href="#mouse-events">#</a></h3>
         <p>
@@ -1340,6 +1572,7 @@ grass.save(<span class="str">'grass.png'</span>)                   <span class="
           <tr><td>img.width / img.height</td><td>Current size in pixels, as <code>int</code>.</td></tr>
           <tr><td>img.clip(x, y, w, h)</td><td>A <strong>new</strong> <code>img</code> holding that rectangle. The source is untouched, so one sheet can be clipped as many times as you like.</td></tr>
           <tr><td>img.resize(w, h)</td><td>Scales the image <strong>in place</strong> — it changes the image itself, so every name for it sees the new size.</td></tr>
+          <tr><td>img.drawRect(x, y, w, h[, color]) / img.drawPixel(x, y[, color]) / img.drawCircle(x, y, r) / img.drawText(text, x, y)</td><td>The same four canvas-level drawing calls, painting onto <strong>this image's own surface</strong> instead.</td></tr>
         </table>
         </div>
         <p><code>clip</code> is the spritesheet operation: one PNG holding a grid of frames, sliced into the individual images you draw.</p>
@@ -1353,9 +1586,32 @@ grass.save(<span class="str">'grass.png'</span>)                   <span class="
           the overlapping part is copied and the rest stays transparent,
           which is normal at a sheet's right or bottom margin. A zero or
           negative width or height <em>is</em> an error, since it could
-          only ever produce an image nothing can draw. Because
-          <code>resize</code> changes the image itself, two names for one
-          image stay in step:
+          only ever produce an image nothing can draw.
+        </p>
+        <p>
+          <strong>Drawing onto an image</strong> uses the same style
+          state as the canvas (<code>fillStyle</code>,
+          <code>borderColor</code>, <code>lineWidth</code>,
+          <code>changeFont</code>) and the same optional trailing
+          <code>color</code> on <code>drawRect</code>/<code>drawPixel</code>
+          — but nothing else about the canvas. No window is needed (an
+          image's surface already exists in full the moment the image
+          does), and the canvas's own
+          <code>translate</code>/<code>rotate</code>/<code>scale</code>
+          transform is never applied — an image is a portable asset
+          with its own local pixel coordinates, independent of whatever
+          the canvas's transform happens to be set to:
+        </p>
+        <pre class="code"><span class="kw">color</span> red = <span class="str">'red'</span>
+<span class="kw">color</span> blue = <span class="str">'blue'</span>
+<span class="kw">img</span> icon = <span class="str">'blank.png'</span>
+fillStyle(red)
+icon.drawRect(0, 0, 16, 16)
+icon.drawPixel(24, 8, blue)      <span class="cm">// this pixel only -- fillStyle stays red after</span>
+icon.save(<span class="str">'icon-with-border.png'</span>)</pre>
+        <p class="muted">
+          Because <code>resize</code> changes the image itself, two
+          names for one image stay in step:
         </p>
         <pre class="code"><span class="kw">img</span> a = sheet.clip(0, 0, 32, 32)
 <span class="kw">img</span> b = a
@@ -1373,7 +1629,7 @@ log(b.width)      <span class="cm">// 8 -- a and b are the same image</span></pr
 <span class="kw">color</span> line = <span class="str">'gray'</span>
 <span class="kw">font</span>  body  = <span class="str">'bold 20px serif'</span>
 
-fillStyle(brand)            <span class="cm">// fills: drawRect, drawCircle, drawText</span>
+fillStyle(brand)            <span class="cm">// fills: drawRect, drawPixel, drawCircle, drawText</span>
 borderColor(line)           <span class="cm">// outlines drawRect/drawCircle</span>
 lineWidth(4)                <span class="cm">// border thickness, in pixels</span>
 changeFont(body)            <span class="cm">// used by drawText and both measure calls</span></pre>
@@ -1383,6 +1639,18 @@ changeFont(body)            <span class="cm">// used by drawText and both measur
           and 16px sans-serif, so a program that never calls these draws
           exactly what it did before they existed.
         </p>
+        <p>
+          <strong><code>drawRect</code>/<code>drawPixel</code> take an
+          optional trailing <code>color</code></strong> that overrides
+          <code>fillStyle</code> for that one call only — the current
+          fill (a flat color or an active gradient) is unaffected
+          afterward:
+        </p>
+        <pre class="code">fillStyle(brand)
+drawRect(0, 0, 20, 20)        <span class="cm">// brand</span>
+drawRect(30, 0, 20, 20, line) <span class="cm">// line, just this once</span>
+drawRect(60, 0, 20, 20)       <span class="cm">// brand again</span></pre>
+        <p class="muted"><code>borderColor</code>/<code>lineWidth</code> still apply as configured either way — only the fill is a per-call override, not the border.</p>
         <div class="callout">
           <strong>Colors and fonts must be declared.</strong> Anything
           other than raw RGB numbers has to be a <code>color</code> or
@@ -1676,6 +1944,31 @@ back.save(<span class="str">'recovered.dat'</span>)            <span class="cm">
 log(back.exists())                    <span class="cm">// true</span></pre>
       </section>
 
+      <section class="doc-section" id="directories">
+        <h2>Directories <a class="anchor" href="#directories">#</a></h2>
+        <pre class="code"><span class="kw">bool</span> created = mkdir(<span class="str">'./temp'</span>)        <span class="cm">// -&gt; bool: true if IT created it</span>
+<span class="kw">arr[text]</span> names = ls(<span class="str">'./temp'</span>)        <span class="cm">// -&gt; arr[text] of entry names</span></pre>
+        <p>
+          <code>mkdir(path)</code> answers <code>true</code> only if it
+          actually created the directory — <code>false</code> for every
+          other outcome, including "it already existed", a missing
+          parent, or no permission. Like the file builtins, nothing
+          here fails the program:
+        </p>
+        <pre class="code">mkdir(<span class="str">'./temp'</span>)                       <span class="cm">// true</span>
+mkdir(<span class="str">'./temp'</span>)                       <span class="cm">// false -- already there</span></pre>
+        <p class="muted">
+          <code>ls(path)</code> answers the directory's entry names
+          (not full paths, and never <code>.</code>/<code>..</code>) as
+          <code>arr[text]</code>, in whatever order the OS hands them
+          back. A missing or unreadable directory answers an empty
+          array rather than failing:
+        </p>
+        <pre class="code"><span class="kw">arr[text]</span> names = ls(<span class="str">'./temp'</span>)
+log(names.length)
+log(ls(<span class="str">'./nowhere'</span>).length)           <span class="cm">// 0</span></pre>
+      </section>
+
       <section class="doc-section" id="freeing-and-deleting">
         <h2>Freeing and deleting <a class="anchor" href="#freeing-and-deleting">#</a></h2>
         <p>
@@ -1695,10 +1988,8 @@ log(back.exists())                    <span class="cm">// true</span></pre>
           <strong>every type</strong>:
         </p>
         <ul>
-          <li><strong>struct / <code>arr[T]</code> / <code>map[T]</code> / <code>blob</code></strong> — a reference-count <em>decrement</em>, not a forced free. A value something else still points at survives until its last reference drops; freeing an array releases each element the same way, so a shared element outlives its array.</li>
-          <li><strong><code>img</code> / <code>aud</code></strong> — freed outright. These are the types the compiler can't always reclaim on its own (an escaping handle lives for the program's lifetime — see the note under Images), so <code>free</code> is the manual escape hatch: cut your clips, then <code>free spritesheet</code>. The contract is the manual one: another binding still aliasing the handle is left dangling — the freed <em>binding</em> reads <code>null</code>, an alias does not.</li>
+          <li><strong>struct / <code>arr[T]</code> / <code>map[T]</code> / <code>blob</code> / <code>img</code> / <code>aud</code> / <code>regex</code></strong> — a reference-count <em>decrement</em>, not a forced free. A value something else still points at survives until its last reference drops; freeing an array releases each element the same way, so a shared element outlives its array. An alias of a freed <code>img</code>/<code>aud</code> stays fully usable — the freed <em>binding</em> reads <code>null</code>, the alias does not, and the surface or clip goes away when the last reference does. Freeing an <code>aud</code> that was the last reference stops every channel still playing it. A <code>/pattern/</code> literal's process-lifetime cache is immortal, so <code>free</code> on a binding aliasing one is a safe no-op.</li>
           <li><strong><code>text</code></strong> — the buffer is freed (a text is exclusively owned).</li>
-          <li><strong><code>regex</code></strong> — a <code>regex()</code> result is freed; a <code>/pattern/</code> literal's process-lifetime cache marks itself and survives, so <code>free</code> is safe on either.</li>
           <li><strong>a query row</strong> — the binding is nulled <em>without</em> freeing: the row is owned by the array it came from. Free the array.</li>
           <li><strong><code>int</code> / <code>float</code> / <code>bool</code></strong> — nothing to release; <code>free x</code> is <code>x = null</code>.</li>
         </ul>
@@ -1857,13 +2148,18 @@ xs.pop()            <span class="cm">// -&gt; last element, removed</span>
 xs.shift()          <span class="cm">// -&gt; first element, removed</span>
 xs.unshift(0)       <span class="cm">// -&gt; new length</span>
 <span class="kw">arr[int]</span> cut = xs.splice(1, 2)   <span class="cm">// remove 2 from index 1, return them</span>
+xs.splice(1, 0, [8, 9])           <span class="cm">// insert [8, 9] at index 1, remove nothing</span>
 xs.indexOf(3)       <span class="cm">// -&gt; first index holding 3, or -1</span></pre>
         <p class="muted">
           <code>splice</code> clamps rather than failing — a negative
           start counts back from the end, and an oversized range clamps
           to what's actually there, so <code>splice(i, 1)</code> at a
-          boundary is a no-op. (There's no variadic insert spelling
-          here; Festina has no variadic calls.)
+          boundary is a no-op. An optional third argument,
+          <code>splice(start, count, insertArr)</code>, inserts —
+          the items to insert are one explicit <code>arr[T]</code>
+          rather than a variadic list (Festina has no variadic calls);
+          either way only the <strong>removed</strong> elements come
+          back, never the inserted ones.
         </p>
         <p>
           <code>pop()</code>/<code>shift()</code> on an empty array
@@ -2082,9 +2378,27 @@ stopAudioPlayer(0)                  <span class="cm">// stop that channel, relea
       </section>
 
       <section class="doc-section" id="log-fail">
-        <h2><code>log()</code> / <code>fail()</code> <a class="anchor" href="#log-fail">#</a></h2>
+        <h2><code>log()</code> / <code>fail()</code> / <code>close()</code> <a class="anchor" href="#log-fail">#</a></h2>
         <pre class="code">log(value)       <span class="cm">// prints any primitive to stdout, newline-terminated</span>
-fail(<span class="str">'message'</span>)  <span class="cm">// prints to stderr, exits(1)</span></pre>
+fail(<span class="str">'message'</span>)  <span class="cm">// prints to stderr, exits(1)</span>
+close(code)      <span class="cm">// exits(code), running `on exit` first if declared</span></pre>
+        <p class="muted">
+          <code>close(code)</code> exits the program with the given
+          exit code — it works in every program, with or without a
+          window, unlike the graphics-only <code>on close</code>
+          handler under <a href="#graphics">Graphics</a> above (which
+          fires on the window's own close button and is a different
+          thing with a similar name). If a program declares
+          <code>on exit(code:int) { ... }</code>, <code>close(code)</code>
+          runs it — passed the same code — before the process actually
+          exits:
+        </p>
+        <pre class="code"><span class="kw">on</span> exit(code:<span class="kw">int</span>) {
+    log(<span class="str">`exiting with ${code}`</span>)
+}
+log(<span class="str">'working...'</span>)
+close(1)          <span class="cm">// prints "exiting with 1", then exits with status 1</span></pre>
+        <p class="muted">With no <code>on exit</code> handler declared, <code>close(code)</code> just exits.</p>
       </section>
 
       <section class="doc-section" id="error-format">
