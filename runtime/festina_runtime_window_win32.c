@@ -408,3 +408,34 @@ void festina_window_events_drain(void (*handler)(const FestinaWindowEvent *event
         handler(&ev);
     }
 }
+
+/* claude.md #139: screenWidth/screenHeight and setClientWidth/
+ * setClientHeight's Win32 half of the seam -- see
+ * festina_runtime_window.h's own doc comment for what each function is
+ * responsible for. Built the same way the rest of this file's Win32
+ * backend was: real X11 code ported to the equivalent Win32 call,
+ * unverified on real Windows hardware yet (see windows.md's own
+ * "verify later on real hardware" note, which this inherits). */
+void festina_window_screen_size(int64_t *out_width, int64_t *out_height) {
+    /* SM_CXSCREEN/SM_CYSCREEN -- the primary display's resolution,
+     * needing no window or display connection to query (unlike every
+     * other seam function in this file, all of which require g_hwnd),
+     * matching festina_window_screen_size's own contract that it must
+     * answer even before any window has ever been opened. */
+    *out_width = GetSystemMetrics(SM_CXSCREEN);
+    *out_height = GetSystemMetrics(SM_CYSCREEN);
+}
+
+void festina_window_resize(int64_t width, int64_t height) {
+    if (!g_hwnd) return;
+    /* SWP_NOMOVE | SWP_NOZORDER: change only the size, leaving the
+     * window's position and stacking order untouched -- x/y are
+     * ignored by Win32 when SWP_NOMOVE is set, so 0/0 below is a
+     * don't-care placeholder, not an actual move to the origin. With
+     * WS_POPUP (no border, see festina_window_open's own comment on
+     * why), the window's outer size IS its client size, so `width`/
+     * `height` here need no adjustment the way a bordered window's
+     * AdjustWindowRect would require. */
+    SetWindowPos(g_hwnd, NULL, 0, 0, (int)width, (int)height,
+                 SWP_NOMOVE | SWP_NOZORDER);
+}

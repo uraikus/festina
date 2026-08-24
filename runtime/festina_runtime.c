@@ -41,11 +41,27 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>       /* clock_gettime/nanosleep -- setTimeout/setInterval */
+#include <dirent.h>     /* opendir/readdir/closedir -- claude.md #132's ls().
+                          * POSIX; MinGW-w64 ships its own real <dirent.h>
+                          * providing the identical opendir/readdir/closedir
+                          * shape (a long-standing, widely-relied-on part of
+                          * its POSIX compatibility layer), so this is used
+                          * unconditionally rather than #ifdef'd like
+                          * festina_mkdir below -- unconfirmed by real
+                          * Windows CI yet, same open item every other
+                          * blind-written win32 piece of this runtime has
+                          * had since windows.md Phase 0. */
 #include "festina_runtime.h"
 #include "festina_runtime_internal.h"
 #ifdef _WIN32
+#include <direct.h> /* _mkdir -- claude.md #132's mkdir(), MSVCRT/UCRT's
+                      * own single-argument spelling (no mode bits -- NTFS
+                      * permissions aren't POSIX mode bits, so there is
+                      * nothing a second argument would mean) */
 #include <fcntl.h> /* _O_BINARY -- festina_runtime_init's stdout/stderr fix */
 #include <io.h>    /* _setmode/_fileno -- MSVCRT/UCRT, not POSIX unistd.h */
+#else
+#include <sys/stat.h> /* mkdir(path, mode) -- POSIX */
 #endif
 
 /* windows.md Phase 0 (claude.md #126): the MinGW/UCRT C runtime opens
@@ -104,6 +120,29 @@ void festina_log_text(const char *v) { printf("%s\n", v ? v : ""); fflush(stdout
 void festina_fail(const char *msg) {
     fprintf(stderr, "fail: %s\n", msg ? msg : "");
     exit(1);
+}
+
+/* claude.md #131: close(code)/`on exit(code:int)`. Lives in the CORE
+ * runtime (not festina_runtime_graphics.c, where g_close_handler and
+ * the window-close event live) precisely because close() has to work
+ * in every program, windowed or not -- unlike g_close_handler, which
+ * only ever fires from an X11/Cocoa/Win32 window-close event and so
+ * can only exist in a program that already links a graphics backend.
+ * festina_register_exit_handler is called at most once, unconditionally,
+ * near the very top of main() (see codegen.py's _emit_main_and_entry)
+ * whenever the program declares one; festina_program_exit runs it (if
+ * registered) and then exits -- the two are kept as separate functions,
+ * matching every other register_*_handler/fire-the-handler pair in this
+ * runtime, rather than folding registration into the exit call itself. */
+static void (*g_exit_handler)(int64_t) = NULL;
+
+void festina_register_exit_handler(void (*handler)(int64_t)) {
+    g_exit_handler = handler;
+}
+
+void festina_program_exit(int64_t code) {
+    if (g_exit_handler) g_exit_handler(code);
+    exit((int)code);
 }
 
 /* ---- environment variables -- claude.md #71 ---- */
@@ -349,6 +388,49 @@ void *festina_text_split(const char *s, const char *sep) {
         }
         festina_pieces_push(&p, cursor, (size_t)(found - cursor));
         cursor = found + sep_len;
+    }
+    return festina_pieces_finish(&p);
+}
+
+/* ---- claude.md #132: mkdir()/ls() ----
+ *
+ * mkdir(path) answers a bool -- true if it created the directory, false
+ * for every other outcome (already exists, a missing parent, no
+ * permission, ...), never failing the program. The same "a program
+ * tests for this, it doesn't stop the program over it" choice claude.md
+ * #93 made for the file builtins blob's own methods replaced (claude.md
+ * #109) -- extended here to directories rather than files. */
+int8_t festina_mkdir(const char *path) {
+    if (!path || !*path) return 0;
+#ifdef _WIN32
+    return _mkdir(path) == 0 ? 1 : 0;
+#else
+    return mkdir(path, 0777) == 0 ? 1 : 0;
+#endif
+}
+
+/* ls(path) answers arr[text] of the directory's own entry NAMES (not
+ * full paths, and not "." or ".." -- neither is useful to a program
+ * that wants to iterate what a directory holds), built exactly like
+ * festina_text_split above: the same FestinaPieces accumulator, wrapped
+ * in the same fresh refcounted arr[text] by festina_pieces_finish. A
+ * missing or unreadable directory answers an EMPTY array rather than
+ * failing the program -- the same test-don't-fail choice mkdir() just
+ * above makes, and blob.exists() made before it. */
+void *festina_ls(const char *path) {
+    FestinaPieces p = {NULL, 0, 0};
+    if (path && *path) {
+        DIR *dir = opendir(path);
+        if (dir) {
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != NULL) {
+                if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                    continue;
+                }
+                festina_pieces_push(&p, entry->d_name, strlen(entry->d_name));
+            }
+            closedir(dir);
+        }
     }
     return festina_pieces_finish(&p);
 }
@@ -2456,6 +2538,90 @@ void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
                 (size_t)(tail * elem_size));
     }
     festina_array_resize(a, elem_size, len - count);
+}
+
+/* claude.md #130: the 3-argument splice(start, count, insertArr) form --
+ * JavaScript's splice(start, deleteCount, ...items) with the variadic
+ * items spelled as one explicit arr[T] argument instead (Festina has no
+ * variadic parameters). Removed elements are handed back through
+ * `dst_hdr` exactly like the 2-argument form above; `insert_data`'s
+ * `insert_len` raw elements then take their place. This function only
+ * moves bytes -- it has no notion of a Festina type, so a refcounted or
+ * text element copied in from `insert_data` is NOT retained/copied
+ * here; codegen does that itself afterward, over the destination's own
+ * newly-written range (see _emit_retain_or_own_range), the same
+ * ownership split every other array method in this file already
+ * follows (codegen decides refcounting, this file only decides bytes).
+ */
+void festina_array_splice_insert(void *hdr, int64_t elem_size, int64_t start,
+                                  int64_t count, const void *insert_data,
+                                  int64_t insert_len, void *dst_hdr) {
+    FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
+    FestinaArrayHeader *dst = (FestinaArrayHeader *)dst_hdr;
+    if (dst) { dst->length = 0; dst->data = NULL; }
+    if (insert_len < 0) insert_len = 0;
+    if (!a) return;
+
+    int64_t len = a->length;
+    if (start < 0) {
+        start = len + start;
+        if (start < 0) start = 0;
+    }
+    if (start > len) start = len;
+    if (count < 0) count = 0;
+    if (start + count > len) count = len - start;
+
+    if (dst && count > 0) {
+        dst->data = malloc((size_t)(count * elem_size));
+        if (!dst->data) festina_fail("out of memory in splice()");
+        memcpy(dst->data, (char *)a->data + start * elem_size,
+               (size_t)(count * elem_size));
+        dst->length = count;
+    }
+
+    int64_t tail = len - (start + count);
+    int64_t new_length = len - count + insert_len;
+
+    if (new_length <= 0) {
+        free(a->data);
+        a->data = NULL;
+        a->length = 0;
+        return;
+    }
+
+    if (new_length > len) {
+        /* Growing: resize first (realloc preserves the existing bytes
+         * up to the old length), then shift the tail right into its
+         * final spot -- both source and destination ranges stay within
+         * the just-grown buffer. */
+        void *grown = realloc(a->data, (size_t)(new_length * elem_size));
+        if (!grown) festina_fail("out of memory growing an array");
+        a->data = grown;
+        if (tail > 0) {
+            memmove((char *)a->data + (start + insert_len) * elem_size,
+                    (char *)a->data + (start + count) * elem_size,
+                    (size_t)(tail * elem_size));
+        }
+    } else {
+        /* Shrinking (or exactly the same size): shift the tail into
+         * its final spot first -- (start + insert_len) + tail ==
+         * new_length <= len, so it still fits inside the OLD buffer --
+         * then resize down. */
+        if (tail > 0) {
+            memmove((char *)a->data + (start + insert_len) * elem_size,
+                    (char *)a->data + (start + count) * elem_size,
+                    (size_t)(tail * elem_size));
+        }
+        void *shrunk = realloc(a->data, (size_t)(new_length * elem_size));
+        if (!shrunk) festina_fail("out of memory in splice()");
+        a->data = shrunk;
+    }
+    a->length = new_length;
+
+    if (insert_len > 0 && insert_data) {
+        memcpy((char *)a->data + start * elem_size, insert_data,
+               (size_t)(insert_len * elem_size));
+    }
 }
 
 /* claude.md #97: indexOf -- the first index holding `value`, or -1.

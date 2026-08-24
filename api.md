@@ -91,13 +91,43 @@ with `==`/`!=` works as expected, but a null `float` never compares
 equal to `null` via `==`, even to itself — it's a real NaN under the
 hood, and IEEE-754 NaN comparisons are always false).
 
-`int`/`float` never mix implicitly, in arithmetic or comparisons:
+`int` and `float` mix freely in any binary operator — arithmetic,
+comparison, or equality — with the `int` side implicitly promoted to
+`float`, as though `.toFloat()` had been written on it:
 
 ```festina
 int a = 5
 float b = 2.5
-float c = a.toFloat() + b        // int.toFloat() is the only int->float conversion
+float c = a + b          // 7.5 -- a is promoted to float automatically
+bool less = a < b         // false
 ```
+
+`/` (division) always returns `float`, even when both operands are
+`int` — the one operator that promotes unconditionally, not just when
+mixed:
+
+```festina
+int x = 10
+int y = 3
+float z = x / y           // 3.33333 -- not 3
+```
+
+Every other arithmetic operator (`+`, `-`, `*`, `%`) only promotes when
+the two operands actually differ — `int + int` still returns `int`.
+Declaring a variable as `int` from a genuinely `float`-typed expression
+(mixed or from `/`) is still an ordinary type mismatch — the promotion
+changes what an expression evaluates to, not what a declared type
+accepts:
+
+```festina
+int bad = a + b            // compile error -- a + b is float
+```
+
+The only way back from a `float` to an `int` is still the rounding
+four (`Math.floor`/`ceil`/`round`/`trunc`) — `int.toFloat()` is still
+the one-directional `int` → `float` conversion, now mostly redundant
+with the implicit promotion above but still useful for forcing a
+result to `float` explicitly, e.g. inside a template literal.
 
 ```text
 // float -> int (the rounding four)
@@ -132,7 +162,8 @@ Division/modulo by zero return `null` (for both `int` and `float`)
 rather than crashing:
 
 ```festina
-int result = 10 / 0   // null
+float divided = 10 / 0   // null -- / always returns float
+int remainder = 10 % 0    // null -- % still returns int for two ints
 ```
 
 `int`/`float`/`bool` also each have `.toText()`, returning the same
@@ -160,11 +191,91 @@ void func log_it() {
 }
 ```
 
-No `var`/`let` — every declaration states its type. Functions are not
-first-class values (no closures, no passing a function as a value) —
-this is why `setTimeout`/`setInterval`'s callback argument must be the
-bare name of an already-declared, zero-parameter, `void`-returning
-function, not an arbitrary expression.
+No `var`/`let` — every declaration states its type.
+
+**Functions are first-class values** — a bare function name (not
+called) is a value of type `func[paramTypes]:returnType`, usable
+anywhere a value can go: a variable, a function argument, a struct
+field, an array element, a map value. Calling THROUGH one of those —
+not just the function's own original name — works exactly like calling
+the function directly:
+
+```festina
+void func greet(name:text) { log(name) }
+
+func[text]:void cb = greet
+cb('world')                              // "world"
+
+void func apply(fn:func[text]:void, arg:text) { fn(arg) }
+apply(greet, 'hi')                       // "hi"
+
+struct Handler { onEvent:func[text]:void }
+Handler h
+h.onEvent = greet
+h.onEvent('yo')                          // "yo"
+
+int func inc(x:int) { return x + 1 }
+arr[func[int]:int] transforms = [inc]
+log(transforms[0](5))                    // 6
+```
+
+`func[]:void` is a zero-argument, void-returning function type; `null`
+is a valid value of any func type too. There are no closures — a
+function's own type never captures anything from where it's declared,
+so a `func[...]:...` value is always just a plain reference to one of
+this program's own top-level (or nested, see below) function
+declarations, nothing more. `setTimeout`/`setInterval`'s own callback
+argument is unaffected by any of this: it's still the bare name of a
+zero-parameter, `void`-returning function specifically, not an
+arbitrary `func[...]:...`-typed expression.
+
+**Arrow functions** — `returnType (params) => expr` — are an anonymous
+function VALUE, compiling to an ordinary function with a compiler-
+generated name; the arrow expression itself evaluates to a
+`func[...]:...` reference to it, usable anywhere the plain-function
+examples above are:
+
+```festina
+func[text]:void cb = void (arg:text) => log(arg)
+cb('world')                                        // "world"
+
+func[int]:int sq = int (x:int) => x * x
+log(sq(7))                                         // 49
+
+void func apply(fn:func[text]:void, arg:text) { fn(arg) }
+apply(void (arg:text) => log(arg), 'hi')           // "hi"
+```
+
+A `void`-returning arrow function's body is a plain expression, run
+for its side effects with its own value discarded (there's no `return`
+inside a void function's body to write, arrow or not); a non-void
+one's body IS its return value, no `return` keyword needed. Arrow
+functions have no closures either, for the identical reason plain
+functions don't: `void (arg:text) => log(`${arg} ${x}`)` compiles
+correctly only if `x` is a top-level global (itself visible to every
+function already) — a genuinely local variable from wherever the arrow
+expression is written is not reachable from inside it.
+
+**Functions are hoisted** — every function's name and signature exists
+everywhere in the program, so calling one from above its own
+declaration (including mutual recursion between two functions, each
+necessarily calling the other before its own declaration) is not an
+error:
+
+```festina
+log(greet('world'))    // fine -- greet is declared below
+
+text func greet(name:text) {
+    return 'Hello, ' + name
+}
+```
+
+A function can also be declared nested inside an `if`/`while`/`for`
+block, or inside another function — wherever it's written, it's still
+one single, ordinary, globally-callable function (there's no
+lexical scoping/closures for functions to begin with), so a call to it
+works regardless of where the call site sits relative to that nested
+declaration.
 
 ## Control flow
 
@@ -449,6 +560,18 @@ numbers[0] = 10
 Memory is reclaimed automatically — see "Structs" above for the full
 picture (non-escaping locals reclaimed at scope-exit, escaping values
 reference counted).
+
+**`arr[img]`/`arr[blob]`/`arr[aud]` load each element from a path**,
+the array-typed counterpart of `img sprite = 'sprite.png'`:
+
+```festina
+arr[img] brushes = ['./brush1.png', './brush2.png']
+arr[blob] saves = ['slot1.dat', 'slot2.dat']
+```
+
+An element may also already be a value of the array's own media type
+(reusing an existing `img`/`blob`/`aud`, aliased rather than reloaded) —
+mixing the two in one literal is fine.
 
 ### Indexing is not bounds-checked
 
@@ -769,6 +892,9 @@ bind each pattern to its own variable outside the loop if that matters.
 
 ```festina
 drawRect(0, 0, 100, 100)
+drawRect(0, 0, 100, 100, blue)           // optional trailing color -- this call only
+drawPixel(10, 10)                        // one pixel, current fillStyle
+drawPixel(10, 10, blue)                  // one pixel, this call only
 drawCircle(50, 50, 25)
 drawText('Hello', 20, 20)
 
@@ -777,12 +903,19 @@ drawImage(profile, 0, 0)
 log(`${profile.width}x${profile.height}`)
 
 saveCanvas('screenshot.png')             // -> bool; writes what you drew
+img snap = saveCanvas()                  // -> img; a snapshot, no file written
 
 render()                                  // put the canvas on screen
-clearCanvas()                             // erase everything
-clearRect(10, 10, 40, 40)                 // erase one region
+clearCanvas()                             // erase everything to transparent
+clearRect(10, 10, 40, 40)                 // erase one region to transparent
+clearCircle(50, 50, 25)                   // erase a circular region to transparent
+clearPixel(10, 10)                        // erase one pixel to transparent
 
 log(`canvas is ${clientWidth}x${clientHeight}`)
+
+log(`screen is ${screenWidth}x${screenHeight}`)  // the physical display, read-only
+setClientWidth(1024)                             // resizes the canvas (and window, if open)
+setClientHeight(768)
 
 on mouseDown(x:int, y:int) { ... }
 on mouseUp(x:int, y:int)   { ... }
@@ -823,9 +956,59 @@ Batching matters — drawing used to blit the whole canvas per call, so a
 frame of 2000 rectangles took ~1.6s. Behind one `render()` the same
 frame takes ~1ms.
 
+**A fresh or cleared canvas is transparent, not white** — matching the
+HTML5 `<canvas>` model this otherwise mirrors. `clearCanvas`/`clearRect`/
+`clearCircle`/`clearPixel` all clear to fully transparent, and a canvas
+that's never been drawn on starts that way too:
+
+```festina
+drawRect(0, 0, 100, 100)
+clearRect(20, 20, 20, 20)   // that region is now transparent
+saveCanvas('sprite.png')    // a real alpha channel, usable as an asset
+```
+
+That transparency is real alpha in whatever `saveCanvas()` produces
+(a file or the `img` snapshot both), not something flattened to a
+solid colour — useful for drawing a sprite or icon with a transparent
+background to compose elsewhere.
+
+**`saveCanvas()` with no argument returns an `img` instead of writing a
+file** — a snapshot of the canvas at that instant, not a live view of
+it: drawing or clearing the canvas afterward never changes what the
+snapshot holds.
+
+```festina
+drawRect(0, 0, 100, 100)
+img snap = saveCanvas()
+clearCanvas()
+snap.save('before-clear.png')   // still has the rectangle
+```
+
 Nothing but `render()` and the event handlers needs a display —
 `saveCanvas`, `clientWidth`/`clientHeight` and loading an image all
 work headless.
+
+**`screenWidth`/`screenHeight`** report the physical display's own
+resolution — not the window's content size (that's `clientWidth`/
+`clientHeight`), a window can be, and usually is, smaller than the
+screen it's on. Both are read-only. Unlike `clientWidth`/`clientHeight`,
+reading them still needs an X server (there's no window yet to answer
+from, and no other way to ask "how big is the screen"), so this is one
+of the few graphics reads that fails without a display.
+
+**`setClientWidth(int)`/`setClientHeight(int)`** resize the canvas —
+and the real OS window too, if one is already open. Both apply
+immediately: `setClientWidth(400)` is followed by `clientWidth` already
+reading `400`, not whatever it was a moment before. A non-positive size
+is silently ignored. If a window is open, the resized content is
+cleared to transparent (matching `clearCanvas`'s own behavior) and `on
+resize` fires once per call:
+
+```festina
+render()
+setClientWidth(1024)   // window resizes; on resize fires once
+setClientHeight(768)   // fires again
+```
 
 ### Mouse events
 
@@ -908,6 +1091,7 @@ clip, resize and `saveCanvas` without an X server.
 | `img.width` / `img.height` | Current size in pixels, as `int`. |
 | `img.clip(x, y, w, h)` | A **new** `img` holding that rectangle. The source is untouched, so one sheet can be clipped as many times as you like. |
 | `img.resize(w, h)` | Scales the image **in place** — it changes the image itself, so every name for it sees the new size. |
+| `img.drawRect(x, y, w, h[, color])` / `img.drawPixel(x, y[, color])` / `img.drawCircle(x, y, r)` / `img.drawText(text, x, y)` | The same four canvas-level drawing calls, painting onto **this image's own surface** instead. |
 
 `clip` is the spritesheet operation: one PNG holding a grid of frames,
 sliced into the individual images you draw.
@@ -925,6 +1109,25 @@ overlapping part is copied and the rest stays transparent, which is
 normal at a sheet's right or bottom margin. A zero or negative width or
 height *is* an error, since it could only ever produce an image nothing
 can draw.
+
+**Drawing onto an image** uses the same style state as the canvas
+(`fillStyle`, `borderColor`, `lineWidth`, `changeFont`) and the same
+optional trailing `color` on `drawRect`/`drawPixel` — but nothing else
+about the canvas. No window is needed (an image's surface already
+exists in full the moment the image does), and the canvas's own
+`translate`/`rotate`/`scale` transform is never applied — an image is a
+portable asset with its own local pixel coordinates, independent of
+whatever the canvas's transform happens to be set to:
+
+```festina
+color red = 'red'
+color blue = 'blue'
+img icon = 'blank.png'
+fillStyle(red)
+icon.drawRect(0, 0, 16, 16)
+icon.drawPixel(24, 8, blue)      // this pixel only -- fillStyle stays red after
+icon.save('icon-with-border.png')
+```
 
 Because `resize` changes the image itself, two names for one image stay
 in step:
@@ -947,7 +1150,7 @@ color brand = '#4a90d9'
 color line = 'gray'
 font  body  = 'bold 20px serif'
 
-fillStyle(brand)            // fills: drawRect, drawCircle, drawText
+fillStyle(brand)            // fills: drawRect, drawPixel, drawCircle, drawText
 borderColor(line)           // outlines drawRect/drawCircle
 lineWidth(4)                // border thickness, in pixels
 changeFont(body)            // used by drawText and both measure calls
@@ -957,6 +1160,20 @@ Style is set once and applies to every later draw — the same model the
 HTML canvas uses. Defaults are black fill, no border, and 16px
 sans-serif, so a program that never calls these draws exactly what it
 did before they existed.
+
+**`drawRect`/`drawPixel` take an optional trailing `color`** that
+overrides `fillStyle` for that one call only — the current fill (a flat
+color or an active gradient) is unaffected afterward:
+
+```festina
+fillStyle(brand)
+drawRect(0, 0, 20, 20)        // brand
+drawRect(30, 0, 20, 20, line) // line, just this once
+drawRect(60, 0, 20, 20)       // brand again
+```
+
+`borderColor`/`lineWidth` still apply as configured either way — only
+the fill is a per-call override, not the border.
 
 > **Colors and fonts must be declared.** Anything other than raw RGB
 > numbers has to be a `color` or `font` declaration first:
@@ -1263,6 +1480,34 @@ back.save('recovered.dat')            // now it has one
 log(back.exists())                    // true
 ```
 
+## Directories
+
+```festina
+bool created = mkdir('./temp')        // -> bool: true if IT created it
+arr[text] names = ls('./temp')        // -> arr[text] of entry names
+```
+
+`mkdir(path)` answers `true` only if it actually created the directory
+— `false` for every other outcome, including "it already existed", a
+missing parent, or no permission. Like the file builtins, nothing here
+fails the program:
+
+```festina
+mkdir('./temp')                       // true
+mkdir('./temp')                       // false -- already there
+```
+
+`ls(path)` answers the directory's entry names (not full paths, and
+never `.`/`..`) as `arr[text]`, in whatever order the OS hands them
+back. A missing or unreadable directory answers an empty array rather
+than failing:
+
+```festina
+arr[text] names = ls('./temp')
+log(names.length)
+log(ls('./nowhere').length)           // 0
+```
+
 ## Freeing and deleting
 
 Memory is automatic — but `free` and `delete` exist for the moments you
@@ -1443,14 +1688,19 @@ xs.pop()            // -> last element, removed
 xs.shift()          // -> first element, removed
 xs.unshift(0)       // -> new length
 arr[int] cut = xs.splice(1, 2)   // remove 2 from index 1, return them
+xs.splice(1, 0, [8, 9])           // insert [8, 9] at index 1, remove nothing
 xs.indexOf(3)       // -> first index holding 3, or -1
 ```
 
 All six behave as their JavaScript namesakes do, including `splice`'s
 clamping — a negative start counts back from the end, and an oversized
 range clamps rather than failing, so `splice(i, 1)` at a boundary is a
-no-op. (`splice`'s variadic insert has no spelling here; Festina has no
-variadic calls.)
+no-op. `splice` takes an optional third argument — `splice(start, count,
+insertArr)` — in place of JavaScript's variadic `...items` (Festina has
+no variadic calls, so the items to insert are one explicit `arr[T]`
+instead of a spread list); either way only the REMOVED elements come
+back, never the inserted ones, exactly as JavaScript's own `splice()`
+answers.
 
 `pop()`/`shift()` on an empty array return `null` — not zero, so an
 empty pop is distinguishable from popping a real `0`:
@@ -1664,12 +1914,30 @@ unit; a file is never imported more than once even if multiple files
 depend on it; errors still point at the file a statement actually came
 from.
 
-## `log()` / `fail()`
+## `log()` / `fail()` / `close()`
 
 ```festina
 log(value)     // prints any primitive to stdout, newline-terminated
 fail('message')  // prints to stderr, exits(1)
+close(code)    // exits(code), running `on exit` first if declared
 ```
+
+`close(code)` exits the program with the given exit code — it works in
+every program, with or without a window, unlike the graphics-only `on
+close` handler under [Graphics](#graphics) above (which fires on the
+window's own close button and is a different thing with a similar
+name). If a program declares `on exit(code:int) { ... }`, `close(code)`
+runs it — passed the same code — before the process actually exits:
+
+```festina
+on exit(code:int) {
+    log(`exiting with ${code}`)
+}
+log('working...')
+close(1)          // prints "exiting with 1", then exits with status 1
+```
+
+With no `on exit` handler declared, `close(code)` just exits.
 
 ## Error format
 

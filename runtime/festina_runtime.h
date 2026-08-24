@@ -35,6 +35,16 @@ void festina_log_text(const char *v);
 /* claude.md #42: fail() -- prints to stderr and exits(1). */
 void festina_fail(const char *msg);
 
+/* claude.md #131: close(code) -- runs a declared `on exit(code:int)`
+ * handler (if any), then exits with `code`. Lives in the core runtime
+ * so it works in every program, windowed or not -- unlike
+ * festina_register_close_handler/festina_run_event_loop's own window-
+ * close event in festina_runtime_graphics.c, which only ever fires
+ * from an actual window. festina_register_exit_handler is called at
+ * most once, unconditionally, near the top of main(). */
+void festina_register_exit_handler(void (*handler)(int64_t));
+void festina_program_exit(int64_t code);
+
 /* claude.md #9, #45: string interpolation support. */
 char *festina_str_from_int(int64_t v);
 char *festina_str_from_float(double v);
@@ -60,6 +70,14 @@ void *festina_text_split(const char *s, const char *sep);
 void *festina_regex_split(void *compiled, const char *s);
 char *festina_arr_join(void *arr, const char *sep, const char *kind);
 char *festina_text_own(const char *s);  /* claude.md #83: NULL-safe strdup */
+
+/* claude.md #132: mkdir(path) -> bool (true if IT created the
+ * directory, false for every other outcome, including "already
+ * exists"); ls(path) -> arr[text] of entry names (built exactly like
+ * festina_text_split -- a fresh refcounted array of owned pieces),
+ * empty for a missing/unreadable directory rather than failing. */
+int8_t festina_mkdir(const char *path);
+void *festina_ls(const char *path);
 
 /* claude.md #93: math, files and time -- all libc/libm, both already on
  * every link line, so none of this costs a new dependency.
@@ -398,8 +416,22 @@ char *festina_regex_replace(void *compiled, const char *text,
 void festina_graphics_init(void);
 void festina_run_event_loop(void);
 void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h);
+/* claude.md #133: the optional-`color`-argument forms of drawRect/
+ * drawPixel -- paint with `color` for THIS call only (fillStyle/any
+ * active gradient are saved and restored around it, untouched
+ * afterward), rather than the process-global fillStyle every other
+ * draw call uses. Border/alpha are unaffected either way -- only the
+ * FILL colour is a per-call override. */
+void festina_draw_rect_color(int64_t x, int64_t y, int64_t w, int64_t h, int64_t color);
 void festina_draw_circle(int64_t x, int64_t y, int64_t r);
 void festina_draw_text(const char *text, int64_t x, int64_t y);
+/* claude.md #133: a single pixel, filled with the current fillStyle
+ * (or, for the _color form, `color` for this call only) -- antialiasing
+ * is disabled around it so an integer-aligned 1x1 rectangle paints
+ * exactly one pixel, deterministically, rather than Cairo's usual edge
+ * blending. No border: a 1x1 shape has nothing meaningful to stroke. */
+void festina_draw_pixel(int64_t x, int64_t y);
+void festina_draw_pixel_color(int64_t x, int64_t y, int64_t color);
 void *festina_load_image(const char *path);
 /* claude.md #101: the image counterparts of the two audio entry points
  * above, with one difference -- an image that never came from a file
@@ -445,6 +477,11 @@ int8_t festina_save_canvas(const char *path);
 void festina_render(void);
 void festina_clear_canvas(void);
 void festina_clear_rect(int64_t x, int64_t y, int64_t w, int64_t h);
+/* claude.md #133: the same "erase back to white, honouring the current
+ * transform" clearRect() already does, at a circle's and a single
+ * pixel's shape instead of a rectangle's. */
+void festina_clear_circle(int64_t x, int64_t y, int64_t r);
+void festina_clear_pixel(int64_t x, int64_t y);
 
 /* claude.md #94: paths, transforms, gradients and alpha.
  *
@@ -491,7 +528,22 @@ void festina_stroke_path(void);
 int64_t festina_image_width(void *img);
 int64_t festina_image_height(void *img);
 void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
+/* claude.md #135: saveCanvas() with no path -> a fresh img, a snapshot
+ * of the canvas at this instant (see the .c doc comment for why a
+ * snapshot rather than a live alias). */
+void *festina_canvas_to_image(void);
 void festina_image_resize(void *img, int64_t w, int64_t h);
+/* claude.md #134: drawRect/drawPixel/drawCircle/drawText as methods on
+ * img -- the same four canvas-level functions above, retargeted at an
+ * image's own surface, its own local pixel coordinates (no canvas
+ * transform applied), but still the same global fillStyle/borderColor/
+ * lineWidth/font state every canvas draw call reads. */
+void festina_image_draw_rect(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
+void festina_image_draw_rect_color(void *img, int64_t x, int64_t y, int64_t w, int64_t h, int64_t color);
+void festina_image_draw_pixel(void *img, int64_t x, int64_t y);
+void festina_image_draw_pixel_color(void *img, int64_t x, int64_t y, int64_t color);
+void festina_image_draw_circle(void *img, int64_t x, int64_t y, int64_t r);
+void festina_image_draw_text(void *img, const char *text, int64_t x, int64_t y);
 void festina_image_free(void *img);
 void festina_draw_image(void *img, int64_t x, int64_t y);
 /* claude.md #89/#90: canvas drawing style -- process-global state set by
@@ -557,6 +609,16 @@ void festina_register_resize_handler(void (*handler)(void));
 void festina_register_close_handler(void (*handler)(void));
 int64_t festina_client_width(void);
 int64_t festina_client_height(void);
+/* claude.md #139: screenWidth/screenHeight -- the physical display's
+ * own resolution (through the windowing seam, festina_window_screen_
+ * size), and setClientWidth/setClientHeight -- resizes the canvas
+ * (and, if a window is open, the real OS window too), synchronously,
+ * whether or not a window exists yet. See festina_runtime_graphics.c's
+ * own comments on festina_set_client_size for the full design. */
+int64_t festina_screen_width(void);
+int64_t festina_screen_height(void);
+void festina_set_client_width(int64_t width);
+void festina_set_client_height(int64_t height);
 
 /*
  * setTimeout/setInterval/clearTimeout/clearInterval -- claude.md #69.
@@ -985,6 +1047,18 @@ int8_t festina_array_pop(void *hdr, int64_t elem_size, void *out);
 int8_t festina_array_shift(void *hdr, int64_t elem_size, void *out);
 void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
                            int64_t count, void *dst_hdr);
+/* claude.md #130: the 3-argument splice(start, count, insertArr) form --
+ * JavaScript's splice(start, deleteCount, ...items), spelled with an
+ * explicit array in place of variadic items since Festina has no
+ * variadic parameters. Removes `count` elements starting at `start`
+ * (handed back through `dst_hdr`, exactly like the 2-argument form
+ * above) and inserts `insert_len` raw elements from `insert_data` in
+ * their place -- codegen retains/copies each inserted element itself
+ * afterward (see codegen.py's _emit_retain_or_own_range), since this
+ * function only moves bytes and has no notion of a Festina type. */
+void festina_array_splice_insert(void *hdr, int64_t elem_size, int64_t start,
+                                  int64_t count, const void *insert_data,
+                                  int64_t insert_len, void *dst_hdr);
 /* claude.md #97: the first index holding `value`, or -1 if absent.
  * -1 rather than null because the answer is an index and every use of
  * one is a comparison or a splice argument. Compares the raw 8-byte

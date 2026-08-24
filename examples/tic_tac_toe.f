@@ -42,7 +42,9 @@ void func drawGrid() {
 }
 
 void func drawMark(cellIndex:int, player:int) {
-    int row = cellIndex / 3
+    // claude.md #143: / always returns float now -- Math.floor is the
+    // way back to the int grid coordinate this genuinely needs.
+    int row = Math.floor(cellIndex / 3)
     int col = cellIndex % 3
     int x = GRID_X + col * CELL + 35
     int y = GRID_Y + row * CELL + 60
@@ -87,8 +89,10 @@ on mouseDown(x:int, y:int) {
         return  // clicked outside the grid -- ignore
     }
 
-    int col = (x - GRID_X) / CELL
-    int row = (y - GRID_Y) / CELL
+    // claude.md #143: / always returns float now -- Math.floor is the
+    // way back to the int grid coordinate this genuinely needs.
+    int col = Math.floor((x - GRID_X) / CELL)
+    int row = Math.floor((y - GRID_Y) / CELL)
     int index = row * 3 + col
 
     if board[index] != 0 {

@@ -230,3 +230,59 @@ class TestClientSize:
         program = parser.parse(f"int {name} = 5")
         with pytest.raises(errors.CompileError, match="already declared"):
             semantic.analyze(program)
+
+
+class TestScreenSize:
+    """claude.md #139: screenWidth/screenHeight -- read-only global ints
+    reporting the PHYSICAL display's own resolution, independent of
+    whatever the current window's content size is (that's clientWidth/
+    clientHeight, tested just above). Same registration shape as those
+    two, just answering a different question -- see semantic.py's
+    _SCREEN_SIZE_GLOBALS."""
+
+    def test_screen_width_and_height_are_valid_int_identifiers(self, parser, semantic):
+        source = "log(screenWidth)\nlog(screenHeight)"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_usable_inside_a_template_literal(self, parser, semantic):
+        source = "log(`${screenWidth}x${screenHeight}`)"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    @pytest.mark.parametrize("name", ["screenWidth", "screenHeight"])
+    def test_assigning_to_it_is_a_compile_error(self, parser, semantic, errors, name):
+        # There is no setter for these -- a program cannot resize the
+        # physical display it's running on, unlike clientWidth/
+        # clientHeight's setClientWidth/setClientHeight below.
+        program = parser.parse(f"{name} = 100")
+        with pytest.raises(errors.CompileError, match="read-only"):
+            semantic.analyze(program)
+
+    @pytest.mark.parametrize("name", ["screenWidth", "screenHeight"])
+    def test_declaring_a_variable_with_the_same_name_is_a_compile_error(self, parser, semantic, errors, name):
+        program = parser.parse(f"int {name} = 5")
+        with pytest.raises(errors.CompileError, match="already declared"):
+            semantic.analyze(program)
+
+
+class TestSetClientSize:
+    """claude.md #139: setClientWidth(int)/setClientHeight(int) -- the
+    setters for clientWidth/clientHeight."""
+
+    @pytest.mark.parametrize("name", ["setClientWidth", "setClientHeight"])
+    def test_call_with_an_int_argument_is_valid(self, parser, semantic, name):
+        program = parser.parse(f"{name}(400)")
+        semantic.analyze(program)
+
+    @pytest.mark.parametrize("name", ["setClientWidth", "setClientHeight"])
+    def test_call_with_no_arguments_is_a_compile_error(self, parser, semantic, errors, name):
+        program = parser.parse(f"{name}()")
+        with pytest.raises(errors.CompileError, match=name):
+            semantic.analyze(program)
+
+    @pytest.mark.parametrize("name", ["setClientWidth", "setClientHeight"])
+    def test_call_with_a_text_argument_is_a_compile_error(self, parser, semantic, errors, name):
+        program = parser.parse(f"{name}('400')")
+        with pytest.raises(errors.CompileError, match=name):
+            semantic.analyze(program)

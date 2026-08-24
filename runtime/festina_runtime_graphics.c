@@ -171,8 +171,20 @@ static void festina_backing_require(void) {
     if (g_backing_surface) return;
     g_backing_surface = cairo_image_surface_create(
         CAIRO_FORMAT_ARGB32, (int)g_canvas_width, (int)g_canvas_height);
+    /* claude.md #136: a fresh canvas starts fully transparent, not
+     * opaque white -- the same blank state every clear* function now
+     * fills back to (see their own shared comment). Explicit rather
+     * than relying on cairo_image_surface_create's own zero-
+     * initialization to already mean this, the same "state what this
+     * needs, don't assume a library default" choice this codebase
+     * already makes elsewhere (e.g. windows.md's own history of
+     * exactly this kind of assumption going wrong). CAIRO_OPERATOR_
+     * SOURCE for the same reason every clear* function needs it: a
+     * transparent source under the default OVER operator would be a
+     * no-op, not a real clear. */
     cairo_t *cr = cairo_create(g_backing_surface);
-    cairo_set_source_rgb(cr, 1, 1, 1); /* white canvas background */
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
     cairo_paint(cr);
     cairo_destroy(cr);
 }
@@ -587,6 +599,32 @@ static void festina_fill_and_border(cairo_t *cr) {
     }
 }
 
+/* claude.md #133: drawRect(x, y, w, h, color)/drawPixel(x, y, color) --
+ * fills with `color` for THIS call only, then restores whatever
+ * fillStyle (flat colour or active gradient) was already set, so a
+ * one-off override never leaks into the next plain drawRect()/
+ * drawCircle()/... call. Border/alpha are untouched either way, since
+ * only the FILL colour is what these two ever override -- the same
+ * split fillStyle()/borderColor() already keep separate. `color < 0`
+ * is `color`'s own 'none' encoding (claude.md #91), so this call paints
+ * nothing, exactly like fillStyle('none') would. */
+static void festina_fill_and_border_with_color(cairo_t *cr, int64_t color) {
+    double save_r = g_fill_r, save_g = g_fill_g, save_b = g_fill_b;
+    int save_none = g_fill_none;
+    cairo_pattern_t *save_gradient = g_fill_gradient;
+    g_fill_gradient = NULL;
+    if (color < 0) {
+        g_fill_none = 1;
+    } else {
+        g_fill_none = 0;
+        festina_unpack_rgb(color, &g_fill_r, &g_fill_g, &g_fill_b);
+    }
+    festina_fill_and_border(cr);
+    g_fill_r = save_r; g_fill_g = save_g; g_fill_b = save_b;
+    g_fill_none = save_none;
+    g_fill_gradient = save_gradient;
+}
+
 /* claude.md #123: opens the platform window through the seam, exactly
  * once. Portable now -- every platform-specific concern (connect
  * retries, decorations, input focus, ...) lives in that platform's own
@@ -635,30 +673,77 @@ void festina_render(void) {
     festina_graphics_present();
 }
 
-/* claude.md #95: erases the whole canvas to opaque white -- the missing
- * half of animation. Without it a canvas could only ever accumulate, so
- * nothing could move: every frame painted on top of every frame before
- * it. */
+/* claude.md #136: every clear* function below fills with FULLY
+ * TRANSPARENT pixels, not opaque white -- matching the HTML5 canvas
+ * model these calls otherwise already mirror (a fresh or cleared
+ * <canvas> is transparent, not white), and carrying through to
+ * saveCanvas()'s real alpha channel (claude.md #93's own PNG writer
+ * already round-trips ARGB32 faithfully; nothing there needed to
+ * change for this).
+ *
+ * Cairo's DEFAULT compositing operator (CAIRO_OPERATOR_OVER) treats a
+ * fully-transparent source as a no-op: result = src*alpha + dst*(1-
+ * alpha), which is just `dst` unchanged when alpha is 0 -- painting
+ * "nothing" over existing content does not erase it. Genuinely
+ * replacing pixels with transparent ones needs CAIRO_OPERATOR_SOURCE,
+ * which replaces the destination outright regardless of source alpha.
+ * Scoped to each function's own short-lived `cr` (created and
+ * destroyed within it, same as every other draw/clear function here),
+ * so there is nothing to restore afterward. */
 void festina_clear_canvas(void) {
     festina_backing_require();
     cairo_t *cr = cairo_create(g_backing_surface);
     /* Deliberately NOT the current transform: clearing is about the
      * canvas itself, and a rotated "clear everything" that leaves
      * wedges behind would be a trap rather than a feature. */
-    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
     cairo_paint(cr);
     cairo_destroy(cr);
 }
 
-/* Erases one rectangle back to white. Unlike clearCanvas this DOES
+/* Erases one rectangle to transparent. Unlike clearCanvas this DOES
  * honour the current transform, since it names a region in the same
  * coordinates the drawing calls around it use. */
 void festina_clear_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
     festina_backing_require();
     cairo_t *cr = festina_canvas_context();
-    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     cairo_fill(cr);
+    cairo_destroy(cr);
+}
+
+/* claude.md #133: clearRect()'s own circle-shaped counterpart -- erases
+ * to transparent, honouring the current transform exactly as clearRect
+ * does. No fast-path mask cache the way drawCircle has one: clearing is
+ * a far rarer call than drawing, so the extra machinery would cost more
+ * to maintain than it would ever save here. */
+void festina_clear_circle(int64_t x, int64_t y, int64_t r) {
+    festina_backing_require();
+    cairo_t *cr = festina_canvas_context();
+    if (r < 0) r = 0;
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
+    cairo_arc(cr, (double)x, (double)y, (double)r, 0.0, 2.0 * 3.14159265358979323846);
+    cairo_fill(cr);
+    cairo_destroy(cr);
+}
+
+/* claude.md #133: clearRect()'s own single-pixel counterpart -- see
+ * festina_draw_pixel just below for why antialiasing is disabled
+ * around the fill. */
+void festina_clear_pixel(int64_t x, int64_t y) {
+    festina_backing_require();
+    cairo_t *cr = festina_canvas_context();
+    cairo_antialias_t save_aa = cairo_get_antialias(cr);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
+    cairo_rectangle(cr, (double)x, (double)y, 1, 1);
+    cairo_fill(cr);
+    cairo_set_antialias(cr, save_aa);
     cairo_destroy(cr);
 }
 
@@ -681,6 +766,62 @@ void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
     cairo_t *cr = festina_canvas_context();
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     festina_fill_and_border(cr); /* claude.md #89 */
+    cairo_destroy(cr);
+}
+
+/* claude.md #133: drawRect(x, y, w, h, color) -- see
+ * festina_fill_and_border_with_color's own comment for the save/
+ * restore-fillStyle semantics. */
+void festina_draw_rect_color(int64_t x, int64_t y, int64_t w, int64_t h, int64_t color) {
+    festina_backing_require();
+    cairo_t *cr = festina_canvas_context();
+    cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
+    festina_fill_and_border_with_color(cr, color);
+    cairo_destroy(cr);
+}
+
+/* claude.md #133: a single pixel, filled with the current fillStyle.
+ * Antialiasing is disabled around the fill so an integer-aligned 1x1
+ * rectangle paints exactly one pixel deterministically -- with it left
+ * on, Cairo blends a sub-pixel-positioned edge even for whole-number
+ * coordinates, which would make a "pixel" a faint smudge instead of one
+ * solid pixel. No border: a 1x1 shape has nothing meaningful to
+ * stroke, unlike drawRect/drawCircle. */
+void festina_draw_pixel(int64_t x, int64_t y) {
+    festina_backing_require();
+    cairo_t *cr = festina_canvas_context();
+    cairo_antialias_t save_aa = cairo_get_antialias(cr);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
+    cairo_rectangle(cr, (double)x, (double)y, 1, 1);
+    if (!g_fill_none) {
+        festina_set_fill_source(cr);
+        cairo_fill(cr);
+    } else {
+        cairo_new_path(cr);
+    }
+    cairo_set_antialias(cr, save_aa);
+    cairo_destroy(cr);
+}
+
+/* claude.md #133: drawPixel(x, y, color) -- `color` for this one pixel
+ * only, the same per-call override drawRect_color makes, but simpler:
+ * a single pixel is never a gradient, so there is no fillStyle state to
+ * save and restore around it at all. */
+void festina_draw_pixel_color(int64_t x, int64_t y, int64_t color) {
+    festina_backing_require();
+    cairo_t *cr = festina_canvas_context();
+    cairo_antialias_t save_aa = cairo_get_antialias(cr);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
+    cairo_rectangle(cr, (double)x, (double)y, 1, 1);
+    if (color >= 0) {
+        double r, g, b;
+        festina_unpack_rgb(color, &r, &g, &b);
+        cairo_set_source_rgba(cr, r, g, b, g_fill_alpha);
+        cairo_fill(cr);
+    } else {
+        cairo_new_path(cr);
+    }
+    cairo_set_antialias(cr, save_aa);
     cairo_destroy(cr);
 }
 
@@ -1113,6 +1254,29 @@ void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h) 
     return festina_image_box(out);
 }
 
+/* claude.md #135: saveCanvas() with no path -> img, a SNAPSHOT of the
+ * canvas at this instant rather than a live view of it -- built the
+ * exact same way festina_image_clip just above builds any other fresh
+ * img from existing pixels (a new ARGB32 surface, the source painted
+ * onto it, boxed). A snapshot rather than an alias is the only choice
+ * that keeps `img` semantics honest: every OTHER img is its own
+ * independent value once created (clip/resize never retroactively
+ * change an unrelated image), and the canvas keeps being drawn into
+ * and cleared long after this call returns -- an alias would make the
+ * returned image silently change out from under whatever the program
+ * does with it next. */
+void *festina_canvas_to_image(void) {
+    festina_backing_require();
+    int w = cairo_image_surface_get_width(g_backing_surface);
+    int h = cairo_image_surface_get_height(g_backing_surface);
+    cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    cairo_t *cr = cairo_create(out);
+    cairo_set_source_surface(cr, g_backing_surface, 0, 0);
+    cairo_paint(cr);
+    cairo_destroy(cr);
+    return festina_image_box(out);
+}
+
 /* claude.md #92: scales this image to w x h IN PLACE, so every binding
  * holding it sees the new size. The old surface is destroyed here --
  * safe precisely because the box, not the surface, is what any Festina
@@ -1142,6 +1306,117 @@ void festina_image_resize(void *img, int64_t w, int64_t h) {
     free(box->bytes);
     box->bytes = NULL;
     box->byte_count = 0;
+}
+
+/* claude.md #134: drawRect/drawPixel/drawCircle/drawText as methods on
+ * img -- the same four canvas-level drawing functions above, retargeted
+ * at an image's OWN surface instead of the canvas backing store. No
+ * window or festina_backing_require() needed at all: an img's surface
+ * already exists in full the moment the image itself does (loaded,
+ * clipped, resized, or decoded from bytes), unlike the canvas's own
+ * lazily-created backing store. Deliberately does NOT apply the
+ * canvas's global transform (translate/rotate/scale, claude.md #94) --
+ * an image is a portable asset with its own local pixel coordinates,
+ * independent of whatever the canvas's own transform happens to be set
+ * to when a program draws onto one. Still reads the SAME global
+ * fillStyle/borderColor/lineWidth/font state every canvas draw call
+ * does, since claude.md #133's own "otherwise uses fillColor" default
+ * makes the most sense as one shared style, not a second one to
+ * configure separately per image.
+ *
+ * `festina_check_image_bytes_stale`-equivalent bookkeeping (claude.md
+ * #101's cached-PNG-bytes invalidation, see festina_image_resize just
+ * above) applies here too: any of these mutates the surface's actual
+ * pixels, so the cached encoded bytes (if any) are stale the moment
+ * this returns. */
+static void festina_image_bytes_now_stale(void *img) {
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    free(box->bytes);
+    box->bytes = NULL;
+    box->byte_count = 0;
+}
+
+void festina_image_draw_rect(void *img, int64_t x, int64_t y, int64_t w, int64_t h) {
+    if (!img) return;
+    cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
+    cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
+    festina_fill_and_border(cr);
+    cairo_destroy(cr);
+    festina_image_bytes_now_stale(img);
+}
+
+void festina_image_draw_rect_color(void *img, int64_t x, int64_t y, int64_t w, int64_t h, int64_t color) {
+    if (!img) return;
+    cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
+    cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
+    festina_fill_and_border_with_color(cr, color);
+    cairo_destroy(cr);
+    festina_image_bytes_now_stale(img);
+}
+
+/* See festina_draw_pixel's own comment (just above festina_draw_circle
+ * in this file) for why antialiasing is disabled around the fill. */
+void festina_image_draw_pixel(void *img, int64_t x, int64_t y) {
+    if (!img) return;
+    cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
+    cairo_antialias_t save_aa = cairo_get_antialias(cr);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
+    cairo_rectangle(cr, (double)x, (double)y, 1, 1);
+    if (!g_fill_none) {
+        festina_set_fill_source(cr);
+        cairo_fill(cr);
+    } else {
+        cairo_new_path(cr);
+    }
+    cairo_set_antialias(cr, save_aa);
+    cairo_destroy(cr);
+    festina_image_bytes_now_stale(img);
+}
+
+void festina_image_draw_pixel_color(void *img, int64_t x, int64_t y, int64_t color) {
+    if (!img) return;
+    cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
+    cairo_antialias_t save_aa = cairo_get_antialias(cr);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
+    cairo_rectangle(cr, (double)x, (double)y, 1, 1);
+    if (color >= 0) {
+        double r, g, b;
+        festina_unpack_rgb(color, &r, &g, &b);
+        cairo_set_source_rgba(cr, r, g, b, g_fill_alpha);
+        cairo_fill(cr);
+    } else {
+        cairo_new_path(cr);
+    }
+    cairo_set_antialias(cr, save_aa);
+    cairo_destroy(cr);
+    festina_image_bytes_now_stale(img);
+}
+
+/* No circle-mask fast path here (unlike the canvas's own drawCircle,
+ * claude.md #104) -- that cache is keyed on the CANVAS's own transform
+ * state, which images deliberately do not use (see this section's own
+ * comment above), and drawing onto an image is a far rarer, less
+ * hot-path call than drawing a frame's worth of shapes onto the canvas
+ * every tick. */
+void festina_image_draw_circle(void *img, int64_t x, int64_t y, int64_t r) {
+    if (!img) return;
+    cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
+    cairo_arc(cr, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0.0, 2.0 * 3.14159265358979323846);
+    festina_fill_and_border(cr);
+    cairo_destroy(cr);
+    festina_image_bytes_now_stale(img);
+}
+
+void festina_image_draw_text(void *img, const char *text, int64_t x, int64_t y) {
+    if (!img || !text) return;
+    cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
+    if (g_fill_none) { cairo_destroy(cr); return; }
+    cairo_set_source_rgba(cr, g_fill_r, g_fill_g, g_fill_b, g_fill_alpha);
+    festina_apply_font(cr);
+    cairo_move_to(cr, (double)x, (double)y);
+    cairo_show_text(cr, text);
+    cairo_destroy(cr);
+    festina_image_bytes_now_stale(img);
 }
 
 /* claude.md #92/#118: the img counterpart of festina_blob_release --
@@ -1210,6 +1485,103 @@ int64_t festina_client_height(void) {
     return g_canvas_height;
 }
 
+/* claude.md #139: screenWidth/screenHeight -- the physical display's
+ * own resolution, through the seam (festina_window_screen_size), since
+ * only a platform backend knows how to ask its own OS that. Two thin
+ * wrappers rather than one two-out-param function reaching all the way
+ * up to codegen, matching festina_client_width/_height's own shape
+ * immediately above -- each is one global property, one call. */
+int64_t festina_screen_width(void) {
+    int64_t w = 0, h = 0;
+    festina_window_screen_size(&w, &h);
+    return w;
+}
+
+int64_t festina_screen_height(void) {
+    int64_t w = 0, h = 0;
+    festina_window_screen_size(&w, &h);
+    return h;
+}
+
+/* claude.md #139: setClientWidth/setClientHeight's shared portable
+ * core -- everything about "what changing the canvas size MEANS" lives
+ * here, once, regardless of which of the two axes changed and whether
+ * a window is even open yet. A non-positive size is silently ignored
+ * (matching festina_check_image_size's own "no image nothing could
+ * ever draw to" reasoning, applied to the canvas itself) rather than
+ * failing the program.
+ *
+ * Deliberately synchronous and self-contained, not "resize the OS
+ * window and wait for its own resize event to come back around": every
+ * Festina-visible piece of state (clientWidth/clientHeight, the
+ * backing surface) changes immediately, in this call, so
+ * `setClientWidth(400) log(clientWidth)` reads 400 right away rather
+ * than whatever stale value was true before the native window manager
+ * gets around to confirming it asynchronously. festina_window_resize
+ * (the seam call at the end) still asks the OS window to match, for
+ * when one is open -- but the real ConfigureNotify/native resize event
+ * that eventually arrives from THAT call is a trailing echo of a
+ * change already applied here, not a second one: see
+ * festina_handle_window_event's own RESIZE case, which skips its
+ * rebuild-and-fire entirely when the event's size already matches what
+ * this function already set, so one logical resize never fires `on
+ * resize` twice. */
+/* claude.md #139: counts native resize echoes still owed back to us
+ * from calls to festina_window_resize below, one per call -- NOT a
+ * size comparison. X11 (and presumably every other backend) does not
+ * coalesce ConfigureNotify-equivalents across back-to-back resize
+ * calls: two setClientWidth/setClientHeight calls in a row produce two
+ * separate native resize requests and, later, two separate echoes,
+ * each carrying whatever geometry was current AT THE TIME the OS
+ * finally got around to it -- which can be a stale intermediate size,
+ * not the final one. A "does this echo's size match current state"
+ * guard (the first approach tried here) is fooled by exactly that: the
+ * first stale echo still passes because current state hasn't been
+ * touched yet, and processing it clobbers g_canvas_width/height away
+ * from the size festina_set_client_size already committed, so the
+ * SECOND echo then also looks "new" and fires `on resize` again too --
+ * confirmed by a real back-to-back setClientWidth/setClientHeight
+ * Xvfb repro that produced 4 firings instead of 2. Counting owed
+ * echoes sidesteps geometry entirely: every echo genuinely caused by
+ * this function is swallowed regardless of what stale size it reports,
+ * while a real window-manager-driven resize (dragging an edge) never
+ * increments this counter at all, so it always falls through and
+ * fires normally. */
+static int g_pending_self_resizes = 0;
+
+static void festina_set_client_size(int64_t width, int64_t height) {
+    if (width <= 0 || height <= 0) return;
+    if (width == g_canvas_width && height == g_canvas_height) return;
+    g_canvas_width = width;
+    g_canvas_height = height;
+    if (g_backing_surface) {
+        cairo_surface_destroy(g_backing_surface);
+        g_backing_surface = cairo_image_surface_create(
+            CAIRO_FORMAT_ARGB32, (int)width, (int)height);
+        /* claude.md #136: fresh canvas state is transparent, not white
+         * -- see festina_backing_require's own identical block. */
+        cairo_t *cr = cairo_create(g_backing_surface);
+        cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+        cairo_set_source_rgba(cr, 0, 0, 0, 0);
+        cairo_paint(cr);
+        cairo_destroy(cr);
+    }
+    if (g_window_open) {
+        festina_graphics_present();
+        if (g_resize_handler) g_resize_handler();
+        g_pending_self_resizes++;
+        festina_window_resize(width, height);
+    }
+}
+
+void festina_set_client_width(int64_t width) {
+    festina_set_client_size(width, g_canvas_height);
+}
+
+void festina_set_client_height(int64_t height) {
+    festina_set_client_size(g_canvas_width, height);
+}
+
 /* claude.md #123: handles one already-NORMALIZED window event -- the
  * portable dispatch every backend's festina_window_events_drain calls
  * into, unchanged regardless of which platform produced the event.
@@ -1242,20 +1614,47 @@ static void festina_handle_window_event(const FestinaWindowEvent *ev) {
         /* claude.md #39's own examples never draw relative to a canvas
          * size (there's no syntax for one), so there's no spec-defined
          * way to preserve old content sanely across a resize -- clear
-         * back to white at the new size, the same behavior resizing a
-         * browser's <canvas> element has, which clientWidth/
-         * clientHeight are named after. The window's own on-screen
-         * surface is already the new size by the time this fires --
-         * each backend resizes its own before emitting RESIZE (see
-         * festina_runtime_window.h) -- so only the portable backing
-         * store needs rebuilding here. */
+         * to transparent at the new size (claude.md #136), the same
+         * behavior resizing a browser's <canvas> element actually has
+         * (a resized/recreated canvas is transparent, not white),
+         * which clientWidth/clientHeight are named after. The window's
+         * own on-screen surface is already the new size by the time
+         * this fires -- each backend resizes its own before emitting
+         * RESIZE (see festina_runtime_window.h) -- so only the
+         * portable backing store needs rebuilding here.
+         *
+         * claude.md #139: skipped entirely while g_pending_self_resizes
+         * is nonzero -- setClientWidth/setClientHeight (festina_set_
+         * client_size) apply the identical rebuild SYNCHRONOUSLY, then
+         * ask the OS window to match via festina_window_resize, which
+         * increments that counter once per call. That native resize
+         * still generates its own RESIZE event later (a
+         * ConfigureNotify/equivalent), arriving here as the trailing
+         * echo of a change already applied, not a new one -- without
+         * this guard, one logical resize would rebuild the backing
+         * store and fire `on resize` again. This is deliberately a
+         * COUNT, not a size comparison: back-to-back calls (e.g.
+         * setClientWidth then setClientHeight) produce two separate,
+         * non-coalesced echoes, and the first echo can carry a stale
+         * intermediate geometry that doesn't match either the size
+         * before or after -- a size-comparison guard is fooled by that
+         * (confirmed by a real Xvfb repro that mis-fired twice), while
+         * counting owed echoes swallows both regardless of what
+         * geometry each one happens to report. A genuine window-
+         * manager-driven resize (dragging an edge) never increments
+         * this counter, so it always falls through and fires. */
+        if (g_pending_self_resizes > 0) {
+            g_pending_self_resizes--;
+            break;
+        }
         g_canvas_width = ev->width;
         g_canvas_height = ev->height;
         cairo_surface_destroy(g_backing_surface);
         g_backing_surface = cairo_image_surface_create(
             CAIRO_FORMAT_ARGB32, (int)ev->width, (int)ev->height);
         cairo_t *cr = cairo_create(g_backing_surface);
-        cairo_set_source_rgb(cr, 1, 1, 1);
+        cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+        cairo_set_source_rgba(cr, 0, 0, 0, 0);
         cairo_paint(cr);
         cairo_destroy(cr);
         festina_graphics_present();
@@ -1449,6 +1848,49 @@ void festina_window_close(void) {
     XDestroyWindow(g_display, g_window);
     XCloseDisplay(g_display);
     g_display = NULL;
+}
+
+/* claude.md #139: reuses the already-open connection if a window is
+ * open; otherwise opens a throwaway one just long enough to ask, and
+ * closes it again -- no retry loop the way festina_window_open's own
+ * XOpenDisplay has one, since this is a read-only property query a
+ * program can call as often as it likes, not a one-time hard
+ * requirement worth stalling up to a second for. Fails clearly (the
+ * identical message render() itself uses) rather than silently
+ * answering 0x0, which would look like a real, if degenerate, screen
+ * size instead of "no display at all". */
+void festina_window_screen_size(int64_t *out_width, int64_t *out_height) {
+    if (g_display) {
+        int screen = DefaultScreen(g_display);
+        *out_width = DisplayWidth(g_display, screen);
+        *out_height = DisplayHeight(g_display, screen);
+        return;
+    }
+    Display *tmp = XOpenDisplay(NULL);
+    if (!tmp) {
+        festina_fail("could not open the X display -- claude.md #39's graphics "
+                      "functions need a running X server (is $DISPLAY set?)");
+        return;
+    }
+    int screen = DefaultScreen(tmp);
+    *out_width = DisplayWidth(tmp, screen);
+    *out_height = DisplayHeight(tmp, screen);
+    XCloseDisplay(tmp);
+}
+
+/* claude.md #139: a no-op with no window open -- festina_set_client_
+ * size (festina_runtime_graphics.c's own portable half) already
+ * updates the canvas's own size for whenever one does; this function's
+ * only job is telling the ALREADY-open native window to match.
+ * cairo_xlib_surface_set_size keeps the Cairo-side surface's own
+ * cached dimensions in step with the just-resized drawable -- without
+ * it, festina_window_present would keep blitting at the OLD size into
+ * a window that has already changed underneath it. */
+void festina_window_resize(int64_t width, int64_t height) {
+    if (!g_display) return;
+    XResizeWindow(g_display, g_window, (unsigned int)width, (unsigned int)height);
+    cairo_xlib_surface_set_size(g_window_surface, (int)width, (int)height);
+    XFlush(g_display);
 }
 
 void festina_window_present(cairo_surface_t *backing) {

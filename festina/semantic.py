@@ -1,10 +1,13 @@
 """Semantic analysis -- claude.md #48 (error categories), #49 (symbol
 table), #50 (type checking), plus the type-resolution/truthiness/equality
 rules from #12-20, the struct/table distinction from #27, #28, #35, and
-#55/#56 (int/float never mix directly; Math.floor/ceil/round/trunc and
-int.toFloat() are the only conversions). #58 (struct/table namespace):
-struct/table names live in `structs`/`tables`, never cross-checked
-against `Scope` (variables/functions) -- separate namespaces by design.
+#56 (Math.floor/ceil/round/trunc and int.toFloat() are the ONLY ways to
+turn a float back into an int -- claude.md #143 superseded #55's own
+"int and float never mix directly" half of this entry: int/float mix
+freely now, in any binary operator, the int side implicitly coerced to
+float). #58 (struct/table namespace): struct/table names live in
+`structs`/`tables`, never cross-checked against `Scope` (variables/
+functions) -- separate namespaces by design.
 #67/#68/#107 (regex(), .test(), .match(), .replace()) follow
 the same "recognized Call-on-Member pattern" approach Math.floor/
 int.toFloat() already established -- Festina has no general concept of
@@ -12,16 +15,21 @@ methods on primitive types, so each one is checked by name against the
 receiver's inferred type in _infer_call, not looked up in some method
 table.
 
-`analyze(program)` walks the AST top to bottom. None of this repo's
-fixtures need forward references (structs/tables/functions are always
-declared before use), so a single left-to-right pass is enough. This
-also makes multi-file compilation (claude.md #5-6) work with no extra
-machinery here: festina.imports.build_program already merged every
-file's statements into one `program.body`, in dependency order, before
+`analyze(program)` walks the AST top to bottom. Struct/table names
+(claude.md #106) and function signatures (claude.md #140) are each
+pre-registered in their own dedicated pass over the whole program
+before the real left-to-right walk begins, so declaring one of those
+below where it's first used/called is never an ordering error --
+"hoisting". Variables still are declared-before-use, genuinely (there
+is no pre-pass for those, and no reasonable hoisting semantics for a
+value that has to come from somewhere at runtime). This also makes
+multi-file compilation (claude.md #5-6) work with no extra machinery
+here: festina.imports.build_program already merged every file's
+statements into one `program.body`, in dependency order, before
 analyze() ever sees it -- the only thing this module does specially for
 that is re-read each top-level statement's originating file (`.file`,
 set by build_program) into the `filename` closure variable right before
-analyzing it, so errors still name the right file (see the loop at the
+analyzing it, so errors still name the right file (see the loops at the
 bottom of analyze()).
 """
 from . import ast
@@ -76,6 +84,10 @@ _REMOVED_BUILTINS = {
 BUILTIN_FUNCTIONS = {
     "log", "fail", "sqlite",
     "drawRect", "drawCircle", "drawText", "drawImage",
+    # claude.md #133: drawPixel (with drawRect's own optional trailing
+    # `color` argument, see _BUILTIN_SIGNATURE_ALTERNATES below) and
+    # clearRect's circle/pixel-shaped counterparts.
+    "drawPixel", "clearCircle", "clearPixel",
     # claude.md #98: how many channels the pool may assign automatically.
     "setMaxAudioPlayers", "maxAudioPlayers",
     # claude.md #99: stop one channel (or, with no argument, all of them).
@@ -101,6 +113,20 @@ BUILTIN_FUNCTIONS = {
     # claude.md #94: single-value queries, so a scalar result needs no
     # throwaway `table` declaration (which would create a real table).
     "sqliteInt", "sqliteFloat", "sqliteText",
+    # claude.md #131: exits the program with `code`, running a declared
+    # `on exit(code:int)` handler first (see _EVENT_SIGNATURES below) --
+    # works with or without a window, unlike mouseDown/.../close's on-
+    # screen-only handlers.
+    "close",
+    # claude.md #132: filesystem builtins -- mkdir() answers a bool
+    # rather than failing (claude.md #93's own "a missing/unwritable
+    # file is something a program tests for" rule, extended to
+    # directories), ls() answers arr[text] of entry names.
+    "mkdir", "ls",
+    # claude.md #139: the setters for clientWidth/clientHeight --
+    # screenWidth/screenHeight have no setter, since a program cannot
+    # resize the physical display it's running on.
+    "setClientWidth", "setClientHeight",
 }
 
 _BUILTIN_RETURN_TYPES = {
@@ -114,11 +140,16 @@ _BUILTIN_RETURN_TYPES = {
     # claude.md #93
     "now": types_mod.PrimitiveType("int"),
     "formatTime": types_mod.PrimitiveType("text"),
-    "saveCanvas": types_mod.PrimitiveType("bool"),
+    # claude.md #135: saveCanvas's return type now depends on its own
+    # arity (bool with a path, img without) -- handled by its own
+    # dedicated branch in _infer_call, not this fixed-per-name table.
     # claude.md #94
     "sqliteInt": types_mod.PrimitiveType("int"),
     "sqliteFloat": types_mod.PrimitiveType("float"),
     "sqliteText": types_mod.PrimitiveType("text"),
+    # claude.md #132
+    "mkdir": types_mod.PrimitiveType("bool"),
+    "ls": types_mod.ArrayType(types_mod.PrimitiveType("text")),
 }
 
 # claude.md #55: int and float never mix directly in a binary operator.
@@ -146,7 +177,9 @@ _BLOB_METHODS = {
 # their args are inferred but not checked against a fixed signature,
 # since claude.md leaves their shape open.
 _BUILTIN_SIGNATURES = {
-    "drawRect": (_INT, _INT, _INT, _INT),
+    # claude.md #133: drawRect's own fixed entry moved to
+    # _BUILTIN_SIGNATURE_ALTERNATES below, alongside drawPixel -- both
+    # now have a second, 1-argument-longer form with a trailing `color`.
     "drawCircle": (_INT, _INT, _INT),
     "drawText": (_TEXT, _INT, _INT),
     "drawImage": (types_mod.ImageType(), _INT, _INT),
@@ -162,11 +195,13 @@ _BUILTIN_SIGNATURES = {
     # claude.md #93
     "now": (),
     "formatTime": (_INT, _TEXT),
-    "saveCanvas": (_TEXT,),
     # claude.md #94
     "render": (),
     "clearCanvas": (),
     "clearRect": (_INT, _INT, _INT, _INT),
+    # claude.md #133
+    "clearCircle": (_INT, _INT, _INT),
+    "clearPixel": (_INT, _INT),
     "beginPath": (),
     "moveTo": (_INT, _INT),
     "lineTo": (_INT, _INT),
@@ -183,6 +218,14 @@ _BUILTIN_SIGNATURES = {
     "fillAlpha": (_FLOAT,),
     "fillLinearGradient": (_INT, _INT, types_mod.ColorType(), _INT, _INT, types_mod.ColorType()),
     "fillRadialGradient": (_INT, _INT, _INT, types_mod.ColorType(), types_mod.ColorType()),
+    # claude.md #131
+    "close": (_INT,),
+    # claude.md #132
+    "mkdir": (_TEXT,),
+    "ls": (_TEXT,),
+    # claude.md #139
+    "setClientWidth": (_INT,),
+    "setClientHeight": (_INT,),
 }
 
 # claude.md #90: three builtins accept two different shapes. The
@@ -215,6 +258,11 @@ _BUILTIN_SIGNATURE_ALTERNATES = {
     # claude.md #99: stopAudioPlayer(n) stops one channel;
     # stopAudioPlayer() stops every channel.
     "stopAudioPlayer": [(), (_INT,)],
+    # claude.md #133: an optional trailing `color` -- present, paints
+    # with it for this one call only; absent, uses the current
+    # fillStyle, exactly like every other draw call already does.
+    "drawRect": [(_INT, _INT, _INT, _INT), (_INT, _INT, _INT, _INT, _COLOR)],
+    "drawPixel": [(_INT, _INT), (_INT, _INT, _COLOR)],
 }
 _REGEX = types_mod.RegexType()
 _AUDIO = types_mod.AudioType()
@@ -268,6 +316,12 @@ _EVENT_SIGNATURES = {
     "keyUp": ((_TEXT,), "(key:text)"),
     "resize": ((), "no parameters"),
     "close": ((), "no parameters"),
+    # claude.md #131: NOT a graphics event -- fires from the close(code)
+    # builtin, which works with or without a window. Kept in this same
+    # table since the shape (a fixed, enforced signature) is identical;
+    # analyze_event_handler and _emit_event_handler both special-case it
+    # away from the other six's window-only registration.
+    "exit": ((_INT,), "(code:int)"),
 }
 
 # claude.md #39: clientWidth/clientHeight report the canvas window's
@@ -279,6 +333,18 @@ _EVENT_SIGNATURES = {
 # "already declared" check rejects a user var/function/struct/table
 # with either name for free, with no extra machinery here.
 _CLIENT_SIZE_GLOBALS = ("clientWidth", "clientHeight")
+
+# claude.md #139: screenWidth/screenHeight -- the PHYSICAL display's own
+# resolution, not the window's content size (that's clientWidth/
+# clientHeight just above). Same read-only global-int registration
+# shape, kept as its own tuple rather than folded into
+# _CLIENT_SIZE_GLOBALS since the two answer genuinely different
+# questions (a window can be smaller than the screen it's on).
+_SCREEN_SIZE_GLOBALS = ("screenWidth", "screenHeight")
+# Both size-global families are read-only the identical way and share
+# every touch point below; combined once here so those touch points
+# don't need to know there happen to be two separate families.
+_SIZE_GLOBALS = _CLIENT_SIZE_GLOBALS + _SCREEN_SIZE_GLOBALS
 
 # claude.md #71: `environment` -- unlike clientWidth/clientHeight above,
 # this is never a valid *value* on its own (only environment.NAME or
@@ -368,6 +434,21 @@ class AnalyzedProgram:
 def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None):
     if isinstance(type_expr, ast.ArrayTypeExpr):
         return types_mod.ArrayType(resolve_type_name(type_expr.element, structs, tables, filename, node))
+    if isinstance(type_expr, ast.FuncTypeExpr):
+        # claude.md #141: func[T, T, ...]:R -- a first-class function
+        # type. Resolved recursively the same way ArrayTypeExpr/
+        # MapTypeExpr are, just over a LIST of param type expressions
+        # instead of one. `"void"` is the same string sentinel
+        # FuncDecl.return_type already uses for a void-returning
+        # function, so this reads it the identical way analyze_func
+        # does (`!= "void"` gates the resolve() call).
+        param_types = tuple(
+            resolve_type_name(p, structs, tables, filename, node)
+            for p in type_expr.param_types
+        )
+        return_type = (None if type_expr.return_type == "void"
+                        else resolve_type_name(type_expr.return_type, structs, tables, filename, node))
+        return types_mod.FuncType(param_types, return_type)
     if isinstance(type_expr, ast.MapTypeExpr):
         value_type = resolve_type_name(type_expr.value, structs, tables, filename, node)
         # claude.md #72: a map value is stored in one fixed 8-byte slot
@@ -408,15 +489,60 @@ def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None
     )
 
 
+def _iter_func_decls(stmts):
+    """claude.md #140: yields every ast.FuncDecl reachable from `stmts`,
+    however deeply nested -- inside a Block, either arm of an IfStmt, a
+    While/ForStmt body, an EventHandler body, or even another FuncDecl's
+    own body (a function nested inside a function, which the parser
+    already allows and analyze_func already treats as an ordinary
+    global declaration regardless of nesting -- see its own comment).
+    This traversal shape must stay in lockstep with analyze_statement/
+    analyze_block's own recursive descent -- every statement kind that
+    can hold a nested statement list is walked here the identical way,
+    since a FuncDecl analyze_statement would eventually reach but this
+    pre-pass skipped would defeat hoisting for exactly that one
+    declaration (it would still analyze fine when the real pass reaches
+    it, just too late for anything calling it earlier to see it)."""
+    for stmt in stmts:
+        if isinstance(stmt, ast.FuncDecl):
+            yield stmt
+            yield from _iter_func_decls(stmt.body.body)
+        elif isinstance(stmt, ast.EventHandler):
+            yield from _iter_func_decls(stmt.body.body)
+        elif isinstance(stmt, ast.Block):
+            yield from _iter_func_decls(stmt.body)
+        elif isinstance(stmt, ast.IfStmt):
+            yield from _iter_func_decls(stmt.then.body)
+            if isinstance(stmt.orelse, ast.IfStmt):
+                yield from _iter_func_decls([stmt.orelse])
+            elif stmt.orelse is not None:
+                yield from _iter_func_decls(stmt.orelse.body)
+        elif isinstance(stmt, (ast.WhileStmt, ast.ForStmt)):
+            yield from _iter_func_decls(stmt.body.body)
+
+
 def analyze(program, filename="<string>"):
     global_scope = Scope()
     structs = {}
     tables = {}
     imports = []
     entry_filename = filename  # see the DatabaseURL check at the bottom
+    # claude.md #142: one monotonic counter for every arrow-function
+    # expression's own synthesized name (__festina_arrow_N) -- a plain
+    # int, not a list-wrapped closure cell, since every read/increment
+    # happens through the single next_arrow_name() closure below rather
+    # than needing `nonlocal` at each call site.
+    _arrow_counter = 0
 
-    # claude.md #39: clientWidth/clientHeight, see _CLIENT_SIZE_GLOBALS above.
-    for _name in _CLIENT_SIZE_GLOBALS:
+    def next_arrow_name():
+        nonlocal _arrow_counter
+        name = f"__festina_arrow_{_arrow_counter}"
+        _arrow_counter += 1
+        return name
+
+    # claude.md #39/#139: clientWidth/clientHeight/screenWidth/screenHeight,
+    # see _SIZE_GLOBALS above.
+    for _name in _SIZE_GLOBALS:
         global_scope.define(_name, Symbol(_name, _INT, "constant", None), None, filename)
     # claude.md #71: environment, see _ENVIRONMENT_NAME above -- type is
     # irrelevant (never consulted), only here so redeclaring it is a
@@ -597,6 +723,48 @@ def analyze(program, filename="<string>"):
                     seen_literal_keys[key_expr.value] = key_expr
                 value_type = infer(val_expr, scope)
             return types_mod.MapType(value_type) if value_type is not None else None
+        if isinstance(expr, ast.ArrowFuncExpr):
+            # claude.md #142: `void (arg:text) => log(arg)` compiles to
+            # an ordinary, synthesized top-level function
+            # (__festina_arrow_N(arg:text) { log(arg) }), with the
+            # arrow expression itself evaluating to a func[...]:...
+            # VALUE referring to it -- "arrow functions compile to
+            # regular functions," the request's own framing. Built and
+            # analyzed HERE, once, synchronously -- NOT through claude.md
+            # #140's whole-program hoisting pre-pass, which an arrow
+            # function has no use for at all: it has no name a forward
+            # reference could ever spell (its synthesized name is
+            # invisible to Festina source), so the synthesized FuncDecl
+            # only ever needs to exist by the time this expression
+            # itself is reached, never any earlier.
+            param_types = tuple(resolve(p.type_expr, expr) for p in expr.params)
+            return_type = None if expr.return_type == "void" else resolve(expr.return_type, expr)
+            # claude.md #23's own void-vs-non-void rules already reject
+            # `return <value>` inside a void function -- so a void arrow
+            # function's body expression becomes a bare ExprStmt
+            # (evaluated for its side effects, result discarded), not
+            # literally `return <expr>` the way the request's own
+            # comment shows it (a simplification in the request's own
+            # wording that would not actually typecheck as written --
+            # see claude.md #142's own log entry). A non-void arrow
+            # function's body IS `return <expr>`, matching the
+            # request's example exactly for that case.
+            if return_type is None:
+                body_block = ast.Block([ast.ExprStmt(expr.body)])
+            else:
+                body_block = ast.Block([ast.Return(expr.body, expr.line, expr.column)])
+            decl = ast.FuncDecl(next_arrow_name(), expr.return_type, expr.params,
+                                 body_block, expr.line, expr.column)
+            register_func_signature(decl)
+            analyze_func(decl)
+            # claude.md #142: codegen.py re-walks this SAME AST object
+            # (see festina/cli.py's compile_file) -- stashing the
+            # synthesized FuncDecl here is what lets it emit the exact
+            # same function codegen needs, rather than re-synthesizing
+            # an independent (and, absent careful coordination,
+            # possibly desynced) name of its own.
+            expr.decl = decl
+            return types_mod.FuncType(param_types, return_type)
         if isinstance(expr, ast.Identifier):
             # claude.md #71: `environment` alone means nothing -- only
             # environment.NAME/environment[keyExpr] do (see
@@ -619,6 +787,24 @@ def analyze(program, filename="<string>"):
                     file=filename, line=expr.line, column=expr.column,
                     category="unknown variable",
                 )
+            if sym.kind == "function":
+                # claude.md #141: a bare reference to a function's own
+                # NAME -- not immediately called -- is a first-class
+                # function VALUE now, typed func[paramTypes]:returnType.
+                # Built fresh from the FuncDecl every time (never cached
+                # on the Symbol itself), so `sym.type` keeps meaning
+                # exactly what it always has everywhere else this Symbol
+                # is read: the RETURN type of a CALL to this function
+                # (_infer_call's own Identifier-callee branch, just
+                # below, still reads sym.type directly for that, unaware
+                # this branch even exists -- the two paths are told
+                # apart structurally, by whether the Identifier is the
+                # callee of an immediately-enclosing Call or not, not by
+                # anything stored on the Symbol).
+                decl = sym.node
+                param_types = tuple(resolve(p.type_expr, decl) for p in decl.params)
+                ret_type = resolve(decl.return_type, decl) if decl.return_type != "void" else None
+                return types_mod.FuncType(param_types, ret_type)
             return sym.type
         if isinstance(expr, ast.Member):
             return _infer_member(expr, scope)
@@ -638,12 +824,12 @@ def analyze(program, filename="<string>"):
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid assignment",
                 )
-            # claude.md #39: clientWidth/clientHeight are read-only too --
-            # same reasoning and same "catch it before the generic
-            # target_type/value_type check below" placement as .length
-            # above, since that check alone has no way to tell a read
-            # from a write target.
-            if isinstance(expr.target, ast.Identifier) and expr.target.name in _CLIENT_SIZE_GLOBALS:
+            # claude.md #39/#139: clientWidth/clientHeight/screenWidth/
+            # screenHeight are read-only too -- same reasoning and same
+            # "catch it before the generic target_type/value_type check
+            # below" placement as .length above, since that check alone
+            # has no way to tell a read from a write target.
+            if isinstance(expr.target, ast.Identifier) and expr.target.name in _SIZE_GLOBALS:
                 raise CompileError(
                     f"'{expr.target.name}' is read-only and cannot be assigned to",
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
@@ -727,15 +913,16 @@ def analyze(program, filename="<string>"):
         if isinstance(expr, ast.BinOp):
             left = infer(expr.left, scope)
             right = infer(expr.right, scope)
-            # claude.md #55: int and float never mix directly, in any
-            # binary operator -- arithmetic, comparison, or equality.
-            if left in _NUMERIC_TYPES and right in _NUMERIC_TYPES and left != right:
-                raise CompileError(
-                    f"cannot use {expr.op} directly between int and float; "
-                    "convert one side first (int.toFloat(), or Math.floor/ceil/round/trunc for float -> int)",
-                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
-                    category="invalid operand type",
-                )
+            # claude.md #143: superseded claude.md #55's old "int and
+            # float never mix directly" rule -- int/float now mix
+            # freely in any binary operator (arithmetic, comparison, or
+            # equality), the int side implicitly coerced to float, as
+            # though int.toFloat() had been written explicitly. Nothing
+            # is checked or rejected here for it any more; see
+            # codegen.py's own comment on _emit_binop for where the
+            # actual sitofp conversion is emitted, and the arithmetic-
+            # result-type branch further down for what type this whole
+            # expression itself infers as.
             if expr.op in ("==", "!="):
                 # claude.md #18 shows == / != between two values of the
                 # same type; it never shows (and #2's "no implicit
@@ -760,6 +947,10 @@ def analyze(program, filename="<string>"):
                     left is None or right is None
                     or left is NULL or right is NULL
                     or left == right
+                    # claude.md #143: int/float mix freely now, == / !=
+                    # included -- the int side is coerced to float, the
+                    # same as every other binary operator.
+                    or (left in _NUMERIC_TYPES and right in _NUMERIC_TYPES)
                 )
                 if not compatible:
                     raise CompileError(
@@ -788,6 +979,14 @@ def analyze(program, filename="<string>"):
                         category="invalid operand type",
                     )
                 return types_mod.PrimitiveType("bool")
+            if expr.op == "/":
+                # claude.md #143: division always returns float,
+                # unconditionally -- the one arithmetic operator that's
+                # float-returning even when BOTH operands are int
+                # (every other arithmetic operator here -- +, -, *, %
+                # -- only promotes to float when the two operands
+                # actually differ, via the generic check just below).
+                return types_mod.PrimitiveType("float")
             if left == types_mod.PrimitiveType("float") or right == types_mod.PrimitiveType("float"):
                 return types_mod.PrimitiveType("float")
             return left if left is not None else right
@@ -1021,6 +1220,33 @@ def analyze(program, filename="<string>"):
                         category="invalid function argument type",
                     )
                 return None
+            # claude.md #135: saveCanvas(path) -> bool (unchanged) or
+            # saveCanvas() -> img (new) -- the return TYPE itself
+            # depends on which form is used, which the generic
+            # _BUILTIN_SIGNATURE_ALTERNATES mechanism just below can't
+            # express (it picks an argument signature by arity, but
+            # answers one fixed return type for the name regardless of
+            # which alternate matched), so this gets its own branch
+            # instead, the same way setTimeout/clearTimeout just above
+            # do for their own reason.
+            if name == "saveCanvas":
+                if len(expr.args) == 0:
+                    return _IMAGE
+                if len(expr.args) != 1:
+                    raise CompileError(
+                        f"saveCanvas() expects 0 or 1 argument(s), got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                arg_type = infer(expr.args[0], scope)
+                if arg_type is not None and arg_type is not NULL and arg_type != _TEXT:
+                    raise CompileError(
+                        f"saveCanvas()'s argument expects text, found "
+                        f"{types_mod.type_name(arg_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return _BOOL
             if name in BUILTIN_FUNCTIONS:
                 sig = _BUILTIN_SIGNATURES.get(name)
                 alternates = _BUILTIN_SIGNATURE_ALTERNATES.get(name)
@@ -1073,6 +1299,38 @@ def analyze(program, filename="<string>"):
                             )
                 return _BUILTIN_RETURN_TYPES.get(name)
             sym = scope.lookup(name)
+            if (sym is not None and sym.kind != "function"
+                    and isinstance(sym.type, types_mod.FuncType)):
+                # claude.md #141: an INDIRECT call, through a func[...]:...
+                # -typed variable/parameter/constant/field/element rather
+                # than a plain declared function's own name -- checked
+                # before the "not a function at all" rejection just
+                # below, since a func-typed local is exactly as callable
+                # as a real function, just via a different Symbol.kind.
+                # A local shadowing a real global function of the same
+                # name (Scope.define permits it -- see its own comment)
+                # is handled automatically here too: scope.lookup always
+                # resolves to the innermost binding, so the shadowing
+                # local's own FuncType signature is what a call is
+                # checked against, never the shadowed global function's.
+                fn_type = sym.type
+                if len(expr.args) != len(fn_type.param_types):
+                    raise CompileError(
+                        f"'{name}' expects {len(fn_type.param_types)} argument(s), "
+                        f"got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                for i, (arg_expr, expected) in enumerate(zip(expr.args, fn_type.param_types)):
+                    arg_type = infer(arg_expr, scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != expected:
+                        raise CompileError(
+                            f"argument {i + 1} of '{name}' expects "
+                            f"{types_mod.type_name(expected)}, found {types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return fn_type.return_type
             if sym is None or sym.kind != "function":
                 # claude.md #109: a name this language used to have gets
                 # told what replaced it, not merely that it is unknown.
@@ -1468,15 +1726,24 @@ def analyze(program, filename="<string>"):
                                 category="invalid function argument type",
                             )
                         return elem
-                    # splice(start, count) -> arr[T] of what was removed
-                    if len(expr.args) != 2:
+                    # claude.md #130: splice(start, count) -> arr[T] of
+                    # what was removed, or splice(start, count,
+                    # insertArr) -- JavaScript's splice(start,
+                    # deleteCount, ...items) with the variadic items
+                    # spelled as one arr[T] argument instead, since
+                    # Festina has no variadic parameters. Either way the
+                    # return value is only what was removed, exactly as
+                    # JS's own splice() answers -- the inserted elements
+                    # are never handed back, only placed.
+                    if len(expr.args) not in (2, 3):
                         raise CompileError(
-                            "splice() expects 2 arguments (start, count), "
+                            "splice() expects 2 arguments (start, count) or "
+                            "3 (start, count, insertArr), "
                             f"got {len(expr.args)}",
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid function argument type",
                         )
-                    for arg in expr.args:
+                    for arg in expr.args[:2]:
                         arg_type = infer(arg, scope)
                         if arg_type is not None and arg_type is not NULL and arg_type != _INT:
                             raise CompileError(
@@ -1485,6 +1752,9 @@ def analyze(program, filename="<string>"):
                                 file=filename, line=callee.line, column=callee.column,
                                 category="invalid function argument type",
                             )
+                    if len(expr.args) == 3:
+                        check_assignable(types_mod.ArrayType(elem), infer(expr.args[2], scope),
+                                          callee, what="splice() insert argument")
                     return types_mod.ArrayType(elem)
             if callee.prop in ("clip", "resize") and infer(callee.obj, scope) == _IMAGE:
                 expected = 4 if callee.prop == "clip" else 2
@@ -1505,6 +1775,50 @@ def analyze(program, filename="<string>"):
                             category="invalid function argument type",
                         )
                 return types_mod.ImageType() if callee.prop == "clip" else None
+            # claude.md #134: drawRect/drawPixel/drawCircle/drawText as
+            # methods on img -- the same four canvas-level drawing
+            # builtins claude.md #37/#39/#133 already give, now also
+            # callable on an image's OWN surface instead of the canvas.
+            # drawRect/drawPixel keep their own optional trailing
+            # `color` (claude.md #133); coordinates are always in the
+            # image's own pixel space, with no window/canvas needed at
+            # all -- see codegen.py's _emit_image_draw_method.
+            if (callee.prop in ("drawRect", "drawPixel", "drawCircle", "drawText")
+                    and infer(callee.obj, scope) == _IMAGE):
+                alternates = {
+                    "drawRect": [(_INT, _INT, _INT, _INT), (_INT, _INT, _INT, _INT, _COLOR)],
+                    "drawPixel": [(_INT, _INT), (_INT, _INT, _COLOR)],
+                }.get(callee.prop)
+                if alternates is not None:
+                    sig = next((a for a in alternates if len(a) == len(expr.args)), None)
+                    if sig is None:
+                        shapes = " or ".join(str(len(a)) for a in alternates)
+                        raise CompileError(
+                            f"{callee.prop}() expects {shapes} argument(s), "
+                            f"got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                else:
+                    sig = {"drawCircle": (_INT, _INT, _INT),
+                           "drawText": (_TEXT, _INT, _INT)}[callee.prop]
+                    if len(expr.args) != len(sig):
+                        raise CompileError(
+                            f"{callee.prop}() expects {len(sig)} argument(s), "
+                            f"got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                for i, (arg, expected) in enumerate(zip(expr.args, sig)):
+                    arg_type = infer(arg, scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != expected:
+                        raise CompileError(
+                            f"{callee.prop}()'s argument {i + 1} expects "
+                            f"{types_mod.type_name(expected)}, found {types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return None
             if callee.prop == "isPlaying" and infer(callee.obj, scope) == _AUDIO:
                 if expr.args:
                     raise CompileError(
@@ -1577,7 +1891,35 @@ def analyze(program, filename="<string>"):
         # receiver -- validates the member access itself (so an unknown
         # method on a real type still fails with a specific message
         # rather than silently passing through as untyped).
-        infer(callee, scope)
+        callee_type = infer(callee, scope)
+        if isinstance(callee_type, types_mod.FuncType):
+            # claude.md #141: an INDIRECT call through a func[...]:...
+            # -typed STRUCT FIELD (h.cb(...)), ARRAY ELEMENT (fns[i](...)),
+            # or MAP VALUE (handlers[key](...)) -- every shape this
+            # fallback's own generic `infer(callee, scope)` just above
+            # already resolves correctly (Member/computed-Member
+            # inference doesn't care whether it's reached from a Call or
+            # anywhere else), so the only thing left is the same arity/
+            # argument-type validation the bare-Identifier indirect-call
+            # branch above already does, checked against callee_type's
+            # own signature rather than a Symbol's.
+            if len(expr.args) != len(callee_type.param_types):
+                raise CompileError(
+                    f"expects {len(callee_type.param_types)} argument(s), "
+                    f"got {len(expr.args)}",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid function argument type",
+                )
+            for i, (arg_expr, expected) in enumerate(zip(expr.args, callee_type.param_types)):
+                arg_type = infer(arg_expr, scope)
+                if arg_type is not None and arg_type is not NULL and arg_type != expected:
+                    raise CompileError(
+                        f"argument {i + 1} expects {types_mod.type_name(expected)}, "
+                        f"found {types_mod.type_name(arg_type)}",
+                        file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                        category="invalid function argument type",
+                    )
+            return callee_type.return_type
         for a in expr.args:
             infer(a, scope)
         return None
@@ -1643,12 +1985,50 @@ def analyze(program, filename="<string>"):
     def analyze_var_decl(decl, scope, is_global):
         declared_type = resolve(decl.type_expr, decl)
         if decl.init is not None:
-            actual_type = infer(decl.init, scope)
-            check_assignable(declared_type, actual_type, decl)
+            # claude.md #137: arr[img]/arr[aud]/arr[blob] declared
+            # directly from a literal of paths -- `arr[img] brushes =
+            # ['./brush1.png', './brush2.png']` -- the array-typed
+            # counterpart of `img sprite = 'sprite.png'` (claude.md
+            # #100/#101/#109's own one-directional text -> media
+            # allowance, handled just below in check_assignable for a
+            # single value). ArrayLit's own generic inference (just
+            # above) has no notion of an "expected" element type -- it
+            # only ever infers each element's OWN type and demands they
+            # all agree, so `['a.png', 'b.png']` infers as arr[text]
+            # regardless of what it's being declared into, and
+            # check_assignable's array/map case never had a "text
+            # element coerces to media element" rule (only the
+            # all-null case) -- so this needs its own check here,
+            # bypassing the generic infer()+check_assignable() path
+            # for exactly this one shape. Every element must be EITHER
+            # a path (text) or already the declared media type itself
+            # (e.g. an existing img being reused in the literal) --
+            # codegen's own _emit_array_lit/_coerce already do the
+            # per-element text -> media loading generically once the
+            # expected element type reaches them; the gap was only
+            # ever here, in what semantic.py would let through.
+            if (isinstance(declared_type, types_mod.ArrayType)
+                    and declared_type.element in (_IMAGE, _AUDIO, _BLOB)
+                    and isinstance(decl.init, ast.ArrayLit)):
+                elem = declared_type.element
+                for e in decl.init.elements:
+                    etype = infer(e, scope)
+                    if etype is not None and etype is not NULL and etype != elem and etype != _TEXT:
+                        raise CompileError(
+                            f"array literal element expects "
+                            f"{types_mod.type_name(elem)} (or text, naming a "
+                            f"path), found {types_mod.type_name(etype)}",
+                            file=filename, line=getattr(e, "line", 0),
+                            column=getattr(e, "column", 0),
+                            category="invalid operand type",
+                        )
+            else:
+                actual_type = infer(decl.init, scope)
+                check_assignable(declared_type, actual_type, decl)
         kind = "constant" if decl.is_const else "variable"
         scope.define(decl.name, Symbol(decl.name, declared_type, kind, decl), decl, filename)
 
-    def analyze_func(decl):
+    def register_func_signature(decl):
         # `log`/`fail`/`sqlite` are already lexer keywords, so a
         # function can never be declared with those names in the first
         # place -- but drawRect/drawCircle/drawText/drawImage/
@@ -1663,6 +2043,18 @@ def analyze(program, filename="<string>"):
         # security.md's audit writeup) on the reasoning that none of
         # graphics/audio/timers were implemented yet, so the collision
         # couldn't actually bite; now that they are, it can.
+        #
+        # claude.md #140: this is deliberately just the NAME/SIGNATURE
+        # half of what used to be one function (analyze_func, below) --
+        # called once per FuncDecl from the whole-program pre-pass near
+        # the bottom of analyze(), for every FuncDecl reachable anywhere
+        # in the program (however deeply nested -- see
+        # _iter_func_decls), before a single CALL anywhere gets checked.
+        # That's what makes declaration order stop mattering
+        # ("hoisting"): a call reached earlier in the real analysis pass
+        # than its own callee's textual declaration still finds the
+        # name already defined in global_scope, with its real signature,
+        # by the time _infer_call looks it up.
         if decl.name in BUILTIN_FUNCTIONS:
             raise CompileError(
                 f"'{decl.name}' is a builtin function name and cannot be used to "
@@ -1674,6 +2066,18 @@ def analyze(program, filename="<string>"):
             )
         return_type = resolve(decl.return_type, decl) if decl.return_type != "void" else None
         global_scope.define(decl.name, Symbol(decl.name, return_type, "function", decl), decl, filename)
+
+    def analyze_func(decl):
+        # claude.md #140: decl's own signature was already registered
+        # by the pre-pass above (register_func_signature) -- this only
+        # analyzes the BODY now, wherever the declaration is textually
+        # reached during the real walk. Re-resolving return_type here
+        # (rather than reading it back out of the Symbol register_func_
+        # signature already stored) is what analyze_func has always
+        # done and stays cheap and side-effect free either way --
+        # resolve() is a pure function of structs/tables, neither of
+        # which changes mid-compile.
+        return_type = resolve(decl.return_type, decl) if decl.return_type != "void" else None
         func_scope = Scope(global_scope)
         for p in decl.params:
             func_scope.define(p.name, Symbol(p.name, resolve(p.type_expr, decl), "parameter"), decl, filename)
@@ -1896,6 +2300,28 @@ def analyze(program, filename="<string>"):
             structs[stmt.name] = {}
         elif isinstance(stmt, ast.TableDecl) and stmt.name not in tables:
             tables[stmt.name] = {}
+
+    # claude.md #140: every function's NAME and SIGNATURE is registered
+    # before any CALL resolves -- "hoisting", the same declaration-
+    # order-independence claude.md #106 just gave struct/table names
+    # above, extended to functions (and, since a nested FuncDecl is
+    # already treated as an ordinary global declaration regardless of
+    # nesting -- see analyze_func's own comment -- however deeply one is
+    # nested inside blocks/loops/other functions; see _iter_func_decls).
+    # filename is threaded the identical way the real analysis loop
+    # right below threads it: reset right before each TOP-LEVEL
+    # statement, since only top-level statements carry their own
+    # `.file` (build_program) -- everything nested under one shares
+    # that statement's file. This has to run as a fully separate pass
+    # over the WHOLE program (not folded into the struct/table loop
+    # just above) because a function's return/parameter types can
+    # themselves name a struct or table, so every struct/table name
+    # must already exist before register_func_signature's own resolve()
+    # calls run.
+    for stmt in program.body:
+        filename = getattr(stmt, "file", filename)
+        for func_decl in _iter_func_decls([stmt]):
+            register_func_signature(func_decl)
 
     for stmt in program.body:
         # claude.md #6: a multi-file program (festina.imports.build_program)
