@@ -21,6 +21,7 @@ import shutil
 import sqlite3
 import struct
 import subprocess
+import sys
 import time
 import wave
 
@@ -9350,21 +9351,33 @@ class TestSlimBinaries:
         src = tmp_path / "main.f"
         src.write_text("drawRect(1, 1, 2, 2)")
         out = tmp_path / "program"
-        # claude.md #126 round four: like the audio case just above,
-        # this must skip (not fail) where offscreen graphics has no
-        # backend at all yet -- windows.md Phase 2, where even the
-        # gate itself only fires as of this round's fix. Calling
-        # compile_file directly (as this test always has, to inspect
-        # the linked binary below) previously meant a platform-gated
-        # CompileError propagated as a raw test failure instead of the
-        # skip every other platform-conditional test gets.
+        # claude.md #126 round four: calling compile_file directly (as
+        # this test always has, to inspect the linked binary below)
+        # means a platform-gated CompileError -- e.g. on a platform
+        # whose graphics gate still fires -- would otherwise propagate
+        # as a raw test failure instead of the skip every other
+        # platform-conditional test gets.
         from tests.conftest import compile_file_or_skip
         compile_file_or_skip(
             cli_mod, str(src), str(out),
             cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
         ldd_output = self._ldd(out)
         assert "libcairo" in ldd_output
-        assert "libX11" in ldd_output
+        # claude.md #129: windows.md Phase 2 landing made this
+        # reachable on real Windows CI for the first time -- offscreen
+        # graphics used to hit the win32 gate unconditionally, so
+        # compile_file_or_skip always skipped before reaching this
+        # assertion there. It compiles and links for real now, and
+        # correctly links no X11 at all: Windows graphics is native
+        # Win32 windowing (festina_runtime_window_win32.c), not an X11
+        # server running under emulation, so there is genuinely nothing
+        # X11 to find in a Windows binary's own DLL dependencies --
+        # this isn't a platform-specific carve-out for a bug, it's the
+        # correct, intended difference the X11 check itself only makes
+        # sense on the platform that actually has X11 in the first
+        # place.
+        if sys.platform != "win32":
+            assert "libX11" in ldd_output
         assert "libasound" not in ldd_output
 
     def test_audio_binary_links_alsa_but_not_cairo_or_x11(self, tmp_path):
