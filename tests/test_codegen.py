@@ -11767,10 +11767,81 @@ class TestArrayMethods:
             "arr[int] xs = [1]\nxs.push('a')",
             "arr[int] xs = [1]\nxs.splice(1)",
             "arr[int] xs = [1]\nxs.splice(1, 'a')",
+            "arr[int] xs = [1]\nxs.splice(0, 1, 2, 3)",
+            "arr[int] xs = [1]\nxs.splice(0, 1, 'a')",
+            "arr[int] xs = [1]\narr[text] ys = ['a']\nxs.splice(0, 1, ys)",
         ]:
             program = parser.parse(source, filename="main.f")
             with pytest.raises(errors.CompileError):
                 semantic.analyze(program, filename="main.f")
+
+    def test_splice_insert_replaces_and_returns_removed(self, compile_and_run):
+        # claude.md #130: splice(start, count, insertArr) -- JavaScript's
+        # splice(start, deleteCount, ...items), the variadic items
+        # spelled as one arr[T] argument since Festina has no variadic
+        # parameters. Only the REMOVED elements come back, exactly as
+        # JS's own splice() answers -- the inserted ones are placed, not
+        # returned.
+        source = """
+        arr[int] xs = [1, 2, 3, 4, 5]
+        arr[int] gone = xs.splice(1, 2, [10, 20, 30])
+        log(`${gone.length}: ${gone[0]},${gone[1]}`)
+        log(`${xs.length}: ${xs[0]},${xs[1]},${xs[2]},${xs[3]},${xs[4]},${xs[5]}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2: 2,3\n6: 1,10,20,30,4,5\n"
+
+    def test_splice_insert_grows_and_shrinks_correctly(self, compile_and_run):
+        source = """
+        // Pure insertion: count is 0, the array only grows.
+        arr[int] a = [1, 2, 3]
+        arr[int] none = a.splice(1, 0, [8, 9])
+        log(`${none.length} ${a.length}: ${a[0]},${a[1]},${a[2]},${a[3]},${a[4]}`)
+
+        // Replacing more than is inserted: the array shrinks.
+        arr[int] b = [1, 2, 3, 4, 5]
+        arr[int] cut = b.splice(0, 4, [99])
+        log(`${cut.length}: ${cut[0]},${cut[1]},${cut[2]},${cut[3]}`)
+        log(`${b.length}: ${b[0]},${b[1]}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "0 5: 1,8,9,2,3\n4: 1,2,3,4\n2: 99,5\n"
+
+    def test_splice_insert_owns_text_elements_independently(self, compile_and_run):
+        # claude.md #130: the inserted elements are COPIED (text) or
+        # RETAINED (struct/arr/map/img/aud/regex/blob) into the target
+        # array, unconditionally -- the source array (here a named
+        # binding, so not itself consumed) keeps its own elements alive
+        # and independent, exactly like push() already does for a single
+        # value.
+        source = """
+        arr[text] words = ['a', 'b', 'c']
+        arr[text] extra = ['x', 'y']
+        arr[text] gone = words.splice(1, 1, extra)
+        log(gone[0])
+        log(`${words.length}: ${words[0]},${words[1]},${words[2]},${words[3]}`)
+        log(`${extra.length}: ${extra[0]},${extra[1]}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "b\n4: a,x,y,c\n2: x,y\n"
+
+    def test_splice_insert_retains_struct_elements(self, compile_and_run):
+        source = """
+        struct P { v:int }
+        P func make(v:int) { P p  p.v = v  return p }
+        arr[P] ps = [make(1), make(2), make(3)]
+        arr[P] src = [make(9)]
+        arr[P] gone = ps.splice(1, 1, src)
+        log(gone[0].v)
+        log(`${ps[0].v},${ps[1].v},${ps[2].v}`)
+        log(src[0].v)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\n1,9,3\n9\n"
 
     def test_a_queue_round_trips(self, compile_and_run):
         # The shape a game's entity list actually takes.

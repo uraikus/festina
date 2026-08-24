@@ -1468,15 +1468,24 @@ def analyze(program, filename="<string>"):
                                 category="invalid function argument type",
                             )
                         return elem
-                    # splice(start, count) -> arr[T] of what was removed
-                    if len(expr.args) != 2:
+                    # claude.md #130: splice(start, count) -> arr[T] of
+                    # what was removed, or splice(start, count,
+                    # insertArr) -- JavaScript's splice(start,
+                    # deleteCount, ...items) with the variadic items
+                    # spelled as one arr[T] argument instead, since
+                    # Festina has no variadic parameters. Either way the
+                    # return value is only what was removed, exactly as
+                    # JS's own splice() answers -- the inserted elements
+                    # are never handed back, only placed.
+                    if len(expr.args) not in (2, 3):
                         raise CompileError(
-                            "splice() expects 2 arguments (start, count), "
+                            "splice() expects 2 arguments (start, count) or "
+                            "3 (start, count, insertArr), "
                             f"got {len(expr.args)}",
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid function argument type",
                         )
-                    for arg in expr.args:
+                    for arg in expr.args[:2]:
                         arg_type = infer(arg, scope)
                         if arg_type is not None and arg_type is not NULL and arg_type != _INT:
                             raise CompileError(
@@ -1485,6 +1494,9 @@ def analyze(program, filename="<string>"):
                                 file=filename, line=callee.line, column=callee.column,
                                 category="invalid function argument type",
                             )
+                    if len(expr.args) == 3:
+                        check_assignable(types_mod.ArrayType(elem), infer(expr.args[2], scope),
+                                          callee, what="splice() insert argument")
                     return types_mod.ArrayType(elem)
             if callee.prop in ("clip", "resize") and infer(callee.obj, scope) == _IMAGE:
                 expected = 4 if callee.prop == "clip" else 2

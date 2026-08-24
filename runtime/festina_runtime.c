@@ -2458,6 +2458,90 @@ void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
     festina_array_resize(a, elem_size, len - count);
 }
 
+/* claude.md #130: the 3-argument splice(start, count, insertArr) form --
+ * JavaScript's splice(start, deleteCount, ...items) with the variadic
+ * items spelled as one explicit arr[T] argument instead (Festina has no
+ * variadic parameters). Removed elements are handed back through
+ * `dst_hdr` exactly like the 2-argument form above; `insert_data`'s
+ * `insert_len` raw elements then take their place. This function only
+ * moves bytes -- it has no notion of a Festina type, so a refcounted or
+ * text element copied in from `insert_data` is NOT retained/copied
+ * here; codegen does that itself afterward, over the destination's own
+ * newly-written range (see _emit_retain_or_own_range), the same
+ * ownership split every other array method in this file already
+ * follows (codegen decides refcounting, this file only decides bytes).
+ */
+void festina_array_splice_insert(void *hdr, int64_t elem_size, int64_t start,
+                                  int64_t count, const void *insert_data,
+                                  int64_t insert_len, void *dst_hdr) {
+    FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
+    FestinaArrayHeader *dst = (FestinaArrayHeader *)dst_hdr;
+    if (dst) { dst->length = 0; dst->data = NULL; }
+    if (insert_len < 0) insert_len = 0;
+    if (!a) return;
+
+    int64_t len = a->length;
+    if (start < 0) {
+        start = len + start;
+        if (start < 0) start = 0;
+    }
+    if (start > len) start = len;
+    if (count < 0) count = 0;
+    if (start + count > len) count = len - start;
+
+    if (dst && count > 0) {
+        dst->data = malloc((size_t)(count * elem_size));
+        if (!dst->data) festina_fail("out of memory in splice()");
+        memcpy(dst->data, (char *)a->data + start * elem_size,
+               (size_t)(count * elem_size));
+        dst->length = count;
+    }
+
+    int64_t tail = len - (start + count);
+    int64_t new_length = len - count + insert_len;
+
+    if (new_length <= 0) {
+        free(a->data);
+        a->data = NULL;
+        a->length = 0;
+        return;
+    }
+
+    if (new_length > len) {
+        /* Growing: resize first (realloc preserves the existing bytes
+         * up to the old length), then shift the tail right into its
+         * final spot -- both source and destination ranges stay within
+         * the just-grown buffer. */
+        void *grown = realloc(a->data, (size_t)(new_length * elem_size));
+        if (!grown) festina_fail("out of memory growing an array");
+        a->data = grown;
+        if (tail > 0) {
+            memmove((char *)a->data + (start + insert_len) * elem_size,
+                    (char *)a->data + (start + count) * elem_size,
+                    (size_t)(tail * elem_size));
+        }
+    } else {
+        /* Shrinking (or exactly the same size): shift the tail into
+         * its final spot first -- (start + insert_len) + tail ==
+         * new_length <= len, so it still fits inside the OLD buffer --
+         * then resize down. */
+        if (tail > 0) {
+            memmove((char *)a->data + (start + insert_len) * elem_size,
+                    (char *)a->data + (start + count) * elem_size,
+                    (size_t)(tail * elem_size));
+        }
+        void *shrunk = realloc(a->data, (size_t)(new_length * elem_size));
+        if (!shrunk) festina_fail("out of memory in splice()");
+        a->data = shrunk;
+    }
+    a->length = new_length;
+
+    if (insert_len > 0 && insert_data) {
+        memcpy((char *)a->data + start * elem_size, insert_data,
+               (size_t)(insert_len * elem_size));
+    }
+}
+
 /* claude.md #97: indexOf -- the first index holding `value`, or -1.
  *
  * -1 rather than null because the answer is an INDEX, and every use of

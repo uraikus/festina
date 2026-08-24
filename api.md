@@ -1443,14 +1443,19 @@ xs.pop()            // -> last element, removed
 xs.shift()          // -> first element, removed
 xs.unshift(0)       // -> new length
 arr[int] cut = xs.splice(1, 2)   // remove 2 from index 1, return them
+xs.splice(1, 0, [8, 9])           // insert [8, 9] at index 1, remove nothing
 xs.indexOf(3)       // -> first index holding 3, or -1
 ```
 
 All six behave as their JavaScript namesakes do, including `splice`'s
 clamping — a negative start counts back from the end, and an oversized
 range clamps rather than failing, so `splice(i, 1)` at a boundary is a
-no-op. (`splice`'s variadic insert has no spelling here; Festina has no
-variadic calls.)
+no-op. `splice` takes an optional third argument — `splice(start, count,
+insertArr)` — in place of JavaScript's variadic `...items` (Festina has
+no variadic calls, so the items to insert are one explicit `arr[T]`
+instead of a spread list); either way only the REMOVED elements come
+back, never the inserted ones, exactly as JavaScript's own `splice()`
+answers.
 
 `pop()`/`shift()` on an empty array return `null` — not zero, so an
 empty pop is distinguishable from popping a real `0`:

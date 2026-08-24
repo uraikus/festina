@@ -1190,6 +1190,8 @@ class CodeGen:
             "declare i8 @festina_array_pop(ptr, i64, ptr)",
             "declare i8 @festina_array_shift(ptr, i64, ptr)",
             "declare void @festina_array_splice(ptr, i64, i64, i64, ptr)",
+            # claude.md #130: the 3-argument splice(start, count, insertArr) form.
+            "declare void @festina_array_splice_insert(ptr, i64, i64, i64, ptr, i64, ptr)",
             # claude.md #97
             "declare i64 @festina_array_index_of(ptr, i64, ptr, i8)",
             "declare void @festina_release_map(ptr)",
@@ -3455,10 +3457,92 @@ class CodeGen:
         start_val, _ = self._emit_expr(expr.args[0], env, lines)
         count_val, _ = self._emit_expr(expr.args[1], env, lines)
         dst = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, lines)
-        lines.append(
-            f"  call void @festina_array_splice(ptr {obj_val}, i64 {elem_size}, "
-            f"i64 {start_val}, i64 {count_val}, ptr {dst})")
+        if len(expr.args) == 3:
+            # claude.md #130: splice(start, count, insertArr) --
+            # JavaScript's splice(start, deleteCount, ...items), the
+            # variadic items spelled as one arr[T] argument since this
+            # language has no variadic parameters.
+            insert_type = types_mod.ArrayType(elem_type)
+            insert_val, insert_vtype = self._emit_value_for(expr.args[2], env, lines, insert_type)
+            insert_val = self._coerce(insert_val, insert_vtype, insert_type, lines, source_expr=expr.args[2])
+            insert_len_ptr = self.tmp()
+            lines.append(f"  {insert_len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {insert_val}, i32 0, i32 0")
+            insert_len = self.tmp()
+            lines.append(f"  {insert_len} = load i64, ptr {insert_len_ptr}")
+            insert_data_ptr = self.tmp()
+            lines.append(f"  {insert_data_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {insert_val}, i32 0, i32 1")
+            insert_data = self.tmp()
+            lines.append(f"  {insert_data} = load ptr, ptr {insert_data_ptr}")
+            lines.append(
+                f"  call void @festina_array_splice_insert(ptr {obj_val}, i64 {elem_size}, "
+                f"i64 {start_val}, i64 {count_val}, ptr {insert_data}, i64 {insert_len}, ptr {dst})")
+            # The call above may have realloc'd this array's own data
+            # buffer, so its pointer has to be reloaded AFTER the call,
+            # not reused from before it.
+            data_field_ptr = self.tmp()
+            lines.append(f"  {data_field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 1")
+            data_ptr_now = self.tmp()
+            lines.append(f"  {data_ptr_now} = load ptr, ptr {data_field_ptr}")
+            self._emit_retain_or_own_range(data_ptr_now, elem_ir, elem_type, start_val, insert_len, lines)
+            self._release_owned_receiver(expr.args[2], insert_val, insert_type, lines)
+        else:
+            lines.append(
+                f"  call void @festina_array_splice(ptr {obj_val}, i64 {elem_size}, "
+                f"i64 {start_val}, i64 {count_val}, ptr {dst})")
         return dst, types_mod.ArrayType(elem_type)
+
+    def _emit_retain_or_own_range(self, data_ptr, elem_llvm_ty, elem_type, start_val, count_val, lines):
+        """claude.md #130: splice(start, count, insertArr) copies raw
+        element BYTES from a SEPARATE array's buffer into this array's
+        buffer (festina_array_splice_insert, a plain memcpy with no
+        notion of a Festina type) -- unlike push/unshift, whose single
+        value's own source expression is examined directly
+        (_is_owning_refcounted_source), there is no single source
+        expression here to ask: the source is a whole array, read only
+        for its raw bytes, and it keeps managing its own elements'
+        lifetime independently of whatever this array now does with the
+        copies. So the newly-written range always needs its own
+        reference, unconditionally, with no freshness check possible or
+        needed: a struct/arr/map/img/aud/regex/blob element is retained
+        in place (same pointer, refcount +1), a text element is copied
+        via festina_text_own (its own pointer replaced with the fresh
+        copy, since text has no shared representation to retain), and
+        anything else (int/float/bool/color, ...) needs nothing -- the
+        raw bytes the runtime already copied are a complete, independent
+        value on their own."""
+        if not (_is_refcounted(elem_type) or elem_type == TEXT):
+            return
+        idx_slot = self.tmp()
+        lines.append(f"  {idx_slot} = alloca i64")
+        lines.append(f"  store i64 0, ptr {idx_slot}")
+        loop_cond = self.label("spliceretain.loopcond")
+        loop_body = self.label("spliceretain.loopbody")
+        loop_end = self.label("spliceretain.loopend")
+        lines.append(f"  br label %{loop_cond}")
+        lines.append(f"{loop_cond}:")
+        idx_val = self.tmp()
+        lines.append(f"  {idx_val} = load i64, ptr {idx_slot}")
+        keep_going = self.tmp()
+        lines.append(f"  {keep_going} = icmp slt i64 {idx_val}, {count_val}")
+        lines.append(f"  br i1 {keep_going}, label %{loop_body}, label %{loop_end}")
+        lines.append(f"{loop_body}:")
+        abs_idx = self.tmp()
+        lines.append(f"  {abs_idx} = add i64 {start_val}, {idx_val}")
+        elem_ptr = self.tmp()
+        lines.append(f"  {elem_ptr} = getelementptr {elem_llvm_ty}, ptr {data_ptr}, i64 {abs_idx}")
+        elem_val = self.tmp()
+        lines.append(f"  {elem_val} = load {elem_llvm_ty}, ptr {elem_ptr}")
+        if elem_type == TEXT:
+            owned = self.tmp()
+            lines.append(f"  {owned} = call ptr @festina_text_own(ptr {elem_val})")
+            lines.append(f"  store ptr {owned}, ptr {elem_ptr}")
+        else:
+            lines.append(f"  call void @festina_retain(ptr {elem_val})")
+        next_idx = self.tmp()
+        lines.append(f"  {next_idx} = add i64 {idx_val}, 1")
+        lines.append(f"  store i64 {next_idx}, ptr {idx_slot}")
+        lines.append(f"  br label %{loop_cond}")
+        lines.append(f"{loop_end}:")
 
     def _emit_array_lit(self, expr, env, lines, expected_type=None, header=None):
         # `header`, when given, is an already-allocated (and, for a

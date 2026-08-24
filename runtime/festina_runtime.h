@@ -985,6 +985,18 @@ int8_t festina_array_pop(void *hdr, int64_t elem_size, void *out);
 int8_t festina_array_shift(void *hdr, int64_t elem_size, void *out);
 void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
                            int64_t count, void *dst_hdr);
+/* claude.md #130: the 3-argument splice(start, count, insertArr) form --
+ * JavaScript's splice(start, deleteCount, ...items), spelled with an
+ * explicit array in place of variadic items since Festina has no
+ * variadic parameters. Removes `count` elements starting at `start`
+ * (handed back through `dst_hdr`, exactly like the 2-argument form
+ * above) and inserts `insert_len` raw elements from `insert_data` in
+ * their place -- codegen retains/copies each inserted element itself
+ * afterward (see codegen.py's _emit_retain_or_own_range), since this
+ * function only moves bytes and has no notion of a Festina type. */
+void festina_array_splice_insert(void *hdr, int64_t elem_size, int64_t start,
+                                  int64_t count, const void *insert_data,
+                                  int64_t insert_len, void *dst_hdr);
 /* claude.md #97: the first index holding `value`, or -1 if absent.
  * -1 rather than null because the answer is an index and every use of
  * one is a comparison or a splice argument. Compares the raw 8-byte
