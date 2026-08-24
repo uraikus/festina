@@ -7319,6 +7319,106 @@ class TestAudioChannelReturnAndClipStop:
         assert result.stdout.strip() == "-1"
 
 
+class TestIsAudioPlayerPlaying:
+    """claude.md #146: isAudioPlayerPlaying(channel) -- the per-CHANNEL
+    counterpart to aud.isPlaying()'s per-clip question. Fills the exact
+    gap TestAudioChannelReturnAndClipStop's own docstring names: play()
+    hands back a channel number, but there was previously no way to ask
+    about that CHANNEL directly once the program no longer has (or
+    cares about) which clip is on it."""
+
+    def test_true_immediately_after_play(self, compile_and_run, tmp_path, audio_null_env):
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        int ch = clip.playLoop()
+        log(isAudioPlayerPlaying(ch))
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_false_immediately_after_stop_audio_player(
+            self, compile_and_run, tmp_path, audio_null_env):
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        int ch = clip.playLoop()
+        stopAudioPlayer(ch)
+        log(isAudioPlayerPlaying(ch))
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "false"
+
+    def test_false_for_a_channel_never_played_on(self, compile_and_run, audio_null_env):
+        result = compile_and_run("log(isAudioPlayerPlaying(5))", env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "false"
+
+    def test_out_of_range_channel_is_clamped_not_a_crash(
+            self, compile_and_run, audio_null_env):
+        # Same "a bad channel number should not kill a running program"
+        # rule play(n)/stopAudioPlayer(n) already apply -- claude.md
+        # #99's own clamp-into-[0,64) behavior, extended to this query.
+        result = compile_and_run(
+            "log(isAudioPlayerPlaying(999))\nlog(isAudioPlayerPlaying(-1))",
+            env=audio_null_env,
+        )
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["false", "false"]
+
+    def test_answers_about_the_channel_not_the_clip(
+            self, compile_and_run, tmp_path, audio_null_env):
+        # A different clip taking the same channel over is exactly the
+        # scenario that makes a per-clip isPlaying() insufficient: the
+        # channel is still playing SOMETHING, even though the original
+        # clip's own aud.isPlaying() would now say false.
+        _write_wav(tmp_path / "a.wav", duration_s=1.0)
+        _write_wav(tmp_path / "b.wav", duration_s=1.0)
+        source = """
+        aud a = 'a.wav'
+        aud b = 'b.wav'
+        int ch = a.playLoop(0)
+        b.playLoop(0)
+        log(a.isPlaying())
+        log(isAudioPlayerPlaying(ch))
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["false", "true"]
+
+    def test_stopping_one_channel_leaves_another_playing_the_same_clip_alone(
+            self, compile_and_run, tmp_path, audio_null_env):
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        int a = clip.playLoop()
+        int b = clip.playLoop()
+        stopAudioPlayer(a)
+        log(isAudioPlayerPlaying(a))
+        log(isAudioPlayerPlaying(b))
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["false", "true"]
+
+    def test_compiles_and_links_successfully(self, cli_mod, tmp_path):
+        # Naming isAudioPlayerPlaying alone (no aud declaration at all)
+        # must still pull in the audio translation unit -- the same
+        # "naming it is what makes a program use audio" contract
+        # stopAudioPlayer/setMaxAudioPlayers already have.
+        if not (shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")):
+            pytest.skip("no C compiler (clang/gcc/cc) on PATH")
+        src_path = tmp_path / "main.f"
+        src_path.write_text("log(isAudioPlayerPlaying(0))")
+        out_path = tmp_path / "program"
+        from tests.conftest import compile_file_or_skip
+        result_path = compile_file_or_skip(cli_mod, str(src_path), str(out_path))
+        assert result_path == str(out_path)
+        assert out_path.exists()
+
+
 class TestSplitAndJoin:
     '''claude.md #116: sentence.split(sep) -> arr[text], sep a text or a
     regex; words.join(sep) -> text, on arrays of text/int/float/bool.

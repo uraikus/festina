@@ -1150,6 +1150,26 @@ void festina_stop_audio_player(int64_t channel) {
     pthread_mutex_unlock(&g_audio_lock);
 }
 
+/* todo.md's own long-standing gap: play()/playLoop() hand back the
+ * channel they used (claude.md #109), and festina_audio_is_playing()
+ * above answers "is this CLIP playing anywhere", but there was no way
+ * to ask about the CHANNEL itself -- the one thing a program actually
+ * has in hand after `int ch = engine.play()` once it no longer has a
+ * live reference to which clip is on it (a different clip may since
+ * have taken the channel over via play(ch)/playLoop(ch), stealing, or
+ * automatic reassignment after this one finished). Clamped into
+ * [0, 64) exactly like festina_stop_audio_player and every other
+ * channel-accepting call, so a bad channel number answers "no" rather
+ * than crashing the program -- the same "a tuning/addressing mistake
+ * should not kill a running program" rule this whole pool already
+ * applies everywhere else. */
+int8_t festina_channel_is_playing(int64_t channel) {
+    pthread_mutex_lock(&g_audio_lock);
+    int8_t playing = g_channels[festina_clamp_channel(channel)].active;
+    pthread_mutex_unlock(&g_audio_lock);
+    return playing;
+}
+
 int8_t festina_audio_is_playing(void *audio) {
     FestinaAudio *a = (FestinaAudio *)audio;
     if (!a) return 0;

@@ -1765,6 +1765,7 @@ music.stop()                          // silence this clip, everywhere
 
 stopAudioPlayer(ch)                   // stop one channel
 stopAudioPlayer()                     // stop every channel
+isAudioPlayerPlaying(ch)              // true while THAT CHANNEL plays anything
 ```
 
 A path declares the clip, the same way `blob`, `color`, `font` and `img`
@@ -1813,6 +1814,19 @@ by not using the pool.
 
 `isPlaying()` is clip-wide, like `stop()`: "is this sound audible
 anywhere" and "silence it everywhere" are one question asked two ways.
+For the other question — "is *this specific channel* still playing
+anything" — there's `isAudioPlayerPlaying(n)`:
+
+```festina
+int hum = engine.playLoop()
+// ...later, with no reference to `engine` in scope anymore...
+if isAudioPlayerPlaying(hum) { stopAudioPlayer(hum) }
+```
+
+It answers about the channel, not the clip — if a different clip has
+since taken that channel over (`play(n)`/`playLoop(n)`, or automatic
+stealing), it reports on whatever's playing there *now*, which
+`engine.isPlaying()` couldn't do once `engine` itself said false.
 
 ### Overlapping sounds
 
@@ -1879,6 +1893,7 @@ stopAudioPlayer(0)                  // stop that channel, release it
 | `stopAudioPlayer(n)` | Stop channel `n` and release it. |
 | `stopAudioPlayer()` | Stop every channel. |
 | `clip.isPlaying()` | True while any channel is playing that clip. |
+| `isAudioPlayerPlaying(n)` | True while channel `n` is playing anything, regardless of clip. |
 
 **`playLoop` reserves its channel.** A reserved channel is never chosen
 by automatic assignment and never stolen — so a looping music track
@@ -1900,8 +1915,8 @@ dropped — there is nothing left the pool is allowed to touch, and the
 alternative would be breaking a reservation you asked for.
 
 `isPlaying()` is about the **clip**, not one playback of it: it is true
-while any channel is playing that clip. To address a single playback,
-name its channel.
+while any channel is playing that clip. To ask about a single
+playback, name its channel with `isAudioPlayerPlaying(n)` instead.
 
 ## Imports
 

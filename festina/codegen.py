@@ -1217,6 +1217,10 @@ class CodeGen:
             "declare i8 @festina_audio_save_copy(ptr, ptr)",
             "declare void @festina_stop_audio_player(i64)",
             "declare i8 @festina_audio_is_playing(ptr)",
+            # claude.md #146: isAudioPlayerPlaying(channel) -- the
+            # per-CHANNEL counterpart to festina_audio_is_playing's
+            # per-clip question.
+            "declare i8 @festina_channel_is_playing(i64)",
             # claude.md #98: the per-aud voice limit.
             "declare void @festina_set_max_audio_players(i64)",
             "declare i64 @festina_get_max_audio_players()",
@@ -6359,6 +6363,20 @@ class CodeGen:
                     chan_val = "-1"
                 lines.append(f"  call void @festina_stop_audio_player(i64 {chan_val})")
                 return "0", None
+            if name == "isAudioPlayerPlaying":
+                # claude.md #146: the per-CHANNEL counterpart to
+                # aud.isPlaying()'s per-clip question -- unlike
+                # stopAudioPlayer, the channel argument is required
+                # (semantic.py's own fixed _BUILTIN_SIGNATURES entry,
+                # not the alternates mechanism): there is no sensible
+                # "any channel" reading the way a bare stopAudioPlayer()
+                # naturally means "every channel".
+                self.uses_audio = True
+                chan_val, chan_type = self._emit_expr(expr.args[0], env, lines)
+                chan_val = self._coerce(chan_val, chan_type, INT, lines)
+                out = self.tmp()
+                lines.append(f"  {out} = call i8 @festina_channel_is_playing(i64 {chan_val})")
+                return out, BOOL
             if name in ("setMaxAudioPlayers", "maxAudioPlayers"):
                 # claude.md #98. Both live in the audio translation unit,
                 # so naming either is what makes a program "use audio" --
