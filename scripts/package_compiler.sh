@@ -39,6 +39,24 @@
 # instead (`C:\...`), not a separator, so this can't share one spelling
 # across platforms the way every other flag here does.
 #
+# A second, real MSYS2 gotcha (found by real Windows CI): PyInstaller
+# there is a NATIVE (non-MSYS) Windows executable, so MSYS2's bash
+# automatically rewrites any argument that looks like a POSIX path
+# (e.g. `/d/a/festina/festina/...`, what `pwd` returns under MSYS2)
+# into its real Windows form before the native process ever sees it --
+# ordinarily transparent, but that auto-conversion gets confused by a
+# COMPOUND `SRC;DEST` argument (`--add-data`'s own required shape) and
+# mis-converts it, observed producing a doubled, broken path
+# (`D:/d/a/festina/festina/...` -- the drive letter prepended to the
+# ALREADY-POSIX path rather than replacing its `/d` prefix). The fix is
+# converting each SRC to its native form ourselves via `cygpath -m`
+# (an MSYS2 core utility, always present -- the `-m` "mixed" form is a
+# real absolute Windows path, drive letter and all, just with forward
+# slashes, so it concatenates cleanly with the `/festina_runtime.c`
+# suffix below without a stray backslash) before it ever reaches a
+# compound argument, sidestepping automatic conversion entirely rather
+# than fighting its compound-argument blind spot.
+#
 # Usage: ./scripts/package_compiler.sh [output_dir]
 #   -> writes <output_dir>/festina (default: ./dist/festina), or
 #      <output_dir>/festina.exe on Windows
@@ -59,9 +77,16 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 
 ADD_DATA_SEP=":"
 FESTINA_BIN="$OUT_DIR/festina"
+RUNTIME_DIR="$REPO_ROOT/runtime"
 if [[ "${OSTYPE:-}" == "msys" ]]; then
     ADD_DATA_SEP=";"
     FESTINA_BIN="$OUT_DIR/festina.exe"
+    # -m (not -w): forward-slash Windows form -- still a real, absolute
+    # Windows path (so MSYS2's auto-conversion leaves it alone), but
+    # avoids a backslash immediately butting up against the
+    # concatenated "/festina_runtime.c" suffix below, which `-w`'s
+    # backslash form would.
+    RUNTIME_DIR="$(cygpath -m "$RUNTIME_DIR")"
 fi
 
 cd "$REPO_ROOT"
@@ -71,14 +96,14 @@ pyinstaller \
     --distpath "$OUT_DIR" \
     --workpath "$WORK_DIR/build" \
     --specpath "$WORK_DIR" \
-    --add-data "$REPO_ROOT/runtime/festina_runtime.c${ADD_DATA_SEP}runtime" \
-    --add-data "$REPO_ROOT/runtime/festina_runtime_graphics.c${ADD_DATA_SEP}runtime" \
-    --add-data "$REPO_ROOT/runtime/festina_runtime_audio.c${ADD_DATA_SEP}runtime" \
-    --add-data "$REPO_ROOT/runtime/festina_runtime_window_mac.m${ADD_DATA_SEP}runtime" \
-    --add-data "$REPO_ROOT/runtime/festina_runtime_window_win32.c${ADD_DATA_SEP}runtime" \
-    --add-data "$REPO_ROOT/runtime/festina_runtime.h${ADD_DATA_SEP}runtime" \
-    --add-data "$REPO_ROOT/runtime/festina_runtime_internal.h${ADD_DATA_SEP}runtime" \
-    --add-data "$REPO_ROOT/runtime/festina_runtime_window.h${ADD_DATA_SEP}runtime" \
+    --add-data "$RUNTIME_DIR/festina_runtime.c${ADD_DATA_SEP}runtime" \
+    --add-data "$RUNTIME_DIR/festina_runtime_graphics.c${ADD_DATA_SEP}runtime" \
+    --add-data "$RUNTIME_DIR/festina_runtime_audio.c${ADD_DATA_SEP}runtime" \
+    --add-data "$RUNTIME_DIR/festina_runtime_window_mac.m${ADD_DATA_SEP}runtime" \
+    --add-data "$RUNTIME_DIR/festina_runtime_window_win32.c${ADD_DATA_SEP}runtime" \
+    --add-data "$RUNTIME_DIR/festina_runtime.h${ADD_DATA_SEP}runtime" \
+    --add-data "$RUNTIME_DIR/festina_runtime_internal.h${ADD_DATA_SEP}runtime" \
+    --add-data "$RUNTIME_DIR/festina_runtime_window.h${ADD_DATA_SEP}runtime" \
     --paths . \
     packaging/festina_entry.py
 
