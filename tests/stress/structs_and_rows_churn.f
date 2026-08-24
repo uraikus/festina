@@ -28,6 +28,35 @@ Inner func pick(a:Inner, b:Inner, useA:bool) {
     return b
 }
 
+// claude.md #141: a struct field holding a first-class function value
+// -- a plain pointer, nothing to leak on its own, but exercised inside
+// this file's own struct-release-heavy loop to prove a func-typed
+// field is correctly skipped (not mishandled as a refcounted or
+// stack-cascaded field) by the struct's own release/free machinery.
+struct Callback { fn:func[int]:int  label:text }
+
+int func doubleIt(x:int) { return x * 2 }
+
+// claude.md #140: a FuncDecl nested INSIDE this function's own body,
+// declared after o's own struct-typed fields are already in use --
+// exercises the real bug hoisting's own implementation found (a
+// genuine LLVM verifier error, "use of undefined value"): without
+// self._current_func_frame_base, the nested function's own trivial
+// `return` incorrectly freed frames belonging to THIS enclosing
+// function's still-live struct/array/map locals, not just its own
+// (empty) one.
+Outer func makeOuterViaNestedHelper(n:int) {
+    Outer o
+    o.count = n
+    o.inner.n = n
+    o.inner.label = `label ${n}`
+    o.xs.push(n)
+    o.m[`k${n}`] = n
+    int func nestedNoOp() { return 1 }
+    o.count = o.count + nestedNoOp() - 1
+    return o
+}
+
 sqlite('DELETE FROM Person')
 int i = 0
 while i < 300 {
@@ -75,6 +104,32 @@ while i < 400 {
     // Deeply unassigned fields, reached rather than written.
     Outer fresh
     total = total + fresh.inner.n + fresh.xs.length
+
+    // claude.md #140: struct/array/map locals declared right alongside
+    // a nested FuncDecl, in a hot loop, under ASan/LeakSanitizer.
+    Outer viaNested = makeOuterViaNestedHelper(i)
+    total = total + viaNested.inner.n + viaNested.xs.length + viaNested.m[`k${i}`]
+
+    // claude.md #141: a struct field holding a first-class function
+    // value, called through indirectly (h.fn(...)) and stored inside
+    // an arr[Callback] the same way any other struct-holding array is.
+    Callback cbk
+    cbk.fn = doubleIt
+    cbk.label = `cb${i}`
+    arr[Callback] cbks = []
+    cbks.push(cbk)
+    total = total + cbk.fn(i) + cbks[0].fn(i)
+
+    // claude.md #142: the same struct field, this time holding an
+    // ARROW function's own synthesized function -- one Callback per
+    // iteration, each pointing at the SAME underlying synthesized
+    // function (there's only ever one, compiled once; see codegen.py's
+    // own `decl.name not in self.func_decls` guard), so this also
+    // proves re-storing the identical func value thousands of times
+    // never double-registers or double-emits it.
+    Callback arrowCbk
+    arrowCbk.fn = int (x:int) => x + 1
+    total = total + arrowCbk.fn(i)
 
     // Query rows: text columns, null columns, and the whole array
     // released together at scope exit.

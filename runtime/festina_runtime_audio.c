@@ -16,8 +16,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>       /* nanosleep -- the null device's pacing stub */
 #include <pthread.h>    /* background audio playback */
-#include <alsa/asoundlib.h>
+/* claude.md #121 / macos.md Phase 1: the DEVICE layer is behind the
+ * festina_pcm_* seam below, so only the per-platform implementation
+ * includes its platform's audio API. FESTINA_AUDIO_DEVICE_EXTERNAL is
+ * the white-box test harnesses' hook: they define it and provide their
+ * own festina_pcm_dev_* stubs, which is what makes the channel-pool
+ * harnesses run on machines with no audio stack at all. */
+#if !defined(FESTINA_AUDIO_DEVICE_EXTERNAL)
+#  if defined(__APPLE__)
+#    include <AudioToolbox/AudioToolbox.h>
+#  elif defined(_WIN32)
+#    include <windows.h>
+#    include <mmsystem.h>    /* windows.md Phase 1: waveOut -- winmm, no COM */
+#  else
+#    include <alsa/asoundlib.h>
+#  endif
+#endif
 #include <mpg123.h>    /* claude.md #101: MP3 decoding */
 #include "festina_runtime.h"
 
@@ -61,10 +77,382 @@ typedef struct FestinaAudio {
     char *path;
 } FestinaAudio;
 
+/* ---- the audio DEVICE seam -- claude.md #121, macos.md/windows.md
+ * Phase 1 ----
+ *
+ * Everything above and below this section is portable: the channel
+ * pool, the WAV/MP3 decoding, the pthread streaming model. The one
+ * thing that differs per platform is the device a stream of
+ * interleaved 16-bit frames is pushed into, and its whole surface is
+ * these three functions:
+ *
+ *   festina_pcm_open(channels, rate, errbuf, n)  -> handle or NULL
+ *   festina_pcm_write(handle, frames, count)     -> frames written, <0 fatal
+ *   festina_pcm_close(handle)
+ *
+ * write() BLOCKS until the device has room -- that is the contract the
+ * per-channel streaming threads are built on, and every backend
+ * reproduces it (ALSA's blocking writei; AudioQueue's fixed buffer
+ * pool plus a condition variable). Recoverable device hiccups are the
+ * backend's own problem (ALSA's snd_pcm_recover lives inside its
+ * write, not in the shared thread loop).
+ *
+ * FESTINA_AUDIO_NULL=1 in the environment turns open() into a null
+ * sink that accepts frames instantly -- one CI/testing mechanism for
+ * every platform, one layer below the ALSA-only ~/.asoundrc trick the
+ * test suite historically used, and honest about being a shim: it
+ * exists so play()/stop()/isPlaying() are exercisable on machines
+ * with no audio device (macOS CI, containers), not to fake playback
+ * timing. */
+
+typedef struct FestinaPcm {
+    int is_null;   /* the FESTINA_AUDIO_NULL sink -- no backend handle */
+    void *dev;     /* the backend's own handle otherwise */
+} FestinaPcm;
+
+/* The three per-backend functions the dispatch below routes to. A
+ * white-box harness (FESTINA_AUDIO_DEVICE_EXTERNAL) supplies these
+ * three symbols itself instead of any real backend. */
+#if defined(FESTINA_AUDIO_DEVICE_EXTERNAL)
+void *festina_pcm_dev_open(int channels, unsigned int rate,
+                           char *errbuf, size_t errbuf_size);
+long festina_pcm_dev_write(void *dev, const int16_t *frames, size_t frame_count);
+void festina_pcm_dev_close(void *dev);
+
+#elif defined(__APPLE__)
+/* macos.md Phase 1: AudioQueue. N preallocated buffers plus a
+ * condition variable reproduce ALSA's blocking push exactly: write()
+ * waits for a free buffer, fills it, enqueues it; the completion
+ * callback returns buffers to the free stack. Per-channel queues
+ * mirror the per-channel ALSA handles one-to-one, and CoreAudio
+ * software-mixes, so the device-busy retry path simply never fires.
+ *
+ * NOTE (macos.md): compiled and null-shim-exercised by the macOS CI
+ * job; real-device playback still needs verification on hardware
+ * before the darwin audio gate in festina/cli.py is lifted. */
+#define FESTINA_AQ_BUFFERS 4
+#define FESTINA_AQ_CHUNK_FRAMES 4096
+
+typedef struct {
+    AudioQueueRef queue;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    AudioQueueBufferRef free_bufs[FESTINA_AQ_BUFFERS];
+    int free_count;
+    int channels;
+    int started;
+} FestinaAqDev;
+
+static void festina_aq_done(void *user, AudioQueueRef q, AudioQueueBufferRef buf) {
+    (void)q;
+    FestinaAqDev *d = (FestinaAqDev *)user;
+    pthread_mutex_lock(&d->lock);
+    d->free_bufs[d->free_count++] = buf;
+    pthread_cond_signal(&d->cond);
+    pthread_mutex_unlock(&d->lock);
+}
+
+static void *festina_pcm_dev_open(int channels, unsigned int rate,
+                                  char *errbuf, size_t errbuf_size) {
+    FestinaAqDev *d = calloc(1, sizeof(FestinaAqDev));
+    if (!d) {
+        snprintf(errbuf, errbuf_size, "out of memory opening an audio queue");
+        return NULL;
+    }
+    d->channels = channels;
+    pthread_mutex_init(&d->lock, NULL);
+    pthread_cond_init(&d->cond, NULL);
+
+    AudioStreamBasicDescription fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.mSampleRate = (Float64)rate;
+    fmt.mFormatID = kAudioFormatLinearPCM;
+    fmt.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+    fmt.mBitsPerChannel = 16;
+    fmt.mChannelsPerFrame = (UInt32)channels;
+    fmt.mBytesPerFrame = (UInt32)(2 * channels);
+    fmt.mFramesPerPacket = 1;
+    fmt.mBytesPerPacket = (UInt32)(2 * channels);
+
+    OSStatus rc = AudioQueueNewOutput(&fmt, festina_aq_done, d, NULL, NULL, 0, &d->queue);
+    if (rc != noErr) {
+        snprintf(errbuf, errbuf_size, "AudioQueueNewOutput failed (OSStatus %d)", (int)rc);
+        pthread_mutex_destroy(&d->lock);
+        pthread_cond_destroy(&d->cond);
+        free(d);
+        return NULL;
+    }
+    UInt32 buf_bytes = (UInt32)(FESTINA_AQ_CHUNK_FRAMES * 2 * channels);
+    for (int i = 0; i < FESTINA_AQ_BUFFERS; i++) {
+        AudioQueueBufferRef buf;
+        rc = AudioQueueAllocateBuffer(d->queue, buf_bytes, &buf);
+        if (rc != noErr) {
+            snprintf(errbuf, errbuf_size, "AudioQueueAllocateBuffer failed (OSStatus %d)", (int)rc);
+            AudioQueueDispose(d->queue, true);
+            pthread_mutex_destroy(&d->lock);
+            pthread_cond_destroy(&d->cond);
+            free(d);
+            return NULL;
+        }
+        d->free_bufs[d->free_count++] = buf;
+    }
+    return d;
+}
+
+static long festina_pcm_dev_write(void *dev, const int16_t *frames, size_t frame_count) {
+    FestinaAqDev *d = (FestinaAqDev *)dev;
+    if (frame_count > FESTINA_AQ_CHUNK_FRAMES) frame_count = FESTINA_AQ_CHUNK_FRAMES;
+
+    pthread_mutex_lock(&d->lock);
+    while (d->free_count == 0) pthread_cond_wait(&d->cond, &d->lock);
+    AudioQueueBufferRef buf = d->free_bufs[--d->free_count];
+    pthread_mutex_unlock(&d->lock);
+
+    size_t bytes = frame_count * 2 * (size_t)d->channels;
+    memcpy(buf->mAudioData, frames, bytes);
+    buf->mAudioDataByteSize = (UInt32)bytes;
+    if (AudioQueueEnqueueBuffer(d->queue, buf, 0, NULL) != noErr) {
+        festina_aq_done(d, d->queue, buf);   /* hand the buffer back */
+        return -1;
+    }
+    if (!d->started) {
+        if (AudioQueueStart(d->queue, NULL) != noErr) return -1;
+        d->started = 1;
+    }
+    return (long)frame_count;
+}
+
+static void festina_pcm_dev_close(void *dev) {
+    FestinaAqDev *d = (FestinaAqDev *)dev;
+    /* Synchronous stop: every in-flight buffer's callback fires before
+     * this returns, so disposing afterwards races nothing. */
+    AudioQueueStop(d->queue, true);
+    AudioQueueDispose(d->queue, true);
+    pthread_mutex_destroy(&d->lock);
+    pthread_cond_destroy(&d->cond);
+    free(d);
+}
+
+#elif defined(_WIN32)
+/* Windows (windows.md Phase 1): winmm's waveOut, not WASAPI -- WASAPI is
+ * COM-based and event-driven, and buys latency we don't need for a
+ * demo-scale runtime. This reproduces the AudioQueue shim just above:
+ * a fixed pool of buffers, a completion callback that returns buffers to
+ * a free list, and a condition variable so festina_pcm_dev_write blocks
+ * exactly like ALSA's snd_pcm_writei does when the device has no room. */
+#define FESTINA_WO_BUFFERS 4
+#define FESTINA_WO_CHUNK_FRAMES 4096
+
+typedef struct {
+    HWAVEOUT hwo;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    WAVEHDR *bufs[FESTINA_WO_BUFFERS];
+    WAVEHDR *free_bufs[FESTINA_WO_BUFFERS];
+    int free_count;
+    int channels;
+} FestinaWoDev;
+
+/* waveOutOpen's CALLBACK_FUNCTION contract: this runs on some internal
+ * thread, not ours, and may only touch a short allow-list of Win32 APIs --
+ * no blocking calls. Storing the freed header and signalling our own
+ * condition variable is exactly the AudioQueue callback's shape. */
+static void CALLBACK festina_wo_proc(HWAVEOUT hwo, UINT msg, DWORD_PTR instance,
+                                      DWORD_PTR param1, DWORD_PTR param2) {
+    (void)hwo; (void)param2;
+    if (msg != WOM_DONE) return;
+    FestinaWoDev *d = (FestinaWoDev *)instance;
+    WAVEHDR *hdr = (WAVEHDR *)param1;
+    pthread_mutex_lock(&d->lock);
+    d->free_bufs[d->free_count++] = hdr;
+    pthread_cond_signal(&d->cond);
+    pthread_mutex_unlock(&d->lock);
+}
+
+static void *festina_pcm_dev_open(int channels, unsigned int rate,
+                                  char *errbuf, size_t errbuf_size) {
+    FestinaWoDev *d = calloc(1, sizeof(FestinaWoDev));
+    if (!d) {
+        snprintf(errbuf, errbuf_size, "out of memory opening a waveOut device");
+        return NULL;
+    }
+    d->channels = channels;
+    pthread_mutex_init(&d->lock, NULL);
+    pthread_cond_init(&d->cond, NULL);
+
+    WAVEFORMATEX fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.wFormatTag = WAVE_FORMAT_PCM;
+    fmt.nChannels = (WORD)channels;
+    fmt.nSamplesPerSec = rate;
+    fmt.wBitsPerSample = 16;
+    fmt.nBlockAlign = (WORD)(channels * 2);
+    fmt.nAvgBytesPerSec = rate * fmt.nBlockAlign;
+
+    MMRESULT rc = waveOutOpen(&d->hwo, WAVE_MAPPER, &fmt,
+                               (DWORD_PTR)festina_wo_proc, (DWORD_PTR)d,
+                               CALLBACK_FUNCTION);
+    if (rc != MMSYSERR_NOERROR) {
+        snprintf(errbuf, errbuf_size, "waveOutOpen failed (MMRESULT %u)", (unsigned)rc);
+        pthread_mutex_destroy(&d->lock);
+        pthread_cond_destroy(&d->cond);
+        free(d);
+        return NULL;
+    }
+
+    size_t buf_bytes = (size_t)FESTINA_WO_CHUNK_FRAMES * 2 * (size_t)channels;
+    for (int i = 0; i < FESTINA_WO_BUFFERS; i++) {
+        WAVEHDR *hdr = calloc(1, sizeof(WAVEHDR));
+        char *data = malloc(buf_bytes);
+        if (!hdr || !data) {
+            snprintf(errbuf, errbuf_size, "out of memory allocating waveOut buffers");
+            free(hdr); free(data);
+            for (int j = 0; j < i; j++) {
+                waveOutUnprepareHeader(d->hwo, d->bufs[j], sizeof(WAVEHDR));
+                free(d->bufs[j]->lpData);
+                free(d->bufs[j]);
+            }
+            waveOutClose(d->hwo);
+            pthread_mutex_destroy(&d->lock);
+            pthread_cond_destroy(&d->cond);
+            free(d);
+            return NULL;
+        }
+        hdr->lpData = data;
+        hdr->dwBufferLength = (DWORD)buf_bytes;
+        rc = waveOutPrepareHeader(d->hwo, hdr, sizeof(WAVEHDR));
+        if (rc != MMSYSERR_NOERROR) {
+            snprintf(errbuf, errbuf_size, "waveOutPrepareHeader failed (MMRESULT %u)", (unsigned)rc);
+            free(data); free(hdr);
+            for (int j = 0; j < i; j++) {
+                waveOutUnprepareHeader(d->hwo, d->bufs[j], sizeof(WAVEHDR));
+                free(d->bufs[j]->lpData);
+                free(d->bufs[j]);
+            }
+            waveOutClose(d->hwo);
+            pthread_mutex_destroy(&d->lock);
+            pthread_cond_destroy(&d->cond);
+            free(d);
+            return NULL;
+        }
+        d->bufs[i] = hdr;
+        d->free_bufs[d->free_count++] = hdr;
+    }
+    return d;
+}
+
+static long festina_pcm_dev_write(void *dev, const int16_t *frames, size_t frame_count) {
+    FestinaWoDev *d = (FestinaWoDev *)dev;
+    if (frame_count > FESTINA_WO_CHUNK_FRAMES) frame_count = FESTINA_WO_CHUNK_FRAMES;
+
+    pthread_mutex_lock(&d->lock);
+    while (d->free_count == 0) pthread_cond_wait(&d->cond, &d->lock);
+    WAVEHDR *hdr = d->free_bufs[--d->free_count];
+    pthread_mutex_unlock(&d->lock);
+
+    size_t bytes = frame_count * 2 * (size_t)d->channels;
+    memcpy(hdr->lpData, frames, bytes);
+    hdr->dwBufferLength = (DWORD)bytes;
+    MMRESULT rc = waveOutWrite(d->hwo, hdr, sizeof(WAVEHDR));
+    if (rc != MMSYSERR_NOERROR) {
+        /* waveOutWrite failed outright -- it will never call us back for
+         * this header, so return it to the free list ourselves instead
+         * of leaking it out of the pool. */
+        pthread_mutex_lock(&d->lock);
+        d->free_bufs[d->free_count++] = hdr;
+        pthread_mutex_unlock(&d->lock);
+        return -1;
+    }
+    return (long)frame_count;
+}
+
+static void festina_pcm_dev_close(void *dev) {
+    FestinaWoDev *d = (FestinaWoDev *)dev;
+    /* waveOutReset is the synchronous counterpart to AudioQueueStop(...,
+     * true) above: every pending buffer's WOM_DONE fires before this
+     * returns, so unpreparing/freeing them right after races nothing. */
+    waveOutReset(d->hwo);
+    for (int i = 0; i < FESTINA_WO_BUFFERS; i++) {
+        waveOutUnprepareHeader(d->hwo, d->bufs[i], sizeof(WAVEHDR));
+        free(d->bufs[i]->lpData);
+        free(d->bufs[i]);
+    }
+    waveOutClose(d->hwo);
+    pthread_mutex_destroy(&d->lock);
+    pthread_cond_destroy(&d->cond);
+    free(d);
+}
+
+#else
+/* Linux: the original six ALSA calls, moved behind the seam verbatim.
+ * snd_pcm_recover lives here now -- "retry the recoverable cases,
+ * report the rest" is a device property, not channel-pool logic. */
+static void *festina_pcm_dev_open(int channels, unsigned int rate,
+                                  char *errbuf, size_t errbuf_size) {
+    snd_pcm_t *pcm = NULL;
+    int rc = snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
+    if (rc >= 0) {
+        rc = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
+                                 (unsigned int)channels, rate, 1, 500000);
+        if (rc < 0) snd_pcm_close(pcm);
+    }
+    if (rc < 0) {
+        snprintf(errbuf, errbuf_size, "%s", snd_strerror(rc));
+        return NULL;
+    }
+    return pcm;
+}
+
+static long festina_pcm_dev_write(void *dev, const int16_t *frames, size_t frame_count) {
+    snd_pcm_sframes_t written = snd_pcm_writei((snd_pcm_t *)dev, frames,
+                                               (snd_pcm_uframes_t)frame_count);
+    if (written < 0) {
+        written = snd_pcm_recover((snd_pcm_t *)dev, (int)written, 0);
+        if (written < 0) return -1;
+        return 0;   /* recovered; nothing consumed -- the caller retries */
+    }
+    return (long)written;
+}
+
+static void festina_pcm_dev_close(void *dev) {
+    snd_pcm_close((snd_pcm_t *)dev);
+}
+#endif
+
+static FestinaPcm *festina_pcm_open(int channels, unsigned int rate,
+                                    char *errbuf, size_t errbuf_size) {
+    FestinaPcm *pcm = calloc(1, sizeof(FestinaPcm));
+    if (!pcm) {
+        snprintf(errbuf, errbuf_size, "out of memory opening an audio device");
+        return NULL;
+    }
+    const char *null_dev = getenv("FESTINA_AUDIO_NULL");
+    if (null_dev && *null_dev && strcmp(null_dev, "0") != 0) {
+        pcm->is_null = 1;
+        return pcm;
+    }
+    pcm->dev = festina_pcm_dev_open(channels, rate, errbuf, errbuf_size);
+    if (!pcm->dev) {
+        free(pcm);
+        return NULL;
+    }
+    return pcm;
+}
+
+static long festina_pcm_write(FestinaPcm *pcm, const int16_t *frames, size_t frame_count) {
+    if (pcm->is_null) return (long)frame_count;   /* instant sink, like ALSA's null plugin */
+    return festina_pcm_dev_write(pcm->dev, frames, frame_count);
+}
+
+static void festina_pcm_close(FestinaPcm *pcm) {
+    if (!pcm->is_null) festina_pcm_dev_close(pcm->dev);
+    free(pcm);
+}
+
 typedef struct FestinaChannel {
     FestinaAudio *clip;      /* what is playing here; NULL when never used */
     pthread_t thread;
-    snd_pcm_t *pcm;          /* only meaningful while active */
+    FestinaPcm *pcm;         /* only meaningful while active */
     int active;              /* a thread is streaming right now */
     int joinable;            /* a thread was started and not yet joined --
                                 stays 1 after the thread exits, since a
@@ -128,7 +516,7 @@ static int festina_pool_limit(void) {
 static void *festina_audio_thread_main(void *arg) {
     FestinaChannel *ch = (FestinaChannel *)arg;
     FestinaAudio *a = ch->clip;
-    const snd_pcm_uframes_t chunk_frames = 4096;
+    const size_t chunk_frames = 4096;
     size_t frame = 0;
 
     for (;;) {
@@ -152,28 +540,23 @@ static void *festina_audio_thread_main(void *arg) {
         }
 
         size_t remaining = a->frame_count - frame;
-        snd_pcm_uframes_t this_chunk =
-            remaining < chunk_frames ? (snd_pcm_uframes_t)remaining : chunk_frames;
+        size_t this_chunk = remaining < chunk_frames ? remaining : chunk_frames;
         /* a->samples is read-only for the whole life of the clip, so
          * every channel streams the same buffer with no lock held here
-         * -- only the channel's own mutable state above needs guarding. */
-        snd_pcm_sframes_t written = snd_pcm_writei(
+         * -- only the channel's own mutable state above needs guarding.
+         * claude.md #121: recoverable device hiccups are handled inside
+         * festina_pcm_write (0 = recovered, retry); a negative return
+         * is unrecoverable and just stops -- there's no Festina-level
+         * way to report a mid-playback error after play() has already
+         * returned successfully. */
+        long written = festina_pcm_write(
             ch->pcm, a->samples + frame * (size_t)a->channels, this_chunk);
-        if (written < 0) {
-            /* snd_pcm_recover handles the common recoverable cases
-             * (buffer underrun, a suspended device); anything it can't
-             * fix, just stop -- there's no Festina-level way to report
-             * a mid-playback error after play() has already returned
-             * successfully. */
-            written = snd_pcm_recover(ch->pcm, (int)written, 0);
-            if (written < 0) break;
-            continue;
-        }
+        if (written < 0) break;
         frame += (size_t)written;
     }
 
     pthread_mutex_lock(&g_audio_lock);
-    snd_pcm_close(ch->pcm);
+    festina_pcm_close(ch->pcm);
     ch->pcm = NULL;
     ch->active = 0;
     ch->looping = 0;
@@ -387,8 +770,15 @@ void *festina_audio_from_bytes(const void *data, int64_t len, const char *label)
         }
     }
 
-    FestinaAudio *a = calloc(1, sizeof(FestinaAudio));
-    if (!a) festina_fail("out of memory loading audio");
+    /* claude.md #118: the clip is REFERENCE COUNTED now, behind the
+     * same i64 header immediately before the payload that structs/
+     * arrays/maps/blobs carry (festina_retain/festina_release_check in
+     * the core runtime) -- see festina_audio_free below for what that
+     * bought. */
+    char *raw = calloc(1, sizeof(int64_t) + sizeof(FestinaAudio));
+    if (!raw) festina_fail("out of memory loading audio");
+    *(int64_t *)raw = 1;
+    FestinaAudio *a = (FestinaAudio *)(raw + sizeof(int64_t));
     a->samples = samples;
     a->frame_count = frames;
     a->channels = channels;
@@ -408,17 +798,16 @@ void *festina_audio_from_bytes(const void *data, int64_t len, const char *label)
     return a;
 }
 
-/* claude.md #101: `img` has had scope-exit reclamation since claude.md
- * #92 and `aud` never did, for no reason beyond nobody having written
- * it -- a clip loaded inside a loop leaked one decoded buffer per
- * iteration. Only ever called for a clip codegen has proven this scope
- * created and never shared, so stopping every channel playing it first
- * is a safety net rather than a likely case; it costs nothing and
- * turns "freed while a thread is still streaming it" from a crash into
- * an impossibility. */
+/* claude.md #101/#118: the aud counterpart of festina_blob_release --
+ * decrement, and only on the last reference destroy the clip. A clip
+ * that other bindings still reference keeps playing untouched; only
+ * genuine destruction stops every channel still streaming it first,
+ * which costs nothing and turns "freed while a thread is still
+ * streaming it" from a crash into an impossibility. */
 void festina_audio_free(void *audio) {
     FestinaAudio *a = (FestinaAudio *)audio;
     if (!a) return;
+    if (!festina_release_check(audio)) return;
     pthread_mutex_lock(&g_audio_lock);
     int busy = 0;
     for (int i = 0; i < FESTINA_AUDIO_PLAYER_CAP; i++) {
@@ -433,7 +822,7 @@ void festina_audio_free(void *audio) {
     free(a->samples);
     free(a->bytes);
     free(a->path);   /* claude.md #110 */
-    free(a);
+    free((char *)audio - sizeof(int64_t));
 }
 
 /* claude.md #110: writes the clip's own encoded bytes -- so an MP3 saves
@@ -648,26 +1037,24 @@ int64_t festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_chan
      * playing channel's handle back and try again -- see
      * festina_audio_free_oldest_locked. Only when there is no other
      * channel left to free has the program genuinely failed to open any
-     * audio device at all, which is what the error below claims. */
-    snd_pcm_t *pcm = NULL;
-    int rc;
+     * audio device at all, which is what the error below claims.
+     * (claude.md #121: through the festina_pcm_* seam now; on backends
+     * that always software-mix -- CoreAudio, the null sink -- the first
+     * open simply succeeds and this loop degenerates.) */
+    FestinaPcm *pcm = NULL;
+    char errbuf[192];
+    errbuf[0] = '\0';
     for (;;) {
-        pcm = NULL;
-        rc = snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
-        if (rc >= 0) {
-            rc = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
-                                     (unsigned int)a->channels, a->sample_rate, 1, 500000);
-            if (rc < 0) snd_pcm_close(pcm);
-        }
-        if (rc >= 0) break;
+        pcm = festina_pcm_open(a->channels, a->sample_rate, errbuf, sizeof(errbuf));
+        if (pcm) break;
         if (!festina_audio_free_oldest_locked(ch)) break;
     }
-    if (rc < 0) {
+    if (!pcm) {
         pthread_mutex_unlock(&g_audio_lock);
         char msg[256];
         snprintf(msg, sizeof(msg),
                  "could not open an audio output device: %s (is any audio device available?)",
-                 snd_strerror(rc));
+                 errbuf);
         festina_fail(msg);
         return -1; /* unreachable -- festina_fail() calls exit() */
     }
@@ -685,9 +1072,9 @@ int64_t festina_audio_play_on(void *audio, int64_t channel, int8_t explicit_chan
     ch->started_seq = g_next_seq++;
     ch->active = 1;  /* set synchronously, before spawning, so isPlaying()
                         is deterministic immediately after play() returns */
-    rc = pthread_create(&ch->thread, NULL, festina_audio_thread_main, ch);
+    int rc = pthread_create(&ch->thread, NULL, festina_audio_thread_main, ch);
     if (rc != 0) {
-        snd_pcm_close(pcm);
+        festina_pcm_close(pcm);
         ch->pcm = NULL;
         ch->active = 0;
         ch->locked = 0;

@@ -116,12 +116,39 @@ class Parser:
             inner = self.parse_type()
             self.eat("RBRACK")
             return ast.MapTypeExpr(inner)
+        if self.at("func"):
+            return self.parse_func_type()
         if self.peek().type in TYPE_KEYWORDS:
             return self.eat().type
         if self.at("IDENT"):
             return self.eat().value
         t = self.peek()
         raise self.err(t, "invalid syntax", f"expected a type, found {t.type}({t.value!r})")
+
+    def parse_func_type(self):
+        """claude.md #141: `func[T, T, ...]:R` as a TYPE (not a
+        declaration -- see parse_statement's own `func` handling for how
+        the two are told apart: this form's `func` is always
+        immediately followed by `[`, a declaration's is always followed
+        by a name). `func[]:void` is a zero-argument, void-returning
+        function type -- the empty-brackets case is handled the same
+        way arr[T]/map[T]'s own bracket pair is, just with zero or more
+        comma-separated types instead of exactly one."""
+        self.eat("func")
+        self.eat("LBRACK")
+        param_types = []
+        while not self.at("RBRACK"):
+            param_types.append(self.parse_type())
+            if self.at_op(","):
+                self.eat()
+        self.eat("RBRACK")
+        self.eat_op(":")
+        if self.at("void"):
+            self.eat("void")
+            return_type = "void"
+        else:
+            return_type = self.parse_type()
+        return ast.FuncTypeExpr(param_types, return_type)
 
     def parse_typed_params(self):
         params = []
@@ -206,7 +233,13 @@ class Parser:
             return self.parse_break()
         if t.type == "continue":
             return self.parse_continue()
-        if t.type == "func":
+        if t.type == "func" and self.peek(1).type != "LBRACK":
+            # claude.md #141: `func[...]:...` (a first-class function
+            # TYPE, always immediately followed by `[`) falls through to
+            # _looks_like_declaration below instead of landing here --
+            # only a bare `func name(...)` (missing its return type, the
+            # one pre-existing case this guards) is still unconditionally
+            # rejected.
             raise self.err(t, "invalid function declaration",
                             "functions require an explicit return type, e.g. 'text func name() { }'")
         if self._starts_func_decl():
@@ -223,7 +256,13 @@ class Parser:
     def _looks_like_declaration(self):
         t0 = self.peek(0)
         t1 = self.peek(1)
-        if t0.type in TYPE_KEYWORDS or t0.type in ("arr", "map"):
+        # claude.md #141: `func[...]:...` starts a declaration too (a
+        # func-typed variable/constant) -- reached only once
+        # parse_statement's own dedicated `func` check has already ruled
+        # out the bare-`func`-with-no-`[`-following case (the "missing
+        # return type" mistake, still always an error), so any `func`
+        # reaching here is unambiguously the type-expression form.
+        if t0.type in TYPE_KEYWORDS or t0.type in ("arr", "map", "func"):
             return True
         if t0.type == "IDENT" and t1.type == "IDENT":
             return True
@@ -242,7 +281,9 @@ class Parser:
         """Index of the token just past the type expression starting at
         token i, without consuming anything. Doesn't validate the type is
         well-formed -- parse_type() does that once we actually parse it;
-        this only needs to skip past it far enough to check for 'func'."""
+        this only needs to skip past it far enough to check for whatever
+        comes next (a declaration's own `func`, claude.md #142's own
+        arrow-function `=>`, ...)."""
         if i >= len(self.toks):
             return i
         if self.toks[i].type in ("arr", "map"):
@@ -253,7 +294,127 @@ class Parser:
                 if i < len(self.toks) and self.toks[i].type == "RBRACK":
                     i += 1
             return i
+        if self.toks[i].type == "func" and i + 1 < len(self.toks) and self.toks[i + 1].type == "LBRACK":
+            # claude.md #141: func[T, T, ...]:R -- skips the WHOLE
+            # construct (param types, the `:`, and the return type,
+            # itself possibly another nested func[...]:...), not just
+            # the bare `func` keyword -- needed so a declaration whose
+            # own return type IS a func[...]:... (`func[int]:int func
+            # makeAdder() {...}`) is still recognized as a function
+            # DECLARATION by _starts_func_decl, and so claude.md #142's
+            # arrow-function lookahead can tell a `func[...]:...`-typed
+            # arrow function's own return type apart from its params.
+            i += 2  # past `func` and `[`
+            while i < len(self.toks) and self.toks[i].type != "RBRACK":
+                i = self._type_expr_end(i)
+                if i < len(self.toks) and self.toks[i].type == "OP" and self.toks[i].value == ",":
+                    i += 1
+            if i < len(self.toks) and self.toks[i].type == "RBRACK":
+                i += 1
+            if i < len(self.toks) and self.toks[i].type == "OP" and self.toks[i].value == ":":
+                i += 1
+                i = self._type_expr_end(i)
+            return i
         return i + 1
+
+    def _starts_arrow_function(self):
+        """claude.md #142: True if the CURRENT position starts
+        `<returnType> (<params>) =>`. For an unambiguous return type --
+        a TYPE_KEYWORD, `void`, arr[T], map[T], or func[...]:... -- none
+        of which can ever start an ordinary EXPRESSION on their own
+        (every one is a reserved word with no other meaning at an
+        expression position, or -- arr[T]/map[T]/func[...]:... -- a
+        keyword immediately followed by a bracket that has no
+        expression-level meaning either), this only needs to confirm
+        the type is immediately followed by `(`: nothing else that
+        shape could possibly be, so anything after `(` that doesn't
+        ALSO shape up as a param list ending in `) =>` is a genuine
+        syntax error the eager parse in parse_arrow_function reports
+        directly, not something this check needs to pre-verify.
+
+        For a bare IDENT return type (a struct/table name), by
+        contrast, `Point(x)` is also a perfectly ordinary function
+        CALL -- the common case, by far -- so this scans the full
+        candidate parameter list all the way to a matching `) =>`
+        before ever committing, via _arrow_params_end, to avoid
+        misparsing every such call as a broken arrow function.
+
+        The FIRST token must itself look like the start of a type --
+        TYPE_KEYWORDS, `void`, `arr`, `map`, `func`, or IDENT -- before
+        _type_expr_end is even consulted. Skipping this gate was a real
+        bug caught directly, not a hypothetical: `_type_expr_end`'s own
+        fallback treats ANY unrecognized token as "a valid one-token
+        type" (correct for its ORIGINAL callers, _starts_func_decl and
+        _looks_like_declaration, both of which already gate on this
+        exact same token set before ever calling it) -- so calling it
+        unconditionally here misidentified `log(x)` itself as an arrow
+        function (`log`'s own token type is the literal keyword `log`,
+        not `IDENT`, so the bare "must confirm _type_expr_end result is
+        followed by LPAREN" check alone let it through), breaking every
+        `log(...)` call in the language until this gate was added."""
+        t = self.peek()
+        if t.type not in TYPE_KEYWORDS and t.type not in ("void", "arr", "map", "func", "IDENT"):
+            return False
+        end = self._type_expr_end(self.i)
+        if end >= len(self.toks) or self.toks[end].type != "LPAREN":
+            return False
+        if t.type != "IDENT":
+            return True
+        return self._arrow_params_end(end) is not None
+
+    def _arrow_params_end(self, lparen_index):
+        """Returns the token index right after a `) =>` closing a
+        well-formed `(name:type, name:type, ...)` parameter list
+        starting at lparen_index (which must be an LPAREN); None if the
+        tokens starting there don't shape up that way at all. Used only
+        for the ambiguous bare-IDENT-return-type case in
+        _starts_arrow_function above -- the unambiguous cases never
+        call this, since parse_arrow_function's own eager parse (via
+        the ordinary parse_typed_params) is what reports a malformed
+        parameter list for those."""
+        i = lparen_index + 1
+        if i < len(self.toks) and self.toks[i].type == "RPAREN":
+            i += 1
+        else:
+            while True:
+                if i >= len(self.toks) or self.toks[i].type != "IDENT":
+                    return None
+                i += 1
+                if not (i < len(self.toks) and self.toks[i].type == "OP" and self.toks[i].value == ":"):
+                    return None
+                i += 1
+                i = self._type_expr_end(i)
+                if i < len(self.toks) and self.toks[i].type == "OP" and self.toks[i].value == ",":
+                    i += 1
+                    continue
+                if i < len(self.toks) and self.toks[i].type == "RPAREN":
+                    i += 1
+                    break
+                return None
+        if i < len(self.toks) and self.toks[i].type == "OP" and self.toks[i].value == "=>":
+            return i + 1
+        return None
+
+    def parse_arrow_function(self):
+        """claude.md #142: `<returnType> (params) => expr`, parsed once
+        _starts_arrow_function has already confirmed the shape.
+        `void`'s own special-cased (not handled by parse_type at all --
+        it's a valid return type but never a valid ordinary variable/
+        field/element type, the same asymmetry parse_func_decl/parse_
+        func_type both already carry) rather than routed through
+        parse_type, matching both of those."""
+        t = self.peek()
+        if self.at("void"):
+            self.eat("void")
+            return_type = "void"
+        else:
+            return_type = self.parse_type()
+        self.eat("LPAREN")
+        params = self.parse_typed_params()
+        self.eat("RPAREN")
+        self.eat_op("=>")
+        body = self.parse_assign_expr()
+        return ast.ArrowFuncExpr(params, return_type, body, t.line, t.column)
 
     def parse_import(self):
         self.eat("import")
@@ -509,6 +670,8 @@ class Parser:
 
     def parse_primary(self):
         t = self.peek()
+        if self._starts_arrow_function():
+            return self.parse_arrow_function()
         if t.type == "NUMBER":
             self.eat()
             return ast.NumberLit(t.value)

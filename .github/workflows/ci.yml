@@ -1,0 +1,249 @@
+# CI for the compiler and runtime -- and macos.md/windows.md Phase 0's
+# exit criterion made mechanical: the macOS and Windows jobs each run
+# the WHOLE suite and rely on the conftest missing-dependency skip to
+# shed exactly the tiers that platform doesn't have yet, while the
+# Linux job sets FESTINA_STRICT_DEPS=1 so those same skips are
+# forbidden where every dependency is expected -- coverage cannot
+# silently shrink on the primary platform. The sanitizer leak tier
+# runs only on Linux by the plans' standing decision (LeakSanitizer is
+# unreliable on darwin, and simply unavailable under MinGW). Both
+# macOS's (Phase 1/2) and Windows's (Phase 1/2, claude.md #127-128)
+# audio and windowed-graphics backends are built and compiled/type-
+# checked here on every push, but stay behind their own real-hardware-
+# verification env vars (FESTINA_ENABLE_MACOS_AUDIO/GRAPHICS,
+# FESTINA_ENABLE_WINDOWS_AUDIO/GRAPHICS) until confirmed on real
+# hardware, so those tiers shed as skips on both platforms for the
+# identical reason. windows.md Phase 3 (claude.md #129) added the
+# windows job's own packaging+smoke-test step, mirroring the macOS/
+# Linux jobs' own.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FESTINA_STRICT_DEPS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang pkg-config libsqlite3-dev \
+            libcairo2-dev libx11-dev libjpeg-dev \
+            libasound2-dev libmpg123-dev \
+            xvfb xdotool openbox fonts-dejavu-core
+          pip install -r requirements-dev.txt -r requirements-build.txt
+      - name: Run the test suite
+        run: python -m pytest tests/ -q
+      - name: Package and smoke-test the standalone compiler binary
+        # claude.md #59 stage 2 / macos.md Phase 3: pyinstaller is an
+        # opt-in, build-time-only dependency (not in requirements-dev.txt,
+        # so tests/test_packaging.py skips without it) -- installing it
+        # here, once, gives the packaging path real CI coverage instead
+        # of running untested until someone happens to package a release
+        # by hand.
+        run: |
+          ./scripts/package_compiler.sh /tmp/festina-dist
+          /tmp/festina-dist/festina compile examples/hello.f -o /tmp/festina-dist/hello
+          /tmp/festina-dist/hello
+
+  macos:
+    # macos.md Phase 0. arm64; Apple clang from the preinstalled
+    # CommandLineTools consumes the generated .ll directly, so brew's
+    # (very large) llvm bottle is deliberately not installed here --
+    # the libLLVM fast path is exercised by the Linux job.
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          brew install pkg-config sqlite cairo jpeg-turbo mpg123
+          pip install -r requirements-dev.txt -r requirements-build.txt
+      - name: Run the test suite
+        # brew's sqlite is keg-only -- its .pc file is invisible
+        # without PKG_CONFIG_PATH, which is precisely the kind of
+        # macOS-shaped seam this job exists to keep honest.
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix sqlite)/lib/pkgconfig:$PKG_CONFIG_PATH"
+          python -m pytest tests/ -q
+      - name: Compile and run the core examples
+        # macos.md Phase 0's exit criteria, verbatim: the four
+        # windowless examples build and run natively.
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix sqlite)/lib/pkgconfig:$PKG_CONFIG_PATH"
+          for ex in hello fizzbuzz config files; do
+            python -m festina.cli compile "examples/$ex.f" -o "/tmp/$ex"
+            "/tmp/$ex"
+          done
+      - name: Compile the audio runtime (AudioQueue backend)
+        # macos.md Phase 1 / claude.md #121: the audio translation
+        # unit's __APPLE__ branch is the AudioQueue device layer --
+        # compiling it here is what type-checks that code against the
+        # real AudioToolbox headers on every push, even while the
+        # darwin audio gate keeps it out of user programs pending
+        # real-hardware playback verification.
+        run: |
+          clang -c -O2 -I runtime \
+            $(pkg-config --cflags libmpg123) \
+            runtime/festina_runtime_audio.c -o /tmp/festina_audio_mac.o
+      - name: Compile the windowing backend (Cocoa)
+        # macos.md Phase 2 / claude.md #123: festina_runtime_window_mac.m
+        # is the native Cocoa windowing device layer -- compiling it
+        # here type-checks it against the real AppKit/Foundation/
+        # CoreGraphics headers on every push, the same way the audio
+        # step above does for AudioToolbox, even while the darwin
+        # graphics gate keeps windowed use out of user programs
+        # pending real-hardware mouse/keyboard verification.
+        run: |
+          clang -c -O2 -I runtime \
+            $(pkg-config --cflags cairo) \
+            runtime/festina_runtime_window_mac.m -o /tmp/festina_window_mac.o
+      - name: Package, codesign, and smoke-test the standalone compiler binary
+        # macos.md Phase 3 item 1+2: this is what "add an arm64 build to
+        # the release flow" cashes out to today -- macos-14 runners are
+        # arm64, so a real Apple Silicon binary is produced, ad-hoc
+        # codesigned (package_compiler.sh's own Darwin branch), and run
+        # on every push, rather than only whenever someone packages a
+        # release by hand. `codesign -v` re-verifies the signature
+        # package_compiler.sh applied is actually valid, not just that
+        # the codesign command exited zero.
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix sqlite)/lib/pkgconfig:$PKG_CONFIG_PATH"
+          ./scripts/package_compiler.sh /tmp/festina-dist
+          codesign -v /tmp/festina-dist/festina
+          /tmp/festina-dist/festina compile examples/hello.f -o /tmp/festina-dist/hello
+          /tmp/festina-dist/hello
+
+  windows:
+    # windows.md Phase 0. MSYS2's UCRT64 environment is the one
+    # supported toolchain (windows.md's own toolchain decision --
+    # MSVC is explicitly out of scope). Python, clang, sqlite3,
+    # pkg-config and libsystre all come from that one MSYS2 environment
+    # rather than mixing a native Windows Python with MSYS2's C
+    # toolchain, so there's exactly one PATH to reason about. This was
+    # the first real run of any of this on real Windows, and it did
+    # surface a real bug (claude.md #126), the way macOS Phase 0's
+    # first hardware rounds did (claude.md #122): the originally
+    # requested mingw-w64-ucrt-x86_64-libgnurx conflicts with
+    # mingw-w64-ucrt-x86_64-libsystre (already pulled in transitively)
+    # and pacman --noconfirm silently drops the conflicting package
+    # instead of erroring, so libsystre -- not libgnurx -- is the real
+    # regex.h provider here. windows.md Phase 1: audio has a real
+    # waveOut backend (built, compiled below against real <mmsystem.h>
+    # headers). windows.md Phase 2 (claude.md #128): graphics now has a
+    # real Win32 windowing backend too, compiled below the same way.
+    # Both stay gated pending real-hardware verification, same as macOS
+    # Phase 1/2's own AudioQueue/Cocoa backends, so both tiers still
+    # shed as skips via the same conftest mechanism macOS Phase 0
+    # built -- no parallel test-selection list, same as the macOS job
+    # above.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-pip
+            mingw-w64-ucrt-x86_64-sqlite3
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-libsystre
+            mingw-w64-ucrt-x86_64-mpg123
+            mingw-w64-ucrt-x86_64-cairo
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
+      - name: Install Python test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run the test suite
+        run: python -m pytest tests/ -q
+      - name: Compile and run the core examples
+        # windows.md Phase 0's exit criteria, verbatim: the four
+        # windowless examples build and run natively as .exe.
+        run: |
+          for ex in hello fizzbuzz config files; do
+            python -m festina.cli compile "examples/$ex.f" -o "/tmp/$ex.exe"
+            "/tmp/$ex.exe"
+          done
+      - name: Compile the audio runtime (waveOut backend)
+        # windows.md Phase 1 / claude.md #127: the audio translation
+        # unit's _WIN32 branch is the waveOut device layer -- compiling
+        # it here type-checks it against the real <mmsystem.h> headers
+        # on every push, the same way the macOS job does for
+        # AudioToolbox, even while the windows audio gate keeps it out
+        # of user programs pending real-hardware playback verification.
+        # Compile-only (not linked), same as the macOS step: this file
+        # calls festina_fail/festina_retain/festina_release_check/
+        # festina_save_bytes, defined in festina_runtime.c, so a
+        # standalone link would fail on those, not on anything this
+        # step actually exists to catch. The Compile-and-run-the-core-
+        # examples step above already exercises the full link -- with
+        # -lwinmm now in _feature_pkgs_and_flags's win32 audio branch --
+        # for any program that actually uses aud/play() (once the gate
+        # is unlocked).
+        run: |
+          clang -c -O2 -I runtime \
+            $(pkg-config --cflags libmpg123) \
+            runtime/festina_runtime_audio.c -o /tmp/festina_audio_win.o
+      - name: Compile the graphics runtime (Cairo/libjpeg)
+        # windows.md Phase 2 / claude.md #128: festina_runtime_graphics.c
+        # compiles a DIFFERENT subset of itself on win32 than it always
+        # has on Linux/macOS -- the `#if !defined(__APPLE__) &&
+        # !defined(_WIN32)` guard now excludes its X11 block here too,
+        # which nothing had ever type-checked before this (the file's
+        # portable Cairo/libjpeg code was already known-portable from
+        # every other platform, but the guard itself, and the real
+        # MSYS2 <cairo.h>/<jpeglib.h> headers, had not been). Compile-
+        # only, same reasoning as the audio step just above: this file
+        # calls into festina_runtime.c's core symbols, so a standalone
+        # link would fail on those, not on anything this step exists
+        # to catch.
+        run: |
+          clang -c -O2 -I runtime \
+            $(pkg-config --cflags cairo) $(pkg-config --cflags libjpeg) \
+            runtime/festina_runtime_graphics.c -o /tmp/festina_graphics_win.o
+      - name: Compile the windowing backend (Win32)
+        # windows.md Phase 2 / claude.md #128: festina_runtime_window_win32.c
+        # is the native Win32 windowing device layer -- compiling it
+        # here type-checks it against the real <windows.h> headers on
+        # every push, the same way the macOS job's own step does for
+        # festina_runtime_window_mac.m, even while the windows graphics
+        # gate keeps windowed use out of user programs pending real-
+        # hardware mouse/keyboard verification.
+        run: |
+          clang -c -O2 -I runtime \
+            $(pkg-config --cflags cairo) \
+            runtime/festina_runtime_window_win32.c -o /tmp/festina_window_win32.o
+      - name: Package and smoke-test the standalone compiler binary
+        # windows.md Phase 3 item 1 (claude.md #129): the same
+        # verification-not-just-hoping-it-works step the linux/macos
+        # jobs already have -- package_compiler.sh's Windows branch
+        # (the `;`-separated --add-data flag PyInstaller requires
+        # there, detected via bash's own OSTYPE, and the resulting
+        # festina.exe name) had never run for real before this. No
+        # codesign step here, unlike the macOS job -- Windows has no
+        # Gatekeeper-equivalent local-run prompt to route around.
+        run: |
+          python -m pip install -r requirements-build.txt
+          ./scripts/package_compiler.sh /tmp/festina-dist
+          /tmp/festina-dist/festina.exe compile examples/hello.f -o /tmp/festina-dist/hello.exe
+          /tmp/festina-dist/hello.exe

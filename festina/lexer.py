@@ -46,7 +46,10 @@ TOKEN_SPEC = [
     ("LBRACK", r"\["), ("RBRACK", r"\]"),
     # claude.md #66: postfix ++/-- -- must come before the single-char
     # +/- alternatives so `x++` lexes as one OP token, not `+` `+`.
-    ("OP", r"===|!==|==|!=|<=|>=|&&|\|\||\+\+|--|[+\-*/%=<>!?:.,;]"),
+    # claude.md #142: `=>` (arrow function) must come before the
+    # single-char class too, for the identical reason -- otherwise
+    # `=>` would lex as `=` then `>`, two separate OP tokens.
+    ("OP", r"===|!==|==|!=|<=|>=|=>|&&|\|\||\+\+|--|[+\-*/%=<>!?:.,;]"),
     ("IDENT", r"[A-Za-z_][A-Za-z0-9_]*"),
 ]
 MASTER_RE = re.compile("|".join(f"(?P<{n}>{p})" for n, p in TOKEN_SPEC), re.DOTALL)

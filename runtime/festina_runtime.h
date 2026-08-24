@@ -18,6 +18,14 @@
  * one exception (sqlite3* and sqlite3_stmt* appear directly below) since
  * it's a permanent, always-linked core dependency, never an optional one. */
 
+/* windows.md Phase 0 (claude.md #126): called once, unconditionally,
+ * as literally the first thing main() does in every compiled program
+ * -- currently just the Windows stdout/stderr text-mode fix (see the
+ * .c file), but the natural place for any future "before anything
+ * else runs" platform setup, so it exists even though today only one
+ * platform needs it to do anything. */
+void festina_runtime_init(void);
+
 /* claude.md #41: log() */
 void festina_log_int(int64_t v);
 void festina_log_float(double v);
@@ -26,6 +34,16 @@ void festina_log_text(const char *v);
 
 /* claude.md #42: fail() -- prints to stderr and exits(1). */
 void festina_fail(const char *msg);
+
+/* claude.md #131: close(code) -- runs a declared `on exit(code:int)`
+ * handler (if any), then exits with `code`. Lives in the core runtime
+ * so it works in every program, windowed or not -- unlike
+ * festina_register_close_handler/festina_run_event_loop's own window-
+ * close event in festina_runtime_graphics.c, which only ever fires
+ * from an actual window. festina_register_exit_handler is called at
+ * most once, unconditionally, near the top of main(). */
+void festina_register_exit_handler(void (*handler)(int64_t));
+void festina_program_exit(int64_t code);
 
 /* claude.md #9, #45: string interpolation support. */
 char *festina_str_from_int(int64_t v);
@@ -44,7 +62,22 @@ void festina_sb_append_json_bool(void *sb, int8_t v);
 void festina_sb_append_json_bool64(void *sb, int64_t v);
 void festina_sb_append_handle(void *sb, const void *handle, const char *label);
 char *festina_sb_finish(void *sb);
+/* claude.md #116: text.split(text|regex) -> arr[text] (a fresh
+ * refcounted array of owned pieces, JS semantics -- see the .c doc
+ * comment), and arr.join(sep) -> owned text, `kind` naming the element
+ * type since the runtime cannot know an arr[T]'s T. */
+void *festina_text_split(const char *s, const char *sep);
+void *festina_regex_split(void *compiled, const char *s);
+char *festina_arr_join(void *arr, const char *sep, const char *kind);
 char *festina_text_own(const char *s);  /* claude.md #83: NULL-safe strdup */
+
+/* claude.md #132: mkdir(path) -> bool (true if IT created the
+ * directory, false for every other outcome, including "already
+ * exists"); ls(path) -> arr[text] of entry names (built exactly like
+ * festina_text_split -- a fresh refcounted array of owned pieces),
+ * empty for a missing/unreadable directory rather than failing. */
+int8_t festina_mkdir(const char *path);
+void *festina_ls(const char *path);
 
 /* claude.md #93: math, files and time -- all libc/libm, both already on
  * every link line, so none of this costs a new dependency.
@@ -93,6 +126,16 @@ sqlite3 *festina_db_open(const char *path);
 void festina_sync_table(sqlite3 *db, const char *table_name,
                          const char **col_names, const char **col_types,
                          int32_t ncols);
+
+/* claude.md #126 round nine: called once, unconditionally, as
+ * literally the last thing every compiled program's main() does
+ * (mirroring festina_runtime_init() at the start) -- finalizes every
+ * cached prepared statement and closes the database, forcing SQLite's
+ * own checkpoint-on-last-close rather than leaving committed data
+ * sitting in the WAL file for whatever reads it next to sort out. A
+ * NULL db (a program with no `table` declarations at all -- see
+ * @__festina_db's own default in codegen.py) is a safe no-op. */
+void festina_db_close(sqlite3 *db);
 
 /*
  * claude.md #32-34: sqlite() queries.
@@ -180,11 +223,19 @@ int8_t festina_row_undefined(void *row, const char **col_names,
  * Returns whether the key existed; a missing key is a safe no-op. */
 int8_t festina_map_delete(int64_t *count, void **entries, const char *key,
                           void (*release)(int64_t, const char *));
-/* claude.md #111: `free` on a regex -- frees a runtime regex() result,
- * but a /pattern/ literal's cached compilation is shared with every
- * later execution of its line, so the value carries a `cached` flag and
- * festina_regex_free no-ops on it. Set by generated code. */
+/* claude.md #111/#118: marks a /pattern/ literal's cached compilation
+ * as immortal (the same negative-header sentinel every other immortal
+ * value uses), so retain/release/`free` on it are all safe no-ops. Set
+ * by generated code right after the literal cache is first filled. */
 void festina_regex_mark_cached(void *compiled);
+/* claude.md #118: the per-call-site memo for the dynamic regex()
+ * builtin -- `slot` is a private [3 x ptr] global codegen emits per
+ * call site ({pattern copy, flags copy, compiled}). Same pattern+flags
+ * as last time answers the cached compilation; a change releases the
+ * slot's reference (safe: regex is refcounted now) and recompiles. The
+ * caller always receives its own +1. */
+void *festina_regex_compile_memo(const char *pattern, const char *flags,
+                                 void **slot);
 
 /*
  * claude.md #67-68 (#107): regex(), .test(), .match(), .replace().
@@ -216,15 +267,13 @@ void festina_regex_mark_cached(void *compiled);
  * reason -- JS's /g makes .match() return an array rather than a
  * string, and a function's return type cannot depend on a flag that
  * `regex(p, f)` only knows at run time. Both are documented in api.md
- * as limits rather than left to be discovered. claude.md #85: a regex produced by a
- * runtime `regex(...)` call and consumed as a temporary in the same
- * expression (`regex(p).test(s)`) is freed via festina_regex_free once
- * that expression is done with it -- previously such a regex leaked on
- * every evaluation, which a `regex(...)` inside a loop turned into an
- * unbounded leak. A /pattern/ literal is compiled once and cached for
- * the life of the process (see _emit_cached_regex_lit) and so is
- * deliberately never freed, as is a regex bound to a variable. An
- * invalid
+ * as limits rather than left to be discovered. claude.md #85/#118: a
+ * compiled regex is refcounted (i64 header before the payload), so a
+ * `regex(...)` temporary, a bound regex's scope exit, and `free` on an
+ * aliased binding all go through festina_regex_free's decrement, and
+ * only the last reference regfrees. A /pattern/ literal is compiled
+ * once, cached for the life of the process, and marked immortal (see
+ * festina_regex_mark_cached above). An invalid
  * pattern calls festina_fail() with regerror()'s message -- claude.md
  * #67: pattern validity is a runtime concern, the Python compiler
  * doesn't parse regex syntax itself.
@@ -239,7 +288,7 @@ void festina_regex_mark_cached(void *compiled);
  * NULL) when there's no match, per claude.md #68.
  */
 void *festina_regex_compile(const char *pattern, const char *flags);
-void festina_regex_free(void *compiled);  /* claude.md #85: regfree + free */
+void festina_regex_free(void *compiled);  /* claude.md #85/#118: release; regfree on last ref */
 int8_t festina_regex_test(void *compiled, const char *text);
 char *festina_regex_match(void *compiled, const char *text);
 /* claude.md #107: neither takes a replace_all argument any more.
@@ -367,8 +416,22 @@ char *festina_regex_replace(void *compiled, const char *text,
 void festina_graphics_init(void);
 void festina_run_event_loop(void);
 void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h);
+/* claude.md #133: the optional-`color`-argument forms of drawRect/
+ * drawPixel -- paint with `color` for THIS call only (fillStyle/any
+ * active gradient are saved and restored around it, untouched
+ * afterward), rather than the process-global fillStyle every other
+ * draw call uses. Border/alpha are unaffected either way -- only the
+ * FILL colour is a per-call override. */
+void festina_draw_rect_color(int64_t x, int64_t y, int64_t w, int64_t h, int64_t color);
 void festina_draw_circle(int64_t x, int64_t y, int64_t r);
 void festina_draw_text(const char *text, int64_t x, int64_t y);
+/* claude.md #133: a single pixel, filled with the current fillStyle
+ * (or, for the _color form, `color` for this call only) -- antialiasing
+ * is disabled around it so an integer-aligned 1x1 rectangle paints
+ * exactly one pixel, deterministically, rather than Cairo's usual edge
+ * blending. No border: a 1x1 shape has nothing meaningful to stroke. */
+void festina_draw_pixel(int64_t x, int64_t y);
+void festina_draw_pixel_color(int64_t x, int64_t y, int64_t color);
 void *festina_load_image(const char *path);
 /* claude.md #101: the image counterparts of the two audio entry points
  * above, with one difference -- an image that never came from a file
@@ -414,6 +477,11 @@ int8_t festina_save_canvas(const char *path);
 void festina_render(void);
 void festina_clear_canvas(void);
 void festina_clear_rect(int64_t x, int64_t y, int64_t w, int64_t h);
+/* claude.md #133: the same "erase back to white, honouring the current
+ * transform" clearRect() already does, at a circle's and a single
+ * pixel's shape instead of a rectangle's. */
+void festina_clear_circle(int64_t x, int64_t y, int64_t r);
+void festina_clear_pixel(int64_t x, int64_t y);
 
 /* claude.md #94: paths, transforms, gradients and alpha.
  *
@@ -460,7 +528,22 @@ void festina_stroke_path(void);
 int64_t festina_image_width(void *img);
 int64_t festina_image_height(void *img);
 void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
+/* claude.md #135: saveCanvas() with no path -> a fresh img, a snapshot
+ * of the canvas at this instant (see the .c doc comment for why a
+ * snapshot rather than a live alias). */
+void *festina_canvas_to_image(void);
 void festina_image_resize(void *img, int64_t w, int64_t h);
+/* claude.md #134: drawRect/drawPixel/drawCircle/drawText as methods on
+ * img -- the same four canvas-level functions above, retargeted at an
+ * image's own surface, its own local pixel coordinates (no canvas
+ * transform applied), but still the same global fillStyle/borderColor/
+ * lineWidth/font state every canvas draw call reads. */
+void festina_image_draw_rect(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
+void festina_image_draw_rect_color(void *img, int64_t x, int64_t y, int64_t w, int64_t h, int64_t color);
+void festina_image_draw_pixel(void *img, int64_t x, int64_t y);
+void festina_image_draw_pixel_color(void *img, int64_t x, int64_t y, int64_t color);
+void festina_image_draw_circle(void *img, int64_t x, int64_t y, int64_t r);
+void festina_image_draw_text(void *img, const char *text, int64_t x, int64_t y);
 void festina_image_free(void *img);
 void festina_draw_image(void *img, int64_t x, int64_t y);
 /* claude.md #89/#90: canvas drawing style -- process-global state set by
@@ -526,6 +609,16 @@ void festina_register_resize_handler(void (*handler)(void));
 void festina_register_close_handler(void (*handler)(void));
 int64_t festina_client_width(void);
 int64_t festina_client_height(void);
+/* claude.md #139: screenWidth/screenHeight -- the physical display's
+ * own resolution (through the windowing seam, festina_window_screen_
+ * size), and setClientWidth/setClientHeight -- resizes the canvas
+ * (and, if a window is open, the real OS window too), synchronously,
+ * whether or not a window exists yet. See festina_runtime_graphics.c's
+ * own comments on festina_set_client_size for the full design. */
+int64_t festina_screen_width(void);
+int64_t festina_screen_height(void);
+void festina_set_client_width(int64_t width);
+void festina_set_client_height(int64_t height);
 
 /*
  * setTimeout/setInterval/clearTimeout/clearInterval -- claude.md #69.
@@ -750,16 +843,14 @@ char *festina_getenv(const char *name);
  * claude.md #77: reference counting for struct/arr[T]/map[T] values
  * escape analysis (claude.md #74/#75/#76) proves DO escape their
  * declaring function -- the remainder that pure escape analysis can
- * never reach on its own. Complete (not just "handles everything but
- * cycles") for Festina specifically -- or so it was, until claude.md
- * #106 allowed `struct Node { next:Node }` and made a reference cycle
- * constructible. A cycle is now a permanent leak (see todo.md); every
- * acyclic value is still reclaimed exactly as described.
- * See festina_retain/festina_release's
- * own doc comment in festina_runtime.c for the full design (the
- * refcount header layout, the negative-refcount immortal sentinel used
- * for a global's own untouched static initial storage, and why no
- * cycle-breaking machinery is needed at all).
+ * never reach on its own. claude.md #106 allowed `struct Node
+ * { next:Node }` and made a reference cycle constructible; claude.md
+ * #120 answers it with trial deletion (the festina_cycle_* helpers
+ * below), so a garbage cycle is collected rather than leaked. See
+ * festina_retain/festina_release's own doc comment in
+ * festina_runtime.c for the full design (the refcount header layout
+ * and the negative-refcount immortal sentinel used for a global's own
+ * untouched static initial storage).
  *
  * `payload` is the pointer Festina code itself sees (past the hidden
  * header) -- both functions are always safe to call on any struct
@@ -776,6 +867,26 @@ void festina_release(void *payload);
  * release became the first in-runtime user (codegen's generated
  * per-struct wrappers call it through their own declaration). */
 int8_t festina_release_check(void *payload);
+
+/* claude.md #120: the type-blind state half of cycle collection --
+ * synchronous single-root trial deletion (Bacon-Rajan), driven by
+ * compiler-generated per-type traversal functions whenever a value of
+ * a possibly-cyclic TYPE is released but still referenced. Color state
+ * lives in bits 61-62 of the ordinary refcount header (black=0
+ * outside every trial), and every helper is null- and immortal-safe.
+ * See the block comment in festina_runtime.c. */
+int8_t festina_cycle_candidate(void *p);
+int8_t festina_cycle_begin_gray(void *p);
+void festina_cycle_dec(void *p);
+void festina_cycle_inc(void *p);
+int64_t festina_cycle_begin_scan(void *p);
+void festina_cycle_set_black(void *p);
+int8_t festina_cycle_needs_black(void *p);
+int8_t festina_cycle_begin_white(void *p);
+void festina_cycle_visit_array(void *payload, void (*fn)(void *));
+void festina_cycle_visit_map(void *payload, void (*fn)(void *));
+void festina_cycle_dispose_array(void *payload);
+void festina_cycle_dispose_map(void *payload);
 
 /*
  * claude.md #36, given its real meaning by claude.md #109: a `blob` is
@@ -936,6 +1047,18 @@ int8_t festina_array_pop(void *hdr, int64_t elem_size, void *out);
 int8_t festina_array_shift(void *hdr, int64_t elem_size, void *out);
 void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
                            int64_t count, void *dst_hdr);
+/* claude.md #130: the 3-argument splice(start, count, insertArr) form --
+ * JavaScript's splice(start, deleteCount, ...items), spelled with an
+ * explicit array in place of variadic items since Festina has no
+ * variadic parameters. Removes `count` elements starting at `start`
+ * (handed back through `dst_hdr`, exactly like the 2-argument form
+ * above) and inserts `insert_len` raw elements from `insert_data` in
+ * their place -- codegen retains/copies each inserted element itself
+ * afterward (see codegen.py's _emit_retain_or_own_range), since this
+ * function only moves bytes and has no notion of a Festina type. */
+void festina_array_splice_insert(void *hdr, int64_t elem_size, int64_t start,
+                                  int64_t count, const void *insert_data,
+                                  int64_t insert_len, void *dst_hdr);
 /* claude.md #97: the first index holding `value`, or -1 if absent.
  * -1 rather than null because the answer is an index and every use of
  * one is a comparison or a splice argument. Compares the raw 8-byte

@@ -1,7 +1,12 @@
-// claude.md #79/#80/#81/#96/#97/#102: arrays and maps, grown, drained,
-// nested, aliased and reclaimed thousands of times.
+// claude.md #79/#80/#81/#96/#97/#102/#132: arrays and maps, grown,
+// drained, nested, aliased and reclaimed thousands of times.
 
 struct Item { id:int name:text tags:arr[text] }
+
+// claude.md #132: mkdir() is idempotent -- calling it thousands of
+// times only ever creates the directory once, everything after answers
+// false rather than failing.
+mkdir('./stress_dir')
 
 arr[int] func squares(n:int) {
     arr[int] out = []
@@ -9,6 +14,15 @@ arr[int] func squares(n:int) {
     while i < n { out.push(i * i) i = i + 1 }
     return out
 }
+
+// claude.md #141: first-class function values -- an array and a map
+// of func[...]:... entries, called through indirectly (via array index
+// / map key), the plain pointer this represents holding no allocation
+// of its own to leak, but exercised alongside genuinely managed
+// arr[T]/map[T] storage to prove that storage's own release logic
+// correctly skips a func-typed slot rather than mishandling it.
+int func inc(x:int) { return x + 1 }
+int func dec(x:int) { return x - 1 }
 
 int total = 0
 int i = 0
@@ -21,6 +35,16 @@ while i < 1500 {
     arr[int] removed = xs.splice(2, 3)
     total = total + removed.length + xs.pop() + xs.shift()
     total = total + xs.indexOf(7)
+
+    // claude.md #132: mkdir()/ls() -- a bounded working set (20 names
+    // cycled by index) so ls()'s own allocation loop runs thousands of
+    // times without the directory itself growing without bound.
+    bool alreadyThere = mkdir('./stress_dir')
+    total = total + (alreadyThere ? 1 : 0)
+    blob marker = `./stress_dir/f${i % 20}.txt`
+    marker.write(`${i}`)
+    arr[text] listed = ls('./stress_dir')
+    total = total + listed.length
 
     // A returned array: ownership transfers out of the function.
     arr[int] sq = squares(8)
@@ -43,6 +67,12 @@ while i < 1500 {
         k = k + 1
     }
     total = total + counts['c9']
+
+    arr[func[int]:int] fns = [inc, dec]
+    map[func[int]:int] fnMap = {}
+    fnMap['inc'] = inc
+    fnMap['dec'] = dec
+    total = total + fns[0](i) + fns[1](i) + fnMap['inc'](i) + fnMap['dec'](i)
 
     // Structs holding managed fields, including an auto-vivified one.
     Item it

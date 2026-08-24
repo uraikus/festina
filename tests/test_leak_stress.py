@@ -200,6 +200,10 @@ for int i = 0, i < 200, i++ {
     head.n = 1
     head.next.n = 2
     head.next.next.n = 3
+    // claude.md #120: close the chain into a genuine reference cycle.
+    // Refcounting alone can never free this; the trial deletion the
+    // cyclic release wrapper runs is what keeps this program leak-free.
+    head.next.next.next = head
     total = total + head.n + head.next.next.n
 }
 log(total)
@@ -240,15 +244,15 @@ int total = 0
 for int i = 0, i < 60, i++ {
     img sheet = 'tiles.png'
     img tile = sheet.clip(0, 0, 8, 8)
-    // Aliasing makes `sheet` escaping, which is the one img shape the
-    // compiler cannot reclaim -- exactly what free is for. img has no
-    // refcount, so the handle is freed ONCE, through one binding;
-    // freeing it through `alias` too would be the double free the
-    // documentation warns about (and ASan confirmed, when this program
-    // was first written wrong).
+    // claude.md #118: img is refcounted -- the alias holds its own
+    // reference, so `free sheet` is a decrement and reading through
+    // `alias` afterwards is SAFE, not the dangling-pointer hazard this
+    // program used to document. Freeing through both bindings is the
+    // ordinary shape now, and scope exit reclaims what free missed.
     img alias = sheet
     free sheet
-    total = total + tile.width
+    total = total + alias.width + tile.width
+    free alias
     free tile
 }
 log(total)
@@ -257,11 +261,12 @@ log(total)
 int total = 0
 for int i = 0, i < 40, i++ {
     aud clip = 'beep.wav'
-    // Same shape as the img program: the alias forces `clip` escaping,
-    // the handle is freed exactly once, and the alias -- which now
-    // dangles, per the documented manual contract -- is never touched.
+    // Same shape as the img program: refcounted since claude.md #118,
+    // so the alias survives `free clip` and is freed through its own
+    // binding (or scope exit) without double-free.
     aud alias = clip
     free clip
+    free alias
     total = total + 1
 }
 log(total)
@@ -301,22 +306,29 @@ class TestLeakStress:
         file.ll` silently produces an UNinstrumented object, so a harness
         built the obvious way passes everything and proves nothing.
 
-        The canary leaks on purpose and the harness must say so. It is a
-        REFERENCE CYCLE (claude.md #106): reference counting cannot free
-        one, so this leaks until this language grows a tracing
-        collector, which makes it about as durable a canary as exists
-        here. The previous canary -- a call result reached through a
-        chain -- was retired because claude.md #108 fixed it, which is
-        exactly the failure mode a canary is supposed to have: it stops
-        leaking, the test fails loudly, and nobody discovers months
-        later that the harness had been vacuous.
+        The canary leaks on purpose and the harness must say so. It is
+        the row-array residual claude.md #119 documents as deliberate: a
+        table-row element off a call-result array (`rows()[0]`) cannot
+        retain its row past the array (rows have no header of their
+        own), so the array is knowingly leaked -- see todo.md. Two
+        previous canaries were retired because the compiler fixed them
+        (the chained call result by claude.md #108/#117, the reference
+        cycle by claude.md #120), which is exactly the failure mode a
+        canary is supposed to have: it stops leaking, this test fails
+        loudly, and nobody discovers months later that the harness had
+        been vacuous.
         """
         canary = tmp_path / "canary.f"
         canary.write_text(
-            "struct Node { n:int next:Node }\n"
-            "void func build() { Node a a.n = 1 a.next = a }\n"
+            "table People { id:int name:text }\n"
+            "sqlite('DELETE FROM People')\n"
+            "sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'row'])\n"
+            "arr[People] func rows() {\n"
+            "    arr[People] r = sqlite('SELECT * FROM People')\n"
+            "    return r\n"
+            "}\n"
             "int i = 0\n"
-            "while i < 200 { build() i = i + 1 }\n"
+            "while i < 200 { text got = rows()[0].name i = i + 1 }\n"
             "log('done')\n"
         )
         result = _run_harness(str(canary))
@@ -337,4 +349,9 @@ class TestLeakStress:
             "regex_and_files_churn.f",  # regex compilation, file and time text
             "structs_and_rows_churn.f", # structs, query rows, scope exits
             "text_churn.f",             # text, the copy-managed one
+            # claude.md #130: splice's own 3rd-argument insertion --
+            # element-range retain/copy into a SEPARATE array's buffer,
+            # a genuinely different ownership shape than push/unshift's
+            # single-value one collections_churn.f already covers.
+            "splice_insert_churn.f",
         }

@@ -172,3 +172,8 @@ benchmarks/loop_sum
 # rebuilt by benchmarks/canvas/run_canvas_benchmark.py on first run.
 benchmarks/canvas/monogame/bin/
 benchmarks/canvas/monogame/obj/
+
+# tests/stress/collections_churn.f's mkdir()/ls() exercise (claude.md
+# #50) creates this in the repo root when scripts/leak_stress.sh is run
+# from here -- runtime scratch output, not something to commit.
+/stress_dir/

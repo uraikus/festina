@@ -2661,6 +2661,229 @@ carries a presence bitmask one hidden slot past its columns; an unknown
 name in undefined() fails the program.
 `tests/test_codegen.py::TestUndefinedAndNameMatchedColumns` (6 tests).
 
+**Platform seams** (macos.md / windows.md Phase 0):
+`tests/test_platform.py` tests each OS's toolchain behavior FROM every
+OS — the porting plans cut their platform differences as pure
+functions of an injectable platform name (`_default_output_name`'s
+win32 `.exe`, `_static_sqlite_attempt`'s GNU-ld-vs-ld64 strategies,
+`_platform_libllvm_paths`' brew/MSYS2 candidates), so the Linux job
+verifies the darwin and win32 branches before either port has CI
+hardware. Also there: the key-name vocabulary artifact
+(runtime/festina_key_names.h — X11 keysym names measured, not
+assumed: Page Up/Down are "Prior"/"Next", and the test pins the wart
+as the contract), binary-fidelity round trips (CRLF + NUL bytes
+through a blob — the fact that makes Windows text-mode mangling
+impossible to reintroduce silently), and skipif-gated
+TestOnMacOS/TestOnWindows exit-criteria tests that go live with each
+platform's CI job. The `macos-14` CI job is green on real hardware
+(claude.md #121-122).
+
+macos.md Phases 1 and 2 (claude.md #121, #123) each cut a small
+device seam out of a shared, portable core and gate the darwin backend
+behind a real-hardware-verification env var until confirmed on a Mac,
+rather than shipping it silently untested: `festina_pcm_open/write/
+close` (`runtime/festina_runtime_audio.c`'s AudioQueue branch) behind
+`FESTINA_ENABLE_MACOS_AUDIO=1`, and `festina_window_open/close/
+present/events_wait/events_drain` (the new `runtime/
+festina_runtime_window.h` seam, implemented by the existing X11
+backend on Linux and a new native Cocoa backend,
+`runtime/festina_runtime_window_mac.m`, on macOS) behind
+`FESTINA_ENABLE_MACOS_GRAPHICS=1`. Both darwin backends are compiled
+and type-checked against their real system headers
+(AudioToolbox/AppKit+Foundation+CoreGraphics) by a dedicated
+compile-only step on every `macos-14` CI push, so a header-level
+regression is caught immediately even though the gate keeps either
+backend out of a user program until manually verified. The graphics
+gate is narrow on purpose: it only applies to programs that actually
+open a window (`gen.uses_graphics`, e.g. declaring `render()` or a
+window event handler) — offscreen-only drawing (`saveCanvas`, the
+broader `gen.uses_graphics_code`) is never gated on any platform,
+pinned by `test_offscreen_graphics_never_reaches_the_darwin_gate`.
+`_check_feature_supported`/`_feature_pkgs_and_flags`/
+`_feature_extra_object` in `festina/cli.py` are each parameterized by
+`platform_name` so every darwin branch is unit-tested from Linux, the
+same pattern Phase 0 established. (35 tests across
+`TestFeatureGating`, `TestAudioFeatureConfig`, and
+`TestKeyNameVocabulary` combined, plus 7 platform-gated
+`TestOnMacOS`/`TestOnWindows` tests.)
+
+macos.md Phase 3 (packaging) is real CI coverage, not new pytest
+tests: `tests/test_packaging.py` already built and smoke-tested a
+packaged binary (2 tests) but pyinstaller's own opt-in,
+build-time-only status (`requirements-build.txt`, not
+`requirements-dev.txt`) meant CI never actually installed it, so that
+path had only ever been run by hand. Both CI jobs now install it and
+run `scripts/package_compiler.sh` for real as a dedicated step, then
+compile and run `examples/hello.f` with the freshly packaged binary —
+on the `macos-14` job specifically that produces and validates a real
+Apple Silicon (arm64) `festina` binary on every push, ad-hoc codesigned
+by the script's own new Darwin branch (`codesign -f -s -`, guarded on
+`uname -s` and on `codesign` being present) and re-verified with
+`codesign -v` in the CI step rather than trusting a zero exit code
+alone. The `-f`/`--force` was added after the first real macOS CI run
+(claude.md #126) found recent PyInstaller already ad-hoc-signs the EXE
+itself, and codesign refuses to resign an already-signed binary
+without it.
+
+windows.md Phase 0 fills the one core-runtime gap the platform seams
+paragraph above didn't yet: `<regex.h>` isn't part of MinGW-w64's libc,
+so `_core_pkgs` (win32-only; empty everywhere else) pulls in `gnurx`
+via pkg-config on `festina_runtime.c`'s cflags AND the final link
+line -- two real Windows CI rounds (claude.md #126) to land on that
+one string: `libgnurx`, windows.md's originally preferred PACKAGE,
+installs fine but `pacman --noconfirm` silently drops it due to a
+conflict with `libsystre` (round one); `libsystre`, the package that's
+actually installed, turns out to ship its pkgconfig file under
+libgnurx's own old name, `gnurx.pc`, not `libsystre.pc` (round two) --
+so `libsystre` is what cli.py tells a user to INSTALL, `gnurx` is what
+it asks pkg-config FOR. Unlike graphics/audio, this isn't an optional
+feature tier, it's core, so `festina doctor` reports it as REQUIRED
+(like sqlite3) rather than optional. `_check_feature_supported` gives
+graphics/audio a clean "not implemented yet, windows.md Phase 1/2"
+CompileError on win32, the same `category="unsupported platform
+feature"` the darwin gates use, and the SAME conftest skip mechanism
+macOS Phase 0 built picks it up automatically -- no new test-skip
+logic needed for a third platform, which is the whole point of that
+mechanism being written generically the first time. `festina doctor`
+also gets a `$MSYSTEM` check: `MSYS` (the plain POSIX-emulation shell)
+is flagged as the wrong environment, since only its UCRT64/MINGW64/
+CLANG64 subsystems produce the ordinary Windows PE executables
+windows.md's toolchain decision is about. A `windows-latest` CI job
+(`msys2/setup-msys2`, UCRT64) runs the whole suite the same shape as
+the macOS job, with no `FESTINA_STRICT_DEPS` since audio/graphics have
+no Windows backend at all yet. Honesty note pinned in windows.md's own
+status block: unlike every macOS claim in this file, NONE of this has
+run on real Windows even once -- this project has no Windows/MSYS2
+access, so the CI job is a best-effort reading of documented usage,
+and its first real run is expected to be exactly the kind of
+bug-finding exercise macOS Phase 0's real hardware rounds were
+(claude.md #122). (9 new tests: `TestCorePkgs`, plus additions to
+`TestFeatureGating`/`TestAudioFeatureConfig`.)
+
+Windows Phase 0 has since run for real four times (claude.md #126),
+each finding something the last one missed. Round three found the one
+core-runtime gap the "POSIX only" audit above had missed:
+`localtime_r` is POSIX, not ISO C, and MinGW-w64's UCRT doesn't
+provide it -- only Microsoft's own `localtime_s`, which reverses the
+argument order (`tm*` first, `time_t*` second) and reports success as
+`0` rather than a non-NULL return, so `festina_format_time` gets a
+`#ifdef _WIN32` branch calling it correctly. Round four got a compiled
+program actually RUNNING on Windows for the first time, which surfaced
+two bugs no source read could have: the MinGW/UCRT CRT opens stdout in
+TEXT mode by default, independent of any `fopen` flag, silently
+rewriting every `\n` a program prints to `\r\n` -- fixed with a new
+`festina_runtime_init()` (`_setmode(_fileno(stdout), _O_BINARY)` under
+`#ifdef _WIN32`, a no-op elsewhere) that `festina/codegen.py` now
+calls unconditionally as the first statement of every generated
+`main()`, ahead of even database/graphics setup. And MinGW's linker
+appends `.exe` to a `-o` name lacking one regardless of whether that
+name was `_default_output_name`'s own choice or an explicit caller
+request -- `_default_output_name`'s docstring already said so, but the
+actual guard only ever covered the former, so an explicit `-o program`
+silently linked to `program.exe` while `compile_file` kept insisting
+`program` was the output. `_rename_if_linker_appended_exe` runs after
+linking and renames the linker's real output back to the caller's
+exact requested name, deliberately choosing not to rewrite their
+request into `.exe` instead. The same round also found that macOS's
+own `festina_runtime_window_mac.m` cairo.h fix (two paragraphs above)
+had been incomplete for an unrelated reason -- see macos.md's status
+block. Honesty note updated: real Windows CI has now compiled AND run
+programs successfully across these fixes, but a run with none of
+these four rounds' bugs left to find has not happened yet.
+
+**claude.md #120**: reference cycles collect — trial deletion in the
+release wrappers.
+
+A release of a value whose TYPE can reach itself (computed over the
+declared type graph, cached; acyclic programs generate nothing) that
+leaves the count positive runs a synchronous Bacon-Rajan trial:
+markGray removes the subgraph's internal counts, scan/scanBlack
+restore what external references prove alive, collectWhite frees the
+rest. Runtime holds the type-blind color/count helpers (color bits
+61-62 of the ordinary header; black = 0, so nothing masks outside a
+trial; immortal composes untouched); codegen generates the four
+per-type traversals, registered-before-generated like the release
+wrappers. The exposed invariant, pinned by its own IR test: every
+traversable location now STORES before it releases (field/element
+writes, map sets, delete, festina_map_delete's C-side entry removal)
+— a stale edge would let markGray double-remove a count and free a
+value still held. The struct_self leak program closes into a real
+cycle and runs leak-free every test run; the harness canary, formerly
+a cycle, is now the #119 row-array residual — the one deliberate leak
+left. Verified under ASan: self/pair/array-routed/map-routed cycles
+reclaimed, held cycles intact; ~34ms for 20k dropped 21-node cycles.
+`tests/test_codegen.py::TestCycleCollection` (6 tests).
+
+**claude.md #119**: the last two chain shapes; ownership recorded, not
+guessed.
+
+A computed-index element off an owning receiver (`matrix()[0]`,
+`conf()['k']`) is minted its own ownership (retain/copy) before the
+container is released — #117 one level down — and an owning refcounted
+argument to a user function is released after the call, exactly where
+text temporaries were already freed (anything the callee kept took its
+own retain). Because a computed member's ownership depends on its
+element TYPE (a struct element retains; a table row cannot — the array
+owns its rows), the emission records what it minted (_minted_values)
+and the predicates read that back instead of walking syntax — the
+predicate/emission agreement #117 demanded, made structural. The row
+case stays borrowed and its array-leak residual is renamed in todo.md
+to its true size; the row's columns verified intact under ASan.
+`tests/test_codegen.py::TestComputedIndexAndArgumentOwnership` (5 tests).
+
+**claude.md #118**: refcount headers for img/aud/regex; regex() memoized.
+
+The three types outside the refcount protocol joined it — the same i64
+header blob carries, allocated in each type's constructor, with the
+free functions becoming releases (decrement; destroy on last
+reference). The _Owned* ownership proofs and every img/aud special
+case in free/delete/receiver-release/field-cascade collapsed into the
+one _is_refcounted dispatch. The regex literal cache's `cached` flag
+became the standard immortal sentinel. Three tests pinning the old
+proofs ("a borrowed/escaping img is not freed", "a literal regex is
+never freed") failed exactly as pinned tradeoffs should and were
+INVERTED: the release is emitted, and the retain precedes it — order
+is the safety argument, as in #117. The per-type img/aud leak
+programs were rewritten from "free exactly once, the alias dangles"
+to freeing through both bindings — the ordinary shape now. Dynamic
+regex() compiles through a per-call-site memo
+(festina_regex_compile_memo, one {pattern, flags, compiled} slot per
+site) — safe only because eviction of a superseded compilation is a
+decrement now; measured 200k evals ~367ms → ~15ms, and an
+alternating-pattern site recompiles per change rather than serving a
+stale automaton (pinned). Harness lesson, third application: the
+audio white-box harnesses gained a festina_release_check stub with
+real header semantics, since the audio TU now calls into the core
+runtime's refcount protocol.
+`tests/test_codegen.py::TestRefcountedHandles` (6 tests), plus the
+inverted tests in TestOwnedRegexLocals/TestImageClipResizeAndSize.
+
+**claude.md #117**: chained extraction stops leaking — retain first.
+
+#102/#108's deliberate leak (a chain yielding a managed value or text
+could not release its parent without freeing the value being handed
+out) is closed by ordering, not machinery: retain the escaping value
+(copy, for text), THEN release the parent, whose cascade nets the
+result to exactly one reference. Call-based chains are owning sources
+now, so the +1 lands with exactly one owner in every position a fresh
+Call result already could (binding, return, global, push, discard).
+Method receivers with fresh results (join/toText/blob methods) release
+whenever owned, ending the result-type judgement that made
+split(' ').join('-') leak. The #108 test pinning the leak inverted, and
+now asserts retain-precedes-release in the IR — the order IS the safety
+argument. Remaining, recorded in todo.md: argument-position chains and
+computed-index receivers.
+`tests/test_codegen.py::TestChainedCallResultReachedForAField` (updated).
+
+**claude.md #116**: text.split(text|regex) -> arr[text] and
+arr.join(text) -> text, on text/int/float/bool element types. JS
+semantics in full (kept empties, edge empties, empty-match regex splits
+between characters, empty text separator splits per UTF-8 code point,
+null joins as ''), each pinned as its own test since each is a
+decision. The split result is a runtime-built refcounted arr[text], so
+every existing array mechanism applies unchanged.
+`tests/test_codegen.py::TestSplitAndJoin` (11 tests).
+
 **claude.md #115**: log(blob)/`${blob}` render the contents after all —
 #114 had put blob in the refuse list; a blob is very often a text file
 and already carries the method the implicit conversion is defined as,

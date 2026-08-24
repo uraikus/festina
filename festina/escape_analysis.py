@@ -34,22 +34,22 @@ call-argument rule for that specific call (the argument may still end
 up escaping some other way, through some other use elsewhere in the
 same function -- this only stops that one call site from being the
 *reason* it escapes). A callee not present in the map (a builtin, a
-method call whose callee isn't a plain Identifier at all, or -- see
-festina/codegen.py's own note on why this is always safe -- a
-not-yet-fully-analyzed function, which can only mean the callee
-currently being walked calling itself: semantic.py already rejects any
-other forward reference to a function before its own declaration, so
-every other possible callee is necessarily already fully analyzed by
-the time it's this function's turn) falls back to the original
-unconditional rule, exactly as if `escaping_params` were never passed
-at all. Building the
-map itself -- walking every function's body once, in the source order
-Festina already requires, so each function's own callees are always
-already fully resolved by the time it's this function's turn -- is
-festina/codegen.py's job (`_emit_analyzed_func_body`), not this
-module's; this module only ever consumes it, one Call node at a time,
-exactly the same way it already consumes nothing at all when the
-caller omits it.
+method call whose callee isn't a plain Identifier at all, self-
+recursion -- the callee currently being walked calling itself, never
+yet in the map since its own entry is only added once its whole body
+has been walked -- or, since claude.md #140's hoisting, a genuine
+forward reference to a function declared later in the program, not yet
+walked at all) falls back to the original unconditional rule, exactly
+as if `escaping_params` were never passed at all -- always SAFE (just a
+missed optimization: one call argument gets an unneeded extra retain/
+release pair it didn't strictly need), never a soundness gap, since
+"not proven safe yet" and "escaping" default to the exact same
+treatment here. Building the map itself -- walking every function's
+body once, in whatever order festina/codegen.py's own
+_register_all_func_signatures/generate emits them in -- is festina/
+codegen.py's job (`_emit_analyzed_func_body`), not this module's; this
+module only ever consumes it, one Call node at a time, exactly the same
+way it already consumes nothing at all when the caller omits it.
 
 This is also deliberately name-based, not a real scope-resolving
 analysis: if an inner if/while/for block happens to declare its OWN,
@@ -277,6 +277,22 @@ def _walk_expr(expr, escaping, escaping_params):
                             _walk_expr(element, escaping, escaping_params)
                     continue
             _walk_expr(a, escaping, escaping_params)
+        return
+    if isinstance(expr, ast.ArrowFuncExpr):
+        # claude.md #142: a deliberate no-op, not an oversight -- unlike
+        # every other expression kind here, this one has NOTHING to
+        # contribute to the ENCLOSING function's own escaping-names set.
+        # Its body is analyzed and emitted in a completely separate
+        # scope (semantic.py's analyze_func always parents a function's
+        # own scope at global_scope, regardless of how deeply that
+        # function is nested or where it's declared from -- claude.md
+        # #140/#141's own "no closures" design), so no name inside an
+        # arrow function's body could ever alias one of THIS function's
+        # own local candidates -- there is no lexical connection between
+        # the two scopes at all. The arrow function's OWN body gets its
+        # OWN, entirely separate find_escaping_names call, the same way
+        # any other nested FuncDecl's body does (see codegen.py's
+        # _emit_analyzed_func_body).
         return
     raise AssertionError(
         f"escape_analysis: unhandled expression node {type(expr).__name__} -- "

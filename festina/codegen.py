@@ -353,12 +353,27 @@ def _is_refcounted(t):
     strings to free first -- dispatched through _release_fn_for the
     same way a struct's field cascade is.
 
+    claude.md #118: img, aud and regex joined the family too, for the
+    same reason blob did -- each now carries the identical i64 header
+    (allocated by festina_image_box / festina_audio_from_bytes /
+    festina_regex_compile) and each has a destructor with contents of
+    its own to free, dispatched through _release_fn_for exactly like
+    blob's. That closed the "escaping img/aud handle leaks" and
+    "`free` on an aliased img/aud dangles" gaps in one move: every
+    binding owns exactly one countable reference, wherever the value
+    came from, so releasing at scope exit / reassignment / `free` is
+    always a safe decrement. A /pattern/ regex literal's process-
+    lifetime cache is the standard immortal sentinel (negative
+    header), so it flows through every one of these paths as a no-op
+    with no special case left in this file.
+
     `text` is deliberately NOT here. A text is managed but not
     refcounted: it is copied on alias (festina_text_own) and freed
     outright, so it needs its own branch wherever ownership is decided
     -- see claude.md #83."""
     return (isinstance(t, (types_mod.StructType, types_mod.ArrayType,
-                           types_mod.MapType))
+                           types_mod.MapType, types_mod.ImageType,
+                           types_mod.AudioType, types_mod.RegexType))
             or t == BLOB)
 
 FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
@@ -530,6 +545,15 @@ def _llvm_type(t):
         # reasoning, FESTINA_MAP_LLVM_TYPE's own `{i64, ptr}` shape
         # still describes the storage this points at.
         return "ptr"
+    if isinstance(t, types_mod.FuncType):
+        # claude.md #141: a bare LLVM function pointer -- like
+        # FontType's static constant pointer just above, this is never
+        # allocated or freed (a declared function is immortal for the
+        # process's whole lifetime), so it rides every generic scalar-
+        # shaped code path (VarDecl, struct field, array element, map
+        # value, argument passing) unchanged, the identical way
+        # ColorType/FontType already do.
+        return "ptr"
     raise CodegenError(f"cannot generate code for type {t!r}")
 
 
@@ -590,58 +614,6 @@ class _StackArrayOrMap:
         self.type_ = type_
 
 
-class _OwnedImage:
-    """claude.md #92: marks, in CodeGen._active_free_locals, an `img`
-    local this scope provably owns -- one whose initializer is a Call
-    (`loadImage(...)` or `sheet.clip(...)`, both of which hand back a
-    freshly created image nothing else references yet) and whose name
-    escape analysis proves never leaves the declaring function.
-
-    Exactly the shape claude.md #86 already uses for regex, and here for
-    a sharper reason: clip() exists to be called repeatedly -- one per
-    sprite -- so without this, extracting frames inside a loop would
-    leak a whole Cairo surface every iteration. An `img` bound from
-    anything else (another img binding, a struct field) is only
-    borrowing, and an escaping one may still be referenced after this
-    scope ends; neither is freed here."""
-
-    def __init__(self):
-        pass
-
-
-class _OwnedAudio:
-    """claude.md #101: the aud counterpart of _OwnedImage below --
-    marks, in CodeGen._active_free_locals, an `aud` local this scope
-    created itself and that escape analysis proves never leaves the
-    function, so scope exit can free it. Audio handles were never freed
-    at all before this; a clip loaded inside a loop leaked one decoded
-    buffer per iteration, which the `aud x = 'path'` short form made
-    easy to write by accident."""
-
-
-class _OwnedRegex:
-    """claude.md #86: marks, in CodeGen._active_free_locals, a `regex`
-    local this scope provably owns outright -- one whose initializer is
-    a `regex(...)` Call (freshly compiled by festina_regex_compile, so
-    nothing else can reference it yet) and whose name escape analysis
-    proves never escapes the declaring function.
-
-    Both halves are load-bearing, and getting either wrong frees
-    something still in use. A regex whose initializer is a /pattern/
-    literal is NOT owned: that pointer comes from a process-lifetime
-    cache (see _emit_cached_regex_lit), and freeing it would leave every
-    later evaluation of that literal running regexec against a freed
-    regex_t. A regex that escapes is not owned either: `text`'s trick of
-    copying at each consuming site to guarantee exclusivity has no
-    regex equivalent (a "copy" would mean recompiling, and the pattern
-    string isn't retained to recompile from), so an escaping regex is
-    left to leak exactly as it did before, rather than freed while
-    another binding may still be pointing at it."""
-
-    def __init__(self):
-        pass
-
-
 class CodeGen:
     def __init__(self, analyzed, filename="main.f"):
         self.analyzed = analyzed
@@ -697,6 +669,10 @@ class CodeGen:
                                                 # _emit_graphics_call and _emit_main_and_entry
         self.event_handlers = {}               # "mouseDown"/"mouse" -> @__festina_on_<name> -- see
                                                 # _emit_event_handler and _emit_main_and_entry
+        self.exit_handler_symbol = None        # claude.md #131: @__festina_on_exit if `on exit(code:int)`
+                                                # was declared, else None -- registered unconditionally
+                                                # in main() (close() works with or without a window), so
+                                                # tracked separately from event_handlers' graphics-only six.
         self.uses_timers = False               # any setTimeout()/setInterval() call anywhere --
                                                 # NOT clearTimeout()/clearInterval() alone; see
                                                 # _emit_timer_call and _emit_main_and_entry
@@ -765,10 +741,15 @@ class CodeGen:
                                                 # None outside any tracked function/handler body (e.g.
                                                 # __festina_main's own top-level statements, which
                                                 # claude.md #74 doesn't analyze at all) -- _emit_block
-                                                # skips all of #74's tracking entirely in that case. Never
-                                                # a stack: Festina has no nested function declarations
-                                                # reaching codegen (see _toplevel), so only ever one
-                                                # function/handler's body is being emitted at a time.
+                                                # skips all of #74's tracking entirely in that case.
+                                                # claude.md #140: no LONGER guaranteed only one function/
+                                                # handler body is being emitted at a time -- a nested
+                                                # FuncDecl (see _emit_stmt's own FuncDecl branch) re-
+                                                # enters _emit_analyzed_func_body recursively while an
+                                                # outer one's own body is still being walked, so this is
+                                                # save/restored around that recursive call rather than
+                                                # reset to a hardcoded None -- see that method's own
+                                                # comment.
         self.escaping_params = {}              # claude.md #74 stage 2 (interprocedural): {func_name:
                                                 # set[int]} -- for each FuncDecl already fully emitted,
                                                 # which of ITS OWN parameter positions escape_analysis
@@ -776,18 +757,17 @@ class CodeGen:
                                                 # incrementally, one entry per function, immediately
                                                 # after that function's own _emit_analyzed_func_body call
                                                 # returns (see that method) -- never all at once in a
-                                                # separate pass, because it doesn't need to be: semantic.py
-                                                # already rejects a call to a function before its own
-                                                # declaration (no forward references), so by the time any
-                                                # function F's body is being walked, every function F could
-                                                # possibly call (other than F itself, mid-recursion) is
-                                                # necessarily already a key in this dict. A self-recursive
-                                                # call inside F's own body looks up F's own name here
-                                                # *before* F's own entry has been added -- a plain,
-                                                # ordinary dict miss, correctly falling back to
-                                                # escape_analysis.py's original conservative "any call
-                                                # argument escapes" default, exactly like a call to an
-                                                # unanalyzed builtin does. Never cleared, never popped:
+                                                # separate pass. claude.md #140: hoisting means a callee
+                                                # is no longer guaranteed to already be a key here by the
+                                                # time some EARLIER-emitted function's body calls it (a
+                                                # genuine forward reference, now allowed) -- exactly like
+                                                # the self-recursive case already below, a miss here is
+                                                # always SAFE, just a missed optimization: escape_
+                                                # analysis.py's own docstring spells out why a map miss
+                                                # (self-recursion, a forward reference, a builtin, ...)
+                                                # falls back to the original conservative "any call
+                                                # argument escapes" default rather than ever being treated
+                                                # as "proven not to escape." Never cleared, never popped:
                                                 # unlike _current_escaping_names (one function at a time)
                                                 # this accumulates across the whole program, since a
                                                 # function emitted early may be called by many functions
@@ -808,16 +788,32 @@ class CodeGen:
                                                 # VarDecl in program order. Consulted by
                                                 # _emit_free_active_locals -- a Return frees every open
                                                 # frame at once (down_to=0, the whole stack, since
-                                                # returning exits every nested scope simultaneously); a
-                                                # Break/Continue frees only the frames opened since the
-                                                # nearest enclosing loop's own body began (down_to = the
-                                                # frame index recorded alongside that loop's own entry in
-                                                # self._loop_targets); a block's own natural, non-
-                                                # terminated fall-through exit frees just its own single
-                                                # (topmost) frame. Same "instance-level stack, not
-                                                # threaded through ctx" shape as _loop_targets, for the
-                                                # same reason: it needs to keep working correctly through
-                                                # arbitrary nesting depth.
+                                                # returning exits every nested scope simultaneously, down
+                                                # to self._current_func_frame_base -- see that field's own
+                                                # comment -- not literally always 0); a Break/Continue
+                                                # frees only the frames opened since the nearest enclosing
+                                                # loop's own body began (down_to = the frame index recorded
+                                                # alongside that loop's own entry in self._loop_targets); a
+                                                # block's own natural, non-terminated fall-through exit
+                                                # frees just its own single (topmost) frame. Same
+                                                # "instance-level stack, not threaded through ctx" shape as
+                                                # _loop_targets, for the same reason: it needs to keep
+                                                # working correctly through arbitrary nesting depth.
+        self._current_func_frame_base = 0      # claude.md #140: the self._active_free_locals index of
+                                                # the OUTERMOST frame belonging to the function/handler
+                                                # currently being emitted -- normally 0, since
+                                                # self._active_free_locals is always empty entering any
+                                                # top-level _emit_func/_emit_event_handler call. But a
+                                                # nested FuncDecl (see _emit_stmt's own FuncDecl branch)
+                                                # re-enters _emit_func recursively while an OUTER
+                                                # function's own frames are still open beneath it on the
+                                                # SAME shared stack -- without this, a bare `return` inside
+                                                # the nested function's own body (down_to=0, unqualified)
+                                                # would free every frame all the way down, including the
+                                                # outer function's still-live locals it has no business
+                                                # touching. Save/restored around _emit_func's own
+                                                # push/pop, exactly like self._current_escaping_names --
+                                                # see that field's own comment for the identical reasoning.
         self._font_constants = {}              # claude.md #91: (px, style, family) -> the name of the
                                                 # static %struct._FestinaFont constant holding it.
                                                 # Keyed on the RESOLVED parts rather than the source
@@ -837,6 +833,28 @@ class CodeGen:
                                                 # source locations still each get their own slot,
                                                 # simpler than deduplicating by text and just as
                                                 # correct (each still only ever compiles once)
+        self._regex_memo_slots = {}            # claude.md #118: id(regex() Call node) -> its private
+                                                # [3 x ptr] memo slot global ({pattern copy, flags
+                                                # copy, compiled}) -- see _emit_regex_call /
+                                                # festina_regex_compile_memo
+        self._cyclic_type_cache = {}           # claude.md #120: type_name -> bool ("can this type
+                                                # reach itself through managed edges") -- the gate on
+                                                # ALL cycle-collection machinery; acyclic types never
+                                                # generate or run any of it
+        self._cycle_fns = {}                   # claude.md #120: (op, type_name) -> generated cycle
+                                                # traversal function name (ops: gray/scan/black/white
+                                                # + the grayedge/blackedge container edge helpers)
+        self._minted_values = set()            # claude.md #119: id(expr) of every emitted expression
+                                                # whose EMISSION minted its own +1 (a retained
+                                                # computed-index element, or a chain whose escaping
+                                                # value _release_member_chain retained/copied) --
+                                                # consulted by the ownership predicates so they and
+                                                # the emission can never disagree about shapes syntax
+                                                # alone cannot classify (a computed member over an
+                                                # owning receiver mints for a refcounted/text element
+                                                # but NOT for a borrowed table row). Recording happens
+                                                # during emission, and every predicate consumer runs
+                                                # after the value it asks about was emitted.
         # claude.md #108: state for a MEMBER CHAIN's deferred receiver
         # release -- see _emit_member_load. _chain_receiver holds the
         # exact AST node the enclosing member load is about to emit as
@@ -905,6 +923,20 @@ class CodeGen:
     # ---- entry point ----
     def generate(self, program):
         self.database_url_expr = getattr(program, "database_url", None)
+        # claude.md #140: every function's signature is registered before
+        # ANY code is emitted -- "hoisting" -- so a call reached earlier
+        # in this same walk than its own callee's declaration still
+        # resolves. filename is threaded the identical way the real
+        # emission pass below threads it (reset right before each
+        # TOP-LEVEL statement, since only top-level statements carry
+        # their own `.file` -- see festina.imports.build_program --
+        # and everything nested under one shares that statement's file),
+        # even though this pre-pass itself never actually raises (a
+        # signature collision was already caught by semantic analysis,
+        # which ran first).
+        for stmt in program.body:
+            self.filename = getattr(stmt, "file", self.filename)
+            self._register_all_func_signatures([stmt])
         for stmt in program.body:
             # claude.md #6: a multi-file program (festina.imports.
             # build_program) is one merged ast.Program, but errors
@@ -953,6 +985,7 @@ class CodeGen:
 
     def _runtime_declares(self):
         return [
+            "declare void @festina_runtime_init()",
             "declare void @festina_log_int(i64)",
             "declare void @festina_log_float(double)",
             # i8, not i1 -- see the module docstring's "Null for bool"
@@ -1004,6 +1037,9 @@ class CodeGen:
             "declare i8 @festina_delete_file(ptr)",
             "declare i64 @festina_now_ms()",
             "declare ptr @festina_format_time(i64, ptr)",
+            # claude.md #132
+            "declare i8 @festina_mkdir(ptr)",
+            "declare ptr @festina_ls(ptr)",
             "declare i8 @festina_str_eq(ptr, ptr)",
             # claude.md #70: DatabaseURL -- path is festina.sqlite's
             # location, NULL/empty meaning "use the default" (a plain
@@ -1012,6 +1048,9 @@ class CodeGen:
             # itself somehow evaluates to a null text value at runtime).
             "declare ptr @festina_db_open(ptr)",
             "declare void @festina_sync_table(ptr, ptr, ptr, ptr, i32)",
+            # claude.md #126 round nine: called unconditionally at the
+            # very end of main() -- see festina_db_close's own comment.
+            "declare void @festina_db_close(ptr)",
             # claude.md #32-34: sqlite() queries.
             "declare ptr @festina_sqlite_prepare(ptr, ptr)",
             # claude.md #113: literal SQL is prepared once per call site.
@@ -1026,6 +1065,10 @@ class CodeGen:
             "declare void @festina_sb_append_json_bool64(ptr, i64)",
             "declare void @festina_sb_append_handle(ptr, ptr, ptr)",
             "declare ptr @festina_sb_finish(ptr)",
+            # claude.md #116: split and join.
+            "declare ptr @festina_text_split(ptr, ptr)",
+            "declare ptr @festina_regex_split(ptr, ptr)",
+            "declare ptr @festina_arr_join(ptr, ptr, ptr)",
             "declare void @festina_sqlite_bind_int(ptr, i32, i64)",
             "declare void @festina_sqlite_bind_float(ptr, i32, double)",
             "declare void @festina_sqlite_bind_text(ptr, i32, ptr)",
@@ -1052,6 +1095,8 @@ class CodeGen:
             "declare i8 @festina_row_undefined(ptr, ptr, i32, ptr)",
             # claude.md #67-68, #107: regex(), .test(), .match(), .replace().
             "declare ptr @festina_regex_compile(ptr, ptr)",
+            # claude.md #118: the per-call-site memo for dynamic regex().
+            "declare ptr @festina_regex_compile_memo(ptr, ptr, ptr)",
             "declare void @festina_regex_free(ptr)",
             "declare i8 @festina_regex_test(ptr, ptr)",
             "declare ptr @festina_regex_match(ptr, ptr)",
@@ -1064,6 +1109,10 @@ class CodeGen:
             "declare void @festina_graphics_init()",
             "declare void @festina_run_event_loop()",
             "declare void @festina_draw_rect(i64, i64, i64, i64)",
+            # claude.md #133
+            "declare void @festina_draw_rect_color(i64, i64, i64, i64, i64)",
+            "declare void @festina_draw_pixel(i64, i64)",
+            "declare void @festina_draw_pixel_color(i64, i64, i64)",
             "declare void @festina_draw_circle(i64, i64, i64)",
             "declare void @festina_draw_text(ptr, i64, i64)",
             # claude.md #89/#90: canvas drawing style + text metrics.
@@ -1082,11 +1131,15 @@ class CodeGen:
             "declare i64 @festina_measure_text_height(ptr)",
             "declare ptr @festina_load_image(ptr)",
             "declare i8 @festina_save_canvas(ptr)",  # claude.md #93
+            "declare ptr @festina_canvas_to_image()",  # claude.md #135
             # claude.md #94: paths, transforms, gradients, alpha
             # claude.md #95: render + clears
             "declare void @festina_render()",
             "declare void @festina_clear_canvas()",
             "declare void @festina_clear_rect(i64, i64, i64, i64)",
+            # claude.md #133
+            "declare void @festina_clear_circle(i64, i64, i64)",
+            "declare void @festina_clear_pixel(i64, i64)",
             "declare void @festina_set_alpha(double)",
             "declare void @festina_fill_linear_gradient(i64, i64, i64, i64, i64, i64)",
             "declare void @festina_fill_radial_gradient(i64, i64, i64, i64, i64)",
@@ -1108,6 +1161,13 @@ class CodeGen:
             "declare i64 @festina_image_height(ptr)",
             "declare ptr @festina_image_clip(ptr, i64, i64, i64, i64)",
             "declare void @festina_image_resize(ptr, i64, i64)",
+            # claude.md #134: drawRect/drawPixel/drawCircle/drawText as img methods.
+            "declare void @festina_image_draw_rect(ptr, i64, i64, i64, i64)",
+            "declare void @festina_image_draw_rect_color(ptr, i64, i64, i64, i64, i64)",
+            "declare void @festina_image_draw_pixel(ptr, i64, i64)",
+            "declare void @festina_image_draw_pixel_color(ptr, i64, i64, i64)",
+            "declare void @festina_image_draw_circle(ptr, i64, i64, i64)",
+            "declare void @festina_image_draw_text(ptr, ptr, i64, i64)",
             "declare void @festina_image_free(ptr)",
             "declare i8 @festina_image_save(ptr, ptr)",
             "declare i8 @festina_image_save_copy(ptr, ptr)",
@@ -1121,8 +1181,19 @@ class CodeGen:
             "declare void @festina_register_key_up_handler(ptr)",
             "declare void @festina_register_resize_handler(ptr)",
             "declare void @festina_register_close_handler(ptr)",
+            # claude.md #131: unlike the six handlers just above, these
+            # two live in the CORE runtime translation unit (not
+            # graphics) -- close(code)/`on exit` work in every program,
+            # windowed or not.
+            "declare void @festina_register_exit_handler(ptr)",
+            "declare void @festina_program_exit(i64)",
             "declare i64 @festina_client_width()",
             "declare i64 @festina_client_height()",
+            # claude.md #139
+            "declare i64 @festina_screen_width()",
+            "declare i64 @festina_screen_height()",
+            "declare void @festina_set_client_width(i64)",
+            "declare void @festina_set_client_height(i64)",
             # claude.md #69: setTimeout/setInterval/clearTimeout/clearInterval
             # -- see the module docstring's "Timers" note.
             "declare i64 @festina_set_timeout(ptr, i64)",
@@ -1163,6 +1234,21 @@ class CodeGen:
             # _emit_free_active_locals's own StructType branch.
             "declare void @festina_retain(ptr)",
             "declare void @festina_release(ptr)",
+            # claude.md #120: the type-blind state half of cycle
+            # collection -- see the festina_cycle_* block comment in
+            # runtime/festina_runtime.c and _cycle_fn here.
+            "declare i8 @festina_cycle_candidate(ptr)",
+            "declare i8 @festina_cycle_begin_gray(ptr)",
+            "declare void @festina_cycle_dec(ptr)",
+            "declare void @festina_cycle_inc(ptr)",
+            "declare i64 @festina_cycle_begin_scan(ptr)",
+            "declare void @festina_cycle_set_black(ptr)",
+            "declare i8 @festina_cycle_needs_black(ptr)",
+            "declare i8 @festina_cycle_begin_white(ptr)",
+            "declare void @festina_cycle_visit_array(ptr, ptr)",
+            "declare void @festina_cycle_visit_map(ptr, ptr)",
+            "declare void @festina_cycle_dispose_array(ptr)",
+            "declare void @festina_cycle_dispose_map(ptr)",
             # claude.md #78: the decrement-and-check half of
             # festina_release, split out so a struct with its own
             # struct-typed field(s) can cascade into releasing those
@@ -1180,6 +1266,8 @@ class CodeGen:
             "declare i8 @festina_array_pop(ptr, i64, ptr)",
             "declare i8 @festina_array_shift(ptr, i64, ptr)",
             "declare void @festina_array_splice(ptr, i64, i64, i64, ptr)",
+            # claude.md #130: the 3-argument splice(start, count, insertArr) form.
+            "declare void @festina_array_splice_insert(ptr, i64, i64, i64, ptr, i64, ptr)",
             # claude.md #97
             "declare i64 @festina_array_index_of(ptr, i64, ptr, i8)",
             "declare void @festina_release_map(ptr)",
@@ -1346,20 +1434,29 @@ class CodeGen:
         frame of self._active_free_locals from the top of the stack down
         to (and including) index `down_to`.
 
-        down_to=0 (the default) frees every currently open frame --
-        correct for a Return, which exits the *entire* function/handler
-        at once, so every nested block's own still-open locals need
-        freeing together, not just the innermost one (see _emit_stmt's
-        Return handling). A Break/Continue only frees frames opened
-        since the nearest enclosing loop's own body began (down_to = the
-        frame index _emit_while/_emit_for recorded when that body's
-        frame was about to be pushed -- see self._loop_targets' own
-        comment) -- an outer function-level local merely *used* inside
-        that loop, not declared inside it, must NOT be freed by the
-        loop's own break/continue, and this is what keeps that true.
-        _emit_block's own natural (non-terminated) fall-through exit
-        frees just its own single frame (down_to = that frame's own,
-        topmost, index) before popping it.
+        down_to=0 is the parameter's own default, but a Return never
+        actually relies on that default -- it passes down_to=self.
+        _current_func_frame_base explicitly (claude.md #140), which
+        frees every frame belonging to the function/handler currently
+        being emitted, all the way to (and including) ITS OWN outermost
+        one, so every nested block's own still-open locals need freeing
+        together, not just the innermost one (see _emit_stmt's Return
+        handling). That base is 0 for a top-level function/handler --
+        self._active_free_locals is always empty entering one -- but
+        NOT for a nested FuncDecl reached inside another function's own
+        body (see self._current_func_frame_base's own comment): a plain
+        hardcoded 0 there would free the ENCLOSING function's still-live
+        locals too, which are further down the SAME shared stack. A
+        Break/Continue only frees frames opened since the nearest
+        enclosing loop's own body began (down_to = the frame index
+        _emit_while/_emit_for recorded when that body's frame was about
+        to be pushed -- see self._loop_targets' own comment) -- an outer
+        function-level local merely *used* inside that loop, not
+        declared inside it, must NOT be freed by the loop's own
+        break/continue, and this is what keeps that true. _emit_block's
+        own natural (non-terminated) fall-through exit frees just its
+        own single frame (down_to = that frame's own, topmost, index)
+        before popping it.
 
         A no-op if self._active_free_locals is empty (outside any
         tracked function/handler body -- e.g. __festina_main's own
@@ -1397,31 +1494,6 @@ class CodeGen:
                     # retained a reference nothing else will ever
                     # release otherwise.
                     self._emit_release_nested_fields_only(ref, type_.struct_type, lines)
-                elif isinstance(type_, _OwnedImage):
-                    # claude.md #92: destroys the Cairo surface and the
-                    # box holding it. Never reached for a borrowed or
-                    # escaping img; see _OwnedImage's own comment.
-                    image = self.tmp()
-                    lines.append(f"  {image} = load ptr, ptr {ref}")
-                    lines.append(f"  call void @festina_image_free(ptr {image})")
-                elif isinstance(type_, _OwnedAudio):
-                    # claude.md #101: frees the decoded PCM, the stored
-                    # source bytes and the clip itself, stopping any
-                    # channel still playing it first. Never reached for
-                    # a borrowed or escaping aud, exactly as _OwnedImage
-                    # above.
-                    clip = self.tmp()
-                    lines.append(f"  {clip} = load ptr, ptr {ref}")
-                    lines.append(f"  call void @festina_audio_free(ptr {clip})")
-                elif isinstance(type_, _OwnedRegex):
-                    # claude.md #86: a regex this scope compiled itself
-                    # and provably never shared -- regfree + free, via
-                    # the same helper #85 already uses for a regex
-                    # temporary. Never reached for a /pattern/ literal
-                    # or an escaping binding; see _OwnedRegex's comment.
-                    compiled = self.tmp()
-                    lines.append(f"  {compiled} = load ptr, ptr {ref}")
-                    lines.append(f"  call void @festina_regex_free(ptr {compiled})")
                 elif isinstance(type_, _StackArrayOrMap):
                     # claude.md #79: a stack-allocated arr[T]/map[T]
                     # local (see _emit_block's own tracking comment) --
@@ -1517,12 +1589,17 @@ class CodeGen:
         one whole-function-scoped name set (a name's escaping-ness is a
         property of the whole enclosing function, not of whichever block
         it happens to be declared in -- see escape_analysis.py's own
-        module docstring). Reset back to None afterward: Festina has no
-        nested function declarations reaching codegen (a FuncDecl only
-        ever exists at a whole program's top level -- see _toplevel), so
-        this never needs to be a stack the way _active_free_locals and
-        _loop_targets are, just a single value cleared between one
-        function/handler's emission and the next.
+        module docstring). claude.md #140: restored to whatever it held
+        before (not unconditionally reset to None) afterward -- a nested
+        FuncDecl inside decl's own body (see _emit_stmt's own FuncDecl
+        branch) re-enters this method recursively one level deeper,
+        while decl's own body is still being walked, so a bare reset
+        would clobber decl's own tracking for everything left to emit
+        after that nested declaration's position. Save/restore around
+        the recursive call, using each call's own local `escaping`
+        parameter, makes this correctly reentrant to however deep
+        nesting goes with no separate explicit stack needed the way
+        _active_free_locals and _loop_targets each keep one.
 
         claude.md #74 stage 2 (interprocedural): passes self.
         escaping_params into find_escaping_names so a Call argument
@@ -1550,12 +1627,29 @@ class CodeGen:
         before its own parameter-binding loop runs -- see
         _emit_param_bindings' own comment for why binding needs it
         before this method would otherwise compute it), not
-        recomputed here -- this method just applies it."""
+        recomputed here -- this method just applies it.
+
+        claude.md #140: SAVES and RESTORES self._current_escaping_names
+        (rather than unconditionally resetting it to None afterward) --
+        a nested FuncDecl reachable from decl's own body (see
+        _emit_stmt's own FuncDecl branch) re-enters this exact method
+        recursively, one level deeper, before decl's own body is fully
+        walked. A bare reset-to-None would clobber decl's own tracking
+        for every statement still left to emit after that nested
+        declaration's position, silently turning tracked-and-safe-to-
+        free locals back into leaks for the rest of decl's own body.
+        Restoring the PREVIOUS value instead (None at the outermost
+        level, decl's own `escaping` one level inside a function nested
+        inside decl, and so on for however deep nesting goes) makes
+        this correctly reentrant with no separate explicit stack
+        needed -- each call's own local `escaping` parameter and the
+        Python call stack itself already are one."""
+        saved_escaping_names = self._current_escaping_names
         self._current_escaping_names = escaping
         try:
             block = self._emit_block(decl.body, body_env, return_type, body_lines)
         finally:
-            self._current_escaping_names = None
+            self._current_escaping_names = saved_escaping_names
         if isinstance(decl, ast.FuncDecl):
             self.escaping_params[decl.name] = {
                 i for i, p in enumerate(decl.params) if p.name in escaping
@@ -1614,8 +1708,12 @@ class CodeGen:
             slot = f"%{p.name}"
             body_lines.append(f"  {slot} = alloca {_llvm_type(t)}")
             arg_ref = f"%arg.{p.name}"
-            if p.name in escaping and isinstance(
-                    t, (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)):
+            if p.name in escaping and _is_refcounted(t):
+                # claude.md #118: _is_refcounted rather than the
+                # struct/arr/map tuple, so a blob/img/aud/regex
+                # parameter that escapes (is reassigned, say) carries
+                # its own +1 here too -- otherwise the reassignment's
+                # release would drop a reference the CALLER still owns.
                 body_lines.append(f"  call void @festina_retain(ptr {arg_ref})")
                 self._active_free_locals[-1].append((slot, t))
             elif p.name in escaping and t == TEXT:
@@ -1627,11 +1725,68 @@ class CodeGen:
             body_env.define(p.name, slot, t)
         return escaping
 
-    def _emit_func(self, decl):
+    def _register_func_signature(self, decl):
+        """claude.md #140: registers decl's NAME and SIGNATURE only --
+        self.func_decls (what _emit_call looks a callee's own arg/return
+        types up from) and self.global_env (what an Identifier reference
+        to the function resolves to) -- with no body emitted yet. Called
+        once per FuncDecl, for every one reachable anywhere in the whole
+        program, from _register_all_func_signatures' own pre-pass in
+        generate(), BEFORE any code that might call it is emitted --
+        this is what makes a function's declaration ORDER stop
+        mattering (hoisting), the code-generation half of what
+        semantic.py's own register_func_signature/analyze_func split
+        already does for type-checking."""
         return_type = None if decl.return_type == "void" else self._resolve(decl.return_type, decl)
         self.func_decls[decl.name] = decl
         self.global_env.define(decl.name, f"@{decl.name}", return_type)
 
+    def _register_all_func_signatures(self, stmts):
+        """claude.md #140: recursively finds every ast.FuncDecl reachable
+        from `stmts` -- inside a Block, either arm of an IfStmt, a
+        While/ForStmt body, an EventHandler body, or even another
+        FuncDecl's own body (a function nested inside a function, which
+        semantic.py's analyze_func already treats as an ordinary global
+        declaration regardless of nesting -- see its own comment) -- and
+        registers each one's signature before generate()'s real emission
+        pass ever starts. This traversal shape must stay in lockstep
+        with _emit_stmt's own recursive descent (the shapes visitable
+        with a FuncDecl inside them are exactly what analyze_statement/
+        analyze_block descend into in semantic.py, and what _emit_stmt/
+        _emit_if/_emit_while/_emit_for descend into here) -- if a new
+        statement kind ever grows a nested body, both need to learn about
+        it together, or a FuncDecl inside it would be reachable at
+        analysis time (semantic.py's own mirror-image walker already
+        found it) but silently skipped here, leaving self.func_decls
+        without an entry _emit_call would then crash looking up."""
+        for stmt in stmts:
+            if isinstance(stmt, ast.FuncDecl):
+                self._register_func_signature(stmt)
+                self._register_all_func_signatures(stmt.body.body)
+            elif isinstance(stmt, ast.EventHandler):
+                self._register_all_func_signatures(stmt.body.body)
+            elif isinstance(stmt, ast.Block):
+                self._register_all_func_signatures(stmt.body)
+            elif isinstance(stmt, ast.IfStmt):
+                self._register_all_func_signatures(stmt.then.body)
+                if isinstance(stmt.orelse, ast.IfStmt):
+                    self._register_all_func_signatures([stmt.orelse])
+                elif stmt.orelse is not None:
+                    self._register_all_func_signatures(stmt.orelse.body)
+            elif isinstance(stmt, (ast.WhileStmt, ast.ForStmt)):
+                self._register_all_func_signatures(stmt.body.body)
+
+    def _emit_func(self, decl):
+        # claude.md #140: signature already registered by generate()'s
+        # own pre-pass (_register_all_func_signatures) before this ever
+        # runs -- re-resolving return_type here is cheap and side-effect
+        # free (resolve_type_name is a pure function of self.structs/
+        # self.tables, neither of which changes mid-compile), simpler
+        # than threading the already-resolved type back out of
+        # self.func_decls (which stores the raw ast.FuncDecl, not its
+        # resolved return type) into this still fully self-contained
+        # function.
+        return_type = None if decl.return_type == "void" else self._resolve(decl.return_type, decl)
         param_types = [self._resolve(p.type_expr, decl) for p in decl.params]
         llvm_ret = "void" if return_type is None else _llvm_type(return_type)
         params_ir = ", ".join(f"{_llvm_type(t)} %arg.{p.name}" for t, p in zip(param_types, decl.params))
@@ -1647,9 +1802,29 @@ class CodeGen:
         # after decl's own body is fully emitted, one level below the
         # body's own frame(s) (_emit_block pushes/pops its own,
         # separately) so a Return anywhere inside frees both via the
-        # same _emit_free_active_locals(down_to=0) call it already
-        # makes -- see _emit_param_bindings' own comment for why this
-        # exists at all.
+        # same _emit_free_active_locals(down_to=self._current_func_frame_base)
+        # call it already makes -- see _emit_param_bindings' own comment
+        # for why this exists at all.
+        #
+        # claude.md #140: self._current_func_frame_base is saved and
+        # restored around this push/pop (not just pushed/popped itself)
+        # -- a nested FuncDecl inside decl's own body (see _emit_stmt's
+        # own FuncDecl branch) re-enters THIS SAME _emit_func recursively
+        # one level deeper, while decl's own frame(s) are still open
+        # beneath it on the identical shared self._active_free_locals
+        # stack. Capturing the base index here, right before this
+        # function's own outermost frame is pushed, is what lets Return
+        # (inside decl's own body, OR inside a nested function's) free
+        # exactly its own frames and stop there -- see
+        # self._current_func_frame_base's own comment for the bug this
+        # fixes, confirmed with a real Xvfb-free repro (a struct/text/
+        # array/map local declared before a nested FuncDecl, in the
+        # SAME enclosing function, produced an LLVM verifier error
+        # ("use of undefined value") before this fix -- the nested
+        # function's own trivial `return` was freeing the ENCLOSING
+        # function's still-live locals, not just its own empty frame).
+        saved_func_frame_base = self._current_func_frame_base
+        self._current_func_frame_base = len(self._active_free_locals)
         self._active_free_locals.append([])
         escaping = self._emit_param_bindings(decl, param_types, body_env, body_lines)
 
@@ -1677,6 +1852,7 @@ class CodeGen:
             else:
                 block["lines"].append(f"  ret {_llvm_type(return_type)} {self._zero_value(return_type)}")
         self._active_free_locals.pop()
+        self._current_func_frame_base = saved_func_frame_base
 
         func = [f"define {llvm_ret} @{decl.name}({params_ir}) {{"]
         func.extend(block["lines"])
@@ -1698,9 +1874,14 @@ class CodeGen:
         sources this runtime actually generates (claude.md #40's own
         examples; semantic.py's _EVENT_SIGNATURES enforces the fixed
         signature each one needs, matching the runtime's fixed function
-        pointer type for it). Any other declared name still compiles (so
-        a typo/bug in its body is still caught) but is simply dead code:
-        nothing ever calls it."""
+        pointer type for it). claude.md #131: `exit` is a seventh
+        recognized name, but not a graphics event -- it fires from the
+        close(code) builtin (see _emit_call's own "close" branch),
+        which works with or without a window, so its registration is
+        unconditional in _emit_main_and_entry rather than joining the
+        other six's graphics-gated loop. Any OTHER declared name still
+        compiles (so a typo/bug in its body is still caught) but is
+        simply dead code: nothing ever calls it."""
         symbol = f"@__festina_on_{decl.name}"
         param_types = [self._resolve(p.type_expr, decl) for p in decl.params]
         params_ir = ", ".join(f"{_llvm_type(t)} %arg.{p.name}" for t, p in zip(param_types, decl.params))
@@ -1731,6 +1912,12 @@ class CodeGen:
                           "resize", "close"):
             self.uses_graphics = True
             self.event_handlers[decl.name] = symbol
+        elif decl.name == "exit":
+            # claude.md #131: NOT a graphics event -- registered
+            # unconditionally in main() below, so this deliberately does
+            # not set self.uses_graphics or join event_handlers (whose
+            # own registration loop is graphics-gated).
+            self.exit_handler_symbol = symbol
 
     # ---- statements ----
     def _emit_free(self, stmt, env, lines):
@@ -1746,22 +1933,19 @@ class CodeGen:
         reading x afterwards reads null, the ordinary absent value.
 
         Per type:
-        - struct/arr[T]/map[T]/blob: a refcount DECREMENT, not a forced
-          free -- an aliased value survives until its other references
-          drop, which is the "retains pointers if they have a pointer
-          elsewhere" guarantee. Freeing an array releases each element
-          the same way, so a shared element outlives its array.
+        - struct/arr[T]/map[T]/blob/img/aud/regex: a refcount
+          DECREMENT, not a forced free -- an aliased value survives
+          until its other references drop, which is the "retains
+          pointers if they have a pointer elsewhere" guarantee.
+          Freeing an array releases each element the same way, so a
+          shared element outlives its array. (claude.md #118: img/aud
+          used to be the exception here -- freed outright, alias left
+          dangling -- and regex needed a runtime flag to protect the
+          literal cache; the refcount header retired both special
+          cases. A /pattern/ literal's cached compilation is immortal,
+          so `free` on a binding aliasing one is a safe no-op.)
         - text: the buffer is exclusively owned (copy-on-alias,
           claude.md #83), so freed outright.
-        - img/aud: freed outright -- these have no refcount (see
-          todo.md), which is exactly why `free` matters most here: it is
-          the manual escape hatch for the escaping-handle leak. The
-          contract is the C one: freeing a handle another binding still
-          aliases leaves that alias dangling. The binding freed here
-          reads null; an ALIAS does not.
-        - regex: freed if it was a runtime regex() result; a /pattern/
-          literal's cached compilation marks itself and
-          festina_regex_free no-ops on it, so `free` is safe on either.
         - a query row: nulled WITHOUT freeing -- the row is owned by the
           array it came from, and freeing it here would double-free at
           the array's own release. Free the array.
@@ -1781,14 +1965,6 @@ class CodeGen:
                 lines.append(f"  call void {self._release_fn_for(ttype)}(ptr {old})")
             elif ttype == TEXT:
                 lines.append(f"  call void @free(ptr {old})")
-            elif isinstance(ttype, types_mod.ImageType):
-                self.uses_graphics_code = True
-                lines.append(f"  call void @festina_image_free(ptr {old})")
-            elif isinstance(ttype, types_mod.AudioType):
-                self.uses_audio = True
-                lines.append(f"  call void @festina_audio_free(ptr {old})")
-            elif ttype == REGEX:
-                lines.append(f"  call void @festina_regex_free(ptr {old})")
             # TableType (a borrowed query row) and any other ptr-backed
             # value: nothing released, only the binding dropped.
             lines.append(f"  store ptr null, ptr {ref}")
@@ -1846,24 +2022,25 @@ class CodeGen:
         # Release what the field holds before nulling it -- the same
         # per-type dispatch a field REASSIGNMENT already performs, since
         # delete is a reassignment to null with one extra effect.
+        #
+        # claude.md #120: the null is stored BEFORE the old value is
+        # released -- a cycle trial run by the release must never see
+        # this field still pointing at the value whose count it just
+        # dropped (see _emit_assign's store-before-release comment).
         old = None
         if _llvm_type(ftype) == "ptr":
             old = self.tmp()
             lines.append(f"  {old} = load ptr, ptr {ptr}")
-        if _is_refcounted(ftype):
-            lines.append(f"  call void {self._release_fn_for(ftype)}(ptr {old})")
-        elif ftype == TEXT:
-            lines.append(f"  call void @free(ptr {old})")
-        elif isinstance(ftype, types_mod.ImageType):
-            self.uses_graphics_code = True
-            lines.append(f"  call void @festina_image_free(ptr {old})")
-        elif isinstance(ftype, types_mod.AudioType):
-            self.uses_audio = True
-            lines.append(f"  call void @festina_audio_free(ptr {old})")
         f_llvm = _llvm_type(ftype)
         null_const = {"ptr": "null", "i64": INT_NULL_CONST,
                       "double": FLOAT_NULL_CONST, "i8": BOOL_NULL_CONST}[f_llvm]
         lines.append(f"  store {f_llvm} {null_const}, ptr {ptr}")
+        if _is_refcounted(ftype):
+            # claude.md #118: covers img/aud fields too now -- one
+            # release dispatch, no media special case left.
+            lines.append(f"  call void {self._release_fn_for(ftype)}(ptr {old})")
+        elif ftype == TEXT:
+            lines.append(f"  call void @free(ptr {old})")
 
         if isinstance(obj_type, types_mod.TableType):
             # claude.md #111: clear the presence bit, so undefined()
@@ -2009,7 +2186,8 @@ class CodeGen:
                                 # comment.
                                 self._active_free_locals[-1].append(
                                     (ref, _StackStructFieldsOnly(type_)))
-                        elif type_ == BLOB:
+                        elif type_ == BLOB or type_ == REGEX or isinstance(
+                                type_, (types_mod.ImageType, types_mod.AudioType)):
                             # claude.md #109: a blob local is ALWAYS
                             # scheduled for release, with no
                             # escaping-ness test and no
@@ -2029,55 +2207,19 @@ class CodeGen:
                             # point of #109's "if a blob = another
                             # blob, copy the reference".
                             #
-                            # This is why blob is refcounted where img
-                            # and aud are merely owned-or-leaked: those
-                            # two have no way to express sharing, so
-                            # they need to PROVE sole ownership before
-                            # freeing. A blob just counts.
+                            # claude.md #118: img/aud/regex carry the
+                            # same header now, so the ownership proofs
+                            # this branch used to demand for them
+                            # (_OwnedImage/_OwnedAudio/_OwnedRegex's
+                            # created-here + never-escaping tests) are
+                            # gone along with those marker classes:
+                            # counting replaced proving, for exactly the
+                            # reason blob's own comment above gives. An
+                            # escaping handle no longer leaks, and a
+                            # /re/ literal's immortal header makes its
+                            # release here a no-op rather than a
+                            # use-after-free hazard.
                             self._active_free_locals[-1].append((ref, type_))
-                        elif isinstance(type_, types_mod.ImageType):
-                            # claude.md #92: same two-part ownership test
-                            # #86 uses for regex -- created here (a Call:
-                            # loadImage or clip) and provably never
-                            # escaping. See _OwnedImage's own comment.
-                            #
-                            # claude.md #101: `img sprite = 'path.png'`
-                            # counts as "created here" too. It compiles
-                            # to a real festina_load_image call (see
-                            # _coerce), so the value is exactly as fresh
-                            # and unshared as loadImage()'s -- but the
-                            # AST node is a StringLit, so testing for a
-                            # Call alone silently stopped reclaiming
-                            # these the moment the short form existed.
-                            # Confirmed under LeakSanitizer: one handle
-                            # per loop iteration.
-                            if (self._is_owning_media_source(stmt.init)
-                                    and stmt.name not in self._current_escaping_names):
-                                self._active_free_locals[-1].append((ref, _OwnedImage()))
-                        elif isinstance(type_, types_mod.AudioType):
-                            # claude.md #101: `aud` gets the reclamation
-                            # `img` has had since #92 -- the two are the
-                            # same shape of handle and there was never a
-                            # reason for one to be freed and the other
-                            # not. Same two-part test.
-                            if (self._is_owning_media_source(stmt.init)
-                                    and stmt.name not in self._current_escaping_names):
-                                self._active_free_locals[-1].append((ref, _OwnedAudio()))
-                        elif type_ == REGEX:
-                            # claude.md #86: only a regex this scope
-                            # compiled itself (a `regex(...)` Call, so
-                            # freshly allocated and unshared) and that
-                            # escape analysis proves never leaves this
-                            # function is freed here. A /pattern/
-                            # literal initializer is a process-lifetime
-                            # cached pointer that must never be freed,
-                            # and an escaping regex has no copy-on-alias
-                            # escape hatch the way text does -- both are
-                            # left to leak, exactly as before. See
-                            # _OwnedRegex's own comment.
-                            if (isinstance(stmt.init, ast.Call)
-                                    and stmt.name not in self._current_escaping_names):
-                                self._active_free_locals[-1].append((ref, _OwnedRegex()))
                         elif type_ == TEXT:
                             # claude.md #83: unlike the other three
                             # types, a text local is ALWAYS scheduled
@@ -2110,7 +2252,8 @@ class CodeGen:
         lines = ctx["lines"]
         if isinstance(stmt, ast.VarDecl):
             type_ = self._resolve(stmt.type_expr, stmt)
-            if type_ == BLOB:
+            if type_ == BLOB or type_ == REGEX or isinstance(
+                    type_, (types_mod.ImageType, types_mod.AudioType)):
                 # claude.md #109: `blob save = 'save.dat'` reads the file
                 # and hands back a fresh handle with a refcount of 1;
                 # `blob other = save` aliases the same handle and needs
@@ -2122,6 +2265,15 @@ class CodeGen:
                 # festina_blob_open call, which is as fresh as any other
                 # call result, so `vtype == TEXT` before coercion IS the
                 # freshness test.
+                #
+                # claude.md #118: img/aud/regex take this exact branch
+                # now that they carry the same header -- `img s =
+                # 'x.png'` is the same coercion shape as the blob path
+                # form, `img b = a` is the same alias-needs-a-retain
+                # shape, and a /re/ literal initializer is immortal, so
+                # the retain the freshness test emits for it, or skips,
+                # is a no-op either way (it is classified fresh, so it
+                # is skipped -- see _refcounted_source_is_fresh).
                 uid = self._unique()
                 slot = f"%{stmt.name}.{uid}"
                 lines.append(f"  {slot} = alloca ptr")
@@ -2403,7 +2555,7 @@ class CodeGen:
             # Identifier, a Member read, ...) never allocates anything of
             # its own to begin with, so there is nothing to release.
             if (_is_refcounted(vtype)
-                    and isinstance(stmt.expr, (ast.Call, ast.ArrayLit, ast.MapLit))):
+                    and self._is_owning_refcounted_source(stmt.expr)):
                 # claude.md #78/#79: through _release_fn_for (which
                 # dispatches to _release_fn_for_struct for a struct, so
                 # a discarded struct-typed call result with its own
@@ -2415,7 +2567,7 @@ class CodeGen:
                 # "owning" a source as a Call is, and just as
                 # unambiguously this statement's own sole reference.
                 lines.append(f"  call void {self._release_fn_for(vtype)}(ptr {val})")
-            elif vtype == TEXT and isinstance(stmt.expr, (ast.Call, ast.TemplateLit)):
+            elif vtype == TEXT and self._is_owning_text_source(stmt.expr):
                 # claude.md #83: the text counterpart just above -- a
                 # discarded text-returning call/template result is,
                 # by the identical "owning" reasoning, provably this
@@ -2436,7 +2588,13 @@ class CodeGen:
             if stmt.value is None or return_type is None:
                 if stmt.value is not None:
                     self._emit_expr(stmt.value, env, lines)  # side effects only
-                self._emit_free_active_locals(lines)
+                # claude.md #140: down_to=self._current_func_frame_base,
+                # not the implicit default of 0 -- see that field's own
+                # comment. A bare 0 here frees every frame on the shared
+                # stack, including an ENCLOSING function's still-live
+                # locals whenever this Return is inside a nested
+                # FuncDecl's own body.
+                self._emit_free_active_locals(lines, down_to=self._current_func_frame_base)
                 lines.append("  ret void")
             else:
                 val, vtype = self._emit_value_for(stmt.value, env, lines, return_type)
@@ -2464,8 +2622,14 @@ class CodeGen:
                 # too, the identical rule -- retain always being the
                 # same generic @festina_retain regardless of type is
                 # exactly what makes this one check cover all three.
+                # claude.md #118: through _refcounted_source_is_fresh
+                # rather than _is_owning_refcounted_source directly, so
+                # `return 'x.png'` in an img/aud/blob function -- where
+                # _coerce just emitted the load call, a fresh +1 --
+                # is not retained a second time.
                 if (_is_refcounted(return_type)
-                        and not self._is_owning_refcounted_source(stmt.value)):
+                        and not self._refcounted_source_is_fresh(
+                            stmt.value, vtype, return_type)):
                     lines.append(f"  call void @festina_retain(ptr {val})")
                 elif return_type == TEXT and not self._is_owning_text_source(stmt.value):
                     # claude.md #83: the text counterpart just above --
@@ -2479,7 +2643,10 @@ class CodeGen:
                     owned = self.tmp()
                     lines.append(f"  {owned} = call ptr @festina_text_own(ptr {val})")
                     val = owned
-                self._emit_free_active_locals(lines)
+                # claude.md #140: see the identical note on the other
+                # Return branch just above -- down_to=self.
+                # _current_func_frame_base, not an implicit 0.
+                self._emit_free_active_locals(lines, down_to=self._current_func_frame_base)
                 lines.append(f"  ret {_llvm_type(return_type)} {val}")
             ctx["terminated"] = True
             return
@@ -2538,6 +2705,21 @@ class CodeGen:
         if isinstance(stmt, ast.Block):
             inner = self._emit_block(stmt, env, return_type, lines)
             ctx["terminated"] = inner["terminated"]
+            return
+        if isinstance(stmt, ast.FuncDecl):
+            # claude.md #140: a FuncDecl nested inside an if/while/for/
+            # another function's body -- semantic.py's analyze_func
+            # already treats one exactly like a top-level declaration
+            # regardless of nesting (always global, see its own
+            # comment), so this emits the identical top-level LLVM
+            # function definition _emit_func always has (into
+            # self.func_defs, unconditionally, once, via generate()'s
+            # own pre-pass having already registered its signature) --
+            # its own textual position in `lines` gets nothing at all,
+            # the same "this position does nothing at runtime, hoisting
+            # already made the function exist" semantics a JS function
+            # declaration statement has.
+            self._emit_func(stmt)
             return
         raise CodegenError(f"cannot generate code for statement {type(stmt).__name__}",
                             file=self.filename, line=getattr(stmt, "line", 0),
@@ -2767,6 +2949,27 @@ class CodeGen:
             return out, REGEX
         if isinstance(expr, ast.TemplateLit):
             return self._emit_template(expr, env, lines), TEXT
+        if isinstance(expr, ast.ArrowFuncExpr):
+            # claude.md #142: semantic.py's own ArrowFuncExpr handling
+            # already built and fully analyzed `expr.decl` (a
+            # synthesized, uniquely-named ast.FuncDecl) and stashed it
+            # on this SAME AST node -- codegen re-walks the identical
+            # object (see festina/cli.py's compile_file), so this reads
+            # it back directly rather than re-synthesizing an
+            # independent name. Registered and emitted HERE, once
+            # (guarded by self.func_decls, the same "already emitted?"
+            # check every other synthesized-function site in this file
+            # already uses), rather than through generate()'s own
+            # whole-program pre-pass -- an arrow function has no name
+            # anything could forward-reference, so it only ever needs
+            # to exist by the time this expression itself is emitted.
+            decl = expr.decl
+            if decl.name not in self.func_decls:
+                self._register_func_signature(decl)
+                self._emit_func(decl)
+            param_types = tuple(self._resolve(p.type_expr, decl) for p in decl.params)
+            ret_type = None if decl.return_type == "void" else self._resolve(decl.return_type, decl)
+            return f"@{decl.name}", types_mod.FuncType(param_types, ret_type)
         if isinstance(expr, ast.Identifier):
             # claude.md #39: clientWidth/clientHeight -- a bare
             # identifier, not a Call, so this can't go through the usual
@@ -2788,10 +2991,44 @@ class CodeGen:
                 out = self.tmp()
                 lines.append(f"  {out} = call i64 @{fn}()")
                 return out, INT
+            # claude.md #139: screenWidth/screenHeight -- the PHYSICAL
+            # display's resolution, unlike clientWidth/clientHeight's
+            # in-memory canvas size. This genuinely cannot be answered
+            # without a live connection to the display server (there is
+            # no "headless" answer to "how big is the screen"), so
+            # unlike clientWidth/clientHeight this sets uses_graphics_
+            # CODE only (link the graphics backend) rather than the
+            # stronger uses_graphics (which would force a window open
+            # and block in the event loop afterward) -- the connect/
+            # query/disconnect-if-newly-opened dance happens entirely
+            # inside festina_screen_width/_height themselves, invisible
+            # here, the same "only pay for what you use" split
+            # loadImage()/img-from-path already established for
+            # graphics code that needs no window.
+            if expr.name in ("screenWidth", "screenHeight"):
+                self.uses_graphics_code = True
+                fn = "festina_screen_width" if expr.name == "screenWidth" else "festina_screen_height"
+                out = self.tmp()
+                lines.append(f"  {out} = call i64 @{fn}()")
+                return out, INT
             if expr.name in self.func_decls:
-                raise CodegenError("functions are not first-class values yet "
-                                    f"(found bare reference to '{expr.name}')",
-                                    file=self.filename, line=expr.line, column=expr.column)
+                # claude.md #141: a bare reference to a function's own
+                # NAME, not immediately called -- the function's own
+                # global symbol (@name) IS its first-class VALUE, no
+                # separate "address-of" step needed the way a local
+                # variable's own storage would need a load: LLVM already
+                # treats a function symbol as a plain `ptr` constant.
+                # Mirrors semantic.py's own infer() special-case for
+                # ast.Identifier -- same "build the FuncType fresh from
+                # the FuncDecl every time" choice, for the identical
+                # reason (self.func_decls stores raw AST, not a cached
+                # resolved signature, and _register_func_signature
+                # already proved this resolve() is cheap and repeatable).
+                decl = self.func_decls[expr.name]
+                param_types = tuple(self._resolve(p.type_expr, decl) for p in decl.params)
+                ret_type = (None if decl.return_type == "void"
+                            else self._resolve(decl.return_type, decl))
+                return f"@{expr.name}", types_mod.FuncType(param_types, ret_type)
             found = env.lookup(expr.name)
             if found is None:
                 raise CodegenError(f"unknown variable '{expr.name}'",
@@ -2836,6 +3073,10 @@ class CodeGen:
                           else "festina_image_height")
                     out = self.tmp()
                     lines.append(f"  {out} = call i64 @{fn}(ptr {obj_val})")
+                    # claude.md #119: the int is independent of the
+                    # image, so an owning receiver (`sheet.clip(...)
+                    # .width`) is released here rather than leaked.
+                    self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
                     return out, INT
                 # A struct/table field genuinely named "width" or
                 # "height" is perfectly legal, so it still resolves the
@@ -2858,7 +3099,7 @@ class CodeGen:
                 # .length is read-only anyway (see semantic.py).
                 # claude.md #108: .length participates in the member
                 # chain too. It never did, which made
-                # _release_member_receiver_temp's own docstring wrong
+                # the receiver-release docstring wrong
                 # about `rowsFor(x).length` -- that shape does not reach
                 # _emit_member_load at all, so #102 never covered it and
                 # it leaked the whole array (measured: 2,880 bytes over
@@ -2897,7 +3138,9 @@ class CodeGen:
                     # key this expression allocated -- `m[`k${i}`]` --
                     # is finished the moment the lookup returns.
                     self._free_text_temp(expr.prop, key_val, key_type, lines)
-                    return out
+                    out = self._mint_and_release_computed(
+                        expr, out[0], obj_val, obj_type, obj_type.value, lines)
+                    return out, obj_type.value
                 if not isinstance(obj_type, types_mod.ArrayType):
                     raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",
                                         file=self.filename, line=getattr(expr, "line", 0))
@@ -2905,6 +3148,8 @@ class CodeGen:
                 ptr, elem_type = self._array_elem_ptr(obj_val, obj_type, idx_val, lines)
                 out = self.tmp()
                 lines.append(f"  {out} = load {_llvm_type(elem_type)}, ptr {ptr}")
+                out = self._mint_and_release_computed(
+                    expr, out, obj_val, obj_type, elem_type, lines)
                 return out, elem_type
             return self._emit_member_load(expr, env, lines)
         if isinstance(expr, ast.ArrayLit):
@@ -3487,10 +3732,92 @@ class CodeGen:
         start_val, _ = self._emit_expr(expr.args[0], env, lines)
         count_val, _ = self._emit_expr(expr.args[1], env, lines)
         dst = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, lines)
-        lines.append(
-            f"  call void @festina_array_splice(ptr {obj_val}, i64 {elem_size}, "
-            f"i64 {start_val}, i64 {count_val}, ptr {dst})")
+        if len(expr.args) == 3:
+            # claude.md #130: splice(start, count, insertArr) --
+            # JavaScript's splice(start, deleteCount, ...items), the
+            # variadic items spelled as one arr[T] argument since this
+            # language has no variadic parameters.
+            insert_type = types_mod.ArrayType(elem_type)
+            insert_val, insert_vtype = self._emit_value_for(expr.args[2], env, lines, insert_type)
+            insert_val = self._coerce(insert_val, insert_vtype, insert_type, lines, source_expr=expr.args[2])
+            insert_len_ptr = self.tmp()
+            lines.append(f"  {insert_len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {insert_val}, i32 0, i32 0")
+            insert_len = self.tmp()
+            lines.append(f"  {insert_len} = load i64, ptr {insert_len_ptr}")
+            insert_data_ptr = self.tmp()
+            lines.append(f"  {insert_data_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {insert_val}, i32 0, i32 1")
+            insert_data = self.tmp()
+            lines.append(f"  {insert_data} = load ptr, ptr {insert_data_ptr}")
+            lines.append(
+                f"  call void @festina_array_splice_insert(ptr {obj_val}, i64 {elem_size}, "
+                f"i64 {start_val}, i64 {count_val}, ptr {insert_data}, i64 {insert_len}, ptr {dst})")
+            # The call above may have realloc'd this array's own data
+            # buffer, so its pointer has to be reloaded AFTER the call,
+            # not reused from before it.
+            data_field_ptr = self.tmp()
+            lines.append(f"  {data_field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 1")
+            data_ptr_now = self.tmp()
+            lines.append(f"  {data_ptr_now} = load ptr, ptr {data_field_ptr}")
+            self._emit_retain_or_own_range(data_ptr_now, elem_ir, elem_type, start_val, insert_len, lines)
+            self._release_owned_receiver(expr.args[2], insert_val, insert_type, lines)
+        else:
+            lines.append(
+                f"  call void @festina_array_splice(ptr {obj_val}, i64 {elem_size}, "
+                f"i64 {start_val}, i64 {count_val}, ptr {dst})")
         return dst, types_mod.ArrayType(elem_type)
+
+    def _emit_retain_or_own_range(self, data_ptr, elem_llvm_ty, elem_type, start_val, count_val, lines):
+        """claude.md #130: splice(start, count, insertArr) copies raw
+        element BYTES from a SEPARATE array's buffer into this array's
+        buffer (festina_array_splice_insert, a plain memcpy with no
+        notion of a Festina type) -- unlike push/unshift, whose single
+        value's own source expression is examined directly
+        (_is_owning_refcounted_source), there is no single source
+        expression here to ask: the source is a whole array, read only
+        for its raw bytes, and it keeps managing its own elements'
+        lifetime independently of whatever this array now does with the
+        copies. So the newly-written range always needs its own
+        reference, unconditionally, with no freshness check possible or
+        needed: a struct/arr/map/img/aud/regex/blob element is retained
+        in place (same pointer, refcount +1), a text element is copied
+        via festina_text_own (its own pointer replaced with the fresh
+        copy, since text has no shared representation to retain), and
+        anything else (int/float/bool/color, ...) needs nothing -- the
+        raw bytes the runtime already copied are a complete, independent
+        value on their own."""
+        if not (_is_refcounted(elem_type) or elem_type == TEXT):
+            return
+        idx_slot = self.tmp()
+        lines.append(f"  {idx_slot} = alloca i64")
+        lines.append(f"  store i64 0, ptr {idx_slot}")
+        loop_cond = self.label("spliceretain.loopcond")
+        loop_body = self.label("spliceretain.loopbody")
+        loop_end = self.label("spliceretain.loopend")
+        lines.append(f"  br label %{loop_cond}")
+        lines.append(f"{loop_cond}:")
+        idx_val = self.tmp()
+        lines.append(f"  {idx_val} = load i64, ptr {idx_slot}")
+        keep_going = self.tmp()
+        lines.append(f"  {keep_going} = icmp slt i64 {idx_val}, {count_val}")
+        lines.append(f"  br i1 {keep_going}, label %{loop_body}, label %{loop_end}")
+        lines.append(f"{loop_body}:")
+        abs_idx = self.tmp()
+        lines.append(f"  {abs_idx} = add i64 {start_val}, {idx_val}")
+        elem_ptr = self.tmp()
+        lines.append(f"  {elem_ptr} = getelementptr {elem_llvm_ty}, ptr {data_ptr}, i64 {abs_idx}")
+        elem_val = self.tmp()
+        lines.append(f"  {elem_val} = load {elem_llvm_ty}, ptr {elem_ptr}")
+        if elem_type == TEXT:
+            owned = self.tmp()
+            lines.append(f"  {owned} = call ptr @festina_text_own(ptr {elem_val})")
+            lines.append(f"  store ptr {owned}, ptr {elem_ptr}")
+        else:
+            lines.append(f"  call void @festina_retain(ptr {elem_val})")
+        next_idx = self.tmp()
+        lines.append(f"  {next_idx} = add i64 {idx_val}, 1")
+        lines.append(f"  store i64 {next_idx}, ptr {idx_slot}")
+        lines.append(f"  br label %{loop_cond}")
+        lines.append(f"{loop_end}:")
 
     def _emit_array_lit(self, expr, env, lines, expected_type=None, header=None):
         # `header`, when given, is an already-allocated (and, for a
@@ -3509,14 +3836,19 @@ class CodeGen:
 
         values = []
         sources = []
+        pre_coerce_types = []   # claude.md #118: pre-coercion types, for
+                                # the freshness test below (a text path
+                                # coerced into a blob/img/aud element is
+                                # already a fresh +1)
         elem_type = expected_elem
         for e in expr.elements:
             if isinstance(e, ast.ArrayLit) and isinstance(expected_elem, types_mod.ArrayType):
                 val, vtype = self._emit_array_lit(e, env, lines, expected_elem)
             else:
                 val, vtype = self._emit_value_for(e, env, lines, expected_elem)
+            pre_coerce_types.append(vtype)
             if expected_elem is not None:
-                val = self._coerce(val, vtype, expected_elem, lines)
+                val = self._coerce(val, vtype, expected_elem, lines, source_expr=e)
                 vtype = expected_elem
             values.append(val)
             sources.append(e)
@@ -3570,7 +3902,8 @@ class CodeGen:
             for i, val in enumerate(values):
                 elem_ptr = self.tmp()
                 lines.append(f"  {elem_ptr} = getelementptr {elem_llvm_ty}, ptr {data_ptr}, i64 {i}")
-                if elem_is_refcounted and not self._is_owning_refcounted_source(sources[i]):
+                if elem_is_refcounted and not self._refcounted_source_is_fresh(
+                        sources[i], pre_coerce_types[i], elem_type):
                     lines.append(f"  call void @festina_retain(ptr {val})")
                 elif elem_type == TEXT and not self._is_owning_text_source(sources[i]):
                     owned = self.tmp()
@@ -3616,12 +3949,15 @@ class CodeGen:
             # as an empty string, same as everywhere else text does).
             key_val, _ = self._emit_value_for(key_expr, env, lines, TEXT)
             val_val, vtype = self._emit_value_for(val_expr, env, lines, expected_value)
+            pre_coerce_type = vtype   # claude.md #118: for the freshness test
             if expected_value is not None:
-                val_val = self._coerce(val_val, vtype, expected_value, lines)
+                val_val = self._coerce(val_val, vtype, expected_value, lines,
+                                       source_expr=val_expr)
                 vtype = expected_value
             value_type = value_type or vtype
             self._emit_map_set(header, value_type, key_val, val_val, val_expr, lines,
-                                key_source_expr=key_expr)
+                                key_source_expr=key_expr,
+                                value_pre_coerce_type=pre_coerce_type)
 
         if value_type is None:
             raise CodegenError(
@@ -3712,7 +4048,7 @@ class CodeGen:
         return self._i64_to_map_value(raw, value_type, lines), value_type
 
     def _emit_map_set(self, map_ptr, value_type, key_val, value_val, value_source_expr, lines,
-                       key_source_expr=None):
+                       key_source_expr=None, value_pre_coerce_type=None):
         """claude.md #72: npcHealths['npc1'] = 30 (and the equivalent
         per-entry calls a map literal builds itself out of -- see
         _emit_map_lit). Unlike a read, this needs the map's own actual
@@ -3752,6 +4088,7 @@ class CodeGen:
         lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 0")
         entries_ptr = self.tmp()
         lines.append(f"  {entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 1")
+        deferred_release = None
         if _is_refcounted(value_type):
             count_val = self.tmp()
             lines.append(f"  {count_val} = load i64, ptr {count_ptr}")
@@ -3761,9 +4098,18 @@ class CodeGen:
             lines.append(f"  {old_raw} = call i64 @festina_map_get(i64 {count_val}, ptr {entries_val}, ptr {key_val}, i64 0)")
             old_ptr = self.tmp()
             lines.append(f"  {old_ptr} = inttoptr i64 {old_raw} to ptr")
-            if not self._is_owning_refcounted_source(value_source_expr):
+            # claude.md #118: the freshness test (with the caller's
+            # pre-coercion type, when it passes one) so a text value
+            # coerced into a blob/img/aud entry is not over-retained.
+            if not self._refcounted_source_is_fresh(
+                    value_source_expr, value_pre_coerce_type, value_type):
                 lines.append(f"  call void @festina_retain(ptr {value_val})")
-            lines.append(f"  call void {self._release_fn_for(value_type)}(ptr {old_ptr})")
+            # claude.md #120: the release of the overwritten value is
+            # DEFERRED until after festina_map_set has stored the new
+            # one -- a cycle trial run by the release must never see the
+            # entry still pointing at the value whose count it just
+            # dropped (see _emit_assign's store-before-release comment).
+            deferred_release = (self._release_fn_for(value_type), old_ptr)
         elif value_type == TEXT:
             # claude.md #83: the text counterpart just above -- same
             # "look up whatever value the key currently maps to (if
@@ -3786,6 +4132,9 @@ class CodeGen:
             lines.append(f"  call void @free(ptr {old_ptr})")
         raw_val = self._map_value_to_i64(value_val, value_type, lines)
         lines.append(f"  call void @festina_map_set(ptr {count_ptr}, ptr {entries_ptr}, ptr {key_val}, i64 {raw_val})")
+        if deferred_release is not None:
+            release_fn, old_ptr = deferred_release
+            lines.append(f"  call void {release_fn}(ptr {old_ptr})")
         # claude.md #97: the key is strdup'd by festina_map_set (see its
         # own comment on why it never aliases the caller's pointer), so
         # a key the caller ALLOCATED -- `m[`s${i}`] = v`, `m[a + b] = v`
@@ -3848,7 +4197,8 @@ class CodeGen:
             # releasable depends on a type this frame cannot see yet.
             self._chain_pending.append((expr.obj, obj_val, obj_type))
             return out, ftype
-        self._release_member_chain(pending, expr.obj, obj_val, obj_type, ftype, lines)
+        out = self._release_member_chain(pending, expr.obj, obj_val, obj_type,
+                                         ftype, lines, out, chain_expr=expr)
         return out, ftype
 
     def _begin_member_chain(self, expr):
@@ -3876,60 +4226,122 @@ class CodeGen:
         self._chain_pending = saved_pending
         return pending
 
-    def _release_member_chain(self, pending, obj_expr, obj_val, obj_type, ftype, lines):
-        """Releases every call result the chain produced, innermost
-        first, if `ftype` -- the type of the value that actually escapes
-        the whole chain -- permits it. _release_member_receiver_temp
-        makes that judgement per receiver."""
-        for parked_expr, parked_val, parked_type in pending:
-            self._release_member_receiver_temp(parked_expr, parked_val, parked_type,
-                                               ftype, lines)
-        self._release_member_receiver_temp(obj_expr, obj_val, obj_type, ftype, lines)
+    def _release_member_chain(self, pending, obj_expr, obj_val, obj_type, ftype,
+                              lines, out=None, chain_expr=None):
+        """claude.md #108 released a chain's call results only when the
+        escaping value was a plain copy; claude.md #117 closes the other
+        half. A managed escaping value is RETAINED first, then the call
+        graph released -- the parent's own cascade decrements the field
+        back, netting exactly one reference, owned by this expression
+        (the widened _is_owning_refcounted_source is what hands that +1
+        to exactly one owner). A text escaping value is COPIED first
+        (festina_text_own), since text has no count to retain, then the
+        graph -- original included -- is released. In both cases the
+        thing that made #102/#108 refuse (the loaded value dying with
+        its parent) is prevented by construction rather than avoided by
+        leaking.
 
-    def _release_member_receiver_temp(self, obj_expr, obj_val, obj_type, field_type, lines):
-        """claude.md #102 (widened by claude.md #108): releases a
-        struct/arr[T]/map[T] that a CALL produced purely to read one
-        value out of, with nothing else ever referencing it --
-        `config().retries`, `makeOuter(i).inner.n`, `rowsFor(x).length`.
+        Only receivers whose emission MINTED ownership, of refcounted
+        type, are released: a Call's fresh result, or (claude.md #119)
+        a computed-index member the computed branch retained -- read
+        off _minted_values, filled before this runs. An intermediate
+        link's value (`.inner` in make().inner.n) is an alias INTO the
+        base call's graph, reached exactly once by the base's own
+        cascade -- releasing it directly too would double-free.
 
-        #102 covered only the first of those, and this docstring used to
-        claim all three. The other two did not go through here at all: a
-        chained read reaches _emit_member_load twice and neither frame
-        saw both a Call receiver and an unmanaged result, and `.length`
-        has its own branch in _emit_expr that never called this. #108
-        routes both here by deciding at the OUTERMOST link of a member
-        chain, where `field_type` is the type of the value that actually
-        escapes it -- so the parameter means "what the whole expression
-        yields", not "the field this one link loaded".
+        claude.md #119: when the escaping value is retained/copied
+        here, the CHAIN expression itself (`chain_expr`) is recorded as
+        minted, so the ownership predicates report the +1 this emission
+        just created -- previously that role fell to the syntax-only
+        Call-base walk, which computed bases made insufficient.
+        Returns the (possibly replaced) result value."""
+        receivers = list(pending) + [(obj_expr, obj_val, obj_type)]
+        call_receivers = [
+            (e, v, t) for e, v, t in receivers
+            if (isinstance(e, ast.Call) or id(e) in self._minted_values)
+            and _is_refcounted(t)
+        ]
+        if not call_receivers:
+            return out
+        if out is not None and _is_refcounted(ftype):
+            lines.append(f"  call void @festina_retain(ptr {out})")
+            if chain_expr is not None:
+                self._minted_values.add(id(chain_expr))
+        elif out is not None and ftype == TEXT:
+            owned = self.tmp()
+            lines.append(f"  {owned} = call ptr @festina_text_own(ptr {out})")
+            out = owned
+            if chain_expr is not None:
+                self._minted_values.add(id(chain_expr))
+        for _, v, t in call_receivers:
+            lines.append(f"  call void {self._release_fn_for(t)}(ptr {v})")
+        return out
 
-        claude.md #77 already releases a call result discarded as a bare
-        statement (`someFunc();`), on the reasoning that a Call's result
-        is fresh and unshared by construction so this expression is
-        provably its only reference. Reading a field off it is the same
-        situation and was simply never covered: measured under
-        LeakSanitizer at one whole struct -- header, fields and all --
-        per evaluation, which in a loop is per iteration.
+    def _mint_and_release_computed(self, expr, out, obj_val, obj_type,
+                                   elem_type, lines):
+        """claude.md #119: closes the computed-index half of #117's two
+        leftover chain leaks. `getRows()[0]`, `getMap()['k']` -- a
+        computed Member whose RECEIVER this expression owns (a Call's
+        fresh result, a literal, an owning chain, or another minted
+        computed index) used to leak the whole container: nothing ever
+        released it, because releasing it before the element escaped
+        would free the element too. Same dilemma as #117's field loads,
+        same one-instruction answer: mint the element's own ownership
+        FIRST (retain a refcounted one, copy a text one), then release
+        the container, whose element-release cascade decrements the
+        just-retained value back to a net of exactly one reference --
+        owned by this expression, recorded in _minted_values so every
+        ownership predicate downstream agrees the +1 exists.
 
-        Restricted to a result whose own type is NOT managed, and that
-        restriction is load-bearing rather than conservative. Releasing
-        the parent recursively releases whatever its struct/arr/map
-        fields point at and frees its text fields outright, so for those
-        result types the value just loaded would be freed before the
-        caller ever saw it -- trading a leak for a use-after-free. Making
-        those cases work needs a notion of an owned temporary that
-        outlives its producing expression, which this codegen does not
-        have; they keep leaking, which is at least safe, and every case
-        that yields a plain copy is now fixed."""
-        if not isinstance(obj_expr, ast.Call):
-            return
-        # claude.md #109: BLOB is admitted here too. A blob is the first
-        # refcounted type with METHODS, so it is the first that can be
-        # the receiver of a call-on-member without being a struct --
-        # `make().exists()` produces a handle purely to ask it one
-        # question. Leaving it out leaked one handle per evaluation.
+        A scalar element needs no minting (its loaded value survives
+        the container by copy), so the container is simply released. A
+        TABLE-ROW element is the one shape that still cannot be fixed
+        this way: a row has no refcount header of its own -- the array
+        owns its rows outright (#85) -- so there is nothing to retain,
+        and releasing the array would free the row out from under the
+        expression. That case deliberately keeps #117's documented
+        leak (todo.md), and stays UNRECORDED here so the predicates
+        keep treating the row as borrowed -- a text column read off it
+        is still copied at its binding, exactly as before.
+
+        Returns the (possibly replaced) element value."""
+        if not (_is_refcounted(obj_type)
+                and self._is_owning_refcounted_source(expr.obj)):
+            return out
+        if isinstance(elem_type, types_mod.TableType):
+            return out
+        if _is_refcounted(elem_type):
+            lines.append(f"  call void @festina_retain(ptr {out})")
+            self._minted_values.add(id(expr))
+        elif elem_type == TEXT:
+            owned = self.tmp()
+            lines.append(f"  {owned} = call ptr @festina_text_own(ptr {out})")
+            out = owned
+            self._minted_values.add(id(expr))
+        lines.append(f"  call void {self._release_fn_for(obj_type)}(ptr {obj_val})")
+        return out
+
+    def _release_owned_receiver(self, obj_expr, obj_val, obj_type, lines):
+        """claude.md #102/#108/#117: releases a receiver (or argument)
+        value that the current expression OWNS and is now done with -- a
+        Call's fresh result, a literal, or a call-based member chain
+        (whose +1 _release_member_chain minted). Used by every
+        method-call site whose RESULT is a fresh value rather than an
+        alias into the receiver -- join's text, toText's rendering, a
+        blob method's answer -- which is why, unlike the field-load
+        path, no result-type judgement is needed: the result never
+        points into what is being released.
+
+        claude.md #118: img/aud receivers are no longer skipped. #110
+        skipped them because freeing a call-result img could free
+        something shared (`img func get() { return shared }` hands back
+        an alias); with the refcount header, the Return path retains an
+        aliased value on the way out, so the call result always owns
+        its own +1 and releasing it here is a decrement, never a
+        premature destroy."""
         if not _is_refcounted(obj_type):
             return
-        if _is_refcounted(field_type) or field_type == TEXT:
+        if not self._is_owning_refcounted_source(obj_expr):
             return
         lines.append(f"  call void {self._release_fn_for(obj_type)}(ptr {obj_val})")
 
@@ -4170,26 +4582,44 @@ class CodeGen:
         own return value does (see _emit_array_lit/_emit_map_lit's own
         "fresh, uniquely-owned" comment), nothing else referencing it
         the instant it's produced."""
-        return isinstance(expr, (ast.Call, ast.ArrayLit, ast.MapLit))
+        if isinstance(expr, (ast.Call, ast.ArrayLit, ast.MapLit)):
+            return True
+        # claude.md #119: an expression whose own emission minted a +1
+        # -- a retained computed-index element (`getRows()[0]`), or a
+        # chain whose escaping value _release_member_chain retained --
+        # is owned by exactly the same argument a fresh Call result is.
+        # The set is filled during emission, so this can never promise
+        # a +1 the emitted IR does not contain.
+        if id(expr) in self._minted_values:
+            return True
+        # claude.md #117: a dotted chain whose base is a Call --
+        # `make().inner`, `make().inner.items` -- yields an OWNED value
+        # now: _emit_member_load retains the result before releasing
+        # the call's own graph, so the +1 transfers to whoever binds it,
+        # exactly like a Call's own return value. A chain based on a
+        # variable stays aliasing/borrowed, unchanged.
+        return self._member_chain_call_base(expr)
 
-    def _is_owning_media_source(self, expr):
-        """claude.md #92/#101: whether an img/aud local's initializer
-        produced a FRESH handle this scope owns outright.
+    def _member_chain_call_base(self, expr):
+        """claude.md #117: True for a non-computed Member chain whose
+        ultimate receiver is a Call -- the exact shape _emit_member_load
+        emits a retain (or a text copy) for. This predicate and that
+        emission MUST agree: the predicate promising ownership the load
+        never produced would drop a needed retain, and the reverse
+        would leak the one the load added.
 
-        A Call is owning -- loadImage/loadAudio, or clip() -- for the
-        same reason it is for every other type: it allocates something
-        nothing else references yet.
-
-        A StringLit (or any text-typed expression) is owning too, and
-        that case is the whole reason this is a function rather than an
-        isinstance check. `img sprite = 'sprite.png'` compiles to a real
-        load call (see _coerce), so the handle is exactly as fresh as
-        loadImage()'s -- but the AST node is not a Call, so the
-        Call-only test #92 used silently stopped reclaiming these the
-        moment claude.md #101 added the short form. A bare Identifier
-        stays non-owning: that is an alias of a handle someone else
-        owns, and freeing it would leave them dangling."""
-        return isinstance(expr, (ast.Call, ast.StringLit, ast.TemplateLit, ast.BinOp))
+        claude.md #119: a chain may also bottom out on a COMPUTED
+        member (`getRows()[0].name`). Whether that base owns its value
+        is not decidable from syntax -- a retained struct element does,
+        a borrowed table row does not -- so the answer is read off
+        _minted_values, which the computed-index emission filled before
+        this walk could ever run (the chain's own emission emits its
+        receiver first)."""
+        while isinstance(expr, ast.Member) and not expr.computed:
+            expr = expr.obj
+        if isinstance(expr, ast.Member) and expr.computed:
+            return id(expr) in self._minted_values
+        return isinstance(expr, ast.Call)
 
     def _is_owning_text_source(self, expr):
         """claude.md #83: the text counterpart to
@@ -4247,7 +4677,13 @@ class CodeGen:
         either way."""
         if isinstance(expr, ast.BinOp):
             return expr.op == "+"
-        return isinstance(expr, (ast.Call, ast.TemplateLit))
+        if isinstance(expr, (ast.Call, ast.TemplateLit)):
+            return True
+        # claude.md #117: a call-based chain ending in a text field
+        # (`make().inner.label`) hands back a COPY -- _emit_member_load
+        # runs it through festina_text_own before releasing the graph it
+        # aliased into -- so it is exactly as owned as a concat result.
+        return self._member_chain_call_base(expr)
 
     def _free_text_temp(self, source_expr, val, vtype, lines):
         """claude.md #83: frees a text value that the expression being
@@ -4285,13 +4721,13 @@ class CodeGen:
 
         The owning test is `isinstance(source_expr, ast.Call)`, which
         cleanly separates the two ways a regex value is produced: only
-        `regex(...)` is a Call, while a /pattern/ literal is an
-        ast.RegexLit compiled once into a process-lifetime cache (see
-        _emit_cached_regex_lit) that must never be freed. A regex bound
-        to a variable is an Identifier at its use sites and so is
-        likewise never freed here -- it still leaks, as it did before,
-        since regex has no binding-level ownership story the way text
-        now does (see todo.md)."""
+        `regex(...)` is a Call (whose memoized result carries this
+        expression's own +1 -- see festina_regex_compile_memo), while a
+        /pattern/ literal is an ast.RegexLit whose cached compilation
+        is immortal, so releasing it here would be a harmless no-op
+        anyway. A regex bound to a variable is an Identifier at its use
+        sites and is not released here -- its own binding's scope-exit
+        release owns that reference (claude.md #118)."""
         if vtype == REGEX and isinstance(source_expr, ast.Call):
             lines.append(f"  call void @festina_regex_free(ptr {val})")
 
@@ -4359,8 +4795,20 @@ class CodeGen:
 
         So the freshness test for a blob is whether a COERCION
         happened, which `source_type` records: text in, blob out means
-        _coerce emitted the open call itself."""
-        if target_type == BLOB and source_type == TEXT:
+        _coerce emitted the open call itself.
+
+        claude.md #118: img and aud have the identical short form
+        (`img s = 'x.png'` -> festina_load_image via _coerce), so the
+        same text-in/handle-out test covers them. A /re/ literal is
+        "fresh" too, on different grounds: its cached compilation is
+        immortal, so retain and release are both no-ops on it and the
+        cheaper answer (skip the retain) is the right one."""
+        if source_type == TEXT and (
+                target_type == BLOB
+                or isinstance(target_type, (types_mod.ImageType,
+                                            types_mod.AudioType))):
+            return True
+        if isinstance(source_expr, ast.RegexLit):
             return True
         return self._is_owning_refcounted_source(source_expr)
 
@@ -4462,6 +4910,23 @@ class CodeGen:
             # cascade wrapper, except the runtime can write this one
             # once instead of codegen generating it per type.
             return "@festina_blob_release"
+        if isinstance(type_, types_mod.ImageType):
+            # claude.md #118: same shape as blob -- release semantics
+            # with a runtime-written destructor (surface, bytes, path).
+            # uses_graphics_CODE, not uses_graphics: releasing an image
+            # needs no X server, same distinction the loading coercion
+            # already draws.
+            self.uses_graphics_code = True
+            return "@festina_image_free"
+        if isinstance(type_, types_mod.AudioType):
+            # claude.md #118: destruction stops every channel still
+            # playing the clip first -- see festina_audio_free.
+            self.uses_audio = True
+            return "@festina_audio_free"
+        if type_ == REGEX:
+            # claude.md #118: regfree on the last reference; a cached
+            # /pattern/ literal is immortal and no-ops through here.
+            return "@festina_regex_free"
         if type_ == TEXT:
             # claude.md #83: text has no refcount header to dispatch
             # through -- "releasing" one is always just a plain,
@@ -4559,6 +5024,7 @@ class CodeGen:
         # standing between the compiler and infinite recursion.
         self._struct_release_fns[type_.name] = fn_name
         struct_ty = self.struct_llvm_name(type_.name)
+        cyclic = self._is_cyclic_type(type_)
         body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
         should_free = self.tmp()
         body.append(f"  {should_free} = call i8 @festina_release_check(ptr %payload)")
@@ -4566,13 +5032,21 @@ class CodeGen:
         body.append(f"  {cond} = icmp ne i8 {should_free}, 0")
         free_label = self.label("relstruct.free")
         done_label = self.label("relstruct.done")
-        body.append(f"  br i1 {cond}, label %{free_label}, label %{done_label}")
+        # claude.md #120: a possibly-cyclic type's not-last-reference
+        # branch runs a trial deletion instead of doing nothing -- the
+        # released value may be the last EXTERNAL reference to a cycle
+        # whose internal edges hold every count above zero. Acyclic
+        # types keep the plain two-way branch and pay nothing.
+        alive_label = self.label("relstruct.alive") if cyclic else done_label
+        body.append(f"  br i1 {cond}, label %{free_label}, label %{alive_label}")
         body.append(f"{free_label}:")
         self._emit_release_struct_field_refs("%payload", type_, body)
         header = self.tmp()
         body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
         body.append(f"  call void @free(ptr {header})")
         body.append(f"  br label %{done_label}")
+        if cyclic:
+            self._emit_cycle_trial(body, type_, alive_label, done_label)
         body.append(f"{done_label}:")
         body.append("  ret void")
         body.append("}")
@@ -4678,6 +5152,7 @@ class CodeGen:
         else:
             elem_release_fn = self._release_fn_for(elem_type)
         elem_llvm_ty = _llvm_type(elem_type)
+        cyclic = self._is_cyclic_type(type_)
         body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
         should_free = self.tmp()
         body.append(f"  {should_free} = call i8 @festina_release_check(ptr %payload)")
@@ -4685,7 +5160,10 @@ class CodeGen:
         body.append(f"  {cond} = icmp ne i8 {should_free}, 0")
         free_label = self.label("relarr.free")
         done_label = self.label("relarr.done")
-        body.append(f"  br i1 {cond}, label %{free_label}, label %{done_label}")
+        # claude.md #120: same trial-on-survival branch the struct
+        # wrapper grows, for an arr[T] whose T sits on a cycle.
+        alive_label = self.label("relarr.alive") if cyclic else done_label
+        body.append(f"  br i1 {cond}, label %{free_label}, label %{alive_label}")
         body.append(f"{free_label}:")
         len_ptr = self.tmp()
         body.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr %payload, i32 0, i32 0")
@@ -4701,6 +5179,8 @@ class CodeGen:
         body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
         body.append(f"  call void @free(ptr {header})")
         body.append(f"  br label %{done_label}")
+        if cyclic:
+            self._emit_cycle_trial(body, type_, alive_label, done_label)
         body.append(f"{done_label}:")
         body.append("  ret void")
         body.append("}")
@@ -4835,6 +5315,7 @@ class CodeGen:
         fn_name = f"@__festina_release_map_{self._unique()}"
         self._map_release_fns[key] = fn_name
         trampoline_name = self._emit_map_value_release_trampoline(value_type)
+        cyclic = self._is_cyclic_type(type_)
         body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
         should_free = self.tmp()
         body.append(f"  {should_free} = call i8 @festina_release_check(ptr %payload)")
@@ -4842,7 +5323,10 @@ class CodeGen:
         body.append(f"  {cond} = icmp ne i8 {should_free}, 0")
         free_label = self.label("relmap.free")
         done_label = self.label("relmap.done")
-        body.append(f"  br i1 {cond}, label %{free_label}, label %{done_label}")
+        # claude.md #120: same trial-on-survival branch as the struct
+        # and array wrappers, for a map[T] whose T sits on a cycle.
+        alive_label = self.label("relmap.alive") if cyclic else done_label
+        body.append(f"  br i1 {cond}, label %{free_label}, label %{alive_label}")
         body.append(f"{free_label}:")
         count_ptr = self.tmp()
         body.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr %payload, i32 0, i32 0")
@@ -4858,6 +5342,8 @@ class CodeGen:
         body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
         body.append(f"  call void @free(ptr {header})")
         body.append(f"  br label %{done_label}")
+        if cyclic:
+            self._emit_cycle_trial(body, type_, alive_label, done_label)
         body.append(f"{done_label}:")
         body.append("  ret void")
         body.append("}")
@@ -4891,6 +5377,311 @@ class CodeGen:
         self.func_defs.extend(body)
         self.func_defs.append("")
         return trampoline_name
+
+    # ---- cycle collection -- claude.md #120 ----
+
+    def _is_cyclic_type(self, t):
+        """claude.md #120: whether values of `t` can participate in a
+        reference cycle -- i.e. whether `t` can reach itself through
+        managed edges (struct fields, arr elements, map values). This
+        is the single gate on all cycle-collection machinery: an
+        acyclic type's releases never run a trial and never generate a
+        traversal function, so a program with no self-referencing
+        types pays literally nothing for the collector's existence.
+        Purely a property of the declared TYPE GRAPH, so it is
+        computed once per type name and cached."""
+        if not isinstance(t, (types_mod.StructType, types_mod.ArrayType,
+                              types_mod.MapType)):
+            return False
+        key = types_mod.type_name(t)
+        cached = self._cyclic_type_cache.get(key)
+        if cached is not None:
+            return cached
+        result = False
+        seen = set()
+        frontier = list(self._managed_type_children(t))
+        while frontier:
+            child = frontier.pop()
+            ckey = types_mod.type_name(child)
+            if ckey == key:
+                result = True
+                break
+            if ckey in seen:
+                continue
+            seen.add(ckey)
+            frontier.extend(self._managed_type_children(child))
+        self._cyclic_type_cache[key] = result
+        return result
+
+    def _managed_type_children(self, t):
+        """The type-graph edges _is_cyclic_type walks: a struct's
+        struct/arr/map-typed fields, a container's element/value type
+        when it is one of those three. Leaf types (text, blob, img,
+        aud, regex, scalars) can never sit ON a cycle -- none of them
+        holds a reference to another managed value -- so they have no
+        outgoing edges here."""
+        kinds = (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)
+        if isinstance(t, types_mod.StructType):
+            return [ft for _, ft in self.struct_fields(t.name)
+                    if isinstance(ft, kinds)]
+        if isinstance(t, types_mod.ArrayType):
+            return [t.element] if isinstance(t.element, kinds) else []
+        if isinstance(t, types_mod.MapType):
+            return [t.value] if isinstance(t.value, kinds) else []
+        return []
+
+    def _cycle_fn(self, op, type_):
+        """claude.md #120: the generated per-type traversal functions
+        that drive a trial deletion -- `gray` (tentatively remove every
+        edge internal to the subgraph), `scan` (decide survival by the
+        counts that remain), `black` (restore a surviving region's
+        counts), `white` (free the garbage region) -- plus the
+        `grayedge`/`blackedge` per-element helpers container traversals
+        hand to festina_cycle_visit_array/_map. Registered before
+        generated, exactly like the release wrappers (claude.md #106's
+        load-bearing cache write), so a self-referencing type's
+        traversal calls itself instead of recursing the compiler."""
+        key = (op, types_mod.type_name(type_))
+        if key in self._cycle_fns:
+            return self._cycle_fns[key]
+        fn_name = f"@__festina_cycle_{op}_{self._unique()}"
+        self._cycle_fns[key] = fn_name
+        if op == "grayedge":
+            body = [f"define void {fn_name}(ptr %c) {{", "entry:"]
+            body.append("  call void @festina_cycle_dec(ptr %c)")
+            body.append(f"  call void {self._cycle_fn('gray', type_)}(ptr %c)")
+            body.append("  ret void")
+            body.append("}")
+            body.append("")
+        elif op == "blackedge":
+            rec_label = self.label("cyedge.rec")
+            done_label = self.label("cyedge.done")
+            nb = self.tmp()
+            cc = self.tmp()
+            body = [f"define void {fn_name}(ptr %c) {{", "entry:"]
+            body.append("  call void @festina_cycle_inc(ptr %c)")
+            body.append(f"  {nb} = call i8 @festina_cycle_needs_black(ptr %c)")
+            body.append(f"  {cc} = icmp ne i8 {nb}, 0")
+            body.append(f"  br i1 {cc}, label %{rec_label}, label %{done_label}")
+            body.append(f"{rec_label}:")
+            body.append(f"  call void {self._cycle_fn('black', type_)}(ptr %c)")
+            body.append(f"  br label %{done_label}")
+            body.append(f"{done_label}:")
+            body.append("  ret void")
+            body.append("}")
+            body.append("")
+        elif isinstance(type_, types_mod.StructType):
+            body = self._cycle_struct_body(op, type_, fn_name)
+        else:
+            body = self._cycle_container_body(op, type_, fn_name)
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _cycle_struct_children(self, type_):
+        """(index, field_type) for every field a trial traverses --
+        exactly the cyclic-typed ones. Everything else the struct owns
+        (text buffers, blobs, acyclic containers, ...) is handled by
+        `white`'s disposal instead, released through the ordinary
+        machinery, because it provably is not part of any cycle and
+        its counts were never touched by the trial."""
+        return [(i, ftype)
+                for i, (_, ftype) in enumerate(self.struct_fields(type_.name))
+                if self._is_cyclic_type(ftype)]
+
+    def _cycle_struct_body(self, op, type_, fn_name):
+        struct_ty = self.struct_llvm_name(type_.name)
+        children = self._cycle_struct_children(type_)
+
+        def load_field(body, i):
+            fptr = self.tmp()
+            body.append(f"  {fptr} = getelementptr {struct_ty}, ptr %p, i32 0, i32 {i}")
+            fval = self.tmp()
+            body.append(f"  {fval} = load ptr, ptr {fptr}")
+            return fval
+
+        body = [f"define void {fn_name}(ptr %p) {{", "entry:"]
+        if op == "gray":
+            go = self.tmp()
+            cond = self.tmp()
+            walk = self.label("cygray.walk")
+            done = self.label("cygray.done")
+            body.append(f"  {go} = call i8 @festina_cycle_begin_gray(ptr %p)")
+            body.append(f"  {cond} = icmp ne i8 {go}, 0")
+            body.append(f"  br i1 {cond}, label %{walk}, label %{done}")
+            body.append(f"{walk}:")
+            for i, ftype in children:
+                fval = load_field(body, i)
+                body.append(f"  call void @festina_cycle_dec(ptr {fval})")
+                body.append(f"  call void {self._cycle_fn('gray', ftype)}(ptr {fval})")
+            body.append(f"  br label %{done}")
+            body.append(f"{done}:")
+        elif op == "scan":
+            r = self.tmp()
+            is1 = self.tmp()
+            blackl = self.label("cyscan.black")
+            chk2 = self.label("cyscan.chk2")
+            walk = self.label("cyscan.walk")
+            done = self.label("cyscan.done")
+            body.append(f"  {r} = call i64 @festina_cycle_begin_scan(ptr %p)")
+            body.append(f"  {is1} = icmp eq i64 {r}, 1")
+            body.append(f"  br i1 {is1}, label %{blackl}, label %{chk2}")
+            body.append(f"{blackl}:")
+            body.append(f"  call void {self._cycle_fn('black', type_)}(ptr %p)")
+            body.append(f"  br label %{done}")
+            body.append(f"{chk2}:")
+            is2 = self.tmp()
+            body.append(f"  {is2} = icmp eq i64 {r}, 2")
+            body.append(f"  br i1 {is2}, label %{walk}, label %{done}")
+            body.append(f"{walk}:")
+            for i, ftype in children:
+                fval = load_field(body, i)
+                body.append(f"  call void {self._cycle_fn('scan', ftype)}(ptr {fval})")
+            body.append(f"  br label %{done}")
+            body.append(f"{done}:")
+        elif op == "black":
+            body.append("  call void @festina_cycle_set_black(ptr %p)")
+            for i, ftype in children:
+                fval = load_field(body, i)
+                body.append(f"  call void @festina_cycle_inc(ptr {fval})")
+                nb = self.tmp()
+                cc = self.tmp()
+                rec = self.label("cyblack.rec")
+                nxt = self.label("cyblack.next")
+                body.append(f"  {nb} = call i8 @festina_cycle_needs_black(ptr {fval})")
+                body.append(f"  {cc} = icmp ne i8 {nb}, 0")
+                body.append(f"  br i1 {cc}, label %{rec}, label %{nxt}")
+                body.append(f"{rec}:")
+                body.append(f"  call void {self._cycle_fn('black', ftype)}(ptr {fval})")
+                body.append(f"  br label %{nxt}")
+                body.append(f"{nxt}:")
+        else:  # white
+            go = self.tmp()
+            cond = self.tmp()
+            walk = self.label("cywhite.walk")
+            done = self.label("cywhite.done")
+            body.append(f"  {go} = call i8 @festina_cycle_begin_white(ptr %p)")
+            body.append(f"  {cond} = icmp ne i8 {go}, 0")
+            body.append(f"  br i1 {cond}, label %{walk}, label %{done}")
+            body.append(f"{walk}:")
+            for i, ftype in children:
+                fval = load_field(body, i)
+                body.append(f"  call void {self._cycle_fn('white', ftype)}(ptr {fval})")
+            # Dispose: everything the node owns that the trial did NOT
+            # traverse -- ordinary releases, whose counts the trial
+            # never altered. Cyclic children are NOT released here:
+            # markGray already removed those counts and the white
+            # recursion above frees whichever of them are garbage.
+            for i, (_, ftype) in enumerate(self.struct_fields(type_.name)):
+                if self._is_cyclic_type(ftype):
+                    continue
+                if _is_refcounted(ftype):
+                    fval = load_field(body, i)
+                    body.append(f"  call void {self._release_fn_for(ftype)}(ptr {fval})")
+                elif ftype == TEXT:
+                    fval = load_field(body, i)
+                    body.append(f"  call void @free(ptr {fval})")
+            hdr = self.tmp()
+            body.append(f"  {hdr} = getelementptr i8, ptr %p, i64 -8")
+            body.append(f"  call void @free(ptr {hdr})")
+            body.append(f"  br label %{done}")
+            body.append(f"{done}:")
+        body.append("  ret void")
+        body.append("}")
+        body.append("")
+        return body
+
+    def _cycle_container_body(self, op, type_, fn_name):
+        """arr[T]/map[T] with a cyclic T: same four operations, with
+        the per-element loop delegated to festina_cycle_visit_array/
+        _map handing each element pointer to the element type's own
+        function (or a grayedge/blackedge helper where the edge has
+        count work of its own). Disposal is the runtime's
+        festina_cycle_dispose_* -- the container's buffers and keys,
+        never its elements."""
+        is_map = isinstance(type_, types_mod.MapType)
+        elem = type_.value if is_map else type_.element
+        visit = "@festina_cycle_visit_map" if is_map else "@festina_cycle_visit_array"
+        dispose = ("@festina_cycle_dispose_map" if is_map
+                   else "@festina_cycle_dispose_array")
+        body = [f"define void {fn_name}(ptr %p) {{", "entry:"]
+        if op == "gray":
+            go = self.tmp()
+            cond = self.tmp()
+            walk = self.label("cygray.walk")
+            done = self.label("cygray.done")
+            body.append(f"  {go} = call i8 @festina_cycle_begin_gray(ptr %p)")
+            body.append(f"  {cond} = icmp ne i8 {go}, 0")
+            body.append(f"  br i1 {cond}, label %{walk}, label %{done}")
+            body.append(f"{walk}:")
+            body.append(f"  call void {visit}(ptr %p, "
+                        f"ptr {self._cycle_fn('grayedge', elem)})")
+            body.append(f"  br label %{done}")
+            body.append(f"{done}:")
+        elif op == "scan":
+            r = self.tmp()
+            is1 = self.tmp()
+            blackl = self.label("cyscan.black")
+            chk2 = self.label("cyscan.chk2")
+            walk = self.label("cyscan.walk")
+            done = self.label("cyscan.done")
+            body.append(f"  {r} = call i64 @festina_cycle_begin_scan(ptr %p)")
+            body.append(f"  {is1} = icmp eq i64 {r}, 1")
+            body.append(f"  br i1 {is1}, label %{blackl}, label %{chk2}")
+            body.append(f"{blackl}:")
+            body.append(f"  call void {self._cycle_fn('black', type_)}(ptr %p)")
+            body.append(f"  br label %{done}")
+            body.append(f"{chk2}:")
+            is2 = self.tmp()
+            body.append(f"  {is2} = icmp eq i64 {r}, 2")
+            body.append(f"  br i1 {is2}, label %{walk}, label %{done}")
+            body.append(f"{walk}:")
+            body.append(f"  call void {visit}(ptr %p, "
+                        f"ptr {self._cycle_fn('scan', elem)})")
+            body.append(f"  br label %{done}")
+            body.append(f"{done}:")
+        elif op == "black":
+            body.append("  call void @festina_cycle_set_black(ptr %p)")
+            body.append(f"  call void {visit}(ptr %p, "
+                        f"ptr {self._cycle_fn('blackedge', elem)})")
+        else:  # white
+            go = self.tmp()
+            cond = self.tmp()
+            walk = self.label("cywhite.walk")
+            done = self.label("cywhite.done")
+            body.append(f"  {go} = call i8 @festina_cycle_begin_white(ptr %p)")
+            body.append(f"  {cond} = icmp ne i8 {go}, 0")
+            body.append(f"  br i1 {cond}, label %{walk}, label %{done}")
+            body.append(f"{walk}:")
+            body.append(f"  call void {visit}(ptr %p, "
+                        f"ptr {self._cycle_fn('white', elem)})")
+            body.append(f"  call void {dispose}(ptr %p)")
+            body.append(f"  br label %{done}")
+            body.append(f"{done}:")
+        body.append("  ret void")
+        body.append("}")
+        body.append("")
+        return body
+
+    def _emit_cycle_trial(self, body, type_, alive_label, done_label):
+        """The still-referenced branch of a cyclic type's release
+        wrapper: when the released value remains at a positive count,
+        try it as a cycle root -- markGray / scan / collectWhite, the
+        classic synchronous trial. A candidate check keeps the trial
+        off null and immortal values; everything else is at worst
+        wasted work (an externally-reachable subgraph scans black and
+        comes out exactly as it went in), never corruption."""
+        body.append(f"{alive_label}:")
+        cand = self.tmp()
+        cc = self.tmp()
+        trial = self.label("reltrial.run")
+        body.append(f"  {cand} = call i8 @festina_cycle_candidate(ptr %payload)")
+        body.append(f"  {cc} = icmp ne i8 {cand}, 0")
+        body.append(f"  br i1 {cc}, label %{trial}, label %{done_label}")
+        body.append(f"{trial}:")
+        body.append(f"  call void {self._cycle_fn('gray', type_)}(ptr %payload)")
+        body.append(f"  call void {self._cycle_fn('scan', type_)}(ptr %payload)")
+        body.append(f"  call void {self._cycle_fn('white', type_)}(ptr %payload)")
+        body.append(f"  br label %{done_label}")
 
     def _emit_assign(self, expr, env, lines):
         # The target's declared type is resolved *before* the value, so an
@@ -4954,9 +5745,11 @@ class CodeGen:
                             file=self.filename, line=getattr(expr.target, "line", 0))
                     key_val, _ = self._emit_expr(expr.target.prop, env, lines)
                     val, vtype = self._emit_value_for(expr.value, env, lines, obj_type.value)
-                    val = self._coerce(val, vtype, obj_type.value, lines)
+                    val = self._coerce(val, vtype, obj_type.value, lines,
+                                       source_expr=expr.value)
                     self._emit_map_set(obj_val, obj_type.value, key_val, val, expr.value, lines,
-                                        key_source_expr=expr.target.prop)
+                                        key_source_expr=expr.target.prop,
+                                        value_pre_coerce_type=vtype)
                     return val, obj_type.value
                 if not isinstance(obj_type, types_mod.ArrayType):
                     raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",
@@ -4990,11 +5783,28 @@ class CodeGen:
                 # time computed-Member reaches this shared code with
                 # `ftype` set, it's already provably the array-element
                 # case (the map one returns earlier, above).
+                # claude.md #118: the freshness test (not the bare
+                # owning-source one) so a text initializer coerced into
+                # a blob/img/aud field -- a fresh handle from _coerce's
+                # own load call -- is not retained a second time.
+                #
+                # claude.md #120: the NEW value is stored BEFORE the old
+                # one is released -- load-retain-store-release, not
+                # load-retain-release-store. With cycle trials, a
+                # release may traverse the object graph, and a field
+                # still physically pointing at a value whose reference
+                # count this very release just removed would be
+                # double-counted by markGray -- enough to whiten (and
+                # free) a value a real external reference still holds.
+                # Storing first keeps the graph the trial walks
+                # consistent with the counts at every release.
                 old = self.tmp()
                 lines.append(f"  {old} = load ptr, ptr {ptr}")
-                if not self._is_owning_refcounted_source(expr.value):
+                if not self._refcounted_source_is_fresh(expr.value, vtype, ftype):
                     lines.append(f"  call void @festina_retain(ptr {val})")
+                lines.append(f"  store {_llvm_type(ftype)} {val}, ptr {ptr}")
                 lines.append(f"  call void {self._release_fn_for(ftype)}(ptr {old})")
+                return val, ftype
             elif ftype == TEXT:
                 # claude.md #83: the text counterpart to the block just
                 # above -- copies (via festina_text_own) rather than
@@ -5221,20 +6031,41 @@ class CodeGen:
                 lines.append(f"  {out} = zext i1 {cmp_out} to i8")
                 return out, BOOL
 
-        # claude.md #55: int and float never mix directly -- semantic.py
-        # already rejected a genuine mismatch before codegen ever runs, so
-        # reaching here with different numeric types is a compiler bug,
-        # not a user error; this is a consistency check, not a promotion
-        # (there's no implicit numeric conversion left in this codegen).
-        if left_type in (INT, FLOAT) and right_type in (INT, FLOAT) and left_type != right_type:
-            raise CodegenError(
-                f"internal error: mismatched numeric operands ({left_type!r}, {right_type!r}) "
-                "reached codegen -- semantic analysis should have rejected this",
-                file=self.filename, line=expr.line,
-            )
+        # claude.md #143: int and float now mix freely in any binary
+        # operator -- superseded claude.md #55's old "never mix
+        # directly" rule, and with it this branch's old job (rejecting
+        # a mismatch semantic.py was supposed to have already caught).
+        # A mismatched INT/FLOAT pair reaching here is now the ordinary,
+        # expected case: whichever side is INT gets an implicit sitofp
+        # (the exact same conversion instruction int.toFloat() itself
+        # emits, see just below), "as though .toFloat() had been
+        # written" -- the request's own framing for this whole feature.
+        if left_type == INT and right_type == FLOAT:
+            coerced = self.tmp()
+            lines.append(f"  {coerced} = sitofp i64 {left_val} to double")
+            left_val, left_type = coerced, FLOAT
+        elif left_type == FLOAT and right_type == INT:
+            coerced = self.tmp()
+            lines.append(f"  {coerced} = sitofp i64 {right_val} to double")
+            right_val, right_type = coerced, FLOAT
         use_float = left_type == FLOAT
 
-        if expr.op in ("/", "%"):
+        if expr.op == "/":
+            # claude.md #143: division always returns float, even for
+            # two ints -- coerce BOTH operands to float unconditionally
+            # (the mixing coercion just above only fires when the two
+            # operand types actually differ, which two ints never do)
+            # before handing off to the identical _emit_divmod every
+            # other float division already goes through.
+            if not use_float:
+                left_coerced = self.tmp()
+                lines.append(f"  {left_coerced} = sitofp i64 {left_val} to double")
+                right_coerced = self.tmp()
+                lines.append(f"  {right_coerced} = sitofp i64 {right_val} to double")
+                left_val, right_val = left_coerced, right_coerced
+            out = self._emit_divmod(expr.op, left_val, right_val, True, lines)
+            return out, FLOAT
+        if expr.op == "%":
             out = self._emit_divmod(expr.op, left_val, right_val, use_float, lines)
             return out, (FLOAT if use_float else INT)
 
@@ -5352,8 +6183,7 @@ class CodeGen:
                     rendered = self._to_text(val, vtype, lines)
                     lines.append(f"  call void @festina_log_text(ptr {rendered})")
                     lines.append(f"  call void @free(ptr {rendered})")
-                    self._release_member_receiver_temp(expr.args[0], val, vtype,
-                                                       INT, lines)
+                    self._release_owned_receiver(expr.args[0], val, vtype, lines)
                     return "0", None
                 if vtype == BLOB:
                     # claude.md #115: log(blob) prints the contents,
@@ -5362,8 +6192,7 @@ class CodeGen:
                     rendered = self._to_text(val, vtype, lines)
                     lines.append(f"  call void @festina_log_text(ptr {rendered})")
                     lines.append(f"  call void @free(ptr {rendered})")
-                    self._release_member_receiver_temp(expr.args[0], val, vtype,
-                                                       INT, lines)
+                    self._release_owned_receiver(expr.args[0], val, vtype, lines)
                     return "0", None
                 if isinstance(vtype, (types_mod.ImageType, types_mod.AudioType)):
                     raise CodegenError(
@@ -5386,6 +6215,16 @@ class CodeGen:
                 text_val = self._to_text(val, vtype, lines)
                 lines.append(f"  call void @festina_fail(ptr {text_val})")
                 return "0", None
+            if name == "close":
+                # claude.md #131: exits the program with `code`, running
+                # a declared `on exit(code:int)` handler first --
+                # festina_program_exit does both (see festina_runtime.c),
+                # since the registered handler (if any) is a runtime
+                # concern, not something codegen calls directly here.
+                val, vtype = self._emit_expr(expr.args[0], env, lines)
+                val = self._coerce(val, vtype, INT, lines, source_expr=expr.args[0])
+                lines.append(f"  call void @festina_program_exit(i64 {val})")
+                return "0", None
             # claude.md #93: files, time and canvas export. Each frees
             # any text temporary it was handed once the call returns --
             # none of these runtime functions keeps a pointer past it
@@ -5396,9 +6235,18 @@ class CodeGen:
             # itself (see _emit_blob_method). The C helpers they called
             # are unchanged and still do the work -- what went away is
             # the free-function spelling, not the capability.
+            # claude.md #132: mkdir()/ls() are the identical "one text
+            # arg, one runtime call" shape formatTime/saveCanvas already
+            # are -- mkdir answers bool (claude.md #93's own "a program
+            # tests for this, it doesn't stop the program" rule, same as
+            # a blob's write/append/delete), ls answers a fresh arr[text]
+            # (festina_ls builds it exactly like festina_text_split
+            # does -- see that function's own comment in
+            # festina_runtime.c).
             _FILE_TIME_BUILTINS = {
                 "formatTime": ("festina_format_time", "ptr", TEXT),
-                "saveCanvas": ("festina_save_canvas", "i8", BOOL),
+                "mkdir": ("festina_mkdir", "i8", BOOL),
+                "ls": ("festina_ls", "ptr", types_mod.ArrayType(TEXT)),
             }
             # claude.md #94: paths, transforms, gradients and alpha.
             # All draw onto (or configure) the canvas, so all of them
@@ -5408,6 +6256,12 @@ class CodeGen:
                 "render": ("festina_render", []),
                 "clearCanvas": ("festina_clear_canvas", []),
                 "clearRect": ("festina_clear_rect", ["i64"] * 4),
+                # claude.md #133
+                "clearCircle": ("festina_clear_circle", ["i64"] * 3),
+                "clearPixel": ("festina_clear_pixel", ["i64"] * 2),
+                # claude.md #139
+                "setClientWidth": ("festina_set_client_width", ["i64"]),
+                "setClientHeight": ("festina_set_client_height", ["i64"]),
                 "beginPath": ("festina_begin_path", []),
                 "moveTo": ("festina_move_to", ["i64", "i64"]),
                 "lineTo": ("festina_line_to", ["i64", "i64"]),
@@ -5448,28 +6302,43 @@ class CodeGen:
                 lines.append(f"  {out} = call i64 @festina_now_ms()")
                 return out, INT
             if name in _FILE_TIME_BUILTINS:
-                fn, ret_ir, ret_type = _FILE_TIME_BUILTINS[name]
-                if name == "saveCanvas":
-                    # claude.md #95: writes the OFFSCREEN canvas, so it
-                    # needs no window -- this is the headless case the
-                    # render() split exists for. It used to open one,
-                    # which meant a program whose whole job was drawing
-                    # a PNG still needed a display and still blocked in
-                    # the event loop afterwards.
-                    self.uses_graphics_code = True
                 emitted = [self._emit_expr(a, env, lines) for a in expr.args]
                 sig = ", ".join(
                     f"{'i64' if t == INT else 'ptr'} {v}" for v, t in emitted)
+                fn, ret_ir, ret_type = _FILE_TIME_BUILTINS[name]
                 out = self.tmp()
                 lines.append(f"  {out} = call {ret_ir} @{fn}({sig})")
                 for arg_expr, (val, vtype) in zip(expr.args, emitted):
                     self._free_text_temp(arg_expr, val, vtype, lines)
                 return out, ret_type
+            # claude.md #95/#135: writes the OFFSCREEN canvas, so it
+            # needs no window either way -- this is the headless case
+            # the render() split exists for. saveCanvas() with no path
+            # is new: a fresh img SNAPSHOT of the canvas (see
+            # festina_canvas_to_image's own comment for why a snapshot,
+            # not a live alias) instead of writing a file, so it gets
+            # its own branch rather than joining _FILE_TIME_BUILTINS
+            # above -- semantic.py already resolved the return TYPE
+            # itself per arity (img vs. bool), which that generic
+            # dispatch has no way to express (one fixed ret_type per
+            # name, not per call).
+            if name == "saveCanvas":
+                self.uses_graphics_code = True
+                if not expr.args:
+                    out = self.tmp()
+                    lines.append(f"  {out} = call ptr @festina_canvas_to_image()")
+                    return out, types_mod.ImageType()
+                val, vtype = self._emit_expr(expr.args[0], env, lines)
+                out = self.tmp()
+                lines.append(f"  {out} = call i8 @festina_save_canvas(ptr {val})")
+                self._free_text_temp(expr.args[0], val, vtype, lines)
+                return out, BOOL
             if name == "sqlite":
                 return self._emit_sqlite_call(expr, env, lines, expected_type)
             if name == "regex":
                 return self._emit_regex_call(expr, env, lines)
             if name in ("drawRect", "drawCircle", "drawText", "drawImage", "loadImage",
+                        "drawPixel",
                         "fillStyle", "borderColor", "lineWidth", "changeFont",
                         "measureTextWidth", "measureTextHeight"):
                 return self._emit_graphics_call(name, expr, env, lines)
@@ -5513,16 +6382,61 @@ class CodeGen:
                 # claude.md #83: the path is only fopen()'d, never kept.
                 self._free_text_temp(expr.args[0], path_val, path_type, lines)
                 return out, AUDIO
+            found = env.lookup(name)
+            if found is not None and isinstance(found[1], types_mod.FuncType):
+                # claude.md #141: an INDIRECT call, through a
+                # func[...]:...-typed variable/parameter/field/element
+                # rather than a plain declared function's own name --
+                # checked (and env.lookup'd) BEFORE self.func_decls
+                # below, mirroring semantic.py's own dispatch order, so
+                # a local variable that shadows a real global function
+                # of the same name resolves to ITS OWN signature here
+                # too, never silently falling through to a direct call
+                # against the shadowed global instead. A real global
+                # function's own env entry (registered by
+                # _register_func_signature) is never mistaken for this:
+                # it stores its RETURN type there, not a FuncType, so
+                # only a genuine func-typed value ever takes this
+                # branch.
+                fn_ref, fn_type = found
+                fn_ptr = self.tmp()
+                lines.append(f"  {fn_ptr} = load ptr, ptr {fn_ref}")
+                arg_vals = []
+                arg_temps = []
+                for arg_expr, ptype in zip(expr.args, fn_type.param_types):
+                    val, vtype = self._emit_value_for(arg_expr, env, lines, ptype)
+                    val = self._coerce(val, vtype, ptype, lines)
+                    arg_vals.append(f"{_llvm_type(ptype)} {val}")
+                    arg_temps.append((arg_expr, val, vtype, ptype))
+                args_ir = ", ".join(arg_vals)
+                ret_type = fn_type.return_type
+                if ret_type is None:
+                    lines.append(f"  call void {fn_ptr}({args_ir})")
+                    out = "0"
+                else:
+                    out = self.tmp()
+                    lines.append(f"  {out} = call {_llvm_type(ret_type)} {fn_ptr}({args_ir})")
+                # claude.md #83/#119: identical post-call argument
+                # cleanup to the direct-call path just below -- see its
+                # own comment for the full reasoning.
+                for arg_expr, val, vtype, ptype in arg_temps:
+                    if (_is_refcounted(ptype)
+                            and self._is_owning_refcounted_source(arg_expr)):
+                        lines.append(
+                            f"  call void {self._release_fn_for(ptype)}(ptr {val})")
+                    else:
+                        self._free_text_temp(arg_expr, val, vtype, lines)
+                return out, ret_type
             if name in self.func_decls:
                 decl = self.func_decls[name]
                 arg_vals = []
-                text_temps = []
+                arg_temps = []
                 for arg_expr, param in zip(expr.args, decl.params):
                     ptype = self._resolve(param.type_expr, decl)
                     val, vtype = self._emit_value_for(arg_expr, env, lines, ptype)
                     val = self._coerce(val, vtype, ptype, lines)
                     arg_vals.append(f"{_llvm_type(ptype)} {val}")
-                    text_temps.append((arg_expr, val, vtype))
+                    arg_temps.append((arg_expr, val, vtype, ptype))
                 ret_ref, ret_type = env.lookup(name)
                 args_ir = ", ".join(arg_vals)
                 if ret_type is None:
@@ -5533,8 +6447,26 @@ class CodeGen:
                     lines.append(f"  {out} = call {_llvm_type(ret_type)} @{name}({args_ir})")
                 # claude.md #83: after the call, not before -- the callee
                 # borrows every text argument for the duration of the call.
-                for arg_expr, val, vtype in text_temps:
-                    self._free_text_temp(arg_expr, val, vtype, lines)
+                #
+                # claude.md #119: an OWNING refcounted argument -- a
+                # Call's fresh result, a literal, an owned chain
+                # (`f(make().inner)`, `f(getRows()[0])`) -- is released
+                # after the call the same way, closing the
+                # argument-position half of #117's leftovers. Sound for
+                # the same reason the text free is: parameters are
+                # borrows, and anything the callee KEPT took its own
+                # retain on the way to wherever it was stored (an
+                # escaping param retains at binding; a global/field
+                # store retains; a returned alias is retained by the
+                # Return path) -- so the caller's +1 is provably the
+                # last reference nothing else will ever drop.
+                for arg_expr, val, vtype, ptype in arg_temps:
+                    if (_is_refcounted(ptype)
+                            and self._is_owning_refcounted_source(arg_expr)):
+                        lines.append(
+                            f"  call void {self._release_fn_for(ptype)}(ptr {val})")
+                    else:
+                        self._free_text_temp(arg_expr, val, vtype, lines)
                 return out, ret_type
             raise CodegenError(f"unknown function '{name}'", file=self.filename, line=callee.line)
         if isinstance(callee, ast.Member) and not callee.computed:
@@ -5594,9 +6526,46 @@ class CodeGen:
                 if isinstance(vtype, (types_mod.StructType, types_mod.TableType,
                                       types_mod.ArrayType, types_mod.MapType)):
                     out = self._to_text(val, vtype, lines)
-                    self._release_member_receiver_temp(callee.obj, val, vtype,
-                                                       TEXT, lines)
+                    self._release_owned_receiver(callee.obj, val, vtype, lines)
                     return out, TEXT
+            # claude.md #116: sentence.split(sep) -> arr[text]. The
+            # result is a fresh refcounted array the runtime built, so
+            # it is exactly as "owning" a source as an array literal --
+            # binding it needs no retain, and scope exit reclaims it
+            # (elements included) through the ordinary arr[text] release.
+            if callee.prop == "split":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if obj_type == TEXT:
+                    sep_val, sep_type = self._emit_expr(expr.args[0], env, lines)
+                    out = self.tmp()
+                    if sep_type == REGEX:
+                        lines.append(f"  {out} = call ptr @festina_regex_split("
+                                     f"ptr {sep_val}, ptr {obj_val})")
+                    else:
+                        lines.append(f"  {out} = call ptr @festina_text_split("
+                                     f"ptr {obj_val}, ptr {sep_val})")
+                    self._free_text_temp(callee.obj, obj_val, obj_type, lines)
+                    self._free_text_temp(expr.args[0], sep_val, sep_type, lines)
+                    self._free_regex_temp(expr.args[0], sep_val, sep_type, lines)
+                    return out, types_mod.ArrayType(TEXT)
+            # claude.md #116: words.join(sep) -> text. One runtime
+            # function; the element KIND rides along as a constant,
+            # since only the compiler knows an arr[T]'s T (the same
+            # reason the JSON render functions are generated per type).
+            if callee.prop == "join":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.ArrayType):
+                    kind = {INT: "int", FLOAT: "float", BOOL: "bool",
+                            TEXT: "text"}.get(obj_type.element)
+                    if kind is not None:
+                        sep_val, sep_type = self._emit_expr(expr.args[0], env, lines)
+                        out = self.tmp()
+                        lines.append(f"  {out} = call ptr @festina_arr_join("
+                                     f"ptr {obj_val}, ptr {sep_val}, "
+                                     f"ptr {self.string_const(kind)})")
+                        self._free_text_temp(expr.args[0], sep_val, sep_type, lines)
+                        self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                        return out, TEXT
             # claude.md #67: pattern.test(value:text) -> bool
             if callee.prop == "test":
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
@@ -5654,8 +6623,15 @@ class CodeGen:
                                "indexOf"):
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if isinstance(obj_type, types_mod.ArrayType):
-                    return self._emit_array_method(
+                    result = self._emit_array_method(
                         callee.prop, obj_val, obj_type, expr, env, lines)
+                    # claude.md #119: an owning receiver (a call/chain
+                    # temporary) is released once the method is done
+                    # with it -- safe even for pop/shift/splice, whose
+                    # removed elements were transferred OUT of the
+                    # array before this release could cascade to them.
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                    return result
             # claude.md #92: sheet.clip(x, y, w, h) -> img (a new image,
             # leaving the sheet untouched) and image.resize(w, h) -> void
             # (in place, so every binding holding it sees the new size).
@@ -5669,10 +6645,61 @@ class CodeGen:
                             f"  {out} = call ptr @festina_image_clip(ptr {obj_val}, "
                             f"i64 {arg_vals[0]}, i64 {arg_vals[1]}, "
                             f"i64 {arg_vals[2]}, i64 {arg_vals[3]})")
+                        # claude.md #118/#119: a clip is an independent
+                        # new surface, so an owning receiver (another
+                        # clip, a call result) is done with here.
+                        self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                         return out, types_mod.ImageType()
                     lines.append(
                         f"  call void @festina_image_resize(ptr {obj_val}, "
                         f"i64 {arg_vals[0]}, i64 {arg_vals[1]})")
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                    return "0", None
+            # claude.md #134: drawRect/drawPixel/drawCircle/drawText as
+            # methods on img -- the same four canvas-level drawing
+            # builtins (claude.md #37/#39/#133), retargeted at the
+            # receiver image's own surface. semantic.py has already
+            # checked argument count/types, including drawRect/
+            # drawPixel's own optional trailing `color`, dispatched here
+            # purely by arity exactly like the canvas-level forms are.
+            if callee.prop in ("drawRect", "drawPixel", "drawCircle", "drawText"):
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.ImageType):
+                    emitted = [self._emit_expr(a, env, lines) for a in expr.args]
+                    arg_vals = [v for v, _ in emitted]
+                    if callee.prop == "drawRect":
+                        if len(arg_vals) == 5:
+                            x, y, w, h, color = arg_vals
+                            lines.append(
+                                f"  call void @festina_image_draw_rect_color(ptr {obj_val}, "
+                                f"i64 {x}, i64 {y}, i64 {w}, i64 {h}, i64 {color})")
+                        else:
+                            x, y, w, h = arg_vals
+                            lines.append(
+                                f"  call void @festina_image_draw_rect(ptr {obj_val}, "
+                                f"i64 {x}, i64 {y}, i64 {w}, i64 {h})")
+                    elif callee.prop == "drawPixel":
+                        if len(arg_vals) == 3:
+                            x, y, color = arg_vals
+                            lines.append(
+                                f"  call void @festina_image_draw_pixel_color(ptr {obj_val}, "
+                                f"i64 {x}, i64 {y}, i64 {color})")
+                        else:
+                            x, y = arg_vals
+                            lines.append(
+                                f"  call void @festina_image_draw_pixel(ptr {obj_val}, i64 {x}, i64 {y})")
+                    elif callee.prop == "drawCircle":
+                        x, y, r = arg_vals
+                        lines.append(
+                            f"  call void @festina_image_draw_circle(ptr {obj_val}, "
+                            f"i64 {x}, i64 {y}, i64 {r})")
+                    else:  # drawText
+                        text, x, y = arg_vals
+                        lines.append(
+                            f"  call void @festina_image_draw_text(ptr {obj_val}, "
+                            f"ptr {text}, i64 {x}, i64 {y})")
+                        self._free_text_temp(expr.args[0], text, emitted[0][1], lines)
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                     return "0", None
             # claude.md #38: music.play() / music.stop() / music.isPlaying()
             # claude.md #99: play/playLoop take an optional channel, and
@@ -5742,8 +6769,7 @@ class CodeGen:
                         f"  {out} = call i8 @{fn}(ptr {obj_val}, ptr {arg_val})")
                     if expr.args:
                         self._free_text_temp(expr.args[0], arg_val, arg_type, lines)
-                    self._release_member_receiver_temp(callee.obj, obj_val, obj_type,
-                                                      BOOL, lines)
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                     return out, BOOL
             # claude.md #109: blob's five methods. The receiver is a
             # blob handle, which already holds the path -- so these are
@@ -5772,8 +6798,7 @@ class CodeGen:
                     # same way any other member receiver is; toText()
                     # hands back an owned copy and the rest return
                     # scalars, so nothing here points into the handle.
-                    self._release_member_receiver_temp(callee.obj, obj_val, obj_type,
-                                                       ret_type, lines)
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                     return out, ret_type
             # claude.md #109: aud.stop() is back, clip-wide -- see the
             # runtime's own note on why #100 removed it and why that
@@ -5814,6 +6839,54 @@ class CodeGen:
                     lines.append(
                         f"  call void @festina_map_for_each(i64 {count}, ptr {entries}, ptr {trampoline_name})")
                     return "0", None
+        if isinstance(callee, ast.Member):
+            # claude.md #141: an indirect call through a func[...]:...
+            # -typed struct field (h.cb(...)), array element
+            # (fns[i](...)), or map value (handlers[key](...)) --
+            # covers BOTH computed (bracket) and non-computed (dot)
+            # member access, neither of which was specially dispatched
+            # above for a callee that turns out to be a stored function
+            # VALUE rather than one of this file's own recognized
+            # method names. Checked LAST, right before the final "only
+            # calls to named functions" fallback below (never reached
+            # by a computed Member at all, since every branch above
+            # this one is gated `and not callee.computed`) -- an
+            # established special method name (img.drawRect,
+            # Math.floor, ...) is never shadowed by this generic path.
+            # _emit_expr on the whole Member node reads the callee's
+            # VALUE exactly the same way any other expression position
+            # would (`func[text]:void tmp = h.cb` uses the identical
+            # code path) -- no special-casing needed for struct/array/
+            # map access specifically, since they're already ordinary,
+            # type-generic reads.
+            callee_val, callee_type = self._emit_expr(callee, env, lines)
+            if isinstance(callee_type, types_mod.FuncType):
+                fn_type = callee_type
+                arg_vals = []
+                arg_temps = []
+                for arg_expr, ptype in zip(expr.args, fn_type.param_types):
+                    val, vtype = self._emit_value_for(arg_expr, env, lines, ptype)
+                    val = self._coerce(val, vtype, ptype, lines)
+                    arg_vals.append(f"{_llvm_type(ptype)} {val}")
+                    arg_temps.append((arg_expr, val, vtype, ptype))
+                args_ir = ", ".join(arg_vals)
+                ret_type = fn_type.return_type
+                if ret_type is None:
+                    lines.append(f"  call void {callee_val}({args_ir})")
+                    out = "0"
+                else:
+                    out = self.tmp()
+                    lines.append(f"  {out} = call {_llvm_type(ret_type)} {callee_val}({args_ir})")
+                # claude.md #83/#119: identical post-call argument
+                # cleanup to the other two call forms above.
+                for arg_expr, val, vtype, ptype in arg_temps:
+                    if (_is_refcounted(ptype)
+                            and self._is_owning_refcounted_source(arg_expr)):
+                        lines.append(
+                            f"  call void {self._release_fn_for(ptype)}(ptr {val})")
+                    else:
+                        self._free_text_temp(arg_expr, val, vtype, lines)
+                return out, ret_type
         raise CodegenError("only calls to named functions are implemented",
                             file=self.filename, line=getattr(expr, "line", 0))
 
@@ -5914,22 +6987,29 @@ class CodeGen:
     # ---- regex() / .test() / .match() / .replace() (claude.md #67-68, #107) ----
     def _emit_regex_call(self, expr, env, lines):
         """claude.md #67: regex(pattern:text) / regex(pattern:text,
-        flags:text) -> regex. Compiles the pattern via POSIX regcomp()
-        at the call site, every time it's evaluated -- no caching across
-        calls, the same tradeoff already accepted for sqlite()'s
-        prepared statements (see _emit_sqlite_call). Unlike a /pattern/
-        flags literal (see _emit_cached_regex_lit above), pattern here
-        is an arbitrary runtime expression, so the same call site can
-        legitimately see a different pattern on different calls (e.g.
-        regex(userPattern) inside a loop) -- caching by call site would
-        be a correctness bug, not just a missed optimization, so a
-        regex() call inside a hot loop still recompiles every iteration;
-        documented as a known gap rather than solved here (claude.md
-        #54's ambiguity rule -- correctness over micro-optimizing
-        something #67 doesn't ask for). An invalid pattern fails at
-        runtime (festina_fail(), via the C runtime's regcomp() error
-        handling), not at compile time -- the Python compiler doesn't
-        itself validate regex syntax (claude.md #67's own words)."""
+        flags:text) -> regex.
+
+        claude.md #118: compiled through a per-call-site MEMO
+        (festina_regex_compile_memo) rather than a bare recompile per
+        evaluation. The pattern is an arbitrary runtime expression, so
+        the same call site can legitimately see a different pattern on
+        different calls -- which is why plain per-AST-node caching (what
+        /pattern/ literals get, see _emit_cached_regex_lit above) would
+        have been a correctness bug, and why this stayed uncached for so
+        long. The memo closes the gap from the other side: the runtime
+        compares the ACTUAL pattern+flags against what this site
+        compiled last time, reuses the compilation on a match (the
+        common case -- a fixed pattern built from config, evaluated in a
+        loop; measured ~24x cheaper than recompiling) and recompiles on
+        a mismatch, so a genuinely varying pattern is never served a
+        stale automaton. Evicting the superseded compilation is only
+        safe because regex is refcounted now (#118): a binding still
+        aliasing the old one keeps it alive.
+
+        An invalid pattern fails at runtime (festina_fail(), via the C
+        runtime's regcomp() error handling), not at compile time -- the
+        Python compiler doesn't itself validate regex syntax (claude.md
+        #67's own words)."""
         callee = expr.callee
         if not expr.args:
             raise CodegenError("regex() requires at least a pattern argument",
@@ -5947,10 +7027,22 @@ class CodeGen:
                     file=self.filename, line=callee.line)
         else:
             flags_val = self.string_const("")
+        # claude.md #118: one private {pattern copy, flags copy,
+        # compiled} slot per regex() call site -- the runtime memo's
+        # working storage. Keyed by AST node identity, the same scheme
+        # _regex_lit_cache uses for literals.
+        key = id(expr)
+        memo_global = self._regex_memo_slots.get(key)
+        if memo_global is None:
+            memo_global = f"@.regex.memo.{len(self._regex_memo_slots)}"
+            self._regex_memo_slots[key] = memo_global
+            self.extra_globals.append(
+                f"{memo_global} = private global [3 x ptr] zeroinitializer")
         out = self.tmp()
-        lines.append(f"  {out} = call ptr @festina_regex_compile(ptr {pattern_val}, ptr {flags_val})")
-        # claude.md #83: regcomp() compiles the pattern into its own
-        # regex_t and reads the flags inline -- neither pointer is
+        lines.append(f"  {out} = call ptr @festina_regex_compile_memo("
+                     f"ptr {pattern_val}, ptr {flags_val}, ptr {memo_global})")
+        # claude.md #83: the memo strdups the pattern/flags it keeps and
+        # regcomp() reads them inline -- neither caller pointer is
         # retained past this call, so a temporary passed for either is
         # the caller's to free.
         self._free_text_temp(expr.args[0], pattern_val, pattern_type, lines)
@@ -6011,7 +7103,7 @@ class CodeGen:
             f"{{ i64 {px or 0}, i64 {slant}, i64 {weight}, ptr {family_ref} }}")
         return name
 
-    # ---- graphics: drawRect/drawCircle/drawText/drawImage/loadImage (claude.md #37, #39) ----
+    # ---- graphics: drawRect/drawPixel/drawCircle/drawText/drawImage/loadImage (claude.md #37, #39, #133) ----
     def _emit_graphics_call(self, name, expr, env, lines):
         """Draws onto (or loads an image for) the graphics canvas.
         Sets self.uses_graphics so main() knows to open the canvas
@@ -6020,9 +7112,11 @@ class CodeGen:
         "only pay for what you use" pattern self.uses_sqlite already
         follows for festina_db_open(). semantic.py has already checked
         each function's argument count/types against claude.md's own
-        worked examples (claude.md #37, #39), so this just emits the
-        call; there's no color argument to pass because none of those
-        examples ever take one (see festina_runtime.h's doc comment).
+        worked examples (claude.md #37, #39); claude.md #133 added one
+        exception -- drawRect/drawPixel each have a second, longer form
+        with a trailing `color` argument, dispatched here purely by
+        arity (`len(args)`), the same way fillStyle/borderColor/
+        changeFont's own 1-vs-3-argument forms already are, just below.
 
         loadImage() deliberately does NOT set self.uses_graphics:
         decoding a PNG (Cairo's own in-memory decoder -- see
@@ -6105,8 +7199,27 @@ class CodeGen:
         # the single call that does. That is what lets a program draw
         # and saveCanvas() with no display present at all.
         if name == "drawRect":
-            x, y, w, h = args
-            lines.append(f"  call void @festina_draw_rect(i64 {x}, i64 {y}, i64 {w}, i64 {h})")
+            # claude.md #133: a 5th argument is an optional trailing
+            # `color` -- paint with it for this call only, instead of
+            # the current fillStyle.
+            if len(args) == 5:
+                x, y, w, h, color = args
+                lines.append(
+                    f"  call void @festina_draw_rect_color(i64 {x}, i64 {y}, "
+                    f"i64 {w}, i64 {h}, i64 {color})")
+            else:
+                x, y, w, h = args
+                lines.append(f"  call void @festina_draw_rect(i64 {x}, i64 {y}, i64 {w}, i64 {h})")
+        elif name == "drawPixel":
+            # claude.md #133: same optional-trailing-`color` shape as
+            # drawRect just above.
+            if len(args) == 3:
+                x, y, color = args
+                lines.append(
+                    f"  call void @festina_draw_pixel_color(i64 {x}, i64 {y}, i64 {color})")
+            else:
+                x, y = args
+                lines.append(f"  call void @festina_draw_pixel(i64 {x}, i64 {y})")
         elif name == "drawCircle":
             x, y, r = args
             lines.append(f"  call void @festina_draw_circle(i64 {x}, i64 {y}, i64 {r})")
@@ -6412,6 +7525,16 @@ class CodeGen:
         entry_func.append("}")
 
         main_lines = ["define i32 @main() {", "entry:"]
+        # windows.md Phase 0 (claude.md #126): unconditional, first
+        # thing main() does, before even the database/graphics setup
+        # below -- see festina_runtime_init's own comment for why.
+        main_lines.append("  call void @festina_runtime_init()")
+        # claude.md #131: `on exit(code:int)` registers unconditionally
+        # (with or without graphics) and before anything else runs, so
+        # close(code) can fire the handler even from code that executes
+        # before a window would otherwise be set up.
+        if self.exit_handler_symbol is not None:
+            main_lines.append(f"  call void @festina_register_exit_handler(ptr {self.exit_handler_symbol})")
         # self.uses_sqlite/self.uses_graphics are only reliably set by
         # this point because every function body (self.func_defs) and
         # every entry statement (the loop above) has already been
@@ -6492,6 +7615,15 @@ class CodeGen:
             # program never needs to link the graphics object file just
             # to wait for its callbacks.
             main_lines.append("  call void @festina_run_timer_loop()")
+        # claude.md #126 round nine: unconditional, last thing main()
+        # does -- @__festina_db defaults to (and stays) null for a
+        # program with no `table` declarations, which festina_db_close
+        # treats as a no-op, so this is safe to call every time rather
+        # than gated on self.uses_sqlite. See that function's own
+        # comment for why an explicit close (not just letting the OS
+        # reclaim the fd on exit) matters.
+        main_lines.append("  %final_db = load ptr, ptr @__festina_db")
+        main_lines.append("  call void @festina_db_close(ptr %final_db)")
         main_lines.append("  ret i32 0")
         main_lines.append("}")
 

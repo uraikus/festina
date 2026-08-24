@@ -137,7 +137,15 @@ class TestBuildProgram:
         with pytest.raises(errors.CompileError) as exc_info:
             semantic.analyze(program, filename=entry)
         assert "broken.f" in str(exc_info.value)
-        assert str(exc_info.value).split(":")[0].endswith("broken.f")
+        # CompileError.__str__ is "{file}:{line}:{column}: error: {message}"
+        # (festina/errors.py) -- exactly 4 colons past the file path
+        # (line/column/"error:"/message boundaries), so rsplit(":", 4)
+        # peels off precisely those 4 pieces from the right regardless
+        # of what's in the path, leaving the file intact even when the
+        # path itself contains a colon (a Windows drive letter, e.g.
+        # "D:\...\broken.f", which a naive split(":")[0] would instead
+        # truncate to "D").
+        assert str(exc_info.value).rsplit(":", 4)[0].endswith("broken.f")
 
     def test_single_file_program_is_unaffected(self, imports_mod, semantic, write_source):
         # No imports at all -- build_program should behave exactly like

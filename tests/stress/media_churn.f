@@ -21,12 +21,49 @@ while i < 120 {
     aud mp3 = 'tone.mp3'
     aud wav = 'beep.wav'
 
+    // claude.md #137: arr[img]/arr[blob] declared directly from a
+    // literal of paths -- each element loaded exactly like a single
+    // `img x = path` declaration, through the same array-literal
+    // retain path claude.md #79/#80 already cover for every other
+    // element type.
+    arr[img] gallery = ['tiles.png', 'gradient.jpg']
+    arr[blob] docs = ['tiles.png']
+    total = total + gallery.length + gallery[0].width
+    if docs[0].exists() { total = total + 1 }
+
     // Derived images: clip() allocates a new surface, resize() replaces
     // one in place and drops the source bytes with it.
     img tile = png.clip(0, 0, 32, 32)
     img shrunk = png.clip(32, 0, 32, 32)
     shrunk.resize(8, 8)
     total = total + tile.width + shrunk.height + jpg.width
+
+    // claude.md #134: drawRect/drawPixel/drawCircle as img methods --
+    // both the plain and the color-override forms, plus one through a
+    // CHAINED call (an owning receiver, released right after the draw,
+    // unlike `tile` above which stays alive under its own binding).
+    // drawText deliberately not exercised here: it's the one drawing
+    // call that reaches cairo_select_font_face/fontconfig, which caches
+    // font-matching state for the whole PROCESS's lifetime with no
+    // teardown API -- a real, one-time, non-growing cost LeakSanitizer
+    // still flags, and no other stress file exercises text-drawing for
+    // the same reason (this is a pre-existing gap, not one this round
+    // introduced or needs to close).
+    color blue = 'blue'
+    tile.drawRect(0, 0, 4, 4)
+    tile.drawRect(4, 4, 4, 4, blue)
+    tile.drawPixel(8, 8)
+    tile.drawPixel(9, 9, blue)
+    tile.drawCircle(16, 16, 3)
+    png.clip(0, 0, 8, 8).drawRect(0, 0, 4, 4, blue)
+
+    // claude.md #135: saveCanvas() with no path -> a fresh img
+    // snapshot -- a genuinely new allocation path (festina_canvas_to_
+    // image), distinct from #134's own drawing-in-place methods above.
+    drawRect(0, 0, 20, 20)
+    img snap = saveCanvas()
+    total = total + snap.width
+    snap.drawPixel(0, 0, blue)
 
     // Stored as BLOBs and read back as freshly decoded handles. The
     // clipped tile has no source bytes, so this also exercises the

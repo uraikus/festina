@@ -21,6 +21,7 @@ import shutil
 import sqlite3
 import struct
 import subprocess
+import sys
 import time
 import wave
 
@@ -58,6 +59,59 @@ class TestUnrecognizedEventName:
 
 
 # ---- end-to-end: real compiled, real executed programs ----
+
+class TestCloseAndExitHandler:
+    """claude.md #131: close(code) exits the program with `code`,
+    running a declared `on exit(code:int)` handler first if there is
+    one. Deliberately NOT a graphics feature -- close()/`on exit` work
+    in a program that never opens a window, unlike `on close` (the
+    existing window-close-button event), which this is not the same
+    thing as."""
+
+    def test_close_exits_with_the_given_code_and_runs_no_handler_by_default(self, compile_and_run):
+        result = compile_and_run("log('before')\nclose(7)\nlog('unreachable')")
+        assert result.returncode == 7
+        assert result.stdout == "before\n"
+
+    def test_on_exit_runs_before_the_program_actually_exits(self, compile_and_run):
+        source = """
+        on exit(code:int) {
+            log(`exiting with ${code}`)
+        }
+        log('before')
+        close(42)
+        log('unreachable')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 42
+        assert result.stdout == "before\nexiting with 42\n"
+
+    def test_close_with_no_on_exit_handler_declared_works_fine(self, compile_and_run):
+        result = compile_and_run("close(0)")
+        assert result.returncode == 0
+        assert result.stdout == ""
+
+    def test_close_requires_exactly_one_int_argument(self, parser, semantic, errors):
+        for source in ["close()", "close(1, 2)", "close('a')", "close(1.5)"]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+    def test_on_exit_requires_exactly_one_int_parameter(self, parser, semantic, errors):
+        for source in [
+            "on exit() { }",
+            "on exit(code:text) { }",
+            "on exit(a:int, b:int) { }",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+    def test_a_user_function_cannot_shadow_close(self, parser, semantic, errors):
+        program = parser.parse("void func close(x:int) { }", filename="main.f")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program, filename="main.f")
+
 
 class TestArithmeticAndControlFlow:
     """claude.md #14-16, #18-20, #23-24: functions, expressions, if/else,
@@ -645,15 +699,12 @@ class TestSelfReferencingStructs:
         assert "call void @__festina_release_struct_Node(" in body
 
     def test_a_reference_cycle_runs_correctly_and_does_not_crash(self, compile_and_run):
-        # claude.md #106's accepted cost, pinned as behavior rather than
-        # hidden. `a.next = a` is a reference cycle, which refcounting
-        # cannot free -- so this LEAKS, deliberately and permanently
-        # until something traces (see todo.md's "What's still ahead").
-        # What must never regress is that it stays a leak: a cycle whose
-        # counts never reach zero must not become a double-free or a
-        # use-after-free, both of which would be far worse than the
-        # leak and both of which a naive "break the cycle on release"
-        # fix would risk.
+        # claude.md #106 made `a.next = a` constructible and accepted
+        # the leak; claude.md #120's trial deletion now reclaims a
+        # GARBAGE cycle. What this test pins is the other half: a
+        # cycle that is still externally held (the global binding here)
+        # keeps working -- reads through it stay valid, the trial run
+        # by each release must never free a reachable cycle.
         source = """
         struct Node {
             n:int
@@ -881,11 +932,14 @@ class TestMaps:
 
     def test_missing_key_on_int_map_returns_the_int_null_sentinel(self, compile_and_run):
         # Same null representation int already uses everywhere else
-        # (e.g. division by zero -- claude.md #57) -- not a special
-        # case invented for maps.
-        div_by_zero = compile_and_run("int a = 1\nint b = 0\nlog(a / b)")
+        # (e.g. modulo by zero -- claude.md #57) -- not a special case
+        # invented for maps. claude.md #143: division by zero is no
+        # longer a source of an INT null value (/ always returns float
+        # now), so % -- still int-returning for two ints -- is the
+        # comparison source instead.
+        int_null = compile_and_run("int a = 1\nint b = 0\nlog(a % b)")
         missing_key = compile_and_run("map[int] m = {'a': 1}\nlog(m['missing'])")
-        assert missing_key.stdout == div_by_zero.stdout
+        assert missing_key.stdout == int_null.stdout
 
     def test_empty_map_literal(self, compile_and_run):
         result = compile_and_run("map[int] m = {}\nlog(m['x'])")
@@ -4216,6 +4270,435 @@ class TestAutomaticMemoryReclamation:
         assert "call void @festina_release_map(" in ir
 
 
+class TestFunctionHoisting:
+    """claude.md #140: every function's name and signature is registered
+    -- both in semantic.py's own symbol table and in codegen's
+    self.func_decls/self.global_env -- in a pre-pass over the whole
+    program before any code that might call it is emitted, so a call
+    reached earlier in program order than its own callee's declaration
+    still compiles and runs correctly ("hoisting"). tests/
+    test_syntax_declarations.py's own TestFunctionHoisting covers the
+    semantic-analysis half (declaration-order stops being an error);
+    these compile-and-RUN the equivalent programs, since hoisting is a
+    codegen concern too -- a forward call has to actually resolve to the
+    right LLVM function and produce the right answer, not just pass
+    semantic analysis."""
+
+    def test_calling_a_function_declared_later_produces_the_right_answer(self, compile_and_run):
+        source = """
+        log(greet('world'))
+
+        text func greet(name:text) {
+            return concatHelper('Hello, ', name)
+        }
+
+        text func concatHelper(a:text, b:text) {
+            return a + b + '!'
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "Hello, world!"
+
+    def test_mutual_recursion_produces_the_right_answer(self, compile_and_run):
+        source = """
+        bool func isEven(n:int) {
+            if (n == 0) { return true }
+            return isOdd(n - 1)
+        }
+
+        bool func isOdd(n:int) {
+            if (n == 0) { return false }
+            return isEven(n - 1)
+        }
+
+        log(isEven(10))
+        log(isOdd(10))
+        log(isEven(7))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["true", "false", "false"]
+
+    def test_a_function_nested_inside_a_block_is_callable_from_above_it(self, compile_and_run):
+        # claude.md #140: a FuncDecl nested inside an if/while/for is
+        # already treated as an ordinary GLOBAL declaration regardless
+        # of nesting (semantic.py's analyze_func always defines into
+        # global_scope) -- this confirms codegen actually emits its
+        # body too (a real, once-crashing gap: _emit_stmt had no
+        # ast.FuncDecl branch at all before this, so a nested
+        # declaration compiled fine at the semantic-analysis stage and
+        # then crashed codegen with "cannot generate code for statement
+        # FuncDecl" the moment it was ever reached).
+        source = """
+        log(nested())
+
+        if (true) {
+            int func nested() { return 42 }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "42"
+
+    def test_a_function_nested_inside_a_never_taken_branch_still_exists(self, compile_and_run):
+        # Semantic analysis (and therefore codegen too) walks BOTH arms
+        # of an if unconditionally -- the declaration is hoisted exactly
+        # the same regardless of whether its own enclosing branch ever
+        # actually runs, matching the way JavaScript's own function
+        # declaration hoisting is unconditional too.
+        source = """
+        log(helper())
+
+        if (false) {
+            int func helper() { return 5 }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "5"
+
+    def test_a_function_nested_inside_another_function_is_globally_callable(self, compile_and_run):
+        source = """
+        void func setup() {
+            int func inner() { return 7 }
+        }
+
+        log(inner())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "7"
+
+    def test_nested_func_decl_does_not_corrupt_the_enclosing_functions_own_locals(self, compile_and_run):
+        # claude.md #140's real regression, found via a genuine LLVM
+        # verifier error ("use of undefined value"), not guessed: a
+        # nested FuncDecl re-enters _emit_func recursively while the
+        # ENCLOSING function's own struct/text/array/map locals are
+        # still tracked on the shared self._active_free_locals stack --
+        # without self._current_func_frame_base, the nested function's
+        # own trivial `return` (down_to=0, unqualified) freed the
+        # OUTER function's still-live locals instead of just its own
+        # (empty) frame. This exercises every refcounted-local shape
+        # that free/release machinery distinguishes: a struct field
+        # (p.x/p.y), a text local, and an array local, all read AFTER
+        # the nested declaration.
+        source = """
+        struct Point { x:int, y:int }
+
+        int func outer(seed:text) {
+            Point p
+            p.x = 1
+            p.y = 2
+            text local = seed + '-suffix'
+            arr[int] nums = [10, 20, 30]
+            int func inner() { return 7 }
+            int total = p.x + p.y + nums.length + inner()
+            log(local)
+            return total
+        }
+
+        log(outer('hi'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # p.x + p.y + nums.length + inner() = 1 + 2 + 3 + 7 = 13
+        assert result.stdout.splitlines() == ["hi-suffix", "13"]
+
+    def test_a_function_declared_before_its_own_struct_type_still_compiles(self, compile_and_run):
+        # claude.md #106's own struct-name pre-pass and claude.md #140's
+        # function-signature pre-pass run as two SEPARATE passes, struct
+        # names first -- this is what lets a function's own parameter/
+        # return type NAME a struct declared later than the function
+        # itself (register_func_signature's resolve() call needs
+        # `Point` to already exist as a name, even before struct
+        # Point's own fields are populated). This is deliberately NOT a
+        # claim that a struct's FIELDS are hoisted the identical way --
+        # accessing p.x before struct Point{}'s own declaration has
+        # been reached by the real analysis pass is a pre-existing,
+        # unrelated limitation claude.md #106 already has (its own
+        # pre-pass only guarantees the NAME exists, same as this one),
+        # so every field access below is deliberately placed after
+        # struct Point's own declaration in program order, isolating
+        # just the one thing actually new here: the function itself.
+        source = """
+        Point func identity(p:Point) {
+            return p
+        }
+
+        struct Point { x:int, y:int }
+
+        Point q
+        q.x = 3
+        q.y = 4
+        log(identity(q).x)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "3"
+
+    def test_break_and_continue_around_a_nested_func_decl_still_work(self, compile_and_run):
+        # self._loop_targets is untouched by this feature (it was
+        # already correctly stack-shaped and reentrant through nested
+        # loops before this), but is worth confirming directly: a
+        # nested FuncDecl's own emission must not leave a stray entry
+        # behind that would make an unrelated LATER break/continue in
+        # the ENCLOSING loop resolve to the wrong target.
+        source = """
+        for int i = 0, i < 5, i++ {
+            if (i == 3) { break }
+            if (i == 1) { continue }
+            int func helper() { return 1 }
+            log(`i=${i} helper=${helper()}`)
+        }
+        log('after loop')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["i=0 helper=1", "i=2 helper=1", "after loop"]
+
+
+class TestFirstClassFunctions:
+    """claude.md #141: func[T, T, ...]:R -- a first-class function
+    value, usable as an argument, struct property, map value, or array
+    value. tests/test_syntax_declarations.py's own TestFuncTypeSyntax/
+    TestFirstClassFunctions cover parsing and semantic analysis; these
+    compile and RUN the equivalent programs, since the actual codegen
+    mechanism (a bare function symbol as a `ptr` value, an indirect
+    `call` through it) needed its own real verification -- a pre-
+    existing placeholder in codegen.py (`raise CodegenError("functions
+    are not first-class values yet"...)`) shows this was anticipated
+    but never implemented before this entry, and a SEPARATE, real gap
+    (`raise CodegenError("only calls to named functions are
+    implemented"...)`) covered calling through a struct field/array
+    element/map value specifically."""
+
+    def test_assigning_a_function_by_name_and_calling_through_the_variable(self, compile_and_run):
+        source = """
+        void func greet(name:text) { log(name) }
+        func[text]:void cb = greet
+        cb('world')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "world"
+
+    def test_passing_a_function_as_an_argument(self, compile_and_run):
+        source = """
+        void func greet(name:text) { log(name) }
+        void func apply(fn:func[text]:void, arg:text) { fn(arg) }
+        apply(greet, 'hi')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "hi"
+
+    def test_storing_in_a_struct_field_and_calling_through_it(self, compile_and_run):
+        source = """
+        void func greet(name:text) { log(name) }
+        struct Holder { cb:func[text]:void }
+        Holder h
+        h.cb = greet
+        h.cb('yo')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "yo"
+
+    def test_storing_in_an_array_and_calling_by_index(self, compile_and_run):
+        source = """
+        int func inc(x:int) { return x + 1 }
+        int func dec(x:int) { return x - 1 }
+        arr[func[int]:int] fns = [inc, dec]
+        log(fns[0](5))
+        log(fns[1](5))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["6", "4"]
+
+    def test_storing_in_a_map_and_calling_by_key(self, compile_and_run):
+        source = """
+        void func greet(name:text) { log(name) }
+        map[func[text]:void] handlers
+        handlers['g'] = greet
+        handlers['g']('map-call')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "map-call"
+
+    def test_a_zero_argument_void_function_value_works(self, compile_and_run):
+        source = """
+        void func tick() { log('ticked') }
+        func[]:void cb = tick
+        cb()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "ticked"
+
+    def test_a_function_value_with_a_non_void_return_type_works(self, compile_and_run):
+        source = """
+        int func square(x:int) { return x * x }
+        func[int]:int f = square
+        log(f(7))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "49"
+
+    def test_local_variable_shadowing_a_global_function_calls_the_local(self, compile_and_run):
+        # claude.md #141: Scope.define permits a local to reuse a
+        # global name -- calling `greet` inside the shadowing scope
+        # must resolve to the LOCAL func-typed variable's own target
+        # (`other`), never silently fall back to the shadowed global
+        # `greet` itself.
+        source = """
+        void func greet(name:text) { log(`global greet: ${name}`) }
+        void func other(name:text) { log(`shadowed target: ${name}`) }
+
+        void func useShadowed() {
+            func[text]:void greet = other
+            greet('x')
+        }
+
+        useShadowed()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "shadowed target: x"
+
+    def test_null_func_value_is_a_valid_declaration(self, compile_and_run):
+        source = """
+        func[text]:void cb = null
+        log('ok')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "ok"
+
+    def test_a_struct_holding_a_func_field_survives_scope_exit_and_a_free(self, compile_and_run):
+        # claude.md #141: a func-typed field must be correctly skipped
+        # by the struct's own release/free cascade (never mistaken for
+        # a refcounted or stack-cascaded field) -- run under
+        # AddressSanitizer via leak_stress.sh separately for the
+        # thousands-of-iterations version of this; this is the plain
+        # correctness check that the VALUE itself still reads right
+        # after a `free`.
+        source = """
+        int func doubleIt(x:int) { return x * 2 }
+        struct Callback { fn:func[int]:int  label:text }
+        Callback cbk
+        cbk.fn = doubleIt
+        cbk.label = 'd'
+        log(cbk.fn(21))
+        free cbk
+        log('freed ok')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["42", "freed ok"]
+
+
+class TestArrowFunctions:
+    """claude.md #142: `returnType (params) => expr` -- an arrow
+    function expression, desugaring to a synthesized, uniquely-named
+    top-level function (compiling to a regular function, per the
+    request's own framing) whose func[...]:... value is the arrow
+    expression's own result. tests/test_syntax_declarations.py's own
+    TestArrowFunctionSyntax/TestArrowFunctions cover parsing and
+    semantic analysis; these compile and RUN the equivalent programs."""
+
+    def test_a_void_arrow_function_assigned_and_called(self, compile_and_run):
+        source = """
+        func[text]:void cb = void (arg:text) => log(arg)
+        cb('hello arrow')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "hello arrow"
+
+    def test_a_non_void_arrow_functions_body_expression_is_its_return_value(self, compile_and_run):
+        source = """
+        func[int]:int sq = int (x:int) => x * x
+        log(sq(7))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "49"
+
+    def test_an_arrow_function_used_directly_as_a_call_argument(self, compile_and_run):
+        source = """
+        void func apply(fn:func[text]:void, arg:text) { fn(arg) }
+        apply(void (arg:text) => log(arg), 'inline arrow')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "inline arrow"
+
+    def test_arrow_functions_in_a_struct_field_array_and_map(self, compile_and_run):
+        source = """
+        struct Holder { cb:func[text]:void }
+        Holder h
+        h.cb = void (arg:text) => log(`struct: ${arg}`)
+        h.cb('via struct')
+
+        arr[func[int]:int] fns = [int (x:int) => x + 1, int (x:int) => x - 1]
+        log(fns[0](10))
+        log(fns[1](10))
+
+        map[func[text]:void] handlers
+        handlers['a'] = void (arg:text) => log(`map: ${arg}`)
+        handlers['a']('via map')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == [
+            "struct: via struct", "11", "9", "map: via map",
+        ]
+
+    def test_two_arrow_functions_at_different_expression_positions_stay_independent(self, compile_and_run):
+        # Each arrow expression synthesizes its own uniquely-named
+        # function -- calling one must never reach the other's body.
+        source = """
+        func[int]:int inc = int (x:int) => x + 1
+        func[int]:int dec = int (x:int) => x - 1
+        log(inc(10))
+        log(dec(10))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["11", "9"]
+
+    def test_referencing_an_enclosing_functions_local_variable_is_a_compile_error(
+            self, parser, semantic, errors):
+        # claude.md #142: no closures -- a CompileError, raised during
+        # semantic analysis itself, so this is checked the same way
+        # every other compile-time rejection in this file is (not via
+        # compile_and_run, which expects the compile to succeed).
+        source = """
+        void func outer() {
+            int localVar = 42
+            func[text]:void cb = void (arg:text) => log(`${arg} ${localVar}`)
+        }
+        outer()
+        """
+        program = parser.parse(source, filename="main.f")
+        with pytest.raises(errors.CompileError, match="unknown variable"):
+            semantic.analyze(program, filename="main.f")
+
+    def test_referencing_a_top_level_global_variable_works(self, compile_and_run):
+        source = """
+        int globalCount = 42
+        func[text]:void cb = void (arg:text) => log(`${arg} ${globalCount}`)
+        cb('x')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "x 42"
+
+
 def _find_window(display, timeout=20):
     # A window actually appears in ~0.2s, measured, consistently -- this
     # timeout is generous insurance, not a figure anything is expected
@@ -4393,7 +4876,15 @@ class TestGraphics:
         src_path = tmp_path / "main.f"
         src_path.write_text(source)
         out_path = tmp_path / "program"
-        result_path = cli_mod.compile_file(str(src_path), str(out_path))
+        # claude.md #126 round six: this program opens a real window
+        # (on mouseDown/mouseUp/mouse/key/resize/close), so on darwin it
+        # must hit the real-hardware-verification gate (macos.md Phase
+        # 2) same as TestAudio's own compile_file_or_skip use right
+        # below -- calling compile_file directly meant that gate's
+        # CompileError surfaced as a raw macOS CI failure instead of the
+        # skip every other platform-conditional test gets.
+        from tests.conftest import compile_file_or_skip
+        result_path = compile_file_or_skip(cli_mod, str(src_path), str(out_path))
         assert result_path == str(out_path)
         assert out_path.exists()
 
@@ -4653,6 +5144,108 @@ class TestGraphics:
             proc.wait(timeout=5)
 
 
+class TestScreenSizeAndSetClientSize:
+    """claude.md #139: screenWidth/screenHeight -- the physical
+    display's own resolution, read-only, answerable with or without a
+    window open -- and setClientWidth/setClientHeight, which resize the
+    canvas synchronously (and the real OS window too, when one is
+    open)."""
+
+    def test_screen_size_without_any_display_is_a_clear_runtime_error(
+            self, compile_and_run, monkeypatch):
+        # festina_window_screen_size answers even with no window open,
+        # but it still needs SOME X server to ask -- with none available
+        # at all it reports the identical "no X display" failure
+        # render() itself reports (both go through the same X11
+        # festina_fail call -- see festina_window_screen_size's own
+        # XOpenDisplay fallback in festina_runtime_graphics.c).
+        monkeypatch.delenv("DISPLAY", raising=False)
+        result = compile_and_run("log(screenWidth)")
+        assert result.returncode == 1
+        assert "X display" in result.stderr
+
+    def test_screen_size_matches_the_real_display_resolution(self, compile_and_run, x_display):
+        # Queried independently via xdotool rather than hardcoded, since
+        # x_display can be a caller-provided real DISPLAY as well as the
+        # throwaway 1024x768 Xvfb this fixture spins up itself -- see
+        # conftest.py's own x_display fixture.
+        env = dict(os.environ, DISPLAY=x_display)
+        probe = subprocess.run(["xdotool", "getdisplaygeometry"], env=env,
+                                capture_output=True, text=True, check=True)
+        expected = "x".join(probe.stdout.split())
+        result = compile_and_run("log(`${screenWidth}x${screenHeight}`)", env={"DISPLAY": x_display})
+        assert result.returncode == 0
+        assert result.stdout.strip() == expected
+
+    def test_set_client_size_updates_client_size_headlessly(self, compile_and_run, monkeypatch):
+        # No window needed at all -- setClientWidth/setClientHeight
+        # update the canvas's own size synchronously regardless of
+        # whether a window even exists yet (claude.md #139's own
+        # "deliberately synchronous and self-contained" design note).
+        monkeypatch.delenv("DISPLAY", raising=False)
+        source = ("log(`${clientWidth}x${clientHeight}`)\n"
+                   "setClientWidth(400)\nsetClientHeight(300)\n"
+                   "log(`${clientWidth}x${clientHeight}`)")
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["800x600", "400x300"]
+
+    def test_set_client_size_ignores_non_positive_values(self, compile_and_run, monkeypatch):
+        # Matches festina_check_image_size's own "no image nothing could
+        # ever draw to" reasoning, applied to the canvas itself -- a
+        # non-positive size is silently ignored, not a runtime failure.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        source = ("setClientWidth(0)\nsetClientHeight(-5)\n"
+                   "log(`${clientWidth}x${clientHeight}`)")
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "800x600"
+
+    def test_set_client_size_resizes_the_open_window_and_fires_on_resize_exactly_once_each(
+            self, run_graphics_program, x_display):
+        # claude.md #139's own regression: two setClientWidth/
+        # setClientHeight calls back-to-back on an open window must fire
+        # `on resize` exactly twice (once per call), not four times --
+        # which is what a naive "does the incoming event's size match
+        # current state" dedup guard actually produced against real X11
+        # (two separate, non-coalesced ConfigureNotify echoes, the first
+        # carrying a stale intermediate geometry that fooled the size
+        # check into treating the second echo as novel too). Confirmed
+        # via a real Xvfb run before landing the fix -- see
+        # festina_handle_window_event's g_pending_self_resizes counter
+        # in festina_runtime_graphics.c, which counts owed echoes rather
+        # than comparing geometry.
+        source = (
+            "int resizeCount = 0\n"
+            "on resize() {\n"
+            "    resizeCount = resizeCount + 1\n"
+            "    log(`resized to ${clientWidth}x${clientHeight}, count=${resizeCount}`)\n"
+            "}\n"
+            "render()\n"
+            "setClientWidth(500)\n"
+            "setClientHeight(350)\n"
+            "log(`after: ${clientWidth}x${clientHeight}`)\n"
+        )
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            _find_window(x_display)
+            text = _wait_for_output(stdout_path, lambda t: "after:" in t)
+            expected = [
+                "resized to 500x600, count=1",
+                "resized to 500x350, count=2",
+                "after: 500x350",
+            ]
+            assert text.splitlines() == expected
+            # Give any spurious extra echo (the regression this guards
+            # against) a real chance to arrive before declaring victory.
+            time.sleep(0.5)
+            with open(stdout_path) as f:
+                assert f.read().splitlines() == expected, "a spurious extra `on resize` fired"
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
 class TestExampleGraphicsAndGame:
     """Interactive regression coverage for examples/graphics.f and
     examples/tic_tac_toe.f -- the two examples that need a real (or
@@ -4831,16 +5424,24 @@ class TestTimers:
         out_path = tmp_path / "program"
         cli_mod.compile_file(str(src_path), str(out_path))
         stdout_path = tmp_path / "stdout.log"
+        # stdbuf (GNU coreutils) forces line buffering so the log file
+        # has lines mid-run; macOS has no stdbuf, so there the test
+        # keeps its actual contract -- an uncleared interval keeps the
+        # process alive -- and drops only the mid-run line inspection
+        # (macos.md Phase 0's first CI run is what found this).
+        have_stdbuf = shutil.which("stdbuf") is not None
+        cmd = (["stdbuf", "-oL"] if have_stdbuf else []) + [str(out_path)]
         proc = subprocess.Popen(
-            ["stdbuf", "-oL", str(out_path)],
+            cmd,
             cwd=tmp_path, stdout=open(stdout_path, "w"), stderr=subprocess.STDOUT,
         )
         try:
             time.sleep(0.3)
             assert proc.poll() is None, "an uncleared setInterval should keep the program running"
-            lines = stdout_path.read_text().splitlines()
-            assert len(lines) >= 2, f"expected multiple 'tick's by now, got {lines!r}"
-            assert all(line == "tick" for line in lines)
+            if have_stdbuf:
+                lines = stdout_path.read_text().splitlines()
+                assert len(lines) >= 2, f"expected multiple 'tick's by now, got {lines!r}"
+                assert all(line == "tick" for line in lines)
         finally:
             proc.terminate()
             proc.wait(timeout=5)
@@ -4922,7 +5523,8 @@ class TestAudio:
         src_path = tmp_path / "main.f"
         src_path.write_text(source)
         out_path = tmp_path / "program"
-        result_path = cli_mod.compile_file(str(src_path), str(out_path))
+        from tests.conftest import compile_file_or_skip
+        result_path = compile_file_or_skip(cli_mod, str(src_path), str(out_path))
         assert result_path == str(out_path)
         assert out_path.exists()
 
@@ -5264,37 +5866,39 @@ _VOICE_POOL_HARNESS = r"""
  * directly, which gives it FestinaAudio/FestinaVoice (both file-local
  * types) and lets it count active voices for real.
  *
- * Second, the ALSA device layer is REPLACED here, via the macros
- * below, and that is not a shortcut -- it is the only way this test
- * can exist. The null ALSA device the rest of the audio tests use
- * consumes PCM instantly (measured: a 2-second clip finishes in 0ms),
- * so under it every voice is finished before the next play() begins
- * and there is no concurrency left to observe. A stub that sleeps per
- * chunk gives playback real duration under the harness's own control,
- * and needs no sound hardware, no ALSA config, and no device at all.
- * Everything above the device -- the pool, the stealing, the slot
- * reuse, the joining -- is the genuine runtime code.
+ * Second, the DEVICE layer is replaced here -- claude.md #121's
+ * festina_pcm_dev_* seam, supplied by this harness instead of any
+ * platform backend (FESTINA_AUDIO_DEVICE_EXTERNAL), which is also
+ * what lets this harness build on a machine with no audio stack at
+ * all, ALSA headers included. That is not a shortcut -- it is the
+ * only way this test can exist. The null device the rest of the audio
+ * tests use consumes PCM instantly (measured: a 2-second clip
+ * finishes in 0ms), so under it every voice is finished before the
+ * next play() begins and there is no concurrency left to observe. A
+ * stub that sleeps per chunk gives playback real duration under the
+ * harness's own control. Everything above the device -- the pool, the
+ * stealing, the slot reuse, the joining -- is the genuine runtime
+ * code.
  */
-#include <alsa/asoundlib.h>
+#define FESTINA_AUDIO_DEVICE_EXTERNAL 1
 #include <time.h>
 
-static int harness_pcm_open(snd_pcm_t **out) { *out = (snd_pcm_t *)1; return 0; }
-static long harness_pcm_writei(snd_pcm_t *pcm, const void *buf, unsigned long frames) {
-    (void)pcm; (void)buf;
+#include "festina_runtime_audio.c"
+
+void *festina_pcm_dev_open(int channels, unsigned int rate,
+                           char *errbuf, size_t errbuf_size) {
+    (void)channels; (void)rate; (void)errbuf; (void)errbuf_size;
+    return (void *)1;
+}
+long festina_pcm_dev_write(void *dev, const int16_t *frames, size_t frame_count) {
+    (void)dev; (void)frames;
     /* ~10ms per 4096-frame chunk, so a clip of a few chunks plays for
      * long enough that back-to-back play() calls genuinely overlap. */
     struct timespec ts = { 0, 10L * 1000L * 1000L };
     nanosleep(&ts, NULL);
-    return (long)frames;
+    return (long)frame_count;
 }
-
-#define snd_pcm_open(pcmp, name, stream, mode) harness_pcm_open(pcmp)
-#define snd_pcm_set_params(pcm, f, a, c, r, s, l) 0
-#define snd_pcm_writei(pcm, buf, frames) harness_pcm_writei(pcm, buf, frames)
-#define snd_pcm_recover(pcm, err, silent) (-1)
-#define snd_pcm_close(pcm) 0
-
-#include "festina_runtime_audio.c"
+void festina_pcm_dev_close(void *dev) { (void)dev; }
 
 /* The only thing the audio unit needs from the core runtime, supplied
  * here so this harness does not have to link festina_runtime.c (and
@@ -5314,6 +5918,19 @@ int8_t festina_save_bytes(const char *target, char **own_path,
                           const char *what, int8_t adopt) {
     (void)target; (void)own_path; (void)data; (void)len; (void)what; (void)adopt;
     return 0;
+}
+
+/* claude.md #118: aud carries a refcount header now, and
+ * festina_audio_free consults the core runtime's decrement-and-check.
+ * Stubbed with the real semantics (these harnesses free clips whose
+ * header festina_audio_from_bytes genuinely allocated) rather than
+ * linked, for the same no-sqlite3 reason as the two stubs above. */
+int8_t festina_release_check(void *payload) {
+    if (!payload) return 0;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return 0;
+    (*header)--;
+    return *header == 0;
 }
 
 static int active_voices(void *audio) {
@@ -5396,31 +6013,32 @@ _SINGLE_STREAM_HARNESS = r"""
  * each other off, which is exactly what they did before there was a
  * pool at all.
  */
-#include <alsa/asoundlib.h>
+#define FESTINA_AUDIO_DEVICE_EXTERNAL 1
 #include <time.h>
 
+#include "festina_runtime_audio.c"
+
+/* claude.md #121: the single-stream device, expressed at the seam --
+ * the second concurrent open fails, exactly as a dmix-less hw: device
+ * refuses a second stream. */
 static int g_open_count = 0;
-static int lim_open(snd_pcm_t **p) {
-    if (g_open_count >= 1) return -EBUSY;
+void *festina_pcm_dev_open(int channels, unsigned int rate,
+                           char *errbuf, size_t errbuf_size) {
+    (void)channels; (void)rate;
+    if (g_open_count >= 1) {
+        snprintf(errbuf, errbuf_size, "device busy (harness single-stream limit)");
+        return NULL;
+    }
     g_open_count++;
-    *p = (snd_pcm_t *)(long)g_open_count;
-    return 0;
+    return (void *)(long)g_open_count;
 }
-static int lim_close(snd_pcm_t *p) { (void)p; g_open_count--; return 0; }
-static long lim_writei(snd_pcm_t *p, const void *b, unsigned long f) {
-    (void)p; (void)b;
+void festina_pcm_dev_close(void *dev) { (void)dev; g_open_count--; }
+long festina_pcm_dev_write(void *dev, const int16_t *frames, size_t frame_count) {
+    (void)dev; (void)frames;
     struct timespec ts = { 0, 10L * 1000L * 1000L };
     nanosleep(&ts, NULL);
-    return (long)f;
+    return (long)frame_count;
 }
-
-#define snd_pcm_open(pcmp, name, stream, mode) lim_open(pcmp)
-#define snd_pcm_set_params(pcm, f, a, c, r, s, l) 0
-#define snd_pcm_writei(pcm, buf, frames) lim_writei(pcm, buf, frames)
-#define snd_pcm_recover(pcm, err, silent) (-1)
-#define snd_pcm_close(pcm) lim_close(pcm)
-
-#include "festina_runtime_audio.c"
 
 void festina_fail(const char *msg) {
     fprintf(stderr, "fail: %s\n", msg ? msg : "");
@@ -5437,6 +6055,19 @@ int8_t festina_save_bytes(const char *target, char **own_path,
                           const char *what, int8_t adopt) {
     (void)target; (void)own_path; (void)data; (void)len; (void)what; (void)adopt;
     return 0;
+}
+
+/* claude.md #118: aud carries a refcount header now, and
+ * festina_audio_free consults the core runtime's decrement-and-check.
+ * Stubbed with the real semantics (these harnesses free clips whose
+ * header festina_audio_from_bytes genuinely allocated) rather than
+ * linked, for the same no-sqlite3 reason as the two stubs above. */
+int8_t festina_release_check(void *payload) {
+    if (!payload) return 0;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return 0;
+    (*header)--;
+    return *header == 0;
 }
 
 static int active_voices(void *audio) {
@@ -5472,28 +6103,28 @@ _CHANNEL_HARNESS = r"""
  *
  * White-box for the same two reasons the pool harness is (see
  * _VOICE_POOL_HARNESS): a Festina program cannot see which channel a
- * clip landed on, and the null ALSA device consumes PCM instantly so
- * there is no concurrency to observe under it. The device layer is
- * stubbed; the channel table is the real one.
+ * clip landed on, and a null device consumes PCM instantly so there
+ * is no concurrency to observe under it. The device layer is supplied
+ * at claude.md #121's festina_pcm_dev_* seam; the channel table is
+ * the real one.
  */
-#include <alsa/asoundlib.h>
+#define FESTINA_AUDIO_DEVICE_EXTERNAL 1
 #include <time.h>
 
-static int harness_pcm_open(snd_pcm_t **out) { *out = (snd_pcm_t *)1; return 0; }
-static long harness_pcm_writei(snd_pcm_t *pcm, const void *buf, unsigned long frames) {
-    (void)pcm; (void)buf;
+#include "festina_runtime_audio.c"
+
+void *festina_pcm_dev_open(int channels, unsigned int rate,
+                           char *errbuf, size_t errbuf_size) {
+    (void)channels; (void)rate; (void)errbuf; (void)errbuf_size;
+    return (void *)1;
+}
+long festina_pcm_dev_write(void *dev, const int16_t *frames, size_t frame_count) {
+    (void)dev; (void)frames;
     struct timespec ts = { 0, 10L * 1000L * 1000L };
     nanosleep(&ts, NULL);
-    return (long)frames;
+    return (long)frame_count;
 }
-
-#define snd_pcm_open(pcmp, name, stream, mode) harness_pcm_open(pcmp)
-#define snd_pcm_set_params(pcm, f, a, c, r, s, l) 0
-#define snd_pcm_writei(pcm, buf, frames) harness_pcm_writei(pcm, buf, frames)
-#define snd_pcm_recover(pcm, err, silent) (-1)
-#define snd_pcm_close(pcm) 0
-
-#include "festina_runtime_audio.c"
+void festina_pcm_dev_close(void *dev) { (void)dev; }
 
 void festina_fail(const char *msg) {
     fprintf(stderr, "fail: %s\n", msg ? msg : "");
@@ -5510,6 +6141,19 @@ int8_t festina_save_bytes(const char *target, char **own_path,
                           const char *what, int8_t adopt) {
     (void)target; (void)own_path; (void)data; (void)len; (void)what; (void)adopt;
     return 0;
+}
+
+/* claude.md #118: aud carries a refcount header now, and
+ * festina_audio_free consults the core runtime's decrement-and-check.
+ * Stubbed with the real semantics (these harnesses free clips whose
+ * header festina_audio_from_bytes genuinely allocated) rather than
+ * linked, for the same no-sqlite3 reason as the two stubs above. */
+int8_t festina_release_check(void *payload) {
+    if (!payload) return 0;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return 0;
+    (*header)--;
+    return *header == 0;
 }
 
 /* Which channel index a clip is playing on, or -1. */
@@ -5653,10 +6297,12 @@ class TestCircleMaskFastPath:
         self._canvas(compile_and_run, monkeypatch,
                       "fillStyle(200, 30, 30)\ndrawCircle(60, 60, 20)")
         _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        _, _, pixel_rgba = _decode_png_rgba(str(tmp_path / "out.png"))
         assert pixel(60, 60) == (200, 30, 30)      # centre
         assert pixel(60, 45) == (200, 30, 30)      # inside, near the top edge
-        assert pixel(60, 20) == (255, 255, 255)    # well outside
-        assert pixel(95, 60) == (255, 255, 255)
+        # claude.md #136: the canvas clears to transparent, not white.
+        assert pixel_rgba(60, 20) == (0, 0, 0, 0)  # well outside
+        assert pixel_rgba(95, 60) == (0, 0, 0, 0)
 
     @pytest.mark.parametrize("radius", [1, 2, 3, 4, 8, 16, 32])
     def test_every_radius_covers_the_right_extent(self, compile_and_run, tmp_path,
@@ -5666,6 +6312,7 @@ class TestCircleMaskFastPath:
         self._canvas(compile_and_run, monkeypatch,
                       f"fillStyle(0, 0, 0)\ndrawCircle(100, 100, {radius})")
         _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        _, _, pixel_rgba = _decode_png_rgba(str(tmp_path / "out.png"))
         # Inked, not necessarily SOLID: a radius-1 circle does not fully
         # cover even its own centre pixel, so Cairo antialiases it to
         # grey -- in the fallback exactly as much as in the fast path
@@ -5673,9 +6320,11 @@ class TestCircleMaskFastPath:
         # pure black here would be testing Cairo's coverage arithmetic
         # rather than this cache.
         assert pixel(100, 100)[0] < 200, (radius, pixel(100, 100))
-        # Just outside the circle in each direction is untouched white.
+        # Just outside the circle in each direction is untouched
+        # transparent (claude.md #136: the canvas clears to transparent,
+        # not white).
         for dx, dy in ((radius + 2, 0), (-radius - 2, 0), (0, radius + 2), (0, -radius - 2)):
-            assert pixel(100 + dx, 100 + dy) == (255, 255, 255), (radius, dx, dy)
+            assert pixel_rgba(100 + dx, 100 + dy) == (0, 0, 0, 0), (radius, dx, dy)
 
     def test_a_bordered_circle_still_gets_its_border(self, compile_and_run, tmp_path,
                                                       monkeypatch):
@@ -5700,9 +6349,11 @@ class TestCircleMaskFastPath:
         self._canvas(compile_and_run, monkeypatch,
                       "fillStyle(0, 0, 0)\nscale(2.0, 2.0)\ndrawCircle(50, 50, 10)")
         _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        _, _, pixel_rgba = _decode_png_rgba(str(tmp_path / "out.png"))
         assert pixel(100, 100) == (0, 0, 0)
         assert pixel(100, 84) == (0, 0, 0)         # 16px out, inside a radius-20 circle
-        assert pixel(100, 78) == (255, 255, 255)   # 22px out, beyond it
+        # claude.md #136: the canvas clears to transparent, not white.
+        assert pixel_rgba(100, 78) == (0, 0, 0, 0)   # 22px out, beyond it
 
     def test_a_translated_circle_moves(self, compile_and_run, tmp_path, monkeypatch):
         # A whole-number translation KEEPS the fast path, so this checks
@@ -5710,11 +6361,18 @@ class TestCircleMaskFastPath:
         self._canvas(compile_and_run, monkeypatch,
                       "fillStyle(0, 0, 0)\ntranslate(100, 50)\ndrawCircle(30, 30, 10)")
         _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        _, _, pixel_rgba = _decode_png_rgba(str(tmp_path / "out.png"))
         assert pixel(130, 80) == (0, 0, 0)
-        assert pixel(30, 30) == (255, 255, 255)
+        # claude.md #136: the canvas clears to transparent, not white.
+        assert pixel_rgba(30, 30) == (0, 0, 0, 0)
 
     def test_alpha_applies_to_a_circle(self, compile_and_run, tmp_path, monkeypatch):
+        # claude.md #136: the canvas itself clears to transparent now,
+        # so an opaque white backdrop is drawn explicitly here -- this
+        # test is about fillAlpha() blending, not about what the canvas
+        # happens to default to.
         self._canvas(compile_and_run, monkeypatch,
+                      "fillStyle(255, 255, 255)\ndrawRect(0, 0, 800, 600)\n"
                       "fillStyle(0, 0, 0)\nfillAlpha(0.5)\ndrawCircle(60, 60, 20)")
         _, _, pixel = _decode_png(str(tmp_path / "out.png"))
         r, g, b = pixel(60, 60)
@@ -5737,9 +6395,10 @@ class TestCircleMaskFastPath:
                                                                     tmp_path, monkeypatch):
         self._canvas(compile_and_run, monkeypatch,
                       "fillStyle(0, 0, 0)\ndrawCircle(60, 60, 0)\ndrawCircle(90, 60, -5)")
-        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
-        assert pixel(60, 60) == (255, 255, 255)
-        assert pixel(90, 60) == (255, 255, 255)
+        # claude.md #136: the canvas clears to transparent, not white.
+        _, _, pixel_rgba = _decode_png_rgba(str(tmp_path / "out.png"))
+        assert pixel_rgba(60, 60) == (0, 0, 0, 0)
+        assert pixel_rgba(90, 60) == (0, 0, 0, 0)
 
     def test_many_distinct_radii_do_not_break_the_cache(self, compile_and_run, tmp_path,
                                                           monkeypatch):
@@ -6110,12 +6769,14 @@ class TestChainedCallResultReachedForAField:
         assert body.count("@__festina_release_struct_Outer(") == 1
         assert body.count("@festina_release") == 0
 
-    def test_a_chain_ending_in_a_managed_value_is_still_not_released(
+    def test_a_chain_ending_in_a_managed_value_retains_then_releases(
             self, parser, semantic, codegen):
-        # The restriction #102 identified is unchanged and still
-        # load-bearing: if the value escaping the chain is itself
-        # managed, releasing the parent would free it. Nothing is
-        # emitted, and the leak stands -- deliberately.
+        # claude.md #117 INVERTED this test, which used to pin #102/#108's
+        # deliberate leak ("releasing the parent would free the value
+        # just loaded"). The fix is retain-first: the Inner is retained,
+        # THEN the Outer released -- whose cascade decrements Inner back
+        # to exactly one reference, owned by the binding. The parent
+        # release must appear, and a retain must precede it.
         source = """
         struct Inner { n:int }
         struct Outer { inner:Inner }
@@ -6134,7 +6795,10 @@ class TestChainedCallResultReachedForAField:
         analyzed = semantic.analyze(program, filename="main.f")
         ir = codegen.generate_ir(program, analyzed, filename="main.f")
         body = ir.split("define void @use()")[1].split("\n}")[0]
-        assert "@__festina_release_struct_Outer(" not in body
+        assert "@__festina_release_struct_Outer(" in body
+        retain_at = body.index("call void @festina_retain(")
+        release_at = body.index("@__festina_release_struct_Outer(")
+        assert retain_at < release_at, "the retain must precede the parent release"
 
     def test_a_chain_ending_in_text_is_still_not_released(self, compile_and_run):
         # Same reasoning, and the same thing that must never happen:
@@ -6225,6 +6889,299 @@ class TestChainedCallResultReachedForAField:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip() == "1225"
+
+
+class TestComputedIndexAndArgumentOwnership:
+    """claude.md #119: the two chain shapes #117 left leaking, closed
+    by the same retain-first argument. A computed-index element off an
+    owning receiver (`getRows()[0]`, `getMap()['k']`) is minted its own
+    ownership (retain for a refcounted element, copy for a text one)
+    and the container released; an owning refcounted ARGUMENT to a user
+    function (`f(make())`, `f(getRows()[0])`) is released after the
+    call, exactly like a text temporary. Whether an emission minted a
+    +1 is recorded (_minted_values) rather than re-derived from syntax,
+    because the one shape syntax cannot classify -- a table-row element
+    is borrowed where a struct element is retained -- is exactly where
+    a predicate/emission disagreement would corrupt memory."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_a_computed_element_retains_before_the_container_release(
+            self, parser, semantic, codegen):
+        source = """
+        arr[arr[int]] func matrix() {
+            arr[arr[int]] m = [[1, 2], [3, 4]]
+            return m
+        }
+        void func use() {
+            arr[int] row = matrix()[0]
+            log(row.length)
+        }
+        use()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @use()")[1].split("\n}")[0]
+        retain_at = body.index("call void @festina_retain(")
+        release_at = body.index("@__festina_release_array_")
+        assert retain_at < release_at, "the element retain must precede the container release"
+
+    def test_computed_index_values_survive_their_container(self, compile_and_run):
+        source = """
+        arr[arr[int]] func matrix() {
+            arr[arr[int]] m = [[1, 2], [3, 4]]
+            return m
+        }
+        map[text] func conf() {
+            map[text] m = {'k': 'value'}
+            return m
+        }
+        arr[text] func names() {
+            arr[text] t = ['alpha', 'beta']
+            return t
+        }
+        int total = 0
+        for int i = 0, i < 60, i++ {
+            arr[int] row = matrix()[1]
+            total = total + row[0] + matrix()[0][1]
+            if conf()['k'] != 'value' { log('corrupted') }
+            if names()[0] != 'alpha' { log('corrupted') }
+        }
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "300"
+
+    def test_an_owning_argument_is_released_after_the_call(
+            self, parser, semantic, codegen):
+        source = """
+        int func total(xs:arr[int]) {
+            return xs.length
+        }
+        void func use() {
+            log(total([1, 2, 3]))
+        }
+        use()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @use()")[1].split("\n}")[0]
+        call_at = body.index("call i64 @total(")
+        release_at = body.index("@festina_release")
+        assert call_at < release_at, "the argument release must come after the call"
+
+    def test_owning_arguments_reach_the_callee_intact(self, compile_and_run):
+        # The callee stores, reads and returns through the borrowed
+        # argument; anything it KEEps takes its own retain, so the
+        # caller's post-call release never pulls memory out from under
+        # a kept reference.
+        source = """
+        struct Box { n:int }
+        arr[Box] kept
+        Box func makeBox(v:int) {
+            Box b
+            b.n = v
+            return b
+        }
+        void func keep(b:Box) {
+            kept.push(b)
+        }
+        int func readThrough(b:Box) {
+            return b.n
+        }
+        int total = 0
+        for int i = 0, i < 50, i++ {
+            keep(makeBox(i))
+            total = total + readThrough(makeBox(i))
+        }
+        total = total + kept[10].n + kept.length
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == str(sum(range(50)) + 10 + 50)
+
+    def test_a_table_row_element_stays_borrowed(self, compile_and_run, tmp_path):
+        # The one computed-index shape that deliberately does NOT mint:
+        # rows have no refcount header (the array owns them outright),
+        # so the container is left alive -- leaked, per todo.md -- and
+        # a column read off the row is still copied at its binding.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table People {{ id:int  name:text }}
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'row'])
+        arr[People] func rows() {{
+            arr[People] r = sqlite('SELECT * FROM People')
+            return r
+        }}
+        text got = rows()[0].name
+        log(got)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "row"
+
+
+class TestCycleCollection:
+    """claude.md #120: reference cycles are collected, not leaked. A
+    release of a value whose TYPE can reach itself (struct fields, arr
+    elements, map values) that leaves the count above zero runs a
+    synchronous trial deletion -- markGray / scan / collectWhite over
+    generated per-type traversals -- freeing a cycle no external
+    reference holds and restoring, exactly, one that something still
+    does. Acyclic types generate none of it and pay nothing. The
+    leak-freedom half is verified under ASan/LeakSanitizer by the
+    struct_self per-type program (now a genuine cycle) and was measured
+    directly for self-cycles, pair cycles, array-routed parent pointers
+    and map-routed rings; these tests pin the structure and the
+    reachability behavior."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def test_a_cyclic_type_release_wrapper_runs_a_trial(
+            self, parser, semantic, codegen):
+        source = """
+        struct Node { n:int next:Node }
+        void func f() {
+            Node a
+            a.n = 1
+            a.next = a
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        wrapper = ir.split("define void @__festina_release_struct_Node(")[1].split("\n}")[0]
+        assert "call i8 @festina_cycle_candidate(" in wrapper
+        assert "@__festina_cycle_gray_" in wrapper
+        assert "@__festina_cycle_scan_" in wrapper
+        assert "@__festina_cycle_white_" in wrapper
+
+    def test_an_acyclic_type_generates_no_cycle_machinery(
+            self, parser, semantic, codegen):
+        # The gate: a program whose types cannot form a cycle carries
+        # zero collector code and zero trial calls.
+        source = """
+        struct Inner { n:int }
+        struct Outer { inner:Inner }
+        void func f() {
+            Outer o
+            o.inner.n = 1
+        }
+        f()
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "festina_cycle_candidate" not in ir.replace(
+            "declare i8 @festina_cycle_candidate(ptr)", "")
+        assert "@__festina_cycle_" not in ir
+
+    def test_garbage_cycles_are_reclaimed_and_reused_memory_stays_sane(
+            self, compile_and_run):
+        # 300 dropped cycles; correctness of everything built afterwards
+        # is the observable half (the zero-leaked-bytes half runs under
+        # the sanitizer harness in test_leak_stress).
+        source = """
+        struct Node { n:int next:Node label:text }
+        void func cycle(v:int) {
+            Node a
+            Node b
+            a.n = v
+            a.label = `n${v}`
+            b.n = v + 1
+            a.next = b
+            b.next = a
+        }
+        int total = 0
+        for int i = 0, i < 300, i++ {
+            cycle(i)
+            total = total + i
+        }
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == str(sum(range(300)))
+
+    def test_a_reachable_cycle_survives_its_trial_intact(self, compile_and_run):
+        # The safety half: a trial on a cycle something still holds
+        # must restore every count and free nothing.
+        source = """
+        struct Node { n:int next:Node }
+        Node keep
+        void func build() {
+            Node a
+            Node b
+            a.n = 10
+            b.n = 20
+            a.next = b
+            b.next = a
+            keep = b
+        }
+        build()
+        log(keep.n)
+        log(keep.next.n)
+        log(keep.next.next.n)
+        keep.next = null
+        log('broken')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["20", "10", "20", "broken"]
+
+    def test_cycles_through_arrays_and_maps_are_collected(self, compile_and_run):
+        source = """
+        struct Tree { n:int kids:arr[Tree] parent:Tree }
+        void func family() {
+            Tree root
+            root.n = 1
+            Tree kid
+            kid.n = 2
+            kid.parent = root
+            root.kids.push(kid)
+        }
+        struct Ring { name:text peers:map[Ring] }
+        void func ring() {
+            Ring a
+            Ring b
+            a.name = 'a'
+            b.name = 'b'
+            a.peers['b'] = b
+            b.peers['a'] = a
+        }
+        for int i = 0, i < 200, i++ {
+            family()
+            ring()
+        }
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+    def test_field_stores_land_before_the_old_values_release(
+            self, parser, semantic, codegen):
+        # claude.md #120's ordering rule: with trials traversing the
+        # object graph, a field must never still point at a value whose
+        # count the in-flight release already dropped -- markGray would
+        # double-count the edge and could free something a real
+        # external reference holds. The store must precede the release
+        # in the emitted IR.
+        source = """
+        struct Node { n:int next:Node }
+        void func f(a:Node, b:Node) {
+            a.next = b
+        }
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        body = ir.split("define void @f(")[1].split("\n}")[0]
+        store_at = body.index("store ptr")
+        release_at = body.index("call void @__festina_release_struct_Node(")
+        assert store_at < release_at, "the field store must precede the old value's release"
 
 
 class TestAudioChannelReturnAndClipStop:
@@ -6360,6 +7317,109 @@ class TestAudioChannelReturnAndClipStop:
         result = compile_and_run(source, env=audio_null_env)
         assert result.returncode == 0
         assert result.stdout.strip() == "-1"
+
+
+class TestSplitAndJoin:
+    '''claude.md #116: sentence.split(sep) -> arr[text], sep a text or a
+    regex; words.join(sep) -> text, on arrays of text/int/float/bool.
+    JS semantics throughout: empty pieces kept, edge empties kept, an
+    empty-match regex splits between characters without a trailing
+    empty, an empty text separator splits per UTF-8 code point, and a
+    null element joins as an empty string.'''
+
+    def test_the_spec_example(self, compile_and_run):
+        source = r'''
+        text sentence = 'the quick brown fox'
+        arr[text] words = sentence.split(' ')
+        log(words.length)
+        sentence = words.join('\t')
+        log(sentence)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ['4', 'the\tquick\tbrown\tfox']
+
+    def test_regex_split(self, compile_and_run):
+        source = r'''
+        arr[text] words = 'one   two	three'.split(/\s+/g)
+        log(words)
+        log(words.join('-'))
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            '["one","two","three"]', 'one-two-three']
+
+    def test_empty_pieces_are_kept(self, compile_and_run):
+        # JS: 'a,,b'.split(',') has three pieces; separators at the
+        # edges yield edge empties.
+        source = '''
+        log('a,,b'.split(','))
+        log(',start'.split(','))
+        log('end,'.split(','))
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            '["a","","b"]', '["","start"]', '["end",""]']
+
+    def test_no_match_is_one_piece(self, compile_and_run):
+        result = compile_and_run("log('whole'.split(','))")
+        assert result.stdout.strip() == '["whole"]'
+
+    def test_an_empty_match_regex_splits_between_characters(self, compile_and_run):
+        # ...and does not loop forever, and adds no trailing empty --
+        # both exactly JS.
+        result = compile_and_run("log('abc'.split(/x*/))")
+        assert result.stdout.strip() == '["a","b","c"]'
+
+    def test_an_empty_text_separator_splits_utf8_code_points(self, compile_and_run):
+        # Per CODE POINT, not per byte -- a byte split would shatter
+        # every non-ASCII character into invalid fragments.
+        result = compile_and_run("log('h\u00e9llo'.split(''))")
+        assert result.stdout.strip() == '["h","\u00e9","l","l","o"]'
+
+    def test_join_renders_scalars_and_null_as_empty(self, compile_and_run):
+        # JS: [1, null, 3].join('-') is '1--3'.
+        source = '''
+        arr[int] nums = [1, null, 3]
+        log(nums.join('-'))
+        arr[bool] flags = [true, false]
+        log(flags.join('|'))
+        arr[float] fs = [1.5, 2.5]
+        log(fs.join(', '))
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ['1--3', 'true|false', '1.5, 2.5']
+
+    def test_a_split_result_is_an_ordinary_array(self, compile_and_run):
+        # Refcounted, aliasable, freeable -- built by the runtime with
+        # the same layout every arr[text] has.
+        source = '''
+        arr[text] words = 'a b c'.split(' ')
+        arr[text] alias = words
+        words.push('d')
+        log(alias.length)
+        free words
+        log(alias[0])
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ['4', 'a']
+
+    def test_split_separator_must_be_text_or_regex(self, parser, semantic, errors):
+        program = parser.parse("log('a b'.split(5))")
+        with pytest.raises(errors.CompileError, match='text or regex'):
+            semantic.analyze(program)
+
+    def test_join_needs_a_joinable_element_type(self, parser, semantic, errors):
+        program = parser.parse(
+            'struct P { n:int }\n'
+            'arr[P] ps = []\n'
+            "log(ps.join(','))")
+        with pytest.raises(errors.CompileError, match='join'):
+            semantic.analyze(program)
+
+    def test_join_separator_must_be_text(self, parser, semantic, errors):
+        program = parser.parse("arr[int] ns = [1]\nlog(ns.join(5))")
+        with pytest.raises(errors.CompileError, match='separator must be text'):
+            semantic.analyze(program)
 
 
 class TestJsonRendering:
@@ -7518,6 +8578,101 @@ class TestMediaFormatsAndPaths:
         assert result.stdout.strip() == "16"
 
 
+class TestTypedMediaArrayLiterals:
+    """claude.md #137: arr[img]/arr[aud]/arr[blob] declared directly
+    from a literal of paths -- `arr[img] brushes = ['a.png', 'b.png']`
+    -- the array-typed counterpart of `img sprite = 'sprite.png'`
+    (claude.md #100/#101/#109's own text -> media declaration
+    shorthand), now also allowed element-by-element inside a literal
+    the array is declared from."""
+
+    def test_an_image_array_literal_loads_each_path(self, compile_and_run, tmp_path,
+                                                      monkeypatch, sprite_sheet_png):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        name = os.path.basename(sprite_sheet_png)
+        shutil.copy(sprite_sheet_png, tmp_path / "other.png")
+        source = f"""
+        arr[img] sheets = ['{name}', 'other.png']
+        log(sheets.length)
+        log(`${{sheets[0].width}}x${{sheets[0].height}}`)
+        log(`${{sheets[1].width}}x${{sheets[1].height}}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\n128x64\n128x64\n"
+
+    def test_a_blob_array_literal_loads_each_path(self, compile_and_run, tmp_path):
+        (tmp_path / "a.txt").write_text("first")
+        (tmp_path / "b.txt").write_text("second")
+        source = """
+        arr[blob] files = ['a.txt', 'b.txt']
+        log(files.length)
+        log(files[0].toText())
+        log(files[1].toText())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\nfirst\nsecond\n"
+
+    def test_an_audio_array_literal_loads_each_path(self, compile_and_run, tmp_path,
+                                                      audio_null_env):
+        shutil.copy(_MP3_FIXTURE, tmp_path / "tone.mp3")
+        result = compile_and_run(
+            "arr[aud] clips = ['tone.mp3']\nlog(clips.length)\nlog(clips[0] == null)",
+            env=audio_null_env,
+        )
+        assert result.returncode == 0
+        assert result.stdout == "1\nfalse\n"
+
+    def test_an_element_may_already_be_the_media_type_not_just_a_path(
+            self, compile_and_run, tmp_path, monkeypatch, sprite_sheet_png):
+        # A mix: one path, one already-declared img reused by reference.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        name = os.path.basename(sprite_sheet_png)
+        shutil.copy(sprite_sheet_png, tmp_path / "second.png")
+        source = f"""
+        img second = 'second.png'
+        arr[img] sheets = ['{name}', second]
+        log(sheets.length)
+        log(sheets[1] == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\nfalse\n"
+
+    def test_a_clipped_images_own_array_literal_does_not_alias_its_source(
+            self, compile_and_run, tmp_path, monkeypatch, sprite_sheet_png):
+        # The array literal path (_emit_array_lit) has to retain a
+        # reused element the same way push()/a plain array literal
+        # already do (claude.md #80) -- reusing `second` here must not
+        # leave sheets[1] silently sharing ownership incorrectly.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        name = os.path.basename(sprite_sheet_png)
+        source = f"""
+        img second = '{name}'
+        arr[img] sheets = [second]
+        second.resize(4, 4)
+        log(`${{sheets[0].width}}x${{sheets[0].height}}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # Aliased, not copied -- resizing through `second` is visible
+        # through `sheets[0]` too, same as any other img alias.
+        assert result.stdout.strip() == "4x4"
+
+    def test_wrong_element_type_is_rejected(self, parser, semantic, errors):
+        for source in [
+            "arr[img] brushes = [5]",
+            "arr[img] brushes = [true]",
+            "aud a = 'x.wav'\narr[img] brushes = [a]",
+            "arr[blob] files = [3.5]",
+            "arr[aud] clips = [null, 7]",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
 class TestMediaColumnsInTables:
     """claude.md #101: `file:aud` / `pic:img` table columns, stored as
     SQLite BLOBs.
@@ -7678,11 +8833,14 @@ class TestAudioChannels:
         cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
         if not cc:
             pytest.skip("no C compiler (clang/gcc/cc) on PATH")
-        # claude.md #101: the audio unit needs libmpg123 too now.
-        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa", "libmpg123"],
+        # claude.md #101: the audio unit needs libmpg123 for decoding.
+        # claude.md #121: and ONLY libmpg123 -- the harness supplies the
+        # device layer at the festina_pcm_dev_* seam, so no ALSA headers
+        # (or any platform audio stack) are needed to build it.
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "libmpg123"],
                                capture_output=True, text=True)
         if alsa.returncode != 0:
-            pytest.skip("alsa/libmpg123 dev headers are not installed")
+            pytest.skip("libmpg123 dev headers are not installed")
         runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
         harness = tmp_path / "channel_harness.c"
         harness.write_text(_CHANNEL_HARNESS)
@@ -7777,11 +8935,14 @@ class TestAudioOnANonMixingDevice:
         cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
         if not cc:
             pytest.skip("no C compiler (clang/gcc/cc) on PATH")
-        # claude.md #101: the audio unit needs libmpg123 too now.
-        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa", "libmpg123"],
+        # claude.md #101: the audio unit needs libmpg123 for decoding.
+        # claude.md #121: and ONLY libmpg123 -- the harness supplies the
+        # device layer at the festina_pcm_dev_* seam, so no ALSA headers
+        # (or any platform audio stack) are needed to build it.
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "libmpg123"],
                                capture_output=True, text=True)
         if alsa.returncode != 0:
-            pytest.skip("alsa/libmpg123 dev headers are not installed")
+            pytest.skip("libmpg123 dev headers are not installed")
         runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
         harness = tmp_path / "single_stream_harness.c"
         harness.write_text(_SINGLE_STREAM_HARNESS)
@@ -7834,11 +8995,14 @@ class TestAudioVoicePool:
         cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
         if not cc:
             pytest.skip("no C compiler (clang/gcc/cc) on PATH")
-        # claude.md #101: the audio unit needs libmpg123 too now.
-        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "alsa", "libmpg123"],
+        # claude.md #101: the audio unit needs libmpg123 for decoding.
+        # claude.md #121: and ONLY libmpg123 -- the harness supplies the
+        # device layer at the festina_pcm_dev_* seam, so no ALSA headers
+        # (or any platform audio stack) are needed to build it.
+        alsa = subprocess.run(["pkg-config", "--cflags", "--libs", "libmpg123"],
                                capture_output=True, text=True)
         if alsa.returncode != 0:
-            pytest.skip("alsa/libmpg123 dev headers are not installed")
+            pytest.skip("libmpg123 dev headers are not installed")
 
         runtime_dir = os.path.join(os.path.dirname(_EXAMPLES_DIR), "runtime")
         harness = tmp_path / "voice_pool_harness.c"
@@ -8061,6 +9225,47 @@ class TestRegexLiteral:
         result = compile_and_run(r"log(/\w+/gi.test('Hello'))")
         assert result.stdout.strip() == "true"
 
+    def test_gnu_class_escapes_work_on_every_platform(self, compile_and_run):
+        # claude.md #122: api.md promises \w/\d/\s/\b, which are GNU
+        # extensions -- macOS's BSD regcomp treats \s as a literal 's',
+        # caught by the first real macos-14 CI run. The runtime now
+        # expands them to POSIX classes before regcomp on EVERY
+        # platform, so this test passing on both CI jobs is the
+        # portability proof.
+        source = r"""
+        log(/a\db/.test('a5b'))
+        log(/a\db/.test('axb'))
+        log(' xy '.match(/\S+/))
+        log('12ab34'.match(/\D+/))
+        log('a1 b2'.replace(/\w\d/g, '#'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false", "xy", "ab", "# #"]
+
+    def test_word_boundary_replaces_only_the_whole_word(self, compile_and_run):
+        # \b: native in glibc, translated to BSD's [[:<:]]/[[:>:]] on
+        # darwin (claude.md #122's one per-platform difference).
+        source = r"""
+        log('a word here'.replace(/\bword\b/, 'X'))
+        log('swordfish'.replace(/\bword\b/, 'X'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["a X here", "swordfish"]
+
+    def test_escapes_inside_brackets_stay_untranslated(self, compile_and_run):
+        # POSIX (and glibc): a backslash inside [...] is a literal, so
+        # the expansion must not fire there -- and a [:class:] body's
+        # ']' must not end the bracket early. Both pinned, because the
+        # translator walks brackets itself and either mistake would be
+        # silent on Linux.
+        source = r"""
+        log('x7y'.match(/[[:digit:]]+/))
+        log(/a\.b/.test('a.b'))
+        log(/a\.b/.test('axb'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["7", "true", "false"]
+
     def test_match_returns_first_match(self, compile_and_run):
         result = compile_and_run("log('room 42, building 7'.match(/[0-9]+/))")
         assert result.stdout.strip() == "42"
@@ -8124,10 +9329,12 @@ class TestRegexLiteral:
 
 
 class TestNumericConversion:
-    """claude.md #55 (no implicit int/float conversion), #56 (Math),
-    #57 (division/modulo by zero returns null). See
-    tests/test_numeric_conversion.py for the parser/semantic-only tests;
-    these check the actual runtime behavior of a compiled program."""
+    """claude.md #56 (Math), #57 (division/modulo by zero returns
+    null), #143 (int/float mixing always promotes to float -- see
+    TestNumericCoercion below for its own dedicated runtime coverage).
+    See tests/test_numeric_conversion.py for the parser/semantic-only
+    tests; these check the actual runtime behavior of a compiled
+    program."""
 
     @pytest.mark.parametrize("fn,expected", [
         ("floor", "19"), ("ceil", "20"), ("round", "20"), ("trunc", "19"),
@@ -8163,23 +9370,25 @@ class TestNumericConversion:
         lines = result.stdout.splitlines()
         assert lines[0] == lines[1]
 
-    def test_mixed_int_float_rejected_end_to_end(self, compile_and_run, errors):
-        # Confirms the whole pipeline (not just semantic.py in isolation)
-        # rejects this -- semantic analysis raises before ever reaching
-        # a linker, so this is a CompileError, not a nonzero exit code.
-        with pytest.raises(errors.CompileError, match="int and float"):
-            compile_and_run("int a = 5\nfloat b = 2.5\nfloat c = a + b")
+    def test_mixed_int_float_produces_float_end_to_end(self, compile_and_run):
+        # claude.md #143: confirms the whole pipeline (not just
+        # semantic.py in isolation) auto-coerces the int side to float,
+        # rather than rejecting the mix the way it used to.
+        result = compile_and_run("int a = 5\nfloat b = 2.5\nfloat c = a + b\nlog(c)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "7.5"
 
     def test_int_division_by_zero_returns_null(self, compile_and_run):
         # claude.md #57: must not crash (SIGFPE) and must not silently
         # compute garbage -- the sentinel is intentionally an
         # implementation detail (see codegen.py's module docstring), so
         # this only checks the process survives and produces *a* value,
-        # not the exact sentinel bit pattern.
+        # not the exact sentinel bit pattern. claude.md #143: `result`
+        # is float now -- / always returns float, even for two ints.
         source = """
         int a = 10
         int b = 0
-        int result = a / b
+        float result = a / b
         log('survived')
         """
         result = compile_and_run(source)
@@ -8198,9 +9407,11 @@ class TestNumericConversion:
         assert result.returncode == 0
         assert result.stdout.strip() == "survived"
 
-    def test_int_division_by_nonzero_is_unaffected(self, compile_and_run):
+    def test_division_and_modulo_by_nonzero(self, compile_and_run):
+        # claude.md #143: / is now float even for two ints; % is
+        # unaffected (still int, unchanged).
         result = compile_and_run("int a = 10\nint b = 4\nlog(a / b)\nlog(a % b)")
-        assert result.stdout.splitlines() == ["2", "2"]
+        assert result.stdout.splitlines() == ["2.5", "2"]
 
     def test_null_int_and_float_assignment(self, compile_and_run):
         # Regression test: `null` used to lower to the LLVM keyword
@@ -8225,7 +9436,10 @@ class TestNumericConversion:
         # for a concretely-typed int/float/bool operand used to reach
         # codegen as `icmp eq i64 %x, null` -- also invalid IR (null is
         # only valid for a pointer type), independent of bool at all.
-        result = compile_and_run("int a = 1 / 0\nlog(a == null)")
+        # claude.md #143: `1 / 0` no longer produces an int (/ always
+        # returns float now) -- `%` still does, so it's the source of a
+        # genuine int null value here instead.
+        result = compile_and_run("int a = 1 % 0\nlog(a == null)")
         assert result.stdout.strip() == "true"
 
     def test_comparing_a_non_null_int_against_the_null_literal(self, compile_and_run):
@@ -8300,6 +9514,90 @@ class TestNumericConversion:
         result = compile_and_run("float tiny = 0.0000001\nlog('compiled fine')")
         assert result.returncode == 0
         assert result.stdout.strip() == "compiled fine"
+
+
+class TestNumericCoercion:
+    """claude.md #143: int and float mix freely in any binary operator
+    now -- the int side implicitly coerced to float, "as though
+    int.toFloat() had been written" -- and division always returns
+    float, even for two ints. Supersedes claude.md #55's old "int and
+    float never mix directly" rule; see tests/test_numeric_conversion.py
+    for the parser/semantic-only coverage of the same rule."""
+
+    @pytest.mark.parametrize("op,expected", [
+        ("+", "7.5"), ("-", "2.5"), ("*", "12.5"), ("%", "0"),
+    ])
+    def test_mixed_arithmetic_coerces_the_int_side(self, compile_and_run, op, expected):
+        result = compile_and_run(f"int a = 5\nfloat b = 2.5\nlog(a {op} b)")
+        assert result.stdout.strip() == expected
+
+    @pytest.mark.parametrize("op,expected", [
+        ("<", "false"), (">", "true"), ("<=", "false"), (">=", "true"),
+        ("==", "false"), ("!=", "true"),
+    ])
+    def test_mixed_comparison_coerces_the_int_side(self, compile_and_run, op, expected):
+        result = compile_and_run(f"int a = 5\nfloat b = 2.5\nlog(a {op} b)")
+        assert result.stdout.strip() == expected
+
+    def test_division_always_returns_float_even_for_two_ints(self, compile_and_run):
+        result = compile_and_run("int a = 10\nint b = 3\nfloat c = a / b\nlog(c)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "3.33333"
+
+    def test_division_between_two_floats_is_unaffected(self, compile_and_run):
+        result = compile_and_run("float a = 10.0\nfloat b = 4.0\nlog(a / b)")
+        assert result.stdout.strip() == "2.5"
+
+    def test_mixed_division_is_float(self, compile_and_run):
+        result = compile_and_run("int a = 10\nfloat b = 4.0\nlog(a / b)")
+        assert result.stdout.strip() == "2.5"
+
+    def test_modulo_between_two_ints_is_still_int(self, compile_and_run):
+        # claude.md #143's own "division always returns float" is
+        # specific to /, not modulo -- confirmed here at runtime (the
+        # 3 is a genuine int, not e.g. "3.0").
+        result = compile_and_run("int a = 10\nint b = 3\nlog(a % b)")
+        assert result.stdout.strip() == "1"
+
+    def test_only_math_methods_convert_a_float_result_back_to_int(self, compile_and_run):
+        # The request's own closing line: "the only way to get back an
+        # int from an operation that makes a float is using the Math
+        # methods." int.toFloat() is the one-directional int->float
+        # conversion; Math.floor/ceil/round/trunc are the only float->int
+        # ones -- both already existed (claude.md #55/#56), unchanged by
+        # this feature, just now the ONLY way back once an operator has
+        # already promoted to float.
+        source = """
+        int a = 10
+        int b = 3
+        float divided = a / b
+        int backToInt = Math.floor(divided)
+        log(backToInt)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "3"
+
+    def test_mixed_operand_in_a_struct_field_assignment(self, compile_and_run):
+        source = """
+        struct Box { total:float }
+        Box b
+        int count = 4
+        float price = 2.5
+        b.total = count * price
+        log(b.total)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "10"
+
+    def test_mixed_operand_as_a_function_argument(self, compile_and_run):
+        source = """
+        float func scaleUp(x:float) { return x * 2 }
+        int n = 5
+        log(scaleUp(n.toFloat()))
+        log(n * 1.5)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["10", "7.5"]
 
 
 class TestFail:
@@ -8441,6 +9739,26 @@ class TestAutomaticSqliteSchemaSync:
         cols = {row[1]: row[2] for row in self._schema(db, "People")}
         assert cols == {"id": "INTEGER", "name": "TEXT"}
 
+    def _diag(self, db, result, mtime_before):
+        # claude.md #126 round eleven: every one of this class's real
+        # Windows CI failures reports an unaltered schema with no error
+        # at all (returncode 0), which is also exactly what a SECOND
+        # compiled program touching a DIFFERENT actual database file
+        # would produce -- the original tmp_path/"festina.sqlite" the
+        # test itself reads back from would simply never have been
+        # written to. Two prior rounds' fixes (an explicit
+        # sqlite3_close/checkpoint, a stdout-flush fix for an unrelated
+        # bug) didn't move this one at all, so this diagnostic -- an
+        # mtime check plus the compiled program's own captured output
+        # -- is what the NEXT real Windows log needs to actually
+        # distinguish "wrote the right file, wrong contents" from
+        # "never touched this file at all" instead of guessing again.
+        mtime_after = db.stat().st_mtime if db.exists() else None
+        return (f"mtime before second run: {mtime_before}, after: {mtime_after} "
+                f"(unchanged means the second compiled program's own "
+                f"festina.sqlite was never touched at all)\n"
+                f"second run stdout: {result.stdout!r}\nstderr: {result.stderr!r}")
+
     def test_missing_column_is_added_and_data_preserved(self, compile_and_run, tmp_path):
         compile_and_run("table People {\n    id:int\n    name:text\n}\nlog('v1')")
         db = tmp_path / "festina.sqlite"
@@ -8448,14 +9766,16 @@ class TestAutomaticSqliteSchemaSync:
         conn.execute("INSERT INTO People (id, name) VALUES (1, 'Patrick')")
         conn.commit()
         conn.close()
+        mtime_before = db.stat().st_mtime
 
         result = compile_and_run(
             "table People {\n    id:int\n    name:text\n    age:int\n}\nlog('v2')",
             filename="v2.f",
         )
-        assert result.returncode == 0
+        assert result.returncode == 0, self._diag(db, result, mtime_before)
         cols = {row[1]: row[2] for row in self._schema(db, "People")}
-        assert cols == {"id": "INTEGER", "name": "TEXT", "age": "INTEGER"}
+        assert cols == {"id": "INTEGER", "name": "TEXT", "age": "INTEGER"}, \
+            self._diag(db, result, mtime_before)
         rows = sqlite3.connect(db).execute("SELECT id, name FROM People").fetchall()
         assert rows == [(1, "Patrick")]
 
@@ -8469,13 +9789,14 @@ class TestAutomaticSqliteSchemaSync:
         conn.execute("INSERT INTO People (id, name, obsolete) VALUES (1, 'Patrick', 'junk')")
         conn.commit()
         conn.close()
+        mtime_before = db.stat().st_mtime
 
         result = compile_and_run(
             "table People {\n    id:int\n    name:text\n}\nlog('v2')", filename="v2.f",
         )
-        assert result.returncode == 0
+        assert result.returncode == 0, self._diag(db, result, mtime_before)
         cols = {row[1] for row in self._schema(db, "People")}
-        assert cols == {"id", "name"}
+        assert cols == {"id", "name"}, self._diag(db, result, mtime_before)
         rows = sqlite3.connect(db).execute("SELECT id, name FROM People").fetchall()
         assert rows == [(1, "Patrick")]
 
@@ -8487,13 +9808,14 @@ class TestAutomaticSqliteSchemaSync:
         conn.execute("INSERT INTO People (id, name) VALUES (1, 'Patrick')")
         conn.commit()
         conn.close()
+        mtime_before = db.stat().st_mtime
 
         result = compile_and_run(
             "table People {\n    id:int\n    full_name:text\n}\nlog('v2')", filename="v2.f",
         )
-        assert result.returncode == 0
+        assert result.returncode == 0, self._diag(db, result, mtime_before)
         cols = {row[1] for row in self._schema(db, "People")}
-        assert cols == {"id", "full_name"}
+        assert cols == {"id", "full_name"}, self._diag(db, result, mtime_before)
         rows = sqlite3.connect(db).execute("SELECT id FROM People").fetchall()
         assert rows == [(1,)]  # id survives the rebuild; the old `name` data does not
 
@@ -8504,13 +9826,14 @@ class TestAutomaticSqliteSchemaSync:
         conn.execute("INSERT INTO Items (id, price) VALUES (1, 100)")
         conn.commit()
         conn.close()
+        mtime_before = db.stat().st_mtime
 
         result = compile_and_run(
             "table Items {\n    id:int\n    price:float\n}\nlog('v2')", filename="v2.f",
         )
-        assert result.returncode == 0
+        assert result.returncode == 0, self._diag(db, result, mtime_before)
         cols = {row[1]: row[2] for row in self._schema(db, "Items")}
-        assert cols == {"id": "INTEGER", "price": "REAL"}
+        assert cols == {"id": "INTEGER", "price": "REAL"}, self._diag(db, result, mtime_before)
         rows = sqlite3.connect(db).execute("SELECT id, price FROM Items").fetchall()
         assert rows == [(1, 100.0)]
 
@@ -8818,10 +10141,33 @@ class TestSlimBinaries:
         src = tmp_path / "main.f"
         src.write_text("drawRect(1, 1, 2, 2)")
         out = tmp_path / "program"
-        cli_mod.compile_file(str(src), str(out), cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
+        # claude.md #126 round four: calling compile_file directly (as
+        # this test always has, to inspect the linked binary below)
+        # means a platform-gated CompileError -- e.g. on a platform
+        # whose graphics gate still fires -- would otherwise propagate
+        # as a raw test failure instead of the skip every other
+        # platform-conditional test gets.
+        from tests.conftest import compile_file_or_skip
+        compile_file_or_skip(
+            cli_mod, str(src), str(out),
+            cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
         ldd_output = self._ldd(out)
         assert "libcairo" in ldd_output
-        assert "libX11" in ldd_output
+        # claude.md #129: windows.md Phase 2 landing made this
+        # reachable on real Windows CI for the first time -- offscreen
+        # graphics used to hit the win32 gate unconditionally, so
+        # compile_file_or_skip always skipped before reaching this
+        # assertion there. It compiles and links for real now, and
+        # correctly links no X11 at all: Windows graphics is native
+        # Win32 windowing (festina_runtime_window_win32.c), not an X11
+        # server running under emulation, so there is genuinely nothing
+        # X11 to find in a Windows binary's own DLL dependencies --
+        # this isn't a platform-specific carve-out for a bug, it's the
+        # correct, intended difference the X11 check itself only makes
+        # sense on the platform that actually has X11 in the first
+        # place.
+        if sys.platform != "win32":
+            assert "libX11" in ldd_output
         assert "libasound" not in ldd_output
 
     def test_audio_binary_links_alsa_but_not_cairo_or_x11(self, tmp_path):
@@ -8836,7 +10182,10 @@ class TestSlimBinaries:
         src = tmp_path / "main.f"
         src.write_text("aud music = 'nonexistent.wav'")
         out = tmp_path / "program"
-        cli_mod.compile_file(str(src), str(out), cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
+        from tests.conftest import compile_file_or_skip
+        compile_file_or_skip(
+            cli_mod, str(src), str(out),
+            cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
         ldd_output = self._ldd(out)
         assert "libasound" in ldd_output
         assert "libcairo" not in ldd_output
@@ -8857,7 +10206,12 @@ class TestSlimBinaries:
         src = tmp_path / "main.f"
         src.write_text("img icon = 'nonexistent.png'")
         out = tmp_path / "program"
-        cli_mod.compile_file(str(src), str(out), cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
+        # claude.md #126 round four: same skip-not-fail fix as the test
+        # just above -- see its own comment.
+        from tests.conftest import compile_file_or_skip
+        compile_file_or_skip(
+            cli_mod, str(src), str(out),
+            cc=shutil.which("clang") or shutil.which("gcc") or shutil.which("cc"))
         assert out.exists()
 
 
@@ -8906,9 +10260,55 @@ class TestMinimalBuildDependencies:
         cli_mod.compile_file(str(src), str(out), cc=clang)
         assert out.exists()
 
-        result = subprocess.run([str(out)], cwd=tmp_path, capture_output=True, text=True, timeout=15)
-        assert result.returncode == 0
-        assert result.stdout.strip() == "built via fallback"
+    def test_a_graphics_program_still_links_via_the_fallback(
+            self, parser, semantic, codegen, tmp_path, monkeypatch):
+        # claude.md #126 round four: real macOS CI (which always takes
+        # this fallback -- ci.yml deliberately skips installing libLLVM
+        # there) found this path had never been updated for
+        # _feature_pkgs_and_flags/_feature_extra_object's own per-
+        # platform swaps -- it built its pkg-config list from the raw
+        # Linux table directly and never linked the darwin Cocoa
+        # companion object at all, so even an offscreen-only graphics
+        # program failed to link with `_festina_window_open` and its
+        # neighbors undefined. This can only exercise the (unchanged)
+        # Linux branch for real, but it does prove the refactor that
+        # fixed the darwin branch didn't regress the platform this
+        # sandbox can actually build on.
+        clang = shutil.which("clang")
+        if not clang:
+            pytest.skip("clang not on PATH -- nothing to fall back to")
+        from festina import cli as cli_mod, llvm_backend
+
+        class _Unavailable:
+            lib = None
+
+        monkeypatch.setattr(llvm_backend, "_binding_instance", _Unavailable())
+        assert llvm_backend.available() is False
+
+        out_png = str(tmp_path / "canvas.png")
+        src = tmp_path / "main.f"
+        src.write_text(f"""
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 10, 10)
+        log(saveCanvas('{out_png}'))
+        """)
+        out = tmp_path / "program"
+        # claude.md #126 round six: same skip-not-fail gap as
+        # TestSlimBinaries/TestGraphics fixed in the two rounds before
+        # this one -- graphics (including this offscreen-only program)
+        # is gated unconditionally on win32 (no backend at all yet), so
+        # a direct compile_file call here would fail hard there instead
+        # of skipping like every other platform-conditional test.
+        from tests.conftest import compile_file_or_skip
+        compile_file_or_skip(cli_mod, str(src), str(out), cc=clang)
+        assert out.exists()
+
+        result = subprocess.run([str(out)], cwd=tmp_path, env={**os.environ, "DISPLAY": ""},
+                                 capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip() == "true"
+        assert os.path.exists(out_png)
 
 
 class TestMissingDependencyErrors:
@@ -9452,24 +10852,16 @@ class TestQueryRowAndRegexReclamation:
 
 
 class TestOwnedRegexLocals:
-    """claude.md #86: a `regex` local this scope provably owns outright
-    -- one whose initializer is a `regex(...)` Call (freshly compiled by
-    festina_regex_compile, so nothing else can reference it yet) and
-    whose name escape analysis proves never leaves the function -- is
-    freed at scope exit. Before this, `regex r = regex(p)` inside a loop
-    leaked a full compiled automaton (several KB) per iteration; #85 had
-    only closed the case where the regex is used as a temporary in the
-    same expression that compiled it.
-
-    Both halves of the ownership test are load-bearing, and relaxing
-    either frees something still in use. A `/pattern/` literal
-    initializer is a pointer into a process-lifetime cache, so freeing
-    it would leave every later evaluation of that literal running
-    regexec against freed memory. An escaping regex has no equivalent of
-    text's copy-on-alias escape hatch -- a regex "copy" would mean
-    recompiling, and the pattern string isn't retained to recompile
-    from -- so it is left to leak exactly as before rather than freed
-    while another binding may still point at it."""
+    """claude.md #86/#118: a `regex` local is released at scope exit --
+    EVERY regex local, not just one this scope could prove it owned.
+    #86's created-here + never-escaping ownership proof existed because
+    a regex had no refcount: freeing was final, so freeing anything
+    possibly shared was a use-after-free. #118 gave regex the standard
+    i64 header, so a binding always owns exactly one countable
+    reference and releasing it is always safe -- a /pattern/ literal's
+    cached compilation is immortal (festina_regex_mark_cached sets the
+    negative-header sentinel) and no-ops through the very same release
+    call, and an escaping regex no longer leaks."""
 
     def _ir(self, parser, semantic, codegen, source, filename="main.f"):
         program = parser.parse(source, filename=filename)
@@ -9488,7 +10880,14 @@ class TestOwnedRegexLocals:
         body = ir.split("define void @f()")[1].split("\n}")[0]
         assert "call void @festina_regex_free(" in body
 
-    def test_regex_local_from_a_literal_is_never_freed(self, parser, semantic, codegen):
+    def test_regex_local_from_a_literal_is_released_and_the_cache_is_immortal(
+            self, parser, semantic, codegen):
+        # claude.md #118 INVERTED this test: it used to assert the
+        # release was absent, because releasing the shared literal cache
+        # would have freed it under every later execution of the line.
+        # The safety argument moved into the value itself -- the cache
+        # is marked immortal at first compile, so the scope-exit release
+        # (present, like every other regex local's) is a no-op on it.
         source = """
         void func f() {
             regex r = /[0-9]+/
@@ -9497,9 +10896,16 @@ class TestOwnedRegexLocals:
         f()
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @festina_regex_free(" not in ir
+        body = ir.split("define void @f()")[1].split("\n}")[0]
+        assert "call void @festina_regex_free(" in body
+        assert "call void @festina_regex_mark_cached(" in body
 
-    def test_escaping_regex_local_is_not_freed(self, parser, semantic, codegen):
+    def test_escaping_regex_local_is_released_too(self, parser, semantic, codegen):
+        # claude.md #118 INVERTED this test: an escaping regex used to
+        # be left to leak (no copy-on-alias escape hatch, no count to
+        # decrement). With the header, `g = r` retains for the global
+        # and the local's own release at scope exit is an ordinary
+        # decrement -- the global keeps the compilation alive.
         source = """
         regex g = /[a-z]+/
         void func f() {
@@ -9510,7 +10916,9 @@ class TestOwnedRegexLocals:
         """
         ir = self._ir(parser, semantic, codegen, source)
         body = ir.split("define void @f()")[1].split("\n}")[0]
-        assert "call void @festina_regex_free(" not in body
+        retain_at = body.index("call void @festina_retain(ptr")
+        release_at = body.index("call void @festina_regex_free(")
+        assert retain_at < release_at
 
     def test_owned_literal_and_escaping_regexes_stay_correct_together(self, compile_and_run):
         source = """
@@ -9538,6 +10946,115 @@ class TestOwnedRegexLocals:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "true\n" * 53
+
+
+class TestRefcountedHandles:
+    """claude.md #118: img, aud and regex carry the same i64 refcount
+    header struct/arr/map/blob do, so every binding owns exactly one
+    countable reference and `free`/scope exit/reassignment are always a
+    safe decrement. This retired two documented gaps at once -- an
+    escaping img/aud handle leaked, and `free` on an aliased one left
+    the alias dangling -- and made the dynamic regex() memo possible
+    (evicting a superseded compilation is only safe when a binding that
+    still aliases it keeps it alive)."""
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    # ---- the regex() memo ----
+
+    def test_dynamic_regex_compiles_through_a_per_site_memo(
+            self, parser, semantic, codegen):
+        # Not plain @festina_regex_compile any more: the memo compares
+        # the actual pattern+flags against the site's last compilation
+        # at run time, which is what per-AST-node caching (the literal
+        # scheme) could never do safely for a runtime pattern.
+        source = "regex r = regex('[0-9]+', 'i')\nlog(r.test('42'))"
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "call ptr @festina_regex_compile_memo(" in ir
+        assert "@.regex.memo.0 = private global [3 x ptr] zeroinitializer" in ir
+
+    def test_each_regex_call_site_gets_its_own_memo_slot(
+            self, parser, semantic, codegen):
+        source = """
+        regex a = regex('[0-9]+')
+        regex b = regex('[a-z]+')
+        log(a.test('1'))
+        log(b.test('x'))
+        """
+        ir = self._ir(parser, semantic, codegen, source)
+        assert "@.regex.memo.0 = private global [3 x ptr] zeroinitializer" in ir
+        assert "@.regex.memo.1 = private global [3 x ptr] zeroinitializer" in ir
+
+    def test_a_changed_pattern_is_recompiled_not_served_stale(
+            self, compile_and_run):
+        # The memo's one correctness hazard, pinned: the same call site
+        # fed a DIFFERENT pattern must recompile, never answer with the
+        # previous automaton. Alternating patterns through one site
+        # exercises the miss path on every iteration after the first.
+        source = """
+        arr[text] pats = ['[0-9]+', '[a-z]+']
+        for int i = 0, i < 6, i++ {
+            regex r = regex(pats[i % 2])
+            log(r.test('42'))
+        }
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false"] * 3
+
+    # ---- free on an alias is a decrement ----
+
+    def test_free_on_an_aliased_img_leaves_the_alias_usable(
+            self, compile_and_run, sprite_sheet_png):
+        # The exact shape security.md used to document as the dangling-
+        # alias hazard, now safe: the alias holds its own reference.
+        source = f"""
+        img sheet = '{sprite_sheet_png}'
+        img tile = sheet.clip(0, 0, 8, 8)
+        img alias = tile
+        free tile
+        log(alias.width)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "8"
+
+    def test_releasing_a_call_result_aliasing_a_shared_img_is_safe(
+            self, compile_and_run, sprite_sheet_png):
+        # claude.md #110 recorded why call-result img receivers could
+        # not be released: `img func get() { return shared }` handed
+        # back the global itself. The Return path retains an aliased
+        # value now, so the temporary's release is a decrement and the
+        # global survives it.
+        source = f"""
+        img shared = '{sprite_sheet_png}'
+        img func getShared() {{
+            return shared
+        }}
+        img c = getShared()
+        free c
+        log(shared.width)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "128"
+
+    def test_free_on_an_aliased_aud_leaves_the_alias_playable(
+            self, compile_and_run, audio_null_env):
+        src = os.path.join(_FIXTURES_DIR, "beep.wav")
+        source = f"""
+        aud clip = '{src}'
+        aud alias = clip
+        free clip
+        int ch = alias.play()
+        log(ch >= 0)
+        alias.stop()
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
 
 
 class TestStructTextFieldReclamation:
@@ -9991,10 +11508,12 @@ class TestImageClipResizeAndSize:
     can't be resized in place, and boxing it means every binding
     sharing an image sees the new one.
 
-    That box is also why img now has an ownership story (`_OwnedImage`,
-    the same shape claude.md #86 uses for regex): clip() exists to be
-    called repeatedly, so without scope-exit reclamation, extracting
-    frames in a loop would leak a whole surface per iteration."""
+    That box is also what carries claude.md #118's refcount header:
+    clip() exists to be called repeatedly, so without scope-exit
+    reclamation, extracting frames in a loop would leak a whole surface
+    per iteration -- and counting (rather than #92's created-here +
+    never-escaping ownership proof) is what lets EVERY img binding be
+    released, aliases and escapers included."""
 
     def _ir(self, parser, semantic, codegen, source, filename="main.f"):
         program = parser.parse(source, filename=filename)
@@ -10036,9 +11555,15 @@ class TestImageClipResizeAndSize:
         body = ir.split("define void @f(ptr %arg.sheet)")[1].split("\n}")[0]
         assert "call void @festina_image_free(ptr" in body
 
-    def test_a_borrowed_image_is_not_freed(self, parser, semantic, codegen):
-        # `other` merely aliases an image the caller owns -- freeing it
-        # here would destroy a surface still in use.
+    def test_an_aliasing_image_binding_retains_before_its_release(
+            self, parser, semantic, codegen):
+        # claude.md #118 INVERTED this test: `other` used to be left
+        # unreleased because it merely aliased the caller's image and a
+        # free was final. With the refcount header the binding takes its
+        # own +1 at the declaration and drops exactly that +1 at scope
+        # exit -- the caller's surface survives because the count says
+        # so, not because the release was skipped. The order is the
+        # safety argument: retain first, release later.
         source = """
         void func f(sheet:img) {
             img other = sheet
@@ -10047,9 +11572,17 @@ class TestImageClipResizeAndSize:
         """
         ir = self._ir(parser, semantic, codegen, source)
         body = ir.split("define void @f(ptr %arg.sheet)")[1].split("\n}")[0]
-        assert "call void @festina_image_free(ptr" not in body
+        retain_at = body.index("call void @festina_retain(ptr")
+        release_at = body.index("call void @festina_image_free(ptr")
+        assert retain_at < release_at
 
-    def test_an_escaping_image_is_not_freed(self, parser, semantic, codegen):
+    def test_an_escaping_image_is_released_and_the_global_retains(
+            self, parser, semantic, codegen):
+        # claude.md #118 INVERTED this test: an escaping img used to be
+        # left to leak (releasing it would have dangled the global).
+        # Now `kept = tile` retains for the global before the local's
+        # own scope-exit release decrements -- the clip survives through
+        # `kept`, and nothing leaks.
         source = """
         img kept
         void func f(sheet:img) {
@@ -10059,7 +11592,9 @@ class TestImageClipResizeAndSize:
         """
         ir = self._ir(parser, semantic, codegen, source)
         body = ir.split("define void @f(ptr %arg.sheet)")[1].split("\n}")[0]
-        assert "call void @festina_image_free(ptr" not in body
+        retain_at = body.index("call void @festina_retain(ptr")
+        release_at = body.index("call void @festina_image_free(ptr")
+        assert retain_at < release_at
 
     # ---- type checking ----
 
@@ -10147,6 +11682,101 @@ class TestImageClipResizeAndSize:
             result = compile_and_run(source)
             assert result.returncode != 0
             assert "must both be positive" in result.stdout + result.stderr
+
+
+class TestImageDrawMethods:
+    """claude.md #134: drawRect/drawPixel/drawCircle/drawText as methods
+    on img -- the same four canvas-level drawing builtins (claude.md
+    #37/#39/#133), retargeted at the receiver image's own surface
+    instead of the canvas. Needs no display or window at all -- an
+    image's surface already exists in full the moment the image does,
+    same as saveCanvas() needing none (claude.md #95) -- verified here
+    the same way, with DISPLAY explicitly unset."""
+
+    def test_draw_methods_paint_onto_the_images_own_surface(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        # sheet.png's own layout (conftest.py's sprite_sheet_png
+        # fixture): tile (0,0), the top-left 32x32, is solid red.
+        out = str(tmp_path / "drawn.png")
+        source = f"""
+        color blue = 'blue'
+        img sheet = '{sprite_sheet_png}'
+        sheet.drawRect(0, 0, 5, 5, blue)
+        sheet.drawPixel(10, 0, blue)
+        log(sheet.save('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(2, 2) == (0, 0, 255), "drawRect's color override should have painted"
+        assert pixel(10, 0) == (0, 0, 255), "drawPixel's color override should have painted"
+        assert pixel(20, 20) == (255, 0, 0), "untouched red tile should be unaffected"
+
+    def test_draw_methods_use_the_current_fill_style_by_default(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        out = str(tmp_path / "drawn.png")
+        source = f"""
+        color blue = 'blue'
+        fillStyle(blue)
+        img sheet = '{sprite_sheet_png}'
+        sheet.drawCircle(16, 16, 4)
+        sheet.drawPixel(0, 0)
+        log(sheet.save('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(16, 16) == (0, 0, 255)
+        assert pixel(0, 0) == (0, 0, 255)
+
+    def test_draw_text_writes_onto_the_image(self, compile_and_run, tmp_path, sprite_sheet_png):
+        out = str(tmp_path / "drawn.png")
+        source = f"""
+        color black = 'black'
+        fillStyle(black)
+        img sheet = '{sprite_sheet_png}'
+        sheet.drawText('hi', 4, 40)
+        log(sheet.save('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        # Just confirms it wrote a valid, readable PNG at the same size
+        # -- glyph rasterization details aren't this test's concern
+        # (see TestSaveCanvas for the equivalent canvas-level choice).
+        width, height, _pixel = _decode_png(out)
+        assert (width, height) == (128, 64)
+
+    def test_a_clipped_images_own_drawing_does_not_affect_its_source(
+            self, compile_and_run, tmp_path, sprite_sheet_png):
+        out = str(tmp_path / "drawn.png")
+        source = f"""
+        color blue = 'blue'
+        img sheet = '{sprite_sheet_png}'
+        img tile = sheet.clip(0, 0, 32, 32)
+        tile.drawRect(0, 0, 32, 32, blue)
+        log(sheet.save('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(5, 5) == (255, 0, 0), "the clip's own drawing must not leak into its source"
+
+    def test_wrong_arity_and_types_are_rejected(self, parser, semantic, errors):
+        for source in [
+            "img sheet = 's.png'\nsheet.drawRect(0, 0, 10)",
+            "img sheet = 's.png'\nsheet.drawRect(0, 0, 10, 10, 10, 10)",
+            "img sheet = 's.png'\nsheet.drawPixel(0)",
+            "img sheet = 's.png'\nsheet.drawPixel(0, 0, 0, 0)",
+            "img sheet = 's.png'\nsheet.drawCircle(0, 0)",
+            "img sheet = 's.png'\nsheet.drawText(0, 0, 0)",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
 
 
 class TestImageClipRendersRealPixels:
@@ -10388,6 +12018,64 @@ class TestMathFileAndTime:
                 semantic.analyze(program)
             assert "blob" in str(excinfo.value)
 
+    # ---- filesystem: claude.md #132 ----
+
+    def test_mkdir_reports_creation_versus_already_exists(self, compile_and_run, tmp_path):
+        target = tmp_path / "sub"
+        source = f"""
+        log(mkdir('{target.as_posix()}'))
+        log(mkdir('{target.as_posix()}'))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\nfalse\n"
+        assert target.is_dir()
+
+    def test_mkdir_on_an_impossible_path_returns_false_not_a_crash(self, compile_and_run, tmp_path):
+        # No parent directory -- mkdir() is a test, not a failure, the
+        # same claude.md #93 rule blob's own write()/append()/delete()
+        # already follow.
+        target = tmp_path / "missing_parent" / "sub"
+        result = compile_and_run(f"log(mkdir('{target.as_posix()}'))")
+        assert result.returncode == 0
+        assert result.stdout == "false\n"
+        assert not target.exists()
+
+    def test_ls_lists_entry_names_not_full_paths(self, compile_and_run, tmp_path):
+        # A dedicated subdirectory, not tmp_path itself -- compile_and_run
+        # writes main.f/program straight into tmp_path, which would
+        # otherwise show up in the listing too.
+        listed = tmp_path / "listed"
+        listed.mkdir()
+        (listed / "a.txt").write_text("x")
+        (listed / "b.txt").write_text("y")
+        (listed / "sub").mkdir()
+        source = f"""
+        arr[text] names = ls('{listed.as_posix()}')
+        log(names.length)
+        log(names.indexOf('a.txt') >= 0)
+        log(names.indexOf('b.txt') >= 0)
+        log(names.indexOf('sub') >= 0)
+        log(names.indexOf('.') >= 0)
+        log(names.indexOf('..') >= 0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "3\ntrue\ntrue\ntrue\nfalse\nfalse\n"
+
+    def test_ls_on_a_missing_directory_is_an_empty_array_not_a_crash(self, compile_and_run, tmp_path):
+        missing = tmp_path / "does_not_exist"
+        result = compile_and_run(f"log(ls('{missing.as_posix()}').length)")
+        assert result.returncode == 0
+        assert result.stdout == "0\n"
+
+    def test_mkdir_and_ls_require_exactly_one_text_argument(self, parser, semantic, errors):
+        for source in ["mkdir()", "mkdir('a', 'b')", "mkdir(5)",
+                       "ls()", "ls('a', 'b')", "ls(5)"]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
     # ---- time ----
 
     def test_now_and_formatTime(self, compile_and_run):
@@ -10414,17 +12102,11 @@ class TestMathFileAndTime:
         assert result.stdout == "true\ntrue\n"
 
 
-def _decode_png(path):
-    """Minimal PNG decoder -> (width, height, pixel(x, y) -> (r, g, b)).
-
-    claude.md #93's saveCanvas is only really verified by reading the
-    file back and finding the drawing in it -- "the call returned true"
-    proves the plumbing, not that the canvas was captured rather than a
-    blank surface. Written out here (zlib plus the five PNG filter
-    types) because the compiler has no image library and neither should
-    its tests; the same reasoning as the sprite_sheet_png fixture, which
-    encodes rather than decodes.
-    """
+def _png_raw(path):
+    """Shared decode step behind _decode_png/_decode_png_rgba below --
+    -> (width, height, stride, bpp, out), `out` the fully unfiltered
+    pixel bytes. See _decode_png's own doc comment for why this is
+    written out by hand at all."""
     import struct
     import zlib
 
@@ -10466,10 +12148,42 @@ def _decode_png(path):
                 line[x] = (line[x] + pred) & 255
         out += line
         prev = line
+    return width, height, stride, bpp, out
+
+
+def _decode_png(path):
+    """Minimal PNG decoder -> (width, height, pixel(x, y) -> (r, g, b)).
+
+    claude.md #93's saveCanvas is only really verified by reading the
+    file back and finding the drawing in it -- "the call returned true"
+    proves the plumbing, not that the canvas was captured rather than a
+    blank surface. Written out here (zlib plus the five PNG filter
+    types) because the compiler has no image library and neither should
+    its tests; the same reasoning as the sprite_sheet_png fixture, which
+    encodes rather than decodes.
+    """
+    width, height, stride, bpp, out = _png_raw(path)
 
     def pixel(x, y):
         off = y * stride + x * bpp
         return tuple(out[off:off + 3])
+
+    return width, height, pixel
+
+
+def _decode_png_rgba(path):
+    """claude.md #136: _decode_png's own RGBA sibling -- (width, height,
+    pixel(x, y) -> (r, g, b, a)), for the transparent-clear tests that
+    need to see the alpha channel _decode_png's plain RGB deliberately
+    drops (every other caller only ever cares about drawn colour, never
+    transparency, so changing _decode_png's own return shape would be
+    pure risk to ~20 existing assertions for no benefit to them)."""
+    width, height, stride, bpp, out = _png_raw(path)
+
+    def pixel(x, y):
+        off = y * stride + x * bpp
+        vals = tuple(out[off:off + bpp])
+        return vals if bpp == 4 else vals + (255,)
 
     return width, height, pixel
 
@@ -10509,7 +12223,10 @@ class TestSaveCanvas:
         assert (width, height) == (800, 600)
         assert pixel(20, 20) == (255, 0, 0), "the red rect is missing"
         assert pixel(60, 20) == (0, 0, 255), "the blue rect is missing"
-        assert pixel(400, 300) == (255, 255, 255), "background should be white"
+        # claude.md #136: the canvas is transparent, not white, wherever
+        # nothing was drawn.
+        _, _, pixel_rgba = _decode_png_rgba(out)
+        assert pixel_rgba(400, 300) == (0, 0, 0, 0), "background should be transparent"
 
     def test_an_unwritable_path_returns_false(self, compile_and_run):
         source = """
@@ -10519,6 +12236,162 @@ class TestSaveCanvas:
         result = compile_and_run(source, env={"DISPLAY": ""})
         assert result.returncode == 0
         assert result.stdout == "false\n"
+
+    def test_no_path_returns_an_img_snapshot(self, compile_and_run, tmp_path):
+        # claude.md #135: saveCanvas() with no argument -> a fresh img
+        # holding what's been drawn, instead of writing a file.
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 40, 40)
+        img snap = saveCanvas()
+        log(`${{snap.width}}x${{snap.height}}`)
+        log(snap.save('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "800x600\ntrue\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(20, 20) == (255, 0, 0)
+
+    def test_the_snapshot_is_independent_of_later_canvas_changes(
+            self, compile_and_run, tmp_path):
+        # A snapshot, not a live view -- clearing/redrawing the canvas
+        # afterward must not retroactively change what was captured.
+        out = str(tmp_path / "snap.png")
+        source = f"""
+        color red = 'red'
+        color blue = 'blue'
+        fillStyle(red)
+        drawRect(0, 0, 40, 40)
+        img snap = saveCanvas()
+        clearCanvas()
+        fillStyle(blue)
+        drawRect(0, 0, 40, 40)
+        log(snap.save('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(20, 20) == (255, 0, 0), "the snapshot should still be the red canvas"
+
+    def test_wrong_arity_and_types_are_rejected(self, parser, semantic, errors):
+        for source in ["saveCanvas(1)", "saveCanvas('a', 'b')"]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
+class TestDrawPixelClearCircleAndColorOverrides:
+    """claude.md #133: drawPixel/clearPixel/clearCircle, and an optional
+    trailing `color` argument on drawRect/drawPixel that paints with it
+    for that one call only, restoring the current fillStyle (flat
+    colour or gradient) afterward rather than changing it."""
+
+    def test_draw_pixel_uses_current_fill_style(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        fillStyle(red)
+        drawPixel(10, 10)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        _, _, pixel_rgba = _decode_png_rgba(out)
+        assert pixel(10, 10) == (255, 0, 0)
+        # claude.md #136: the canvas clears to transparent, not white.
+        assert pixel_rgba(11, 10) == (0, 0, 0, 0), "only the one pixel should be painted"
+        assert pixel_rgba(10, 11) == (0, 0, 0, 0), "only the one pixel should be painted"
+
+    def test_draw_rect_and_pixel_color_override_does_not_change_fill_style(
+            self, compile_and_run, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        color blue = 'blue'
+        fillStyle(red)
+        drawRect(0, 0, 10, 10, blue)
+        drawPixel(20, 20, blue)
+        drawRect(30, 0, 10, 10)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(5, 5) == (0, 0, 255), "the color override should win"
+        assert pixel(20, 20) == (0, 0, 255), "drawPixel's own override"
+        assert pixel(35, 5) == (255, 0, 0), "fillStyle(red) should still be in effect after"
+
+    def test_draw_rect_color_none_paints_nothing(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color none = 'none'
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 20, 20, none)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        # claude.md #136: the canvas clears to transparent, not white --
+        # painting nothing leaves it transparent, not opaque.
+        _, _, pixel_rgba = _decode_png_rgba(out)
+        assert pixel_rgba(10, 10) == (0, 0, 0, 0)
+
+    def test_clear_pixel_erases_one_pixel_to_transparent(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 10, 10)
+        clearPixel(5, 5)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        _, _, pixel_rgba = _decode_png_rgba(out)
+        assert pixel_rgba(5, 5) == (0, 0, 0, 0)
+        assert pixel(4, 4) == (255, 0, 0), "only the one pixel should be erased"
+
+    def test_clear_circle_erases_a_circular_region_to_transparent(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 100, 100)
+        clearCircle(50, 50, 20)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        _, _, pixel_rgba = _decode_png_rgba(out)
+        assert pixel_rgba(50, 50) == (0, 0, 0, 0), "circle center should be cleared"
+        assert pixel(1, 1) == (255, 0, 0), "far corner should still be red"
+
+    def test_wrong_arity_and_types_are_rejected(self, parser, semantic, errors):
+        for source in [
+            "drawPixel()",
+            "drawPixel(1)",
+            "drawPixel(1, 2, 3)",
+            "drawRect(0, 0, 10)",
+            "drawRect(0, 0, 10, 10, 10, 10)",
+            "clearCircle(0, 0)",
+            "clearPixel(0)",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
 
 
 class TestScalarQueries:
@@ -10836,6 +12709,7 @@ class TestRenderClearAndHeadless:
         assert result.stdout == "true\nexited on its own\n"
 
     def test_clear_canvas_erases_everything(self, compile_and_run, tmp_path):
+        # claude.md #136: clears to fully TRANSPARENT, not opaque white.
         out = str(tmp_path / "cleared.png")
         source = f"""
         color red = 'red'
@@ -10846,8 +12720,8 @@ class TestRenderClearAndHeadless:
         """
         result = compile_and_run(source, env={"DISPLAY": ""})
         assert result.returncode == 0
-        _w, _h, pixel = _decode_png(out)
-        assert pixel(50, 50) == (255, 255, 255), "clearCanvas() left the rect behind"
+        _w, _h, pixel = _decode_png_rgba(out)
+        assert pixel(50, 50) == (0, 0, 0, 0), "clearCanvas() left the rect behind"
 
     def test_clear_rect_erases_only_its_region(self, compile_and_run, tmp_path):
         out = str(tmp_path / "partial.png")
@@ -10860,10 +12734,10 @@ class TestRenderClearAndHeadless:
         """
         result = compile_and_run(source, env={"DISPLAY": ""})
         assert result.returncode == 0
-        _w, _h, pixel = _decode_png(out)
-        assert pixel(60, 60) == (255, 255, 255), "clearRect() did not erase its region"
-        assert pixel(150, 150) == (255, 0, 0), "clearRect() erased outside its region"
-        assert pixel(10, 10) == (255, 0, 0), "clearRect() erased outside its region"
+        _w, _h, pixel = _decode_png_rgba(out)
+        assert pixel(60, 60) == (0, 0, 0, 0), "clearRect() did not erase its region"
+        assert pixel(150, 150) == (255, 0, 0, 255), "clearRect() erased outside its region"
+        assert pixel(10, 10) == (255, 0, 0, 255), "clearRect() erased outside its region"
 
     def test_drawing_survives_until_render(self, run_graphics_program, x_display):
         # Drawing before the window exists is not an error -- the canvas
@@ -11022,10 +12896,81 @@ class TestArrayMethods:
             "arr[int] xs = [1]\nxs.push('a')",
             "arr[int] xs = [1]\nxs.splice(1)",
             "arr[int] xs = [1]\nxs.splice(1, 'a')",
+            "arr[int] xs = [1]\nxs.splice(0, 1, 2, 3)",
+            "arr[int] xs = [1]\nxs.splice(0, 1, 'a')",
+            "arr[int] xs = [1]\narr[text] ys = ['a']\nxs.splice(0, 1, ys)",
         ]:
             program = parser.parse(source, filename="main.f")
             with pytest.raises(errors.CompileError):
                 semantic.analyze(program, filename="main.f")
+
+    def test_splice_insert_replaces_and_returns_removed(self, compile_and_run):
+        # claude.md #130: splice(start, count, insertArr) -- JavaScript's
+        # splice(start, deleteCount, ...items), the variadic items
+        # spelled as one arr[T] argument since Festina has no variadic
+        # parameters. Only the REMOVED elements come back, exactly as
+        # JS's own splice() answers -- the inserted ones are placed, not
+        # returned.
+        source = """
+        arr[int] xs = [1, 2, 3, 4, 5]
+        arr[int] gone = xs.splice(1, 2, [10, 20, 30])
+        log(`${gone.length}: ${gone[0]},${gone[1]}`)
+        log(`${xs.length}: ${xs[0]},${xs[1]},${xs[2]},${xs[3]},${xs[4]},${xs[5]}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2: 2,3\n6: 1,10,20,30,4,5\n"
+
+    def test_splice_insert_grows_and_shrinks_correctly(self, compile_and_run):
+        source = """
+        // Pure insertion: count is 0, the array only grows.
+        arr[int] a = [1, 2, 3]
+        arr[int] none = a.splice(1, 0, [8, 9])
+        log(`${none.length} ${a.length}: ${a[0]},${a[1]},${a[2]},${a[3]},${a[4]}`)
+
+        // Replacing more than is inserted: the array shrinks.
+        arr[int] b = [1, 2, 3, 4, 5]
+        arr[int] cut = b.splice(0, 4, [99])
+        log(`${cut.length}: ${cut[0]},${cut[1]},${cut[2]},${cut[3]}`)
+        log(`${b.length}: ${b[0]},${b[1]}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "0 5: 1,8,9,2,3\n4: 1,2,3,4\n2: 99,5\n"
+
+    def test_splice_insert_owns_text_elements_independently(self, compile_and_run):
+        # claude.md #130: the inserted elements are COPIED (text) or
+        # RETAINED (struct/arr/map/img/aud/regex/blob) into the target
+        # array, unconditionally -- the source array (here a named
+        # binding, so not itself consumed) keeps its own elements alive
+        # and independent, exactly like push() already does for a single
+        # value.
+        source = """
+        arr[text] words = ['a', 'b', 'c']
+        arr[text] extra = ['x', 'y']
+        arr[text] gone = words.splice(1, 1, extra)
+        log(gone[0])
+        log(`${words.length}: ${words[0]},${words[1]},${words[2]},${words[3]}`)
+        log(`${extra.length}: ${extra[0]},${extra[1]}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "b\n4: a,x,y,c\n2: x,y\n"
+
+    def test_splice_insert_retains_struct_elements(self, compile_and_run):
+        source = """
+        struct P { v:int }
+        P func make(v:int) { P p  p.v = v  return p }
+        arr[P] ps = [make(1), make(2), make(3)]
+        arr[P] src = [make(9)]
+        arr[P] gone = ps.splice(1, 1, src)
+        log(gone[0].v)
+        log(`${ps[0].v},${ps[1].v},${ps[2].v}`)
+        log(src[0].v)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "2\n1,9,3\n9\n"
 
     def test_a_queue_round_trips(self, compile_and_run):
         # The shape a game's entity list actually takes.

@@ -41,13 +41,70 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>       /* clock_gettime/nanosleep -- setTimeout/setInterval */
+#include <dirent.h>     /* opendir/readdir/closedir -- claude.md #132's ls().
+                          * POSIX; MinGW-w64 ships its own real <dirent.h>
+                          * providing the identical opendir/readdir/closedir
+                          * shape (a long-standing, widely-relied-on part of
+                          * its POSIX compatibility layer), so this is used
+                          * unconditionally rather than #ifdef'd like
+                          * festina_mkdir below -- unconfirmed by real
+                          * Windows CI yet, same open item every other
+                          * blind-written win32 piece of this runtime has
+                          * had since windows.md Phase 0. */
 #include "festina_runtime.h"
 #include "festina_runtime_internal.h"
+#ifdef _WIN32
+#include <direct.h> /* _mkdir -- claude.md #132's mkdir(), MSVCRT/UCRT's
+                      * own single-argument spelling (no mode bits -- NTFS
+                      * permissions aren't POSIX mode bits, so there is
+                      * nothing a second argument would mean) */
+#include <fcntl.h> /* _O_BINARY -- festina_runtime_init's stdout/stderr fix */
+#include <io.h>    /* _setmode/_fileno -- MSVCRT/UCRT, not POSIX unistd.h */
+#else
+#include <sys/stat.h> /* mkdir(path, mode) -- POSIX */
+#endif
+
+/* windows.md Phase 0 (claude.md #126): the MinGW/UCRT C runtime opens
+ * stdout/stderr in TEXT mode by default, which silently rewrites every
+ * '\n' a program prints to '\r\n' at the point of the write -- found
+ * by real Windows CI comparing a compiled program's actual output
+ * against a plain "\n"-terminated expectation. Every other platform's
+ * libc has no such translation to begin with, so this is a no-op
+ * everywhere but win32. Called once, unconditionally, as literally the
+ * first thing every compiled program's main() does (see codegen.py). */
+void festina_runtime_init(void) {
+#ifdef _WIN32
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+#endif
+}
 
 /* ---- log() / fail() -- claude.md #41, #42 ---- */
 
-void festina_log_int(int64_t v) { printf("%lld\n", (long long)v); }
-void festina_log_float(double v) { printf("%g\n", v); }
+/* claude.md #126 round nine: every log() call flushes explicitly
+ * rather than trusting stdout's own default buffering mode. Once
+ * stdout is redirected to a file or pipe (as any subprocess-captured
+ * or piped program's is), the C runtime switches from line-buffered to
+ * fully block-buffered by default -- a handful of short log() lines
+ * can sit unflushed in that buffer for a long time, invisible to
+ * anything reading the file/pipe concurrently rather than after the
+ * process exits. `stdbuf -oL` (the usual fix -- force line buffering
+ * from outside the process) works on Linux/macOS because it's an
+ * LD_PRELOAD/DYLD_INSERT_LIBRARIES interposition trick against the
+ * SAME libc the target binary links -- it can't do anything for a
+ * compiled Festina program on Windows, which is a plain native UCRT64
+ * PE binary, not something built against MSYS2's own runtime the way
+ * MSYS2's own `stdbuf` is. Real Windows CI's timer test (an uncleared
+ * setInterval, read from a still-running process's stdout after a
+ * short wait) is a direct, real-world instance of exactly the
+ * consequence any log()-heavy long-running program's redirected
+ * output would have without this -- not just a test artifact. An
+ * explicit fflush after each call is small, portable, and correct
+ * everywhere, unlike relying on `setvbuf(..., _IOLBF, ...)`, which
+ * Microsoft's own C runtime has long treated the same as full
+ * buffering rather than true line buffering. */
+void festina_log_int(int64_t v) { printf("%lld\n", (long long)v); fflush(stdout); }
+void festina_log_float(double v) { printf("%g\n", v); fflush(stdout); }
 /* claude.md #97: bool's null is the reserved third bit pattern 2 (see
  * codegen's BOOL_NULL_CONST), and printing it with a plain `v ? true :
  * false` rendered it as "true" -- indistinguishable from a genuine
@@ -56,12 +113,36 @@ void festina_log_float(double v) { printf("%g\n", v); }
  * sentinel takes this branch, so no real boolean's output changes. */
 void festina_log_bool(int8_t v) {
     printf("%s\n", v == 2 ? "null" : (v ? "true" : "false"));
+    fflush(stdout);
 }
-void festina_log_text(const char *v) { printf("%s\n", v ? v : ""); }
+void festina_log_text(const char *v) { printf("%s\n", v ? v : ""); fflush(stdout); }
 
 void festina_fail(const char *msg) {
     fprintf(stderr, "fail: %s\n", msg ? msg : "");
     exit(1);
+}
+
+/* claude.md #131: close(code)/`on exit(code:int)`. Lives in the CORE
+ * runtime (not festina_runtime_graphics.c, where g_close_handler and
+ * the window-close event live) precisely because close() has to work
+ * in every program, windowed or not -- unlike g_close_handler, which
+ * only ever fires from an X11/Cocoa/Win32 window-close event and so
+ * can only exist in a program that already links a graphics backend.
+ * festina_register_exit_handler is called at most once, unconditionally,
+ * near the very top of main() (see codegen.py's _emit_main_and_entry)
+ * whenever the program declares one; festina_program_exit runs it (if
+ * registered) and then exits -- the two are kept as separate functions,
+ * matching every other register_*_handler/fire-the-handler pair in this
+ * runtime, rather than folding registration into the exit call itself. */
+static void (*g_exit_handler)(int64_t) = NULL;
+
+void festina_register_exit_handler(void (*handler)(int64_t)) {
+    g_exit_handler = handler;
+}
+
+void festina_program_exit(int64_t code) {
+    if (g_exit_handler) g_exit_handler(code);
+    exit((int)code);
 }
 
 /* ---- environment variables -- claude.md #71 ---- */
@@ -225,6 +306,175 @@ char *festina_sb_finish(void *sbv) {
     char *out = sb->data;
     free(sb);
     return out;
+}
+
+/* ---- split and join -- claude.md #116 ----
+ *
+ * `sentence.split(sep)` -> arr[text], with sep either a text or a
+ * regex; `words.join(sep)` -> text. JS semantics throughout, because
+ * that is the dialect every other string operation here speaks:
+ * empty pieces between adjacent separators are KEPT ('a,,b' -> three
+ * pieces), a separator at the edge yields an edge empty, an
+ * empty-match regex splits between characters without looping forever,
+ * and join renders a null element as an empty string.
+ *
+ * The result array is built right here: the same {refcount | len, data}
+ * layout every arr[text] has (festina_sqlite_collect_rows already
+ * builds compatible arrays), refcount starting at 1, each piece an
+ * owned buffer -- so scope exit, aliasing, free and element release
+ * all apply to a split result with nothing new. */
+
+typedef struct {
+    char **items;
+    int64_t count;
+    int64_t cap;
+} FestinaPieces;
+
+static void festina_pieces_push(FestinaPieces *p, const char *start, size_t len) {
+    if (p->count == p->cap) {
+        p->cap = p->cap ? p->cap * 2 : 8;
+        char **grown = realloc(p->items, (size_t)p->cap * sizeof(char *));
+        if (!grown) festina_fail("out of memory in split()");
+        p->items = grown;
+    }
+    char *piece = malloc(len + 1);
+    if (!piece) festina_fail("out of memory in split()");
+    memcpy(piece, start, len);
+    piece[len] = '\0';
+    p->items[p->count++] = piece;
+}
+
+/* Wraps the collected pieces in a fresh refcounted arr[text]. */
+static void *festina_pieces_finish(FestinaPieces *p) {
+    char *raw = malloc(8 + 16);
+    if (!raw) festina_fail("out of memory in split()");
+    *(int64_t *)raw = 1;                       /* refcount */
+    int64_t *header = (int64_t *)(raw + 8);
+    header[0] = p->count;                      /* length */
+    memcpy(&header[1], &p->items, sizeof(char **));
+    return header;
+}
+
+void *festina_text_split(const char *s, const char *sep) {
+    FestinaPieces p = {NULL, 0, 0};
+    if (!s) s = "";
+    if (!sep) {
+        /* No separator to split on: the whole string, one piece --
+         * what JS's no-argument split does. */
+        festina_pieces_push(&p, s, strlen(s));
+        return festina_pieces_finish(&p);
+    }
+    if (!*sep) {
+        /* Empty separator: split between characters -- UTF-8 CODE
+         * POINTS, not bytes, or every non-ASCII string would shatter
+         * into invalid fragments. A continuation byte is 10xxxxxx. */
+        const char *c = s;
+        while (*c) {
+            const char *start = c;
+            c++;
+            while ((*c & 0xC0) == 0x80) c++;
+            festina_pieces_push(&p, start, (size_t)(c - start));
+        }
+        if (p.count == 0) festina_pieces_push(&p, s, 0);
+        return festina_pieces_finish(&p);
+    }
+    size_t sep_len = strlen(sep);
+    const char *cursor = s;
+    for (;;) {
+        const char *found = strstr(cursor, sep);
+        if (!found) {
+            festina_pieces_push(&p, cursor, strlen(cursor));
+            break;
+        }
+        festina_pieces_push(&p, cursor, (size_t)(found - cursor));
+        cursor = found + sep_len;
+    }
+    return festina_pieces_finish(&p);
+}
+
+/* ---- claude.md #132: mkdir()/ls() ----
+ *
+ * mkdir(path) answers a bool -- true if it created the directory, false
+ * for every other outcome (already exists, a missing parent, no
+ * permission, ...), never failing the program. The same "a program
+ * tests for this, it doesn't stop the program over it" choice claude.md
+ * #93 made for the file builtins blob's own methods replaced (claude.md
+ * #109) -- extended here to directories rather than files. */
+int8_t festina_mkdir(const char *path) {
+    if (!path || !*path) return 0;
+#ifdef _WIN32
+    return _mkdir(path) == 0 ? 1 : 0;
+#else
+    return mkdir(path, 0777) == 0 ? 1 : 0;
+#endif
+}
+
+/* ls(path) answers arr[text] of the directory's own entry NAMES (not
+ * full paths, and not "." or ".." -- neither is useful to a program
+ * that wants to iterate what a directory holds), built exactly like
+ * festina_text_split above: the same FestinaPieces accumulator, wrapped
+ * in the same fresh refcounted arr[text] by festina_pieces_finish. A
+ * missing or unreadable directory answers an EMPTY array rather than
+ * failing the program -- the same test-don't-fail choice mkdir() just
+ * above makes, and blob.exists() made before it. */
+void *festina_ls(const char *path) {
+    FestinaPieces p = {NULL, 0, 0};
+    if (path && *path) {
+        DIR *dir = opendir(path);
+        if (dir) {
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != NULL) {
+                if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                    continue;
+                }
+                festina_pieces_push(&p, entry->d_name, strlen(entry->d_name));
+            }
+            closedir(dir);
+        }
+    }
+    return festina_pieces_finish(&p);
+}
+
+/* `kind` names the element type ("text"/"int"/"float"/"bool") -- codegen
+ * passes it as a constant, since this runtime cannot know an arr[T]'s T.
+ * A null element joins as an empty string, exactly JS's choice. */
+char *festina_arr_join(void *arr, const char *sep, const char *kind) {
+    if (!sep) sep = "";
+    void *sb = festina_sb_new();
+    if (arr) {
+        int64_t *header = (int64_t *)arr;
+        int64_t n = header[0];
+        char *data;
+        memcpy(&data, &header[1], sizeof(char *));
+        int is_text = strcmp(kind, "text") == 0;
+        int is_int = strcmp(kind, "int") == 0;
+        int is_float = strcmp(kind, "float") == 0;
+        for (int64_t i = 0; i < n; i++) {
+            if (i > 0) festina_sb_append(sb, sep);
+            if (is_text) {
+                char *v = ((char **)data)[i];
+                if (v) festina_sb_append(sb, v);
+            } else if (is_int) {
+                int64_t v = ((int64_t *)data)[i];
+                if (v != festina_null_int()) {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "%lld", (long long)v);
+                    festina_sb_append(sb, buf);
+                }
+            } else if (is_float) {
+                double v = ((double *)data)[i];
+                if (v == v) {   /* NaN is Festina's float null */
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "%g", v);
+                    festina_sb_append(sb, buf);
+                }
+            } else {            /* bool: one byte per element, 2 = null */
+                int8_t v = ((int8_t *)data)[i];
+                if (v != 2) festina_sb_append(sb, v ? "true" : "false");
+            }
+        }
+    }
+    return festina_sb_finish(sb);
 }
 
 char *festina_str_concat(const char *a, const char *b) {
@@ -632,7 +882,19 @@ char *festina_format_time(int64_t ms, const char *format) {
     if (!format) format = "%Y-%m-%d %H:%M:%S";
     time_t secs = (time_t)(ms / 1000);
     struct tm parts;
+    /* windows.md Phase 0 (claude.md #126): localtime_r is POSIX, not
+     * ISO C, and MinGW-w64's UCRT headers don't provide it -- only
+     * Microsoft's own localtime_s, which is otherwise the same
+     * thread-safe idea but reverses the argument order (tm* first,
+     * time_t* second) and reports success as 0, not a non-NULL
+     * pointer. This was the one spot the "core runtime is pure POSIX,
+     * no platform branches needed" audit missed, found by the first
+     * real Windows CI run that got far enough to compile it. */
+#ifdef _WIN32
+    if (localtime_s(&parts, &secs) != 0) return NULL;
+#else
     if (!localtime_r(&secs, &parts)) return NULL;
+#endif
     char buf[512];
     size_t n = strftime(buf, sizeof(buf), format, &parts);
     if (n == 0) return NULL;
@@ -967,6 +1229,59 @@ void festina_sync_table(sqlite3 *db, const char *table_name,
     festina_exec(db, rename_sql);
 }
 
+/* claude.md #126 round nine: no compiled program ever explicitly
+ * closed its own database handle before this -- main() just returned
+ * and let the OS reclaim the file descriptor on process exit, which
+ * WORKS (SQLite's WAL format is specifically designed to survive an
+ * unclosed/crashed writer -- the next connection recovers it) but
+ * skips SQLite's own auto-checkpoint-on-last-close, leaving the
+ * database's actual data in the WAL file rather than the main one
+ * until something else triggers a checkpoint. That's still readable by
+ * any WAL-aware SQLite build, but real Windows CI's SQLite schema-sync
+ * tests -- a second, separate process (a plain Python sqlite3
+ * connection, not necessarily even the SAME SQLite build/version this
+ * binary statically links) reading back a schema the FIRST compiled
+ * program had just committed -- kept seeing the OLD schema, exactly
+ * the symptom an unwritten-back WAL would produce for a reader that
+ * can't or doesn't perform WAL recovery identically. Explicitly
+ * closing forces SQLite's own checkpoint, leaving the main .sqlite
+ * file itself fully caught up regardless of what reads it next.
+ *
+ * sqlite3_close() (not the _v2 form) is used deliberately: unlike
+ * _v2, which silently defers to a "zombie" close if anything is still
+ * unfinalized, plain sqlite3_close() returns SQLITE_BUSY and does
+ * NOTHING if it is -- exactly the signal needed to know finalizing the
+ * statement cache below actually worked, rather than papering over a
+ * bug in it. festina_sqlite_prepare_cached's whole point is to leave
+ * cached statements alive across many calls (never finalized during
+ * normal operation, only reset) -- so at real program shutdown, unlike
+ * any other close, every one of them needs finalizing first or this
+ * close does nothing at all. */
+void festina_db_close(sqlite3 *db) {
+    if (!db) return;
+    for (int i = 0; i < g_cached_stmt_count; i++) {
+        sqlite3_finalize(g_cached_stmts[i]);
+    }
+    g_cached_stmt_count = 0;
+    /* claude.md #126 round eleven: round nine's own bet that this
+     * function would fix the still-open SQLite schema-sync mismatches
+     * was refuted by round ten's real Windows log -- unchanged,
+     * identical failures with this fix already in place. The finalize
+     * loop above was reasoned to be the one thing that could make
+     * sqlite3_close return anything other than SQLITE_OK, but that was
+     * never actually confirmed on the platform where it matters --
+     * this call was, and still is, best-effort. Surfacing a non-OK
+     * result to stderr costs nothing (never changes program behavior
+     * or the exit code) and gives the next real log a concrete answer
+     * instead of another silent maybe, should the tests calling this
+     * out in their own failure diagnostics need it. */
+    int rc = sqlite3_close(db);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "festina_db_close: sqlite3_close returned %d (%s) -- "
+                "a statement or blob handle was still open\n", rc, sqlite3_errmsg(db));
+    }
+}
+
 /* ---- sqlite() queries -- claude.md #32-34 ---- */
 
 /* Kept in sync with festina/codegen.py's INT_NULL_CONST / FLOAT_NULL_CONST
@@ -1261,21 +1576,115 @@ int8_t festina_row_undefined(void *row, const char **col_names,
 typedef struct {
     regex_t re;
     int8_t global;
-    /* claude.md #111: set for a /pattern/ literal's process-lifetime
-     * cached compilation (see codegen's _emit_cached_regex_lit). `free`
-     * works on every type, and a regex BINDING cannot know at compile
-     * time whether it holds a runtime regex() result (freeable) or the
-     * shared cached literal (freeing it would leave the cache dangling
-     * for every later execution of that line) -- so the value itself
-     * carries the answer and festina_regex_free consults it. */
-    int8_t cached;
 } FestinaRegex;
+
+/* claude.md #118: a regex is REFERENCE COUNTED now, carrying the same
+ * i64 header immediately before the payload that structs/arrays/maps/
+ * blobs use. Two things needed it at once: `free` on an aliased regex
+ * binding had to become a safe decrement like every other refcounted
+ * type's, and festina_regex_compile_memo below can only evict a
+ * superseded compilation safely if a binding that still aliases it
+ * keeps it alive. A /pattern/ literal's process-lifetime cached form
+ * uses the standard immortal sentinel (a NEGATIVE header, see
+ * festina_retain's own comment) instead of the separate `cached` flag
+ * it used to carry -- retain/release/free on one are all no-ops through
+ * the exact same check every other immortal value already goes
+ * through. */
+/* claude.md #122 / macos.md Phase 0's first real-hardware finding:
+ * `\w`/`\d`/`\s`/`\b` are GNU extensions of glibc's regcomp(), and
+ * api.md promises them -- but macOS's BSD libc silently treats `\s` as
+ * a literal 's', so /\s+/ matched nothing and three regex tests failed
+ * on the first macos-14 CI run. The portable answer is translation,
+ * not a vendored engine: expand the GNU class escapes into the POSIX
+ * bracket classes every implementation defines, on EVERY platform, so
+ * one behavior exists and it is the one already tested. Inside a
+ * bracket expression a backslash is literal per POSIX (and glibc
+ * agrees), so translation applies outside brackets only; [:class:]
+ * bodies are walked so their ']' does not end the bracket early.
+ *
+ * `\b` has no POSIX spelling at all. glibc supports it natively, so on
+ * Linux it passes through untouched; BSD instead has the [[:<:]] and
+ * [[:>:]] word-boundary brackets, so on __APPLE__ `\b` becomes the
+ * opening form when a word character (or an escape/class/group that
+ * starts one) follows, and the closing form otherwise -- which covers
+ * the `\bword\b` shape `\b` exists for. */
+static char *festina_regex_expand_gnu(const char *pattern) {
+    size_t len = strlen(pattern);
+    char *out = malloc(len * 13 + 16);
+    if (!out) festina_fail("out of memory compiling a regex");
+    size_t o = 0, i = 0;
+    int in_bracket = 0;
+    size_t bracket_elems = 0;   /* ']' as the first element is literal */
+
+    while (i < len) {
+        char c = pattern[i];
+        if (in_bracket) {
+            if (c == '[' && i + 1 < len &&
+                    (pattern[i + 1] == ':' || pattern[i + 1] == '.' || pattern[i + 1] == '=')) {
+                char kind = pattern[i + 1];
+                out[o++] = c; out[o++] = kind; i += 2;
+                while (i + 1 < len && !(pattern[i] == kind && pattern[i + 1] == ']'))
+                    out[o++] = pattern[i++];
+                if (i + 1 < len) { out[o++] = kind; out[o++] = ']'; i += 2; }
+                bracket_elems++;
+                continue;
+            }
+            if (c == ']' && bracket_elems > 0) in_bracket = 0;
+            else if (c != '^' || bracket_elems > 0) bracket_elems++;
+            out[o++] = c; i++;
+            continue;
+        }
+        if (c == '\\' && i + 1 < len) {
+            char n = pattern[i + 1];
+            const char *rep = NULL;
+            switch (n) {
+                case 's': rep = "[[:space:]]"; break;
+                case 'S': rep = "[^[:space:]]"; break;
+                case 'd': rep = "[[:digit:]]"; break;
+                case 'D': rep = "[^[:digit:]]"; break;
+                case 'w': rep = "[[:alnum:]_]"; break;
+                case 'W': rep = "[^[:alnum:]_]"; break;
+#ifdef __APPLE__
+                case 'b': {
+                    char next = (i + 2 < len) ? pattern[i + 2] : '\0';
+                    int opening = ((next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z')
+                                   || (next >= '0' && next <= '9') || next == '_'
+                                   || next == '\\' || next == '[' || next == '(');
+                    rep = opening ? "[[:<:]]" : "[[:>:]]";
+                    break;
+                }
+#endif
+                default: break;
+            }
+            if (rep) {
+                size_t rlen = strlen(rep);
+                memcpy(out + o, rep, rlen);
+                o += rlen;
+            } else {
+                out[o++] = c;
+                out[o++] = n;
+            }
+            i += 2;
+            continue;
+        }
+        if (c == '[') {
+            in_bracket = 1;
+            bracket_elems = 0;
+        }
+        out[o++] = c;
+        i++;
+    }
+    out[o] = '\0';
+    return out;
+}
 
 void *festina_regex_compile(const char *pattern, const char *flags) {
     if (!pattern) pattern = "";
     if (!flags) flags = "";
-    FestinaRegex *compiled = malloc(sizeof(FestinaRegex));
-    if (!compiled) festina_fail("out of memory in festina_regex_compile");
+    char *raw = malloc(sizeof(int64_t) + sizeof(FestinaRegex));
+    if (!raw) festina_fail("out of memory in festina_regex_compile");
+    *(int64_t *)raw = 1;
+    FestinaRegex *compiled = (FestinaRegex *)(raw + sizeof(int64_t));
 
     int cflags = REG_EXTENDED;
     if (strchr(flags, 'i')) cflags |= REG_ICASE;
@@ -1285,43 +1694,130 @@ void *festina_regex_compile(const char *pattern, const char *flags) {
      * wants done with the matches -- so it is recorded here and read
      * back by festina_regex_replace. */
     compiled->global = strchr(flags, 'g') != NULL;
-    compiled->cached = 0;
 
-    int rc = regcomp(&compiled->re, pattern, cflags);
+    /* claude.md #122: expanded form fed to regcomp; the ORIGINAL
+     * pattern in any error message, since that is what the program
+     * wrote. regcomp copies what it needs, so the expansion is freed
+     * either way. */
+    char *expanded = festina_regex_expand_gnu(pattern);
+    int rc = regcomp(&compiled->re, expanded, cflags);
+    free(expanded);
     if (rc != 0) {
         char errbuf[256];
         regerror(rc, &compiled->re, errbuf, sizeof(errbuf));
         char msg[512];
         snprintf(msg, sizeof(msg), "invalid regex pattern '%s': %s", pattern, errbuf);
-        free(compiled);
+        free(raw);
         festina_fail(msg);
     }
     return compiled;
 }
 
-/* claude.md #85: releases a regex_t compiled by festina_regex_compile.
- * Only ever called for a regex produced by a runtime `regex(...)` call
- * and consumed as a temporary in the same expression -- a /pattern/
- * literal is compiled once and cached for the life of the process (see
- * _emit_cached_regex_lit), so it is deliberately never freed. regfree()
- * releases what regcomp() allocated INSIDE the regex_t; the regex_t
- * itself was a separate malloc and needs its own free(). */
+/* claude.md #85/#118: the regex counterpart of festina_blob_release --
+ * decrement, and only on the last reference regfree() what regcomp()
+ * allocated inside the regex_t before freeing the storage. A cached
+ * /pattern/ literal's immortal header makes festina_release_check
+ * answer 0, so `free` on one is a safe no-op with no flag to consult. */
 void festina_regex_free(void *compiled) {
     if (!compiled) return;
-    /* claude.md #111: a cached literal is shared by every future
-     * execution of its source line -- freeing it here would be a
-     * use-after-free later, so `free` on one is a safe no-op. */
-    if (((FestinaRegex *)compiled)->cached) return;
+    if (!festina_release_check(compiled)) return;
     regfree(&((FestinaRegex *)compiled)->re);
-    free(compiled);
+    free((char *)compiled - sizeof(int64_t));
 }
 
-/* claude.md #111: marks a compiled regex as the process-lifetime cached
- * form -- called by generated code right after the literal cache is
- * first filled. */
+/* claude.md #111/#118: marks a compiled regex as the process-lifetime
+ * cached form -- called by generated code right after the literal cache
+ * is first filled. Sets the standard immortal sentinel, so every
+ * retain/release path (including `free` on a binding that aliases the
+ * literal) no-ops on it without a special case. */
 void festina_regex_mark_cached(void *compiled) {
-    if (compiled) ((FestinaRegex *)compiled)->cached = 1;
+    if (compiled) *(int64_t *)((char *)compiled - sizeof(int64_t)) = -1;
 }
+
+/* claude.md #118: the per-call-site memo for the dynamic regex(pattern,
+ * flags) builtin. `slot` is a private [3 x ptr] global codegen emits
+ * for each regex() call site: {pattern copy, flags copy, compiled}.
+ * The same pattern+flags as last time answers the cached compilation
+ * (~24x cheaper than recompiling, measured in api.md); a different
+ * pattern releases the slot's reference to the old one and compiles
+ * fresh. That release is what the refcount header makes safe: a
+ * binding that still aliases the superseded regex keeps it alive, and
+ * only the last reference regfrees it -- without the header this
+ * eviction was a use-after-free waiting to happen, which is why
+ * regex() recompiled per evaluation until now.
+ *
+ * The caller always receives its own +1 (retained here on a hit, the
+ * fresh count on a miss -- where the slot takes an extra retain for
+ * itself), so a memoized result is released by exactly the same
+ * scope-exit/temporary machinery a festina_regex_compile result always
+ * was. The slot's own reference intentionally lives until the pattern
+ * changes or the process exits -- the same reachable-until-exit rule
+ * the literal cache follows. */
+void *festina_regex_compile_memo(const char *pattern, const char *flags,
+                                 void **slot) {
+    if (!pattern) pattern = "";
+    if (!flags) flags = "";
+    if (slot[2] && strcmp((const char *)slot[0], pattern) == 0
+            && strcmp((const char *)slot[1], flags) == 0) {
+        festina_retain(slot[2]);
+        return slot[2];
+    }
+    festina_regex_free(slot[2]);
+    free(slot[0]);
+    free(slot[1]);
+    slot[0] = strdup(pattern);
+    slot[1] = strdup(flags);
+    if (!slot[0] || !slot[1]) festina_fail("out of memory in regex()");
+    void *compiled = festina_regex_compile(pattern, flags);
+    slot[2] = compiled;
+    festina_retain(compiled);
+    return compiled;
+}
+
+/* claude.md #116: the regex half of split() -- lives here with the
+ * other FestinaRegex consumers; the pieces machinery it uses is up
+ * with the text half. */
+void *festina_regex_split(void *compiled, const char *s) {
+    FestinaPieces p = {NULL, 0, 0};
+    if (!s) s = "";
+    if (!compiled) {
+        festina_pieces_push(&p, s, strlen(s));
+        return festina_pieces_finish(&p);
+    }
+    regex_t *re = &((FestinaRegex *)compiled)->re;
+    const char *start = s;    /* start of the piece being accumulated */
+    const char *cursor = s;   /* where the next match is searched from */
+    for (;;) {
+        regmatch_t m;
+        int eflags = (cursor == s) ? 0 : REG_NOTBOL;
+        if (regexec(re, cursor, 1, &m, eflags) != 0) {
+            festina_pieces_push(&p, start, strlen(start));
+            break;
+        }
+        if (m.rm_so == m.rm_eo) {
+            /* An empty match splits BETWEEN characters, JS-style:
+             * 'abc'.split(/x*<em>/) is ['a','b','c'], with no trailing
+             * empty. Emitting the piece behind the cursor and stepping
+             * one character forward is both the split and the
+             * guarantee of progress. */
+            const char *at = cursor + m.rm_so;
+            if (at > start) {
+                festina_pieces_push(&p, start, (size_t)(at - start));
+                start = at;
+            }
+            if (!*at) break;
+            cursor = at + 1;
+        } else {
+            const char *match_start = cursor + m.rm_so;
+            festina_pieces_push(&p, start, (size_t)(match_start - start));
+            cursor += m.rm_eo;
+            start = cursor;
+        }
+    }
+    if (p.count == 0) festina_pieces_push(&p, s, strlen(s));
+    return festina_pieces_finish(&p);
+}
+
 
 int8_t festina_regex_test(void *compiled, const char *text) {
     if (!compiled) return 0;
@@ -1731,6 +2227,7 @@ void festina_release(void *payload) {
     }
 }
 
+
 /* ---- maps -- claude.md #72 ---- */
 
 /* One key/value pair -- `value` is a raw 8-byte payload meaning
@@ -1828,11 +2325,19 @@ int8_t festina_map_delete(int64_t *count, void **entries, const char *key,
     FestinaMapEntry *arr = (FestinaMapEntry *)*entries;
     for (int64_t i = 0; i < *count; i++) {
         if (!festina_str_eq(arr[i].key, key)) continue;
-        if (release) release(arr[i].value, arr[i].key);
-        free(arr[i].key);
+        /* claude.md #120: the entry is REMOVED before its value is
+         * released. The release may run a cycle trial that traverses
+         * this very map, and an entry still pointing at a value whose
+         * count the release just dropped would be double-counted by
+         * markGray -- the same store-before-release rule every field
+         * write follows now (see codegen's _emit_assign). */
+        int64_t value = arr[i].value;
+        char *owned_key = arr[i].key;
         memmove(&arr[i], &arr[i + 1],
                 (size_t)(*count - i - 1) * sizeof(FestinaMapEntry));
         (*count)--;
+        if (release) release(value, owned_key);
+        free(owned_key);
         return 1;
     }
     return 0;
@@ -2035,6 +2540,90 @@ void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
     festina_array_resize(a, elem_size, len - count);
 }
 
+/* claude.md #130: the 3-argument splice(start, count, insertArr) form --
+ * JavaScript's splice(start, deleteCount, ...items) with the variadic
+ * items spelled as one explicit arr[T] argument instead (Festina has no
+ * variadic parameters). Removed elements are handed back through
+ * `dst_hdr` exactly like the 2-argument form above; `insert_data`'s
+ * `insert_len` raw elements then take their place. This function only
+ * moves bytes -- it has no notion of a Festina type, so a refcounted or
+ * text element copied in from `insert_data` is NOT retained/copied
+ * here; codegen does that itself afterward, over the destination's own
+ * newly-written range (see _emit_retain_or_own_range), the same
+ * ownership split every other array method in this file already
+ * follows (codegen decides refcounting, this file only decides bytes).
+ */
+void festina_array_splice_insert(void *hdr, int64_t elem_size, int64_t start,
+                                  int64_t count, const void *insert_data,
+                                  int64_t insert_len, void *dst_hdr) {
+    FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
+    FestinaArrayHeader *dst = (FestinaArrayHeader *)dst_hdr;
+    if (dst) { dst->length = 0; dst->data = NULL; }
+    if (insert_len < 0) insert_len = 0;
+    if (!a) return;
+
+    int64_t len = a->length;
+    if (start < 0) {
+        start = len + start;
+        if (start < 0) start = 0;
+    }
+    if (start > len) start = len;
+    if (count < 0) count = 0;
+    if (start + count > len) count = len - start;
+
+    if (dst && count > 0) {
+        dst->data = malloc((size_t)(count * elem_size));
+        if (!dst->data) festina_fail("out of memory in splice()");
+        memcpy(dst->data, (char *)a->data + start * elem_size,
+               (size_t)(count * elem_size));
+        dst->length = count;
+    }
+
+    int64_t tail = len - (start + count);
+    int64_t new_length = len - count + insert_len;
+
+    if (new_length <= 0) {
+        free(a->data);
+        a->data = NULL;
+        a->length = 0;
+        return;
+    }
+
+    if (new_length > len) {
+        /* Growing: resize first (realloc preserves the existing bytes
+         * up to the old length), then shift the tail right into its
+         * final spot -- both source and destination ranges stay within
+         * the just-grown buffer. */
+        void *grown = realloc(a->data, (size_t)(new_length * elem_size));
+        if (!grown) festina_fail("out of memory growing an array");
+        a->data = grown;
+        if (tail > 0) {
+            memmove((char *)a->data + (start + insert_len) * elem_size,
+                    (char *)a->data + (start + count) * elem_size,
+                    (size_t)(tail * elem_size));
+        }
+    } else {
+        /* Shrinking (or exactly the same size): shift the tail into
+         * its final spot first -- (start + insert_len) + tail ==
+         * new_length <= len, so it still fits inside the OLD buffer --
+         * then resize down. */
+        if (tail > 0) {
+            memmove((char *)a->data + (start + insert_len) * elem_size,
+                    (char *)a->data + (start + count) * elem_size,
+                    (size_t)(tail * elem_size));
+        }
+        void *shrunk = realloc(a->data, (size_t)(new_length * elem_size));
+        if (!shrunk) festina_fail("out of memory in splice()");
+        a->data = shrunk;
+    }
+    a->length = new_length;
+
+    if (insert_len > 0 && insert_data) {
+        memcpy((char *)a->data + start * elem_size, insert_data,
+               (size_t)(insert_len * elem_size));
+    }
+}
+
 /* claude.md #97: indexOf -- the first index holding `value`, or -1.
  *
  * -1 rather than null because the answer is an INDEX, and every use of
@@ -2092,5 +2681,154 @@ void festina_release_map(void *payload) {
     int64_t count = *(int64_t *)payload;
     void *entries = *(void **)((char *)payload + sizeof(int64_t));
     festina_map_free_entries(count, entries);
+    free((char *)payload - sizeof(int64_t));
+}
+
+/* ---- cycle collection -- claude.md #120 ----
+ *
+ * Reference counting cannot free a cycle (`a.next = a` holds itself at
+ * count 1 forever), so releases of values whose TYPE can participate in
+ * a cycle run a synchronous trial deletion (the classic Bacon-Rajan
+ * test, single-rooted): tentatively remove every reference internal to
+ * the subgraph (markGray), see which nodes still have references from
+ * outside it (scan restores those and everything they reach --
+ * scanBlack), and free what nothing external reaches (collectWhite).
+ * The compiler generates the per-type traversal functions -- only it
+ * knows a struct's field layout -- and they drive the small,
+ * type-blind state helpers here.
+ *
+ * The trial's color state lives in bits 61-62 of the same i64 header
+ * the refcount occupies (black=0, gray=1, white=2): outside a trial
+ * every header is a plain count (black), and a trial always ends with
+ * every surviving node black again, so festina_retain /
+ * festina_release_check never need masking. The count occupies the low
+ * 61 bits during a trial; markGray's decrements can never underflow
+ * into the color bits, because a node's internal in-edges never exceed
+ * its count (each is a counted reference). A NEGATIVE header is the
+ * immortal sentinel exactly as everywhere else: an immortal value is
+ * never colored, decremented, traversed, or freed -- anything an
+ * immortal anchors is reachable by definition, and every helper here
+ * checks for it before touching anything. */
+
+#define FESTINA_COLOR_SHIFT 61
+#define FESTINA_COLOR_MASK (3LL << FESTINA_COLOR_SHIFT)
+#define FESTINA_COUNT_MASK (~FESTINA_COLOR_MASK)
+#define FESTINA_GRAY 1LL
+#define FESTINA_WHITE 2LL
+
+static int64_t *festina_cycle_header(void *p) {
+    return (int64_t *)((char *)p - sizeof(int64_t));
+}
+
+/* Whether a just-released-but-still-referenced value should be tried
+ * as a cycle root: non-null with a positive header (positive rules out
+ * both immortal and colored -- outside a trial, color bits are 0). */
+int8_t festina_cycle_candidate(void *p) {
+    if (!p) return 0;
+    return *festina_cycle_header(p) > 0;
+}
+
+/* markGray's node half: claim the node for the gray traversal. The
+ * caller (generated code) then decrements and grays each child edge --
+ * exactly once per parent, which with the once-per-node claim here is
+ * what bounds the walk on a cyclic graph. */
+int8_t festina_cycle_begin_gray(void *p) {
+    if (!p) return 0;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return 0;
+    if (((*h & FESTINA_COLOR_MASK) >> FESTINA_COLOR_SHIFT) == FESTINA_GRAY) return 0;
+    *h = (*h & FESTINA_COUNT_MASK) | (FESTINA_GRAY << FESTINA_COLOR_SHIFT);
+    return 1;
+}
+
+/* markGray's edge half: tentatively remove one internal reference. */
+void festina_cycle_dec(void *p) {
+    if (!p) return;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return;
+    (*h)--;
+}
+
+/* scanBlack's edge half: restore one tentatively-removed reference. */
+void festina_cycle_inc(void *p) {
+    if (!p) return;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return;
+    (*h)++;
+}
+
+/* scan's node decision. 0: nothing to do here (null, immortal, or not
+ * gray -- already decided). 1: external references remain, the caller
+ * must scanBlack from this node. 2: no external references -- the node
+ * is tentatively garbage (now white); the caller scans its children. */
+int64_t festina_cycle_begin_scan(void *p) {
+    if (!p) return 0;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return 0;
+    if (((*h & FESTINA_COLOR_MASK) >> FESTINA_COLOR_SHIFT) != FESTINA_GRAY) return 0;
+    if ((*h & FESTINA_COUNT_MASK) > 0) return 1;
+    *h = (*h & FESTINA_COUNT_MASK) | (FESTINA_WHITE << FESTINA_COLOR_SHIFT);
+    return 2;
+}
+
+void festina_cycle_set_black(void *p) {
+    if (!p) return;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return;
+    *h &= FESTINA_COUNT_MASK;
+}
+
+/* scanBlack's recursion guard: a child that is not yet black still
+ * needs its own subtree's counts restored. */
+int8_t festina_cycle_needs_black(void *p) {
+    if (!p) return 0;
+    int64_t h = *festina_cycle_header(p);
+    if (h < 0) return 0;
+    return (h & FESTINA_COLOR_MASK) != 0;
+}
+
+/* collectWhite's node claim: only a white node is freed, and it is
+ * recolored black first so a cyclic graph frees each node exactly
+ * once. */
+int8_t festina_cycle_begin_white(void *p) {
+    if (!p) return 0;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return 0;
+    if (((*h & FESTINA_COLOR_MASK) >> FESTINA_COLOR_SHIFT) != FESTINA_WHITE) return 0;
+    *h &= FESTINA_COUNT_MASK;
+    return 1;
+}
+
+/* The container traversal loops, type-blind: hand every element/value
+ * pointer of an arr[T]/map[T]-of-managed-T to the generated per-type
+ * edge function. */
+void festina_cycle_visit_array(void *payload, void (*fn)(void *)) {
+    int64_t length = *(int64_t *)payload;
+    void **data = *(void ***)((char *)payload + sizeof(int64_t));
+    for (int64_t i = 0; i < length; i++) fn(data[i]);
+}
+
+void festina_cycle_visit_map(void *payload, void (*fn)(void *)) {
+    int64_t count = *(int64_t *)payload;
+    FestinaMapEntry *entries = *(FestinaMapEntry **)((char *)payload + sizeof(int64_t));
+    for (int64_t i = 0; i < count; i++) fn((void *)(intptr_t)entries[i].value);
+}
+
+/* collectWhite's container disposal: free the container's own storage
+ * WITHOUT releasing its elements -- markGray already removed those
+ * counts, and collectWhite's own recursion frees whichever of them are
+ * garbage. Mirrors festina_release_array/_map's free logic minus the
+ * refcount check the trial has already superseded. */
+void festina_cycle_dispose_array(void *payload) {
+    void *data = *(void **)((char *)payload + sizeof(int64_t));
+    free(data);
+    free((char *)payload - sizeof(int64_t));
+}
+
+void festina_cycle_dispose_map(void *payload) {
+    int64_t count = *(int64_t *)payload;
+    FestinaMapEntry *entries = *(FestinaMapEntry **)((char *)payload + sizeof(int64_t));
+    for (int64_t i = 0; i < count; i++) free(entries[i].key);
+    free(entries);
     free((char *)payload - sizeof(int64_t));
 }

@@ -3,7 +3,7 @@
 Three different dependency lists, and they're not the same size — this
 is the practical payoff of the staged "real compilation, minimal setup"
 plan (`claude.md #59`; see [api.md](api.md#compilation-pipeline) for the
-pipeline itself, and [security.md](security.md#binary-slimming) for why
+pipeline itself, and [security.md](security.md#slim-binaries) for why
 the runtime dependency list below is now conditional per program).
 
 ## To *use* the compiler from a checkout
@@ -30,7 +30,7 @@ If you don't know ahead of time whether every program you'll ever
 compile needs graphics/audio, the simplest move is installing all
 seven system packages up front (below) — a *compiled program* only ends up
 depending on the ones it actually uses (that's the whole point of
-[security.md](security.md#binary-slimming)'s binary-slimming split);
+[security.md](security.md#slim-binaries)'s binary-slimming split);
 it's only the *compiler's own build-time* dependency list that's
 conditional per program.
 
@@ -52,9 +52,89 @@ sudo apt install clang libsqlite3-dev libcairo2-dev libx11-dev libjpeg-dev \
 `clang` conveniently pulls in `libLLVM` as a dependency, covering both
 the fast path and its fallback in one line. (`gcc` works too for the
 fast path, but only if `libLLVM` is separately present — `clang` is the
-simpler single recommendation.) macOS (Homebrew) should be similar in
-spirit — `brew install llvm sqlite pkg-config` — though native macOS
-support isn't there yet; see [todo.md](todo.md).
+simpler single recommendation.)
+
+macOS (Homebrew), verified on real Apple Silicon CI (`macos-14`,
+`macos.md` Phases 0–2):
+
+```bash
+xcode-select --install                                # Xcode >= 15 -- the floor
+brew install pkg-config sqlite cairo jpeg-turbo mpg123 # graphics + audio tiers
+```
+
+There's no `llvm` line: Apple clang, from the CommandLineTools Xcode
+already installs, consumes the generated LLVM IR (`.ll`) directly,
+including its opaque-`ptr` form — brew's own (very large) `llvm` bottle
+is unnecessary here, and the libLLVM fast path is a Linux-only
+convenience covered by the Debian/Ubuntu line above. brew's `sqlite` is
+keg-only, so its `.pc` file needs `PKG_CONFIG_PATH` set explicitly:
+
+```bash
+export PKG_CONFIG_PATH="$(brew --prefix sqlite)/lib/pkgconfig:$PKG_CONFIG_PATH"
+```
+
+No `XQuartz` and no X11 of any kind: graphics on macOS is a native
+Cocoa window (`runtime/festina_runtime_window_mac.m`, macos.md Phase
+2), not an X11 server running under emulation, so there's nothing X11
+to install and no window server other than the one macOS already
+runs. Both the audio (AudioQueue) and graphics (Cocoa) backends are
+built and CI-compiled on every push, but stay gated behind
+`FESTINA_ENABLE_MACOS_AUDIO=1` / `FESTINA_ENABLE_MACOS_GRAPHICS=1`
+until confirmed on real hardware — compiling an audio- or
+window-opening program on darwin without the relevant env var fails
+with a specific error naming the gate, exactly like the missing-tool
+errors above; `festina doctor` reports the same status.
+
+Windows (MSYS2 UCRT64), verified on real `windows-latest` CI
+(`windows.md` Phases 0–2) — this is the one and only supported Windows
+toolchain, and **MSVC is explicitly out of scope** (windows.md's own
+toolchain decision, made first before anything else in that plan):
+
+```bash
+# From an MSYS2 UCRT64 shell specifically -- not the plain MSYS shell
+# (festina doctor flags that one as the wrong one) and not
+# MINGW64/CLANG64 either.
+pacman -S mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-python \
+          mingw-w64-ucrt-x86_64-sqlite3 mingw-w64-ucrt-x86_64-pkgconf \
+          mingw-w64-ucrt-x86_64-libsystre                  # core -- required
+pacman -S mingw-w64-ucrt-x86_64-cairo \
+          mingw-w64-ucrt-x86_64-libjpeg-turbo               # graphics tier
+pacman -S mingw-w64-ucrt-x86_64-mpg123                      # audio tier
+```
+
+`libsystre` is windows.md Phase 0's own POSIX `<regex.h>` provider
+(MinGW-w64's UCRT doesn't ship one) — pkg-config asks for it under the
+OLD name `gnurx`, not `libsystre` (a real, and non-obvious, package-
+name-vs-pkg-config-name split; `festina doctor` explains it if
+missing). No `llvm` line here either, for the same reason as macOS
+above: `mingw-w64-ucrt-x86_64-clang` already covers both the fast path
+and its fallback, no separate libLLVM package needed.
+
+Both the audio (waveOut) and graphics (Win32) backends are built and
+CI-compiled on every push, but stay gated behind
+`FESTINA_ENABLE_WINDOWS_AUDIO=1` / `FESTINA_ENABLE_WINDOWS_GRAPHICS=1`
+until confirmed on real hardware — the identical shape as the macOS
+gates just above, and `festina doctor` reports the same status.
+
+### The DLL story for compiled Windows programs (windows.md Phase 3)
+
+A MinGW-built program can depend on a handful of MSYS2 runtime DLLs
+that aren't part of a bare Windows install. Festina's compiler
+statically links two of them into every Windows binary it produces —
+`-static-libgcc` always, plus a probed static `-lwinpthread` whenever
+the program doesn't use `aud` (audio already links winpthread
+dynamically via its own `-pthread` flag, so this is skipped rather
+than risking a link-order conflict) — so a core-only or
+offscreen-graphics-only program (`hello.exe`, and anything that never
+calls `aud`) is genuinely copy-anywhere: no MSYS2 install needed on
+the machine that *runs* it, only on the one that *compiled* it. A
+program that uses graphics or audio still needs its own feature DLLs
+findable at runtime (`libcairo-2.dll`, `libjpeg-8.dll`,
+`libmpg123-0.dll`, ...) — either run it from an MSYS2 UCRT64 shell
+(already on `PATH` there) or copy them alongside the `.exe` from
+`/ucrt64/bin`. Check any specific binary's own dependencies with
+`objdump -p your_program.exe | grep 'DLL Name'` — the Windows analog
+of `ldd` used below.
 
 ## To *use* a packaged `festina` binary
 
@@ -68,9 +148,24 @@ something the resulting binary or `festina/` itself needs:
 
 ```bash
 pip install -r requirements-build.txt  # pyinstaller
-./scripts/package_compiler.sh          # -> ./dist/festina
+./scripts/package_compiler.sh          # -> ./dist/festina (./dist/festina.exe on Windows)
 ./dist/festina compile examples/hello.f -o hello
 ```
+
+On macOS the script also ad-hoc codesigns the result (`codesign -s -`,
+macos.md Phase 3) so Gatekeeper allows running it locally without a
+prompt — a self-signature, not an identity; it doesn't make the binary
+trusted on anyone else's machine. Distributing to other people's Macs
+is a separate, deliberately out-of-scope decision (real Developer-ID
+signing + notarization) that only matters once there's an actual
+distribution channel.
+
+On Windows (windows.md Phase 3), `--add-data` needs a `;` between
+source and destination rather than `:` — a real PyInstaller platform
+difference the script itself detects and handles, nothing to do by
+hand — and the resulting binary is `festina.exe`, automatically, the
+same way MinGW's linker already appends `.exe` to every OTHER compiled
+Festina program.
 
 ## To *run* a program someone already compiled with Festina
 
@@ -83,7 +178,7 @@ links `libcairo.so`/`libX11.so` and their own transitive dependencies
 and one that never uses `claude.md #38`'s audio never links
 `libasound.so` — confirmed directly with `ldd` on real compiled
 binaries, not just reasoned about (see
-[security.md](security.md#binary-slimming) for the full story, including
+[security.md](security.md#slim-binaries) for the full story, including
 why this needed the runtime split into separate translation units rather
 than just optimizer flags). Check any specific binary with `ldd` to see
 exactly what it needs:
@@ -91,6 +186,11 @@ exactly what it needs:
 ```bash
 ldd ./your_compiled_program
 ```
+
+On Windows, `ldd` isn't a MinGW/Windows concept — use
+`objdump -p your_program.exe | grep 'DLL Name'` instead (see the DLL
+story note above: a core-only or offscreen-graphics-only program needs
+nothing beyond what a bare Windows install already has).
 
 ### Static-linking sqlite3
 
@@ -113,7 +213,7 @@ in any requirements file:
 |---|---|---|
 | `pyinstaller` | `tests/test_packaging.py` (2 tests) | `pip install -r requirements-build.txt` |
 | `Xvfb` + `xdotool` + `xwd` | Interactive graphics tests — clicking, moving the mouse, pressing keys, resizing a real (virtual) window, and reading canvas pixels back to check `claude.md #89`'s colours and fonts actually render (`TestGraphics`, `TestCanvasStyleRendersRealPixels`, plus `TestTimers`'s combined graphics+timers case) | `sudo apt install xvfb xdotool x11-apps` on Debian/Ubuntu (`xwd` ships in `x11-apps`) — a real `$DISPLAY` works too, if one is already available |
-| `openbox` (+ optional `xprop`, from `x11-utils`) | One regression test for a real window-manager crash (see [security.md](security.md#graphics-a-real-window-manager-crash-badmatch-on-xsetinputfocus)) that a bare Xvfb instance (no WM at all) can never reproduce (`TestGraphics::test_graphics_init_does_not_crash_under_a_real_window_manager`; 1 test) | `sudo apt install openbox x11-utils` on Debian/Ubuntu — `xprop` is only used to poll for the WM's own readiness signal instead of a fixed sleep; the test still runs (with a fixed sleep instead) without it |
+| `openbox` (+ optional `xprop`, from `x11-utils`) | One regression test for a real window-manager crash (see [security.md](security.md#notable-fixed-findings)) that a bare Xvfb instance (no WM at all) can never reproduce (`TestGraphics::test_graphics_init_does_not_crash_under_a_real_window_manager`; 1 test) | `sudo apt install openbox x11-utils` on Debian/Ubuntu — `xprop` is only used to poll for the WM's own readiness signal instead of a fixed sleep; the test still runs (with a fixed sleep instead) without it |
 
 Every one of those skips cleanly and independently when its tool isn't
 present — the suite still passes, just with fewer tests run. Audio's

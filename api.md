@@ -17,7 +17,7 @@ flag to distinguish them:
 |---|---|
 | `festina compile entry.f -o out` | Compile to a native executable at `out` (default: `entry`'s own filename without `.f`). `--emit-llvm` prints LLVM IR to stdout instead of linking. `--cc` picks the C compiler/linker (default: whichever of `clang`/`gcc`/`cc` is found first). |
 | `festina run entry.f` | Compile to a throwaway temp executable and run it immediately — stdin/stdout/stderr inherited directly (not captured), so an interactive program (graphics/audio/timers) behaves exactly like a normal compile-then-run. Exits with the *compiled program's own* exit code, so `festina run x.f && ...` composes the same way `go run`/`cargo run` do. The temp binary is always cleaned up afterward. |
-| `festina doctor` | Checks every dependency the compiler itself needs (a C compiler, `pkg-config`, sqlite3/cairo-xlib/alsa dev headers, `libLLVM`) and reports what's missing and how to install it — the same install hints a real compile failure would give (`claude.md #59`), just checked proactively instead of only on failure. Also reports whether `festina` itself is resolvable on `PATH`, and if not, exactly how to add it (the checkout's `bin/` directory, or a packaged binary — see [setup.md](setup.md)). Exits 0 if every *required* dependency is present — graphics/audio are optional, since a compiler that can't build a graphics program is still a fully working compiler for everything else (see [security.md](security.md#binary-slimming)). |
+| `festina doctor` | Checks every dependency the compiler itself needs (a C compiler, `pkg-config`, sqlite3/cairo-xlib/alsa dev headers, `libLLVM`) and reports what's missing and how to install it — the same install hints a real compile failure would give (`claude.md #59`), just checked proactively instead of only on failure. Also reports whether `festina` itself is resolvable on `PATH`, and if not, exactly how to add it (the checkout's `bin/` directory, or a packaged binary — see [setup.md](setup.md)). Exits 0 if every *required* dependency is present — graphics/audio are optional, since a compiler that can't build a graphics program is still a fully working compiler for everything else (see [security.md](security.md#slim-binaries)). |
 | `festina help` | Prints this same command list. |
 
 ```bash
@@ -52,7 +52,7 @@ Festina source (.f)
 A compiled program only links what it actually uses: the graphics
 (Cairo/X11) and audio (ALSA) runtime object files are only passed to the
 linker when the program calls something from them (see
-[security.md](security.md#binary-slimming)). `libsqlite3` is always
+[security.md](security.md#slim-binaries)). `libsqlite3` is always
 available (statically linked when possible — see
 [setup.md](setup.md#static-linking-sqlite3)), since automatic database
 support (`table`, `sqlite()`) is always on.
@@ -91,13 +91,43 @@ with `==`/`!=` works as expected, but a null `float` never compares
 equal to `null` via `==`, even to itself — it's a real NaN under the
 hood, and IEEE-754 NaN comparisons are always false).
 
-`int`/`float` never mix implicitly, in arithmetic or comparisons:
+`int` and `float` mix freely in any binary operator — arithmetic,
+comparison, or equality — with the `int` side implicitly promoted to
+`float`, as though `.toFloat()` had been written on it:
 
 ```festina
 int a = 5
 float b = 2.5
-float c = a.toFloat() + b        // int.toFloat() is the only int->float conversion
+float c = a + b          // 7.5 -- a is promoted to float automatically
+bool less = a < b         // false
 ```
+
+`/` (division) always returns `float`, even when both operands are
+`int` — the one operator that promotes unconditionally, not just when
+mixed:
+
+```festina
+int x = 10
+int y = 3
+float z = x / y           // 3.33333 -- not 3
+```
+
+Every other arithmetic operator (`+`, `-`, `*`, `%`) only promotes when
+the two operands actually differ — `int + int` still returns `int`.
+Declaring a variable as `int` from a genuinely `float`-typed expression
+(mixed or from `/`) is still an ordinary type mismatch — the promotion
+changes what an expression evaluates to, not what a declared type
+accepts:
+
+```festina
+int bad = a + b            // compile error -- a + b is float
+```
+
+The only way back from a `float` to an `int` is still the rounding
+four (`Math.floor`/`ceil`/`round`/`trunc`) — `int.toFloat()` is still
+the one-directional `int` → `float` conversion, now mostly redundant
+with the implicit promotion above but still useful for forcing a
+result to `float` explicitly, e.g. inside a template literal.
 
 ```text
 // float -> int (the rounding four)
@@ -132,7 +162,8 @@ Division/modulo by zero return `null` (for both `int` and `float`)
 rather than crashing:
 
 ```festina
-int result = 10 / 0   // null
+float divided = 10 / 0   // null -- / always returns float
+int remainder = 10 % 0    // null -- % still returns int for two ints
 ```
 
 `int`/`float`/`bool` also each have `.toText()`, returning the same
@@ -160,11 +191,91 @@ void func log_it() {
 }
 ```
 
-No `var`/`let` — every declaration states its type. Functions are not
-first-class values (no closures, no passing a function as a value) —
-this is why `setTimeout`/`setInterval`'s callback argument must be the
-bare name of an already-declared, zero-parameter, `void`-returning
-function, not an arbitrary expression.
+No `var`/`let` — every declaration states its type.
+
+**Functions are first-class values** — a bare function name (not
+called) is a value of type `func[paramTypes]:returnType`, usable
+anywhere a value can go: a variable, a function argument, a struct
+field, an array element, a map value. Calling THROUGH one of those —
+not just the function's own original name — works exactly like calling
+the function directly:
+
+```festina
+void func greet(name:text) { log(name) }
+
+func[text]:void cb = greet
+cb('world')                              // "world"
+
+void func apply(fn:func[text]:void, arg:text) { fn(arg) }
+apply(greet, 'hi')                       // "hi"
+
+struct Handler { onEvent:func[text]:void }
+Handler h
+h.onEvent = greet
+h.onEvent('yo')                          // "yo"
+
+int func inc(x:int) { return x + 1 }
+arr[func[int]:int] transforms = [inc]
+log(transforms[0](5))                    // 6
+```
+
+`func[]:void` is a zero-argument, void-returning function type; `null`
+is a valid value of any func type too. There are no closures — a
+function's own type never captures anything from where it's declared,
+so a `func[...]:...` value is always just a plain reference to one of
+this program's own top-level (or nested, see below) function
+declarations, nothing more. `setTimeout`/`setInterval`'s own callback
+argument is unaffected by any of this: it's still the bare name of a
+zero-parameter, `void`-returning function specifically, not an
+arbitrary `func[...]:...`-typed expression.
+
+**Arrow functions** — `returnType (params) => expr` — are an anonymous
+function VALUE, compiling to an ordinary function with a compiler-
+generated name; the arrow expression itself evaluates to a
+`func[...]:...` reference to it, usable anywhere the plain-function
+examples above are:
+
+```festina
+func[text]:void cb = void (arg:text) => log(arg)
+cb('world')                                        // "world"
+
+func[int]:int sq = int (x:int) => x * x
+log(sq(7))                                         // 49
+
+void func apply(fn:func[text]:void, arg:text) { fn(arg) }
+apply(void (arg:text) => log(arg), 'hi')           // "hi"
+```
+
+A `void`-returning arrow function's body is a plain expression, run
+for its side effects with its own value discarded (there's no `return`
+inside a void function's body to write, arrow or not); a non-void
+one's body IS its return value, no `return` keyword needed. Arrow
+functions have no closures either, for the identical reason plain
+functions don't: `void (arg:text) => log(`${arg} ${x}`)` compiles
+correctly only if `x` is a top-level global (itself visible to every
+function already) — a genuinely local variable from wherever the arrow
+expression is written is not reachable from inside it.
+
+**Functions are hoisted** — every function's name and signature exists
+everywhere in the program, so calling one from above its own
+declaration (including mutual recursion between two functions, each
+necessarily calling the other before its own declaration) is not an
+error:
+
+```festina
+log(greet('world'))    // fine -- greet is declared below
+
+text func greet(name:text) {
+    return 'Hello, ' + name
+}
+```
+
+A function can also be declared nested inside an `if`/`while`/`for`
+block, or inside another function — wherever it's written, it's still
+one single, ordinary, globally-callable function (there's no
+lexical scoping/closures for functions to begin with), so a call to it
+works regardless of where the call site sits relative to that nested
+declaration.
 
 ## Control flow
 
@@ -206,7 +317,17 @@ text a = 'room 42'.replace('room', 'suite')
 text b = 'a1b2c3'.replace(/[0-9]/g, '-')   // 'g' = every match
 bool matched = /[0-9]+/.test('room 42')
 text found = 'room 42'.match(/[0-9]+/)   // null if no match
+
+arr[text] words = sentence.split(' ')    // or a regex: .split(/\s+/g)
+sentence = words.join('\t')              // join works on text/int/float/bool arrays
 ```
+
+`split` follows JS: empty pieces between adjacent separators are kept
+(`'a,,b'.split(',')` has three pieces), a separator at the edge yields
+an edge empty, an empty-match regex splits between characters, and an
+empty text separator splits per UTF-8 code point. `join` renders a
+`null` element as an empty string (`[1, null, 3].join('-')` is
+`'1--3'`), also JS's choice.
 
 ## Logging and rendering
 
@@ -314,23 +435,25 @@ for int i = 0, i < 3, i++ {
 ```
 
 Linked lists, trees and parent pointers all work, and are reclaimed
-automatically like any other struct.
-
-**One exception, and it is a real one: a *cycle* is never freed.**
-Automatic reclamation is reference counting, and a value that points
-back at itself — directly, or around any longer loop — keeps its own
-count above zero forever:
+automatically like any other struct — **including cycles**. Reference
+counting alone can never free a value that points back at itself (the
+loop keeps its own count above zero forever), so for types that *can*
+form a cycle the compiler adds a cycle detector: when such a value is
+released but still referenced, the runtime checks whether what remains
+is only the cycle holding itself, and frees it if so.
 
 ```festina
 Node a
 a.n = 7
-a.next = a      // leaks: nothing will ever free `a`
+a.next = a      // reclaimed when `a` goes away, cycle and all
 ```
 
-Nothing goes wrong at runtime; the memory is simply never returned. If
-you build a structure with back-references, break them before dropping
-it (`child.parent = null`) or accept that it lives for the life of the
-program.
+A cycle something still points at is never touched — parent pointers,
+rings and doubly-linked structures stay valid for exactly as long as
+anything outside them can reach them. Cycles through containers
+(`kids:arr[Tree]` with a `parent:Tree` back-pointer, a `map` of peers)
+collect the same way. Programs whose types cannot form a cycle carry
+none of this machinery.
 
 Memory for structs, arrays, and maps is managed automatically — no
 manual allocation or freeing. A local struct/`arr[T]`/`map[T]`
@@ -413,13 +536,15 @@ each row's own text columns, are freed when that array is — so a
 program that queries repeatedly no longer grows without bound. A single
 row read out of one (`People p = rows[0]`) borrows from the array
 rather than owning a copy, so it stays valid exactly as long as the
-array does. A regex compiled at runtime and used straight away
-(`regex(p).test(s)`) is freed after use, while a `/pattern/` literal is
-compiled once and kept for the life of the process. A regex bound to a variable is reclaimed too, when the
-compiler can prove it safe — one compiled by `regex(...)` and never
-shared outside the function it was declared in. A regex that escapes,
-and one bound from a `/pattern/` literal (which is compiled once and
-shared for the life of the process), are both deliberately left alone.
+array does.
+
+`img`, `aud` and `regex` handles are reference counted exactly like
+structs: every binding — aliased, escaping, or a `/pattern/` literal's
+— is released when it goes away, and the surface, decoded clip, or
+compiled automaton is destroyed when the last reference drops. `img b
+= a` shares one handle; `free a` afterwards is a decrement and `b`
+stays usable. A `/pattern/` literal's process-lifetime compilation is
+immortal, so every release that reaches it is a safe no-op.
 The one thing not reclaimed is text globals at process exit, where the
 operating system reclaims everything anyway.
 
@@ -435,6 +560,18 @@ numbers[0] = 10
 Memory is reclaimed automatically — see "Structs" above for the full
 picture (non-escaping locals reclaimed at scope-exit, escaping values
 reference counted).
+
+**`arr[img]`/`arr[blob]`/`arr[aud]` load each element from a path**,
+the array-typed counterpart of `img sprite = 'sprite.png'`:
+
+```festina
+arr[img] brushes = ['./brush1.png', './brush2.png']
+arr[blob] saves = ['slot1.dat', 'slot2.dat']
+```
+
+An element may also already be a value of the array's own media type
+(reusing an existing `img`/`blob`/`aud`, aliased rather than reloaded) —
+mixing the two in one literal is fine.
 
 ### Indexing is not bounds-checked
 
@@ -686,9 +823,12 @@ digits.test('room 42')                     // -> bool
 
 `flags` immediately follows the closing `/`, no space (`/pattern/flags`).
 Only `i` and `g` are accepted; any other flag letter is a compile-time
-error. `\w`/`\d`/`\s`/`\b` work as expected (glibc's `regcomp()`
-supports them as GNU extensions), but there are no capture groups,
-backreferences, or non-greedy quantifiers (POSIX ERE's own limits).
+error. `\w`/`\d`/`\s` (and their negations) and `\b` work as expected
+on every platform — the runtime expands them to portable POSIX classes
+before compiling, so they no longer depend on glibc's GNU extensions —
+but there are no capture groups, backreferences, or non-greedy
+quantifiers (POSIX ERE's own limits). Inside `[...]` a backslash is a
+literal, per POSIX.
 
 ### What `g` does, and what it doesn't
 
@@ -730,31 +870,31 @@ regex globalDynamic = regex(userPattern, 'g')   // 'g' works here too
 The flag belongs to the compiled pattern, not to the call site, so both
 spellings behave identically.
 
-### Literals are compiled once; `regex()` is compiled per evaluation
+### Literals are compiled once; `regex()` is memoized per call site
 
 A `/pattern/` literal is compiled the first time its line is reached and
-cached for the life of the process. A `regex(pattern, flags)` call
-compiles on every evaluation, because its pattern is an arbitrary
-expression — the same call site can legitimately see a different pattern
-each time, so caching it would silently reuse the first one forever.
+cached for the life of the process. A `regex(pattern, flags)` call is
+**memoized per call site**: each call compares its actual pattern and
+flags against what that site compiled last time, reuses the compilation
+when they match, and recompiles when they differ. A pattern that varies
+per call is never served a stale automaton — the check is against the
+runtime strings, not the source location.
 
-That is a real cost in a hot loop. Measured over 200,000 iterations:
-
-| | Time |
-|---|---|
-| `/[0-9]+/.test(s)` | 15 ms |
-| `regex('[0-9]+')` hoisted to a variable outside the loop | 13 ms |
-| `regex('[0-9]+').test(s)` inside the loop | 367 ms |
-
-Roughly 24x, and entirely avoidable: binding the pattern to a variable
-outside the loop compiles it once and costs the same as a literal. Use
-the literal whenever the pattern is known, and hoist `regex()` out of
-loops when it isn't.
+So the steady-state cost matches the literal's. Measured over 200,000
+iterations, `regex('[0-9]+').test(s)` inside a loop runs in ~15 ms, the
+same as `/[0-9]+/.test(s)` — before the memo it was ~367 ms (one full
+`regcomp()` per iteration, roughly 24x). A loop that genuinely
+*alternates* patterns through one call site still pays a recompile per
+change, since the memo keeps only the most recent compilation per site;
+bind each pattern to its own variable outside the loop if that matters.
 
 ## Graphics
 
 ```festina
 drawRect(0, 0, 100, 100)
+drawRect(0, 0, 100, 100, blue)           // optional trailing color -- this call only
+drawPixel(10, 10)                        // one pixel, current fillStyle
+drawPixel(10, 10, blue)                  // one pixel, this call only
 drawCircle(50, 50, 25)
 drawText('Hello', 20, 20)
 
@@ -763,12 +903,19 @@ drawImage(profile, 0, 0)
 log(`${profile.width}x${profile.height}`)
 
 saveCanvas('screenshot.png')             // -> bool; writes what you drew
+img snap = saveCanvas()                  // -> img; a snapshot, no file written
 
 render()                                  // put the canvas on screen
-clearCanvas()                             // erase everything
-clearRect(10, 10, 40, 40)                 // erase one region
+clearCanvas()                             // erase everything to transparent
+clearRect(10, 10, 40, 40)                 // erase one region to transparent
+clearCircle(50, 50, 25)                   // erase a circular region to transparent
+clearPixel(10, 10)                        // erase one pixel to transparent
 
 log(`canvas is ${clientWidth}x${clientHeight}`)
+
+log(`screen is ${screenWidth}x${screenHeight}`)  // the physical display, read-only
+setClientWidth(1024)                             // resizes the canvas (and window, if open)
+setClientHeight(768)
 
 on mouseDown(x:int, y:int) { ... }
 on mouseUp(x:int, y:int)   { ... }
@@ -809,9 +956,59 @@ Batching matters — drawing used to blit the whole canvas per call, so a
 frame of 2000 rectangles took ~1.6s. Behind one `render()` the same
 frame takes ~1ms.
 
+**A fresh or cleared canvas is transparent, not white** — matching the
+HTML5 `<canvas>` model this otherwise mirrors. `clearCanvas`/`clearRect`/
+`clearCircle`/`clearPixel` all clear to fully transparent, and a canvas
+that's never been drawn on starts that way too:
+
+```festina
+drawRect(0, 0, 100, 100)
+clearRect(20, 20, 20, 20)   // that region is now transparent
+saveCanvas('sprite.png')    // a real alpha channel, usable as an asset
+```
+
+That transparency is real alpha in whatever `saveCanvas()` produces
+(a file or the `img` snapshot both), not something flattened to a
+solid colour — useful for drawing a sprite or icon with a transparent
+background to compose elsewhere.
+
+**`saveCanvas()` with no argument returns an `img` instead of writing a
+file** — a snapshot of the canvas at that instant, not a live view of
+it: drawing or clearing the canvas afterward never changes what the
+snapshot holds.
+
+```festina
+drawRect(0, 0, 100, 100)
+img snap = saveCanvas()
+clearCanvas()
+snap.save('before-clear.png')   // still has the rectangle
+```
+
 Nothing but `render()` and the event handlers needs a display —
 `saveCanvas`, `clientWidth`/`clientHeight` and loading an image all
 work headless.
+
+**`screenWidth`/`screenHeight`** report the physical display's own
+resolution — not the window's content size (that's `clientWidth`/
+`clientHeight`), a window can be, and usually is, smaller than the
+screen it's on. Both are read-only. Unlike `clientWidth`/`clientHeight`,
+reading them still needs an X server (there's no window yet to answer
+from, and no other way to ask "how big is the screen"), so this is one
+of the few graphics reads that fails without a display.
+
+**`setClientWidth(int)`/`setClientHeight(int)`** resize the canvas —
+and the real OS window too, if one is already open. Both apply
+immediately: `setClientWidth(400)` is followed by `clientWidth` already
+reading `400`, not whatever it was a moment before. A non-positive size
+is silently ignored. If a window is open, the resized content is
+cleared to transparent (matching `clearCanvas`'s own behavior) and `on
+resize` fires once per call:
+
+```festina
+render()
+setClientWidth(1024)   // window resizes; on resize fires once
+setClientHeight(768)   // fires again
+```
 
 ### Mouse events
 
@@ -894,6 +1091,7 @@ clip, resize and `saveCanvas` without an X server.
 | `img.width` / `img.height` | Current size in pixels, as `int`. |
 | `img.clip(x, y, w, h)` | A **new** `img` holding that rectangle. The source is untouched, so one sheet can be clipped as many times as you like. |
 | `img.resize(w, h)` | Scales the image **in place** — it changes the image itself, so every name for it sees the new size. |
+| `img.drawRect(x, y, w, h[, color])` / `img.drawPixel(x, y[, color])` / `img.drawCircle(x, y, r)` / `img.drawText(text, x, y)` | The same four canvas-level drawing calls, painting onto **this image's own surface** instead. |
 
 `clip` is the spritesheet operation: one PNG holding a grid of frames,
 sliced into the individual images you draw.
@@ -911,6 +1109,25 @@ overlapping part is copied and the rest stays transparent, which is
 normal at a sheet's right or bottom margin. A zero or negative width or
 height *is* an error, since it could only ever produce an image nothing
 can draw.
+
+**Drawing onto an image** uses the same style state as the canvas
+(`fillStyle`, `borderColor`, `lineWidth`, `changeFont`) and the same
+optional trailing `color` on `drawRect`/`drawPixel` — but nothing else
+about the canvas. No window is needed (an image's surface already
+exists in full the moment the image does), and the canvas's own
+`translate`/`rotate`/`scale` transform is never applied — an image is a
+portable asset with its own local pixel coordinates, independent of
+whatever the canvas's transform happens to be set to:
+
+```festina
+color red = 'red'
+color blue = 'blue'
+img icon = 'blank.png'
+fillStyle(red)
+icon.drawRect(0, 0, 16, 16)
+icon.drawPixel(24, 8, blue)      // this pixel only -- fillStyle stays red after
+icon.save('icon-with-border.png')
+```
 
 Because `resize` changes the image itself, two names for one image stay
 in step:
@@ -933,7 +1150,7 @@ color brand = '#4a90d9'
 color line = 'gray'
 font  body  = 'bold 20px serif'
 
-fillStyle(brand)            // fills: drawRect, drawCircle, drawText
+fillStyle(brand)            // fills: drawRect, drawPixel, drawCircle, drawText
 borderColor(line)           // outlines drawRect/drawCircle
 lineWidth(4)                // border thickness, in pixels
 changeFont(body)            // used by drawText and both measure calls
@@ -943,6 +1160,20 @@ Style is set once and applies to every later draw — the same model the
 HTML canvas uses. Defaults are black fill, no border, and 16px
 sans-serif, so a program that never calls these draws exactly what it
 did before they existed.
+
+**`drawRect`/`drawPixel` take an optional trailing `color`** that
+overrides `fillStyle` for that one call only — the current fill (a flat
+color or an active gradient) is unaffected afterward:
+
+```festina
+fillStyle(brand)
+drawRect(0, 0, 20, 20)        // brand
+drawRect(30, 0, 20, 20, line) // line, just this once
+drawRect(60, 0, 20, 20)       // brand again
+```
+
+`borderColor`/`lineWidth` still apply as configured either way — only
+the fill is a per-call override, not the border.
 
 > **Colors and fonts must be declared.** Anything other than raw RGB
 > numbers has to be a `color` or `font` declaration first:
@@ -1249,6 +1480,34 @@ back.save('recovered.dat')            // now it has one
 log(back.exists())                    // true
 ```
 
+## Directories
+
+```festina
+bool created = mkdir('./temp')        // -> bool: true if IT created it
+arr[text] names = ls('./temp')        // -> arr[text] of entry names
+```
+
+`mkdir(path)` answers `true` only if it actually created the directory
+— `false` for every other outcome, including "it already existed", a
+missing parent, or no permission. Like the file builtins, nothing here
+fails the program:
+
+```festina
+mkdir('./temp')                       // true
+mkdir('./temp')                       // false -- already there
+```
+
+`ls(path)` answers the directory's entry names (not full paths, and
+never `.`/`..`) as `arr[text]`, in whatever order the OS hands them
+back. A missing or unreadable directory answers an empty array rather
+than failing:
+
+```festina
+arr[text] names = ls('./temp')
+log(names.length)
+log(ls('./nowhere').length)           // 0
+```
+
 ## Freeing and deleting
 
 Memory is automatic — but `free` and `delete` exist for the moments you
@@ -1266,20 +1525,17 @@ free spritesheet                       // the sheet goes now, not at exit
 `free name` releases whatever the binding holds and sets the binding to
 `null`. It works on **every type**:
 
-- **struct / `arr[T]` / `map[T]` / `blob`** — a reference-count
-  *decrement*, not a forced free. A value something else still points at
-  survives until its last reference drops; freeing an array releases
-  each element the same way, so a shared element outlives its array.
-- **`img` / `aud`** — freed outright. These are the types the compiler
-  can't always reclaim on its own (an escaping handle lives for the
-  program's lifetime — see the note under Images), so `free` is the
-  manual escape hatch: cut your clips, then `free spritesheet`. The
-  contract is the manual one: another binding still aliasing the handle
-  is left dangling — the freed *binding* reads `null`, an alias does not.
+- **struct / `arr[T]` / `map[T]` / `blob` / `img` / `aud` / `regex`** —
+  a reference-count *decrement*, not a forced free. A value something
+  else still points at survives until its last reference drops; freeing
+  an array releases each element the same way, so a shared element
+  outlives its array. An alias of a freed `img`/`aud` stays fully
+  usable — the freed *binding* reads `null`, the alias does not, and the
+  surface or clip goes away when the last reference does. Freeing an
+  `aud` that was the last reference stops every channel still playing
+  it. A `/pattern/` literal's process-lifetime cache is immortal, so
+  `free` on a binding aliasing one is a safe no-op.
 - **`text`** — the buffer is freed (a text is exclusively owned).
-- **`regex`** — a `regex()` result is freed; a `/pattern/` literal's
-  process-lifetime cache marks itself and survives, so `free` is safe on
-  either.
 - **a query row** — the binding is nulled *without* freeing: the row is
   owned by the array it came from. Free the array.
 - **`int` / `float` / `bool`** — nothing to release; `free x` is `x = null`.
@@ -1432,14 +1688,19 @@ xs.pop()            // -> last element, removed
 xs.shift()          // -> first element, removed
 xs.unshift(0)       // -> new length
 arr[int] cut = xs.splice(1, 2)   // remove 2 from index 1, return them
+xs.splice(1, 0, [8, 9])           // insert [8, 9] at index 1, remove nothing
 xs.indexOf(3)       // -> first index holding 3, or -1
 ```
 
 All six behave as their JavaScript namesakes do, including `splice`'s
 clamping — a negative start counts back from the end, and an oversized
 range clamps rather than failing, so `splice(i, 1)` at a boundary is a
-no-op. (`splice`'s variadic insert has no spelling here; Festina has no
-variadic calls.)
+no-op. `splice` takes an optional third argument — `splice(start, count,
+insertArr)` — in place of JavaScript's variadic `...items` (Festina has
+no variadic calls, so the items to insert are one explicit `arr[T]`
+instead of a spread list); either way only the REMOVED elements come
+back, never the inserted ones, exactly as JavaScript's own `splice()`
+answers.
 
 `pop()`/`shift()` on an empty array return `null` — not zero, so an
 empty pop is distinguishable from popping a real `0`:
@@ -1653,12 +1914,30 @@ unit; a file is never imported more than once even if multiple files
 depend on it; errors still point at the file a statement actually came
 from.
 
-## `log()` / `fail()`
+## `log()` / `fail()` / `close()`
 
 ```festina
 log(value)     // prints any primitive to stdout, newline-terminated
 fail('message')  // prints to stderr, exits(1)
+close(code)    // exits(code), running `on exit` first if declared
 ```
+
+`close(code)` exits the program with the given exit code — it works in
+every program, with or without a window, unlike the graphics-only `on
+close` handler under [Graphics](#graphics) above (which fires on the
+window's own close button and is a different thing with a similar
+name). If a program declares `on exit(code:int) { ... }`, `close(code)`
+runs it — passed the same code — before the process actually exits:
+
+```festina
+on exit(code:int) {
+    log(`exiting with ${code}`)
+}
+log('working...')
+close(1)          // prints "exiting with 1", then exits with status 1
+```
+
+With no `on exit` handler declared, `close(code)` just exits.
 
 ## Error format
 
