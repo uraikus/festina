@@ -6,32 +6,28 @@ item lives in [claude.md](claude.md) (the numbered decision log) and
 
 ## Platforms
 
-Linux is the supported platform today. Porting is backend work, not
-language work — the compiler and core runtime are portable C/LLVM.
+Linux is fully supported. macOS and Windows are also fully
+implemented and built — [macos.md](macos.md) and [windows.md](windows.md)
+are implementation records now, not open plans. Porting turned out to
+be exactly what it looked like going in: backend work, not language
+work — the compiler and core runtime are portable C/LLVM, and both
+ports share the same two backend seams (audio device, windowing).
 
-- **macOS** — planned in full in [macos.md](macos.md). All four
-  phases are built: toolchain bring-up (Phase 0), the audio device
-  seam with an AudioQueue backend (Phase 1), the windowing seam with a
-  native Cocoa backend (Phase 2, no XQuartz needed after all), and
-  packaging — an ad-hoc-codesigned arm64 binary, built and smoke-tested
-  by CI on every push (Phase 3). Both the audio and windowed-graphics
-  gates stay closed on darwin (`FESTINA_ENABLE_MACOS_AUDIO=1` /
-  `FESTINA_ENABLE_MACOS_GRAPHICS=1` to try either) until verified on
-  real hardware — the one thing left.
-- **Windows** — planned in full in [windows.md](windows.md). Phase 0
-  (toolchain bring-up) is built: MSYS2/MinGW-w64 as the one supported
-  toolchain, the regex core gap filled by installing MSYS2's
-  `libsystre` package and asking pkg-config for `gnurx` (not
-  `libgnurx` — two real CI rounds found it conflicts with libsystre
-  and gets silently dropped, then that pkg-config's own name doesn't
-  match the package name either, claude.md #126), `festina doctor`'s
-  Windows hints, and a `windows-latest` CI job. This project still has
-  no Windows/MSYS2 access, so the fix for those two rounds' findings
-  is itself unconfirmed by a third real run — that's the next thing
-  needed. Open: that confirmation, then the same two
-  backend seams macos.md already cut (audio, windowing) implemented as
-  waveOut and Win32 + the shared Cairo blit (Phases 1–2), then
-  packaging and the DLL story (Phase 3).
+What's actually left, for both ports, is external to this codebase —
+real hardware to confirm on, which this project doesn't have:
+
+- **Audio playback and windowed mouse/keyboard/window behavior**, on
+  both a real Mac and a real Windows machine. Each stays behind an
+  explicit opt-in env var (`FESTINA_ENABLE_MACOS_AUDIO`/
+  `_GRAPHICS`, `FESTINA_ENABLE_WINDOWS_AUDIO`/`_GRAPHICS`) until
+  confirmed — everything up to that point (both backends compile,
+  type-check against real platform headers, and pass CI on every
+  push) is done.
+- **One exception that needs no hardware at all**: unlike macOS,
+  GitHub's Windows CI runners can create real Win32 windows. The
+  windowed-graphics gate has just never actually been lifted for a CI
+  run to try it (see [windows.md](windows.md)'s "genuine opportunity,
+  not yet taken" note) — the cheapest open item on either platform.
 - **Static sqlite3 linking** for fully self-contained binaries — see
   [setup.md](setup.md#static-linking-sqlite3).
 
