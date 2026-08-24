@@ -769,6 +769,9 @@ bind each pattern to its own variable outside the loop if that matters.
 
 ```festina
 drawRect(0, 0, 100, 100)
+drawRect(0, 0, 100, 100, blue)           // optional trailing color -- this call only
+drawPixel(10, 10)                        // one pixel, current fillStyle
+drawPixel(10, 10, blue)                  // one pixel, this call only
 drawCircle(50, 50, 25)
 drawText('Hello', 20, 20)
 
@@ -781,6 +784,8 @@ saveCanvas('screenshot.png')             // -> bool; writes what you drew
 render()                                  // put the canvas on screen
 clearCanvas()                             // erase everything
 clearRect(10, 10, 40, 40)                 // erase one region
+clearCircle(50, 50, 25)                   // erase a circular region
+clearPixel(10, 10)                        // erase one pixel
 
 log(`canvas is ${clientWidth}x${clientHeight}`)
 
@@ -947,7 +952,7 @@ color brand = '#4a90d9'
 color line = 'gray'
 font  body  = 'bold 20px serif'
 
-fillStyle(brand)            // fills: drawRect, drawCircle, drawText
+fillStyle(brand)            // fills: drawRect, drawPixel, drawCircle, drawText
 borderColor(line)           // outlines drawRect/drawCircle
 lineWidth(4)                // border thickness, in pixels
 changeFont(body)            // used by drawText and both measure calls
@@ -957,6 +962,20 @@ Style is set once and applies to every later draw — the same model the
 HTML canvas uses. Defaults are black fill, no border, and 16px
 sans-serif, so a program that never calls these draws exactly what it
 did before they existed.
+
+**`drawRect`/`drawPixel` take an optional trailing `color`** that
+overrides `fillStyle` for that one call only — the current fill (a flat
+color or an active gradient) is unaffected afterward:
+
+```festina
+fillStyle(brand)
+drawRect(0, 0, 20, 20)        // brand
+drawRect(30, 0, 20, 20, line) // line, just this once
+drawRect(60, 0, 20, 20)       // brand again
+```
+
+`borderColor`/`lineWidth` still apply as configured either way — only
+the fill is a per-call override, not the border.
 
 > **Colors and fonts must be declared.** Anything other than raw RGB
 > numbers has to be a `color` or `font` declaration first:

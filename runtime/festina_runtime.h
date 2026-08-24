@@ -416,8 +416,22 @@ char *festina_regex_replace(void *compiled, const char *text,
 void festina_graphics_init(void);
 void festina_run_event_loop(void);
 void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h);
+/* claude.md #133: the optional-`color`-argument forms of drawRect/
+ * drawPixel -- paint with `color` for THIS call only (fillStyle/any
+ * active gradient are saved and restored around it, untouched
+ * afterward), rather than the process-global fillStyle every other
+ * draw call uses. Border/alpha are unaffected either way -- only the
+ * FILL colour is a per-call override. */
+void festina_draw_rect_color(int64_t x, int64_t y, int64_t w, int64_t h, int64_t color);
 void festina_draw_circle(int64_t x, int64_t y, int64_t r);
 void festina_draw_text(const char *text, int64_t x, int64_t y);
+/* claude.md #133: a single pixel, filled with the current fillStyle
+ * (or, for the _color form, `color` for this call only) -- antialiasing
+ * is disabled around it so an integer-aligned 1x1 rectangle paints
+ * exactly one pixel, deterministically, rather than Cairo's usual edge
+ * blending. No border: a 1x1 shape has nothing meaningful to stroke. */
+void festina_draw_pixel(int64_t x, int64_t y);
+void festina_draw_pixel_color(int64_t x, int64_t y, int64_t color);
 void *festina_load_image(const char *path);
 /* claude.md #101: the image counterparts of the two audio entry points
  * above, with one difference -- an image that never came from a file
@@ -463,6 +477,11 @@ int8_t festina_save_canvas(const char *path);
 void festina_render(void);
 void festina_clear_canvas(void);
 void festina_clear_rect(int64_t x, int64_t y, int64_t w, int64_t h);
+/* claude.md #133: the same "erase back to white, honouring the current
+ * transform" clearRect() already does, at a circle's and a single
+ * pixel's shape instead of a rectangle's. */
+void festina_clear_circle(int64_t x, int64_t y, int64_t r);
+void festina_clear_pixel(int64_t x, int64_t y);
 
 /* claude.md #94: paths, transforms, gradients and alpha.
  *

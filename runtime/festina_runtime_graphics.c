@@ -587,6 +587,32 @@ static void festina_fill_and_border(cairo_t *cr) {
     }
 }
 
+/* claude.md #133: drawRect(x, y, w, h, color)/drawPixel(x, y, color) --
+ * fills with `color` for THIS call only, then restores whatever
+ * fillStyle (flat colour or active gradient) was already set, so a
+ * one-off override never leaks into the next plain drawRect()/
+ * drawCircle()/... call. Border/alpha are untouched either way, since
+ * only the FILL colour is what these two ever override -- the same
+ * split fillStyle()/borderColor() already keep separate. `color < 0`
+ * is `color`'s own 'none' encoding (claude.md #91), so this call paints
+ * nothing, exactly like fillStyle('none') would. */
+static void festina_fill_and_border_with_color(cairo_t *cr, int64_t color) {
+    double save_r = g_fill_r, save_g = g_fill_g, save_b = g_fill_b;
+    int save_none = g_fill_none;
+    cairo_pattern_t *save_gradient = g_fill_gradient;
+    g_fill_gradient = NULL;
+    if (color < 0) {
+        g_fill_none = 1;
+    } else {
+        g_fill_none = 0;
+        festina_unpack_rgb(color, &g_fill_r, &g_fill_g, &g_fill_b);
+    }
+    festina_fill_and_border(cr);
+    g_fill_r = save_r; g_fill_g = save_g; g_fill_b = save_b;
+    g_fill_none = save_none;
+    g_fill_gradient = save_gradient;
+}
+
 /* claude.md #123: opens the platform window through the seam, exactly
  * once. Portable now -- every platform-specific concern (connect
  * retries, decorations, input focus, ...) lives in that platform's own
@@ -662,6 +688,36 @@ void festina_clear_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
     cairo_destroy(cr);
 }
 
+/* claude.md #133: clearRect()'s own circle-shaped counterpart -- erases
+ * back to white, honouring the current transform exactly as clearRect
+ * does. No fast-path mask cache the way drawCircle has one: clearing is
+ * a far rarer call than drawing, so the extra machinery would cost more
+ * to maintain than it would ever save here. */
+void festina_clear_circle(int64_t x, int64_t y, int64_t r) {
+    festina_backing_require();
+    cairo_t *cr = festina_canvas_context();
+    if (r < 0) r = 0;
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_arc(cr, (double)x, (double)y, (double)r, 0.0, 2.0 * 3.14159265358979323846);
+    cairo_fill(cr);
+    cairo_destroy(cr);
+}
+
+/* claude.md #133: clearRect()'s own single-pixel counterpart -- see
+ * festina_draw_pixel just below for why antialiasing is disabled
+ * around the fill. */
+void festina_clear_pixel(int64_t x, int64_t y) {
+    festina_backing_require();
+    cairo_t *cr = festina_canvas_context();
+    cairo_antialias_t save_aa = cairo_get_antialias(cr);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_rectangle(cr, (double)x, (double)y, 1, 1);
+    cairo_fill(cr);
+    cairo_set_antialias(cr, save_aa);
+    cairo_destroy(cr);
+}
+
 /* Blits the backing store (source of truth for what's been drawn) onto
  * the visible window, through the seam -- called after every draw call
  * for immediate feedback. A backend's own redraw-on-expose (an X11
@@ -681,6 +737,62 @@ void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
     cairo_t *cr = festina_canvas_context();
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     festina_fill_and_border(cr); /* claude.md #89 */
+    cairo_destroy(cr);
+}
+
+/* claude.md #133: drawRect(x, y, w, h, color) -- see
+ * festina_fill_and_border_with_color's own comment for the save/
+ * restore-fillStyle semantics. */
+void festina_draw_rect_color(int64_t x, int64_t y, int64_t w, int64_t h, int64_t color) {
+    festina_backing_require();
+    cairo_t *cr = festina_canvas_context();
+    cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
+    festina_fill_and_border_with_color(cr, color);
+    cairo_destroy(cr);
+}
+
+/* claude.md #133: a single pixel, filled with the current fillStyle.
+ * Antialiasing is disabled around the fill so an integer-aligned 1x1
+ * rectangle paints exactly one pixel deterministically -- with it left
+ * on, Cairo blends a sub-pixel-positioned edge even for whole-number
+ * coordinates, which would make a "pixel" a faint smudge instead of one
+ * solid pixel. No border: a 1x1 shape has nothing meaningful to
+ * stroke, unlike drawRect/drawCircle. */
+void festina_draw_pixel(int64_t x, int64_t y) {
+    festina_backing_require();
+    cairo_t *cr = festina_canvas_context();
+    cairo_antialias_t save_aa = cairo_get_antialias(cr);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
+    cairo_rectangle(cr, (double)x, (double)y, 1, 1);
+    if (!g_fill_none) {
+        festina_set_fill_source(cr);
+        cairo_fill(cr);
+    } else {
+        cairo_new_path(cr);
+    }
+    cairo_set_antialias(cr, save_aa);
+    cairo_destroy(cr);
+}
+
+/* claude.md #133: drawPixel(x, y, color) -- `color` for this one pixel
+ * only, the same per-call override drawRect_color makes, but simpler:
+ * a single pixel is never a gradient, so there is no fillStyle state to
+ * save and restore around it at all. */
+void festina_draw_pixel_color(int64_t x, int64_t y, int64_t color) {
+    festina_backing_require();
+    cairo_t *cr = festina_canvas_context();
+    cairo_antialias_t save_aa = cairo_get_antialias(cr);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
+    cairo_rectangle(cr, (double)x, (double)y, 1, 1);
+    if (color >= 0) {
+        double r, g, b;
+        festina_unpack_rgb(color, &r, &g, &b);
+        cairo_set_source_rgba(cr, r, g, b, g_fill_alpha);
+        cairo_fill(cr);
+    } else {
+        cairo_new_path(cr);
+    }
+    cairo_set_antialias(cr, save_aa);
     cairo_destroy(cr);
 }
 

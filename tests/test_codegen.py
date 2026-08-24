@@ -11377,6 +11377,110 @@ class TestSaveCanvas:
         assert result.stdout == "false\n"
 
 
+class TestDrawPixelClearCircleAndColorOverrides:
+    """claude.md #133: drawPixel/clearPixel/clearCircle, and an optional
+    trailing `color` argument on drawRect/drawPixel that paints with it
+    for that one call only, restoring the current fillStyle (flat
+    colour or gradient) afterward rather than changing it."""
+
+    def test_draw_pixel_uses_current_fill_style(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        fillStyle(red)
+        drawPixel(10, 10)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(10, 10) == (255, 0, 0)
+        assert pixel(11, 10) == (255, 255, 255), "only the one pixel should be painted"
+        assert pixel(10, 11) == (255, 255, 255), "only the one pixel should be painted"
+
+    def test_draw_rect_and_pixel_color_override_does_not_change_fill_style(
+            self, compile_and_run, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        color blue = 'blue'
+        fillStyle(red)
+        drawRect(0, 0, 10, 10, blue)
+        drawPixel(20, 20, blue)
+        drawRect(30, 0, 10, 10)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(5, 5) == (0, 0, 255), "the color override should win"
+        assert pixel(20, 20) == (0, 0, 255), "drawPixel's own override"
+        assert pixel(35, 5) == (255, 0, 0), "fillStyle(red) should still be in effect after"
+
+    def test_draw_rect_color_none_paints_nothing(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color none = 'none'
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 20, 20, none)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(10, 10) == (255, 255, 255)
+
+    def test_clear_pixel_erases_one_pixel_back_to_white(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 10, 10)
+        clearPixel(5, 5)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(5, 5) == (255, 255, 255)
+        assert pixel(4, 4) == (255, 0, 0), "only the one pixel should be erased"
+
+    def test_clear_circle_erases_a_circular_region_back_to_white(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 100, 100)
+        clearCircle(50, 50, 20)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(50, 50) == (255, 255, 255), "circle center should be cleared"
+        assert pixel(1, 1) == (255, 0, 0), "far corner should still be red"
+
+    def test_wrong_arity_and_types_are_rejected(self, parser, semantic, errors):
+        for source in [
+            "drawPixel()",
+            "drawPixel(1)",
+            "drawPixel(1, 2, 3)",
+            "drawRect(0, 0, 10)",
+            "drawRect(0, 0, 10, 10, 10, 10)",
+            "clearCircle(0, 0)",
+            "clearPixel(0)",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
 class TestScalarQueries:
     """claude.md #94: sqliteInt/sqliteFloat/sqliteText take one value out
     of a query without a `table` declaration to hold it.

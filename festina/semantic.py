@@ -76,6 +76,10 @@ _REMOVED_BUILTINS = {
 BUILTIN_FUNCTIONS = {
     "log", "fail", "sqlite",
     "drawRect", "drawCircle", "drawText", "drawImage",
+    # claude.md #133: drawPixel (with drawRect's own optional trailing
+    # `color` argument, see _BUILTIN_SIGNATURE_ALTERNATES below) and
+    # clearRect's circle/pixel-shaped counterparts.
+    "drawPixel", "clearCircle", "clearPixel",
     # claude.md #98: how many channels the pool may assign automatically.
     "setMaxAudioPlayers", "maxAudioPlayers",
     # claude.md #99: stop one channel (or, with no argument, all of them).
@@ -159,7 +163,9 @@ _BLOB_METHODS = {
 # their args are inferred but not checked against a fixed signature,
 # since claude.md leaves their shape open.
 _BUILTIN_SIGNATURES = {
-    "drawRect": (_INT, _INT, _INT, _INT),
+    # claude.md #133: drawRect's own fixed entry moved to
+    # _BUILTIN_SIGNATURE_ALTERNATES below, alongside drawPixel -- both
+    # now have a second, 1-argument-longer form with a trailing `color`.
     "drawCircle": (_INT, _INT, _INT),
     "drawText": (_TEXT, _INT, _INT),
     "drawImage": (types_mod.ImageType(), _INT, _INT),
@@ -180,6 +186,9 @@ _BUILTIN_SIGNATURES = {
     "render": (),
     "clearCanvas": (),
     "clearRect": (_INT, _INT, _INT, _INT),
+    # claude.md #133
+    "clearCircle": (_INT, _INT, _INT),
+    "clearPixel": (_INT, _INT),
     "beginPath": (),
     "moveTo": (_INT, _INT),
     "lineTo": (_INT, _INT),
@@ -233,6 +242,11 @@ _BUILTIN_SIGNATURE_ALTERNATES = {
     # claude.md #99: stopAudioPlayer(n) stops one channel;
     # stopAudioPlayer() stops every channel.
     "stopAudioPlayer": [(), (_INT,)],
+    # claude.md #133: an optional trailing `color` -- present, paints
+    # with it for this one call only; absent, uses the current
+    # fillStyle, exactly like every other draw call already does.
+    "drawRect": [(_INT, _INT, _INT, _INT), (_INT, _INT, _INT, _INT, _COLOR)],
+    "drawPixel": [(_INT, _INT), (_INT, _INT, _COLOR)],
 }
 _REGEX = types_mod.RegexType()
 _AUDIO = types_mod.AudioType()

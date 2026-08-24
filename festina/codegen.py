@@ -1066,6 +1066,10 @@ class CodeGen:
             "declare void @festina_graphics_init()",
             "declare void @festina_run_event_loop()",
             "declare void @festina_draw_rect(i64, i64, i64, i64)",
+            # claude.md #133
+            "declare void @festina_draw_rect_color(i64, i64, i64, i64, i64)",
+            "declare void @festina_draw_pixel(i64, i64)",
+            "declare void @festina_draw_pixel_color(i64, i64, i64)",
             "declare void @festina_draw_circle(i64, i64, i64)",
             "declare void @festina_draw_text(ptr, i64, i64)",
             # claude.md #89/#90: canvas drawing style + text metrics.
@@ -1089,6 +1093,9 @@ class CodeGen:
             "declare void @festina_render()",
             "declare void @festina_clear_canvas()",
             "declare void @festina_clear_rect(i64, i64, i64, i64)",
+            # claude.md #133
+            "declare void @festina_clear_circle(i64, i64, i64)",
+            "declare void @festina_clear_pixel(i64, i64)",
             "declare void @festina_set_alpha(double)",
             "declare void @festina_fill_linear_gradient(i64, i64, i64, i64, i64, i64)",
             "declare void @festina_fill_radial_gradient(i64, i64, i64, i64, i64)",
@@ -5985,6 +5992,9 @@ class CodeGen:
                 "render": ("festina_render", []),
                 "clearCanvas": ("festina_clear_canvas", []),
                 "clearRect": ("festina_clear_rect", ["i64"] * 4),
+                # claude.md #133
+                "clearCircle": ("festina_clear_circle", ["i64"] * 3),
+                "clearPixel": ("festina_clear_pixel", ["i64"] * 2),
                 "beginPath": ("festina_begin_path", []),
                 "moveTo": ("festina_move_to", ["i64", "i64"]),
                 "lineTo": ("festina_line_to", ["i64", "i64"]),
@@ -6047,6 +6057,7 @@ class CodeGen:
             if name == "regex":
                 return self._emit_regex_call(expr, env, lines)
             if name in ("drawRect", "drawCircle", "drawText", "drawImage", "loadImage",
+                        "drawPixel",
                         "fillStyle", "borderColor", "lineWidth", "changeFont",
                         "measureTextWidth", "measureTextHeight"):
                 return self._emit_graphics_call(name, expr, env, lines)
@@ -6672,7 +6683,7 @@ class CodeGen:
             f"{{ i64 {px or 0}, i64 {slant}, i64 {weight}, ptr {family_ref} }}")
         return name
 
-    # ---- graphics: drawRect/drawCircle/drawText/drawImage/loadImage (claude.md #37, #39) ----
+    # ---- graphics: drawRect/drawPixel/drawCircle/drawText/drawImage/loadImage (claude.md #37, #39, #133) ----
     def _emit_graphics_call(self, name, expr, env, lines):
         """Draws onto (or loads an image for) the graphics canvas.
         Sets self.uses_graphics so main() knows to open the canvas
@@ -6681,9 +6692,11 @@ class CodeGen:
         "only pay for what you use" pattern self.uses_sqlite already
         follows for festina_db_open(). semantic.py has already checked
         each function's argument count/types against claude.md's own
-        worked examples (claude.md #37, #39), so this just emits the
-        call; there's no color argument to pass because none of those
-        examples ever take one (see festina_runtime.h's doc comment).
+        worked examples (claude.md #37, #39); claude.md #133 added one
+        exception -- drawRect/drawPixel each have a second, longer form
+        with a trailing `color` argument, dispatched here purely by
+        arity (`len(args)`), the same way fillStyle/borderColor/
+        changeFont's own 1-vs-3-argument forms already are, just below.
 
         loadImage() deliberately does NOT set self.uses_graphics:
         decoding a PNG (Cairo's own in-memory decoder -- see
@@ -6766,8 +6779,27 @@ class CodeGen:
         # the single call that does. That is what lets a program draw
         # and saveCanvas() with no display present at all.
         if name == "drawRect":
-            x, y, w, h = args
-            lines.append(f"  call void @festina_draw_rect(i64 {x}, i64 {y}, i64 {w}, i64 {h})")
+            # claude.md #133: a 5th argument is an optional trailing
+            # `color` -- paint with it for this call only, instead of
+            # the current fillStyle.
+            if len(args) == 5:
+                x, y, w, h, color = args
+                lines.append(
+                    f"  call void @festina_draw_rect_color(i64 {x}, i64 {y}, "
+                    f"i64 {w}, i64 {h}, i64 {color})")
+            else:
+                x, y, w, h = args
+                lines.append(f"  call void @festina_draw_rect(i64 {x}, i64 {y}, i64 {w}, i64 {h})")
+        elif name == "drawPixel":
+            # claude.md #133: same optional-trailing-`color` shape as
+            # drawRect just above.
+            if len(args) == 3:
+                x, y, color = args
+                lines.append(
+                    f"  call void @festina_draw_pixel_color(i64 {x}, i64 {y}, i64 {color})")
+            else:
+                x, y = args
+                lines.append(f"  call void @festina_draw_pixel(i64 {x}, i64 {y})")
         elif name == "drawCircle":
             x, y, r = args
             lines.append(f"  call void @festina_draw_circle(i64 {x}, i64 {y}, i64 {r})")
