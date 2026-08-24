@@ -780,6 +780,7 @@ drawImage(profile, 0, 0)
 log(`${profile.width}x${profile.height}`)
 
 saveCanvas('screenshot.png')             // -> bool; writes what you drew
+img snap = saveCanvas()                  // -> img; a snapshot, no file written
 
 render()                                  // put the canvas on screen
 clearCanvas()                             // erase everything
@@ -827,6 +828,18 @@ render()
 Batching matters — drawing used to blit the whole canvas per call, so a
 frame of 2000 rectangles took ~1.6s. Behind one `render()` the same
 frame takes ~1ms.
+
+**`saveCanvas()` with no argument returns an `img` instead of writing a
+file** — a snapshot of the canvas at that instant, not a live view of
+it: drawing or clearing the canvas afterward never changes what the
+snapshot holds.
+
+```festina
+drawRect(0, 0, 100, 100)
+img snap = saveCanvas()
+clearCanvas()
+snap.save('before-clear.png')   // still has the rectangle
+```
 
 Nothing but `render()` and the event handlers needs a display —
 `saveCanvas`, `clientWidth`/`clientHeight` and loading an image all

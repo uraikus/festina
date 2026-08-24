@@ -47,6 +47,14 @@ while i < 120 {
     tile.drawCircle(16, 16, 3)
     png.clip(0, 0, 8, 8).drawRect(0, 0, 4, 4, blue)
 
+    // claude.md #135: saveCanvas() with no path -> a fresh img
+    // snapshot -- a genuinely new allocation path (festina_canvas_to_
+    // image), distinct from #134's own drawing-in-place methods above.
+    drawRect(0, 0, 20, 20)
+    img snap = saveCanvas()
+    total = total + snap.width
+    snap.drawPixel(0, 0, blue)
+
     // Stored as BLOBs and read back as freshly decoded handles. The
     // clipped tile has no source bytes, so this also exercises the
     // encode-on-demand path.

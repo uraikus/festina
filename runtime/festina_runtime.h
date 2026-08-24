@@ -528,6 +528,10 @@ void festina_stroke_path(void);
 int64_t festina_image_width(void *img);
 int64_t festina_image_height(void *img);
 void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
+/* claude.md #135: saveCanvas() with no path -> a fresh img, a snapshot
+ * of the canvas at this instant (see the .c doc comment for why a
+ * snapshot rather than a live alias). */
+void *festina_canvas_to_image(void);
 void festina_image_resize(void *img, int64_t w, int64_t h);
 /* claude.md #134: drawRect/drawPixel/drawCircle/drawText as methods on
  * img -- the same four canvas-level functions above, retargeted at an

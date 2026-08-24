@@ -1225,6 +1225,29 @@ void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h) 
     return festina_image_box(out);
 }
 
+/* claude.md #135: saveCanvas() with no path -> img, a SNAPSHOT of the
+ * canvas at this instant rather than a live view of it -- built the
+ * exact same way festina_image_clip just above builds any other fresh
+ * img from existing pixels (a new ARGB32 surface, the source painted
+ * onto it, boxed). A snapshot rather than an alias is the only choice
+ * that keeps `img` semantics honest: every OTHER img is its own
+ * independent value once created (clip/resize never retroactively
+ * change an unrelated image), and the canvas keeps being drawn into
+ * and cleared long after this call returns -- an alias would make the
+ * returned image silently change out from under whatever the program
+ * does with it next. */
+void *festina_canvas_to_image(void) {
+    festina_backing_require();
+    int w = cairo_image_surface_get_width(g_backing_surface);
+    int h = cairo_image_surface_get_height(g_backing_surface);
+    cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    cairo_t *cr = cairo_create(out);
+    cairo_set_source_surface(cr, g_backing_surface, 0, 0);
+    cairo_paint(cr);
+    cairo_destroy(cr);
+    return festina_image_box(out);
+}
+
 /* claude.md #92: scales this image to w x h IN PLACE, so every binding
  * holding it sees the new size. The old surface is destroyed here --
  * safe precisely because the box, not the surface, is what any Festina

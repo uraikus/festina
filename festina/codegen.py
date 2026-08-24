@@ -1088,6 +1088,7 @@ class CodeGen:
             "declare i64 @festina_measure_text_height(ptr)",
             "declare ptr @festina_load_image(ptr)",
             "declare i8 @festina_save_canvas(ptr)",  # claude.md #93
+            "declare ptr @festina_canvas_to_image()",  # claude.md #135
             # claude.md #94: paths, transforms, gradients, alpha
             # claude.md #95: render + clears
             "declare void @festina_render()",
@@ -5987,7 +5988,6 @@ class CodeGen:
             # festina_runtime.c).
             _FILE_TIME_BUILTINS = {
                 "formatTime": ("festina_format_time", "ptr", TEXT),
-                "saveCanvas": ("festina_save_canvas", "i8", BOOL),
                 "mkdir": ("festina_mkdir", "i8", BOOL),
                 "ls": ("festina_ls", "ptr", types_mod.ArrayType(TEXT)),
             }
@@ -6042,23 +6042,37 @@ class CodeGen:
                 lines.append(f"  {out} = call i64 @festina_now_ms()")
                 return out, INT
             if name in _FILE_TIME_BUILTINS:
-                fn, ret_ir, ret_type = _FILE_TIME_BUILTINS[name]
-                if name == "saveCanvas":
-                    # claude.md #95: writes the OFFSCREEN canvas, so it
-                    # needs no window -- this is the headless case the
-                    # render() split exists for. It used to open one,
-                    # which meant a program whose whole job was drawing
-                    # a PNG still needed a display and still blocked in
-                    # the event loop afterwards.
-                    self.uses_graphics_code = True
                 emitted = [self._emit_expr(a, env, lines) for a in expr.args]
                 sig = ", ".join(
                     f"{'i64' if t == INT else 'ptr'} {v}" for v, t in emitted)
+                fn, ret_ir, ret_type = _FILE_TIME_BUILTINS[name]
                 out = self.tmp()
                 lines.append(f"  {out} = call {ret_ir} @{fn}({sig})")
                 for arg_expr, (val, vtype) in zip(expr.args, emitted):
                     self._free_text_temp(arg_expr, val, vtype, lines)
                 return out, ret_type
+            # claude.md #95/#135: writes the OFFSCREEN canvas, so it
+            # needs no window either way -- this is the headless case
+            # the render() split exists for. saveCanvas() with no path
+            # is new: a fresh img SNAPSHOT of the canvas (see
+            # festina_canvas_to_image's own comment for why a snapshot,
+            # not a live alias) instead of writing a file, so it gets
+            # its own branch rather than joining _FILE_TIME_BUILTINS
+            # above -- semantic.py already resolved the return TYPE
+            # itself per arity (img vs. bool), which that generic
+            # dispatch has no way to express (one fixed ret_type per
+            # name, not per call).
+            if name == "saveCanvas":
+                self.uses_graphics_code = True
+                if not expr.args:
+                    out = self.tmp()
+                    lines.append(f"  {out} = call ptr @festina_canvas_to_image()")
+                    return out, types_mod.ImageType()
+                val, vtype = self._emit_expr(expr.args[0], env, lines)
+                out = self.tmp()
+                lines.append(f"  {out} = call i8 @festina_save_canvas(ptr {val})")
+                self._free_text_temp(expr.args[0], val, vtype, lines)
+                return out, BOOL
             if name == "sqlite":
                 return self._emit_sqlite_call(expr, env, lines, expected_type)
             if name == "regex":

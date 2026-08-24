@@ -128,7 +128,9 @@ _BUILTIN_RETURN_TYPES = {
     # claude.md #93
     "now": types_mod.PrimitiveType("int"),
     "formatTime": types_mod.PrimitiveType("text"),
-    "saveCanvas": types_mod.PrimitiveType("bool"),
+    # claude.md #135: saveCanvas's return type now depends on its own
+    # arity (bool with a path, img without) -- handled by its own
+    # dedicated branch in _infer_call, not this fixed-per-name table.
     # claude.md #94
     "sqliteInt": types_mod.PrimitiveType("int"),
     "sqliteFloat": types_mod.PrimitiveType("float"),
@@ -181,7 +183,6 @@ _BUILTIN_SIGNATURES = {
     # claude.md #93
     "now": (),
     "formatTime": (_INT, _TEXT),
-    "saveCanvas": (_TEXT,),
     # claude.md #94
     "render": (),
     "clearCanvas": (),
@@ -1059,6 +1060,33 @@ def analyze(program, filename="<string>"):
                         category="invalid function argument type",
                     )
                 return None
+            # claude.md #135: saveCanvas(path) -> bool (unchanged) or
+            # saveCanvas() -> img (new) -- the return TYPE itself
+            # depends on which form is used, which the generic
+            # _BUILTIN_SIGNATURE_ALTERNATES mechanism just below can't
+            # express (it picks an argument signature by arity, but
+            # answers one fixed return type for the name regardless of
+            # which alternate matched), so this gets its own branch
+            # instead, the same way setTimeout/clearTimeout just above
+            # do for their own reason.
+            if name == "saveCanvas":
+                if len(expr.args) == 0:
+                    return _IMAGE
+                if len(expr.args) != 1:
+                    raise CompileError(
+                        f"saveCanvas() expects 0 or 1 argument(s), got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                arg_type = infer(expr.args[0], scope)
+                if arg_type is not None and arg_type is not NULL and arg_type != _TEXT:
+                    raise CompileError(
+                        f"saveCanvas()'s argument expects text, found "
+                        f"{types_mod.type_name(arg_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return _BOOL
             if name in BUILTIN_FUNCTIONS:
                 sig = _BUILTIN_SIGNATURES.get(name)
                 alternates = _BUILTIN_SIGNATURE_ALTERNATES.get(name)

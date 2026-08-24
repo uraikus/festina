@@ -11471,6 +11471,52 @@ class TestSaveCanvas:
         assert result.returncode == 0
         assert result.stdout == "false\n"
 
+    def test_no_path_returns_an_img_snapshot(self, compile_and_run, tmp_path):
+        # claude.md #135: saveCanvas() with no argument -> a fresh img
+        # holding what's been drawn, instead of writing a file.
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 40, 40)
+        img snap = saveCanvas()
+        log(`${{snap.width}}x${{snap.height}}`)
+        log(snap.save('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "800x600\ntrue\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(20, 20) == (255, 0, 0)
+
+    def test_the_snapshot_is_independent_of_later_canvas_changes(
+            self, compile_and_run, tmp_path):
+        # A snapshot, not a live view -- clearing/redrawing the canvas
+        # afterward must not retroactively change what was captured.
+        out = str(tmp_path / "snap.png")
+        source = f"""
+        color red = 'red'
+        color blue = 'blue'
+        fillStyle(red)
+        drawRect(0, 0, 40, 40)
+        img snap = saveCanvas()
+        clearCanvas()
+        fillStyle(blue)
+        drawRect(0, 0, 40, 40)
+        log(snap.save('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(20, 20) == (255, 0, 0), "the snapshot should still be the red canvas"
+
+    def test_wrong_arity_and_types_are_rejected(self, parser, semantic, errors):
+        for source in ["saveCanvas(1)", "saveCanvas('a', 'b')"]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
 
 class TestDrawPixelClearCircleAndColorOverrides:
     """claude.md #133: drawPixel/clearPixel/clearCircle, and an optional
