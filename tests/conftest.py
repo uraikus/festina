@@ -177,6 +177,59 @@ def compile_and_run(tmp_path, codegen, cli_mod):
 
 
 @pytest.fixture
+def compile_and_run_wasm(tmp_path, codegen, cli_mod):
+    """WASM counterpart to compile_and_run (claude.md #148, wasm.md):
+    compiles to wasm32-wasi and executes the result through the same
+    Node-based WASI host cli_mod.run_program itself uses
+    (runtime/wasm/run_wasi.mjs), rather than reimplementing that here.
+
+    Skips cleanly (not a failure) when either half of the toolchain
+    this needs is missing -- a clang that can actually target
+    wasm32-wasi (`_wasm_toolchain_ok`, the same real functional probe
+    `festina doctor` uses, not just "clang exists"), or Node on PATH to
+    run the compiled .wasm -- the same "opt-in, environment-dependent"
+    tier as compile_and_run's own C-compiler skip and x_display's own
+    Xvfb skip. Like compile_file_or_skip, FESTINA_STRICT_DEPS=1 turns
+    that skip into a hard failure instead -- the Linux CI job sets it so
+    this whole tier can't silently vanish there the way every other
+    optional tier already can't (see .github/workflows/ci.yml, which
+    installs wasi-libc/libclang-rt-*-dev-wasm32 and Node specifically so
+    this fixture is never skipped on the primary platform).
+
+    Unlike compile_and_run, there's no `args=` parameter: Festina
+    programs have no way to read argv at all (no language builtin for
+    it -- see api.md), and run_wasi.mjs's own WASI `args` is just
+    `[wasmPath]` for that reason, so there is nothing here to pass
+    through.
+    """
+    clang = shutil.which("clang")
+    node = shutil.which("node")
+    missing = None
+    if not clang or not cli_mod._wasm_toolchain_ok(clang):
+        missing = ("no working wasm32-wasi clang on PATH -- needs wasi-libc and "
+                    "clang's wasm32 compiler-rt installed (see wasm.md)")
+    elif not node:
+        missing = "Node.js isn't on PATH -- needed to run a compiled .wasm via its built-in WASI support"
+    if missing:
+        if os.environ.get("FESTINA_STRICT_DEPS"):
+            pytest.fail(missing)
+        pytest.skip(missing)
+
+    def _run(source, filename="main.f"):
+        src_path = tmp_path / filename
+        src_path.write_text(source, encoding="utf-8")
+        out_path = tmp_path / "program.wasm"
+        compile_file_or_skip(cli_mod, str(src_path), str(out_path), cc=clang, target="wasm32-wasi")
+        result = subprocess.run(
+            [node, "--no-warnings", cli_mod._WASM_RUN_SCRIPT, str(out_path), str(tmp_path)],
+            cwd=tmp_path, capture_output=True, text=True, timeout=30, encoding="utf-8",
+        )
+        return result
+
+    return _run
+
+
+@pytest.fixture
 def audio_null_env(tmp_path):
     """A HOME override whose .asoundrc redirects ALSA's "default" PCM
     device to ALSA's own built-in null plugin -- a real ALSA mechanism

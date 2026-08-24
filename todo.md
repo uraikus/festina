@@ -29,6 +29,15 @@ real hardware to confirm on, which this project doesn't have:
   run to try it (see [windows.md](windows.md)'s "genuine opportunity,
   not yet taken" note) — the cheapest open item on either platform.
 
+WASM (`wasm32-wasi`) is also implemented and CI-verified — see
+[wasm.md](wasm.md). Graphics/audio are out of scope there permanently
+(WASI has no backend for either at all, not a hardware-verification
+gate), and two things are genuinely still open, neither blocking:
+running a compiled `.wasm` in a browser (untested — every test/
+benchmark here uses Node's own `node:wasi` host, not a browser's WASI
+polyfill), and ASan/LeakSanitizer coverage for the target (unexplored,
+same as macOS's own sanitizer tier is explicitly out of scope).
+
 ## Language & standard library
 
 - **HTTP / networking** — the largest missing capability, and the one

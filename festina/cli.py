@@ -117,20 +117,28 @@ _sqlite_link_cache = {}
 _UNSET = object()
 
 
-def _default_output_name(entry_path, platform_name=None):
+def _default_output_name(entry_path, platform_name=None, target="native"):
     """windows.md Phase 0: on Windows the default output gains `.exe` --
     both because the shell only executes files with an executable
     extension, and because MinGW's linker appends `.exe` itself when
     the requested name has no suffix, so asking for `program` and then
     running `program` would miss the `program.exe` actually written.
     `platform_name` is injectable purely so the win32/darwin branches
-    are unit-testable from any platform (tests/test_platform.py)."""
+    are unit-testable from any platform (tests/test_platform.py).
+
+    claude.md #148: a wasm32-wasi build gets `.wasm` regardless of
+    platform_name -- the HOST doing the compiling has no bearing on
+    what the OUTPUT actually is (a .wasm binary is not something any
+    shell on ANY host executes directly the way a native binary or
+    .exe is; see wasm.md for how it's actually run)."""
     platform_name = platform_name or sys.platform
     base = os.path.basename(entry_path)
     if base.endswith(".f"):
         base = base[:-2]
     base = base or "a.out"
-    if platform_name == "win32" and not base.lower().endswith(".exe"):
+    if target == "wasm32-wasi" and not base.lower().endswith(".wasm"):
+        base += ".wasm"
+    elif platform_name == "win32" and not base.lower().endswith(".exe"):
         base += ".exe"
     return base
 
@@ -278,6 +286,13 @@ _PKG_MANAGER_PACKAGES = {
     # already covers, and clang alone is enough on Windows too (see
     # setup.md's "no llvm line here either" note).
     "llvm": {"apt": ["llvm"]},
+    # claude.md #148: apt-only, like alsa/gnurx above -- wasi-libc and
+    # clang's wasm32 compiler-rt are Debian/Ubuntu package names this
+    # project has actually installed and verified (runtime/wasm/
+    # README.md); no brew/msys2 equivalent has been found or tried, so
+    # nothing is claimed for those managers rather than guessing a
+    # package name that might not exist.
+    "wasm": {"apt": ["wasi-libc", "libclang-rt-18-dev-wasm32"]},
 }
 
 
@@ -623,7 +638,15 @@ def _ensure_runtime_object(cc, name, source, pkg_config_packages):
     caller) -- see _RUNTIME_FEATURES' module docstring note for why this
     matters for the *linked* binary, not just compile-time cflags. A
     feature may need several packages (claude.md #101: graphics is
-    Cairo/X11 *and* libjpeg, audio is ALSA *and* libmpg123)."""
+    Cairo/X11 *and* libjpeg, audio is ALSA *and* libmpg123).
+
+    WASM export (claude.md #148) deliberately does NOT reuse this
+    function -- see _ensure_wasm_object below -- since its own cflags
+    come from nowhere pkg-config knows about at all (a vendored sqlite3
+    header, not the system's pkg-config'd one), and folding that
+    fundamentally different cflags story into this one would complicate
+    a function every native platform already relies on for something
+    only one target needs."""
     cache_dir = os.path.join(tempfile.gettempdir(), "festina-runtime-cache")
     os.makedirs(cache_dir, exist_ok=True)
     cc_key = hashlib.sha1(cc.encode()).hexdigest()[:8]
@@ -643,6 +666,113 @@ def _ensure_runtime_object(cc, name, source, pkg_config_packages):
         raise CompileError(f"failed to compile the Festina runtime ({name}):\n{result.stderr}",
                             category="link error")
     return obj_path
+
+
+# ---- WASM export (claude.md #148) ----
+#
+# WASI (Preview 1) via clang's own --target=wasm32-wasi, verified end to
+# end against a real, immediately-runnable target -- Node.js's built-in
+# WASI support -- rather than only reasoned about, the same "verify for
+# real, not just in theory" standard this whole log holds every other
+# platform to. See wasm.md for the full design writeup, benchmarks
+# against C/Go compiled to wasm, and documented limitations; this
+# section is the implementation.
+_WASM_TARGET = "wasm32-wasi"
+_WASM_DIR = os.path.join(_RUNTIME_DIR, "wasm")
+_WASM_SQLITE_C = os.path.join(_WASM_DIR, "sqlite3.c")
+_WASM_ENTRY_C = os.path.join(_RUNTIME_DIR, "festina_runtime_wasm_entry.c")
+
+
+def _ensure_wasm_object(cc, name, source, include_dirs=()):
+    """The WASM counterpart to _ensure_runtime_object -- same cache-once
+    -and-reuse shape (a real compile-time cost: the vendored sqlite3.c
+    amalgamation alone takes ~20 real seconds even at -O2), but a
+    genuinely different cflags story, so kept separate rather than
+    parameterizing the native function for a target it was never meant
+    to know about. `festina_wasm_{name}` (not `festina_runtime_{name}`)
+    keeps this cache namespace-separate from native's own -- the two
+    are never the same object even when `cc` (plain "clang", no
+    --target flag baked into the string itself) happens to match."""
+    cache_dir = os.path.join(tempfile.gettempdir(), "festina-runtime-cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cc_key = hashlib.sha1(cc.encode()).hexdigest()[:8]
+    obj_path = os.path.join(cache_dir, f"festina_wasm_{name}.{cc_key}.o")
+
+    freshness_sources = [source, *_RUNTIME_HEADERS]
+    if (os.path.exists(obj_path)
+            and os.path.getmtime(obj_path) >= max(os.path.getmtime(s) for s in freshness_sources)):
+        return obj_path
+
+    include_flags = [f"-I{d}" for d in include_dirs]
+    cmd = [cc, f"--target={_WASM_TARGET}", "-O2", "-c", source, *include_flags, "-o", obj_path]
+    result = _run_tool(cmd)
+    if result.returncode != 0:
+        raise CompileError(f"failed to compile the Festina WASM runtime ({name}):\n{result.stderr}",
+                            category="link error")
+    return obj_path
+
+
+def _wasm_runtime_objects(cc):
+    """core (linked against the vendored sqlite3.h, see runtime/wasm/
+    README.md) + the vendored sqlite3.c itself + the __main_void entry
+    bridge (see festina_runtime_wasm_entry.c's own top comment for why
+    that one exists at all) -- no graphics, no audio, ever: see
+    _check_wasm_feature_supported, called unconditionally before this
+    even runs, for why."""
+    return [
+        _ensure_wasm_object(cc, "core", _RUNTIME_C, include_dirs=[_WASM_DIR]),
+        _ensure_wasm_object(cc, "sqlite3", _WASM_SQLITE_C),
+        _ensure_wasm_object(cc, "entry", _WASM_ENTRY_C),
+    ]
+
+
+def _check_wasm_feature_supported(feature):
+    """Unlike _check_feature_supported's macOS/Windows gates (a real
+    backend EXISTS, awaiting hardware verification -- overridable once
+    that happens), there is no graphics or audio backend for WASI at
+    all to verify: no display server, no audio device model WASI
+    exposes -- see wasm.md's own "Limitations" section for the full
+    accounting. No env var escape hatch, because there is nothing an
+    override could actually turn on."""
+    if feature == "graphics":
+        raise CompileError(
+            "graphics (drawRect/drawCircle/drawText/img/render()/mouse & "
+            "key events/...) is not supported when compiling to WASM -- "
+            "WASI has no display server or windowing model at all. See "
+            "wasm.md's Limitations section.",
+            category="unsupported platform feature")
+    if feature == "audio":
+        raise CompileError(
+            "audio (aud/play()/playLoop()/...) is not supported when "
+            "compiling to WASM -- WASI has no audio device model at all. "
+            "See wasm.md's Limitations section.",
+            category="unsupported platform feature")
+
+
+def _wasm_toolchain_ok(cc):
+    """`festina doctor`'s own WASM check (claude.md #148). Deliberately a
+    REAL functional probe -- actually invoking `cc --target=wasm32-wasi`
+    on a trivial C snippet -- rather than guessing at wasi-libc/
+    libclang_rt's install paths (which vary by distro/package version:
+    this project found them at /usr/lib/wasm32-wasi and
+    /usr/lib/llvm-18/lib/clang/18/lib/wasi on the Debian box this was
+    built on, but hardcoding either path here would be exactly the kind
+    of unverified guess this codebase's own doctor checks elsewhere
+    (_pkg_config_has, _which_any) avoid by construction. A round-trip
+    compile is the only check that can't give a false "OK" -- clang
+    itself is happy to accept --target=wasm32-wasi as a flag and then
+    fail deep in the link step if wasi-libc's headers/libs aren't
+    actually there."""
+    if shutil.which(cc) is None:
+        return False
+    try:
+        result = subprocess.run(
+            [cc, f"--target={_WASM_TARGET}", "-x", "c", "-", "-o", os.devnull],
+            input="int main(void) { return 0; }\n",
+            capture_output=True, text=True, timeout=30)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def _check_feature_supported(feature, platform_name=None):
@@ -809,7 +939,7 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
     return objects, link_libs
 
 
-def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
+def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", target="native"):
     # claude.md #5, #6: resolves entry_path's full import graph (a plain
     # single-file program is the degenerate case -- just entry_path on
     # its own) and merges every file into one ast.Program, in dependency
@@ -823,13 +953,17 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
     # claude.md #59's "if a canvas isn't used, keep the binary slim"
     # needs to know which optional runtime object files this specific
     # program actually needs (see _runtime_objects_and_link_libs).
-    gen = codegen_mod.CodeGen(analyzed, filename=entry_path)
+    # claude.md #148: target is threaded into CodeGen itself, not just
+    # this function's own linking choices below -- wasm32-wasi's 32-bit
+    # size_t needs real codegen differences (see CodeGen.__init__'s own
+    # note on self.pointer_bits), not just a different link recipe.
+    gen = codegen_mod.CodeGen(analyzed, filename=entry_path, target=target)
     ir = gen.generate(program)
 
     if emit_llvm:
         return ir
 
-    output_path = output_path or _default_output_name(entry_path)
+    output_path = output_path or _default_output_name(entry_path, target=target)
     # gen.uses_graphics alone isn't quite enough here: loadImage() alone
     # deliberately does NOT set it (see _emit_graphics_call's doc comment
     # -- decoding a PNG needs no window), but festina_load_image() still
@@ -838,6 +972,11 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
     # a canvas. gen.uses_graphics_code is the superset that also covers
     # that case.
     needs_graphics = gen.uses_graphics or gen.uses_graphics_code
+
+    if target == "wasm32-wasi":
+        _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio)
+        return output_path
+
     runtime_objects, link_libs = _runtime_objects_and_link_libs(
         cc, needs_graphics, gen.uses_audio, wants_window=gen.uses_graphics)
 
@@ -849,7 +988,10 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
     return output_path
 
 
-def run_program(entry_path, cc="clang"):
+_WASM_RUN_SCRIPT = os.path.join(_WASM_DIR, "run_wasi.mjs")
+
+
+def run_program(entry_path, cc="clang", target="native"):
     """`festina run` -- compile entry_path to a throwaway temp executable
     and run it immediately, the same way `go run`/`cargo run` do: no
     lasting output file, stdin/stdout/stderr inherited directly from this
@@ -864,14 +1006,34 @@ def run_program(entry_path, cc="clang"):
     message and a nonzero exit code, exactly like it already does for
     `festina compile`. Returns the *compiled program's own* exit code on
     success, so `festina run x.f && ...` composes the same way a real
-    compile-then-execute pair would."""
+    compile-then-execute pair would.
+
+    claude.md #148: target=wasm32-wasi runs the compiled .wasm through
+    Node's own WASI support (runtime/wasm/run_wasi.mjs) instead of
+    executing it directly -- a .wasm file isn't something any OS's
+    shell can exec on its own the way a native binary or .exe is."""
     with tempfile.TemporaryDirectory(prefix="festina-run-") as d:
         # windows.md Phase 0: through _default_output_name so the temp
         # binary is `program.exe` on Windows -- MinGW's linker appends
         # .exe itself when the name has no suffix, and running the name
         # we ASKED for rather than the file it WROTE would fail.
-        out_path = os.path.join(d, _default_output_name("program.f"))
-        compile_file(entry_path, out_path, cc=cc)
+        out_path = os.path.join(d, _default_output_name("program.f", target=target))
+        compile_file(entry_path, out_path, cc=cc, target=target)
+        if target == "wasm32-wasi":
+            node = shutil.which("node")
+            if node is None:
+                raise CompileError(
+                    "running a WASM binary needs Node.js on PATH, for its "
+                    "built-in WASI support -- see wasm.md.",
+                    file=entry_path, category="missing dependency")
+            # cwd=os.getcwd(), not `d`: a compiled program's own relative
+            # paths (festina.sqlite, blob/mkdir/ls targets) resolve
+            # against the INVOKING shell's directory, exactly like a
+            # native compiled binary's own cwd-relative access already
+            # does -- the preopen just has to name that same directory.
+            result = subprocess.run(
+                [node, "--no-warnings", _WASM_RUN_SCRIPT, out_path, os.getcwd()])
+            return result.returncode
         result = subprocess.run([out_path])
         return result.returncode
 
@@ -950,6 +1112,43 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
         result = _run_tool(cmd)
         if result.returncode != 0:
             raise CompileError(f"native linking failed:\n{result.stderr}",
+                                file=entry_path, category="link error")
+    finally:
+        os.unlink(ir_path)
+
+
+def _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, needs_audio):
+    """claude.md #148: WASM export's own link recipe -- always the .ll-
+    text-to-clang path (see _compile_via_clang_ir_frontend's own
+    docstring for what that fallback normally covers on native targets;
+    here it's not a fallback at all, it's the only path, since there is
+    no libLLVM in-process wasm32 object-emission story this project has
+    verified -- --target=wasm32-wasi needs clang specifically, not
+    "whichever of clang/gcc/cc"). Rejects graphics/audio OUTRIGHT before
+    doing any real work -- see _check_wasm_feature_supported -- rather
+    than letting a doomed compile run for tens of seconds (the vendored
+    sqlite3.c amalgamation alone) only to fail at the link step with
+    undefined Cairo/ALSA symbols nothing here could ever provide."""
+    if needs_graphics:
+        _check_wasm_feature_supported("graphics")
+    if needs_audio:
+        _check_wasm_feature_supported("audio")
+    if shutil.which(cc) is None or "clang" not in os.path.basename(cc).lower():
+        raise CompileError(
+            f"WASM export needs clang specifically (got --cc={cc!r}) -- "
+            f"only clang can target wasm32-wasi at all. See wasm.md.",
+            file=entry_path, category="missing dependency")
+
+    runtime_objects = _wasm_runtime_objects(cc)
+
+    with tempfile.NamedTemporaryFile(suffix=".ll", mode="w", delete=False) as tmp:
+        tmp.write(ir)
+        ir_path = tmp.name
+    try:
+        cmd = [cc, f"--target={_WASM_TARGET}", "-O2", ir_path, *runtime_objects, "-o", output_path]
+        result = _run_tool(cmd)
+        if result.returncode != 0:
+            raise CompileError(f"WASM linking failed:\n{result.stderr}",
                                 file=entry_path, category="link error")
     finally:
         os.unlink(ir_path)
@@ -1144,6 +1343,27 @@ def _doctor_report():
               "clang was not found either, and only clang can parse the raw IR text that fallback "
               "needs -- install `llvm` (e.g. `apt install llvm` on Debian/Ubuntu) or clang itself",
               key="llvm")
+
+    # claude.md #148: WASM export is its own fully optional feature tier,
+    # same shape as graphics/audio just above -- a compiler that can't
+    # cross-compile to wasm32-wasi is still a fully working compiler for
+    # every native build, so this is never required. Checked with a real
+    # clang invocation (_wasm_toolchain_ok), not a guessed install path;
+    # `cc` here is deliberately clang specifically (not cc_name from
+    # above), since _compile_via_wasm itself requires clang regardless
+    # of what --cc the user's native builds are configured to use.
+    clang_path = shutil.which("clang")
+    if clang_path is None:
+        check(False, False,
+              "WASM export (optional -- `festina compile --target=wasm32-wasi`, see wasm.md)",
+              "needs clang specifically (not gcc/cc) -- " + _INSTALL_HINTS["clang"], key="wasm")
+    else:
+        check(_wasm_toolchain_ok(clang_path), False,
+              "WASM export (optional -- `festina compile --target=wasm32-wasi`, see wasm.md)",
+              "clang was found but can't target wasm32-wasi -- install wasi-libc and "
+              "clang's wasm32 runtime, e.g. `apt install wasi-libc libclang-rt-18-dev-wasm32` "
+              "on Debian/Ubuntu (package name may vary by clang version) -- see wasm.md",
+              key="wasm")
 
     lines.append("")
     lines.append("festina on PATH")
@@ -1511,15 +1731,25 @@ def _build_arg_parser():
     # arguments are required" message.
     sub = ap.add_subparsers(dest="command", metavar="command")
 
+    # claude.md #148: "native" builds and links a regular executable for
+    # the host platform, same as always; "wasm32-wasi" cross-compiles to
+    # a standalone .wasm binary instead (see wasm.md) -- both compile
+    # and run accept it, since `run` is really "compile, then execute"
+    # and a wasm32-wasi binary needs a WASI host (Node) to execute it
+    # rather than the OS running it directly.
+    target_help = "compilation target: a native executable, or a wasm32-wasi .wasm binary (default: native)"
+
     compile_p = sub.add_parser("compile", help="compile a Festina program to a native executable")
     compile_p.add_argument("input", help="entry .f file")
     compile_p.add_argument("-o", "--output", help="output executable path (default: input filename without .f)")
     compile_p.add_argument("--emit-llvm", action="store_true", help="print LLVM IR to stdout instead of linking")
     compile_p.add_argument("--cc", default=default_cc, help=cc_help)
+    compile_p.add_argument("--target", choices=["native", "wasm32-wasi"], default="native", help=target_help)
 
     run_p = sub.add_parser("run", help="compile a Festina program and immediately run it")
     run_p.add_argument("input", help="entry .f file")
     run_p.add_argument("--cc", default=default_cc, help=cc_help)
+    run_p.add_argument("--target", choices=["native", "wasm32-wasi"], default="native", help=target_help)
 
     doctor_p = sub.add_parser("doctor", help="check whether the compiler's own dependencies are installed")
     doctor_p.add_argument("--fix", action="store_true",
@@ -1550,7 +1780,7 @@ def main(argv=None):
 
     if args.command == "run":
         try:
-            return run_program(args.input, cc=args.cc)
+            return run_program(args.input, cc=args.cc, target=args.target)
         except CompileError as e:
             print(str(e), file=sys.stderr)
             return 1
@@ -1560,7 +1790,7 @@ def main(argv=None):
 
     # args.command == "compile"
     try:
-        result = compile_file(args.input, args.output, emit_llvm=args.emit_llvm, cc=args.cc)
+        result = compile_file(args.input, args.output, emit_llvm=args.emit_llvm, cc=args.cc, target=args.target)
     except CompileError as e:
         print(str(e), file=sys.stderr)
         return 1
@@ -1570,6 +1800,17 @@ def main(argv=None):
 
     if args.emit_llvm:
         print(result)
+    elif args.target == "wasm32-wasi":
+        # claude.md #148: the native success message's sqlite-static-vs-
+        # dynamic note doesn't apply here -- the wasm build always
+        # statically compiles the vendored amalgamation (runtime/wasm/
+        # README.md), there's no dynamic-linking story for wasm32-wasi
+        # to fall back to -- and the libLLVM fast path is never used for
+        # wasm either (_compile_via_wasm always shells out to clang, the
+        # same way the IR-frontend fallback does for native), so noting
+        # its absence would be misleading rather than informative.
+        print(f"festina: wrote {result} (run with a WASI host, e.g. `festina run --target=wasm32-wasi`, "
+              f"or `node runtime/wasm/run_wasi.mjs {result} <preopen-dir>`)")
     else:
         _, sqlite_static = _sqlite_link_flags(args.cc)  # cached by compile_file's own call
         notes = []
