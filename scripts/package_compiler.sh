@@ -112,6 +112,23 @@ if [[ "${OSTYPE:-}" == "msys" ]]; then
     # wholesale without also pre-converting those would trade one
     # broken path for three different ones.
     export MSYS2_ARG_CONV_EXCL="*"
+    # claude.md #129 round three: two straight real-CI rounds each
+    # produced the IDENTICAL broken path (D:/d/a/festina/festina/...)
+    # despite two DIFFERENT fix attempts (cygpath -m alone, then paired
+    # with MSYS2_ARG_CONV_EXCL) -- reasoning further from here without
+    # seeing what this script actually computed would be a third guess
+    # in the dark, the same mistake claude.md #126 round eleven's own
+    # instrumentation-over-guessing precedent exists to avoid. This
+    # block is purely diagnostic, stderr-only, and never changes what
+    # gets built -- it exists to turn the next real Windows CI log into
+    # one that can actually distinguish "cygpath itself returned the
+    # broken value" from "something downstream re-mangled a correct
+    # one," which the error message alone cannot.
+    echo "debug: OSTYPE=$OSTYPE" >&2
+    echo "debug: cygpath resolves to: $(command -v cygpath || echo 'NOT FOUND')" >&2
+    echo "debug: RUNTIME_DIR (post-cygpath) = $RUNTIME_DIR" >&2
+    echo "debug: DISTPATH (post-cygpath) = $DISTPATH" >&2
+    echo "debug: first --add-data value = $RUNTIME_DIR/festina_runtime.c${ADD_DATA_SEP}runtime" >&2
 fi
 
 cd "$REPO_ROOT"
