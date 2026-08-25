@@ -90,6 +90,20 @@ class HttpType:
 
 
 @dataclass(frozen=True)
+class UrlType:
+    """claude.md #162: parseURL(text) -- a parsed URL's own
+    hash/hostname/password/pathname/port/protocol/searchParams/
+    username. Same one-shape-only reasoning as HttpType/RegexType:
+    every field lives in the runtime value (a small refcounted struct,
+    see festina_runtime_url.c), never the static type -- there's
+    nothing here to distinguish one url from another at the type
+    level, unlike StructType/TableType."""
+
+    def __repr__(self):
+        return "UrlType()"
+
+
+@dataclass(frozen=True)
 class SocketType:
     """claude.md #151: an upgraded WebSocket connection, handed to `on
     upgrade(s:socket)`/`on message(s:socket, msg:blob)`/`on
@@ -226,6 +240,8 @@ def type_name(t):
         return "regex"
     if isinstance(t, HttpType):
         return "http"
+    if isinstance(t, UrlType):
+        return "url"
     if isinstance(t, SocketType):
         return "socket"
     if isinstance(t, ColorType):

@@ -38,8 +38,14 @@ A Festina program's external interfaces are exactly:
   this: `festina_runtime_http.c` (the HTTP/WebSocket implementation)
   is linked only when it's actually used, the same per-feature
   splitting graphics/audio already get (see *Slim binaries* below).
+  claude.md #162 adds the reverse direction too: `req.send()` (zero
+  arguments) makes a real *outbound* HTTP/HTTPS connection to whatever
+  `req.url` names — a program that builds that URL (or the body/
+  headers sent with it) from untrusted input has the same SSRF/
+  data-exfiltration exposure any other language's own outbound-HTTP
+  client would; this runtime does no allowlisting of hosts on its own.
 
-This is a real, structural change from every other builtin: `req.path`/
+This is a real, structural change from every other builtin: `req.url`/
 `req.method`/`req.headers`/a WebSocket frame's own payload are the
 *first* values in this language that originate entirely from an
 untrusted, remote party by design, not merely something a local user
@@ -156,7 +162,8 @@ corruption**:
 A compiled program links only what it uses. The runtime is split into
 core / graphics (Cairo, X11, libjpeg) / audio (ALSA, libmpg123) / http
 (claude.md #151 — plain POSIX sockets on Linux/macOS, winsock2 on
-Windows; no third-party library on any platform) translation units,
+Windows; no third-party library on any platform) / https (claude.md
+#160 — `openSecurePort()` only, mbedTLS) translation units,
 and the compiler puts a feature's object file and
 libraries on the link line only when the program actually exercises it —
 a `log('hello')` program links none of them. Fewer resident libraries is

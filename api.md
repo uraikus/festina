@@ -1624,8 +1624,9 @@ failing at runtime; see [wasm.md](wasm.md).
 openPort(8080)
 
 on request(req:http) {
-    if req.path == '/hello' {
-        req.send('hello world')
+    url u = parseURL(req.url)
+    if u.pathname == '/hello' {
+        req.send({'body': 'hello world'})
         return
     }
     req.ok()
@@ -1647,22 +1648,65 @@ delays every *other* connection's own turn. This is built for the kind
 of small, script-shaped server this language already targets, not as a
 general-purpose production server replacement.
 
+### The `http` type
+
+`http` is a genuine value — construct one directly with a literal, the
+same shorthand a `struct` literal never gets (there is no `{...}`
+struct-literal syntax in this language; `http` is the one type built
+this way, because it's the value both the server (`on request`'s own
+`req`) and the client (an outbound `req.send()`, below) share):
+
+```festina
+http {
+    url:text       // e.g. 'http://example.com/path?a=1'
+    method:text    // 'GET', 'POST', ...
+    code:int       // the status code -- null until a response exists
+    headers:map[text]
+    // plus the methods documented below: ok()/redirect()/upgrade()/
+    // send()/toText()/toBlob()/toImg()/toAud()
+}
+```
+
+`url`/`method`/`code`/`headers` are all **read-only** once constructed —
+the only way to set them is the literal itself:
+
+```festina
+map[text] headers = {'E-Tag': now().toText()}
+http res = {'code': 200, 'body': 'ok', headers}    // {headers} is shorthand
+                                                    // for {'headers': headers}
+```
+
+A literal accepts five keys, all optional: `url`/`method` (`text`,
+default `''`), `code` (`int`, default `null`), `headers` (`map[text]`,
+default empty), and `body` — not a real field (there is no `.body` to
+read back later; it feeds straight into the value's content, read back
+through `toText()`/`toBlob()`/`toImg()`/`toAud()`) — accepting anything
+with a body form: `text` (sent as-is), `int`/`float`/`bool`
+(stringified, the same implicit conversion `log()` already does), a
+`struct`/table row/`arr`/`map` (rendered as JSON, the same `.toText()`
+every container already has), `blob` (sent as its own raw bytes), or
+`img`/`aud` (sent as the underlying encoded file bytes — unlike
+`log()`/templates/`s.send()`, a real HTTP body uploading or returning a
+picture or clip is completely ordinary, so neither is rejected here).
+Any other key is a compile-time error.
+
 ### `on request(req:http)`
 
 Fires once per incoming HTTP request, fully parsed (request line,
 headers, and body already buffered — see [Limitations](#http-limitations)
-below for what "fully parsed" doesn't include).
+below for what "fully parsed" doesn't include). `req.code` is `null` (no
+response exists yet); `req.url` is reconstructed from the connection's
+own scheme/`Host` header/path (falling back to `127.0.0.1:<port>` if the
+client sent no `Host` header at all) — parse it with `parseURL()`
+(below) to pull out the path or query parameters.
 
 ```festina
-req.port                              // int -- the port this connection arrived on
+req.url                               // text -- e.g. 'http://127.0.0.1:8080/hello?a=1'
 req.method                            // text -- 'GET', 'POST', ...
-req.path                              // text -- '/hello', never includes the query string separately
+req.code                              // int -- null on a live inbound request
 req.headers                           // map[text] -- header names lowercased; a repeated
                                        // header's last occurrence wins
 ```
-
-All four are read-only — assigning to any of them is a compile-time
-error.
 
 **Responding** — exactly one of the following ends the request; calling
 a second one on the same `req` is a silent no-op (never a crash, never a
@@ -1671,18 +1715,17 @@ double response):
 ```festina
 req.ok()                              // 200, empty body
 req.redirect('https://example.com')   // 302, Location header set
-req.send(data, code, headers)         // see below
+req.send(res)                         // see below
 ```
 
-`req.send(data:any, code:int, headers:map[text])` — `code` defaults to
-`200`, `headers` to none. `data` accepts anything with a body form:
-`text` (sent as-is), `int`/`float`/`bool` (stringified, the same
-implicit conversion `log()` already does), a `struct`/table row/
-`arr`/`map` (rendered as JSON, the same `.toText()` every container
-already has), or `blob` (sent as its own raw bytes, not decoded through
-`.toText()` — the more likely thing to want for a binary response). An
-`img`/`aud` argument is a **compile error**: neither has a body form,
-the same reasoning `log()`/templates already reject them with.
+`req.send(res:http)` — the SERVER form, taking exactly one already-
+constructed `http` value (an existing variable, or an inline literal:
+`req.send({'code': 201, 'body': 'created'})`) and sending it as this
+connection's response. `res.code` defaults to `200` if left unset in
+the literal; `res.headers` defaults to none. (`req.send()` — zero
+arguments — is a *different* call entirely: the CLIENT form, documented
+under [Making outbound requests](#http-client) below; the two are
+told apart purely by arity.)
 
 If `on request`'s own body returns without calling `ok()`/`redirect()`/
 `send()`/`upgrade()` at all, the connection still gets a response — a
@@ -1705,7 +1748,8 @@ matching every other "nothing there" case in this language.
 
 ```festina
 on request(req:http) {
-    if req.path == '/ws' {
+    url u = parseURL(req.url)
+    if u.pathname == '/ws' {
         req.upgrade()
     }
 }
@@ -1745,11 +1789,79 @@ s.state                               // map[text] -- a per-connection scratchpa
                                        // whole lifetime
 s.state['user'] = 'ada'               // read/write like any other map[text]
 
-s.send(data)                          // data:any -- same sendable types as req.send(),
-                                       // minus the code/headers (a frame has neither);
-                                       // blob sends a binary frame, everything else text
+s.send(data)                          // data:any -- same sendable types as an http
+                                       // literal's own 'body' key, minus the code/
+                                       // headers (a frame has neither); blob sends a
+                                       // binary frame, everything else text
 s.close()                             // sends a close frame and ends the connection
 ```
+
+### <a name="http-client"></a>Making outbound requests
+
+There is no separate `fetch()` builtin — `req.send()`, called with
+**zero** arguments, is the client form of the exact same method
+`req.send(res)` uses on the server side (above); which one applies is
+decided purely by how many arguments the call has.
+
+```festina
+img profile = 'profile.png'
+http req = {'url': 'http://example.com', 'method': 'POST', 'body': profile,
+            'headers': {'authorization': 'bearer example'}}
+req.send()                            // blocks until the response arrives, then
+                                       // REPLACES req's own body/code/headers with it
+log(req.code)                         // e.g. 200
+log(req.toText())
+```
+
+`req.send()` resolves `req.url`'s host, connects (TLS automatically for
+an `https://` URL, plain TCP for `http://` — the scheme is read from the
+value at runtime, so both are always linked into any program that calls
+`req.send()` at all), sends `req.method`/`req.headers`/whatever `body`
+the literal was given as one HTTP/1.1 request, and blocks until the
+whole response arrives (this runtime is single-threaded, the same
+tradeoff `setTimeout`/`on request` itself already accepts: a slow
+outbound request delays every other connection's own turn for as long
+as it takes). `req.url`/`req.method` are left untouched; `req.code`,
+`req.headers`, and the body read back through `req.toText()`/
+`toBlob()`/`toImg()`/`toAud()` are all overwritten in place with the
+response. A genuine network failure — the host doesn't resolve, the
+connection is refused, the TLS handshake fails, or the response can't
+be parsed as HTTP — **throws** (catch it with `try`/`catch`, [see
+below](#try--catch--throw)), the same "this can really fail, with real
+diagnostic text" precedent `toStruct()`/`toArr()`'s JSON parsing
+already established, rather than the "test, don't fail" convention most
+of this runtime's I/O uses. There's no timeout to configure — a 30
+second socket timeout bounds the worst case.
+
+Calling `req.send()` a second time on the same value sends a second,
+independent request (using whatever `url`/`method`/`headers`/body it
+currently holds, response overwrite and all) — nothing about the zero-
+argument form is "used up" after the first call.
+
+### <a name="url-type"></a>The `url` type / `parseURL()`
+
+`parseURL(text):url` parses an absolute URL into its components — used
+above to read `req.url`'s path/query on the server side, and to build
+one for `req.send()` on the client side (a plain `text` field works
+there too; `parseURL()`/`url` exist for **reading** one apart, not as
+the only way to spell one). Throws (catch with `try`/`catch`) if the
+text has no `://` or a non-numeric port.
+
+```festina
+url u = parseURL('https://ada:secret@example.com:8443/path?a=1&b=2#frag')
+u.protocol                            // text -- 'https:' (includes the trailing colon,
+                                       // matching how a browser's own URL API spells it)
+u.username                            // text -- 'ada'
+u.password                            // text -- 'secret'
+u.hostname                            // text -- 'example.com'
+u.port                                // int -- 8443 (null if the URL named none)
+u.pathname                            // text -- '/path'
+u.searchParams                        // map[text] -- {'a': '1', 'b': '2'}, percent-decoded
+u.hash                                // text -- '#frag'
+```
+
+Every field is read-only — a `url` is built once, by `parseURL()`, and
+never mutated afterward.
 
 ### <a name="http-limitations"></a>Limitations
 
@@ -1775,6 +1887,82 @@ s.close()                             // sends a close frame and ends the connec
   own event loop and the graphics event loop are mutually exclusive in
   this version. `setTimeout`/`setInterval` combine fine; both are
   serviced from the same loop.
+
+See [Graceful shutdown](#graceful-shutdown) below (under `close()`/`on
+exit`) for what Ctrl-C/`SIGTERM` do to a running server — the port
+stops accepting new connections immediately, but an already-open one
+gets a real chance to finish first.
+
+### <a name="opensecureport"></a>`openSecurePort(port:int, key:blob)` — TLS
+
+```festina
+blob key = 'server.pem'   // a combined PEM file: certificate(s), then the
+                           // unencrypted private key, in either order
+
+on request(req:http) {
+    req.send({'body': 'hello over TLS'})
+}
+
+openSecurePort(8443, key)
+```
+
+The TLS counterpart to `openPort()` — same listener/connection table,
+same single-threaded event loop, and the exact same `on request`/
+`on upgrade`/`on message`/`on socketClose` handler surface (a program
+can mix plain `openPort()` and TLS `openSecurePort()` listeners
+freely; a connection's own `req`/`s` behaves identically either way —
+nothing about *reading* a request or *sending* a response differs
+based on which port it arrived on). WebSocket upgrades work the same
+way too (`wss://` on the client side).
+
+`key` is one `blob` — read from a file the same way any other `blob`
+is (`blob key = 'server.pem'`) — holding a PEM-encoded certificate (or
+a full chain, leaf certificate first) **and** the matching
+**unencrypted** private key, concatenated in one file, in either
+order. A bad port number is a silent no-op, the same "test, don't
+fail" convention `openPort()` itself uses — but a certificate/key that
+fails to parse, or a key that doesn't match the certificate, **fails
+the program** (via `fail()`, naming the real underlying problem): that
+is a program-authoring mistake, not a runtime condition worth testing
+for.
+
+Generating a real certificate is outside this language's scope — use
+whatever your deployment already uses (e.g. `openssl req -x509
+-newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes` for a
+self-signed one, or a certificate from a real CA/ACME client for
+production — `cat cert.pem key.pem > server.pem` combines them into
+the one file `openSecurePort` expects).
+
+Built on [mbedTLS](https://www.trustedfirmware.org/projects/mbed-tls/)
+2.x — a new system dependency, but only for a program that actually
+calls `openSecurePort()` (see [setup.md](setup.md)); a program that
+only ever calls `openPort()` never links it, the same binary-slimming
+split every other optional feature in this language already gets.
+
+**Scope, beyond what [Limitations](#http-limitations) above already
+says** (all of it applies here too — HTTP/1.1 request-line + headers +
+`Content-Length` body, no keep-alive, WebSocket text/binary/close
+frames only):
+
+- **Server-side only.** There is no TLS *client* in this language —
+  `openSecurePort()` is the only TLS-related builtin.
+- **One certificate/key pair per listening port, no SNI.** A program
+  needing per-hostname certificates calls `openSecurePort()` once per
+  port instead.
+- **No client-certificate / mutual TLS.** This runtime never asks a
+  connecting client for a certificate.
+- **No ALPN.** Every connection is plain HTTP/1.1-over-TLS — no HTTP/2
+  negotiation.
+- **An encrypted (password-protected) private key is rejected** — the
+  key in `key` must be in the clear.
+- **Linux, plus macOS and Windows behind the same opt-in-flag /
+  real-hardware-verification story `openPort()`'s own Limitations
+  entry above describes** (`FESTINA_ENABLE_MACOS_HTTP=1`/
+  `FESTINA_ENABLE_WINDOWS_HTTP=1` — there is no separate TLS-specific
+  flag, since `openSecurePort()` always brings `openPort()`'s own
+  listener/event-loop machinery along with it). Not available under
+  `--target=wasm32-wasi`, for the identical reason `openPort()` isn't
+  there either.
 
 ## Freeing and deleting
 
@@ -2221,6 +2409,174 @@ close(1)          // prints "exiting with 1", then exits with status 1
 ```
 
 With no `on exit` handler declared, `close(code)` just exits.
+
+### <a name="graceful-shutdown"></a>Graceful shutdown (Ctrl-C / `SIGTERM`)
+
+A program that uses `openPort()`/`openSecurePort()`, `setTimeout`/
+`setInterval`, or graphics now stops the same clean way `close(code)`
+already does when it receives `SIGINT` (Ctrl-C) or `SIGTERM` — a
+declared `on exit(code:int)` fires (passed a conventional
+`128 + signal` code: `130` for `SIGINT`, `143` for `SIGTERM`), then the
+process exits — instead of the OS's own default, abrupt,
+no-cleanup-at-all termination:
+
+```festina
+on exit(code:int) {
+    log(`shutting down (${code})`)
+}
+on request(req:http) {
+    req.send({'code': 200, 'body': 'hello'})
+}
+openPort(8080)
+// Ctrl-C now logs "shutting down (130)" instead of just vanishing.
+```
+
+For an HTTP/WebSocket server specifically, shutdown is **graceful** in
+the way that matters: every listening port closes *immediately* (a new
+connection attempt is refused right away, not silently dropped), but
+connections already open are given up to 10 seconds to finish on their
+own before this runtime gives up on them and exits anyway — a normal
+request/response finishes in milliseconds, so this only ever matters
+for a long-lived WebSocket connection that never closes.
+
+**Only installed where it can actually take effect.** A plain script
+with no `openPort()`/timers/graphics — just top-level code, or your own
+hand-written loop — keeps the OS's own default `SIGINT`/`SIGTERM`
+behavior (an immediate kill, `on exit` not run) exactly as before this
+feature existed: there is no point in such a program's own execution
+where it could ever notice a shutdown request, so installing a handler
+there would make Ctrl-C *stop working* instead of merely skipping
+cleanup — worse, not better. `SIGTERM` is POSIX only; Windows has no
+real delivery of it (only `SIGINT`/Ctrl-C).
+
+## `troubleshoot()` — structured logging
+
+```festina
+troubleshoot('user_login_failed', {'user_id': '7', 'reason': 'bad_password'})
+// {"timestamp":"2026-08-25T16:18:47Z","level":"info","event":"user_login_failed","fields":{"user_id":"7","reason":"bad_password"}}
+```
+
+`troubleshoot(event, fields)` prints one JSON line to stdout — a
+`timestamp` (UTC, RFC3339-ish), a fixed `"level":"info"`, `event`
+(any type, coerced to text like `log()`/`fail()`), and `fields`
+(**must be `map[text]`** — string tags, not an arbitrary value; wrap
+whatever you need to attach as text first). Meant to be piped into a
+real log aggregator rather than read by eye — every field is always
+present and always in the same shape, unlike `log()`. Both arguments
+are required; pass `{}` for `fields` if there's nothing to attach.
+
+`fail(message)` still works exactly as it always has (unchanged, and
+still what an uncaught `throw` produces too — see
+[try/catch/throw](#try--catch--throw) below). `fail(message, fields)`
+is the structured form: a JSON line to stderr instead of the plain
+`fail: <message>` line — `"level":"error"`, key `"message"` rather
+than `"event"` — then `exit(1)`, same as always:
+
+```festina
+fail('db connection lost', {'host': 'db1', 'retry': 'no'})
+// {"timestamp":"2026-08-25T16:18:57Z","level":"error","message":"db connection lost","fields":{"host":"db1","retry":"no"}}
+```
+
+## <a name="try--catch--throw"></a>`try` / `catch` / `throw`
+
+```festina
+void func risky(x:int) {
+    if (x < 0) {
+        throw `negative: ${x}`
+    }
+    log(x)
+}
+
+try {
+    risky(5)
+    risky(-1)
+    log('unreachable')
+} catch (error:text) {
+    log(`caught: ${error}`)
+}
+log('still running')
+```
+
+`throw <expr>` raises `expr`, coerced to text exactly like `log()`/
+`fail()` (any type works — not just text). It unwinds up through
+however many function calls are on the way (not just a `throw` written
+directly inside the `try` body itself) to the nearest enclosing
+`try`/`catch`, binding the caught message to `catch`'s own variable —
+always declared `:text`, since a thrown value always is one. With no
+enclosing `try` reachable at all, `throw` behaves exactly like
+`fail(expr)`: prints to stderr and exits(1) — `throw` is never a
+riskier way to end the program than `fail()` already is, only a
+strictly more capable one. `return`, `break`, and `continue` all work
+normally from inside either a `try` or a `catch` body, and a caught
+`catch` body can itself `throw` again (a rethrow, or a different error
+entirely) to propagate out to whatever `try` encloses *that*.
+
+**One real, honest limitation.** `throw` unwinds by jumping directly to
+the catching `try` (not by returning normally through every call frame
+in between), so a local declared in the function that *directly*
+contains the `throw` is always freed correctly — no different from an
+early `return` from that same function. But a function that merely
+*calls* something which eventually throws, without itself containing a
+`throw` or a `try`, never gets the chance to run any of its own
+cleanup: whatever `struct`/`arr`/`map`/`text`/etc. locals it declared
+leak. This is a leak, never a crash or corrupted state — confirmed
+directly (not just reasoned about) via Valgrind: 0 bytes leaked
+throwing from the function a `try` calls directly, and 0 bytes leaked
+one level deeper still; a real, reproducible leak, one allocation per
+call, the moment a genuine *intermediate* frame sits between the `try`
+and the actual `throw`. Keep whatever a `try`-adjacent call chain
+allocates minimal, or accept the same class of leak this language
+already accepts elsewhere (e.g. the one documented row-array chain
+shape in [security.md](security.md)).
+
+**Not available under `--target=wasm32-wasi`** — WASI has no setjmp/
+longjmp support at all — rejected at compile time; see [wasm.md](wasm.md).
+
+## `.toStruct()` / `.toArr()` — parsing JSON
+
+```festina
+struct Person { id:int  name:text  active:bool  score:float }
+Person p = '{"id": 7, "name": "Ada", "active": true, "score": 9.5}'.toStruct(Person)
+arr[int] xs = '[1, 2, 3, 4, 5]'.toArr(int)
+```
+
+`text.toStruct(StructName)` and `text.toArr(ElementType)` parse a JSON
+value into a real Festina value — the reverse of `.toText()`'s own JSON
+rendering ([Logging and rendering](#logging-and-rendering) above). A
+JSON object key matches a struct field by name, case-insensitively
+(the same convention a query column already matches by, claude.md
+#111) — a JSON key with no matching field is silently skipped (so an
+API that adds fields over time doesn't break your program), and a
+struct field the JSON never mentioned keeps its ordinary zero value (so
+an optional/omitted field doesn't either). `toArr`'s own element type
+is given directly, not in brackets: `.toArr(int)`, not `.toArr(arr[int])`.
+
+Malformed JSON, a value that doesn't match the expected shape (a string
+where a number was expected, an object where an array was expected,
+...), or trailing data after the value all `throw` a descriptive text
+message — this is the intended pairing with [`try`/`catch`](#try--catch--throw)
+above, e.g. for parsing an untrusted `req.toText()` body in an `on
+request` handler without a bad request taking the whole server down.
+
+**v1 scope cut, documented not silent.** A target struct's fields and
+`toArr`'s own element type must be `int`/`float`/`bool`/`text` —
+nested `struct`/`arr[T]`/`map[T]` aren't parseable yet, rejected at
+compile time with a clear error naming exactly what's unsupported.
+`\u` unicode string escapes are also not yet supported (raw,
+un-escaped non-ASCII UTF-8 bytes in a JSON string are unaffected and
+parse completely normally — this only affects a producer that
+specifically chooses to `\u`-escape).
+
+**One real, honest limitation, the same structural class `throw`'s own
+limitation above already is.** A JSON value that fails to parse
+*partway through* being built — a struct whose third field turns out
+to be the wrong type, having already parsed the first two; an array
+whose fourth element fails, having already collected three — leaks
+whatever was already built for that one call. A **successful** parse
+leaks nothing (confirmed directly under Valgrind, including 30 repeated
+calls in a loop, not just reasoned about) — this is strictly an
+error-path leak, bounded to at most one partially-built value per
+failed call, never unbounded or accumulating across successful ones.
 
 ## Error format
 

@@ -8,7 +8,6 @@ class TestExcludedSyntax:
         ("let x = 1", "let"),
         ("if x === 1 {\n}", "==="),
         ("if x !== 1 {\n}", "!=="),
-        ("throw 'error'", "throw"),
         ("const db = require('database.f')", "require()"),
     ])
     def test_excluded_construct_is_rejected(self, parser, errors, source, label):
@@ -23,8 +22,12 @@ class TestExcludedSyntax:
             semantic.analyze(program)
 
 
-class TestFailReplacesThrow:
-    """claude.md #42: use fail() instead of throw."""
+class TestFail:
+    """claude.md #42: fail() still works standalone -- claude.md #157
+    later added throw/try/catch alongside it (real compile-and-run
+    coverage in tests/test_try_catch.py), not as a replacement for it;
+    an uncaught throw behaves exactly like fail() (see that file's own
+    test_uncaught_throw_behaves_exactly_like_fail)."""
 
     def test_fail_call_parses(self, parser):
         source = """
