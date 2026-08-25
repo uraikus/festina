@@ -252,12 +252,26 @@ void festina_fail_structured(const char *msg, const char *fields_json) {
  * below is free to be an ordinary runtime C function using
  * __builtin_longjmp on whatever buffer festina_try_push registered.
  *
- * The catch-frame stack is a plain, unsynchronized global -- correct
- * today because this runtime is single-threaded throughout (the
- * `thread {}` feature this pairs with in the language's own roadmap is
- * deliberately NOT built yet -- see todo.md -- specifically because it
- * would need this, along with every other piece of global runtime
- * state, redesigned for real concurrent access first).
+ * The catch-frame stack is `__thread`-local (claude.md #163), not a
+ * plain global -- generated Festina code itself still only ever runs
+ * on the single main thread (every OTHER piece of runtime state --
+ * globals, refcounts -- is exactly as unsynchronized as it always
+ * was, and stays that way), but claude.md #163's background http
+ * worker pool calls this SAME festina_throw/try_push/try_error
+ * machinery -- via a hand-written __builtin_setjmp catch frame, not
+ * generated IR -- from its own worker threads, to convert a network
+ * failure into a queued callback result rather than let it escape
+ * across threads. A plain, shared g_festina_catch_top would let a
+ * worker thread's own push/pop race the main thread's unrelated
+ * try/catch activity, or -- worse -- longjmp into a stack frame that
+ * isn't even on the current thread's stack. Thread-local storage
+ * gives each thread (main or worker) its own completely independent
+ * catch-frame stack and pending-error slot, with zero synchronization
+ * needed, since nothing here is ever actually SHARED between threads
+ * in the first place -- confirmed directly with a standalone harness
+ * (two threads, one throwing, one not, both racing the main thread's
+ * own independent try/catch) before this went anywhere near the real
+ * runtime.
  *
  * THE ONE REAL, DOCUMENTED LIMITATION (see api.md and claude.md #157):
  * longjmp unwinds the C stack directly, bypassing every LLVM-generated
@@ -292,13 +306,14 @@ typedef struct FestinaCatchFrame {
     struct FestinaCatchFrame *prev;
 } FestinaCatchFrame;
 
-static FestinaCatchFrame *g_festina_catch_top = NULL;
+static __thread FestinaCatchFrame *g_festina_catch_top = NULL;
 /* Owned by the runtime between a throw and the moment festina_try_error()
  * hands it over; NULL the rest of the time. Only ever holds ONE message
- * at a time -- a throw can only reach here once nothing between it and
- * the catch has already unwound, so there's never a second pending
- * throw to overwrite this before the first is collected. */
-static char *g_festina_error_message = NULL;
+ * at a time (per thread) -- a throw can only reach here once nothing
+ * between it and the catch has already unwound, so there's never a
+ * second pending throw to overwrite this before the first is
+ * collected. */
+static __thread char *g_festina_error_message = NULL;
 
 /* Registers buf (codegen's own alloca'd sjlj buffer, already populated
  * by ITS direct llvm.eh.sjlj.setjmp call, which returned 0 -- the
@@ -1840,6 +1855,53 @@ void *festina_blob_open(const char *path) {
     return festina_blob_alloc(copy, bytes, len);
 }
 
+/* claude.md #165: runs on a background worker thread (see
+ * festina_runtime_async.c) -- reads `b->path` (already set, at
+ * construction time, by festina_blob_load_dispatch below) and fills
+ * in `bytes`/`length` in place, mutating the SAME blob value the
+ * caller already got back immediately. Never throws (matches
+ * festina_blob_open's own "unreadable path -> empty blob" contract
+ * exactly), so this needs none of festina_runtime_http.c's own
+ * catch-frame machinery. */
+static void festina_blob_load_worker(void *payload) {
+    FestinaBlob *b = (FestinaBlob *)payload;
+    int64_t len = 0;
+    char *bytes = festina_read_file_sized(b->path, &len);
+    if (!bytes) { bytes = strdup(""); len = 0; }
+    free(b->bytes);
+    b->bytes = bytes;
+    b->length = len;
+}
+
+/* claude.md #165: codegen's own entry point for a `.callback()`-
+ * carrying blob construction (`blob b = 'path'.callback(fn)` or the
+ * fully anonymous `blob 'path'.callback(fn)`) -- mirrors
+ * festina_http_send_client_dispatch's own null-check shape exactly.
+ * `callback` NULL is the unchanged, fully synchronous path (identical
+ * to festina_blob_open, just routed through here so codegen has one
+ * call site regardless of whether a callback is present -- the
+ * null-vs-non-null decision has to happen at RUNTIME, the same reason
+ * http's own dispatcher does). Non-NULL returns an EMPTY blob
+ * (bytes/length zero, `path` already correct) immediately -- exactly
+ * as unpopulated, and just as indistinguishable from a genuinely
+ * empty/unreadable file, as blob's own pre-existing "test, don't
+ * fail" contract already made every OTHER unreadable-path case; the
+ * whole point of `callback` is not reading the blob until it fires. */
+void *festina_blob_load_dispatch(const char *path, void (*callback)(void *)) {
+    if (!callback) return festina_blob_open(path);
+    if (!path) path = "";
+    char *copy = strdup(path);
+    if (!copy) festina_fail("out of memory allocating a blob");
+    char *empty = strdup("");
+    if (!empty) festina_fail("out of memory allocating a blob");
+    void *payload = festina_blob_alloc(copy, empty, 0);
+    festina_retain(payload); /* survives after the caller's own scope releases its
+                              * reference -- balanced by festina_blob_release,
+                              * passed to festina_async_io_run as release_fn below */
+    festina_async_io_dispatch(payload, festina_blob_load_worker, callback, festina_blob_release);
+    return payload;
+}
+
 /* claude.md #109: a blob read back out of a SQLite BLOB column. It has
  * bytes and no path, so .toText() works and .exists()/.write()/
  * .append()/.delete() all answer false -- there is no file to act on,
@@ -3299,6 +3361,79 @@ void festina_fire_expired_timers(void) {
     }
 }
 
+/* claude.md #165: the generic async-io hook seam -- see this trio's
+ * own doc comment in festina_runtime.h for the full reasoning. All
+ * three default to "nothing registered": festina_async_io_outstanding()
+ * answers 0, festina_async_io_drain() does nothing, and
+ * festina_async_io_dispatch() falls back to running the job inline
+ * (synchronously) rather than crashing -- exactly as if
+ * festina_runtime_async.c were never linked at all -- which, for a
+ * program that never uses blob/img/aud's own `.callback()` form, it
+ * never is.
+ *
+ * `run_fn` (unlike the other two) is NOT optional in practice --
+ * festina_blob_load_dispatch (below) only ever calls
+ * festina_async_io_dispatch AFTER a program has already used
+ * `.callback()` somewhere, which is exactly what makes codegen set
+ * uses_async_io and link festina_runtime_async.c at all, so this hook
+ * is always registered by the time it's actually needed. The
+ * synchronous fallback below exists purely so festina_blob_load_dispatch
+ * itself can be UNCONDITIONALLY part of core (linked into every
+ * program, whether or not it ever calls `.callback()`) without
+ * core ever making a DIRECT symbol reference into the conditionally-
+ * linked festina_runtime_async.c -- that direct-call mistake is
+ * exactly what broke the very first build of this feature (a hard
+ * link failure for every program that never used `.callback()` at
+ * all, since festina_blob_load_dispatch calling
+ * festina_async_io_run() BY NAME meant the linker needed that symbol
+ * to exist regardless, confirmed directly by the immediate full-suite
+ * failure this caused before this fix). */
+static int64_t (*g_async_io_outstanding_fn)(void) = NULL;
+static void (*g_async_io_drain_fn)(void) = NULL;
+static void (*g_async_io_run_fn)(void *payload, void (*work_fn)(void *),
+                                 void (*callback)(void *), void (*release_fn)(void *)) = NULL;
+
+void festina_set_async_io_hooks(
+        int64_t (*outstanding_fn)(void), void (*drain_fn)(void),
+        void (*run_fn)(void *, void (*)(void *), void (*)(void *), void (*)(void *))) {
+    g_async_io_outstanding_fn = outstanding_fn;
+    g_async_io_drain_fn = drain_fn;
+    g_async_io_run_fn = run_fn;
+}
+
+int64_t festina_async_io_outstanding(void) {
+    return g_async_io_outstanding_fn ? g_async_io_outstanding_fn() : 0;
+}
+
+void festina_async_io_drain(void) {
+    if (g_async_io_drain_fn) g_async_io_drain_fn();
+}
+
+void festina_async_io_dispatch(void *payload, void (*work_fn)(void *),
+                               void (*callback)(void *), void (*release_fn)(void *)) {
+    if (g_async_io_run_fn) {
+        g_async_io_run_fn(payload, work_fn, callback, release_fn);
+        return;
+    }
+    /* Unreachable in practice -- see this function's own doc comment
+     * above -- but a real, correct synchronous fallback rather than a
+     * silent no-op or a crash, if it's ever somehow reached anyway. */
+    work_fn(payload);
+    if (callback) callback(payload);
+    if (release_fn) release_fn(payload);
+}
+
+/* claude.md #165: bounds a sleep/poll timeout that would otherwise be
+ * "block forever" (no active timer) to a short, regular wake -- the
+ * only way festina_run_timer_loop's own plain nanosleep (no fd to
+ * poll(), unlike festina_run_http_loop's self-pipe) can notice a
+ * background blob/img/aud load finishing in a timely way. 20ms is
+ * arbitrary but small enough that a completed background load's own
+ * callback fires promptly without this loop spinning uselessly the
+ * rest of the time (it still only wakes AT ALL when there's a reason
+ * to -- an active timer, or outstanding async-io work). */
+#define FESTINA_ASYNC_IO_POLL_SECONDS 0.02
+
 /* The blocking loop main() enters (via festina_run_timer_loop, see
  * festina/codegen.py's _emit_main_and_entry) for a program that uses
  * setTimeout/setInterval but never opens a graphics window --
@@ -3310,7 +3445,10 @@ void festina_fire_expired_timers(void) {
  * Node's empty event loop exiting the process. An uncleared
  * setInterval() therefore keeps a graphics-free program running
  * forever, exactly like in a real JS runtime; it needs to be stopped
- * externally (or via clearInterval()) the same way. */
+ * externally (or via clearInterval()) the same way. claude.md #165:
+ * "nothing left to wait for" now also means "and no outstanding
+ * blob/img/aud background load" -- see festina_async_io_outstanding
+ * above. */
 void festina_run_timer_loop(void) {
     while (1) {
         /* claude.md #161: checked once per iteration (this loop's own
@@ -3325,8 +3463,18 @@ void festina_run_timer_loop(void) {
             festina_program_exit(festina_shutdown_exit_code());
         }
         double earliest = festina_next_timer_deadline();
-        if (earliest < 0.0) return; /* nothing left to wait for */
-        double remaining = earliest - festina_now_seconds();
+        int64_t async_io_outstanding = festina_async_io_outstanding();
+        if (earliest < 0.0 && async_io_outstanding == 0) {
+            return; /* nothing left to wait for */
+        }
+        double remaining = earliest;
+        if (earliest >= 0.0) {
+            remaining = earliest - festina_now_seconds();
+        }
+        if (async_io_outstanding > 0
+                && (earliest < 0.0 || remaining > FESTINA_ASYNC_IO_POLL_SECONDS)) {
+            remaining = FESTINA_ASYNC_IO_POLL_SECONDS;
+        }
         if (remaining > 0.0) {
             struct timespec ts;
             ts.tv_sec = (time_t)remaining;
@@ -3334,6 +3482,7 @@ void festina_run_timer_loop(void) {
             nanosleep(&ts, NULL);
         }
         festina_fire_expired_timers();
+        festina_async_io_drain();
     }
 }
 

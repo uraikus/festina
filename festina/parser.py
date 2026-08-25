@@ -263,6 +263,42 @@ class Parser:
                             "functions require an explicit return type, e.g. 'text func name() { }'")
         if self._starts_func_decl():
             return self.parse_func_decl()
+        # claude.md #164: `http {...}` -- an anonymous, fire-and-forget
+        # request: no variable name to call .send() on, so the send is
+        # implied. Checked BEFORE _looks_like_declaration (which would
+        # otherwise route this to parse_var_decl, whose own
+        # `self.eat("IDENT")` right after the type expects a variable
+        # name -- exactly what this form deliberately has none of) and
+        # before the plain `t.type == "LBRACE"` block check above (this
+        # branch only ever matches when `http` comes FIRST, so a bare
+        # `{` at statement-start is still an ordinary block,
+        # unambiguously). Desugars to `{...}.send()` at parse time --
+        # semantic.py/codegen.py need no awareness this shorthand
+        # exists at all, since `{...}.send()` (claude.md #164's OTHER
+        # new shorthand) already handles the resulting AST shape.
+        if t.type == "http" and self.peek(1).type == "LBRACE":
+            return self.parse_http_anon_send()
+        # claude.md #165: `blob 'path'.callback(fn)` (also img/aud,
+        # though only blob is actually implemented past semantic.py
+        # for now -- see that module's own comment) -- the anonymous,
+        # fire-and-forget counterpart to `http {...}` just above, same
+        # "checked before _looks_like_declaration would otherwise
+        # misroute it" reasoning. Unlike `http {...}`, no AST
+        # rewriting is needed here at all -- the type keyword is
+        # discarded outright (it's redundant: `.callback()`'s own type
+        # is always read off its argument func's OWN signature, see
+        # semantic.py's `_infer_call`) and whatever expression follows
+        # (expected to be a `.callback(...)` call, though nothing here
+        # enforces that shape specifically -- semantic.py's own type
+        # check on the discarded type keyword's absence means any
+        # OTHER expression here is simply evaluated and its result
+        # discarded, same as any other bare expression-statement) is
+        # parsed and wrapped as an ordinary ExprStmt.
+        if t.type in ("blob", "img", "aud") and self.peek(1).type != "IDENT":
+            self.eat()  # the (redundant, purely readability) type keyword
+            expr = self.parse_expression()
+            self._semi()
+            return ast.ExprStmt(expr)
         if t.type == "LBRACE":
             return self.parse_block()
         if self._looks_like_declaration():
@@ -446,6 +482,20 @@ class Parser:
         if not path_tok.value or not _IMPORT_PATH_RE.match(path_tok.value):
             raise self.err(path_tok, "invalid import", f"invalid import path {path_tok.value!r}")
         return ast.ImportDecl(path_tok.value, path_tok.line, path_tok.column)
+
+    def parse_http_anon_send(self):
+        """claude.md #164: `http {...}` -- desugars to `{...}.send()` at
+        parse time (an ExprStmt wrapping a Call whose callee is a
+        Member on the freshly-parsed MapLit) so semantic.py/codegen.py
+        need no separate awareness of this spelling at all -- see
+        parse_statement's own comment on why this is checked before
+        _looks_like_declaration would otherwise misroute it."""
+        t = self.eat("http")
+        maplit = self.parse_primary()  # positioned at LBRACE -- produces an ast.MapLit
+        callee = ast.Member(maplit, "send", computed=False, line=t.line, column=t.column)
+        call = ast.Call(callee, [], line=t.line, column=t.column)
+        self._semi()
+        return ast.ExprStmt(call)
 
     def parse_var_decl(self):
         t = self.peek()

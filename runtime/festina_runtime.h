@@ -814,6 +814,58 @@ void festina_clear_interval(int64_t id);
  * and codegen only ever emits a call to whichever one the program needs. */
 void festina_run_timer_loop(void);
 
+/* claude.md #165: the generic async-io hook seam -- blob/img/aud's own
+ * `.callback()` (a background file load, the same non-blocking shape
+ * claude.md #163 gave http's client req.send()) needs SOME loop to
+ * keep running until outstanding work finishes and to drain completed
+ * callbacks on the main thread, but unlike http.callback (where ANY
+ * use already guarantees festina_run_http_loop is the one running),
+ * a program using ONLY blob.callback() -- no openPort(), no graphics,
+ * maybe not even a timer -- has no such guarantee: it could end up in
+ * festina_run_timer_loop, festina_run_http_loop, OR
+ * festina_run_event_loop depending on what ELSE the program does.
+ * All three loops therefore check these same two hooks every
+ * iteration (see each one's own festina_async_io_outstanding/_drain
+ * call) -- both default to "nothing registered" (a plain 0/no-op) so
+ * a program that never uses blob/img/aud's own callback form pays
+ * nothing beyond one branch per iteration, and never needs to link
+ * festina_runtime_async.c (the ONE translation unit that actually
+ * registers them, via festina_register_async_io_hooks below, called
+ * from main() only when CodeGen.uses_async_io is set) at all -- the
+ * same "only link what a program actually uses" split every other
+ * optional feature in this runtime already gets. Mirrors
+ * festina_set_tls_client_hooks' own registration-seam shape exactly,
+ * for the identical cross-translation-unit reason. */
+void festina_set_async_io_hooks(int64_t (*outstanding_fn)(void), void (*drain_fn)(void),
+                                void (*run_fn)(void *payload, void (*work_fn)(void *payload),
+                                               void (*callback)(void *payload),
+                                               void (*release_fn)(void *payload)));
+int64_t festina_async_io_outstanding(void);
+void festina_async_io_drain(void);
+/* codegen's own conditional call site (uses_async_io, mirroring
+ * uses_https's own festina_register_tls_hooks() call) -- defined in
+ * festina_runtime_async.c, registers ITS OWN outstanding/drain/run
+ * functions via festina_set_async_io_hooks above. */
+void festina_register_async_io_hooks(void);
+/* claude.md #165: the ALWAYS-linked-core entry point for dispatching an
+ * async-io job -- blob/img/aud's own `.callback()`-non-null dispatch
+ * functions (festina_blob_load_dispatch and its img/aud counterparts)
+ * call THIS, never festina_runtime_async.c's festina_async_io_run
+ * directly (that would be an unconditional cross-translation-unit
+ * symbol reference from always-linked core into a conditionally-linked
+ * file -- a hard link failure for every program that doesn't use
+ * async-io at all). This wrapper goes through the g_async_io_run_fn
+ * hook above instead, exactly like festina_async_io_outstanding/_drain
+ * already do, and falls back to a synchronous inline run if no hook is
+ * registered (unreachable in practice: codegen only emits a call to
+ * festina_blob_load_dispatch when uses_async_io is set, which is also
+ * what gates linking festina_runtime_async.c and calling
+ * festina_register_async_io_hooks from main() -- but a real, correct
+ * fallback rather than a silent no-op or a crash). */
+void festina_async_io_dispatch(void *payload, void (*work_fn)(void *payload),
+                               void (*callback)(void *payload),
+                               void (*release_fn)(void *payload));
+
 /*
  * claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying().
  *
@@ -1052,6 +1104,12 @@ void festina_cycle_dispose_map(void *payload);
  * .exists()/.write()/.append()/.delete() all answer false.
  */
 void *festina_blob_open(const char *path);
+/* claude.md #165: codegen's own entry point for `.callback()` --
+ * `callback` NULL is identical to calling festina_blob_open directly;
+ * non-NULL returns an empty (not-yet-loaded) blob immediately and
+ * fills it in on a background thread, firing `callback` from the main
+ * thread once done. See festina_runtime.c's own doc comment. */
+void *festina_blob_load_dispatch(const char *path, void (*callback)(void *));
 void *festina_blob_from_bytes(const void *data, int64_t len);
 void festina_blob_release(void *payload);
 char *festina_blob_to_text(void *payload);   /* owned copy, per claude.md #83 */
@@ -1385,13 +1443,21 @@ void festina_run_http_loop(void);
  * returns the SAME live map every call, already retained on the way
  * out (contrast the OLD festina_http_headers, which rebuilt a fresh
  * one on every single read) -- the identical "same live value,
- * retained" contract festina_socket_state below already has. */
+ * retained" contract festina_socket_state below already has.
+ *
+ * claude.md #163: `callback` is a 5th field -- a bare function pointer
+ * (NULL for none), the same runtime representation every other
+ * `func`-typed value already has, so it needs no separate release
+ * function of its own. Non-NULL is what makes festina_http_send_client_dispatch
+ * (below) take req.send()'s non-blocking path. */
 void *festina_http_literal_new(const char *url, const char *method, int64_t code,
-                               void *headers, const uint8_t *body, int64_t body_len);
+                               void *headers, const uint8_t *body, int64_t body_len,
+                               void (*callback)(void *));
 char *festina_http_url(void *payload);
 char *festina_http_method(void *payload);
 int64_t festina_http_code(void *payload);
 void *festina_http_headers(void *payload);
+void *festina_http_callback(void *payload);  /* the bare function pointer, or NULL */
 
 /* http -- methods. ok/redirect/upgrade/send(res) are each a no-op
  * (not an error) if this value isn't bound to a live, still-open
@@ -1432,6 +1498,19 @@ void festina_http_send(void *req_payload, void *res_payload);
  * on the client side links mbedTLS the same way openSecurePort()
  * does. */
 void festina_http_send_client(void *payload);
+/* claude.md #163: codegen's own entry point for req.send() (zero
+ * arguments) -- replaces the old direct festina_http_send_client call.
+ * Checks `payload`'s own `.callback` field at RUNTIME: NULL takes the
+ * exact festina_http_send_client path above (still fully blocking,
+ * unchanged behavior); non-NULL hands the request to a background
+ * worker pool instead and returns immediately, running `callback`
+ * later from the main thread's own event loop once the request
+ * completes (success or a caught network failure -- see
+ * festina_runtime_http.c's own "http -- async client" section).
+ * POSIX only for now (Linux/macOS) -- on Windows this is currently
+ * identical to calling festina_http_send_client directly; `callback`
+ * is simply not consulted there yet (see api.md). */
+void festina_http_send_client_dispatch(void *payload);
 /* claude.md #162: registers festina_runtime_https.c's own TLS CLIENT
  * hooks (mirroring festina_set_tls_hooks' own SERVER-side registration
  * -- see that function's own doc comment for the identical cross-

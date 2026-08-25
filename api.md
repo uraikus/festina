@@ -1503,6 +1503,45 @@ fresh.write('now it does')
 log(fresh.exists())                   // true
 ```
 
+### Loading in the background: `.callback()`
+
+`blob key = 'path'` reads the file synchronously, blocking until it's
+done. `.callback()` — on any `text` path expression, not just a
+literal — starts the read in the background instead, returning an
+empty (not-yet-loaded) blob immediately and firing a callback once the
+read actually finishes, from the same main thread everything else in a
+Festina program runs on:
+
+```festina
+void func onLoaded(b:blob) {
+    log(`loaded: ${b.toText()}`)
+}
+
+blob b = 'large-file.dat'.callback(onLoaded)
+log('dispatched')                     // logs BEFORE onLoaded ever runs
+```
+
+`callback` must be `func[blob]:void`, called with the SAME `b` the
+declaration produced, mutated in place with the real bytes once
+they've been read (exactly the shape `req.send()`'s own `callback`
+already has — see [Non-blocking requests](#http-and-websocket-servers)
+above). When the response doesn't need a name, drop the variable and
+write the load as its own statement, prefixed with the target type
+purely for readability (it isn't otherwise required — `.callback()`'s
+own target type is already unambiguous from `callback`'s signature):
+
+```festina
+blob 'large-file.dat'.callback(onLoaded)
+```
+
+An unreadable path behaves exactly like the synchronous form —
+`b.exists()` is `false`, `b.toText()` is empty — there's simply no
+separate "it failed" signal beyond that, matching blob's own existing
+"test, don't fail" contract; the whole point of `callback` is not
+reading `b` until it fires.
+
+**img/aud don't have this yet** — only `blob`.
+
 `toText()` hands back an ordinary owned `text`, so it composes with
 everything else:
 
@@ -1662,13 +1701,14 @@ http {
     method:text    // 'GET', 'POST', ...
     code:int       // the status code -- null until a response exists
     headers:map[text]
+    callback:func[http]:void   // null means "block" -- see below
     // plus the methods documented below: ok()/redirect()/upgrade()/
     // send()/toText()/toBlob()/toImg()/toAud()
 }
 ```
 
-`url`/`method`/`code`/`headers` are all **read-only** once constructed —
-the only way to set them is the literal itself:
+`url`/`method`/`code`/`headers`/`callback` are all **read-only** once
+constructed — the only way to set them is the literal itself:
 
 ```festina
 map[text] headers = {'E-Tag': now().toText()}
@@ -1676,9 +1716,11 @@ http res = {'code': 200, 'body': 'ok', headers}    // {headers} is shorthand
                                                     // for {'headers': headers}
 ```
 
-A literal accepts five keys, all optional: `url`/`method` (`text`,
+A literal accepts six keys, all optional: `url`/`method` (`text`,
 default `''`), `code` (`int`, default `null`), `headers` (`map[text]`,
-default empty), and `body` — not a real field (there is no `.body` to
+default empty), `callback` (`func[http]:void`, default `null` — see
+[Making outbound requests](#http-client) below for what non-`null`
+actually does), and `body` — not a real field (there is no `.body` to
 read back later; it feeds straight into the value's content, read back
 through `toText()`/`toBlob()`/`toImg()`/`toAud()`) — accepting anything
 with a body form: `text` (sent as-is), `int`/`float`/`bool`
@@ -1837,6 +1879,93 @@ Calling `req.send()` a second time on the same value sends a second,
 independent request (using whatever `url`/`method`/`headers`/body it
 currently holds, response overwrite and all) — nothing about the zero-
 argument form is "used up" after the first call.
+
+### Non-blocking requests: `callback`
+
+Give the literal a `callback` and `req.send()` returns **immediately**
+instead of blocking — the request runs on a background worker thread,
+and `callback` fires later, from the same main thread everything else
+runs on, once it completes:
+
+```festina
+void func processLater(r:http) {
+    text response = r.toText()
+    log(`Response: ${response} ${now()}`)
+}
+
+http req = {'url': 'https://example.com', 'callback': processLater}
+req.send()
+log(`Request made... ${now()}`)   // logs BEFORE processLater ever runs
+```
+
+`callback` must be `func[http]:void` — called with the SAME value
+`req.send()` was called on, mutated in place with the response exactly
+the way the blocking form already is (`r.code`/`r.headers`/`r.toText()`
+etc. all read the response once `callback` fires). A network failure
+that would otherwise throw instead leaves `r.code` `null` and
+`r.toText()`/etc. holding the failure's own message — there's no
+`try`/`catch` frame left to deliver a throw to by the time a background
+result comes back, so `if r.code == null { ... }` inside `callback` is
+how to tell success from failure:
+
+```festina
+void func onDone(r:http) {
+    if r.code == null {
+        log(`failed: ${r.toText()}`)
+    } else {
+        log(`ok: ${r.code}`)
+    }
+}
+```
+
+A callback-mode `req` survives independent of whatever scope built it
+— even a value constructed entirely inside a function that returns
+before the request finishes still fires its callback correctly later:
+
+```festina
+void func fireAndForget() {
+    http {'url': 'https://example.com', 'callback': onDone}
+    // fireAndForget's own local scope ends here -- the request keeps
+    // going anyway, and onDone still fires once it completes.
+}
+```
+
+Calling `req.send()` again on a callback-mode value queues another
+independent background request the same way. **Linux and macOS only**
+for now — on Windows, `callback` is currently not consulted at all and
+`req.send()` stays fully blocking regardless, the same staged-rollout
+shape audio/graphics/http itself already went through on that
+platform.
+
+### Shorthand: `{...}.send()` and `http {...}`
+
+An `http` literal can be sent in the same expression it's built in,
+without a separate `req.send()` statement:
+
+```festina
+http req = {'url': 'https://example.com', 'callback': processLater}.send()
+```
+
+This means exactly what it looks like — build the literal, then send
+it — not a different return value from `.send()` itself (`.send()`
+elsewhere still returns nothing; this is recognized specifically as a
+variable's own initializer).
+
+When the response doesn't need to be read at all, drop the variable
+entirely — a bare `http` value followed directly by a literal is a
+complete statement, an implicit send with no name to call `.send()` on:
+
+```festina
+http {'url': 'https://example.com', 'callback': processLater}
+```
+
+(Only reachable with the leading `http` — a bare `{...}` at the start
+of a statement is still an ordinary block, as always.) With no
+`callback` at all, this is a fire-and-forget *blocking* send whose
+response is simply discarded — rarely useful with no callback, but not
+an error. Exactly like the named-variable form above, the value stays
+alive until its request completes (and, in callback mode, until the
+callback has run) even though nothing ever names it.
 
 ### <a name="url-type"></a>The `url` type / `parseURL()`
 

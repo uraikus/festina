@@ -95,6 +95,11 @@ _RUNTIME_GRAPHICS_C = os.path.join(_RUNTIME_DIR, "festina_runtime_graphics.c")
 _RUNTIME_AUDIO_C = os.path.join(_RUNTIME_DIR, "festina_runtime_audio.c")
 _RUNTIME_HTTP_C = os.path.join(_RUNTIME_DIR, "festina_runtime_http.c")
 _RUNTIME_HTTPS_C = os.path.join(_RUNTIME_DIR, "festina_runtime_https.c")
+# claude.md #165: blob/img/aud's own `.callback()` -- the generic
+# background-worker pool this needs, split out for the same "a program
+# that never uses it never links -pthread for THIS reason" per-feature
+# reasoning http/audio's own splits already established.
+_RUNTIME_ASYNC_C = os.path.join(_RUNTIME_DIR, "festina_runtime_async.c")
 # Both headers are #included by more than one of the .c files above (see
 # festina_runtime_internal.h's own doc comment) -- included in every
 # object file's cache-freshness check below (_ensure_runtime_object)
@@ -554,6 +559,19 @@ _RUNTIME_FEATURES = {
         "pkgs": ["mbedtls", "mbedx509", "mbedcrypto"],
         "extra_link_flags": [],
     },
+    # claude.md #165: blob's own `.callback()` -- a small worker pool,
+    # no third-party library dependency at all (same shape "http"
+    # above has), just -pthread -- the identical flag "audio" above
+    # already links for its own background playback threads, via the
+    # same portable plain-pthread.h code (no platform-specific
+    # branches in festina_runtime_async.c itself), so this needs no
+    # platform gate of its own the way graphics/audio DEVICE access
+    # does.
+    "async_io": {
+        "source": _RUNTIME_ASYNC_C,
+        "pkgs": [],
+        "extra_link_flags": ["-pthread"],
+    },
 }
 
 
@@ -812,6 +830,18 @@ def _check_wasm_feature_supported(feature):
             "no process model to spawn into at all. See wasm.md's "
             "Limitations section.",
             category="unsupported platform feature")
+    if feature == "async_io":
+        # claude.md #165: the default (non-shared-memory) wasm32-wasi
+        # target this project builds for has no real pthread
+        # implementation at all -- the identical "genuinely absent"
+        # situation exec()/http/try are already in above, not a
+        # hardware-verification gate.
+        raise CompileError(
+            "<text>.callback() (background blob loading) is not "
+            "supported when compiling to WASM -- WASI has no real "
+            "threading model in this project's build. See wasm.md's "
+            "Limitations section.",
+            category="unsupported platform feature")
     if feature == "http":
         # claude.md #151: added alongside openPort() itself -- WASI
         # Preview 1 (this project's own wasm target) has no listening-
@@ -1014,7 +1044,7 @@ def _check_feature_supported(feature, platform_name=None):
 
 
 def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=False,
-                                    uses_http=False, uses_https=False):
+                                    uses_http=False, uses_https=False, uses_async_io=False):
     """Every program links core (log/fail/sqlite/regex/timers -- see
     festina_runtime.c's top comment) plus -lm (claude.md #56's
     Math.floor/ceil/round/trunc lower to libm intrinsics -- round() in
@@ -1062,7 +1092,8 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
         link_libs += _pkg_config("--libs", pkg)
 
     for name, wants in (("graphics", uses_graphics), ("audio", uses_audio),
-                        ("http", uses_http), ("https", uses_https)):
+                        ("http", uses_http), ("https", uses_https),
+                        ("async_io", uses_async_io)):
         if not wants:
             continue
         skip_gate = name == "graphics" and not wants_window
@@ -1138,18 +1169,20 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", targ
     if target == "wasm32-wasi":
         _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio,
                            needs_exec=gen.uses_exec, needs_http=gen.uses_http,
-                           needs_try=gen.uses_try, needs_https=gen.uses_https)
+                           needs_try=gen.uses_try, needs_https=gen.uses_https,
+                           needs_async_io=gen.uses_async_io)
         return output_path
 
     runtime_objects, link_libs = _runtime_objects_and_link_libs(
         cc, needs_graphics, gen.uses_audio, wants_window=gen.uses_graphics,
-        uses_http=gen.uses_http, uses_https=gen.uses_https)
+        uses_http=gen.uses_http, uses_https=gen.uses_https, uses_async_io=gen.uses_async_io)
 
     if llvm_backend.available():
         _compile_via_libllvm(ir, entry_path, output_path, cc, runtime_objects, link_libs)
     else:
         _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio, link_libs,
-                                        needs_http=gen.uses_http, needs_https=gen.uses_https)
+                                        needs_http=gen.uses_http, needs_https=gen.uses_https,
+                                        needs_async_io=gen.uses_async_io)
     _rename_if_linker_appended_exe(output_path)
     return output_path
 
@@ -1224,7 +1257,7 @@ def _compile_via_libllvm(ir, entry_path, output_path, cc, runtime_objects, link_
 
 
 def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, needs_audio, link_libs,
-                                    needs_http=False, needs_https=False):
+                                    needs_http=False, needs_https=False, needs_async_io=False):
     """Fallback used only when libLLVM couldn't be loaded in this process
     -- the original pipeline, handing the .ll file straight to `cc`
     (which then must actually be clang, or another compiler with an LLVM
@@ -1290,6 +1323,14 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
         pkgs, flags = _feature_pkgs_and_flags("https")
         pkg_configs += pkgs
         extra_link_flags += flags
+    if needs_async_io:
+        # claude.md #165: blob's own .callback() -- see _RUNTIME_FEATURES
+        # own "async_io" entry for why this needs only -pthread, no
+        # pkg-config package.
+        runtime_sources.append(_RUNTIME_ASYNC_C)
+        pkgs, flags = _feature_pkgs_and_flags("async_io")
+        pkg_configs += pkgs
+        extra_link_flags += flags
     cflags = []
     for pkg in pkg_configs:
         cflags += _pkg_config("--cflags", pkg)
@@ -1308,7 +1349,7 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
 
 
 def _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, needs_audio, needs_exec=False,
-                      needs_http=False, needs_try=False, needs_https=False):
+                      needs_http=False, needs_try=False, needs_https=False, needs_async_io=False):
     """claude.md #148: WASM export's own link recipe -- always the .ll-
     text-to-clang path (see _compile_via_clang_ir_frontend's own
     docstring for what that fallback normally covers on native targets;
@@ -1338,6 +1379,8 @@ def _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, needs_aud
         _check_wasm_feature_supported("https")
     if needs_try:
         _check_wasm_feature_supported("try")
+    if needs_async_io:
+        _check_wasm_feature_supported("async_io")
     if shutil.which(cc) is None or "clang" not in os.path.basename(cc).lower():
         raise CompileError(
             f"WASM export needs clang specifically (got --cc={cc!r}) -- "

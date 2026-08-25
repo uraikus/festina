@@ -1698,9 +1698,20 @@ void festina_run_event_loop(void) {
             timeout = earliest - festina_now_seconds();
             if (timeout < 0.0) timeout = 0.0;
         }
+        /* claude.md #165: this loop's own lifetime is governed by the
+         * window (it only ever exits on a real close or a shutdown
+         * signal), so an outstanding blob/img/aud background load
+         * never needs to keep it ALIVE the way it does for the other
+         * two loops -- it only needs a bounded wait so a completed
+         * load's callback fires promptly rather than waiting for the
+         * next real window/timer event. */
+        if (festina_async_io_outstanding() > 0 && (timeout < 0.0 || timeout > 0.02)) {
+            timeout = 0.02;
+        }
         festina_window_events_wait(timeout);
         festina_window_events_drain(festina_handle_window_event);
         festina_fire_expired_timers();
+        festina_async_io_drain();
     }
     cairo_surface_destroy(g_backing_surface);
     g_backing_surface = NULL;

@@ -335,6 +335,22 @@ REGEX = types_mod.RegexType()
 AUDIO = types_mod.AudioType()
 
 
+def _http_send_lit_receiver(node):
+    """claude.md #164: mirrors semantic.py's own identically-named
+    helper exactly (see its doc comment for the full reasoning) --
+    answers the inner MapLit if `node` is exactly
+    `Call(Member(<MapLit>, 'send', computed=False), [])`, else None.
+    Duplicated rather than imported, matching how this file and
+    semantic.py already keep no cross-import dependency on each
+    other."""
+    if (isinstance(node, ast.Call) and len(node.args) == 0
+            and isinstance(node.callee, ast.Member)
+            and not node.callee.computed and node.callee.prop == "send"
+            and isinstance(node.callee.obj, ast.MapLit)):
+        return node.callee.obj
+    return None
+
+
 def _is_refcounted(t):
     """claude.md #109: the single "does this value carry a refcount
     header" test, replacing the struct/arr[T]/map[T] tuple that used to
@@ -750,6 +766,12 @@ class CodeGen:
         self.uses_timers = False               # any setTimeout()/setInterval() call anywhere --
                                                 # NOT clearTimeout()/clearInterval() alone; see
                                                 # _emit_timer_call and _emit_main_and_entry
+        self.uses_async_io = False             # claude.md #165: any blob/img/aud `.callback()` call
+                                                # anywhere -- links festina_runtime_async.c (the
+                                                # generic background-load worker pool) and, like
+                                                # uses_timers, guarantees SOME loop runs even if
+                                                # nothing else in the program would otherwise need
+                                                # one (see _emit_main_and_entry's own loop-selection)
         self.uses_graphics_code = False        # any drawRect/drawCircle/drawText/drawImage/
                                                 # loadImage call anywhere -- a strict superset of
                                                 # uses_graphics (see _emit_graphics_call's doc
@@ -1198,6 +1220,11 @@ class CodeGen:
             # from a path, refcounted, with the file operations that
             # used to be free functions hanging off it.
             "declare ptr @festina_blob_open(ptr)",
+            # claude.md #165: <text>.callback(fn) -- non-blocking blob
+            # loading, the file-loading counterpart to claude.md #163's
+            # http client callback.
+            "declare ptr @festina_blob_load_dispatch(ptr, ptr)",
+            "declare void @festina_register_async_io_hooks()",
             "declare ptr @festina_blob_from_bytes(ptr, i64)",
             "declare void @festina_blob_release(ptr)",
             "declare ptr @festina_blob_to_text(ptr)",
@@ -1268,12 +1295,15 @@ class CodeGen:
             # claude.md #162: http -- redesigned into a genuine
             # refcounted value (url/method/code/headers/body), see
             # festina_runtime.h's own doc comment for the full
-            # rationale.
-            "declare ptr @festina_http_literal_new(ptr, ptr, i64, ptr, ptr, i64)",
+            # rationale. claude.md #163 adds `callback` as a 7th
+            # constructor argument (a bare func pointer, `null` for
+            # none) and its own read-back accessor.
+            "declare ptr @festina_http_literal_new(ptr, ptr, i64, ptr, ptr, i64, ptr)",
             "declare ptr @festina_http_url(ptr)",
             "declare ptr @festina_http_method(ptr)",
             "declare i64 @festina_http_code(ptr)",
             "declare ptr @festina_http_headers(ptr)",
+            "declare ptr @festina_http_callback(ptr)",
             "declare void @festina_http_ok(ptr)",
             "declare void @festina_http_redirect(ptr, ptr)",
             "declare void @festina_http_upgrade(ptr)",
@@ -1282,7 +1312,16 @@ class CodeGen:
             "declare ptr @festina_http_to_aud(ptr)",
             "declare ptr @festina_http_to_text(ptr)",
             "declare void @festina_http_send(ptr, ptr)",
-            "declare void @festina_http_send_client(ptr)",
+            # claude.md #163: req.send() (zero arguments) now calls
+            # festina_http_send_client_dispatch, not
+            # festina_http_send_client directly -- the dispatcher
+            # checks `.callback` at runtime and decides blocking vs.
+            # background from there (see festina_runtime.h's own doc
+            # comment). festina_http_send_client itself is still very
+            # much alive in the runtime -- called from generated code
+            # only indirectly now, through the dispatcher, so it needs
+            # no `declare` of its own here anymore.
+            "declare void @festina_http_send_client_dispatch(ptr)",
             "declare void @festina_release_http(ptr)",
             # festina_blob_bytes is already declared above (blob's own
             # sqlite-column binding uses it too) -- reused as-is by
@@ -3912,18 +3951,19 @@ class CodeGen:
         return text_val, len_val, (text_val if vtype != TEXT else None)
 
     def _emit_http_lit(self, maplit, env, lines):
-        """claude.md #162: `http x = {...}` -- and `req.send({...})`'s
-        own inline-response form -- build a fresh http value via
-        festina_http_literal_new from a MapLit's entries. semantic.py's
-        own _validate_http_lit already confirmed every key is one of
-        url/method/code/headers/body with the right value type, so
-        this only has to emit+coerce each one and make the single
-        call; entries are evaluated in the SOURCE ORDER they appear
-        (matching every other expression-evaluation-order convention
-        in this compiler), a key simply never mentioned in the literal
-        keeps festina_http_literal_new's own zero-value default for it
-        (empty text for url/method, festina_null_int() for code, an
-        empty map for headers, no body)."""
+        """claude.md #162 (extended by #163's `callback`): `http x =
+        {...}` -- and `req.send({...})`'s own inline-response form --
+        build a fresh http value via festina_http_literal_new from a
+        MapLit's entries. semantic.py's own _validate_http_lit already
+        confirmed every key is one of url/method/code/headers/body/
+        callback with the right value type, so this only has to
+        emit+coerce each one and make the single call; entries are
+        evaluated in the SOURCE ORDER they appear (matching every other
+        expression-evaluation-order convention in this compiler), a key
+        simply never mentioned in the literal keeps
+        festina_http_literal_new's own zero-value default for it (empty
+        text for url/method, festina_null_int() for code, an empty map
+        for headers, no body, `null` -- no callback -- for callback)."""
         self.uses_http = True
         url_val = self.string_const("")
         method_val = self.string_const("")
@@ -3931,6 +3971,7 @@ class CodeGen:
         headers_val = "null"
         body_ptr = "null"
         body_len_val = "0"
+        callback_val = "null"
         cleanups = []  # [(callable taking no args)] run AFTER the literal_new call
         for key_expr, val_expr in maplit.entries:
             key = key_expr.value
@@ -3970,9 +4011,19 @@ class CodeGen:
                     else:
                         self._free_text_temp(e, v, t, lines)
                 cleanups.append(_cleanup_body)
+            elif key == "callback":
+                # claude.md #163: a bare function pointer -- the SAME
+                # runtime representation every other FuncType-typed
+                # value already has (types.py's own doc comment:
+                # "immortal for the life of the process"), so there is
+                # nothing to retain, release, or free here at all --
+                # unlike every other key above, this one is just "emit
+                # the expression, use its value directly."
+                callback_val, _ = self._emit_expr(val_expr, env, lines)
         out = self.tmp()
         lines.append(f"  {out} = call ptr @festina_http_literal_new(ptr {url_val}, ptr {method_val}, "
-                     f"i64 {code_val}, ptr {headers_val}, ptr {body_ptr}, i64 {body_len_val})")
+                     f"i64 {code_val}, ptr {headers_val}, ptr {body_ptr}, i64 {body_len_val}, "
+                     f"ptr {callback_val})")
         for cleanup in cleanups:
             cleanup()
         return out, types_mod.HttpType()
@@ -4412,6 +4463,30 @@ class CodeGen:
             # entry, which an http literal's genuinely heterogeneous
             # field set (text/int/map/body) can never satisfy.
             return self._emit_http_lit(node, env, lines)
+        if isinstance(expected_type, types_mod.HttpType):
+            lit = _http_send_lit_receiver(node)
+            if lit is not None:
+                # claude.md #164: `http req = {...}.send()` -- builds
+                # the literal exactly like the plain `http x = {...}`
+                # case just above, THEN also dispatches the send, and
+                # returns the SAME pointer for `req`'s own binding to
+                # take ownership of -- no release here (unlike a bare
+                # `{...}.send()` expression-statement, which DOES
+                # release it -- see _release_http_send_receiver): this
+                # value doesn't die at the end of the statement, `req`
+                # keeps living. Safe specifically because the receiver
+                # is ALWAYS a fresh MapLit here (semantic.py's own
+                # _http_send_lit_receiver only ever matches that
+                # shape) -- nothing else could possibly hold a
+                # reference to it yet, so handing it straight to `req`
+                # with no extra retain is exactly the same "moves,
+                # doesn't copy" reasoning every other fresh-value
+                # VarDecl binding already relies on.
+                out, out_type = self._emit_http_lit(lit, env, lines)
+                self.uses_http = True
+                self.uses_https = True
+                lines.append(f"  call void @festina_http_send_client_dispatch(ptr {out})")
+                return out, out_type
         if isinstance(node, ast.MapLit):
             # claude.md #156: ast.MapLit itself has no amor-vs-plain
             # distinction (the same `{k: v, ...}` syntax either way) --
@@ -5165,13 +5240,18 @@ class CodeGen:
             # leak one reference every time .searchParams is read).
             self._minted_values.add(id(expr))
             return out, result_type
-        if isinstance(obj_type, types_mod.HttpType) and expr.prop in ("url", "method", "code", "headers"):
-            # claude.md #162: url/method/code are owned dedicated
-            # accessor calls (see festina_runtime_http.c's own
-            # FestinaHttpValue doc comment -- codegen never lays these
-            # fields out itself, same reasoning img.width/.height
-            # already have); headers is now the SAME live map every
-            # read (retained on the way out), not a rebuild.
+        if isinstance(obj_type, types_mod.HttpType) and expr.prop in (
+                "url", "method", "code", "headers", "callback"):
+            # claude.md #162 (extended by #163's `callback`): url/
+            # method/code are owned dedicated accessor calls (see
+            # festina_runtime_http.c's own FestinaHttpValue doc comment
+            # -- codegen never lays these fields out itself, same
+            # reasoning img.width/.height already have); headers is now
+            # the SAME live map every read (retained on the way out),
+            # not a rebuild; callback is a bare function pointer,
+            # returned as-is -- no ownership question at all, the same
+            # reason _emit_http_lit's own callback handling needs no
+            # cleanup lambda either.
             self.uses_http = True
             out = self.tmp()
             if expr.prop == "url":
@@ -5183,6 +5263,9 @@ class CodeGen:
             elif expr.prop == "code":
                 lines.append(f"  {out} = call i64 @festina_http_code(ptr {obj_val})")
                 result_type = INT
+            elif expr.prop == "callback":
+                lines.append(f"  {out} = call ptr @festina_http_callback(ptr {obj_val})")
+                result_type = types_mod.FuncType((types_mod.HttpType(),), None)
             else:
                 lines.append(f"  {out} = call ptr @festina_http_headers(ptr {obj_val})")
                 result_type = types_mod.MapType(TEXT)
@@ -5430,6 +5513,22 @@ class CodeGen:
         if not self._is_owning_refcounted_source(obj_expr):
             return
         lines.append(f"  call void {self._release_fn_for(obj_type)}(ptr {obj_val})")
+
+    def _release_http_send_receiver(self, obj_expr, obj_val, lines):
+        """claude.md #164: `.send()`'s own receiver-release, used
+        instead of the generic _release_owned_receiver above for
+        exactly one reason -- `obj_expr` may be a raw ast.MapLit
+        (`{...}.send()`, or `http {...}`'s desugared form), which
+        _is_owning_refcounted_source was never taught to recognize as
+        owning (see _emit_http_lit's own doc comment for why: no other
+        http-adjacent value could be built from a bare MapLit before
+        claude.md #162). Without this, an anonymous `{...}.send()` --
+        no named variable anywhere to release it later -- would leak
+        its own freshly-built http value every time. HttpType is
+        always refcounted (_is_refcounted's own tuple), so unlike the
+        generic version this skips that check entirely."""
+        if self._is_owning_refcounted_source(obj_expr) or isinstance(obj_expr, ast.MapLit):
+            lines.append(f"  call void @festina_release_http(ptr {obj_val})")
 
     def _load_field_value(self, ptr, ftype, lines):
         """Loads one field, giving a struct/arr[T]/map[T]-typed one real
@@ -8123,6 +8222,25 @@ class CodeGen:
                         f"ptr {names_global}, i32 {ncols}, ptr {arg_val})")
                     self._free_text_temp(expr.args[0], arg_val, arg_type, lines)
                     return out, BOOL
+            # claude.md #165: <text>.callback(fn:func[blob]:void) -- a
+            # non-blocking blob load. `fn`'s own inferred FuncType is
+            # what tells this apart from an ordinary blob load
+            # entirely (semantic.py already confirmed it's exactly
+            # func[blob]:void -- img/aud aren't supported yet) --
+            # dispatches through festina_blob_load_dispatch, the exact
+            # same null-callback-means-blocking shape
+            # festina_http_send_client_dispatch already established.
+            if callee.prop == "callback":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if obj_type == TEXT:
+                    fn_val, _fn_type = self._emit_expr(expr.args[0], env, lines)
+                    self.uses_async_io = True
+                    out = self.tmp()
+                    lines.append(
+                        f"  {out} = call ptr @festina_blob_load_dispatch(ptr {obj_val}, "
+                        f"ptr {fn_val})")
+                    self._free_text_temp(callee.obj, obj_val, obj_type, lines)
+                    return out, BLOB
             # claude.md #110: save()/saveCopy() on blob, img or aud. One
             # branch for all three, dispatched on the receiver's type --
             # the runtime functions differ only in which struct's path
@@ -8223,7 +8341,22 @@ class CodeGen:
             # above (an optional code/headers pair, and an any-typed
             # first argument).
             if callee.prop == "send":
-                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                # claude.md #164: `{...}.send()` -- the receiver ITSELF
+                # is a raw MapLit (semantic.py's own matching check
+                # already confirmed this can only mean an http
+                # literal -- sockets have no literal syntax at all) --
+                # built via the exact same _emit_http_lit an
+                # `http x = {...}` VarDecl already uses, bypassing the
+                # generic _emit_expr(callee.obj, ...) entirely, since
+                # that path has no notion of "build an http value" for
+                # a bare MapLit (see _emit_http_lit's own doc comment).
+                # `http {...}` (parser.py's own statement-level
+                # shorthand) desugars to this identical AST shape, so
+                # this one branch covers both spellings.
+                if isinstance(callee.obj, ast.MapLit):
+                    obj_val, obj_type = self._emit_http_lit(callee.obj, env, lines)
+                else:
+                    obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if isinstance(obj_type, types_mod.HttpType):
                     # claude.md #162: send() is now overloaded by ARITY
                     # -- see semantic.py's own comment on this same
@@ -8238,10 +8371,19 @@ class CodeGen:
                         # unconditional "the compiler can't know a
                         # runtime string's scheme in advance" reasoning
                         # openSecurePort()'s own uses_https already
-                        # established.
+                        # established. claude.md #163: dispatches
+                        # through festina_http_send_client_dispatch, not
+                        # festina_http_send_client directly -- that
+                        # function checks obj_val's own `.callback` at
+                        # RUNTIME (codegen has no way to know it in
+                        # advance) and decides blocking vs. a background
+                        # worker from there; either way this call
+                        # returns immediately from codegen's own point
+                        # of view, since the blocking case is just as
+                        # synchronous as it always was, one call deeper.
                         self.uses_https = True
-                        lines.append(f"  call void @festina_http_send_client(ptr {obj_val})")
-                        self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                        lines.append(f"  call void @festina_http_send_client_dispatch(ptr {obj_val})")
+                        self._release_http_send_receiver(callee.obj, obj_val, lines)
                         return "0", None
                     # The SERVER side -- send obj_val's own live
                     # connection a response built from expr.args[0], an
@@ -8265,7 +8407,7 @@ class CodeGen:
                         # value could be built from one before this
                         # entry.
                         lines.append(f"  call void {self._release_fn_for(res_type)}(ptr {res_val})")
-                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                    self._release_http_send_receiver(callee.obj, obj_val, lines)
                     return "0", None
                 if isinstance(obj_type, types_mod.SocketType):
                     # claude.md #151: blob sends as a binary frame,
@@ -9125,6 +9267,12 @@ class CodeGen:
         # dispatch branch) should gate this.
         if self.uses_https:
             main_lines.append("  call void @festina_register_tls_hooks()")
+        if self.uses_async_io:
+            # claude.md #165: same reasoning/placement as
+            # festina_register_tls_hooks() just above -- this has
+            # nothing to do with SQLite either, gated purely on
+            # self.uses_async_io.
+            main_lines.append("  call void @festina_register_async_io_hooks()")
         # self.uses_sqlite/self.uses_graphics are only reliably set by
         # this point because every function body (self.func_defs) and
         # every entry statement (the loop above) has already been
@@ -9214,13 +9362,21 @@ class CodeGen:
             # an X11 event loop), so this is never reached at the same
             # time uses_graphics is true.
             main_lines.append("  call void @festina_run_http_loop()")
-        elif self.uses_timers:
+        elif self.uses_timers or self.uses_async_io:
             # No window, but setTimeout/setInterval callbacks still need
             # a blocking loop to fire in -- festina_run_timer_loop is the
             # pure-POSIX (nanosleep-based, no X11 at all) equivalent that
             # lives in the core translation unit, so a timers-only
             # program never needs to link the graphics object file just
-            # to wait for its callbacks.
+            # to wait for its callbacks. claude.md #165: `or
+            # self.uses_async_io` -- a program using ONLY blob/img/aud's
+            # own `.callback()` form (no openPort(), no graphics, not
+            # even a timer) still needs SOME loop to wait in for a
+            # background load to finish, and festina_run_timer_loop
+            # already checks the shared async-io hooks each iteration
+            # regardless of why it was entered (see its own doc
+            # comment) -- so widening this ONE condition is the whole
+            # fix; no new branch needed.
             main_lines.append("  call void @festina_run_timer_loop()")
         # claude.md #126 round nine: unconditional, last thing main()
         # does -- @__festina_db defaults to (and stays) null for a
