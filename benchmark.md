@@ -335,26 +335,26 @@ _Last run: 2026-08-25 on this machine, `wrk -t4 -c50 -d5s` per route -- see benc
 
 | Language | Requests/sec | Avg latency | Transfer/sec |
 |---|---|---|---|
-| Festina | 35,384 | 1.26 ms | 3.44 MB/s |
-| Rust | 39,409 | 1.01 ms | 3.65 MB/s |
-| Go | 21,627 | 2.07 ms | 2.00 MB/s |
-| Bun | 19,545 | 2.34 ms | 2.50 MB/s |
+| Festina | 33,370 | 1.41 ms | 3.25 MB/s |
+| Rust | 38,084 | 1.14 ms | 3.52 MB/s |
+| Go | 20,653 | 2.17 ms | 1.91 MB/s |
+| Bun | 14,156 | 3.37 ms | 1.81 MB/s |
 
 ### `json` (`/json`)
 
 | Language | Requests/sec | Avg latency | Transfer/sec |
 |---|---|---|---|
-| Festina | 32,526 | 1.75 ms | 3.78 MB/s |
-| Rust | 38,865 | 1.04 ms | 4.34 MB/s |
-| Go | 22,453 | 2.00 ms | 2.51 MB/s |
-| Bun | 14,374 | 3.46 ms | 2.11 MB/s |
+| Festina | 32,643 | 1.41 ms | 3.80 MB/s |
+| Rust | 38,570 | 1.06 ms | 4.30 MB/s |
+| Go | 21,340 | 2.24 ms | 2.38 MB/s |
+| Bun | 13,985 | 3.09 ms | 2.05 MB/s |
 
 <!-- HTTP_BENCHMARK_RESULTS_END -->
 
 ### Reading these numbers
 
 - **claude.md #155 roughly doubled Festina's own numbers here** (from
-  ~17.6k/17.8k req/s to ~35k/32.5k) -- found by reviewing
+  ~17.6k/17.8k req/s to ~33k/32.6k) -- found by reviewing
   `festina_runtime_http.c` specifically for this benchmark's own sake,
   not by guessing at likely hot spots. The single biggest lever:
   `festina_http_send` used to write a response as 4-5 separate
