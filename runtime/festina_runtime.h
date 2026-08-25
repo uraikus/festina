@@ -1290,6 +1290,14 @@ int64_t festina_array_index_of(void *hdr, int64_t elem_size,
                                 const void *value, int8_t is_text);
 void festina_release_array(void *payload);
 void festina_release_map(void *payload);
+/* claude.md #167: the value-aware counterpart to festina_release_map,
+ * for a map[text]-shaped payload this runtime built directly in C
+ * (never through codegen, which already generates its own value-aware
+ * wrapper per Festina-level map[text] variable) -- frees each entry's
+ * own owned text VALUE before deferring to the same entries/header
+ * cleanup festina_release_map itself uses. See that function's own doc
+ * comment for why the generic one is wrong for this shape. */
+void festina_release_text_map(void *payload);
 
 /* claude.md #151: openPort/on request/on upgrade/on message/on
  * socketClose -- a single-threaded HTTP + WebSocket server, in its

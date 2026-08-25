@@ -93,7 +93,17 @@ could feed a program that also happens to read stdin/argv. Concretely:
   cap, could still exhaust memory. No rate limiting of any kind exists;
   a program facing genuinely hostile traffic needs that in front of it
   (a reverse proxy, a firewall), the same way any other minimal server
-  implementation would.
+  implementation would. claude.md #167's keep-alive means a connection
+  can now legitimately stay open with no request in flight at all
+  (waiting to be reused) — the cap above still applies to whatever a
+  connection is actually buffering, and an idle keep-alive connection is
+  closed automatically after ~15 seconds of nobody using it (see api.md's
+  own Keep-alive section), so this doesn't add an unbounded-lifetime
+  connection to the list above; it does mean a client that opens many
+  connections and sends just enough on each to avoid the idle timeout
+  could hold more connections open for longer than the previous
+  one-request-then-close model ever allowed — the same reverse-proxy/
+  firewall answer above still applies to a client doing that on purpose.
 - **The request parser (HTTP/1.1 headers, WebSocket frames) is new,
   hand-written C parsing untrusted bytes** — the single largest new
   category of memory-unsafety risk this language has ever taken on,
@@ -233,3 +243,17 @@ in claude.md and tests/CONTRACT.md:
   a broken socket at all — `send()` just returns an error — so the
   Windows port (windows.md) needed no equivalent fix, only the same
   return-value check every platform already does.
+- **Every `map[text]` this runtime ever built directly in C leaked its
+  own values** (claude.md #167, found while verifying keep-alive under
+  Valgrind, then confirmed pre-existing and unrelated to it): a request
+  header, a socket's own `state`, a URL's own `searchParams` — every one
+  of those maps' VALUES is owned, heap-allocated text, but all four were
+  released through the generic, deliberately value-blind
+  `festina_release_map` (correct for `map[int]`/`map[bool]`, wrong for
+  `map[text]`) instead of the value-aware release codegen already
+  generates for every Festina-visible `map[text]` variable. A leak, not
+  a use-after-free or corruption — confirmed with a debug-symbol build
+  under Valgrind, isolated from keep-alive by reproducing byte-for-byte
+  on a single plain request against the code exactly as it stood before
+  that entry. Fixed with `festina_release_text_map`, a C-side equivalent
+  of codegen's own wrapper, used at all four sites.

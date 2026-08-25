@@ -1992,12 +1992,39 @@ u.hash                                // text -- '#frag'
 Every field is read-only — a `url` is built once, by `parseURL()`, and
 never mutated afterward.
 
+### Keep-alive (claude.md #167)
+
+A server connection stays open for another request once a response
+finishes, instead of closing after every single one — ordinary HTTP/1.1
+semantics, nothing to opt into:
+
+- **HTTP/1.1 requests default to keep-alive**, matching every real
+  client (browsers, `curl`, `http.client`, ...). Send `Connection:
+  close` on the request to close after that one response anyway.
+- **HTTP/1.0 requests default to close**, unless the request itself
+  sends `Connection: keep-alive`.
+- **An idle connection — nothing in flight, just open and waiting to be
+  reused — is closed automatically after about 15 seconds** with no new
+  request. A slow client still sending its OWN request (headers or body
+  trickling in) is never affected by this; only genuinely idle time
+  between requests counts.
+- Combines with everything else `openPort()` already does, including
+  claude.md #166's graphics combination and WebSocket upgrades (an `on
+  upgrade` connection leaves HTTP request/response handling behind
+  entirely, so keep-alive has nothing to do there — it was never
+  "closing" a WebSocket connection to begin with).
+
+Nothing about handling a single request changes — `on request` fires
+once per request exactly as before, `req.headers`/`req.toText()`/etc.
+describe just that one request, and a fresh `req` value arrives for the
+next one on the same connection. The `Connection` response header is
+set automatically to match; a program's own `req.send()`/`req.ok()`/
+`req.redirect()` never need to think about it.
+
 ### <a name="http-limitations"></a>Limitations
 
 - **HTTP/1.1 request-line + headers + a `Content-Length` body only.**
-  No chunked transfer-encoding, no HTTP/1.0-specific behavior.
-- **No keep-alive.** Every response closes the connection afterward —
-  each request is its own TCP connection, start to finish.
+  No chunked transfer-encoding.
 - **No WebSocket fragmentation, ping/pong sent by this runtime, or
   extensions.** A fragmented message (a frame with `FIN=0`, or a
   continuation frame) closes the connection rather than being silently

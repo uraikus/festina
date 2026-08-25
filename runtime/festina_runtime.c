@@ -1029,7 +1029,12 @@ void festina_release_url(void *payload) {
     free(u->hostname);
     free(u->pathname);
     free(u->hash);
-    festina_release_map(u->search_params);
+    /* claude.md #167: festina_release_text_map, not the generic
+     * festina_release_map -- search_params' own values are owned text
+     * (festina_parse_search_params builds each one via
+     * festina_url_decode, the same shape festina_text_own produces),
+     * see that function's own doc comment for the leak this fixes. */
+    festina_release_text_map(u->search_params);
     free(u);
 }
 
@@ -4101,6 +4106,42 @@ void festina_release_map(void *payload) {
      * scope limitation as festina_release_array above. */
     int64_t count = *(int64_t *)payload;
     void *entries = *(void **)((char *)payload + sizeof(int64_t));
+    festina_map_free_entries(count, entries);
+    free((char *)payload - sizeof(int64_t));
+}
+
+/* claude.md #167: found while chasing an unrelated keep-alive leak,
+ * confirmed pre-existing and unrelated to it (reproduces identically on
+ * a single plain request against the code exactly as it stood before
+ * this entry) -- festina_release_map above is deliberately value-blind
+ * (see its own doc comment), correct for a map[T] whose values need no
+ * freeing (map[int], map[bool], ...) but WRONG for one whose values are
+ * themselves owned, heap-allocated text -- every codegen-generated
+ * map[text] variable already gets a DIFFERENT, value-aware release
+ * function instead of the generic one (_release_fn_for_map in
+ * codegen.py, which frees each value through festina_map_for_each
+ * before deferring to festina_map_free_entries for the rest) precisely
+ * because of this. This runtime builds a handful of map[text] values
+ * directly in C, never through codegen, and every one of them was
+ * calling the wrong (generic) release: an inbound request's own
+ * `req.headers` and any http value's `.headers` in general
+ * (festina_runtime_http.c's festina_release_http and its outbound-
+ * response overwrite site), `socket.state` (festina_conn_teardown), and
+ * `url.searchParams` (festina_release_url, just below) all leaked every
+ * value they ever held. This is the C-side equivalent of codegen's own
+ * wrapper -- frees each value via festina_map_for_each first, then
+ * defers to the exact same festina_map_free_entries/header-free
+ * festina_release_map itself uses. */
+static void festina_free_map_text_value(int64_t raw, const char *key) {
+    (void)key;
+    free((void *)(intptr_t)raw);
+}
+
+void festina_release_text_map(void *payload) {
+    if (!festina_release_check(payload)) return;
+    int64_t count = *(int64_t *)payload;
+    void *entries = *(void **)((char *)payload + sizeof(int64_t));
+    festina_map_for_each(count, entries, festina_free_map_text_value);
     festina_map_free_entries(count, entries);
     free((char *)payload - sizeof(int64_t));
 }

@@ -296,22 +296,34 @@ separately, `apt install wrk`/`brew install wrk`).
 
 **Equivalent logic, not equivalent idiom, the same rule the five
 programs above already follow.** Festina's HTTP server
-(`festina_runtime_http.c`, claude.md #151) is deliberately
-single-threaded (one connection serviced at a time) and has no
-keep-alive (every response closes the connection -- api.md's HTTP
-Limitations). Rust's and Go's servers here are hand-rolled raw-socket
-implementations with a single-threaded, sequential accept loop and the
-same close-after-response behavior -- not `hyper`/`net/http`'s own
-default (multi-threaded, keep-alive-capable) servers, which would be
-measuring a mature framework's concurrency model against Festina's
-single-threaded one rather than the same connection-handling logic in
-four languages. Bun is the one exception: it uses `Bun.serve()`, its
-own native HTTP implementation, since there is no reason to hand-roll
-sockets in a runtime that ships a fast one already (the same "each
-language uses its own normal toolchain" rule the Methodology above
-states) -- with `Connection: close` set explicitly on every response so
-it closes each connection the same way the other three do, rather than
-its own keep-alive support doing the winning here.
+(`festina_runtime_http.c`, claude.md #151) was, when this section was
+last measured, deliberately single-threaded (one connection serviced at
+a time) and had no keep-alive (every response closed the connection).
+Rust's and Go's servers here are hand-rolled raw-socket implementations
+with a single-threaded, sequential accept loop and the same
+close-after-response behavior -- not `hyper`/`net/http`'s own default
+(multi-threaded, keep-alive-capable) servers, which would be measuring
+a mature framework's concurrency model against Festina's single-threaded
+one rather than the same connection-handling logic in four languages.
+Bun is the one exception: it uses `Bun.serve()`, its own native HTTP
+implementation, since there is no reason to hand-roll sockets in a
+runtime that ships a fast one already (the same "each language uses its
+own normal toolchain" rule the Methodology above states) -- with
+`Connection: close` set explicitly on every response so it closes each
+connection the same way the other three do, rather than its own
+keep-alive support doing the winning here.
+
+**Stale as of claude.md #167: Festina itself now supports keep-alive**
+(default for HTTP/1.1, see api.md's HTTP Limitations), so the
+deliberately-matched "no keep-alive anywhere" methodology above no
+longer describes Festina's own real connection-handling -- the numbers
+below still reflect the OLD, matched, close-after-every-response
+comparison (none of the four servers, Festina included, were re-run
+after #167 shipped). Rerunning this fairly now would mean adding
+keep-alive to the Rust/Go raw-socket servers too (and letting Bun's own
+default back in, rather than disabling it) to keep the comparison
+apples-to-apples against Festina's NEW behavior -- a real follow-up, not
+done here.
 
 Each `wrk` run: 4 threads, 50 open connections, 5 seconds, against one
 route at a time (a JIT-inclined runtime like Bun gets no separate

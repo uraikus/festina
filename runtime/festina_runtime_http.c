@@ -306,6 +306,43 @@ typedef struct {
     int64_t body_len;
     int request_ready;
     int responded;    /* ok/redirect/send/upgrade -- see festina_runtime.h */
+    /* claude.md #167: whether THIS request's own response should keep
+     * the connection open for another one, decided once, right after
+     * this request's headers are parsed (see festina_try_parse_request)
+     * -- HTTP/1.1 defaults to keep-alive unless the request sent
+     * `Connection: close`; HTTP/1.0 defaults to close unless it sent
+     * `Connection: keep-alive`. Read by festina_http_ok/_redirect/_send
+     * to pick which `Connection:` header to answer with, and by
+     * festina_dispatch_request's own tail to decide between
+     * festina_conn_reset_for_next_request and festina_conn_teardown. */
+    int keep_alive;
+    /* claude.md #167: festina_now_seconds() as of the last time this
+     * connection had a REASON to be considered idle-since -- reset every
+     * time it becomes newly idle (accepted, or just reset for another
+     * request) in festina_conn_new_slot/festina_conn_reset_for_next_request.
+     * Read by festina_reap_idle_keepalive_connections to close a
+     * keep-alive connection nobody is using any more rather than holding
+     * its fd/slot open forever -- see that function's own doc comment. */
+    double last_activity;
+    /* claude.md #167: set once, in festina_conn_reset_for_next_request
+     * -- true means this connection has already completed at least one
+     * full request/response cycle and is now idle FOR REUSE, as opposed
+     * to a freshly accepted connection that simply hasn't sent its
+     * FIRST request yet (indistinguishable from an idle reused one by
+     * buf_len/headers_parsed alone -- both are "nothing parsed, nothing
+     * buffered"). Read only by shutdown's own immediate-close-idle-
+     * connections step (festina_run_http_loop) -- reaping THIS kind of
+     * idle connection right away, rather than waiting out the grace
+     * period, is only safe once it's actually known nothing more is
+     * coming; a connection that hasn't sent its first request yet might
+     * still be about to (confirmed as a real bug during development: a
+     * test connecting right before SIGTERM, then sending its one and
+     * only request just after, lost its response entirely without this
+     * guard). festina_reap_idle_keepalive_connections' own TIMEOUT-based
+     * reap has no such problem -- an idle connection that never sends
+     * anything at all for the full idle window is a reasonable target
+     * either way, first request or not. */
+    int served_a_request;
 
     /* claude.md #155: festina_try_parse_request's own resumable-scan
      * state -- headers_parsed guards the request-line/header-parsing
@@ -720,6 +757,7 @@ static FestinaConn *festina_conn_new_slot(void) {
     c->alive = 1;
     c->mode = FESTINA_CONN_READING_REQUEST;
     c->content_length = -1;
+    c->last_activity = festina_now_seconds();
     festina_conn_index_put(c->conn_id, slot);
     return c;
 }
@@ -739,7 +777,12 @@ static void festina_conn_teardown(FestinaConn *c) {
     free(c->path);
     festina_headers_free(c->headers, c->header_count);
     free(c->body);
-    if (c->state_map) festina_release_map(c->state_map);
+    /* claude.md #167: festina_release_text_map, not the generic
+     * festina_release_map -- socket.state's own values are ordinary
+     * owned text (set via `s.state[k] = v`, the same map[text]
+     * semantics any other Festina map[text] has), see that function's
+     * own doc comment for the leak this fixes. */
+    if (c->state_map) festina_release_text_map(c->state_map);
     c->alive = 0;
     festina_conn_index_remove(c->conn_id);
 
@@ -753,10 +796,134 @@ static void festina_conn_teardown(FestinaConn *c) {
     g_conn_free_slots[g_conn_free_count++] = slot;
 }
 
+/* claude.md #167: a keep-alive response's own counterpart to
+ * festina_conn_teardown -- the SAME connection (fd, tls state, conn_id,
+ * socket.state map) serves another request, so only per-request parsing
+ * state is torn down and reset, exactly mirroring what
+ * festina_conn_new_slot itself zeroes for a brand new connection. Any
+ * bytes already read past THIS request's own body are shifted down to
+ * the front of buf rather than discarded -- ordinarily there won't be
+ * any (a well-behaved client waits for the response before sending the
+ * next request), but a client that pipelines anyway (sends request 2
+ * before reading response 1) may already have handed bytes for it to
+ * this same recv() call, and simply waiting for another poll()-readable
+ * event to notice them could deadlock: nothing else is coming from a
+ * client that already sent everything and is now just waiting on
+ * responses. This runtime still doesn't PARSE pipelined requests
+ * concurrently or reorder anything -- see festina_conn_readable's own
+ * dispatch loop, which just calls festina_try_parse_request again
+ * immediately after a keep-alive reset, so a second buffered request is
+ * picked up on the very next pass rather than left to wait. */
+static void festina_conn_reset_for_next_request(FestinaConn *c) {
+    size_t consumed = c->body_start_offset + (c->content_length > 0 ? (size_t)c->content_length : 0);
+    size_t remaining = consumed < c->buf_len ? c->buf_len - consumed : 0;
+    if (remaining > 0) memmove(c->buf, c->buf + consumed, remaining);
+    c->buf_len = remaining;
+
+    free(c->method); c->method = NULL;
+    free(c->path); c->path = NULL;
+    festina_headers_free(c->headers, c->header_count);
+    c->headers = NULL;
+    c->header_count = 0;
+    c->header_capacity = 0;
+    free(c->body); c->body = NULL;
+    c->body_len = 0;
+    c->content_length = -1;
+    c->request_ready = 0;
+    c->responded = 0;
+    c->keep_alive = 0;
+    c->headers_parsed = 0;
+    c->header_scan_pos = 0;
+    c->body_start_offset = 0;
+    c->last_activity = festina_now_seconds();
+    c->served_a_request = 1;
+}
+
+/* claude.md #167: bounds how long a keep-alive connection may sit open
+ * with no request in flight before festina_reap_idle_keepalive_
+ * connections (below) closes it -- without this, a client that opens a
+ * connection, sends one request, and simply never sends another (or
+ * closes) would hold an fd and a connection-table slot open forever;
+ * nothing else in this runtime limits the NUMBER of connections at all
+ * (see security.md), so an unbounded idle lifetime would be a real, if
+ * slow, resource-exhaustion path this feature would otherwise introduce
+ * that didn't exist before it (every previously-alive connection WAS
+ * mid-request, by construction, before keep-alive gave a connection a
+ * reason to be alive AND idle at once). 15 seconds is a deliberately
+ * modest default -- generous enough for a real client's normal think-
+ * time between reusing a connection (a browser loading a page's sub-
+ * resources, a script issuing a handful of requests in a loop), short
+ * enough that an abandoned connection is reclaimed promptly rather than
+ * accumulating. Overridable via FESTINA_HTTP_KEEPALIVE_IDLE_SECONDS --
+ * not a documented language-level configuration knob (same tier as
+ * FESTINA_SHUTDOWN_GRACE_SECONDS, whose own festina_shutdown_grace_
+ * seconds this mirrors exactly), but real, checked-in-tests behavior:
+ * it's what lets tests exercise the reap path in a fraction of a second
+ * rather than actually waiting out the production default. */
+#define FESTINA_HTTP_KEEPALIVE_IDLE_SECONDS_DEFAULT 15.0
+
+static double festina_keepalive_idle_seconds(void) {
+    const char *env = getenv("FESTINA_HTTP_KEEPALIVE_IDLE_SECONDS");
+    if (env) {
+        double v = atof(env);
+        if (v > 0.0) return v;
+    }
+    return FESTINA_HTTP_KEEPALIVE_IDLE_SECONDS_DEFAULT;
+}
+
+/* claude.md #167: closes any keep-alive connection that's had no
+ * request in flight (mode still READING_REQUEST, nothing buffered,
+ * nothing parsed) for longer than festina_keepalive_idle_seconds().
+ * Deliberately does NOT touch a connection with a request actually in
+ * progress (buf_len > 0 or headers_parsed) -- that's pre-existing
+ * behavior this entry doesn't change at all (a slow client mid-request
+ * was always left alone, bounded only by FESTINA_HTTP_MAX_BUFFER).
+ * Called once per iteration from both festina_run_http_loop and
+ * festina_http_service_once (claude.md #166), the same "cheap, no-op
+ * when nothing needs it" placement festina_fire_expired_timers/
+ * festina_async_drain_completed already have in the former. */
+static void festina_reap_idle_keepalive_connections(void) {
+    double now = festina_now_seconds();
+    double idle_seconds = festina_keepalive_idle_seconds();
+    for (int64_t i = 0; i < g_conn_count; i++) {
+        FestinaConn *c = &g_conns[i];
+        if (!c->alive || c->mode != FESTINA_CONN_READING_REQUEST) continue;
+        if (c->buf_len > 0 || c->headers_parsed) continue; /* a request IS in flight */
+        if (now - c->last_activity > idle_seconds) {
+            festina_conn_teardown(c);
+        }
+    }
+}
+
+/* claude.md #167: the earliest moment ANY currently-idle keep-alive
+ * connection will time out, or -1.0 if none are idle at all -- folded
+ * into festina_run_http_loop's own poll() timeout the same way the next
+ * timer deadline and the shutdown drain deadline already are, so an
+ * otherwise-quiet server actually wakes up promptly to reap an
+ * abandoned connection instead of only noticing on the NEXT unrelated
+ * poll() wakeup (which might be a very long time away, or never, on an
+ * otherwise idle server). festina_http_service_once (claude.md #166)
+ * has no equivalent need -- the graphics loop that calls it already
+ * wakes on its own short, unconditional bound whenever any connection
+ * is alive at all (see festina_http_service_outstanding_impl). */
+static double festina_earliest_keepalive_deadline(void) {
+    double earliest = -1.0;
+    double idle_seconds = festina_keepalive_idle_seconds();
+    for (int64_t i = 0; i < g_conn_count; i++) {
+        FestinaConn *c = &g_conns[i];
+        if (!c->alive || c->mode != FESTINA_CONN_READING_REQUEST) continue;
+        if (c->buf_len > 0 || c->headers_parsed) continue;
+        double deadline = c->last_activity + idle_seconds;
+        if (earliest < 0.0 || deadline < earliest) earliest = deadline;
+    }
+    return earliest;
+}
+
 /* ---- HTTP/1.1 request parsing -- request-line + headers + an
  * optional Content-Length body only (see festina_runtime.h's own top
  * comment for the full scope decision: no chunked encoding, no
- * pipelining, no keep-alive). ---- */
+ * pipelining -- see claude.md #167 for keep-alive, which this scope
+ * note no longer excludes). ---- */
 static void festina_try_parse_request(FestinaConn *c) {
     if (c->request_ready) return;
 
@@ -806,12 +973,21 @@ static void festina_try_parse_request(FestinaConn *c) {
         while (p < limit && *p != ' ') p++;
         if (p >= limit) { c->alive = 0; return; }
         size_t path_len = (size_t)(p - path_start);
-        /* The rest of the line (HTTP version) is read but not kept --
-         * this runtime doesn't distinguish HTTP/1.0 from HTTP/1.1
-         * behavior. */
+        /* claude.md #167: the rest of the line (HTTP version) now
+         * matters for exactly one thing -- keep-alive's own default
+         * when the request sends no `Connection` header at all.
+         * `version_start` still points at the space right after
+         * `path_start`'s own while loop stopped (not yet consumed),
+         * same as before this entry; only whether it's read anywhere
+         * is new. */
+        const char *version_start = p;
         while (p < limit && *p != '\r') p++;
+        const char *version_end = p;
         if (p < limit) p++;
         if (p < limit && *p == '\n') p++;
+        const char *v = version_start;
+        while (v < version_end && *v == ' ') v++;
+        int is_http_1_0 = ((size_t)(version_end - v) >= 8 && strncasecmp(v, "HTTP/1.0", 8) == 0);
 
         c->method = malloc(method_len + 1);
         c->path = malloc(path_len + 1);
@@ -845,6 +1021,20 @@ static void festina_try_parse_request(FestinaConn *c) {
         c->content_length = cl ? strtoll(cl, NULL, 10) : 0;
         if (c->content_length < 0) c->content_length = 0;
         c->body_start_offset = (size_t)((const uint8_t *)limit - c->buf) + 4;
+        /* claude.md #167: `Connection: close` always forces it, exact
+         * match, case-insensitive -- the same "exact token, not a
+         * comma-separated parse" rigor already used for the Upgrade
+         * header a few lines above in festina_http_upgrade. Anything
+         * else (an explicit `Connection: keep-alive`, or no header at
+         * all) falls back to the HTTP version's own default: keep-alive
+         * for 1.1+, close for 1.0 -- ordinary HTTP semantics, and this
+         * runtime's only use for the version it now bothers to read. */
+        const char *conn_hdr = festina_headers_get(c->headers, c->header_count, "connection");
+        if (conn_hdr && strcasecmp(conn_hdr, "close") == 0) {
+            c->keep_alive = 0;
+        } else {
+            c->keep_alive = !is_http_1_0;
+        }
         c->headers_parsed = 1;
     }
 
@@ -1147,7 +1337,19 @@ static void festina_dispatch_request(FestinaConn *c) {
         fallback_value.conn_id = fresh->conn_id;
         festina_http_ok(&fallback_value.url);
     }
-    festina_conn_teardown(fresh);
+    /* claude.md #167: keep_alive was decided once, when this request's
+     * own headers were parsed (festina_try_parse_request) -- read here
+     * rather than re-derived, since by now `fresh->headers`/etc have
+     * already been consulted by whichever of ok()/redirect()/send()
+     * above actually answered (or the fallback just above did). A
+     * websocket upgrade never reaches this line at all (the mode check
+     * above already returned), so keep-alive vs. close is only ever a
+     * question for a connection still in FESTINA_CONN_READING_REQUEST. */
+    if (fresh->keep_alive) {
+        festina_conn_reset_for_next_request(fresh);
+    } else {
+        festina_conn_teardown(fresh);
+    }
 }
 
 static void festina_dispatch_ws_frame(FestinaConn *c, uint8_t opcode,
@@ -1247,9 +1449,33 @@ static void festina_conn_readable(FestinaConn *c) {
         }
     }
     if (c->mode == FESTINA_CONN_READING_REQUEST) {
-        festina_try_parse_request(c);
-        if (!c->alive) return; /* malformed request -- already torn down */
-        if (c->request_ready) festina_dispatch_request(c);
+        /* claude.md #167: a loop, not a single try-then-dispatch --
+         * festina_dispatch_request's own keep-alive path
+         * (festina_conn_reset_for_next_request) can leave buf already
+         * holding a SECOND complete request if the client sent more
+         * than one before this recv() loop, above, drained everything
+         * currently on the wire (see that function's own doc comment
+         * on why simply waiting for another poll()-readable event
+         * could deadlock in that case). Each iteration re-checks
+         * c->alive/request_ready itself, so the loop naturally stops
+         * the moment there's no complete request left buffered --
+         * ordinarily that's true after exactly one iteration, since a
+         * well-behaved client doesn't send request 2 before it's read
+         * response 1. */
+        for (;;) {
+            festina_try_parse_request(c);
+            if (!c->alive) return; /* malformed request -- already torn down */
+            if (!c->request_ready) return; /* need more bytes -- wait for the next poll() */
+            festina_dispatch_request(c);
+            /* dispatch may have torn this connection down (no keep-
+             * alive, or the peer vanished mid-handler -- see
+             * festina_dispatch_request's own comment), switched it to
+             * WebSocket mode, or reset it for another request; refetch
+             * by id and stop looping unless it's still here and still
+             * reading a plain HTTP request. */
+            c = festina_conn_by_id(c->conn_id);
+            if (!c || c->mode != FESTINA_CONN_READING_REQUEST) return;
+        }
     } else {
         for (;;) {
             uint8_t opcode;
@@ -1523,6 +1749,29 @@ void festina_run_http_loop(void) {
                 g_http_draining = 1;
                 g_http_drain_deadline = festina_now_seconds() + festina_shutdown_grace_seconds();
                 festina_close_all_listeners();
+                /* claude.md #167: an idle keep-alive connection that's
+                 * ALREADY served at least one request -- no request in
+                 * flight, just open and waiting to be reused -- has
+                 * nothing left to finish, so it shouldn't hold up the
+                 * grace period the way a connection genuinely mid-
+                 * request does; close it right away, the same instant
+                 * every listener above already is. served_a_request is
+                 * the load-bearing part of this check, not an
+                 * optimization -- a freshly accepted connection that
+                 * simply hasn't sent its FIRST request yet looks
+                 * IDENTICAL by every other field (buf_len == 0,
+                 * !headers_parsed), and closing it here would silently
+                 * drop a request that was genuinely about to arrive
+                 * (confirmed as a real bug during development, not
+                 * theoretical -- see FestinaConn's own doc comment on
+                 * this field). */
+                for (int64_t i = 0; i < g_conn_count; i++) {
+                    FestinaConn *ic = &g_conns[i];
+                    if (ic->alive && ic->mode == FESTINA_CONN_READING_REQUEST
+                            && ic->buf_len == 0 && !ic->headers_parsed && ic->served_a_request) {
+                        festina_conn_teardown(ic);
+                    }
+                }
             }
             /* claude.md #163: an outstanding background request also
              * has to finish before shutdown gives up on it, the same
@@ -1626,6 +1875,14 @@ void festina_run_http_loop(void) {
         if (g_http_draining && (deadline < 0.0 || g_http_drain_deadline < deadline)) {
             deadline = g_http_drain_deadline;
         }
+        /* claude.md #167: same bounding trick, for the same reason --
+         * an idle keep-alive connection's own reap deadline needs to
+         * wake this loop up promptly, not whenever the next unrelated
+         * event happens to. */
+        double keepalive_deadline = festina_earliest_keepalive_deadline();
+        if (keepalive_deadline >= 0.0 && (deadline < 0.0 || keepalive_deadline < deadline)) {
+            deadline = keepalive_deadline;
+        }
         int timeout_ms = -1;
         if (deadline >= 0.0) {
             double remaining = deadline - festina_now_seconds();
@@ -1672,6 +1929,11 @@ void festina_run_http_loop(void) {
         /* claude.md #165: the generic blob/img/aud pool's own drain --
          * a no-op when festina_runtime_async.c was never linked. */
         festina_async_io_drain();
+        /* claude.md #167: reap any keep-alive connection that's been
+         * idle too long -- see its own doc comment. Cheap (a linear
+         * scan already the same size as the poll-set-building one just
+         * above) and a no-op whenever nothing's actually timed out. */
+        festina_reap_idle_keepalive_connections();
     }
 }
 
@@ -1748,6 +2010,14 @@ static void festina_http_service_once(int timeout_ms) {
         }
     }
     festina_async_drain_completed();
+    /* claude.md #167: same reap as festina_run_http_loop's own -- see
+     * its doc comment. The caller (festina_run_event_loop,
+     * festina_runtime_graphics.c) already re-invokes this function on a
+     * short bound whenever any connection is alive at all (see
+     * festina_http_service_outstanding_impl below), so no separate
+     * deadline-bounding is needed here the way festina_run_http_loop's
+     * own poll() timeout needs one. */
+    festina_reap_idle_keepalive_connections();
 }
 
 /* claude.md #166: festina_set_http_service_hooks' outstanding_fn --
@@ -1831,7 +2101,12 @@ void festina_release_http(void *payload) {
     FestinaHttpValue *v = FESTINA_HTTP_FROM_PAYLOAD(payload);
     free(v->url);
     free(v->method);
-    festina_release_map(v->headers);
+    /* claude.md #167: festina_release_text_map, not the generic
+     * festina_release_map -- an http value's own headers map is always
+     * owned text (festina_build_headers_map/req.headers construction,
+     * or a user-built http literal's own map), see that function's own
+     * doc comment for the leak this fixes. */
+    festina_release_text_map(v->headers);
     free(v->body);
     free(v);
 }
@@ -1903,6 +2178,23 @@ static FestinaConn *festina_live_conn(void *payload) {
     return conn_id ? festina_conn_by_id(conn_id) : NULL;
 }
 
+/* claude.md #167: the one piece of every server-side response that now
+ * depends on this request's own keep-alive decision (festina_try_parse_
+ * request, c->keep_alive) -- shared by all three response writers below
+ * rather than duplicated three times. Answering the client's own
+ * question honestly matters here, not just internally: a client that
+ * asked for keep-alive and gets told `Connection: close` back would
+ * (correctly, per HTTP/1.1) close its own end too, silently defeating
+ * the whole feature for that request even though this server intended
+ * to keep it open. */
+static void festina_append_connection_header(FestinaSendBuf *buf, FestinaConn *c) {
+    if (c->keep_alive) {
+        FESTINA_APPEND_LIT(buf, "Connection: keep-alive\r\n\r\n");
+    } else {
+        FESTINA_APPEND_LIT(buf, "Connection: close\r\n\r\n");
+    }
+}
+
 void festina_http_ok(void *payload) {
     FestinaConn *c = festina_live_conn(payload);
     if (!c || c->responded) return;
@@ -1910,7 +2202,8 @@ void festina_http_ok(void *payload) {
     char stack_storage[256];
     FestinaSendBuf buf;
     festina_sendbuf_init(&buf, stack_storage, sizeof(stack_storage));
-    FESTINA_APPEND_LIT(&buf, "HTTP/1.1 200 Festina\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    FESTINA_APPEND_LIT(&buf, "HTTP/1.1 200 Festina\r\nContent-Length: 0\r\n");
+    festina_append_connection_header(&buf, c);
     festina_send_all(c, buf.data, buf.len);
     festina_sendbuf_free(&buf);
 }
@@ -1929,7 +2222,8 @@ void festina_http_redirect(void *payload, const char *url) {
     festina_sendbuf_init(&buf, stack_storage, sizeof(stack_storage));
     FESTINA_APPEND_LIT(&buf, "HTTP/1.1 302 Found\r\nLocation: ");
     if (url) festina_sendbuf_append(&buf, url, strlen(url));
-    FESTINA_APPEND_LIT(&buf, "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    FESTINA_APPEND_LIT(&buf, "\r\nContent-Length: 0\r\n");
+    festina_append_connection_header(&buf, c);
     festina_send_all(c, buf.data, buf.len);
     festina_sendbuf_free(&buf);
 }
@@ -2071,7 +2365,7 @@ void festina_http_send(void *req_payload, void *res_payload) {
     int cl_len = snprintf(cl_line, sizeof(cl_line), "Content-Length: %lld\r\n",
                           (long long)(res->body_len < 0 ? 0 : res->body_len));
     if (cl_len > 0) festina_sendbuf_append(&buf, cl_line, (size_t)cl_len);
-    FESTINA_APPEND_LIT(&buf, "Connection: close\r\n\r\n");
+    festina_append_connection_header(&buf, c);
 
     festina_send_all(c, buf.data, buf.len);
     festina_sendbuf_free(&buf);
@@ -2407,7 +2701,12 @@ void festina_http_send_client(void *payload) {
      * headers/body, no longer needed once the request has actually
      * gone out). */
     v->code = new_code;
-    festina_release_map(v->headers);
+    /* claude.md #167: festina_release_text_map, not the generic
+     * festina_release_map -- an http value's own headers map is always
+     * owned text (festina_build_headers_map/req.headers construction,
+     * or a user-built http literal's own map), see that function's own
+     * doc comment for the leak this fixes. */
+    festina_release_text_map(v->headers);
     v->headers = new_headers;
     free(v->body);
     v->body = new_body;

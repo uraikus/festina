@@ -382,14 +382,18 @@ class TestHttpServer:
         """)
         sock = _socket.create_connection(("127.0.0.1", server.port), timeout=5)
         head = ("POST / HTTP/1.1\r\nHost: x\r\nX-A: hello\r\nX-B: world\r\n"
-                "Content-Length: 10\r\n\r\n")
+                "Connection: close\r\nContent-Length: 10\r\n\r\n")
         sock.sendall(head.encode())
         _time.sleep(0.3)  # force a separate readable event before the body arrives
         sock.sendall(b"0123456789")
         # A single recv() isn't guaranteed to return the whole response
         # in one call (a real, if rare, flake under load) -- read until
-        # the server closes the connection, which it always does after
-        # responding (no keep-alive -- api.md's own HTTP Limitations).
+        # the server closes the connection. claude.md #167: HTTP/1.1
+        # defaults to keep-alive now, so this request sends its own
+        # explicit `Connection: close` to keep this exact read-until-EOF
+        # shape rather than switching to a fixed-length read -- the
+        # split-arrival behavior under test has nothing to do with
+        # keep-alive either way.
         chunks = []
         while True:
             chunk = sock.recv(4096)
@@ -426,6 +430,151 @@ class TestHttpServer:
         for expected in (1, 2, 3):
             _, _, body = server.http_get("/")
             assert body.decode() == str(expected)
+
+
+class TestHttpKeepAlive:
+    """claude.md #167: HTTP/1.1 keep-alive -- the first item off api.md's
+    own http Limitations list (previously "No keep-alive. Every response
+    closes the connection afterward"). `server.http_get`/`http_post`
+    (tests/conftest.py) each open and close their OWN fresh connection,
+    so they can't exercise reuse at all -- every test here drives a raw
+    socket or its own `http.client.HTTPConnection` instead, reusing it
+    across multiple requests on purpose."""
+
+    def test_two_requests_reuse_one_tcp_connection(self, compile_and_run_server):
+        import http.client
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) {
+            req.send({'code': 200, 'body': `hi ${req.url}`})
+        }
+        """)
+        conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+        conn.request("GET", "/a")
+        r1 = conn.getresponse()
+        body1 = r1.read()
+        sock1 = conn.sock
+        assert r1.getheader("Connection") == "keep-alive"
+
+        conn.request("GET", "/b")
+        r2 = conn.getresponse()
+        body2 = r2.read()
+        # http.client only opens a NEW socket if the previous one was
+        # closed -- reaching getresponse() a second time on the SAME
+        # `conn` object, still holding the SAME socket, is direct proof
+        # the server never closed its end after the first response.
+        assert conn.sock is sock1
+        assert r2.getheader("Connection") == "keep-alive"
+        assert body1.endswith(b"/a") and body2.endswith(b"/b")
+        conn.close()
+
+    def test_explicit_connection_close_closes_after_one_response(self, compile_and_run_server):
+        import http.client
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.send({'code': 200, 'body': 'ok'}) }
+        """)
+        conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+        conn.request("GET", "/", headers={"Connection": "close"})
+        r = conn.getresponse()
+        r.read()
+        assert r.getheader("Connection") == "close"
+        # http.client itself already noticed the server's own
+        # `Connection: close` and dropped the socket -- direct proof
+        # this response actually closed the connection, not just said
+        # it would.
+        assert conn.sock is None
+        conn.close()
+
+    def test_http_1_0_defaults_to_close_with_no_connection_header(self, compile_and_run_server):
+        import socket as _socket
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.send({'code': 200, 'body': 'ok'}) }
+        """)
+        sock = _socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        sock.sendall(b"GET / HTTP/1.0\r\nHost: x\r\n\r\n")
+        data = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        sock.close()
+        assert b"Connection: close" in data
+        assert data.endswith(b"ok")
+
+    def test_pipelined_requests_are_all_served_in_order(self, compile_and_run_server):
+        import socket as _socket
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.send({'code': 200, 'body': req.url}) }
+        """)
+        sock = _socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        # Three requests in ONE write, before reading anything back --
+        # the client sent all of it before the server had a chance to
+        # respond to any of it. See festina_conn_reset_for_next_request's
+        # own doc comment for why this doesn't deadlock.
+        sock.sendall(
+            b"GET /p1 HTTP/1.1\r\nHost: x\r\n\r\n"
+            b"GET /p2 HTTP/1.1\r\nHost: x\r\n\r\n"
+            b"GET /p3 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        data = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        sock.close()
+        # Each response body is its own request's own full URL -- three
+        # bodies, in the order the requests were sent.
+        assert [p.split(b"\r\n\r\n", 1)[1] for p in data.split(b"HTTP/1.1 200")[1:]] == [
+            b"http://x/p1", b"http://x/p2", b"http://x/p3"]
+
+    def test_idle_keepalive_connection_is_reaped(self, compile_and_run_server, monkeypatch):
+        import http.client
+        # claude.md #167: FESTINA_HTTP_KEEPALIVE_IDLE_SECONDS, the same
+        # test-only override shape FESTINA_SHUTDOWN_GRACE_SECONDS
+        # already established -- lets this exercise the reap path in a
+        # fraction of a second instead of the real 15s default.
+        monkeypatch.setenv("FESTINA_HTTP_KEEPALIVE_IDLE_SECONDS", "0.3")
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.send({'code': 200, 'body': 'ok'}) }
+        """)
+        conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+        conn.request("GET", "/")
+        r = conn.getresponse()
+        r.read()
+        conn.sock.settimeout(3)
+        assert conn.sock.recv(16) == b""  # server-initiated close, once idle too long
+        conn.close()
+
+    def test_a_request_still_completing_is_never_reaped(self, compile_and_run_server, monkeypatch):
+        # The idle-reap only ever targets a connection with NO request
+        # in flight -- a slow client trickling its own request in over
+        # more than the idle window must not be torn down mid-request.
+        monkeypatch.setenv("FESTINA_HTTP_KEEPALIVE_IDLE_SECONDS", "0.3")
+        import socket as _socket
+        import time as _time
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.send({'code': 200, 'body': req.toText()}) }
+        """)
+        sock = _socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        sock.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n")
+        _time.sleep(0.5)  # longer than the idle window, but mid-request (headers parsed already)
+        sock.sendall(b"hello")
+        sock.settimeout(5)
+        data = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        sock.close()
+        assert data.endswith(b"hello")
 
 
 class TestHttpClient:
