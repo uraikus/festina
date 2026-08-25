@@ -866,6 +866,27 @@ void festina_async_io_dispatch(void *payload, void (*work_fn)(void *payload),
                                void (*callback)(void *payload),
                                void (*release_fn)(void *payload));
 
+/* claude.md #166: the http-servicing hook seam -- see this trio's own
+ * doc comment in festina_runtime.c for the full reasoning. Lets
+ * festina_run_event_loop (festina_runtime_graphics.c) service an open
+ * openPort()/openSecurePort() listener without a direct reference into
+ * festina_runtime_http.c, the same "always-safe default, no-op unless
+ * registered" shape as festina_set_async_io_hooks just above. This is
+ * what makes openPort() combinable with graphics -- previously rejected
+ * outright at compile time (festina/cli.py). */
+void festina_set_http_service_hooks(int64_t (*outstanding_fn)(void), void (*ready_fn)(void));
+int64_t festina_http_service_outstanding(void);
+void festina_http_service_ready(void);
+/* codegen's own conditional call site (uses_http, mirroring
+ * uses_async_io's own festina_register_async_io_hooks() call) -- defined
+ * in festina_runtime_http.c, registers ITS OWN outstanding/ready
+ * functions via festina_set_http_service_hooks above. Registered
+ * whenever a program uses http at all (not just when it ALSO uses
+ * graphics) -- harmless either way, since festina_run_event_loop is the
+ * only thing that ever calls through these hooks, and it's simply never
+ * linked into a program that doesn't open a window. */
+void festina_register_http_service_hooks(void);
+
 /*
  * claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying().
  *

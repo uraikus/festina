@@ -1675,6 +1675,128 @@ void festina_run_http_loop(void) {
     }
 }
 
+/* claude.md #166: exactly one non-blocking servicing pass over open
+ * listeners/connections -- accept anything pending, read/write/dispatch
+ * anything ready right now, then drain this file's own http-specific
+ * async-request completions (claude.md #163's client-callback pool).
+ * Deliberately a SEPARATE, smaller implementation from
+ * festina_run_http_loop's own poll loop above rather than a shared/
+ * refactored one -- that loop is already fully tested end to end
+ * (including graceful shutdown's own drain deadline, which has nothing
+ * to do with this one-shot embedded case, and which this function does
+ * NOT replicate -- see festina_http_service_ready's own doc comment for
+ * what that means for a combined graphics+http program's shutdown
+ * behavior); duplicating the poll-set-building/dispatch here avoids
+ * risking a regression in it, the same "don't refactor stable, tested
+ * code just to save a few lines" call claude.md #165 already made for
+ * async_io's own pool vs. http's. Called ONLY through the hook seam in
+ * festina_runtime.c/.h, from festina_run_event_loop
+ * (festina_runtime_graphics.c) -- never from festina_run_http_loop
+ * itself. Timers are NOT fired here and the generic async-io pool is
+ * NOT drained here either -- whichever loop calls this already owns
+ * both (festina_run_event_loop already calls festina_fire_expired_timers/
+ * festina_async_io_drain every iteration on its own). */
+static void festina_http_service_once(int timeout_ms) {
+    size_t max_nfds = (size_t)(g_listener_count + g_conn_count) + 1;
+    if (max_nfds > g_poll_cap) {
+        size_t new_cap = g_poll_cap ? g_poll_cap * 2 : 16;
+        while (new_cap < max_nfds) new_cap *= 2;
+        FestinaPollFd *grown_fds = realloc(g_poll_fds, new_cap * sizeof(FestinaPollFd));
+        if (!grown_fds) festina_fail("out of memory growing the http loop's poll set");
+        g_poll_fds = grown_fds;
+        int64_t *grown_ids = realloc(g_poll_conn_ids, new_cap * sizeof(int64_t));
+        if (!grown_ids) festina_fail("out of memory growing the http loop's poll set");
+        g_poll_conn_ids = grown_ids;
+        g_poll_cap = new_cap;
+    }
+
+    size_t fdi = 0;
+    for (int64_t i = 0; i < g_listener_count; i++) {
+        g_poll_fds[fdi].fd = g_listeners[i].fd;
+        g_poll_fds[fdi].events = POLLIN;
+        fdi++;
+    }
+    for (int64_t i = 0; i < g_conn_count; i++) {
+        if (!g_conns[i].alive) continue;
+        g_poll_fds[fdi].fd = g_conns[i].fd;
+        g_poll_fds[fdi].events = (short)(POLLIN | (g_conns[i].tls_wants_write ? POLLOUT : 0));
+        g_poll_conn_ids[fdi - (size_t)g_listener_count] = g_conns[i].conn_id;
+        fdi++;
+    }
+    size_t nfds = fdi;
+    size_t poll_nfds = nfds;
+    if (g_async_pool_started) {
+        g_poll_fds[nfds].fd = g_async_wake_fds[0];
+        g_poll_fds[nfds].events = POLLIN;
+        poll_nfds = nfds + 1;
+    }
+    if (poll_nfds == 0) return; /* no listener open and nothing connected */
+
+    int rc = festina_poll(g_poll_fds, poll_nfds, timeout_ms);
+    if (rc < 0 && !festina_socket_was_interrupted()) return;
+    if (rc > 0) {
+        for (int64_t i = 0; i < g_listener_count; i++) {
+            if (g_poll_fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
+                festina_accept_new_connections(g_poll_fds[i].fd, g_listeners[i].port,
+                                               g_listeners[i].tls_config);
+            }
+        }
+        for (size_t i = (size_t)g_listener_count; i < nfds; i++) {
+            if (!(g_poll_fds[i].revents & (POLLIN | POLLOUT | POLLHUP | POLLERR))) continue;
+            FestinaConn *c = festina_conn_by_id(g_poll_conn_ids[i - (size_t)g_listener_count]);
+            if (c) festina_conn_readable(c);
+        }
+    }
+    festina_async_drain_completed();
+}
+
+/* claude.md #166: festina_set_http_service_hooks' outstanding_fn --
+ * "is there any http-related reason festina_run_event_loop should keep
+ * its own wait short" -- a listener open, a live connection, or a
+ * pending background client request (claude.md #163) all count, the
+ * same three things festina_run_http_loop's own "nothing left to wait
+ * for" check already looks at. */
+static int64_t festina_http_service_outstanding_impl(void) {
+    return (int64_t)g_listener_count + festina_alive_conn_count() + g_async_outstanding;
+}
+
+/* claude.md #166: festina_set_http_service_hooks' ready_fn -- always a
+ * ZERO-timeout pass (see festina_http_service_once above): the caller,
+ * festina_run_event_loop, already bounds ITS OWN wait to a short
+ * interval whenever festina_http_service_outstanding() is nonzero (the
+ * same shape it already uses for outstanding async-io work), so by the
+ * time this runs there's no reason to also block here -- either
+ * something is ready right now (handled immediately) or nothing is
+ * (checked again next iteration, at most one bounded wait later).
+ *
+ * NOTE on graceful shutdown: unlike festina_run_http_loop's own grace-
+ * period draining (claude.md #161 -- closing listeners and giving
+ * already-open connections up to FESTINA_SHUTDOWN_GRACE_SECONDS to
+ * finish before exiting anyway), a combined graphics+http program's
+ * shutdown goes through festina_run_event_loop's own path instead: a
+ * Ctrl-C/SIGTERM there tears the window down and exits immediately, with
+ * no equivalent drain window for an in-flight http connection. A real,
+ * documented gap for v1 of this combination (see api.md), not something
+ * this function attempts to paper over -- doing so correctly would mean
+ * teaching the graphics loop its own version of the same grace-period
+ * bookkeeping, a bigger change than "make the combination possible at
+ * all" needed to take on in one pass. */
+static void festina_http_service_ready_impl(void) {
+    festina_http_service_once(0);
+}
+
+/* claude.md #166: codegen's own conditional call site (uses_http,
+ * mirroring uses_async_io's own festina_register_async_io_hooks() call)
+ * -- registers this file's own outstanding/ready functions into the
+ * shared hook seam festina_runtime.c declares. Called unconditionally
+ * whenever a program uses http at all, whether or not it also uses
+ * graphics -- see festina_runtime.h's own doc comment on why that's
+ * harmless. */
+void festina_register_http_service_hooks(void) {
+    festina_set_http_service_hooks(festina_http_service_outstanding_impl,
+                                   festina_http_service_ready_impl);
+}
+
 /* ---- http -- construction / destruction ----
  *
  * claude.md #162: the ONE place a FestinaHttpValue is actually

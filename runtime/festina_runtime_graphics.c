@@ -1677,7 +1677,12 @@ static void festina_handle_window_event(const FestinaWindowEvent *ev) {
  * unloading). Timer state itself lives in festina_runtime.c, reached
  * only through festina_next_timer_deadline()/festina_fire_expired_timers()
  * (festina_runtime_internal.h) -- this file owns no timer bookkeeping
- * of its own. */
+ * of its own. claude.md #166: also the loop a combined graphics+http
+ * program blocks in -- since main() only ever enters ONE blocking loop
+ * (see festina/codegen.py's _emit_main_and_entry), openPort() being
+ * used at all doesn't change which loop that is once graphics is also
+ * in play; it just adds http servicing to this one, through the hook
+ * seam declared in festina_runtime.h. */
 void festina_run_event_loop(void) {
     g_should_stop_looping = 0;
     /* claude.md #161: checked once per iteration alongside
@@ -1708,10 +1713,23 @@ void festina_run_event_loop(void) {
         if (festina_async_io_outstanding() > 0 && (timeout < 0.0 || timeout > 0.02)) {
             timeout = 0.02;
         }
+        /* claude.md #166: an open openPort()/openSecurePort() listener
+         * (or a live connection, or a pending background client
+         * request) gets exactly the same bounded-wait treatment --
+         * this is what makes combining http with graphics possible at
+         * all: this loop stays the ONE thing main() blocks in, and http
+         * work just gets serviced from inside it, at the cost of the
+         * same up-to-20ms latency already accepted for background
+         * blob/img/aud loads. A no-op call (both hooks default to
+         * "nothing registered") for a program that never uses http. */
+        if (festina_http_service_outstanding() > 0 && (timeout < 0.0 || timeout > 0.02)) {
+            timeout = 0.02;
+        }
         festina_window_events_wait(timeout);
         festina_window_events_drain(festina_handle_window_event);
         festina_fire_expired_timers();
         festina_async_io_drain();
+        festina_http_service_ready();
     }
     cairo_surface_destroy(g_backing_surface);
     g_backing_surface = NULL;

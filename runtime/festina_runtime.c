@@ -3423,6 +3423,47 @@ void festina_async_io_dispatch(void *payload, void (*work_fn)(void *),
     if (release_fn) release_fn(payload);
 }
 
+/* claude.md #166: the http-servicing hook seam -- lets
+ * festina_run_event_loop (festina_runtime_graphics.c, linked only when a
+ * program opens a window) service an open openPort()/openSecurePort()
+ * listener without a direct cross-translation-unit reference into
+ * festina_runtime_http.c (linked only when a program uses http) --
+ * mirrors festina_set_async_io_hooks immediately above exactly, for the
+ * identical reason (a program using graphics but not http must never be
+ * forced to link http.o just because festina_run_event_loop names one
+ * of its symbols directly).
+ *
+ * This is what lifts claude.md #151's original "openPort() cannot be
+ * combined with graphics" restriction: previously, main()'s own loop-
+ * selection picked exactly one of festina_run_event_loop/
+ * festina_run_http_loop, so a program using both would have one of them
+ * silently never run at all -- rejected outright at compile time instead
+ * (festina/cli.py). Now festina_run_event_loop also drains ready http
+ * work each iteration (festina_http_service_ready below), bounding its
+ * own wait the same way it already bounds it for outstanding async-io
+ * work -- an open port adds up to FESTINA_ASYNC_IO_POLL_SECONDS of
+ * latency to accepting a connection or reading the next byte while a
+ * window is open, the same tradeoff already accepted for background
+ * blob/img/aud loads. festina_run_http_loop itself is UNCHANGED and
+ * still the loop used for a program that opens a port but never a
+ * window -- these hooks are purely additive. */
+static int64_t (*g_http_service_outstanding_fn)(void) = NULL;
+static void (*g_http_service_ready_fn)(void) = NULL;
+
+void festina_set_http_service_hooks(int64_t (*outstanding_fn)(void),
+                                    void (*ready_fn)(void)) {
+    g_http_service_outstanding_fn = outstanding_fn;
+    g_http_service_ready_fn = ready_fn;
+}
+
+int64_t festina_http_service_outstanding(void) {
+    return g_http_service_outstanding_fn ? g_http_service_outstanding_fn() : 0;
+}
+
+void festina_http_service_ready(void) {
+    if (g_http_service_ready_fn) g_http_service_ready_fn();
+}
+
 /* claude.md #165: bounds a sleep/poll timeout that would otherwise be
  * "block forever" (no active timer) to a short, regular wake -- the
  * only way festina_run_timer_loop's own plain nanosleep (no fd to

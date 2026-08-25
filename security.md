@@ -77,7 +77,15 @@ could feed a program that also happens to read stdin/argv. Concretely:
   thread; this bullet's own claim about `on request`/`on message`
   handlers is unaffected by either, and no Festina-visible
   global/refcount ever becomes something a program has to reason about
-  concurrently.
+  concurrently. claude.md #166 lifts the earlier restriction against
+  combining `openPort()` with graphics — a program that does both blocks
+  in the graphics event loop, which now also services the open port, so
+  a slow `on mouseDown`/`on request` handler denies service to
+  EITHER side while it runs, not just its own; and Ctrl-C/SIGTERM on
+  such a program skips the standalone server's own graceful-shutdown
+  grace period entirely (see api.md's own [http
+  limitations](api.md#http-limitations)) — a documented gap, not a
+  silent one.
 - **An 8MB per-connection buffer cap** (request line + headers + body,
   or one WebSocket frame's payload) bounds a single connection's own
   memory use, but this runtime does not limit the NUMBER of concurrent

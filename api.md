@@ -2011,11 +2011,29 @@ never mutated afterward.
   the same shape audio/graphics already use there. Not available under
   `--target=wasm32-wasi` at all — WASI Preview 1 has no listening-socket
   support — rejected at compile time; see [wasm.md](wasm.md).
-- **Cannot be combined with graphics** (`render()`, or an `on
-  mouseDown`/.../`close` handler) in the same program — the server's
-  own event loop and the graphics event loop are mutually exclusive in
-  this version. `setTimeout`/`setInterval` combine fine; both are
-  serviced from the same loop.
+- **Combining with graphics** (`render()`, or an `on
+  mouseDown`/.../`close` handler) in the same program works (claude.md
+  #166), but the two loops don't run side by side — a program that also
+  opens a window blocks in the graphics event loop the whole time, which
+  services the open port from inside itself rather than a separate
+  thread. Practically, that means:
+  - **Up to ~20ms of added latency** accepting a connection or reading
+    the next byte while the window is open — the graphics loop only
+    checks for http work on its own regular wake, the same bound
+    already accepted for a background `blob`/`img`/`aud` `.callback()`
+    load (see [Files](#files) below). Negligible for interactive use;
+    worth knowing if you're benchmarking raw request latency.
+  - **No graceful-shutdown grace period.** The http-only server drains
+    already-open connections for up to 10 seconds after Ctrl-C/SIGTERM
+    (see [Graceful shutdown](#graceful-shutdown) below) before exiting;
+    a combined program instead closes the window and exits immediately,
+    the same instant it always has, with no equivalent drain window for
+    an in-flight request. A future version may close this gap; it isn't
+    closed yet.
+
+  `setTimeout`/`setInterval` combine fine with either shape; all three
+  (timers, an open port, and a window) are serviced from the same loop
+  once graphics is involved.
 
 See [Graceful shutdown](#graceful-shutdown) below (under `close()`/`on
 exit`) for what Ctrl-C/`SIGTERM` do to a running server — the port

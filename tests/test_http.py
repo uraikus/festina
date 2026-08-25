@@ -13,7 +13,10 @@ if that tier vanishes. Linux/macOS only, matching the feature itself;
 there is no Windows backend and no wasm32-wasi backend (see the
 platform/wasm-rejection tests near the bottom).
 """
+import os
+import subprocess
 import sys
+import time
 
 import pytest
 
@@ -895,17 +898,25 @@ class TestWebSocketServer:
 
 
 class TestPlatformAndWasmGating:
-    """claude.md #151: http/graphics are mutually exclusive in this
-    version; there is no wasm32-wasi backend at all -- both checked
+    """there is no wasm32-wasi backend for http at all -- checked
     without needing a real toolchain (the same tier
     _check_wasm_feature_supported's own graphics/audio/exec tests in
     test_wasm.py already sit in). darwin AND win32 both gate a
     backend that EXISTS (built, CI-compiled -- win32's own winsock2
     port confirmed by a real MinGW cross-compile, claude.md #151's own
     Windows round) but awaits real-hardware verification, the same
-    shape audio/graphics already established for both platforms."""
+    shape audio/graphics already established for both platforms.
+    claude.md #166 lifted the original http/graphics exclusivity
+    restriction -- see TestGraphicsAndHttp below for that combination's
+    own compile-and-run coverage."""
 
-    def test_http_and_graphics_together_is_rejected(self, cli_mod, tmp_path):
+    def test_http_and_graphics_together_compiles_cleanly(self, cli_mod, tmp_path):
+        # claude.md #166: this used to be rejected outright at compile
+        # time (claude.md #151's original restriction, when main()
+        # could only ever block in ONE of festina_run_event_loop/
+        # festina_run_http_loop). No CompileError any more -- see
+        # TestGraphicsAndHttp for proof both actually WORK together,
+        # not just that compilation succeeds.
         src = tmp_path / "main.f"
         src.write_text(
             "openPort(8080)\n"
@@ -913,10 +924,7 @@ class TestPlatformAndWasmGating:
             "on mouseDown(x:int, y:int) { }\n",
             encoding="utf-8",
         )
-        with pytest.raises(cli_mod.CompileError) as exc_info:
-            cli_mod.compile_file(str(src), str(tmp_path / "out"), cc="clang")
-        assert exc_info.value.category == "unsupported platform feature"
-        assert "graphics" in str(exc_info.value)
+        cli_mod.compile_file(str(src), str(tmp_path / "out"), cc="clang")  # no raise
 
     def test_http_on_windows_is_gated_pending_verification(self, cli_mod, monkeypatch):
         monkeypatch.delenv("FESTINA_ENABLE_WINDOWS_HTTP", raising=False)
@@ -951,3 +959,145 @@ class TestPlatformAndWasmGating:
                                   cc="clang", target="wasm32-wasi")
         assert exc_info.value.category == "unsupported platform feature"
         assert "openPort" in str(exc_info.value)
+
+
+def _find_festina_window(display, timeout=20):
+    """A trimmed copy of test_codegen.py's own _find_window -- not
+    imported from there (this file's own established style keeps each
+    test module self-contained, matching e.g. test_async_io.py never
+    reaching into test_http.py for its own http-server-combined case).
+    See that function's own doc comment for why the timeout is generous
+    insurance, not a figure ever expected to be approached."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = subprocess.run(
+            ["xdotool", "search", "--name", "Festina"],
+            env=dict(os.environ, DISPLAY=display),
+            capture_output=True, text=True,
+        )
+        wids = result.stdout.split()
+        if wids:
+            return wids[0]
+        time.sleep(0.2)
+    raise AssertionError("the Festina canvas window never appeared")
+
+
+class TestGraphicsAndHttp:
+    """claude.md #166: openPort() combined with graphics -- previously
+    rejected outright at compile time (see
+    TestPlatformAndWasmGating.test_http_and_graphics_together_compiles_cleanly
+    just above). festina_run_event_loop (festina_runtime_graphics.c)
+    now services an open port itself through a hook seam
+    (festina_set_http_service_hooks, festina_runtime.c/.h), so main()
+    still ever blocks in exactly one loop -- these tests prove BOTH
+    halves of that combination actually work, not just that compiling
+    it no longer raises. Needs a working DISPLAY (run_graphics_program,
+    tests/conftest.py -- the same Xvfb-backed tier test_codegen.py's own
+    TestGraphics uses), so this skips cleanly under the same tier that
+    already does."""
+
+    def test_a_request_is_served_while_the_window_is_open(self, run_graphics_program):
+        # No xdotool interaction needed for this one -- just proves the
+        # http side of the combination actually answers a real request
+        # while festina_run_event_loop, not festina_run_http_loop, is
+        # the loop running.
+        import http.client
+        import socket as _socket
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        source = (
+            f"openPort({port})\n"
+            "on request(req:http) { req.send({'code': 200, 'body': 'combined-ok'}) }\n"
+        )
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            deadline = time.time() + 10
+            connected = False
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    pytest.fail(f"server process exited early (code {proc.returncode})")
+                try:
+                    probe = _socket.create_connection(("127.0.0.1", port), timeout=0.2)
+                    probe.close()
+                    connected = True
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            assert connected, "server never started listening while the window was open"
+
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", "/")
+            resp = conn.getresponse()
+            assert resp.status == 200
+            assert resp.read() == b"combined-ok"
+            conn.close()
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_window_input_and_requests_both_work_in_the_same_process(
+            self, run_graphics_program, x_display):
+        # The other half: a real mouse click still reaches `on
+        # mouseDown` while a port is open, interleaved with real http
+        # requests -- proving festina_run_event_loop's own window-event
+        # dispatch is unaffected by also servicing http (and vice
+        # versa, confirmed by the two requests below succeeding both
+        # before AND after the click).
+        import http.client
+        import socket as _socket
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        source = (
+            f"openPort({port})\n"
+            "on request(req:http) { req.send({'code': 200, 'body': 'ok'}) }\n"
+            "on mouseDown(x:int, y:int) { log(`down ${x} ${y}`) }\n"
+        )
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            deadline = time.time() + 10
+            connected = False
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    pytest.fail(f"server process exited early (code {proc.returncode})")
+                try:
+                    probe = _socket.create_connection(("127.0.0.1", port), timeout=0.2)
+                    probe.close()
+                    connected = True
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            assert connected, "server never started listening while the window was open"
+
+            def _get_ok():
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("GET", "/")
+                resp = conn.getresponse()
+                status, body = resp.status, resp.read()
+                conn.close()
+                return status, body
+
+            assert _get_ok() == (200, b"ok")
+
+            wid = _find_festina_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            subprocess.run(["xdotool", "mousemove", "--window", wid, "42", "24"],
+                            env=env, check=True)
+            subprocess.run(["xdotool", "click", "--window", wid, "1"], env=env, check=True)
+
+            deadline = time.time() + 20
+            text = ""
+            while time.time() < deadline:
+                text = stdout_path.read_text()
+                if "down 42 24" in text:
+                    break
+                time.sleep(0.1)
+            assert "down 42 24" in text
+
+            assert _get_ok() == (200, b"ok")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)

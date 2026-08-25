@@ -1292,6 +1292,12 @@ class CodeGen:
             "declare void @festina_register_message_handler(ptr)",
             "declare void @festina_register_socketclose_handler(ptr)",
             "declare void @festina_run_http_loop()",
+            # claude.md #166: registered from main() whenever
+            # self.uses_http (see _emit_main_and_entry) -- lets
+            # festina_run_event_loop (festina_runtime_graphics.c)
+            # service an open port too, which is what makes combining
+            # openPort() with graphics possible at all.
+            "declare void @festina_register_http_service_hooks()",
             # claude.md #162: http -- redesigned into a genuine
             # refcounted value (url/method/code/headers/body), see
             # festina_runtime.h's own doc comment for the full
@@ -9273,6 +9279,15 @@ class CodeGen:
             # nothing to do with SQLite either, gated purely on
             # self.uses_async_io.
             main_lines.append("  call void @festina_register_async_io_hooks()")
+        if self.uses_http:
+            # claude.md #166: gated purely on self.uses_http, same
+            # placement/reasoning as the two hook registrations just
+            # above -- registered whether or not this program ALSO
+            # uses graphics (harmless either way, see
+            # festina_register_http_service_hooks' own doc comment);
+            # this is what lets festina_run_event_loop service an open
+            # port when main() picks it as the one blocking loop below.
+            main_lines.append("  call void @festina_register_http_service_hooks()")
         # self.uses_sqlite/self.uses_graphics are only reliably set by
         # this point because every function body (self.func_defs) and
         # every entry statement (the loop above) has already been
@@ -9343,7 +9358,11 @@ class CodeGen:
             # in the graphics translation unit (X11 select()-based), so
             # it's only ever declared-and-called -- never linked in --
             # for a program that actually opens a window; see cli.py's
-            # per-feature object file selection.
+            # per-feature object file selection. claude.md #166: also
+            # services an open http port, if self.uses_http is ALSO set
+            # -- see festina_register_http_service_hooks() just above
+            # and festina_run_event_loop's own doc comment in
+            # festina_runtime_graphics.c for how.
             main_lines.append("  call void @festina_run_event_loop()")
         elif self.uses_http:
             # claude.md #151: openPort() was called somewhere (or an
@@ -9355,12 +9374,12 @@ class CodeGen:
             # below does whenever both are in play -- checked first,
             # not `elif self.uses_http and not self.uses_timers`, since
             # a timers-only program still needs SOME loop when http is
-            # also present and http's own loop already covers it.
-            # graphics+http together is rejected at compile time (see
-            # cli.py's _check_platform_feature_supported/needs_http --
-            # this single-threaded server was never meant to also drive
-            # an X11 event loop), so this is never reached at the same
-            # time uses_graphics is true.
+            # also present and http's own loop already covers it. Only
+            # reached when self.uses_graphics is false -- claude.md
+            # #166: a program using BOTH takes the branch just above
+            # instead (festina_run_event_loop services http itself
+            # there), so this simpler, non-graphics-aware loop is
+            # exactly what a program with no window at all still gets.
             main_lines.append("  call void @festina_run_http_loop()")
         elif self.uses_timers or self.uses_async_io:
             # No window, but setTimeout/setInterval callbacks still need

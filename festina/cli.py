@@ -1147,24 +1147,20 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", targ
     # that case.
     needs_graphics = gen.uses_graphics or gen.uses_graphics_code
 
-    # claude.md #151: openPort()/on request/.../on socketClose together
-    # with anything that opens a real window -- rejected outright,
-    # before any of the real linking work below, rather than silently
-    # producing a binary whose http loop never runs at all (main()'s
-    # own loop-selection picks ONE blocking loop, graphics winning
-    # over http when both are present -- see _emit_main_and_entry's
-    # own comment). This single-threaded server was never designed to
-    # also drive an X11/Cocoa/Win32 event loop; that combination may
-    # be revisited later, but isn't attempted here.
-    if gen.uses_http and gen.uses_graphics:
-        raise CompileError(
-            "openPort()/on request/on upgrade/on message/on socketClose "
-            "cannot be combined with graphics (render(), or an on "
-            "mouseDown/mouseUp/mouse/keyDown/keyUp/resize/close handler) "
-            "in the same program -- the http server's own event loop and "
-            "the graphics event loop are mutually exclusive in this "
-            "version.",
-            file=entry_path, category="unsupported platform feature")
+    # claude.md #151 originally rejected openPort()/on request/.../on
+    # socketClose together with anything that opens a real window
+    # outright, before any of the real linking work below -- main()'s
+    # own loop-selection picked exactly ONE blocking loop
+    # (festina_run_event_loop when graphics is in play, otherwise
+    # festina_run_http_loop), so a program combining both would have
+    # had one of them silently never run at all. claude.md #166 lifts
+    # this: festina_run_event_loop now also services http through a
+    # hook seam (festina_set_http_service_hooks, festina_runtime.c),
+    # the same shape claude.md #165's async-io hooks already
+    # established, so no compile-time rejection is needed any more --
+    # codegen's own loop-selection (_emit_main_and_entry) is unchanged,
+    # it just always resolves to the graphics loop when both are used,
+    # and that loop now knows what to do with an open port.
 
     if target == "wasm32-wasi":
         _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio,
