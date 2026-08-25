@@ -64,6 +64,17 @@ same as macOS's own sanitizer tier is explicitly out of scope).
   swap the map side already needed at every touchpoint -- plus
   removing `ArrayType.amortized`'s `compare=False` once there's a real
   representation difference to distinguish.
+- **`.toStruct(T)`/`.toArr(T)` only parse scalar shapes** (claude.md
+  #159): a target struct's fields and `toArr`'s own element type must
+  be `int`/`float`/`bool`/`text` -- nested `struct`/`arr[T]`/`map[T]`
+  aren't parseable yet, rejected at compile time. `\u` unicode string
+  escapes aren't supported either (raw UTF-8 bytes are unaffected).
+  Extending this means teaching `_from_json_struct_fn_for`/
+  `_from_json_arr_fn_for` (festina/codegen.py) to recurse into a
+  nested field/element's own from-json function the same way
+  `_json_fn_for` already recurses for rendering -- plus a `map[text]`
+  parsing counterpart (a JSON object with arbitrary keys, rather than
+  known field names) for a `map[T]` target.
 
 ## Memory model
 
@@ -90,6 +101,19 @@ remains:
 - **Text globals are not freed at process exit** — deliberate: they are
   reachable until exit, LeakSanitizer agrees, and freeing them would be
   exit-time busywork.
+- **A `throw` reached from a called function leaks that function's own
+  locals** (claude.md #157) — and, structurally the same issue,
+  **`.toStruct()`/`.toArr()` leak whatever they'd already built when a
+  parse fails partway through** (claude.md #159), since neither the
+  intermediate C stack frames a `longjmp` skips nor codegen's own
+  hand-written JSON-parsing functions ever go through
+  `_active_free_locals`'s normal scope-exit tracking. Both are
+  error-path-only (a successful run leaks nothing, confirmed under
+  Valgrind) and bounded (never unbounded/accumulating). A real fix
+  would mean exception-safe cleanup for values built mid-expression-
+  evaluation generally — this language has no RAII/unwind-table story
+  at all today, and building one is a genuinely large undertaking, not
+  attempted in either round.
 
 ## Deliberate behavior (documented, not planned work)
 

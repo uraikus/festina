@@ -924,6 +924,10 @@ class CodeGen:
                                                 # render function; registered before the body is
                                                 # generated, so a self-referencing struct recurses
                                                 # into its own function instead of generating forever
+        self._from_json_fns = {}               # claude.md #159: "struct:Name" / "arr:elemtype" ->
+                                                # its generated .toStruct()/.toArr() parsing function,
+                                                # cached the same way self._json_fns is above (the
+                                                # opposite direction -- parsing rather than rendering).
         self._row_to_struct_fns = set()        # claude.md #112: row->struct converters already
                                                 # generated, one per struct type used as a
                                                 # sqlite() target
@@ -1143,6 +1147,23 @@ class CodeGen:
             # text (codegen's own _to_text on each argument).
             "declare void @festina_troubleshoot(ptr, ptr)",
             "declare void @festina_fail_structured(ptr, ptr)",
+            # claude.md #159: .toStruct()/.toArr() JSON parsing -- see
+            # runtime/festina_runtime.c's own comment on this whole
+            # group (every one either succeeds or throws internally).
+            "declare ptr @festina_json_cursor_new(ptr)",
+            "declare void @festina_json_cursor_free(ptr)",
+            "declare void @festina_json_expect_end(ptr)",
+            "declare void @festina_json_object_start(ptr)",
+            "declare void @festina_json_array_start(ptr)",
+            "declare i8 @festina_json_object_next(ptr, ptr)",
+            "declare i8 @festina_json_array_next(ptr, ptr)",
+            "declare ptr @festina_json_read_key(ptr)",
+            "declare i8 @festina_json_key_matches(ptr, ptr)",
+            "declare void @festina_json_skip_field_value(ptr)",
+            "declare i64 @festina_json_read_int(ptr)",
+            "declare double @festina_json_read_float(ptr)",
+            "declare i8 @festina_json_read_bool(ptr)",
+            "declare ptr @festina_json_read_text(ptr)",
             "declare ptr @festina_str_from_int(i64)",
             "declare ptr @festina_str_from_float(double)",
             "declare ptr @festina_str_from_bool(i8)",
@@ -4068,6 +4089,168 @@ class CodeGen:
             body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('}')})")
 
         body.append("  ret void")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _emit_json_read_scalar(self, ftype, cursor_ref, lines):
+        """claude.md #159: emits the one runtime call that reads ONE
+        JSON value at the cursor into ftype's own Festina representation
+        -- int/float/bool/text are the only types _from_json_struct_fn_for/
+        _from_json_arr_fn_for ever call this for (v1's own scope cut,
+        already enforced in semantic.py -- see that check's own
+        comment). Each of these either returns a valid value or calls
+        festina_throw() internally and never returns (festina_runtime.c's
+        own comment on this whole group), so nothing here ever needs to
+        branch on success/failure itself."""
+        v = self.tmp()
+        if ftype == INT:
+            lines.append(f"  {v} = call i64 @festina_json_read_int(ptr {cursor_ref})")
+        elif ftype == FLOAT:
+            lines.append(f"  {v} = call double @festina_json_read_float(ptr {cursor_ref})")
+        elif ftype == BOOL:
+            lines.append(f"  {v} = call i8 @festina_json_read_bool(ptr {cursor_ref})")
+        elif ftype == TEXT:
+            lines.append(f"  {v} = call ptr @festina_json_read_text(ptr {cursor_ref})")
+        else:
+            raise CodegenError(
+                f"internal error: .toStruct()/.toArr() only support int/float/"
+                f"bool/text (semantic.py should have already rejected "
+                f"{types_mod.type_name(ftype)})", file=self.filename)
+        return v
+
+    def _from_json_struct_fn_for(self, struct_type):
+        """claude.md #159: returns (generating on first use, cached by
+        struct name) `ptr @__festina_from_json_struct_N(ptr %cursor)` --
+        parses one JSON object at the cursor into a FRESH struct value
+        (a new, refcount=1 heap header, exactly the same
+        _emit_fresh_heap_header every other struct-producing site
+        already uses) and returns it.
+
+        v1 scope cut (semantic.py's own check, not re-validated here):
+        every field is int/float/bool/text. A JSON key matching a known
+        field (case-insensitively, mirroring claude.md #111's own query-
+        column convention) is parsed as that field's type and stored; an
+        unrecognized key's own value is skipped (festina_json_skip_value,
+        fully general regardless of this v1's own scope -- see its own
+        comment) -- lenient, forward-compatible parsing, the same
+        "an extra JSON key/a missing struct field is fine" contract
+        api.md documents. A duplicate key overwrites (last one wins,
+        freeing whatever text the earlier one already stored -- the
+        identical "last one wins" convention a map literal's own
+        repeated key already follows)."""
+        cache_key = f"struct:{struct_type.name}"
+        cached = self._from_json_fns.get(cache_key)
+        if cached is not None:
+            return cached
+        fn_name = f"@__festina_from_json_struct_{self._unique()}"
+        self._from_json_fns[cache_key] = fn_name
+
+        body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
+        struct_ty = self.struct_llvm_name(struct_type.name)
+        out = self._emit_fresh_heap_header(struct_ty, body)
+        body.append("  call void @festina_json_object_start(ptr %cursor)")
+        first = self.tmp()
+        body.append(f"  {first} = alloca i8")
+        body.append(f"  store i8 1, ptr {first}")
+        loop_lbl = self.label("fromjson.loop")
+        end_lbl = self.label("fromjson.end")
+        readkey_lbl = self.label("fromjson.readkey")
+        keydone_lbl = self.label("fromjson.keydone")
+        body.append(f"  br label %{loop_lbl}")
+        body.append(f"{loop_lbl}:")
+        done = self.tmp()
+        body.append(f"  {done} = call i8 @festina_json_object_next(ptr %cursor, ptr {first})")
+        done_b = self.tmp()
+        body.append(f"  {done_b} = icmp ne i8 {done}, 0")
+        body.append(f"  br i1 {done_b}, label %{end_lbl}, label %{readkey_lbl}")
+        body.append(f"{readkey_lbl}:")
+        key_reg = self.tmp()
+        body.append(f"  {key_reg} = call ptr @festina_json_read_key(ptr %cursor)")
+
+        fields = self.struct_fields(struct_type.name)
+        for idx, (fname, ftype) in enumerate(fields):
+            match_lbl = self.label(f"fromjson.match{idx}")
+            next_check_lbl = self.label(f"fromjson.check{idx}")
+            matches = self.tmp()
+            fname_const = self.string_const(fname)
+            body.append(f"  {matches} = call i8 @festina_json_key_matches(ptr {key_reg}, ptr {fname_const})")
+            matches_b = self.tmp()
+            body.append(f"  {matches_b} = icmp ne i8 {matches}, 0")
+            body.append(f"  br i1 {matches_b}, label %{match_lbl}, label %{next_check_lbl}")
+            body.append(f"{match_lbl}:")
+            slot = self.tmp()
+            body.append(f"  {slot} = getelementptr {struct_ty}, ptr {out}, i32 0, i32 {idx}")
+            if ftype == TEXT:
+                old = self.tmp()
+                body.append(f"  {old} = load ptr, ptr {slot}")
+                body.append(f"  call void @free(ptr {old})")
+            v = self._emit_json_read_scalar(ftype, "%cursor", body)
+            ir_ty = _llvm_type(ftype)
+            body.append(f"  store {ir_ty} {v}, ptr {slot}")
+            body.append(f"  br label %{keydone_lbl}")
+            body.append(f"{next_check_lbl}:")
+        # No field matched -- an unrecognized key, skipped whole.
+        body.append("  call void @festina_json_skip_field_value(ptr %cursor)")
+        body.append(f"  br label %{keydone_lbl}")
+        body.append(f"{keydone_lbl}:")
+        body.append(f"  call void @free(ptr {key_reg})")
+        body.append(f"  br label %{loop_lbl}")
+        body.append(f"{end_lbl}:")
+        body.append(f"  ret ptr {out}")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _from_json_arr_fn_for(self, elem_type):
+        """claude.md #159: the arr[T] counterpart to
+        _from_json_struct_fn_for -- returns (generating on first use,
+        cached by element type name) `ptr @__festina_from_json_arr_N(ptr
+        %cursor)`, parsing one JSON array at the cursor into a fresh
+        arr[T] header and returning it. v1 scope cut: T is int/float/
+        bool/text (semantic.py's own check, not re-validated here).
+        Each parsed element is pushed via festina_array_push -- the
+        SAME runtime helper `.push()` itself uses -- never needing an
+        ownership retain/copy first the way `.push(expr)` sometimes
+        does, since festina_json_read_text always returns an already-
+        fresh, uniquely-owned buffer (or NULL), never an alias of
+        something else that would need copying."""
+        cache_key = f"arr:{types_mod.type_name(elem_type)}"
+        cached = self._from_json_fns.get(cache_key)
+        if cached is not None:
+            return cached
+        fn_name = f"@__festina_from_json_arr_{self._unique()}"
+        self._from_json_fns[cache_key] = fn_name
+
+        body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
+        out = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, body)
+        body.append("  call void @festina_json_array_start(ptr %cursor)")
+        first = self.tmp()
+        body.append(f"  {first} = alloca i8")
+        body.append(f"  store i8 1, ptr {first}")
+        loop_lbl = self.label("fromjson.aloop")
+        end_lbl = self.label("fromjson.aend")
+        elem_lbl = self.label("fromjson.aelem")
+        body.append(f"  br label %{loop_lbl}")
+        body.append(f"{loop_lbl}:")
+        done = self.tmp()
+        body.append(f"  {done} = call i8 @festina_json_array_next(ptr %cursor, ptr {first})")
+        done_b = self.tmp()
+        body.append(f"  {done_b} = icmp ne i8 {done}, 0")
+        body.append(f"  br i1 {done_b}, label %{end_lbl}, label %{elem_lbl}")
+        body.append(f"{elem_lbl}:")
+        v = self._emit_json_read_scalar(elem_type, "%cursor", body)
+        elem_ir = _llvm_type(elem_type)
+        elem_size = _elem_size(elem_type)
+        slot = self.tmp()
+        body.append(f"  {slot} = alloca {elem_ir}")
+        body.append(f"  store {elem_ir} {v}, ptr {slot}")
+        body.append(f"  call void @festina_array_push(ptr {out}, i64 {elem_size}, ptr {slot})")
+        body.append(f"  br label %{loop_lbl}")
+        body.append(f"{end_lbl}:")
+        body.append(f"  ret ptr {out}")
         body.append("}")
         body.append("")
         self.func_defs.extend(body)
@@ -7465,6 +7648,36 @@ class CodeGen:
                     out = self._to_text(val, vtype, lines)
                     self._release_owned_receiver(callee.obj, val, vtype, lines)
                     return out, TEXT
+            # claude.md #159: 'json'.toStruct(T) -> T; 'json'.toArr(T)
+            # -> arr[T]. semantic.py already validated the receiver is
+            # text and the target shape is v1-supported (scalar fields/
+            # element only), so this is purely: get a cursor over the
+            # receiver's own bytes, hand it to the (cached, generated
+            # on first use) per-type parsing function, check for
+            # trailing garbage, free the cursor. The RESULT is exactly
+            # as fresh/owning a value as any other struct/array-
+            # producing site (a brand-new, refcount=1 heap header the
+            # generated function itself calloc'd) -- no retain needed
+            # on the way out, same as an array/map literal or a call
+            # result already isn't.
+            if callee.prop in ("toStruct", "toArr") and len(expr.args) == 1 \
+                    and isinstance(expr.args[0], ast.TypeArg):
+                recv_val, recv_type = self._emit_expr(callee.obj, env, lines)
+                cursor = self.tmp()
+                lines.append(f"  {cursor} = call ptr @festina_json_cursor_new(ptr {recv_val})")
+                target_type = self._resolve(expr.args[0].type_expr, expr.args[0])
+                if callee.prop == "toStruct":
+                    fn_name = self._from_json_struct_fn_for(target_type)
+                    result_type = target_type
+                else:
+                    fn_name = self._from_json_arr_fn_for(target_type)
+                    result_type = types_mod.ArrayType(target_type)
+                out = self.tmp()
+                lines.append(f"  {out} = call ptr {fn_name}(ptr {cursor})")
+                lines.append(f"  call void @festina_json_expect_end(ptr {cursor})")
+                lines.append(f"  call void @festina_json_cursor_free(ptr {cursor})")
+                self._free_text_temp(callee.obj, recv_val, recv_type, lines)
+                return out, result_type
             # claude.md #116: sentence.split(sep) -> arr[text]. The
             # result is a fresh refcounted array the runtime built, so
             # it is exactly as "owning" a source as an array literal --

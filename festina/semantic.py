@@ -1717,6 +1717,58 @@ def analyze(program, filename="<string>"):
                 if isinstance(recv, (types_mod.StructType, types_mod.TableType,
                                      types_mod.ArrayType, types_mod.MapType)):
                     return _TEXT
+            # claude.md #159: 'json'.toStruct(T) -> T; 'json'.toArr(T)
+            # -> arr[T]. The parser only ever produces a single-element
+            # args list containing an ast.TypeArg for these two method
+            # names (see parse_call_member's own comment) -- the
+            # isinstance check here is defensive, not load-bearing.
+            if callee.prop in ("toStruct", "toArr") and len(expr.args) == 1 \
+                    and isinstance(expr.args[0], ast.TypeArg):
+                recv = infer(callee.obj, scope)
+                if recv is not None and recv is not NULL and recv != _TEXT:
+                    raise CompileError(
+                        f"{callee.prop}() can only be called on text, found "
+                        f"{types_mod.type_name(recv)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid method receiver",
+                    )
+                target_type = resolve_type_name(
+                    expr.args[0].type_expr, structs, tables, filename, expr.args[0])
+                # claude.md #159 v1 SCOPE CUT (api.md/todo.md document
+                # it too): only int/float/bool/text are supported as a
+                # target struct's own field types or toArr()'s own
+                # element type -- nested struct/arr[T]/map[T] aren't
+                # parseable yet. Rejected here, at compile time, with a
+                # clear message naming exactly what's unsupported --
+                # never silently ignored or left null.
+                _JSON_SCALAR_TYPES = (_INT, _FLOAT, _BOOL, _TEXT)
+                if callee.prop == "toStruct":
+                    if not isinstance(target_type, types_mod.StructType):
+                        raise CompileError(
+                            f"toStruct()'s argument must be a struct name, found "
+                            f"{types_mod.type_name(target_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    for fname, ftype in structs.get(target_type.name, {}).items():
+                        if ftype not in _JSON_SCALAR_TYPES:
+                            raise CompileError(
+                                f"toStruct({target_type.name}) doesn't support field "
+                                f"'{fname}' of type {types_mod.type_name(ftype)} yet -- "
+                                f"only int/float/bool/text fields are supported",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
+                    return target_type
+                else:  # toArr
+                    if target_type not in _JSON_SCALAR_TYPES:
+                        raise CompileError(
+                            f"toArr()'s element type must be int/float/bool/text, "
+                            f"found {types_mod.type_name(target_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    return types_mod.ArrayType(target_type)
             # claude.md #116: sentence.split(sep) -> arr[text]; sep is a
             # text (literal substring) or a regex, the same pair
             # .replace() already accepts.

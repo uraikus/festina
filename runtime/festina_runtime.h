@@ -43,6 +43,26 @@ void festina_fail(const char *msg);
 void festina_troubleshoot(const char *event, const char *fields_json);
 void festina_fail_structured(const char *msg, const char *fields_json);
 
+/* claude.md #159: .toStruct()/.toArr() JSON parsing. Every one of
+ * these either succeeds and returns a valid result, or calls
+ * festina_throw() internally and never returns -- see
+ * festina_runtime.c's own comment on this whole group. `cursor` is
+ * always the opaque value festina_json_cursor_new returned. */
+void *festina_json_cursor_new(const char *text);
+void festina_json_cursor_free(void *cursor);
+void festina_json_expect_end(void *cursor);
+void festina_json_object_start(void *cursor);
+void festina_json_array_start(void *cursor);
+int8_t festina_json_object_next(void *cursor, int8_t *first);
+int8_t festina_json_array_next(void *cursor, int8_t *first);
+char *festina_json_read_key(void *cursor);
+int8_t festina_json_key_matches(const char *key, const char *field_name);
+void festina_json_skip_field_value(void *cursor);
+int64_t festina_json_read_int(void *cursor);
+double festina_json_read_float(void *cursor);
+int8_t festina_json_read_bool(void *cursor);
+char *festina_json_read_text(void *cursor);
+
 /* claude.md #157: try/catch/throw. See festina_runtime.c's own comment
  * on this whole group for the setjmp/longjmp design and its one
  * documented leak caveat (a throw reached through a called function).

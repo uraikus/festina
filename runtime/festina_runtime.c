@@ -34,8 +34,10 @@
  * with a `table` declaration, even though the core object file itself is
  * always linked in).
  */
+#include <ctype.h>   /* isdigit/tolower -- claude.md #159's JSON parser */
 #include <errno.h>
 #include <regex.h>
+#include <stdarg.h>  /* va_list -- claude.md #159's festina_json_throwf */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -376,6 +378,362 @@ void festina_throw(const char *msg) {
     festina_fail(msg); /* never actually reached -- see this function's own comment above */
 }
 #endif
+
+static int64_t festina_null_int(void);      /* defined with the sqlite helpers below */
+static double festina_null_float(void);     /* defined with the sqlite helpers below */
+
+/* ---- JSON parsing: .toStruct()/.toArr() -- claude.md #159 ----
+ *
+ * A hand-written recursive-descent parser, but structured so every
+ * low-level primitive below either succeeds and returns a valid
+ * result, or calls festina_throw() directly and never returns --
+ * reusing claude.md #157's own throw/catch machinery as this whole
+ * feature's ENTIRE error-handling story, rather than threading error
+ * values through hand-generated LLVM IR. This means codegen's own
+ * generated per-struct/per-array parsing functions (see
+ * codegen.py's _from_json_fn_for) are plain, straight-line/looping
+ * code with no separate failure path to branch on at all -- a parse
+ * failure anywhere unwinds exactly the way any other throw does, all
+ * the way to the nearest enclosing try/catch (or behaves like fail()
+ * if there is none).
+ *
+ * v1 SCOPE CUT (documented in api.md/todo.md, not silent): a target
+ * struct's fields and a target array's element type must be
+ * int/float/bool/text -- nested struct/arr[T]/map[T] aren't supported
+ * yet, rejected at COMPILE TIME with a clear error naming the
+ * unsupported field/element and its type. festina_json_skip_value
+ * below is still fully general regardless (an unrecognized struct key
+ * can still legally hold arbitrarily nested JSON, and needs to be
+ * correctly skipped past either way -- see its own comment).
+ *
+ * ONE REAL, DOCUMENTED LIMITATION, the SAME structural class claude.md
+ * #157 already accepted (see festina_throw's own comment above): a
+ * throw from anywhere inside codegen's own generated
+ * __festina_from_json_struct_N/__festina_from_json_arr_N leaves
+ * whatever that ONE call had already built (the struct's own header,
+ * any field text already read, any array elements already pushed)
+ * permanently unreclaimed -- that function is HAND-WRITTEN LLVM IR,
+ * not a real Festina function body going through _emit_block's own
+ * _active_free_locals tracking, so nothing in generated code ever gets
+ * the chance to free it on the way out. A SUCCESSFUL parse leaks
+ * NOTHING (confirmed directly under Valgrind, including 30 repeated
+ * calls in a loop) -- this is strictly an error-path leak, bounded to
+ * at most one partially-built struct/array per FAILED call, never
+ * unbounded or accumulating across successful ones. Fixing this
+ * properly would mean real exception-safe cleanup for values built
+ * mid-expression-evaluation generally (this language has no RAII/
+ * unwind-table story at all today) -- a substantially larger
+ * undertaking than this feature's own reasonable scope, tracked in
+ * todo.md rather than attempted here. */
+
+typedef struct FestinaJsonCursor {
+    const char *s;
+    int64_t len;
+    int64_t pos;
+} FestinaJsonCursor;
+
+static void festina_json_throwf(const char *fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    /* strdup'd, not the stack buffer itself -- festina_throw() TAKES
+     * OWNERSHIP of what it's given (claude.md #157/#158's own
+     * convention), and buf's own storage is gone the instant this
+     * function returns (which festina_throw never actually lets
+     * happen here, but the call itself still needs a heap pointer). */
+    festina_throw(strdup(buf));
+}
+
+static void festina_json_skip_ws(FestinaJsonCursor *c) {
+    while (c->pos < c->len) {
+        char ch = c->s[c->pos];
+        if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') c->pos++;
+        else break;
+    }
+}
+
+static int festina_json_peek(FestinaJsonCursor *c) {
+    festina_json_skip_ws(c);
+    if (c->pos >= c->len) return -1;
+    return (unsigned char)c->s[c->pos];
+}
+
+/* Consumes `ch` if it's next (after skipping ws); throws otherwise. */
+static void festina_json_expect(FestinaJsonCursor *c, char ch) {
+    int p = festina_json_peek(c);
+    if (p != (unsigned char)ch) {
+        if (p < 0) festina_json_throwf("expected '%c' but reached the end of input", ch);
+        else festina_json_throwf("expected '%c' at position %lld, found '%c'",
+                                  ch, (long long)c->pos, (char)p);
+    }
+    c->pos++;
+}
+
+/* Consumes `ch` if it's next; returns 1/0, never throws -- used for
+ * "is there another element/key, or is this the end" checks, where
+ * "no" is a normal, expected outcome rather than a parse error. */
+static int festina_json_try_eat(FestinaJsonCursor *c, char ch) {
+    if (festina_json_peek(c) != (unsigned char)ch) return 0;
+    c->pos++;
+    return 1;
+}
+
+/* True (and consumes "null") if the next token is a JSON null literal;
+ * false (cursor untouched) otherwise. Every scalar reader below checks
+ * this first -- a JSON null is always legal for any supported target
+ * type here, becoming that type's own zero/null value (the same
+ * "database NULL renders as null text/element renders as null" -- but
+ * mirrored, reading rather than writing -- api.md's own existing JSON
+ * rendering rule already documents). */
+static int festina_json_try_null(FestinaJsonCursor *c) {
+    festina_json_skip_ws(c);
+    if (c->pos + 4 <= c->len && memcmp(c->s + c->pos, "null", 4) == 0) { c->pos += 4; return 1; }
+    return 0;
+}
+
+static char *festina_json_parse_string(FestinaJsonCursor *c) {
+    festina_json_skip_ws(c);
+    if (c->pos >= c->len || c->s[c->pos] != '"') {
+        festina_json_throwf("expected a string at position %lld", (long long)c->pos);
+    }
+    c->pos++;
+    size_t cap = 32, len = 0;
+    char *out = malloc(cap);
+    if (!out) festina_json_throwf("out of memory parsing a JSON string");
+    for (;;) {
+        if (c->pos >= c->len) { free(out); festina_json_throwf("unterminated string"); }
+        unsigned char ch = (unsigned char)c->s[c->pos++];
+        char decoded;
+        if (ch == '"') { out[len] = 0; return out; }
+        if (ch == '\\') {
+            if (c->pos >= c->len) { free(out); festina_json_throwf("unterminated escape sequence"); }
+            char esc = c->s[c->pos++];
+            switch (esc) {
+                case '"': decoded = '"'; break;
+                case '\\': decoded = '\\'; break;
+                case '/': decoded = '/'; break;
+                case 'b': decoded = '\b'; break;
+                case 'f': decoded = '\f'; break;
+                case 'n': decoded = '\n'; break;
+                case 'r': decoded = '\r'; break;
+                case 't': decoded = '\t'; break;
+                default:
+                    free(out);
+                    /* claude.md #159: \u unicode escapes are a
+                     * documented v1 scope cut, not silently mishandled
+                     * -- raw (unescaped) non-ASCII UTF-8 bytes in a
+                     * string are unaffected and parse completely
+                     * normally; this only affects a producer that
+                     * specifically chooses to \u-escape. */
+                    if (esc == 'u') festina_json_throwf("\\u unicode escapes are not yet supported");
+                    else festina_json_throwf("invalid escape sequence '\\%c'", esc);
+                    return NULL; /* unreachable */
+            }
+        } else if (ch < 0x20) {
+            free(out);
+            festina_json_throwf("unescaped control character in a JSON string");
+            return NULL; /* unreachable */
+        } else {
+            decoded = (char)ch;
+        }
+        if (len + 2 > cap) {
+            cap *= 2;
+            char *grown = realloc(out, cap);
+            if (!grown) { free(out); festina_json_throwf("out of memory parsing a JSON string"); }
+            out = grown;
+        }
+        out[len++] = decoded;
+    }
+}
+
+/* Parses a JSON number TOKEN and returns it as a double -- the caller
+ * decides int vs float interpretation (festina_json_read_int below
+ * truncates). JSON itself doesn't syntactically distinguish "5" from
+ * "5.0"; neither does this language's own numeric coercion (assigning
+ * a whole-number float where an int is expected, or vice versa, both
+ * already just work), so this deliberately doesn't reject "5.0" for an
+ * int field/element -- consistent with, not stricter than, Festina's
+ * own existing int/float rules. */
+static double festina_json_parse_number(FestinaJsonCursor *c) {
+    festina_json_skip_ws(c);
+    int64_t start = c->pos;
+    if (c->pos < c->len && c->s[c->pos] == '-') c->pos++;
+    if (c->pos >= c->len || !isdigit((unsigned char)c->s[c->pos])) {
+        festina_json_throwf("expected a number at position %lld", (long long)start);
+    }
+    if (c->s[c->pos] == '0') c->pos++;
+    else { while (c->pos < c->len && isdigit((unsigned char)c->s[c->pos])) c->pos++; }
+    if (c->pos < c->len && c->s[c->pos] == '.') {
+        c->pos++;
+        if (c->pos >= c->len || !isdigit((unsigned char)c->s[c->pos]))
+            festina_json_throwf("malformed number at position %lld", (long long)start);
+        while (c->pos < c->len && isdigit((unsigned char)c->s[c->pos])) c->pos++;
+    }
+    if (c->pos < c->len && (c->s[c->pos] == 'e' || c->s[c->pos] == 'E')) {
+        c->pos++;
+        if (c->pos < c->len && (c->s[c->pos] == '+' || c->s[c->pos] == '-')) c->pos++;
+        if (c->pos >= c->len || !isdigit((unsigned char)c->s[c->pos]))
+            festina_json_throwf("malformed number at position %lld", (long long)start);
+        while (c->pos < c->len && isdigit((unsigned char)c->s[c->pos])) c->pos++;
+    }
+    int64_t n = c->pos - start;
+    char buf[64];
+    if (n >= (int64_t)sizeof(buf)) festina_json_throwf("number literal too long");
+    memcpy(buf, c->s + start, (size_t)n);
+    buf[n] = 0;
+    return strtod(buf, NULL);
+}
+
+static int8_t festina_json_parse_bool(FestinaJsonCursor *c) {
+    festina_json_skip_ws(c);
+    if (c->pos + 4 <= c->len && memcmp(c->s + c->pos, "true", 4) == 0) { c->pos += 4; return 1; }
+    if (c->pos + 5 <= c->len && memcmp(c->s + c->pos, "false", 5) == 0) { c->pos += 5; return 0; }
+    festina_json_throwf("expected true or false at position %lld", (long long)c->pos);
+    return 0; /* unreachable */
+}
+
+/* Recursively skips over ANY well-formed JSON value (string, number,
+ * bool, null, object, array) without building anything -- used for a
+ * struct field the target Festina struct doesn't declare (an unknown
+ * JSON key is a normal, forward-compatible thing to see, not an error
+ * -- api.md's own documented lenient-parsing contract). Fully general
+ * regardless of this v1's own scalars-only SUPPORTED-field scope (see
+ * this section's own top comment) -- an unknown key's own value can
+ * still be arbitrarily nested either way, and needs to be correctly
+ * skipped past regardless of whether this version could ever build a
+ * Festina value from it. */
+static void festina_json_skip_value(FestinaJsonCursor *c) {
+    if (festina_json_try_null(c)) return;
+    int p = festina_json_peek(c);
+    if (p == '"') { char *s = festina_json_parse_string(c); free(s); return; }
+    if (p == 't' || p == 'f') { festina_json_parse_bool(c); return; }
+    if (p == '{') {
+        c->pos++;
+        if (festina_json_try_eat(c, '}')) return;
+        for (;;) {
+            char *k = festina_json_parse_string(c);
+            free(k);
+            festina_json_expect(c, ':');
+            festina_json_skip_value(c);
+            if (festina_json_try_eat(c, ',')) continue;
+            festina_json_expect(c, '}');
+            return;
+        }
+    }
+    if (p == '[') {
+        c->pos++;
+        if (festina_json_try_eat(c, ']')) return;
+        for (;;) {
+            festina_json_skip_value(c);
+            if (festina_json_try_eat(c, ',')) continue;
+            festina_json_expect(c, ']');
+            return;
+        }
+    }
+    if (p == '-' || (p >= '0' && p <= '9')) { festina_json_parse_number(c); return; }
+    if (p < 0) festina_json_throwf("unexpected end of input");
+    else festina_json_throwf("unexpected character '%c' at position %lld", (char)p, (long long)c->pos);
+}
+
+/* Case-insensitive key match -- struct fields match a JSON key the
+ * same way a query column already does (claude.md #111's own
+ * case-insensitive convention, mirrored here for consistency, not
+ * re-derived). */
+static int festina_json_key_eq(const char *a, const char *b) {
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+/* ---- Public entry points -- codegen calls these directly. ---- */
+
+void *festina_json_cursor_new(const char *text) {
+    FestinaJsonCursor *c = malloc(sizeof(FestinaJsonCursor));
+    if (!c) festina_json_throwf("out of memory starting a JSON parse");
+    c->s = text ? text : "";
+    c->len = (int64_t)strlen(c->s);
+    c->pos = 0;
+    return c;
+}
+
+void festina_json_cursor_free(void *cursor) { free(cursor); }
+
+/* Rejects trailing garbage after the top-level value -- called once,
+ * by the OUTERMOST generated function, after the whole struct/array
+ * has been consumed. `'{}extra'.toStruct(T)` is a parse error, not a
+ * silently-ignored suffix. */
+void festina_json_expect_end(void *cursor) {
+    FestinaJsonCursor *c = cursor;
+    if (festina_json_peek(c) >= 0) {
+        festina_json_throwf("unexpected trailing data at position %lld", (long long)c->pos);
+    }
+}
+
+void festina_json_object_start(void *cursor) { festina_json_expect((FestinaJsonCursor *)cursor, '{'); }
+void festina_json_array_start(void *cursor) { festina_json_expect((FestinaJsonCursor *)cursor, '['); }
+
+/* Called at the START of each object-field loop iteration -- returns 1
+ * (and consumes the closing '}') once the object has ended, 0
+ * otherwise (leaving the cursor positioned at the next key). `*first`
+ * is an in/out flag the generated loop owns as its own local, tracking
+ * whether a leading ',' needs consuming first. */
+int8_t festina_json_object_next(void *cursor, int8_t *first) {
+    FestinaJsonCursor *c = cursor;
+    if (festina_json_try_eat(c, '}')) return 1;
+    if (!*first) festina_json_expect(c, ',');
+    *first = 0;
+    return 0;
+}
+
+/* The array counterpart -- identical shape, closing ']'. */
+int8_t festina_json_array_next(void *cursor, int8_t *first) {
+    FestinaJsonCursor *c = cursor;
+    if (festina_json_try_eat(c, ']')) return 1;
+    if (!*first) festina_json_expect(c, ',');
+    *first = 0;
+    return 0;
+}
+
+char *festina_json_read_key(void *cursor) {
+    FestinaJsonCursor *c = cursor;
+    char *key = festina_json_parse_string(c);
+    festina_json_expect(c, ':');
+    return key;
+}
+
+int8_t festina_json_key_matches(const char *key, const char *field_name) {
+    return (int8_t)festina_json_key_eq(key, field_name);
+}
+
+void festina_json_skip_field_value(void *cursor) { festina_json_skip_value((FestinaJsonCursor *)cursor); }
+
+int64_t festina_json_read_int(void *cursor) {
+    FestinaJsonCursor *c = cursor;
+    if (festina_json_try_null(c)) return festina_null_int();
+    return (int64_t)festina_json_parse_number(c);
+}
+
+double festina_json_read_float(void *cursor) {
+    FestinaJsonCursor *c = cursor;
+    if (festina_json_try_null(c)) return festina_null_float();
+    return festina_json_parse_number(c);
+}
+
+int8_t festina_json_read_bool(void *cursor) {
+    FestinaJsonCursor *c = cursor;
+    if (festina_json_try_null(c)) return 2; /* claude.md #97's bool-null sentinel */
+    return festina_json_parse_bool(c);
+}
+
+char *festina_json_read_text(void *cursor) {
+    FestinaJsonCursor *c = cursor;
+    if (festina_json_try_null(c)) return NULL;
+    return festina_json_parse_string(c);
+}
 
 /* claude.md #131: close(code)/`on exit(code:int)`. Lives in the CORE
  * runtime (not festina_runtime_graphics.c, where g_close_handler and

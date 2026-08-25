@@ -183,6 +183,12 @@ def _walk_expr(expr, escaping, escaping_params):
         return
     if isinstance(expr, (ast.NumberLit, ast.StringLit, ast.BoolLit, ast.NullLit, ast.RegexLit)):
         return
+    if isinstance(expr, ast.TypeArg):
+        # claude.md #159: .toStruct(T)/.toArr(T)'s own "argument" is a
+        # TYPE, not a value -- wraps a type expression, never a
+        # variable reference, so there is nothing here that could ever
+        # escape.
+        return
     if isinstance(expr, ast.TemplateLit):
         for e in expr.exprs:
             _walk_expr(e, escaping, escaping_params)

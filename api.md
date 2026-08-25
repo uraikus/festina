@@ -2305,6 +2305,52 @@ shape in [security.md](security.md)).
 **Not available under `--target=wasm32-wasi`** — WASI has no setjmp/
 longjmp support at all — rejected at compile time; see [wasm.md](wasm.md).
 
+## `.toStruct()` / `.toArr()` — parsing JSON
+
+```festina
+struct Person { id:int  name:text  active:bool  score:float }
+Person p = '{"id": 7, "name": "Ada", "active": true, "score": 9.5}'.toStruct(Person)
+arr[int] xs = '[1, 2, 3, 4, 5]'.toArr(int)
+```
+
+`text.toStruct(StructName)` and `text.toArr(ElementType)` parse a JSON
+value into a real Festina value — the reverse of `.toText()`'s own JSON
+rendering ([Logging and rendering](#logging-and-rendering) above). A
+JSON object key matches a struct field by name, case-insensitively
+(the same convention a query column already matches by, claude.md
+#111) — a JSON key with no matching field is silently skipped (so an
+API that adds fields over time doesn't break your program), and a
+struct field the JSON never mentioned keeps its ordinary zero value (so
+an optional/omitted field doesn't either). `toArr`'s own element type
+is given directly, not in brackets: `.toArr(int)`, not `.toArr(arr[int])`.
+
+Malformed JSON, a value that doesn't match the expected shape (a string
+where a number was expected, an object where an array was expected,
+...), or trailing data after the value all `throw` a descriptive text
+message — this is the intended pairing with [`try`/`catch`](#try--catch--throw)
+above, e.g. for parsing an untrusted `req.toText()` body in an `on
+request` handler without a bad request taking the whole server down.
+
+**v1 scope cut, documented not silent.** A target struct's fields and
+`toArr`'s own element type must be `int`/`float`/`bool`/`text` —
+nested `struct`/`arr[T]`/`map[T]` aren't parseable yet, rejected at
+compile time with a clear error naming exactly what's unsupported.
+`\u` unicode string escapes are also not yet supported (raw,
+un-escaped non-ASCII UTF-8 bytes in a JSON string are unaffected and
+parse completely normally — this only affects a producer that
+specifically chooses to `\u`-escape).
+
+**One real, honest limitation, the same structural class `throw`'s own
+limitation above already is.** A JSON value that fails to parse
+*partway through* being built — a struct whose third field turns out
+to be the wrong type, having already parsed the first two; an array
+whose fourth element fails, having already collected three — leaks
+whatever was already built for that one call. A **successful** parse
+leaks nothing (confirmed directly under Valgrind, including 30 repeated
+calls in a loop, not just reasoned about) — this is strictly an
+error-path leak, bounded to at most one partially-built value per
+failed call, never unbounded or accumulating across successful ones.
+
 ## Error format
 
 Compile errors are `file:line:column: error: message`, e.g.:

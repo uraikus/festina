@@ -704,7 +704,18 @@ class Parser:
                 self.eat("RBRACK")
                 node = ast.Member(node, idx, True)
             elif self.at("LPAREN"):
-                args = self.parse_args()
+                # claude.md #159: .toStruct(StructName)/.toArr(ElementType)
+                # -- the one place in the language a call's own
+                # "argument" is a TYPE, not a value expression. Special-
+                # cased on the method name here (right before parsing
+                # the parens, so a same-named user function/method
+                # elsewhere is completely unaffected) rather than
+                # generalizing "types as call arguments" anywhere else.
+                if (isinstance(node, ast.Member) and not node.computed
+                        and node.prop in ("toStruct", "toArr")):
+                    args = [self._parse_type_arg()]
+                else:
+                    args = self.parse_args()
                 node = ast.Call(node, args)
             else:
                 break
@@ -724,6 +735,18 @@ class Parser:
                 self.eat()
         self.eat("RPAREN")
         return args
+
+    def _parse_type_arg(self):
+        # claude.md #159: .toStruct(T)/.toArr(T) -- exactly one type,
+        # parsed with the same parse_type() every other type position
+        # in the grammar already uses (a var decl, a param, a struct
+        # field, ...), wrapped as an ast.TypeArg so semantic.py/
+        # codegen.py can tell it apart from an ordinary expression
+        # argument at a glance.
+        self.eat("LPAREN")
+        type_expr = self.parse_type()
+        self.eat("RPAREN")
+        return ast.TypeArg(type_expr)
 
     def parse_primary(self):
         t = self.peek()

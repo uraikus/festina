@@ -386,6 +386,20 @@ class Call(Node):
         self.column = column
 
 
+class TypeArg(Node):
+    """claude.md #159: wraps a parsed type expression standing in an
+    ast.Call's own `args` list -- exclusively .toStruct(T)/.toArr(T)'s
+    own single "argument", which is a TYPE, not a value expression.
+    Lets semantic.py/codegen.py tell this apart from an ordinary
+    expression argument with a plain isinstance check, the same way
+    every other node kind in `args` already would be."""
+
+    def __init__(self, type_expr, line=0, column=0):
+        self.type_expr = type_expr
+        self.line = line
+        self.column = column
+
+
 class ArrowFuncExpr(Node):
     """`returnType (params) => expr` -- claude.md #142. `params` is a
     list of ast.Param, the identical shape a FuncDecl's own params
