@@ -1503,6 +1503,45 @@ fresh.write('now it does')
 log(fresh.exists())                   // true
 ```
 
+### Loading in the background: `.callback()`
+
+`blob key = 'path'` reads the file synchronously, blocking until it's
+done. `.callback()` — on any `text` path expression, not just a
+literal — starts the read in the background instead, returning an
+empty (not-yet-loaded) blob immediately and firing a callback once the
+read actually finishes, from the same main thread everything else in a
+Festina program runs on:
+
+```festina
+void func onLoaded(b:blob) {
+    log(`loaded: ${b.toText()}`)
+}
+
+blob b = 'large-file.dat'.callback(onLoaded)
+log('dispatched')                     // logs BEFORE onLoaded ever runs
+```
+
+`callback` must be `func[blob]:void`, called with the SAME `b` the
+declaration produced, mutated in place with the real bytes once
+they've been read (exactly the shape `req.send()`'s own `callback`
+already has — see [Non-blocking requests](#http-and-websocket-servers)
+above). When the response doesn't need a name, drop the variable and
+write the load as its own statement, prefixed with the target type
+purely for readability (it isn't otherwise required — `.callback()`'s
+own target type is already unambiguous from `callback`'s signature):
+
+```festina
+blob 'large-file.dat'.callback(onLoaded)
+```
+
+An unreadable path behaves exactly like the synchronous form —
+`b.exists()` is `false`, `b.toText()` is empty — there's simply no
+separate "it failed" signal beyond that, matching blob's own existing
+"test, don't fail" contract; the whole point of `callback` is not
+reading `b` until it fires.
+
+**img/aud don't have this yet** — only `blob`.
+
 `toText()` hands back an ordinary owned `text`, so it composes with
 everything else:
 

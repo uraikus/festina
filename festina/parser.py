@@ -278,6 +278,27 @@ class Parser:
         # new shorthand) already handles the resulting AST shape.
         if t.type == "http" and self.peek(1).type == "LBRACE":
             return self.parse_http_anon_send()
+        # claude.md #165: `blob 'path'.callback(fn)` (also img/aud,
+        # though only blob is actually implemented past semantic.py
+        # for now -- see that module's own comment) -- the anonymous,
+        # fire-and-forget counterpart to `http {...}` just above, same
+        # "checked before _looks_like_declaration would otherwise
+        # misroute it" reasoning. Unlike `http {...}`, no AST
+        # rewriting is needed here at all -- the type keyword is
+        # discarded outright (it's redundant: `.callback()`'s own type
+        # is always read off its argument func's OWN signature, see
+        # semantic.py's `_infer_call`) and whatever expression follows
+        # (expected to be a `.callback(...)` call, though nothing here
+        # enforces that shape specifically -- semantic.py's own type
+        # check on the discarded type keyword's absence means any
+        # OTHER expression here is simply evaluated and its result
+        # discarded, same as any other bare expression-statement) is
+        # parsed and wrapped as an ordinary ExprStmt.
+        if t.type in ("blob", "img", "aud") and self.peek(1).type != "IDENT":
+            self.eat()  # the (redundant, purely readability) type keyword
+            expr = self.parse_expression()
+            self._semi()
+            return ast.ExprStmt(expr)
         if t.type == "LBRACE":
             return self.parse_block()
         if self._looks_like_declaration():

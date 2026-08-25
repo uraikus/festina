@@ -1583,7 +1583,16 @@ void festina_run_http_loop(void) {
         }
         size_t nfds = fdi;
 
-        if (nfds == 0 && festina_next_timer_deadline() < 0.0 && g_async_outstanding == 0) {
+        /* claude.md #165: an outstanding blob/img/aud background load
+         * (a SEPARATE pool from this file's own g_async_outstanding,
+         * which is http-specific) also has to keep this loop alive --
+         * see festina_runtime.h's own doc comment on the shared hook
+         * seam for why a program using ONLY http features could still
+         * have this kind of work outstanding (e.g. `on request`
+         * loading a file in the background while also serving http). */
+        int64_t async_io_outstanding = festina_async_io_outstanding();
+        if (nfds == 0 && festina_next_timer_deadline() < 0.0
+                && g_async_outstanding == 0 && async_io_outstanding == 0) {
             return; /* nothing left to wait for at all */
         }
 
@@ -1622,6 +1631,15 @@ void festina_run_http_loop(void) {
             double remaining = deadline - festina_now_seconds();
             timeout_ms = remaining > 0.0 ? (int)(remaining * 1000.0) + 1 : 0;
         }
+        /* claude.md #165: this loop has no fd of its own for the
+         * generic async-io pool (a separate pool from THIS file's own
+         * http-specific one, which DOES have a wake-pipe fd already in
+         * the poll set above) -- bounding the timeout is the only way
+         * to notice a completed background blob/img/aud load promptly.
+         * Same 20ms granularity festina_run_timer_loop uses. */
+        if (async_io_outstanding > 0 && (timeout_ms < 0 || timeout_ms > 20)) {
+            timeout_ms = 20;
+        }
 
         int rc = festina_poll(g_poll_fds, poll_nfds, timeout_ms);
         if (rc < 0 && !festina_socket_was_interrupted()) return;
@@ -1651,6 +1669,9 @@ void festina_run_http_loop(void) {
          * to call when nothing has completed (a no-op when the async
          * pool was never started at all). */
         festina_async_drain_completed();
+        /* claude.md #165: the generic blob/img/aud pool's own drain --
+         * a no-op when festina_runtime_async.c was never linked. */
+        festina_async_io_drain();
     }
 }
 

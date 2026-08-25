@@ -2174,6 +2174,59 @@ def analyze(program, filename="<string>"):
                                 category="invalid function argument type",
                             )
                     return _BOOL
+            # claude.md #165: <text>.callback(fn:func[T]:void) -- a
+            # non-blocking blob load, the file-loading counterpart to
+            # claude.md #163's http client callback. T is read directly
+            # off `fn`'s OWN signature, not from surrounding context
+            # the way claude.md #164's `{...}.send()` needed a
+            # VarDecl-specific bypass for -- `.callback()`'s receiver
+            # is plain text, never a heterogeneous literal, so there's
+            # no MapLit-style inference conflict to route around, and
+            # this works as an ordinary expression anywhere a
+            # text->blob coercion already would (a VarDecl init, an
+            # assignment, a function argument, ...), no special
+            # position required.
+            #
+            # blob ONLY for now -- img/aud were asked for too, but both
+            # already call festina_fail() (a hard process exit, not
+            # blob's own graceful "empty on failure" contract) on a
+            # corrupt/unreadable file, which a background WORKER thread
+            # calling exit() concurrently with the main thread is a
+            # real, unverified risk this pass doesn't ship; img
+            # additionally needs its decoded cairo_surface_t built on
+            # that same worker thread, a Cairo thread-safety question
+            # not yet confirmed either. Both are a natural, likely
+            # follow-up, not ruled out -- just not done here. See
+            # claude.md #165's own account.
+            if callee.prop == "callback" and infer(callee.obj, scope) == _TEXT:
+                if len(expr.args) != 1:
+                    raise CompileError(
+                        f"callback() expects exactly 1 argument (the func to "
+                        f"call once the background load finishes), got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                fn_type = infer(expr.args[0], scope)
+                if (isinstance(fn_type, types_mod.FuncType) and len(fn_type.param_types) == 1
+                        and fn_type.return_type is None
+                        and fn_type.param_types[0] in (_IMAGE, _AUDIO)):
+                    raise CompileError(
+                        f"callback() only supports func[blob]:void for now -- "
+                        f"img/aud background loading isn't implemented yet",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                if (not isinstance(fn_type, types_mod.FuncType)
+                        or len(fn_type.param_types) != 1
+                        or fn_type.return_type is not None
+                        or fn_type.param_types[0] != _BLOB):
+                    raise CompileError(
+                        f"callback() expects func[blob]:void, found "
+                        f"{types_mod.type_name(fn_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return _BLOB
             # claude.md #109: blob's five methods -- the file functions
             # claude.md #93 spelled as free functions taking a path,
             # moved onto the value that already knows the path. Checked

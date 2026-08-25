@@ -766,6 +766,12 @@ class CodeGen:
         self.uses_timers = False               # any setTimeout()/setInterval() call anywhere --
                                                 # NOT clearTimeout()/clearInterval() alone; see
                                                 # _emit_timer_call and _emit_main_and_entry
+        self.uses_async_io = False             # claude.md #165: any blob/img/aud `.callback()` call
+                                                # anywhere -- links festina_runtime_async.c (the
+                                                # generic background-load worker pool) and, like
+                                                # uses_timers, guarantees SOME loop runs even if
+                                                # nothing else in the program would otherwise need
+                                                # one (see _emit_main_and_entry's own loop-selection)
         self.uses_graphics_code = False        # any drawRect/drawCircle/drawText/drawImage/
                                                 # loadImage call anywhere -- a strict superset of
                                                 # uses_graphics (see _emit_graphics_call's doc
@@ -1214,6 +1220,11 @@ class CodeGen:
             # from a path, refcounted, with the file operations that
             # used to be free functions hanging off it.
             "declare ptr @festina_blob_open(ptr)",
+            # claude.md #165: <text>.callback(fn) -- non-blocking blob
+            # loading, the file-loading counterpart to claude.md #163's
+            # http client callback.
+            "declare ptr @festina_blob_load_dispatch(ptr, ptr)",
+            "declare void @festina_register_async_io_hooks()",
             "declare ptr @festina_blob_from_bytes(ptr, i64)",
             "declare void @festina_blob_release(ptr)",
             "declare ptr @festina_blob_to_text(ptr)",
@@ -8211,6 +8222,25 @@ class CodeGen:
                         f"ptr {names_global}, i32 {ncols}, ptr {arg_val})")
                     self._free_text_temp(expr.args[0], arg_val, arg_type, lines)
                     return out, BOOL
+            # claude.md #165: <text>.callback(fn:func[blob]:void) -- a
+            # non-blocking blob load. `fn`'s own inferred FuncType is
+            # what tells this apart from an ordinary blob load
+            # entirely (semantic.py already confirmed it's exactly
+            # func[blob]:void -- img/aud aren't supported yet) --
+            # dispatches through festina_blob_load_dispatch, the exact
+            # same null-callback-means-blocking shape
+            # festina_http_send_client_dispatch already established.
+            if callee.prop == "callback":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if obj_type == TEXT:
+                    fn_val, _fn_type = self._emit_expr(expr.args[0], env, lines)
+                    self.uses_async_io = True
+                    out = self.tmp()
+                    lines.append(
+                        f"  {out} = call ptr @festina_blob_load_dispatch(ptr {obj_val}, "
+                        f"ptr {fn_val})")
+                    self._free_text_temp(callee.obj, obj_val, obj_type, lines)
+                    return out, BLOB
             # claude.md #110: save()/saveCopy() on blob, img or aud. One
             # branch for all three, dispatched on the receiver's type --
             # the runtime functions differ only in which struct's path
@@ -9237,6 +9267,12 @@ class CodeGen:
         # dispatch branch) should gate this.
         if self.uses_https:
             main_lines.append("  call void @festina_register_tls_hooks()")
+        if self.uses_async_io:
+            # claude.md #165: same reasoning/placement as
+            # festina_register_tls_hooks() just above -- this has
+            # nothing to do with SQLite either, gated purely on
+            # self.uses_async_io.
+            main_lines.append("  call void @festina_register_async_io_hooks()")
         # self.uses_sqlite/self.uses_graphics are only reliably set by
         # this point because every function body (self.func_defs) and
         # every entry statement (the loop above) has already been
@@ -9326,13 +9362,21 @@ class CodeGen:
             # an X11 event loop), so this is never reached at the same
             # time uses_graphics is true.
             main_lines.append("  call void @festina_run_http_loop()")
-        elif self.uses_timers:
+        elif self.uses_timers or self.uses_async_io:
             # No window, but setTimeout/setInterval callbacks still need
             # a blocking loop to fire in -- festina_run_timer_loop is the
             # pure-POSIX (nanosleep-based, no X11 at all) equivalent that
             # lives in the core translation unit, so a timers-only
             # program never needs to link the graphics object file just
-            # to wait for its callbacks.
+            # to wait for its callbacks. claude.md #165: `or
+            # self.uses_async_io` -- a program using ONLY blob/img/aud's
+            # own `.callback()` form (no openPort(), no graphics, not
+            # even a timer) still needs SOME loop to wait in for a
+            # background load to finish, and festina_run_timer_loop
+            # already checks the shared async-io hooks each iteration
+            # regardless of why it was entered (see its own doc
+            # comment) -- so widening this ONE condition is the whole
+            # fix; no new branch needed.
             main_lines.append("  call void @festina_run_timer_loop()")
         # claude.md #126 round nine: unconditional, last thing main()
         # does -- @__festina_db defaults to (and stays) null for a
