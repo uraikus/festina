@@ -104,6 +104,23 @@ class Parser:
 
     # ---- types ----
     def parse_type(self):
+        if self.at("amor"):
+            # claude.md #156: amor map[T] / amor arr[T] -- amortized
+            # growth, a modifier on the container type itself rather
+            # than a separate type name (composes with `const` the
+            # same way: `const amor map[text] m`, parsed in
+            # parse_const_decl below). Only map[T]/arr[T] have a growth
+            # strategy to modify at all -- anything else after `amor`
+            # is a clear, direct error rather than a confusing
+            # downstream one.
+            amor_tok = self.eat("amor")
+            if not (self.at("arr") or self.at("map")):
+                t = self.peek()
+                raise self.err(amor_tok, "invalid syntax",
+                                f"'amor' must be followed by arr[T] or map[T], found {t.type}({t.value!r})")
+            inner_type = self.parse_type()
+            inner_type.amortized = True
+            return inner_type
         if self.at("arr"):
             self.eat("arr")
             self.eat("LBRACK")
@@ -262,7 +279,7 @@ class Parser:
         # out the bare-`func`-with-no-`[`-following case (the "missing
         # return type" mistake, still always an error), so any `func`
         # reaching here is unambiguously the type-expression form.
-        if t0.type in TYPE_KEYWORDS or t0.type in ("arr", "map", "func"):
+        if t0.type in TYPE_KEYWORDS or t0.type in ("arr", "map", "amor", "func"):
             return True
         if t0.type == "IDENT" and t1.type == "IDENT":
             return True
@@ -286,6 +303,11 @@ class Parser:
         arrow-function `=>`, ...)."""
         if i >= len(self.toks):
             return i
+        if self.toks[i].type == "amor":
+            # claude.md #156: amor map[T] / amor arr[T] -- just a
+            # one-token prefix ahead of whatever map[T]/arr[T] itself
+            # spans, not a container needing its own [T] skip.
+            return self._type_expr_end(i + 1)
         if self.toks[i].type in ("arr", "map"):
             i += 1
             if i < len(self.toks) and self.toks[i].type == "LBRACK":
@@ -353,7 +375,7 @@ class Parser:
         followed by LPAREN" check alone let it through), breaking every
         `log(...)` call in the language until this gate was added."""
         t = self.peek()
-        if t.type not in TYPE_KEYWORDS and t.type not in ("void", "arr", "map", "func", "IDENT"):
+        if t.type not in TYPE_KEYWORDS and t.type not in ("void", "arr", "map", "amor", "func", "IDENT"):
             return False
         end = self._type_expr_end(self.i)
         if end >= len(self.toks) or self.toks[end].type != "LPAREN":

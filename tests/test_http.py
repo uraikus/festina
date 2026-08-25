@@ -328,8 +328,18 @@ class TestHttpServer:
         sock.sendall(head.encode())
         _time.sleep(0.3)  # force a separate readable event before the body arrives
         sock.sendall(b"0123456789")
-        response = sock.recv(4096)
+        # A single recv() isn't guaranteed to return the whole response
+        # in one call (a real, if rare, flake under load) -- read until
+        # the server closes the connection, which it always does after
+        # responding (no keep-alive -- api.md's own HTTP Limitations).
+        chunks = []
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
         sock.close()
+        response = b"".join(chunks)
         assert response.endswith(b"POST hello/world [0123456789]")
 
     def test_no_body_request_gives_empty_text(self, compile_and_run_server):

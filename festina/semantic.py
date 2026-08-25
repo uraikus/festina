@@ -531,7 +531,8 @@ class AnalyzedProgram:
 
 def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None):
     if isinstance(type_expr, ast.ArrayTypeExpr):
-        return types_mod.ArrayType(resolve_type_name(type_expr.element, structs, tables, filename, node))
+        return types_mod.ArrayType(resolve_type_name(type_expr.element, structs, tables, filename, node),
+                                    amortized=type_expr.amortized)
     if isinstance(type_expr, ast.FuncTypeExpr):
         # claude.md #141: func[T, T, ...]:R -- a first-class function
         # type. Resolved recursively the same way ArrayTypeExpr/
@@ -562,7 +563,7 @@ def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None
                 file=filename, line=getattr(node, "line", 0), column=getattr(node, "column", 0),
                 category="unknown type",
             )
-        return types_mod.MapType(value_type)
+        return types_mod.MapType(value_type, amortized=type_expr.amortized)
     name = type_expr
     if name in types_mod.PRIMITIVE_NAMES:
         return types_mod.PrimitiveType(name)
@@ -2333,6 +2334,29 @@ def analyze(program, filename="<string>"):
 
     def analyze_var_decl(decl, scope, is_global):
         declared_type = resolve(decl.type_expr, decl)
+        # claude.md #156: `amor map[T]` (local or global) requires an
+        # initializer -- unlike plain map[T]/arr[T], which start
+        # "empty" via a real, immortal, zero-entry static header
+        # (see codegen.py's _global_var_defs), an amortized map local's
+        # own with-no-initializer path was deliberately never given
+        # the equivalent (codegen's own scope boundary: it always
+        # heap-allocates through the generic path instead, which needs
+        # a real value to store, not an implicit empty default) --
+        # requiring one here is what keeps that boundary from ever
+        # being reached as an uninitialized-pointer bug instead of a
+        # clear compile error. Struct fields have no initializer
+        # syntax at all, so this can't (and doesn't need to) apply to
+        # them -- they rely on auto-vivify instead (see codegen.py's
+        # own comment on that path).
+        if (isinstance(declared_type, types_mod.MapType) and declared_type.amortized
+                and decl.init is None):
+            raise CompileError(
+                f"'{decl.name}' (amor map[{types_mod.type_name(declared_type.value)}]) "
+                f"requires an initializer -- write e.g. `amor map[{types_mod.type_name(declared_type.value)}] "
+                f"{decl.name} = {{}}` for an empty one",
+                file=filename, line=decl.line, column=decl.column,
+                category="invalid declaration",
+            )
         if decl.init is not None:
             # claude.md #137: arr[img]/arr[aud]/arr[blob] declared
             # directly from a literal of paths -- `arr[img] brushes =
@@ -2369,6 +2393,42 @@ def analyze(program, filename="<string>"):
                             f"path), found {types_mod.type_name(etype)}",
                             file=filename, line=getattr(e, "line", 0),
                             column=getattr(e, "column", 0),
+                            category="invalid operand type",
+                        )
+            elif (isinstance(declared_type, types_mod.MapType) and declared_type.amortized
+                    and isinstance(decl.init, ast.MapLit)):
+                # claude.md #156: same bypass shape as the arr[img] case
+                # just above, for the identical reason -- MapLit's own
+                # generic inference (_infer_member's MapLit branch)
+                # always returns a NON-amortized MapType regardless of
+                # context (it has no way to know a declaration wants
+                # `amor`), so the generic infer()+check_assignable()
+                # path below would always reject a `{...}` literal
+                # against an `amor map[T]` declared type. Validates
+                # each entry directly against the declared value type
+                # instead -- the same per-entry key/value checks the
+                # generic inference already does (claude.md #72's key-
+                # must-be-text rule, claude.md #154's mixed-value-type
+                # rule), just checked against a known target type
+                # rather than inferred from the literal's own entries.
+                value_type_name = types_mod.type_name(declared_type.value)
+                for key_expr, val_expr in decl.init.entries:
+                    key_type = infer(key_expr, scope)
+                    if key_type is not None and key_type is not NULL and key_type != _TEXT:
+                        raise CompileError(
+                            f"map key must be text, found {types_mod.type_name(key_type)}",
+                            file=filename, line=getattr(key_expr, "line", 0),
+                            column=getattr(key_expr, "column", 0),
+                            category="invalid operand type",
+                        )
+                    val_type = infer(val_expr, scope)
+                    if (val_type is not None and val_type is not NULL
+                            and val_type != declared_type.value):
+                        raise CompileError(
+                            f"map literal value expects {value_type_name}, "
+                            f"found {types_mod.type_name(val_type)}",
+                            file=filename, line=getattr(val_expr, "line", 0),
+                            column=getattr(val_expr, "column", 0),
                             category="invalid operand type",
                         )
             else:

@@ -2517,6 +2517,45 @@ void festina_map_set(int64_t *count, void **entries, const char *key, int64_t va
     (*count)++;
 }
 
+/* claude.md #156: amor map[T] -- npcHealths['npc1'] = 30 on an
+ * amortized map, and the equivalent per-entry calls an `amor map[T]`
+ * literal builds itself out of (see festina/codegen.py's
+ * _emit_map_lit, whose own is_amap parameter routes here). Identical
+ * to festina_map_set in every way except growth: this one doubles
+ * capacity (tracked in the caller's own header, alongside count and
+ * entries -- see FESTINA_AMAP_LLVM_TYPE's own comment in codegen.py
+ * for why that's a real, distinct header field and not just an unused
+ * parameter) instead of realloc-ing to exactly count+1 on every
+ * single insert, so N inserts cost O(log N) reallocs instead of O(N)
+ * -- the actual point of `amor`, and the fix claude.md #155
+ * explicitly left OUT of plain map[T] itself (a language-wide
+ * representation change, out of scope for that HTTP-specific round)
+ * by adding this as a real, opt-in alternative
+ * instead. */
+void festina_amap_set(int64_t *count, int64_t *capacity, void **entries, const char *key, int64_t value) {
+    if (!key) key = "";
+    FestinaMapEntry *found = festina_map_find(*count, *entries, key);
+    if (found) {
+        found->value = value;
+        return;
+    }
+    if (*count == *capacity) {
+        int64_t new_capacity = *capacity ? *capacity * 2 : 8;
+        FestinaMapEntry *grown = realloc(*entries, (size_t)new_capacity * sizeof(FestinaMapEntry));
+        if (!grown) festina_fail("out of memory growing an amortized map");
+        *entries = grown;
+        *capacity = new_capacity;
+    }
+    FestinaMapEntry *arr = (FestinaMapEntry *)*entries;
+    /* Same key-ownership reasoning as festina_map_set's own comment:
+     * copied, not aliased, since this map may outlive whatever Festina
+     * value `key` came from. */
+    arr[*count].key = strdup(key);
+    if (!arr[*count].key) festina_fail("out of memory growing an amortized map");
+    arr[*count].value = value;
+    (*count)++;
+}
+
 /* claude.md #111: `delete m.key` / `delete m['key']` -- remove the
  * entry outright, JS-style, rather than setting it to null: a deleted
  * key stops existing (forEach no longer visits it, count drops), which

@@ -1075,6 +1075,110 @@ class TestMaps:
         assert result.stdout.strip() == "origin: (0,0)"
 
 
+class TestAmorMap:
+    """claude.md #156: amor map[T] -- an "amortized map", the `amor`
+    prefix modifier (composes with `const`: `const amor map[T] x`).
+    Same {key: value, ...} literal syntax, same indexed get/set/
+    forEach/delete/toText surface as plain map[T] -- only the growth
+    strategy differs internally (festina_amap_set's own doubling
+    capacity in place of festina_map_set's realloc-by-exactly-one),
+    which these tests can't observe directly, so they exercise the
+    same observable behavior plain map[T] already has, plus enough
+    entries to force several real capacity doublings."""
+
+    def test_literal_init_indexed_get_and_set(self, compile_and_run):
+        source = """
+        amor map[int] scores = {'a': 1, 'b': 2}
+        scores['c'] = 3
+        scores['a'] = 10
+        log(scores['a'])
+        log(scores['b'])
+        log(scores['c'])
+        log(scores['missing'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["10", "2", "3", "-9223372036854775808"]
+
+    def test_forEach_visits_every_entry(self, compile_and_run):
+        source = """
+        amor map[int] m = {'a': 1, 'b': 2, 'c': 3}
+        int total = 0
+        void func addUp(v:int, key:text) {
+            total = total + v
+        }
+        m.forEach(addUp)
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "6"
+
+    def test_delete_removes_the_entry(self, compile_and_run):
+        source = """
+        amor map[text] m = {'a': 'x', 'b': 'y'}
+        delete m['a']
+        log(m['a'])
+        log(m['b'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["", "y"]
+
+    def test_toText_renders_json(self, compile_and_run):
+        source = """
+        amor map[int] m = {'a': 1, 'b': 2}
+        log(m)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == '{"a":1,"b":2}'
+
+    def test_many_inserts_survive_real_capacity_growth(self, compile_and_run):
+        # claude.md #156's own point: festina_amap_set doubles capacity
+        # rather than growing by exactly one per insert -- 200 entries
+        # forces several real doublings (8 -> 16 -> ... -> 256), not
+        # just the empty/one-entry cases the other tests above cover.
+        source = """
+        amor map[int] m = {}
+        int i = 0
+        while i < 200 {
+            m[`key${i}`] = i
+            i = i + 1
+        }
+        log(m['key0'])
+        log(m['key100'])
+        log(m['key199'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "100", "199"]
+
+    def test_const_amor_map_composes(self, compile_and_run):
+        source = """
+        const amor map[text] m = {'x': 'y'}
+        log(m['x'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "y"
+
+    def test_struct_field_auto_vivifies(self, compile_and_run):
+        # claude.md #156: a struct field has no initializer syntax at
+        # all, so an `amor map[T]` field relies entirely on the same
+        # lazy-build-on-first-touch auto-vivify path plain map[T]
+        # fields already use -- exercising this catches the real risk
+        # this feature's own review found: building the WRONG (smaller,
+        # plain-map-shaped) header for a field the rest of codegen
+        # treats as amor-shaped would silently corrupt memory the
+        # moment festina_amap_set first touched the missing capacity
+        # field, not raise a clean error.
+        source = """
+        struct Bag { m:amor map[int] }
+        Bag b
+        b.m['a'] = 1
+        b.m['b'] = 2
+        log(b.m['a'])
+        log(b.m['b'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "2"]
+
+
 class TestLoops:
     """claude.md #60 (for loops), #61 (while loops), #66 (postfix ++/--)."""
 

@@ -673,7 +673,41 @@ and returning nothing, the same "bare name of a declared function"
 restriction `setTimeout`'s callback has. Not a hash table internally —
 lookup/insert are O(n) over the entry count, a deliberate simplicity
 tradeoff for what's meant to be a small, config/game-state-shaped
-collection, not a large-scale data structure.
+collection, not a large-scale data structure. Also grows by exactly one
+entry per insert internally, not amortized — see `amor map[T]` below
+if that matters for a specific map.
+
+### `amor` — amortized-growth maps
+
+```festina
+amor map[int] hitCounts = {}
+const amor map[text] labels = {'ok': 'success'}   // composes with const
+
+int i = 0
+while i < 10000 {
+    hitCounts[`key${i}`] = i
+    i = i + 1
+}
+```
+
+`amor map[T]` — an "amortized map" — is `map[T]` with a different
+internal growth strategy: doubling capacity as needed instead of
+growing by exactly one entry per insert, so a long run of inserts costs
+O(log n) reallocations instead of O(n). Same literal syntax, same
+indexed get/set, `.forEach()`, `delete`, and `.toText()`/JSON rendering
+as plain `map[T]` — `amor` only changes how it grows internally, not
+what it does. **Requires an initializer** (`amor map[int] m` with no
+`= ...` is a compile error) — unlike plain `map[T]`, which can start
+implicitly empty, an amortized map's own declaration always needs a
+real value to store. Composes with `const` (`const amor map[T] m =
+...`); as a struct field (`m:amor map[int]`), no initializer is needed
+or possible, the same as any other struct field.
+
+`amor arr[T]` parses and type-checks (also composing with `const`) but
+does not yet change how an array grows — `push()`/`unshift()`/etc.
+still realloc to exactly the new size either way, identically to plain
+`arr[T]`. Real array amortization is a natural follow-up, not yet
+built.
 
 ## Built-in SQLite
 
