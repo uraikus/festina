@@ -791,6 +791,18 @@ def _check_wasm_feature_supported(feature):
             "has no listening-socket support at all. See wasm.md's "
             "Limitations section.",
             category="unsupported platform feature")
+    if feature == "try":
+        # claude.md #157: added alongside try/catch/throw itself --
+        # LLVM's wasm32 backend has no SjLj lowering at all outside
+        # emscripten's own EH pass (confirmed directly: clang rejects
+        # __builtin_longjmp outright for this target), the identical
+        # "genuinely absent" situation exec()/http are already in
+        # above -- not a hardware-verification gate like macOS/Windows.
+        raise CompileError(
+            "try/catch/throw is not supported when compiling to WASM -- "
+            "there is no setjmp/longjmp (SjLj) support for this target "
+            "at all. See wasm.md's Limitations section.",
+            category="unsupported platform feature")
 
 
 def _wasm_toolchain_ok(cc):
@@ -1080,7 +1092,8 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", targ
 
     if target == "wasm32-wasi":
         _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio,
-                           needs_exec=gen.uses_exec, needs_http=gen.uses_http)
+                           needs_exec=gen.uses_exec, needs_http=gen.uses_http,
+                           needs_try=gen.uses_try)
         return output_path
 
     runtime_objects, link_libs = _runtime_objects_and_link_libs(
@@ -1240,7 +1253,7 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
 
 
 def _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, needs_audio, needs_exec=False,
-                      needs_http=False):
+                      needs_http=False, needs_try=False):
     """claude.md #148: WASM export's own link recipe -- always the .ll-
     text-to-clang path (see _compile_via_clang_ir_frontend's own
     docstring for what that fallback normally covers on native targets;
@@ -1266,6 +1279,8 @@ def _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, needs_aud
         _check_wasm_feature_supported("exec")
     if needs_http:
         _check_wasm_feature_supported("http")
+    if needs_try:
+        _check_wasm_feature_supported("try")
     if shutil.which(cc) is None or "clang" not in os.path.basename(cc).lower():
         raise CompileError(
             f"WASM export needs clang specifically (got --cc={cc!r}) -- "

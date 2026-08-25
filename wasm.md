@@ -231,6 +231,11 @@ fail at compile time, before any of the real work
 - **`openPort()`/`on request`/`on upgrade`/`on message`/`on
   socketClose`** (claude.md #151) — WASI Preview 1 has no listening-
   socket support of any kind.
+- **`try`/`catch`/`throw`** (claude.md #157) — LLVM's wasm32 backend
+  has no setjmp/longjmp (SjLj) lowering at all outside emscripten's own
+  exception-handling pass, which this project doesn't use; confirmed
+  directly, not assumed (`clang` rejects `__builtin_longjmp` outright
+  for this target).
 
 A few more things worth knowing, that aren't compile-time errors:
 

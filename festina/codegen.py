@@ -633,6 +633,18 @@ class _StackStructFieldsOnly:
         self.struct_type = struct_type
 
 
+class _TryFrameMarker:
+    """claude.md #157: a placeholder entry in CodeGen._active_free_locals
+    marking "a try block's own runtime catch-frame is still open here" --
+    not a local variable at all, but it needs the exact same "pop this
+    on every exit path from this scope, however that exit happens"
+    treatment a real local's cleanup gets, so it rides the same
+    machinery rather than needing its own separate tracking stack. See
+    _emit_try's own comment for why this frame is pushed in its own,
+    dedicated entry (wrapping _emit_block's call for the try body,
+    rather than living inside that call's own frame)."""
+
+
 class _StackArrayOrMap:
     """claude.md #79: wraps an ArrayType/MapType to mark, in CodeGen.
     _active_free_locals, a STACK-allocated arr[T]/map[T] local (see
@@ -747,6 +759,13 @@ class CodeGen:
                                                 # file needs to be linked in at all, so a program
                                                 # that never touches audio doesn't pull in
                                                 # libasound (see cli.py's _ensure_runtime_objects)
+        self.uses_try = False                  # claude.md #157: any try/throw anywhere -- unlike
+                                                # uses_graphics/uses_audio, festina_throw's own
+                                                # __builtin_longjmp is unconditional core, so this
+                                                # exists purely so compile_file can reject a
+                                                # wasm32-wasi build outright (there is no SjLj
+                                                # support for that target at all), the same way
+                                                # uses_exec below already does.
         self.uses_exec = False                 # claude.md #150: any exec() call anywhere -- unlike
                                                 # uses_graphics/uses_audio, festina_process_exec is
                                                 # unconditional core (no extra library to
@@ -1095,6 +1114,28 @@ class CodeGen:
             # latent ABI mismatch that happened to work only because 0/1
             # were the only values ever produced.
             "declare void @festina_log_bool(i8)",
+            # claude.md #157: try/catch. _emit_try emits the actual
+            # setjmp call directly (see its own docstring for why a
+            # runtime-side wrapper doesn't work) via these four
+            # intrinsics -- the same, portable, fixed-size-buffer
+            # mechanism clang lowers __builtin_setjmp/__builtin_longjmp
+            # to. festina_try_push registers the buffer that direct
+            # setjmp call just populated as the new top catch frame
+            # (only on its normal, 0-returning arrival); festina_try_pop
+            # pops the current top frame on a NORMAL exit from a try
+            # body (_emit_free_active_locals's own _TryFrameMarker
+            # handling is the only generated-code caller); festina_try_error
+            # hands over (and releases the runtime's own ownership of)
+            # the thrown message as an ordinary owned text value;
+            # festina_throw never returns.
+            "declare ptr @llvm.frameaddress.p0(i32 immarg)",
+            "declare ptr @llvm.stacksave.p0()",
+            "declare i32 @llvm.eh.sjlj.setjmp(ptr)",
+            "declare void @llvm.eh.sjlj.longjmp(ptr)",
+            "declare void @festina_try_push(ptr)",
+            "declare void @festina_try_pop()",
+            "declare ptr @festina_try_error()",
+            "declare void @festina_throw(ptr)",
             "declare void @festina_log_text(ptr)",
             "declare void @festina_fail(ptr)",
             "declare ptr @festina_str_from_int(i64)",
@@ -1606,10 +1647,27 @@ class CodeGen:
 
     # ---- functions ----
 
-    def _emit_free_active_locals(self, lines, down_to=0):
+    def _emit_free_active_locals(self, lines, down_to=0, skip_try_pop=False):
         """claude.md #74: frees every non-escaping local active in every
         frame of self._active_free_locals from the top of the stack down
         to (and including) index `down_to`.
+
+        claude.md #157: skip_try_pop=True (ThrowStmt's own call is the
+        only caller) leaves every _TryFrameMarker entry in the walked
+        range alone -- emits nothing for it, unlike every other exit
+        path (Return/Break/Continue/a try body's own normal
+        fallthrough), which DO emit festina_try_pop() for one here (see
+        that branch's own comment). A throw must never pop the very
+        catch frame it might be about to unwind INTO: festina_throw
+        itself looks up and pops exactly the frame it jumps to, at
+        runtime, once it actually runs -- if this walk popped it FIRST,
+        in generated code that always executes (unlike everything past
+        the throw, which never runs), festina_throw would find the
+        frame already gone and treat a perfectly-caught throw as
+        uncaught. Real locals in the same walked range still need
+        freeing here regardless (see _emit_try's own docstring for why
+        that part isn't optional) -- only the marker itself is special-
+        cased.
 
         down_to=0 is the parameter's own default, but a Return never
         actually relies on that default -- it passes down_to=self.
@@ -1662,7 +1720,24 @@ class CodeGen:
             return
         for frame in reversed(self._active_free_locals[down_to:]):
             for ref, type_ in frame:
-                if isinstance(type_, _StackStructFieldsOnly):
+                if isinstance(type_, _TryFrameMarker):
+                    # claude.md #157: not a local at all -- pops the
+                    # runtime's own catch-frame stack so a LATER,
+                    # unrelated throw (reached after this try/catch
+                    # statement has already exited, on whatever path)
+                    # can never land back in this try's own now-stale
+                    # catch block. Every exit from a try body -- normal
+                    # fallthrough, return, break, continue -- reaches
+                    # here via this exact shared walk, so this is the
+                    # ONLY place festina_try_pop needs calling from
+                    # generated code (a throw itself pops its own frame
+                    # from inside festina_throw, before the longjmp --
+                    # see that function's own comment) -- skip_try_pop
+                    # is exactly ThrowStmt's own call opting out of that
+                    # for this reason (see this method's own docstring).
+                    if not skip_try_pop:
+                        lines.append("  call void @festina_try_pop()")
+                elif isinstance(type_, _StackStructFieldsOnly):
                     # claude.md #78: a stack-allocated struct local
                     # (see _emit_block's own tracking comment) whose own
                     # storage is never released here -- only whatever
@@ -2864,6 +2939,53 @@ class CodeGen:
         if isinstance(stmt, ast.ForStmt):
             self._emit_for(stmt, env, return_type, ctx)
             return
+        if isinstance(stmt, ast.TryStmt):
+            self._emit_try(stmt, env, return_type, ctx)
+            return
+        if isinstance(stmt, ast.ThrowStmt):
+            self.uses_try = True  # claude.md #157: see self.uses_try's own comment
+            # claude.md #157: coerced to text exactly like fail() (see
+            # the "fail" branch elsewhere in this method). UNLIKE
+            # fail()/exit() though, throw frees every active local in
+            # THIS function first -- self._emit_free_active_locals(down_to
+            # =self._current_func_frame_base), the exact same call
+            # Return makes just above -- because a throw CAUGHT by a
+            # try in this same function keeps running afterward (the
+            # process doesn't exit the way it does after fail()), so
+            # anything declared between the try and here needs freeing
+            # NOW: relying on _emit_block's own trailing "free my own
+            # frame" cleanup (further down in program order) would never
+            # run, since festina_throw's longjmp diverts control away
+            # before that unreachable code executes -- a real leak a
+            # direct Valgrind run against exactly this shape caught (see
+            # claude.md #157). Locals in frames BELOW this function's
+            # own base are correctly left alone: either an enclosing
+            # try elsewhere in THIS function catches this (nothing below
+            # its own frame base was ever this throw's to free), or it's
+            # uncaught here and propagates out of the function entirely,
+            # at which point this function's own frame -- all the way
+            # down to _current_func_frame_base -- is gone regardless,
+            # exactly like an ordinary Return.
+            val, vtype = self._emit_expr(stmt.expr, env, lines)
+            text_val = self._to_text(val, vtype, lines)
+            if vtype == TEXT and not self._is_owning_text_source(stmt.expr):
+                # claude.md #157: the identical hazard Return's own text
+                # branch already guards against, and the identical fix
+                # -- without this, `throw s` (aliasing a local) would
+                # hand festina_throw a pointer that _emit_free_active_locals
+                # is about to free right below, right along with every
+                # other active local (a real use-after-free a direct
+                # Valgrind run against exactly this shape caught). Any
+                # non-text vtype needs no such guard -- _to_text always
+                # produces a fresh buffer for those, never an alias of
+                # an existing local.
+                owned = self.tmp()
+                lines.append(f"  {owned} = call ptr @festina_text_own(ptr {text_val})")
+                text_val = owned
+            self._emit_free_active_locals(lines, down_to=self._current_func_frame_base,
+                                           skip_try_pop=True)
+            lines.append(f"  call void @festina_throw(ptr {text_val})")
+            return
         if isinstance(stmt, ast.FreeStmt):
             self._emit_free(stmt, env, lines)
             return
@@ -3037,6 +3159,118 @@ class CodeGen:
         lines.append(f"  br label %{cond_label}")
 
         self._start_block(end_label, lines)
+
+    def _emit_try(self, stmt, env, return_type, ctx):
+        """claude.md #157: try { A } catch (name:text) { B }.
+
+        The setjmp call is emitted RIGHT HERE, directly into the
+        enclosing function's own IR -- not delegated to a runtime
+        helper, which a first attempt at this tried and a direct test
+        caught as broken: setjmp only captures a valid jump target
+        while its OWN calling function's stack frame is still live, and
+        a helper that calls it and then returns has already made that
+        frame invalid by the time some later throw tries to jump back
+        into it. Emitting it here means the "calling function" IS the
+        one containing this try statement, which by construction can't
+        have returned yet -- it can't exit before hitting one of the
+        paths _TryFrameMarker instruments below.
+
+        llvm.eh.sjlj.setjmp/llvm.eh.sjlj.longjmp (not libc's own
+        setjmp/longjmp symbols) specifically because they're portable
+        LLVM intrinsics with a fixed-size buffer, not a platform/libc-
+        specific symbol name and struct layout -- the same mechanism
+        clang itself lowers __builtin_setjmp/__builtin_longjmp to. 0
+        means this is the first, normal arrival (run A); nonzero means
+        a throw's __builtin_longjmp (festina_throw, in the C runtime --
+        longjmp has no equivalent placement restriction, so it's free
+        to live in an ordinary nested function) landed straight back
+        here (run B).
+
+        This is a plain two-way branch structurally, exactly like
+        _emit_if just above -- the only difference is A's own frame
+        (self._active_free_locals) gets one extra entry, a
+        _TryFrameMarker, pushed in ITS OWN dedicated wrapper frame (not
+        inside the one _emit_block(stmt.try_body, ...) manages itself)
+        so that ANY exit from A -- normal fallthrough, return, break,
+        continue, however deeply nested -- pops the runtime's catch
+        frame via the exact same _emit_free_active_locals walk that
+        already frees every other local on those exact same paths. A
+        throw reached from directly inside A needs no special handling
+        here at all: festina_throw pops the runtime's own frame itself
+        (see its own comment) before the longjmp, so by the time B
+        runs, both the runtime's bookkeeping and Python's
+        self._active_free_locals are already consistent with "the try
+        is over" -- nothing here needs to detect that it happened.
+        """
+        self.uses_try = True
+        lines = ctx["lines"]
+        buf = self.tmp()
+        lines.append(f"  {buf} = alloca [5 x ptr], align 16")
+        bufp = self.tmp()
+        lines.append(f"  {bufp} = getelementptr inbounds [5 x ptr], ptr {buf}, i64 0, i64 0")
+        frame_addr = self.tmp()
+        lines.append(f"  {frame_addr} = call ptr @llvm.frameaddress.p0(i32 0)")
+        lines.append(f"  store ptr {frame_addr}, ptr {bufp}, align 16")
+        stack_save = self.tmp()
+        lines.append(f"  {stack_save} = call ptr @llvm.stacksave.p0()")
+        slot2 = self.tmp()
+        lines.append(f"  {slot2} = getelementptr inbounds ptr, ptr {bufp}, i64 2")
+        lines.append(f"  store ptr {stack_save}, ptr {slot2}, align 16")
+        rc = self.tmp()
+        lines.append(f"  {rc} = call i32 @llvm.eh.sjlj.setjmp(ptr {bufp})")
+        is_catch = self.tmp()
+        lines.append(f"  {is_catch} = icmp ne i32 {rc}, 0")
+        try_label = self.label("try.body")
+        catch_label = self.label("try.catch")
+        end_label = self.label("try.end")
+        lines.append(f"  br i1 {is_catch}, label %{catch_label}, label %{try_label}")
+
+        self._start_block(try_label, lines)
+        lines.append(f"  call void @festina_try_push(ptr {bufp})")
+        tracking = self._current_escaping_names is not None
+        if tracking:
+            self._active_free_locals.append([(None, _TryFrameMarker())])
+        try:
+            try_ctx = self._emit_block(stmt.try_body, env, return_type, lines)
+        finally:
+            if tracking:
+                if not try_ctx["terminated"]:
+                    self._emit_free_active_locals(lines, down_to=len(self._active_free_locals) - 1)
+                self._active_free_locals.pop()
+        if not try_ctx["terminated"]:
+            lines.append(f"  br label %{end_label}")
+
+        self._start_block(catch_label, lines)
+        # claude.md #157: festina_try_error() hands over an owned text
+        # value (the runtime's own copy, made when the throw happened --
+        # see its own comment) -- bound as an ordinary local exactly the
+        # way _emit_block would bind any other with-init text VarDecl,
+        # so its own scope-exit cleanup (below, via catch_env's frame)
+        # is the SAME generic TEXT-local handling every other text local
+        # already gets, not anything special-cased for this one.
+        err_val = self.tmp()
+        lines.append(f"  {err_val} = call ptr @festina_try_error()")
+        err_slot = self.tmp()
+        lines.append(f"  {err_slot} = alloca ptr")
+        lines.append(f"  store ptr {err_val}, ptr {err_slot}")
+        catch_env = Env(env)
+        catch_env.define(stmt.catch_var, err_slot, TEXT)
+        if tracking:
+            self._active_free_locals.append([(err_slot, TEXT)])
+        try:
+            catch_ctx = self._emit_block(stmt.catch_body, catch_env, return_type, lines)
+        finally:
+            if tracking:
+                if not catch_ctx["terminated"]:
+                    self._emit_free_active_locals(lines, down_to=len(self._active_free_locals) - 1)
+                self._active_free_locals.pop()
+        if not catch_ctx["terminated"]:
+            lines.append(f"  br label %{end_label}")
+
+        if try_ctx["terminated"] and catch_ctx["terminated"]:
+            ctx["terminated"] = True
+        else:
+            self._start_block(end_label, lines)
 
     _uid = 0
 

@@ -206,7 +206,9 @@ class Parser:
             raise self.err(t, "invalid declaration",
                             f"'{t.type}' is not part of Festina; declare variables as 'type name = value'")
         if t.type == "throw":
-            raise self.err(t, "invalid statement", "'throw' is not supported; use fail() instead")
+            return self.parse_throw()
+        if t.type == "try":
+            return self.parse_try()
         if t.type == "import":
             return self.parse_import()
         if t.type == "const":
@@ -552,6 +554,39 @@ class Parser:
         update = self.parse_expression()
         body = self.parse_block()
         return ast.ForStmt(init, test, update, body, t.line, t.column)
+
+    def parse_try(self):
+        # claude.md #157: try { ... } catch (name:text) { ... } -- catch
+        # is required (no bare `try` with no handler -- there would be
+        # nothing distinguishing it from just writing the body directly),
+        # and its variable's type annotation must be exactly `text`
+        # (throw only ever raises text -- see parse_throw), spelled out
+        # so a typo'd `catch(error:int)` is a clear error here rather
+        # than a confusing one from semantic.py's own type checking.
+        t = self.eat("try")
+        try_body = self.parse_block()
+        self.eat("catch")
+        self.eat("LPAREN")
+        name_tok = self.eat("IDENT")
+        self.eat_op(":")
+        type_tok = self.peek()
+        if type_tok.type != "text":
+            raise self.err(type_tok, "invalid syntax",
+                            f"catch's variable is always text (a thrown value is always "
+                            f"text), found {type_tok.type}({type_tok.value!r})")
+        self.eat("text")
+        self.eat("RPAREN")
+        catch_body = self.parse_block()
+        return ast.TryStmt(try_body, name_tok.value, catch_body, t.line, t.column)
+
+    def parse_throw(self):
+        # claude.md #157: throw <expr> -- unlike fail() (a call
+        # expression), this is its own statement, the same shape
+        # return/free/delete already are.
+        t = self.eat("throw")
+        value = self.parse_expression()
+        self._semi()
+        return ast.ThrowStmt(value, t.line, t.column)
 
     def parse_return(self):
         t = self.eat("return")

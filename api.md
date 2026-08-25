@@ -2222,6 +2222,61 @@ close(1)          // prints "exiting with 1", then exits with status 1
 
 With no `on exit` handler declared, `close(code)` just exits.
 
+## `try` / `catch` / `throw`
+
+```festina
+void func risky(x:int) {
+    if (x < 0) {
+        throw `negative: ${x}`
+    }
+    log(x)
+}
+
+try {
+    risky(5)
+    risky(-1)
+    log('unreachable')
+} catch (error:text) {
+    log(`caught: ${error}`)
+}
+log('still running')
+```
+
+`throw <expr>` raises `expr`, coerced to text exactly like `log()`/
+`fail()` (any type works — not just text). It unwinds up through
+however many function calls are on the way (not just a `throw` written
+directly inside the `try` body itself) to the nearest enclosing
+`try`/`catch`, binding the caught message to `catch`'s own variable —
+always declared `:text`, since a thrown value always is one. With no
+enclosing `try` reachable at all, `throw` behaves exactly like
+`fail(expr)`: prints to stderr and exits(1) — `throw` is never a
+riskier way to end the program than `fail()` already is, only a
+strictly more capable one. `return`, `break`, and `continue` all work
+normally from inside either a `try` or a `catch` body, and a caught
+`catch` body can itself `throw` again (a rethrow, or a different error
+entirely) to propagate out to whatever `try` encloses *that*.
+
+**One real, honest limitation.** `throw` unwinds by jumping directly to
+the catching `try` (not by returning normally through every call frame
+in between), so a local declared in the function that *directly*
+contains the `throw` is always freed correctly — no different from an
+early `return` from that same function. But a function that merely
+*calls* something which eventually throws, without itself containing a
+`throw` or a `try`, never gets the chance to run any of its own
+cleanup: whatever `struct`/`arr`/`map`/`text`/etc. locals it declared
+leak. This is a leak, never a crash or corrupted state — confirmed
+directly (not just reasoned about) via Valgrind: 0 bytes leaked
+throwing from the function a `try` calls directly, and 0 bytes leaked
+one level deeper still; a real, reproducible leak, one allocation per
+call, the moment a genuine *intermediate* frame sits between the `try`
+and the actual `throw`. Keep whatever a `try`-adjacent call chain
+allocates minimal, or accept the same class of leak this language
+already accepts elsewhere (e.g. the one documented row-array chain
+shape in [security.md](security.md)).
+
+**Not available under `--target=wasm32-wasi`** — WASI has no setjmp/
+longjmp support at all — rejected at compile time; see [wasm.md](wasm.md).
+
 ## Error format
 
 Compile errors are `file:line:column: error: message`, e.g.:

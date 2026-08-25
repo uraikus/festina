@@ -139,6 +139,176 @@ void festina_fail(const char *msg) {
     exit(1);
 }
 
+/* ---- try/catch/throw -- claude.md #157 ----
+ *
+ * setjmp/longjmp exception emulation -- but NOT the classic "wrap
+ * setjmp in a small C helper function" shape a first attempt at this
+ * reached for (and which a direct test caught as genuinely broken --
+ * see claude.md #157's own account): setjmp() only captures a jump
+ * target valid while ITS OWN calling function's stack frame is still
+ * live. A helper that calls setjmp() and then returns 0 back to its
+ * own caller has already made that frame invalid by the time some
+ * LATER, unrelated throw tries to jump back into it -- undefined
+ * behavior in the C standard's own terms, and empirically a silent
+ * "just keeps running past the throw" or an outright crash depending
+ * on what else has since reused that stack space.
+ *
+ * The fix: the actual setjmp call happens directly in the FESTINA
+ * FUNCTION THAT CONTAINS THE try STATEMENT -- codegen's own _emit_try
+ * emits it as raw LLVM IR (the llvm.eh.sjlj.setjmp/llvm.eh.sjlj.longjmp
+ * intrinsics, the same portable, fixed-size-buffer mechanism clang
+ * itself lowers __builtin_setjmp/__builtin_longjmp to -- chosen over
+ * calling libc's own setjmp/longjmp symbols directly from hand-written
+ * IR specifically because THEIR symbol names and jmp_buf layout are
+ * platform/libc-specific in exactly the way an intrinsic isn't). That
+ * frame is exactly as long-lived as the try statement needs it to be:
+ * it can't return before hitting one of the exit paths codegen's own
+ * _TryFrameMarker mechanism already instruments.
+ *
+ * longjmp itself has NO equivalent placement constraint -- only the
+ * ORIGINATING setjmp call cares where it's made, so festina_throw
+ * below is free to be an ordinary runtime C function using
+ * __builtin_longjmp on whatever buffer festina_try_push registered.
+ *
+ * The catch-frame stack is a plain, unsynchronized global -- correct
+ * today because this runtime is single-threaded throughout (the
+ * `thread {}` feature this pairs with in the language's own roadmap is
+ * deliberately NOT built yet -- see todo.md -- specifically because it
+ * would need this, along with every other piece of global runtime
+ * state, redesigned for real concurrent access first).
+ *
+ * THE ONE REAL, DOCUMENTED LIMITATION (see api.md and claude.md #157):
+ * longjmp unwinds the C stack directly, bypassing every LLVM-generated
+ * cleanup instruction in every frame between the throw and the
+ * catching try -- EXCEPT the one frame that matters most, which
+ * codegen's own ThrowStmt handling covers explicitly (a plain, direct
+ * _emit_free_active_locals call, right before the festina_throw call
+ * itself -- unlike every other frame's cleanup, this one is emitted
+ * BEFORE, not after, so it isn't dead code the longjmp skips). So: a
+ * throw is leak-free for every local active in the FUNCTION THAT
+ * DIRECTLY CONTAINS the throw statement, whether that's the try's own
+ * body or a function it calls (or a function THAT calls, arbitrarily
+ * deep) -- exactly like Return already is for that same function. The
+ * real gap is narrower than "any called function": any INTERMEDIATE
+ * frame on the call chain between the try and the actual throw -- a
+ * function that merely CALLS something which eventually throws,
+ * without itself containing a throw or try -- never runs any of its
+ * own cleanup at all, because longjmp skips past its remaining code
+ * entirely, the same way it skips a frame with no cleanup story of its
+ * own. Confirmed empirically, not just reasoned about: a direct
+ * Valgrind run showed 0 leaked bytes throwing from the SAME function a
+ * try calls, and from a function THAT function calls in turn -- and a
+ * real, reproducible "N bytes in N blocks definitely lost" (N = call
+ * count) the moment a genuine intermediate frame sat between them.
+ * This is a leak, never a use-after-free or corruption (nothing is
+ * freed that shouldn't be, only some things that should be freed
+ * eventually aren't) -- the same correctness class this runtime already accepts
+ * for the one documented row-array chain shape in security.md. */
+
+typedef struct FestinaCatchFrame {
+    void *buf;  /* codegen's own [5 x ptr] alloca -- see _emit_try */
+    struct FestinaCatchFrame *prev;
+} FestinaCatchFrame;
+
+static FestinaCatchFrame *g_festina_catch_top = NULL;
+/* Owned by the runtime between a throw and the moment festina_try_error()
+ * hands it over; NULL the rest of the time. Only ever holds ONE message
+ * at a time -- a throw can only reach here once nothing between it and
+ * the catch has already unwound, so there's never a second pending
+ * throw to overwrite this before the first is collected. */
+static char *g_festina_error_message = NULL;
+
+/* Registers buf (codegen's own alloca'd sjlj buffer, already populated
+ * by ITS direct llvm.eh.sjlj.setjmp call, which returned 0 -- the
+ * normal, first-arrival path) as the new top catch frame. Called by
+ * generated code once, right after that setjmp -- never on the
+ * "returned via a longjmp" (nonzero) path. */
+void festina_try_push(void *buf) {
+    FestinaCatchFrame *frame = malloc(sizeof(FestinaCatchFrame));
+    if (!frame) { fprintf(stderr, "festina: out of memory (try)\n"); exit(1); }
+    frame->buf = buf;
+    frame->prev = g_festina_catch_top;
+    g_festina_catch_top = frame;
+}
+
+/* Only ever called right after festina_try_push() pushed the SAME
+ * frame this pops (codegen's own _TryFrameMarker handling in
+ * _emit_free_active_locals is the only caller, on every NORMAL exit
+ * from a try body); a THROWING exit pops its own frame itself, from
+ * inside festina_throw, before the jump. */
+void festina_try_pop(void) {
+    FestinaCatchFrame *frame = g_festina_catch_top;
+    if (!frame) return; /* defensive; should never happen from generated code */
+    g_festina_catch_top = frame->prev;
+    free(frame);
+}
+
+/* Hands ownership of the thrown message over to generated code as an
+ * ordinary, exclusively-owned text value -- the runtime's own copy
+ * (see festina_throw) becomes the caller's from this point on, so this
+ * never needs calling twice for the same throw. */
+char *festina_try_error(void) {
+    char *msg = g_festina_error_message;
+    g_festina_error_message = NULL;
+    return msg ? msg : strdup("");
+}
+
+/* Never returns. With no enclosing try reachable, behaves exactly like
+ * fail(msg) -- throw is always at least as safe as fail(), never a
+ * riskier way to end the program.
+ *
+ * TAKES OWNERSHIP of msg -- unlike every other runtime call taking a
+ * `ptr` text argument, this does NOT make its own copy (codegen's own
+ * ThrowStmt handling already made an exclusively-owned one, via a
+ * plain festina_text_own, specifically so it stays valid regardless of
+ * what _emit_free_active_locals frees right afterward -- see that
+ * comment for why a second copy here would be redundant AND would
+ * itself leak, since nothing downstream would ever free it once this
+ * call diverts control away for good). Otherwise: pops the frame it's
+ * unwinding TO (not any frame still open between here and there --
+ * those are simply never visited, which is this mechanism's one
+ * documented leak -- see this file's own top comment), and jumps via
+ * __builtin_longjmp -- safe to call from here (an ordinary, nested
+ * runtime function) even though the matching setjmp is not, since only
+ * setjmp cares about its own call site's frame lifetime; longjmp has
+ * no equivalent restriction.
+ *
+ * wasm32-wasi gets a stub, the identical shape festina_process_exec's
+ * own wasm32-wasi branch already uses just below (see this file's own
+ * top-of-file comment on why): __builtin_longjmp is flatly rejected by
+ * clang for this target ("not supported for the current target",
+ * confirmed directly -- LLVM's wasm32 backend has no SjLj lowering at
+ * all outside emscripten's own EH pass, which this project doesn't
+ * use), so this whole file would fail to compile for EVERY program,
+ * try/throw or not, without this split -- this translation unit is
+ * still compiled UNCONDITIONALLY for every wasm build. try/throw is
+ * rejected outright at compile time instead (festina/cli.py's
+ * _check_wasm_feature_supported, gated on codegen's own uses_try) --
+ * this stub degrading every throw to fail()'s own behavior instead of
+ * a hard compile error would be surprising, silently platform-
+ * dependent semantics rather than a clear, honest "not supported
+ * here"; it exists purely so this file compiles, never to be reached
+ * by a real program. */
+#if !defined(__wasi__)
+void festina_throw(const char *msg) {
+    if (g_festina_catch_top == NULL) {
+        festina_fail(msg);
+        return; /* unreachable -- festina_fail() always exits */
+    }
+    free(g_festina_error_message);
+    g_festina_error_message = (char *)msg;
+    FestinaCatchFrame *frame = g_festina_catch_top;
+    g_festina_catch_top = frame->prev;
+    void *buf = frame->buf;
+    free(frame);
+    __builtin_longjmp(buf, 1);
+}
+#else
+void festina_throw(const char *msg) {
+    festina_fail(msg); /* never actually reached -- see this function's own comment above */
+}
+#endif
+
 /* claude.md #131: close(code)/`on exit(code:int)`. Lives in the CORE
  * runtime (not festina_runtime_graphics.c, where g_close_handler and
  * the window-close event live) precisely because close() has to work

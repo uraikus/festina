@@ -2561,6 +2561,27 @@ def analyze(program, filename="<string>"):
             check_condition_bool(cond_type, stmt)
             infer(stmt.update, loop_scope)
             analyze_block(stmt.body, loop_scope, return_type, loop_depth + 1)
+        elif isinstance(stmt, ast.TryStmt):
+            # claude.md #157: try_body and catch_body are each analyzed
+            # in their own fresh child scope (analyze_block already
+            # does this) -- catch_var is visible only inside catch_body,
+            # never inside try_body or after the whole statement, the
+            # same "scoped to exactly where it's declared" rule the for
+            # loop's own init variable already follows. loop_depth
+            # passes through unchanged, same reasoning as IfStmt just
+            # above: try/catch is a branch, not a loop boundary of its
+            # own, so break/continue inside it still target whatever
+            # loop (if any) already encloses it.
+            analyze_block(stmt.try_body, scope, return_type, loop_depth)
+            catch_scope = Scope(scope)
+            catch_scope.define(stmt.catch_var, Symbol(stmt.catch_var, _TEXT, "variable"),
+                                stmt, filename)
+            analyze_block(stmt.catch_body, catch_scope, return_type, loop_depth)
+        elif isinstance(stmt, ast.ThrowStmt):
+            # claude.md #157: any type is accepted and coerced to text
+            # at codegen, exactly like log()/fail() (claude.md #35) --
+            # no restriction here beyond "it's a valid expression".
+            infer(stmt.expr, scope)
         elif isinstance(stmt, ast.FreeStmt):
             # claude.md #111: `free name`. Any declared variable of any
             # type -- releasing is type-dispatched in codegen, and for a

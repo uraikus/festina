@@ -35,6 +35,16 @@ void festina_log_text(const char *v);
 /* claude.md #42: fail() -- prints to stderr and exits(1). */
 void festina_fail(const char *msg);
 
+/* claude.md #157: try/catch/throw. See festina_runtime.c's own comment
+ * on this whole group for the setjmp/longjmp design and its one
+ * documented leak caveat (a throw reached through a called function).
+ * The actual setjmp call is emitted directly by codegen (_emit_try) --
+ * festina_try_push registers the buffer it produced. */
+void festina_try_push(void *buf);
+void festina_try_pop(void);
+char *festina_try_error(void);
+void festina_throw(const char *msg);
+
 /* claude.md #131: close(code) -- runs a declared `on exit(code:int)`
  * handler (if any), then exits with `code`. Lives in the core runtime
  * so it works in every program, windowed or not -- unlike
