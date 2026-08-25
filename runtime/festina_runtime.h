@@ -83,6 +83,26 @@ void festina_throw(const char *msg);
 void festina_register_exit_handler(void (*handler)(int64_t));
 void festina_program_exit(int64_t code);
 
+/* claude.md #161: graceful shutdown -- SIGINT (every platform) and
+ * SIGTERM (POSIX only -- Windows has no real delivery of it, see
+ * festina_runtime.c's own comment) now run the SAME clean-exit path
+ * close(code) already uses (`on exit(code:int)` fires, then the
+ * process exits) instead of the OS's own default abrupt termination,
+ * and -- for a program using openPort()/openSecurePort() -- give
+ * already-accepted connections a real chance to finish first (see
+ * festina_runtime_http.c's own festina_run_http_loop). Generated
+ * code's own main() calls festina_install_shutdown_handler() at most
+ * once, and ONLY when the program has one of the three pollable
+ * blocking loops below (see festina_runtime.c's own comment on why --
+ * installing it anywhere else, including for a program that declares
+ * `on exit` but has none of those loops, would silently swallow
+ * Ctrl+C with nothing left to ever check for it). festina_shutdown_requested()/
+ * _exit_code() are what every blocking loop (http/timer/graphics)
+ * polls once per ordinary iteration to notice and act on it. */
+void festina_install_shutdown_handler(void);
+int64_t festina_shutdown_requested(void);
+int64_t festina_shutdown_exit_code(void);
+
 /* claude.md #9, #45: string interpolation support. */
 char *festina_str_from_int(int64_t v);
 char *festina_str_from_float(double v);

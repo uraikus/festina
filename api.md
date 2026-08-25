@@ -1776,6 +1776,11 @@ s.close()                             // sends a close frame and ends the connec
   this version. `setTimeout`/`setInterval` combine fine; both are
   serviced from the same loop.
 
+See [Graceful shutdown](#graceful-shutdown) below (under `close()`/`on
+exit`) for what Ctrl-C/`SIGTERM` do to a running server — the port
+stops accepting new connections immediately, but an already-open one
+gets a real chance to finish first.
+
 ### <a name="opensecureport"></a>`openSecurePort(port:int, key:blob)` — TLS
 
 ```festina
@@ -2292,6 +2297,45 @@ close(1)          // prints "exiting with 1", then exits with status 1
 ```
 
 With no `on exit` handler declared, `close(code)` just exits.
+
+### <a name="graceful-shutdown"></a>Graceful shutdown (Ctrl-C / `SIGTERM`)
+
+A program that uses `openPort()`/`openSecurePort()`, `setTimeout`/
+`setInterval`, or graphics now stops the same clean way `close(code)`
+already does when it receives `SIGINT` (Ctrl-C) or `SIGTERM` — a
+declared `on exit(code:int)` fires (passed a conventional
+`128 + signal` code: `130` for `SIGINT`, `143` for `SIGTERM`), then the
+process exits — instead of the OS's own default, abrupt,
+no-cleanup-at-all termination:
+
+```festina
+on exit(code:int) {
+    log(`shutting down (${code})`)
+}
+on request(req:http) {
+    req.send('hello', 200)
+}
+openPort(8080)
+// Ctrl-C now logs "shutting down (130)" instead of just vanishing.
+```
+
+For an HTTP/WebSocket server specifically, shutdown is **graceful** in
+the way that matters: every listening port closes *immediately* (a new
+connection attempt is refused right away, not silently dropped), but
+connections already open are given up to 10 seconds to finish on their
+own before this runtime gives up on them and exits anyway — a normal
+request/response finishes in milliseconds, so this only ever matters
+for a long-lived WebSocket connection that never closes.
+
+**Only installed where it can actually take effect.** A plain script
+with no `openPort()`/timers/graphics — just top-level code, or your own
+hand-written loop — keeps the OS's own default `SIGINT`/`SIGTERM`
+behavior (an immediate kill, `on exit` not run) exactly as before this
+feature existed: there is no point in such a program's own execution
+where it could ever notice a shutdown request, so installing a handler
+there would make Ctrl-C *stop working* instead of merely skipping
+cleanup — worse, not better. `SIGTERM` is POSIX only; Windows has no
+real delivery of it (only `SIGINT`/Ctrl-C).
 
 ## `troubleshoot()` — structured logging
 

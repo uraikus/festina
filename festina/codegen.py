@@ -1411,6 +1411,9 @@ class CodeGen:
             # windowed or not.
             "declare void @festina_register_exit_handler(ptr)",
             "declare void @festina_program_exit(i64)",
+            # claude.md #161: graceful shutdown -- see festina_runtime.h's
+            # own doc comment right above these declarations.
+            "declare void @festina_install_shutdown_handler()",
             "declare i64 @festina_client_width()",
             "declare i64 @festina_client_height()",
             # claude.md #139
@@ -8873,6 +8876,25 @@ class CodeGen:
         # before a window would otherwise be set up.
         if self.exit_handler_symbol is not None:
             main_lines.append(f"  call void @festina_register_exit_handler(ptr {self.exit_handler_symbol})")
+        # claude.md #161: graceful shutdown -- installed ONLY when this
+        # program has one of the three blocking loops just below, each
+        # of which already polls festina_shutdown_requested() once per
+        # ordinary iteration (see festina_runtime.h's own doc comment).
+        # Deliberately NOT gated on self.exit_handler_symbol alone: a
+        # program that declares `on exit(code:int)` but has no
+        # http/timers/graphics loop -- say, its own hand-written
+        # `while (true) { ... }` at top level -- has no point in its
+        # own execution that could ever check the flag either. Installing
+        # the handler there wouldn't just skip running the exit handler
+        # (today's existing behavior); it would make Ctrl-C/SIGTERM stop
+        # working AT ALL for such a program (the signal sets the flag and
+        # returns control right back into the same un-checking loop,
+        # silently swallowing what used to be an immediate kill) --
+        # confirmed directly, and a strictly worse regression than the
+        # gap this feature is closing. Only install where a poll point
+        # is actually guaranteed to run soon.
+        if self.uses_graphics or self.uses_http or self.uses_timers:
+            main_lines.append("  call void @festina_install_shutdown_handler()")
         # claude.md #151: `on request`/`on upgrade`/`on message`/
         # `on socketClose` -- NOT graphics events either, same
         # unconditional-registration shape as `exit` just above (an

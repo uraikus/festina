@@ -1276,17 +1276,37 @@ void festina_open_secure_port(int64_t port, const uint8_t *key, int64_t key_len)
     festina_open_port_impl(port, tls_config);
 }
 
+static void festina_close_listener_at(int64_t i) {
+    festina_close_fd(g_listeners[i].fd);
+    if (g_listeners[i].tls_config && g_tls_listener_free) {
+        g_tls_listener_free(g_listeners[i].tls_config);
+    }
+    g_listeners[i] = g_listeners[g_listener_count - 1];
+    g_listener_count--;
+}
+
 void festina_close_port(int64_t port) {
     for (int64_t i = 0; i < g_listener_count; i++) {
         if (g_listeners[i].port == (int)port) {
-            festina_close_fd(g_listeners[i].fd);
-            if (g_listeners[i].tls_config && g_tls_listener_free) {
-                g_tls_listener_free(g_listeners[i].tls_config);
-            }
-            g_listeners[i] = g_listeners[g_listener_count - 1];
-            g_listener_count--;
+            festina_close_listener_at(i);
             return;
         }
+    }
+}
+
+/* claude.md #161: graceful shutdown's own first move -- close every
+ * listening socket outright (rather than merely excluding them from
+ * the next poll() call) so the OS immediately refuses any new
+ * connection attempt (ECONNREFUSED) instead of it sitting in the
+ * kernel's accept queue with nothing ever calling accept() on it.
+ * Reuses festina_close_listener_at, the exact same per-listener
+ * cleanup festina_close_port already does (fd close + TLS config
+ * free) -- walked backwards so removing index i by swapping in the
+ * last element (that function's own compaction trick) never skips
+ * the element that swap just moved into position i. */
+static void festina_close_all_listeners(void) {
+    for (int64_t i = g_listener_count - 1; i >= 0; i--) {
+        festina_close_listener_at(i);
     }
 }
 
@@ -1303,8 +1323,66 @@ static FestinaPollFd *g_poll_fds = NULL;
 static int64_t *g_poll_conn_ids = NULL;
 static size_t g_poll_cap = 0;
 
+/* claude.md #161: graceful shutdown's own drain state -- set once, the
+ * first loop iteration after festina_shutdown_requested() goes true.
+ * FESTINA_SHUTDOWN_GRACE_SECONDS bounds how long already-open
+ * connections get to finish on their own before this loop gives up on
+ * them and exits anyway: generous for this runtime's own one-shot
+ * request-then-close HTTP/1.1 model (a normal response finishes in
+ * milliseconds), but bounded, since a long-lived WebSocket connection
+ * that never closes on its own would otherwise hold shutdown open
+ * forever. */
+static int g_http_draining = 0;
+static double g_http_drain_deadline = 0.0;
+#define FESTINA_SHUTDOWN_GRACE_SECONDS_DEFAULT 10.0
+
+/* Overridable via FESTINA_SHUTDOWN_GRACE_SECONDS -- not a documented
+ * language feature (see api.md's own note: this is a debug/test knob,
+ * not language-level configuration), but real, checked-in-tests
+ * behavior: it's what lets tests/test_graceful_shutdown.py exercise
+ * the forced-cutoff path (a connection that genuinely never closes)
+ * in a fraction of a second rather than actually waiting out the
+ * production default. */
+static double festina_shutdown_grace_seconds(void) {
+    const char *env = getenv("FESTINA_SHUTDOWN_GRACE_SECONDS");
+    if (env) {
+        double v = atof(env);
+        if (v > 0.0) return v;
+    }
+    return FESTINA_SHUTDOWN_GRACE_SECONDS_DEFAULT;
+}
+
+static int64_t festina_alive_conn_count(void) {
+    int64_t n = 0;
+    for (int64_t i = 0; i < g_conn_count; i++) {
+        if (g_conns[i].alive) n++;
+    }
+    return n;
+}
+
 void festina_run_http_loop(void) {
     for (;;) {
+        /* claude.md #161: checked once per iteration, this loop's own
+         * natural poll point (the same shape festina_run_timer_loop's
+         * own check has). The first tick after a signal arrives closes
+         * every listener OUTRIGHT (not just excluded from the next
+         * poll() call) so the OS immediately refuses any new connection
+         * attempt instead of it sitting unaccepted -- from then on,
+         * the listener-building loop just below emits nothing (the
+         * listener table is already empty), so this loop keeps
+         * servicing whatever connections were already open, same as
+         * always, until either none are left or the grace period
+         * above elapses. */
+        if (festina_shutdown_requested()) {
+            if (!g_http_draining) {
+                g_http_draining = 1;
+                g_http_drain_deadline = festina_now_seconds() + festina_shutdown_grace_seconds();
+                festina_close_all_listeners();
+            }
+            if (festina_alive_conn_count() == 0 || festina_now_seconds() >= g_http_drain_deadline) {
+                festina_program_exit(festina_shutdown_exit_code());
+            }
+        }
         /* claude.md #155: over-allocate to the known upper bound
          * (g_listener_count + g_conn_count, the connection table's own
          * high-water mark -- includes any dead-but-not-yet-reused
@@ -1355,6 +1433,21 @@ void festina_run_http_loop(void) {
         }
 
         double deadline = festina_next_timer_deadline();
+        /* claude.md #161: while draining, the grace-period deadline
+         * ALSO bounds how long poll() may block -- otherwise, with no
+         * timer active and every open connection sitting idle (a
+         * WebSocket that never sends anything else), poll() would
+         * block with timeout_ms == -1 (forever) and this loop would
+         * never come back around to re-check
+         * festina_now_seconds() >= g_http_drain_deadline at all,
+         * silently defeating the whole grace period -- confirmed
+         * directly (a stuck WebSocket connection genuinely hung this
+         * loop past its 10-second deadline, only ending because the
+         * TEST's own client eventually closed the socket on its own,
+         * not because of anything this loop did) before this fix. */
+        if (g_http_draining && (deadline < 0.0 || g_http_drain_deadline < deadline)) {
+            deadline = g_http_drain_deadline;
+        }
         int timeout_ms = -1;
         if (deadline >= 0.0) {
             double remaining = deadline - festina_now_seconds();

@@ -37,6 +37,17 @@
 #include <ctype.h>   /* isdigit/tolower -- claude.md #159's JSON parser */
 #include <errno.h>
 #include <regex.h>
+#if !defined(__wasi__)
+#include <signal.h>  /* sig_atomic_t/signal/SIGINT/SIGTERM -- claude.md #161's
+                       * graceful shutdown. wasi-libc's own <signal.h> is an
+                       * unconditional #error unless compiled with
+                       * -D_WASI_EMULATED_SIGNAL (confirmed directly) -- WASI
+                       * has no signal model at all, so this is skipped
+                       * outright for that target, not merely left with
+                       * unused declarations (see the matching #else stubs
+                       * below, right where sig_atomic_t would otherwise be
+                       * used). */
+#endif
 #include <stdarg.h>  /* va_list -- claude.md #159's festina_json_throwf */
 #include <stdint.h>
 #include <stdio.h>
@@ -757,6 +768,98 @@ void festina_program_exit(int64_t code) {
     if (g_exit_handler) g_exit_handler(code);
     exit((int)code);
 }
+
+/* claude.md #161: graceful shutdown -- SIGINT/SIGTERM stop a program
+ * the same clean way close(code) already does (`on exit(code:int)`
+ * runs, then the process exits) instead of the OS's own default,
+ * abrupt, no-cleanup-at-all termination -- and, for a program that
+ * uses openPort()/openSecurePort(), give already-accepted connections
+ * a real chance to finish instead of being severed mid-response (see
+ * festina_runtime_http.c's own festina_run_http_loop, which is what
+ * actually does the draining -- this is only the signal-to-flag
+ * plumbing every blocking loop polls).
+ *
+ * DESIGN: the signal handler itself does the absolute minimum
+ * async-signal-safety allows -- setting two `sig_atomic_t` flags and
+ * returning, nothing else (no malloc, no I/O, no calling back into
+ * arbitrary Festina/C code directly from signal context, which could
+ * land mid-way through an in-progress non-reentrant call like
+ * malloc() itself and deadlock or corrupt heap state). Every blocking
+ * loop (festina_run_http_loop, festina_run_timer_loop,
+ * festina_run_event_loop) instead POLLS festina_shutdown_requested()
+ * once per ordinary iteration -- the same "check a flag on your own
+ * schedule, from safe context" pattern already used for
+ * festina_next_timer_deadline()/_fire_expired_timers() -- and does
+ * its real cleanup (draining connections, closing a window, ...) from
+ * there, in normal (non-signal-handler) execution.
+ *
+ * DESIGN: festina_install_shutdown_handler() is called from generated
+ * code's own main() -- and ONLY there, ONLY when the program actually
+ * has one of those three pollable loops (see codegen.py's
+ * _emit_main_and_entry) -- deliberately NOT unconditionally
+ * from festina_runtime_init() the way that function's own stdout/stderr
+ * fix is. A plain script with a hand-written loop and no event loop of
+ * any kind has no point in its own execution that could ever check
+ * festina_shutdown_requested() at all; installing a handler there would
+ * silently swallow Ctrl+C (the flag gets set, but nothing ever polls it,
+ * so the program would run to completion instead of stopping) --
+ * genuinely worse than doing nothing, since the OS's own default
+ * SIGINT/SIGTERM disposition already stops such a program today. Only
+ * install where "graceful" has an observable, correct meaning.
+ *
+ * DESIGN: SIGTERM is POSIX-only (`#ifndef _WIN32`) -- Windows has no
+ * real SIGTERM delivery at all (nothing sends it under normal process
+ * termination; taskkill/TerminateProcess don't raise it), the same
+ * "Windows has no SIGPIPE either" situation festina_runtime_http.c's
+ * own festina_open_port already documents for a different signal.
+ * SIGINT is registered on every platform -- Windows' CRT does raise it
+ * for a real Ctrl+C on a console process. */
+#if !defined(__wasi__)
+static volatile sig_atomic_t g_shutdown_requested = 0;
+static volatile sig_atomic_t g_shutdown_exit_code = 0;
+
+static void festina_shutdown_signal_handler(int sig) {
+    g_shutdown_requested = 1;
+    /* 128+signal is the conventional POSIX/shell exit-code encoding for
+     * "terminated by signal N" (130 for SIGINT, 143 for SIGTERM) --
+     * matches what a shell itself would report for the same signal
+     * killing an ordinary (non-Festina) process, so a caller scripting
+     * around a compiled Festina program sees the familiar convention. */
+    g_shutdown_exit_code = 128 + sig;
+}
+
+void festina_install_shutdown_handler(void) {
+    signal(SIGINT, festina_shutdown_signal_handler);
+#ifndef _WIN32
+    signal(SIGTERM, festina_shutdown_signal_handler);
+#endif
+}
+
+int64_t festina_shutdown_requested(void) {
+    return g_shutdown_requested;
+}
+
+int64_t festina_shutdown_exit_code(void) {
+    return g_shutdown_exit_code;
+}
+#else
+/* WASI Preview 1 has no signal model at all -- confirmed directly:
+ * wasi-libc's own <signal.h> provides none of sig_atomic_t/signal()/
+ * SIGINT/SIGTERM, the identical "genuinely absent, not a hardware-
+ * verification gate" situation exec()/http/try already document for
+ * this target (see cli.py's _check_wasm_feature_supported). Graceful
+ * shutdown simply doesn't apply here -- but this translation unit is
+ * compiled UNCONDITIONALLY for every wasm build (core, like regex --
+ * see this file's own top comment), and a timers-only wasm program
+ * (uses_timers, still perfectly valid under WASI) still emits a call
+ * to festina_install_shutdown_handler (see codegen.py's own
+ * _emit_main_and_entry) -- so these stubs exist purely so the core
+ * object file still compiles and links; the call itself is simply a
+ * no-op here. */
+void festina_install_shutdown_handler(void) { }
+int64_t festina_shutdown_requested(void) { return 0; }
+int64_t festina_shutdown_exit_code(void) { return 0; }
+#endif
 
 /* ---- environment variables -- claude.md #71 ---- */
 
@@ -2938,6 +3041,17 @@ void festina_fire_expired_timers(void) {
  * externally (or via clearInterval()) the same way. */
 void festina_run_timer_loop(void) {
     while (1) {
+        /* claude.md #161: checked once per iteration (this loop's own
+         * natural poll point -- nanosleep is interrupted, EINTR, by
+         * the very signal that sets this flag, so the very next check
+         * after a Ctrl+C/SIGTERM sees it almost immediately, not after
+         * waiting out the rest of whatever timer was pending). Exits
+         * via festina_program_exit rather than a plain return, so a
+         * declared `on exit(code:int)` handler still runs -- the same
+         * clean-shutdown path close(code) already uses. */
+        if (festina_shutdown_requested()) {
+            festina_program_exit(festina_shutdown_exit_code());
+        }
         double earliest = festina_next_timer_deadline();
         if (earliest < 0.0) return; /* nothing left to wait for */
         double remaining = earliest - festina_now_seconds();
