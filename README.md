@@ -4,10 +4,11 @@
 
 Keep the syntax you already know. Drop the interpreter, the runtime
 overhead, and the boilerplate. Festina compiles through LLVM to a real,
-standalone executable — with SQLite, graphics, audio, and JS-style
-timers built directly into the language, not bolted on as libraries.
+standalone executable — with SQLite, graphics, audio, JS-style timers,
+and an HTTP/WebSocket server built directly into the language, not
+bolted on as libraries.
 
-[![Tests](https://img.shields.io/badge/tests-1462%20passing-brightgreen)](tests/CONTRACT.md)
+[![Tests](https://img.shields.io/badge/tests-1639%20passing-brightgreen)](tests/CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ```festina
@@ -63,6 +64,16 @@ bin/festina compile examples/greet.f -o greet && ./greet
 
 ## Get started
 
+One line, on Linux/macOS/MSYS2 UCRT64 bash on Windows (no prebuilt binary
+to trust — it clones the source and checks/installs build dependencies
+for you; see [setup.md](setup.md) for what it actually does):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/uraikus/festina/main/install.sh | sh
+```
+
+Or from an existing checkout:
+
 ```bash
 sudo apt install clang libsqlite3-dev libcairo2-dev libx11-dev libasound2-dev pkg-config
 bin/festina compile examples/hello.f -o hello
@@ -78,6 +89,9 @@ bin/festina run examples/hello.f
 Not sure your machine has everything Festina needs? `bin/festina doctor`
 checks every dependency above and tells you exactly what's missing and
 how to install it — including whether `festina` itself is on `PATH` yet.
+Add `--fix` and it installs whatever's missing for you (via `apt`/
+Homebrew/MSYS2's `pacman`, whichever this machine has) and adds
+`festina` to `PATH` too.
 
 That's the whole loop — see [setup.md](setup.md) for the full dependency
 breakdown (what's required vs. only-if-you-use-it), packaged-binary
@@ -180,9 +194,10 @@ bin/festina compile examples/tic_tac_toe.f -o tic_tac_toe && ./tic_tac_toe
 | [`audio.f`](examples/audio.f) | `aud` from a path, `.play()`/`.stop()`/`.isPlaying()`, channels, with a tiny bundled WAV |
 | [`files.f`](examples/files.f) | `blob` — a file's bytes, its methods, `save`/`saveCopy`, and what sharing one means |
 | [`tic_tac_toe.f`](examples/tic_tac_toe.f) | The game above — graphics, global game state, and win-checking logic together |
+| [`layers.f`](examples/layers.f) | `arr[img]` as a layer stack — each layer modified by its own drawing methods, one function compositing all of them every frame |
 
 Every one of these is compiled and checked by the test suite on every
-change (`tests/test_examples.py` and, for the two needing a display,
+change (`tests/test_examples.py` and, for the three needing a display,
 `tests/test_codegen.py::TestExampleGraphicsAndGame`) — they're not just
 snippets that happened to work once.
 
@@ -200,7 +215,7 @@ frame about twice as fast as Chromium's.
 ## Project status
 
 The compiler frontend, LLVM codegen backend, and native C runtime are
-real and tested: **1462 tests, 0 failures** (8 more skip cleanly when
+real and tested: **1639 tests, 0 failures** (8 more skip cleanly when
 their optional tooling isn't installed — see
 [setup.md](setup.md#running-the-test-suite)). Every language construct
 in the [specification](claude.md) is implemented end to end, not just
@@ -209,9 +224,10 @@ parsed. That includes a leak stress suite —
 programs plus one isolation program per data type under
 AddressSanitizer and LeakSanitizer — because "the answers are right"
 and "nothing accumulates while producing them" are different claims.
-See [`tests/CONTRACT.md`](tests/CONTRACT.md) for exactly what's covered
-and how, and [todo.md](todo.md) for what's next (macOS, Windows,
-HTTP).
+Native builds on Linux, macOS, and Windows, plus cross-compiling to
+`wasm32-wasi` (see [wasm.md](wasm.md)), are all supported today. See
+[`tests/CONTRACT.md`](tests/CONTRACT.md) for exactly what's covered
+and how, and [todo.md](todo.md) for what's next.
 
 ```bash
 python3 -m pytest            # the whole suite

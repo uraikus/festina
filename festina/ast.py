@@ -23,19 +23,26 @@ class ImportDecl(Node):
 
 
 class ArrayTypeExpr(Node):
-    """`arr[T]` as it appears in a type position."""
+    """`arr[T]` as it appears in a type position -- or `amor arr[T]`,
+    claude.md #156's own amortized-growth modifier (`amortized`,
+    default False), parsed as a prefix ahead of the `arr[T]` itself
+    (see parser.py's own `amor` handling, which composes with `const`
+    the same way -- `const amor arr[int] xs`)."""
 
-    def __init__(self, element):
+    def __init__(self, element, amortized=False):
         self.element = element
+        self.amortized = amortized
 
 
 class MapTypeExpr(Node):
     """`map[T]` as it appears in a type position -- claude.md #72. Keys
     are always text, so (mirroring ArrayTypeExpr) only the value type
-    needs spelling out."""
+    needs spelling out. `amortized` mirrors ArrayTypeExpr's own field
+    exactly -- claude.md #156's `amor map[T]`."""
 
-    def __init__(self, value):
+    def __init__(self, value, amortized=False):
         self.value = value
+        self.amortized = amortized
 
 
 class FuncTypeExpr(Node):

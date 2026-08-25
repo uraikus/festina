@@ -93,6 +93,7 @@ _RUNTIME_DIR = os.path.join(_data_root(), "runtime")
 _RUNTIME_C = os.path.join(_RUNTIME_DIR, "festina_runtime.c")
 _RUNTIME_GRAPHICS_C = os.path.join(_RUNTIME_DIR, "festina_runtime_graphics.c")
 _RUNTIME_AUDIO_C = os.path.join(_RUNTIME_DIR, "festina_runtime_audio.c")
+_RUNTIME_HTTP_C = os.path.join(_RUNTIME_DIR, "festina_runtime_http.c")
 # Both headers are #included by more than one of the .c files above (see
 # festina_runtime_internal.h's own doc comment) -- included in every
 # object file's cache-freshness check below (_ensure_runtime_object)
@@ -107,21 +108,38 @@ _RUNTIME_HEADERS = [
 
 _sqlite_link_cache = {}
 
+# A real sentinel, not None -- _festina_path_fix_plan's own injectable
+# parameters (festina_path, meipass, shell_env) each have a legitimate
+# "explicitly absent" value of None/"" that a test needs to be able to
+# pass in on purpose (e.g. "PATH genuinely doesn't resolve festina" or
+# "$SHELL genuinely isn't set"), which None-as-default can't tell apart
+# from "the caller didn't pass this argument at all, so go compute the
+# real one."
+_UNSET = object()
 
-def _default_output_name(entry_path, platform_name=None):
+
+def _default_output_name(entry_path, platform_name=None, target="native"):
     """windows.md Phase 0: on Windows the default output gains `.exe` --
     both because the shell only executes files with an executable
     extension, and because MinGW's linker appends `.exe` itself when
     the requested name has no suffix, so asking for `program` and then
     running `program` would miss the `program.exe` actually written.
     `platform_name` is injectable purely so the win32/darwin branches
-    are unit-testable from any platform (tests/test_platform.py)."""
+    are unit-testable from any platform (tests/test_platform.py).
+
+    claude.md #148: a wasm32-wasi build gets `.wasm` regardless of
+    platform_name -- the HOST doing the compiling has no bearing on
+    what the OUTPUT actually is (a .wasm binary is not something any
+    shell on ANY host executes directly the way a native binary or
+    .exe is; see wasm.md for how it's actually run)."""
     platform_name = platform_name or sys.platform
     base = os.path.basename(entry_path)
     if base.endswith(".f"):
         base = base[:-2]
     base = base or "a.out"
-    if platform_name == "win32" and not base.lower().endswith(".exe"):
+    if target == "wasm32-wasi" and not base.lower().endswith(".wasm"):
+        base += ".wasm"
+    elif platform_name == "win32" and not base.lower().endswith(".exe"):
         base += ".exe"
     return base
 
@@ -229,6 +247,53 @@ _PKG_INSTALL_HINTS = {
              "claude.md #67/#68's regex()/.test()/.match()/.replace(), which "
              "every compiled program links whether it uses regex or not "
              "(see windows.md Phase 0)",
+}
+
+# `festina doctor --fix`: the same dependencies as _INSTALL_HINTS/
+# _PKG_INSTALL_HINTS above, but as literal package names per package
+# manager instead of prose a human has to read and copy-paste from.
+# Deliberately narrow -- only the three package managers setup.md
+# itself documents and actually tests against (apt on Debian/Ubuntu,
+# Homebrew on macOS, MSYS2's pacman on Windows). A key with no entry
+# for the detected manager (or a manager --fix doesn't recognize at
+# all, e.g. dnf/pacman-on-Arch/zypper) means "print the hint above and
+# let the person install it by hand" rather than guessing a command
+# that might be wrong -- the same "fail loudly and clearly" preference
+# claude.md #59 already applies to a missing dependency itself.
+#
+# "cc" has no "brew" entry on purpose: the actual macOS fix is Xcode
+# Command Line Tools (`xcode-select --install`, setup.md's own
+# recommendation -- Apple's clang already works, brew's own llvm
+# formula is unnecessary and keg-only besides), which pops a GUI
+# installer --fix cannot drive non-interactively. _run_doctor_fix
+# special-cases that one dependency with its own printed note instead
+# of a package list.
+_PKG_MANAGER_PACKAGES = {
+    "cc": {"apt": ["clang"], "msys2": ["mingw-w64-ucrt-x86_64-clang"]},
+    "pkg-config": {"apt": ["pkg-config"], "brew": ["pkg-config"],
+                   "msys2": ["mingw-w64-ucrt-x86_64-pkgconf"]},
+    "sqlite3": {"apt": ["libsqlite3-dev"], "brew": ["sqlite"],
+                "msys2": ["mingw-w64-ucrt-x86_64-sqlite3"]},
+    "cairo-xlib": {"apt": ["libcairo2-dev", "libx11-dev"]},  # linux-only check
+    "cairo": {"brew": ["cairo"], "msys2": ["mingw-w64-ucrt-x86_64-cairo"]},  # mac/win-only check
+    "libjpeg": {"apt": ["libjpeg-dev"], "brew": ["jpeg-turbo"],
+                "msys2": ["mingw-w64-ucrt-x86_64-libjpeg-turbo"]},
+    "libmpg123": {"apt": ["libmpg123-dev"], "brew": ["mpg123"]},  # linux/mac-only check
+    "alsa": {"apt": ["libasound2-dev"]},  # linux-only check
+    "gnurx": {"msys2": ["mingw-w64-ucrt-x86_64-libsystre"]},  # windows-only check
+    # Optional speed win, not a blocker -- see the check() call site's
+    # own "not required(has_clang)" logic. brew/msys2 need nothing
+    # separate here: brew's "llvm" formula is the same one "cc"'s fix
+    # already covers, and clang alone is enough on Windows too (see
+    # setup.md's "no llvm line here either" note).
+    "llvm": {"apt": ["llvm"]},
+    # claude.md #148: apt-only, like alsa/gnurx above -- wasi-libc and
+    # clang's wasm32 compiler-rt are Debian/Ubuntu package names this
+    # project has actually installed and verified (runtime/wasm/
+    # README.md); no brew/msys2 equivalent has been found or tried, so
+    # nothing is claimed for those managers rather than guessing a
+    # package name that might not exist.
+    "wasm": {"apt": ["wasi-libc", "libclang-rt-18-dev-wasm32"]},
 }
 
 
@@ -446,6 +511,17 @@ _RUNTIME_FEATURES = {
         # split) it's no longer unconditionally on every link line.
         "extra_link_flags": ["-pthread"],
     },
+    # claude.md #151: openPort/on request/on upgrade/on message/on
+    # socketClose -- plain POSIX sockets + poll(), no external library
+    # at all (unlike graphics/audio), so no pkgs and no extra link
+    # flags on Linux or macOS -- see _feature_pkgs_and_flags for the
+    # win32 branch (there is none: http has no Windows backend at
+    # all, gated out at _check_feature_supported instead).
+    "http": {
+        "source": _RUNTIME_HTTP_C,
+        "pkgs": [],
+        "extra_link_flags": [],
+    },
 }
 
 
@@ -524,6 +600,15 @@ def _feature_pkgs_and_flags(name, platform_name=None):
         pkgs.remove("cairo-xlib")
         pkgs.append("cairo")
         flags += ["-lgdi32", "-luser32"]
+    elif name == "http" and platform_name == "win32":
+        # claude.md #151 (Windows round): winsock2 (WSAStartup/socket/
+        # bind/listen/accept/WSAPoll/closesocket/...) lives in
+        # ws2_32.dll -- a system DLL with an import library but no
+        # pkg-config file, the same shape winmm/gdi32/user32 already
+        # are for audio/graphics above. No pkgs at all either way
+        # (this feature has never had a third-party library
+        # dependency on any platform).
+        flags += ["-lws2_32"]
     return pkgs, flags
 
 
@@ -574,7 +659,15 @@ def _ensure_runtime_object(cc, name, source, pkg_config_packages):
     caller) -- see _RUNTIME_FEATURES' module docstring note for why this
     matters for the *linked* binary, not just compile-time cflags. A
     feature may need several packages (claude.md #101: graphics is
-    Cairo/X11 *and* libjpeg, audio is ALSA *and* libmpg123)."""
+    Cairo/X11 *and* libjpeg, audio is ALSA *and* libmpg123).
+
+    WASM export (claude.md #148) deliberately does NOT reuse this
+    function -- see _ensure_wasm_object below -- since its own cflags
+    come from nowhere pkg-config knows about at all (a vendored sqlite3
+    header, not the system's pkg-config'd one), and folding that
+    fundamentally different cflags story into this one would complicate
+    a function every native platform already relies on for something
+    only one target needs."""
     cache_dir = os.path.join(tempfile.gettempdir(), "festina-runtime-cache")
     os.makedirs(cache_dir, exist_ok=True)
     cc_key = hashlib.sha1(cc.encode()).hexdigest()[:8]
@@ -596,6 +689,136 @@ def _ensure_runtime_object(cc, name, source, pkg_config_packages):
     return obj_path
 
 
+# ---- WASM export (claude.md #148) ----
+#
+# WASI (Preview 1) via clang's own --target=wasm32-wasi, verified end to
+# end against a real, immediately-runnable target -- Node.js's built-in
+# WASI support -- rather than only reasoned about, the same "verify for
+# real, not just in theory" standard this whole log holds every other
+# platform to. See wasm.md for the full design writeup, benchmarks
+# against C/Go compiled to wasm, and documented limitations; this
+# section is the implementation.
+_WASM_TARGET = "wasm32-wasi"
+_WASM_DIR = os.path.join(_RUNTIME_DIR, "wasm")
+_WASM_SQLITE_C = os.path.join(_WASM_DIR, "sqlite3.c")
+_WASM_ENTRY_SRC = os.path.join(_RUNTIME_DIR, "festina_runtime_wasm_entry.ll")
+
+
+def _ensure_wasm_object(cc, name, source, include_dirs=()):
+    """The WASM counterpart to _ensure_runtime_object -- same cache-once
+    -and-reuse shape (a real compile-time cost: the vendored sqlite3.c
+    amalgamation alone takes ~20 real seconds even at -O2), but a
+    genuinely different cflags story, so kept separate rather than
+    parameterizing the native function for a target it was never meant
+    to know about. `festina_wasm_{name}` (not `festina_runtime_{name}`)
+    keeps this cache namespace-separate from native's own -- the two
+    are never the same object even when `cc` (plain "clang", no
+    --target flag baked into the string itself) happens to match."""
+    cache_dir = os.path.join(tempfile.gettempdir(), "festina-runtime-cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cc_key = hashlib.sha1(cc.encode()).hexdigest()[:8]
+    obj_path = os.path.join(cache_dir, f"festina_wasm_{name}.{cc_key}.o")
+
+    freshness_sources = [source, *_RUNTIME_HEADERS]
+    if (os.path.exists(obj_path)
+            and os.path.getmtime(obj_path) >= max(os.path.getmtime(s) for s in freshness_sources)):
+        return obj_path
+
+    include_flags = [f"-I{d}" for d in include_dirs]
+    cmd = [cc, f"--target={_WASM_TARGET}", "-O2", "-c", source, *include_flags, "-o", obj_path]
+    result = _run_tool(cmd)
+    if result.returncode != 0:
+        raise CompileError(f"failed to compile the Festina WASM runtime ({name}):\n{result.stderr}",
+                            category="link error")
+    return obj_path
+
+
+def _wasm_runtime_objects(cc):
+    """core (linked against the vendored sqlite3.h, see runtime/wasm/
+    README.md) + the vendored sqlite3.c itself + the __main_argc_argv
+    entry bridge (see festina_runtime_wasm_entry.ll's own top comment
+    for why that one exists at all, and why it's raw LLVM IR rather
+    than C) -- no graphics, no audio, ever: see
+    _check_wasm_feature_supported, called unconditionally before this
+    even runs, for why."""
+    return [
+        _ensure_wasm_object(cc, "core", _RUNTIME_C, include_dirs=[_WASM_DIR]),
+        _ensure_wasm_object(cc, "sqlite3", _WASM_SQLITE_C),
+        _ensure_wasm_object(cc, "entry", _WASM_ENTRY_SRC),
+    ]
+
+
+def _check_wasm_feature_supported(feature):
+    """Unlike _check_feature_supported's macOS/Windows gates (a real
+    backend EXISTS, awaiting hardware verification -- overridable once
+    that happens), there is no graphics or audio backend for WASI at
+    all to verify: no display server, no audio device model WASI
+    exposes -- see wasm.md's own "Limitations" section for the full
+    accounting. No env var escape hatch, because there is nothing an
+    override could actually turn on."""
+    if feature == "graphics":
+        raise CompileError(
+            "graphics (drawRect/drawCircle/drawText/img/render()/mouse & "
+            "key events/...) is not supported when compiling to WASM -- "
+            "WASI has no display server or windowing model at all. See "
+            "wasm.md's Limitations section.",
+            category="unsupported platform feature")
+    if feature == "audio":
+        raise CompileError(
+            "audio (aud/play()/playLoop()/...) is not supported when "
+            "compiling to WASM -- WASI has no audio device model at all. "
+            "See wasm.md's Limitations section.",
+            category="unsupported platform feature")
+    if feature == "exec":
+        # claude.md #150: added alongside exec() itself -- WASI has no
+        # process model at all (no fork/exec/spawn of any kind), so
+        # this is the identical "genuinely absent, not gated pending
+        # hardware" situation graphics/audio are already in above, not
+        # a new category of restriction.
+        raise CompileError(
+            "exec() is not supported when compiling to WASM -- WASI has "
+            "no process model to spawn into at all. See wasm.md's "
+            "Limitations section.",
+            category="unsupported platform feature")
+    if feature == "http":
+        # claude.md #151: added alongside openPort() itself -- WASI
+        # Preview 1 (this project's own wasm target) has no listening-
+        # socket support of any kind, the identical "genuinely absent"
+        # situation exec() is already in above.
+        raise CompileError(
+            "openPort()/on request/on upgrade/on message/on socketClose "
+            "are not supported when compiling to WASM -- WASI Preview 1 "
+            "has no listening-socket support at all. See wasm.md's "
+            "Limitations section.",
+            category="unsupported platform feature")
+
+
+def _wasm_toolchain_ok(cc):
+    """`festina doctor`'s own WASM check (claude.md #148). Deliberately a
+    REAL functional probe -- actually invoking `cc --target=wasm32-wasi`
+    on a trivial C snippet -- rather than guessing at wasi-libc/
+    libclang_rt's install paths (which vary by distro/package version:
+    this project found them at /usr/lib/wasm32-wasi and
+    /usr/lib/llvm-18/lib/clang/18/lib/wasi on the Debian box this was
+    built on, but hardcoding either path here would be exactly the kind
+    of unverified guess this codebase's own doctor checks elsewhere
+    (_pkg_config_has, _which_any) avoid by construction. A round-trip
+    compile is the only check that can't give a false "OK" -- clang
+    itself is happy to accept --target=wasm32-wasi as a flag and then
+    fail deep in the link step if wasi-libc's headers/libs aren't
+    actually there."""
+    if shutil.which(cc) is None:
+        return False
+    try:
+        result = subprocess.run(
+            [cc, f"--target={_WASM_TARGET}", "-x", "c", "-", "-o", os.devnull],
+            input="int main(void) { return 0; }\n",
+            capture_output=True, text=True, timeout=30)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _check_feature_supported(feature, platform_name=None):
     """macos.md/windows.md Phase 0: a feature whose backend does not
     exist yet on this platform fails with a message that says exactly
@@ -608,10 +831,14 @@ def _check_feature_supported(feature, platform_name=None):
     CI-compiled) but awaits real-hardware verification, overridable via
     an env var for exactly that verification -- windows.md Phase 2's
     graphics gate joined this shape alongside Phase 1's own audio gate
-    and every darwin gate (claude.md #128); there is no remaining
-    "nothing built yet, raises unconditionally" branch left on any
-    platform. All raise the same category so the conftest skip picks
-    them up uniformly.
+    and every darwin gate (claude.md #128); claude.md #151's own
+    darwin AND win32 http gates joined them the same way (the win32
+    http backend needed real winsock2 porting work first -- see
+    festina_runtime_http.c's own top comment -- unlike audio/graphics,
+    which already had a real win32 backend by the time #151 started).
+    There is no remaining "nothing built yet, raises unconditionally"
+    branch left on any platform. All raise the same category so the
+    conftest skip picks them up uniformly.
 
     `feature` here is a narrower question than "is this object file
     linked" (see needs_graphics/wants_window in compile_file): audio
@@ -691,9 +918,46 @@ def _check_feature_supported(feature, platform_name=None):
             "an offscreen canvas and saveCanvas() work today with no "
             "window involved at all.",
             category="unsupported platform feature")
+    if feature == "http" and platform_name == "darwin":
+        # claude.md #151: the whole implementation (festina_runtime_http.c)
+        # is plain POSIX sockets + poll() -- nothing Linux-specific
+        # about it, and it should compile and run unchanged on macOS,
+        # but (like every other backend gated here) hasn't been
+        # verified against real macOS hardware, so it gets the
+        # identical "exists, awaiting verification" treatment audio/
+        # graphics already established rather than a confident,
+        # unverified "yes".
+        if os.environ.get("FESTINA_ENABLE_MACOS_HTTP"):
+            return
+        raise CompileError(
+            "openPort()/on request/on upgrade/on message/on socketClose "
+            "are not yet verified on macOS -- the implementation is "
+            "plain POSIX sockets with nothing Linux-specific about it, "
+            "but has not been run against real macOS hardware; set "
+            "FESTINA_ENABLE_MACOS_HTTP=1 to try it.",
+            category="unsupported platform feature")
+    if feature == "http" and platform_name == "win32":
+        # claude.md #151 (Windows round): the winsock2 port now EXISTS
+        # (built, compiled by this project's own MinGW cross-compile
+        # check -- see festina_runtime_http.c's own top comment for
+        # the real porting work that needed: a distinct SOCKET handle
+        # type, closesocket()/WSAPoll()/ioctlsocket() in place of
+        # close()/poll()/fcntl(), WSAGetLastError() in place of errno)
+        # -- same "exists, awaiting real-hardware verification" shape
+        # every other Windows gate here already has, not the
+        # "genuinely absent" shape exec()'s own wasm rejection is.
+        if os.environ.get("FESTINA_ENABLE_WINDOWS_HTTP"):
+            return
+        raise CompileError(
+            "openPort()/on request/on upgrade/on message/on socketClose "
+            "are not yet verified on Windows -- the winsock2 backend is "
+            "built (claude.md #151) but awaits real-hardware "
+            "verification; set FESTINA_ENABLE_WINDOWS_HTTP=1 to try it.",
+            category="unsupported platform feature")
 
 
-def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=False):
+def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=False,
+                                    uses_http=False):
     """Every program links core (log/fail/sqlite/regex/timers -- see
     festina_runtime.c's top comment) plus -lm (claude.md #56's
     Math.floor/ceil/round/trunc lower to libm intrinsics -- round() in
@@ -740,7 +1004,8 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
     for pkg in core_pkgs:
         link_libs += _pkg_config("--libs", pkg)
 
-    for name, wants in (("graphics", uses_graphics), ("audio", uses_audio)):
+    for name, wants in (("graphics", uses_graphics), ("audio", uses_audio),
+                        ("http", uses_http)):
         if not wants:
             continue
         skip_gate = name == "graphics" and not wants_window
@@ -760,7 +1025,7 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
     return objects, link_libs
 
 
-def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
+def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", target="native"):
     # claude.md #5, #6: resolves entry_path's full import graph (a plain
     # single-file program is the degenerate case -- just entry_path on
     # its own) and merges every file into one ast.Program, in dependency
@@ -774,13 +1039,17 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
     # claude.md #59's "if a canvas isn't used, keep the binary slim"
     # needs to know which optional runtime object files this specific
     # program actually needs (see _runtime_objects_and_link_libs).
-    gen = codegen_mod.CodeGen(analyzed, filename=entry_path)
+    # claude.md #148: target is threaded into CodeGen itself, not just
+    # this function's own linking choices below -- wasm32-wasi's 32-bit
+    # size_t needs real codegen differences (see CodeGen.__init__'s own
+    # note on self.pointer_bits), not just a different link recipe.
+    gen = codegen_mod.CodeGen(analyzed, filename=entry_path, target=target)
     ir = gen.generate(program)
 
     if emit_llvm:
         return ir
 
-    output_path = output_path or _default_output_name(entry_path)
+    output_path = output_path or _default_output_name(entry_path, target=target)
     # gen.uses_graphics alone isn't quite enough here: loadImage() alone
     # deliberately does NOT set it (see _emit_graphics_call's doc comment
     # -- decoding a PNG needs no window), but festina_load_image() still
@@ -789,18 +1058,48 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang"):
     # a canvas. gen.uses_graphics_code is the superset that also covers
     # that case.
     needs_graphics = gen.uses_graphics or gen.uses_graphics_code
+
+    # claude.md #151: openPort()/on request/.../on socketClose together
+    # with anything that opens a real window -- rejected outright,
+    # before any of the real linking work below, rather than silently
+    # producing a binary whose http loop never runs at all (main()'s
+    # own loop-selection picks ONE blocking loop, graphics winning
+    # over http when both are present -- see _emit_main_and_entry's
+    # own comment). This single-threaded server was never designed to
+    # also drive an X11/Cocoa/Win32 event loop; that combination may
+    # be revisited later, but isn't attempted here.
+    if gen.uses_http and gen.uses_graphics:
+        raise CompileError(
+            "openPort()/on request/on upgrade/on message/on socketClose "
+            "cannot be combined with graphics (render(), or an on "
+            "mouseDown/mouseUp/mouse/keyDown/keyUp/resize/close handler) "
+            "in the same program -- the http server's own event loop and "
+            "the graphics event loop are mutually exclusive in this "
+            "version.",
+            file=entry_path, category="unsupported platform feature")
+
+    if target == "wasm32-wasi":
+        _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio,
+                           needs_exec=gen.uses_exec, needs_http=gen.uses_http)
+        return output_path
+
     runtime_objects, link_libs = _runtime_objects_and_link_libs(
-        cc, needs_graphics, gen.uses_audio, wants_window=gen.uses_graphics)
+        cc, needs_graphics, gen.uses_audio, wants_window=gen.uses_graphics,
+        uses_http=gen.uses_http)
 
     if llvm_backend.available():
         _compile_via_libllvm(ir, entry_path, output_path, cc, runtime_objects, link_libs)
     else:
-        _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio, link_libs)
+        _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio, link_libs,
+                                        needs_http=gen.uses_http)
     _rename_if_linker_appended_exe(output_path)
     return output_path
 
 
-def run_program(entry_path, cc="clang"):
+_WASM_RUN_SCRIPT = os.path.join(_WASM_DIR, "run_wasi.mjs")
+
+
+def run_program(entry_path, cc="clang", target="native"):
     """`festina run` -- compile entry_path to a throwaway temp executable
     and run it immediately, the same way `go run`/`cargo run` do: no
     lasting output file, stdin/stdout/stderr inherited directly from this
@@ -815,14 +1114,34 @@ def run_program(entry_path, cc="clang"):
     message and a nonzero exit code, exactly like it already does for
     `festina compile`. Returns the *compiled program's own* exit code on
     success, so `festina run x.f && ...` composes the same way a real
-    compile-then-execute pair would."""
+    compile-then-execute pair would.
+
+    claude.md #148: target=wasm32-wasi runs the compiled .wasm through
+    Node's own WASI support (runtime/wasm/run_wasi.mjs) instead of
+    executing it directly -- a .wasm file isn't something any OS's
+    shell can exec on its own the way a native binary or .exe is."""
     with tempfile.TemporaryDirectory(prefix="festina-run-") as d:
         # windows.md Phase 0: through _default_output_name so the temp
         # binary is `program.exe` on Windows -- MinGW's linker appends
         # .exe itself when the name has no suffix, and running the name
         # we ASKED for rather than the file it WROTE would fail.
-        out_path = os.path.join(d, _default_output_name("program.f"))
-        compile_file(entry_path, out_path, cc=cc)
+        out_path = os.path.join(d, _default_output_name("program.f", target=target))
+        compile_file(entry_path, out_path, cc=cc, target=target)
+        if target == "wasm32-wasi":
+            node = shutil.which("node")
+            if node is None:
+                raise CompileError(
+                    "running a WASM binary needs Node.js on PATH, for its "
+                    "built-in WASI support -- see wasm.md.",
+                    file=entry_path, category="missing dependency")
+            # cwd=os.getcwd(), not `d`: a compiled program's own relative
+            # paths (festina.sqlite, blob/mkdir/ls targets) resolve
+            # against the INVOKING shell's directory, exactly like a
+            # native compiled binary's own cwd-relative access already
+            # does -- the preopen just has to name that same directory.
+            result = subprocess.run(
+                [node, "--no-warnings", _WASM_RUN_SCRIPT, out_path, os.getcwd()])
+            return result.returncode
         result = subprocess.run([out_path])
         return result.returncode
 
@@ -846,7 +1165,8 @@ def _compile_via_libllvm(ir, entry_path, output_path, cc, runtime_objects, link_
                                 file=entry_path, category="link error")
 
 
-def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, needs_audio, link_libs):
+def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, needs_audio, link_libs,
+                                    needs_http=False):
     """Fallback used only when libLLVM couldn't be loaded in this process
     -- the original pipeline, handing the .ll file straight to `cc`
     (which then must actually be clang, or another compiler with an LLVM
@@ -889,6 +1209,19 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
         pkgs, flags = _feature_pkgs_and_flags("audio")
         pkg_configs += pkgs
         extra_link_flags += flags
+    if needs_http:
+        # claude.md #151: no pkg-config packages on any platform (this
+        # feature has never had a third-party library dependency), but
+        # win32 does need -lws2_32 (_feature_pkgs_and_flags's own
+        # platform branch) -- claude.md #126 round four's own lesson
+        # (this exact fallback path once used the Linux-only table
+        # directly and silently dropped every platform swap) is why
+        # this goes through _feature_pkgs_and_flags rather than
+        # _RUNTIME_FEATURES["http"] directly.
+        runtime_sources.append(_RUNTIME_HTTP_C)
+        pkgs, flags = _feature_pkgs_and_flags("http")
+        pkg_configs += pkgs
+        extra_link_flags += flags
     cflags = []
     for pkg in pkg_configs:
         cflags += _pkg_config("--cflags", pkg)
@@ -901,6 +1234,54 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
         result = _run_tool(cmd)
         if result.returncode != 0:
             raise CompileError(f"native linking failed:\n{result.stderr}",
+                                file=entry_path, category="link error")
+    finally:
+        os.unlink(ir_path)
+
+
+def _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, needs_audio, needs_exec=False,
+                      needs_http=False):
+    """claude.md #148: WASM export's own link recipe -- always the .ll-
+    text-to-clang path (see _compile_via_clang_ir_frontend's own
+    docstring for what that fallback normally covers on native targets;
+    here it's not a fallback at all, it's the only path, since there is
+    no libLLVM in-process wasm32 object-emission story this project has
+    verified -- --target=wasm32-wasi needs clang specifically, not
+    "whichever of clang/gcc/cc"). Rejects graphics/audio/exec()
+    OUTRIGHT before doing any real work -- see
+    _check_wasm_feature_supported -- rather than letting a doomed
+    compile run for tens of seconds (the vendored sqlite3.c
+    amalgamation alone) only to fail at the link step with undefined
+    Cairo/ALSA symbols nothing here could ever provide (claude.md #150:
+    exec() itself would actually LINK fine -- festina_process_exec's
+    own wasm32-wasi stub, see runtime/festina_runtime.c, exists
+    specifically so this translation unit still compiles -- so this is
+    the only one of the three that needs an explicit check here rather
+    than the link step catching it on its own)."""
+    if needs_graphics:
+        _check_wasm_feature_supported("graphics")
+    if needs_audio:
+        _check_wasm_feature_supported("audio")
+    if needs_exec:
+        _check_wasm_feature_supported("exec")
+    if needs_http:
+        _check_wasm_feature_supported("http")
+    if shutil.which(cc) is None or "clang" not in os.path.basename(cc).lower():
+        raise CompileError(
+            f"WASM export needs clang specifically (got --cc={cc!r}) -- "
+            f"only clang can target wasm32-wasi at all. See wasm.md.",
+            file=entry_path, category="missing dependency")
+
+    runtime_objects = _wasm_runtime_objects(cc)
+
+    with tempfile.NamedTemporaryFile(suffix=".ll", mode="w", delete=False) as tmp:
+        tmp.write(ir)
+        ir_path = tmp.name
+    try:
+        cmd = [cc, f"--target={_WASM_TARGET}", "-O2", ir_path, *runtime_objects, "-o", output_path]
+        result = _run_tool(cmd)
+        if result.returncode != 0:
+            raise CompileError(f"WASM linking failed:\n{result.stderr}",
                                 file=entry_path, category="link error")
     finally:
         os.unlink(ir_path)
@@ -945,13 +1326,18 @@ def _doctor_report():
     slimming split means a compiler that can't build a graphics program
     is still a fully working compiler for everything else; a program
     that never uses graphics/audio never even asks for cairo-xlib/alsa's
-    flags (see _RUNTIME_FEATURES above). Returns (lines, all_required_ok)
-    so main() can turn the second value into an exit code without
-    re-parsing the printed text."""
+    flags (see _RUNTIME_FEATURES above). Returns (lines, all_required_ok,
+    missing) so main() can turn the second value into an exit code
+    without re-parsing the printed text, and `festina doctor --fix`
+    (_run_doctor_fix) can turn the third -- a list of (key, required)
+    pairs, one per failed check that named a key -- into real install
+    commands via _PKG_MANAGER_PACKAGES, without re-deriving what's
+    missing by re-parsing the printed text either."""
     lines = []
     all_ok = True
+    missing = []
 
-    def check(ok, required, label, hint=None):
+    def check(ok, required, label, hint=None, key=None):
         nonlocal all_ok
         if ok:
             status = "OK"
@@ -963,6 +1349,8 @@ def _doctor_report():
         lines.append(f"  [{status:^17}] {label}")
         if not ok and hint:
             lines.append(f"  {'':19} -> {hint}")
+        if not ok and key:
+            missing.append((key, required))
 
     lines.append("Festina compiler dependencies")
     lines.append("==============================")
@@ -970,7 +1358,8 @@ def _doctor_report():
     cc_name, cc_path = _which_any("clang", "gcc", "cc")
     check(cc_name is not None, True,
           f"C compiler ({cc_name} at {cc_path})" if cc_name else "C compiler (clang, gcc, or cc)",
-          "install one, e.g. `apt install clang` on Debian/Ubuntu, or `brew install llvm` on macOS -- see setup.md")
+          "install one, e.g. `apt install clang` on Debian/Ubuntu, or `brew install llvm` on macOS -- see setup.md",
+          key="cc")
 
     if sys.platform == "win32" and os.environ.get("MSYSTEM") == "MSYS":
         # windows.md Phase 0 item 4: `MSYSTEM=MSYS` is the plain
@@ -989,11 +1378,11 @@ def _doctor_report():
     pkgconf_path = shutil.which("pkg-config")
     check(pkgconf_path is not None, True,
           f"pkg-config (at {pkgconf_path})" if pkgconf_path else "pkg-config",
-          _INSTALL_HINTS["pkg-config"])
+          _INSTALL_HINTS["pkg-config"], key="pkg-config")
 
     check(_pkg_config_has("sqlite3"), True,
           "sqlite3 dev headers (required -- every Festina program has SQLite built in, claude.md #10/#28-31)",
-          _PKG_INSTALL_HINTS["sqlite3"])
+          _PKG_INSTALL_HINTS["sqlite3"], key="sqlite3")
 
     # windows.md Phase 0: also required, like sqlite3 just above -- not
     # an optional feature tier at all, since festina_runtime.c's regex
@@ -1004,7 +1393,7 @@ def _doctor_report():
         check(_pkg_config_has(pkg), True,
               "POSIX regex (required on Windows -- <regex.h> isn't part of MinGW's "
               "libc, claude.md #67/#68's regex()/.test()/.match()/.replace())",
-              _PKG_INSTALL_HINTS["gnurx"])
+              _PKG_INSTALL_HINTS["gnurx"], key="gnurx")
 
     # claude.md #123/#128: platform-aware, like audio just below --
     # darwin's and windows' graphics runtimes both carry zero X11 code
@@ -1014,11 +1403,11 @@ def _doctor_report():
     if sys.platform in ("darwin", "win32"):
         check(_pkg_config_has("cairo"), False,
               "cairo dev headers (optional -- only used by graphics: drawRect, on mouseDown, img, ...)",
-              _PKG_INSTALL_HINTS["cairo"])
+              _PKG_INSTALL_HINTS["cairo"], key="cairo")
     else:
         check(_pkg_config_has("cairo-xlib"), False,
               "cairo-xlib dev headers (optional -- only used by graphics: drawRect, on mouseDown, img, ...)",
-              _PKG_INSTALL_HINTS["cairo-xlib"])
+              _PKG_INSTALL_HINTS["cairo-xlib"], key="cairo-xlib")
     # claude.md #101: JPEG/MP3 decoding. Grouped with their own feature
     # rather than listed as separate tiers -- a program that uses
     # graphics needs libjpeg whether or not it happens to load a .jpg,
@@ -1029,7 +1418,7 @@ def _doctor_report():
     # because there was not yet anything on win32 to need it.
     check(_pkg_config_has("libjpeg"), False,
           "libjpeg dev headers (optional -- only used by graphics: JPEG images)",
-          _PKG_INSTALL_HINTS["libjpeg"])
+          _PKG_INSTALL_HINTS["libjpeg"], key="libjpeg")
     if sys.platform == "darwin":
         # claude.md #123: windowed use (render(), any event handler)
         # additionally needs the Cocoa backend's real-hardware
@@ -1067,10 +1456,10 @@ def _doctor_report():
     else:
         check(_pkg_config_has("libmpg123"), False,
               "libmpg123 dev headers (optional -- only used by audio: MP3 clips)",
-              _PKG_INSTALL_HINTS["libmpg123"])
+              _PKG_INSTALL_HINTS["libmpg123"], key="libmpg123")
         check(_pkg_config_has("alsa"), False,
               "alsa dev headers (optional -- only used by audio: loadAudio(), .play(), ...)",
-              _PKG_INSTALL_HINTS["alsa"])
+              _PKG_INSTALL_HINTS["alsa"], key="alsa")
 
     llvm_ok = llvm_backend.available()
     has_clang = shutil.which("clang") is not None
@@ -1085,7 +1474,29 @@ def _doctor_report():
               "libLLVM (not found -- falls back to handing LLVM IR text to clang directly)",
               None if has_clang else
               "clang was not found either, and only clang can parse the raw IR text that fallback "
-              "needs -- install `llvm` (e.g. `apt install llvm` on Debian/Ubuntu) or clang itself")
+              "needs -- install `llvm` (e.g. `apt install llvm` on Debian/Ubuntu) or clang itself",
+              key="llvm")
+
+    # claude.md #148: WASM export is its own fully optional feature tier,
+    # same shape as graphics/audio just above -- a compiler that can't
+    # cross-compile to wasm32-wasi is still a fully working compiler for
+    # every native build, so this is never required. Checked with a real
+    # clang invocation (_wasm_toolchain_ok), not a guessed install path;
+    # `cc` here is deliberately clang specifically (not cc_name from
+    # above), since _compile_via_wasm itself requires clang regardless
+    # of what --cc the user's native builds are configured to use.
+    clang_path = shutil.which("clang")
+    if clang_path is None:
+        check(False, False,
+              "WASM export (optional -- `festina compile --target=wasm32-wasi`, see wasm.md)",
+              "needs clang specifically (not gcc/cc) -- " + _INSTALL_HINTS["clang"], key="wasm")
+    else:
+        check(_wasm_toolchain_ok(clang_path), False,
+              "WASM export (optional -- `festina compile --target=wasm32-wasi`, see wasm.md)",
+              "clang was found but can't target wasm32-wasi -- install wasi-libc and "
+              "clang's wasm32 runtime, e.g. `apt install wasi-libc libclang-rt-18-dev-wasm32` "
+              "on Debian/Ubuntu (package name may vary by clang version) -- see wasm.md",
+              key="wasm")
 
     lines.append("")
     lines.append("festina on PATH")
@@ -1112,11 +1523,11 @@ def _doctor_report():
                           f"startup file) to keep it, then restart your shell -- or run "
                           f"scripts/package_compiler.sh and put the resulting standalone binary "
                           f"somewhere already on PATH instead (see setup.md)")
-    return lines, all_ok
+    return lines, all_ok, missing
 
 
 def _run_doctor():
-    lines, all_ok = _doctor_report()
+    lines, all_ok, _missing = _doctor_report()
     print("\n".join(lines))
     print()
     if all_ok:
@@ -1124,7 +1535,322 @@ def _run_doctor():
               "only matter for a program that actually uses drawRect/on mouseDown/img/loadAudio/etc.")
         return 0
     print("One or more REQUIRED dependencies are missing -- see the MISSING lines above.")
+    print("Run `festina doctor --fix` to try installing them automatically.")
     return 1
+
+
+def _detect_package_manager():
+    """Which of the three package managers `doctor --fix` knows how to
+    drive, based on what setup.md itself documents per platform --
+    apt on Linux, Homebrew on macOS, MSYS2's pacman on Windows. None of
+    the others (dnf, Arch's pacman, zypper, ...) are covered: guessing
+    a plausible-looking command for a manager this project has never
+    actually run against risks confidently telling someone to run
+    something wrong, which is worse than not offering to fix it at all.
+    Returns None if no supported manager is found."""
+    if sys.platform == "win32":
+        return "msys2" if shutil.which("pacman") else None
+    if sys.platform == "darwin":
+        return "brew" if shutil.which("brew") else None
+    if shutil.which("apt") or shutil.which("apt-get"):
+        return "apt"
+    return None
+
+
+def _doctor_fix_install_command(manager, packages):
+    """The actual command to run for this manager, given a deduplicated
+    package list. Prepends `sudo` for apt only when not already root
+    (hasattr guard: os.geteuid doesn't exist on Windows) -- brew
+    actively refuses to run as root, and MSYS2's pacman needs no
+    elevation at all since it manages its own user-writable prefix, not
+    the host Windows installation. `-y`/`--noconfirm` on the package
+    manager itself is safe to pass unconditionally here: by the time
+    this is called, _run_doctor_fix has already gotten the person's own
+    confirmation (or --yes) once, so a second manager-level prompt would
+    be redundant, not an extra safety check."""
+    if manager == "apt":
+        apt = "apt" if shutil.which("apt") else "apt-get"
+        cmd = [apt, "install", "-y", *packages]
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            cmd = ["sudo", *cmd]
+        return cmd
+    if manager == "brew":
+        return ["brew", "install", *packages]
+    if manager == "msys2":
+        return ["pacman", "-S", "--noconfirm", *packages]
+    return None
+
+
+def _confirm(assume_yes, prompt="Proceed? [y/N] "):
+    """Shared confirmation gate for both of `festina doctor --fix`'s
+    kinds of system change (installing packages, editing PATH) --
+    refuses outright when running non-interactively without --yes,
+    rather than either hanging on a read that will never come or
+    silently proceeding without real consent. `input()` itself has no
+    such guard built in, so this enforces it explicitly, the same
+    two-sided caution git/npm-style installers apply."""
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print("Not running interactively and --yes wasn't passed -- re-run with "
+              "`festina doctor --fix --yes` to proceed without confirming.")
+        return False
+    answer = input(prompt).strip().lower()
+    if answer not in ("y", "yes"):
+        print("Not proceeding.")
+        return False
+    return True
+
+
+def _fix_missing_dependencies(missing, all_ok, assume_yes):
+    """The dependency-installing half of `doctor --fix`: builds one
+    deduplicated install command across every missing key for the
+    detected package manager, confirms, runs it, and re-checks.
+    Returns 0 if every REQUIRED dependency is now present (or already
+    was -- `missing` may hold only optional ones), else a nonzero exit
+    code -- the install command's own exact returncode when that's
+    specifically what failed, 1 for every other kind of failure (no
+    supported manager, nothing installable, declined, still missing
+    after a successful-exit install). `all_ok` is _doctor_report's own
+    already-computed answer for "nothing required missing to begin
+    with," passed in rather than re-derived so the early-exit paths
+    below don't need their own copy of that logic."""
+    if not missing:
+        print("All dependencies are already installed.")
+        return 0
+
+    manager = _detect_package_manager()
+    if manager is None:
+        print("doctor --fix only knows how to drive apt (Debian/Ubuntu), Homebrew "
+              "(macOS), and MSYS2's pacman (Windows) -- none of those were found "
+              "on PATH here. Install the missing dependencies by hand using the "
+              "hints above.")
+        return 0 if all_ok else 1
+
+    missing_keys = {key for key, _required in missing}
+    if manager == "brew" and "cc" in missing_keys:
+        print("Note: the actual macOS fix for a missing C compiler is Xcode "
+              "Command Line Tools (`xcode-select --install`) -- that pops a GUI "
+              "installer doctor --fix can't drive non-interactively, so run it "
+              "yourself if clang is still missing after this.")
+
+    packages = []
+    seen = set()
+    unfixable_required = []
+    for key, required in missing:
+        pkgs = _PKG_MANAGER_PACKAGES.get(key, {}).get(manager, [])
+        if not pkgs:
+            if required:
+                unfixable_required.append(key)
+            continue
+        for pkg in pkgs:
+            if pkg not in seen:
+                seen.add(pkg)
+                packages.append(pkg)
+
+    if not packages:
+        print(f"Nothing doctor --fix knows how to install for {manager} here -- "
+              "see the hints above and install by hand.")
+        return 0 if all_ok else 1
+
+    cmd = _doctor_fix_install_command(manager, packages)
+    print(f"About to run: {' '.join(cmd)}")
+    if unfixable_required:
+        print(f"(this still won't cover: {', '.join(unfixable_required)} -- see the hints above for those)")
+
+    if not _confirm(assume_yes):
+        return 1
+
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        print(f"\n'{' '.join(cmd)}' exited with status {result.returncode}.")
+        return result.returncode
+
+    print()
+    print("Re-checking...")
+    print()
+    lines2, all_ok2, _missing2 = _doctor_report()
+    print("\n".join(lines2))
+    print()
+    if all_ok2:
+        print("All required dependencies are now installed.")
+        return 0
+    print("Some required dependencies are still missing -- see above.")
+    return 1
+
+
+# `festina doctor --fix` (part two): the same treatment for `festina`
+# itself not being resolvable on PATH -- _doctor_report has always
+# diagnosed this and printed the fix, this is what actually DOES it.
+# A plain-data plan (_festina_path_fix_plan) separate from the code
+# that executes it (_apply_festina_path_fix), the same split
+# _doctor_fix_install_command/_fix_missing_dependencies already use
+# for package installs, and for the identical reason
+# _default_output_name takes an injectable platform_name: every branch
+# here is a pure function of state the caller can substitute, so each
+# platform's plan is unit-testable from any one OS, not just whichever
+# one the suite happens to run on.
+def _festina_path_fix_plan(platform_name=None, festina_path=_UNSET, meipass=_UNSET,
+                            shell_env=_UNSET, bin_dir=None):
+    """What doctor --fix could do about `festina` not resolving on
+    PATH. Returns None if it already resolves (nothing to fix) or a
+    dict describing one of four plans:
+
+    - "symlink": running the packaged binary directly (PyInstaller
+      --onefile, sys._MEIPASS set) -- symlink it onto PATH at
+      /usr/local/bin/festina, mirroring the hint _doctor_report
+      already prints for this exact case.
+    - "shell_rc": running from a checkout, on a POSIX shell doctor
+      --fix knows how to edit (bash or zsh, the two setup.md's own
+      "add that line to ~/.bashrc / ~/.zshrc" hint names) -- append an
+      export line to that shell's own startup file.
+    - "windows_path": running from a checkout on win32 -- `setx` the
+      user's PATH environment variable (best-effort: this project has
+      no Windows machine to confirm setx's own well-known PATH-length
+      truncation risk isn't hit here, the same "no hardware to test
+      against" honesty windows.md/macos.md already apply elsewhere).
+    - "unsupported_shell": running from a checkout on a POSIX shell
+      doctor --fix does NOT know how to edit (fish, csh, an unset
+      $SHELL, ...) -- nothing to automate, same manual instructions
+      _doctor_report already prints."""
+    platform_name = platform_name or sys.platform
+    if festina_path is _UNSET:
+        festina_path = shutil.which("festina")
+    if festina_path:
+        return None
+
+    if meipass is _UNSET:
+        meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return {"kind": "symlink", "source": sys.executable, "target": "/usr/local/bin/festina"}
+
+    if bin_dir is None:
+        bin_dir = os.path.join(_data_root(), "bin")
+
+    if platform_name == "win32":
+        return {"kind": "windows_path", "bin_dir": bin_dir}
+
+    if shell_env is _UNSET:
+        shell_env = os.environ.get("SHELL", "")
+    shell = os.path.basename(shell_env)
+    rc_by_shell = {"bash": "~/.bashrc", "zsh": "~/.zshrc"}
+    if shell not in rc_by_shell:
+        return {"kind": "unsupported_shell", "bin_dir": bin_dir, "shell": shell or "unknown"}
+    rc_file = os.path.expanduser(rc_by_shell[shell])
+    return {"kind": "shell_rc", "rc_file": rc_file, "bin_dir": bin_dir,
+            "line": f'export PATH="$PATH:{bin_dir}"'}
+
+
+def _apply_festina_path_fix(plan, assume_yes):
+    """Executes a plan from _festina_path_fix_plan. Returns True if
+    `festina` should resolve from a NEW shell/session afterward (never
+    the current process -- nothing can retroactively change a PATH a
+    process already inherited at startup), False if skipped, declined,
+    or unsupported."""
+    kind = plan["kind"]
+
+    if kind == "unsupported_shell":
+        print(f"'festina' is not on PATH, and doctor --fix doesn't know how to edit "
+              f"a '{plan['shell']}' startup file automatically -- add this line to "
+              f"your shell's own startup file yourself:")
+        print(f'  export PATH="$PATH:{plan["bin_dir"]}"')
+        return False
+
+    if kind == "symlink":
+        source, target = plan["source"], plan["target"]
+        # Refuses to clobber something already at that path that ISN'T
+        # already this exact symlink -- claude.md #59's own "fail
+        # loudly" preference applies here just as much as to guessing a
+        # wrong install command: overwriting an unrelated program a
+        # person put at /usr/local/bin/festina themselves would be a
+        # much worse surprise than just not automating this one case.
+        if os.path.exists(target) and not (
+                os.path.islink(target) and os.path.realpath(target) == os.path.realpath(source)):
+            print(f"Something already exists at {target} that isn't already a symlink "
+                  f"to this binary -- not overwriting it. Add {source} to PATH by hand instead.")
+            return False
+        print(f"About to run: ln -sf {source} {target}")
+        if not _confirm(assume_yes):
+            return False
+        cmd = ["ln", "-sf", source, target]
+        if not os.access(os.path.dirname(target), os.W_OK):
+            cmd = ["sudo", *cmd]
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            print(f"'{' '.join(cmd)}' exited with status {result.returncode}.")
+            return False
+        print(f"'festina' now resolves to {target}.")
+        return True
+
+    if kind == "shell_rc":
+        rc_file, line, bin_dir = plan["rc_file"], plan["line"], plan["bin_dir"]
+        try:
+            with open(rc_file, encoding="utf-8") as f:
+                already_there = bin_dir in f.read()
+        except FileNotFoundError:
+            already_there = False
+        if already_there:
+            print(f"{rc_file} already references this checkout's bin/ directory -- "
+                  f"nothing to add. Restart your shell (or `source {rc_file}`) if it "
+                  f"still isn't picking it up.")
+            return True
+        print(f"About to append to {rc_file}:")
+        print(f"  {line}")
+        if not _confirm(assume_yes):
+            return False
+        with open(rc_file, "a", encoding="utf-8") as f:
+            f.write(f"\n# Added by `festina doctor --fix`\n{line}\n")
+        print(f"Added. Restart your shell (or run `source {rc_file}`) to pick it up.")
+        return True
+
+    if kind == "windows_path":
+        bin_dir = plan["bin_dir"]
+        print(f'About to run: setx PATH "%PATH%;{bin_dir}"')
+        if not _confirm(assume_yes):
+            return False
+        result = subprocess.run(["setx", "PATH", f"%PATH%;{bin_dir}"])
+        if result.returncode != 0:
+            print(f"'setx' exited with status {result.returncode}.")
+            return False
+        print("Added -- this only affects NEW terminal sessions (Windows environment "
+              "variables aren't retroactive), and setx has a known ~1024-character PATH "
+              "truncation limit, so double-check with `echo %PATH%` in a fresh terminal "
+              "if `festina` still doesn't resolve there.")
+        return True
+
+    return False
+
+
+def _run_doctor_fix(assume_yes=False):
+    """`festina doctor --fix`: run the same report doctor always does,
+    then try to actually FIX what it found instead of just printing
+    hints for a human to act on by hand -- both installing whatever
+    dependencies are missing (_fix_missing_dependencies) and, if
+    `festina` itself isn't resolving on PATH, doing whatever this
+    platform's own fix for that is too (_festina_path_fix_plan/
+    _apply_festina_path_fix). Confirms before making either kind of
+    change (skippable with --yes); the exit code reflects the
+    dependency side only, exactly like plain `festina doctor` itself
+    -- not being on PATH has never been a `required`-flagged doctor
+    check (see _doctor_report), so fixing or not fixing it here
+    shouldn't change what this command's own success/failure means."""
+    lines, all_ok, missing = _doctor_report()
+    print("\n".join(lines))
+    print()
+
+    path_plan = _festina_path_fix_plan()
+    if not missing and path_plan is None:
+        print("Everything required is already installed and 'festina' is already "
+              "on PATH -- nothing to fix.")
+        return 0
+
+    deps_code = _fix_missing_dependencies(missing, all_ok, assume_yes)
+
+    if path_plan is not None:
+        print()
+        _apply_festina_path_fix(path_plan, assume_yes)
+
+    return deps_code
 
 
 def _build_arg_parser():
@@ -1138,17 +1864,32 @@ def _build_arg_parser():
     # arguments are required" message.
     sub = ap.add_subparsers(dest="command", metavar="command")
 
+    # claude.md #148: "native" builds and links a regular executable for
+    # the host platform, same as always; "wasm32-wasi" cross-compiles to
+    # a standalone .wasm binary instead (see wasm.md) -- both compile
+    # and run accept it, since `run` is really "compile, then execute"
+    # and a wasm32-wasi binary needs a WASI host (Node) to execute it
+    # rather than the OS running it directly.
+    target_help = "compilation target: a native executable, or a wasm32-wasi .wasm binary (default: native)"
+
     compile_p = sub.add_parser("compile", help="compile a Festina program to a native executable")
     compile_p.add_argument("input", help="entry .f file")
     compile_p.add_argument("-o", "--output", help="output executable path (default: input filename without .f)")
     compile_p.add_argument("--emit-llvm", action="store_true", help="print LLVM IR to stdout instead of linking")
     compile_p.add_argument("--cc", default=default_cc, help=cc_help)
+    compile_p.add_argument("--target", choices=["native", "wasm32-wasi"], default="native", help=target_help)
 
     run_p = sub.add_parser("run", help="compile a Festina program and immediately run it")
     run_p.add_argument("input", help="entry .f file")
     run_p.add_argument("--cc", default=default_cc, help=cc_help)
+    run_p.add_argument("--target", choices=["native", "wasm32-wasi"], default="native", help=target_help)
 
-    sub.add_parser("doctor", help="check whether the compiler's own dependencies are installed")
+    doctor_p = sub.add_parser("doctor", help="check whether the compiler's own dependencies are installed")
+    doctor_p.add_argument("--fix", action="store_true",
+                           help="try to auto-install missing dependencies via the detected "
+                                "package manager (apt/Homebrew/MSYS2 pacman)")
+    doctor_p.add_argument("--yes", "-y", action="store_true",
+                           help="with --fix, don't prompt for confirmation before installing")
     sub.add_parser("help", help="show this help message")
     return ap
 
@@ -1166,11 +1907,13 @@ def main(argv=None):
         return 0 if args.command == "help" else 1
 
     if args.command == "doctor":
+        if args.fix:
+            return _run_doctor_fix(assume_yes=args.yes)
         return _run_doctor()
 
     if args.command == "run":
         try:
-            return run_program(args.input, cc=args.cc)
+            return run_program(args.input, cc=args.cc, target=args.target)
         except CompileError as e:
             print(str(e), file=sys.stderr)
             return 1
@@ -1180,7 +1923,7 @@ def main(argv=None):
 
     # args.command == "compile"
     try:
-        result = compile_file(args.input, args.output, emit_llvm=args.emit_llvm, cc=args.cc)
+        result = compile_file(args.input, args.output, emit_llvm=args.emit_llvm, cc=args.cc, target=args.target)
     except CompileError as e:
         print(str(e), file=sys.stderr)
         return 1
@@ -1190,6 +1933,17 @@ def main(argv=None):
 
     if args.emit_llvm:
         print(result)
+    elif args.target == "wasm32-wasi":
+        # claude.md #148: the native success message's sqlite-static-vs-
+        # dynamic note doesn't apply here -- the wasm build always
+        # statically compiles the vendored amalgamation (runtime/wasm/
+        # README.md), there's no dynamic-linking story for wasm32-wasi
+        # to fall back to -- and the libLLVM fast path is never used for
+        # wasm either (_compile_via_wasm always shells out to clang, the
+        # same way the IR-frontend fallback does for native), so noting
+        # its absence would be misleading rather than informative.
+        print(f"festina: wrote {result} (run with a WASI host, e.g. `festina run --target=wasm32-wasi`, "
+              f"or `node runtime/wasm/run_wasi.mjs {result} <preopen-dir>`)")
     else:
         _, sqlite_static = _sqlite_link_flags(args.cc)  # cached by compile_file's own call
         notes = []

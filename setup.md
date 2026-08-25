@@ -6,13 +6,35 @@ plan (`claude.md #59`; see [api.md](api.md#compilation-pipeline) for the
 pipeline itself, and [security.md](security.md#slim-binaries) for why
 the runtime dependency list below is now conditional per program).
 
+## Installing with one command
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/uraikus/festina/main/install.sh | sh
+```
+
+`install.sh` (Linux, macOS, and MSYS2 UCRT64 bash on Windows --
+windows.md's own one supported Windows toolchain/shell; a native
+PowerShell installer would first need to bootstrap MSYS2 itself, out
+of scope for the same reason windows.md keeps MSVC out of scope)
+clones a fresh checkout into `$FESTINA_INSTALL_DIR` (default
+`~/.festina`; re-running it updates an existing one in place), then
+hands off entirely to `festina doctor --fix` below for both dependency
+checking/installing and adding `festina` to `PATH` -- there's no
+prebuilt binary to download here, since this repository has no release
+pipeline yet, so "install from source" is what a one-line install
+actually means today. `--yes`/`-y` as a script argument skips every
+confirmation prompt, for a fully non-interactive install.
+
 ## To *use* the compiler from a checkout
 
 `bin/festina compile program.f` on a fresh system (or `bin/festina run
 program.f` to skip the intermediate binary and just run it -- see
 [api.md](api.md#cli) for the full command list, including `festina
 doctor`, which checks every dependency below for you and tells you
-exactly what's missing):
+exactly what's missing -- and `festina doctor --fix`, which installs
+it for you via whichever of `apt`/Homebrew/MSYS2's `pacman` this
+machine has and adds `festina` to `PATH` too, after confirming each
+change with you first):
 
 | Dependency | Why | Required? |
 |---|---|---|
@@ -199,6 +221,14 @@ runtime if a static `libsqlite3.a` archive was available in the *build*
 environment (falls back to a normal dynamic link otherwise) — check
 `festina: wrote ...` compiler output, which notes when it fell back.
 
+### Compiling to WASM
+
+`festina compile --target=wasm32-wasi program.f -o program.wasm` (or
+`festina run --target=wasm32-wasi program.f`) cross-compiles to a
+standalone `wasm32-wasi` binary instead of a native executable — see
+[wasm.md](wasm.md) for the full design writeup, setup, and known
+limitations (graphics/audio aren't available under WASI at all).
+
 ## Running the test suite
 
 ```bash
@@ -214,6 +244,7 @@ in any requirements file:
 | `pyinstaller` | `tests/test_packaging.py` (2 tests) | `pip install -r requirements-build.txt` |
 | `Xvfb` + `xdotool` + `xwd` | Interactive graphics tests — clicking, moving the mouse, pressing keys, resizing a real (virtual) window, and reading canvas pixels back to check `claude.md #89`'s colours and fonts actually render (`TestGraphics`, `TestCanvasStyleRendersRealPixels`, plus `TestTimers`'s combined graphics+timers case) | `sudo apt install xvfb xdotool x11-apps` on Debian/Ubuntu (`xwd` ships in `x11-apps`) — a real `$DISPLAY` works too, if one is already available |
 | `openbox` (+ optional `xprop`, from `x11-utils`) | One regression test for a real window-manager crash (see [security.md](security.md#notable-fixed-findings)) that a bare Xvfb instance (no WM at all) can never reproduce (`TestGraphics::test_graphics_init_does_not_crash_under_a_real_window_manager`; 1 test) | `sudo apt install openbox x11-utils` on Debian/Ubuntu — `xprop` is only used to poll for the WM's own readiness signal instead of a fixed sleep; the test still runs (with a fixed sleep instead) without it |
+| `wasi-libc` + `libclang-rt-*-dev-wasm32` + Node.js | Real compile-and-run WASM export tests (`tests/test_wasm.py`'s `TestWasmRun`; see [wasm.md](wasm.md)) | `sudo apt install wasi-libc libclang-rt-18-dev-wasm32` on Debian/Ubuntu (substitute your clang's own version), plus Node.js on PATH — `festina doctor` reports whether both are present |
 
 Every one of those skips cleanly and independently when its tool isn't
 present — the suite still passes, just with fewer tests run. Audio's

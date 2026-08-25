@@ -1075,6 +1075,110 @@ class TestMaps:
         assert result.stdout.strip() == "origin: (0,0)"
 
 
+class TestAmorMap:
+    """claude.md #156: amor map[T] -- an "amortized map", the `amor`
+    prefix modifier (composes with `const`: `const amor map[T] x`).
+    Same {key: value, ...} literal syntax, same indexed get/set/
+    forEach/delete/toText surface as plain map[T] -- only the growth
+    strategy differs internally (festina_amap_set's own doubling
+    capacity in place of festina_map_set's realloc-by-exactly-one),
+    which these tests can't observe directly, so they exercise the
+    same observable behavior plain map[T] already has, plus enough
+    entries to force several real capacity doublings."""
+
+    def test_literal_init_indexed_get_and_set(self, compile_and_run):
+        source = """
+        amor map[int] scores = {'a': 1, 'b': 2}
+        scores['c'] = 3
+        scores['a'] = 10
+        log(scores['a'])
+        log(scores['b'])
+        log(scores['c'])
+        log(scores['missing'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["10", "2", "3", "-9223372036854775808"]
+
+    def test_forEach_visits_every_entry(self, compile_and_run):
+        source = """
+        amor map[int] m = {'a': 1, 'b': 2, 'c': 3}
+        int total = 0
+        void func addUp(v:int, key:text) {
+            total = total + v
+        }
+        m.forEach(addUp)
+        log(total)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "6"
+
+    def test_delete_removes_the_entry(self, compile_and_run):
+        source = """
+        amor map[text] m = {'a': 'x', 'b': 'y'}
+        delete m['a']
+        log(m['a'])
+        log(m['b'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["", "y"]
+
+    def test_toText_renders_json(self, compile_and_run):
+        source = """
+        amor map[int] m = {'a': 1, 'b': 2}
+        log(m)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == '{"a":1,"b":2}'
+
+    def test_many_inserts_survive_real_capacity_growth(self, compile_and_run):
+        # claude.md #156's own point: festina_amap_set doubles capacity
+        # rather than growing by exactly one per insert -- 200 entries
+        # forces several real doublings (8 -> 16 -> ... -> 256), not
+        # just the empty/one-entry cases the other tests above cover.
+        source = """
+        amor map[int] m = {}
+        int i = 0
+        while i < 200 {
+            m[`key${i}`] = i
+            i = i + 1
+        }
+        log(m['key0'])
+        log(m['key100'])
+        log(m['key199'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["0", "100", "199"]
+
+    def test_const_amor_map_composes(self, compile_and_run):
+        source = """
+        const amor map[text] m = {'x': 'y'}
+        log(m['x'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "y"
+
+    def test_struct_field_auto_vivifies(self, compile_and_run):
+        # claude.md #156: a struct field has no initializer syntax at
+        # all, so an `amor map[T]` field relies entirely on the same
+        # lazy-build-on-first-touch auto-vivify path plain map[T]
+        # fields already use -- exercising this catches the real risk
+        # this feature's own review found: building the WRONG (smaller,
+        # plain-map-shaped) header for a field the rest of codegen
+        # treats as amor-shaped would silently corrupt memory the
+        # moment festina_amap_set first touched the missing capacity
+        # field, not raise a clean error.
+        source = """
+        struct Bag { m:amor map[int] }
+        Bag b
+        b.m['a'] = 1
+        b.m['b'] = 2
+        log(b.m['a'])
+        log(b.m['b'])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "2"]
+
+
 class TestLoops:
     """claude.md #60 (for loops), #61 (while loops), #66 (postfix ++/--)."""
 
@@ -5247,13 +5351,41 @@ class TestScreenSizeAndSetClientSize:
 
 
 class TestExampleGraphicsAndGame:
-    """Interactive regression coverage for examples/graphics.f and
-    examples/tic_tac_toe.f -- the two examples that need a real (or
-    virtual) X server, so they can't join tests/test_examples.py's
-    plain compile-and-check-stdout sweep. Lives here, not there, so it
-    can reuse this file's own _find_window/_wait_for_output helpers and
-    x_display/run_graphics_program fixtures, the same as TestGraphics
-    above and TestTimers's combined graphics+timers test below."""
+    """Interactive regression coverage for examples/graphics.f,
+    examples/tic_tac_toe.f, and examples/layers.f -- the examples that
+    need a real (or virtual) X server, so they can't join
+    tests/test_examples.py's plain compile-and-check-stdout sweep.
+    Lives here, not there, so it can reuse this file's own
+    _find_window/_wait_for_output helpers and x_display/
+    run_graphics_program fixtures, the same as TestGraphics above and
+    TestTimers's combined graphics+timers test below."""
+
+    def test_layers_demo_renders_all_layers_and_stops_on_its_own(self, run_graphics_program, x_display):
+        # claude.md #149: arr[img] as a layer stack, composited by one
+        # renderFrame() every setInterval tick. Like timers.f, the demo
+        # clears its own interval and logs a final line once it's done
+        # (200 frames), rather than needing this test to be the one that
+        # decides when to stop it -- so this only needs to wait for that
+        # line, the same pattern TestIndividualExamples.
+        # test_timers_demo_runs_and_exits_on_its_own already uses for a
+        # non-graphics example. Manually verified beyond what's
+        # automated here (same "high confidence, not worth a netpbm
+        # test dependency" call TestGraphics's own docstring makes):
+        # captured the real rendered window via xwd and visually
+        # confirmed all four layers actually composite -- the sky/ground
+        # background, the scattered stars (plus one added mid-run), the
+        # bouncing ball's accumulated trail (including a real bounce off
+        # an edge), and the "Frame N/200" HUD text on top.
+        source = open(os.path.join(_EXAMPLES_DIR, "layers.f")).read()
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            _find_window(x_display)
+            text = _wait_for_output(stdout_path, lambda t: "rendered 200 frames" in t, timeout=30)
+            assert "opening the canvas -- close the window to exit" in text
+            assert "rendered 200 frames -- stopping (close the window to exit)" in text
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
 
     def test_graphics_demo_dispatches_mouse_key_and_resize(self, run_graphics_program, x_display):
         source = open(os.path.join(_EXAMPLES_DIR, "graphics.f")).read()
@@ -7317,6 +7449,106 @@ class TestAudioChannelReturnAndClipStop:
         result = compile_and_run(source, env=audio_null_env)
         assert result.returncode == 0
         assert result.stdout.strip() == "-1"
+
+
+class TestIsAudioPlayerPlaying:
+    """claude.md #146: isAudioPlayerPlaying(channel) -- the per-CHANNEL
+    counterpart to aud.isPlaying()'s per-clip question. Fills the exact
+    gap TestAudioChannelReturnAndClipStop's own docstring names: play()
+    hands back a channel number, but there was previously no way to ask
+    about that CHANNEL directly once the program no longer has (or
+    cares about) which clip is on it."""
+
+    def test_true_immediately_after_play(self, compile_and_run, tmp_path, audio_null_env):
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        int ch = clip.playLoop()
+        log(isAudioPlayerPlaying(ch))
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_false_immediately_after_stop_audio_player(
+            self, compile_and_run, tmp_path, audio_null_env):
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        int ch = clip.playLoop()
+        stopAudioPlayer(ch)
+        log(isAudioPlayerPlaying(ch))
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "false"
+
+    def test_false_for_a_channel_never_played_on(self, compile_and_run, audio_null_env):
+        result = compile_and_run("log(isAudioPlayerPlaying(5))", env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "false"
+
+    def test_out_of_range_channel_is_clamped_not_a_crash(
+            self, compile_and_run, audio_null_env):
+        # Same "a bad channel number should not kill a running program"
+        # rule play(n)/stopAudioPlayer(n) already apply -- claude.md
+        # #99's own clamp-into-[0,64) behavior, extended to this query.
+        result = compile_and_run(
+            "log(isAudioPlayerPlaying(999))\nlog(isAudioPlayerPlaying(-1))",
+            env=audio_null_env,
+        )
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["false", "false"]
+
+    def test_answers_about_the_channel_not_the_clip(
+            self, compile_and_run, tmp_path, audio_null_env):
+        # A different clip taking the same channel over is exactly the
+        # scenario that makes a per-clip isPlaying() insufficient: the
+        # channel is still playing SOMETHING, even though the original
+        # clip's own aud.isPlaying() would now say false.
+        _write_wav(tmp_path / "a.wav", duration_s=1.0)
+        _write_wav(tmp_path / "b.wav", duration_s=1.0)
+        source = """
+        aud a = 'a.wav'
+        aud b = 'b.wav'
+        int ch = a.playLoop(0)
+        b.playLoop(0)
+        log(a.isPlaying())
+        log(isAudioPlayerPlaying(ch))
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["false", "true"]
+
+    def test_stopping_one_channel_leaves_another_playing_the_same_clip_alone(
+            self, compile_and_run, tmp_path, audio_null_env):
+        _write_wav(tmp_path / "clip.wav", duration_s=1.0)
+        source = """
+        aud clip = 'clip.wav'
+        int a = clip.playLoop()
+        int b = clip.playLoop()
+        stopAudioPlayer(a)
+        log(isAudioPlayerPlaying(a))
+        log(isAudioPlayerPlaying(b))
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["false", "true"]
+
+    def test_compiles_and_links_successfully(self, cli_mod, tmp_path):
+        # Naming isAudioPlayerPlaying alone (no aud declaration at all)
+        # must still pull in the audio translation unit -- the same
+        # "naming it is what makes a program use audio" contract
+        # stopAudioPlayer/setMaxAudioPlayers already have.
+        if not (shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")):
+            pytest.skip("no C compiler (clang/gcc/cc) on PATH")
+        src_path = tmp_path / "main.f"
+        src_path.write_text("log(isAudioPlayerPlaying(0))")
+        out_path = tmp_path / "program"
+        from tests.conftest import compile_file_or_skip
+        result_path = compile_file_or_skip(cli_mod, str(src_path), str(out_path))
+        assert result_path == str(out_path)
+        assert out_path.exists()
 
 
 class TestSplitAndJoin:
@@ -13463,3 +13695,253 @@ class TestTopLevelBlockScopeTracking:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "v2\n"
+
+
+class TestArgv:
+    """claude.md #150: `argv` -- a real, mutable `arr[text]` global,
+    pre-registered in semantic.analyze (so it's usable without any
+    declaration) and populated from the process's real OS argc/argv at
+    the very start of main(), before any top-level statement runs. See
+    _emit_main_and_entry's own comment for why the store is a plain,
+    direct `store ptr %argv_arr, ptr @argv` rather than going through
+    the generic global retain/release helper every OTHER global
+    reassignment uses."""
+
+    def test_argv0_is_the_program_path(self, compile_and_run):
+        result = compile_and_run("log(argv.length)\nlog(argv[0] != '')\n")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["1", "true"]
+
+    def test_extra_arguments_are_visible(self, compile_and_run):
+        source = """
+        log(argv.length)
+        log(argv[1])
+        log(argv[2])
+        """
+        result = compile_and_run(source, args=["hello", "world"])
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["3", "hello", "world"]
+
+    def test_argv_is_a_real_mutable_array(self, compile_and_run):
+        # Nothing about argv's pre-registration makes it special once
+        # main() has populated it -- ordinary arr[text] operations work
+        # on it like any other array local/global.
+        source = """
+        argv.push('extra')
+        log(argv[argv.length - 1])
+        """
+        result = compile_and_run(source, args=["a"])
+        assert result.returncode == 0
+        assert result.stdout == "extra\n"
+
+
+class TestExec:
+    """claude.md #150: exec(args:arr[text]):int -- spawns args[0]
+    (PATH-searched), inheriting stdio, and returns its real exit code,
+    or -1 if the process never started at all (distinguished from a
+    real exit(127) via the self-pipe technique -- see
+    festina_process_exec's own comment in runtime/festina_runtime.c).
+    Named festina_process_exec at the runtime level, not festina_exec,
+    to avoid colliding with the pre-existing internal SQL-DDL helper of
+    that name."""
+
+    def test_successful_exec_returns_the_real_exit_code(self, compile_and_run):
+        source = """
+        arr[text] cmd = ['/bin/sh', '-c', 'exit 3']
+        log(exec(cmd))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "3\n"
+
+    def test_a_missing_executable_returns_negative_one(self, compile_and_run):
+        # Not 127 -- that would be indistinguishable from a real
+        # program that legitimately calls exit(127) itself. See the
+        # self-pipe technique in festina_process_exec.
+        source = """
+        arr[text] cmd = ['/no/such/binary/at/all/xyz']
+        log(exec(cmd))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "-1\n"
+
+    def test_stdio_is_inherited(self, compile_and_run):
+        # exec() inherits stdout rather than capturing it -- the child's
+        # own output lands directly in the parent's stdout stream.
+        source = """
+        arr[text] cmd = ['/bin/echo', 'from-child']
+        exec(cmd)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert "from-child" in result.stdout
+
+    def test_exec_is_rejected_for_wasm(self, cli_mod, tmp_path):
+        src = tmp_path / "main.f"
+        src.write_text("arr[text] cmd = ['ls']\nexec(cmd)", encoding="utf-8")
+        with pytest.raises(cli_mod.CompileError) as exc_info:
+            cli_mod.compile_file(str(src), str(tmp_path / "out.wasm"),
+                                  cc="clang", target="wasm32-wasi")
+        assert exc_info.value.category == "unsupported platform feature"
+        assert "exec" in str(exc_info.value)
+
+
+class TestToInt:
+    """claude.md #150: text.toInt():int -- JS parseInt()-style parsing
+    (leading whitespace skipped, an optional sign, digits until the
+    first non-digit), returning int-null (-9223372036854775808) rather
+    than raising on unparseable input, mirroring toFloat's existing
+    null-on-failure convention. A literal-receiver call constant-folds
+    entirely at compile time (see _parse_int_like_strtoll) -- steering
+    message mid-task: 'offload as much of the work as possible at the
+    compilation phase.'"""
+
+    def test_a_clean_int_parses(self, compile_and_run):
+        result = compile_and_run("log('42'.toInt())")
+        assert result.returncode == 0
+        assert result.stdout == "42\n"
+
+    def test_trailing_garbage_is_ignored_js_style(self, compile_and_run):
+        result = compile_and_run("log('42abc'.toInt())")
+        assert result.returncode == 0
+        assert result.stdout == "42\n"
+
+    def test_leading_whitespace_and_sign_are_handled(self, compile_and_run):
+        result = compile_and_run("log('  -17'.toInt())")
+        assert result.returncode == 0
+        assert result.stdout == "-17\n"
+
+    def test_unparseable_text_returns_null(self, compile_and_run):
+        source = """
+        int n = 'nope'.toInt()
+        log(n == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+
+    def test_empty_text_returns_null(self, compile_and_run):
+        source = """
+        int n = ''.toInt()
+        log(n == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+
+    def test_a_dynamic_receiver_is_parsed_at_runtime(self, compile_and_run):
+        # Not a StringLit receiver -- takes the real festina_text_to_int
+        # runtime path rather than the compile-time constant fold.
+        source = """
+        text func makeNum() { return '9' + '9' }
+        log(makeNum().toInt())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "99\n"
+
+    def test_literal_receiver_constant_folds(self, parser, semantic, codegen):
+        # No festina_text_to_int call at all -- computed entirely in
+        # Python via _parse_int_like_strtoll, matching the mid-task
+        # steering message to offload work to compile time wherever
+        # possible.
+        program = parser.parse("log('123'.toInt())")
+        analyzed = semantic.analyze(program)
+        ir = codegen.generate_ir(program, analyzed)
+        assert "call i64 @festina_text_to_int(" not in ir
+        assert "123" in ir
+
+
+class TestTextIndexing:
+    """claude.md #150: text[i]:text -- read-only, UTF-8 codepoint-
+    indexed character access, returning null (not a runtime crash) for
+    an out-of-range or negative index. Deliberately DIFFERENT semantics
+    from arr[T] indexing (which is unchecked raw-memory access) --
+    text's own bounds are always checked. A literal receiver with a
+    literal non-negative index constant-folds entirely in Python."""
+
+    def test_a_middle_character(self, compile_and_run):
+        result = compile_and_run("text s = 'hello'\nlog(s[1])")
+        assert result.returncode == 0
+        assert result.stdout == "e\n"
+
+    def test_index_zero(self, compile_and_run):
+        result = compile_and_run("text s = 'hello'\nlog(s[0])")
+        assert result.returncode == 0
+        assert result.stdout == "h\n"
+
+    def test_out_of_range_is_null_not_a_crash(self, compile_and_run):
+        source = """
+        text s = 'hi'
+        text c = s[100]
+        log(c == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+
+    def test_negative_index_is_null(self, compile_and_run):
+        source = """
+        text s = 'hi'
+        text c = s[-1]
+        log(c == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+
+    def test_multibyte_utf8_is_indexed_by_codepoint_not_byte(self, compile_and_run):
+        # 'café' -- 'é' is a 2-byte UTF-8 sequence, so a byte-indexed
+        # implementation would return a broken half-character here;
+        # codepoint indexing must return the whole 'é'.
+        result = compile_and_run("text s = 'café'\nlog(s[3])")
+        assert result.returncode == 0
+        assert result.stdout == "é\n"
+
+    def test_assignment_is_rejected(self, parser, semantic, errors):
+        program = parser.parse("text s = 'hi'\ns[0] = 'x'")
+        with pytest.raises(errors.CompileError, match="immutable"):
+            semantic.analyze(program)
+
+    def test_a_dynamic_receiver_and_index_go_through_the_runtime_path(self, compile_and_run):
+        source = """
+        text func makeText() { return 'ab' + 'cd' }
+        int func idx() { return 1 + 1 }
+        log(makeText()[idx()])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "c\n"
+
+    def test_literal_receiver_and_index_constant_folds(self, parser, semantic, codegen):
+        program = parser.parse("text s = 'hello'\nlog(s[1])\nlog('world'[0])")
+        analyzed = semantic.analyze(program)
+        ir = codegen.generate_ir(program, analyzed)
+        # 'world'[0] is a literal-on-literal index -- folded to 'w' in
+        # Python, no festina_text_char_at call needed for it. s[1]
+        # (a variable receiver) still goes through the runtime path.
+        assert "call ptr @festina_text_char_at(" in ir
+        assert '"w\\00"' in ir or "w\\00" in ir
+
+    def test_indexing_does_not_leak(self, compile_and_run):
+        # festina_text_char_at always returns a freshly allocated
+        # buffer -- the dynamic-path codegen must free the receiver AND
+        # correctly mark the result as owning (self._minted_values) so
+        # a bound/used result isn't defensively re-copied and leaked.
+        # This is a correctness/output check, not a real leak check --
+        # see scripts/leak_stress.sh for the ASan/LeakSanitizer side of
+        # this, run manually during development of claude.md #150.
+        source = """
+        text s = 'abcdef'
+        text out = ''
+        int j = 0
+        while j < 6 {
+            out = out + s[j]
+            j = j + 1
+        }
+        log(out)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "abcdef\n"

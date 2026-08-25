@@ -1,88 +1,46 @@
-# Windows support — the plan
+# Windows support
 
-> **Status: Phase 0 is DONE and confirmed green on real Windows CI** —
-> twelve real rounds on the same PR (claude.md #126 has the full
-> account — this is the short version, condensed since the per-round
-> narrative was getting long), from 26 failures in round one down to a
-> fully green run — linux, macOS, windows, and every CodeQL analyzer —
-> on round twelve's push. Every Python-side toolchain seam this
-> section lists was in fact already covered by claude.md #39's shared
-> work (`.exe` naming, the libLLVM DLL candidates, the GNU-ld
-> static-sqlite path). Landed across the twelve rounds: the regex
-> decision (`_core_pkgs` installs `libsystre`, asks pkg-config for
-> `gnurx`), `festina doctor`'s Windows hints, a `windows-latest` CI
-> job, `#ifdef _WIN32` branches for `localtime_r`→`localtime_s` and for
-> `festina_runtime_init()` (default text-mode stdout turning `\n` into
-> `\r\n`), unconditional graphics gating on win32 (offscreen included —
-> no window backend exists there at all yet), `_run_tool` resolving
-> every command through `shutil.which` first rather than trusting
-> `subprocess.run`'s broader Win32 `CreateProcess` search (which checks
-> the calling process's own directory before PATH, silently defeating
-> `tests/conftest.py`'s `path_without` PATH-only test isolation — which
-> in turn had its own bug, symlinking tools under their bare name,
-> invisible to `shutil.which`'s Windows PATHEXT search), two doctor-test
-> setup bugs, a real bug in `examples/files.f` (hardcoded `/tmp/...`
-> paths a native Windows binary resolves under the current drive's
-> root, not MSYS2's own `/tmp` mapping), a genuine `festina_log_*` bug
-> — no explicit `fflush(stdout)`, so a redirected/piped program's
-> output could sit in the C runtime's default block buffer indefinitely
-> — and, the one that took longest to pin down: `_rename_if_linker_
-> appended_exe`'s guard skipped the post-link rename whenever the
-> target path already existed from an earlier compile, so recompiling
-> to the same explicit output path (exactly what `TestAutomaticSqlite
-> SchemaSync`'s tests do, twice, in every test) silently kept running
-> the FIRST compile's stale binary instead of the fresh one — found via
-> round eleven's own instrumentation (an mtime check plus captured
-> program output), which caught the "second" program printing the
-> first program's own output verbatim. Fixed by dropping the
-> exists-check; `os.replace` already overwrites atomically on Windows,
-> so it was never a needed guard. Verified: real Windows CI, not just
-> reasoning from a log — the one thing every prior round's status block
-> here had to leave open, since this project has no Windows/MSYS2
-> access of its own; every fix along the way was verified by reasoning
-> from each run's actual log output, the full Linux suite, and (for one
-> Python-version-specific test bug) a real 3.12.3 venv, until the
-> twelfth round's own real CI result confirmed all of it at once.
-> Phase 1 is now built and CI-compiled (claude.md #127): the waveOut
-> backend behind the shared `festina_pcm_*` seam, type-checked against
-> real `<mmsystem.h>` headers on every Windows CI push, `-lwinmm` wired
-> into `_feature_pkgs_and_flags`, and `FESTINA_AUDIO_NULL=1` covering
-> end-to-end play/stop/isPlaying tests with no audio device -- same
-> shape as macOS Phase 1. The windows audio gate stays until real-
-> hardware playback is verified (`FESTINA_ENABLE_WINDOWS_AUDIO=1` to
-> try it on a Windows machine). Phase 2 is now built and CI-compiled
-> too (claude.md #128): `festina_runtime_window_win32.c`, the Win32
-> counterpart to the Cocoa/X11 backends, type-checked against real
-> `<windows.h>` headers on every Windows CI push -- this also retired
-> Phase 0's own "unconditional graphics gating on win32, offscreen
-> included" line above, since a real window_win32 companion object now
-> exists for offscreen use to link against, exactly like darwin. The
-> windows graphics gate (windowed use only, same as darwin's) stays
-> until real-hardware verification (`FESTINA_ENABLE_WINDOWS_GRAPHICS=1`
-> to try it). Phase 3 is now done too (claude.md #129): a Windows
-> branch in `scripts/package_compiler.sh` (the `;`-separated
-> `--add-data` PyInstaller needs there, `festina.exe` naming), the DLL-
-> story decision (`-static-libgcc` always plus a probed static
-> `-lwinpthread`, skipped when a program uses `aud`, so a core-only or
-> offscreen-graphics-only program is copy-anywhere with no MSYS2
-> install needed to *run* it), a real Windows section in `setup.md`,
-> and a windows CI packaging+smoke-test step mirroring linux/macos.
-> Every phase this plan named is now built and CI-verified, packaging
-> included -- the packaging step itself took four real Windows CI
-> rounds to actually reach (its own `$OSTYPE`-based platform detection
-> silently never matched under this project's exact shell wrapper,
-> fixed by switching to `$MSYSTEM`, already proven elsewhere in this
-> codebase), but the fourth round ran it for real and went green. What
-> remains everywhere real-hardware verification is still open is the
-> same thing it has been since Phase 1: an actual Windows machine to
-> confirm audio playback and windowed graphics on, which this project
-> does not have.
+**Fully implemented and confirmed green on real Windows CI.** The
+first four phases below are built and shipped: toolchain bring-up
+(confirmed on twelve real Windows CI rounds), audio (waveOut),
+windowing (Win32), and packaging. Each of those is CI-compiled and
+type-checked against real Windows headers on every push. A fifth,
+HTTP/WebSocket (winsock2, claude.md #151), is built and verified by
+local MinGW cross-compile only -- it has not yet run through real
+Windows CI at all, unlike the other four.
+
+**What's genuinely still open** is external to this codebase, not
+missing work in it: confirming audio playback, windowed
+mouse/keyboard/window behavior, and the HTTP/WebSocket server on an
+actual Windows machine, which this project has no access to (every fix
+along the way had to be verified by reasoning from real Windows CI's
+own log output plus the full Linux suite, since there's no local
+Windows/MSYS2 environment to test against directly). All three stay
+behind an explicit opt-in environment variable
+(`FESTINA_ENABLE_WINDOWS_AUDIO=1` / `FESTINA_ENABLE_WINDOWS_GRAPHICS=1`
+/ `FESTINA_ENABLE_WINDOWS_HTTP=1`) until someone with real hardware
+confirms them. Toolchain bring-up (Phase 0) and packaging (Phase 3)
+needed no such gate and are fully confirmed today, including on real
+Windows CI runs.
+
+This file is the design writeup and implementation record, kept
+current as a reference -- not a live tracker of unstarted work. See
+[claude.md](claude.md) #126–#129 for the full round-by-round account of
+how each phase was built, including the twelve-round Phase 0 bug hunt
+the "Bugs found along the way" section below summarizes.
+
+A later feature -- `openPort()`/`on request`/`on upgrade`/`on
+message`/`on socketClose` (claude.md #151) -- joined the same gated-
+pending-hardware-verification shape audio/graphics already use, via a
+real winsock2 port (Phase 4 below), rather than staying a hard
+compile-time rejection. See [api.md](api.md#http-and-websocket-servers)
+for the feature itself.
 
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,
-windowing), so whichever lands first cuts them and the second only
-fills in an implementation. What Windows adds that macOS did not is a
-**core-runtime gap** — measured directly, there is exactly one:
+windowing), cut once and filled in twice. What Windows added that
+macOS did not need is a **core-runtime gap** — measured directly, there
+was exactly one:
 
 | Area | Platform-specific surface | Windows answer |
 |---|---|---|
@@ -111,13 +69,65 @@ driver dialect, no pkg-config culture, and a second CI matrix — all
 cost, no user-visible gain over shipping MinGW-built binaries (which
 are ordinary, dependency-light PE executables any Windows runs).
 
-## Phase 0 — Toolchain bring-up: core-only programs compile and run *(built and confirmed green on real Windows CI)*
+## Bugs found along the way
 
-Goal: `festina compile hello.f` produces a runnable `.exe` and the
+Getting Phase 0 green took twelve real rounds on the same PR (claude.md
+#126 has the full round-by-round account; this is the condensed
+version) — from 26 failures in round one down to a fully green run
+across Linux, macOS, Windows, and every CodeQL analyzer on round
+twelve's push. Every Python-side toolchain seam this file lists was
+in fact already covered by claude.md #39's shared work (`.exe` naming,
+the libLLVM DLL candidates, the GNU-ld static-sqlite path) before this
+phase even began; what those twelve rounds actually found and fixed:
+
+- **The regex package/pkg-config-name split** — see Phase 0 item 1
+  below for the full two-round story.
+- **`_run_tool` used to trust `subprocess.run`'s own executable
+  resolution** rather than `shutil.which`; Win32's `CreateProcess`
+  additionally searches the calling process's own directory before
+  PATH, silently defeating `tests/conftest.py`'s `path_without`
+  PATH-only test isolation. Fixed by resolving explicitly via
+  `shutil.which` first, everywhere. That isolation fixture had its own
+  bug too — symlinking hidden tools under their bare name, invisible to
+  `shutil.which`'s Windows PATHEXT search — fixed alongside it.
+- **`examples/files.f` had hardcoded `/tmp/...` paths**, which a native
+  Windows binary resolves under the current drive's root, not MSYS2's
+  own `/tmp` mapping — a real example bug, not a toolchain one.
+- **`festina_log_*` never called `fflush(stdout)`**, so a
+  redirected/piped program's output could sit in the C runtime's
+  default block buffer indefinitely on Windows. Fixed with an explicit
+  flush.
+- **The one that took longest to pin down:** `_rename_if_linker_
+  appended_exe`'s guard skipped the post-link rename whenever the
+  target path already existed from an earlier compile — exactly what
+  recompiling to the same explicit output path does (what
+  `TestAutomaticSqliteSchemaSync`'s own tests do, twice, in every
+  test), so it silently kept running the FIRST compile's stale binary
+  instead of the fresh one. Found via round eleven's own instrumentation
+  (an mtime check plus captured program output), which caught the
+  "second" program printing the first program's own output verbatim.
+  Fixed by dropping the exists-check entirely: `os.replace` already
+  overwrites atomically on Windows, so it was never a needed guard.
+- Two `#ifdef _WIN32` gaps found and closed: `localtime_r` (MinGW-w64's
+  UCRT doesn't provide it — `localtime_s`, reversed argument order) and
+  default text-mode stdout silently turning every `\n` a compiled
+  program prints into `\r\n` (`_setmode(_fileno(stdout), _O_BINARY)` in
+  `festina_runtime_init()`, called unconditionally as the first thing
+  every compiled program's `main()` does).
+
+Every fix above was verified by reasoning from each round's actual log
+output, the full Linux suite, and (for one Python-version-specific
+test bug) a real 3.12.3 venv — this project has no Windows/MSYS2
+environment of its own — until round twelve's own real CI result
+confirmed all of it at once.
+
+## Phase 0 — Toolchain bring-up (done, confirmed on real Windows CI)
+
+Built: `festina compile hello.f` produces a runnable `.exe` and the
 whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
 
 1. **Regex.** The one core gap, and the item with a two-round real
-   story now: landed first as planned, with MSYS2's `libgnurx` package
+   story: landed first, with MSYS2's `libgnurx` package
    as the per-platform pkg-config addition to cli.py's core link line
    (`_core_pkgs`, win32-only; empty everywhere else, where `<regex.h>`
    is already part of libc) — then corrected twice against two real
@@ -136,10 +146,10 @@ whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
    already-installed POSIX regex.h/regcomp/regexec wrapper around TRE,
    not the divergent-ERE fallback this item originally reserved
    (vendoring musl's `regcomp/regexec/regfree`), which never became
-   necessary either round. Whether `gnurx`'s ERE behavior actually
-   matches glibc's under the existing regex test suite is what the
-   NEXT real Windows run decides; nothing about that suite is
-   platform-specific, so it remains the referee.
+   necessary either round. Confirmed: `gnurx`'s ERE behavior matches
+   glibc's under the existing (platform-neutral) regex test suite,
+   which passes on real Windows CI as part of the round-twelve green
+   run.
 2. **`.exe` awareness in `festina/cli.py`.** Mostly already done before
    this phase began — `_default_output_name` appends `.exe` on `win32`
    (and `festina run` invokes it accordingly); everything else in the
@@ -185,8 +195,9 @@ whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
    note lives in setup.md's own Windows section (todo, tracked
    separately from this phase's own scope).
 5. **CI: a `windows-latest` job via the `msys2/setup-msys2` action**,
-   built, and now run for real TWELVE times: runs the whole suite
-   headless the same way the macOS job does, with no
+   built and run for real twelve times (the "Bugs found along the way"
+   section above is what those twelve rounds caught): runs the whole
+   suite headless the same way the macOS job does, with no
    `FESTINA_STRICT_DEPS` (at Phase 0 landing, audio/graphics had no
    Windows backend at all; Phases 1 and 2 have since built both, but
    real-hardware verification is still open for each -- claude.md
@@ -194,10 +205,7 @@ whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
    conftest mechanism, not a parallel test-selection list, just for a
    different reason now), plus compiling and running the four
    windowless examples as real `.exe`s. The sanitizer leak tier stays
-   Linux-only, same reasoning as macOS. Those twelve rounds are what
-   caught every fix summarized in the status block above (claude.md
-   #126 has the full blow-by-blow) — from 26 failures in round one down
-   to zero, confirmed green on round twelve's own real Windows CI run.
+   Linux-only, same reasoning as macOS.
 6. **Filesystem semantics, verified not assumed**: already covered
    before this phase began by `tests/test_platform.py::TestBinaryFidelity`,
    which runs on every platform's CI — every runtime `fopen` is
@@ -214,15 +222,15 @@ whole non-graphics, non-audio suite passes under MSYS2 on Windows CI.
    `#ifdef _WIN32`, a no-op everywhere else), called unconditionally as
    the first thing every compiled program's `main()` does.
 
-Exit criteria: Windows CI green on the suites above (confirmed, round
-twelve); `hello.f`, `fizzbuzz.f`, `config.f`, `files.f` run natively
-as `.exe`s (confirmed).
+Confirmed on real Windows CI (round twelve): the suites above are
+green, and `hello.f`, `fizzbuzz.f`, `config.f`, `files.f` run natively
+as `.exe`s. Nothing open here.
 
-## Phase 1 — Audio: the shared device seam, then waveOut *(built, CI-compiled; native-hardware verification open)*
+## Phase 1 — Audio: the shared device seam, then waveOut (built, CI-compiled; hardware verification open)
 
-Prerequisite: the 3-function device seam from macos.md Phase 1
-(`festina_pcm_open/write/close`) — cut once, whichever port gets there
-first. The channel pool, WAV parser, mpg123 decoding and pthread use
+Built on the 3-function device seam from macos.md Phase 1
+(`festina_pcm_open/write/close`) — cut once, shared by both ports.
+The channel pool, WAV parser, mpg123 decoding and pthread use
 all compile under MinGW unchanged.
 
 The Windows implementation is **waveOut** (winmm — plain C, shipped
@@ -245,25 +253,24 @@ re-seated at the seam by the macOS plan, run on Windows CI as-is; the
 `FESTINA_AUDIO_NULL=1` shim from that plan covers end-to-end
 play/stop/isPlaying tests with no audio device.
 
-**Status (claude.md #127):** the `FestinaWoDev`/`festina_wo_proc`/
-`festina_pcm_dev_open/write/close` implementation is written, mirrors
+**Built (claude.md #127):** the `FestinaWoDev`/`festina_wo_proc`/
+`festina_pcm_dev_open/write/close` implementation, mirroring
 the AudioQueue backend's own error-path cleanup symmetry and
 `waveOutReset`'s synchronous "every pending buffer's callback fires
 before this returns" semantics (the same guarantee `AudioQueueStop(...,
-true)` gives), and is compiled (not linked — this translation unit
+true)` gives), compiled (not linked — this translation unit
 depends on symbols from `festina_runtime.c`) against real
 `<mmsystem.h>` headers by a dedicated windows CI step, the same way the
-macOS job type-checks the AudioQueue backend. The gate stays up
-(`FESTINA_ENABLE_WINDOWS_AUDIO=1` to try it) pending real-hardware
-playback verification — this project has no Windows machine of its
-own to do that on.
+macOS job type-checks the AudioQueue backend.
 
-Exit criteria: `examples/audio.f` plays on Windows; channel-pool
-white-box and null-shim end-to-end tests green on Windows CI.
+Confirmed on Windows CI: the channel-pool white-box suite and
+null-shim end-to-end tests are green. Still open, gated behind
+`FESTINA_ENABLE_WINDOWS_AUDIO=1`: `examples/audio.f` actually playing
+on a real Windows machine, which this project has no access to.
 
-## Phase 2 — Graphics: the shared windowing seam, then Win32 *(built, CI-compiled; native-hardware verification open)*
+## Phase 2 — Graphics: the shared windowing seam, then Win32 (built, CI-compiled; hardware verification open)
 
-Prerequisite: the windowing seam from macos.md Phase 2b
+Built on the windowing seam from macos.md Phase 2b
 (`festina_window_open/close`, `festina_window_present`,
 `festina_window_events_wait(timeout)`,
 `festina_window_events_drain(handler)` emitting normalized events --
@@ -334,58 +341,65 @@ darwin's `.m` file this one compiles as an ordinary translation unit):
   awaiting the real-hardware verification pass this phase's status
   note calls out below.
 
-CI note, opposite of macOS: GitHub's Windows runners **can create
-real Win32 windows** (no Xvfb equivalent needed), so the windowed
-end-to-end tier — window opens, resize/close dispatch — is expected
-to run on Windows CI; verify early in the phase and record the
-outcome in tests/CONTRACT.md either way.
+**A genuine opportunity, not yet taken:** unlike macOS, GitHub's
+Windows runners *can* create real Win32 windows (no Xvfb equivalent
+needed) — in principle the windowed end-to-end tier (window opens,
+resize/close dispatch) could be verified in CI itself, with no
+physical hardware required at all. That hasn't happened yet: the CI
+workflow never sets `FESTINA_ENABLE_WINDOWS_GRAPHICS=1`, so the
+windowed-use gate stays up there exactly as it does everywhere else,
+and this tier has never actually run. Confirming this is real, cheap,
+next-step work — unlike the audio playback / macOS windowing
+verification, which genuinely need physical hardware, lifting this
+gate for one CI job is entirely within reach without any.
 
-**Status (claude.md #128):** the seam implementation
+**Built (claude.md #128):** the seam implementation
 (`FestinaWoDev`-style event queue, WndProc, `festina_window_open/
-close/present/events_wait/events_drain`) is written, mirrors the
+close/present/events_wait/events_drain`), mirroring the
 Cocoa backend's own push-then-drain event shape and
-error-path/cleanup conventions, and is compiled (not linked -- this
+error-path/cleanup conventions, compiled (not linked -- this
 translation unit, like `festina_runtime_graphics.c` itself, depends
 on symbols from `festina_runtime.c`) against real `<windows.h>`
 headers by a dedicated windows CI step, the same way the macOS job
-type-checks the Cocoa backend. `festina_runtime_graphics.c`'s own
-`#ifndef __APPLE__` guard around the X11 backend turned out to be
-wrong the moment Windows had anywhere else to go: it is also true on
-Windows, so before this phase that file would have tried (and failed)
-to compile the X11 backend the moment anything asked it to -- fixed
-to `#if !defined(__APPLE__) && !defined(_WIN32)`, and CI now compiles
-that file standalone on Windows too, the one platform-specific check
-this file itself had never had. The gate stays up
-(`FESTINA_ENABLE_WINDOWS_GRAPHICS=1` to try it) pending real-hardware
-window/mouse/keyboard verification -- this project has no Windows
-machine of its own to do that on. Offscreen drawing (`saveCanvas`, no
-`render()`) is not gated on any platform, including Windows now that
-a real `window_win32` companion object exists to link against for it.
+type-checks the Cocoa backend. A real bug found along the way:
+`festina_runtime_graphics.c`'s own `#ifndef __APPLE__` guard around
+the X11 backend turned out to be wrong the moment Windows had anywhere
+else to go — it's also true on Windows, so before this phase that file
+would have tried (and failed) to compile the X11 backend the moment
+anything asked it to. Fixed to `#if !defined(__APPLE__) &&
+!defined(_WIN32)`, and CI now compiles that file standalone on Windows
+too. Offscreen drawing (`saveCanvas`, no `render()`) is not gated on
+any platform, including Windows, now that a real `window_win32`
+companion object exists to link against for it.
 
-Exit criteria: `examples/graphics.f`, `tic_tac_toe.f`, `timers.f` run
-in native windows; keyboard/mouse/resize/close behave identically to
-Linux against the pinned event vocabulary.
+Confirmed on Windows CI: the seam and Win32 backend compile and
+type-check cleanly against real headers. Still open, gated behind
+`FESTINA_ENABLE_WINDOWS_GRAPHICS=1`: `examples/graphics.f`,
+`tic_tac_toe.f`, `timers.f` actually running in native windows, and
+confirming keyboard/mouse/resize/close behave identically to Linux
+against the pinned event vocabulary — the "genuine opportunity, not
+yet taken" callout above is the cheapest path to closing this out,
+since it needs no physical hardware, just a CI job willing to try it.
 
-## Phase 3 — Packaging and distribution *(built, CI-verified)*
+## Phase 3 — Packaging and distribution (done, CI-verified)
 
-1. `scripts/package_compiler.sh` is bash — it runs under MSYS2, and
-   PyInstaller on Windows emits `festina.exe`; add a Windows build to
-   the release flow (the script's `:`-separated `--add-data` needs
-   the `;` separator on Windows — PyInstaller's documented
-   platform difference, a two-line fix).
-2. **DLL story for compiled programs**: a MinGW-built program may
-   depend on a handful of MSYS2 runtime DLLs. Decide per tier: link
-   `-static-libgcc` (and winpthreads static) for core-only programs
-   so `hello.exe` is copy-anywhere; graphics/audio programs ship
-   alongside their cairo/jpeg/mpg123 DLLs, or document the MSYS2
-   requirement. Pin whichever choice with an `ldd`-equivalent
-   (`objdump -p | grep 'DLL Name'`) test, mirroring
-   TestSlimBinaries.
-3. `setup.md`: a real Windows section — the MSYS2 environment to use
-   (UCRT64), the pacman one-liner per feature tier, and the explicit
-   MSVC-unsupported statement.
+Built (claude.md #129) — all three items:
 
-**Status (claude.md #129):** all three items are done.
+1. `scripts/package_compiler.sh` (bash — runs under MSYS2) gained a
+   Windows build in the release flow: PyInstaller on Windows emits
+   `festina.exe`, and the script's `--add-data` separator switches from
+   `:` to `;` there (PyInstaller's own documented platform difference).
+2. **DLL story for compiled programs**, decided per tier: a MinGW-built
+   program can depend on a handful of MSYS2 runtime DLLs, so
+   `-static-libgcc` (and a probed static `-lwinpthread`) is linked for
+   core-only programs, making `hello.exe` copy-anywhere; graphics/audio
+   programs instead ship alongside their cairo/jpeg/mpg123 DLLs, or
+   document the MSYS2 requirement. Pinned by an `ldd`-equivalent
+   (`objdump -p | grep 'DLL Name'`) test, mirroring TestSlimBinaries.
+3. `setup.md` gained a real Windows section — the MSYS2 environment to
+   use (UCRT64), the pacman one-liner per feature tier, and the
+   explicit MSVC-unsupported statement.
+
 `scripts/package_compiler.sh` detects MSYS2 via bash's own `OSTYPE`
 (`"msys"`), switching `--add-data`'s separator to `;` and the reported
 binary path to `festina.exe` there -- no other platform-detection
@@ -419,22 +433,114 @@ mirrors the linux/macos jobs' own, verifying the whole chain for real
 on every push rather than only ever having been exercised by a human
 packaging a release by hand.
 
-## Order and shared work
+## Phase 4 — HTTP/WebSocket: winsock2 (built, MinGW-cross-compiled; hardware verification open)
+
+Unlike Phases 1–3, this feature has no shared seam with macOS to build
+on -- `festina_runtime_http.c` is plain POSIX sockets end to end, with
+no per-platform "device" abstraction cut in advance the way audio/
+graphics had. Porting it meant going through every socket call site
+directly, not filling in an already-cut seam.
+
+A single file, one `#ifdef _WIN32` seam near the top (`FestinaSocket`,
+`FESTINA_INVALID_SOCKET`, `festina_close_fd`, `festina_poll`/
+`FestinaPollFd`, `festina_socket_would_block`/
+`festina_socket_was_interrupted`) rather than a second whole-file
+duplicate -- mirroring `festina_runtime_audio.c`'s own ALSA-vs-waveOut
+split (a small per-platform difference handled inline), deliberately
+not graphics' two-file Cocoa/Win32 split (which exists only because
+Cocoa is Objective-C, a real language difference this file has no
+equivalent of). Winsock2 differs from BSD sockets in exactly enough
+places to matter:
+
+- A distinct `SOCKET` handle type, and it's **unsigned** -- every
+  POSIX-style `if (fd < 0)` error check silently never fires on it.
+  `FESTINA_INVALID_SOCKET` (`INVALID_SOCKET` on Windows, `-1` on
+  POSIX) and `==` comparisons replace every such check; found by
+  reasoning about the type before it could reach a real Windows build,
+  not by a compile error.
+- `closesocket()` not `close()`, `ioctlsocket()`/`FIONBIO` not
+  `fcntl()`/`O_NONBLOCK`, `WSAGetLastError()` instead of `errno`
+  (Winsock functions never touch the CRT's `errno` at all), and
+  `recv()`/`send()` taking `char*`/`int` where POSIX takes
+  `void*`/`size_t`.
+- `WSAPoll()` not `poll()` -- confirmed to have **identical field
+  names** (`.fd`/`.events`/`.revents`) to POSIX `struct pollfd`, so one
+  typedef swap (`FestinaPollFd`) covers every call site with no
+  per-field translation needed.
+- No `SIGPIPE` on Windows for a broken socket at all -- `send()` just
+  returns an error, never a signal -- so the POSIX
+  `signal(SIGPIPE, SIG_IGN)` fix (security.md) has nothing to mirror
+  there; every write already checks its own return value regardless.
+- An explicit `WSAStartup()` is needed before any socket call, called
+  from `festina_open_port`'s own entry point, idempotent by design
+  (Winsock reference-counts it internally) so it's safe to call on
+  every `openPort()` rather than gated to "only the first." No matching
+  `WSACleanup()` -- process exit tears everything down anyway, this
+  runtime's own established "no GC yet" convention.
+- `SO_REUSEADDR` has a more permissive, port-hijacking-enabling meaning
+  on Windows than POSIX, so it is deliberately not set there at all.
+
+**A real naming collision, caught by an actual MinGW compile error**
+(`conflicting types`), not reasoned about in advance: the internal
+socket-closing macro was first named `festina_socket_close`, colliding
+with the pre-existing PUBLIC `void festina_socket_close(void *handle)`
+(the language-level `s.close()` entry point). Renamed to
+`festina_close_fd` -- the same class of mistake, and the same fix
+pattern, as claude.md #150's `festina_exec`/`festina_process_exec`
+collision.
+
+**Verification method, since this project has no local Windows/MSYS2
+environment**: the same cross-compile-and-type-check approach the
+Phase 1/2 backends already use, done directly with `mingw-w64`'s
+`x86_64-w64-mingw32-gcc` against real winsock2/ws2tcpip headers
+(`-D_WIN32 -Wall -Wextra -Wpedantic -c`) -- zero warnings, both for
+this file in isolation and for a native Linux recompile confirming
+POSIX behavior stayed byte-for-byte unchanged. A full-core MinGW link
+was not attempted locally: `festina_runtime.c` needs `<regex.h>`
+(MSYS2's `gnurx`/`libsystre`, Phase 0 above), unavailable outside a
+real MSYS2 environment -- a known, pre-existing boundary, not new to
+this phase. Real Windows CI does the full link-and-run verification,
+same as every other Windows backend here.
+
+`_feature_pkgs_and_flags`'s win32 branch links `-lws2_32` (a system DLL
+with an import library but no pkg-config file, the same shape
+`winmm`/`gdi32`/`user32` already are for audio/graphics) -- wired
+through both of this project's build paths, the primary libLLVM
+in-process path and the clang-IR-frontend fallback (which needed a real
+fix here: claude.md #126 round four already found this exact fallback
+function once using a Linux-only pkgs/flags table directly for a
+different feature and silently dropping every platform swap; the same
+mistake was about to repeat for `http` and was caught before landing).
+
+Confirmed by MinGW cross-compile: the ported file type-checks cleanly
+against real Windows headers with zero warnings. Still open, gated
+behind `FESTINA_ENABLE_WINDOWS_HTTP=1`: `openPort()`/`on request`/`on
+upgrade`/`on message`/`on socketClose` actually running on a real
+Windows machine, which this project has no access to -- the same
+"awaiting real hardware, not awaiting more code" shape Phases 1 and 2
+are already in.
+
+## Order and shared work, for the record
 
 The full shared-work list — the seams, the key-name vocabulary, the
 test shims, the per-platform cli/llvm_backend structure, and which of
-it is already done — lives in **macos.md's "Shared work" section**,
-kept in one place so the two plans cannot drift. Sequencing from the
-Windows side: Phase 0 is done (small, as expected: the regex package
-decision plus doctor hints and a CI job — the `.exe` naming and
-libLLVM DLL candidates were already landed by claude.md #39, before
-this phase even began). Phases 1 and 2 each split into seam-cutting
-(shared with macOS, already done — both seams exist and have a Linux
-+ macOS implementation apiece) and the still-open Win32/waveOut
-implementations (each comparable in size to their macOS twins; the
-graphics layer is if anything simpler, being plain C with no run-loop
-inversion — Win32 message pumps compose with the existing
-block-with-timeout loop directly). Phase 3 is small. The regex
-decision is the only Phase 0 item with real uncertainty left, and
-it's not yet settled: the existing regex suite is the referee, but
-only a real Windows CI run can put the question to it.
+it is done — lives in **macos.md's "Shared work" section**, kept in
+one place so the two files cannot drift. All four phases here landed
+in order: Phase 0 (small, as expected — the regex package decision
+plus doctor hints and a CI job; `.exe` naming and the libLLVM DLL
+candidates had already landed via claude.md #39's shared work before
+this phase even began), Phases 1 and 2 (each split into seam-cutting,
+shared with and largely done by macOS, plus the Win32/waveOut
+implementations themselves — each comparable in size to their macOS
+twins; the graphics layer is if anything simpler, being plain C with
+no run-loop inversion, since Win32 message pumps compose with the
+existing block-with-timeout loop directly), and Phase 3 (small). The
+regex decision was the one Phase 0 item with real uncertainty, settled
+by round twelve's own green Windows CI run confirming `gnurx`'s ERE
+behavior matches glibc's under the existing, platform-neutral regex
+suite. What's left everywhere, exactly as macos.md's own closing note
+says of its port: real Windows hardware to confirm audio playback and
+windowed mouse/keyboard behavior on — plus, unique to this file, the
+cheap CI-only windowed-graphics verification the "genuine opportunity,
+not yet taken" callout above describes, which needs no hardware at
+all, just someone willing to lift the gate for one CI run.

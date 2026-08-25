@@ -14,7 +14,9 @@ SPEC_KEYWORDS = frozenset({
     "import", "if", "else", "on", "fail", "log", "sqlite",
     "for", "while",  # claude.md #60, #61
     "map",  # claude.md #72
+    "amor",  # claude.md #156: amor map[T] / amor arr[T] -- amortized growth
     "break", "continue",  # claude.md #73
+    "http", "socket",  # claude.md #151
 })
 
 # Extra control tokens the parser needs distinct token types for, so it

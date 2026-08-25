@@ -138,7 +138,12 @@ while i < 120 {
     int ch = wav.play()
     total = total + ch
     mp3.playLoop(0)
+    // claude.md #146: isAudioPlayerPlaying(channel) -- pure read of
+    // fixed-size runtime state, no allocation, but exercised here
+    // alongside the rest of the channel pool anyway.
+    if isAudioPlayerPlaying(0) { total = total + 1 }
     stopAudioPlayer(0)
+    if isAudioPlayerPlaying(0) { log('unreachable') }
     wav.stop()
     stopAudioPlayer()
     i = i + 1

@@ -1,94 +1,44 @@
-# macOS support — the plan
+# macOS support
 
-> **Status: Phase 0 is DONE and verified on real hardware** — the
-> `macos-14` CI job is green (four rounds of real-Apple-Silicon
-> iteration, claude.md #121–#122): the full suite passes natively, the
-> four windowless examples compile and run, and the darwin branches of
-> every toolchain seam are unit-tested from all platforms
-> (`tests/test_platform.py`). The rounds also surfaced and fixed a
-> genuine language portability bug — GNU regex escapes silently not
-> matching under BSD libc — now solved by POSIX-class translation on
-> every platform. Phase 1 is built and CI-compiled (the
-> `festina_pcm_*` seam, the AudioQueue backend type-checked against
-> real AudioToolbox headers, `FESTINA_AUDIO_NULL=1` as the
-> cross-platform test sink); the darwin audio gate stays until
-> real-hardware playback is verified (`FESTINA_ENABLE_MACOS_AUDIO=1`
-> to try it on a Mac). Phase 2 is built and CI-compiled the same way
-> (claude.md #123): the `festina_window_*` seam, a native Cocoa
-> backend (`festina_runtime_window_mac.m`, type-checked against real
-> AppKit/Foundation/CoreGraphics headers on every push), and offscreen
-> graphics (`saveCanvas`, no window) unblocked on darwin with no
-> XQuartz dependency at all — 2a's XQuartz stage turned out to be
-> unnecessary and was skipped in favor of going straight to 2b, since
-> the X11 backend's own real (Linux, Xvfb-based) test suite already
-> gives 2b's design a verified behavioral reference to implement
-> against. The darwin *windowed*-graphics gate stays until real
-> mouse/keyboard/window behavior is verified on hardware
-> (`FESTINA_ENABLE_MACOS_GRAPHICS=1` to try it on a Mac); offscreen
-> drawing is never gated. Phase 3 is done: `scripts/package_compiler.sh`
-> ad-hoc codesigns the binary it produces on darwin (`codesign -f -s -`
-> — the `-f` matters, since recent PyInstaller already self-signs, see
-> below), the macos-14 CI job packages, codesigns, and smoke-tests a
-> real arm64 `festina` binary on every push, and [setup.md](setup.md)
-> has a real macOS section. Full Developer-ID signing/notarization
-> remains deliberately out of scope until there's an actual
-> distribution channel.
->
-> **The offscreen-graphics claim above got two real tests and failed
-> both** (claude.md #126): `festina_runtime_graphics.c` had never
-> actually compiled on real macOS hardware before Phase 2 swapped
-> cairo-xlib for plain `cairo` (every earlier CI round skipped it as a
-> missing dependency), and the very first time it did, `#include
-> <cairo/cairo.h>` in the new windowing seam header couldn't find the
-> file — Homebrew's cairo pkg-config `-I` flag points directly into the
-> headers directory, unlike the implicit `/usr/include` search that
-> quietly made the same include style work on Linux. Fixed to the
-> portable `#include <cairo.h>` — except `festina_runtime_window_mac.m`
-> turned out to have the identical line, independently, and only real
-> macOS CI compiling THAT file (nothing else does) caught it on the
-> very next run; fixed the same way. The packaging codesign step needed
-> `-f`/`--force` for the unrelated PyInstaller self-signing reason
-> above, and that same run found `tests/test_packaging.py`'s own
-> "prove no system Python is needed" test had replaced PATH outright
-> with a hardcoded `/usr/bin:/bin`, dropping Homebrew's bin directory
-> where `pkg-config` actually lives — invisible on Linux, where
-> pkg-config already lives in `/usr/bin`. Fixed to prepend rather than
-> replace. All fixes are one or two lines each, verified against the
-> real Linux cairo-xlib pkg-config flags and the full suite, but not
-> yet reconfirmed by a real macOS CI run that gets all the way through.
->
-> **The `festina_runtime_window_mac.m` include fix above was itself
-> incomplete** (claude.md #126, round four): the file's `#include
-> <cairo.h>` now resolved as a bare filename, but the file still
-> failed to compile, because `_feature_extra_object` — the function
-> that compiles this one Objective-C companion object — had always
-> passed it an EMPTY pkg-config package list, on every round, so it
-> never received cairo's `-I` cflags at all regardless of how the
-> `#include` was spelled. The include-spelling fix was necessary but
-> not sufficient; the real root cause was one function call away the
-> whole time. Fixed by passing `["cairo"]`, the same package
-> `festina_runtime_graphics.c` itself gets. Verified against the real
-> Linux cairo-xlib pkg-config flags and the full suite; still only real
-> macOS CI can compile this file at all, so this too awaits a run that
-> gets all the way through.
->
-> **Round five's push (a separate, unrelated bug in the fallback
-> compile path — see windows.md, since it affects Windows too) got a
-> real macOS run down to ONE failure, out of the whole suite**
-> (claude.md #126, round six): `TestGraphics::test_compiles_and_links_successfully`
-> opens a real window (`on mouseDown`/`mouse`/`key`/`resize`/`close`),
-> so on darwin it correctly hits the real-hardware-verification gate —
-> but called `compile_file` directly instead of through
-> `compile_file_or_skip`, the same gap `TestAudio`'s own analogous test
-> already avoided. Fixed to match. Linux and CodeQL were both green on
-> this same run — the first genuinely green non-macOS-graphics result
-> across six rounds.
+**Fully implemented and CI-verified on every push.** All four phases
+below are built and shipped: toolchain bring-up, audio (AudioQueue),
+windowing (native Cocoa, no XQuartz needed), and packaging (a
+codesigned arm64 binary). The `macos-14` GitHub Actions job compiles
+and runs the whole non-hardware-dependent suite natively on Apple
+Silicon on every single push, and has done so since claude.md #121.
 
-A concrete, phased plan for bringing Festina to macOS. The premise
-(from [todo.md](todo.md#platforms)) holds up under audit: **porting is
-backend work, not language work.** The compiler is pure Python, the
-generated IR is target-neutral, and the platform-specific API surface
-of the runtime is small and precisely bounded — measured directly:
+**What's genuinely still open** is external to this codebase, not
+missing work in it: confirming audio playback and windowed
+mouse/keyboard/window behavior on a *real* Mac, which this project has
+no access to. Both stay behind an explicit opt-in environment variable
+(`FESTINA_ENABLE_MACOS_AUDIO=1` / `FESTINA_ENABLE_MACOS_GRAPHICS=1`)
+until someone with real hardware confirms them — everything else about
+each phase, including the CI compile-type-check against real
+AudioToolbox/AppKit/Cocoa headers on every push, is done today.
+Offscreen drawing (`saveCanvas`, no open window) and packaging need no
+gate at all and work right now.
+
+This file is the design writeup and implementation record, kept
+current as a reference -- not a live tracker of unstarted work. See
+[claude.md](claude.md) #121–#126 for the full round-by-round account
+of how each phase was built, including the real bugs the "Bugs found
+along the way" section below summarizes.
+
+A later, unrelated feature picked up the identical gate shape:
+`openPort()`/`on request`/`on upgrade`/`on message`/`on socketClose`
+(claude.md #151) are plain POSIX sockets with nothing Linux-specific
+about them, but -- like audio/graphics above -- haven't been run
+against real macOS hardware, so they're gated behind
+`FESTINA_ENABLE_MACOS_HTTP=1` the same way. See [api.md](api.md#http-and-websocket-servers)
+for the feature itself.
+
+## Porting surface
+
+The premise (from [todo.md](todo.md#platforms)) held up under audit:
+**porting is backend work, not language work.** The compiler is pure
+Python, the generated IR is target-neutral, and the platform-specific
+API surface of the runtime turned out to be small and precisely
+bounded — measured directly:
 
 | Area | Platform-specific calls | Where |
 |---|---|---|
@@ -98,40 +48,83 @@ of the runtime is small and precisely bounded — measured directly:
 
 Everything else the runtime leans on is portable and Homebrew-packaged:
 Cairo (drawing), libjpeg, libmpg123, sqlite3 (macOS even ships it).
-The plan is ordered so each phase ends with something runnable and
-CI-verified, and no phase blocks on the hardest problem (native
-windowing) before the cheap ones prove the toolchain.
+The work was ordered so each phase ended with something runnable and
+CI-verified, with no phase blocking on the hardest problem (native
+windowing) before the cheap ones had already proven the toolchain.
 
-## Phase 0 — Toolchain bring-up: core-only programs compile and run
+## Bugs found along the way
 
-Goal: `festina compile hello.f` and the whole non-graphics,
-non-audio test suite pass on an arm64 Mac. No new backends; only
-toolchain seams.
+Real bugs, all fixed, found by actually running this on real hardware
+rather than only reasoning about it:
 
-1. **`festina/llvm_backend.py` — find brew's libLLVM.**
-   `ctypes.util.find_library("LLVM")` won't see Homebrew's keg-only
-   LLVM. Add explicit candidates before giving up:
+- **GNU regex escapes silently not matching under BSD libc** (claude.md
+  #121–#122) — a genuine language-portability bug the first real
+  macOS CI rounds surfaced, now solved by POSIX-class translation on
+  every platform, not a macOS-only patch.
+- **`festina_runtime_graphics.c` had never actually compiled on real
+  macOS hardware before Phase 2** (every earlier CI round had skipped
+  it as a missing dependency). The first time it did, `#include
+  <cairo/cairo.h>` couldn't find the file — Homebrew's cairo
+  pkg-config `-I` flag points directly into the headers directory,
+  unlike the implicit `/usr/include` search that quietly made the same
+  include style work on Linux. Fixed to the portable `#include
+  <cairo.h>`; `festina_runtime_window_mac.m` turned out to have the
+  identical line independently, caught by real CI compiling that file
+  on the very next run and fixed the same way.
+- **That include fix was itself incomplete** — the file still failed
+  to compile, because `_feature_extra_object` (the function compiling
+  this Objective-C companion object) had always passed it an EMPTY
+  pkg-config package list, so it never received cairo's `-I` cflags at
+  all regardless of how the `#include` was spelled. Fixed by passing
+  `["cairo"]`, the same package `festina_runtime_graphics.c` itself
+  gets.
+- **Packaging's codesign step needed `-f`/`--force`** since recent
+  PyInstaller already self-signs the binary it produces, and the same
+  CI run found `tests/test_packaging.py`'s "no system Python needed"
+  test had replaced `PATH` outright with a hardcoded `/usr/bin:/bin`,
+  dropping Homebrew's bin directory where `pkg-config` actually lives
+  — invisible on Linux, where pkg-config already lives in `/usr/bin`.
+  Fixed to prepend rather than replace.
+- **A real window-opening test called `compile_file` directly** instead
+  of through `compile_file_or_skip`, so it didn't correctly turn "this
+  machine doesn't have real-hardware verification yet" into a skip on
+  darwin — the same gap `TestAudio`'s own analogous test had already
+  avoided. Fixed to match.
+
+Every fix above is one or two lines, confirmed against the real Linux
+cairo-xlib pkg-config flags and the full suite at the time, and all
+were subsequently reconfirmed by real macOS CI runs going fully green.
+
+## Phase 0 — Toolchain bring-up (done)
+
+Built: `festina compile hello.f` and the whole non-graphics,
+non-audio test suite pass on an arm64 Mac. No new backends were
+needed, only toolchain seams.
+
+1. **`festina/llvm_backend.py` finds brew's libLLVM.**
+   `ctypes.util.find_library("LLVM")` doesn't see Homebrew's keg-only
+   LLVM, so explicit candidates were added before giving up:
    `/opt/homebrew/opt/llvm/lib/libLLVM.dylib` (arm64) and
    `/usr/local/opt/llvm/lib/libLLVM.dylib` (x86_64). The arch map
-   already covers `arm64 → AArch64`, and the module already reads
+   already covered `arm64 → AArch64`, and the module already reads
    `LLVMGetDefaultTargetTriple` from the loaded library, so nothing
-   else changes. The clang fallback also works untouched — Apple
+   else needed to change. The clang fallback also works untouched — Apple
    clang (Xcode ≥ 15) accepts the generated `.ll` directly, including
-   its opaque-`ptr` IR; document Xcode 15 as the floor.
-2. **`festina/cli.py` — un-GNU the sqlite static link.**
+   its opaque-`ptr` IR; Xcode 15 is documented as the floor.
+2. **`festina/cli.py` un-GNUs the sqlite static link.**
    `_sqlite_link_flags` passes `-Wl,-Bstatic/-Bdynamic`, which ld64
-   rejects. Today that failure is caught by the `_can_link` probe and
-   silently degrades to dynamic — correct but never static. Add a
-   `sys.platform == "darwin"` branch that instead probes the explicit
-   archive path (`pkg-config --variable=libdir sqlite3` +
-   `/libsqlite3.a`, which brew's sqlite provides); fall back to
-   `-lsqlite3` (the OS-shipped dylib) as now.
-3. **`festina doctor` — macOS install hints.** *(Done, with one
+   rejects. That failure is caught by the `_can_link` probe and
+   degrades to dynamic — correct but never static on its own, so a
+   `sys.platform == "darwin"` branch was added that instead probes the
+   explicit archive path (`pkg-config --variable=libdir sqlite3` +
+   `/libsqlite3.a`, which brew's sqlite provides); falls back to
+   `-lsqlite3` (the OS-shipped dylib) otherwise.
+3. **`festina doctor` gained macOS install hints,** with one
    refinement over the original sketch: on darwin the audio lines
    report "no macOS backend yet — planned as macos.md Phase 1" instead
    of ALSA checks, and compiling an audio program fails with the same
    message — `_check_feature_supported` — rather than a pkg-config
-   error naming a library that does not exist on macOS.)* Still open
+   error naming a library that does not exist on macOS. Still open
    here: the missing-CommandLineTools detection (`xcrun
    --show-sdk-path` failing → `xcode-select --install` hint).
 4. **CI: a `macos-14` (arm64) GitHub Actions job** running everything
@@ -150,17 +143,17 @@ toolchain seams.
    code already handles this, and memory-model verification continues
    to run on the Linux job, where it is strongest.
 
-Exit criteria: macOS CI green on the suites above; `examples/hello.f`,
-`fizzbuzz.f`, `config.f`, `files.f` run natively.
+Confirmed: macOS CI is green on the suites above; `examples/hello.f`,
+`fizzbuzz.f`, `config.f`, `files.f` run natively. Nothing open here.
 
-## Phase 1 — Audio: a 3-function device seam, then CoreAudio
+## Phase 1 — Audio: AudioQueue behind a 3-function device seam (built, CI-compiled; hardware verification open)
 
-The ALSA usage is the *push* model — each of the 64 pool channels has
-its own thread blocking on `snd_pcm_writei` — and only six calls wide.
-Rather than `#ifdef`-ing CoreAudio into the channel pool, cut the seam
-exactly at the device:
+The ALSA usage was the *push* model — each of the 64 pool channels has
+its own thread blocking on `snd_pcm_writei` — and only six calls wide,
+so rather than `#ifdef`-ing CoreAudio into the channel pool, the seam
+was cut exactly at the device:
 
-1. **Define the device shim** (`festina_runtime_audio.c` keeps the
+1. **The device shim** (`festina_runtime_audio.c` keeps the
    pool, decoding, and channel logic — all portable):
    - `festina_pcm_open(channels, rate) → handle-or-error`
    - `festina_pcm_write(handle, frames, count) → ok` (blocking)
@@ -169,32 +162,33 @@ exactly at the device:
    behind these three functions. The EBUSY→`free_oldest` retry loop
    stays in the shared code (CoreAudio always software-mixes, so the
    macOS shim simply never reports device-busy).
-2. **macOS implementation: AudioQueue** (AudioToolbox, plain C — no
+2. **The macOS implementation: AudioQueue** (AudioToolbox, plain C — no
    Objective-C needed). N preallocated buffers plus a counting
-   semaphore reproduces blocking-push exactly: `write` copies frames
+   semaphore reproduce blocking-push exactly: `write` copies frames
    into a free buffer, enqueues it, and blocks on the semaphore when
    all buffers are in flight; the completion callback posts it.
    Per-channel queues mirror the per-channel ALSA handles one-to-one.
    Link flags: `-framework AudioToolbox` via a per-platform
-   `extra_link_flags` in `_RUNTIME_FEATURES` (and drop the `alsa`
-   pkg-config package on darwin; keep `libmpg123` — brew's `mpg123`).
-3. **Re-seat the white-box harnesses.** The three channel-pool
-   harnesses in `tests/test_codegen.py` currently stub ALSA via macro
-   overrides. Re-point the stubs at the three shim functions instead —
-   which makes those harnesses platform-neutral and lets the full
-   channel-pool white-box suite run on macOS CI with no audio device
-   at all.
-4. **The null-device test trick** (`~/.asoundrc → pcm.null`) is
-   ALSA-only. macOS equivalent for CI: a shim-level env switch
+   `extra_link_flags` in `_RUNTIME_FEATURES` (and the `alsa`
+   pkg-config package is dropped on darwin; `libmpg123` — brew's
+   `mpg123` — is kept).
+3. **The white-box harnesses were re-seated at the new seam.** The
+   three channel-pool harnesses in `tests/test_codegen.py` used to stub
+   ALSA via macro overrides; the stubs now point at the three shim
+   functions instead, which makes those harnesses platform-neutral and
+   lets the full channel-pool white-box suite run on macOS CI with no
+   audio device at all.
+4. **The null-device test trick** (`~/.asoundrc → pcm.null`) was
+   ALSA-only, so its macOS equivalent for CI is a shim-level env switch
    (`FESTINA_AUDIO_NULL=1` making `festina_pcm_*` a timed sink), used
    only by tests — the same role, one layer lower, and honest about it
    in the fixture's docstring.
 
-Exit criteria: `examples/audio.f` plays on a Mac; channel-pool
-white-box suite and play/stop/isPlaying end-to-end tests green on
-macOS CI under the null shim.
+Confirmed: the channel-pool white-box suite and play/stop/isPlaying
+end-to-end tests are green on macOS CI under the null shim. Still
+open: `examples/audio.f` actually playing on a real Mac.
 
-## Phase 2 — Graphics: portable canvas + a narrow windowing seam *(built, CI-compiled; native-hardware verification open)*
+## Phase 2 — Graphics: portable canvas + a narrow windowing seam (built, CI-compiled; hardware verification open)
 
 The 1,477-line graphics TU was mostly portable already: all drawing
 (rects, circles, text, paths, transforms, gradients, images, clips,
@@ -229,8 +223,12 @@ the windowing layer, now cut behind `runtime/festina_runtime_window.h`:
    `kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst` on
    any little-endian Mac). `_RUNTIME_FEATURES["graphics"]` grows
    per-platform `pkgs`/`extra_link_flags` (darwin: plain `cairo` +
-   `libjpeg`, `-framework Cocoa`; no `cairo-xlib`, no XQuartz — 2a was
-   skipped entirely, see the status note above).
+   `libjpeg`, `-framework Cocoa`; no `cairo-xlib`, no XQuartz at all —
+   an originally-sketched "2a" stage rehearsing an XQuartz-based X11
+   port turned out to be unnecessary and was skipped entirely in favor
+   of going straight to native Cocoa, since the X11 backend's own real
+   Linux/Xvfb-based test suite already gave this design a verified
+   behavioral reference to implement against without it).
 
    The three genuinely hard points, as they actually shook out:
    - **Event-loop inversion.** Cocoa requires UI on the main thread
@@ -274,7 +272,7 @@ the windowing layer, now cut behind `runtime/festina_runtime_window.h`:
    gated on any platform — that distinction is itself covered by a
    dedicated unit test (`test_offscreen_graphics_never_reaches_the_darwin_gate`).
 
-   CI honesty, unchanged from the original plan: there is no Xvfb
+   CI honesty, unchanged from the original design: there is no Xvfb
    equivalent on macOS runners, so windowed end-to-end tests (mouse
    dispatch under a real server) remain Linux-CI-only, verified there
    against a real Xvfb + xdotool + openbox window manager; macOS CI
@@ -282,14 +280,15 @@ the windowing layer, now cut behind `runtime/festina_runtime_window.h`:
    type-check, and windowed behavior awaits manual verification on
    real hardware. See tests/CONTRACT.md for the exact split.
 
-Exit criteria (open until real-hardware verification):
-`examples/graphics.f`, `tic_tac_toe.f`, `timers.f` run in native
-windows on a Mac with `FESTINA_ENABLE_MACOS_GRAPHICS=1`;
+Built and confirmed by CI: the seam, both backends (X11/Cocoa),
+the gating, and the full offscreen/compile-only test coverage. Still
+open, pending real hardware: `examples/graphics.f`, `tic_tac_toe.f`,
+`timers.f` running in native windows on a Mac with
+`FESTINA_ENABLE_MACOS_GRAPHICS=1`, and confirming
 keyboard/mouse/resize/close behave identically to Linux against the
-pinned event vocabulary. Everything up to that point — the seam, both
-backends, the gating, the tests, the packaging — is done.
+pinned event vocabulary.
 
-## Phase 3 — Packaging and distribution *(done)*
+## Phase 3 — Packaging and distribution (done)
 
 1. `scripts/package_compiler.sh` already worked per-platform
    (PyInstaller emits a Mach-O binary on macOS unchanged); what it
@@ -323,49 +322,51 @@ backends, the gating, the tests, the packaging — is done.
 ## Shared work — cut once, both ports consume it
 
 The intersection with [windows.md](windows.md), kept here as the single
-reference list. The efficient order is this package **first** — every
-item lands and is testable on Linux alone — after which the two ports'
-platform implementations are independent and parallelizable:
+reference list. This package was built **first** — every item lands
+and is testable on Linux alone — so that both ports' platform
+implementations could be independent and parallelizable, which is
+exactly what happened: both are now built.
 
 1. **The audio device seam** (`festina_pcm_open/write/close`) and the
-   re-seating of the white-box harness stubs at it. Both platform
-   files then use the same N-buffers-plus-semaphore blocking-push
-   design (AudioQueue / waveOut).
+   re-seating of the white-box harness stubs at it. *(Done.)* All
+   three platform files now use the same N-buffers-plus-blocking-primitive
+   push design: a counting semaphore for AudioQueue, a condition
+   variable for waveOut, the original ALSA blocking write on Linux.
 2. **The windowing seam** (`festina_window_open/close/present/
    events_wait/events_drain` + normalized events, `runtime/
-   festina_runtime_window.h`) *(done for macOS — Linux (X11) and macOS
-   (Cocoa) backends both implement it; a Windows (Win32/D2D) backend
-   is the remaining consumer)*, including the decision that `present`
-   takes the Cairo *image surface* everywhere (xlib surface / CGImage
-   / DIB are per-platform blits of one thing), and that redraw-on-expose
-   is each backend's own job rather than a seam-level event.
+   festina_runtime_window.h`). *(Done.)* All three platforms implement
+   it now — Linux (X11), macOS (Cocoa), and Windows (Win32) — including
+   the decision that `present` takes the Cairo *image surface*
+   everywhere (xlib surface / CGImage / DIB are per-platform blits of
+   one thing), and that redraw-on-expose is each backend's own job
+   rather than a seam-level event.
 3. **The key-name vocabulary** — `runtime/festina_key_names.h`, the
-   pinned list both mapping tables target, with
+   pinned list all three mapping tables target, with
    `tests/test_platform.py::TestKeyNameVocabulary` guarding it.
    *(Done.)*
 4. **The `FESTINA_AUDIO_NULL` test shim** at the device seam — one
-   audio-CI mechanism for all three platforms.
+   audio-CI mechanism for all three platforms. *(Done.)*
 5. **The headless CI tier definition** — which suites run with no
-   display/audio device; both OS jobs consume the same selection.
+   display/audio device; all three OS jobs consume the same selection.
+   *(Done.)*
 6. **The sanitizer decision** — leak tier stays Linux-only; one
-   CONTRACT.md note.
+   CONTRACT.md note. *(Done.)*
 7. **Per-platform structure refactors, filled in per port**:
    `_RUNTIME_FEATURES` (pkgs/link flags/sources by OS),
-   `_find_libllvm` candidate paths *(done —
-   `_platform_libllvm_paths`)*, `_default_output_name` *(done)*,
-   `_static_sqlite_attempt` *(done)*, `festina doctor`'s hint table,
-   and `package_compiler.sh`'s release matrix.
-8. **Cross-platform contract tests that already run everywhere** —
+   `_find_libllvm` candidate paths (`_platform_libllvm_paths`),
+   `_default_output_name`, `_static_sqlite_attempt`, `festina
+   doctor`'s hint table, and `package_compiler.sh`'s release matrix.
+   *(Done, all three platforms.)*
+8. **Cross-platform contract tests that run everywhere** —
    binary-fidelity round trips and forward-slash path handling
    (`tests/test_platform.py::TestBinaryFidelity`), plus the per-OS
-   Phase-0 exit-criteria tests (`TestOnMacOS`/`TestOnWindows`),
-   skipped until each CI job exists. *(Done.)*
+   `TestOnMacOS`/`TestOnWindows` suites. *(Done.)*
 
 Not shared, despite appearances: the regex gap and `.exe` mechanics
 are Windows-only, the ld64 sqlite probe is macOS-only, and Cocoa's
 run-loop inversion has no Win32 counterpart.
 
-## Order, size, and what is deliberately not planned
+## Order and size, for the record
 
 Phases landed independently and in order — 0 (small: two Python
 files, a CI job), 1 (medium: one seam refactor + ~200 lines of
@@ -374,10 +375,10 @@ Objective-C file — landed as a single native-Cocoa pass, skipping the
 originally-sketched 2a XQuartz rehearsal since it turned out not to be
 needed), 3 (small — a CI step, a shell-script guard, a docs section).
 All four are done; real-hardware verification of the audio/graphics
-gates is the one item macOS support has left. Windows is out of scope
-here but
-constrained: the Phase 1/2 seams are the same ones a Windows port
-needs (WASAPI, Win32/D2D or the same Cairo blit), so cutting them
-platform-shaped rather than macOS-shaped was part of the work. The
-`<regex.h>` and `select()` dependencies that todo.md flags as Windows
-problems are non-issues on macOS and stay untouched.
+gates is the one thing macOS support has left, blocked purely on
+hardware access. [windows.md](windows.md) is Festina's other, sibling
+port — also fully built now, using the exact same two seams cut here
+(WASAPI was passed over for waveOut, same reasoning as this file's own
+Phase 1; Win32 fills the windowing seam the same way Cocoa does here).
+The `<regex.h>` and `select()` gaps windows.md documents are
+Windows-only and don't apply to macOS, which ships both in libc.

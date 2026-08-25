@@ -10,6 +10,10 @@ catch regressions and track progress over time, run against the same
 few workloads on every change that plausibly affects performance
 (codegen, runtime, or the standard library), not as a marketing claim.
 
+These same five programs are also benchmarked cross-compiled to
+`wasm32-wasi` (against C and Go, also compiled to wasm) — see
+[wasm.md](wasm.md#benchmarks).
+
 ## Methodology
 
 Five programs, each implemented equivalently in Festina, Rust, Go, and
@@ -55,6 +59,11 @@ python3 benchmarks/canvas/run_canvas_benchmark.py --update-doc
 # The MonoGame side needs a .NET SDK and, on first run, network access
 # to restore its NuGet package; without either it is skipped with a note
 # rather than failing the run.
+
+python3 benchmarks/http/run_http_benchmarks.py                # the HTTP server comparison
+python3 benchmarks/http/run_http_benchmarks.py --update-doc
+
+# Needs `wrk` on PATH (not a project dependency -- apt/brew install wrk).
 ```
 
 The runner skips any language toolchain not installed rather than
@@ -63,52 +72,52 @@ failing — see [setup.md](setup.md) for what each one needs.
 ## Results
 
 <!-- BENCHMARK_RESULTS_START -->
-_Last run: 2026-08-16 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
+_Last run: 2026-08-24 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
 
 ### `hello`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 1.2 ms | 65.3 ms | 1.45 MB |
-| Rust | 1.4 ms | 73.1 ms | 3.77 MB |
-| Go | 1.3 ms | 147.5 ms | 2.11 MB |
-| Bun | 9.3 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 1.4 ms | 70.9 ms | 1.46 MB |
+| Rust | 1.5 ms | 97.0 ms | 3.77 MB |
+| Go | 1.3 ms | 320.1 ms | 2.11 MB |
+| Bun | 10.6 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `fib`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 7.2 ms | 71.5 ms | 1.45 MB |
-| Rust | 8.8 ms | 83.3 ms | 3.77 MB |
-| Go | 13.7 ms | 131.7 ms | 2.11 MB |
-| Bun | 28.0 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 7.6 ms | 76.5 ms | 1.46 MB |
+| Rust | 8.1 ms | 105.6 ms | 3.77 MB |
+| Go | 14.5 ms | 241.9 ms | 2.11 MB |
+| Bun | 28.5 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `loop_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 551.1 ms | 80.1 ms | 1.45 MB |
-| Rust | 582.0 ms | 85.9 ms | 3.77 MB |
-| Go | 533.2 ms | 138.3 ms | 2.11 MB |
-| Bun | 10474.8 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 518.4 ms | 161.2 ms | 1.46 MB |
+| Rust | 525.0 ms | 132.1 ms | 3.77 MB |
+| Go | 460.5 ms | 483.8 ms | 2.11 MB |
+| Bun | 9082.7 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `array_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 98.5 ms | 87.7 ms | 1.45 MB |
-| Rust | 98.7 ms | 101.5 ms | 3.77 MB |
-| Go | 98.7 ms | 134.4 ms | 2.11 MB |
-| Bun | 2455.5 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 92.2 ms | 344.7 ms | 1.47 MB |
+| Rust | 90.3 ms | 234.0 ms | 3.77 MB |
+| Go | 87.9 ms | 167.9 ms | 2.11 MB |
+| Bun | 2393.8 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `string_concat`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 3.5 ms | 73.8 ms | 1.45 MB |
-| Rust | 1.3 ms | 99.4 ms | 3.77 MB |
-| Go | 28.2 ms | 129.5 ms | 2.11 MB |
-| Bun | 11.3 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 3.6 ms | 73.3 ms | 1.46 MB |
+| Rust | 1.7 ms | 182.6 ms | 3.77 MB |
+| Go | 30.2 ms | 151.0 ms | 2.11 MB |
+| Bun | 12.7 ms | n/a (JIT, no separate build step) | n/a |
 
 <!-- BENCHMARK_RESULTS_END -->
 
@@ -193,16 +202,16 @@ _Last run: 2026-08-16 on this machine -- see benchmark.md's "Methodology" sectio
   page by orders of magnitude. The row is worth having because headless
   rendering with no GPU is a real situation — CI, a build server, a
   container — and it is worth reading only with that sentence attached.
-- These are intentionally small, fast benchmarks so they can be re-run
-  on every change worth checking, not a comprehensive suite (no I/O, no
-  concurrency, no realistic mixed workload) — see [todo.md](todo.md)
-  for what's still missing from Festina itself that would make a
-  broader comparison meaningful (HTTP, for one).
+- These five are intentionally small, fast benchmarks so they can be
+  re-run on every change worth checking, not a comprehensive suite (no
+  concurrency, no realistic mixed workload). I/O now has its own
+  section below — see [HTTP](#http-festina-vs-rust-vs-go-vs-bun) —
+  once claude.md #151/#152 gave Festina an actual server to measure.
 
 ## Canvas: Festina vs an HTML `<canvas>` vs MonoGame
 
 <!-- CANVAS_RESULTS_START -->
-_Last run: 2026-08-16 on this machine. Chromium 141.0.7390.37._
+_Last run: 2026-08-24 on this machine. Chromium 141.0.7390.37._
 
 20,000 filled rectangles and 20,000 filled circles, fill colour changed
 between every shape, into an 800x600 surface. Both sides draw
@@ -214,9 +223,9 @@ which documents what each one cost when it was measured the other way.
 
 | | Frame (min) | Frame (median) | First frame |
 |---|---|---|---|
-| Festina (Cairo) | 31 ms | 32 ms | 16 ms (process start + PNG encode) |
-| HTML `<canvas>` (Chromium/Skia) | 60 ms | 62 ms | 240 ms (browser launch) |
-| MonoGame (SpriteBatch, **software** GL) | 181 ms | 410 ms | 166 ms (.NET runtime + GL context) |
+| Festina (Cairo) | 37 ms | 39 ms | 24 ms (process start + PNG encode) |
+| HTML `<canvas>` (Chromium/Skia) | 97 ms | 110 ms | 429 ms (browser launch) |
+| MonoGame (SpriteBatch, **software** GL) | 252 ms | 270 ms | 181 ms (.NET runtime + GL context) |
 
 > **The MonoGame row needs its caveat read before its number.**
 > MonoGame is a GPU framework, and this machine has no GPU — its GL
@@ -238,7 +247,7 @@ which documents what each one cost when it was measured the other way.
 > not as a figure precise to the millisecond the way the other two
 > rows are.
 
-On this workload **Festina draws it 1.9x faster**.
+On this workload **Festina draws it 2.6x faster**.
 
 That took one change, and finding it took measuring rather than
 guessing. The first version of this benchmark had Festina 1.4x SLOWER,
@@ -254,19 +263,129 @@ frame from 90 ms to 31 ms (claude.md #104). The remaining split is
 20,000 times is too cheap to measure.
 
 Two things are worth reading alongside the headline. The browser's frame
-time is far noisier -- 60 ms at best against a 62 ms median here, and
+time is far noisier -- 97 ms at best against a 110 ms median here, and
 the median moves by 20+ ms between runs of this same script, while
-Festina's two numbers (31 and 32 ms) sit on top of each other. For a
+Festina's two numbers (37 and 39 ms) sit on top of each other. For a
 frame budget, predictability is not a footnote. And getting to the
 *first* frame differs by more than an order of magnitude in the same
 direction, because one side starts a process and the other starts a
 browser.
 
 Both outputs were compared cell-by-cell over a 16x16 grid to confirm
-they drew the same scene -- worst per-channel difference 0.2 out of 255.
-Not byte-for-byte: Cairo and Skia disagree about antialiasing on every
-curve, and demanding identical bytes would only prove the two
-rasterizers are the same program. The check has already earned itself
-once, catching a bug in this very script that left one side comparing a
-blank canvas.
+they drew the same scene -- worst per-channel difference 0.2 out
+of 255. Not byte-for-byte: Cairo and Skia disagree about antialiasing on
+every curve, and demanding identical bytes would only prove the two
+rasterizers are the same program. The check has earned itself twice
+now: once catching a bug in this very script that left one side
+comparing a blank canvas, and again catching itself comparing raw RGB
+without accounting for alpha -- Festina's own offscreen canvas starts
+transparent (api.md's own "a fresh or cleared canvas is transparent,
+not white"), so a background pixel neither side actually drew on read
+as black here against the browser harness's own opaque white fill,
+which the comparison mistook for a real rendering difference until it
+started compositing both sides onto the same white background first.
 <!-- CANVAS_RESULTS_END -->
+
+## HTTP: Festina vs Rust vs Go vs Bun
+
+Four servers (source in [`benchmarks/http/`](benchmarks/http/)), each
+answering the same two routes -- `/` (a fixed plaintext body) and
+`/json` (a small JSON body) -- load-tested with
+[`wrk`](https://github.com/wg/wrk) (not a project dependency; installed
+separately, `apt install wrk`/`brew install wrk`).
+
+**Equivalent logic, not equivalent idiom, the same rule the five
+programs above already follow.** Festina's HTTP server
+(`festina_runtime_http.c`, claude.md #151) is deliberately
+single-threaded (one connection serviced at a time) and has no
+keep-alive (every response closes the connection -- api.md's HTTP
+Limitations). Rust's and Go's servers here are hand-rolled raw-socket
+implementations with a single-threaded, sequential accept loop and the
+same close-after-response behavior -- not `hyper`/`net/http`'s own
+default (multi-threaded, keep-alive-capable) servers, which would be
+measuring a mature framework's concurrency model against Festina's
+single-threaded one rather than the same connection-handling logic in
+four languages. Bun is the one exception: it uses `Bun.serve()`, its
+own native HTTP implementation, since there is no reason to hand-roll
+sockets in a runtime that ships a fast one already (the same "each
+language uses its own normal toolchain" rule the Methodology above
+states) -- with `Connection: close` set explicitly on every response so
+it closes each connection the same way the other three do, rather than
+its own keep-alive support doing the winning here.
+
+Each `wrk` run: 4 threads, 50 open connections, 5 seconds, against one
+route at a time (a JIT-inclined runtime like Bun gets no separate
+warmup here — `wrk`'s own 5-second window includes whatever warmup
+happens inside it, the same "the timed window is the real number"
+approach as the process-startup benchmarks above, since a resident
+server process outlives any of them anyway).
+
+Reproduce locally:
+
+```bash
+python3 benchmarks/http/run_http_benchmarks.py
+python3 benchmarks/http/run_http_benchmarks.py --update-doc
+python3 benchmarks/http/run_http_benchmarks.py --duration 10s --connections 100 --threads 8
+```
+
+<!-- HTTP_BENCHMARK_RESULTS_START -->
+_Last run: 2026-08-25 on this machine, `wrk -t4 -c50 -d5s` per route -- see benchmark.md's HTTP "Methodology" for how to reproduce; absolute numbers vary by hardware and load, relative ordering is the point._
+
+### `plaintext` (`/`)
+
+| Language | Requests/sec | Avg latency | Transfer/sec |
+|---|---|---|---|
+| Festina | 33,370 | 1.41 ms | 3.25 MB/s |
+| Rust | 38,084 | 1.14 ms | 3.52 MB/s |
+| Go | 20,653 | 2.17 ms | 1.91 MB/s |
+| Bun | 14,156 | 3.37 ms | 1.81 MB/s |
+
+### `json` (`/json`)
+
+| Language | Requests/sec | Avg latency | Transfer/sec |
+|---|---|---|---|
+| Festina | 32,643 | 1.41 ms | 3.80 MB/s |
+| Rust | 38,570 | 1.06 ms | 4.30 MB/s |
+| Go | 21,340 | 2.24 ms | 2.38 MB/s |
+| Bun | 13,985 | 3.09 ms | 2.05 MB/s |
+
+<!-- HTTP_BENCHMARK_RESULTS_END -->
+
+### Reading these numbers
+
+- **claude.md #155 roughly doubled Festina's own numbers here** (from
+  ~17.6k/17.8k req/s to ~33k/32.6k) -- found by reviewing
+  `festina_runtime_http.c` specifically for this benchmark's own sake,
+  not by guessing at likely hot spots. The single biggest lever:
+  `festina_http_send` used to write a response as 4-5 separate
+  `send()` calls (status line, each extra header, `Content-Length`,
+  `Connection: close`, then the body); with `TCP_NODELAY` set (Nagle's
+  algorithm disabled for low latency), every one of those was its own
+  TCP segment, not just its own syscall. Coalescing the status
+  line/headers into one buffer sent in a single call, plus removing a
+  malloc/free pair the event loop used to pay on every single tick,
+  closed most of the gap to Go/Bun and pulled Festina from behind both
+  to ahead of both, within ~10% of Rust's raw-socket number. Full
+  writeup in claude.md #155.
+- This measures connection-accept + request-parse + respond throughput
+  under load from one client machine talking to one server process on
+  the same machine (no network hop, no TLS) -- not a claim about
+  production capacity, the same disclaimer every other benchmark on
+  this page already carries.
+- **`/json`** exercises more than `/`: Festina's route builds a struct
+  and renders it through the same JSON-via-`.toText()` path every other
+  container response already uses (claude.md #151), not a hand-built
+  string the way `/` sends one -- so a gap between the two routes for
+  Festina specifically reflects that serialization cost, not connection
+  handling.
+- Rust's and Go's numbers here are *not* what those languages'
+  idiomatic HTTP stacks would report -- seeing "Rust is only Nx faster
+  than Festina at HTTP" from this section should be read as "at
+  matching, single-threaded, no-keep-alive connection handling," not as
+  a claim about `hyper`/`axum` or `net/http` in general, which support
+  keep-alive and would show a very different number here purely from
+  not reopening a TCP connection on every single request.
+- No WebSocket throughput benchmark exists yet -- `on message` traffic
+  has a very different shape (persistent connections, small frequent
+  frames) from a request/response load test, and would need its own
+  methodology rather than reusing `wrk`'s HTTP-request model.

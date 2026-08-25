@@ -92,6 +92,10 @@ BUILTIN_FUNCTIONS = {
     "setMaxAudioPlayers", "maxAudioPlayers",
     # claude.md #99: stop one channel (or, with no argument, all of them).
     "stopAudioPlayer",
+    # claude.md #146: true while that channel is playing anything,
+    # regardless of clip -- the per-CHANNEL counterpart to aud's own
+    # clip-wide isPlaying() method.
+    "isAudioPlayerPlaying",
     # claude.md #89/#91: canvas drawing style + text metrics. `font` is
     # NOT here -- claude.md #91 turned it into a type name, so the
     # setter is changeFont().
@@ -127,6 +131,18 @@ BUILTIN_FUNCTIONS = {
     # screenWidth/screenHeight have no setter, since a program cannot
     # resize the physical display it's running on.
     "setClientWidth", "setClientHeight",
+    # claude.md #150: exec(args) -- spawns args[0] with args[1:] as its
+    # own argv, answering its real exit code (or -1 if it never even
+    # started) rather than failing the program -- the same test-don't-
+    # fail choice claude.md #93/#132 already made for file/directory
+    # operations.
+    "exec",
+    # claude.md #151: openPort/closePort -- start/stop listening for
+    # HTTP connections on a port. Neither fails the program either
+    # (openPort on an already-open port, or a privileged/in-use one,
+    # is a silent no-op; closePort on a port never opened likewise) --
+    # the same "test, don't fail" convention as mkdir/exec above.
+    "openPort", "closePort",
 }
 
 _BUILTIN_RETURN_TYPES = {
@@ -150,6 +166,10 @@ _BUILTIN_RETURN_TYPES = {
     # claude.md #132
     "mkdir": types_mod.PrimitiveType("bool"),
     "ls": types_mod.ArrayType(types_mod.PrimitiveType("text")),
+    # claude.md #146
+    "isAudioPlayerPlaying": types_mod.PrimitiveType("bool"),
+    # claude.md #150
+    "exec": types_mod.PrimitiveType("int"),
 }
 
 # claude.md #55: int and float never mix directly in a binary operator.
@@ -226,6 +246,16 @@ _BUILTIN_SIGNATURES = {
     # claude.md #139
     "setClientWidth": (_INT,),
     "setClientHeight": (_INT,),
+    # claude.md #146: the channel argument is required, unlike
+    # stopAudioPlayer's optional one (see _BUILTIN_SIGNATURE_ALTERNATES
+    # below) -- there's no sensible "any channel" reading for a query.
+    "isAudioPlayerPlaying": (_INT,),
+    # claude.md #150: exec(args) -- args[0] the program to run
+    # (PATH-searched), the rest its own argv.
+    "exec": (types_mod.ArrayType(_TEXT),),
+    # claude.md #151
+    "openPort": (_INT,),
+    "closePort": (_INT,),
 }
 
 # claude.md #90: three builtins accept two different shapes. The
@@ -267,6 +297,57 @@ _BUILTIN_SIGNATURE_ALTERNATES = {
 _REGEX = types_mod.RegexType()
 _AUDIO = types_mod.AudioType()
 _IMAGE = types_mod.ImageType()
+_HTTP = types_mod.HttpType()
+_SOCKET = types_mod.SocketType()
+
+# claude.md #151: http's fixed-arity, fixed-argument-type methods --
+# same (arg types, return type) shape as _BLOB_METHODS above, and for
+# the identical reason (arity/argument types enforced by name here
+# rather than left to the generic member-access fallback). `send`
+# isn't here: its `data` argument accepts any concrete type with a
+# body form (checked structurally in _infer_call, the same way
+# setTimeout's callback argument is) and its `code`/`headers`
+# arguments are each optional, which this fixed-shape table has no way
+# to express -- see _infer_call's own dedicated branch for it.
+_HTTP_METHODS = {
+    "ok": ((), None),
+    "redirect": ((_TEXT,), None),
+    # claude.md #151: switches this connection from HTTP to WebSocket
+    # -- sends the 101 handshake immediately (a no-op if the request
+    # doesn't carry a valid Upgrade: websocket/Sec-WebSocket-Key pair,
+    # never a compile-time OR runtime failure), then, once `on
+    # request` returns, the runtime fires `on upgrade(s:socket)` once
+    # for this same connection if one is declared.
+    "upgrade": ((), None),
+    "toBlob": ((), _BLOB),
+    "toImg": ((), _IMAGE),
+    "toAud": ((), _AUDIO),
+    "toText": ((), _TEXT),
+}
+
+# claude.md #151: socket's own fixed-arity method -- `send` is
+# handled the same bespoke way http's own `send` is (see above);
+# `close` is the only socket method with a fixed, checkable shape.
+_SOCKET_METHODS = {
+    "close": ((), None),
+}
+
+# claude.md #151: the concrete types http.send()/socket.send()'s
+# `data:any` argument actually accepts -- deliberately the SAME set
+# _to_text (this module's own codegen counterpart) already gives a
+# text form to, since every one of these (other than blob, sent as
+# its own raw bytes rather than decoded through toText()) becomes the
+# response/frame body by calling toText() on it first. img/aud/http/
+# socket/regex/color/font/func are rejected with a compile error --
+# no body form, the same "silently printing a placeholder would hide
+# a mistake" reasoning claude.md #114 already applied to log()/
+# templates for img/aud specifically, widened here to every type that
+# was never sendable in the first place.
+def _is_sendable_type(t):
+    if t in (_TEXT, _INT, _FLOAT, _BOOL, _BLOB):
+        return True
+    return isinstance(t, (types_mod.StructType, types_mod.TableType,
+                          types_mod.ArrayType, types_mod.MapType))
 
 # claude.md #56: float -> int, with an explicit rounding decision.
 MATH_ROUNDING_FUNCTIONS = {"floor", "ceil", "round", "trunc"}
@@ -322,6 +403,23 @@ _EVENT_SIGNATURES = {
     # analyze_event_handler and _emit_event_handler both special-case it
     # away from the other six's window-only registration.
     "exit": ((_INT,), "(code:int)"),
+    # claude.md #151: the http/websocket event sources -- fired from
+    # festina_runtime_http.c's own single-threaded poll loop, not a
+    # graphics event, so (like `exit` above) these register
+    # unconditionally in main() rather than joining the graphics-gated
+    # event_handlers loop. `on request` fires once per accepted
+    # connection's parsed HTTP request; `on upgrade` fires once, right
+    # after a `req.upgrade()` call inside `on request` completes the
+    # WebSocket handshake for that same connection; `on message` fires
+    # once per complete WebSocket frame received; `on socketClose`
+    # fires once, whenever an upgraded connection ends (the peer
+    # closed it, sent a close frame, or the read failed) -- exactly
+    # once per connection that ever reached `on upgrade`, never for a
+    # plain HTTP connection that never upgraded.
+    "request": ((_HTTP,), "(req:http)"),
+    "upgrade": ((_SOCKET,), "(s:socket)"),
+    "message": ((_SOCKET, _BLOB), "(s:socket, msg:blob)"),
+    "socketClose": ((_SOCKET,), "(s:socket)"),
 }
 
 # claude.md #39: clientWidth/clientHeight report the canvas window's
@@ -433,7 +531,8 @@ class AnalyzedProgram:
 
 def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None):
     if isinstance(type_expr, ast.ArrayTypeExpr):
-        return types_mod.ArrayType(resolve_type_name(type_expr.element, structs, tables, filename, node))
+        return types_mod.ArrayType(resolve_type_name(type_expr.element, structs, tables, filename, node),
+                                    amortized=type_expr.amortized)
     if isinstance(type_expr, ast.FuncTypeExpr):
         # claude.md #141: func[T, T, ...]:R -- a first-class function
         # type. Resolved recursively the same way ArrayTypeExpr/
@@ -464,7 +563,7 @@ def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None
                 file=filename, line=getattr(node, "line", 0), column=getattr(node, "column", 0),
                 category="unknown type",
             )
-        return types_mod.MapType(value_type)
+        return types_mod.MapType(value_type, amortized=type_expr.amortized)
     name = type_expr
     if name in types_mod.PRIMITIVE_NAMES:
         return types_mod.PrimitiveType(name)
@@ -474,6 +573,10 @@ def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None
         return types_mod.AudioType()
     if name == "regex":
         return types_mod.RegexType()
+    if name == "http":
+        return types_mod.HttpType()
+    if name == "socket":
+        return types_mod.SocketType()
     if name == "color":
         return types_mod.ColorType()
     if name == "font":
@@ -548,6 +651,18 @@ def analyze(program, filename="<string>"):
     # irrelevant (never consulted), only here so redeclaring it is a
     # duplicate-declaration error like any other reserved global.
     global_scope.define(_ENVIRONMENT_NAME, Symbol(_ENVIRONMENT_NAME, None, "constant", None), None, filename)
+    # claude.md #150: argv -- an ordinary, MUTABLE global arr[text]
+    # (kind "variable", unlike clientWidth/environment just above),
+    # since it's a plain snapshot captured once at process startup, not
+    # a live system readout -- nothing about reassigning it, or calling
+    # push()/splice()/etc on it, is any different from any other
+    # declared arr[text] variable, so there's no reason to forbid it
+    # the way clientWidth's own read-only checks do. Pre-registered
+    # only so redeclaring `argv` is a duplicate-declaration error like
+    # any other reserved global; codegen.py's own generate() is the
+    # other half (its own pre-registration, plus populating the real
+    # value from argc/argv in main()'s prologue).
+    global_scope.define("argv", Symbol("argv", types_mod.ArrayType(_TEXT), "variable", None), None, filename)
 
     def resolve(type_expr, node=None):
         return resolve_type_name(type_expr, structs, tables, filename, node)
@@ -689,7 +804,25 @@ def analyze(program, filename="<string>"):
             # ArrayLit's own convention exactly: None (needs a declared
             # type for context, e.g. an empty `{}`) if there's nothing
             # to infer it from.
+            #
+            # claude.md #153: value_type used to just get overwritten on
+            # every entry with nothing checking it against the PREVIOUS
+            # entry's own answer -- so a mixed-value literal like
+            # {'a': 1, 'b': 'two'} passed this check silently and reached
+            # codegen, which then emitted invalid LLVM IR (a raw i64
+            # where a ptr was required, or vice versa) instead of a clean
+            # compile error. A real, pre-existing gap, first found and
+            # left open by claude.md #151's own testing (its own
+            # writeup: "map literals never check that every entry shares
+            # one value type... left for its own separate round").
+            # concrete_value_type mirrors ArrayLit's concrete_type above
+            # exactly -- tracks the first non-null value's type purely to
+            # catch a genuine mismatch; value_type itself is left
+            # tracking the *last* entry's type, unchanged from before
+            # this fix, since that's what feeds the returned MapType and
+            # existing null-value corner cases already depend on it.
             value_type = None
+            concrete_value_type = None
             # Duplicate-literal-key detection: "last value wins" for a
             # repeated key (claude.md #72) is fine as a runtime rule when
             # the key is a general text expression -- there's no way to
@@ -722,6 +855,17 @@ def analyze(program, filename="<string>"):
                         )
                     seen_literal_keys[key_expr.value] = key_expr
                 value_type = infer(val_expr, scope)
+                if value_type is not None and value_type is not NULL:
+                    if concrete_value_type is None:
+                        concrete_value_type = value_type
+                    elif value_type != concrete_value_type:
+                        raise CompileError(
+                            f"map literal values must all be the same type, "
+                            f"found {types_mod.type_name(concrete_value_type)} and "
+                            f"{types_mod.type_name(value_type)}",
+                            file=filename, line=getattr(val_expr, "line", 0), column=getattr(val_expr, "column", 0),
+                            category="invalid operand type",
+                        )
             return types_mod.MapType(value_type) if value_type is not None else None
         if isinstance(expr, ast.ArrowFuncExpr):
             # claude.md #142: `void (arg:text) => log(arg)` compiles to
@@ -843,6 +987,31 @@ def analyze(program, filename="<string>"):
                     and expr.target.obj.name == _ENVIRONMENT_NAME):
                 raise CompileError(
                     f"'{_ENVIRONMENT_NAME}' is read-only and cannot be assigned to",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid assignment",
+                )
+            # claude.md #150: text[i] is read-only too -- same placement/
+            # reasoning as the checks just above. text has no in-place
+            # mutation anywhere else in this language either (.replace()
+            # etc. all return a NEW text rather than editing one in
+            # place), so `s[i] = 'x'` would be the one exception to that
+            # rule rather than a natural extension of it.
+            if (isinstance(expr.target, ast.Member) and expr.target.computed
+                    and infer(expr.target.obj, scope) == _TEXT):
+                raise CompileError(
+                    "text is immutable -- s[i] can only be read, not assigned to",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid assignment",
+                )
+            # claude.md #151: http's own three fields (port/method/
+            # headers) are read-only too -- same placement/reasoning
+            # as .length above (the ArrayType-style generic check
+            # below can't tell a read from a write target either).
+            if (isinstance(expr.target, ast.Member) and not expr.target.computed
+                    and expr.target.prop in ("port", "method", "path", "headers")
+                    and isinstance(infer(expr.target.obj, scope), types_mod.HttpType)):
+                raise CompileError(
+                    f"'.{expr.target.prop}' is read-only and cannot be assigned to",
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid assignment",
                 )
@@ -1053,6 +1222,22 @@ def analyze(program, filename="<string>"):
                         category="invalid operand type",
                     )
                 return obj_type.value
+            if obj_type == _TEXT:
+                # claude.md #150: s[i] -> a single UTF-8 code point, the
+                # same unit split('') already uses -- or null (not a
+                # bounds-check failure the way arr[T] indexing is,
+                # api.md's own "Indexing is not bounds-checked" section
+                # already scopes that unchecked-ness to arr[T] alone)
+                # for i<0 or i past the last code point, the same
+                # "answer null, don't crash" choice a missing map[T] key
+                # already gets just above.
+                if idx_type is not None and idx_type is not NULL and idx_type != _INT:
+                    raise CompileError(
+                        f"text index must be int, found {types_mod.type_name(idx_type)}",
+                        file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                        category="invalid operand type",
+                    )
+                return _TEXT
             if not isinstance(obj_type, types_mod.ArrayType):
                 raise CompileError(
                     f"cannot index into {types_mod.type_name(obj_type)}",
@@ -1133,6 +1318,57 @@ def analyze(program, filename="<string>"):
             raise CompileError(
                 f"img has no field '{expr.prop}' "
                 f"(img has .width, .height, .clip() and .resize())",
+                file=filename, line=expr.line, column=expr.column,
+                category="invalid field access",
+            )
+        if isinstance(obj_type, types_mod.HttpType):
+            # claude.md #151: four read-only fields (port/method/path/
+            # headers -- the request's own properties, set once when
+            # it's parsed, never assignable), the rest are methods
+            # (see _HTTP_METHODS/_infer_call's own `send` branch) --
+            # same strict shape as ImageType's own field/method split
+            # above, for the same reason. `path` is beyond the user's
+            # own literal spec (see festina_runtime.h's own top
+            # comment) -- a request has no way to route on anything
+            # without it.
+            if expr.prop == "port":
+                return _INT
+            if expr.prop in ("method", "path"):
+                return _TEXT
+            if expr.prop == "headers":
+                return types_mod.MapType(_TEXT)
+            if expr.prop in _HTTP_METHODS or expr.prop == "send":
+                raise CompileError(
+                    f"'{expr.prop}' is a method on http -- call it, "
+                    f"e.g. `req.{expr.prop}(...)`",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            raise CompileError(
+                f"http has no field '{expr.prop}' (http has .port, "
+                f".method, .path, .headers, and the methods listed in api.md)",
+                file=filename, line=expr.line, column=expr.column,
+                category="invalid field access",
+            )
+        if isinstance(obj_type, types_mod.SocketType):
+            # claude.md #151: `state` is the one real field -- a plain
+            # mutable map[text] scratchpad for per-connection data
+            # (`s.state['user'] = 'ada'`), which needs no special-
+            # casing here at all: MapType's own computed-member
+            # read/assignment machinery already handles a map reached
+            # through an arbitrary expression, socket included.
+            if expr.prop == "state":
+                return types_mod.MapType(_TEXT)
+            if expr.prop in _SOCKET_METHODS or expr.prop == "send":
+                raise CompileError(
+                    f"'{expr.prop}' is a method on socket -- call it, "
+                    f"e.g. `s.{expr.prop}(...)`",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            raise CompileError(
+                f"socket has no field '{expr.prop}' (socket has .state, "
+                f".send() and .close())",
                 file=filename, line=expr.line, column=expr.column,
                 category="invalid field access",
             )
@@ -1388,6 +1624,16 @@ def analyze(program, filename="<string>"):
             # claude.md #55: int.toFloat() -> float
             if callee.prop == "toFloat" and not expr.args and infer(callee.obj, scope) == _INT:
                 return _FLOAT
+            # claude.md #150: text.toInt() -> int, JS parseInt()-style
+            # (skips leading whitespace/an optional sign, stops at the
+            # first non-digit rather than requiring the whole text to
+            # be numeric) -- null (int's own -9223372036854775808
+            # sentinel, the same one every other "no valid int here"
+            # site in this language already answers with) when nothing
+            # parseable is found at all, never a compile-time-only or
+            # runtime failure.
+            if callee.prop == "toInt" and not expr.args and infer(callee.obj, scope) == _TEXT:
+                return _INT
             # int/float/bool.toText() -> text -- an explicit spelling of
             # the same stringification template interpolation already
             # does implicitly for these three types (see codegen.py's
@@ -1658,6 +1904,110 @@ def analyze(program, filename="<string>"):
                             category="invalid function argument type",
                         )
                 return return_type
+            # claude.md #151: http's fixed-shape methods, checked the
+            # identical dict-driven way blob's own just above are.
+            if callee.prop in _HTTP_METHODS and infer(callee.obj, scope) == _HTTP:
+                arg_types, return_type = _HTTP_METHODS[callee.prop]
+                if len(expr.args) != len(arg_types):
+                    raise CompileError(
+                        f"{callee.prop}() expects {len(arg_types)} argument"
+                        f"{'' if len(arg_types) == 1 else 's'}, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                for i, expected in enumerate(arg_types):
+                    arg_type = infer(expr.args[i], scope)
+                    if (arg_type is not None and arg_type is not NULL
+                            and arg_type != expected):
+                        raise CompileError(
+                            f"{callee.prop}()'s argument {i + 1} expects "
+                            f"{types_mod.type_name(expected)}, found "
+                            f"{types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return return_type
+            # claude.md #151: socket's own fixed-shape method (`close`).
+            if callee.prop in _SOCKET_METHODS and infer(callee.obj, scope) == _SOCKET:
+                arg_types, return_type = _SOCKET_METHODS[callee.prop]
+                if len(expr.args) != len(arg_types):
+                    raise CompileError(
+                        f"{callee.prop}() expects {len(arg_types)} argument"
+                        f"{'' if len(arg_types) == 1 else 's'}, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return return_type
+            # claude.md #151: req.send(data:any, code:int, headers:map)
+            # -- `data` accepts any concrete type with a body form
+            # (_is_sendable_type, the same set _to_text already gives
+            # a text form to, plus blob sent as its own raw bytes),
+            # `code` defaults to 200, `headers` defaults to no extra
+            # headers -- both trailing arguments genuinely optional,
+            # which _HTTP_METHODS' fixed-arity table has no way to
+            # express, so this is its own bespoke branch, the same
+            # reason saveCanvas()/setTimeout() above have theirs.
+            if callee.prop == "send" and infer(callee.obj, scope) == _HTTP:
+                if not (1 <= len(expr.args) <= 3):
+                    raise CompileError(
+                        f"send() expects 1 to 3 arguments (data, an optional "
+                        f"status code, an optional headers map), got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                data_type = infer(expr.args[0], scope)
+                if (data_type is not None and data_type is not NULL
+                        and not _is_sendable_type(data_type)):
+                    raise CompileError(
+                        f"send()'s data argument has no body form -- found "
+                        f"{types_mod.type_name(data_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                if len(expr.args) >= 2:
+                    code_type = infer(expr.args[1], scope)
+                    if code_type is not None and code_type is not NULL and code_type != _INT:
+                        raise CompileError(
+                            f"send()'s status code argument must be int, found "
+                            f"{types_mod.type_name(code_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                if len(expr.args) == 3:
+                    headers_type = infer(expr.args[2], scope)
+                    if (headers_type is not None and headers_type is not NULL
+                            and headers_type != types_mod.MapType(_TEXT)):
+                        raise CompileError(
+                            f"send()'s headers argument must be map[text], found "
+                            f"{types_mod.type_name(headers_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return None
+            # claude.md #151: socket.send(data:any) -- the same
+            # sendable-type check as http.send() above, but always
+            # exactly one argument (a WebSocket frame has no status
+            # code or headers to attach) -- blob sends as a binary
+            # frame, everything else as a text frame (see codegen's
+            # _emit_socket_send).
+            if callee.prop == "send" and infer(callee.obj, scope) == _SOCKET:
+                if len(expr.args) != 1:
+                    raise CompileError(
+                        f"send() expects exactly 1 argument (the data to send), "
+                        f"got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                data_type = infer(expr.args[0], scope)
+                if (data_type is not None and data_type is not NULL
+                        and not _is_sendable_type(data_type)):
+                    raise CompileError(
+                        f"send()'s data argument has no body form -- found "
+                        f"{types_mod.type_name(data_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return None
             # claude.md #109: aud.stop() is back, and means the thing
             # claude.md #100 identified as its only honest reading --
             # stop every channel playing this clip. #100 removed it
@@ -1984,6 +2334,29 @@ def analyze(program, filename="<string>"):
 
     def analyze_var_decl(decl, scope, is_global):
         declared_type = resolve(decl.type_expr, decl)
+        # claude.md #156: `amor map[T]` (local or global) requires an
+        # initializer -- unlike plain map[T]/arr[T], which start
+        # "empty" via a real, immortal, zero-entry static header
+        # (see codegen.py's _global_var_defs), an amortized map local's
+        # own with-no-initializer path was deliberately never given
+        # the equivalent (codegen's own scope boundary: it always
+        # heap-allocates through the generic path instead, which needs
+        # a real value to store, not an implicit empty default) --
+        # requiring one here is what keeps that boundary from ever
+        # being reached as an uninitialized-pointer bug instead of a
+        # clear compile error. Struct fields have no initializer
+        # syntax at all, so this can't (and doesn't need to) apply to
+        # them -- they rely on auto-vivify instead (see codegen.py's
+        # own comment on that path).
+        if (isinstance(declared_type, types_mod.MapType) and declared_type.amortized
+                and decl.init is None):
+            raise CompileError(
+                f"'{decl.name}' (amor map[{types_mod.type_name(declared_type.value)}]) "
+                f"requires an initializer -- write e.g. `amor map[{types_mod.type_name(declared_type.value)}] "
+                f"{decl.name} = {{}}` for an empty one",
+                file=filename, line=decl.line, column=decl.column,
+                category="invalid declaration",
+            )
         if decl.init is not None:
             # claude.md #137: arr[img]/arr[aud]/arr[blob] declared
             # directly from a literal of paths -- `arr[img] brushes =
@@ -2020,6 +2393,42 @@ def analyze(program, filename="<string>"):
                             f"path), found {types_mod.type_name(etype)}",
                             file=filename, line=getattr(e, "line", 0),
                             column=getattr(e, "column", 0),
+                            category="invalid operand type",
+                        )
+            elif (isinstance(declared_type, types_mod.MapType) and declared_type.amortized
+                    and isinstance(decl.init, ast.MapLit)):
+                # claude.md #156: same bypass shape as the arr[img] case
+                # just above, for the identical reason -- MapLit's own
+                # generic inference (_infer_member's MapLit branch)
+                # always returns a NON-amortized MapType regardless of
+                # context (it has no way to know a declaration wants
+                # `amor`), so the generic infer()+check_assignable()
+                # path below would always reject a `{...}` literal
+                # against an `amor map[T]` declared type. Validates
+                # each entry directly against the declared value type
+                # instead -- the same per-entry key/value checks the
+                # generic inference already does (claude.md #72's key-
+                # must-be-text rule, claude.md #154's mixed-value-type
+                # rule), just checked against a known target type
+                # rather than inferred from the literal's own entries.
+                value_type_name = types_mod.type_name(declared_type.value)
+                for key_expr, val_expr in decl.init.entries:
+                    key_type = infer(key_expr, scope)
+                    if key_type is not None and key_type is not NULL and key_type != _TEXT:
+                        raise CompileError(
+                            f"map key must be text, found {types_mod.type_name(key_type)}",
+                            file=filename, line=getattr(key_expr, "line", 0),
+                            column=getattr(key_expr, "column", 0),
+                            category="invalid operand type",
+                        )
+                    val_type = infer(val_expr, scope)
+                    if (val_type is not None and val_type is not NULL
+                            and val_type != declared_type.value):
+                        raise CompileError(
+                            f"map literal value expects {value_type_name}, "
+                            f"found {types_mod.type_name(val_type)}",
+                            file=filename, line=getattr(val_expr, "line", 0),
+                            column=getattr(val_expr, "column", 0),
                             category="invalid operand type",
                         )
             else:

@@ -1,5 +1,6 @@
-"""claude.md #38/#99/#100: aud, `aud m = 'path'`, .play()/
-.playLoop()/.isPlaying(), and stopAudioPlayer().
+"""claude.md #38/#99/#100/#146: aud, `aud m = 'path'`, .play()/
+.playLoop()/.isPlaying(), stopAudioPlayer(), and
+isAudioPlayerPlaying(channel).
 
 Lexer/parser/semantic-level tests only -- see tests/test_codegen.py's
 TestAudio for the real compile-and-run end-to-end coverage, including
@@ -129,6 +130,35 @@ class TestAudioMethods:
             program = parser.parse(source)
             with pytest.raises(errors.CompileError):
                 semantic.analyze(program)
+
+    def test_is_audio_player_playing_takes_a_required_int_channel(self, parser, semantic):
+        # claude.md #146: a free function, like stopAudioPlayer -- but
+        # unlike stopAudioPlayer's OPTIONAL channel (bare = "every
+        # channel"), the channel here is required: there is no sensible
+        # "any channel" reading for a query.
+        program = parser.parse("bool p = isAudioPlayerPlaying(0)")
+        semantic.analyze(program)
+
+    def test_is_audio_player_playing_result_must_match_declared_type(
+            self, parser, semantic, errors):
+        program = parser.parse("int p = isAudioPlayerPlaying(0)")
+        with pytest.raises(errors.CompileError, match="cannot assign"):
+            semantic.analyze(program)
+
+    def test_is_audio_player_playing_rejects_zero_arguments(self, parser, semantic, errors):
+        program = parser.parse("bool p = isAudioPlayerPlaying()")
+        with pytest.raises(errors.CompileError, match="1 argument"):
+            semantic.analyze(program)
+
+    def test_is_audio_player_playing_rejects_too_many_arguments(self, parser, semantic, errors):
+        program = parser.parse("bool p = isAudioPlayerPlaying(1, 2)")
+        with pytest.raises(errors.CompileError, match="1 argument"):
+            semantic.analyze(program)
+
+    def test_is_audio_player_playing_rejects_a_non_int_channel(self, parser, semantic, errors):
+        program = parser.parse("bool p = isAudioPlayerPlaying('a')")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
 
     def test_unrecognized_method_is_a_compile_error(self, parser, semantic, errors):
         source = "aud music = 'music.wav'\nmusic.pause()"

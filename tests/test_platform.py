@@ -383,7 +383,7 @@ class TestFeatureGating:
     def test_doctor_on_darwin_reports_audio_as_planned_not_missing(
             self, cli_mod, monkeypatch):
         monkeypatch.setattr(sys, "platform", "darwin")
-        lines, _ = cli_mod._doctor_report()
+        lines, _, _missing = cli_mod._doctor_report()
         report = "\n".join(lines)
         assert "macos.md Phase 1" in report
         assert "alsa" not in report, (
@@ -398,7 +398,7 @@ class TestFeatureGating:
         # user has no way to install.
         monkeypatch.setattr(sys, "platform", "win32")
         _stub_which_any(cli_mod, monkeypatch)
-        lines, _ = cli_mod._doctor_report()
+        lines, _, _missing = cli_mod._doctor_report()
         report = "\n".join(lines)
         assert "windows.md Phase 1" in report
         assert "windows.md Phase 2" in report
@@ -410,7 +410,7 @@ class TestFeatureGating:
         monkeypatch.setattr(sys, "platform", "win32")
         _stub_which_any(cli_mod, monkeypatch)
         monkeypatch.setattr(cli_mod, "_pkg_config_has", lambda pkg: False)
-        lines, all_ok = cli_mod._doctor_report()
+        lines, all_ok, _missing = cli_mod._doctor_report()
         report = "\n".join(lines)
         # The install hint names the real package (libsystre); the
         # pkg-config name it's actually queried under (gnurx) is an
@@ -423,15 +423,173 @@ class TestFeatureGating:
         monkeypatch.setattr(sys, "platform", "win32")
         _stub_which_any(cli_mod, monkeypatch)
         monkeypatch.setenv("MSYSTEM", "MSYS")
-        lines, _ = cli_mod._doctor_report()
+        lines, _, _missing = cli_mod._doctor_report()
         assert "wrong shell" in "\n".join(lines)
 
     def test_doctor_says_nothing_extra_for_ucrt64(self, cli_mod, monkeypatch):
         monkeypatch.setattr(sys, "platform", "win32")
         _stub_which_any(cli_mod, monkeypatch)
         monkeypatch.setenv("MSYSTEM", "UCRT64")
-        lines, _ = cli_mod._doctor_report()
+        lines, _, _missing = cli_mod._doctor_report()
         assert "wrong shell" not in "\n".join(lines)
+
+
+class TestDetectPackageManager:
+    """`festina doctor --fix`: which of the three package managers
+    setup.md documents (apt/Debian-Ubuntu, Homebrew/macOS, MSYS2's
+    pacman/Windows) it should drive -- one per platform, by design
+    (see _PKG_MANAGER_PACKAGES' own docstring for why this doesn't try
+    to guess for dnf/Arch's pacman/zypper/etc). Same sys.platform-spoof
+    pattern as TestDoctor above, and the same reason _stub_which_any
+    exists: shutil.which has its own real win32 branch that a spoofed
+    platform string on real POSIX CI would otherwise crash into."""
+
+    def test_linux_detects_apt(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(cli_mod.shutil, "which",
+                             lambda cmd: "/usr/bin/apt" if cmd == "apt" else None)
+        assert cli_mod._detect_package_manager() == "apt"
+
+    def test_linux_falls_back_to_apt_get(self, cli_mod, monkeypatch):
+        # Some Debian/Ubuntu images ship apt-get without the newer apt
+        # frontend -- doctor --fix should still recognize the family.
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(cli_mod.shutil, "which",
+                             lambda cmd: "/usr/bin/apt-get" if cmd == "apt-get" else None)
+        assert cli_mod._detect_package_manager() == "apt"
+
+    def test_linux_without_apt_is_unsupported(self, cli_mod, monkeypatch):
+        # dnf/Arch pacman/zypper -- deliberately not guessed at, see
+        # _PKG_MANAGER_PACKAGES' own docstring.
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(cli_mod.shutil, "which", lambda cmd: None)
+        assert cli_mod._detect_package_manager() is None
+
+    def test_darwin_detects_brew(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(cli_mod.shutil, "which",
+                             lambda cmd: "/opt/homebrew/bin/brew" if cmd == "brew" else None)
+        assert cli_mod._detect_package_manager() == "brew"
+
+    def test_darwin_without_brew_is_unsupported(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(cli_mod.shutil, "which", lambda cmd: None)
+        assert cli_mod._detect_package_manager() is None
+
+    def test_windows_detects_msys2_pacman(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(cli_mod.shutil, "which",
+                             lambda cmd: "/usr/bin/pacman" if cmd == "pacman" else None)
+        assert cli_mod._detect_package_manager() == "msys2"
+
+    def test_windows_without_pacman_is_unsupported(self, cli_mod, monkeypatch):
+        # Not running inside an MSYS2 shell at all.
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(cli_mod.shutil, "which", lambda cmd: None)
+        assert cli_mod._detect_package_manager() is None
+
+
+class TestDoctorFixInstallCommand:
+    """_doctor_fix_install_command: the exact command line for each
+    manager, given an already-deduplicated package list -- pure
+    function, no subprocess involved, so every branch is checked
+    directly rather than through a real (or even faked) install."""
+
+    def test_apt_as_root_has_no_sudo_prefix(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(cli_mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+        monkeypatch.setattr(cli_mod.os, "geteuid", lambda: 0, raising=False)
+        cmd = cli_mod._doctor_fix_install_command("apt", ["clang", "pkg-config"])
+        assert cmd == ["apt", "install", "-y", "clang", "pkg-config"]
+
+    def test_apt_as_non_root_is_prefixed_with_sudo(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(cli_mod.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+        monkeypatch.setattr(cli_mod.os, "geteuid", lambda: 1000, raising=False)
+        cmd = cli_mod._doctor_fix_install_command("apt", ["clang"])
+        assert cmd == ["sudo", "apt", "install", "-y", "clang"]
+
+    def test_apt_falls_back_to_apt_get_when_apt_is_absent(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(cli_mod.shutil, "which",
+                             lambda cmd: None if cmd == "apt" else f"/usr/bin/{cmd}")
+        monkeypatch.setattr(cli_mod.os, "geteuid", lambda: 0, raising=False)
+        cmd = cli_mod._doctor_fix_install_command("apt", ["clang"])
+        assert cmd[0:2] == ["apt-get", "install"]
+
+    def test_brew_never_gets_a_sudo_prefix(self, cli_mod, monkeypatch):
+        # Homebrew actively refuses to run as root -- confirming this
+        # never accidentally inherits apt's sudo logic.
+        monkeypatch.setattr(cli_mod.os, "geteuid", lambda: 0, raising=False)
+        cmd = cli_mod._doctor_fix_install_command("brew", ["sqlite", "cairo"])
+        assert cmd == ["brew", "install", "sqlite", "cairo"]
+
+    def test_msys2_uses_noconfirm_pacman(self, cli_mod):
+        cmd = cli_mod._doctor_fix_install_command(
+            "msys2", ["mingw-w64-ucrt-x86_64-clang"])
+        assert cmd == ["pacman", "-S", "--noconfirm", "mingw-w64-ucrt-x86_64-clang"]
+
+
+class TestFestinaPathFixPlan:
+    """_festina_path_fix_plan: what `doctor --fix` could do about
+    'festina' not resolving on PATH, as a pure function of injectable
+    state -- the same reason _default_output_name takes a `platform_name`
+    parameter, extended here to every other real-world input this
+    decision depends on (whether festina already resolves, whether this
+    is the packaged binary, and which shell is running), so each branch
+    is testable from any one OS without touching this machine's real
+    environment at all."""
+
+    def test_already_on_path_is_nothing_to_fix(self, cli_mod):
+        assert cli_mod._festina_path_fix_plan(
+            festina_path="/usr/local/bin/festina") is None
+
+    def test_packaged_binary_plans_a_symlink(self, cli_mod, monkeypatch):
+        monkeypatch.setattr(cli_mod.sys, "executable", "/tmp/dist/festina")
+        plan = cli_mod._festina_path_fix_plan(
+            platform_name="linux", festina_path=None, meipass="/tmp/_MEIxyz")
+        assert plan == {"kind": "symlink", "source": "/tmp/dist/festina",
+                         "target": "/usr/local/bin/festina"}
+
+    def test_bash_checkout_plans_a_bashrc_append(self, cli_mod):
+        plan = cli_mod._festina_path_fix_plan(
+            platform_name="linux", festina_path=None, meipass=None,
+            shell_env="/bin/bash", bin_dir="/repo/bin")
+        assert plan["kind"] == "shell_rc"
+        assert plan["rc_file"].endswith(".bashrc")
+        assert plan["line"] == 'export PATH="$PATH:/repo/bin"'
+
+    def test_zsh_checkout_plans_a_zshrc_append(self, cli_mod):
+        plan = cli_mod._festina_path_fix_plan(
+            platform_name="darwin", festina_path=None, meipass=None,
+            shell_env="/bin/zsh", bin_dir="/repo/bin")
+        assert plan["kind"] == "shell_rc"
+        assert plan["rc_file"].endswith(".zshrc")
+
+    def test_unrecognized_shell_is_unsupported(self, cli_mod):
+        plan = cli_mod._festina_path_fix_plan(
+            platform_name="linux", festina_path=None, meipass=None,
+            shell_env="/usr/bin/fish", bin_dir="/repo/bin")
+        assert plan == {"kind": "unsupported_shell", "bin_dir": "/repo/bin", "shell": "fish"}
+
+    def test_unset_shell_is_unsupported_not_a_crash(self, cli_mod):
+        plan = cli_mod._festina_path_fix_plan(
+            platform_name="linux", festina_path=None, meipass=None,
+            shell_env="", bin_dir="/repo/bin")
+        assert plan["kind"] == "unsupported_shell"
+        assert plan["shell"] == "unknown"
+
+    def test_windows_checkout_plans_a_setx(self, cli_mod):
+        plan = cli_mod._festina_path_fix_plan(
+            platform_name="win32", festina_path=None, meipass=None, bin_dir="C:\\repo\\bin")
+        assert plan == {"kind": "windows_path", "bin_dir": "C:\\repo\\bin"}
+
+    def test_windows_packaged_binary_still_plans_a_symlink_not_setx(self, cli_mod, monkeypatch):
+        # _MEIPASS takes precedence over platform -- the packaged-binary
+        # case looks identical everywhere (there's no bin/ checkout
+        # directory to add to PATH at all once running is via the
+        # bundled --onefile executable).
+        monkeypatch.setattr(cli_mod.sys, "executable", "C:\\dist\\festina.exe")
+        plan = cli_mod._festina_path_fix_plan(
+            platform_name="win32", festina_path=None, meipass="C:\\_MEIxyz")
+        assert plan["kind"] == "symlink"
 
 
 class TestAudioFeatureConfig:
@@ -485,6 +643,27 @@ class TestAudioFeatureConfig:
         pkgs, flags = cli_mod._feature_pkgs_and_flags("graphics", "win32")
         assert pkgs == ["libjpeg", "cairo"]
         assert flags == ["-lgdi32", "-luser32"]
+
+    def test_linux_http_has_no_pkgs_or_flags(self, cli_mod):
+        # claude.md #151: plain POSIX sockets -- never had a third-
+        # party library dependency on any platform.
+        pkgs, flags = cli_mod._feature_pkgs_and_flags("http", "linux")
+        assert pkgs == []
+        assert flags == []
+
+    def test_darwin_http_has_no_pkgs_or_flags(self, cli_mod):
+        # Same POSIX sockets as Linux -- darwin needs nothing extra.
+        pkgs, flags = cli_mod._feature_pkgs_and_flags("http", "darwin")
+        assert pkgs == []
+        assert flags == []
+
+    def test_windows_http_links_ws2_32(self, cli_mod):
+        # claude.md #151 (Windows round): winsock2 lives in ws2_32.dll
+        # -- a system DLL with an import library but no pkg-config
+        # file, the same shape winmm/gdi32/user32 already are above.
+        pkgs, flags = cli_mod._feature_pkgs_and_flags("http", "win32")
+        assert pkgs == []
+        assert flags == ["-lws2_32"]
 
     def test_windows_graphics_extra_object_is_the_win32_companion(self, cli_mod, monkeypatch):
         # windows.md Phase 2: the win32 counterpart to
