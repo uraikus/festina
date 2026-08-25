@@ -44,6 +44,26 @@ same as macOS's own sanitizer tier is explicitly out of scope).
   #101): each new format is a new system dependency for every machine
   that compiles a media-using program. Revisit only with a concrete
   need.
+- **`amor arr[T]` has no runtime effect yet** (claude.md #156): the
+  `amor` prefix modifier was built for both `map[T]` and `arr[T]`
+  together, and `amor map[T]` genuinely gets amortized (doubling)
+  growth via a new `festina_amap_set`, but array's own growable-buffer
+  surface (`push`/`pop`/`shift`/`unshift`/`splice`, each independently
+  calling `festina_array_resize`) is far larger than map's four
+  operations -- building real amortized growth across all of it
+  correctly wasn't achievable in the same round. `amor arr[T]` parses,
+  type-checks, and round-trips through `type_name()` today, but
+  compiles and behaves byte-for-byte like plain `arr[T]`
+  (`ArrayType.amortized` is `field(compare=False)` specifically so the
+  two stay assignment-compatible in the meantime). Fixing this means: a
+  `FestinaAmorArray` header (`{i64 length, ptr data, i64 capacity}`,
+  the same byte-compatible-prefix trick `FESTINA_AMAP_LLVM_TYPE`
+  already uses over `FESTINA_MAP_LLVM_TYPE`), a capacity-aware
+  `festina_array_resize` counterpart, and auditing each of
+  push/pop/shift/unshift/splice's own codegen for the GEP-type-name
+  swap the map side already needed at every touchpoint -- plus
+  removing `ArrayType.amortized`'s `compare=False` once there's a real
+  representation difference to distinguish.
 
 ## Memory model
 

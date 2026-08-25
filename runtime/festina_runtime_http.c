@@ -212,12 +212,23 @@ typedef struct {
     char *value;
 } FestinaHeader;
 
-static void festina_headers_add(FestinaHeader **headers, int64_t *count,
+static void festina_headers_add(FestinaHeader **headers, int64_t *count, int64_t *capacity,
                                 const char *name_start, size_t name_len,
                                 const char *value_start, size_t value_len) {
-    FestinaHeader *grown = realloc(*headers, (size_t)(*count + 1) * sizeof(FestinaHeader));
-    if (!grown) festina_fail("out of memory growing a parsed HTTP header list");
-    *headers = grown;
+    /* claude.md #155: doubling growth, not a realloc-by-exactly-one
+     * per header -- every other growable buffer in this file already
+     * doubles (the connection read buffer, the listener/connection
+     * tables); this one didn't, for no reason tied to headers
+     * specifically. A real request's header count is small, but
+     * doubling costs nothing extra to have and turns N reallocs into
+     * O(log N). */
+    if (*count == *capacity) {
+        int64_t new_capacity = *capacity ? *capacity * 2 : 8;
+        FestinaHeader *grown = realloc(*headers, (size_t)new_capacity * sizeof(FestinaHeader));
+        if (!grown) festina_fail("out of memory growing a parsed HTTP header list");
+        *headers = grown;
+        *capacity = new_capacity;
+    }
     char *name = malloc(name_len + 1);
     char *value = malloc(value_len + 1);
     if (!name || !value) festina_fail("out of memory copying an HTTP header");
@@ -280,11 +291,32 @@ typedef struct {
                    * without it. */
     FestinaHeader *headers;
     int64_t header_count;
+    int64_t header_capacity;   /* claude.md #155: see festina_headers_add */
     int64_t content_length;   /* -1 until the header is parsed */
     uint8_t *body;             /* NULL until the body is fully buffered */
     int64_t body_len;
     int request_ready;
     int responded;    /* ok/redirect/send/upgrade -- see festina_runtime.h */
+
+    /* claude.md #155: festina_try_parse_request's own resumable-scan
+     * state -- headers_parsed guards the request-line/header-parsing
+     * block to run AT MOST ONCE per connection (a request whose body
+     * arrives in a later, separate recv() used to re-run that whole
+     * block from scratch on every call, which not only rescanned
+     * already-scanned bytes but re-malloc'd method/path over the
+     * previous call's own pointers with nothing freeing them first,
+     * and re-appended every header onto the still-populated headers
+     * array -- a real, confirmed leak+duplication bug, found while
+     * designing this fix, not merely a performance one).
+     * header_scan_pos is how far the \r\n\r\n search got on the last
+     * call that didn't find it, so the next call resumes there instead
+     * of rescanning from byte 0. body_start_offset is cached once
+     * headers are parsed, so the have-we-got-the-whole-body check on
+     * every later call is O(1) instead of re-deriving it from hdr_end
+     * (which would require rescanning to even have hdr_end again). */
+    int headers_parsed;
+    size_t header_scan_pos;
+    size_t body_start_offset;
 
     /* socket.state -- lazily created (see festina_socket_state), a
      * live map[text] header block: {refcount, count, entries}, this
@@ -573,84 +605,106 @@ static void festina_conn_teardown(FestinaConn *c) {
 /* ---- HTTP/1.1 request parsing -- request-line + headers + an
  * optional Content-Length body only (see festina_runtime.h's own top
  * comment for the full scope decision: no chunked encoding, no
- * pipelining, no keep-alive). Re-scans the whole accumulated buffer
- * on every call rather than tracking a resume position -- O(request
- * size) per byte-chunk received, accepted for the same "small,
- * script-shaped server" scope the whole feature already targets. ---- */
+ * pipelining, no keep-alive). ---- */
 static void festina_try_parse_request(FestinaConn *c) {
     if (c->request_ready) return;
-    /* claude.md #151: find the header terminator first -- nothing
-     * about the request-line or headers can be trusted complete until
-     * it's found. */
-    uint8_t *hdr_end = NULL;
-    for (size_t i = 0; i + 3 < c->buf_len; i++) {
-        if (c->buf[i] == '\r' && c->buf[i + 1] == '\n'
-                && c->buf[i + 2] == '\r' && c->buf[i + 3] == '\n') {
-            hdr_end = c->buf + i;
-            break;
+
+    if (!c->headers_parsed) {
+        /* claude.md #155: resume the \r\n\r\n search from where the
+         * last call left off (header_scan_pos) instead of rescanning
+         * the whole buffer from byte 0 every time more bytes arrive --
+         * and this whole block runs at most once per connection
+         * (headers_parsed), where it used to re-run in full (re-malloc
+         * method/path over the previous call's own pointers with
+         * nothing freeing them, re-append every header onto the
+         * still-populated headers array) on every call that found
+         * hdr_end again but was still waiting on the body -- a real,
+         * confirmed leak+duplication bug for any request whose body
+         * arrives in a later, separate recv() (reproduced directly:
+         * headers in one write, body in a second one after a delay,
+         * definitely-lost bytes for the doubled method/path/header
+         * allocations under Valgrind), not merely a performance one.
+         * Backs up 3 bytes from the previous stopping point: a partial
+         * "\r\n\r" sitting right at the end of what was scanned last
+         * time needs re-testing once the byte that could complete it
+         * arrives, since the loop below never tried starting AT that
+         * position with all 4 bytes available. */
+        size_t scan_start = c->header_scan_pos > 3 ? c->header_scan_pos - 3 : 0;
+        uint8_t *hdr_end = NULL;
+        for (size_t i = scan_start; i + 3 < c->buf_len; i++) {
+            if (c->buf[i] == '\r' && c->buf[i + 1] == '\n'
+                    && c->buf[i + 2] == '\r' && c->buf[i + 3] == '\n') {
+                hdr_end = c->buf + i;
+                break;
+            }
         }
-    }
-    if (!hdr_end) return;
-    const char *p = (const char *)c->buf;
-    const char *limit = (const char *)hdr_end;
+        if (!hdr_end) {
+            c->header_scan_pos = c->buf_len;
+            return;
+        }
+        const char *p = (const char *)c->buf;
+        const char *limit = (const char *)hdr_end;
 
-    /* Request line: METHOD SP PATH SP VERSION */
-    const char *method_start = p;
-    while (p < limit && *p != ' ') p++;
-    if (p >= limit) { c->alive = 0; return; } /* malformed -- drop it */
-    size_t method_len = (size_t)(p - method_start);
-    p++; /* past the space */
-    const char *path_start = p;
-    while (p < limit && *p != ' ') p++;
-    if (p >= limit) { c->alive = 0; return; }
-    size_t path_len = (size_t)(p - path_start);
-    /* The rest of the line (HTTP version) is read but not kept -- this
-     * runtime doesn't distinguish HTTP/1.0 from HTTP/1.1 behavior. */
-    while (p < limit && *p != '\r') p++;
-    if (p < limit) p++;
-    if (p < limit && *p == '\n') p++;
-
-    c->method = malloc(method_len + 1);
-    c->path = malloc(path_len + 1);
-    if (!c->method || !c->path) festina_fail("out of memory parsing an HTTP request");
-    memcpy(c->method, method_start, method_len);
-    c->method[method_len] = '\0';
-    memcpy(c->path, path_start, path_len);
-    c->path[path_len] = '\0';
-
-    /* Headers: one "Name: value\r\n" per line until the blank line
-     * already located above. */
-    while (p < limit) {
-        const char *line_start = p;
+        /* Request line: METHOD SP PATH SP VERSION */
+        const char *method_start = p;
+        while (p < limit && *p != ' ') p++;
+        if (p >= limit) { c->alive = 0; return; } /* malformed -- drop it */
+        size_t method_len = (size_t)(p - method_start);
+        p++; /* past the space */
+        const char *path_start = p;
+        while (p < limit && *p != ' ') p++;
+        if (p >= limit) { c->alive = 0; return; }
+        size_t path_len = (size_t)(p - path_start);
+        /* The rest of the line (HTTP version) is read but not kept --
+         * this runtime doesn't distinguish HTTP/1.0 from HTTP/1.1
+         * behavior. */
         while (p < limit && *p != '\r') p++;
-        const char *line_end = p;
         if (p < limit) p++;
         if (p < limit && *p == '\n') p++;
-        const char *colon = line_start;
-        while (colon < line_end && *colon != ':') colon++;
-        if (colon >= line_end) continue; /* malformed header line -- skip it */
-        const char *name_start = line_start;
-        size_t name_len = (size_t)(colon - line_start);
-        const char *value_start = colon + 1;
-        while (value_start < line_end && *value_start == ' ') value_start++;
-        size_t value_len = (size_t)(line_end - value_start);
-        festina_headers_add(&c->headers, &c->header_count,
-                            name_start, name_len, value_start, value_len);
+
+        c->method = malloc(method_len + 1);
+        c->path = malloc(path_len + 1);
+        if (!c->method || !c->path) festina_fail("out of memory parsing an HTTP request");
+        memcpy(c->method, method_start, method_len);
+        c->method[method_len] = '\0';
+        memcpy(c->path, path_start, path_len);
+        c->path[path_len] = '\0';
+
+        /* Headers: one "Name: value\r\n" per line until the blank line
+         * already located above. */
+        while (p < limit) {
+            const char *line_start = p;
+            while (p < limit && *p != '\r') p++;
+            const char *line_end = p;
+            if (p < limit) p++;
+            if (p < limit && *p == '\n') p++;
+            const char *colon = line_start;
+            while (colon < line_end && *colon != ':') colon++;
+            if (colon >= line_end) continue; /* malformed header line -- skip it */
+            const char *name_start = line_start;
+            size_t name_len = (size_t)(colon - line_start);
+            const char *value_start = colon + 1;
+            while (value_start < line_end && *value_start == ' ') value_start++;
+            size_t value_len = (size_t)(line_end - value_start);
+            festina_headers_add(&c->headers, &c->header_count, &c->header_capacity,
+                                name_start, name_len, value_start, value_len);
+        }
+
+        const char *cl = festina_headers_get(c->headers, c->header_count, "content-length");
+        c->content_length = cl ? strtoll(cl, NULL, 10) : 0;
+        if (c->content_length < 0) c->content_length = 0;
+        c->body_start_offset = (size_t)((const uint8_t *)limit - c->buf) + 4;
+        c->headers_parsed = 1;
     }
 
-    const char *cl = festina_headers_get(c->headers, c->header_count, "content-length");
-    c->content_length = cl ? strtoll(cl, NULL, 10) : 0;
-    if (c->content_length < 0) c->content_length = 0;
-
-    size_t body_start_offset = (size_t)((const uint8_t *)limit - c->buf) + 4;
-    size_t have_body = c->buf_len > body_start_offset ? c->buf_len - body_start_offset : 0;
+    size_t have_body = c->buf_len > c->body_start_offset ? c->buf_len - c->body_start_offset : 0;
     if (have_body < (size_t)c->content_length) return; /* still waiting for the body */
 
     c->body_len = c->content_length;
     if (c->body_len > 0) {
         c->body = malloc((size_t)c->body_len);
         if (!c->body) festina_fail("out of memory buffering an HTTP request body");
-        memcpy(c->body, c->buf + body_start_offset, (size_t)c->body_len);
+        memcpy(c->body, c->buf + c->body_start_offset, (size_t)c->body_len);
     }
     c->request_ready = 1;
 }
@@ -685,6 +739,62 @@ static int festina_send_all(FestinaSocket fd, const void *data, size_t len) {
     }
     return 1;
 }
+
+/* claude.md #155: a small growable buffer for building a response's
+ * status-line + headers block in memory before sending it in ONE
+ * festina_send_all call, instead of one call per line -- with
+ * TCP_NODELAY set (Nagle's algorithm disabled, see
+ * festina_accept_new_connections), every separate send() used to
+ * become its own TCP segment, not just its own syscall, so a response
+ * with a couple of extra headers was several packets instead of one.
+ * Starts pointed at a small caller-owned stack buffer (every real
+ * response's status+headers block fits easily) and only actually
+ * allocates on the heap if that's not enough -- the common case pays
+ * no malloc at all. The body itself is deliberately NOT copied into
+ * this buffer and sent separately: copying a large body in would cost
+ * more than the syscall it saves, the same reasoning that already
+ * kept the body out of any single buffer here. */
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+    int on_heap;
+} FestinaSendBuf;
+
+static void festina_sendbuf_init(FestinaSendBuf *b, char *stack_storage, size_t stack_cap) {
+    b->data = stack_storage;
+    b->len = 0;
+    b->cap = stack_cap;
+    b->on_heap = 0;
+}
+
+static void festina_sendbuf_reserve(FestinaSendBuf *b, size_t extra) {
+    if (b->len + extra <= b->cap) return;
+    size_t new_cap = b->cap ? b->cap * 2 : 256;
+    while (new_cap < b->len + extra) new_cap *= 2;
+    char *grown = b->on_heap ? realloc(b->data, new_cap) : malloc(new_cap);
+    if (!grown) festina_fail("out of memory building an HTTP response header block");
+    if (!b->on_heap) memcpy(grown, b->data, b->len); /* first spill off the stack */
+    b->data = grown;
+    b->cap = new_cap;
+    b->on_heap = 1;
+}
+
+static void festina_sendbuf_append(FestinaSendBuf *b, const char *s, size_t n) {
+    if (n == 0) return;
+    festina_sendbuf_reserve(b, n);
+    memcpy(b->data + b->len, s, n);
+    b->len += n;
+}
+
+static void festina_sendbuf_free(FestinaSendBuf *b) {
+    if (b->on_heap) free(b->data);
+}
+
+/* sizeof(lit)-1 rather than a hand-counted length or strlen() on a
+ * literal -- compiler-computed, so it can never drift from the
+ * literal's own text the way a manually maintained number could. */
+#define FESTINA_APPEND_LIT(b, lit) festina_sendbuf_append((b), (lit), sizeof(lit) - 1)
 
 /* Writes ONE unmasked server->client frame (server frames are never
  * masked per RFC 6455) -- `opcode` 0x1 text, 0x2 binary, 0x8 close,
@@ -1002,35 +1112,60 @@ void festina_close_port(int64_t port) {
 
 /* ---- the combined loop -- HTTP/WebSocket I/O + timers ---- */
 
+/* claude.md #155: persistent, doubling-growth poll-set buffers rather
+ * than malloc'd and freed fresh on every single loop tick -- the same
+ * buffer-reuse idea festina_conn_ensure_capacity already uses for a
+ * connection's own read buffer, applied to the loop that drives every
+ * connection. Never freed (this runtime's own established "no GC yet,
+ * process exit tears everything down" convention, same as g_conns/
+ * g_listeners themselves). */
+static FestinaPollFd *g_poll_fds = NULL;
+static int64_t *g_poll_conn_ids = NULL;
+static size_t g_poll_cap = 0;
+
 void festina_run_http_loop(void) {
     for (;;) {
-        int64_t live_conns = 0;
-        for (int64_t i = 0; i < g_conn_count; i++) if (g_conns[i].alive) live_conns++;
-        if (g_listener_count == 0 && live_conns == 0 && festina_next_timer_deadline() < 0.0) {
-            return; /* nothing left to wait for at all */
+        /* claude.md #155: over-allocate to the known upper bound
+         * (g_listener_count + g_conn_count, the connection table's own
+         * high-water mark -- includes any dead-but-not-yet-reused
+         * slots, so it's never an undercount) instead of first
+         * counting exactly how many connections are alive -- trades a
+         * small amount of possibly-wasted array size for skipping one
+         * whole linear pass over the connection table every tick. */
+        size_t max_nfds = (size_t)(g_listener_count + g_conn_count);
+        if (max_nfds > g_poll_cap) {
+            size_t new_cap = g_poll_cap ? g_poll_cap * 2 : 16;
+            while (new_cap < max_nfds) new_cap *= 2;
+            FestinaPollFd *grown_fds = realloc(g_poll_fds, new_cap * sizeof(FestinaPollFd));
+            if (!grown_fds) festina_fail("out of memory growing the http loop's poll set");
+            g_poll_fds = grown_fds;
+            int64_t *grown_ids = realloc(g_poll_conn_ids, new_cap * sizeof(int64_t));
+            if (!grown_ids) festina_fail("out of memory growing the http loop's poll set");
+            g_poll_conn_ids = grown_ids;
+            g_poll_cap = new_cap;
         }
 
-        size_t nfds = (size_t)(g_listener_count + live_conns);
-        FestinaPollFd *fds = malloc((nfds > 0 ? nfds : 1) * sizeof(FestinaPollFd));
-        if (!fds) festina_fail("out of memory building the http loop's poll set");
         size_t fdi = 0;
         for (int64_t i = 0; i < g_listener_count; i++) {
-            fds[fdi].fd = g_listeners[i].fd;
-            fds[fdi].events = POLLIN;
+            g_poll_fds[fdi].fd = g_listeners[i].fd;
+            g_poll_fds[fdi].events = POLLIN;
             fdi++;
         }
         /* index -> conn_id, so a poll-ready slot can be matched back to
          * its connection even if the table was compacted between here
          * and the dispatch below (it isn't, within one pass, but the
          * indirection costs nothing and stays correct either way). */
-        int64_t *fd_conn_ids = malloc((live_conns > 0 ? (size_t)live_conns : 1) * sizeof(int64_t));
-        if (!fd_conn_ids) festina_fail("out of memory building the http loop's poll set");
         for (int64_t i = 0; i < g_conn_count; i++) {
             if (!g_conns[i].alive) continue;
-            fds[fdi].fd = g_conns[i].fd;
-            fds[fdi].events = POLLIN;
-            fd_conn_ids[fdi - (size_t)g_listener_count] = g_conns[i].conn_id;
+            g_poll_fds[fdi].fd = g_conns[i].fd;
+            g_poll_fds[fdi].events = POLLIN;
+            g_poll_conn_ids[fdi - (size_t)g_listener_count] = g_conns[i].conn_id;
             fdi++;
+        }
+        size_t nfds = fdi;
+
+        if (nfds == 0 && festina_next_timer_deadline() < 0.0) {
+            return; /* nothing left to wait for at all */
         }
 
         double deadline = festina_next_timer_deadline();
@@ -1040,23 +1175,21 @@ void festina_run_http_loop(void) {
             timeout_ms = remaining > 0.0 ? (int)(remaining * 1000.0) + 1 : 0;
         }
 
-        int rc = festina_poll(fds, nfds, timeout_ms);
-        if (rc < 0 && !festina_socket_was_interrupted()) { free(fds); free(fd_conn_ids); return; }
+        int rc = festina_poll(g_poll_fds, nfds, timeout_ms);
+        if (rc < 0 && !festina_socket_was_interrupted()) return;
 
         if (rc > 0) {
             for (int64_t i = 0; i < g_listener_count; i++) {
-                if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
-                    festina_accept_new_connections(fds[i].fd, g_listeners[i].port);
+                if (g_poll_fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
+                    festina_accept_new_connections(g_poll_fds[i].fd, g_listeners[i].port);
                 }
             }
             for (size_t i = (size_t)g_listener_count; i < nfds; i++) {
-                if (!(fds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
-                FestinaConn *c = festina_conn_by_id(fd_conn_ids[i - (size_t)g_listener_count]);
+                if (!(g_poll_fds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+                FestinaConn *c = festina_conn_by_id(g_poll_conn_ids[i - (size_t)g_listener_count]);
                 if (c) festina_conn_readable(c);
             }
         }
-        free(fds);
-        free(fd_conn_ids);
 
         festina_fire_expired_timers();
     }
@@ -1102,13 +1235,19 @@ void festina_http_redirect(void *handle, const char *url) {
     FestinaConn *c = festina_conn_from_handle(handle);
     if (!c || c->responded) return;
     c->responded = 1;
-    const char *status_line = "HTTP/1.1 302 Found\r\n";
-    festina_send_all(c->fd, status_line, strlen(status_line));
-    char loc[1024];
-    int loc_len = snprintf(loc, sizeof(loc), "Location: %s\r\n", url ? url : "");
-    if (loc_len > 0) festina_send_all(c->fd, loc, (size_t)loc_len);
-    const char *tail = "Content-Length: 0\r\nConnection: close\r\n\r\n";
-    festina_send_all(c->fd, tail, strlen(tail));
+    /* claude.md #155: one buffer, one send() -- same reasoning as
+     * festina_http_send below. Appending `url` directly (rather than
+     * through a fixed-size snprintf stack buffer, the previous shape)
+     * also drops an incidental length cap this never needed to have --
+     * FestinaSendBuf grows to fit whatever's appended. */
+    char stack_storage[256];
+    FestinaSendBuf buf;
+    festina_sendbuf_init(&buf, stack_storage, sizeof(stack_storage));
+    FESTINA_APPEND_LIT(&buf, "HTTP/1.1 302 Found\r\nLocation: ");
+    if (url) festina_sendbuf_append(&buf, url, strlen(url));
+    FESTINA_APPEND_LIT(&buf, "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    festina_send_all(c->fd, buf.data, buf.len);
+    festina_sendbuf_free(&buf);
 }
 
 void festina_http_upgrade(void *handle) {
@@ -1175,18 +1314,26 @@ char *festina_http_to_text(void *handle) {
 
 /* festina_map_for_each's callback has no userdata slot -- fine here
  * since this whole runtime is single-threaded (see festina_runtime.h's
- * own top comment), so a single scratch global for "the fd the
- * headers currently being written belong to" is always unambiguous:
+ * own top comment), so a single scratch global for "the FestinaSendBuf
+ * extra headers are currently being appended to" is always unambiguous:
  * nothing else can run between festina_http_send setting it and the
- * forEach call finishing on the same thread. */
-static FestinaSocket g_http_send_extra_headers_fd = FESTINA_INVALID_SOCKET;
+ * forEach call finishing on the same thread. claude.md #155: this used
+ * to be the fd itself, with each header snprintf'd into its own stack
+ * buffer and sent immediately -- now it appends directly into the
+ * response's own FestinaSendBuf instead (name, ": ", value, "\r\n"
+ * appended as their own pieces, cheaper than routing every header
+ * through snprintf when the value is just a plain string), so the
+ * whole response -- including any extra headers -- goes out in ONE
+ * festina_send_all call. */
+static FestinaSendBuf *g_http_send_header_buf = NULL;
 
 static void festina_write_extra_header(int64_t value, const char *key) {
-    if (g_http_send_extra_headers_fd == FESTINA_INVALID_SOCKET) return;
+    if (!g_http_send_header_buf) return;
     const char *header_value = (const char *)(intptr_t)value;
-    char line[1024];
-    int n = snprintf(line, sizeof(line), "%s: %s\r\n", key, header_value ? header_value : "");
-    if (n > 0) festina_send_all(g_http_send_extra_headers_fd, line, (size_t)n);
+    festina_sendbuf_append(g_http_send_header_buf, key, strlen(key));
+    FESTINA_APPEND_LIT(g_http_send_header_buf, ": ");
+    if (header_value) festina_sendbuf_append(g_http_send_header_buf, header_value, strlen(header_value));
+    FESTINA_APPEND_LIT(g_http_send_header_buf, "\r\n");
 }
 
 void festina_http_send(void *handle, const void *data, int64_t len,
@@ -1194,23 +1341,39 @@ void festina_http_send(void *handle, const void *data, int64_t len,
     FestinaConn *c = festina_conn_from_handle(handle);
     if (!c || c->responded) return;
     c->responded = 1;
+
+    /* claude.md #155: one buffer, one send() for the whole status
+     * line + headers block -- see FestinaSendBuf's own comment for
+     * why (TCP_NODELAY means every separate send() used to be its own
+     * TCP segment, not just its own syscall). The body is sent as its
+     * own second call rather than copied in here -- see the same
+     * comment for why that copy isn't worth it. */
+    char stack_storage[512];
+    FestinaSendBuf buf;
+    festina_sendbuf_init(&buf, stack_storage, sizeof(stack_storage));
+
     char status_line[64];
     int sl_len = snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d Festina\r\n", (int)code);
-    festina_send_all(c->fd, status_line, (size_t)sl_len);
+    if (sl_len > 0) festina_sendbuf_append(&buf, status_line, (size_t)sl_len);
+
     if (extra_headers) {
         FestinaMapBlock *block = (FestinaMapBlock *)((char *)extra_headers - sizeof(int64_t));
-        g_http_send_extra_headers_fd = c->fd;
+        g_http_send_header_buf = &buf;
         festina_map_for_each(block->count, block->entries, festina_write_extra_header);
-        g_http_send_extra_headers_fd = FESTINA_INVALID_SOCKET;
+        g_http_send_header_buf = NULL;
     }
+
     char cl_line[64];
     int cl_len = snprintf(cl_line, sizeof(cl_line), "Content-Length: %lld\r\n",
                           (long long)(len < 0 ? 0 : len));
-    festina_send_all(c->fd, cl_line, (size_t)cl_len);
-    const char *conn_line = "Connection: close\r\n\r\n";
-    festina_send_all(c->fd, conn_line, strlen(conn_line));
+    if (cl_len > 0) festina_sendbuf_append(&buf, cl_line, (size_t)cl_len);
+    FESTINA_APPEND_LIT(&buf, "Connection: close\r\n\r\n");
+
+    festina_send_all(c->fd, buf.data, buf.len);
+    festina_sendbuf_free(&buf);
     if (len > 0 && data) festina_send_all(c->fd, data, (size_t)len);
 }
+#undef FESTINA_APPEND_LIT
 
 /* ---- s:socket ---- */
 

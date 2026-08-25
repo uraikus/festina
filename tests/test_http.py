@@ -294,6 +294,54 @@ class TestHttpServer:
         status, _, body = server.http_post("/", body=b"raw bytes here")
         assert body == b"raw bytes here"
 
+    def test_body_arriving_in_a_separate_write_after_headers(self, compile_and_run_server):
+        # claude.md #155: a request whose headers and body arrive in
+        # two SEPARATE socket writes (forced here with a real delay in
+        # between, so the server sees them as two distinct readable
+        # events, not one recv() that happened to return everything at
+        # once) used to re-run request-line/header parsing from
+        # scratch on the second event -- re-malloc'ing method/path over
+        # the first call's own pointers with nothing freeing them, and
+        # re-appending every header onto the still-populated header
+        # list. Confirmed as a real, definitely-lost leak under
+        # Valgrind during development (the duplicated header entries
+        # are invisible from here -- req.headers is a map, and a
+        # repeated key with an identical value dedups the same way it
+        # always does -- so this test's real job is exercising the
+        # split-arrival code path for correctness at all, structurally
+        # guaranteeing the leak can't recur: header parsing is now
+        # guarded to run at most once per connection). Uses a raw
+        # socket rather than http_post -- a normal client call has no
+        # way to force two separate TCP reads on the server side.
+        import socket as _socket
+        import time as _time
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) {
+            text body = req.toText()
+            req.send(`${req.method} ${req.headers['x-a']}/${req.headers['x-b']} [${body}]`)
+        }
+        """)
+        sock = _socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        head = ("POST / HTTP/1.1\r\nHost: x\r\nX-A: hello\r\nX-B: world\r\n"
+                "Content-Length: 10\r\n\r\n")
+        sock.sendall(head.encode())
+        _time.sleep(0.3)  # force a separate readable event before the body arrives
+        sock.sendall(b"0123456789")
+        # A single recv() isn't guaranteed to return the whole response
+        # in one call (a real, if rare, flake under load) -- read until
+        # the server closes the connection, which it always does after
+        # responding (no keep-alive -- api.md's own HTTP Limitations).
+        chunks = []
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        sock.close()
+        response = b"".join(chunks)
+        assert response.endswith(b"POST hello/world [0123456789]")
+
     def test_no_body_request_gives_empty_text(self, compile_and_run_server):
         server = compile_and_run_server("""
         openPort(__PORT__)

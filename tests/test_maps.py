@@ -252,3 +252,54 @@ class TestMapForEach:
         program = parser.parse(source)
         with pytest.raises(errors.CompileError):
             semantic.analyze(program)
+
+
+class TestAmorPrefix:
+    """claude.md #156: `amor map[T]` / `amor arr[T]` -- an "amortized"
+    growth modifier, composing with `const` the same way (`const amor
+    map[text] m`). Parser/semantic-level coverage only -- see
+    tests/test_codegen.py::TestAmorMap for real compile-and-run
+    coverage of amor map[T]'s own observable behavior."""
+
+    def test_amor_map_parses_as_a_var_decl(self, parser):
+        parser.parse("amor map[int] scores = {}")
+
+    def test_amor_arr_parses_as_a_var_decl(self, parser):
+        parser.parse("amor arr[int] xs = []")
+
+    def test_const_amor_map_parses(self, parser):
+        parser.parse("const amor map[text] m = {'x': 'y'}")
+
+    def test_amor_map_resolves_to_an_amortized_maptype(self, parser, semantic, types_mod):
+        program = parser.parse("amor map[int] m = {'a': 1}")
+        decl = program.body[0]
+        resolved = semantic.resolve_type_name(decl.type_expr, {}, {})
+        assert resolved == types_mod.MapType(types_mod.PrimitiveType("int"), amortized=True)
+        assert resolved != types_mod.MapType(types_mod.PrimitiveType("int"))
+
+    def test_amor_must_be_followed_by_arr_or_map(self, parser):
+        with pytest.raises(Exception):
+            parser.parse("amor int x = 1")
+
+    def test_amor_map_without_an_initializer_is_a_compile_error(self, parser, semantic, errors):
+        # claude.md #156: unlike plain map[T] (which starts "empty" via
+        # a real immortal static header -- see codegen.py's
+        # _global_var_defs), amor map[T] never got that treatment (a
+        # deliberate scope boundary: it always heap-allocates through
+        # the same generic path blob/img/aud/etc. use, which needs a
+        # real value to store) -- requiring an initializer here is
+        # what keeps that boundary from being reachable as an
+        # uninitialized-pointer bug instead of a clear compile error.
+        program = parser.parse("amor map[int] m")
+        with pytest.raises(errors.CompileError, match="requires an initializer"):
+            semantic.analyze(program)
+
+    def test_amor_map_literal_rejects_a_mismatched_value_type(self, parser, semantic, errors):
+        program = parser.parse("amor map[int] m = {'a': 1, 'b': 'two'}")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_amor_map_literal_with_a_variable_key_parses(self, parser, semantic):
+        source = "text npc2Id = 'npc2'\namor map[int] m = {'npc1': 10, npc2Id: 15}"
+        program = parser.parse(source)
+        semantic.analyze(program)
