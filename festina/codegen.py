@@ -370,10 +370,22 @@ def _is_refcounted(t):
     `text` is deliberately NOT here. A text is managed but not
     refcounted: it is copied on alias (festina_text_own) and freed
     outright, so it needs its own branch wherever ownership is decided
-    -- see claude.md #83."""
+    -- see claude.md #83.
+
+    claude.md #151: http and socket joined the family too, for the
+    same reason img/aud did -- each request/socket handle
+    festina_runtime_http.c hands out carries the identical i64 header
+    (festina_handle_new), so retain/reassignment/`free`/scope-exit
+    release all just work unchanged. Unlike img/aud, releasing one of
+    these never frees anything about the underlying CONNECTION (owned
+    separately by the connection table, see festina_runtime.h) -- only
+    the tiny handle itself, dispatched through
+    festina_release_conn_handle (_release_fn_for), shared by both
+    types since neither has more than the one shape."""
     return (isinstance(t, (types_mod.StructType, types_mod.ArrayType,
                            types_mod.MapType, types_mod.ImageType,
-                           types_mod.AudioType, types_mod.RegexType))
+                           types_mod.AudioType, types_mod.RegexType,
+                           types_mod.HttpType, types_mod.SocketType))
             or t == BLOB)
 
 FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
@@ -529,6 +541,11 @@ def _llvm_type(t):
     if isinstance(t, types_mod.RegexType):
         # claude.md #67: a compiled regex_t*, opaque to codegen -- see
         # _emit_regex_call.
+        return "ptr"
+    if isinstance(t, (types_mod.HttpType, types_mod.SocketType)):
+        # claude.md #151: a tiny {refcount, conn_id} handle, opaque to
+        # codegen -- see festina_runtime.h's own doc comment for the
+        # full representation.
         return "ptr"
     if isinstance(t, types_mod.ColorType):
         # claude.md #91: a packed 0xRRGGBB integer (negative for 'none')
@@ -721,6 +738,23 @@ class CodeGen:
                                                 # needs_audio already do for that target (WASI has
                                                 # no process model to spawn into at all -- see
                                                 # wasm.md's Limitations section)
+        self.uses_http = False                 # claude.md #151: openPort()/closePort()/any
+                                                # http-or-socket-typed value anywhere (including
+                                                # an `on request`/`on upgrade`/`on message`/
+                                                # `on socketClose` handler even with no direct
+                                                # openPort() call in sight) -- both a linking
+                                                # signal (festina_runtime_http.c) and a real
+                                                # main()/loop-selection branch, same dual role
+                                                # uses_graphics/uses_timers already have. Also
+                                                # used by cli.py to reject a wasm32-wasi build
+                                                # outright (WASI has no listening-socket support)
+                                                # and to gate macOS/Windows the same
+                                                # "exists, unverified/unbuilt" way audio/graphics
+                                                # already do -- see _check_platform_feature_supported.
+        self.http_request_handler_symbol = None
+        self.http_upgrade_handler_symbol = None
+        self.http_message_handler_symbol = None
+        self.http_socketclose_handler_symbol = None
 
         # claude.md #102: a table column of type aud/img makes the
         # program use that feature, whether or not it ever names a
@@ -1093,6 +1127,39 @@ class CodeGen:
             "declare ptr @festina_text_char_at(ptr, i64)",
             "declare ptr @festina_argv_array(i32, ptr)",
             "declare i64 @festina_process_exec(ptr)",
+            "declare i64 @strlen(ptr)",
+            # claude.md #151: openPort/on request/on upgrade/on message/
+            # on socketClose -- see festina_runtime.h's own extensive
+            # doc comment right above these declarations for the whole
+            # design (single-threaded event loop, the handle
+            # representation, http/1.1 and WebSocket scope).
+            "declare void @festina_open_port(i64)",
+            "declare void @festina_close_port(i64)",
+            "declare void @festina_register_request_handler(ptr)",
+            "declare void @festina_register_upgrade_handler(ptr)",
+            "declare void @festina_register_message_handler(ptr)",
+            "declare void @festina_register_socketclose_handler(ptr)",
+            "declare void @festina_run_http_loop()",
+            "declare i64 @festina_http_port(ptr)",
+            "declare ptr @festina_http_method(ptr)",
+            "declare ptr @festina_http_path(ptr)",
+            "declare ptr @festina_http_headers(ptr)",
+            "declare void @festina_http_ok(ptr)",
+            "declare void @festina_http_redirect(ptr, ptr)",
+            "declare void @festina_http_upgrade(ptr)",
+            "declare ptr @festina_http_to_blob(ptr)",
+            "declare ptr @festina_http_to_img(ptr)",
+            "declare ptr @festina_http_to_aud(ptr)",
+            "declare ptr @festina_http_to_text(ptr)",
+            "declare void @festina_http_send(ptr, ptr, i64, i64, ptr)",
+            # festina_blob_bytes is already declared above (blob's own
+            # sqlite-column binding uses it too) -- reused as-is by
+            # _emit_sendable_body, not redeclared here.
+            "declare ptr @festina_socket_state(ptr)",
+            "declare void @festina_socket_send_text(ptr, ptr)",
+            "declare void @festina_socket_send_binary(ptr, ptr, i64)",
+            "declare void @festina_socket_close(ptr)",
+            "declare void @festina_release_conn_handle(ptr)",
             # claude.md #70: DatabaseURL -- path is festina.sqlite's
             # location, NULL/empty meaning "use the default" (a plain
             # string constant already covers the no-directive case, so
@@ -1977,6 +2044,25 @@ class CodeGen:
             # not set self.uses_graphics or join event_handlers (whose
             # own registration loop is graphics-gated).
             self.exit_handler_symbol = symbol
+        elif decl.name in ("request", "upgrade", "message", "socketClose"):
+            # claude.md #151: NOT graphics events either -- same
+            # unconditional-registration shape as `exit` just above,
+            # for the same reason (an http/websocket connection has
+            # nothing to do with a window). Declaring one of these
+            # without ever calling openPort() anywhere is legal (the
+            # handler just never fires, nothing ever accepts a
+            # connection), but still sets uses_http so the runtime
+            # translation unit these symbols reference is always
+            # linked in wherever any of the four is declared.
+            self.uses_http = True
+            if decl.name == "request":
+                self.http_request_handler_symbol = symbol
+            elif decl.name == "upgrade":
+                self.http_upgrade_handler_symbol = symbol
+            elif decl.name == "message":
+                self.http_message_handler_symbol = symbol
+            else:
+                self.http_socketclose_handler_symbol = symbol
 
     # ---- statements ----
     def _emit_free(self, stmt, env, lines):
@@ -3147,6 +3233,16 @@ class CodeGen:
                 # which would run any side effects in it twice.
                 ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
                 return self._load_field_value(ptr, ftype, lines)
+            if not expr.computed and expr.prop in ("port", "method", "path", "headers", "state"):
+                obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+                result = self._emit_http_socket_field(expr, obj_val, obj_type, lines)
+                if result is not None:
+                    return result
+                # A struct/table field genuinely named one of these is
+                # perfectly legal (mirroring img.width/.height's own
+                # fallthrough just above) -- resolves the ordinary way.
+                ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
+                return self._load_field_value(ptr, ftype, lines)
             if not expr.computed and expr.prop == "length":
                 # claude.md #79: an arr[T] value is a `ptr` to its own
                 # {i64, ptr} storage now, so .length is a GEP+load of
@@ -3393,6 +3489,40 @@ class CodeGen:
         else:
             raise CodegenError(f"cannot interpolate a value of type {types_mod.type_name(type_)}")
         return out
+
+    def _emit_sendable_body(self, val, vtype, lines):
+        """claude.md #151: http.send()/socket.send()'s `data:any`
+        argument -- reuses _to_text for every type it already gives a
+        text form to (see semantic.py's _is_sendable_type, the
+        identical set), EXCEPT blob, sent as its own raw bytes rather
+        than decoded through toText() (a response/frame body is much
+        more likely to be genuinely binary than a log() argument
+        ever is).
+
+        Returns (data_ptr, len_val, temp_to_free): `data_ptr`/`len_val`
+        are the raw bytes to send. `temp_to_free` is a freshly
+        allocated scratch buffer THIS conversion made (free it via a
+        plain @free only AFTER actually using data_ptr/len_val, e.g.
+        after the send call itself) -- None when data_ptr aliases
+        something the caller already owns some other way (`val`
+        itself, when vtype is already TEXT and _to_text is a no-op
+        passthrough; the blob's own internal storage, borrowed rather
+        than copied). `val`/`vtype`'s own ownership is always the
+        caller's separate responsibility, exactly like any other
+        consumed argument (see exec()'s own argument-cleanup
+        pattern) -- this never touches it."""
+        if vtype == BLOB:
+            len_ptr = self.tmp()
+            lines.append(f"  {len_ptr} = alloca i64")
+            data = self.tmp()
+            lines.append(f"  {data} = call ptr @festina_blob_bytes(ptr {val}, ptr {len_ptr})")
+            len_val = self.tmp()
+            lines.append(f"  {len_val} = load i64, ptr {len_ptr}")
+            return data, len_val, None
+        text_val = self._to_text(val, vtype, lines)
+        len_val = self.tmp()
+        lines.append(f"  {len_val} = call i64 @strlen(ptr {text_val})")
+        return text_val, len_val, (text_val if vtype != TEXT else None)
 
     def _json_append_slot(self, body, sb, ftype, slot_ptr, depth_val):
         """claude.md #114: appends ONE value (stored at `slot_ptr`, of
@@ -4304,6 +4434,85 @@ class CodeGen:
         lines.append(f"  {out} = call ptr @festina_getenv(ptr {key_val})")
         return out, TEXT
 
+    def _emit_http_socket_field(self, expr, obj_val, obj_type, lines):
+        """claude.md #151: req.port/.method/.path/.headers, s.state --
+        factored out of _emit_expr's own Member dispatch (which calls
+        this after emitting expr.obj itself) specifically so
+        _emit_member_load below can ALSO reach it: a real bug caught
+        by testing `s.state[k] = v` -- _emit_assign resolves the
+        ASSIGNMENT TARGET's own object half (s.state) by calling
+        _emit_member_load directly, bypassing _emit_expr's dispatch
+        (and therefore these branches) entirely, so without this
+        shared helper `s.state[...] = ...` failed with "cannot access
+        field 'state' on socket" even though semantic analysis (and a
+        plain, non-computed `log(s.state)`) both already worked fine.
+
+        `obj_val`/`obj_type` are the ALREADY-EMITTED receiver -- never
+        re-emits expr.obj, so this is safe to call from either site
+        without re-running its side effects. Returns (out, type_) if
+        `expr` matched one of these fields, or None if the caller
+        should fall through to its own ordinary field-access handling
+        (a struct/table field genuinely named one of these names --
+        see semantic.py's own identical fallthrough)."""
+        if expr.computed:
+            return None
+        if isinstance(obj_type, types_mod.HttpType) and expr.prop in ("port", "method", "path", "headers"):
+            # claude.md #151: a runtime call, same reasoning as
+            # img.width/.height (the real values live behind the
+            # handle, in festina_runtime_http.c's own connection
+            # table, not in any field this compiler could lay out
+            # itself).
+            self.uses_http = True
+            out = self.tmp()
+            if expr.prop == "port":
+                lines.append(f"  {out} = call i64 @festina_http_port(ptr {obj_val})")
+                result_type = INT
+            elif expr.prop == "method":
+                lines.append(f"  {out} = call ptr @festina_http_method(ptr {obj_val})")
+                result_type = TEXT
+            elif expr.prop == "path":
+                lines.append(f"  {out} = call ptr @festina_http_path(ptr {obj_val})")
+                result_type = TEXT
+            else:
+                lines.append(f"  {out} = call ptr @festina_http_headers(ptr {obj_val})")
+                result_type = types_mod.MapType(TEXT)
+            self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
+            # claude.md #151: a plain non-computed Member's DEFAULT
+            # treatment (_is_owning_refcounted_source /
+            # _is_owning_text_source) is "aliasing, not owning" --
+            # correct for an ordinary struct field, wrong here:
+            # festina_http_method/_path/_headers each return a
+            # genuinely FRESH value (an owned text copy, or a
+            # brand-new map[text]) with no other reference anywhere.
+            # Marking this node in _minted_values is what tells both
+            # of those ownership checks the truth -- the exact same
+            # mechanism text[i] (claude.md #150) already established
+            # for this identical problem. Skipping this for a text
+            # result would silently double-copy it; skipping it for
+            # the map result would leak one reference every time
+            # .headers is read and its binding later goes out of
+            # scope (an extra, never-undone retain codegen would
+            # otherwise add on top of this already-fresh value).
+            self._minted_values.add(id(expr))
+            return out, result_type
+        if isinstance(obj_type, types_mod.SocketType) and expr.prop == "state":
+            # claude.md #151: s.state -- the SAME live map every call
+            # for this connection (see festina_socket_state's own doc
+            # comment in festina_runtime.h), already retained ONE
+            # extra time on the way out specifically so this call
+            # site's own result reads as fresh/owning -- same
+            # _minted_values reasoning as .headers just above,
+            # required for the identical reason (skipping it would
+            # leak one reference per read whose binding later goes
+            # out of scope).
+            self.uses_http = True
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_socket_state(ptr {obj_val})")
+            self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
+            self._minted_values.add(id(expr))
+            return out, types_mod.MapType(TEXT)
+        return None
+
     def _emit_member_load(self, expr, env, lines):
         """claude.md #102 released the receiver of a ONE-step field read
         off a call result (`make().n`). claude.md #108 extends that to a
@@ -4328,14 +4537,35 @@ class CodeGen:
         by "a chain is in flight". A member load reached while emitting
         a call ARGUMENT (`make(other.field).inner.n`) is not part of
         this chain, and treating it as one would silently move its own
-        release to a point that may never come."""
+        release to a point that may never come.
+
+        claude.md #151: req.port/.method/.path/.headers/s.state are
+        checked here too (via _emit_http_socket_field), not just in
+        _emit_expr's own Member dispatch -- a real bug caught by
+        testing `s.state[k] = v`: _emit_assign resolves an assignment
+        TARGET's own object half by calling this function directly,
+        bypassing _emit_expr's dispatch (and its own copy of this
+        same check) entirely. Neither type has a further chainable
+        field off one of these results, so a match here short-
+        circuits before this function's own chain-release bookkeeping
+        ever runs -- _emit_http_socket_field already released its
+        receiver itself; letting the logic below ALSO decide what to
+        do with `expr.obj`/`obj_val` would double-handle it."""
         state = self._begin_member_chain(expr)
+        handled = None
         try:
             obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
-            ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
-            out, ftype = self._load_field_value(ptr, ftype, lines)
+            if not expr.computed:
+                handled = self._emit_http_socket_field(expr, obj_val, obj_type, lines)
+            if handled is not None:
+                out, ftype = handled
+            else:
+                ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
+                out, ftype = self._load_field_value(ptr, ftype, lines)
         finally:
             pending = self._end_member_chain(state)
+        if handled is not None:
+            return out, ftype
         if pending is None:
             # An inner link. Park the receiver -- whether it is
             # releasable depends on a type this frame cannot see yet.
@@ -4823,6 +5053,24 @@ class CodeGen:
             return expr.op == "+"
         if isinstance(expr, (ast.Call, ast.TemplateLit)):
             return True
+        # claude.md #151: a direct _minted_values check, mirroring
+        # _is_owning_refcounted_source's own top-level check just
+        # above it in this file -- needed for a NON-computed Member
+        # whose own emission (not a chain walk) already guarantees a
+        # fresh buffer, e.g. req.method/req.path (festina_http_method/
+        # _path always return an owned copy). _member_chain_call_base
+        # just below only ever consults _minted_values for a COMPUTED
+        # member (or one reached by walking past non-computed dots to
+        # find one) -- text[i]'s own marking (claude.md #150) happens
+        # to be computed already, so it worked without this; a plain
+        # `.prop` access never reaches that check at all without this
+        # direct one first. Safe to add unconditionally: every node
+        # this set has ever held was deliberately marked BECAUSE its
+        # own emission is already known-fresh, so this can only ever
+        # confirm what's already true, never manufacture a wrong
+        # answer for a node nothing marked.
+        if id(expr) in self._minted_values:
+            return True
         # claude.md #117: a call-based chain ending in a text field
         # (`make().inner.label`) hands back a COPY -- _emit_member_load
         # runs it through festina_text_own before releasing the graph it
@@ -5071,6 +5319,15 @@ class CodeGen:
             # claude.md #118: regfree on the last reference; a cached
             # /pattern/ literal is immortal and no-ops through here.
             return "@festina_regex_free"
+        if isinstance(type_, (types_mod.HttpType, types_mod.SocketType)):
+            # claude.md #151: one shared release function for both --
+            # neither carries anything of its own to free beyond the
+            # tiny handle itself (the underlying connection is owned
+            # separately by festina_runtime_http.c's own connection
+            # table, torn down independently of any handle's
+            # lifetime -- see festina_runtime.h's doc comment).
+            self.uses_http = True
+            return "@festina_release_conn_handle"
         if type_ == TEXT:
             # claude.md #83: text has no refcount header to dispatch
             # through -- "releasing" one is always just a plain,
@@ -6476,6 +6733,15 @@ class CodeGen:
                 else:
                     self._free_text_temp(arg_expr, val, vtype, lines)
                 return out, INT
+            if name in ("openPort", "closePort"):
+                # claude.md #151: both take a single plain int -- no
+                # refcounted/text argument-cleanup story at all, unlike
+                # exec() just above.
+                self.uses_http = True
+                val, _ = self._emit_expr(expr.args[0], env, lines)
+                fn = "festina_open_port" if name == "openPort" else "festina_close_port"
+                lines.append(f"  call void @{fn}(i64 {val})")
+                return "0", None
             # claude.md #95/#135: writes the OFFSCREEN canvas, so it
             # needs no window either way -- this is the headless case
             # the render() split exists for. saveCanvas() with no path
@@ -7002,6 +7268,112 @@ class CodeGen:
                     # scalars, so nothing here points into the handle.
                     self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                     return out, ret_type
+            # claude.md #151: http's fixed-shape methods (everything
+            # except send(), which needs the bespoke any-typed/
+            # optional-argument handling just below).
+            if callee.prop in ("ok", "redirect", "upgrade", "toBlob", "toImg", "toAud", "toText"):
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.HttpType):
+                    self.uses_http = True
+                    if callee.prop == "ok":
+                        lines.append(f"  call void @festina_http_ok(ptr {obj_val})")
+                        self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                        return "0", None
+                    if callee.prop == "redirect":
+                        url_val, url_type = self._emit_expr(expr.args[0], env, lines)
+                        lines.append(f"  call void @festina_http_redirect(ptr {obj_val}, ptr {url_val})")
+                        self._free_text_temp(expr.args[0], url_val, url_type, lines)
+                        self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                        return "0", None
+                    if callee.prop == "upgrade":
+                        lines.append(f"  call void @festina_http_upgrade(ptr {obj_val})")
+                        self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                        return "0", None
+                    fn, ret_ir, ret_type = {
+                        "toBlob": ("festina_http_to_blob", "ptr", BLOB),
+                        "toImg": ("festina_http_to_img", "ptr", types_mod.ImageType()),
+                        "toAud": ("festina_http_to_aud", "ptr", types_mod.AudioType()),
+                        "toText": ("festina_http_to_text", "ptr", TEXT),
+                    }[callee.prop]
+                    if callee.prop == "toImg":
+                        self.uses_graphics_code = True
+                    if callee.prop == "toAud":
+                        self.uses_audio = True
+                    out = self.tmp()
+                    lines.append(f"  {out} = call {ret_ir} @{fn}(ptr {obj_val})")
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                    return out, ret_type
+            # claude.md #151: req.send(data:any, code:int, headers:map)
+            # -- see semantic.py's own bespoke `send` branch for why
+            # this can't be a fixed-shape dict entry like the ones just
+            # above (an optional code/headers pair, and an any-typed
+            # first argument).
+            if callee.prop == "send":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.HttpType):
+                    self.uses_http = True
+                    data_val, data_type = self._emit_expr(expr.args[0], env, lines)
+                    data_ptr, len_val, temp = self._emit_sendable_body(data_val, data_type, lines)
+                    if len(expr.args) >= 2:
+                        code_val, _ = self._emit_expr(expr.args[1], env, lines)
+                    else:
+                        code_val = "200"
+                    headers_val = "null"
+                    headers_expr = expr.args[2] if len(expr.args) == 3 else None
+                    headers_type = None
+                    if headers_expr is not None:
+                        headers_val, headers_type = self._emit_expr(headers_expr, env, lines)
+                    lines.append(
+                        f"  call void @festina_http_send(ptr {obj_val}, ptr {data_ptr}, "
+                        f"i64 {len_val}, i64 {code_val}, ptr {headers_val})")
+                    if temp is not None:
+                        lines.append(f"  call void @free(ptr {temp})")
+                    if _is_refcounted(data_type) and self._is_owning_refcounted_source(expr.args[0]):
+                        lines.append(f"  call void {self._release_fn_for(data_type)}(ptr {data_val})")
+                    else:
+                        self._free_text_temp(expr.args[0], data_val, data_type, lines)
+                    if headers_expr is not None:
+                        if _is_refcounted(headers_type) and self._is_owning_refcounted_source(headers_expr):
+                            lines.append(f"  call void {self._release_fn_for(headers_type)}(ptr {headers_val})")
+                        else:
+                            self._free_text_temp(headers_expr, headers_val, headers_type, lines)
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                    return "0", None
+                if isinstance(obj_type, types_mod.SocketType):
+                    # claude.md #151: blob sends as a binary frame,
+                    # everything else as a text frame -- _to_text
+                    # (inside _emit_sendable_body) already gives every
+                    # non-blob sendable type a text form.
+                    self.uses_http = True
+                    data_val, data_type = self._emit_expr(expr.args[0], env, lines)
+                    if data_type == BLOB:
+                        len_ptr = self.tmp()
+                        lines.append(f"  {len_ptr} = alloca i64")
+                        data_ptr = self.tmp()
+                        lines.append(f"  {data_ptr} = call ptr @festina_blob_bytes(ptr {data_val}, ptr {len_ptr})")
+                        len_val = self.tmp()
+                        lines.append(f"  {len_val} = load i64, ptr {len_ptr}")
+                        lines.append(
+                            f"  call void @festina_socket_send_binary(ptr {obj_val}, "
+                            f"ptr {data_ptr}, i64 {len_val})")
+                    else:
+                        text_val = self._to_text(data_val, data_type, lines)
+                        lines.append(f"  call void @festina_socket_send_text(ptr {obj_val}, ptr {text_val})")
+                        if data_type != TEXT:
+                            lines.append(f"  call void @free(ptr {text_val})")
+                    if _is_refcounted(data_type) and self._is_owning_refcounted_source(expr.args[0]):
+                        lines.append(f"  call void {self._release_fn_for(data_type)}(ptr {data_val})")
+                    else:
+                        self._free_text_temp(expr.args[0], data_val, data_type, lines)
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                    return "0", None
+            if callee.prop == "close":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.SocketType):
+                    self.uses_http = True
+                    lines.append(f"  call void @festina_socket_close(ptr {obj_val})")
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                    return "0", None
             # claude.md #109: aud.stop() is back, clip-wide -- see the
             # runtime's own note on why #100 removed it and why that
             # reasoning did not survive play() returning a channel.
@@ -7772,6 +8144,22 @@ class CodeGen:
         # before a window would otherwise be set up.
         if self.exit_handler_symbol is not None:
             main_lines.append(f"  call void @festina_register_exit_handler(ptr {self.exit_handler_symbol})")
+        # claude.md #151: `on request`/`on upgrade`/`on message`/
+        # `on socketClose` -- NOT graphics events either, same
+        # unconditional-registration shape as `exit` just above (an
+        # http/websocket connection has nothing to do with a window).
+        if self.http_request_handler_symbol is not None:
+            main_lines.append(
+                f"  call void @festina_register_request_handler(ptr {self.http_request_handler_symbol})")
+        if self.http_upgrade_handler_symbol is not None:
+            main_lines.append(
+                f"  call void @festina_register_upgrade_handler(ptr {self.http_upgrade_handler_symbol})")
+        if self.http_message_handler_symbol is not None:
+            main_lines.append(
+                f"  call void @festina_register_message_handler(ptr {self.http_message_handler_symbol})")
+        if self.http_socketclose_handler_symbol is not None:
+            main_lines.append(
+                f"  call void @festina_register_socketclose_handler(ptr {self.http_socketclose_handler_symbol})")
         # self.uses_sqlite/self.uses_graphics are only reliably set by
         # this point because every function body (self.func_defs) and
         # every entry statement (the loop above) has already been
@@ -7844,6 +8232,23 @@ class CodeGen:
             # for a program that actually opens a window; see cli.py's
             # per-feature object file selection.
             main_lines.append("  call void @festina_run_event_loop()")
+        elif self.uses_http:
+            # claude.md #151: openPort() was called somewhere (or an
+            # http/websocket handler was declared) -- festina_run_http_loop
+            # is the single-threaded poll()-based loop that services
+            # connections AND fires any pending setTimeout/setInterval
+            # callbacks (see its own doc comment in festina_runtime.h),
+            # so this branch fully subsumes what festina_run_timer_loop
+            # below does whenever both are in play -- checked first,
+            # not `elif self.uses_http and not self.uses_timers`, since
+            # a timers-only program still needs SOME loop when http is
+            # also present and http's own loop already covers it.
+            # graphics+http together is rejected at compile time (see
+            # cli.py's _check_platform_feature_supported/needs_http --
+            # this single-threaded server was never meant to also drive
+            # an X11 event loop), so this is never reached at the same
+            # time uses_graphics is true.
+            main_lines.append("  call void @festina_run_http_loop()")
         elif self.uses_timers:
             # No window, but setTimeout/setInterval callbacks still need
             # a blocking loop to fire in -- festina_run_timer_loop is the

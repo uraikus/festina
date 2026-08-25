@@ -58,6 +58,32 @@ class AudioType:
 
 
 @dataclass(frozen=True)
+class HttpType:
+    """claude.md #151: an incoming HTTP request, handed to `on
+    request(req:http)`. Like RegexType/AudioType/ImageType there is
+    only one shape of this type -- the request's own method/headers/
+    body all live in the runtime value (a small refcounted handle
+    wrapping a connection id, see festina_runtime_http.c), never the
+    static type."""
+
+    def __repr__(self):
+        return "HttpType()"
+
+
+@dataclass(frozen=True)
+class SocketType:
+    """claude.md #151: an upgraded WebSocket connection, handed to `on
+    upgrade(s:socket)`/`on message(s:socket, msg:blob)`/`on
+    socketClose(s:socket)`. Same one-shape-only reasoning as HttpType
+    -- the connection this wraps is looked up by id at every runtime
+    call, never held as a live pointer past a single call (see
+    festina_runtime_http.c's own doc comment on why)."""
+
+    def __repr__(self):
+        return "SocketType()"
+
+
+@dataclass(frozen=True)
 class RegexType:
     """claude.md #67 -- a regex value's pattern/flags live in the
     runtime pointer value (see festina_regex_compile), never the static
@@ -169,6 +195,10 @@ def type_name(t):
         return "aud"
     if isinstance(t, RegexType):
         return "regex"
+    if isinstance(t, HttpType):
+        return "http"
+    if isinstance(t, SocketType):
+        return "socket"
     if isinstance(t, ColorType):
         return "color"
     if isinstance(t, FontType):

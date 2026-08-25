@@ -30,11 +30,58 @@ A Festina program's external interfaces are exactly:
 - **The local X server and ALSA device**, only for programs that
   actually use graphics or audio — and only those programs link the
   libraries at all (see *Slim binaries* below).
+- **The network**, for a program that calls `openPort()` (claude.md
+  #151) — the one genuinely new external interface this language has,
+  and the first that lets *remote, untrusted* input reach a compiled
+  program at all (`environment`/the filesystem above are both local-
+  attacker-only). A program that never calls `openPort()` gets none of
+  this: `festina_runtime_http.c` (the HTTP/WebSocket implementation)
+  is linked only when it's actually used, the same per-feature
+  splitting graphics/audio already get (see *Slim binaries* below).
 
-There is **no networking**. Until HTTP support exists (see
-[todo.md](todo.md)), no Festina program can be reached by, or reach,
-remote input. That single fact narrows most of what "attack surface"
-means here.
+This is a real, structural change from every other builtin: `req.path`/
+`req.method`/`req.headers`/a WebSocket frame's own payload are the
+*first* values in this language that originate entirely from an
+untrusted, remote party by design, not merely something a local user
+could feed a program that also happens to read stdin/argv. Concretely:
+
+- **No TLS.** `openPort()` is plain HTTP/WebSocket, no certificate, no
+  encryption — traffic is inspectable and modifiable by anything on the
+  network path. A program handling anything sensitive needs a TLS-
+  terminating reverse proxy in front of it; this is not, and does not
+  claim to be, a hardened public-facing server on its own.
+  `req.headers`/`req.toText()`/etc. are exactly as trustworthy as
+  whatever sent them — this language does no authentication, does no
+  input validation of its own, and never will (that's the PROGRAM'S
+  job, using the ordinary building blocks — `regex`, `.replace()`,
+  string comparison — every other kind of untrusted text already has).
+- **Single-threaded, one request at a time** (see
+  [api.md](api.md#http-and-websocket-servers)) — a slow or hung `on
+  request`/`on message` handler denies service to every OTHER
+  connection for as long as it runs. This is a real, structural
+  availability property of the design (not a bug to be fixed later),
+  and matters most for a program whose handler does slow work
+  (a large `sqlite()` query, a big JSON render) in the request path.
+- **An 8MB per-connection buffer cap** (request line + headers + body,
+  or one WebSocket frame's payload) bounds a single connection's own
+  memory use, but this runtime does not limit the NUMBER of concurrent
+  connections at all — many simultaneous connections, each near the
+  cap, could still exhaust memory. No rate limiting of any kind exists;
+  a program facing genuinely hostile traffic needs that in front of it
+  (a reverse proxy, a firewall), the same way any other minimal server
+  implementation would.
+- **The request parser (HTTP/1.1 headers, WebSocket frames) is new,
+  hand-written C parsing untrusted bytes** — the single largest new
+  category of memory-unsafety risk this language has ever taken on,
+  audited and stress-tested (ASan + LeakSanitizer, including abrupt-
+  disconnect and malformed-input cases) but, unlike SQLite/Cairo/
+  libjpeg/libmpg123 elsewhere in this runtime, not a widely-deployed,
+  independently-hardened third-party implementation. Treat it with the
+  same caution any new, from-scratch network-facing parser deserves.
+
+Every other builtin's own external interface (filesystem,
+`environment`, X11/ALSA) is unchanged: still local-attacker-only, still
+covered by everything below.
 
 ## Standing properties
 
@@ -107,7 +154,8 @@ corruption**:
 ## Slim binaries
 
 A compiled program links only what it uses. The runtime is split into
-core / graphics (Cairo, X11, libjpeg) / audio (ALSA, libmpg123)
+core / graphics (Cairo, X11, libjpeg) / audio (ALSA, libmpg123) / http
+(claude.md #151 — plain POSIX sockets, no third-party library at all)
 translation units, and the compiler puts a feature's object file and
 libraries on the link line only when the program actually exercises it —
 a `log('hello')` program links none of them. Fewer resident libraries is
@@ -141,3 +189,17 @@ in claude.md and tests/CONTRACT.md:
 - **A transient X connection failure killed graphics programs**:
   `XOpenDisplay` is now retried (10 × 100ms) so a busy machine's
   refused connection is not misreported as a missing display.
+- **A remote client could silently kill any `openPort()` program**
+  (claude.md #151): `send()`/`write()` on a connection the peer has
+  already reset or closed early raises `SIGPIPE`, whose default
+  disposition terminates the *whole process* with no error message at
+  all — trivially triggerable by any client that opens a connection
+  and disconnects mid-response, and indistinguishable from a plain
+  hang until traced. This is the most severe class of finding this
+  runtime has (a genuinely remote, unauthenticated denial of service,
+  one line of client behavior away), caught by an actual multi-request
+  stress test rather than reasoned about in advance. Fixed with
+  `signal(SIGPIPE, SIG_IGN)` at `openPort()`'s own entry point — every
+  write already checks its own return value the POSIX way (`-1`,
+  `errno == EPIPE`) wherever it matters, so the signal itself was pure
+  noise once ignored, not something needing a handler.

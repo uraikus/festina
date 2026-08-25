@@ -25,6 +25,15 @@ current as a reference -- not a live tracker of unstarted work. See
 how each phase was built, including the twelve-round Phase 0 bug hunt
 the "Bugs found along the way" section below summarizes.
 
+Unlike audio/graphics above, a later feature -- `openPort()`/`on
+request`/`on upgrade`/`on message`/`on socketClose` (claude.md #151) --
+is NOT gated pending hardware verification: there is genuinely no
+Windows backend for it at all (the implementation is plain POSIX
+sockets; a real port would need winsock2, a separate phase never
+attempted here), so it's a hard compile-time rejection with no
+override. See [api.md](api.md#http-and-websocket-servers) for the
+feature itself.
+
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,
 windowing), cut once and filled in twice. What Windows added that

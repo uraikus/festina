@@ -228,6 +228,9 @@ fail at compile time, before any of the real work
   kind.
 - **`exec()`** (claude.md #150) — WASI has no process model to spawn
   into at all: no fork/exec/spawn of any kind.
+- **`openPort()`/`on request`/`on upgrade`/`on message`/`on
+  socketClose`** (claude.md #151) — WASI Preview 1 has no listening-
+  socket support of any kind.
 
 A few more things worth knowing, that aren't compile-time errors:
 

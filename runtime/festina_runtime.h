@@ -232,6 +232,12 @@ void festina_sqlite_bind_null(sqlite3_stmt *stmt, int32_t idx);
  * than crashing. */
 void festina_set_audio_decoder(void *(*fn)(const void *, int64_t, const char *));
 void festina_set_image_decoder(void *(*fn)(const void *, int64_t, const char *));
+/* claude.md #151: the indirection req.toImg()/req.toAud() go
+ * through -- NULL if the program never registered a decoder (never
+ * actually uses graphics/audio), matching festina_set_*_decoder's own
+ * "unset means null" contract. */
+void *festina_decode_image_bytes(const void *data, int64_t len, const char *label);
+void *festina_decode_audio_bytes(const void *data, int64_t len, const char *label);
 
 /* Runs a prepared statement to completion and finalizes it, discarding
  * any rows (INSERT/UPDATE/DELETE, or a SELECT whose result isn't
@@ -1118,5 +1124,161 @@ int64_t festina_array_index_of(void *hdr, int64_t elem_size,
                                 const void *value, int8_t is_text);
 void festina_release_array(void *payload);
 void festina_release_map(void *payload);
+
+/* claude.md #151: openPort/on request/on upgrade/on message/on
+ * socketClose -- a single-threaded HTTP + WebSocket server, in its
+ * own translation unit (festina_runtime_http.c) so a program that
+ * never calls openPort() never links any of it, the same per-feature
+ * split graphics/audio already use. Linux/macOS only for now (plain
+ * POSIX sockets) -- see cli.py's own platform gate; there is no
+ * Windows backend yet (would need winsock2, a real separate phase,
+ * not something faked here), and there is no WASI backend at all
+ * (WASI Preview 1, this project's own wasm target, has no listening-
+ * socket support) -- both rejected at COMPILE time
+ * (_check_platform_feature_supported/_check_wasm_feature_supported),
+ * never a link failure.
+ *
+ * DESIGN, single-threaded event loop (per this feature's own explicit
+ * scoping): every connection is serviced from the SAME thread
+ * festina_run_http_loop() runs on, via poll() -- the same "one thread
+ * total" model setTimeout/setInterval and the graphics event loop
+ * already use, extended here rather than reinvented. This is what
+ * keeps festina_retain/festina_release non-atomic plain increments/
+ * decrements everywhere else in this runtime; a thread-per-connection
+ * model would need every one of those to become atomic (or locked),
+ * a much bigger, whole-runtime change genuinely out of scope for a
+ * server feature specifically. The real cost: a slow `on request`/
+ * `on message` handler (one that blocks, or just does a lot of work)
+ * delays every OTHER connection's own turn -- acceptable for the
+ * kind of small, script-shaped server program this language already
+ * targets, not a general-purpose production HTTP server replacement.
+ *
+ * DESIGN, http/socket VALUES: both are refcounted opaque handles
+ * (`festina_release_conn_handle` below, shared by both types --
+ * neither has more than one shape, exactly like RegexType/blob's own
+ * "one release function, no per-type variants" precedent), but the
+ * handle itself is NOT a pointer to live connection state -- it's a
+ * tiny malloc'd `{refcount, conn_id}` pair. Every runtime call that
+ * takes one (festina_http_port, festina_socket_send_text, ...) looks
+ * `conn_id` up in the connection table fresh, on every call, and
+ * silently does nothing (or answers a null/false/-1, matching
+ * whatever "nothing happened" already means for that call) if the
+ * connection is no longer there -- the same "never fails the
+ * program" convention exec()/mkdir()/the file builtins already use,
+ * extended to cover a REAL use-after-teardown case a server
+ * genuinely has to tolerate (a client disconnects mid-handler, or a
+ * program stores `req`/`s` somewhere that outlives the connection).
+ * conn_id is a monotonic counter, never reused, specifically so a
+ * stale id can never alias a DIFFERENT, later connection that
+ * happens to reuse the same fd -- the classic fd-reuse-after-close
+ * bug this indirection exists to rule out by construction.
+ *
+ * DESIGN, http/1.1 scope: request-line + headers + a Content-Length
+ * body only -- no chunked transfer-encoding, no HTTP/1.0, no
+ * pipelining. Every response closes the connection afterward
+ * (`Connection: close`, unconditionally) -- there is no keep-alive in
+ * this version, so each request is genuinely its own TCP connection
+ * end to end, which is what keeps the per-connection state machine
+ * this small (accept -> read one request -> dispatch -> respond ->
+ * close, a straight line with no "wait for the next request on this
+ * same fd" branch to get wrong). See wasm.md-style Limitations
+ * documentation in api.md for the honest accounting of what this
+ * does not do.
+ *
+ * DESIGN, WebSocket scope: RFC 6455 text/binary data frames and close
+ * frames only -- no fragmentation (a fragmented message is dropped,
+ * not reassembled), no ping/pong keepalive sent by this runtime
+ * (a received ping/pong is read and ignored, never crashes the
+ * connection), no permessage-deflate or any other extension. A
+ * received frame -- text or binary -- always reaches `on message` as
+ * a `blob` (never as `text` directly): the language has no "this
+ * value might be text or might be bytes" type to hand back instead,
+ * and a blob's own .toText() is one call away for a program that
+ * knows its peer only ever sends text frames.
+ */
+void festina_open_port(int64_t port);
+void festina_close_port(int64_t port);
+
+void festina_register_request_handler(void (*fn)(void *req));
+void festina_register_upgrade_handler(void (*fn)(void *sock));
+void festina_register_message_handler(void (*fn)(void *sock, void *msg));
+void festina_register_socketclose_handler(void (*fn)(void *sock));
+
+/* The blocking loop main() enters when the program calls openPort()
+ * anywhere (self.uses_http in codegen.py) -- folds in
+ * festina_next_timer_deadline()/festina_fire_expired_timers() exactly
+ * the way festina_run_event_loop (graphics) already does, so a
+ * program combining openPort() with setTimeout/setInterval gets both
+ * serviced from this one loop rather than two competing blocking
+ * calls. Exits once there is truly nothing left to wait for: no open
+ * listening port, no live connection, and no active timer -- the
+ * same "exits once the event loop is empty" rule
+ * festina_run_timer_loop's own doc comment already states, widened
+ * to cover open sockets too. An open listening port with nothing
+ * else going on therefore keeps a program running forever (it has
+ * to -- that's what "listening" means), the same way an uncleared
+ * setInterval() already does. */
+void festina_run_http_loop(void);
+
+/* req:http -- fields (see semantic.py's _infer_member HttpType branch
+ * for the read-only enforcement; codegen never emits a store through
+ * any of these). festina_http_headers returns a FRESH map[text]
+ * (refcount 1, lowercased header names, the last occurrence of a
+ * repeated header name wins) -- ownership transfers to the caller the
+ * same way any other function returning a brand-new container already
+ * does, no extra retain needed (contrast festina_socket_state below,
+ * which hands out the SAME live map repeatedly and does need one). */
+int64_t festina_http_port(void *handle);
+char *festina_http_method(void *handle);       /* owned text copy */
+char *festina_http_path(void *handle);         /* owned text copy -- see
+                                                 * this header's own top
+                                                 * comment: added beyond
+                                                 * the user's literal
+                                                 * spec, a request has no
+                                                 * way to route without it */
+void *festina_http_headers(void *handle);      /* fresh map[text] */
+
+/* req:http -- methods. Each of ok/redirect/upgrade/send is a no-op
+ * (not an error) if this connection already responded once, or is no
+ * longer live at all -- "only the FIRST response action wins" is
+ * enforced here, not left to the caller to avoid double-responding by
+ * hand. */
+void festina_http_ok(void *handle);
+void festina_http_redirect(void *handle, const char *url);
+void festina_http_upgrade(void *handle);
+void *festina_http_to_blob(void *handle);   /* the request body, fresh blob */
+void *festina_http_to_img(void *handle);    /* body decoded as an image */
+void *festina_http_to_aud(void *handle);    /* body decoded as audio */
+char *festina_http_to_text(void *handle);   /* the body, as owned text */
+/* `data`/`len`: the already-rendered body bytes (codegen has already
+ * called .toText()/festina_blob_bytes on whatever the user passed --
+ * see codegen.py's _emit_http_send). `code`: the HTTP status code.
+ * `extra_headers`: a map[text] of additional response headers (may be
+ * NULL for none), copied out before this returns -- ownership of
+ * `extra_headers` itself is NOT taken. */
+void festina_http_send(void *handle, const void *data, int64_t len,
+                       int64_t code, void *extra_headers);
+
+/* s:socket -- state/send/close. festina_socket_state returns the
+ * SAME live, already-retained map[text] every call for this
+ * connection (not a fresh copy) -- writes through it
+ * (`s.state['k'] = v`, ordinary map codegen once the pointer is in
+ * hand) persist for the connection's whole lifetime, released only
+ * when the connection itself is torn down. Returns NULL if the
+ * connection is no longer live (see this header's own top comment on
+ * why every socket call tolerates that rather than crashing). */
+void *festina_socket_state(void *handle);
+void festina_socket_send_text(void *handle, const char *text);
+void festina_socket_send_binary(void *handle, const void *data, int64_t len);
+void festina_socket_close(void *handle);
+
+/* Shared release function for BOTH http and socket handles -- neither
+ * type has more than the one shape (see this header's own top
+ * comment), so, like festina_release_map/_array above, one function
+ * covers it; codegen's _release_fn_for dispatches both HttpType and
+ * SocketType here. Frees only the tiny handle itself, never the
+ * underlying connection (owned by the connection table, torn down
+ * separately when the connection actually closes). */
+void festina_release_conn_handle(void *payload);
 
 #endif

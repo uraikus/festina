@@ -137,6 +137,12 @@ BUILTIN_FUNCTIONS = {
     # fail choice claude.md #93/#132 already made for file/directory
     # operations.
     "exec",
+    # claude.md #151: openPort/closePort -- start/stop listening for
+    # HTTP connections on a port. Neither fails the program either
+    # (openPort on an already-open port, or a privileged/in-use one,
+    # is a silent no-op; closePort on a port never opened likewise) --
+    # the same "test, don't fail" convention as mkdir/exec above.
+    "openPort", "closePort",
 }
 
 _BUILTIN_RETURN_TYPES = {
@@ -247,6 +253,9 @@ _BUILTIN_SIGNATURES = {
     # claude.md #150: exec(args) -- args[0] the program to run
     # (PATH-searched), the rest its own argv.
     "exec": (types_mod.ArrayType(_TEXT),),
+    # claude.md #151
+    "openPort": (_INT,),
+    "closePort": (_INT,),
 }
 
 # claude.md #90: three builtins accept two different shapes. The
@@ -288,6 +297,57 @@ _BUILTIN_SIGNATURE_ALTERNATES = {
 _REGEX = types_mod.RegexType()
 _AUDIO = types_mod.AudioType()
 _IMAGE = types_mod.ImageType()
+_HTTP = types_mod.HttpType()
+_SOCKET = types_mod.SocketType()
+
+# claude.md #151: http's fixed-arity, fixed-argument-type methods --
+# same (arg types, return type) shape as _BLOB_METHODS above, and for
+# the identical reason (arity/argument types enforced by name here
+# rather than left to the generic member-access fallback). `send`
+# isn't here: its `data` argument accepts any concrete type with a
+# body form (checked structurally in _infer_call, the same way
+# setTimeout's callback argument is) and its `code`/`headers`
+# arguments are each optional, which this fixed-shape table has no way
+# to express -- see _infer_call's own dedicated branch for it.
+_HTTP_METHODS = {
+    "ok": ((), None),
+    "redirect": ((_TEXT,), None),
+    # claude.md #151: switches this connection from HTTP to WebSocket
+    # -- sends the 101 handshake immediately (a no-op if the request
+    # doesn't carry a valid Upgrade: websocket/Sec-WebSocket-Key pair,
+    # never a compile-time OR runtime failure), then, once `on
+    # request` returns, the runtime fires `on upgrade(s:socket)` once
+    # for this same connection if one is declared.
+    "upgrade": ((), None),
+    "toBlob": ((), _BLOB),
+    "toImg": ((), _IMAGE),
+    "toAud": ((), _AUDIO),
+    "toText": ((), _TEXT),
+}
+
+# claude.md #151: socket's own fixed-arity method -- `send` is
+# handled the same bespoke way http's own `send` is (see above);
+# `close` is the only socket method with a fixed, checkable shape.
+_SOCKET_METHODS = {
+    "close": ((), None),
+}
+
+# claude.md #151: the concrete types http.send()/socket.send()'s
+# `data:any` argument actually accepts -- deliberately the SAME set
+# _to_text (this module's own codegen counterpart) already gives a
+# text form to, since every one of these (other than blob, sent as
+# its own raw bytes rather than decoded through toText()) becomes the
+# response/frame body by calling toText() on it first. img/aud/http/
+# socket/regex/color/font/func are rejected with a compile error --
+# no body form, the same "silently printing a placeholder would hide
+# a mistake" reasoning claude.md #114 already applied to log()/
+# templates for img/aud specifically, widened here to every type that
+# was never sendable in the first place.
+def _is_sendable_type(t):
+    if t in (_TEXT, _INT, _FLOAT, _BOOL, _BLOB):
+        return True
+    return isinstance(t, (types_mod.StructType, types_mod.TableType,
+                          types_mod.ArrayType, types_mod.MapType))
 
 # claude.md #56: float -> int, with an explicit rounding decision.
 MATH_ROUNDING_FUNCTIONS = {"floor", "ceil", "round", "trunc"}
@@ -343,6 +403,23 @@ _EVENT_SIGNATURES = {
     # analyze_event_handler and _emit_event_handler both special-case it
     # away from the other six's window-only registration.
     "exit": ((_INT,), "(code:int)"),
+    # claude.md #151: the http/websocket event sources -- fired from
+    # festina_runtime_http.c's own single-threaded poll loop, not a
+    # graphics event, so (like `exit` above) these register
+    # unconditionally in main() rather than joining the graphics-gated
+    # event_handlers loop. `on request` fires once per accepted
+    # connection's parsed HTTP request; `on upgrade` fires once, right
+    # after a `req.upgrade()` call inside `on request` completes the
+    # WebSocket handshake for that same connection; `on message` fires
+    # once per complete WebSocket frame received; `on socketClose`
+    # fires once, whenever an upgraded connection ends (the peer
+    # closed it, sent a close frame, or the read failed) -- exactly
+    # once per connection that ever reached `on upgrade`, never for a
+    # plain HTTP connection that never upgraded.
+    "request": ((_HTTP,), "(req:http)"),
+    "upgrade": ((_SOCKET,), "(s:socket)"),
+    "message": ((_SOCKET, _BLOB), "(s:socket, msg:blob)"),
+    "socketClose": ((_SOCKET,), "(s:socket)"),
 }
 
 # claude.md #39: clientWidth/clientHeight report the canvas window's
@@ -495,6 +572,10 @@ def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None
         return types_mod.AudioType()
     if name == "regex":
         return types_mod.RegexType()
+    if name == "http":
+        return types_mod.HttpType()
+    if name == "socket":
+        return types_mod.SocketType()
     if name == "color":
         return types_mod.ColorType()
     if name == "font":
@@ -892,6 +973,18 @@ def analyze(program, filename="<string>"):
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid assignment",
                 )
+            # claude.md #151: http's own three fields (port/method/
+            # headers) are read-only too -- same placement/reasoning
+            # as .length above (the ArrayType-style generic check
+            # below can't tell a read from a write target either).
+            if (isinstance(expr.target, ast.Member) and not expr.target.computed
+                    and expr.target.prop in ("port", "method", "path", "headers")
+                    and isinstance(infer(expr.target.obj, scope), types_mod.HttpType)):
+                raise CompileError(
+                    f"'.{expr.target.prop}' is read-only and cannot be assigned to",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid assignment",
+                )
             # claude.md #22: a `const`-declared variable cannot be
             # reassigned -- the whole point of "constant," and needed
             # for "Constants should be available for compiler
@@ -1195,6 +1288,57 @@ def analyze(program, filename="<string>"):
             raise CompileError(
                 f"img has no field '{expr.prop}' "
                 f"(img has .width, .height, .clip() and .resize())",
+                file=filename, line=expr.line, column=expr.column,
+                category="invalid field access",
+            )
+        if isinstance(obj_type, types_mod.HttpType):
+            # claude.md #151: four read-only fields (port/method/path/
+            # headers -- the request's own properties, set once when
+            # it's parsed, never assignable), the rest are methods
+            # (see _HTTP_METHODS/_infer_call's own `send` branch) --
+            # same strict shape as ImageType's own field/method split
+            # above, for the same reason. `path` is beyond the user's
+            # own literal spec (see festina_runtime.h's own top
+            # comment) -- a request has no way to route on anything
+            # without it.
+            if expr.prop == "port":
+                return _INT
+            if expr.prop in ("method", "path"):
+                return _TEXT
+            if expr.prop == "headers":
+                return types_mod.MapType(_TEXT)
+            if expr.prop in _HTTP_METHODS or expr.prop == "send":
+                raise CompileError(
+                    f"'{expr.prop}' is a method on http -- call it, "
+                    f"e.g. `req.{expr.prop}(...)`",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            raise CompileError(
+                f"http has no field '{expr.prop}' (http has .port, "
+                f".method, .path, .headers, and the methods listed in api.md)",
+                file=filename, line=expr.line, column=expr.column,
+                category="invalid field access",
+            )
+        if isinstance(obj_type, types_mod.SocketType):
+            # claude.md #151: `state` is the one real field -- a plain
+            # mutable map[text] scratchpad for per-connection data
+            # (`s.state['user'] = 'ada'`), which needs no special-
+            # casing here at all: MapType's own computed-member
+            # read/assignment machinery already handles a map reached
+            # through an arbitrary expression, socket included.
+            if expr.prop == "state":
+                return types_mod.MapType(_TEXT)
+            if expr.prop in _SOCKET_METHODS or expr.prop == "send":
+                raise CompileError(
+                    f"'{expr.prop}' is a method on socket -- call it, "
+                    f"e.g. `s.{expr.prop}(...)`",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            raise CompileError(
+                f"socket has no field '{expr.prop}' (socket has .state, "
+                f".send() and .close())",
                 file=filename, line=expr.line, column=expr.column,
                 category="invalid field access",
             )
@@ -1730,6 +1874,110 @@ def analyze(program, filename="<string>"):
                             category="invalid function argument type",
                         )
                 return return_type
+            # claude.md #151: http's fixed-shape methods, checked the
+            # identical dict-driven way blob's own just above are.
+            if callee.prop in _HTTP_METHODS and infer(callee.obj, scope) == _HTTP:
+                arg_types, return_type = _HTTP_METHODS[callee.prop]
+                if len(expr.args) != len(arg_types):
+                    raise CompileError(
+                        f"{callee.prop}() expects {len(arg_types)} argument"
+                        f"{'' if len(arg_types) == 1 else 's'}, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                for i, expected in enumerate(arg_types):
+                    arg_type = infer(expr.args[i], scope)
+                    if (arg_type is not None and arg_type is not NULL
+                            and arg_type != expected):
+                        raise CompileError(
+                            f"{callee.prop}()'s argument {i + 1} expects "
+                            f"{types_mod.type_name(expected)}, found "
+                            f"{types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return return_type
+            # claude.md #151: socket's own fixed-shape method (`close`).
+            if callee.prop in _SOCKET_METHODS and infer(callee.obj, scope) == _SOCKET:
+                arg_types, return_type = _SOCKET_METHODS[callee.prop]
+                if len(expr.args) != len(arg_types):
+                    raise CompileError(
+                        f"{callee.prop}() expects {len(arg_types)} argument"
+                        f"{'' if len(arg_types) == 1 else 's'}, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return return_type
+            # claude.md #151: req.send(data:any, code:int, headers:map)
+            # -- `data` accepts any concrete type with a body form
+            # (_is_sendable_type, the same set _to_text already gives
+            # a text form to, plus blob sent as its own raw bytes),
+            # `code` defaults to 200, `headers` defaults to no extra
+            # headers -- both trailing arguments genuinely optional,
+            # which _HTTP_METHODS' fixed-arity table has no way to
+            # express, so this is its own bespoke branch, the same
+            # reason saveCanvas()/setTimeout() above have theirs.
+            if callee.prop == "send" and infer(callee.obj, scope) == _HTTP:
+                if not (1 <= len(expr.args) <= 3):
+                    raise CompileError(
+                        f"send() expects 1 to 3 arguments (data, an optional "
+                        f"status code, an optional headers map), got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                data_type = infer(expr.args[0], scope)
+                if (data_type is not None and data_type is not NULL
+                        and not _is_sendable_type(data_type)):
+                    raise CompileError(
+                        f"send()'s data argument has no body form -- found "
+                        f"{types_mod.type_name(data_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                if len(expr.args) >= 2:
+                    code_type = infer(expr.args[1], scope)
+                    if code_type is not None and code_type is not NULL and code_type != _INT:
+                        raise CompileError(
+                            f"send()'s status code argument must be int, found "
+                            f"{types_mod.type_name(code_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                if len(expr.args) == 3:
+                    headers_type = infer(expr.args[2], scope)
+                    if (headers_type is not None and headers_type is not NULL
+                            and headers_type != types_mod.MapType(_TEXT)):
+                        raise CompileError(
+                            f"send()'s headers argument must be map[text], found "
+                            f"{types_mod.type_name(headers_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return None
+            # claude.md #151: socket.send(data:any) -- the same
+            # sendable-type check as http.send() above, but always
+            # exactly one argument (a WebSocket frame has no status
+            # code or headers to attach) -- blob sends as a binary
+            # frame, everything else as a text frame (see codegen's
+            # _emit_socket_send).
+            if callee.prop == "send" and infer(callee.obj, scope) == _SOCKET:
+                if len(expr.args) != 1:
+                    raise CompileError(
+                        f"send() expects exactly 1 argument (the data to send), "
+                        f"got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                data_type = infer(expr.args[0], scope)
+                if (data_type is not None and data_type is not NULL
+                        and not _is_sendable_type(data_type)):
+                    raise CompileError(
+                        f"send()'s data argument has no body form -- found "
+                        f"{types_mod.type_name(data_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return None
             # claude.md #109: aud.stop() is back, and means the thing
             # claude.md #100 identified as its only honest reading --
             # stop every channel playing this clip. #100 removed it

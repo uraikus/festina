@@ -1250,6 +1250,24 @@ void festina_set_image_decoder(void *(*fn)(const void *, int64_t, const char *))
     g_image_decoder = fn;
 }
 
+/* claude.md #151: the same indirection req.toImg()/req.toAud()
+ * (festina_runtime_http.c) go through, for the identical reason the
+ * sqlite-column path just below already does -- core must not
+ * reference festina_image_from_bytes/festina_audio_from_bytes
+ * directly (those live in the graphics/audio translation units), so
+ * these two thin wrappers are what any OTHER translation unit calls
+ * instead. NULL (no decoder registered -- the program never actually
+ * uses graphics/audio, so codegen never registered one) answers NULL
+ * rather than crashing, the same "unset decoder" behavior the column
+ * path already has. */
+void *festina_decode_image_bytes(const void *data, int64_t len, const char *label) {
+    return g_image_decoder ? g_image_decoder(data, len, label) : NULL;
+}
+
+void *festina_decode_audio_bytes(const void *data, int64_t len, const char *label) {
+    return g_audio_decoder ? g_audio_decoder(data, len, label) : NULL;
+}
+
 /* festina_sync_table below builds several SQL statements incrementally
  * across a loop over the declared columns, in the form
  * `pos += snprintf(buf + pos, sizeof(buf) - pos, ...)`. That pattern

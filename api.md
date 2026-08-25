@@ -1584,6 +1584,161 @@ unambiguous. Not available under `--target=wasm32-wasi` — WASI has no
 process model to spawn into — rejected at compile time rather than
 failing at runtime; see [wasm.md](wasm.md).
 
+## HTTP and WebSocket servers
+
+```festina
+openPort(8080)
+
+on request(req:http) {
+    if req.path == '/hello' {
+        req.send('hello world')
+        return
+    }
+    req.ok()
+}
+```
+
+`openPort(port:int)` starts listening for HTTP connections on `port`;
+`closePort(port:int)` stops. Neither fails the program — an already-open
+port, a privileged or in-use one, or closing a port never opened are all
+silent no-ops, the same "test, don't fail" convention `mkdir()`/`exec()`
+already use. A program is free to open more than one port.
+
+Every connection is serviced from a **single thread**, the same "one
+thread total" model `setTimeout`/`setInterval` and graphics event
+handlers already use — connections are multiplexed, not run in
+parallel, so ordinary globals need no locking to read/write safely
+across requests. The tradeoff: a slow `on request`/`on message` handler
+delays every *other* connection's own turn. This is built for the kind
+of small, script-shaped server this language already targets, not as a
+general-purpose production server replacement.
+
+### `on request(req:http)`
+
+Fires once per incoming HTTP request, fully parsed (request line,
+headers, and body already buffered — see [Limitations](#http-limitations)
+below for what "fully parsed" doesn't include).
+
+```festina
+req.port                              // int -- the port this connection arrived on
+req.method                            // text -- 'GET', 'POST', ...
+req.path                              // text -- '/hello', never includes the query string separately
+req.headers                           // map[text] -- header names lowercased; a repeated
+                                       // header's last occurrence wins
+```
+
+All four are read-only — assigning to any of them is a compile-time
+error.
+
+**Responding** — exactly one of the following ends the request; calling
+a second one on the same `req` is a silent no-op (never a crash, never a
+double response):
+
+```festina
+req.ok()                              // 200, empty body
+req.redirect('https://example.com')   // 302, Location header set
+req.send(data, code, headers)         // see below
+```
+
+`req.send(data:any, code:int, headers:map[text])` — `code` defaults to
+`200`, `headers` to none. `data` accepts anything with a body form:
+`text` (sent as-is), `int`/`float`/`bool` (stringified, the same
+implicit conversion `log()` already does), a `struct`/table row/
+`arr`/`map` (rendered as JSON, the same `.toText()` every container
+already has), or `blob` (sent as its own raw bytes, not decoded through
+`.toText()` — the more likely thing to want for a binary response). An
+`img`/`aud` argument is a **compile error**: neither has a body form,
+the same reasoning `log()`/templates already reject them with.
+
+If `on request`'s own body returns without calling `ok()`/`redirect()`/
+`send()`/`upgrade()` at all, the connection still gets a response — a
+plain `200` with an empty body — rather than hanging the client
+forever.
+
+**Reading the body:**
+
+```festina
+text t = req.toText()                 // the raw bytes, as text
+blob b = req.toBlob()                 // the raw bytes, as a blob
+img i = req.toImg()                   // decoded as an image (null if it isn't one)
+aud a = req.toAud()                   // decoded as audio (null if it isn't one)
+```
+
+A request with no body answers an empty `text`/`blob` (never `null`),
+matching every other "nothing there" case in this language.
+
+### WebSocket: `req.upgrade()`
+
+```festina
+on request(req:http) {
+    if req.path == '/ws' {
+        req.upgrade()
+    }
+}
+
+on upgrade(s:socket) {
+    log('client connected')
+}
+
+on message(s:socket, msg:blob) {
+    s.send(`you said: ${msg.toText()}`)
+}
+
+on socketClose(s:socket) {
+    log('client disconnected')
+}
+```
+
+`req.upgrade()` performs the WebSocket handshake (RFC 6455) immediately
+and switches the connection over — nothing else about the request
+matters afterward (a call to `ok()`/`send()`/etc. on the same `req` is
+now a no-op, same as any second response attempt). If the request isn't
+actually a valid WebSocket handshake (missing/mismatched headers),
+`upgrade()` is a silent no-op and the connection falls through to the
+normal "no response sent" default (`200`, empty body) — never a crash.
+
+Once upgraded, `on upgrade(s:socket)` fires once for that connection,
+then `on message(s:socket, msg:blob)` fires once per message received
+— **always as a `blob`**, whether the peer sent a text or binary frame
+(call `.toText()` if you know it's always text). `on socketClose(s)`
+fires exactly once when the connection ends, however it ends (the peer
+closed it, sent a close frame, or the read failed) — never for a plain
+HTTP connection that never upgraded.
+
+```festina
+s.state                               // map[text] -- a per-connection scratchpad,
+                                       // starts empty, persists for the connection's
+                                       // whole lifetime
+s.state['user'] = 'ada'               // read/write like any other map[text]
+
+s.send(data)                          // data:any -- same sendable types as req.send(),
+                                       // minus the code/headers (a frame has neither);
+                                       // blob sends a binary frame, everything else text
+s.close()                             // sends a close frame and ends the connection
+```
+
+### <a name="http-limitations"></a>Limitations
+
+- **HTTP/1.1 request-line + headers + a `Content-Length` body only.**
+  No chunked transfer-encoding, no HTTP/1.0-specific behavior.
+- **No keep-alive.** Every response closes the connection afterward —
+  each request is its own TCP connection, start to finish.
+- **No WebSocket fragmentation, ping/pong sent by this runtime, or
+  extensions.** A fragmented message (a frame with `FIN=0`, or a
+  continuation frame) closes the connection rather than being silently
+  dropped or misread. A received ping is answered with a pong
+  automatically; a received pong is ignored. `permessage-deflate` and
+  every other WebSocket extension are unsupported.
+- **Linux and macOS only** — plain POSIX sockets, no Windows backend.
+  Not available under `--target=wasm32-wasi` at all — WASI Preview 1
+  has no listening-socket support — rejected at compile time; see
+  [wasm.md](wasm.md).
+- **Cannot be combined with graphics** (`render()`, or an `on
+  mouseDown`/.../`close` handler) in the same program — the server's
+  own event loop and the graphics event loop are mutually exclusive in
+  this version. `setTimeout`/`setInterval` combine fine; both are
+  serviced from the same loop.
+
 ## Freeing and deleting
 
 Memory is automatic — but `free` and `delete` exist for the moments you

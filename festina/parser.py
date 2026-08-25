@@ -8,7 +8,7 @@ from . import ast
 from . import lexer as lexer_mod
 from .errors import CompileError
 
-TYPE_KEYWORDS = lexer_mod.PRIMITIVE_TYPE_KEYWORDS | {"img", "aud"}
+TYPE_KEYWORDS = lexer_mod.PRIMITIVE_TYPE_KEYWORDS | {"img", "aud", "http", "socket"}
 
 _IMPORT_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+\.f$")
 
