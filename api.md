@@ -330,6 +330,41 @@ empty text separator splits per UTF-8 code point. `join` renders a
 `null` element as an empty string (`[1, null, 3].join('-')` is
 `'1--3'`), also JS's choice.
 
+### Parsing an int
+
+```festina
+int n = '42'.toInt()          // 42
+int m = '  -17abc'.toInt()    // -17 -- leading whitespace, sign, trailing garbage all ok
+int bad = 'nope'.toInt()      // null -- not a compile error, not a crash
+if bad == null {
+    fail('not a number')
+}
+```
+
+`toInt()` follows JS's `parseInt()`: skips leading whitespace, reads an
+optional `+`/`-`, then digits until the first non-digit (or the end of
+the text) — whatever comes after the digits is ignored, not an error.
+Returns `null` if no digits were found at all. A literal receiver
+(`'42'.toInt()`) is computed entirely at compile time; nothing is
+emitted to parse it at runtime.
+
+### Indexing a character out
+
+```festina
+text s = 'hello'
+log(s[0])              // h
+log(s[10])              // null -- out of range, not a crash
+log(s[-1])              // null -- negative, not a crash
+```
+
+`s[i]` reads the `i`-th UTF-8 **code point** (not byte — a multi-byte
+character like `é` is one index, matching `.length`'s own code-point
+count), as a fresh `text`. Unlike [array indexing](#indexing-is-not-bounds-checked),
+this is always bounds-checked: an out-of-range or negative index
+answers `null` rather than reading past the buffer. Read-only —
+`s[0] = 'x'` is a compile-time error, the same way `environment.NAME =
+...` is.
+
 ## Logging and rendering
 
 `log()` and `${}` interpolation accept any value that has a text form —
@@ -807,6 +842,26 @@ Returns the named environment variable as `text`, or `null` if it
 isn't set. Read-only (assigning to `environment.NAME` is a compile-time
 error) and can't be used by itself without a `.NAME`/`[keyExpr]` — both
 are also compile-time errors, not runtime ones.
+
+## Command-line arguments
+
+```festina
+log(argv.length)
+log(argv[0])          // the program's own path, same as C's argv[0]
+if argv.length > 1 {
+    log(`first arg: ${argv[1]}`)
+}
+```
+
+`argv` is a real `arr[text]` global, populated from the process's own
+OS argc/argv before any top-level statement runs — no declaration
+needed. Unlike `environment`, it's an ordinary mutable array once
+populated: `argv.push(...)`, `argv[i] = ...`, and every other
+[array](#arrays)/[growing array](#growing-arrays) operation work on it
+normally. Works under `--target=wasm32-wasi` too (WASI has its own
+argc/argv), but this checkout's own runner (`run_wasi.mjs`) only ever
+passes the compiled module's own path through, so `argv` there is
+always a single-element array — see [wasm.md](wasm.md).
 
 ## Regex
 
@@ -1508,6 +1563,26 @@ arr[text] names = ls('./temp')
 log(names.length)
 log(ls('./nowhere').length)           // 0
 ```
+
+## Running other programs
+
+```festina
+arr[text] cmd = ['/bin/echo', 'hello']
+int status = exec(cmd)
+log(status)                            // 0
+```
+
+`exec(args:arr[text]):int` spawns `args[0]` (searched on `PATH` the
+same way a shell finds it) with the rest of `args` as its own argv,
+**inheriting stdin/stdout/stderr directly** — it doesn't capture the
+child's output, the same "not a sandbox, this really runs it" model
+`sqlite()`/the file builtins already use for the filesystem. Blocks
+until the child exits and returns its real exit code, or `-1` if the
+process never started at all (executable not found, no permission) —
+`-1` is never a code the child itself could produce, so it's
+unambiguous. Not available under `--target=wasm32-wasi` — WASI has no
+process model to spawn into — rejected at compile time rather than
+failing at runtime; see [wasm.md](wasm.md).
 
 ## Freeing and deleting
 

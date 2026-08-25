@@ -19,9 +19,9 @@ accounting.
 
 This file is the design writeup, implementation record, and benchmark
 results, kept current as a reference — see [claude.md](claude.md) #148
-for the round-by-round account of how it was built, including the two
-real bugs the [Bugs found along the way](#bugs-found-along-the-way)
-section below summarizes.
+and #150 for the round-by-round account of how it was built, including
+the three real bugs the "Bug 1"/"Bug 2"/"Bug 3" subsections under
+[Design](#design) below document.
 
 ## Why wasm32-wasi, not bare wasm32
 
@@ -60,8 +60,9 @@ fallback path already produces straight to
    where this copy came from and why vendoring it (something this
    project explicitly chose *not* to do for native targets, which link
    the system's own libsqlite3) is the only option here.
-3. **`runtime/festina_runtime_wasm_entry.c`** — a one-line bridge, see
-   [below](#bug-2-__main_void-not-main).
+3. **`runtime/festina_runtime_wasm_entry.ll`** — a small entry-point
+   bridge, see [below](#bug-2-__main_argc_argv-not-main) and
+   [below](#bug-3-the-bridge-has-to-be-raw-ir-not-c).
 
 No libLLVM in-process object-emission path is used for wasm at all
 (unlike native, where it's the fast path when available) — this
@@ -104,21 +105,76 @@ i32` first. Every other `i64`/pointer conversion elsewhere in codegen.py
 genuinely safe across pointer widths in LLVM; only the calloc/malloc
 *call-site ABI boundary* needed a real fix.
 
-### Bug 2: `__main_void`, not `main`
+### Bug 2: `__main_argc_argv`, not `main`
 
 wasi-libc's own `_start` doesn't call a function literally named
-`main` — ordinary C compilation silently renames `int main(void)` to
-`__main_void` via macro machinery in the C frontend before the compiler
-ever sees it. Festina's codegen emits raw LLVM IR text directly
-(`_emit_main_and_entry`), which never goes through that renaming at
-all, so the literal `define i32 @main()` it always emits links clean on
-every native target (where `main` really is the expected symbol) but
-left `wasm-ld: undefined symbol: main` on a real wasm32-wasi link.
-Fixed with the smallest fix that doesn't make codegen itself
-target-aware for something that's really wasi-libc's own linking
-convention: a one-line bridge object,
-[`runtime/festina_runtime_wasm_entry.c`](runtime/festina_runtime_wasm_entry.c),
-linked only for the wasm build.
+`main` — ordinary C compilation silently renames a user's `main` to
+`__main_void` (a no-arg `main`) or `__main_argc_argv` (an
+argc/argv-taking `main`) via macro machinery in the C frontend before
+the compiler ever sees it. Festina's codegen emits raw LLVM IR text
+directly (`_emit_main_and_entry`), which never goes through that
+renaming at all, so the literal `define i32 @main(...)` it always
+emits links clean on every native target (where `main` really is the
+expected symbol) but left `wasm-ld: undefined symbol: main` on a real
+wasm32-wasi link. Fixed with the smallest fix that doesn't make codegen
+itself target-aware for something that's really wasi-libc's own
+linking convention: a small bridge object,
+[`runtime/festina_runtime_wasm_entry.ll`](runtime/festina_runtime_wasm_entry.ll),
+linked only for the wasm build, that calls the real `main` under its
+own name and re-exports the result as `__main_argc_argv`.
+
+`main`'s own signature changed from `()` to `(i32 %argc, ptr %argv)`
+with claude.md #150's `argv` global — this needed no native-side
+change at all (this signature already IS the real C ABI entry point on
+every native target), just this bridge's own argument list following
+along, and a second, non-obvious bug the change surfaced — see below.
+
+### Bug 3: the bridge has to be raw IR, not C
+
+The bridge above was originally written in C, the same as the
+original `__main_void` version this project shipped with: `extern int
+main(int, char **); int __main_argc_argv(int argc, char **argv) {
+return main(argc, argv); }`. It compiled and linked without any error
+or warning, then hung at actual runtime — every wasm32-wasi build
+after the `argv` change silently stopped producing output at all.
+
+Root cause, confirmed directly via `llvm-objdump -r`'s relocation
+output, not guessed at: the *same* C-frontend macro that renames a
+*defined* `int main(int, char**)` to `__main_argc_argv` for
+`wasm32-wasi` also rewrites *any reference* to the literal identifier
+`main` in a translation unit compiled for that target — including an
+`extern` declaration and a call built from it. The bridge's own
+`return main(argc, argv)` was silently rewritten to `return
+__main_argc_argv(argc, argv)` — calling **itself**, not Festina's real
+`main` — visible directly in the object's relocation record
+(`R_WASM_FUNCTION_INDEX_LEB __main_argc_argv+0` at the call site, not a
+reference to `main` at all). At `-O0` this produced genuine, visible
+infinite recursion (a `RuntimeError: memory access out of bounds` trap,
+`main` calling `main` calling `main` in the stack trace); at `-O2`
+(this project's real build flags) the same self-call instead became a
+silent infinite loop — indistinguishable from a hang, no error at all.
+Confirmed as the actual root cause by rebuilding an otherwise-identical
+C bridge under a *different* function name (`real_main`, unaffected by
+the macro) and watching the hang disappear.
+
+This is why the void-arg bridge never hit this bug even though it's
+the same macro: renaming a *defined* `int main(void)` targets a
+*different* name (`__original_main`), not the bridge's own
+(`__main_void`), so that bridge's own reference to `main` was never
+self-referential in the first place. Only the argc/argv bridge's
+identically-named `__main_argc_argv` collided with its own reference.
+
+Fixed by writing the bridge as raw LLVM IR text
+(`festina_runtime_wasm_entry.ll`, not `.c`) instead — this bypasses the
+C frontend (and its renaming macro) entirely, so `declare i32
+@main(i32, ptr)` there can only ever mean the real external symbol,
+confirmed via the same relocation inspection (`U main`, not `U
+__main_argc_argv`) and via actual execution (correct exit code,
+correct `argv`, no hang). Renaming codegen's own generated `main`
+symbol was the other option considered and rejected, same reasoning as
+Bug 2's own fix: it would make codegen target-aware for something
+that's really wasi-libc's own linking convention, not a property of
+the generated program.
 
 ## Setup
 
@@ -170,13 +226,20 @@ fail at compile time, before any of the real work
 - **Audio** — `aud`, `play()`/`playLoop()`/`stopAudioPlayer()`/
   `isAudioPlayerPlaying()` — WASI has no audio device model of any
   kind.
+- **`exec()`** (claude.md #150) — WASI has no process model to spawn
+  into at all: no fork/exec/spawn of any kind.
 
 A few more things worth knowing, that aren't compile-time errors:
 
-- **No command-line arguments.** Festina has no language builtin for
-  reading argv at all (true on every target, not wasm-specific), so
-  this was never something wasm export could lose — `run_wasi.mjs`
-  passes the wasm module's own path as `args[0]` and nothing else.
+- **`argv` always comes back as a single element.** `argv` (claude.md
+  #150) works under wasm32-wasi — WASI has its own real argc/argv, and
+  main()'s bridge forwards it the same way it does natively (see Bug 2
+  above) — but `run_wasi.mjs` hardcodes WASI's own `args` to
+  `[wasmPath]` and nothing else, so `argv.length` is always `1` for
+  anything run through this project's own runner. A different WASI
+  host that supplies real extra arguments would see them show up in
+  `argv` correctly; this is `run_wasi.mjs`'s own limitation, not a
+  language one.
 - **Filesystem access is sandboxed to one preopened directory**, WASI's
   own capability model (`runtime/wasm/run_wasi.mjs`'s own top comment)
   — `blob`, `mkdir`, `ls`, and SQLite's own file all resolve against

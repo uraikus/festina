@@ -196,11 +196,14 @@ def compile_and_run_wasm(tmp_path, codegen, cli_mod):
     installs wasi-libc/libclang-rt-*-dev-wasm32 and Node specifically so
     this fixture is never skipped on the primary platform).
 
-    Unlike compile_and_run, there's no `args=` parameter: Festina
-    programs have no way to read argv at all (no language builtin for
-    it -- see api.md), and run_wasi.mjs's own WASI `args` is just
-    `[wasmPath]` for that reason, so there is nothing here to pass
-    through.
+    Unlike compile_and_run, there's no `args=` parameter: claude.md
+    #150 gave Festina programs a real `argv` global, but run_wasi.mjs's
+    own WASI `args` is hardcoded to just `[wasmPath]` (see its own
+    comment) -- nothing here forwards extra command-line arguments into
+    the WASI host, so `argv` under wasm always comes back as a
+    single-element array (the module's own path) regardless of what a
+    caller of this fixture might want to pass. Extending that is a
+    run_wasi.mjs change, not something this fixture can paper over.
     """
     clang = shutil.which("clang")
     node = shutil.which("node")

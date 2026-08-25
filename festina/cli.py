@@ -680,7 +680,7 @@ def _ensure_runtime_object(cc, name, source, pkg_config_packages):
 _WASM_TARGET = "wasm32-wasi"
 _WASM_DIR = os.path.join(_RUNTIME_DIR, "wasm")
 _WASM_SQLITE_C = os.path.join(_WASM_DIR, "sqlite3.c")
-_WASM_ENTRY_C = os.path.join(_RUNTIME_DIR, "festina_runtime_wasm_entry.c")
+_WASM_ENTRY_SRC = os.path.join(_RUNTIME_DIR, "festina_runtime_wasm_entry.ll")
 
 
 def _ensure_wasm_object(cc, name, source, include_dirs=()):
@@ -714,15 +714,16 @@ def _ensure_wasm_object(cc, name, source, include_dirs=()):
 
 def _wasm_runtime_objects(cc):
     """core (linked against the vendored sqlite3.h, see runtime/wasm/
-    README.md) + the vendored sqlite3.c itself + the __main_void entry
-    bridge (see festina_runtime_wasm_entry.c's own top comment for why
-    that one exists at all) -- no graphics, no audio, ever: see
+    README.md) + the vendored sqlite3.c itself + the __main_argc_argv
+    entry bridge (see festina_runtime_wasm_entry.ll's own top comment
+    for why that one exists at all, and why it's raw LLVM IR rather
+    than C) -- no graphics, no audio, ever: see
     _check_wasm_feature_supported, called unconditionally before this
     even runs, for why."""
     return [
         _ensure_wasm_object(cc, "core", _RUNTIME_C, include_dirs=[_WASM_DIR]),
         _ensure_wasm_object(cc, "sqlite3", _WASM_SQLITE_C),
-        _ensure_wasm_object(cc, "entry", _WASM_ENTRY_C),
+        _ensure_wasm_object(cc, "entry", _WASM_ENTRY_SRC),
     ]
 
 
@@ -746,6 +747,17 @@ def _check_wasm_feature_supported(feature):
             "audio (aud/play()/playLoop()/...) is not supported when "
             "compiling to WASM -- WASI has no audio device model at all. "
             "See wasm.md's Limitations section.",
+            category="unsupported platform feature")
+    if feature == "exec":
+        # claude.md #150: added alongside exec() itself -- WASI has no
+        # process model at all (no fork/exec/spawn of any kind), so
+        # this is the identical "genuinely absent, not gated pending
+        # hardware" situation graphics/audio are already in above, not
+        # a new category of restriction.
+        raise CompileError(
+            "exec() is not supported when compiling to WASM -- WASI has "
+            "no process model to spawn into at all. See wasm.md's "
+            "Limitations section.",
             category="unsupported platform feature")
 
 
@@ -974,7 +986,8 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", targ
     needs_graphics = gen.uses_graphics or gen.uses_graphics_code
 
     if target == "wasm32-wasi":
-        _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio)
+        _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio,
+                           needs_exec=gen.uses_exec)
         return output_path
 
     runtime_objects, link_libs = _runtime_objects_and_link_libs(
@@ -1117,22 +1130,30 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
         os.unlink(ir_path)
 
 
-def _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, needs_audio):
+def _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, needs_audio, needs_exec=False):
     """claude.md #148: WASM export's own link recipe -- always the .ll-
     text-to-clang path (see _compile_via_clang_ir_frontend's own
     docstring for what that fallback normally covers on native targets;
     here it's not a fallback at all, it's the only path, since there is
     no libLLVM in-process wasm32 object-emission story this project has
     verified -- --target=wasm32-wasi needs clang specifically, not
-    "whichever of clang/gcc/cc"). Rejects graphics/audio OUTRIGHT before
-    doing any real work -- see _check_wasm_feature_supported -- rather
-    than letting a doomed compile run for tens of seconds (the vendored
-    sqlite3.c amalgamation alone) only to fail at the link step with
-    undefined Cairo/ALSA symbols nothing here could ever provide."""
+    "whichever of clang/gcc/cc"). Rejects graphics/audio/exec()
+    OUTRIGHT before doing any real work -- see
+    _check_wasm_feature_supported -- rather than letting a doomed
+    compile run for tens of seconds (the vendored sqlite3.c
+    amalgamation alone) only to fail at the link step with undefined
+    Cairo/ALSA symbols nothing here could ever provide (claude.md #150:
+    exec() itself would actually LINK fine -- festina_process_exec's
+    own wasm32-wasi stub, see runtime/festina_runtime.c, exists
+    specifically so this translation unit still compiles -- so this is
+    the only one of the three that needs an explicit check here rather
+    than the link step catching it on its own)."""
     if needs_graphics:
         _check_wasm_feature_supported("graphics")
     if needs_audio:
         _check_wasm_feature_supported("audio")
+    if needs_exec:
+        _check_wasm_feature_supported("exec")
     if shutil.which(cc) is None or "clang" not in os.path.basename(cc).lower():
         raise CompileError(
             f"WASM export needs clang specifically (got --cc={cc!r}) -- "

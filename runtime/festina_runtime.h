@@ -79,6 +79,49 @@ char *festina_text_own(const char *s);  /* claude.md #83: NULL-safe strdup */
 int8_t festina_mkdir(const char *path);
 void *festina_ls(const char *path);
 
+/* claude.md #150: text.toInt() -> int (festina_null_int() -- the same
+ * i64-minimum sentinel every other "no valid int here" site in this
+ * runtime already answers with -- when nothing parseable is found, JS
+ * parseInt()-style otherwise: leading whitespace and an optional sign
+ * are skipped, parsing stops at the first non-digit rather than
+ * requiring the whole text to be numeric); text[i] -> text (a single
+ * UTF-8 code point, matching split('')'s own per-code-point unit, or
+ * NULL -- Festina's own text null -- for i<0 or i beyond the last code
+ * point, the same "answer null, don't crash" choice claude.md #72
+ * already made for a missing map[T] key). Both NULL-safe on a null
+ * receiver, treating it as "" like every other text-consuming runtime
+ * call here already does. */
+int64_t festina_text_to_int(const char *s);
+char *festina_text_char_at(const char *s, int64_t index);
+
+/* claude.md #150: argv -- builds a fresh refcounted arr[text] (the same
+ * shape festina_text_split's own pieces-array does) from the argc/argv
+ * a compiled program's own `main` received; called once, in main()'s
+ * own prologue (see codegen.py's _emit_main_and_entry), before
+ * anything else runs. */
+void *festina_argv_array(int argc, char **argv);
+
+/* claude.md #150: exec(args) -- spawns args[0] with args[1:] as its own
+ * argv (PATH-searched, no shell involved -- so no shell-quoting rules
+ * to get right or wrong), inheriting this process's own stdin/stdout/
+ * stderr, waits for it, and answers its real exit code -- or -1 if the
+ * process could never even start (missing executable, ...), the same
+ * "a program tests for this, it doesn't crash the whole process over
+ * it" choice claude.md #93/#132 already made for file/directory
+ * operations. `args` is the arr[text] header pointer exactly like
+ * festina_arr_join's own `arr` parameter -- args[0] the program to
+ * run, the rest its own arguments. Named festina_process_exec, not
+ * festina_exec -- that name was already taken, by an internal `static
+ * void festina_exec(sqlite3*, const char*)` DDL helper further down
+ * this same file (nothing to do with this one; a genuine naming
+ * collision, not a rename of that function). Not available under
+ * wasm32-wasi at all (WASI has no process model to spawn into -- see
+ * wasm.md's Limitations section); rejected outright at compile time
+ * there (see festina/cli.py's _check_wasm_feature_supported), so the
+ * .c file's own wasm32-wasi branch is a stub nothing ever actually
+ * calls. */
+int64_t festina_process_exec(void *args);
+
 /* claude.md #93: math, files and time -- all libc/libm, both already on
  * every link line, so none of this costs a new dependency.
  *

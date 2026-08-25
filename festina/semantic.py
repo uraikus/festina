@@ -131,6 +131,12 @@ BUILTIN_FUNCTIONS = {
     # screenWidth/screenHeight have no setter, since a program cannot
     # resize the physical display it's running on.
     "setClientWidth", "setClientHeight",
+    # claude.md #150: exec(args) -- spawns args[0] with args[1:] as its
+    # own argv, answering its real exit code (or -1 if it never even
+    # started) rather than failing the program -- the same test-don't-
+    # fail choice claude.md #93/#132 already made for file/directory
+    # operations.
+    "exec",
 }
 
 _BUILTIN_RETURN_TYPES = {
@@ -156,6 +162,8 @@ _BUILTIN_RETURN_TYPES = {
     "ls": types_mod.ArrayType(types_mod.PrimitiveType("text")),
     # claude.md #146
     "isAudioPlayerPlaying": types_mod.PrimitiveType("bool"),
+    # claude.md #150
+    "exec": types_mod.PrimitiveType("int"),
 }
 
 # claude.md #55: int and float never mix directly in a binary operator.
@@ -236,6 +244,9 @@ _BUILTIN_SIGNATURES = {
     # stopAudioPlayer's optional one (see _BUILTIN_SIGNATURE_ALTERNATES
     # below) -- there's no sensible "any channel" reading for a query.
     "isAudioPlayerPlaying": (_INT,),
+    # claude.md #150: exec(args) -- args[0] the program to run
+    # (PATH-searched), the rest its own argv.
+    "exec": (types_mod.ArrayType(_TEXT),),
 }
 
 # claude.md #90: three builtins accept two different shapes. The
@@ -558,6 +569,18 @@ def analyze(program, filename="<string>"):
     # irrelevant (never consulted), only here so redeclaring it is a
     # duplicate-declaration error like any other reserved global.
     global_scope.define(_ENVIRONMENT_NAME, Symbol(_ENVIRONMENT_NAME, None, "constant", None), None, filename)
+    # claude.md #150: argv -- an ordinary, MUTABLE global arr[text]
+    # (kind "variable", unlike clientWidth/environment just above),
+    # since it's a plain snapshot captured once at process startup, not
+    # a live system readout -- nothing about reassigning it, or calling
+    # push()/splice()/etc on it, is any different from any other
+    # declared arr[text] variable, so there's no reason to forbid it
+    # the way clientWidth's own read-only checks do. Pre-registered
+    # only so redeclaring `argv` is a duplicate-declaration error like
+    # any other reserved global; codegen.py's own generate() is the
+    # other half (its own pre-registration, plus populating the real
+    # value from argc/argv in main()'s prologue).
+    global_scope.define("argv", Symbol("argv", types_mod.ArrayType(_TEXT), "variable", None), None, filename)
 
     def resolve(type_expr, node=None):
         return resolve_type_name(type_expr, structs, tables, filename, node)
@@ -856,6 +879,19 @@ def analyze(program, filename="<string>"):
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid assignment",
                 )
+            # claude.md #150: text[i] is read-only too -- same placement/
+            # reasoning as the checks just above. text has no in-place
+            # mutation anywhere else in this language either (.replace()
+            # etc. all return a NEW text rather than editing one in
+            # place), so `s[i] = 'x'` would be the one exception to that
+            # rule rather than a natural extension of it.
+            if (isinstance(expr.target, ast.Member) and expr.target.computed
+                    and infer(expr.target.obj, scope) == _TEXT):
+                raise CompileError(
+                    "text is immutable -- s[i] can only be read, not assigned to",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid assignment",
+                )
             # claude.md #22: a `const`-declared variable cannot be
             # reassigned -- the whole point of "constant," and needed
             # for "Constants should be available for compiler
@@ -1063,6 +1099,22 @@ def analyze(program, filename="<string>"):
                         category="invalid operand type",
                     )
                 return obj_type.value
+            if obj_type == _TEXT:
+                # claude.md #150: s[i] -> a single UTF-8 code point, the
+                # same unit split('') already uses -- or null (not a
+                # bounds-check failure the way arr[T] indexing is,
+                # api.md's own "Indexing is not bounds-checked" section
+                # already scopes that unchecked-ness to arr[T] alone)
+                # for i<0 or i past the last code point, the same
+                # "answer null, don't crash" choice a missing map[T] key
+                # already gets just above.
+                if idx_type is not None and idx_type is not NULL and idx_type != _INT:
+                    raise CompileError(
+                        f"text index must be int, found {types_mod.type_name(idx_type)}",
+                        file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                        category="invalid operand type",
+                    )
+                return _TEXT
             if not isinstance(obj_type, types_mod.ArrayType):
                 raise CompileError(
                     f"cannot index into {types_mod.type_name(obj_type)}",
@@ -1398,6 +1450,16 @@ def analyze(program, filename="<string>"):
             # claude.md #55: int.toFloat() -> float
             if callee.prop == "toFloat" and not expr.args and infer(callee.obj, scope) == _INT:
                 return _FLOAT
+            # claude.md #150: text.toInt() -> int, JS parseInt()-style
+            # (skips leading whitespace/an optional sign, stops at the
+            # first non-digit rather than requiring the whole text to
+            # be numeric) -- null (int's own -9223372036854775808
+            # sentinel, the same one every other "no valid int here"
+            # site in this language already answers with) when nothing
+            # parseable is found at all, never a compile-time-only or
+            # runtime failure.
+            if callee.prop == "toInt" and not expr.args and infer(callee.obj, scope) == _TEXT:
+                return _INT
             # int/float/bool.toText() -> text -- an explicit spelling of
             # the same stringification template interpolation already
             # does implicitly for these three types (see codegen.py's

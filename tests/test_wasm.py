@@ -64,8 +64,10 @@ class TestWasmRun:
     """End-to-end: real compiles, real Node WASI execution. Exercises
     the parts of the core language a wasm32-wasi build actually needs
     to get right that native doesn't: the 32-bit calloc/malloc ABI
-    (arrays/maps/structs on the heap) and the __main_void entry bridge
-    (every one of these programs needs to reach main() at all)."""
+    (arrays/maps/structs on the heap) and the __main_argc_argv entry
+    bridge (every one of these programs needs to reach main() at all --
+    see runtime/festina_runtime_wasm_entry.ll's own top comment for why
+    that bridge is raw LLVM IR, not C)."""
 
     def test_hello_world(self, compile_and_run_wasm):
         result = compile_and_run_wasm("log('hello from wasm')")
@@ -150,6 +152,41 @@ class TestWasmRun:
         result = compile_and_run_wasm("close(7)")
         assert result.returncode == 7
 
+    def test_argv_is_populated_from_the_real_wasi_argc_argv(self, compile_and_run_wasm):
+        # claude.md #150: the whole point of the __main_argc_argv bridge
+        # (see this class's own docstring) -- main()'s real (i32, ptr)
+        # parameters, filled in by wasi-libc's own _start before
+        # __festina_main() runs, get turned into @argv the same way
+        # they do natively. run_wasi.mjs hardcodes WASI's own `args` to
+        # `[wasmPath]` (see compile_and_run_wasm's own docstring), so
+        # there's exactly one element to check here, not the module
+        # path's own exact text (that's an implementation detail of
+        # where tmp_path puts the compiled .wasm).
+        result = compile_and_run_wasm(
+            "log(argv.length)\n"
+            "log(argv[0] != null && argv[0] != '')\n"
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["1", "true"]
+
+    def test_to_int_and_text_indexing_work_under_wasm(self, compile_and_run_wasm):
+        # Both new features are ordinary core codegen (no wasm-specific
+        # branch at all, unlike exec/argv) -- this is here mainly to
+        # confirm the wasi-libc <string.h>/UTF-8 walking in
+        # festina_text_to_int/festina_text_char_at links and behaves
+        # identically to native, not because either needed its own
+        # wasm-specific implementation.
+        result = compile_and_run_wasm(
+            "log('42abc'.toInt())\n"
+            "log('nope'.toInt() == null)\n"
+            "text s = 'hello'\n"
+            "log(s[1])\n"
+            "log(s[100] == null)\n"
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["42", "true", "e", "true"]
+
+
 class TestWasmGraphicsAudioRejection:
     """The graphics/audio check (_check_wasm_feature_supported) fires
     before _compile_via_wasm ever looks at `cc` at all -- so unlike
@@ -175,6 +212,19 @@ class TestWasmGraphicsAudioRejection:
                                   cc="clang", target="wasm32-wasi")
         assert exc_info.value.category == "unsupported platform feature"
         assert "audio" in str(exc_info.value)
+
+    def test_exec_is_rejected_at_compile_time(self, cli_mod, tmp_path):
+        # claude.md #150: exec() gated the same way graphics/audio are
+        # -- WASI has no process model to spawn into at all, so this is
+        # rejected outright rather than compiling something that could
+        # never work at runtime.
+        src = tmp_path / "main.f"
+        src.write_text("arr[text] cmd = ['ls']\nexec(cmd)", encoding="utf-8")
+        with pytest.raises(cli_mod.CompileError) as exc_info:
+            cli_mod.compile_file(str(src), str(tmp_path / "out.wasm"),
+                                  cc="clang", target="wasm32-wasi")
+        assert exc_info.value.category == "unsupported platform feature"
+        assert "exec" in str(exc_info.value)
 
 
 class TestWasmCliValidation:

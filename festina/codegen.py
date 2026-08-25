@@ -711,6 +711,16 @@ class CodeGen:
                                                 # file needs to be linked in at all, so a program
                                                 # that never touches audio doesn't pull in
                                                 # libasound (see cli.py's _ensure_runtime_objects)
+        self.uses_exec = False                 # claude.md #150: any exec() call anywhere -- unlike
+                                                # uses_graphics/uses_audio, festina_process_exec is
+                                                # unconditional core (no extra library to
+                                                # conditionally link -- fork/exec/waitpid are plain
+                                                # libc), so this exists purely so compile_file can
+                                                # reject a wasm32-wasi build outright, before doing
+                                                # any real work, the same way needs_graphics/
+                                                # needs_audio already do for that target (WASI has
+                                                # no process model to spawn into at all -- see
+                                                # wasm.md's Limitations section)
 
         # claude.md #102: a table column of type aud/img makes the
         # program use that feature, whether or not it ever names a
@@ -941,6 +951,24 @@ class CodeGen:
 
     # ---- entry point ----
     def generate(self, program):
+        # claude.md #150: argv -- registered here rather than discovered
+        # by walking program.body (the way every user-declared global
+        # is, in _toplevel below) since there is no VarDecl AST node for
+        # it at all; semantic.py's own analyze() already pre-registers
+        # the SAME name into its global scope (so redeclaring `argv` is
+        # a duplicate-declaration error like any other reserved global,
+        # exactly the way clientWidth/environment are already handled),
+        # so this and that are the two places aware of it, matching
+        # every other pre-registered global's own split between the
+        # two stages. Once this line runs, `argv` behaves EXACTLY like
+        # an ordinary global arr[text] variable to every other piece of
+        # codegen -- _global_var_defs emits its {refcount|len,data}
+        # header with no special-casing at all, an ordinary Identifier
+        # read/copy/free/reassignment all just work -- only its INITIAL
+        # value is special, populated from the real argc/argv `main`
+        # receives rather than a user-written init expression (see
+        # _emit_main_and_entry).
+        self.global_env.define("argv", "@argv", types_mod.ArrayType(TEXT))
         self.database_url_expr = getattr(program, "database_url", None)
         # claude.md #140: every function's signature is registered before
         # ANY code is emitted -- "hoisting" -- so a call reached earlier
@@ -1060,6 +1088,11 @@ class CodeGen:
             "declare i8 @festina_mkdir(ptr)",
             "declare ptr @festina_ls(ptr)",
             "declare i8 @festina_str_eq(ptr, ptr)",
+            # claude.md #150: text.toInt()/text[i], argv, exec().
+            "declare i64 @festina_text_to_int(ptr)",
+            "declare ptr @festina_text_char_at(ptr, i64)",
+            "declare ptr @festina_argv_array(i32, ptr)",
+            "declare i64 @festina_process_exec(ptr)",
             # claude.md #70: DatabaseURL -- path is festina.sqlite's
             # location, NULL/empty meaning "use the default" (a plain
             # string constant already covers the no-directive case, so
@@ -3158,6 +3191,27 @@ class CodeGen:
                 # efficient, since expr.obj could be an arbitrary
                 # expression with side effects (e.g. a function call
                 # returning an array or map).
+                # claude.md #150: s[i] -- a compile-time-constant
+                # receiver AND index (`'hello'[1]`) is resolved in
+                # Python directly, the same "offload it out of the
+                # compiled program entirely" treatment .toInt() just
+                # above gives a literal receiver -- checked BEFORE
+                # emitting expr.obj at all, since a StringLit needs no
+                # emission in the first place (a bare _const_string
+                # reference costs nothing either way, but skipping the
+                # call entirely is the more honest "did no runtime work"
+                # answer). Only folds a literal, non-negative int index
+                # (`ast.NumberLit`) -- a negative index (`-1]`, parsed as
+                # UnaryOp(-, NumberLit(1))) or any other expression falls
+                # through to the runtime path below, which already
+                # handles both correctly.
+                if (isinstance(expr.obj, ast.StringLit) and isinstance(expr.prop, ast.NumberLit)
+                        and isinstance(expr.prop.value, int) and not isinstance(expr.prop.value, bool)):
+                    chars = list(expr.obj.value)
+                    idx = expr.prop.value
+                    if 0 <= idx < len(chars):
+                        return self._const_string(chars[idx], lines), TEXT
+                    return "null", TEXT
                 obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
                 if isinstance(obj_type, types_mod.MapType):
                     key_val, key_type = self._emit_expr(expr.prop, env, lines)
@@ -3170,6 +3224,29 @@ class CodeGen:
                     out = self._mint_and_release_computed(
                         expr, out[0], obj_val, obj_type, obj_type.value, lines)
                     return out, obj_type.value
+                if obj_type == TEXT:
+                    # claude.md #150: unlike arr[text][i] (a BORROWED
+                    # pointer into the array's own storage, see
+                    # _mint_and_release_computed's own "a scalar element
+                    # needs no minting" branch just above), this always
+                    # calls a runtime function that mallocs a genuinely
+                    # fresh, exclusively-owned one-code-point buffer --
+                    # so this expression node is unconditionally marked
+                    # minted (`_minted_values`), the same set
+                    # _mint_and_release_computed itself populates for a
+                    # refcounted element read through an owning
+                    # container, so _is_owning_text_source's own
+                    # _member_chain_call_base check (which reads that
+                    # exact set) correctly treats the result as already
+                    # owned everywhere it's later bound, passed, or
+                    # freed as an unused temp -- with NO extra copy and
+                    # NO leak either way.
+                    idx_val, _ = self._emit_expr(expr.prop, env, lines)
+                    out = self.tmp()
+                    lines.append(f"  {out} = call ptr @festina_text_char_at(ptr {obj_val}, i64 {idx_val})")
+                    self._free_text_temp(expr.obj, obj_val, obj_type, lines)
+                    self._minted_values.add(id(expr))
+                    return out, TEXT
                 if not isinstance(obj_type, types_mod.ArrayType):
                     raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",
                                         file=self.filename, line=getattr(expr, "line", 0))
@@ -6378,6 +6455,27 @@ class CodeGen:
                 for arg_expr, (val, vtype) in zip(expr.args, emitted):
                     self._free_text_temp(arg_expr, val, vtype, lines)
                 return out, ret_type
+            if name == "exec":
+                # claude.md #150: exec(args) -- args is arr[text], passed
+                # exactly as the header pointer festina_process_exec
+                # itself reads directly (same shape festina_arr_join's
+                # own `arr` parameter takes). The argument-cleanup here
+                # is the IDENTICAL "release if owning, else it's
+                # borrowed" logic an ordinary user-function call's own
+                # argument passing already uses just below (claude.md
+                # #119) -- reused rather than duplicated, since exec()'s
+                # own single arr[text] argument is exactly that same
+                # case (a refcounted type, not text), not a new one.
+                self.uses_exec = True
+                arg_expr = expr.args[0]
+                val, vtype = self._emit_expr(arg_expr, env, lines)
+                out = self.tmp()
+                lines.append(f"  {out} = call i64 @festina_process_exec(ptr {val})")
+                if _is_refcounted(vtype) and self._is_owning_refcounted_source(arg_expr):
+                    lines.append(f"  call void {self._release_fn_for(vtype)}(ptr {val})")
+                else:
+                    self._free_text_temp(arg_expr, val, vtype, lines)
+                return out, INT
             # claude.md #95/#135: writes the OFFSCREEN canvas, so it
             # needs no window either way -- this is the headless case
             # the render() split exists for. saveCanvas() with no path
@@ -6592,6 +6690,29 @@ class CodeGen:
                     out = self.tmp()
                     lines.append(f"  {out} = sitofp i64 {val} to double")
                     return out, FLOAT
+            # claude.md #150: text.toInt() -> int. A literal receiver
+            # (`'42'.toInt()`) is parsed once, in Python, at compile
+            # time -- offloading work out of the compiled program
+            # entirely, the same "resolved once, then costs nothing"
+            # treatment claude.md #91 already gives color/font literals
+            # -- rather than emitting a runtime call whose argument
+            # happens to always be the same known string. A dynamic
+            # receiver (the overwhelmingly common real case -- a
+            # scanned token, user input, ...) still goes through
+            # festina_text_to_int, which implements the identical
+            # parseInt()-style rule this constant fold mirrors in
+            # Python (see that function's own doc comment in
+            # runtime/festina_runtime.c for exactly what "identical"
+            # means here).
+            if callee.prop == "toInt" and not expr.args:
+                if isinstance(callee.obj, ast.StringLit):
+                    return str(_parse_int_like_strtoll(callee.obj.value)), INT
+                val, vtype = self._emit_expr(callee.obj, env, lines)
+                if vtype == TEXT:
+                    out = self.tmp()
+                    lines.append(f"  {out} = call i64 @festina_text_to_int(ptr {val})")
+                    self._free_text_temp(callee.obj, val, vtype, lines)
+                    return out, INT
             # int/float/bool.toText() -> text -- an explicit spelling of
             # exactly the stringification template interpolation already
             # does under the hood (_to_text, shared with _emit_template),
@@ -7605,11 +7726,46 @@ class CodeGen:
         entry_func.extend(lines)
         entry_func.append("}")
 
-        main_lines = ["define i32 @main() {", "entry:"]
+        # claude.md #150: real argc/argv, unconditionally -- every
+        # target (native and wasm32-wasi both) always gets a program's
+        # own real invocation arguments now, not just the wasm bridge's
+        # own __main_argc_argv path this signature also happens to
+        # satisfy (see runtime/festina_runtime_wasm_entry.c). Native
+        # linking needs no bridge at all: `define i32 @main(...)` with
+        # this exact signature already IS the real C ABI entry point on
+        # every native target, argc/argv included, so this changes
+        # nothing about how native main() gets found or called.
+        main_lines = ["define i32 @main(i32 %argc, ptr %argv_raw) {", "entry:"]
         # windows.md Phase 0 (claude.md #126): unconditional, first
         # thing main() does, before even the database/graphics setup
         # below -- see festina_runtime_init's own comment for why.
         main_lines.append("  call void @festina_runtime_init()")
+        # claude.md #150: argv -- built from the real argc/argv above
+        # and stored directly into @argv (generate()'s own
+        # pre-registration), deliberately WITHOUT going through
+        # _emit_global_retain_release the way an ordinary global's
+        # declaration-with-initializer does. That helper is the right
+        # tool when either side of the store is uncertain -- here
+        # neither is: festina_argv_array's own return is always a
+        # freshly built, uniquely-owned array (nothing else has ever
+        # seen this pointer, so no retain is needed -- ownership just
+        # transfers straight into @argv's slot), and @argv's own
+        # current value at this point is always its untouched static
+        # initializer -- the immortal, refcount=-1, zeroinitializer-
+        # payload sentinel every refcounted global gets (this is
+        # provably main()'s first-ever write to @argv, before any user
+        # code has run) -- so there's nothing to release either, not
+        # even a header-level no-op. Going through the generic helper
+        # anyway would still be correct, but it unconditionally emits a
+        # call to the arr[text] release wrapper (_release_fn_for_array),
+        # which then has to exist in EVERY compiled program's own IR
+        # even when nothing else in that program ever touches
+        # arr[text] -- real, avoidable code-size/output-shape noise for
+        # a release that can never do anything (the sentinel's own
+        # length is always 0). Before anything else in main() runs, so
+        # top-level code can read argv as its very first statement.
+        main_lines.append("  %argv_arr = call ptr @festina_argv_array(i32 %argc, ptr %argv_raw)")
+        main_lines.append("  store ptr %argv_arr, ptr @argv")
         # claude.md #131: `on exit(code:int)` registers unconditionally
         # (with or without graphics) and before anything else runs, so
         # close(code) can fire the handler even from code that executes
@@ -7921,6 +8077,46 @@ class CodeGen:
                 lines.append(f"  store {_llvm_type(type_)} {val}, ptr {ref}")
             return
         self._emit_stmt(stmt, env, None, ctx)
+
+
+def _parse_int_like_strtoll(text):
+    """claude.md #150: Python-side replica of festina_text_to_int's own
+    C strtoll()-based parse -- used ONLY to constant-fold a literal
+    text receiver (`'42'.toInt()`) at compile time (see that call
+    site's own comment); a dynamic receiver always goes through the
+    real runtime function instead, so the two never need to agree via
+    shared code, only via matching behavior, verified directly against
+    each other (see tests/test_codegen.py's TestToInt). Deliberately
+    ASCII-only digit/whitespace recognition (`'0' <= c <= '9'`, not
+    Python's own Unicode-aware str.isdigit()/str.isspace()) -- C's
+    strtoll in the "C" locale is ASCII-only for base 10, and Python's
+    versions of those checks accept characters (Devanagari digits,
+    superscripts, ...) the C runtime's own parse never would, which
+    would make this compile-time shortcut disagree with the runtime
+    path it's supposed to be indistinguishable from for the exact same
+    literal text.
+    """
+    n = len(text)
+    i = 0
+    while i < n and text[i] in " \t\n\r\v\f":
+        i += 1
+    start = i
+    if i < n and text[i] in "+-":
+        i += 1
+    digits_start = i
+    while i < n and "0" <= text[i] <= "9":
+        i += 1
+    if i == digits_start:
+        return int(INT_NULL_CONST)
+    value = int(text[start:i])
+    # claude.md #150: strtoll() itself clamps to LLONG_MIN/LLONG_MAX on
+    # overflow (setting errno, which festina_text_to_int deliberately
+    # doesn't check -- see that function's own comment) rather than
+    # wrapping or erroring -- matched here so a literal long enough to
+    # overflow folds to the exact same clamped value the runtime path
+    # would have produced for it.
+    i64_min, i64_max = -(2 ** 63), 2 ** 63 - 1
+    return max(i64_min, min(i64_max, value))
 
 
 def generate_ir(program, analyzed, filename="main.f"):
