@@ -505,6 +505,266 @@ class TestHttpClient:
         assert "caught:" in result.stdout
 
 
+class TestHttpCallbackSemantics:
+    """claude.md #163: an optional `callback:func[http]:void` field on
+    http -- non-null is what makes req.send() (the client, zero-
+    argument form) non-blocking. Checked at the type level only here;
+    real runtime behavior lives in TestHttpCallbackRuntime below."""
+
+    def test_callback_field_accepts_a_matching_func(self, parser, semantic):
+        source = """
+        void func onDone(r:http) { }
+        http req = {'url': 'http://example.com', 'callback': onDone}
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_callback_field_rejects_a_wrong_signature(self, parser, semantic, errors):
+        program = parser.parse("""
+        void func wrong(x:int) { }
+        http req = {'url': 'http://example.com', 'callback': wrong}
+        """)
+        with pytest.raises(errors.CompileError, match="'callback' expects"):
+            semantic.analyze(program)
+
+    def test_callback_is_read_only(self, parser, semantic, errors):
+        program = parser.parse("""
+        void func onDone(r:http) { }
+        on request(req:http) { req.callback = onDone }
+        """)
+        with pytest.raises(errors.CompileError, match="read-only"):
+            semantic.analyze(program)
+
+    def test_reading_callback_back(self, parser, semantic):
+        source = """
+        void func onDone(r:http) { }
+        http req = {'url': 'http://example.com', 'callback': onDone}
+        func[http]:void cb = req.callback
+        """
+        semantic.analyze(parser.parse(source))
+
+
+class TestHttpShorthandSemantics:
+    """claude.md #164: `{...}.send()` (the receiver itself a raw http
+    literal) and its two sugars -- `http req = {...}.send()` and the
+    fully anonymous `http {...}` statement, which parser.py desugars
+    to the identical `{...}.send()` AST shape."""
+
+    def test_bare_maplit_send_analyzes(self, parser, semantic):
+        # A bare `{` at statement start always means a block (pre-
+        # existing, unrelated to this feature) -- so `{...}.send()`
+        # written directly as a top-level statement is unreachable;
+        # the only source spelling that reaches this exact AST shape
+        # is `http {...}` (below), which parser.py desugars to it.
+        source = "http {'url': 'http://example.com', 'method': 'GET'}"
+        semantic.analyze(parser.parse(source))
+
+    def test_maplit_send_rejects_an_unknown_key(self, parser, semantic, errors):
+        program = parser.parse("http {'bogus': 'x'}")
+        with pytest.raises(errors.CompileError, match="no field"):
+            semantic.analyze(program)
+
+    def test_chained_assignment_form_analyzes(self, parser, semantic):
+        source = "http req = {'url': 'http://example.com', 'method': 'GET'}.send()"
+        semantic.analyze(parser.parse(source))
+
+    def test_anonymous_statement_form_parses_and_analyzes(self, parser, semantic, ast_mod):
+        source = "http {'url': 'http://example.com', 'method': 'GET'}"
+        program = parser.parse(source)
+        # claude.md #164: desugars to an ExprStmt wrapping `{...}.send()`
+        # -- confirms the parser-level rewrite actually happened, not
+        # just that semantic.py tolerated some other shape.
+        assert isinstance(program.body[0], ast_mod.ExprStmt)
+        call = program.body[0].expr
+        assert isinstance(call, ast_mod.Call)
+        assert isinstance(call.callee, ast_mod.Member)
+        assert call.callee.prop == "send"
+        assert isinstance(call.callee.obj, ast_mod.MapLit)
+        semantic.analyze(program)
+
+    def test_anonymous_form_is_distinct_from_a_plain_block(self, parser, semantic, ast_mod):
+        # A bare `{` at statement-start (no `http` prefix) is still an
+        # ordinary block statement, completely unaffected by this
+        # shorthand -- claude.md #164's own parser.py comment on why
+        # the check is gated on `http` coming FIRST.
+        program = parser.parse("{ int x = 1 }")
+        assert not isinstance(program.body[0], ast_mod.ExprStmt)
+        semantic.analyze(program)
+
+    def test_anonymous_form_with_no_callback_still_analyzes(self, parser, semantic):
+        # No callback at all is legal too -- an anonymous BLOCKING
+        # send, result entirely discarded (including any thrown
+        # failure never being catchable, since nothing named it) --
+        # never a compile error, matching this feature's own "never
+        # crashes on something merely useless" convention.
+        semantic.analyze(parser.parse("http {'url': 'http://example.com'}"))
+
+
+class TestHttpCallbackRuntime:
+    """claude.md #163: req.send()'s non-blocking form -- a non-null
+    `callback` makes the client dispatch return immediately, running
+    `callback` later, from the main thread, once the request actually
+    completes. Real compile-and-run coverage against a real
+    compile_and_run_server instance -- two genuinely separate compiled
+    processes, exactly like TestHttpClient above."""
+
+    def test_send_with_a_callback_does_not_block(self, compile_and_run_server, compile_and_run):
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) {
+            req.send({'code': 200, 'body': 'hello'})
+        }
+        """)
+        result = compile_and_run(f"""
+        void func onDone(r:http) {{
+            log(`callback: ${{r.code}} ${{r.toText()}}`)
+            close(0)
+        }}
+        http req = {{'url': 'http://127.0.0.1:{server.port}/', 'method': 'GET',
+                      'callback': onDone}}
+        req.send()
+        log('dispatched')
+        """)
+        assert result.returncode == 0, result.stdout
+        # claude.md #163's own point: 'dispatched' -- logged
+        # immediately after req.send() returns -- must appear BEFORE
+        # the callback's own output, proving the call didn't block.
+        dispatched_at = result.stdout.index("dispatched")
+        callback_at = result.stdout.index("callback:")
+        assert dispatched_at < callback_at, result.stdout
+        assert "200 hello" in result.stdout
+
+    def test_callback_failure_path_sets_code_null(self, compile_and_run):
+        # 127.0.0.1:1 -- nothing listens there -- exercises the
+        # __builtin_setjmp-caught-on-the-worker-thread failure path
+        # (see festina_runtime_http.c's own "http -- async client"
+        # section) rather than the success path above.
+        result = compile_and_run("""
+        void func onDone(r:http) {
+            if r.code == null {
+                log(`failed: ${r.toText()}`)
+            } else {
+                log(`unexpected success: ${r.code}`)
+            }
+            close(0)
+        }
+        http req = {'url': 'http://127.0.0.1:1/', 'method': 'GET', 'callback': onDone}
+        req.send()
+        """)
+        assert result.returncode == 0, result.stdout
+        assert "failed:" in result.stdout
+
+    def test_multiple_concurrent_callbacks_all_complete(self, compile_and_run_server, compile_and_run):
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.ok() }
+        """)
+        result = compile_and_run(f"""
+        int done = 0
+        void func onDone(r:http) {{
+            done = done + 1
+            if done == 8 {{ close(0) }}
+        }}
+        int i = 0
+        while i < 8 {{
+            http req = {{'url': 'http://127.0.0.1:{server.port}/', 'method': 'GET',
+                          'callback': onDone}}
+            req.send()
+            i = i + 1
+        }}
+        log('all 8 dispatched')
+        """)
+        assert result.returncode == 0, result.stdout
+        assert "all 8 dispatched" in result.stdout
+
+    def test_callback_fires_even_after_its_declaring_function_returns(
+            self, compile_and_run_server, compile_and_run):
+        # claude.md #163's own point about escape analysis: a callback-
+        # mode http value built and sent entirely inside a function
+        # that returns immediately afterward must still survive to
+        # fire its callback later -- the retain inside
+        # festina_http_send_client_dispatch is what makes this safe
+        # independent of the declaring function's own lexical scope.
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.send({'code': 200, 'body': 'still alive'}) }
+        """)
+        result = compile_and_run(f"""
+        void func onDone(r:http) {{
+            log(`escaped: ${{r.toText()}}`)
+            close(0)
+        }}
+        void func fireAndForget() {{
+            http req = {{'url': 'http://127.0.0.1:{server.port}/', 'method': 'GET',
+                          'callback': onDone}}
+            req.send()
+        }}
+        fireAndForget()
+        log('fireAndForget returned')
+        """)
+        assert result.returncode == 0, result.stdout
+        assert "fireAndForget returned" in result.stdout
+        assert "escaped: still alive" in result.stdout
+
+
+class TestHttpShorthandRuntime:
+    """claude.md #164: the two `{...}.send()`-based shorthands, verified
+    end to end -- `http req = {...}.send()` and the fully anonymous
+    `http {...}` statement."""
+
+    def test_chained_assignment_form(self, compile_and_run_server, compile_and_run):
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.send({'code': 201, 'body': 'chained'}) }
+        """)
+        result = compile_and_run(f"""
+        void func onDone(r:http) {{
+            log(`chained: ${{r.code}} ${{r.toText()}}`)
+            close(0)
+        }}
+        http req = {{'url': 'http://127.0.0.1:{server.port}/', 'method': 'GET',
+                      'callback': onDone}}.send()
+        log('dispatched via chained form')
+        """)
+        assert result.returncode == 0, result.stdout
+        assert result.stdout.index("dispatched") < result.stdout.index("chained:")
+        assert "201 chained" in result.stdout
+
+    def test_anonymous_statement_form(self, compile_and_run_server, compile_and_run):
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.send({'code': 202, 'body': 'anon'}) }
+        """)
+        result = compile_and_run(f"""
+        void func onDone(r:http) {{
+            log(`anon: ${{r.code}} ${{r.toText()}}`)
+            close(0)
+        }}
+        http {{'url': 'http://127.0.0.1:{server.port}/', 'method': 'GET', 'callback': onDone}}
+        log('dispatched via anonymous form')
+        """)
+        assert result.returncode == 0, result.stdout
+        assert result.stdout.index("dispatched") < result.stdout.index("anon:")
+        assert "202 anon" in result.stdout
+
+    def test_anonymous_form_blocking_with_no_callback(self, compile_and_run_server, compile_and_run):
+        # No callback at all -- a plain, blocking, fire-and-forget
+        # send whose response is never read anywhere. Mostly a "this
+        # doesn't leak or crash" check (see the leak verification in
+        # this feature's own claude.md entry); the ordering assertion
+        # from the other two tests doesn't apply here since there's no
+        # callback output to compare against.
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.ok() }
+        """)
+        result = compile_and_run(f"""
+        http {{'url': 'http://127.0.0.1:{server.port}/', 'method': 'GET'}}
+        log('sent, blocking, no callback')
+        """)
+        assert result.returncode == 0, result.stdout
+        assert "sent, blocking, no callback" in result.stdout
+
+
 class TestWebSocketServer:
     def test_upgrade_then_message_roundtrip(self, compile_and_run_server):
         server = compile_and_run_server("""

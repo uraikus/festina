@@ -263,6 +263,21 @@ class Parser:
                             "functions require an explicit return type, e.g. 'text func name() { }'")
         if self._starts_func_decl():
             return self.parse_func_decl()
+        # claude.md #164: `http {...}` -- an anonymous, fire-and-forget
+        # request: no variable name to call .send() on, so the send is
+        # implied. Checked BEFORE _looks_like_declaration (which would
+        # otherwise route this to parse_var_decl, whose own
+        # `self.eat("IDENT")` right after the type expects a variable
+        # name -- exactly what this form deliberately has none of) and
+        # before the plain `t.type == "LBRACE"` block check above (this
+        # branch only ever matches when `http` comes FIRST, so a bare
+        # `{` at statement-start is still an ordinary block,
+        # unambiguously). Desugars to `{...}.send()` at parse time --
+        # semantic.py/codegen.py need no awareness this shorthand
+        # exists at all, since `{...}.send()` (claude.md #164's OTHER
+        # new shorthand) already handles the resulting AST shape.
+        if t.type == "http" and self.peek(1).type == "LBRACE":
+            return self.parse_http_anon_send()
         if t.type == "LBRACE":
             return self.parse_block()
         if self._looks_like_declaration():
@@ -446,6 +461,20 @@ class Parser:
         if not path_tok.value or not _IMPORT_PATH_RE.match(path_tok.value):
             raise self.err(path_tok, "invalid import", f"invalid import path {path_tok.value!r}")
         return ast.ImportDecl(path_tok.value, path_tok.line, path_tok.column)
+
+    def parse_http_anon_send(self):
+        """claude.md #164: `http {...}` -- desugars to `{...}.send()` at
+        parse time (an ExprStmt wrapping a Call whose callee is a
+        Member on the freshly-parsed MapLit) so semantic.py/codegen.py
+        need no separate awareness of this spelling at all -- see
+        parse_statement's own comment on why this is checked before
+        _looks_like_declaration would otherwise misroute it."""
+        t = self.eat("http")
+        maplit = self.parse_primary()  # positioned at LBRACE -- produces an ast.MapLit
+        callee = ast.Member(maplit, "send", computed=False, line=t.line, column=t.column)
+        call = ast.Call(callee, [], line=t.line, column=t.column)
+        self._semi()
+        return ast.ExprStmt(call)
 
     def parse_var_decl(self):
         t = self.peek()

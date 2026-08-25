@@ -82,6 +82,12 @@ static int festina_socket_was_interrupted(void) { return WSAGetLastError() == WS
 #  include <netinet/tcp.h>
 #  include <arpa/inet.h>
 #  include <netdb.h>      /* getaddrinfo -- claude.md #162's client fetch */
+#  include <pthread.h>    /* claude.md #163: the async-callback worker pool below --
+                            * POSIX only for now, the same staged-platform-rollout
+                            * shape every other http feature here already uses (see
+                            * "http -- async client" further down). Already an
+                            * accepted dependency in this runtime -- festina_runtime_audio.c
+                            * links it too, whenever audio is used. */
    typedef int FestinaSocket;
    typedef struct pollfd FestinaPollFd;
 #  define FESTINA_INVALID_SOCKET (-1)
@@ -390,6 +396,16 @@ typedef struct {
     uint8_t *body;
     int64_t body_len;
     int64_t conn_id;  /* 0 = not live */
+    /* claude.md #163: a bare function pointer -- NULL for "no callback",
+     * matching FuncType's own runtime representation exactly (types.py's
+     * own doc comment: "a bare function pointer... immortal for the
+     * life of the process"), so this needs no refcounting/cleanup of
+     * its own, the same reason a `func`-typed struct field never does.
+     * Signature is always `void(http)` (checked by
+     * semantic.py's own _HTTP_LIT_FIELD_TYPES) -- non-NULL here is
+     * exactly what makes req.send() take the non-blocking path (see
+     * festina_http_send_client_dispatch, "http -- async client" below). */
+    void (*callback)(void *);
 } FestinaHttpValue;
 
 #define FESTINA_HTTP_FROM_PAYLOAD(payload) \
@@ -402,9 +418,25 @@ typedef struct {
  * are actually defined. */
 static void *festina_http_value_new(const char *url, const char *method, int64_t code,
                                      void *headers, const uint8_t *body, int64_t body_len,
-                                     int64_t conn_id);
+                                     int64_t conn_id, void (*callback)(void *));
 void festina_release_http(void *payload);
 void festina_http_ok(void *payload);
+
+/* claude.md #163: forward-declared here (defined in "http -- async
+ * client" further down, well after festina_run_http_loop's own
+ * definition) so that loop's per-iteration exit check and drain step
+ * can reference them. Declared unconditionally (not inside the
+ * POSIX-only #if guarding the worker pool itself) so this file reads
+ * identically on every platform -- g_async_outstanding simply never
+ * becomes nonzero on Windows, since festina_http_send_client_dispatch
+ * never queues anything there (see that section's own #else branch). */
+static int64_t g_async_outstanding = 0;
+static int g_async_pool_started = 0;
+static int g_async_wake_fds[2] = {-1, -1};   /* self-pipe: [0] read (in the poll set), [1] write --
+                                              * never opened on Windows, where g_async_pool_started
+                                              * also never becomes true, so festina_run_http_loop
+                                              * never actually reads index [0] there either. */
+static void festina_async_drain_completed(void);
 
 /* Kept in sync with festina_runtime.c's own static festina_null_int()
  * (INT64_MIN) -- that function is private to that translation unit,
@@ -1078,7 +1110,7 @@ static void festina_dispatch_request(FestinaConn *c) {
      * THIS connection's own, so .ok()/.redirect()/.upgrade()/.send(res)
      * all reach it correctly. */
     void *payload = festina_http_value_new(url, c->method, FESTINA_NULL_INT, headers,
-                                           c->body, c->body_len, c->conn_id);
+                                           c->body, c->body_len, c->conn_id, NULL);
     free(url);
     if (g_request_handler) g_request_handler(payload);
     /* c may be gone (the peer could theoretically vanish mid-handler
@@ -1492,7 +1524,14 @@ void festina_run_http_loop(void) {
                 g_http_drain_deadline = festina_now_seconds() + festina_shutdown_grace_seconds();
                 festina_close_all_listeners();
             }
-            if (festina_alive_conn_count() == 0 || festina_now_seconds() >= g_http_drain_deadline) {
+            /* claude.md #163: an outstanding background request also
+             * has to finish before shutdown gives up on it, the same
+             * grace period an already-open connection already gets --
+             * it's real in-flight work, even though it isn't in
+             * g_conns at all (it owns its own raw socket, on a worker
+             * thread, entirely separate from this connection table). */
+            if ((festina_alive_conn_count() == 0 && g_async_outstanding == 0)
+                    || festina_now_seconds() >= g_http_drain_deadline) {
                 festina_program_exit(festina_shutdown_exit_code());
             }
         }
@@ -1502,8 +1541,11 @@ void festina_run_http_loop(void) {
          * slots, so it's never an undercount) instead of first
          * counting exactly how many connections are alive -- trades a
          * small amount of possibly-wasted array size for skipping one
-         * whole linear pass over the connection table every tick. */
-        size_t max_nfds = (size_t)(g_listener_count + g_conn_count);
+         * whole linear pass over the connection table every tick.
+         * claude.md #163: +1 reserves room for the async wake-pipe fd
+         * appended one slot past nfds below, whether or not the async
+         * pool has actually been started by the time this runs. */
+        size_t max_nfds = (size_t)(g_listener_count + g_conn_count) + 1;
         if (max_nfds > g_poll_cap) {
             size_t new_cap = g_poll_cap ? g_poll_cap * 2 : 16;
             while (new_cap < max_nfds) new_cap *= 2;
@@ -1541,8 +1583,22 @@ void festina_run_http_loop(void) {
         }
         size_t nfds = fdi;
 
-        if (nfds == 0 && festina_next_timer_deadline() < 0.0) {
+        if (nfds == 0 && festina_next_timer_deadline() < 0.0 && g_async_outstanding == 0) {
             return; /* nothing left to wait for at all */
+        }
+
+        /* claude.md #163: the async wake-pipe fd, appended ONE SLOT
+         * PAST nfds -- deliberately outside the [0, nfds) range the
+         * listener/connection loops below iterate, so neither of them
+         * needs to know it exists at all. Only added once the pool has
+         * actually been spawned (g_async_pool_started) -- resting at
+         * program start, exactly like every other feature here that's
+         * only linked, not necessarily used. */
+        size_t poll_nfds = nfds;
+        if (g_async_pool_started) {
+            g_poll_fds[nfds].fd = g_async_wake_fds[0];
+            g_poll_fds[nfds].events = POLLIN;
+            poll_nfds = nfds + 1;
         }
 
         double deadline = festina_next_timer_deadline();
@@ -1567,7 +1623,7 @@ void festina_run_http_loop(void) {
             timeout_ms = remaining > 0.0 ? (int)(remaining * 1000.0) + 1 : 0;
         }
 
-        int rc = festina_poll(g_poll_fds, nfds, timeout_ms);
+        int rc = festina_poll(g_poll_fds, poll_nfds, timeout_ms);
         if (rc < 0 && !festina_socket_was_interrupted()) return;
 
         if (rc > 0) {
@@ -1590,6 +1646,11 @@ void festina_run_http_loop(void) {
         }
 
         festina_fire_expired_timers();
+        /* claude.md #163: unconditional, once per iteration, the same
+         * placement as festina_fire_expired_timers just above -- cheap
+         * to call when nothing has completed (a no-op when the async
+         * pool was never started at all). */
+        festina_async_drain_completed();
     }
 }
 
@@ -1602,7 +1663,8 @@ void festina_run_http_loop(void) {
  * (festina_http_send_client, further below) all funnel through this. */
 static void *festina_http_value_new(const char *url, const char *method, int64_t code,
                                      void *headers /* owned, or NULL for a fresh empty one */,
-                                     const uint8_t *body, int64_t body_len, int64_t conn_id) {
+                                     const uint8_t *body, int64_t body_len, int64_t conn_id,
+                                     void (*callback)(void *)) {
     FestinaHttpValue *v = calloc(1, sizeof(*v));
     if (!v) festina_fail("out of memory building an http value");
     v->refcount = 1;
@@ -1617,6 +1679,7 @@ static void *festina_http_value_new(const char *url, const char *method, int64_t
         v->body_len = body_len;
     }
     v->conn_id = conn_id;
+    v->callback = callback;
     return &v->url;
 }
 
@@ -1641,8 +1704,22 @@ void festina_release_http(void *payload) {
  * "copy in, caller frees its own temporary" convention
  * festina_blob_from_bytes already uses). */
 void *festina_http_literal_new(const char *url, const char *method, int64_t code,
-                               void *headers, const uint8_t *body, int64_t body_len) {
-    return festina_http_value_new(url, method, code, headers, body, body_len, 0);
+                               void *headers, const uint8_t *body, int64_t body_len,
+                               void (*callback)(void *)) {
+    return festina_http_value_new(url, method, code, headers, body, body_len, 0, callback);
+}
+
+/* claude.md #163: codegen's own read-back for `.callback` -- a bare
+ * function pointer, cast to `void*` for the same reason every OTHER
+ * FuncType-typed field read already returns one (types.py's own doc
+ * comment: the runtime value behind a FuncType IS a bare function
+ * pointer). NULL reads back as NULL -- the generic FuncType-callee
+ * dispatch in codegen.py already treats a null callee as... actually
+ * calling a null function pointer would crash, so nothing in
+ * generated code ever calls `.callback` directly; only THIS runtime's
+ * own background dispatch does, after already checking it for NULL. */
+void *festina_http_callback(void *payload) {
+    return (void *)FESTINA_HTTP_FROM_PAYLOAD(payload)->callback;
 }
 
 /* ---- http -- fields ---- */
@@ -1788,7 +1865,20 @@ char *festina_http_to_text(void *payload) {
  * through snprintf when the value is just a plain string), so the
  * whole response -- including any extra headers -- goes out in ONE
  * festina_send_all call. */
-static FestinaSendBuf *g_http_send_header_buf = NULL;
+/* claude.md #163: __thread, not a plain global -- festina_map_for_each
+ * has no user-data parameter to route this through directly, and this
+ * scratch variable used to be safe as a plain global purely because
+ * only the single main thread ever called festina_http_send_client
+ * (the SERVER side, festina_http_send, is still main-thread-only and
+ * would have been fine as a plain global forever). Once
+ * festina_http_send_client became callable from multiple background
+ * worker threads at once, a plain global here became a genuine data
+ * race -- confirmed directly by ThreadSanitizer (multiple concurrent
+ * worker threads corrupting each other's own header-writing pass)
+ * before this fix, clean after it. Each thread's own bracketing
+ * assignment (set at the top of the header-writing pass, cleared
+ * right after) only ever touches ITS OWN copy. */
+static __thread FestinaSendBuf *g_http_send_header_buf = NULL;
 
 static void festina_write_extra_header(int64_t value, const char *key) {
     if (!g_http_send_header_buf) return;
@@ -2181,6 +2271,202 @@ void festina_http_send_client(void *payload) {
     v->body_len = new_body_len;
 }
 #undef FESTINA_APPEND_LIT
+
+/* ---- http -- async client (claude.md #163) ----
+ *
+ * `req.callback` non-NULL is what makes `req.send()` non-blocking: a
+ * small, lazily-spawned pool of worker threads (POSIX only for now --
+ * see this file's own top-of-file note on Windows http's own staged
+ * rollout; a Windows program simply gets the ordinary blocking
+ * behavior regardless of `callback`, a clear documented limitation
+ * rather than a silent difference nobody could predict) does the
+ * ACTUAL blocking work (reusing festina_http_send_client entirely
+ * unchanged -- every connect/TLS/parse detail stays in ONE place),
+ * while the callback itself only ever runs on the MAIN thread, from
+ * festina_run_http_loop's own per-iteration drain step -- never from
+ * a worker thread directly. That split is load-bearing, not a style
+ * choice: arbitrary Festina code (the callback body) touches
+ * refcounts and globals that are correct ONLY because exactly one
+ * thread ever runs generated Festina code at all; running it from a
+ * worker would reopen every race this runtime's single-threaded
+ * design exists to avoid.
+ *
+ * A network failure inside festina_http_send_client throws
+ * (claude.md #162) -- caught HERE, on the worker's own thread, via a
+ * hand-written __builtin_setjmp frame (verified directly, with a
+ * standalone two-thread harness, to interoperate correctly with
+ * festina_throw's own __builtin_longjmp before this went anywhere
+ * near the real runtime -- see festina_runtime.c's own
+ * g_festina_catch_top doc comment for why that state had to become
+ * __thread-local first) rather than letting it escape across threads.
+ * A failed request still fires the callback -- there's no `try` frame
+ * left to deliver a throw TO by the time a background result comes
+ * back later -- leaving `.code` `null` (explicitly reset here, in
+ * case the literal set it to something else, which would otherwise
+ * make a failure indistinguishable from a real response) and
+ * `.toText()`/`.toBlob()` reading the failure's own message, so
+ * `if r.code == null { ... }` inside the callback is how a program
+ * tells success from failure. */
+
+#if !defined(_WIN32)
+
+#define FESTINA_HTTP_ASYNC_WORKERS 4
+
+typedef struct FestinaAsyncJob {
+    void *payload;   /* the http value, retained (see the dispatch below) */
+    struct FestinaAsyncJob *next;
+} FestinaAsyncJob;
+
+static pthread_mutex_t g_async_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_async_work_cond = PTHREAD_COND_INITIALIZER;
+static FestinaAsyncJob *g_async_queue_head = NULL;   /* work waiting for a worker */
+static FestinaAsyncJob *g_async_queue_tail = NULL;
+static FestinaAsyncJob *g_async_done_head = NULL;    /* finished, awaiting the main thread's drain */
+static FestinaAsyncJob *g_async_done_tail = NULL;
+
+static void *festina_async_worker(void *unused) {
+    (void)unused;
+    for (;;) {
+        pthread_mutex_lock(&g_async_lock);
+        while (!g_async_queue_head) pthread_cond_wait(&g_async_work_cond, &g_async_lock);
+        FestinaAsyncJob *job = g_async_queue_head;
+        g_async_queue_head = job->next;
+        if (!g_async_queue_head) g_async_queue_tail = NULL;
+        pthread_mutex_unlock(&g_async_lock);
+        job->next = NULL;
+
+        void *catch_buf[5];
+        if (__builtin_setjmp(catch_buf) == 0) {
+            festina_try_push(catch_buf);
+            festina_http_send_client(job->payload);
+            festina_try_pop();
+        } else {
+            /* festina_throw already popped the frame it's unwinding to
+             * (see festina_try_pop's own doc comment) -- nothing left
+             * to clean up here beyond collecting the message. */
+            char *msg = festina_try_error();
+            FestinaHttpValue *v = FESTINA_HTTP_FROM_PAYLOAD(job->payload);
+            v->code = FESTINA_NULL_INT;
+            free(v->body);
+            size_t mlen = strlen(msg);
+            v->body = mlen ? malloc(mlen) : NULL;
+            if (v->body) { memcpy(v->body, msg, mlen); v->body_len = (int64_t)mlen; }
+            else v->body_len = 0;
+            free(msg);
+        }
+
+        pthread_mutex_lock(&g_async_lock);
+        if (g_async_done_tail) g_async_done_tail->next = job; else g_async_done_head = job;
+        g_async_done_tail = job;
+        pthread_mutex_unlock(&g_async_lock);
+        char byte = 1;
+        ssize_t rc = write(g_async_wake_fds[1], &byte, 1);
+        (void)rc; /* the read side just needs SOMETHING to notice -- a dropped
+                   * wake byte under EAGAIN (pipe momentarily full) is harmless,
+                   * since festina_async_drain_completed drains the WHOLE done
+                   * list on every call regardless of how many wake bytes arrived */
+    }
+    return NULL; /* unreachable -- worker threads run for the life of the process */
+}
+
+/* Spawns the pool and the wake pipe exactly once, on first use -- a
+ * program that never uses `callback` never creates a single thread,
+ * even though it links this whole file (matching festina_runtime_audio.c's
+ * own "the library is linked whenever the FEATURE might be used, the
+ * thread only actually spawned once a clip really plays" shape). */
+static void festina_async_ensure_pool(void) {
+    pthread_mutex_lock(&g_async_lock);
+    if (g_async_pool_started) { pthread_mutex_unlock(&g_async_lock); return; }
+    g_async_pool_started = 1;
+    pthread_mutex_unlock(&g_async_lock);
+
+    if (pipe(g_async_wake_fds) != 0) festina_fail("out of resources starting the async http worker pool");
+    int flags = fcntl(g_async_wake_fds[0], F_GETFL, 0);
+    fcntl(g_async_wake_fds[0], F_SETFL, flags | O_NONBLOCK);
+    for (int i = 0; i < FESTINA_HTTP_ASYNC_WORKERS; i++) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, festina_async_worker, NULL) != 0) {
+            festina_fail("out of resources starting the async http worker pool");
+        }
+        pthread_detach(t); /* daemon-style -- never joined; the process exiting reclaims them */
+    }
+}
+
+/* codegen's entry point for the CLIENT form of req.send() (zero
+ * arguments) -- replaces the direct festina_http_send_client call
+ * that used to be there. The null-vs-non-null check on `callback` has
+ * to happen at RUNTIME, not compile time -- codegen has no way to
+ * know a variable's own `.callback` field's value in advance, the
+ * same reason every other http method already tolerates whatever
+ * state the value is actually in at the call site. */
+void festina_http_send_client_dispatch(void *payload) {
+    FestinaHttpValue *v = FESTINA_HTTP_FROM_PAYLOAD(payload);
+    if (!v->callback) {
+        festina_http_send_client(payload);
+        return;
+    }
+    festina_async_ensure_pool();
+    festina_retain(payload); /* survives after the caller's own scope releases its reference --
+                              * balanced by festina_release_http in the drain step below */
+    FestinaAsyncJob *job = malloc(sizeof(*job));
+    if (!job) festina_fail("out of memory queuing an async http request");
+    job->payload = payload;
+    job->next = NULL;
+    pthread_mutex_lock(&g_async_lock);
+    g_async_outstanding++;
+    if (g_async_queue_tail) g_async_queue_tail->next = job; else g_async_queue_head = job;
+    g_async_queue_tail = job;
+    pthread_mutex_unlock(&g_async_lock);
+    pthread_cond_signal(&g_async_work_cond);
+}
+
+/* Called once per festina_run_http_loop iteration (mirroring
+ * festina_fire_expired_timers's own unconditional per-iteration
+ * placement) -- runs every completed job's callback on THIS thread
+ * (the main thread), the only thread that ever runs generated Festina
+ * code. Cheap to call when nothing has completed (two NULL checks
+ * under the lock). */
+static void festina_async_drain_completed(void) {
+    if (!g_async_pool_started) return;
+    pthread_mutex_lock(&g_async_lock);
+    FestinaAsyncJob *done = g_async_done_head;
+    g_async_done_head = g_async_done_tail = NULL;
+    pthread_mutex_unlock(&g_async_lock);
+
+    char discard[64];
+    while (read(g_async_wake_fds[0], discard, sizeof(discard)) > 0) { } /* drain the pipe --
+                                                                          * O_NONBLOCK means this
+                                                                          * returns (<=0) once empty
+                                                                          * rather than blocking */
+    while (done) {
+        FestinaAsyncJob *next = done->next;
+        FestinaHttpValue *v = FESTINA_HTTP_FROM_PAYLOAD(done->payload);
+        void (*callback)(void *) = v->callback;
+        if (callback) callback(done->payload);
+        festina_release_http(done->payload);
+        free(done);
+        pthread_mutex_lock(&g_async_lock);
+        g_async_outstanding--;
+        pthread_mutex_unlock(&g_async_lock);
+        done = next;
+    }
+}
+
+#else /* _WIN32 */
+
+/* claude.md #163: Windows doesn't get the worker pool yet -- same
+ * staged rollout every other http feature in this file already has
+ * (see the top-of-file note). `callback` is simply never consulted
+ * here, so req.send() stays exactly as blocking as it always was on
+ * this platform -- a real, documented limitation, not a silent gap:
+ * see api.md. */
+void festina_http_send_client_dispatch(void *payload) {
+    festina_http_send_client(payload);
+}
+
+static void festina_async_drain_completed(void) { }
+
+#endif /* _WIN32 */
 
 /* ---- s:socket ---- */
 

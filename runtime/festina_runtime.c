@@ -252,12 +252,26 @@ void festina_fail_structured(const char *msg, const char *fields_json) {
  * below is free to be an ordinary runtime C function using
  * __builtin_longjmp on whatever buffer festina_try_push registered.
  *
- * The catch-frame stack is a plain, unsynchronized global -- correct
- * today because this runtime is single-threaded throughout (the
- * `thread {}` feature this pairs with in the language's own roadmap is
- * deliberately NOT built yet -- see todo.md -- specifically because it
- * would need this, along with every other piece of global runtime
- * state, redesigned for real concurrent access first).
+ * The catch-frame stack is `__thread`-local (claude.md #163), not a
+ * plain global -- generated Festina code itself still only ever runs
+ * on the single main thread (every OTHER piece of runtime state --
+ * globals, refcounts -- is exactly as unsynchronized as it always
+ * was, and stays that way), but claude.md #163's background http
+ * worker pool calls this SAME festina_throw/try_push/try_error
+ * machinery -- via a hand-written __builtin_setjmp catch frame, not
+ * generated IR -- from its own worker threads, to convert a network
+ * failure into a queued callback result rather than let it escape
+ * across threads. A plain, shared g_festina_catch_top would let a
+ * worker thread's own push/pop race the main thread's unrelated
+ * try/catch activity, or -- worse -- longjmp into a stack frame that
+ * isn't even on the current thread's stack. Thread-local storage
+ * gives each thread (main or worker) its own completely independent
+ * catch-frame stack and pending-error slot, with zero synchronization
+ * needed, since nothing here is ever actually SHARED between threads
+ * in the first place -- confirmed directly with a standalone harness
+ * (two threads, one throwing, one not, both racing the main thread's
+ * own independent try/catch) before this went anywhere near the real
+ * runtime.
  *
  * THE ONE REAL, DOCUMENTED LIMITATION (see api.md and claude.md #157):
  * longjmp unwinds the C stack directly, bypassing every LLVM-generated
@@ -292,13 +306,14 @@ typedef struct FestinaCatchFrame {
     struct FestinaCatchFrame *prev;
 } FestinaCatchFrame;
 
-static FestinaCatchFrame *g_festina_catch_top = NULL;
+static __thread FestinaCatchFrame *g_festina_catch_top = NULL;
 /* Owned by the runtime between a throw and the moment festina_try_error()
  * hands it over; NULL the rest of the time. Only ever holds ONE message
- * at a time -- a throw can only reach here once nothing between it and
- * the catch has already unwound, so there's never a second pending
- * throw to overwrite this before the first is collected. */
-static char *g_festina_error_message = NULL;
+ * at a time (per thread) -- a throw can only reach here once nothing
+ * between it and the catch has already unwound, so there's never a
+ * second pending throw to overwrite this before the first is
+ * collected. */
+static __thread char *g_festina_error_message = NULL;
 
 /* Registers buf (codegen's own alloca'd sjlj buffer, already populated
  * by ITS direct llvm.eh.sjlj.setjmp call, which returned 0 -- the

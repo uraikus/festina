@@ -49,6 +49,11 @@ def parser():
 
 
 @pytest.fixture
+def ast_mod():
+    return import_spec_module("ast")
+
+
+@pytest.fixture
 def errors():
     return import_spec_module("errors")
 

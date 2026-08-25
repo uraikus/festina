@@ -380,24 +380,36 @@ def _is_sendable_type(t):
 def _is_http_body_type(t):
     return _is_sendable_type(t) or t in (_IMAGE, _AUDIO)
 
-# claude.md #162: the field set `http x = {...}` accepts -- shared
-# between VarDecl's own bypass (mirroring claude.md #156's identical
-# amor-map-literal bypass, see analyze_var_decl) and req.send(res)'s
-# one-argument form, when the caller writes the response inline
-# (`req.send({'code':200, ...})`) rather than through an
-# already-declared http variable. Each entry's KEY must already be a
-# literal text key (ast.StringLit) naming one of these five fields --
-# an arbitrary computed key expression is rejected outright, since
-# there is no way to validate (or, in codegen, build) a heterogeneous
-# literal whose very field set isn't known until runtime, unlike a
-# genuine map[T] literal where every value shares one type regardless
-# of which key produced it.
+# claude.md #163: `callback`'s exact required signature -- `void
+# func(http)`, matching `void func processLater(http r) { ... }` in
+# the feature's own originating example. A module-level constant
+# (rather than building it fresh at every call site) purely so
+# `_validate_http_lit`'s generic `val_type != expected` comparison
+# below and `_infer_member`'s own HttpType branch can share the exact
+# same FuncType instance -- structural equality (FuncType is a frozen
+# dataclass) means this would work either way, but sharing one literal
+# instance is simpler to read than reconstructing it twice.
+_HTTP_CALLBACK_TYPE = types_mod.FuncType((types_mod.HttpType(),), None)
+
+# claude.md #162 (extended by #163's `callback`): the field set
+# `http x = {...}` accepts -- shared between VarDecl's own bypass
+# (mirroring claude.md #156's identical amor-map-literal bypass, see
+# analyze_var_decl) and req.send(res)'s one-argument form, when the
+# caller writes the response inline (`req.send({'code':200, ...})`)
+# rather than through an already-declared http variable. Each entry's
+# KEY must already be a literal text key (ast.StringLit) naming one of
+# these six fields -- an arbitrary computed key expression is rejected
+# outright, since there is no way to validate (or, in codegen, build)
+# a heterogeneous literal whose very field set isn't known until
+# runtime, unlike a genuine map[T] literal where every value shares
+# one type regardless of which key produced it.
 _HTTP_LIT_FIELD_TYPES = {
     "url": _TEXT,
     "method": _TEXT,
     "code": _INT,
     "headers": None,  # checked separately below (map[text])
     "body": None,     # checked separately below (_is_http_body_type)
+    "callback": _HTTP_CALLBACK_TYPE,
 }
 
 
@@ -406,7 +418,7 @@ def _validate_http_lit(maplit, scope, filename, infer):
         if not isinstance(key_expr, ast.StringLit):
             raise CompileError(
                 "an http literal's keys must be plain text -- "
-                "'url'/'method'/'code'/'headers'/'body', not a computed expression",
+                "'url'/'method'/'code'/'headers'/'body'/'callback', not a computed expression",
                 file=filename, line=getattr(key_expr, "line", 0),
                 column=getattr(key_expr, "column", 0),
                 category="invalid operand type",
@@ -415,7 +427,7 @@ def _validate_http_lit(maplit, scope, filename, infer):
         if key not in _HTTP_LIT_FIELD_TYPES:
             raise CompileError(
                 f"http has no field '{key}' to construct -- an http literal "
-                f"accepts 'url', 'method', 'code', 'headers', and 'body'",
+                f"accepts 'url', 'method', 'code', 'headers', 'body', and 'callback'",
                 file=filename, line=getattr(key_expr, "line", 0),
                 column=getattr(key_expr, "column", 0),
                 category="invalid field access",
@@ -451,6 +463,31 @@ def _validate_http_lit(maplit, scope, filename, infer):
                     column=getattr(val_expr, "column", 0),
                     category="invalid operand type",
                 )
+
+
+def _http_send_lit_receiver(node):
+    """claude.md #164: `http req = {...}.send()` -- if `node` is
+    exactly `Call(Member(<MapLit>, 'send', computed=False), [])`,
+    answers the inner MapLit; otherwise None. Used ONLY at a VarDecl's
+    own init position (analyze_var_decl/`_emit_value_for`'s matching
+    bypass in codegen.py) -- NOT a general property of `.send()`
+    expressions elsewhere, deliberately: `.send()` itself still always
+    returns void (see _infer_call's own `send` branch), so this is
+    pure syntax-level sugar recognized at exactly one position, not a
+    new return type. That restriction is what keeps this safe --
+    `req.send()` on an EXISTING variable still can't be captured into
+    a new binding at all (a real double-ownership hazard: the same
+    pointer would then be reachable through two independent bindings,
+    each releasing it on its own), and this helper only ever matches
+    when the receiver is a MapLit literal, which is unconditionally
+    fresh (nothing else could possibly reference it yet) regardless of
+    where it appears."""
+    if (isinstance(node, ast.Call) and len(node.args) == 0
+            and isinstance(node.callee, ast.Member)
+            and not node.callee.computed and node.callee.prop == "send"
+            and isinstance(node.callee.obj, ast.MapLit)):
+        return node.callee.obj
+    return None
 
 # claude.md #56: float -> int, with an explicit rounding decision.
 MATH_ROUNDING_FUNCTIONS = {"floor", "ceil", "round", "trunc"}
@@ -1108,14 +1145,14 @@ def analyze(program, filename="<string>"):
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid assignment",
                 )
-            # claude.md #162: http's own four fields (url/method/code/
-            # headers) are read-only too -- same placement/reasoning
-            # as .length above (the ArrayType-style generic check
-            # below can't tell a read from a write target either). The
-            # only way to SET them is the literal-construction syntax
-            # (`http x = {...}`) at creation time.
+            # claude.md #162/#163: http's own five fields (url/method/
+            # code/headers/callback) are read-only too -- same
+            # placement/reasoning as .length above (the ArrayType-style
+            # generic check below can't tell a read from a write target
+            # either). The only way to SET them is the literal-
+            # construction syntax (`http x = {...}`) at creation time.
             if (isinstance(expr.target, ast.Member) and not expr.target.computed
-                    and expr.target.prop in ("url", "method", "code", "headers")
+                    and expr.target.prop in ("url", "method", "code", "headers", "callback")
                     and isinstance(infer(expr.target.obj, scope), types_mod.HttpType)):
                 raise CompileError(
                     f"'.{expr.target.prop}' is read-only and cannot be assigned to",
@@ -1458,22 +1495,25 @@ def analyze(program, filename="<string>"):
                 category="invalid field access",
             )
         if isinstance(obj_type, types_mod.HttpType):
-            # claude.md #162: four read-only fields (url/method/code/
-            # headers), the rest are methods (see _HTTP_METHODS/
-            # _infer_call's own `send` branch) -- same strict shape as
-            # ImageType's own field/method split above, for the same
-            # reason. `url`/`code` replace the old `port`/`path` pair
-            # (claude.md #151) -- a live inbound request reconstructs
-            # `url` from its own scheme/Host header/path (see
-            # festina_runtime_http.c's own comment), and `code` is
-            # `null` on an inbound request or a freshly-constructed
-            # outbound one, set once a response actually exists.
+            # claude.md #162/#163: five read-only fields (url/method/
+            # code/headers/callback), the rest are methods (see
+            # _HTTP_METHODS/_infer_call's own `send` branch) -- same
+            # strict shape as ImageType's own field/method split above,
+            # for the same reason. `url`/`code` replace the old
+            # `port`/`path` pair (claude.md #151) -- a live inbound
+            # request reconstructs `url` from its own scheme/Host
+            # header/path (see festina_runtime_http.c's own comment),
+            # and `code` is `null` on an inbound request or a freshly-
+            # constructed outbound one, set once a response actually
+            # exists (or a background send() fails -- claude.md #163).
             if expr.prop in ("url", "method"):
                 return _TEXT
             if expr.prop == "code":
                 return _INT
             if expr.prop == "headers":
                 return types_mod.MapType(_TEXT)
+            if expr.prop == "callback":
+                return _HTTP_CALLBACK_TYPE
             if expr.prop in _HTTP_METHODS or expr.prop == "send":
                 raise CompileError(
                     f"'{expr.prop}' is a method on http -- call it, "
@@ -1483,7 +1523,7 @@ def analyze(program, filename="<string>"):
                 )
             raise CompileError(
                 f"http has no field '{expr.prop}' (http has .url, "
-                f".method, .code, .headers, and the methods listed in api.md)",
+                f".method, .code, .headers, .callback, and the methods listed in api.md)",
                 file=filename, line=expr.line, column=expr.column,
                 category="invalid field access",
             )
@@ -2204,7 +2244,27 @@ def analyze(program, filename="<string>"):
             # which _HTTP_METHODS' fixed-arity table has no way to
             # express, so this is its own bespoke branch, the same
             # reason saveCanvas()/setTimeout() above have theirs.
-            if callee.prop == "send" and infer(callee.obj, scope) == _HTTP:
+            # claude.md #164: `{...}.send()` -- an http literal built
+            # and sent in one expression, no named variable at all --
+            # needs the receiver treated as http WITHOUT ever calling
+            # the generic `infer(callee.obj, scope)` on it: a raw
+            # MapLit's own generic inference demands one homogeneous
+            # value type across every entry, which an http-shaped
+            # literal's genuinely heterogeneous fields (text/int/map/
+            # func/body) can never satisfy, the same reason
+            # `http x = {...}` needed its own bypass in the first
+            # place (see _validate_http_lit's own doc comment). Gated
+            # on `callee.prop == "send"` FIRST -- a MapLit calling some
+            # OTHER method name (`{...}.pop()`, say) is nothing to do
+            # with http and must fall through untouched.
+            # `parser.py`'s own `http {...}` statement shorthand
+            # desugars to exactly this same AST shape (a MapLit as a
+            # `.send()` call's receiver), so this one check covers
+            # both spellings.
+            callee_obj_is_http_lit = callee.prop == "send" and isinstance(callee.obj, ast.MapLit)
+            if callee_obj_is_http_lit:
+                _validate_http_lit(callee.obj, scope, filename, infer)
+            if callee.prop == "send" and (callee_obj_is_http_lit or infer(callee.obj, scope) == _HTTP):
                 # claude.md #162: send() is now overloaded by ARITY,
                 # not just optional trailing arguments the way it used
                 # to be -- `req.send(res:http)` (one argument) is the
@@ -2698,14 +2758,27 @@ def analyze(program, filename="<string>"):
                             category="invalid operand type",
                         )
             elif (isinstance(declared_type, types_mod.HttpType)
-                    and isinstance(decl.init, ast.MapLit)):
+                    and (isinstance(decl.init, ast.MapLit)
+                         or _http_send_lit_receiver(decl.init) is not None)):
                 # claude.md #162: same bypass shape as the amor-map
                 # case just above, for the identical reason -- MapLit's
                 # own generic inference demands one homogeneous value
                 # type across every entry, which an http literal's
                 # genuinely heterogeneous field set (text/int/map/body)
-                # can never satisfy.
-                _validate_http_lit(decl.init, scope, filename, infer)
+                # can never satisfy. claude.md #164 widens this to
+                # `http req = {...}.send()` too (see
+                # _http_send_lit_receiver's own doc comment) -- the
+                # trailing `.send()` is validated as a plain 0-argument
+                # http `send()` call by _infer_call already having run
+                # on `decl.init` via the generic path below... except
+                # it HASN'T, because this whole branch is instead of
+                # that generic infer()+check_assignable() call, so the
+                # MapLit itself is what actually gets validated here --
+                # correct either way, since the trailing `.send()`
+                # syntax carries no extra semantic content beyond "the
+                # literal just built also gets sent."
+                lit = decl.init if isinstance(decl.init, ast.MapLit) else _http_send_lit_receiver(decl.init)
+                _validate_http_lit(lit, scope, filename, infer)
             else:
                 actual_type = infer(decl.init, scope)
                 check_assignable(declared_type, actual_type, decl)

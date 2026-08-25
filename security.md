@@ -68,6 +68,14 @@ could feed a program that also happens to read stdin/argv. Concretely:
   availability property of the design (not a bug to be fixed later),
   and matters most for a program whose handler does slow work
   (a large `sqlite()` query, a big JSON render) in the request path.
+  claude.md #163's non-blocking `req.send()` (a `callback`-carrying
+  outbound request) is a narrow, deliberate exception at the OS-process
+  level — a small background thread pool does the actual network I/O —
+  but every piece of GENERATED FESTINA CODE, including the callback
+  itself, still runs on that same single main thread; this bullet's
+  own claim about `on request`/`on message` handlers is unaffected by
+  it, and no Festina-visible global/refcount ever becomes something a
+  program has to reason about concurrently.
 - **An 8MB per-connection buffer cap** (request line + headers + body,
   or one WebSocket frame's payload) bounds a single connection's own
   memory use, but this runtime does not limit the NUMBER of concurrent

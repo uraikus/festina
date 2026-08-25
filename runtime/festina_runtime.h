@@ -1385,13 +1385,21 @@ void festina_run_http_loop(void);
  * returns the SAME live map every call, already retained on the way
  * out (contrast the OLD festina_http_headers, which rebuilt a fresh
  * one on every single read) -- the identical "same live value,
- * retained" contract festina_socket_state below already has. */
+ * retained" contract festina_socket_state below already has.
+ *
+ * claude.md #163: `callback` is a 5th field -- a bare function pointer
+ * (NULL for none), the same runtime representation every other
+ * `func`-typed value already has, so it needs no separate release
+ * function of its own. Non-NULL is what makes festina_http_send_client_dispatch
+ * (below) take req.send()'s non-blocking path. */
 void *festina_http_literal_new(const char *url, const char *method, int64_t code,
-                               void *headers, const uint8_t *body, int64_t body_len);
+                               void *headers, const uint8_t *body, int64_t body_len,
+                               void (*callback)(void *));
 char *festina_http_url(void *payload);
 char *festina_http_method(void *payload);
 int64_t festina_http_code(void *payload);
 void *festina_http_headers(void *payload);
+void *festina_http_callback(void *payload);  /* the bare function pointer, or NULL */
 
 /* http -- methods. ok/redirect/upgrade/send(res) are each a no-op
  * (not an error) if this value isn't bound to a live, still-open
@@ -1432,6 +1440,19 @@ void festina_http_send(void *req_payload, void *res_payload);
  * on the client side links mbedTLS the same way openSecurePort()
  * does. */
 void festina_http_send_client(void *payload);
+/* claude.md #163: codegen's own entry point for req.send() (zero
+ * arguments) -- replaces the old direct festina_http_send_client call.
+ * Checks `payload`'s own `.callback` field at RUNTIME: NULL takes the
+ * exact festina_http_send_client path above (still fully blocking,
+ * unchanged behavior); non-NULL hands the request to a background
+ * worker pool instead and returns immediately, running `callback`
+ * later from the main thread's own event loop once the request
+ * completes (success or a caught network failure -- see
+ * festina_runtime_http.c's own "http -- async client" section).
+ * POSIX only for now (Linux/macOS) -- on Windows this is currently
+ * identical to calling festina_http_send_client directly; `callback`
+ * is simply not consulted there yet (see api.md). */
+void festina_http_send_client_dispatch(void *payload);
 /* claude.md #162: registers festina_runtime_https.c's own TLS CLIENT
  * hooks (mirroring festina_set_tls_hooks' own SERVER-side registration
  * -- see that function's own doc comment for the identical cross-
