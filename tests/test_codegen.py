@@ -13591,3 +13591,253 @@ class TestTopLevelBlockScopeTracking:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "v2\n"
+
+
+class TestArgv:
+    """claude.md #150: `argv` -- a real, mutable `arr[text]` global,
+    pre-registered in semantic.analyze (so it's usable without any
+    declaration) and populated from the process's real OS argc/argv at
+    the very start of main(), before any top-level statement runs. See
+    _emit_main_and_entry's own comment for why the store is a plain,
+    direct `store ptr %argv_arr, ptr @argv` rather than going through
+    the generic global retain/release helper every OTHER global
+    reassignment uses."""
+
+    def test_argv0_is_the_program_path(self, compile_and_run):
+        result = compile_and_run("log(argv.length)\nlog(argv[0] != '')\n")
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["1", "true"]
+
+    def test_extra_arguments_are_visible(self, compile_and_run):
+        source = """
+        log(argv.length)
+        log(argv[1])
+        log(argv[2])
+        """
+        result = compile_and_run(source, args=["hello", "world"])
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["3", "hello", "world"]
+
+    def test_argv_is_a_real_mutable_array(self, compile_and_run):
+        # Nothing about argv's pre-registration makes it special once
+        # main() has populated it -- ordinary arr[text] operations work
+        # on it like any other array local/global.
+        source = """
+        argv.push('extra')
+        log(argv[argv.length - 1])
+        """
+        result = compile_and_run(source, args=["a"])
+        assert result.returncode == 0
+        assert result.stdout == "extra\n"
+
+
+class TestExec:
+    """claude.md #150: exec(args:arr[text]):int -- spawns args[0]
+    (PATH-searched), inheriting stdio, and returns its real exit code,
+    or -1 if the process never started at all (distinguished from a
+    real exit(127) via the self-pipe technique -- see
+    festina_process_exec's own comment in runtime/festina_runtime.c).
+    Named festina_process_exec at the runtime level, not festina_exec,
+    to avoid colliding with the pre-existing internal SQL-DDL helper of
+    that name."""
+
+    def test_successful_exec_returns_the_real_exit_code(self, compile_and_run):
+        source = """
+        arr[text] cmd = ['/bin/sh', '-c', 'exit 3']
+        log(exec(cmd))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "3\n"
+
+    def test_a_missing_executable_returns_negative_one(self, compile_and_run):
+        # Not 127 -- that would be indistinguishable from a real
+        # program that legitimately calls exit(127) itself. See the
+        # self-pipe technique in festina_process_exec.
+        source = """
+        arr[text] cmd = ['/no/such/binary/at/all/xyz']
+        log(exec(cmd))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "-1\n"
+
+    def test_stdio_is_inherited(self, compile_and_run):
+        # exec() inherits stdout rather than capturing it -- the child's
+        # own output lands directly in the parent's stdout stream.
+        source = """
+        arr[text] cmd = ['/bin/echo', 'from-child']
+        exec(cmd)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert "from-child" in result.stdout
+
+    def test_exec_is_rejected_for_wasm(self, cli_mod, tmp_path):
+        src = tmp_path / "main.f"
+        src.write_text("arr[text] cmd = ['ls']\nexec(cmd)", encoding="utf-8")
+        with pytest.raises(cli_mod.CompileError) as exc_info:
+            cli_mod.compile_file(str(src), str(tmp_path / "out.wasm"),
+                                  cc="clang", target="wasm32-wasi")
+        assert exc_info.value.category == "unsupported platform feature"
+        assert "exec" in str(exc_info.value)
+
+
+class TestToInt:
+    """claude.md #150: text.toInt():int -- JS parseInt()-style parsing
+    (leading whitespace skipped, an optional sign, digits until the
+    first non-digit), returning int-null (-9223372036854775808) rather
+    than raising on unparseable input, mirroring toFloat's existing
+    null-on-failure convention. A literal-receiver call constant-folds
+    entirely at compile time (see _parse_int_like_strtoll) -- steering
+    message mid-task: 'offload as much of the work as possible at the
+    compilation phase.'"""
+
+    def test_a_clean_int_parses(self, compile_and_run):
+        result = compile_and_run("log('42'.toInt())")
+        assert result.returncode == 0
+        assert result.stdout == "42\n"
+
+    def test_trailing_garbage_is_ignored_js_style(self, compile_and_run):
+        result = compile_and_run("log('42abc'.toInt())")
+        assert result.returncode == 0
+        assert result.stdout == "42\n"
+
+    def test_leading_whitespace_and_sign_are_handled(self, compile_and_run):
+        result = compile_and_run("log('  -17'.toInt())")
+        assert result.returncode == 0
+        assert result.stdout == "-17\n"
+
+    def test_unparseable_text_returns_null(self, compile_and_run):
+        source = """
+        int n = 'nope'.toInt()
+        log(n == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+
+    def test_empty_text_returns_null(self, compile_and_run):
+        source = """
+        int n = ''.toInt()
+        log(n == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+
+    def test_a_dynamic_receiver_is_parsed_at_runtime(self, compile_and_run):
+        # Not a StringLit receiver -- takes the real festina_text_to_int
+        # runtime path rather than the compile-time constant fold.
+        source = """
+        text func makeNum() { return '9' + '9' }
+        log(makeNum().toInt())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "99\n"
+
+    def test_literal_receiver_constant_folds(self, parser, semantic, codegen):
+        # No festina_text_to_int call at all -- computed entirely in
+        # Python via _parse_int_like_strtoll, matching the mid-task
+        # steering message to offload work to compile time wherever
+        # possible.
+        program = parser.parse("log('123'.toInt())")
+        analyzed = semantic.analyze(program)
+        ir = codegen.generate_ir(program, analyzed)
+        assert "call i64 @festina_text_to_int(" not in ir
+        assert "123" in ir
+
+
+class TestTextIndexing:
+    """claude.md #150: text[i]:text -- read-only, UTF-8 codepoint-
+    indexed character access, returning null (not a runtime crash) for
+    an out-of-range or negative index. Deliberately DIFFERENT semantics
+    from arr[T] indexing (which is unchecked raw-memory access) --
+    text's own bounds are always checked. A literal receiver with a
+    literal non-negative index constant-folds entirely in Python."""
+
+    def test_a_middle_character(self, compile_and_run):
+        result = compile_and_run("text s = 'hello'\nlog(s[1])")
+        assert result.returncode == 0
+        assert result.stdout == "e\n"
+
+    def test_index_zero(self, compile_and_run):
+        result = compile_and_run("text s = 'hello'\nlog(s[0])")
+        assert result.returncode == 0
+        assert result.stdout == "h\n"
+
+    def test_out_of_range_is_null_not_a_crash(self, compile_and_run):
+        source = """
+        text s = 'hi'
+        text c = s[100]
+        log(c == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+
+    def test_negative_index_is_null(self, compile_and_run):
+        source = """
+        text s = 'hi'
+        text c = s[-1]
+        log(c == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+
+    def test_multibyte_utf8_is_indexed_by_codepoint_not_byte(self, compile_and_run):
+        # 'café' -- 'é' is a 2-byte UTF-8 sequence, so a byte-indexed
+        # implementation would return a broken half-character here;
+        # codepoint indexing must return the whole 'é'.
+        result = compile_and_run("text s = 'café'\nlog(s[3])")
+        assert result.returncode == 0
+        assert result.stdout == "é\n"
+
+    def test_assignment_is_rejected(self, parser, semantic, errors):
+        program = parser.parse("text s = 'hi'\ns[0] = 'x'")
+        with pytest.raises(errors.CompileError, match="immutable"):
+            semantic.analyze(program)
+
+    def test_a_dynamic_receiver_and_index_go_through_the_runtime_path(self, compile_and_run):
+        source = """
+        text func makeText() { return 'ab' + 'cd' }
+        int func idx() { return 1 + 1 }
+        log(makeText()[idx()])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "c\n"
+
+    def test_literal_receiver_and_index_constant_folds(self, parser, semantic, codegen):
+        program = parser.parse("text s = 'hello'\nlog(s[1])\nlog('world'[0])")
+        analyzed = semantic.analyze(program)
+        ir = codegen.generate_ir(program, analyzed)
+        # 'world'[0] is a literal-on-literal index -- folded to 'w' in
+        # Python, no festina_text_char_at call needed for it. s[1]
+        # (a variable receiver) still goes through the runtime path.
+        assert "call ptr @festina_text_char_at(" in ir
+        assert '"w\\00"' in ir or "w\\00" in ir
+
+    def test_indexing_does_not_leak(self, compile_and_run):
+        # festina_text_char_at always returns a freshly allocated
+        # buffer -- the dynamic-path codegen must free the receiver AND
+        # correctly mark the result as owning (self._minted_values) so
+        # a bound/used result isn't defensively re-copied and leaked.
+        # This is a correctness/output check, not a real leak check --
+        # see scripts/leak_stress.sh for the ASan/LeakSanitizer side of
+        # this, run manually during development of claude.md #150.
+        source = """
+        text s = 'abcdef'
+        text out = ''
+        int j = 0
+        while j < 6 {
+            out = out + s[j]
+            j = j + 1
+        }
+        log(out)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "abcdef\n"

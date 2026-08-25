@@ -60,8 +60,25 @@
                       * nothing a second argument would mean) */
 #include <fcntl.h> /* _O_BINARY -- festina_runtime_init's stdout/stderr fix */
 #include <io.h>    /* _setmode/_fileno -- MSVCRT/UCRT, not POSIX unistd.h */
+#include <process.h> /* _spawnvp/_P_WAIT -- claude.md #150's exec() */
 #else
 #include <sys/stat.h> /* mkdir(path, mode) -- POSIX */
+#if !defined(__wasi__)
+#include <fcntl.h>    /* F_SETFD/FD_CLOEXEC -- the self-pipe in festina_process_exec */
+#include <unistd.h>   /* fork/execvp/pipe/close/read/write */
+#include <sys/wait.h> /* waitpid/WIFEXITED/WEXITSTATUS */
+#endif
+/* wasm32-wasi gets neither -- WASI has no process model at all
+ * (confirmed directly: <sys/wait.h> doesn't even exist in wasi-libc's
+ * own sysroot, not just "declares fork() but it always fails").
+ * festina_process_exec's own body below is a stub for that target, never
+ * actually reached by a real program -- a wasm compile that tries to
+ * use exec() is rejected outright at compile time (see festina/cli.py's
+ * _check_wasm_feature_supported) -- but this translation unit is still
+ * compiled UNCONDITIONALLY for every wasm build (core, like regex --
+ * see this file's own top comment), so it still needs to compile
+ * cleanly regardless of whether the specific program being built ever
+ * calls exec() at all. */
 #endif
 
 /* windows.md Phase 0 (claude.md #126): the MinGW/UCRT C runtime opens
@@ -391,6 +408,181 @@ void *festina_text_split(const char *s, const char *sep) {
     }
     return festina_pieces_finish(&p);
 }
+
+/* ---- claude.md #150: text.toInt() / text[i] ----
+ *
+ * toInt() is JS parseInt()-style: strtoll() already does exactly the
+ * skip-leading-whitespace, optional-sign, stop-at-first-non-digit
+ * dance this wants, so this just distinguishes "genuinely nothing
+ * parseable" (endptr never moved past the start at all) from a real
+ * parse -- reusing libc's own parser rather than hand-rolling a second,
+ * divergent one. festina_null_int() is declared further down (the
+ * sqlite() section) but defined as a plain `static` function above its
+ * own first use there -- forward-declared here for that reason. */
+static int64_t festina_null_int(void);
+
+int64_t festina_text_to_int(const char *s) {
+    if (!s) s = "";
+    char *end = NULL;
+    long long v = strtoll(s, &end, 10);
+    if (end == s) return festina_null_int();  /* nothing parseable at all */
+    return (int64_t)v;
+}
+
+/* text[i] -> a single UTF-8 code point, the same unit split('') already
+ * uses (see festina_text_split's own empty-separator branch just
+ * above) -- walked independently here rather than factored out, since
+ * this one also has to stop early once it reaches `index`, and NULL on
+ * a negative or past-the-end index rather than that function's own
+ * "whole string, walked to completion" shape. */
+char *festina_text_char_at(const char *s, int64_t index) {
+    if (!s) s = "";
+    if (index < 0) return NULL;
+    const char *c = s;
+    int64_t i = 0;
+    while (*c) {
+        const char *start = c;
+        c++;
+        while ((*c & 0xC0) == 0x80) c++;
+        if (i == index) {
+            size_t len = (size_t)(c - start);
+            char *out = malloc(len + 1);
+            if (!out) festina_fail("out of memory in text indexing");
+            memcpy(out, start, len);
+            out[len] = '\0';
+            return out;
+        }
+        i++;
+    }
+    return NULL;  /* index >= the text's own code point count */
+}
+
+/* ---- claude.md #150: argv ---- */
+
+void *festina_argv_array(int argc, char **argv) {
+    FestinaPieces p = {NULL, 0, 0};
+    for (int i = 0; i < argc; i++) {
+        const char *a = argv[i] ? argv[i] : "";
+        festina_pieces_push(&p, a, strlen(a));
+    }
+    return festina_pieces_finish(&p);
+}
+
+/* ---- claude.md #150: exec() ---- */
+
+#if defined(_WIN32)
+int64_t festina_process_exec(void *args) {
+    if (!args) return -1;
+    int64_t *header = (int64_t *)args;
+    int64_t n = header[0];
+    if (n <= 0) return -1;
+    char **data;
+    memcpy(&data, &header[1], sizeof(char **));
+
+    char **argv_c = malloc((size_t)(n + 1) * sizeof(char *));
+    if (!argv_c) return -1;
+    for (int64_t i = 0; i < n; i++) argv_c[i] = data[i] ? data[i] : "";
+    argv_c[n] = NULL;
+
+    /* _P_WAIT: spawn and block until it exits, handing back its exit
+     * code directly -- the closest _spawnvp equivalent to fork()+
+     * execvp()+waitpid() below. PATH-searched, same as execvp. */
+    intptr_t rc = _spawnvp(_P_WAIT, argv_c[0], (const char *const *)argv_c);
+    free(argv_c);
+    return (rc == -1) ? -1 : (int64_t)rc;
+}
+#elif defined(__wasi__)
+int64_t festina_process_exec(void *args) {
+    /* Never actually reached -- see this file's own include-block
+     * comment on why wasm32-wasi still needs this to exist and compile
+     * cleanly even though nothing can call it in a real program. */
+    (void)args;
+    return -1;
+}
+#else
+int64_t festina_process_exec(void *args) {
+    if (!args) return -1;
+    int64_t *header = (int64_t *)args;
+    int64_t n = header[0];
+    if (n <= 0) return -1;
+    char **data;
+    memcpy(&data, &header[1], sizeof(char **));
+
+    /* execvp needs a NULL-terminated argv, unlike Festina's own
+     * arr[text] (a plain count + pointer array, no sentinel) -- built
+     * fresh here rather than assuming the caller already left room. */
+    char **argv_c = malloc((size_t)(n + 1) * sizeof(char *));
+    if (!argv_c) return -1;
+    for (int64_t i = 0; i < n; i++) argv_c[i] = data[i] ? data[i] : "";
+    argv_c[n] = NULL;
+
+    /* A self-pipe, close-on-exec on both ends -- the standard trick for
+     * telling "the process never started at all" (a missing/
+     * unexecutable path) apart from "it started and genuinely exited
+     * with this same code on its own". Confirmed directly this
+     * distinction is NOT free: a first version without the pipe read
+     * back exit code 127 for a missing executable -- indistinguishable
+     * from a real program that legitimately calls exit(127) itself --
+     * because a failed execvp()'s own fallback `_exit(127)` is an
+     * ordinary, WIFEXITED-true exit as far as waitpid() can see, not a
+     * distinct kind of failure. A successful execvp() replaces the
+     * child's whole image, closing the write end for free (CLOEXEC)
+     * with nothing ever written to it, so the parent's read below
+     * returns EOF (0 bytes) immediately; a FAILED execvp() falls
+     * through to the write() first, which is what the parent actually
+     * checks for. */
+    int pfd[2];
+    if (pipe(pfd) != 0) { free(argv_c); return -1; }
+    fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+    fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
+
+    pid_t pid = fork();
+    int64_t result;
+    if (pid < 0) {
+        close(pfd[0]);
+        close(pfd[1]);
+        result = -1;
+    } else if (pid == 0) {
+        /* Child: execvp only ever returns on failure (the executable
+         * wasn't found, wasn't executable, ...) -- _exit (not exit) so
+         * a failed exec doesn't run the PARENT's own atexit handlers/
+         * flush its buffers a second time in this now-duplicated
+         * process. */
+        close(pfd[0]);
+        execvp(argv_c[0], argv_c);
+        int exec_errno = errno;
+        ssize_t written = write(pfd[1], &exec_errno, sizeof(exec_errno));
+        (void)written;  /* best effort -- about to _exit regardless */
+        _exit(127);
+    } else {
+        close(pfd[1]);
+        int exec_errno = 0;
+        ssize_t got = read(pfd[0], &exec_errno, sizeof(exec_errno));
+        close(pfd[0]);
+        int status;
+        if (waitpid(pid, &status, 0) < 0) {
+            result = -1;
+        } else if (got > 0) {
+            /* execvp() itself failed in the child -- it never really
+             * started, regardless of what its own exit code happened
+             * to be. */
+            result = -1;
+        } else if (WIFEXITED(status)) {
+            result = WEXITSTATUS(status);
+        } else {
+            /* Killed by a signal rather than exiting -- no single
+             * non-negative exit-code encoding for that would avoid
+             * colliding with a real exit code, so this collapses to
+             * the same "couldn't get a real answer" -1 a start failure
+             * already uses, rather than inventing a second, narrower
+             * sentinel space a caller would have to know about too. */
+            result = -1;
+        }
+    }
+    free(argv_c);
+    return result;
+}
+#endif
 
 /* ---- claude.md #132: mkdir()/ls() ----
  *
@@ -1056,6 +1248,24 @@ void festina_set_audio_decoder(void *(*fn)(const void *, int64_t, const char *))
 
 void festina_set_image_decoder(void *(*fn)(const void *, int64_t, const char *)) {
     g_image_decoder = fn;
+}
+
+/* claude.md #151: the same indirection req.toImg()/req.toAud()
+ * (festina_runtime_http.c) go through, for the identical reason the
+ * sqlite-column path just below already does -- core must not
+ * reference festina_image_from_bytes/festina_audio_from_bytes
+ * directly (those live in the graphics/audio translation units), so
+ * these two thin wrappers are what any OTHER translation unit calls
+ * instead. NULL (no decoder registered -- the program never actually
+ * uses graphics/audio, so codegen never registered one) answers NULL
+ * rather than crashing, the same "unset decoder" behavior the column
+ * path already has. */
+void *festina_decode_image_bytes(const void *data, int64_t len, const char *label) {
+    return g_image_decoder ? g_image_decoder(data, len, label) : NULL;
+}
+
+void *festina_decode_audio_bytes(const void *data, int64_t len, const char *label) {
+    return g_audio_decoder ? g_audio_decoder(data, len, label) : NULL;
 }
 
 /* festina_sync_table below builds several SQL statements incrementally

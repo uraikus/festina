@@ -176,6 +176,201 @@ def compile_and_run(tmp_path, codegen, cli_mod):
     return _run
 
 
+def _free_tcp_port():
+    """claude.md #151: an OS-assigned free port, for openPort()'s own
+    literal (Festina's source text, not the running process, decides
+    what port to listen on -- there's no way to hand a compiled
+    program a port at runtime the way an env var could, so the source
+    itself has to name a real, currently-unused one). Binding to port
+    0 and reading back what the OS actually chose, then closing
+    immediately, is the standard TOCTOU-accepting way to pick one --
+    another process could in principle grab it in the gap before this
+    fixture's own compiled binary opens it, but that race is the same
+    one every "find a free port for a test" fixture anywhere already
+    accepts, not something specific to this feature."""
+    import socket as _socket
+    s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+@pytest.fixture
+def compile_and_run_server(tmp_path, codegen, cli_mod):
+    """claude.md #151: compiles an openPort()-using Festina program,
+    launches the compiled binary as a real background subprocess (not
+    captured/blocking the way compile_and_run's subprocess.run is --
+    a server never exits on its own), and hands the test a small
+    client object once the port is confirmed actually accepting
+    connections (polled with a real connect() attempt, not a fixed
+    sleep -- a fixed delay would be either flaky under load or
+    wastefully long otherwise).
+
+    The source itself must call `openPort(__PORT__)` -- `__PORT__` is
+    replaced with a real free port before compiling (plain literal
+    substitution, not str.format(): Festina source is full of its own
+    bare `{`/`}`, which .format() would misparse). Cleanup (SIGTERM, falling back to
+    SIGKILL if the process doesn't exit within a couple seconds) runs
+    via a finalizer, so a failing assertion mid-test still tears the
+    server down rather than leaking a listening process into the rest
+    of the test session."""
+    cc = _require_c_compiler()
+
+    class _Server:
+        def __init__(self, process, port):
+            self.process = process
+            self.port = port
+
+        def http_get(self, path, timeout=5, headers=None):
+            import http.client
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+            conn.request("GET", path, headers=headers or {})
+            resp = conn.getresponse()
+            body = resp.read()
+            conn.close()
+            return resp.status, dict(resp.getheaders()), body
+
+        def http_post(self, path, body=b"", headers=None, timeout=5):
+            import http.client
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+            conn.request("POST", path, body=body, headers=headers or {})
+            resp = conn.getresponse()
+            data = resp.read()
+            conn.close()
+            return resp.status, dict(resp.getheaders()), data
+
+        def ws_connect(self, path="/", timeout=5):
+            """A minimal, hand-rolled RFC 6455 client -- deliberately
+            not reusing any part of this project's own implementation,
+            so a bug shared between the two could never cancel itself
+            out. See festina_runtime_http.c's own top comment for the
+            protocol subset this needs to match (text/binary/close
+            frames, masked client->server, unmasked server->client)."""
+            import base64, hashlib, os as _os, socket as _socket, struct
+            key = base64.b64encode(_os.urandom(16)).decode()
+            sock = _socket.create_connection(("127.0.0.1", self.port), timeout=timeout)
+            req = (
+                f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
+                f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            )
+            sock.sendall(req.encode())
+            resp = sock.recv(4096)
+            status_line = resp.splitlines()[0]
+            expected_accept = base64.b64encode(
+                hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+            ).decode()
+            return _WsConn(sock), status_line, expected_accept, resp
+
+    class _WsConn:
+        def __init__(self, sock):
+            self.sock = sock
+
+        def send_text(self, text):
+            self._send_frame(0x1, text.encode())
+
+        def send_binary(self, data):
+            self._send_frame(0x2, data)
+
+        def send_close(self, code=1000):
+            import struct
+            self._send_frame(0x8, struct.pack(">H", code))
+
+        def _send_frame(self, opcode, payload):
+            import os as _os
+            mask = _os.urandom(4)
+            masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if len(payload) <= 125:
+                header = bytes([0x80 | opcode, 0x80 | len(payload)])
+            else:
+                import struct
+                header = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack(">H", len(payload))
+            self.sock.sendall(header + mask + masked)
+
+        def recv_frame(self):
+            import struct
+            b = self._recv_exact(2)
+            opcode = b[0] & 0x0F
+            length = b[1] & 0x7F
+            if length == 126:
+                length = struct.unpack(">H", self._recv_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack(">Q", self._recv_exact(8))[0]
+            payload = self._recv_exact(length)
+            return opcode, payload
+
+        def _recv_exact(self, n):
+            data = b""
+            while len(data) < n:
+                chunk = self.sock.recv(n - len(data))
+                if not chunk:
+                    raise ConnectionError("websocket connection closed early")
+                data += chunk
+            return data
+
+        def close(self):
+            self.sock.close()
+
+    def _run(source_template, filename="main.f"):
+        port = _free_tcp_port()
+        # claude.md #151: NOT str.format() -- Festina source is full of
+        # its own bare `{`/`}` (every block body, every map literal),
+        # which .format() would misread as format-spec placeholders.
+        # A plain, literal token substitution has no such collision.
+        source = source_template.replace("__PORT__", str(port))
+        src_path = tmp_path / filename
+        src_path.write_text(source, encoding="utf-8")
+        out_path = tmp_path / "program"
+        compile_file_or_skip(cli_mod, str(src_path), str(out_path), cc=cc)
+        process = subprocess.Popen(
+            [str(out_path)], cwd=tmp_path,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        # Poll for the port actually accepting connections, rather than
+        # a fixed sleep -- openPort() itself is one of the first things
+        # the compiled program's own top-level code runs, but process
+        # startup time is real and not worth guessing at.
+        import socket as _socket
+        deadline = time.time() + 5
+        connected = False
+        while time.time() < deadline:
+            if process.poll() is not None:
+                pytest.fail(
+                    f"server process exited early (code {process.returncode}):\n"
+                    f"{process.stdout.read() if process.stdout else ''}")
+            try:
+                probe = _socket.create_connection(("127.0.0.1", port), timeout=0.2)
+                probe.close()
+                connected = True
+                break
+            except OSError:
+                time.sleep(0.05)
+        if not connected:
+            process.kill()
+            pytest.fail(f"server never started listening on port {port}")
+        return _Server(process, port)
+
+    servers = []
+    orig_run = _run
+
+    def _run_and_track(*a, **kw):
+        server = orig_run(*a, **kw)
+        servers.append(server)
+        return server
+
+    yield _run_and_track
+
+    for server in servers:
+        if server.process.poll() is None:
+            server.process.terminate()
+            try:
+                server.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                server.process.kill()
+                server.process.wait(timeout=3)
+
+
 @pytest.fixture
 def compile_and_run_wasm(tmp_path, codegen, cli_mod):
     """WASM counterpart to compile_and_run (claude.md #148, wasm.md):
@@ -196,11 +391,14 @@ def compile_and_run_wasm(tmp_path, codegen, cli_mod):
     installs wasi-libc/libclang-rt-*-dev-wasm32 and Node specifically so
     this fixture is never skipped on the primary platform).
 
-    Unlike compile_and_run, there's no `args=` parameter: Festina
-    programs have no way to read argv at all (no language builtin for
-    it -- see api.md), and run_wasi.mjs's own WASI `args` is just
-    `[wasmPath]` for that reason, so there is nothing here to pass
-    through.
+    Unlike compile_and_run, there's no `args=` parameter: claude.md
+    #150 gave Festina programs a real `argv` global, but run_wasi.mjs's
+    own WASI `args` is hardcoded to just `[wasmPath]` (see its own
+    comment) -- nothing here forwards extra command-line arguments into
+    the WASI host, so `argv` under wasm always comes back as a
+    single-element array (the module's own path) regardless of what a
+    caller of this fixture might want to pass. Extending that is a
+    run_wasi.mjs change, not something this fixture can paper over.
     """
     clang = shutil.which("clang")
     node = shutil.which("node")

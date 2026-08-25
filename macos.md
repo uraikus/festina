@@ -24,6 +24,14 @@ current as a reference -- not a live tracker of unstarted work. See
 of how each phase was built, including the real bugs the "Bugs found
 along the way" section below summarizes.
 
+A later, unrelated feature picked up the identical gate shape:
+`openPort()`/`on request`/`on upgrade`/`on message`/`on socketClose`
+(claude.md #151) are plain POSIX sockets with nothing Linux-specific
+about them, but -- like audio/graphics above -- haven't been run
+against real macOS hardware, so they're gated behind
+`FESTINA_ENABLE_MACOS_HTTP=1` the same way. See [api.md](api.md#http-and-websocket-servers)
+for the feature itself.
+
 ## Porting surface
 
 The premise (from [todo.md](todo.md#platforms)) held up under audit:

@@ -15,6 +15,7 @@ SPEC_KEYWORDS = frozenset({
     "for", "while",  # claude.md #60, #61
     "map",  # claude.md #72
     "break", "continue",  # claude.md #73
+    "http", "socket",  # claude.md #151
 })
 
 # Extra control tokens the parser needs distinct token types for, so it

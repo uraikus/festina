@@ -644,6 +644,27 @@ class TestAudioFeatureConfig:
         assert pkgs == ["libjpeg", "cairo"]
         assert flags == ["-lgdi32", "-luser32"]
 
+    def test_linux_http_has_no_pkgs_or_flags(self, cli_mod):
+        # claude.md #151: plain POSIX sockets -- never had a third-
+        # party library dependency on any platform.
+        pkgs, flags = cli_mod._feature_pkgs_and_flags("http", "linux")
+        assert pkgs == []
+        assert flags == []
+
+    def test_darwin_http_has_no_pkgs_or_flags(self, cli_mod):
+        # Same POSIX sockets as Linux -- darwin needs nothing extra.
+        pkgs, flags = cli_mod._feature_pkgs_and_flags("http", "darwin")
+        assert pkgs == []
+        assert flags == []
+
+    def test_windows_http_links_ws2_32(self, cli_mod):
+        # claude.md #151 (Windows round): winsock2 lives in ws2_32.dll
+        # -- a system DLL with an import library but no pkg-config
+        # file, the same shape winmm/gdi32/user32 already are above.
+        pkgs, flags = cli_mod._feature_pkgs_and_flags("http", "win32")
+        assert pkgs == []
+        assert flags == ["-lws2_32"]
+
     def test_windows_graphics_extra_object_is_the_win32_companion(self, cli_mod, monkeypatch):
         # windows.md Phase 2: the win32 counterpart to
         # test_the_darwin_window_backend_extra_object_gets_cairo_cflags

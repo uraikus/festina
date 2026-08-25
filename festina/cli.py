@@ -93,6 +93,7 @@ _RUNTIME_DIR = os.path.join(_data_root(), "runtime")
 _RUNTIME_C = os.path.join(_RUNTIME_DIR, "festina_runtime.c")
 _RUNTIME_GRAPHICS_C = os.path.join(_RUNTIME_DIR, "festina_runtime_graphics.c")
 _RUNTIME_AUDIO_C = os.path.join(_RUNTIME_DIR, "festina_runtime_audio.c")
+_RUNTIME_HTTP_C = os.path.join(_RUNTIME_DIR, "festina_runtime_http.c")
 # Both headers are #included by more than one of the .c files above (see
 # festina_runtime_internal.h's own doc comment) -- included in every
 # object file's cache-freshness check below (_ensure_runtime_object)
@@ -510,6 +511,17 @@ _RUNTIME_FEATURES = {
         # split) it's no longer unconditionally on every link line.
         "extra_link_flags": ["-pthread"],
     },
+    # claude.md #151: openPort/on request/on upgrade/on message/on
+    # socketClose -- plain POSIX sockets + poll(), no external library
+    # at all (unlike graphics/audio), so no pkgs and no extra link
+    # flags on Linux or macOS -- see _feature_pkgs_and_flags for the
+    # win32 branch (there is none: http has no Windows backend at
+    # all, gated out at _check_feature_supported instead).
+    "http": {
+        "source": _RUNTIME_HTTP_C,
+        "pkgs": [],
+        "extra_link_flags": [],
+    },
 }
 
 
@@ -588,6 +600,15 @@ def _feature_pkgs_and_flags(name, platform_name=None):
         pkgs.remove("cairo-xlib")
         pkgs.append("cairo")
         flags += ["-lgdi32", "-luser32"]
+    elif name == "http" and platform_name == "win32":
+        # claude.md #151 (Windows round): winsock2 (WSAStartup/socket/
+        # bind/listen/accept/WSAPoll/closesocket/...) lives in
+        # ws2_32.dll -- a system DLL with an import library but no
+        # pkg-config file, the same shape winmm/gdi32/user32 already
+        # are for audio/graphics above. No pkgs at all either way
+        # (this feature has never had a third-party library
+        # dependency on any platform).
+        flags += ["-lws2_32"]
     return pkgs, flags
 
 
@@ -680,7 +701,7 @@ def _ensure_runtime_object(cc, name, source, pkg_config_packages):
 _WASM_TARGET = "wasm32-wasi"
 _WASM_DIR = os.path.join(_RUNTIME_DIR, "wasm")
 _WASM_SQLITE_C = os.path.join(_WASM_DIR, "sqlite3.c")
-_WASM_ENTRY_C = os.path.join(_RUNTIME_DIR, "festina_runtime_wasm_entry.c")
+_WASM_ENTRY_SRC = os.path.join(_RUNTIME_DIR, "festina_runtime_wasm_entry.ll")
 
 
 def _ensure_wasm_object(cc, name, source, include_dirs=()):
@@ -714,15 +735,16 @@ def _ensure_wasm_object(cc, name, source, include_dirs=()):
 
 def _wasm_runtime_objects(cc):
     """core (linked against the vendored sqlite3.h, see runtime/wasm/
-    README.md) + the vendored sqlite3.c itself + the __main_void entry
-    bridge (see festina_runtime_wasm_entry.c's own top comment for why
-    that one exists at all) -- no graphics, no audio, ever: see
+    README.md) + the vendored sqlite3.c itself + the __main_argc_argv
+    entry bridge (see festina_runtime_wasm_entry.ll's own top comment
+    for why that one exists at all, and why it's raw LLVM IR rather
+    than C) -- no graphics, no audio, ever: see
     _check_wasm_feature_supported, called unconditionally before this
     even runs, for why."""
     return [
         _ensure_wasm_object(cc, "core", _RUNTIME_C, include_dirs=[_WASM_DIR]),
         _ensure_wasm_object(cc, "sqlite3", _WASM_SQLITE_C),
-        _ensure_wasm_object(cc, "entry", _WASM_ENTRY_C),
+        _ensure_wasm_object(cc, "entry", _WASM_ENTRY_SRC),
     ]
 
 
@@ -746,6 +768,28 @@ def _check_wasm_feature_supported(feature):
             "audio (aud/play()/playLoop()/...) is not supported when "
             "compiling to WASM -- WASI has no audio device model at all. "
             "See wasm.md's Limitations section.",
+            category="unsupported platform feature")
+    if feature == "exec":
+        # claude.md #150: added alongside exec() itself -- WASI has no
+        # process model at all (no fork/exec/spawn of any kind), so
+        # this is the identical "genuinely absent, not gated pending
+        # hardware" situation graphics/audio are already in above, not
+        # a new category of restriction.
+        raise CompileError(
+            "exec() is not supported when compiling to WASM -- WASI has "
+            "no process model to spawn into at all. See wasm.md's "
+            "Limitations section.",
+            category="unsupported platform feature")
+    if feature == "http":
+        # claude.md #151: added alongside openPort() itself -- WASI
+        # Preview 1 (this project's own wasm target) has no listening-
+        # socket support of any kind, the identical "genuinely absent"
+        # situation exec() is already in above.
+        raise CompileError(
+            "openPort()/on request/on upgrade/on message/on socketClose "
+            "are not supported when compiling to WASM -- WASI Preview 1 "
+            "has no listening-socket support at all. See wasm.md's "
+            "Limitations section.",
             category="unsupported platform feature")
 
 
@@ -787,10 +831,14 @@ def _check_feature_supported(feature, platform_name=None):
     CI-compiled) but awaits real-hardware verification, overridable via
     an env var for exactly that verification -- windows.md Phase 2's
     graphics gate joined this shape alongside Phase 1's own audio gate
-    and every darwin gate (claude.md #128); there is no remaining
-    "nothing built yet, raises unconditionally" branch left on any
-    platform. All raise the same category so the conftest skip picks
-    them up uniformly.
+    and every darwin gate (claude.md #128); claude.md #151's own
+    darwin AND win32 http gates joined them the same way (the win32
+    http backend needed real winsock2 porting work first -- see
+    festina_runtime_http.c's own top comment -- unlike audio/graphics,
+    which already had a real win32 backend by the time #151 started).
+    There is no remaining "nothing built yet, raises unconditionally"
+    branch left on any platform. All raise the same category so the
+    conftest skip picks them up uniformly.
 
     `feature` here is a narrower question than "is this object file
     linked" (see needs_graphics/wants_window in compile_file): audio
@@ -870,9 +918,46 @@ def _check_feature_supported(feature, platform_name=None):
             "an offscreen canvas and saveCanvas() work today with no "
             "window involved at all.",
             category="unsupported platform feature")
+    if feature == "http" and platform_name == "darwin":
+        # claude.md #151: the whole implementation (festina_runtime_http.c)
+        # is plain POSIX sockets + poll() -- nothing Linux-specific
+        # about it, and it should compile and run unchanged on macOS,
+        # but (like every other backend gated here) hasn't been
+        # verified against real macOS hardware, so it gets the
+        # identical "exists, awaiting verification" treatment audio/
+        # graphics already established rather than a confident,
+        # unverified "yes".
+        if os.environ.get("FESTINA_ENABLE_MACOS_HTTP"):
+            return
+        raise CompileError(
+            "openPort()/on request/on upgrade/on message/on socketClose "
+            "are not yet verified on macOS -- the implementation is "
+            "plain POSIX sockets with nothing Linux-specific about it, "
+            "but has not been run against real macOS hardware; set "
+            "FESTINA_ENABLE_MACOS_HTTP=1 to try it.",
+            category="unsupported platform feature")
+    if feature == "http" and platform_name == "win32":
+        # claude.md #151 (Windows round): the winsock2 port now EXISTS
+        # (built, compiled by this project's own MinGW cross-compile
+        # check -- see festina_runtime_http.c's own top comment for
+        # the real porting work that needed: a distinct SOCKET handle
+        # type, closesocket()/WSAPoll()/ioctlsocket() in place of
+        # close()/poll()/fcntl(), WSAGetLastError() in place of errno)
+        # -- same "exists, awaiting real-hardware verification" shape
+        # every other Windows gate here already has, not the
+        # "genuinely absent" shape exec()'s own wasm rejection is.
+        if os.environ.get("FESTINA_ENABLE_WINDOWS_HTTP"):
+            return
+        raise CompileError(
+            "openPort()/on request/on upgrade/on message/on socketClose "
+            "are not yet verified on Windows -- the winsock2 backend is "
+            "built (claude.md #151) but awaits real-hardware "
+            "verification; set FESTINA_ENABLE_WINDOWS_HTTP=1 to try it.",
+            category="unsupported platform feature")
 
 
-def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=False):
+def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=False,
+                                    uses_http=False):
     """Every program links core (log/fail/sqlite/regex/timers -- see
     festina_runtime.c's top comment) plus -lm (claude.md #56's
     Math.floor/ceil/round/trunc lower to libm intrinsics -- round() in
@@ -919,7 +1004,8 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
     for pkg in core_pkgs:
         link_libs += _pkg_config("--libs", pkg)
 
-    for name, wants in (("graphics", uses_graphics), ("audio", uses_audio)):
+    for name, wants in (("graphics", uses_graphics), ("audio", uses_audio),
+                        ("http", uses_http)):
         if not wants:
             continue
         skip_gate = name == "graphics" and not wants_window
@@ -973,17 +1059,39 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", targ
     # that case.
     needs_graphics = gen.uses_graphics or gen.uses_graphics_code
 
+    # claude.md #151: openPort()/on request/.../on socketClose together
+    # with anything that opens a real window -- rejected outright,
+    # before any of the real linking work below, rather than silently
+    # producing a binary whose http loop never runs at all (main()'s
+    # own loop-selection picks ONE blocking loop, graphics winning
+    # over http when both are present -- see _emit_main_and_entry's
+    # own comment). This single-threaded server was never designed to
+    # also drive an X11/Cocoa/Win32 event loop; that combination may
+    # be revisited later, but isn't attempted here.
+    if gen.uses_http and gen.uses_graphics:
+        raise CompileError(
+            "openPort()/on request/on upgrade/on message/on socketClose "
+            "cannot be combined with graphics (render(), or an on "
+            "mouseDown/mouseUp/mouse/keyDown/keyUp/resize/close handler) "
+            "in the same program -- the http server's own event loop and "
+            "the graphics event loop are mutually exclusive in this "
+            "version.",
+            file=entry_path, category="unsupported platform feature")
+
     if target == "wasm32-wasi":
-        _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio)
+        _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio,
+                           needs_exec=gen.uses_exec, needs_http=gen.uses_http)
         return output_path
 
     runtime_objects, link_libs = _runtime_objects_and_link_libs(
-        cc, needs_graphics, gen.uses_audio, wants_window=gen.uses_graphics)
+        cc, needs_graphics, gen.uses_audio, wants_window=gen.uses_graphics,
+        uses_http=gen.uses_http)
 
     if llvm_backend.available():
         _compile_via_libllvm(ir, entry_path, output_path, cc, runtime_objects, link_libs)
     else:
-        _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio, link_libs)
+        _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio, link_libs,
+                                        needs_http=gen.uses_http)
     _rename_if_linker_appended_exe(output_path)
     return output_path
 
@@ -1057,7 +1165,8 @@ def _compile_via_libllvm(ir, entry_path, output_path, cc, runtime_objects, link_
                                 file=entry_path, category="link error")
 
 
-def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, needs_audio, link_libs):
+def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, needs_audio, link_libs,
+                                    needs_http=False):
     """Fallback used only when libLLVM couldn't be loaded in this process
     -- the original pipeline, handing the .ll file straight to `cc`
     (which then must actually be clang, or another compiler with an LLVM
@@ -1100,6 +1209,19 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
         pkgs, flags = _feature_pkgs_and_flags("audio")
         pkg_configs += pkgs
         extra_link_flags += flags
+    if needs_http:
+        # claude.md #151: no pkg-config packages on any platform (this
+        # feature has never had a third-party library dependency), but
+        # win32 does need -lws2_32 (_feature_pkgs_and_flags's own
+        # platform branch) -- claude.md #126 round four's own lesson
+        # (this exact fallback path once used the Linux-only table
+        # directly and silently dropped every platform swap) is why
+        # this goes through _feature_pkgs_and_flags rather than
+        # _RUNTIME_FEATURES["http"] directly.
+        runtime_sources.append(_RUNTIME_HTTP_C)
+        pkgs, flags = _feature_pkgs_and_flags("http")
+        pkg_configs += pkgs
+        extra_link_flags += flags
     cflags = []
     for pkg in pkg_configs:
         cflags += _pkg_config("--cflags", pkg)
@@ -1117,22 +1239,33 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
         os.unlink(ir_path)
 
 
-def _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, needs_audio):
+def _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, needs_audio, needs_exec=False,
+                      needs_http=False):
     """claude.md #148: WASM export's own link recipe -- always the .ll-
     text-to-clang path (see _compile_via_clang_ir_frontend's own
     docstring for what that fallback normally covers on native targets;
     here it's not a fallback at all, it's the only path, since there is
     no libLLVM in-process wasm32 object-emission story this project has
     verified -- --target=wasm32-wasi needs clang specifically, not
-    "whichever of clang/gcc/cc"). Rejects graphics/audio OUTRIGHT before
-    doing any real work -- see _check_wasm_feature_supported -- rather
-    than letting a doomed compile run for tens of seconds (the vendored
-    sqlite3.c amalgamation alone) only to fail at the link step with
-    undefined Cairo/ALSA symbols nothing here could ever provide."""
+    "whichever of clang/gcc/cc"). Rejects graphics/audio/exec()
+    OUTRIGHT before doing any real work -- see
+    _check_wasm_feature_supported -- rather than letting a doomed
+    compile run for tens of seconds (the vendored sqlite3.c
+    amalgamation alone) only to fail at the link step with undefined
+    Cairo/ALSA symbols nothing here could ever provide (claude.md #150:
+    exec() itself would actually LINK fine -- festina_process_exec's
+    own wasm32-wasi stub, see runtime/festina_runtime.c, exists
+    specifically so this translation unit still compiles -- so this is
+    the only one of the three that needs an explicit check here rather
+    than the link step catching it on its own)."""
     if needs_graphics:
         _check_wasm_feature_supported("graphics")
     if needs_audio:
         _check_wasm_feature_supported("audio")
+    if needs_exec:
+        _check_wasm_feature_supported("exec")
+    if needs_http:
+        _check_wasm_feature_supported("http")
     if shutil.which(cc) is None or "clang" not in os.path.basename(cc).lower():
         raise CompileError(
             f"WASM export needs clang specifically (got --cc={cc!r}) -- "
