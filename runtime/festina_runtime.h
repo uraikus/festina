@@ -1129,14 +1129,15 @@ void festina_release_map(void *payload);
  * socketClose -- a single-threaded HTTP + WebSocket server, in its
  * own translation unit (festina_runtime_http.c) so a program that
  * never calls openPort() never links any of it, the same per-feature
- * split graphics/audio already use. Linux/macOS only for now (plain
- * POSIX sockets) -- see cli.py's own platform gate; there is no
- * Windows backend yet (would need winsock2, a real separate phase,
- * not something faked here), and there is no WASI backend at all
- * (WASI Preview 1, this project's own wasm target, has no listening-
- * socket support) -- both rejected at COMPILE time
- * (_check_platform_feature_supported/_check_wasm_feature_supported),
- * never a link failure.
+ * split graphics/audio already use. Linux/macOS/Windows -- see that
+ * file's own top comment for the winsock2 porting Windows needed
+ * (a real seam, not a recompile: a distinct SOCKET handle type,
+ * closesocket()/WSAPoll()/ioctlsocket() in place of
+ * close()/poll()/fcntl(), WSAGetLastError() in place of errno).
+ * There is no WASI backend at all (WASI Preview 1, this project's own
+ * wasm target, has no listening-socket support) -- rejected at
+ * COMPILE time (_check_platform_feature_supported/
+ * _check_wasm_feature_supported), never a link failure.
  *
  * DESIGN, single-threaded event loop (per this feature's own explicit
  * scoping): every connection is serviced from the SAME thread

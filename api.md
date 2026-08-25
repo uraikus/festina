@@ -1729,10 +1729,13 @@ s.close()                             // sends a close frame and ends the connec
   dropped or misread. A received ping is answered with a pong
   automatically; a received pong is ignored. `permessage-deflate` and
   every other WebSocket extension are unsupported.
-- **Linux and macOS only** — plain POSIX sockets, no Windows backend.
-  Not available under `--target=wasm32-wasi` at all — WASI Preview 1
-  has no listening-socket support — rejected at compile time; see
-  [wasm.md](wasm.md).
+- **Linux and macOS, plus Windows behind an opt-in flag.** Linux/macOS
+  use plain POSIX sockets; Windows uses a real winsock2 port (built,
+  CI-compiled — see [windows.md](windows.md)) gated behind
+  `FESTINA_ENABLE_WINDOWS_HTTP=1` pending real-hardware verification,
+  the same shape audio/graphics already use there. Not available under
+  `--target=wasm32-wasi` at all — WASI Preview 1 has no listening-socket
+  support — rejected at compile time; see [wasm.md](wasm.md).
 - **Cannot be combined with graphics** (`render()`, or an `on
   mouseDown`/.../`close` handler) in the same program — the server's
   own event loop and the graphics event loop are mutually exclusive in

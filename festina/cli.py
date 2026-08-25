@@ -600,6 +600,15 @@ def _feature_pkgs_and_flags(name, platform_name=None):
         pkgs.remove("cairo-xlib")
         pkgs.append("cairo")
         flags += ["-lgdi32", "-luser32"]
+    elif name == "http" and platform_name == "win32":
+        # claude.md #151 (Windows round): winsock2 (WSAStartup/socket/
+        # bind/listen/accept/WSAPoll/closesocket/...) lives in
+        # ws2_32.dll -- a system DLL with an import library but no
+        # pkg-config file, the same shape winmm/gdi32/user32 already
+        # are for audio/graphics above. No pkgs at all either way
+        # (this feature has never had a third-party library
+        # dependency on any platform).
+        flags += ["-lws2_32"]
     return pkgs, flags
 
 
@@ -818,20 +827,18 @@ def _check_feature_supported(feature, platform_name=None):
     not exist on their OS. `platform_name` is injectable so every
     branch is unit-testable from any platform (tests/test_platform.py).
 
-    Most branches here gate a backend that EXISTS (built, CI-compiled)
-    but awaits real-hardware verification, overridable via an env var
-    for exactly that verification -- windows.md Phase 2's graphics
-    gate joined this shape alongside Phase 1's own audio gate and
-    every darwin gate (claude.md #128), and claude.md #151's own
-    darwin http gate joined them the same way. The win32 http branch
-    is the one genuine exception, reintroduced by #151: unlike
-    graphics/audio (which DO have a real win32 backend today, just
-    unverified on hardware), there is no Windows implementation of
-    openPort()/on request/... at all (it would need winsock2, a
-    separate phase never attempted) -- so that one branch raises
-    unconditionally, with no override, on purpose. All raise the same
-    category so the conftest skip picks them up uniformly regardless
-    of which shape a given branch is.
+    Every branch here now gates a backend that EXISTS (built,
+    CI-compiled) but awaits real-hardware verification, overridable via
+    an env var for exactly that verification -- windows.md Phase 2's
+    graphics gate joined this shape alongside Phase 1's own audio gate
+    and every darwin gate (claude.md #128); claude.md #151's own
+    darwin AND win32 http gates joined them the same way (the win32
+    http backend needed real winsock2 porting work first -- see
+    festina_runtime_http.c's own top comment -- unlike audio/graphics,
+    which already had a real win32 backend by the time #151 started).
+    There is no remaining "nothing built yet, raises unconditionally"
+    branch left on any platform. All raise the same category so the
+    conftest skip picks them up uniformly.
 
     `feature` here is a narrower question than "is this object file
     linked" (see needs_graphics/wants_window in compile_file): audio
@@ -930,15 +937,22 @@ def _check_feature_supported(feature, platform_name=None):
             "FESTINA_ENABLE_MACOS_HTTP=1 to try it.",
             category="unsupported platform feature")
     if feature == "http" and platform_name == "win32":
-        # claude.md #151: genuinely absent, not hardware-gated -- there
-        # is no Windows backend at all (would need winsock2, a real
-        # separate phase, not something this round attempted), so no
-        # env-var override exists to bypass this one.
+        # claude.md #151 (Windows round): the winsock2 port now EXISTS
+        # (built, compiled by this project's own MinGW cross-compile
+        # check -- see festina_runtime_http.c's own top comment for
+        # the real porting work that needed: a distinct SOCKET handle
+        # type, closesocket()/WSAPoll()/ioctlsocket() in place of
+        # close()/poll()/fcntl(), WSAGetLastError() in place of errno)
+        # -- same "exists, awaiting real-hardware verification" shape
+        # every other Windows gate here already has, not the
+        # "genuinely absent" shape exec()'s own wasm rejection is.
+        if os.environ.get("FESTINA_ENABLE_WINDOWS_HTTP"):
+            return
         raise CompileError(
             "openPort()/on request/on upgrade/on message/on socketClose "
-            "are not supported on Windows -- there is no winsock2-based "
-            "implementation yet (plain POSIX sockets only, Linux/macOS "
-            "today).",
+            "are not yet verified on Windows -- the winsock2 backend is "
+            "built (claude.md #151) but awaits real-hardware "
+            "verification; set FESTINA_ENABLE_WINDOWS_HTTP=1 to try it.",
             category="unsupported platform feature")
 
 
@@ -1196,9 +1210,18 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
         pkg_configs += pkgs
         extra_link_flags += flags
     if needs_http:
-        # claude.md #151: no pkg-config packages or extra link flags
-        # at all (plain POSIX sockets) -- just the source file itself.
+        # claude.md #151: no pkg-config packages on any platform (this
+        # feature has never had a third-party library dependency), but
+        # win32 does need -lws2_32 (_feature_pkgs_and_flags's own
+        # platform branch) -- claude.md #126 round four's own lesson
+        # (this exact fallback path once used the Linux-only table
+        # directly and silently dropped every platform swap) is why
+        # this goes through _feature_pkgs_and_flags rather than
+        # _RUNTIME_FEATURES["http"] directly.
         runtime_sources.append(_RUNTIME_HTTP_C)
+        pkgs, flags = _feature_pkgs_and_flags("http")
+        pkg_configs += pkgs
+        extra_link_flags += flags
     cflags = []
     for pkg in pkg_configs:
         cflags += _pkg_config("--cflags", pkg)

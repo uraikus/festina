@@ -453,10 +453,14 @@ class TestWebSocketServer:
 
 class TestPlatformAndWasmGating:
     """claude.md #151: http/graphics are mutually exclusive in this
-    version; there is no Windows backend; there is no wasm32-wasi
-    backend at all -- all three checked without needing a real
-    toolchain (the same tier _check_wasm_feature_supported's own
-    graphics/audio/exec tests in test_wasm.py already sit in)."""
+    version; there is no wasm32-wasi backend at all -- both checked
+    without needing a real toolchain (the same tier
+    _check_wasm_feature_supported's own graphics/audio/exec tests in
+    test_wasm.py already sit in). darwin AND win32 both gate a
+    backend that EXISTS (built, CI-compiled -- win32's own winsock2
+    port confirmed by a real MinGW cross-compile, claude.md #151's own
+    Windows round) but awaits real-hardware verification, the same
+    shape audio/graphics already established for both platforms."""
 
     def test_http_and_graphics_together_is_rejected(self, cli_mod, tmp_path):
         src = tmp_path / "main.f"
@@ -471,10 +475,15 @@ class TestPlatformAndWasmGating:
         assert exc_info.value.category == "unsupported platform feature"
         assert "graphics" in str(exc_info.value)
 
-    def test_http_is_rejected_on_windows(self, cli_mod):
+    def test_http_on_windows_is_gated_pending_verification(self, cli_mod, monkeypatch):
+        monkeypatch.delenv("FESTINA_ENABLE_WINDOWS_HTTP", raising=False)
         with pytest.raises(cli_mod.CompileError) as exc_info:
             cli_mod._check_feature_supported("http", platform_name="win32")
         assert exc_info.value.category == "unsupported platform feature"
+
+    def test_http_on_windows_override_env_var_bypasses_the_gate(self, cli_mod, monkeypatch):
+        monkeypatch.setenv("FESTINA_ENABLE_WINDOWS_HTTP", "1")
+        cli_mod._check_feature_supported("http", platform_name="win32")  # no raise
 
     def test_http_on_macos_is_gated_pending_verification(self, cli_mod, monkeypatch):
         monkeypatch.delenv("FESTINA_ENABLE_MACOS_HTTP", raising=False)

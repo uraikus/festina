@@ -1,20 +1,24 @@
 # Windows support
 
-**Fully implemented and confirmed green on real Windows CI.** All
-three phases below are built and shipped: toolchain bring-up
-(confirmed on twelve real Windows CI rounds), audio (waveOut), and
-windowing (Win32) — plus packaging. Every phase is CI-compiled and
-type-checked against real Windows headers on every push.
+**Fully implemented and confirmed green on real Windows CI.** The
+first four phases below are built and shipped: toolchain bring-up
+(confirmed on twelve real Windows CI rounds), audio (waveOut),
+windowing (Win32), and packaging. Each of those is CI-compiled and
+type-checked against real Windows headers on every push. A fifth,
+HTTP/WebSocket (winsock2, claude.md #151), is built and verified by
+local MinGW cross-compile only -- it has not yet run through real
+Windows CI at all, unlike the other four.
 
 **What's genuinely still open** is external to this codebase, not
-missing work in it: confirming audio playback and windowed
-mouse/keyboard/window behavior on an actual Windows machine, which
-this project has no access to (every fix along the way had to be
-verified by reasoning from real Windows CI's own log output plus the
-full Linux suite, since there's no local Windows/MSYS2 environment to
-test against directly). Both stay behind an explicit opt-in
-environment variable (`FESTINA_ENABLE_WINDOWS_AUDIO=1` /
-`FESTINA_ENABLE_WINDOWS_GRAPHICS=1`) until someone with real hardware
+missing work in it: confirming audio playback, windowed
+mouse/keyboard/window behavior, and the HTTP/WebSocket server on an
+actual Windows machine, which this project has no access to (every fix
+along the way had to be verified by reasoning from real Windows CI's
+own log output plus the full Linux suite, since there's no local
+Windows/MSYS2 environment to test against directly). All three stay
+behind an explicit opt-in environment variable
+(`FESTINA_ENABLE_WINDOWS_AUDIO=1` / `FESTINA_ENABLE_WINDOWS_GRAPHICS=1`
+/ `FESTINA_ENABLE_WINDOWS_HTTP=1`) until someone with real hardware
 confirms them. Toolchain bring-up (Phase 0) and packaging (Phase 3)
 needed no such gate and are fully confirmed today, including on real
 Windows CI runs.
@@ -25,14 +29,12 @@ current as a reference -- not a live tracker of unstarted work. See
 how each phase was built, including the twelve-round Phase 0 bug hunt
 the "Bugs found along the way" section below summarizes.
 
-Unlike audio/graphics above, a later feature -- `openPort()`/`on
-request`/`on upgrade`/`on message`/`on socketClose` (claude.md #151) --
-is NOT gated pending hardware verification: there is genuinely no
-Windows backend for it at all (the implementation is plain POSIX
-sockets; a real port would need winsock2, a separate phase never
-attempted here), so it's a hard compile-time rejection with no
-override. See [api.md](api.md#http-and-websocket-servers) for the
-feature itself.
+A later feature -- `openPort()`/`on request`/`on upgrade`/`on
+message`/`on socketClose` (claude.md #151) -- joined the same gated-
+pending-hardware-verification shape audio/graphics already use, via a
+real winsock2 port (Phase 4 below), rather than staying a hard
+compile-time rejection. See [api.md](api.md#http-and-websocket-servers)
+for the feature itself.
 
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,
@@ -430,6 +432,93 @@ and smoke-test the standalone compiler binary" windows CI step
 mirrors the linux/macos jobs' own, verifying the whole chain for real
 on every push rather than only ever having been exercised by a human
 packaging a release by hand.
+
+## Phase 4 — HTTP/WebSocket: winsock2 (built, MinGW-cross-compiled; hardware verification open)
+
+Unlike Phases 1–3, this feature has no shared seam with macOS to build
+on -- `festina_runtime_http.c` is plain POSIX sockets end to end, with
+no per-platform "device" abstraction cut in advance the way audio/
+graphics had. Porting it meant going through every socket call site
+directly, not filling in an already-cut seam.
+
+A single file, one `#ifdef _WIN32` seam near the top (`FestinaSocket`,
+`FESTINA_INVALID_SOCKET`, `festina_close_fd`, `festina_poll`/
+`FestinaPollFd`, `festina_socket_would_block`/
+`festina_socket_was_interrupted`) rather than a second whole-file
+duplicate -- mirroring `festina_runtime_audio.c`'s own ALSA-vs-waveOut
+split (a small per-platform difference handled inline), deliberately
+not graphics' two-file Cocoa/Win32 split (which exists only because
+Cocoa is Objective-C, a real language difference this file has no
+equivalent of). Winsock2 differs from BSD sockets in exactly enough
+places to matter:
+
+- A distinct `SOCKET` handle type, and it's **unsigned** -- every
+  POSIX-style `if (fd < 0)` error check silently never fires on it.
+  `FESTINA_INVALID_SOCKET` (`INVALID_SOCKET` on Windows, `-1` on
+  POSIX) and `==` comparisons replace every such check; found by
+  reasoning about the type before it could reach a real Windows build,
+  not by a compile error.
+- `closesocket()` not `close()`, `ioctlsocket()`/`FIONBIO` not
+  `fcntl()`/`O_NONBLOCK`, `WSAGetLastError()` instead of `errno`
+  (Winsock functions never touch the CRT's `errno` at all), and
+  `recv()`/`send()` taking `char*`/`int` where POSIX takes
+  `void*`/`size_t`.
+- `WSAPoll()` not `poll()` -- confirmed to have **identical field
+  names** (`.fd`/`.events`/`.revents`) to POSIX `struct pollfd`, so one
+  typedef swap (`FestinaPollFd`) covers every call site with no
+  per-field translation needed.
+- No `SIGPIPE` on Windows for a broken socket at all -- `send()` just
+  returns an error, never a signal -- so the POSIX
+  `signal(SIGPIPE, SIG_IGN)` fix (security.md) has nothing to mirror
+  there; every write already checks its own return value regardless.
+- An explicit `WSAStartup()` is needed before any socket call, called
+  from `festina_open_port`'s own entry point, idempotent by design
+  (Winsock reference-counts it internally) so it's safe to call on
+  every `openPort()` rather than gated to "only the first." No matching
+  `WSACleanup()` -- process exit tears everything down anyway, this
+  runtime's own established "no GC yet" convention.
+- `SO_REUSEADDR` has a more permissive, port-hijacking-enabling meaning
+  on Windows than POSIX, so it is deliberately not set there at all.
+
+**A real naming collision, caught by an actual MinGW compile error**
+(`conflicting types`), not reasoned about in advance: the internal
+socket-closing macro was first named `festina_socket_close`, colliding
+with the pre-existing PUBLIC `void festina_socket_close(void *handle)`
+(the language-level `s.close()` entry point). Renamed to
+`festina_close_fd` -- the same class of mistake, and the same fix
+pattern, as claude.md #150's `festina_exec`/`festina_process_exec`
+collision.
+
+**Verification method, since this project has no local Windows/MSYS2
+environment**: the same cross-compile-and-type-check approach the
+Phase 1/2 backends already use, done directly with `mingw-w64`'s
+`x86_64-w64-mingw32-gcc` against real winsock2/ws2tcpip headers
+(`-D_WIN32 -Wall -Wextra -Wpedantic -c`) -- zero warnings, both for
+this file in isolation and for a native Linux recompile confirming
+POSIX behavior stayed byte-for-byte unchanged. A full-core MinGW link
+was not attempted locally: `festina_runtime.c` needs `<regex.h>`
+(MSYS2's `gnurx`/`libsystre`, Phase 0 above), unavailable outside a
+real MSYS2 environment -- a known, pre-existing boundary, not new to
+this phase. Real Windows CI does the full link-and-run verification,
+same as every other Windows backend here.
+
+`_feature_pkgs_and_flags`'s win32 branch links `-lws2_32` (a system DLL
+with an import library but no pkg-config file, the same shape
+`winmm`/`gdi32`/`user32` already are for audio/graphics) -- wired
+through both of this project's build paths, the primary libLLVM
+in-process path and the clang-IR-frontend fallback (which needed a real
+fix here: claude.md #126 round four already found this exact fallback
+function once using a Linux-only pkgs/flags table directly for a
+different feature and silently dropping every platform swap; the same
+mistake was about to repeat for `http` and was caught before landing).
+
+Confirmed by MinGW cross-compile: the ported file type-checks cleanly
+against real Windows headers with zero warnings. Still open, gated
+behind `FESTINA_ENABLE_WINDOWS_HTTP=1`: `openPort()`/`on request`/`on
+upgrade`/`on message`/`on socketClose` actually running on a real
+Windows machine, which this project has no access to -- the same
+"awaiting real hardware, not awaiting more code" shape Phases 1 and 2
+are already in.
 
 ## Order and shared work, for the record
 

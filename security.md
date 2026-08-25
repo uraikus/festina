@@ -155,8 +155,9 @@ corruption**:
 
 A compiled program links only what it uses. The runtime is split into
 core / graphics (Cairo, X11, libjpeg) / audio (ALSA, libmpg123) / http
-(claude.md #151 — plain POSIX sockets, no third-party library at all)
-translation units, and the compiler puts a feature's object file and
+(claude.md #151 — plain POSIX sockets on Linux/macOS, winsock2 on
+Windows; no third-party library on any platform) translation units,
+and the compiler puts a feature's object file and
 libraries on the link line only when the program actually exercises it —
 a `log('hello')` program links none of them. Fewer resident libraries is
 a smaller patch surface for any deployment, independent of whether a
@@ -202,4 +203,8 @@ in claude.md and tests/CONTRACT.md:
   `signal(SIGPIPE, SIG_IGN)` at `openPort()`'s own entry point — every
   write already checks its own return value the POSIX way (`-1`,
   `errno == EPIPE`) wherever it matters, so the signal itself was pure
-  noise once ignored, not something needing a handler.
+  noise once ignored, not something needing a handler. Windows never
+  had this exposure in the first place: winsock2 has no `SIGPIPE` for
+  a broken socket at all — `send()` just returns an error — so the
+  Windows port (windows.md) needed no equivalent fix, only the same
+  return-value check every platform already does.

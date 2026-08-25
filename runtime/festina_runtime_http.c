@@ -9,29 +9,84 @@
  * per-feature object file selection, driven by CodeGen.uses_http in
  * festina/codegen.py).
  *
- * Linux/macOS only (plain POSIX sockets, poll()) -- rejected at
- * COMPILE time on Windows and under wasm32-wasi (see cli.py's
- * _check_platform_feature_supported/_check_wasm_feature_supported),
- * never a link failure, so this file is never even compiled for
- * either of those targets.
+ * Linux/macOS/Windows -- rejected at COMPILE time under wasm32-wasi
+ * only (see cli.py's _check_wasm_feature_supported: WASI has no
+ * listening-socket support at all), never a link failure. windows.md
+ * Phase 2's own "gated pending real-hardware verification, not
+ * unimplemented" shape applies here too (claude.md #151's own Windows
+ * round) -- FESTINA_ENABLE_WINDOWS_HTTP=1, see
+ * cli.py's _check_feature_supported.
+ *
+ * claude.md #151 (Windows round): the socket API itself needed real
+ * porting, not just a recompile -- Winsock2 differs from BSD sockets
+ * in exactly enough places to matter: a distinct SOCKET handle type
+ * (unsigned, so "< 0" checks that work for a POSIX fd silently never
+ * fire), closesocket() not close(), WSAPoll() not poll() (same field
+ * names though, confirmed directly -- one typedef swap covers every
+ * call site), ioctlsocket()/FIONBIO not fcntl()/O_NONBLOCK, and
+ * WSAGetLastError() instead of errno for every socket call's own
+ * error (Winsock functions never touch the CRT's errno at all). The
+ * seam below (FestinaSocket/FESTINA_INVALID_SOCKET/festina_close_fd/
+ * festina_poll/FestinaPollFd/festina_socket_would_block/
+ * festina_socket_was_interrupted) is what
+ * lets every call site below this point read identically on both
+ * platforms -- deliberately ONE file with a seam at the top, the same
+ * shape festina_runtime_audio.c already uses for its own much smaller
+ * ALSA-vs-waveOut split, rather than a second whole-file duplicate
+ * the way graphics' Cocoa/Win32 WINDOWING half needed (that split
+ * exists because Cocoa is Objective-C, a real language difference
+ * this file has no equivalent of -- see festina_runtime.h's own
+ * top-of-file note). Windows also has no SIGPIPE at all for a broken
+ * socket (send() just answers an error, no signal ever raised) and
+ * needs an explicit WSAStartup() before any socket call -- handled at
+ * festina_open_port's own entry point (see its own comment on why
+ * there's no matching WSACleanup()), mirrored by the POSIX
+ * SIGPIPE-ignore this file already had.
  */
-#include <errno.h>
-#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <signal.h>
-#include <strings.h>    /* strcasecmp */
-#include <unistd.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
 #include "festina_runtime.h"
 #include "festina_runtime_internal.h"
+
+/* claude.md #151 (Windows round): named festina_close_fd, not
+ * festina_socket_close -- a real naming collision found by an actual
+ * MinGW compile error (conflicting types) against the PUBLIC
+ * festina_socket_close(void *handle) below (s.close()'s own runtime
+ * entry point, declared in festina_runtime.h) -- the same class of
+ * mistake claude.md #150's festina_exec/festina_process_exec rename
+ * already hit once in this codebase. */
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+   typedef SOCKET FestinaSocket;
+   typedef WSAPOLLFD FestinaPollFd;
+#  define FESTINA_INVALID_SOCKET INVALID_SOCKET
+#  define festina_close_fd(fd) closesocket(fd)
+#  define festina_poll(fds, n, timeout) WSAPoll((fds), (n), (timeout))
+static int festina_socket_would_block(void) { return WSAGetLastError() == WSAEWOULDBLOCK; }
+static int festina_socket_was_interrupted(void) { return WSAGetLastError() == WSAEINTR; }
+#else
+#  include <errno.h>
+#  include <fcntl.h>
+#  include <signal.h>
+#  include <strings.h>    /* strcasecmp */
+#  include <unistd.h>
+#  include <poll.h>
+#  include <sys/socket.h>
+#  include <netinet/in.h>
+#  include <netinet/tcp.h>
+#  include <arpa/inet.h>
+   typedef int FestinaSocket;
+   typedef struct pollfd FestinaPollFd;
+#  define FESTINA_INVALID_SOCKET (-1)
+#  define festina_close_fd(fd) close(fd)
+#  define festina_poll(fds, n, timeout) poll((fds), (n), (timeout))
+static int festina_socket_would_block(void) { return errno == EAGAIN || errno == EWOULDBLOCK; }
+static int festina_socket_was_interrupted(void) { return errno == EINTR; }
+#endif
 
 /* ---- SHA1 + base64 -- the WebSocket handshake's own two ingredients
  * (RFC 6455 section 1.3: base64(SHA1(Sec-WebSocket-Key + a fixed
@@ -199,7 +254,7 @@ typedef enum {
 
 typedef struct {
     int64_t conn_id;   /* monotonic, never reused -- see festina_runtime.h */
-    int fd;
+    FestinaSocket fd;
     int listen_port;
     int alive;          /* 0 once torn down; the slot may be reused later */
     FestinaConnMode mode;
@@ -255,7 +310,7 @@ static int64_t g_conn_capacity = 0;
 static int64_t g_next_conn_id = 1;
 
 typedef struct {
-    int fd;
+    FestinaSocket fd;
     int port;
 } FestinaListener;
 
@@ -354,7 +409,7 @@ static void festina_conn_teardown(FestinaConn *c) {
         g_socketclose_handler(handle);
         festina_release_conn_handle(handle);
     }
-    close(c->fd);
+    festina_close_fd(c->fd);
     free(c->buf);
     free(c->method);
     free(c->path);
@@ -465,13 +520,13 @@ static char *festina_ws_accept_key(const char *client_key) {
     return festina_base64_encode(digest, 20);
 }
 
-static int festina_send_all(int fd, const void *data, size_t len) {
+static int festina_send_all(FestinaSocket fd, const void *data, size_t len) {
     const uint8_t *p = (const uint8_t *)data;
     size_t sent = 0;
     while (sent < len) {
-        ssize_t n = send(fd, p + sent, len - sent, 0);
+        ssize_t n = send(fd, (const char *)(p + sent), (int)(len - sent), 0);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (festina_socket_was_interrupted()) continue;
             return 0;
         }
         if (n == 0) return 0;
@@ -483,7 +538,7 @@ static int festina_send_all(int fd, const void *data, size_t len) {
 /* Writes ONE unmasked server->client frame (server frames are never
  * masked per RFC 6455) -- `opcode` 0x1 text, 0x2 binary, 0x8 close,
  * 0xA pong. */
-static void festina_ws_send_frame(int fd, uint8_t opcode, const void *data, size_t len) {
+static void festina_ws_send_frame(FestinaSocket fd, uint8_t opcode, const void *data, size_t len) {
     uint8_t header[10];
     size_t header_len = 0;
     header[0] = 0x80 | (opcode & 0x0F); /* FIN=1, no fragmentation from this runtime */
@@ -652,10 +707,10 @@ static void festina_conn_readable(FestinaConn *c) {
     for (;;) {
         festina_conn_ensure_capacity(c, 4096);
         if (c->buf_len >= c->buf_cap) { festina_conn_teardown(c); return; }
-        ssize_t n = recv(c->fd, c->buf + c->buf_len, c->buf_cap - c->buf_len, 0);
+        ssize_t n = recv(c->fd, (char *)(c->buf + c->buf_len), (int)(c->buf_cap - c->buf_len), 0);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            if (errno == EINTR) continue;
+            if (festina_socket_would_block()) break;
+            if (festina_socket_was_interrupted()) continue;
             festina_conn_teardown(c);
             return;
         }
@@ -686,22 +741,27 @@ static void festina_conn_readable(FestinaConn *c) {
     }
 }
 
-static void festina_set_nonblocking(int fd) {
+static void festina_set_nonblocking(FestinaSocket fd) {
+#ifdef _WIN32
+    u_long mode = 1;
+    ioctlsocket(fd, FIONBIO, &mode);
+#else
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
 }
 
-static void festina_accept_new_connections(int listen_fd, int port) {
+static void festina_accept_new_connections(FestinaSocket listen_fd, int port) {
     for (;;) {
-        int fd = accept(listen_fd, NULL, NULL);
-        if (fd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-            if (errno == EINTR) continue;
+        FestinaSocket fd = accept(listen_fd, NULL, NULL);
+        if (fd == FESTINA_INVALID_SOCKET) {
+            if (festina_socket_would_block()) return;
+            if (festina_socket_was_interrupted()) continue;
             return;
         }
         festina_set_nonblocking(fd);
         int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
         FestinaConn *c = festina_conn_new_slot();
         c->fd = fd;
         c->listen_port = port;
@@ -710,6 +770,23 @@ static void festina_accept_new_connections(int listen_fd, int port) {
 
 void festina_open_port(int64_t port) {
     if (port < 1 || port > 65535) return; /* never fails the program -- see festina_runtime.h */
+#ifdef _WIN32
+    /* claude.md #151 (Windows round): Winsock needs an explicit
+     * WSAStartup() before any socket call -- idempotent to call more
+     * than once (Winsock reference-counts it internally), so this is
+     * safe on every openPort() rather than gated to "only the first".
+     * WSACleanup() is deliberately never called: the process exiting
+     * tears everything down anyway (this runtime's own established
+     * "no GC yet" convention -- see the module docstring), and a
+     * clean shutdown here would need tracking how many WSAStartup
+     * calls actually happened, for no benefit. */
+    static int wsa_started = 0;
+    if (!wsa_started) {
+        WSADATA wsa_data;
+        WSAStartup(MAKEWORD(2, 2), &wsa_data);
+        wsa_started = 1;
+    }
+#else
     /* claude.md #151: a real, silent-crash bug caught by an actual
      * stress test, not reasoned about in advance -- send()/recv() on a
      * connection the PEER has already reset (a client that closes
@@ -720,22 +797,34 @@ void festina_open_port(int64_t port) {
      * (return -1, errno == EPIPE) wherever this file checks -- see
      * festina_send_all -- so the signal itself is pure noise this
      * server needs ignored, not handled. Idempotent, so it's safe to
-     * call on every openPort() rather than only the first. */
+     * call on every openPort() rather than only the first. Windows has
+     * no SIGPIPE for a broken socket at all (send() just answers an
+     * error, same as this file already checks for) -- nothing to
+     * ignore there, hence the #else. */
     signal(SIGPIPE, SIG_IGN);
+#endif
     for (int64_t i = 0; i < g_listener_count; i++) {
         if (g_listeners[i].port == (int)port) return; /* already open -- silent no-op */
     }
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return;
+    FestinaSocket fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == FESTINA_INVALID_SOCKET) return;
+#ifndef _WIN32
+    /* claude.md #151 (Windows round): SO_REUSEADDR means something
+     * more permissive on Windows (lets a DIFFERENT process bind the
+     * SAME port concurrently, not just "skip TIME_WAIT" the way it
+     * does on POSIX) -- a real foot-gun there, not the same option
+     * with a platform quirk, so it's simply not set on Windows at
+     * all rather than ported as-is. */
     int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
+#endif
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons((uint16_t)port);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) { close(fd); return; }
-    if (listen(fd, 128) != 0) { close(fd); return; }
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) { festina_close_fd(fd); return; }
+    if (listen(fd, 128) != 0) { festina_close_fd(fd); return; }
     festina_set_nonblocking(fd);
 
     if (g_listener_count == g_listener_capacity) {
@@ -752,7 +841,7 @@ void festina_open_port(int64_t port) {
 void festina_close_port(int64_t port) {
     for (int64_t i = 0; i < g_listener_count; i++) {
         if (g_listeners[i].port == (int)port) {
-            close(g_listeners[i].fd);
+            festina_close_fd(g_listeners[i].fd);
             g_listeners[i] = g_listeners[g_listener_count - 1];
             g_listener_count--;
             return;
@@ -771,7 +860,7 @@ void festina_run_http_loop(void) {
         }
 
         size_t nfds = (size_t)(g_listener_count + live_conns);
-        struct pollfd *fds = malloc((nfds > 0 ? nfds : 1) * sizeof(struct pollfd));
+        FestinaPollFd *fds = malloc((nfds > 0 ? nfds : 1) * sizeof(FestinaPollFd));
         if (!fds) festina_fail("out of memory building the http loop's poll set");
         size_t fdi = 0;
         for (int64_t i = 0; i < g_listener_count; i++) {
@@ -800,8 +889,8 @@ void festina_run_http_loop(void) {
             timeout_ms = remaining > 0.0 ? (int)(remaining * 1000.0) + 1 : 0;
         }
 
-        int rc = poll(fds, nfds, timeout_ms);
-        if (rc < 0 && errno != EINTR) { free(fds); free(fd_conn_ids); return; }
+        int rc = festina_poll(fds, nfds, timeout_ms);
+        if (rc < 0 && !festina_socket_was_interrupted()) { free(fds); free(fd_conn_ids); return; }
 
         if (rc > 0) {
             for (int64_t i = 0; i < g_listener_count; i++) {
@@ -939,10 +1028,10 @@ char *festina_http_to_text(void *handle) {
  * headers currently being written belong to" is always unambiguous:
  * nothing else can run between festina_http_send setting it and the
  * forEach call finishing on the same thread. */
-static int g_http_send_extra_headers_fd = -1;
+static FestinaSocket g_http_send_extra_headers_fd = FESTINA_INVALID_SOCKET;
 
 static void festina_write_extra_header(int64_t value, const char *key) {
-    if (g_http_send_extra_headers_fd < 0) return;
+    if (g_http_send_extra_headers_fd == FESTINA_INVALID_SOCKET) return;
     const char *header_value = (const char *)(intptr_t)value;
     char line[1024];
     int n = snprintf(line, sizeof(line), "%s: %s\r\n", key, header_value ? header_value : "");
@@ -961,7 +1050,7 @@ void festina_http_send(void *handle, const void *data, int64_t len,
         FestinaMapBlock *block = (FestinaMapBlock *)((char *)extra_headers - sizeof(int64_t));
         g_http_send_extra_headers_fd = c->fd;
         festina_map_for_each(block->count, block->entries, festina_write_extra_header);
-        g_http_send_extra_headers_fd = -1;
+        g_http_send_extra_headers_fd = FESTINA_INVALID_SOCKET;
     }
     char cl_line[64];
     int cl_len = snprintf(cl_line, sizeof(cl_line), "Content-Length: %lld\r\n",
