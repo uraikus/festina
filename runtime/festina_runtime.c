@@ -34,8 +34,22 @@
  * with a `table` declaration, even though the core object file itself is
  * always linked in).
  */
+#include <ctype.h>   /* isdigit/tolower -- claude.md #159's JSON parser */
 #include <errno.h>
 #include <regex.h>
+#if !defined(__wasi__)
+#include <signal.h>  /* sig_atomic_t/signal/SIGINT/SIGTERM -- claude.md #161's
+                       * graceful shutdown. wasi-libc's own <signal.h> is an
+                       * unconditional #error unless compiled with
+                       * -D_WASI_EMULATED_SIGNAL (confirmed directly) -- WASI
+                       * has no signal model at all, so this is skipped
+                       * outright for that target, not merely left with
+                       * unused declarations (see the matching #else stubs
+                       * below, right where sig_atomic_t would otherwise be
+                       * used). */
+#endif
+#include <stdarg.h>  /* va_list -- claude.md #159's festina_json_throwf */
+#include <stddef.h>  /* offsetof -- claude.md #162's url accessors */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -139,6 +153,886 @@ void festina_fail(const char *msg) {
     exit(1);
 }
 
+/* ---- troubleshoot() / structured fail() -- claude.md #158 ----
+ *
+ * A UTC RFC3339-ish timestamp ("...Z", second precision -- structured
+ * log consumers expect UTC, unlike formatTime's own local-time
+ * convention, claude.md #93), shared by both functions below. */
+static void festina_write_log_timestamp(char *buf, size_t n) {
+    time_t now = time(NULL);
+    struct tm parts;
+#ifdef _WIN32
+    gmtime_s(&parts, &now);
+#else
+    gmtime_r(&now, &parts);
+#endif
+    strftime(buf, n, "%Y-%m-%dT%H:%M:%SZ", &parts);
+}
+
+/* claude.md #158: troubleshoot(event, fields) -- one JSON line to
+ * stdout: {"timestamp":"...","level":"info","event":"...","fields":{...}}.
+ * `fields_json` arrives ALREADY RENDERED as valid JSON text -- codegen
+ * calls the exact same container-to-JSON path .toText() already uses
+ * for any map[T]/arr[T]/struct (see codegen.py's own _json_fn_for via
+ * _to_text), so this function never inspects a Festina value directly,
+ * only assembles the surrounding envelope around two already-text
+ * pieces. NULL-safe on both (an empty/missing fields map renders as
+ * the JSON object "{}"). */
+void festina_troubleshoot(const char *event, const char *fields_json) {
+    char ts[32];
+    festina_write_log_timestamp(ts, sizeof(ts));
+    void *sb = festina_sb_new();
+    festina_sb_append(sb, "{\"timestamp\":\"");
+    festina_sb_append(sb, ts);
+    festina_sb_append(sb, "\",\"level\":\"info\",\"event\":");
+    festina_sb_append_json_text(sb, event);
+    festina_sb_append(sb, ",\"fields\":");
+    festina_sb_append(sb, fields_json ? fields_json : "{}");
+    festina_sb_append(sb, "}");
+    char *line = festina_sb_finish(sb);
+    printf("%s\n", line);
+    fflush(stdout);
+    free(line);
+}
+
+/* claude.md #158: fail(message, fields) -- the 2-argument structured
+ * form. Unlike plain fail(message)'s stable "fail: <message>\n" line
+ * (unchanged, still what an uncaught throw also produces -- claude.md
+ * #157's own "throw is never riskier than fail()" contract depends on
+ * that staying exactly as it is), this prints a full JSON envelope to
+ * stderr instead -- "level":"error", key "message" rather than
+ * "event" (a structured error line reads as an event announcing
+ * itself, not the failure it actually is) -- then exits(1), same as
+ * every other fail() path. */
+void festina_fail_structured(const char *msg, const char *fields_json) {
+    char ts[32];
+    festina_write_log_timestamp(ts, sizeof(ts));
+    void *sb = festina_sb_new();
+    festina_sb_append(sb, "{\"timestamp\":\"");
+    festina_sb_append(sb, ts);
+    festina_sb_append(sb, "\",\"level\":\"error\",\"message\":");
+    festina_sb_append_json_text(sb, msg);
+    festina_sb_append(sb, ",\"fields\":");
+    festina_sb_append(sb, fields_json ? fields_json : "{}");
+    festina_sb_append(sb, "}");
+    char *line = festina_sb_finish(sb);
+    fprintf(stderr, "%s\n", line);
+    free(line); /* harmless either way -- exit() is next -- kept for hygiene */
+    exit(1);
+}
+
+/* ---- try/catch/throw -- claude.md #157 ----
+ *
+ * setjmp/longjmp exception emulation -- but NOT the classic "wrap
+ * setjmp in a small C helper function" shape a first attempt at this
+ * reached for (and which a direct test caught as genuinely broken --
+ * see claude.md #157's own account): setjmp() only captures a jump
+ * target valid while ITS OWN calling function's stack frame is still
+ * live. A helper that calls setjmp() and then returns 0 back to its
+ * own caller has already made that frame invalid by the time some
+ * LATER, unrelated throw tries to jump back into it -- undefined
+ * behavior in the C standard's own terms, and empirically a silent
+ * "just keeps running past the throw" or an outright crash depending
+ * on what else has since reused that stack space.
+ *
+ * The fix: the actual setjmp call happens directly in the FESTINA
+ * FUNCTION THAT CONTAINS THE try STATEMENT -- codegen's own _emit_try
+ * emits it as raw LLVM IR (the llvm.eh.sjlj.setjmp/llvm.eh.sjlj.longjmp
+ * intrinsics, the same portable, fixed-size-buffer mechanism clang
+ * itself lowers __builtin_setjmp/__builtin_longjmp to -- chosen over
+ * calling libc's own setjmp/longjmp symbols directly from hand-written
+ * IR specifically because THEIR symbol names and jmp_buf layout are
+ * platform/libc-specific in exactly the way an intrinsic isn't). That
+ * frame is exactly as long-lived as the try statement needs it to be:
+ * it can't return before hitting one of the exit paths codegen's own
+ * _TryFrameMarker mechanism already instruments.
+ *
+ * longjmp itself has NO equivalent placement constraint -- only the
+ * ORIGINATING setjmp call cares where it's made, so festina_throw
+ * below is free to be an ordinary runtime C function using
+ * __builtin_longjmp on whatever buffer festina_try_push registered.
+ *
+ * The catch-frame stack is `__thread`-local (claude.md #163), not a
+ * plain global -- generated Festina code itself still only ever runs
+ * on the single main thread (every OTHER piece of runtime state --
+ * globals, refcounts -- is exactly as unsynchronized as it always
+ * was, and stays that way), but claude.md #163's background http
+ * worker pool calls this SAME festina_throw/try_push/try_error
+ * machinery -- via a hand-written __builtin_setjmp catch frame, not
+ * generated IR -- from its own worker threads, to convert a network
+ * failure into a queued callback result rather than let it escape
+ * across threads. A plain, shared g_festina_catch_top would let a
+ * worker thread's own push/pop race the main thread's unrelated
+ * try/catch activity, or -- worse -- longjmp into a stack frame that
+ * isn't even on the current thread's stack. Thread-local storage
+ * gives each thread (main or worker) its own completely independent
+ * catch-frame stack and pending-error slot, with zero synchronization
+ * needed, since nothing here is ever actually SHARED between threads
+ * in the first place -- confirmed directly with a standalone harness
+ * (two threads, one throwing, one not, both racing the main thread's
+ * own independent try/catch) before this went anywhere near the real
+ * runtime.
+ *
+ * THE ONE REAL, DOCUMENTED LIMITATION (see api.md and claude.md #157):
+ * longjmp unwinds the C stack directly, bypassing every LLVM-generated
+ * cleanup instruction in every frame between the throw and the
+ * catching try -- EXCEPT the one frame that matters most, which
+ * codegen's own ThrowStmt handling covers explicitly (a plain, direct
+ * _emit_free_active_locals call, right before the festina_throw call
+ * itself -- unlike every other frame's cleanup, this one is emitted
+ * BEFORE, not after, so it isn't dead code the longjmp skips). So: a
+ * throw is leak-free for every local active in the FUNCTION THAT
+ * DIRECTLY CONTAINS the throw statement, whether that's the try's own
+ * body or a function it calls (or a function THAT calls, arbitrarily
+ * deep) -- exactly like Return already is for that same function. The
+ * real gap is narrower than "any called function": any INTERMEDIATE
+ * frame on the call chain between the try and the actual throw -- a
+ * function that merely CALLS something which eventually throws,
+ * without itself containing a throw or try -- never runs any of its
+ * own cleanup at all, because longjmp skips past its remaining code
+ * entirely, the same way it skips a frame with no cleanup story of its
+ * own. Confirmed empirically, not just reasoned about: a direct
+ * Valgrind run showed 0 leaked bytes throwing from the SAME function a
+ * try calls, and from a function THAT function calls in turn -- and a
+ * real, reproducible "N bytes in N blocks definitely lost" (N = call
+ * count) the moment a genuine intermediate frame sat between them.
+ * This is a leak, never a use-after-free or corruption (nothing is
+ * freed that shouldn't be, only some things that should be freed
+ * eventually aren't) -- the same correctness class this runtime already accepts
+ * for the one documented row-array chain shape in security.md. */
+
+typedef struct FestinaCatchFrame {
+    void *buf;  /* codegen's own [5 x ptr] alloca -- see _emit_try */
+    struct FestinaCatchFrame *prev;
+} FestinaCatchFrame;
+
+static __thread FestinaCatchFrame *g_festina_catch_top = NULL;
+/* Owned by the runtime between a throw and the moment festina_try_error()
+ * hands it over; NULL the rest of the time. Only ever holds ONE message
+ * at a time (per thread) -- a throw can only reach here once nothing
+ * between it and the catch has already unwound, so there's never a
+ * second pending throw to overwrite this before the first is
+ * collected. */
+static __thread char *g_festina_error_message = NULL;
+
+/* Registers buf (codegen's own alloca'd sjlj buffer, already populated
+ * by ITS direct llvm.eh.sjlj.setjmp call, which returned 0 -- the
+ * normal, first-arrival path) as the new top catch frame. Called by
+ * generated code once, right after that setjmp -- never on the
+ * "returned via a longjmp" (nonzero) path. */
+void festina_try_push(void *buf) {
+    FestinaCatchFrame *frame = malloc(sizeof(FestinaCatchFrame));
+    if (!frame) { fprintf(stderr, "festina: out of memory (try)\n"); exit(1); }
+    frame->buf = buf;
+    frame->prev = g_festina_catch_top;
+    g_festina_catch_top = frame;
+}
+
+/* Only ever called right after festina_try_push() pushed the SAME
+ * frame this pops (codegen's own _TryFrameMarker handling in
+ * _emit_free_active_locals is the only caller, on every NORMAL exit
+ * from a try body); a THROWING exit pops its own frame itself, from
+ * inside festina_throw, before the jump. */
+void festina_try_pop(void) {
+    FestinaCatchFrame *frame = g_festina_catch_top;
+    if (!frame) return; /* defensive; should never happen from generated code */
+    g_festina_catch_top = frame->prev;
+    free(frame);
+}
+
+/* Hands ownership of the thrown message over to generated code as an
+ * ordinary, exclusively-owned text value -- the runtime's own copy
+ * (see festina_throw) becomes the caller's from this point on, so this
+ * never needs calling twice for the same throw. */
+char *festina_try_error(void) {
+    char *msg = g_festina_error_message;
+    g_festina_error_message = NULL;
+    return msg ? msg : strdup("");
+}
+
+/* Never returns. With no enclosing try reachable, behaves exactly like
+ * fail(msg) -- throw is always at least as safe as fail(), never a
+ * riskier way to end the program.
+ *
+ * TAKES OWNERSHIP of msg -- unlike every other runtime call taking a
+ * `ptr` text argument, this does NOT make its own copy (codegen's own
+ * ThrowStmt handling already made an exclusively-owned one, via a
+ * plain festina_text_own, specifically so it stays valid regardless of
+ * what _emit_free_active_locals frees right afterward -- see that
+ * comment for why a second copy here would be redundant AND would
+ * itself leak, since nothing downstream would ever free it once this
+ * call diverts control away for good). Otherwise: pops the frame it's
+ * unwinding TO (not any frame still open between here and there --
+ * those are simply never visited, which is this mechanism's one
+ * documented leak -- see this file's own top comment), and jumps via
+ * __builtin_longjmp -- safe to call from here (an ordinary, nested
+ * runtime function) even though the matching setjmp is not, since only
+ * setjmp cares about its own call site's frame lifetime; longjmp has
+ * no equivalent restriction.
+ *
+ * wasm32-wasi gets a stub, the identical shape festina_process_exec's
+ * own wasm32-wasi branch already uses just below (see this file's own
+ * top-of-file comment on why): __builtin_longjmp is flatly rejected by
+ * clang for this target ("not supported for the current target",
+ * confirmed directly -- LLVM's wasm32 backend has no SjLj lowering at
+ * all outside emscripten's own EH pass, which this project doesn't
+ * use), so this whole file would fail to compile for EVERY program,
+ * try/throw or not, without this split -- this translation unit is
+ * still compiled UNCONDITIONALLY for every wasm build. try/throw is
+ * rejected outright at compile time instead (festina/cli.py's
+ * _check_wasm_feature_supported, gated on codegen's own uses_try) --
+ * this stub degrading every throw to fail()'s own behavior instead of
+ * a hard compile error would be surprising, silently platform-
+ * dependent semantics rather than a clear, honest "not supported
+ * here"; it exists purely so this file compiles, never to be reached
+ * by a real program. */
+#if !defined(__wasi__)
+void festina_throw(const char *msg) {
+    if (g_festina_catch_top == NULL) {
+        festina_fail(msg);
+        return; /* unreachable -- festina_fail() always exits */
+    }
+    free(g_festina_error_message);
+    g_festina_error_message = (char *)msg;
+    FestinaCatchFrame *frame = g_festina_catch_top;
+    g_festina_catch_top = frame->prev;
+    void *buf = frame->buf;
+    free(frame);
+    __builtin_longjmp(buf, 1);
+}
+#else
+void festina_throw(const char *msg) {
+    festina_fail(msg); /* never actually reached -- see this function's own comment above */
+}
+#endif
+
+static int64_t festina_null_int(void);      /* defined with the sqlite helpers below */
+static double festina_null_float(void);     /* defined with the sqlite helpers below */
+
+/* ---- JSON parsing: .toStruct()/.toArr() -- claude.md #159 ----
+ *
+ * A hand-written recursive-descent parser, but structured so every
+ * low-level primitive below either succeeds and returns a valid
+ * result, or calls festina_throw() directly and never returns --
+ * reusing claude.md #157's own throw/catch machinery as this whole
+ * feature's ENTIRE error-handling story, rather than threading error
+ * values through hand-generated LLVM IR. This means codegen's own
+ * generated per-struct/per-array parsing functions (see
+ * codegen.py's _from_json_fn_for) are plain, straight-line/looping
+ * code with no separate failure path to branch on at all -- a parse
+ * failure anywhere unwinds exactly the way any other throw does, all
+ * the way to the nearest enclosing try/catch (or behaves like fail()
+ * if there is none).
+ *
+ * v1 SCOPE CUT (documented in api.md/todo.md, not silent): a target
+ * struct's fields and a target array's element type must be
+ * int/float/bool/text -- nested struct/arr[T]/map[T] aren't supported
+ * yet, rejected at COMPILE TIME with a clear error naming the
+ * unsupported field/element and its type. festina_json_skip_value
+ * below is still fully general regardless (an unrecognized struct key
+ * can still legally hold arbitrarily nested JSON, and needs to be
+ * correctly skipped past either way -- see its own comment).
+ *
+ * ONE REAL, DOCUMENTED LIMITATION, the SAME structural class claude.md
+ * #157 already accepted (see festina_throw's own comment above): a
+ * throw from anywhere inside codegen's own generated
+ * __festina_from_json_struct_N/__festina_from_json_arr_N leaves
+ * whatever that ONE call had already built (the struct's own header,
+ * any field text already read, any array elements already pushed)
+ * permanently unreclaimed -- that function is HAND-WRITTEN LLVM IR,
+ * not a real Festina function body going through _emit_block's own
+ * _active_free_locals tracking, so nothing in generated code ever gets
+ * the chance to free it on the way out. A SUCCESSFUL parse leaks
+ * NOTHING (confirmed directly under Valgrind, including 30 repeated
+ * calls in a loop) -- this is strictly an error-path leak, bounded to
+ * at most one partially-built struct/array per FAILED call, never
+ * unbounded or accumulating across successful ones. Fixing this
+ * properly would mean real exception-safe cleanup for values built
+ * mid-expression-evaluation generally (this language has no RAII/
+ * unwind-table story at all today) -- a substantially larger
+ * undertaking than this feature's own reasonable scope, tracked in
+ * todo.md rather than attempted here. */
+
+typedef struct FestinaJsonCursor {
+    const char *s;
+    int64_t len;
+    int64_t pos;
+} FestinaJsonCursor;
+
+static void festina_json_throwf(const char *fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    /* strdup'd, not the stack buffer itself -- festina_throw() TAKES
+     * OWNERSHIP of what it's given (claude.md #157/#158's own
+     * convention), and buf's own storage is gone the instant this
+     * function returns (which festina_throw never actually lets
+     * happen here, but the call itself still needs a heap pointer). */
+    festina_throw(strdup(buf));
+}
+
+static void festina_json_skip_ws(FestinaJsonCursor *c) {
+    while (c->pos < c->len) {
+        char ch = c->s[c->pos];
+        if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') c->pos++;
+        else break;
+    }
+}
+
+static int festina_json_peek(FestinaJsonCursor *c) {
+    festina_json_skip_ws(c);
+    if (c->pos >= c->len) return -1;
+    return (unsigned char)c->s[c->pos];
+}
+
+/* Consumes `ch` if it's next (after skipping ws); throws otherwise. */
+static void festina_json_expect(FestinaJsonCursor *c, char ch) {
+    int p = festina_json_peek(c);
+    if (p != (unsigned char)ch) {
+        if (p < 0) festina_json_throwf("expected '%c' but reached the end of input", ch);
+        else festina_json_throwf("expected '%c' at position %lld, found '%c'",
+                                  ch, (long long)c->pos, (char)p);
+    }
+    c->pos++;
+}
+
+/* Consumes `ch` if it's next; returns 1/0, never throws -- used for
+ * "is there another element/key, or is this the end" checks, where
+ * "no" is a normal, expected outcome rather than a parse error. */
+static int festina_json_try_eat(FestinaJsonCursor *c, char ch) {
+    if (festina_json_peek(c) != (unsigned char)ch) return 0;
+    c->pos++;
+    return 1;
+}
+
+/* True (and consumes "null") if the next token is a JSON null literal;
+ * false (cursor untouched) otherwise. Every scalar reader below checks
+ * this first -- a JSON null is always legal for any supported target
+ * type here, becoming that type's own zero/null value (the same
+ * "database NULL renders as null text/element renders as null" -- but
+ * mirrored, reading rather than writing -- api.md's own existing JSON
+ * rendering rule already documents). */
+static int festina_json_try_null(FestinaJsonCursor *c) {
+    festina_json_skip_ws(c);
+    if (c->pos + 4 <= c->len && memcmp(c->s + c->pos, "null", 4) == 0) { c->pos += 4; return 1; }
+    return 0;
+}
+
+static char *festina_json_parse_string(FestinaJsonCursor *c) {
+    festina_json_skip_ws(c);
+    if (c->pos >= c->len || c->s[c->pos] != '"') {
+        festina_json_throwf("expected a string at position %lld", (long long)c->pos);
+    }
+    c->pos++;
+    size_t cap = 32, len = 0;
+    char *out = malloc(cap);
+    if (!out) festina_json_throwf("out of memory parsing a JSON string");
+    for (;;) {
+        if (c->pos >= c->len) { free(out); festina_json_throwf("unterminated string"); }
+        unsigned char ch = (unsigned char)c->s[c->pos++];
+        char decoded;
+        if (ch == '"') { out[len] = 0; return out; }
+        if (ch == '\\') {
+            if (c->pos >= c->len) { free(out); festina_json_throwf("unterminated escape sequence"); }
+            char esc = c->s[c->pos++];
+            switch (esc) {
+                case '"': decoded = '"'; break;
+                case '\\': decoded = '\\'; break;
+                case '/': decoded = '/'; break;
+                case 'b': decoded = '\b'; break;
+                case 'f': decoded = '\f'; break;
+                case 'n': decoded = '\n'; break;
+                case 'r': decoded = '\r'; break;
+                case 't': decoded = '\t'; break;
+                default:
+                    free(out);
+                    /* claude.md #159: \u unicode escapes are a
+                     * documented v1 scope cut, not silently mishandled
+                     * -- raw (unescaped) non-ASCII UTF-8 bytes in a
+                     * string are unaffected and parse completely
+                     * normally; this only affects a producer that
+                     * specifically chooses to \u-escape. */
+                    if (esc == 'u') festina_json_throwf("\\u unicode escapes are not yet supported");
+                    else festina_json_throwf("invalid escape sequence '\\%c'", esc);
+                    return NULL; /* unreachable */
+            }
+        } else if (ch < 0x20) {
+            free(out);
+            festina_json_throwf("unescaped control character in a JSON string");
+            return NULL; /* unreachable */
+        } else {
+            decoded = (char)ch;
+        }
+        if (len + 2 > cap) {
+            cap *= 2;
+            char *grown = realloc(out, cap);
+            if (!grown) { free(out); festina_json_throwf("out of memory parsing a JSON string"); }
+            out = grown;
+        }
+        out[len++] = decoded;
+    }
+}
+
+/* Parses a JSON number TOKEN and returns it as a double -- the caller
+ * decides int vs float interpretation (festina_json_read_int below
+ * truncates). JSON itself doesn't syntactically distinguish "5" from
+ * "5.0"; neither does this language's own numeric coercion (assigning
+ * a whole-number float where an int is expected, or vice versa, both
+ * already just work), so this deliberately doesn't reject "5.0" for an
+ * int field/element -- consistent with, not stricter than, Festina's
+ * own existing int/float rules. */
+static double festina_json_parse_number(FestinaJsonCursor *c) {
+    festina_json_skip_ws(c);
+    int64_t start = c->pos;
+    if (c->pos < c->len && c->s[c->pos] == '-') c->pos++;
+    if (c->pos >= c->len || !isdigit((unsigned char)c->s[c->pos])) {
+        festina_json_throwf("expected a number at position %lld", (long long)start);
+    }
+    if (c->s[c->pos] == '0') c->pos++;
+    else { while (c->pos < c->len && isdigit((unsigned char)c->s[c->pos])) c->pos++; }
+    if (c->pos < c->len && c->s[c->pos] == '.') {
+        c->pos++;
+        if (c->pos >= c->len || !isdigit((unsigned char)c->s[c->pos]))
+            festina_json_throwf("malformed number at position %lld", (long long)start);
+        while (c->pos < c->len && isdigit((unsigned char)c->s[c->pos])) c->pos++;
+    }
+    if (c->pos < c->len && (c->s[c->pos] == 'e' || c->s[c->pos] == 'E')) {
+        c->pos++;
+        if (c->pos < c->len && (c->s[c->pos] == '+' || c->s[c->pos] == '-')) c->pos++;
+        if (c->pos >= c->len || !isdigit((unsigned char)c->s[c->pos]))
+            festina_json_throwf("malformed number at position %lld", (long long)start);
+        while (c->pos < c->len && isdigit((unsigned char)c->s[c->pos])) c->pos++;
+    }
+    int64_t n = c->pos - start;
+    char buf[64];
+    if (n >= (int64_t)sizeof(buf)) festina_json_throwf("number literal too long");
+    memcpy(buf, c->s + start, (size_t)n);
+    buf[n] = 0;
+    return strtod(buf, NULL);
+}
+
+static int8_t festina_json_parse_bool(FestinaJsonCursor *c) {
+    festina_json_skip_ws(c);
+    if (c->pos + 4 <= c->len && memcmp(c->s + c->pos, "true", 4) == 0) { c->pos += 4; return 1; }
+    if (c->pos + 5 <= c->len && memcmp(c->s + c->pos, "false", 5) == 0) { c->pos += 5; return 0; }
+    festina_json_throwf("expected true or false at position %lld", (long long)c->pos);
+    return 0; /* unreachable */
+}
+
+/* Recursively skips over ANY well-formed JSON value (string, number,
+ * bool, null, object, array) without building anything -- used for a
+ * struct field the target Festina struct doesn't declare (an unknown
+ * JSON key is a normal, forward-compatible thing to see, not an error
+ * -- api.md's own documented lenient-parsing contract). Fully general
+ * regardless of this v1's own scalars-only SUPPORTED-field scope (see
+ * this section's own top comment) -- an unknown key's own value can
+ * still be arbitrarily nested either way, and needs to be correctly
+ * skipped past regardless of whether this version could ever build a
+ * Festina value from it. */
+static void festina_json_skip_value(FestinaJsonCursor *c) {
+    if (festina_json_try_null(c)) return;
+    int p = festina_json_peek(c);
+    if (p == '"') { char *s = festina_json_parse_string(c); free(s); return; }
+    if (p == 't' || p == 'f') { festina_json_parse_bool(c); return; }
+    if (p == '{') {
+        c->pos++;
+        if (festina_json_try_eat(c, '}')) return;
+        for (;;) {
+            char *k = festina_json_parse_string(c);
+            free(k);
+            festina_json_expect(c, ':');
+            festina_json_skip_value(c);
+            if (festina_json_try_eat(c, ',')) continue;
+            festina_json_expect(c, '}');
+            return;
+        }
+    }
+    if (p == '[') {
+        c->pos++;
+        if (festina_json_try_eat(c, ']')) return;
+        for (;;) {
+            festina_json_skip_value(c);
+            if (festina_json_try_eat(c, ',')) continue;
+            festina_json_expect(c, ']');
+            return;
+        }
+    }
+    if (p == '-' || (p >= '0' && p <= '9')) { festina_json_parse_number(c); return; }
+    if (p < 0) festina_json_throwf("unexpected end of input");
+    else festina_json_throwf("unexpected character '%c' at position %lld", (char)p, (long long)c->pos);
+}
+
+/* Case-insensitive key match -- struct fields match a JSON key the
+ * same way a query column already does (claude.md #111's own
+ * case-insensitive convention, mirrored here for consistency, not
+ * re-derived). */
+static int festina_json_key_eq(const char *a, const char *b) {
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+/* ---- Public entry points -- codegen calls these directly. ---- */
+
+void *festina_json_cursor_new(const char *text) {
+    FestinaJsonCursor *c = malloc(sizeof(FestinaJsonCursor));
+    if (!c) festina_json_throwf("out of memory starting a JSON parse");
+    c->s = text ? text : "";
+    c->len = (int64_t)strlen(c->s);
+    c->pos = 0;
+    return c;
+}
+
+void festina_json_cursor_free(void *cursor) { free(cursor); }
+
+/* Rejects trailing garbage after the top-level value -- called once,
+ * by the OUTERMOST generated function, after the whole struct/array
+ * has been consumed. `'{}extra'.toStruct(T)` is a parse error, not a
+ * silently-ignored suffix. */
+void festina_json_expect_end(void *cursor) {
+    FestinaJsonCursor *c = cursor;
+    if (festina_json_peek(c) >= 0) {
+        festina_json_throwf("unexpected trailing data at position %lld", (long long)c->pos);
+    }
+}
+
+void festina_json_object_start(void *cursor) { festina_json_expect((FestinaJsonCursor *)cursor, '{'); }
+void festina_json_array_start(void *cursor) { festina_json_expect((FestinaJsonCursor *)cursor, '['); }
+
+/* Called at the START of each object-field loop iteration -- returns 1
+ * (and consumes the closing '}') once the object has ended, 0
+ * otherwise (leaving the cursor positioned at the next key). `*first`
+ * is an in/out flag the generated loop owns as its own local, tracking
+ * whether a leading ',' needs consuming first. */
+int8_t festina_json_object_next(void *cursor, int8_t *first) {
+    FestinaJsonCursor *c = cursor;
+    if (festina_json_try_eat(c, '}')) return 1;
+    if (!*first) festina_json_expect(c, ',');
+    *first = 0;
+    return 0;
+}
+
+/* The array counterpart -- identical shape, closing ']'. */
+int8_t festina_json_array_next(void *cursor, int8_t *first) {
+    FestinaJsonCursor *c = cursor;
+    if (festina_json_try_eat(c, ']')) return 1;
+    if (!*first) festina_json_expect(c, ',');
+    *first = 0;
+    return 0;
+}
+
+char *festina_json_read_key(void *cursor) {
+    FestinaJsonCursor *c = cursor;
+    char *key = festina_json_parse_string(c);
+    festina_json_expect(c, ':');
+    return key;
+}
+
+int8_t festina_json_key_matches(const char *key, const char *field_name) {
+    return (int8_t)festina_json_key_eq(key, field_name);
+}
+
+void festina_json_skip_field_value(void *cursor) { festina_json_skip_value((FestinaJsonCursor *)cursor); }
+
+int64_t festina_json_read_int(void *cursor) {
+    FestinaJsonCursor *c = cursor;
+    if (festina_json_try_null(c)) return festina_null_int();
+    return (int64_t)festina_json_parse_number(c);
+}
+
+double festina_json_read_float(void *cursor) {
+    FestinaJsonCursor *c = cursor;
+    if (festina_json_try_null(c)) return festina_null_float();
+    return festina_json_parse_number(c);
+}
+
+int8_t festina_json_read_bool(void *cursor) {
+    FestinaJsonCursor *c = cursor;
+    if (festina_json_try_null(c)) return 2; /* claude.md #97's bool-null sentinel */
+    return festina_json_parse_bool(c);
+}
+
+char *festina_json_read_text(void *cursor) {
+    FestinaJsonCursor *c = cursor;
+    if (festina_json_try_null(c)) return NULL;
+    return festina_json_parse_string(c);
+}
+
+/* ---- url / parseURL() -- claude.md #162 ----
+ *
+ * Deliberately modeled on the WHATWG URL object's own field names
+ * (hash/hostname/password/pathname/port/protocol/searchParams/
+ * username) rather than inventing new ones, since that's the shape
+ * asked for directly. Absolute URLs only (`scheme://...`) -- no
+ * relative-URL resolution against a base, no IDNA/punycode host
+ * normalization, no exhaustive RFC 3986 validation; a pragmatic
+ * subset that parses the URLs a real program actually constructs
+ * (an API endpoint, a webhook target), not a general-purpose URL
+ * library. parseURL() THROWS (claude.md #157's own catchable
+ * exception mechanism, reused here exactly the way claude.md #159's
+ * JSON parser already reuses it) on a genuinely malformed URL -- no
+ * `://`, or an unparseable port -- rather than returning some
+ * default/empty value a caller could easily miss.
+ *
+ * Refcounted like blob/img/aud/http (the same `{refcount, ...}`
+ * header every one of those shares -- see _is_refcounted's own
+ * comment in codegen.py), constructed once by festina_parse_url and
+ * read through afterward by seven small accessors, one per field --
+ * `port` is the one exception (kept as a public field access via
+ * festina_url_port returning i64 directly, no separate accessor
+ * split needed since it was never text to begin with). */
+typedef struct {
+    int64_t refcount;
+    char *protocol;    /* includes the trailing ':' -- e.g. "https:" --
+                        * matching the WHATWG URL object's own convention */
+    char *username;
+    char *password;
+    char *hostname;
+    int64_t port;       /* festina_null_int() when the URL named no
+                         * explicit port (the scheme's own default
+                         * applies implicitly -- this never guesses
+                         * what that default is) */
+    char *pathname;     /* always starts with '/' */
+    char *hash;         /* includes the leading '#' if present, else "" */
+    void *search_params; /* map[text] payload (see festina_runtime_http.c's
+                          * own festina_new_empty_text_map for the identical
+                          * {refcount, count, entries} shape) -- percent-
+                          * decoded keys/values, '+' decoded to a space in
+                          * the query string specifically (classic
+                          * application/x-www-form-urlencoded convention),
+                          * NOT in the path/hash. */
+} FestinaUrlValue;
+
+static char *festina_url_slice(const char *start, const char *end) {
+    size_t len = (size_t)(end - start);
+    char *out = malloc(len + 1);
+    if (!out) festina_fail("out of memory parsing a URL");
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return out;
+}
+
+/* One hex digit -> its value, or -1 if not a hex digit. */
+static int festina_hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Percent-decodes [start, end) into a fresh, owned, NUL-terminated
+ * string -- '+' becomes a space (query-string convention; callers
+ * that don't want that, e.g. a plain path/hash slice, use
+ * festina_url_slice above instead, never this). A malformed escape
+ * (a trailing '%' or non-hex digits) is passed through literally
+ * rather than rejected -- the same "lenient, never fails the
+ * program" spirit claude.md #159's own JSON parser applies to
+ * unknown-but-harmless input shapes, not to genuinely malformed ones
+ * (which still throw, just not here -- this only ever decodes
+ * already-delimited query text, never a place a throw would help). */
+static char *festina_url_decode(const char *start, const char *end) {
+    size_t len = (size_t)(end - start);
+    char *out = malloc(len + 1);
+    if (!out) festina_fail("out of memory parsing a URL");
+    size_t oi = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = start[i];
+        if (c == '+') {
+            out[oi++] = ' ';
+        } else if (c == '%' && i + 2 < len) {
+            int hi = festina_hex_digit(start[i + 1]);
+            int lo = festina_hex_digit(start[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out[oi++] = (char)((hi << 4) | lo);
+                i += 2;
+            } else {
+                out[oi++] = c;
+            }
+        } else {
+            out[oi++] = c;
+        }
+    }
+    out[oi] = '\0';
+    return out;
+}
+
+/* festina_runtime_http.c has its own helper of this exact name/shape
+ * (a fresh {refcount, count, entries} map[text] block) -- not
+ * reachable from here (a different translation unit), so this is
+ * CORE's own private copy, used by both url search params and by
+ * anything else in this file that ever needs a fresh empty map[text]. */
+typedef struct {
+    int64_t refcount;
+    int64_t count;
+    void *entries;
+} FestinaMapBlockCore;
+
+static void *festina_new_empty_text_map(void) {
+    FestinaMapBlockCore *block = calloc(1, sizeof(FestinaMapBlockCore));
+    if (!block) festina_fail("out of memory allocating a map");
+    block->refcount = 1;
+    return &block->count;
+}
+
+/* Parses `a=1&b=2` (already-decoded of its own leading '?') into a
+ * fresh map[text] -- last-key-wins for a repeated parameter, the
+ * identical "last one wins" convention claude.md #159's own JSON
+ * object parsing already uses for a duplicate key. */
+static void *festina_parse_search_params(const char *query, size_t len) {
+    void *map = festina_new_empty_text_map();
+    FestinaMapBlockCore *block = (FestinaMapBlockCore *)((char *)map - sizeof(int64_t));
+    const char *p = query;
+    const char *end = query + len;
+    while (p < end) {
+        const char *pair_end = memchr(p, '&', (size_t)(end - p));
+        if (!pair_end) pair_end = end;
+        const char *eq = memchr(p, '=', (size_t)(pair_end - p));
+        char *key, *value;
+        if (eq) {
+            key = festina_url_decode(p, eq);
+            value = festina_url_decode(eq + 1, pair_end);
+        } else {
+            key = festina_url_decode(p, pair_end);
+            value = festina_text_own("");
+        }
+        if (key[0] != '\0') {
+            festina_map_set(&block->count, &block->entries, key,
+                            (int64_t)(intptr_t)value);
+        } else {
+            free(value);
+        }
+        free(key);
+        p = (pair_end < end) ? pair_end + 1 : end;
+    }
+    return map;
+}
+
+void *festina_parse_url(const char *text) {
+    if (!text) text = "";
+    const char *scheme_end = strstr(text, "://");
+    if (!scheme_end) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "parseURL: '%s' has no scheme (expected "
+                 "something like 'https://host/path')", text);
+        festina_throw(festina_text_own(msg));
+        return NULL; /* unreachable -- festina_throw never returns */
+    }
+    const char *p = scheme_end + 3;
+
+    FestinaUrlValue *u = calloc(1, sizeof(FestinaUrlValue));
+    if (!u) festina_fail("out of memory parsing a URL");
+    u->refcount = 1;
+    u->port = festina_null_int();
+    {
+        char *scheme = festina_url_slice(text, scheme_end);
+        size_t slen = strlen(scheme);
+        char *with_colon = malloc(slen + 2);
+        if (!with_colon) festina_fail("out of memory parsing a URL");
+        memcpy(with_colon, scheme, slen);
+        with_colon[slen] = ':';
+        with_colon[slen + 1] = '\0';
+        free(scheme);
+        u->protocol = with_colon;
+    }
+
+    /* authority: [user[:password]@]host[:port], up to the first of
+     * '/', '?', '#', or the end of the string. */
+    const char *authority_end = p;
+    while (*authority_end && *authority_end != '/' && *authority_end != '?'
+           && *authority_end != '#') authority_end++;
+    const char *host_start = p;
+    const char *at = memchr(p, '@', (size_t)(authority_end - p));
+    if (at) {
+        const char *colon = memchr(p, ':', (size_t)(at - p));
+        if (colon) {
+            u->username = festina_url_decode(p, colon);
+            u->password = festina_url_decode(colon + 1, at);
+        } else {
+            u->username = festina_url_decode(p, at);
+            u->password = festina_text_own("");
+        }
+        host_start = at + 1;
+    } else {
+        u->username = festina_text_own("");
+        u->password = festina_text_own("");
+    }
+    const char *port_colon = memchr(host_start, ':', (size_t)(authority_end - host_start));
+    if (port_colon) {
+        u->hostname = festina_url_slice(host_start, port_colon);
+        char *port_text = festina_url_slice(port_colon + 1, authority_end);
+        if (port_text[0] != '\0') {
+            char *end_ptr = NULL;
+            long port_val = strtol(port_text, &end_ptr, 10);
+            if (end_ptr == port_text || *end_ptr != '\0' || port_val < 0 || port_val > 65535) {
+                char msg[256];
+                snprintf(msg, sizeof(msg), "parseURL: '%s' has an invalid port", text);
+                free(port_text);
+                festina_throw(festina_text_own(msg));
+                return NULL; /* unreachable */
+            }
+            u->port = port_val;
+        }
+        free(port_text);
+    } else {
+        u->hostname = festina_url_slice(host_start, authority_end);
+    }
+
+    p = authority_end;
+    const char *path_start = p;
+    while (*p && *p != '?' && *p != '#') p++;
+    u->pathname = (p > path_start) ? festina_url_slice(path_start, p) : festina_text_own("/");
+
+    if (*p == '?') {
+        p++;
+        const char *query_start = p;
+        while (*p && *p != '#') p++;
+        u->search_params = festina_parse_search_params(query_start, (size_t)(p - query_start));
+    } else {
+        u->search_params = festina_new_empty_text_map();
+    }
+
+    if (*p == '#') {
+        u->hash = festina_url_slice(p, p + strlen(p));
+    } else {
+        u->hash = festina_text_own("");
+    }
+
+    return &u->protocol;
+}
+
+#define FESTINA_URL_FROM_PAYLOAD(payload) \
+    ((FestinaUrlValue *)((char *)(payload) - offsetof(FestinaUrlValue, protocol)))
+
+char *festina_url_protocol(void *payload) { return festina_text_own(FESTINA_URL_FROM_PAYLOAD(payload)->protocol); }
+char *festina_url_username(void *payload) { return festina_text_own(FESTINA_URL_FROM_PAYLOAD(payload)->username); }
+char *festina_url_password(void *payload) { return festina_text_own(FESTINA_URL_FROM_PAYLOAD(payload)->password); }
+char *festina_url_hostname(void *payload) { return festina_text_own(FESTINA_URL_FROM_PAYLOAD(payload)->hostname); }
+int64_t festina_url_port(void *payload) { return FESTINA_URL_FROM_PAYLOAD(payload)->port; }
+char *festina_url_pathname(void *payload) { return festina_text_own(FESTINA_URL_FROM_PAYLOAD(payload)->pathname); }
+char *festina_url_hash(void *payload) { return festina_text_own(FESTINA_URL_FROM_PAYLOAD(payload)->hash); }
+void *festina_url_search_params(void *payload) {
+    void *sp = FESTINA_URL_FROM_PAYLOAD(payload)->search_params;
+    festina_retain(sp);
+    return sp;
+}
+
+void festina_release_url(void *payload) {
+    if (!festina_release_check(payload)) return;
+    FestinaUrlValue *u = FESTINA_URL_FROM_PAYLOAD(payload);
+    free(u->protocol);
+    free(u->username);
+    free(u->password);
+    free(u->hostname);
+    free(u->pathname);
+    free(u->hash);
+    festina_release_map(u->search_params);
+    free(u);
+}
+
 /* claude.md #131: close(code)/`on exit(code:int)`. Lives in the CORE
  * runtime (not festina_runtime_graphics.c, where g_close_handler and
  * the window-close event live) precisely because close() has to work
@@ -161,6 +1055,98 @@ void festina_program_exit(int64_t code) {
     if (g_exit_handler) g_exit_handler(code);
     exit((int)code);
 }
+
+/* claude.md #161: graceful shutdown -- SIGINT/SIGTERM stop a program
+ * the same clean way close(code) already does (`on exit(code:int)`
+ * runs, then the process exits) instead of the OS's own default,
+ * abrupt, no-cleanup-at-all termination -- and, for a program that
+ * uses openPort()/openSecurePort(), give already-accepted connections
+ * a real chance to finish instead of being severed mid-response (see
+ * festina_runtime_http.c's own festina_run_http_loop, which is what
+ * actually does the draining -- this is only the signal-to-flag
+ * plumbing every blocking loop polls).
+ *
+ * DESIGN: the signal handler itself does the absolute minimum
+ * async-signal-safety allows -- setting two `sig_atomic_t` flags and
+ * returning, nothing else (no malloc, no I/O, no calling back into
+ * arbitrary Festina/C code directly from signal context, which could
+ * land mid-way through an in-progress non-reentrant call like
+ * malloc() itself and deadlock or corrupt heap state). Every blocking
+ * loop (festina_run_http_loop, festina_run_timer_loop,
+ * festina_run_event_loop) instead POLLS festina_shutdown_requested()
+ * once per ordinary iteration -- the same "check a flag on your own
+ * schedule, from safe context" pattern already used for
+ * festina_next_timer_deadline()/_fire_expired_timers() -- and does
+ * its real cleanup (draining connections, closing a window, ...) from
+ * there, in normal (non-signal-handler) execution.
+ *
+ * DESIGN: festina_install_shutdown_handler() is called from generated
+ * code's own main() -- and ONLY there, ONLY when the program actually
+ * has one of those three pollable loops (see codegen.py's
+ * _emit_main_and_entry) -- deliberately NOT unconditionally
+ * from festina_runtime_init() the way that function's own stdout/stderr
+ * fix is. A plain script with a hand-written loop and no event loop of
+ * any kind has no point in its own execution that could ever check
+ * festina_shutdown_requested() at all; installing a handler there would
+ * silently swallow Ctrl+C (the flag gets set, but nothing ever polls it,
+ * so the program would run to completion instead of stopping) --
+ * genuinely worse than doing nothing, since the OS's own default
+ * SIGINT/SIGTERM disposition already stops such a program today. Only
+ * install where "graceful" has an observable, correct meaning.
+ *
+ * DESIGN: SIGTERM is POSIX-only (`#ifndef _WIN32`) -- Windows has no
+ * real SIGTERM delivery at all (nothing sends it under normal process
+ * termination; taskkill/TerminateProcess don't raise it), the same
+ * "Windows has no SIGPIPE either" situation festina_runtime_http.c's
+ * own festina_open_port already documents for a different signal.
+ * SIGINT is registered on every platform -- Windows' CRT does raise it
+ * for a real Ctrl+C on a console process. */
+#if !defined(__wasi__)
+static volatile sig_atomic_t g_shutdown_requested = 0;
+static volatile sig_atomic_t g_shutdown_exit_code = 0;
+
+static void festina_shutdown_signal_handler(int sig) {
+    g_shutdown_requested = 1;
+    /* 128+signal is the conventional POSIX/shell exit-code encoding for
+     * "terminated by signal N" (130 for SIGINT, 143 for SIGTERM) --
+     * matches what a shell itself would report for the same signal
+     * killing an ordinary (non-Festina) process, so a caller scripting
+     * around a compiled Festina program sees the familiar convention. */
+    g_shutdown_exit_code = 128 + sig;
+}
+
+void festina_install_shutdown_handler(void) {
+    signal(SIGINT, festina_shutdown_signal_handler);
+#ifndef _WIN32
+    signal(SIGTERM, festina_shutdown_signal_handler);
+#endif
+}
+
+int64_t festina_shutdown_requested(void) {
+    return g_shutdown_requested;
+}
+
+int64_t festina_shutdown_exit_code(void) {
+    return g_shutdown_exit_code;
+}
+#else
+/* WASI Preview 1 has no signal model at all -- confirmed directly:
+ * wasi-libc's own <signal.h> provides none of sig_atomic_t/signal()/
+ * SIGINT/SIGTERM, the identical "genuinely absent, not a hardware-
+ * verification gate" situation exec()/http/try already document for
+ * this target (see cli.py's _check_wasm_feature_supported). Graceful
+ * shutdown simply doesn't apply here -- but this translation unit is
+ * compiled UNCONDITIONALLY for every wasm build (core, like regex --
+ * see this file's own top comment), and a timers-only wasm program
+ * (uses_timers, still perfectly valid under WASI) still emits a call
+ * to festina_install_shutdown_handler (see codegen.py's own
+ * _emit_main_and_entry) -- so these stubs exist purely so the core
+ * object file still compiles and links; the call itself is simply a
+ * no-op here. */
+void festina_install_shutdown_handler(void) { }
+int64_t festina_shutdown_requested(void) { return 0; }
+int64_t festina_shutdown_exit_code(void) { return 0; }
+#endif
 
 /* ---- environment variables -- claude.md #71 ---- */
 
@@ -867,6 +1853,53 @@ void *festina_blob_open(const char *path) {
     char *copy = strdup(path);
     if (!copy) festina_fail("out of memory allocating a blob");
     return festina_blob_alloc(copy, bytes, len);
+}
+
+/* claude.md #165: runs on a background worker thread (see
+ * festina_runtime_async.c) -- reads `b->path` (already set, at
+ * construction time, by festina_blob_load_dispatch below) and fills
+ * in `bytes`/`length` in place, mutating the SAME blob value the
+ * caller already got back immediately. Never throws (matches
+ * festina_blob_open's own "unreadable path -> empty blob" contract
+ * exactly), so this needs none of festina_runtime_http.c's own
+ * catch-frame machinery. */
+static void festina_blob_load_worker(void *payload) {
+    FestinaBlob *b = (FestinaBlob *)payload;
+    int64_t len = 0;
+    char *bytes = festina_read_file_sized(b->path, &len);
+    if (!bytes) { bytes = strdup(""); len = 0; }
+    free(b->bytes);
+    b->bytes = bytes;
+    b->length = len;
+}
+
+/* claude.md #165: codegen's own entry point for a `.callback()`-
+ * carrying blob construction (`blob b = 'path'.callback(fn)` or the
+ * fully anonymous `blob 'path'.callback(fn)`) -- mirrors
+ * festina_http_send_client_dispatch's own null-check shape exactly.
+ * `callback` NULL is the unchanged, fully synchronous path (identical
+ * to festina_blob_open, just routed through here so codegen has one
+ * call site regardless of whether a callback is present -- the
+ * null-vs-non-null decision has to happen at RUNTIME, the same reason
+ * http's own dispatcher does). Non-NULL returns an EMPTY blob
+ * (bytes/length zero, `path` already correct) immediately -- exactly
+ * as unpopulated, and just as indistinguishable from a genuinely
+ * empty/unreadable file, as blob's own pre-existing "test, don't
+ * fail" contract already made every OTHER unreadable-path case; the
+ * whole point of `callback` is not reading the blob until it fires. */
+void *festina_blob_load_dispatch(const char *path, void (*callback)(void *)) {
+    if (!callback) return festina_blob_open(path);
+    if (!path) path = "";
+    char *copy = strdup(path);
+    if (!copy) festina_fail("out of memory allocating a blob");
+    char *empty = strdup("");
+    if (!empty) festina_fail("out of memory allocating a blob");
+    void *payload = festina_blob_alloc(copy, empty, 0);
+    festina_retain(payload); /* survives after the caller's own scope releases its
+                              * reference -- balanced by festina_blob_release,
+                              * passed to festina_async_io_run as release_fn below */
+    festina_async_io_dispatch(payload, festina_blob_load_worker, callback, festina_blob_release);
+    return payload;
 }
 
 /* claude.md #109: a blob read back out of a SQLite BLOB column. It has
@@ -2328,6 +3361,79 @@ void festina_fire_expired_timers(void) {
     }
 }
 
+/* claude.md #165: the generic async-io hook seam -- see this trio's
+ * own doc comment in festina_runtime.h for the full reasoning. All
+ * three default to "nothing registered": festina_async_io_outstanding()
+ * answers 0, festina_async_io_drain() does nothing, and
+ * festina_async_io_dispatch() falls back to running the job inline
+ * (synchronously) rather than crashing -- exactly as if
+ * festina_runtime_async.c were never linked at all -- which, for a
+ * program that never uses blob/img/aud's own `.callback()` form, it
+ * never is.
+ *
+ * `run_fn` (unlike the other two) is NOT optional in practice --
+ * festina_blob_load_dispatch (below) only ever calls
+ * festina_async_io_dispatch AFTER a program has already used
+ * `.callback()` somewhere, which is exactly what makes codegen set
+ * uses_async_io and link festina_runtime_async.c at all, so this hook
+ * is always registered by the time it's actually needed. The
+ * synchronous fallback below exists purely so festina_blob_load_dispatch
+ * itself can be UNCONDITIONALLY part of core (linked into every
+ * program, whether or not it ever calls `.callback()`) without
+ * core ever making a DIRECT symbol reference into the conditionally-
+ * linked festina_runtime_async.c -- that direct-call mistake is
+ * exactly what broke the very first build of this feature (a hard
+ * link failure for every program that never used `.callback()` at
+ * all, since festina_blob_load_dispatch calling
+ * festina_async_io_run() BY NAME meant the linker needed that symbol
+ * to exist regardless, confirmed directly by the immediate full-suite
+ * failure this caused before this fix). */
+static int64_t (*g_async_io_outstanding_fn)(void) = NULL;
+static void (*g_async_io_drain_fn)(void) = NULL;
+static void (*g_async_io_run_fn)(void *payload, void (*work_fn)(void *),
+                                 void (*callback)(void *), void (*release_fn)(void *)) = NULL;
+
+void festina_set_async_io_hooks(
+        int64_t (*outstanding_fn)(void), void (*drain_fn)(void),
+        void (*run_fn)(void *, void (*)(void *), void (*)(void *), void (*)(void *))) {
+    g_async_io_outstanding_fn = outstanding_fn;
+    g_async_io_drain_fn = drain_fn;
+    g_async_io_run_fn = run_fn;
+}
+
+int64_t festina_async_io_outstanding(void) {
+    return g_async_io_outstanding_fn ? g_async_io_outstanding_fn() : 0;
+}
+
+void festina_async_io_drain(void) {
+    if (g_async_io_drain_fn) g_async_io_drain_fn();
+}
+
+void festina_async_io_dispatch(void *payload, void (*work_fn)(void *),
+                               void (*callback)(void *), void (*release_fn)(void *)) {
+    if (g_async_io_run_fn) {
+        g_async_io_run_fn(payload, work_fn, callback, release_fn);
+        return;
+    }
+    /* Unreachable in practice -- see this function's own doc comment
+     * above -- but a real, correct synchronous fallback rather than a
+     * silent no-op or a crash, if it's ever somehow reached anyway. */
+    work_fn(payload);
+    if (callback) callback(payload);
+    if (release_fn) release_fn(payload);
+}
+
+/* claude.md #165: bounds a sleep/poll timeout that would otherwise be
+ * "block forever" (no active timer) to a short, regular wake -- the
+ * only way festina_run_timer_loop's own plain nanosleep (no fd to
+ * poll(), unlike festina_run_http_loop's self-pipe) can notice a
+ * background blob/img/aud load finishing in a timely way. 20ms is
+ * arbitrary but small enough that a completed background load's own
+ * callback fires promptly without this loop spinning uselessly the
+ * rest of the time (it still only wakes AT ALL when there's a reason
+ * to -- an active timer, or outstanding async-io work). */
+#define FESTINA_ASYNC_IO_POLL_SECONDS 0.02
+
 /* The blocking loop main() enters (via festina_run_timer_loop, see
  * festina/codegen.py's _emit_main_and_entry) for a program that uses
  * setTimeout/setInterval but never opens a graphics window --
@@ -2339,12 +3445,36 @@ void festina_fire_expired_timers(void) {
  * Node's empty event loop exiting the process. An uncleared
  * setInterval() therefore keeps a graphics-free program running
  * forever, exactly like in a real JS runtime; it needs to be stopped
- * externally (or via clearInterval()) the same way. */
+ * externally (or via clearInterval()) the same way. claude.md #165:
+ * "nothing left to wait for" now also means "and no outstanding
+ * blob/img/aud background load" -- see festina_async_io_outstanding
+ * above. */
 void festina_run_timer_loop(void) {
     while (1) {
+        /* claude.md #161: checked once per iteration (this loop's own
+         * natural poll point -- nanosleep is interrupted, EINTR, by
+         * the very signal that sets this flag, so the very next check
+         * after a Ctrl+C/SIGTERM sees it almost immediately, not after
+         * waiting out the rest of whatever timer was pending). Exits
+         * via festina_program_exit rather than a plain return, so a
+         * declared `on exit(code:int)` handler still runs -- the same
+         * clean-shutdown path close(code) already uses. */
+        if (festina_shutdown_requested()) {
+            festina_program_exit(festina_shutdown_exit_code());
+        }
         double earliest = festina_next_timer_deadline();
-        if (earliest < 0.0) return; /* nothing left to wait for */
-        double remaining = earliest - festina_now_seconds();
+        int64_t async_io_outstanding = festina_async_io_outstanding();
+        if (earliest < 0.0 && async_io_outstanding == 0) {
+            return; /* nothing left to wait for */
+        }
+        double remaining = earliest;
+        if (earliest >= 0.0) {
+            remaining = earliest - festina_now_seconds();
+        }
+        if (async_io_outstanding > 0
+                && (earliest < 0.0 || remaining > FESTINA_ASYNC_IO_POLL_SECONDS)) {
+            remaining = FESTINA_ASYNC_IO_POLL_SECONDS;
+        }
         if (remaining > 0.0) {
             struct timespec ts;
             ts.tv_sec = (time_t)remaining;
@@ -2352,6 +3482,7 @@ void festina_run_timer_loop(void) {
             nanosleep(&ts, NULL);
         }
         festina_fire_expired_timers();
+        festina_async_io_drain();
     }
 }
 

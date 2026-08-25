@@ -35,6 +35,73 @@ void festina_log_text(const char *v);
 /* claude.md #42: fail() -- prints to stderr and exits(1). */
 void festina_fail(const char *msg);
 
+/* claude.md #158: troubleshoot(event, fields) -- one structured JSON
+ * line to stdout; fail(message, fields) -- the structured 2-argument
+ * form of fail(), a JSON line to stderr then exit(1). `fields_json` is
+ * already-rendered JSON text (codegen's own _to_text on a map[text]
+ * argument). */
+void festina_troubleshoot(const char *event, const char *fields_json);
+void festina_fail_structured(const char *msg, const char *fields_json);
+
+/* claude.md #159: .toStruct()/.toArr() JSON parsing. Every one of
+ * these either succeeds and returns a valid result, or calls
+ * festina_throw() internally and never returns -- see
+ * festina_runtime.c's own comment on this whole group. `cursor` is
+ * always the opaque value festina_json_cursor_new returned. */
+void *festina_json_cursor_new(const char *text);
+void festina_json_cursor_free(void *cursor);
+void festina_json_expect_end(void *cursor);
+void festina_json_object_start(void *cursor);
+void festina_json_array_start(void *cursor);
+int8_t festina_json_object_next(void *cursor, int8_t *first);
+int8_t festina_json_array_next(void *cursor, int8_t *first);
+char *festina_json_read_key(void *cursor);
+int8_t festina_json_key_matches(const char *key, const char *field_name);
+void festina_json_skip_field_value(void *cursor);
+int64_t festina_json_read_int(void *cursor);
+double festina_json_read_float(void *cursor);
+int8_t festina_json_read_bool(void *cursor);
+char *festina_json_read_text(void *cursor);
+
+/* claude.md #162: url / parseURL(text) -- modeled on the WHATWG URL
+ * object's own field names (hash/hostname/password/pathname/port/
+ * protocol/searchParams/username). One shape only, like RegexType/
+ * HttpType (see festina_runtime.c's own doc comment on the parser's
+ * real scope: absolute URLs only, no IDNA, no exhaustive RFC 3986
+ * validation). Refcounted (the same `{refcount, ...}` header blob/
+ * img/aud/http already share) -- festina_release_url is this type's
+ * own destructor, dispatched through codegen's _release_fn_for the
+ * same way every other refcounted type's is. parseURL() itself
+ * THROWS (claude.md #157) on a genuinely malformed URL, catchable by
+ * an enclosing try, the same design claude.md #159's JSON parser
+ * already established for "this operation can fail with real
+ * diagnostic text" runtime primitives. */
+void *festina_parse_url(const char *text);
+char *festina_url_protocol(void *payload);
+char *festina_url_username(void *payload);
+char *festina_url_password(void *payload);
+char *festina_url_hostname(void *payload);
+int64_t festina_url_port(void *payload);
+char *festina_url_pathname(void *payload);
+char *festina_url_hash(void *payload);
+void *festina_url_search_params(void *payload);  /* fresh reference --
+                                                   * caller owns it, same
+                                                   * "retain on the way out"
+                                                   * convention every other
+                                                   * shared-live-value field
+                                                   * getter already uses */
+void festina_release_url(void *payload);
+
+/* claude.md #157: try/catch/throw. See festina_runtime.c's own comment
+ * on this whole group for the setjmp/longjmp design and its one
+ * documented leak caveat (a throw reached through a called function).
+ * The actual setjmp call is emitted directly by codegen (_emit_try) --
+ * festina_try_push registers the buffer it produced. */
+void festina_try_push(void *buf);
+void festina_try_pop(void);
+char *festina_try_error(void);
+void festina_throw(const char *msg);
+
 /* claude.md #131: close(code) -- runs a declared `on exit(code:int)`
  * handler (if any), then exits with `code`. Lives in the core runtime
  * so it works in every program, windowed or not -- unlike
@@ -44,6 +111,26 @@ void festina_fail(const char *msg);
  * most once, unconditionally, near the top of main(). */
 void festina_register_exit_handler(void (*handler)(int64_t));
 void festina_program_exit(int64_t code);
+
+/* claude.md #161: graceful shutdown -- SIGINT (every platform) and
+ * SIGTERM (POSIX only -- Windows has no real delivery of it, see
+ * festina_runtime.c's own comment) now run the SAME clean-exit path
+ * close(code) already uses (`on exit(code:int)` fires, then the
+ * process exits) instead of the OS's own default abrupt termination,
+ * and -- for a program using openPort()/openSecurePort() -- give
+ * already-accepted connections a real chance to finish first (see
+ * festina_runtime_http.c's own festina_run_http_loop). Generated
+ * code's own main() calls festina_install_shutdown_handler() at most
+ * once, and ONLY when the program has one of the three pollable
+ * blocking loops below (see festina_runtime.c's own comment on why --
+ * installing it anywhere else, including for a program that declares
+ * `on exit` but has none of those loops, would silently swallow
+ * Ctrl+C with nothing left to ever check for it). festina_shutdown_requested()/
+ * _exit_code() are what every blocking loop (http/timer/graphics)
+ * polls once per ordinary iteration to notice and act on it. */
+void festina_install_shutdown_handler(void);
+int64_t festina_shutdown_requested(void);
+int64_t festina_shutdown_exit_code(void);
 
 /* claude.md #9, #45: string interpolation support. */
 char *festina_str_from_int(int64_t v);
@@ -727,6 +814,58 @@ void festina_clear_interval(int64_t id);
  * and codegen only ever emits a call to whichever one the program needs. */
 void festina_run_timer_loop(void);
 
+/* claude.md #165: the generic async-io hook seam -- blob/img/aud's own
+ * `.callback()` (a background file load, the same non-blocking shape
+ * claude.md #163 gave http's client req.send()) needs SOME loop to
+ * keep running until outstanding work finishes and to drain completed
+ * callbacks on the main thread, but unlike http.callback (where ANY
+ * use already guarantees festina_run_http_loop is the one running),
+ * a program using ONLY blob.callback() -- no openPort(), no graphics,
+ * maybe not even a timer -- has no such guarantee: it could end up in
+ * festina_run_timer_loop, festina_run_http_loop, OR
+ * festina_run_event_loop depending on what ELSE the program does.
+ * All three loops therefore check these same two hooks every
+ * iteration (see each one's own festina_async_io_outstanding/_drain
+ * call) -- both default to "nothing registered" (a plain 0/no-op) so
+ * a program that never uses blob/img/aud's own callback form pays
+ * nothing beyond one branch per iteration, and never needs to link
+ * festina_runtime_async.c (the ONE translation unit that actually
+ * registers them, via festina_register_async_io_hooks below, called
+ * from main() only when CodeGen.uses_async_io is set) at all -- the
+ * same "only link what a program actually uses" split every other
+ * optional feature in this runtime already gets. Mirrors
+ * festina_set_tls_client_hooks' own registration-seam shape exactly,
+ * for the identical cross-translation-unit reason. */
+void festina_set_async_io_hooks(int64_t (*outstanding_fn)(void), void (*drain_fn)(void),
+                                void (*run_fn)(void *payload, void (*work_fn)(void *payload),
+                                               void (*callback)(void *payload),
+                                               void (*release_fn)(void *payload)));
+int64_t festina_async_io_outstanding(void);
+void festina_async_io_drain(void);
+/* codegen's own conditional call site (uses_async_io, mirroring
+ * uses_https's own festina_register_tls_hooks() call) -- defined in
+ * festina_runtime_async.c, registers ITS OWN outstanding/drain/run
+ * functions via festina_set_async_io_hooks above. */
+void festina_register_async_io_hooks(void);
+/* claude.md #165: the ALWAYS-linked-core entry point for dispatching an
+ * async-io job -- blob/img/aud's own `.callback()`-non-null dispatch
+ * functions (festina_blob_load_dispatch and its img/aud counterparts)
+ * call THIS, never festina_runtime_async.c's festina_async_io_run
+ * directly (that would be an unconditional cross-translation-unit
+ * symbol reference from always-linked core into a conditionally-linked
+ * file -- a hard link failure for every program that doesn't use
+ * async-io at all). This wrapper goes through the g_async_io_run_fn
+ * hook above instead, exactly like festina_async_io_outstanding/_drain
+ * already do, and falls back to a synchronous inline run if no hook is
+ * registered (unreachable in practice: codegen only emits a call to
+ * festina_blob_load_dispatch when uses_async_io is set, which is also
+ * what gates linking festina_runtime_async.c and calling
+ * festina_register_async_io_hooks from main() -- but a real, correct
+ * fallback rather than a silent no-op or a crash). */
+void festina_async_io_dispatch(void *payload, void (*work_fn)(void *payload),
+                               void (*callback)(void *payload),
+                               void (*release_fn)(void *payload));
+
 /*
  * claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying().
  *
@@ -965,6 +1104,12 @@ void festina_cycle_dispose_map(void *payload);
  * .exists()/.write()/.append()/.delete() all answer false.
  */
 void *festina_blob_open(const char *path);
+/* claude.md #165: codegen's own entry point for `.callback()` --
+ * `callback` NULL is identical to calling festina_blob_open directly;
+ * non-NULL returns an empty (not-yet-loaded) blob immediately and
+ * fills it in on a background thread, firing `callback` from the main
+ * thread once done. See festina_runtime.c's own doc comment. */
+void *festina_blob_load_dispatch(const char *path, void (*callback)(void *));
 void *festina_blob_from_bytes(const void *data, int64_t len);
 void festina_blob_release(void *payload);
 char *festina_blob_to_text(void *payload);   /* owned copy, per claude.md #83 */
@@ -1154,13 +1299,10 @@ void festina_release_map(void *payload);
  * kind of small, script-shaped server program this language already
  * targets, not a general-purpose production HTTP server replacement.
  *
- * DESIGN, http/socket VALUES: both are refcounted opaque handles
- * (`festina_release_conn_handle` below, shared by both types --
- * neither has more than one shape, exactly like RegexType/blob's own
- * "one release function, no per-type variants" precedent), but the
- * handle itself is NOT a pointer to live connection state -- it's a
- * tiny malloc'd `{refcount, conn_id}` pair. Every runtime call that
- * takes one (festina_http_port, festina_socket_send_text, ...) looks
+ * DESIGN, socket VALUES: a refcounted opaque handle
+ * (`festina_release_conn_handle` below) -- NOT a pointer to live
+ * connection state, a tiny malloc'd `{refcount, conn_id}` pair. Every
+ * runtime call that takes one (festina_socket_send_text, ...) looks
  * `conn_id` up in the connection table fresh, on every call, and
  * silently does nothing (or answers a null/false/-1, matching
  * whatever "nothing happened" already means for that call) if the
@@ -1168,11 +1310,29 @@ void festina_release_map(void *payload);
  * program" convention exec()/mkdir()/the file builtins already use,
  * extended to cover a REAL use-after-teardown case a server
  * genuinely has to tolerate (a client disconnects mid-handler, or a
- * program stores `req`/`s` somewhere that outlives the connection).
- * conn_id is a monotonic counter, never reused, specifically so a
- * stale id can never alias a DIFFERENT, later connection that
- * happens to reuse the same fd -- the classic fd-reuse-after-close
- * bug this indirection exists to rule out by construction.
+ * program stores `s` somewhere that outlives the connection). conn_id
+ * is a monotonic counter, never reused, specifically so a stale id
+ * can never alias a DIFFERENT, later connection that happens to reuse
+ * the same fd -- the classic fd-reuse-after-close bug this
+ * indirection exists to rule out by construction.
+ *
+ * DESIGN, http VALUES (claude.md #162, superseding the ORIGINAL
+ * "same handle shape as socket" design claude.md #151 shipped):
+ * http is a genuine refcounted VALUE now, not a handle -- url/method/
+ * code/headers/body all live directly in it (see
+ * festina_runtime_http.c's own FestinaHttpValue doc comment), copied
+ * out once at construction time rather than looked up fresh from the
+ * connection table on every field read. This is what lets an http
+ * value be constructed directly by a program (`http x = {...}`),
+ * returned by a client req.send(), or simply outlive its originating
+ * connection (if it ever had one) with everything still readable.
+ * conn_id is the one field that still reaches back into the
+ * connection table -- 0 for a value with no live connection behind it
+ * at all, in which case .ok()/.redirect()/.upgrade()/.send(res) are
+ * silent no-ops (the exact same "never crashes on a value that
+ * doesn't apply" tolerance the old handle design already had), while
+ * .toText()/.toBlob()/.toImg()/.toAud() work identically either way,
+ * live or not.
  *
  * DESIGN, http/1.1 scope: request-line + headers + a Content-Length
  * body only -- no chunked transfer-encoding, no HTTP/1.0, no
@@ -1200,6 +1360,45 @@ void festina_release_map(void *payload);
 void festina_open_port(int64_t port);
 void festina_close_port(int64_t port);
 
+/* claude.md #160: openSecurePort(port, key) -- the TLS counterpart to
+ * openPort() above, sharing the same listener table, connection
+ * table, and single-threaded poll() event loop (a TLS listener is
+ * just a FestinaListener with a non-NULL tls_config; a TLS connection
+ * just a FestinaConn with non-NULL tls -- see festina_runtime_http.c's
+ * own struct comments). `key` is a combined PEM blob (certificate,
+ * or a full chain leaf-first, and the matching UNENCRYPTED private
+ * key, in either order) -- see festina_runtime_https.c's own top
+ * comment for the full design writeup (mbedTLS 2.x, server-only, no
+ * client certs, no SNI, no ALPN) and setup.md for the new system
+ * dependency this introduces. Same "never fails the program on a bad
+ * port number" contract as openPort() -- but a malformed/mismatched
+ * certificate or key DOES fail the program (via festina_fail, with
+ * the real mbedTLS error text), the same "test, don't fail" vs. "a
+ * program-authoring mistake" line claude.md #59 already draws for
+ * every other builtin. */
+void festina_open_secure_port(int64_t port, const uint8_t *key, int64_t key_len);
+
+/* claude.md #160: registers festina_runtime_https.c's own seven-
+ * function TLS hook table (see that file's own top comment) --
+ * generated code's own main() calls this, and ONLY this, exactly
+ * once, exactly when self.uses_https (festina/codegen.py's
+ * _emit_main_and_entry), so a program that never calls
+ * openSecurePort() never references (and therefore never needs
+ * linked) a single mbedTLS-touching symbol. festina_set_tls_hooks
+ * itself lives in festina_runtime_http.c (it stores into that file's
+ * own static g_tls_* pointers) and is declared here only so
+ * festina_runtime_https.c -- a different translation unit -- can call
+ * it from festina_register_tls_hooks below. */
+void festina_register_tls_hooks(void);
+void festina_set_tls_hooks(
+    void *(*listener_new)(const uint8_t *pem, int64_t pem_len),
+    void (*listener_free)(void *tls_config),
+    void *(*conn_new)(void *tls_config, int fd),
+    void (*conn_free)(void *tls_state),
+    int (*handshake)(void *tls_state),
+    long (*recv_fn)(void *tls_state, void *buf, int64_t cap),
+    long (*send_fn)(void *tls_state, const void *data, int64_t len));
+
 void festina_register_request_handler(void (*fn)(void *req));
 void festina_register_upgrade_handler(void (*fn)(void *sock));
 void festina_register_message_handler(void (*fn)(void *sock, void *msg));
@@ -1221,44 +1420,109 @@ void festina_register_socketclose_handler(void (*fn)(void *sock));
  * setInterval() already does. */
 void festina_run_http_loop(void);
 
-/* req:http -- fields (see semantic.py's _infer_member HttpType branch
- * for the read-only enforcement; codegen never emits a store through
- * any of these). festina_http_headers returns a FRESH map[text]
- * (refcount 1, lowercased header names, the last occurrence of a
- * repeated header name wins) -- ownership transfers to the caller the
- * same way any other function returning a brand-new container already
- * does, no extra retain needed (contrast festina_socket_state below,
- * which hands out the SAME live map repeatedly and does need one). */
-int64_t festina_http_port(void *handle);
-char *festina_http_method(void *handle);       /* owned text copy */
-char *festina_http_path(void *handle);         /* owned text copy -- see
-                                                 * this header's own top
-                                                 * comment: added beyond
-                                                 * the user's literal
-                                                 * spec, a request has no
-                                                 * way to route without it */
-void *festina_http_headers(void *handle);      /* fresh map[text] */
+/* http -- claude.md #162's redesign: a genuine refcounted VALUE (see
+ * festina_runtime_http.c's own FestinaHttpValue doc comment), not the
+ * old {refcount, conn_id} handle -- url/method/code/headers/body all
+ * live directly in it now. `url`/`method`/`code`/`headers` are
+ * read-only via dot-access (see semantic.py's _infer_member HttpType
+ * branch; codegen never emits a store through any of these) -- the
+ * only way to SET them is the literal-construction syntax
+ * (festina_http_literal_new below) at creation time.
+ *
+ * festina_http_literal_new is codegen's own entry point for
+ * `http x = {...}` -- takes ownership of `headers` (NULL means "the
+ * literal named no headers key", answered with a fresh empty map
+ * instead), copies body/body_len (the caller's own temporary buffer
+ * stays the caller's to free afterward, same convention
+ * festina_blob_from_bytes already uses).
+ *
+ * festina_http_url/_method return an owned text COPY (this value's
+ * own field is never handed out directly, so a caller mutating the
+ * returned text -- impossible in this language, but still -- could
+ * never reach back into the value itself). festina_http_headers
+ * returns the SAME live map every call, already retained on the way
+ * out (contrast the OLD festina_http_headers, which rebuilt a fresh
+ * one on every single read) -- the identical "same live value,
+ * retained" contract festina_socket_state below already has.
+ *
+ * claude.md #163: `callback` is a 5th field -- a bare function pointer
+ * (NULL for none), the same runtime representation every other
+ * `func`-typed value already has, so it needs no separate release
+ * function of its own. Non-NULL is what makes festina_http_send_client_dispatch
+ * (below) take req.send()'s non-blocking path. */
+void *festina_http_literal_new(const char *url, const char *method, int64_t code,
+                               void *headers, const uint8_t *body, int64_t body_len,
+                               void (*callback)(void *));
+char *festina_http_url(void *payload);
+char *festina_http_method(void *payload);
+int64_t festina_http_code(void *payload);
+void *festina_http_headers(void *payload);
+void *festina_http_callback(void *payload);  /* the bare function pointer, or NULL */
 
-/* req:http -- methods. Each of ok/redirect/upgrade/send is a no-op
- * (not an error) if this connection already responded once, or is no
- * longer live at all -- "only the FIRST response action wins" is
- * enforced here, not left to the caller to avoid double-responding by
- * hand. */
-void festina_http_ok(void *handle);
-void festina_http_redirect(void *handle, const char *url);
-void festina_http_upgrade(void *handle);
-void *festina_http_to_blob(void *handle);   /* the request body, fresh blob */
-void *festina_http_to_img(void *handle);    /* body decoded as an image */
-void *festina_http_to_aud(void *handle);    /* body decoded as audio */
-char *festina_http_to_text(void *handle);   /* the body, as owned text */
-/* `data`/`len`: the already-rendered body bytes (codegen has already
- * called .toText()/festina_blob_bytes on whatever the user passed --
- * see codegen.py's _emit_http_send). `code`: the HTTP status code.
- * `extra_headers`: a map[text] of additional response headers (may be
- * NULL for none), copied out before this returns -- ownership of
- * `extra_headers` itself is NOT taken. */
-void festina_http_send(void *handle, const void *data, int64_t len,
-                       int64_t code, void *extra_headers);
+/* http -- methods. ok/redirect/upgrade/send(res) are each a no-op
+ * (not an error) if this value isn't bound to a live, still-open
+ * connection (a plain constructed value, a client response, or a
+ * connection that's already responded once or is no longer live) --
+ * "only the FIRST response action wins, and only a LIVE request can
+ * respond at all" is enforced here, not left to the caller to avoid
+ * by hand. toBlob/toImg/toAud/toText read this value's own body
+ * directly -- no connection lookup at all, so these work identically
+ * whether `payload` is live or not. */
+void festina_http_ok(void *payload);
+void festina_http_redirect(void *payload, const char *url);
+void festina_http_upgrade(void *payload);
+void *festina_http_to_blob(void *payload);   /* the body, fresh blob */
+void *festina_http_to_img(void *payload);    /* body decoded as an image */
+void *festina_http_to_aud(void *payload);    /* body decoded as audio */
+char *festina_http_to_text(void *payload);   /* the body, as owned text */
+/* req.send(res:http) -- the SERVER side: sends res's own code
+ * (defaulting to 200 when res.code is still null)/headers/body as
+ * this LIVE request's response. `res_payload` is only read from, never
+ * mutated or its ownership taken. */
+void festina_http_send(void *req_payload, void *res_payload);
+/* req.send() (zero-argument) / codegen's own client dispatch -- the
+ * CLIENT side: an outbound request built from `payload`'s own url/
+ * method/headers/body, MUTATING `payload` in place afterward: code/
+ * headers/body are overwritten with the response (url/method are left
+ * alone -- they still describe what was sent). THROWS (claude.md #157)
+ * on a genuine network/protocol failure (DNS resolution, connect, TLS
+ * handshake, an unparseable response) -- catchable by an enclosing
+ * try, the same design claude.md #159's JSON parser already
+ * established for "this can fail with real diagnostic text" runtime
+ * primitives. Blocking -- see festina_runtime_http.c's own comment on
+ * why that's an accepted, already-established tradeoff, not an
+ * oversight. https:// needs festina_set_tls_client_hooks (below)
+ * registered first -- codegen only omits that when the program can
+ * prove no https:// URL could ever reach this call, which in practice
+ * (a runtime string) it never can, so every program using req.send()
+ * on the client side links mbedTLS the same way openSecurePort()
+ * does. */
+void festina_http_send_client(void *payload);
+/* claude.md #163: codegen's own entry point for req.send() (zero
+ * arguments) -- replaces the old direct festina_http_send_client call.
+ * Checks `payload`'s own `.callback` field at RUNTIME: NULL takes the
+ * exact festina_http_send_client path above (still fully blocking,
+ * unchanged behavior); non-NULL hands the request to a background
+ * worker pool instead and returns immediately, running `callback`
+ * later from the main thread's own event loop once the request
+ * completes (success or a caught network failure -- see
+ * festina_runtime_http.c's own "http -- async client" section).
+ * POSIX only for now (Linux/macOS) -- on Windows this is currently
+ * identical to calling festina_http_send_client directly; `callback`
+ * is simply not consulted there yet (see api.md). */
+void festina_http_send_client_dispatch(void *payload);
+/* claude.md #162: registers festina_runtime_https.c's own TLS CLIENT
+ * hooks (mirroring festina_set_tls_hooks' own SERVER-side registration
+ * -- see that function's own doc comment for the identical cross-
+ * translation-unit reasoning) -- called from festina_register_tls_hooks
+ * itself, not separately, so a program linking mbedTLS at all gets
+ * both halves registered together. */
+void festina_set_tls_client_hooks(
+    void *(*client_connect)(int fd, const char *hostname),
+    long (*recv_fn)(void *tls_state, void *buf, int64_t cap),
+    long (*send_fn)(void *tls_state, const void *data, int64_t len),
+    void (*close_fn)(void *tls_state));
+void festina_release_http(void *payload);
 
 /* s:socket -- state/send/close. festina_socket_state returns the
  * SAME live, already-retained map[text] every call for this
@@ -1273,13 +1537,13 @@ void festina_socket_send_text(void *handle, const char *text);
 void festina_socket_send_binary(void *handle, const void *data, int64_t len);
 void festina_socket_close(void *handle);
 
-/* Shared release function for BOTH http and socket handles -- neither
- * type has more than the one shape (see this header's own top
- * comment), so, like festina_release_map/_array above, one function
- * covers it; codegen's _release_fn_for dispatches both HttpType and
- * SocketType here. Frees only the tiny handle itself, never the
- * underlying connection (owned by the connection table, torn down
- * separately when the connection actually closes). */
+/* claude.md #162: socket's OWN release function now -- http moved to
+ * festina_release_http above (a real value with real contents to
+ * free), the SocketType branch of codegen's own _release_fn_for is
+ * the only dispatch still reaching this one. Frees only the tiny
+ * {refcount, conn_id} handle itself, never the underlying connection
+ * (owned by the connection table, torn down separately when the
+ * connection actually closes). */
 void festina_release_conn_handle(void *payload);
 
 #endif

@@ -335,6 +335,22 @@ REGEX = types_mod.RegexType()
 AUDIO = types_mod.AudioType()
 
 
+def _http_send_lit_receiver(node):
+    """claude.md #164: mirrors semantic.py's own identically-named
+    helper exactly (see its doc comment for the full reasoning) --
+    answers the inner MapLit if `node` is exactly
+    `Call(Member(<MapLit>, 'send', computed=False), [])`, else None.
+    Duplicated rather than imported, matching how this file and
+    semantic.py already keep no cross-import dependency on each
+    other."""
+    if (isinstance(node, ast.Call) and len(node.args) == 0
+            and isinstance(node.callee, ast.Member)
+            and not node.callee.computed and node.callee.prop == "send"
+            and isinstance(node.callee.obj, ast.MapLit)):
+        return node.callee.obj
+    return None
+
+
 def _is_refcounted(t):
     """claude.md #109: the single "does this value carry a refcount
     header" test, replacing the struct/arr[T]/map[T] tuple that used to
@@ -390,7 +406,8 @@ def _is_refcounted(t):
     return (isinstance(t, (types_mod.StructType, types_mod.ArrayType,
                            types_mod.MapType, types_mod.ImageType,
                            types_mod.AudioType, types_mod.RegexType,
-                           types_mod.HttpType, types_mod.SocketType))
+                           types_mod.HttpType, types_mod.SocketType,
+                           types_mod.UrlType))
             or t == BLOB)
 
 FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
@@ -564,6 +581,12 @@ def _llvm_type(t):
         # codegen -- see festina_runtime.h's own doc comment for the
         # full representation.
         return "ptr"
+    if isinstance(t, types_mod.UrlType):
+        # claude.md #162: an opaque FestinaUrlValue*, same "codegen
+        # never sees the real struct layout, only a ptr threaded
+        # through dedicated accessor calls" shape http/socket already
+        # have.
+        return "ptr"
     if isinstance(t, types_mod.ColorType):
         # claude.md #91: a packed 0xRRGGBB integer (negative for 'none')
         # -- see _pack_color. One register, and an integer compare is
@@ -631,6 +654,18 @@ class _StackStructFieldsOnly:
 
     def __init__(self, struct_type):
         self.struct_type = struct_type
+
+
+class _TryFrameMarker:
+    """claude.md #157: a placeholder entry in CodeGen._active_free_locals
+    marking "a try block's own runtime catch-frame is still open here" --
+    not a local variable at all, but it needs the exact same "pop this
+    on every exit path from this scope, however that exit happens"
+    treatment a real local's cleanup gets, so it rides the same
+    machinery rather than needing its own separate tracking stack. See
+    _emit_try's own comment for why this frame is pushed in its own,
+    dedicated entry (wrapping _emit_block's call for the try body,
+    rather than living inside that call's own frame)."""
 
 
 class _StackArrayOrMap:
@@ -731,6 +766,12 @@ class CodeGen:
         self.uses_timers = False               # any setTimeout()/setInterval() call anywhere --
                                                 # NOT clearTimeout()/clearInterval() alone; see
                                                 # _emit_timer_call and _emit_main_and_entry
+        self.uses_async_io = False             # claude.md #165: any blob/img/aud `.callback()` call
+                                                # anywhere -- links festina_runtime_async.c (the
+                                                # generic background-load worker pool) and, like
+                                                # uses_timers, guarantees SOME loop runs even if
+                                                # nothing else in the program would otherwise need
+                                                # one (see _emit_main_and_entry's own loop-selection)
         self.uses_graphics_code = False        # any drawRect/drawCircle/drawText/drawImage/
                                                 # loadImage call anywhere -- a strict superset of
                                                 # uses_graphics (see _emit_graphics_call's doc
@@ -747,6 +788,13 @@ class CodeGen:
                                                 # file needs to be linked in at all, so a program
                                                 # that never touches audio doesn't pull in
                                                 # libasound (see cli.py's _ensure_runtime_objects)
+        self.uses_try = False                  # claude.md #157: any try/throw anywhere -- unlike
+                                                # uses_graphics/uses_audio, festina_throw's own
+                                                # __builtin_longjmp is unconditional core, so this
+                                                # exists purely so compile_file can reject a
+                                                # wasm32-wasi build outright (there is no SjLj
+                                                # support for that target at all), the same way
+                                                # uses_exec below already does.
         self.uses_exec = False                 # claude.md #150: any exec() call anywhere -- unlike
                                                 # uses_graphics/uses_audio, festina_process_exec is
                                                 # unconditional core (no extra library to
@@ -774,6 +822,15 @@ class CodeGen:
         self.http_upgrade_handler_symbol = None
         self.http_message_handler_symbol = None
         self.http_socketclose_handler_symbol = None
+        self.uses_https = False                # claude.md #160: openSecurePort() specifically --
+                                                # narrower than uses_http (set alongside it, see
+                                                # openSecurePort's own dispatch branch below): a
+                                                # program can use openPort()/on request/... with no
+                                                # TLS involved at all, and that must never pull in
+                                                # mbedTLS. Drives cli.py's own festina_runtime_https.c
+                                                # linking + -lmbedtls/-lmbedx509/-lmbedcrypto (only
+                                                # when true) and the festina_register_tls_hooks()
+                                                # call in main() below (see _emit_main_and_entry).
 
         # claude.md #102: a table column of type aud/img makes the
         # program use that feature, whether or not it ever names a
@@ -905,6 +962,10 @@ class CodeGen:
                                                 # render function; registered before the body is
                                                 # generated, so a self-referencing struct recurses
                                                 # into its own function instead of generating forever
+        self._from_json_fns = {}               # claude.md #159: "struct:Name" / "arr:elemtype" ->
+                                                # its generated .toStruct()/.toArr() parsing function,
+                                                # cached the same way self._json_fns is above (the
+                                                # opposite direction -- parsing rather than rendering).
         self._row_to_struct_fns = set()        # claude.md #112: row->struct converters already
                                                 # generated, one per struct type used as a
                                                 # sqlite() target
@@ -1095,8 +1156,52 @@ class CodeGen:
             # latent ABI mismatch that happened to work only because 0/1
             # were the only values ever produced.
             "declare void @festina_log_bool(i8)",
+            # claude.md #157: try/catch. _emit_try emits the actual
+            # setjmp call directly (see its own docstring for why a
+            # runtime-side wrapper doesn't work) via these four
+            # intrinsics -- the same, portable, fixed-size-buffer
+            # mechanism clang lowers __builtin_setjmp/__builtin_longjmp
+            # to. festina_try_push registers the buffer that direct
+            # setjmp call just populated as the new top catch frame
+            # (only on its normal, 0-returning arrival); festina_try_pop
+            # pops the current top frame on a NORMAL exit from a try
+            # body (_emit_free_active_locals's own _TryFrameMarker
+            # handling is the only generated-code caller); festina_try_error
+            # hands over (and releases the runtime's own ownership of)
+            # the thrown message as an ordinary owned text value;
+            # festina_throw never returns.
+            "declare ptr @llvm.frameaddress.p0(i32 immarg)",
+            "declare ptr @llvm.stacksave.p0()",
+            "declare i32 @llvm.eh.sjlj.setjmp(ptr)",
+            "declare void @llvm.eh.sjlj.longjmp(ptr)",
+            "declare void @festina_try_push(ptr)",
+            "declare void @festina_try_pop()",
+            "declare ptr @festina_try_error()",
+            "declare void @festina_throw(ptr)",
             "declare void @festina_log_text(ptr)",
             "declare void @festina_fail(ptr)",
+            # claude.md #158: troubleshoot()/fail()'s structured form --
+            # both assemble a JSON envelope around already-rendered
+            # text (codegen's own _to_text on each argument).
+            "declare void @festina_troubleshoot(ptr, ptr)",
+            "declare void @festina_fail_structured(ptr, ptr)",
+            # claude.md #159: .toStruct()/.toArr() JSON parsing -- see
+            # runtime/festina_runtime.c's own comment on this whole
+            # group (every one either succeeds or throws internally).
+            "declare ptr @festina_json_cursor_new(ptr)",
+            "declare void @festina_json_cursor_free(ptr)",
+            "declare void @festina_json_expect_end(ptr)",
+            "declare void @festina_json_object_start(ptr)",
+            "declare void @festina_json_array_start(ptr)",
+            "declare i8 @festina_json_object_next(ptr, ptr)",
+            "declare i8 @festina_json_array_next(ptr, ptr)",
+            "declare ptr @festina_json_read_key(ptr)",
+            "declare i8 @festina_json_key_matches(ptr, ptr)",
+            "declare void @festina_json_skip_field_value(ptr)",
+            "declare i64 @festina_json_read_int(ptr)",
+            "declare double @festina_json_read_float(ptr)",
+            "declare i8 @festina_json_read_bool(ptr)",
+            "declare ptr @festina_json_read_text(ptr)",
             "declare ptr @festina_str_from_int(i64)",
             "declare ptr @festina_str_from_float(double)",
             "declare ptr @festina_str_from_bool(i8)",
@@ -1115,6 +1220,11 @@ class CodeGen:
             # from a path, refcounted, with the file operations that
             # used to be free functions hanging off it.
             "declare ptr @festina_blob_open(ptr)",
+            # claude.md #165: <text>.callback(fn) -- non-blocking blob
+            # loading, the file-loading counterpart to claude.md #163's
+            # http client callback.
+            "declare ptr @festina_blob_load_dispatch(ptr, ptr)",
+            "declare void @festina_register_async_io_hooks()",
             "declare ptr @festina_blob_from_bytes(ptr, i64)",
             "declare void @festina_blob_release(ptr)",
             "declare ptr @festina_blob_to_text(ptr)",
@@ -1154,15 +1264,46 @@ class CodeGen:
             # representation, http/1.1 and WebSocket scope).
             "declare void @festina_open_port(i64)",
             "declare void @festina_close_port(i64)",
+            # claude.md #160: openSecurePort() -- see
+            # festina_runtime.h's own doc comment right above these
+            # two declarations. festina_register_tls_hooks() is called
+            # from main() only when self.uses_https (see
+            # _emit_main_and_entry) -- see festina_runtime_https.c's
+            # own top comment for why this is the ONLY TLS-related
+            # symbol this module ever references, cross-translation-
+            # -unit hook wiring aside.
+            "declare void @festina_open_secure_port(i64, ptr, i64)",
+            "declare void @festina_register_tls_hooks()",
+            # claude.md #162: url / parseURL() -- lives in CORE
+            # (festina_runtime.c), see festina_runtime.h's own doc
+            # comment right above these declarations.
+            "declare ptr @festina_parse_url(ptr)",
+            "declare ptr @festina_url_protocol(ptr)",
+            "declare ptr @festina_url_username(ptr)",
+            "declare ptr @festina_url_password(ptr)",
+            "declare ptr @festina_url_hostname(ptr)",
+            "declare i64 @festina_url_port(ptr)",
+            "declare ptr @festina_url_pathname(ptr)",
+            "declare ptr @festina_url_hash(ptr)",
+            "declare ptr @festina_url_search_params(ptr)",
+            "declare void @festina_release_url(ptr)",
             "declare void @festina_register_request_handler(ptr)",
             "declare void @festina_register_upgrade_handler(ptr)",
             "declare void @festina_register_message_handler(ptr)",
             "declare void @festina_register_socketclose_handler(ptr)",
             "declare void @festina_run_http_loop()",
-            "declare i64 @festina_http_port(ptr)",
+            # claude.md #162: http -- redesigned into a genuine
+            # refcounted value (url/method/code/headers/body), see
+            # festina_runtime.h's own doc comment for the full
+            # rationale. claude.md #163 adds `callback` as a 7th
+            # constructor argument (a bare func pointer, `null` for
+            # none) and its own read-back accessor.
+            "declare ptr @festina_http_literal_new(ptr, ptr, i64, ptr, ptr, i64, ptr)",
+            "declare ptr @festina_http_url(ptr)",
             "declare ptr @festina_http_method(ptr)",
-            "declare ptr @festina_http_path(ptr)",
+            "declare i64 @festina_http_code(ptr)",
             "declare ptr @festina_http_headers(ptr)",
+            "declare ptr @festina_http_callback(ptr)",
             "declare void @festina_http_ok(ptr)",
             "declare void @festina_http_redirect(ptr, ptr)",
             "declare void @festina_http_upgrade(ptr)",
@@ -1170,7 +1311,18 @@ class CodeGen:
             "declare ptr @festina_http_to_img(ptr)",
             "declare ptr @festina_http_to_aud(ptr)",
             "declare ptr @festina_http_to_text(ptr)",
-            "declare void @festina_http_send(ptr, ptr, i64, i64, ptr)",
+            "declare void @festina_http_send(ptr, ptr)",
+            # claude.md #163: req.send() (zero arguments) now calls
+            # festina_http_send_client_dispatch, not
+            # festina_http_send_client directly -- the dispatcher
+            # checks `.callback` at runtime and decides blocking vs.
+            # background from there (see festina_runtime.h's own doc
+            # comment). festina_http_send_client itself is still very
+            # much alive in the runtime -- called from generated code
+            # only indirectly now, through the dispatcher, so it needs
+            # no `declare` of its own here anymore.
+            "declare void @festina_http_send_client_dispatch(ptr)",
+            "declare void @festina_release_http(ptr)",
             # festina_blob_bytes is already declared above (blob's own
             # sqlite-column binding uses it too) -- reused as-is by
             # _emit_sendable_body, not redeclared here.
@@ -1325,6 +1477,9 @@ class CodeGen:
             # windowed or not.
             "declare void @festina_register_exit_handler(ptr)",
             "declare void @festina_program_exit(i64)",
+            # claude.md #161: graceful shutdown -- see festina_runtime.h's
+            # own doc comment right above these declarations.
+            "declare void @festina_install_shutdown_handler()",
             "declare i64 @festina_client_width()",
             "declare i64 @festina_client_height()",
             # claude.md #139
@@ -1606,10 +1761,27 @@ class CodeGen:
 
     # ---- functions ----
 
-    def _emit_free_active_locals(self, lines, down_to=0):
+    def _emit_free_active_locals(self, lines, down_to=0, skip_try_pop=False):
         """claude.md #74: frees every non-escaping local active in every
         frame of self._active_free_locals from the top of the stack down
         to (and including) index `down_to`.
+
+        claude.md #157: skip_try_pop=True (ThrowStmt's own call is the
+        only caller) leaves every _TryFrameMarker entry in the walked
+        range alone -- emits nothing for it, unlike every other exit
+        path (Return/Break/Continue/a try body's own normal
+        fallthrough), which DO emit festina_try_pop() for one here (see
+        that branch's own comment). A throw must never pop the very
+        catch frame it might be about to unwind INTO: festina_throw
+        itself looks up and pops exactly the frame it jumps to, at
+        runtime, once it actually runs -- if this walk popped it FIRST,
+        in generated code that always executes (unlike everything past
+        the throw, which never runs), festina_throw would find the
+        frame already gone and treat a perfectly-caught throw as
+        uncaught. Real locals in the same walked range still need
+        freeing here regardless (see _emit_try's own docstring for why
+        that part isn't optional) -- only the marker itself is special-
+        cased.
 
         down_to=0 is the parameter's own default, but a Return never
         actually relies on that default -- it passes down_to=self.
@@ -1662,7 +1834,24 @@ class CodeGen:
             return
         for frame in reversed(self._active_free_locals[down_to:]):
             for ref, type_ in frame:
-                if isinstance(type_, _StackStructFieldsOnly):
+                if isinstance(type_, _TryFrameMarker):
+                    # claude.md #157: not a local at all -- pops the
+                    # runtime's own catch-frame stack so a LATER,
+                    # unrelated throw (reached after this try/catch
+                    # statement has already exited, on whatever path)
+                    # can never land back in this try's own now-stale
+                    # catch block. Every exit from a try body -- normal
+                    # fallthrough, return, break, continue -- reaches
+                    # here via this exact shared walk, so this is the
+                    # ONLY place festina_try_pop needs calling from
+                    # generated code (a throw itself pops its own frame
+                    # from inside festina_throw, before the longjmp --
+                    # see that function's own comment) -- skip_try_pop
+                    # is exactly ThrowStmt's own call opting out of that
+                    # for this reason (see this method's own docstring).
+                    if not skip_try_pop:
+                        lines.append("  call void @festina_try_pop()")
+                elif isinstance(type_, _StackStructFieldsOnly):
                     # claude.md #78: a stack-allocated struct local
                     # (see _emit_block's own tracking comment) whose own
                     # storage is never released here -- only whatever
@@ -2864,6 +3053,53 @@ class CodeGen:
         if isinstance(stmt, ast.ForStmt):
             self._emit_for(stmt, env, return_type, ctx)
             return
+        if isinstance(stmt, ast.TryStmt):
+            self._emit_try(stmt, env, return_type, ctx)
+            return
+        if isinstance(stmt, ast.ThrowStmt):
+            self.uses_try = True  # claude.md #157: see self.uses_try's own comment
+            # claude.md #157: coerced to text exactly like fail() (see
+            # the "fail" branch elsewhere in this method). UNLIKE
+            # fail()/exit() though, throw frees every active local in
+            # THIS function first -- self._emit_free_active_locals(down_to
+            # =self._current_func_frame_base), the exact same call
+            # Return makes just above -- because a throw CAUGHT by a
+            # try in this same function keeps running afterward (the
+            # process doesn't exit the way it does after fail()), so
+            # anything declared between the try and here needs freeing
+            # NOW: relying on _emit_block's own trailing "free my own
+            # frame" cleanup (further down in program order) would never
+            # run, since festina_throw's longjmp diverts control away
+            # before that unreachable code executes -- a real leak a
+            # direct Valgrind run against exactly this shape caught (see
+            # claude.md #157). Locals in frames BELOW this function's
+            # own base are correctly left alone: either an enclosing
+            # try elsewhere in THIS function catches this (nothing below
+            # its own frame base was ever this throw's to free), or it's
+            # uncaught here and propagates out of the function entirely,
+            # at which point this function's own frame -- all the way
+            # down to _current_func_frame_base -- is gone regardless,
+            # exactly like an ordinary Return.
+            val, vtype = self._emit_expr(stmt.expr, env, lines)
+            text_val = self._to_text(val, vtype, lines)
+            if vtype == TEXT and not self._is_owning_text_source(stmt.expr):
+                # claude.md #157: the identical hazard Return's own text
+                # branch already guards against, and the identical fix
+                # -- without this, `throw s` (aliasing a local) would
+                # hand festina_throw a pointer that _emit_free_active_locals
+                # is about to free right below, right along with every
+                # other active local (a real use-after-free a direct
+                # Valgrind run against exactly this shape caught). Any
+                # non-text vtype needs no such guard -- _to_text always
+                # produces a fresh buffer for those, never an alias of
+                # an existing local.
+                owned = self.tmp()
+                lines.append(f"  {owned} = call ptr @festina_text_own(ptr {text_val})")
+                text_val = owned
+            self._emit_free_active_locals(lines, down_to=self._current_func_frame_base,
+                                           skip_try_pop=True)
+            lines.append(f"  call void @festina_throw(ptr {text_val})")
+            return
         if isinstance(stmt, ast.FreeStmt):
             self._emit_free(stmt, env, lines)
             return
@@ -3037,6 +3273,118 @@ class CodeGen:
         lines.append(f"  br label %{cond_label}")
 
         self._start_block(end_label, lines)
+
+    def _emit_try(self, stmt, env, return_type, ctx):
+        """claude.md #157: try { A } catch (name:text) { B }.
+
+        The setjmp call is emitted RIGHT HERE, directly into the
+        enclosing function's own IR -- not delegated to a runtime
+        helper, which a first attempt at this tried and a direct test
+        caught as broken: setjmp only captures a valid jump target
+        while its OWN calling function's stack frame is still live, and
+        a helper that calls it and then returns has already made that
+        frame invalid by the time some later throw tries to jump back
+        into it. Emitting it here means the "calling function" IS the
+        one containing this try statement, which by construction can't
+        have returned yet -- it can't exit before hitting one of the
+        paths _TryFrameMarker instruments below.
+
+        llvm.eh.sjlj.setjmp/llvm.eh.sjlj.longjmp (not libc's own
+        setjmp/longjmp symbols) specifically because they're portable
+        LLVM intrinsics with a fixed-size buffer, not a platform/libc-
+        specific symbol name and struct layout -- the same mechanism
+        clang itself lowers __builtin_setjmp/__builtin_longjmp to. 0
+        means this is the first, normal arrival (run A); nonzero means
+        a throw's __builtin_longjmp (festina_throw, in the C runtime --
+        longjmp has no equivalent placement restriction, so it's free
+        to live in an ordinary nested function) landed straight back
+        here (run B).
+
+        This is a plain two-way branch structurally, exactly like
+        _emit_if just above -- the only difference is A's own frame
+        (self._active_free_locals) gets one extra entry, a
+        _TryFrameMarker, pushed in ITS OWN dedicated wrapper frame (not
+        inside the one _emit_block(stmt.try_body, ...) manages itself)
+        so that ANY exit from A -- normal fallthrough, return, break,
+        continue, however deeply nested -- pops the runtime's catch
+        frame via the exact same _emit_free_active_locals walk that
+        already frees every other local on those exact same paths. A
+        throw reached from directly inside A needs no special handling
+        here at all: festina_throw pops the runtime's own frame itself
+        (see its own comment) before the longjmp, so by the time B
+        runs, both the runtime's bookkeeping and Python's
+        self._active_free_locals are already consistent with "the try
+        is over" -- nothing here needs to detect that it happened.
+        """
+        self.uses_try = True
+        lines = ctx["lines"]
+        buf = self.tmp()
+        lines.append(f"  {buf} = alloca [5 x ptr], align 16")
+        bufp = self.tmp()
+        lines.append(f"  {bufp} = getelementptr inbounds [5 x ptr], ptr {buf}, i64 0, i64 0")
+        frame_addr = self.tmp()
+        lines.append(f"  {frame_addr} = call ptr @llvm.frameaddress.p0(i32 0)")
+        lines.append(f"  store ptr {frame_addr}, ptr {bufp}, align 16")
+        stack_save = self.tmp()
+        lines.append(f"  {stack_save} = call ptr @llvm.stacksave.p0()")
+        slot2 = self.tmp()
+        lines.append(f"  {slot2} = getelementptr inbounds ptr, ptr {bufp}, i64 2")
+        lines.append(f"  store ptr {stack_save}, ptr {slot2}, align 16")
+        rc = self.tmp()
+        lines.append(f"  {rc} = call i32 @llvm.eh.sjlj.setjmp(ptr {bufp})")
+        is_catch = self.tmp()
+        lines.append(f"  {is_catch} = icmp ne i32 {rc}, 0")
+        try_label = self.label("try.body")
+        catch_label = self.label("try.catch")
+        end_label = self.label("try.end")
+        lines.append(f"  br i1 {is_catch}, label %{catch_label}, label %{try_label}")
+
+        self._start_block(try_label, lines)
+        lines.append(f"  call void @festina_try_push(ptr {bufp})")
+        tracking = self._current_escaping_names is not None
+        if tracking:
+            self._active_free_locals.append([(None, _TryFrameMarker())])
+        try:
+            try_ctx = self._emit_block(stmt.try_body, env, return_type, lines)
+        finally:
+            if tracking:
+                if not try_ctx["terminated"]:
+                    self._emit_free_active_locals(lines, down_to=len(self._active_free_locals) - 1)
+                self._active_free_locals.pop()
+        if not try_ctx["terminated"]:
+            lines.append(f"  br label %{end_label}")
+
+        self._start_block(catch_label, lines)
+        # claude.md #157: festina_try_error() hands over an owned text
+        # value (the runtime's own copy, made when the throw happened --
+        # see its own comment) -- bound as an ordinary local exactly the
+        # way _emit_block would bind any other with-init text VarDecl,
+        # so its own scope-exit cleanup (below, via catch_env's frame)
+        # is the SAME generic TEXT-local handling every other text local
+        # already gets, not anything special-cased for this one.
+        err_val = self.tmp()
+        lines.append(f"  {err_val} = call ptr @festina_try_error()")
+        err_slot = self.tmp()
+        lines.append(f"  {err_slot} = alloca ptr")
+        lines.append(f"  store ptr {err_val}, ptr {err_slot}")
+        catch_env = Env(env)
+        catch_env.define(stmt.catch_var, err_slot, TEXT)
+        if tracking:
+            self._active_free_locals.append([(err_slot, TEXT)])
+        try:
+            catch_ctx = self._emit_block(stmt.catch_body, catch_env, return_type, lines)
+        finally:
+            if tracking:
+                if not catch_ctx["terminated"]:
+                    self._emit_free_active_locals(lines, down_to=len(self._active_free_locals) - 1)
+                self._active_free_locals.pop()
+        if not catch_ctx["terminated"]:
+            lines.append(f"  br label %{end_label}")
+
+        if try_ctx["terminated"] and catch_ctx["terminated"]:
+            ctx["terminated"] = True
+        else:
+            self._start_block(end_label, lines)
 
     _uid = 0
 
@@ -3569,11 +3917,31 @@ class CodeGen:
         caller's separate responsibility, exactly like any other
         consumed argument (see exec()'s own argument-cleanup
         pattern) -- this never touches it."""
-        if vtype == BLOB:
+        if vtype == BLOB or isinstance(vtype, (types_mod.ImageType, types_mod.AudioType)):
+            # claude.md #162: an http literal's own 'body' key
+            # additionally accepts img/aud (see semantic.py's
+            # _is_http_body_type -- a real request/response body
+            # uploading or returning a picture/clip is completely
+            # ordinary, unlike socket.send()'s data:any, which never
+            # reaches this img/aud branch at all since
+            # _is_sendable_type -- the ORIGINAL, narrower predicate --
+            # still gates it). festina_image_bytes/_audio_bytes share
+            # festina_blob_bytes's own (handle, len_out) -> borrowed-
+            # bytes-ptr shape exactly (claude.md #101's own sqlite
+            # blob-column binding already established this), so one
+            # branch covers all three.
+            if vtype == BLOB:
+                fn = "festina_blob_bytes"
+            elif isinstance(vtype, types_mod.AudioType):
+                self.uses_audio = True
+                fn = "festina_audio_bytes"
+            else:
+                self.uses_graphics_code = True
+                fn = "festina_image_bytes"
             len_ptr = self.tmp()
             lines.append(f"  {len_ptr} = alloca i64")
             data = self.tmp()
-            lines.append(f"  {data} = call ptr @festina_blob_bytes(ptr {val}, ptr {len_ptr})")
+            lines.append(f"  {data} = call ptr @{fn}(ptr {val}, ptr {len_ptr})")
             len_val = self.tmp()
             lines.append(f"  {len_val} = load i64, ptr {len_ptr}")
             return data, len_val, None
@@ -3581,6 +3949,84 @@ class CodeGen:
         len_val = self.tmp()
         lines.append(f"  {len_val} = call i64 @strlen(ptr {text_val})")
         return text_val, len_val, (text_val if vtype != TEXT else None)
+
+    def _emit_http_lit(self, maplit, env, lines):
+        """claude.md #162 (extended by #163's `callback`): `http x =
+        {...}` -- and `req.send({...})`'s own inline-response form --
+        build a fresh http value via festina_http_literal_new from a
+        MapLit's entries. semantic.py's own _validate_http_lit already
+        confirmed every key is one of url/method/code/headers/body/
+        callback with the right value type, so this only has to
+        emit+coerce each one and make the single call; entries are
+        evaluated in the SOURCE ORDER they appear (matching every other
+        expression-evaluation-order convention in this compiler), a key
+        simply never mentioned in the literal keeps
+        festina_http_literal_new's own zero-value default for it (empty
+        text for url/method, festina_null_int() for code, an empty map
+        for headers, no body, `null` -- no callback -- for callback)."""
+        self.uses_http = True
+        url_val = self.string_const("")
+        method_val = self.string_const("")
+        code_val = INT_NULL_CONST
+        headers_val = "null"
+        body_ptr = "null"
+        body_len_val = "0"
+        callback_val = "null"
+        cleanups = []  # [(callable taking no args)] run AFTER the literal_new call
+        for key_expr, val_expr in maplit.entries:
+            key = key_expr.value
+            if key == "url":
+                v, t = self._emit_expr(val_expr, env, lines)
+                url_val = self._to_text(v, t, lines)
+                cleanups.append(lambda v=v, t=t, e=val_expr: self._free_text_temp(e, v, t, lines))
+            elif key == "method":
+                v, t = self._emit_expr(val_expr, env, lines)
+                method_val = self._to_text(v, t, lines)
+                cleanups.append(lambda v=v, t=t, e=val_expr: self._free_text_temp(e, v, t, lines))
+            elif key == "code":
+                code_val, _ = self._emit_expr(val_expr, env, lines)
+            elif key == "headers":
+                v, t = self._emit_expr(val_expr, env, lines)
+                # claude.md #162: festina_http_literal_new takes
+                # OWNERSHIP of `headers` -- an owning source (a fresh
+                # {...} literal, a call result) hands it in directly;
+                # an aliasing one (an existing map[text] variable, the
+                # `{headers}` shorthand's own common case) needs one
+                # extra retain first, so the original binding keeps its
+                # own valid reference exactly the same way any other
+                # "pass a live container into something that will hold
+                # onto it" call site in this compiler already does.
+                if not self._is_owning_refcounted_source(val_expr):
+                    lines.append(f"  call void @festina_retain(ptr {v})")
+                headers_val = v
+            elif key == "body":
+                v, t = self._emit_expr(val_expr, env, lines)
+                body_ptr, body_len_val, body_temp = self._emit_sendable_body(v, t, lines)
+
+                def _cleanup_body(v=v, t=t, e=val_expr, temp=body_temp):
+                    if temp is not None:
+                        lines.append(f"  call void @free(ptr {temp})")
+                    if _is_refcounted(t) and self._is_owning_refcounted_source(e):
+                        lines.append(f"  call void {self._release_fn_for(t)}(ptr {v})")
+                    else:
+                        self._free_text_temp(e, v, t, lines)
+                cleanups.append(_cleanup_body)
+            elif key == "callback":
+                # claude.md #163: a bare function pointer -- the SAME
+                # runtime representation every other FuncType-typed
+                # value already has (types.py's own doc comment:
+                # "immortal for the life of the process"), so there is
+                # nothing to retain, release, or free here at all --
+                # unlike every other key above, this one is just "emit
+                # the expression, use its value directly."
+                callback_val, _ = self._emit_expr(val_expr, env, lines)
+        out = self.tmp()
+        lines.append(f"  {out} = call ptr @festina_http_literal_new(ptr {url_val}, ptr {method_val}, "
+                     f"i64 {code_val}, ptr {headers_val}, ptr {body_ptr}, i64 {body_len_val}, "
+                     f"ptr {callback_val})")
+        for cleanup in cleanups:
+            cleanup()
+        return out, types_mod.HttpType()
 
     def _json_append_slot(self, body, sb, ftype, slot_ptr, depth_val):
         """claude.md #114: appends ONE value (stored at `slot_ptr`, of
@@ -3834,6 +4280,168 @@ class CodeGen:
         self.func_defs.extend(body)
         return fn_name
 
+    def _emit_json_read_scalar(self, ftype, cursor_ref, lines):
+        """claude.md #159: emits the one runtime call that reads ONE
+        JSON value at the cursor into ftype's own Festina representation
+        -- int/float/bool/text are the only types _from_json_struct_fn_for/
+        _from_json_arr_fn_for ever call this for (v1's own scope cut,
+        already enforced in semantic.py -- see that check's own
+        comment). Each of these either returns a valid value or calls
+        festina_throw() internally and never returns (festina_runtime.c's
+        own comment on this whole group), so nothing here ever needs to
+        branch on success/failure itself."""
+        v = self.tmp()
+        if ftype == INT:
+            lines.append(f"  {v} = call i64 @festina_json_read_int(ptr {cursor_ref})")
+        elif ftype == FLOAT:
+            lines.append(f"  {v} = call double @festina_json_read_float(ptr {cursor_ref})")
+        elif ftype == BOOL:
+            lines.append(f"  {v} = call i8 @festina_json_read_bool(ptr {cursor_ref})")
+        elif ftype == TEXT:
+            lines.append(f"  {v} = call ptr @festina_json_read_text(ptr {cursor_ref})")
+        else:
+            raise CodegenError(
+                f"internal error: .toStruct()/.toArr() only support int/float/"
+                f"bool/text (semantic.py should have already rejected "
+                f"{types_mod.type_name(ftype)})", file=self.filename)
+        return v
+
+    def _from_json_struct_fn_for(self, struct_type):
+        """claude.md #159: returns (generating on first use, cached by
+        struct name) `ptr @__festina_from_json_struct_N(ptr %cursor)` --
+        parses one JSON object at the cursor into a FRESH struct value
+        (a new, refcount=1 heap header, exactly the same
+        _emit_fresh_heap_header every other struct-producing site
+        already uses) and returns it.
+
+        v1 scope cut (semantic.py's own check, not re-validated here):
+        every field is int/float/bool/text. A JSON key matching a known
+        field (case-insensitively, mirroring claude.md #111's own query-
+        column convention) is parsed as that field's type and stored; an
+        unrecognized key's own value is skipped (festina_json_skip_value,
+        fully general regardless of this v1's own scope -- see its own
+        comment) -- lenient, forward-compatible parsing, the same
+        "an extra JSON key/a missing struct field is fine" contract
+        api.md documents. A duplicate key overwrites (last one wins,
+        freeing whatever text the earlier one already stored -- the
+        identical "last one wins" convention a map literal's own
+        repeated key already follows)."""
+        cache_key = f"struct:{struct_type.name}"
+        cached = self._from_json_fns.get(cache_key)
+        if cached is not None:
+            return cached
+        fn_name = f"@__festina_from_json_struct_{self._unique()}"
+        self._from_json_fns[cache_key] = fn_name
+
+        body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
+        struct_ty = self.struct_llvm_name(struct_type.name)
+        out = self._emit_fresh_heap_header(struct_ty, body)
+        body.append("  call void @festina_json_object_start(ptr %cursor)")
+        first = self.tmp()
+        body.append(f"  {first} = alloca i8")
+        body.append(f"  store i8 1, ptr {first}")
+        loop_lbl = self.label("fromjson.loop")
+        end_lbl = self.label("fromjson.end")
+        readkey_lbl = self.label("fromjson.readkey")
+        keydone_lbl = self.label("fromjson.keydone")
+        body.append(f"  br label %{loop_lbl}")
+        body.append(f"{loop_lbl}:")
+        done = self.tmp()
+        body.append(f"  {done} = call i8 @festina_json_object_next(ptr %cursor, ptr {first})")
+        done_b = self.tmp()
+        body.append(f"  {done_b} = icmp ne i8 {done}, 0")
+        body.append(f"  br i1 {done_b}, label %{end_lbl}, label %{readkey_lbl}")
+        body.append(f"{readkey_lbl}:")
+        key_reg = self.tmp()
+        body.append(f"  {key_reg} = call ptr @festina_json_read_key(ptr %cursor)")
+
+        fields = self.struct_fields(struct_type.name)
+        for idx, (fname, ftype) in enumerate(fields):
+            match_lbl = self.label(f"fromjson.match{idx}")
+            next_check_lbl = self.label(f"fromjson.check{idx}")
+            matches = self.tmp()
+            fname_const = self.string_const(fname)
+            body.append(f"  {matches} = call i8 @festina_json_key_matches(ptr {key_reg}, ptr {fname_const})")
+            matches_b = self.tmp()
+            body.append(f"  {matches_b} = icmp ne i8 {matches}, 0")
+            body.append(f"  br i1 {matches_b}, label %{match_lbl}, label %{next_check_lbl}")
+            body.append(f"{match_lbl}:")
+            slot = self.tmp()
+            body.append(f"  {slot} = getelementptr {struct_ty}, ptr {out}, i32 0, i32 {idx}")
+            if ftype == TEXT:
+                old = self.tmp()
+                body.append(f"  {old} = load ptr, ptr {slot}")
+                body.append(f"  call void @free(ptr {old})")
+            v = self._emit_json_read_scalar(ftype, "%cursor", body)
+            ir_ty = _llvm_type(ftype)
+            body.append(f"  store {ir_ty} {v}, ptr {slot}")
+            body.append(f"  br label %{keydone_lbl}")
+            body.append(f"{next_check_lbl}:")
+        # No field matched -- an unrecognized key, skipped whole.
+        body.append("  call void @festina_json_skip_field_value(ptr %cursor)")
+        body.append(f"  br label %{keydone_lbl}")
+        body.append(f"{keydone_lbl}:")
+        body.append(f"  call void @free(ptr {key_reg})")
+        body.append(f"  br label %{loop_lbl}")
+        body.append(f"{end_lbl}:")
+        body.append(f"  ret ptr {out}")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _from_json_arr_fn_for(self, elem_type):
+        """claude.md #159: the arr[T] counterpart to
+        _from_json_struct_fn_for -- returns (generating on first use,
+        cached by element type name) `ptr @__festina_from_json_arr_N(ptr
+        %cursor)`, parsing one JSON array at the cursor into a fresh
+        arr[T] header and returning it. v1 scope cut: T is int/float/
+        bool/text (semantic.py's own check, not re-validated here).
+        Each parsed element is pushed via festina_array_push -- the
+        SAME runtime helper `.push()` itself uses -- never needing an
+        ownership retain/copy first the way `.push(expr)` sometimes
+        does, since festina_json_read_text always returns an already-
+        fresh, uniquely-owned buffer (or NULL), never an alias of
+        something else that would need copying."""
+        cache_key = f"arr:{types_mod.type_name(elem_type)}"
+        cached = self._from_json_fns.get(cache_key)
+        if cached is not None:
+            return cached
+        fn_name = f"@__festina_from_json_arr_{self._unique()}"
+        self._from_json_fns[cache_key] = fn_name
+
+        body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
+        out = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, body)
+        body.append("  call void @festina_json_array_start(ptr %cursor)")
+        first = self.tmp()
+        body.append(f"  {first} = alloca i8")
+        body.append(f"  store i8 1, ptr {first}")
+        loop_lbl = self.label("fromjson.aloop")
+        end_lbl = self.label("fromjson.aend")
+        elem_lbl = self.label("fromjson.aelem")
+        body.append(f"  br label %{loop_lbl}")
+        body.append(f"{loop_lbl}:")
+        done = self.tmp()
+        body.append(f"  {done} = call i8 @festina_json_array_next(ptr %cursor, ptr {first})")
+        done_b = self.tmp()
+        body.append(f"  {done_b} = icmp ne i8 {done}, 0")
+        body.append(f"  br i1 {done_b}, label %{end_lbl}, label %{elem_lbl}")
+        body.append(f"{elem_lbl}:")
+        v = self._emit_json_read_scalar(elem_type, "%cursor", body)
+        elem_ir = _llvm_type(elem_type)
+        elem_size = _elem_size(elem_type)
+        slot = self.tmp()
+        body.append(f"  {slot} = alloca {elem_ir}")
+        body.append(f"  store {elem_ir} {v}, ptr {slot}")
+        body.append(f"  call void @festina_array_push(ptr {out}, i64 {elem_size}, ptr {slot})")
+        body.append(f"  br label %{loop_lbl}")
+        body.append(f"{end_lbl}:")
+        body.append(f"  ret ptr {out}")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
     def _emit_value_for(self, node, env, lines, expected_type):
         """Like _emit_expr, but for positions where the *declared* type is
         already known (a var's declared type, a param's type, a function's
@@ -3846,6 +4454,39 @@ class CodeGen:
         real null (see the module docstring)."""
         if isinstance(node, ast.ArrayLit):
             return self._emit_array_lit(node, env, lines, expected_type)
+        if isinstance(node, ast.MapLit) and isinstance(expected_type, types_mod.HttpType):
+            # claude.md #162: `http x = {...}` -- checked before the
+            # generic ast.MapLit branch just below, for the identical
+            # reason claude.md #156's own amor-map bypass in
+            # analyze_var_decl (semantic.py) exists: a MapLit's generic
+            # handling demands one homogeneous value type across every
+            # entry, which an http literal's genuinely heterogeneous
+            # field set (text/int/map/body) can never satisfy.
+            return self._emit_http_lit(node, env, lines)
+        if isinstance(expected_type, types_mod.HttpType):
+            lit = _http_send_lit_receiver(node)
+            if lit is not None:
+                # claude.md #164: `http req = {...}.send()` -- builds
+                # the literal exactly like the plain `http x = {...}`
+                # case just above, THEN also dispatches the send, and
+                # returns the SAME pointer for `req`'s own binding to
+                # take ownership of -- no release here (unlike a bare
+                # `{...}.send()` expression-statement, which DOES
+                # release it -- see _release_http_send_receiver): this
+                # value doesn't die at the end of the statement, `req`
+                # keeps living. Safe specifically because the receiver
+                # is ALWAYS a fresh MapLit here (semantic.py's own
+                # _http_send_lit_receiver only ever matches that
+                # shape) -- nothing else could possibly hold a
+                # reference to it yet, so handing it straight to `req`
+                # with no extra retain is exactly the same "moves,
+                # doesn't copy" reasoning every other fresh-value
+                # VarDecl binding already relies on.
+                out, out_type = self._emit_http_lit(lit, env, lines)
+                self.uses_http = True
+                self.uses_https = True
+                lines.append(f"  call void @festina_http_send_client_dispatch(ptr {out})")
+                return out, out_type
         if isinstance(node, ast.MapLit):
             # claude.md #156: ast.MapLit itself has no amor-vs-plain
             # distinction (the same `{k: v, ...}` syntax either way) --
@@ -4565,23 +5206,66 @@ class CodeGen:
         see semantic.py's own identical fallthrough)."""
         if expr.computed:
             return None
-        if isinstance(obj_type, types_mod.HttpType) and expr.prop in ("port", "method", "path", "headers"):
-            # claude.md #151: a runtime call, same reasoning as
-            # img.width/.height (the real values live behind the
-            # handle, in festina_runtime_http.c's own connection
-            # table, not in any field this compiler could lay out
-            # itself).
+        if isinstance(obj_type, types_mod.UrlType) and expr.prop in (
+                "hash", "hostname", "password", "pathname", "port", "protocol",
+                "searchParams", "username"):
+            # claude.md #162: same "a runtime call, the real value
+            # lives behind the handle" reasoning as http's own fields
+            # right below -- every one of these is a small dedicated
+            # accessor over the FestinaUrlValue* parseURL() built.
+            out = self.tmp()
+            fn_and_type = {
+                "hash": ("festina_url_hash", TEXT),
+                "hostname": ("festina_url_hostname", TEXT),
+                "password": ("festina_url_password", TEXT),
+                "pathname": ("festina_url_pathname", TEXT),
+                "protocol": ("festina_url_protocol", TEXT),
+                "username": ("festina_url_username", TEXT),
+            }
+            if expr.prop == "port":
+                lines.append(f"  {out} = call i64 @festina_url_port(ptr {obj_val})")
+                result_type = INT
+            elif expr.prop == "searchParams":
+                lines.append(f"  {out} = call ptr @festina_url_search_params(ptr {obj_val})")
+                result_type = types_mod.MapType(TEXT)
+            else:
+                fn, result_type = fn_and_type[expr.prop]
+                lines.append(f"  {out} = call ptr @{fn}(ptr {obj_val})")
+            self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
+            # claude.md #162: every one of these hands back a genuinely
+            # FRESH value (an owned text copy, or -- searchParams -- an
+            # already-retained-on-the-way-out map reference), the exact
+            # same _minted_values reasoning http's own fields use just
+            # below (skipping this would double-copy text results and
+            # leak one reference every time .searchParams is read).
+            self._minted_values.add(id(expr))
+            return out, result_type
+        if isinstance(obj_type, types_mod.HttpType) and expr.prop in (
+                "url", "method", "code", "headers", "callback"):
+            # claude.md #162 (extended by #163's `callback`): url/
+            # method/code are owned dedicated accessor calls (see
+            # festina_runtime_http.c's own FestinaHttpValue doc comment
+            # -- codegen never lays these fields out itself, same
+            # reasoning img.width/.height already have); headers is now
+            # the SAME live map every read (retained on the way out),
+            # not a rebuild; callback is a bare function pointer,
+            # returned as-is -- no ownership question at all, the same
+            # reason _emit_http_lit's own callback handling needs no
+            # cleanup lambda either.
             self.uses_http = True
             out = self.tmp()
-            if expr.prop == "port":
-                lines.append(f"  {out} = call i64 @festina_http_port(ptr {obj_val})")
-                result_type = INT
+            if expr.prop == "url":
+                lines.append(f"  {out} = call ptr @festina_http_url(ptr {obj_val})")
+                result_type = TEXT
             elif expr.prop == "method":
                 lines.append(f"  {out} = call ptr @festina_http_method(ptr {obj_val})")
                 result_type = TEXT
-            elif expr.prop == "path":
-                lines.append(f"  {out} = call ptr @festina_http_path(ptr {obj_val})")
-                result_type = TEXT
+            elif expr.prop == "code":
+                lines.append(f"  {out} = call i64 @festina_http_code(ptr {obj_val})")
+                result_type = INT
+            elif expr.prop == "callback":
+                lines.append(f"  {out} = call ptr @festina_http_callback(ptr {obj_val})")
+                result_type = types_mod.FuncType((types_mod.HttpType(),), None)
             else:
                 lines.append(f"  {out} = call ptr @festina_http_headers(ptr {obj_val})")
                 result_type = types_mod.MapType(TEXT)
@@ -4590,18 +5274,20 @@ class CodeGen:
             # treatment (_is_owning_refcounted_source /
             # _is_owning_text_source) is "aliasing, not owning" --
             # correct for an ordinary struct field, wrong here:
-            # festina_http_method/_path/_headers each return a
-            # genuinely FRESH value (an owned text copy, or a
-            # brand-new map[text]) with no other reference anywhere.
-            # Marking this node in _minted_values is what tells both
-            # of those ownership checks the truth -- the exact same
-            # mechanism text[i] (claude.md #150) already established
-            # for this identical problem. Skipping this for a text
-            # result would silently double-copy it; skipping it for
-            # the map result would leak one reference every time
-            # .headers is read and its binding later goes out of
-            # scope (an extra, never-undone retain codegen would
-            # otherwise add on top of this already-fresh value).
+            # festina_http_url/_method/_headers each return a
+            # genuinely FRESH value (an owned text copy, or an
+            # already-retained live map) with no other reference
+            # anywhere the caller doesn't already own. Marking this
+            # node in _minted_values is what tells both of those
+            # ownership checks the truth -- the exact same mechanism
+            # text[i] (claude.md #150) already established for this
+            # identical problem. Skipping this for a text result would
+            # silently double-copy it; skipping it for the map result
+            # would leak one reference every time .headers is read and
+            # its binding later goes out of scope (an extra, never-
+            # undone retain codegen would otherwise add on top of this
+            # already-fresh/retained value). `code` (a plain i64) needs
+            # none of this, but doesn't hurt from it either.
             self._minted_values.add(id(expr))
             return out, result_type
         if isinstance(obj_type, types_mod.SocketType) and expr.prop == "state":
@@ -4827,6 +5513,22 @@ class CodeGen:
         if not self._is_owning_refcounted_source(obj_expr):
             return
         lines.append(f"  call void {self._release_fn_for(obj_type)}(ptr {obj_val})")
+
+    def _release_http_send_receiver(self, obj_expr, obj_val, lines):
+        """claude.md #164: `.send()`'s own receiver-release, used
+        instead of the generic _release_owned_receiver above for
+        exactly one reason -- `obj_expr` may be a raw ast.MapLit
+        (`{...}.send()`, or `http {...}`'s desugared form), which
+        _is_owning_refcounted_source was never taught to recognize as
+        owning (see _emit_http_lit's own doc comment for why: no other
+        http-adjacent value could be built from a bare MapLit before
+        claude.md #162). Without this, an anonymous `{...}.send()` --
+        no named variable anywhere to release it later -- would leak
+        its own freshly-built http value every time. HttpType is
+        always refcounted (_is_refcounted's own tuple), so unlike the
+        generic version this skips that check entirely."""
+        if self._is_owning_refcounted_source(obj_expr) or isinstance(obj_expr, ast.MapLit):
+            lines.append(f"  call void @festina_release_http(ptr {obj_val})")
 
     def _load_field_value(self, ptr, ftype, lines):
         """Loads one field, giving a struct/arr[T]/map[T]-typed one real
@@ -5225,6 +5927,60 @@ class CodeGen:
         if vtype == TEXT and self._is_owning_text_source(source_expr):
             lines.append(f"  call void @free(ptr {val})")
 
+    def _emit_json_arg_text(self, arg_expr, env, lines, expected_type=None):
+        """claude.md #158: evaluates arg_expr and renders it to text via
+        _to_text -- used by troubleshoot()/fail()'s structured forms to
+        get a JSON-safe piece for whatever type was passed (the exact
+        same conversion log()'s own struct/map/blob path already uses),
+        since (unlike log()'s primitive fast path, which prints an
+        int/float/bool directly with no text conversion at all) every
+        one of these needs a real text representation to splice into
+        the surrounding JSON envelope.
+
+        Returns (text_val, arg_expr, val, vtype) -- text_val is ready to
+        pass to whatever runtime call actually consumes it; the other
+        three are exactly what _cleanup_json_arg_text needs, deferred to
+        its own separate call so the caller controls WHEN cleanup runs
+        relative to that consuming call (seemingly obvious, but a real
+        bug here -- freeing text_val inside this same method, before
+        the caller had even emitted the call actually using it, was
+        caught directly: real garbage bytes in troubleshoot()'s own
+        stdout output rather than the rendered fields JSON -- see
+        _cleanup_json_arg_text's own comment)."""
+        if expected_type is not None:
+            # claude.md #158: threads a fixed expected type (always
+            # map[text] for troubleshoot()/fail()'s own fields argument)
+            # into an ArrayLit/MapLit exactly the way a var declaration's
+            # own init already does -- without this, `troubleshoot('x',
+            # {})` couldn't resolve an empty literal's value type at
+            # all, and `troubleshoot('x', {'a': 'b'})` would infer a
+            # plain map[T] with no connection to this expected shape.
+            val, vtype = self._emit_value_for(arg_expr, env, lines, expected_type)
+        else:
+            val, vtype = self._emit_expr(arg_expr, env, lines)
+        text_val = self._to_text(val, vtype, lines)
+        return text_val, arg_expr, val, vtype
+
+    def _cleanup_json_arg_text(self, text_val, arg_expr, val, vtype, lines):
+        """claude.md #158: the OTHER half of _emit_json_arg_text --
+        called by troubleshoot()'s own codegen AFTER emitting the
+        festina_troubleshoot() call that actually consumes text_val
+        (never by fail(), which always exits right after either form,
+        so, matching every other fail()/exit() call site's own
+        established "dead code past an exiting call" precedent, no
+        cleanup is emitted there at all). Frees text_val unless it's a
+        bare alias of an already-owned text value (_to_text is a no-op
+        passthrough there, so text_val IS val -- freeing it would free
+        something the original binding still owns and will free at its
+        own scope-exit), then releases the ORIGINAL value's own
+        reference via _release_owned_receiver (always safe to call
+        regardless of type -- it no-ops for anything that isn't
+        refcounted, e.g. plain text/int/float/bool) -- exactly the
+        cleanup log()'s own struct/map/blob argument path already does."""
+        if vtype != TEXT or self._is_owning_text_source(arg_expr):
+            lines.append(f"  call void @free(ptr {text_val})")
+        self._release_owned_receiver(arg_expr, val, vtype, lines)
+
     def _free_regex_temp(self, source_expr, val, vtype, lines):
         """claude.md #85: the regex counterpart to _free_text_temp --
         frees a regex_t compiled by a runtime `regex(...)` call and used
@@ -5451,15 +6207,29 @@ class CodeGen:
             # claude.md #118: regfree on the last reference; a cached
             # /pattern/ literal is immortal and no-ops through here.
             return "@festina_regex_free"
-        if isinstance(type_, (types_mod.HttpType, types_mod.SocketType)):
-            # claude.md #151: one shared release function for both --
-            # neither carries anything of its own to free beyond the
-            # tiny handle itself (the underlying connection is owned
-            # separately by festina_runtime_http.c's own connection
-            # table, torn down independently of any handle's
-            # lifetime -- see festina_runtime.h's doc comment).
+        if isinstance(type_, types_mod.HttpType):
+            # claude.md #162: http moved to a real destructor -- url/
+            # method/headers/body all live directly in the value now
+            # (see festina_runtime_http.c's own FestinaHttpValue doc
+            # comment), so releasing one has real contents to free,
+            # unlike the tiny {refcount, conn_id} handle socket still
+            # uses just below.
+            self.uses_http = True
+            return "@festina_release_http"
+        if isinstance(type_, types_mod.SocketType):
+            # claude.md #151: the tiny handle itself is all there is to
+            # free (the underlying connection is owned separately by
+            # festina_runtime_http.c's own connection table, torn down
+            # independently of any handle's lifetime -- see
+            # festina_runtime.h's doc comment).
             self.uses_http = True
             return "@festina_release_conn_handle"
+        if isinstance(type_, types_mod.UrlType):
+            # claude.md #162: lives in CORE (festina_runtime.c), not
+            # festina_runtime_http.c -- parseURL() has nothing to do
+            # with openPort()/on request/fetch() and must not force
+            # uses_http on a program that only ever parses a URL.
+            return "@festina_release_url"
         if type_ == TEXT:
             # claude.md #83: text has no refcount header to dispatch
             # through -- "releasing" one is always just a plain,
@@ -6756,9 +7526,41 @@ class CodeGen:
                 self._free_text_temp(expr.args[0], val, vtype, lines)
                 return "0", None
             if name == "fail":
-                val, vtype = self._emit_expr(expr.args[0], env, lines)
-                text_val = self._to_text(val, vtype, lines)
-                lines.append(f"  call void @festina_fail(ptr {text_val})")
+                # claude.md #158: fail(message) is unchanged (still the
+                # exact "fail: <message>" line an uncaught throw also
+                # produces -- claude.md #157). fail(message, fields), the
+                # new structured form, is a genuinely different runtime
+                # call/output shape, not a superset -- see
+                # festina_fail_structured's own comment. Neither form
+                # calls _cleanup_json_arg_text for either argument: both
+                # always exit(1) right after, so, matching every other
+                # fail()/exit() call site's own established precedent,
+                # anything past the call would be dead code.
+                text_val, *_ = self._emit_json_arg_text(expr.args[0], env, lines)
+                if len(expr.args) == 2:
+                    fields_json, *_ = self._emit_json_arg_text(
+                        expr.args[1], env, lines, expected_type=types_mod.MapType(TEXT))
+                    lines.append(f"  call void @festina_fail_structured(ptr {text_val}, ptr {fields_json})")
+                else:
+                    lines.append(f"  call void @festina_fail(ptr {text_val})")
+                return "0", None
+            if name == "troubleshoot":
+                # claude.md #158: unlike fail(), this always returns
+                # normally, so both arguments' own rendered-text buffers
+                # (and, for the fields argument, the original map[text]
+                # value's own reference) need real cleanup -- but only
+                # AFTER the festina_troubleshoot() call that actually
+                # consumes text_val/fields_json, never before (see
+                # _emit_json_arg_text's own comment on the real bug that
+                # ordering mistake caused).
+                event_text, event_expr, event_val, event_vtype = \
+                    self._emit_json_arg_text(expr.args[0], env, lines)
+                fields_json, fields_expr, fields_val, fields_vtype = \
+                    self._emit_json_arg_text(expr.args[1], env, lines,
+                                              expected_type=types_mod.MapType(TEXT))
+                lines.append(f"  call void @festina_troubleshoot(ptr {event_text}, ptr {fields_json})")
+                self._cleanup_json_arg_text(event_text, event_expr, event_val, event_vtype, lines)
+                self._cleanup_json_arg_text(fields_json, fields_expr, fields_val, fields_vtype, lines)
                 return "0", None
             if name == "close":
                 # claude.md #131: exits the program with `code`, running
@@ -6886,6 +7688,43 @@ class CodeGen:
                 fn = "festina_open_port" if name == "openPort" else "festina_close_port"
                 lines.append(f"  call void @{fn}(i64 {val})")
                 return "0", None
+            if name == "openSecurePort":
+                # claude.md #160: the TLS counterpart -- shares uses_http
+                # (same listener/connection table, same event loop) and
+                # adds uses_https on top (the narrower "mbedTLS is
+                # actually needed" signal, see this flag's own comment).
+                # The key argument is always blob (semantic.py's own
+                # _BUILTIN_SIGNATURES entry) -- _emit_sendable_body
+                # already knows how to pull a blob's raw bytes out as
+                # (data_ptr, len_val), the identical shape
+                # http.send()/socket.send() already use for their own
+                # blob-typed `data` argument.
+                self.uses_http = True
+                self.uses_https = True
+                port_val, _ = self._emit_expr(expr.args[0], env, lines)
+                key_expr = expr.args[1]
+                key_val, key_vtype = self._emit_expr(key_expr, env, lines)
+                data_ptr, len_val, temp_to_free = self._emit_sendable_body(key_val, key_vtype, lines)
+                lines.append(f"  call void @festina_open_secure_port(i64 {port_val}, "
+                             f"ptr {data_ptr}, i64 {len_val})")
+                if temp_to_free is not None:
+                    lines.append(f"  call void @free(ptr {temp_to_free})")
+                if _is_refcounted(key_vtype) and self._is_owning_refcounted_source(key_expr):
+                    lines.append(f"  call void {self._release_fn_for(key_vtype)}(ptr {key_val})")
+                return "0", None
+            if name == "parseURL":
+                # claude.md #162: lives in CORE -- no uses_http/_https
+                # flag to set here at all, unlike openPort/openSecurePort
+                # just above (parseURL has nothing to do with the HTTP
+                # server or fetch() -- see festina_release_url's own
+                # comment in _release_fn_for).
+                text_expr = expr.args[0]
+                text_val, text_vtype = self._emit_expr(text_expr, env, lines)
+                text_val = self._to_text(text_val, text_vtype, lines)
+                out = self.tmp()
+                lines.append(f"  {out} = call ptr @festina_parse_url(ptr {text_val})")
+                self._free_text_temp(text_expr, text_val, text_vtype, lines)
+                return out, types_mod.UrlType()
             # claude.md #95/#135: writes the OFFSCREEN canvas, so it
             # needs no window either way -- this is the headless case
             # the render() split exists for. saveCanvas() with no path
@@ -7140,6 +7979,36 @@ class CodeGen:
                     out = self._to_text(val, vtype, lines)
                     self._release_owned_receiver(callee.obj, val, vtype, lines)
                     return out, TEXT
+            # claude.md #159: 'json'.toStruct(T) -> T; 'json'.toArr(T)
+            # -> arr[T]. semantic.py already validated the receiver is
+            # text and the target shape is v1-supported (scalar fields/
+            # element only), so this is purely: get a cursor over the
+            # receiver's own bytes, hand it to the (cached, generated
+            # on first use) per-type parsing function, check for
+            # trailing garbage, free the cursor. The RESULT is exactly
+            # as fresh/owning a value as any other struct/array-
+            # producing site (a brand-new, refcount=1 heap header the
+            # generated function itself calloc'd) -- no retain needed
+            # on the way out, same as an array/map literal or a call
+            # result already isn't.
+            if callee.prop in ("toStruct", "toArr") and len(expr.args) == 1 \
+                    and isinstance(expr.args[0], ast.TypeArg):
+                recv_val, recv_type = self._emit_expr(callee.obj, env, lines)
+                cursor = self.tmp()
+                lines.append(f"  {cursor} = call ptr @festina_json_cursor_new(ptr {recv_val})")
+                target_type = self._resolve(expr.args[0].type_expr, expr.args[0])
+                if callee.prop == "toStruct":
+                    fn_name = self._from_json_struct_fn_for(target_type)
+                    result_type = target_type
+                else:
+                    fn_name = self._from_json_arr_fn_for(target_type)
+                    result_type = types_mod.ArrayType(target_type)
+                out = self.tmp()
+                lines.append(f"  {out} = call ptr {fn_name}(ptr {cursor})")
+                lines.append(f"  call void @festina_json_expect_end(ptr {cursor})")
+                lines.append(f"  call void @festina_json_cursor_free(ptr {cursor})")
+                self._free_text_temp(callee.obj, recv_val, recv_type, lines)
+                return out, result_type
             # claude.md #116: sentence.split(sep) -> arr[text]. The
             # result is a fresh refcounted array the runtime built, so
             # it is exactly as "owning" a source as an array literal --
@@ -7353,6 +8222,25 @@ class CodeGen:
                         f"ptr {names_global}, i32 {ncols}, ptr {arg_val})")
                     self._free_text_temp(expr.args[0], arg_val, arg_type, lines)
                     return out, BOOL
+            # claude.md #165: <text>.callback(fn:func[blob]:void) -- a
+            # non-blocking blob load. `fn`'s own inferred FuncType is
+            # what tells this apart from an ordinary blob load
+            # entirely (semantic.py already confirmed it's exactly
+            # func[blob]:void -- img/aud aren't supported yet) --
+            # dispatches through festina_blob_load_dispatch, the exact
+            # same null-callback-means-blocking shape
+            # festina_http_send_client_dispatch already established.
+            if callee.prop == "callback":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if obj_type == TEXT:
+                    fn_val, _fn_type = self._emit_expr(expr.args[0], env, lines)
+                    self.uses_async_io = True
+                    out = self.tmp()
+                    lines.append(
+                        f"  {out} = call ptr @festina_blob_load_dispatch(ptr {obj_val}, "
+                        f"ptr {fn_val})")
+                    self._free_text_temp(callee.obj, obj_val, obj_type, lines)
+                    return out, BLOB
             # claude.md #110: save()/saveCopy() on blob, img or aud. One
             # branch for all three, dispatched on the receiver's type --
             # the runtime functions differ only in which struct's path
@@ -7453,35 +8341,73 @@ class CodeGen:
             # above (an optional code/headers pair, and an any-typed
             # first argument).
             if callee.prop == "send":
-                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                # claude.md #164: `{...}.send()` -- the receiver ITSELF
+                # is a raw MapLit (semantic.py's own matching check
+                # already confirmed this can only mean an http
+                # literal -- sockets have no literal syntax at all) --
+                # built via the exact same _emit_http_lit an
+                # `http x = {...}` VarDecl already uses, bypassing the
+                # generic _emit_expr(callee.obj, ...) entirely, since
+                # that path has no notion of "build an http value" for
+                # a bare MapLit (see _emit_http_lit's own doc comment).
+                # `http {...}` (parser.py's own statement-level
+                # shorthand) desugars to this identical AST shape, so
+                # this one branch covers both spellings.
+                if isinstance(callee.obj, ast.MapLit):
+                    obj_val, obj_type = self._emit_http_lit(callee.obj, env, lines)
+                else:
+                    obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if isinstance(obj_type, types_mod.HttpType):
+                    # claude.md #162: send() is now overloaded by ARITY
+                    # -- see semantic.py's own comment on this same
+                    # branch for the full reasoning.
                     self.uses_http = True
-                    data_val, data_type = self._emit_expr(expr.args[0], env, lines)
-                    data_ptr, len_val, temp = self._emit_sendable_body(data_val, data_type, lines)
-                    if len(expr.args) >= 2:
-                        code_val, _ = self._emit_expr(expr.args[1], env, lines)
-                    else:
-                        code_val = "200"
-                    headers_val = "null"
-                    headers_expr = expr.args[2] if len(expr.args) == 3 else None
-                    headers_type = None
-                    if headers_expr is not None:
-                        headers_val, headers_type = self._emit_expr(headers_expr, env, lines)
-                    lines.append(
-                        f"  call void @festina_http_send(ptr {obj_val}, ptr {data_ptr}, "
-                        f"i64 {len_val}, i64 {code_val}, ptr {headers_val})")
-                    if temp is not None:
-                        lines.append(f"  call void @free(ptr {temp})")
-                    if _is_refcounted(data_type) and self._is_owning_refcounted_source(expr.args[0]):
-                        lines.append(f"  call void {self._release_fn_for(data_type)}(ptr {data_val})")
-                    else:
-                        self._free_text_temp(expr.args[0], data_val, data_type, lines)
-                    if headers_expr is not None:
-                        if _is_refcounted(headers_type) and self._is_owning_refcounted_source(headers_expr):
-                            lines.append(f"  call void {self._release_fn_for(headers_type)}(ptr {headers_val})")
-                        else:
-                            self._free_text_temp(headers_expr, headers_val, headers_type, lines)
-                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                    if len(expr.args) == 0:
+                        # The CLIENT side -- an outbound request, using
+                        # obj_val's own url/method/headers/body,
+                        # mutating it in place with the response.
+                        # https:// support means every program reaching
+                        # this branch needs mbedTLS linked, the same
+                        # unconditional "the compiler can't know a
+                        # runtime string's scheme in advance" reasoning
+                        # openSecurePort()'s own uses_https already
+                        # established. claude.md #163: dispatches
+                        # through festina_http_send_client_dispatch, not
+                        # festina_http_send_client directly -- that
+                        # function checks obj_val's own `.callback` at
+                        # RUNTIME (codegen has no way to know it in
+                        # advance) and decides blocking vs. a background
+                        # worker from there; either way this call
+                        # returns immediately from codegen's own point
+                        # of view, since the blocking case is just as
+                        # synchronous as it always was, one call deeper.
+                        self.uses_https = True
+                        lines.append(f"  call void @festina_http_send_client_dispatch(ptr {obj_val})")
+                        self._release_http_send_receiver(callee.obj, obj_val, lines)
+                        return "0", None
+                    # The SERVER side -- send obj_val's own live
+                    # connection a response built from expr.args[0], an
+                    # http value either already in hand or constructed
+                    # inline right here (`req.send({...})`) via the
+                    # exact same _emit_http_lit an `http x = {...}`
+                    # VarDecl already uses (routed through
+                    # _emit_value_for with an explicit expected type,
+                    # since a bare _emit_expr on a MapLit has no notion
+                    # of "build an http value" at all).
+                    res_val, res_type = self._emit_value_for(
+                        expr.args[0], env, lines, types_mod.HttpType())
+                    lines.append(f"  call void @festina_http_send(ptr {obj_val}, ptr {res_val})")
+                    if self._is_owning_refcounted_source(expr.args[0]) or isinstance(expr.args[0], ast.MapLit):
+                        # claude.md #162: an inline literal is ALWAYS a
+                        # fresh, owned value (see _emit_http_lit) even
+                        # though it isn't an ast.Call/etc.
+                        # _is_owning_refcounted_source itself would
+                        # recognize -- that predicate was never taught
+                        # about MapLit since no other http-adjacent
+                        # value could be built from one before this
+                        # entry.
+                        lines.append(f"  call void {self._release_fn_for(res_type)}(ptr {res_val})")
+                    self._release_http_send_receiver(callee.obj, obj_val, lines)
                     return "0", None
                 if isinstance(obj_type, types_mod.SocketType):
                     # claude.md #151: blob sends as a binary frame,
@@ -8292,6 +9218,25 @@ class CodeGen:
         # before a window would otherwise be set up.
         if self.exit_handler_symbol is not None:
             main_lines.append(f"  call void @festina_register_exit_handler(ptr {self.exit_handler_symbol})")
+        # claude.md #161: graceful shutdown -- installed ONLY when this
+        # program has one of the three blocking loops just below, each
+        # of which already polls festina_shutdown_requested() once per
+        # ordinary iteration (see festina_runtime.h's own doc comment).
+        # Deliberately NOT gated on self.exit_handler_symbol alone: a
+        # program that declares `on exit(code:int)` but has no
+        # http/timers/graphics loop -- say, its own hand-written
+        # `while (true) { ... }` at top level -- has no point in its
+        # own execution that could ever check the flag either. Installing
+        # the handler there wouldn't just skip running the exit handler
+        # (today's existing behavior); it would make Ctrl-C/SIGTERM stop
+        # working AT ALL for such a program (the signal sets the flag and
+        # returns control right back into the same un-checking loop,
+        # silently swallowing what used to be an immediate kill) --
+        # confirmed directly, and a strictly worse regression than the
+        # gap this feature is closing. Only install where a poll point
+        # is actually guaranteed to run soon.
+        if self.uses_graphics or self.uses_http or self.uses_timers:
+            main_lines.append("  call void @festina_install_shutdown_handler()")
         # claude.md #151: `on request`/`on upgrade`/`on message`/
         # `on socketClose` -- NOT graphics events either, same
         # unconditional-registration shape as `exit` just above (an
@@ -8308,6 +9253,26 @@ class CodeGen:
         if self.http_socketclose_handler_symbol is not None:
             main_lines.append(
                 f"  call void @festina_register_socketclose_handler(ptr {self.http_socketclose_handler_symbol})")
+        # claude.md #160: unconditional-when-used, same shape as the
+        # four http handler registrations just above -- deliberately
+        # NOT nested inside the "if self.tables or self.uses_sqlite"
+        # block below (a first draft of this put it there, alongside
+        # the audio/image decoder hooks, and a table-less/sqlite-less
+        # openSecurePort() program silently never registered its TLS
+        # hooks at all -- confirmed directly: the compiled program
+        # exited immediately instead of listening, since that whole
+        # block, database open included, is skipped for a program with
+        # no tables and no sqlite() call). openSecurePort() has nothing
+        # to do with SQLite; only self.uses_https (set by its own
+        # dispatch branch) should gate this.
+        if self.uses_https:
+            main_lines.append("  call void @festina_register_tls_hooks()")
+        if self.uses_async_io:
+            # claude.md #165: same reasoning/placement as
+            # festina_register_tls_hooks() just above -- this has
+            # nothing to do with SQLite either, gated purely on
+            # self.uses_async_io.
+            main_lines.append("  call void @festina_register_async_io_hooks()")
         # self.uses_sqlite/self.uses_graphics are only reliably set by
         # this point because every function body (self.func_defs) and
         # every entry statement (the loop above) has already been
@@ -8397,13 +9362,21 @@ class CodeGen:
             # an X11 event loop), so this is never reached at the same
             # time uses_graphics is true.
             main_lines.append("  call void @festina_run_http_loop()")
-        elif self.uses_timers:
+        elif self.uses_timers or self.uses_async_io:
             # No window, but setTimeout/setInterval callbacks still need
             # a blocking loop to fire in -- festina_run_timer_loop is the
             # pure-POSIX (nanosleep-based, no X11 at all) equivalent that
             # lives in the core translation unit, so a timers-only
             # program never needs to link the graphics object file just
-            # to wait for its callbacks.
+            # to wait for its callbacks. claude.md #165: `or
+            # self.uses_async_io` -- a program using ONLY blob/img/aud's
+            # own `.callback()` form (no openPort(), no graphics, not
+            # even a timer) still needs SOME loop to wait in for a
+            # background load to finish, and festina_run_timer_loop
+            # already checks the shared async-io hooks each iteration
+            # regardless of why it was entered (see its own doc
+            # comment) -- so widening this ONE condition is the whole
+            # fix; no new branch needed.
             main_lines.append("  call void @festina_run_timer_loop()")
         # claude.md #126 round nine: unconditional, last thing main()
         # does -- @__festina_db defaults to (and stays) null for a

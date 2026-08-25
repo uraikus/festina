@@ -49,6 +49,11 @@ def parser():
 
 
 @pytest.fixture
+def ast_mod():
+    return import_spec_module("ast")
+
+
+@pytest.fixture
 def errors():
     return import_spec_module("errors")
 
@@ -356,6 +361,123 @@ def compile_and_run_server(tmp_path, codegen, cli_mod):
 
     def _run_and_track(*a, **kw):
         server = orig_run(*a, **kw)
+        servers.append(server)
+        return server
+
+    yield _run_and_track
+
+    for server in servers:
+        if server.process.poll() is None:
+            server.process.terminate()
+            try:
+                server.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                server.process.kill()
+                server.process.wait(timeout=3)
+
+
+@pytest.fixture
+def compile_and_run_secure_server(tmp_path, codegen, cli_mod):
+    """claude.md #160: the TLS counterpart to compile_and_run_server --
+    same real-background-subprocess shape, but the source must call
+    `openSecurePort(__PORT__, key)` where `key:blob = '__CERT_PATH__'`
+    (both placeholders substituted the same literal, non-.format() way
+    `compile_and_run_server` already substitutes `__PORT__`). A fresh,
+    throwaway self-signed cert+key pair (CN=localhost, RSA 2048, 1-day
+    validity) is generated per test via the real `openssl` CLI --
+    skipped cleanly (not a failure) if `openssl` isn't on PATH, the
+    same "this environment lacks a real dependency" skip
+    compile_file_or_skip already gives a missing mbedTLS dev package
+    (a program that calls openSecurePort() but has no mbedTLS to link
+    against skips here too, via that same mechanism -- see
+    _RUNTIME_FEATURES["https"] in festina/cli.py).
+
+    `https_get` mirrors `_Server.http_get` above but through a real TLS
+    handshake -- Python's own `ssl` module as the client, certificate
+    verification deliberately OFF (CERT_NONE): this is testing THIS
+    project's own TLS server implementation end to end against a real,
+    independent TLS client stack, not validating a CA chain a
+    throwaway self-signed test cert was never meant to have."""
+    cc = _require_c_compiler()
+    openssl = shutil.which("openssl")
+    if not openssl:
+        pytest.skip("openssl isn't on PATH -- needed to generate a throwaway "
+                     "self-signed test certificate for openSecurePort() tests")
+
+    class _SecureServer:
+        def __init__(self, process, port):
+            self.process = process
+            self.port = port
+
+        def https_get(self, path, timeout=5, headers=None):
+            import http.client
+            import ssl as _ssl
+            ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+            conn = http.client.HTTPSConnection(
+                "127.0.0.1", self.port, timeout=timeout, context=ctx)
+            conn.request("GET", path, headers=headers or {})
+            resp = conn.getresponse()
+            body = resp.read()
+            conn.close()
+            return resp.status, dict(resp.getheaders()), body
+
+        def raw_connect(self, timeout=5):
+            """The bare, unwrapped TCP socket -- for tests that want to
+            drive the TLS handshake (or deliberately not) themselves,
+            e.g. confirming a plaintext HTTP request against a TLS-only
+            port fails rather than being silently accepted."""
+            import socket as _socket
+            return _socket.create_connection(("127.0.0.1", self.port), timeout=timeout)
+
+    def _run(source_template, filename="main.f"):
+        port = _free_tcp_port()
+        cert_path = tmp_path / "combined.pem"
+        key_pem = tmp_path / "key.pem"
+        crt_pem = tmp_path / "crt.pem"
+        result = subprocess.run(
+            [openssl, "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key_pem),
+             "-out", str(crt_pem), "-days", "1", "-nodes", "-subj", "/CN=localhost"],
+            capture_output=True, text=True)
+        if result.returncode != 0:
+            pytest.fail(f"openssl failed to generate a test certificate:\n{result.stderr}")
+        cert_path.write_bytes(crt_pem.read_bytes() + key_pem.read_bytes())
+
+        source = (source_template.replace("__PORT__", str(port))
+                                  .replace("__CERT_PATH__", str(cert_path)))
+        src_path = tmp_path / filename
+        src_path.write_text(source, encoding="utf-8")
+        out_path = tmp_path / "program"
+        compile_file_or_skip(cli_mod, str(src_path), str(out_path), cc=cc)
+        process = subprocess.Popen(
+            [str(out_path)], cwd=tmp_path,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        import socket as _socket
+        deadline = time.time() + 5
+        connected = False
+        while time.time() < deadline:
+            if process.poll() is not None:
+                pytest.fail(
+                    f"server process exited early (code {process.returncode}):\n"
+                    f"{process.stdout.read() if process.stdout else ''}")
+            try:
+                probe = _socket.create_connection(("127.0.0.1", port), timeout=0.2)
+                probe.close()
+                connected = True
+                break
+            except OSError:
+                time.sleep(0.05)
+        if not connected:
+            process.kill()
+            pytest.fail(f"server never started listening on port {port}")
+        return _SecureServer(process, port)
+
+    servers = []
+
+    def _run_and_track(*a, **kw):
+        server = _run(*a, **kw)
         servers.append(server)
         return server
 

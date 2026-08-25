@@ -206,7 +206,9 @@ class Parser:
             raise self.err(t, "invalid declaration",
                             f"'{t.type}' is not part of Festina; declare variables as 'type name = value'")
         if t.type == "throw":
-            raise self.err(t, "invalid statement", "'throw' is not supported; use fail() instead")
+            return self.parse_throw()
+        if t.type == "try":
+            return self.parse_try()
         if t.type == "import":
             return self.parse_import()
         if t.type == "const":
@@ -261,6 +263,42 @@ class Parser:
                             "functions require an explicit return type, e.g. 'text func name() { }'")
         if self._starts_func_decl():
             return self.parse_func_decl()
+        # claude.md #164: `http {...}` -- an anonymous, fire-and-forget
+        # request: no variable name to call .send() on, so the send is
+        # implied. Checked BEFORE _looks_like_declaration (which would
+        # otherwise route this to parse_var_decl, whose own
+        # `self.eat("IDENT")` right after the type expects a variable
+        # name -- exactly what this form deliberately has none of) and
+        # before the plain `t.type == "LBRACE"` block check above (this
+        # branch only ever matches when `http` comes FIRST, so a bare
+        # `{` at statement-start is still an ordinary block,
+        # unambiguously). Desugars to `{...}.send()` at parse time --
+        # semantic.py/codegen.py need no awareness this shorthand
+        # exists at all, since `{...}.send()` (claude.md #164's OTHER
+        # new shorthand) already handles the resulting AST shape.
+        if t.type == "http" and self.peek(1).type == "LBRACE":
+            return self.parse_http_anon_send()
+        # claude.md #165: `blob 'path'.callback(fn)` (also img/aud,
+        # though only blob is actually implemented past semantic.py
+        # for now -- see that module's own comment) -- the anonymous,
+        # fire-and-forget counterpart to `http {...}` just above, same
+        # "checked before _looks_like_declaration would otherwise
+        # misroute it" reasoning. Unlike `http {...}`, no AST
+        # rewriting is needed here at all -- the type keyword is
+        # discarded outright (it's redundant: `.callback()`'s own type
+        # is always read off its argument func's OWN signature, see
+        # semantic.py's `_infer_call`) and whatever expression follows
+        # (expected to be a `.callback(...)` call, though nothing here
+        # enforces that shape specifically -- semantic.py's own type
+        # check on the discarded type keyword's absence means any
+        # OTHER expression here is simply evaluated and its result
+        # discarded, same as any other bare expression-statement) is
+        # parsed and wrapped as an ordinary ExprStmt.
+        if t.type in ("blob", "img", "aud") and self.peek(1).type != "IDENT":
+            self.eat()  # the (redundant, purely readability) type keyword
+            expr = self.parse_expression()
+            self._semi()
+            return ast.ExprStmt(expr)
         if t.type == "LBRACE":
             return self.parse_block()
         if self._looks_like_declaration():
@@ -445,6 +483,20 @@ class Parser:
             raise self.err(path_tok, "invalid import", f"invalid import path {path_tok.value!r}")
         return ast.ImportDecl(path_tok.value, path_tok.line, path_tok.column)
 
+    def parse_http_anon_send(self):
+        """claude.md #164: `http {...}` -- desugars to `{...}.send()` at
+        parse time (an ExprStmt wrapping a Call whose callee is a
+        Member on the freshly-parsed MapLit) so semantic.py/codegen.py
+        need no separate awareness of this spelling at all -- see
+        parse_statement's own comment on why this is checked before
+        _looks_like_declaration would otherwise misroute it."""
+        t = self.eat("http")
+        maplit = self.parse_primary()  # positioned at LBRACE -- produces an ast.MapLit
+        callee = ast.Member(maplit, "send", computed=False, line=t.line, column=t.column)
+        call = ast.Call(callee, [], line=t.line, column=t.column)
+        self._semi()
+        return ast.ExprStmt(call)
+
     def parse_var_decl(self):
         t = self.peek()
         type_expr = self.parse_type()
@@ -552,6 +604,39 @@ class Parser:
         update = self.parse_expression()
         body = self.parse_block()
         return ast.ForStmt(init, test, update, body, t.line, t.column)
+
+    def parse_try(self):
+        # claude.md #157: try { ... } catch (name:text) { ... } -- catch
+        # is required (no bare `try` with no handler -- there would be
+        # nothing distinguishing it from just writing the body directly),
+        # and its variable's type annotation must be exactly `text`
+        # (throw only ever raises text -- see parse_throw), spelled out
+        # so a typo'd `catch(error:int)` is a clear error here rather
+        # than a confusing one from semantic.py's own type checking.
+        t = self.eat("try")
+        try_body = self.parse_block()
+        self.eat("catch")
+        self.eat("LPAREN")
+        name_tok = self.eat("IDENT")
+        self.eat_op(":")
+        type_tok = self.peek()
+        if type_tok.type != "text":
+            raise self.err(type_tok, "invalid syntax",
+                            f"catch's variable is always text (a thrown value is always "
+                            f"text), found {type_tok.type}({type_tok.value!r})")
+        self.eat("text")
+        self.eat("RPAREN")
+        catch_body = self.parse_block()
+        return ast.TryStmt(try_body, name_tok.value, catch_body, t.line, t.column)
+
+    def parse_throw(self):
+        # claude.md #157: throw <expr> -- unlike fail() (a call
+        # expression), this is its own statement, the same shape
+        # return/free/delete already are.
+        t = self.eat("throw")
+        value = self.parse_expression()
+        self._semi()
+        return ast.ThrowStmt(value, t.line, t.column)
 
     def parse_return(self):
         t = self.eat("return")
@@ -669,7 +754,18 @@ class Parser:
                 self.eat("RBRACK")
                 node = ast.Member(node, idx, True)
             elif self.at("LPAREN"):
-                args = self.parse_args()
+                # claude.md #159: .toStruct(StructName)/.toArr(ElementType)
+                # -- the one place in the language a call's own
+                # "argument" is a TYPE, not a value expression. Special-
+                # cased on the method name here (right before parsing
+                # the parens, so a same-named user function/method
+                # elsewhere is completely unaffected) rather than
+                # generalizing "types as call arguments" anywhere else.
+                if (isinstance(node, ast.Member) and not node.computed
+                        and node.prop in ("toStruct", "toArr")):
+                    args = [self._parse_type_arg()]
+                else:
+                    args = self.parse_args()
                 node = ast.Call(node, args)
             else:
                 break
@@ -689,6 +785,18 @@ class Parser:
                 self.eat()
         self.eat("RPAREN")
         return args
+
+    def _parse_type_arg(self):
+        # claude.md #159: .toStruct(T)/.toArr(T) -- exactly one type,
+        # parsed with the same parse_type() every other type position
+        # in the grammar already uses (a var decl, a param, a struct
+        # field, ...), wrapped as an ast.TypeArg so semantic.py/
+        # codegen.py can tell it apart from an ordinary expression
+        # argument at a glance.
+        self.eat("LPAREN")
+        type_expr = self.parse_type()
+        self.eat("RPAREN")
+        return ast.TypeArg(type_expr)
 
     def parse_primary(self):
         t = self.peek()
@@ -753,12 +861,38 @@ class Parser:
             # block instead -- see parse_statement's own LBRACE check,
             # which runs first and never falls through to here), so
             # there's no ambiguity with block syntax to resolve.
+            #
+            # claude.md #162: shorthand entries -- a bare identifier
+            # with no `: value` (JS's own object-literal shorthand,
+            # `{headers}` for `{'headers': headers}`) is recognized
+            # right here at parse time, not deferred to semantic
+            # analysis: after parsing `key`, the NEXT token decides it
+            # (`,`/`}` means shorthand, `:` means an ordinary explicit
+            # entry) -- no lookahead beyond the one token parse_assign_expr
+            # already consumed. Only a bare IDENT can be shorthand
+            # (`key` must already be exactly ast.Identifier -- an
+            # arbitrary computed key expression like `{a.b}` or
+            # `{f()}` has no single name to reuse as both the literal
+            # string key and the value reference, so it still requires
+            # an explicit `: value`, caught below by the ordinary
+            # eat_op(":") failing with its own clear error). This
+            # produces the exact same (key_expr, value_expr) shape an
+            # explicit entry does -- key becomes a TextLit of the
+            # identifier's own name, value an Identifier reference to
+            # it -- so nothing downstream (MapLit's own semantic/codegen
+            # handling, or the new http-literal handling claude.md #162
+            # also adds) needs to know shorthand was ever used at all.
             self.eat("LBRACE")
             entries = []
             while not self.at("RBRACE"):
                 key = self.parse_assign_expr()
-                self.eat_op(":")
-                value = self.parse_assign_expr()
+                if (isinstance(key, ast.Identifier)
+                        and not self.at_op(":")):
+                    value = ast.Identifier(key.name, key.line, key.column)
+                    key = ast.StringLit(key.name)
+                else:
+                    self.eat_op(":")
+                    value = self.parse_assign_expr()
                 entries.append((key, value))
                 if self.at_op(","):
                     self.eat()

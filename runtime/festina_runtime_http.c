@@ -43,6 +43,7 @@
  * there's no matching WSACleanup()), mirrored by the POSIX
  * SIGPIPE-ignore this file already had.
  */
+#include <stddef.h>  /* offsetof -- claude.md #162's FestinaHttpValue accessors */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,9 +77,17 @@ static int festina_socket_was_interrupted(void) { return WSAGetLastError() == WS
 #  include <unistd.h>
 #  include <poll.h>
 #  include <sys/socket.h>
+#  include <sys/time.h>   /* struct timeval -- claude.md #162's SO_RCVTIMEO/SO_SNDTIMEO */
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <arpa/inet.h>
+#  include <netdb.h>      /* getaddrinfo -- claude.md #162's client fetch */
+#  include <pthread.h>    /* claude.md #163: the async-callback worker pool below --
+                            * POSIX only for now, the same staged-platform-rollout
+                            * shape every other http feature here already uses (see
+                            * "http -- async client" further down). Already an
+                            * accepted dependency in this runtime -- festina_runtime_audio.c
+                            * links it too, whenever audio is used. */
    typedef int FestinaSocket;
    typedef struct pollfd FestinaPollFd;
 #  define FESTINA_INVALID_SOCKET (-1)
@@ -323,6 +332,26 @@ typedef struct {
      * pointer aimed at the `count` field (see festina_runtime.h's own
      * doc comment on the http/socket handle representation for why). */
     void *state_map;
+
+    /* claude.md #160: openSecurePort()'s own per-connection TLS state
+     * -- NULL for a plain (non-TLS) connection, an opaque handle
+     * g_tls_conn_new produced for one accepted on a TLS listener. Every
+     * read/write/teardown site below checks `tls` rather than keeping
+     * a separate is_tls flag: a connection is TLS if and only if it
+     * has TLS state, by construction (festina_accept_new_connections
+     * sets it at accept time from the listener's own tls_config, never
+     * changed afterward). tls_handshake_done gates festina_conn_readable's
+     * own dispatch: raw bytes off the wire are still the TLS handshake
+     * itself until this flips, never HTTP/WebSocket data.
+     * tls_wants_write records whether the last handshake attempt
+     * needed to WRITE before it could make more progress (mbedTLS's
+     * own WANT_WRITE) -- festina_run_http_loop's poll-set construction
+     * adds POLLOUT for this connection only when it's set, so a
+     * handshake that stalls on a full TCP send buffer still gets woken
+     * up to retry instead of waiting on a POLLIN that may never come. */
+    void *tls;
+    int tls_handshake_done;
+    int tls_wants_write;
 } FestinaConn;
 
 typedef struct {
@@ -335,6 +364,86 @@ typedef struct {
     int64_t count;
     void *entries;
 } FestinaMapBlock;
+
+/* claude.md #162: http's own real representation -- a genuine value
+ * (url/method/code/headers/body all live IN this struct, copied out
+ * once at the point of construction) rather than the old
+ * {refcount, conn_id} handle that looked everything up fresh from
+ * the connection table on every field read. This is what lets an
+ * http value outlive its originating request/response entirely --
+ * constructed by a program directly (`http x = {...}`), handed back
+ * by a client req.send()/`on request`'s own req, or read from long
+ * after the connection it came from (if any) has already been torn
+ * down -- `.toText()`/etc. only ever touch this struct's own `body`,
+ * never reach back into festina_conn_by_id at all anymore.
+ *
+ * `conn_id` is the ONE thing that still reaches back into the live
+ * connection table -- 0 means "not live" (a plain constructed value,
+ * or a client response), nonzero means this value is the actual
+ * inbound request `on request` was called with, and .ok()/.redirect()/
+ * .upgrade()/.send(res) can still push bytes out over it. Every one
+ * of those already tolerates conn_id naming a connection that's since
+ * been torn down (festina_conn_by_id returns NULL, same "never
+ * crashes on a stale reference" contract festina_conn_from_handle
+ * itself always had) -- silently doing nothing, same as calling them
+ * on a conn_id-0 value in the first place. */
+typedef struct {
+    int64_t refcount;
+    char *url;
+    char *method;
+    int64_t code;    /* festina_null_int() until a response exists */
+    void *headers;    /* map[text] payload, owned */
+    uint8_t *body;
+    int64_t body_len;
+    int64_t conn_id;  /* 0 = not live */
+    /* claude.md #163: a bare function pointer -- NULL for "no callback",
+     * matching FuncType's own runtime representation exactly (types.py's
+     * own doc comment: "a bare function pointer... immortal for the
+     * life of the process"), so this needs no refcounting/cleanup of
+     * its own, the same reason a `func`-typed struct field never does.
+     * Signature is always `void(http)` (checked by
+     * semantic.py's own _HTTP_LIT_FIELD_TYPES) -- non-NULL here is
+     * exactly what makes req.send() take the non-blocking path (see
+     * festina_http_send_client_dispatch, "http -- async client" below). */
+    void (*callback)(void *);
+} FestinaHttpValue;
+
+#define FESTINA_HTTP_FROM_PAYLOAD(payload) \
+    ((FestinaHttpValue *)((char *)(payload) - offsetof(FestinaHttpValue, url)))
+
+/* Forward declarations -- festina_dispatch_request (needs to BUILD a
+ * value) and festina_run_http_loop's own fallback-response path (needs
+ * to call .ok()) both come well before this file's "http --
+ * construction"/"http -- methods" sections below, which is where these
+ * are actually defined. */
+static void *festina_http_value_new(const char *url, const char *method, int64_t code,
+                                     void *headers, const uint8_t *body, int64_t body_len,
+                                     int64_t conn_id, void (*callback)(void *));
+void festina_release_http(void *payload);
+void festina_http_ok(void *payload);
+
+/* claude.md #163: forward-declared here (defined in "http -- async
+ * client" further down, well after festina_run_http_loop's own
+ * definition) so that loop's per-iteration exit check and drain step
+ * can reference them. Declared unconditionally (not inside the
+ * POSIX-only #if guarding the worker pool itself) so this file reads
+ * identically on every platform -- g_async_outstanding simply never
+ * becomes nonzero on Windows, since festina_http_send_client_dispatch
+ * never queues anything there (see that section's own #else branch). */
+static int64_t g_async_outstanding = 0;
+static int g_async_pool_started = 0;
+static int g_async_wake_fds[2] = {-1, -1};   /* self-pipe: [0] read (in the poll set), [1] write --
+                                              * never opened on Windows, where g_async_pool_started
+                                              * also never becomes true, so festina_run_http_loop
+                                              * never actually reads index [0] there either. */
+static void festina_async_drain_completed(void);
+
+/* Kept in sync with festina_runtime.c's own static festina_null_int()
+ * (INT64_MIN) -- that function is private to that translation unit,
+ * so this file (a genuinely different one) can't call it directly;
+ * codegen.py's own INT_NULL_CONST is the third place this same
+ * value is spelled out, per that constant's own doc comment. */
+#define FESTINA_NULL_INT INT64_MIN
 
 static FestinaConn *g_conns = NULL;
 static int64_t g_conn_count = 0;       /* high-water mark: slots [0, g_conn_count) are
@@ -471,6 +580,12 @@ static void festina_conn_index_remove(int64_t conn_id) {
 typedef struct {
     FestinaSocket fd;
     int port;
+    /* claude.md #160: NULL for a plain openPort() listener, an opaque
+     * handle g_tls_listener_new produced for one opened via
+     * openSecurePort() -- every connection accept()ed on this
+     * listener's own fd gets its own per-connection TLS state built
+     * from this shared config (see FestinaConn's own tls field). */
+    void *tls_config;
 } FestinaListener;
 
 static FestinaListener *g_listeners = NULL;
@@ -486,6 +601,40 @@ void festina_register_request_handler(void (*fn)(void *)) { g_request_handler = 
 void festina_register_upgrade_handler(void (*fn)(void *)) { g_upgrade_handler = fn; }
 void festina_register_message_handler(void (*fn)(void *, void *)) { g_message_handler = fn; }
 void festina_register_socketclose_handler(void (*fn)(void *)) { g_socketclose_handler = fn; }
+
+/* claude.md #160: the openSecurePort()/mbedTLS hook table -- NULL
+ * (never called) for a program that never links festina_runtime_https.c
+ * at all (see that file's own top comment for the cross-translation-
+ * unit registration this mirrors from g_audio_decoder/g_image_decoder).
+ * Every site below that touches TLS goes through these seven pointers,
+ * never an mbedTLS symbol directly -- this translation unit has no
+ * mbedTLS #include at all, deliberately, so it stays buildable and
+ * linkable with zero TLS dependency for every program that doesn't
+ * call openSecurePort(). */
+static void *(*g_tls_listener_new)(const uint8_t *pem, int64_t pem_len) = NULL;
+static void (*g_tls_listener_free)(void *tls_config) = NULL;
+static void *(*g_tls_conn_new)(void *tls_config, int fd) = NULL;
+static void (*g_tls_conn_free)(void *tls_state) = NULL;
+static int (*g_tls_handshake)(void *tls_state) = NULL;
+static long (*g_tls_recv)(void *tls_state, void *buf, int64_t cap) = NULL;
+static long (*g_tls_send)(void *tls_state, const void *data, int64_t len) = NULL;
+
+void festina_set_tls_hooks(
+        void *(*listener_new)(const uint8_t *, int64_t),
+        void (*listener_free)(void *),
+        void *(*conn_new)(void *, int),
+        void (*conn_free)(void *),
+        int (*handshake)(void *),
+        long (*recv_fn)(void *, void *, int64_t),
+        long (*send_fn)(void *, const void *, int64_t)) {
+    g_tls_listener_new = listener_new;
+    g_tls_listener_free = listener_free;
+    g_tls_conn_new = conn_new;
+    g_tls_conn_free = conn_free;
+    g_tls_handshake = handshake;
+    g_tls_recv = recv_fn;
+    g_tls_send = send_fn;
+}
 
 /* claude.md #151: an 8MB cap on how much a single connection may
  * buffer (request line + headers + body, or one WebSocket frame's
@@ -582,6 +731,8 @@ static void festina_conn_teardown(FestinaConn *c) {
         g_socketclose_handler(handle);
         festina_release_conn_handle(handle);
     }
+    if (c->tls && g_tls_conn_free) g_tls_conn_free(c->tls);
+    c->tls = NULL;
     festina_close_fd(c->fd);
     free(c->buf);
     free(c->method);
@@ -725,11 +876,33 @@ static char *festina_ws_accept_key(const char *client_key) {
     return festina_base64_encode(digest, 20);
 }
 
-static int festina_send_all(FestinaSocket fd, const void *data, size_t len) {
+/* claude.md #160: takes the FestinaConn itself, not a raw fd -- a TLS
+ * connection's writes have to go through g_tls_send (mbedtls_ssl_write
+ * under the hood), not a plain send() syscall, and c->tls is the only
+ * place that's recorded. Every call site already had the FestinaConn
+ * in hand (`c->fd` was itself always a field access off one), so this
+ * is a signature change with no new bookkeeping needed at any caller. */
+static int festina_send_all(FestinaConn *c, const void *data, size_t len) {
+    if (c->tls) {
+        const uint8_t *p = (const uint8_t *)data;
+        size_t sent = 0;
+        while (sent < len) {
+            /* claude.md #155's own festina_send_all precedent (see the
+             * plain-socket branch below): a write that would block is
+             * treated as outright failure here too, not retried via
+             * the event loop -- g_tls_send already folds mbedTLS's
+             * WANT_READ/WANT_WRITE into that same "just fail" answer
+             * (see festina_runtime_https.c's own comment on why). */
+            long n = g_tls_send(c->tls, p + sent, (int64_t)(len - sent));
+            if (n <= 0) return 0;
+            sent += (size_t)n;
+        }
+        return 1;
+    }
     const uint8_t *p = (const uint8_t *)data;
     size_t sent = 0;
     while (sent < len) {
-        ssize_t n = send(fd, (const char *)(p + sent), (int)(len - sent), 0);
+        ssize_t n = send(c->fd, (const char *)(p + sent), (int)(len - sent), 0);
         if (n < 0) {
             if (festina_socket_was_interrupted()) continue;
             return 0;
@@ -799,7 +972,7 @@ static void festina_sendbuf_free(FestinaSendBuf *b) {
 /* Writes ONE unmasked server->client frame (server frames are never
  * masked per RFC 6455) -- `opcode` 0x1 text, 0x2 binary, 0x8 close,
  * 0xA pong. */
-static void festina_ws_send_frame(FestinaSocket fd, uint8_t opcode, const void *data, size_t len) {
+static void festina_ws_send_frame(FestinaConn *c, uint8_t opcode, const void *data, size_t len) {
     uint8_t header[10];
     size_t header_len = 0;
     header[0] = 0x80 | (opcode & 0x0F); /* FIN=1, no fragmentation from this runtime */
@@ -816,8 +989,8 @@ static void festina_ws_send_frame(FestinaSocket fd, uint8_t opcode, const void *
         for (int i = 0; i < 8; i++) header[2 + i] = (uint8_t)((uint64_t)len >> (56 - 8 * i));
         header_len = 10;
     }
-    if (!festina_send_all(fd, header, header_len)) return;
-    if (len > 0) festina_send_all(fd, data, len);
+    if (!festina_send_all(c, header, header_len)) return;
+    if (len > 0) festina_send_all(c, data, len);
 }
 
 /* Tries to parse and consume ONE complete frame from c->buf. Returns
@@ -885,15 +1058,67 @@ static void festina_conn_ensure_capacity(FestinaConn *c, size_t extra) {
     c->buf_cap = new_cap;
 }
 
+/* claude.md #162: reconstructs the one field the OLD design never
+ * needed to (there was no `.url`, only separate `.port`/`.path`) --
+ * scheme from whether this connection came in on a TLS listener,
+ * host from the request's own Host header (falling back to
+ * "127.0.0.1:<port>" when the client sent none at all -- HTTP/1.0
+ * clients, or a deliberately minimal one), path straight from the
+ * request line. An honest reconstruction, not a claim of knowing the
+ * "real" externally-visible URL a reverse proxy in front of this
+ * server might present instead -- the same kind of best-effort
+ * inference `req.headers`/etc. already are. */
+static char *festina_build_inbound_url(FestinaConn *c) {
+    const char *scheme = c->tls ? "https" : "http";
+    const char *host = festina_headers_get(c->headers, c->header_count, "host");
+    char host_buf[80];
+    if (!host) {
+        snprintf(host_buf, sizeof(host_buf), "127.0.0.1:%d", c->listen_port);
+        host = host_buf;
+    }
+    const char *path = c->path ? c->path : "/";
+    size_t len = strlen(scheme) + 3 + strlen(host) + strlen(path) + 1;
+    char *url = malloc(len);
+    if (!url) festina_fail("out of memory building an inbound request's url");
+    snprintf(url, len, "%s://%s%s", scheme, host, path);
+    return url;
+}
+
+/* claude.md #162: builds the SAME fresh map[text] claude.md #151's own
+ * original festina_http_headers accessor used to build on every call
+ * -- now built exactly once, at dispatch time, and stored directly in
+ * the http value itself (see festina_http_headers's own new "return
+ * the live map, retained" doc comment for why that's a real
+ * improvement, not just a rename). */
+static void *festina_build_headers_map(FestinaConn *c) {
+    void *map = festina_new_empty_text_map();
+    FestinaMapBlock *block = (FestinaMapBlock *)((char *)map - sizeof(int64_t));
+    for (int64_t i = 0; i < c->header_count; i++) {
+        char *owned_value = festina_text_own(c->headers[i].value);
+        festina_map_set(&block->count, &block->entries, c->headers[i].name,
+                        (int64_t)(intptr_t)owned_value);
+    }
+    return map;
+}
+
 static void festina_dispatch_request(FestinaConn *c) {
-    void *handle = festina_handle_new(c->conn_id);
-    if (g_request_handler) g_request_handler(handle);
+    char *url = festina_build_inbound_url(c);
+    void *headers = festina_build_headers_map(c);
+    /* claude.md #162: `code` is festina_null_int() -- a live inbound
+     * request has no status code of its own (see the http type's own
+     * doc comment: null until a response exists) -- and conn_id is
+     * THIS connection's own, so .ok()/.redirect()/.upgrade()/.send(res)
+     * all reach it correctly. */
+    void *payload = festina_http_value_new(url, c->method, FESTINA_NULL_INT, headers,
+                                           c->body, c->body_len, c->conn_id, NULL);
+    free(url);
+    if (g_request_handler) g_request_handler(payload);
     /* c may be gone (the peer could theoretically vanish mid-handler
      * via another fd's event, though nothing in THIS handler's own
      * body can close arbitrary other connections) -- re-look-up by id
      * rather than trusting the stale pointer across the callback. */
     FestinaConn *fresh = festina_conn_by_id(c->conn_id);
-    festina_release_conn_handle(handle);
+    festina_release_http(payload);
     if (!fresh) return;
     if (fresh->mode == FESTINA_CONN_WEBSOCKET) {
         fresh->ever_upgraded = 1;
@@ -905,18 +1130,22 @@ static void festina_dispatch_request(FestinaConn *c) {
         return; /* stays open for WebSocket framing */
     }
     if (!fresh->responded) {
-        /* claude.md #151: nothing in `on request` ever called ok()/
-         * redirect()/send()/upgrade() -- rather than leave the client
-         * hanging forever, send the same forgiving default every
-         * other "the program didn't explicitly handle this" path in
-         * this runtime already sends: a plain 200 with an empty body.
-         * &fresh->conn_id is a valid handle in its own right here (see
-         * festina_conn_from_handle -- a handle IS just a pointer to an
-         * int64_t conn_id, with no refcounting done inside
-         * festina_http_ok/_send themselves), so this skips the
-         * malloc/free a real festina_handle_new() round trip would
-         * otherwise cost for a purely-internal call. */
-        festina_http_ok(&fresh->conn_id);
+        /* claude.md #151/#162: nothing in `on request` ever called
+         * ok()/redirect()/send()/upgrade() -- rather than leave the
+         * client hanging forever, send the same forgiving default
+         * every other "the program didn't explicitly handle this"
+         * path in this runtime already sends: a plain 200 with an
+         * empty body. A throwaway on-stack FestinaHttpValue with just
+         * conn_id set (everything else zeroed, and never touched by
+         * festina_http_ok) reaches festina_live_conn's own lookup
+         * correctly -- the same "skip the real allocation for a
+         * purely-internal call" trick claude.md #151's own
+         * `&fresh->conn_id`-as-handle used, adapted to this value's
+         * real (larger) shape. */
+        FestinaHttpValue fallback_value;
+        memset(&fallback_value, 0, sizeof(fallback_value));
+        fallback_value.conn_id = fresh->conn_id;
+        festina_http_ok(&fallback_value.url);
     }
     festina_conn_teardown(fresh);
 }
@@ -937,12 +1166,12 @@ static void festina_dispatch_ws_frame(FestinaConn *c, uint8_t opcode,
         break;
     }
     case 0x8: /* close */
-        festina_ws_send_frame(c->fd, 0x8, payload, payload_len);
+        festina_ws_send_frame(c, 0x8, payload, payload_len);
         free(payload);
         festina_conn_teardown(c);
         break;
     case 0x9: /* ping -- answer with a pong carrying the same payload */
-        festina_ws_send_frame(c->fd, 0xA, payload, payload_len);
+        festina_ws_send_frame(c, 0xA, payload, payload_len);
         free(payload);
         break;
     case 0xA: /* pong -- nothing sent this, but tolerate it anyway */
@@ -957,7 +1186,7 @@ static void festina_dispatch_ws_frame(FestinaConn *c, uint8_t opcode,
         free(payload);
         {
             uint8_t close_payload[2] = {0x03, 0xEB}; /* 1003, big-endian */
-            festina_ws_send_frame(c->fd, 0x8, close_payload, 2);
+            festina_ws_send_frame(c, 0x8, close_payload, 2);
         }
         festina_conn_teardown(c);
         break;
@@ -965,19 +1194,50 @@ static void festina_dispatch_ws_frame(FestinaConn *c, uint8_t opcode,
 }
 
 static void festina_conn_readable(FestinaConn *c) {
+    /* claude.md #160: raw bytes off the wire are still the TLS
+     * handshake itself until this connection's own handshake
+     * completes -- driven here, across however many poll() ticks it
+     * takes (mbedtls_ssl_handshake is itself non-blocking on this
+     * runtime's already-non-blocking fds, returning WANT_READ/
+     * WANT_WRITE rather than blocking to completion). Every one of
+     * THIS function's own call sites (festina_run_http_loop, once per
+     * readable-or-writable poll event) reaches this unconditionally,
+     * same as a plain connection's first readable byte would. */
+    if (c->tls && !c->tls_handshake_done) {
+        int hs = g_tls_handshake(c->tls);
+        if (hs < 0) { festina_conn_teardown(c); return; }
+        if (hs != 1) { c->tls_wants_write = (hs == 2); return; }
+        c->tls_handshake_done = 1;
+        c->tls_wants_write = 0;
+        /* Falls through to the read loop below immediately -- the
+         * handshake's own last flight and the client's first
+         * application-data record can arrive in the same physical
+         * recv(), already fully consumed by mbedTLS's internal BIO
+         * reads during the handshake call above, so waiting for
+         * another POLLIN here could stall forever. */
+    }
     for (;;) {
         festina_conn_ensure_capacity(c, 4096);
         if (c->buf_len >= c->buf_cap) { festina_conn_teardown(c); return; }
-        ssize_t n = recv(c->fd, (char *)(c->buf + c->buf_len), (int)(c->buf_cap - c->buf_len), 0);
-        if (n < 0) {
-            if (festina_socket_would_block()) break;
-            if (festina_socket_was_interrupted()) continue;
-            festina_conn_teardown(c);
-            return;
-        }
-        if (n == 0) { /* peer closed */
-            festina_conn_teardown(c);
-            return;
+        ssize_t n;
+        if (c->tls) {
+            long r = g_tls_recv(c->tls, c->buf + c->buf_len, (int64_t)(c->buf_cap - c->buf_len));
+            if (r == -1) break;                      /* would block */
+            if (r <= -2) { festina_conn_teardown(c); return; } /* fatal */
+            if (r == 0) { festina_conn_teardown(c); return; }  /* peer closed */
+            n = (ssize_t)r;
+        } else {
+            n = recv(c->fd, (char *)(c->buf + c->buf_len), (int)(c->buf_cap - c->buf_len), 0);
+            if (n < 0) {
+                if (festina_socket_would_block()) break;
+                if (festina_socket_was_interrupted()) continue;
+                festina_conn_teardown(c);
+                return;
+            }
+            if (n == 0) { /* peer closed */
+                festina_conn_teardown(c);
+                return;
+            }
         }
         c->buf_len += (size_t)n;
         if (c->buf_len >= (size_t)FESTINA_HTTP_MAX_BUFFER
@@ -1012,7 +1272,7 @@ static void festina_set_nonblocking(FestinaSocket fd) {
 #endif
 }
 
-static void festina_accept_new_connections(FestinaSocket listen_fd, int port) {
+static void festina_accept_new_connections(FestinaSocket listen_fd, int port, void *tls_config) {
     for (;;) {
         FestinaSocket fd = accept(listen_fd, NULL, NULL);
         if (fd == FESTINA_INVALID_SOCKET) {
@@ -1026,11 +1286,36 @@ static void festina_accept_new_connections(FestinaSocket listen_fd, int port) {
         FestinaConn *c = festina_conn_new_slot();
         c->fd = fd;
         c->listen_port = port;
+        if (tls_config) {
+            /* claude.md #160: the fd handed to mbedTLS's own BIO
+             * callbacks has to be a plain `int` (mbedtls_net_context's
+             * one field) -- true of FestinaSocket already on POSIX
+             * (typedef int), and matches mbedTLS's own established
+             * Windows convention of storing a SOCKET truncated to int
+             * (see festina_runtime_https.c's own top comment: not a
+             * new risk this file introduces). */
+            c->tls = g_tls_conn_new(tls_config, (int)fd);
+            if (!c->tls) { festina_conn_teardown(c); continue; }
+        }
     }
 }
 
-void festina_open_port(int64_t port) {
-    if (port < 1 || port > 65535) return; /* never fails the program -- see festina_runtime.h */
+/* claude.md #160: the shared body of festina_open_port/
+ * _open_secure_port -- everything except deciding whether `tls_config`
+ * is non-NULL, which the two public entry points do differently
+ * (plain openPort() always passes NULL; openSecurePort() builds one
+ * via g_tls_listener_new first and passes that). Takes ownership of a
+ * non-NULL tls_config immediately: every early-return path below frees
+ * it via g_tls_listener_free before returning (openPort/closePort's
+ * own established "never fails the program, just silently doesn't
+ * open" contract extends to openSecurePort too -- a bad port number or
+ * a bind()/listen() failure shouldn't leak the TLS config it'll never
+ * use). */
+static void festina_open_port_impl(int64_t port, void *tls_config) {
+    if (port < 1 || port > 65535) { /* never fails the program -- see festina_runtime.h */
+        if (tls_config && g_tls_listener_free) g_tls_listener_free(tls_config);
+        return;
+    }
 #ifdef _WIN32
     /* claude.md #151 (Windows round): Winsock needs an explicit
      * WSAStartup() before any socket call -- idempotent to call more
@@ -1065,10 +1350,16 @@ void festina_open_port(int64_t port) {
     signal(SIGPIPE, SIG_IGN);
 #endif
     for (int64_t i = 0; i < g_listener_count; i++) {
-        if (g_listeners[i].port == (int)port) return; /* already open -- silent no-op */
+        if (g_listeners[i].port == (int)port) { /* already open -- silent no-op */
+            if (tls_config && g_tls_listener_free) g_tls_listener_free(tls_config);
+            return;
+        }
     }
     FestinaSocket fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == FESTINA_INVALID_SOCKET) return;
+    if (fd == FESTINA_INVALID_SOCKET) {
+        if (tls_config && g_tls_listener_free) g_tls_listener_free(tls_config);
+        return;
+    }
 #ifndef _WIN32
     /* claude.md #151 (Windows round): SO_REUSEADDR means something
      * more permissive on Windows (lets a DIFFERENT process bind the
@@ -1084,8 +1375,16 @@ void festina_open_port(int64_t port) {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons((uint16_t)port);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) { festina_close_fd(fd); return; }
-    if (listen(fd, 128) != 0) { festina_close_fd(fd); return; }
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        festina_close_fd(fd);
+        if (tls_config && g_tls_listener_free) g_tls_listener_free(tls_config);
+        return;
+    }
+    if (listen(fd, 128) != 0) {
+        festina_close_fd(fd);
+        if (tls_config && g_tls_listener_free) g_tls_listener_free(tls_config);
+        return;
+    }
     festina_set_nonblocking(fd);
 
     if (g_listener_count == g_listener_capacity) {
@@ -1096,17 +1395,63 @@ void festina_open_port(int64_t port) {
     }
     g_listeners[g_listener_count].fd = fd;
     g_listeners[g_listener_count].port = (int)port;
+    g_listeners[g_listener_count].tls_config = tls_config;
     g_listener_count++;
+}
+
+void festina_open_port(int64_t port) {
+    festina_open_port_impl(port, NULL);
+}
+
+void festina_open_secure_port(int64_t port, const uint8_t *key, int64_t key_len) {
+    /* claude.md #160: never fails the program on a bad port number
+     * (matches festina_open_port_impl's own contract for one), but a
+     * malformed/mismatched certificate or key IS a program-authoring
+     * mistake worth failing loudly for -- g_tls_listener_new itself
+     * calls festina_fail with the real mbedTLS error text on any parse
+     * failure (see festina_runtime_https.c), so nothing further needs
+     * checking here beyond routing to it in the first place. A program
+     * that links no TLS hooks at all (g_tls_listener_new NULL --
+     * unreachable in practice, since codegen only emits a call to this
+     * function when self.uses_https, which is exactly when it also
+     * registers the hooks) is treated the same as an invalid port: a
+     * silent no-op, not a crash. */
+    if (port < 1 || port > 65535 || !g_tls_listener_new) return;
+    void *tls_config = g_tls_listener_new(key, key_len);
+    festina_open_port_impl(port, tls_config);
+}
+
+static void festina_close_listener_at(int64_t i) {
+    festina_close_fd(g_listeners[i].fd);
+    if (g_listeners[i].tls_config && g_tls_listener_free) {
+        g_tls_listener_free(g_listeners[i].tls_config);
+    }
+    g_listeners[i] = g_listeners[g_listener_count - 1];
+    g_listener_count--;
 }
 
 void festina_close_port(int64_t port) {
     for (int64_t i = 0; i < g_listener_count; i++) {
         if (g_listeners[i].port == (int)port) {
-            festina_close_fd(g_listeners[i].fd);
-            g_listeners[i] = g_listeners[g_listener_count - 1];
-            g_listener_count--;
+            festina_close_listener_at(i);
             return;
         }
+    }
+}
+
+/* claude.md #161: graceful shutdown's own first move -- close every
+ * listening socket outright (rather than merely excluding them from
+ * the next poll() call) so the OS immediately refuses any new
+ * connection attempt (ECONNREFUSED) instead of it sitting in the
+ * kernel's accept queue with nothing ever calling accept() on it.
+ * Reuses festina_close_listener_at, the exact same per-listener
+ * cleanup festina_close_port already does (fd close + TLS config
+ * free) -- walked backwards so removing index i by swapping in the
+ * last element (that function's own compaction trick) never skips
+ * the element that swap just moved into position i. */
+static void festina_close_all_listeners(void) {
+    for (int64_t i = g_listener_count - 1; i >= 0; i--) {
+        festina_close_listener_at(i);
     }
 }
 
@@ -1123,16 +1468,84 @@ static FestinaPollFd *g_poll_fds = NULL;
 static int64_t *g_poll_conn_ids = NULL;
 static size_t g_poll_cap = 0;
 
+/* claude.md #161: graceful shutdown's own drain state -- set once, the
+ * first loop iteration after festina_shutdown_requested() goes true.
+ * FESTINA_SHUTDOWN_GRACE_SECONDS bounds how long already-open
+ * connections get to finish on their own before this loop gives up on
+ * them and exits anyway: generous for this runtime's own one-shot
+ * request-then-close HTTP/1.1 model (a normal response finishes in
+ * milliseconds), but bounded, since a long-lived WebSocket connection
+ * that never closes on its own would otherwise hold shutdown open
+ * forever. */
+static int g_http_draining = 0;
+static double g_http_drain_deadline = 0.0;
+#define FESTINA_SHUTDOWN_GRACE_SECONDS_DEFAULT 10.0
+
+/* Overridable via FESTINA_SHUTDOWN_GRACE_SECONDS -- not a documented
+ * language feature (see api.md's own note: this is a debug/test knob,
+ * not language-level configuration), but real, checked-in-tests
+ * behavior: it's what lets tests/test_graceful_shutdown.py exercise
+ * the forced-cutoff path (a connection that genuinely never closes)
+ * in a fraction of a second rather than actually waiting out the
+ * production default. */
+static double festina_shutdown_grace_seconds(void) {
+    const char *env = getenv("FESTINA_SHUTDOWN_GRACE_SECONDS");
+    if (env) {
+        double v = atof(env);
+        if (v > 0.0) return v;
+    }
+    return FESTINA_SHUTDOWN_GRACE_SECONDS_DEFAULT;
+}
+
+static int64_t festina_alive_conn_count(void) {
+    int64_t n = 0;
+    for (int64_t i = 0; i < g_conn_count; i++) {
+        if (g_conns[i].alive) n++;
+    }
+    return n;
+}
+
 void festina_run_http_loop(void) {
     for (;;) {
+        /* claude.md #161: checked once per iteration, this loop's own
+         * natural poll point (the same shape festina_run_timer_loop's
+         * own check has). The first tick after a signal arrives closes
+         * every listener OUTRIGHT (not just excluded from the next
+         * poll() call) so the OS immediately refuses any new connection
+         * attempt instead of it sitting unaccepted -- from then on,
+         * the listener-building loop just below emits nothing (the
+         * listener table is already empty), so this loop keeps
+         * servicing whatever connections were already open, same as
+         * always, until either none are left or the grace period
+         * above elapses. */
+        if (festina_shutdown_requested()) {
+            if (!g_http_draining) {
+                g_http_draining = 1;
+                g_http_drain_deadline = festina_now_seconds() + festina_shutdown_grace_seconds();
+                festina_close_all_listeners();
+            }
+            /* claude.md #163: an outstanding background request also
+             * has to finish before shutdown gives up on it, the same
+             * grace period an already-open connection already gets --
+             * it's real in-flight work, even though it isn't in
+             * g_conns at all (it owns its own raw socket, on a worker
+             * thread, entirely separate from this connection table). */
+            if ((festina_alive_conn_count() == 0 && g_async_outstanding == 0)
+                    || festina_now_seconds() >= g_http_drain_deadline) {
+                festina_program_exit(festina_shutdown_exit_code());
+            }
+        }
         /* claude.md #155: over-allocate to the known upper bound
          * (g_listener_count + g_conn_count, the connection table's own
          * high-water mark -- includes any dead-but-not-yet-reused
          * slots, so it's never an undercount) instead of first
          * counting exactly how many connections are alive -- trades a
          * small amount of possibly-wasted array size for skipping one
-         * whole linear pass over the connection table every tick. */
-        size_t max_nfds = (size_t)(g_listener_count + g_conn_count);
+         * whole linear pass over the connection table every tick.
+         * claude.md #163: +1 reserves room for the async wake-pipe fd
+         * appended one slot past nfds below, whether or not the async
+         * pool has actually been started by the time this runs. */
+        size_t max_nfds = (size_t)(g_listener_count + g_conn_count) + 1;
         if (max_nfds > g_poll_cap) {
             size_t new_cap = g_poll_cap ? g_poll_cap * 2 : 16;
             while (new_cap < max_nfds) new_cap *= 2;
@@ -1158,81 +1571,230 @@ void festina_run_http_loop(void) {
         for (int64_t i = 0; i < g_conn_count; i++) {
             if (!g_conns[i].alive) continue;
             g_poll_fds[fdi].fd = g_conns[i].fd;
-            g_poll_fds[fdi].events = POLLIN;
+            /* claude.md #160: a connection whose TLS handshake last
+             * stalled wanting to WRITE (a full TCP send buffer, rare
+             * but possible even for small handshake flights) also
+             * needs POLLOUT, or it could wait forever on a POLLIN that
+             * may never come -- see FestinaConn's own tls_wants_write
+             * doc comment. */
+            g_poll_fds[fdi].events = (short)(POLLIN | (g_conns[i].tls_wants_write ? POLLOUT : 0));
             g_poll_conn_ids[fdi - (size_t)g_listener_count] = g_conns[i].conn_id;
             fdi++;
         }
         size_t nfds = fdi;
 
-        if (nfds == 0 && festina_next_timer_deadline() < 0.0) {
+        /* claude.md #165: an outstanding blob/img/aud background load
+         * (a SEPARATE pool from this file's own g_async_outstanding,
+         * which is http-specific) also has to keep this loop alive --
+         * see festina_runtime.h's own doc comment on the shared hook
+         * seam for why a program using ONLY http features could still
+         * have this kind of work outstanding (e.g. `on request`
+         * loading a file in the background while also serving http). */
+        int64_t async_io_outstanding = festina_async_io_outstanding();
+        if (nfds == 0 && festina_next_timer_deadline() < 0.0
+                && g_async_outstanding == 0 && async_io_outstanding == 0) {
             return; /* nothing left to wait for at all */
         }
 
+        /* claude.md #163: the async wake-pipe fd, appended ONE SLOT
+         * PAST nfds -- deliberately outside the [0, nfds) range the
+         * listener/connection loops below iterate, so neither of them
+         * needs to know it exists at all. Only added once the pool has
+         * actually been spawned (g_async_pool_started) -- resting at
+         * program start, exactly like every other feature here that's
+         * only linked, not necessarily used. */
+        size_t poll_nfds = nfds;
+        if (g_async_pool_started) {
+            g_poll_fds[nfds].fd = g_async_wake_fds[0];
+            g_poll_fds[nfds].events = POLLIN;
+            poll_nfds = nfds + 1;
+        }
+
         double deadline = festina_next_timer_deadline();
+        /* claude.md #161: while draining, the grace-period deadline
+         * ALSO bounds how long poll() may block -- otherwise, with no
+         * timer active and every open connection sitting idle (a
+         * WebSocket that never sends anything else), poll() would
+         * block with timeout_ms == -1 (forever) and this loop would
+         * never come back around to re-check
+         * festina_now_seconds() >= g_http_drain_deadline at all,
+         * silently defeating the whole grace period -- confirmed
+         * directly (a stuck WebSocket connection genuinely hung this
+         * loop past its 10-second deadline, only ending because the
+         * TEST's own client eventually closed the socket on its own,
+         * not because of anything this loop did) before this fix. */
+        if (g_http_draining && (deadline < 0.0 || g_http_drain_deadline < deadline)) {
+            deadline = g_http_drain_deadline;
+        }
         int timeout_ms = -1;
         if (deadline >= 0.0) {
             double remaining = deadline - festina_now_seconds();
             timeout_ms = remaining > 0.0 ? (int)(remaining * 1000.0) + 1 : 0;
         }
+        /* claude.md #165: this loop has no fd of its own for the
+         * generic async-io pool (a separate pool from THIS file's own
+         * http-specific one, which DOES have a wake-pipe fd already in
+         * the poll set above) -- bounding the timeout is the only way
+         * to notice a completed background blob/img/aud load promptly.
+         * Same 20ms granularity festina_run_timer_loop uses. */
+        if (async_io_outstanding > 0 && (timeout_ms < 0 || timeout_ms > 20)) {
+            timeout_ms = 20;
+        }
 
-        int rc = festina_poll(g_poll_fds, nfds, timeout_ms);
+        int rc = festina_poll(g_poll_fds, poll_nfds, timeout_ms);
         if (rc < 0 && !festina_socket_was_interrupted()) return;
 
         if (rc > 0) {
             for (int64_t i = 0; i < g_listener_count; i++) {
                 if (g_poll_fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
-                    festina_accept_new_connections(g_poll_fds[i].fd, g_listeners[i].port);
+                    festina_accept_new_connections(g_poll_fds[i].fd, g_listeners[i].port,
+                                                   g_listeners[i].tls_config);
                 }
             }
             for (size_t i = (size_t)g_listener_count; i < nfds; i++) {
-                if (!(g_poll_fds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+                /* claude.md #160: POLLOUT included here too -- a
+                 * mid-handshake connection that requested it (see the
+                 * events-mask construction above) needs to be woken by
+                 * it, exactly the same as POLLIN wakes every other
+                 * connection's own festina_conn_readable call. */
+                if (!(g_poll_fds[i].revents & (POLLIN | POLLOUT | POLLHUP | POLLERR))) continue;
                 FestinaConn *c = festina_conn_by_id(g_poll_conn_ids[i - (size_t)g_listener_count]);
                 if (c) festina_conn_readable(c);
             }
         }
 
         festina_fire_expired_timers();
+        /* claude.md #163: unconditional, once per iteration, the same
+         * placement as festina_fire_expired_timers just above -- cheap
+         * to call when nothing has completed (a no-op when the async
+         * pool was never started at all). */
+        festina_async_drain_completed();
+        /* claude.md #165: the generic blob/img/aud pool's own drain --
+         * a no-op when festina_runtime_async.c was never linked. */
+        festina_async_io_drain();
     }
 }
 
-/* ---- req:http -- fields ---- */
-
-int64_t festina_http_port(void *handle) {
-    FestinaConn *c = festina_conn_from_handle(handle);
-    return c ? (int64_t)c->listen_port : 0;
-}
-
-char *festina_http_method(void *handle) {
-    FestinaConn *c = festina_conn_from_handle(handle);
-    return festina_text_own(c && c->method ? c->method : "");
-}
-
-char *festina_http_path(void *handle) {
-    FestinaConn *c = festina_conn_from_handle(handle);
-    return festina_text_own(c && c->path ? c->path : "");
-}
-
-void *festina_http_headers(void *handle) {
-    void *map = festina_new_empty_text_map();
-    FestinaConn *c = festina_conn_from_handle(handle);
-    if (!c) return map;
-    FestinaMapBlock *block = (FestinaMapBlock *)((char *)map - sizeof(int64_t));
-    for (int64_t i = 0; i < c->header_count; i++) {
-        char *owned_value = festina_text_own(c->headers[i].value);
-        festina_map_set(&block->count, &block->entries, c->headers[i].name,
-                        (int64_t)(intptr_t)owned_value);
+/* ---- http -- construction / destruction ----
+ *
+ * claude.md #162: the ONE place a FestinaHttpValue is actually
+ * allocated -- festina_dispatch_request (an inbound request),
+ * festina_http_literal_new (codegen's own `http x = {...}` literal
+ * construction), and the client response path
+ * (festina_http_send_client, further below) all funnel through this. */
+static void *festina_http_value_new(const char *url, const char *method, int64_t code,
+                                     void *headers /* owned, or NULL for a fresh empty one */,
+                                     const uint8_t *body, int64_t body_len, int64_t conn_id,
+                                     void (*callback)(void *)) {
+    FestinaHttpValue *v = calloc(1, sizeof(*v));
+    if (!v) festina_fail("out of memory building an http value");
+    v->refcount = 1;
+    v->url = festina_text_own(url ? url : "");
+    v->method = festina_text_own(method ? method : "");
+    v->code = code;
+    v->headers = headers ? headers : festina_new_empty_text_map();
+    if (body_len > 0) {
+        v->body = malloc((size_t)body_len);
+        if (!v->body) festina_fail("out of memory building an http value's body");
+        memcpy(v->body, body, (size_t)body_len);
+        v->body_len = body_len;
     }
-    return map;
+    v->conn_id = conn_id;
+    v->callback = callback;
+    return &v->url;
 }
 
-/* ---- req:http -- methods ---- */
-
-void festina_http_ok(void *handle) {
-    festina_http_send(handle, NULL, 0, 200, NULL);
+void festina_release_http(void *payload) {
+    if (!festina_release_check(payload)) return;
+    FestinaHttpValue *v = FESTINA_HTTP_FROM_PAYLOAD(payload);
+    free(v->url);
+    free(v->method);
+    festina_release_map(v->headers);
+    free(v->body);
+    free(v);
 }
 
-void festina_http_redirect(void *handle, const char *url) {
-    FestinaConn *c = festina_conn_from_handle(handle);
+/* claude.md #162: codegen's own entry point for `http x = {...}` --
+ * every argument already fully evaluated/coerced by the time this is
+ * called (url/method default to "" and code to festina_null_int()
+ * when the literal doesn't mention that key at all -- see
+ * _emit_http_lit in codegen.py). Takes ownership of `headers` (may be
+ * NULL, meaning "no headers key in the literal" -- a fresh empty map
+ * is made instead) and copies `body`/`body_len` (the caller's own
+ * buffer is freed by codegen right after this call returns, the same
+ * "copy in, caller frees its own temporary" convention
+ * festina_blob_from_bytes already uses). */
+void *festina_http_literal_new(const char *url, const char *method, int64_t code,
+                               void *headers, const uint8_t *body, int64_t body_len,
+                               void (*callback)(void *)) {
+    return festina_http_value_new(url, method, code, headers, body, body_len, 0, callback);
+}
+
+/* claude.md #163: codegen's own read-back for `.callback` -- a bare
+ * function pointer, cast to `void*` for the same reason every OTHER
+ * FuncType-typed field read already returns one (types.py's own doc
+ * comment: the runtime value behind a FuncType IS a bare function
+ * pointer). NULL reads back as NULL -- the generic FuncType-callee
+ * dispatch in codegen.py already treats a null callee as... actually
+ * calling a null function pointer would crash, so nothing in
+ * generated code ever calls `.callback` directly; only THIS runtime's
+ * own background dispatch does, after already checking it for NULL. */
+void *festina_http_callback(void *payload) {
+    return (void *)FESTINA_HTTP_FROM_PAYLOAD(payload)->callback;
+}
+
+/* ---- http -- fields ---- */
+
+char *festina_http_url(void *payload) {
+    return festina_text_own(FESTINA_HTTP_FROM_PAYLOAD(payload)->url);
+}
+
+char *festina_http_method(void *payload) {
+    return festina_text_own(FESTINA_HTTP_FROM_PAYLOAD(payload)->method);
+}
+
+int64_t festina_http_code(void *payload) {
+    return FESTINA_HTTP_FROM_PAYLOAD(payload)->code;
+}
+
+void *festina_http_headers(void *payload) {
+    /* claude.md #162: the SAME live map every read, retained on the
+     * way out -- unlike claude.md #151's own original behavior (a
+     * fresh rebuild from the connection's raw header list on every
+     * call), headers now live directly in the value itself, so
+     * there's nothing left to rebuild; this exactly mirrors
+     * festina_socket_state's own "same live value, retained" shape. */
+    void *headers = FESTINA_HTTP_FROM_PAYLOAD(payload)->headers;
+    festina_retain(headers);
+    return headers;
+}
+
+/* ---- http -- methods (server side: .ok()/.redirect()/.upgrade()/
+ * .send(res) all still need the underlying LIVE connection -- a
+ * silent no-op whenever conn_id is 0 or the connection named by it is
+ * already gone, the exact same "never crashes on a value that
+ * doesn't apply" tolerance festina_conn_from_handle's own stale-
+ * handle case already established) ---- */
+
+static FestinaConn *festina_live_conn(void *payload) {
+    int64_t conn_id = FESTINA_HTTP_FROM_PAYLOAD(payload)->conn_id;
+    return conn_id ? festina_conn_by_id(conn_id) : NULL;
+}
+
+void festina_http_ok(void *payload) {
+    FestinaConn *c = festina_live_conn(payload);
+    if (!c || c->responded) return;
+    c->responded = 1;
+    char stack_storage[256];
+    FestinaSendBuf buf;
+    festina_sendbuf_init(&buf, stack_storage, sizeof(stack_storage));
+    FESTINA_APPEND_LIT(&buf, "HTTP/1.1 200 Festina\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    festina_send_all(c, buf.data, buf.len);
+    festina_sendbuf_free(&buf);
+}
+
+void festina_http_redirect(void *payload, const char *url) {
+    FestinaConn *c = festina_live_conn(payload);
     if (!c || c->responded) return;
     c->responded = 1;
     /* claude.md #155: one buffer, one send() -- same reasoning as
@@ -1246,12 +1808,12 @@ void festina_http_redirect(void *handle, const char *url) {
     FESTINA_APPEND_LIT(&buf, "HTTP/1.1 302 Found\r\nLocation: ");
     if (url) festina_sendbuf_append(&buf, url, strlen(url));
     FESTINA_APPEND_LIT(&buf, "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-    festina_send_all(c->fd, buf.data, buf.len);
+    festina_send_all(c, buf.data, buf.len);
     festina_sendbuf_free(&buf);
 }
 
-void festina_http_upgrade(void *handle) {
-    FestinaConn *c = festina_conn_from_handle(handle);
+void festina_http_upgrade(void *payload) {
+    FestinaConn *c = festina_live_conn(payload);
     if (!c || c->responded) return;
     const char *key = festina_headers_get(c->headers, c->header_count, "sec-websocket-key");
     const char *upgrade_hdr = festina_headers_get(c->headers, c->header_count, "upgrade");
@@ -1266,7 +1828,7 @@ void festina_http_upgrade(void *handle) {
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Accept: %s\r\n\r\n", accept_key);
     free(accept_key);
-    if (len > 0) festina_send_all(c->fd, response, (size_t)len);
+    if (len > 0) festina_send_all(c, response, (size_t)len);
     c->responded = 1;
     c->mode = FESTINA_CONN_WEBSOCKET;
     /* Any request bytes buffered past the header/body this request
@@ -1277,15 +1839,14 @@ void festina_http_upgrade(void *handle) {
     c->buf_len = 0;
 }
 
-void *festina_http_to_blob(void *handle) {
-    FestinaConn *c = festina_conn_from_handle(handle);
-    if (!c) return festina_blob_from_bytes("", 0);
-    return festina_blob_from_bytes(c->body ? c->body : (const uint8_t *)"", c->body_len);
+void *festina_http_to_blob(void *payload) {
+    FestinaHttpValue *v = FESTINA_HTTP_FROM_PAYLOAD(payload);
+    return festina_blob_from_bytes(v->body ? v->body : (const uint8_t *)"", v->body_len);
 }
 
-void *festina_http_to_img(void *handle) {
-    FestinaConn *c = festina_conn_from_handle(handle);
-    if (!c || !c->body) return NULL;
+void *festina_http_to_img(void *payload) {
+    FestinaHttpValue *v = FESTINA_HTTP_FROM_PAYLOAD(payload);
+    if (!v->body) return NULL;
     /* claude.md #151: through festina_decode_image_bytes, NOT
      * festina_image_from_bytes directly -- that symbol lives in the
      * graphics translation unit, which this file must not reference
@@ -1293,22 +1854,22 @@ void *festina_http_to_img(void *handle) {
      * .toImg() would otherwise be forced to link Cairo/X11/libjpeg
      * just to satisfy this one reference -- see
      * festina_decode_image_bytes's own comment in festina_runtime.c). */
-    return festina_decode_image_bytes(c->body, c->body_len, "http-request-body");
+    return festina_decode_image_bytes(v->body, v->body_len, "http-body");
 }
 
-void *festina_http_to_aud(void *handle) {
-    FestinaConn *c = festina_conn_from_handle(handle);
-    if (!c || !c->body) return NULL;
-    return festina_decode_audio_bytes(c->body, c->body_len, "http-request-body");
+void *festina_http_to_aud(void *payload) {
+    FestinaHttpValue *v = FESTINA_HTTP_FROM_PAYLOAD(payload);
+    if (!v->body) return NULL;
+    return festina_decode_audio_bytes(v->body, v->body_len, "http-body");
 }
 
-char *festina_http_to_text(void *handle) {
-    FestinaConn *c = festina_conn_from_handle(handle);
-    if (!c || !c->body) return festina_text_own("");
-    char *out = malloc((size_t)c->body_len + 1);
-    if (!out) festina_fail("out of memory converting an HTTP request body to text");
-    memcpy(out, c->body, (size_t)c->body_len);
-    out[c->body_len] = '\0';
+char *festina_http_to_text(void *payload) {
+    FestinaHttpValue *v = FESTINA_HTTP_FROM_PAYLOAD(payload);
+    if (!v->body) return festina_text_own("");
+    char *out = malloc((size_t)v->body_len + 1);
+    if (!out) festina_fail("out of memory converting an http body to text");
+    memcpy(out, v->body, (size_t)v->body_len);
+    out[v->body_len] = '\0';
     return out;
 }
 
@@ -1325,7 +1886,20 @@ char *festina_http_to_text(void *handle) {
  * through snprintf when the value is just a plain string), so the
  * whole response -- including any extra headers -- goes out in ONE
  * festina_send_all call. */
-static FestinaSendBuf *g_http_send_header_buf = NULL;
+/* claude.md #163: __thread, not a plain global -- festina_map_for_each
+ * has no user-data parameter to route this through directly, and this
+ * scratch variable used to be safe as a plain global purely because
+ * only the single main thread ever called festina_http_send_client
+ * (the SERVER side, festina_http_send, is still main-thread-only and
+ * would have been fine as a plain global forever). Once
+ * festina_http_send_client became callable from multiple background
+ * worker threads at once, a plain global here became a genuine data
+ * race -- confirmed directly by ThreadSanitizer (multiple concurrent
+ * worker threads corrupting each other's own header-writing pass)
+ * before this fix, clean after it. Each thread's own bracketing
+ * assignment (set at the top of the header-writing pass, cleared
+ * right after) only ever touches ITS OWN copy. */
+static __thread FestinaSendBuf *g_http_send_header_buf = NULL;
 
 static void festina_write_extra_header(int64_t value, const char *key) {
     if (!g_http_send_header_buf) return;
@@ -1336,11 +1910,21 @@ static void festina_write_extra_header(int64_t value, const char *key) {
     FESTINA_APPEND_LIT(g_http_send_header_buf, "\r\n");
 }
 
-void festina_http_send(void *handle, const void *data, int64_t len,
-                       int64_t code, void *extra_headers) {
-    FestinaConn *c = festina_conn_from_handle(handle);
-    if (!c || c->responded) return;
+/* claude.md #162: req.send(res:http) -- the server side, unchanged in
+ * spirit from before this entry (claude.md #151/#155), just reading
+ * code/headers/body off `res_payload` (a constructed http value)
+ * instead of three separate arguments. `res_payload` may be NULL
+ * (req.send() called with no response value at all makes no sense,
+ * but codegen never actually emits that -- ok() has its own dedicated
+ * fast path above precisely so 200-empty never needs a throwaway
+ * http value built just to describe it) -- defensive, not load-
+ * bearing. */
+void festina_http_send(void *req_payload, void *res_payload) {
+    FestinaConn *c = festina_live_conn(req_payload);
+    if (!c || c->responded || !res_payload) return;
     c->responded = 1;
+    FestinaHttpValue *res = FESTINA_HTTP_FROM_PAYLOAD(res_payload);
+    int64_t code = (res->code == FESTINA_NULL_INT) ? 200 : res->code;
 
     /* claude.md #155: one buffer, one send() for the whole status
      * line + headers block -- see FestinaSendBuf's own comment for
@@ -1356,24 +1940,554 @@ void festina_http_send(void *handle, const void *data, int64_t len,
     int sl_len = snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d Festina\r\n", (int)code);
     if (sl_len > 0) festina_sendbuf_append(&buf, status_line, (size_t)sl_len);
 
-    if (extra_headers) {
-        FestinaMapBlock *block = (FestinaMapBlock *)((char *)extra_headers - sizeof(int64_t));
-        g_http_send_header_buf = &buf;
-        festina_map_for_each(block->count, block->entries, festina_write_extra_header);
-        g_http_send_header_buf = NULL;
-    }
+    FestinaMapBlock *block = (FestinaMapBlock *)((char *)res->headers - sizeof(int64_t));
+    g_http_send_header_buf = &buf;
+    festina_map_for_each(block->count, block->entries, festina_write_extra_header);
+    g_http_send_header_buf = NULL;
 
     char cl_line[64];
     int cl_len = snprintf(cl_line, sizeof(cl_line), "Content-Length: %lld\r\n",
-                          (long long)(len < 0 ? 0 : len));
+                          (long long)(res->body_len < 0 ? 0 : res->body_len));
     if (cl_len > 0) festina_sendbuf_append(&buf, cl_line, (size_t)cl_len);
     FESTINA_APPEND_LIT(&buf, "Connection: close\r\n\r\n");
 
-    festina_send_all(c->fd, buf.data, buf.len);
+    festina_send_all(c, buf.data, buf.len);
     festina_sendbuf_free(&buf);
-    if (len > 0 && data) festina_send_all(c->fd, data, (size_t)len);
+    if (res->body_len > 0 && res->body) festina_send_all(c, res->body, (size_t)res->body_len);
+}
+
+/* ---- http -- client side: the zero-argument req.send() (claude.md
+ * #162) -- an OUTBOUND request, built from this value's own url/
+ * method/headers/body, with the response overwriting code/headers/
+ * body in place afterward (url/method are left alone -- they still
+ * describe what was SENT, which stays useful after the fact). Plain
+ * HTTP only in this function; TLS is handled by
+ * festina_http_send_client itself dispatching to the g_tls_client_*
+ * hooks (festina_runtime_https.c) exactly the way the server side
+ * dispatches to g_tls_handshake/_recv/_send -- see that file's own
+ * comment for why mbedTLS never appears by name in this translation
+ * unit at all. ---- */
+
+static void *(*g_tls_client_connect)(int fd, const char *hostname) = NULL;
+static long (*g_tls_client_recv)(void *tls_state, void *buf, int64_t cap) = NULL;
+static long (*g_tls_client_send)(void *tls_state, const void *data, int64_t len) = NULL;
+static void (*g_tls_client_close)(void *tls_state) = NULL;
+
+void festina_set_tls_client_hooks(
+        void *(*client_connect)(int, const char *),
+        long (*recv_fn)(void *, void *, int64_t),
+        long (*send_fn)(void *, const void *, int64_t),
+        void (*close_fn)(void *)) {
+    g_tls_client_connect = client_connect;
+    g_tls_client_recv = recv_fn;
+    g_tls_client_send = send_fn;
+    g_tls_client_close = close_fn;
+}
+
+/* A tiny transport union so the request-building/response-parsing
+ * code below (festina_http_send_client itself) never has to branch on
+ * TLS-or-not more than once, at connect time -- every subsequent
+ * send/recv goes through these two function pointers regardless of
+ * which transport is actually underneath, the same "one shared
+ * abstraction over plain-socket-or-TLS" shape festina_send_all/
+ * festina_conn_readable already established for the SERVER side. */
+typedef struct {
+    FestinaSocket fd;
+    void *tls; /* NULL for plain HTTP */
+} FestinaClientTransport;
+
+static long festina_client_send_all(FestinaClientTransport *t, const void *data, size_t len) {
+    if (t->tls) {
+        const uint8_t *p = (const uint8_t *)data;
+        size_t sent = 0;
+        while (sent < len) {
+            long n = g_tls_client_send(t->tls, p + sent, (int64_t)(len - sent));
+            if (n <= 0) return 0;
+            sent += (size_t)n;
+        }
+        return 1;
+    }
+    const uint8_t *p = (const uint8_t *)data;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(t->fd, (const char *)(p + sent), (int)(len - sent), 0);
+        if (n < 0) {
+            if (festina_socket_was_interrupted()) continue;
+            return 0;
+        }
+        if (n == 0) return 0;
+        sent += (size_t)n;
+    }
+    return 1;
+}
+
+/* Reads until the peer closes (or a hard error), growing `*buf`/`*len`
+ * as needed -- the client side has no Content-Length to trust ahead
+ * of time the way the request-line parser does (claude.md #151's own
+ * scope: no chunked transfer-encoding either direction), so this
+ * simply reads everything the server sends and the header parser
+ * below finds Content-Length inside it afterward. Bounded by the same
+ * FESTINA_HTTP_MAX_BUFFER cap the server side already enforces, for
+ * the identical "a hostile or broken peer streaming forever" reason. */
+static void festina_client_read_all(FestinaClientTransport *t, uint8_t **buf, size_t *len) {
+    size_t cap = 8192;
+    *buf = malloc(cap);
+    if (!*buf) festina_fail("out of memory reading an http response");
+    *len = 0;
+    for (;;) {
+        if (*len + 4096 > cap) {
+            cap *= 2;
+            if (cap > FESTINA_HTTP_MAX_BUFFER) cap = FESTINA_HTTP_MAX_BUFFER;
+            uint8_t *grown = realloc(*buf, cap);
+            if (!grown) festina_fail("out of memory reading an http response");
+            *buf = grown;
+        }
+        if (*len >= (size_t)FESTINA_HTTP_MAX_BUFFER) break;
+        long n;
+        if (t->tls) {
+            n = g_tls_client_recv(t->tls, *buf + *len, (int64_t)(cap - *len));
+            if (n == -1) continue; /* would-block on a blocking client socket
+                                     * shouldn't happen, but retry rather than
+                                     * spin-fail if it ever does */
+            if (n <= 0) break;
+        } else {
+            ssize_t r = recv(t->fd, (char *)(*buf + *len), (int)(cap - *len), 0);
+            if (r < 0) {
+                if (festina_socket_was_interrupted()) continue;
+                break;
+            }
+            if (r == 0) break;
+            n = r;
+        }
+        *len += (size_t)n;
+    }
+}
+
+/* Parses "METHOD-less" -- an HTTP RESPONSE -- status line + headers +
+ * body out of the raw bytes festina_client_read_all collected, into
+ * `out_code`/`out_headers`(a fresh map[text])/`out_body`/
+ * `out_body_len`. THROWS (claude.md #157) on a response that doesn't
+ * even have a parseable status line -- the one genuinely ambiguous
+ * "is this malformed or did the connection just drop" case a client
+ * can hit, and worth surfacing with real text rather than silently
+ * answering an all-zero response. A missing/short body (fewer bytes
+ * than Content-Length claimed, connection closed early) is NOT
+ * treated as an error -- whatever arrived is just what the caller
+ * gets, the same lenient spirit claude.md #159's own JSON parser
+ * applies to shapes that are unusual but not actually broken. */
+static void festina_parse_http_response(const uint8_t *data, size_t len,
+                                        int64_t *out_code, void **out_headers,
+                                        uint8_t **out_body, int64_t *out_body_len) {
+    const char *p = (const char *)data;
+    const char *end = (const char *)data + len;
+    if (len < 12 || memcmp(p, "HTTP/1.", 7) != 0) {
+        festina_throw(festina_text_own("fetch: the server's response didn't start with a "
+                                       "valid HTTP status line"));
+        return; /* unreachable */
+    }
+    const char *sp1 = memchr(p, ' ', (size_t)(end - p));
+    if (!sp1) { festina_throw(festina_text_own("fetch: malformed HTTP status line")); return; }
+    *out_code = strtoll(sp1 + 1, NULL, 10);
+
+    const char *hdr_start = memchr(p, '\n', (size_t)(end - p));
+    if (!hdr_start) { festina_throw(festina_text_own("fetch: malformed HTTP response (no headers)")); return; }
+    hdr_start++;
+
+    void *headers = festina_new_empty_text_map();
+    FestinaMapBlock *hblock = (FestinaMapBlock *)((char *)headers - sizeof(int64_t));
+    int64_t content_length = -1;
+    const char *line = hdr_start;
+    while (line < end) {
+        const char *line_end = memchr(line, '\n', (size_t)(end - line));
+        if (!line_end) line_end = end;
+        const char *trimmed_end = line_end;
+        if (trimmed_end > line && trimmed_end[-1] == '\r') trimmed_end--;
+        if (trimmed_end == line) { line = line_end + 1; break; } /* blank line: end of headers */
+        const char *colon = memchr(line, ':', (size_t)(trimmed_end - line));
+        if (colon) {
+            size_t name_len = (size_t)(colon - line);
+            const char *value_start = colon + 1;
+            while (value_start < trimmed_end && *value_start == ' ') value_start++;
+            char *name = malloc(name_len + 1);
+            if (!name) festina_fail("out of memory parsing an http response header");
+            for (size_t i = 0; i < name_len; i++) name[i] = (char)tolower((unsigned char)line[i]);
+            name[name_len] = '\0';
+            size_t value_len = (size_t)(trimmed_end - value_start);
+            char *owned_value = malloc(value_len + 1);
+            if (!owned_value) festina_fail("out of memory parsing an http response header");
+            memcpy(owned_value, value_start, value_len);
+            owned_value[value_len] = '\0';
+            if (strcmp(name, "content-length") == 0) content_length = strtoll(owned_value, NULL, 10);
+            festina_map_set(&hblock->count, &hblock->entries, name, (int64_t)(intptr_t)owned_value);
+            free(name);
+        }
+        line = line_end + 1;
+    }
+    *out_headers = headers;
+
+    size_t have_body = (size_t)(end - line);
+    size_t body_len = (content_length >= 0 && (size_t)content_length < have_body)
+                       ? (size_t)content_length : have_body;
+    if (body_len > 0) {
+        *out_body = malloc(body_len);
+        if (!*out_body) festina_fail("out of memory reading an http response body");
+        memcpy(*out_body, line, body_len);
+        *out_body_len = (int64_t)body_len;
+    } else {
+        *out_body = NULL;
+        *out_body_len = 0;
+    }
+}
+
+void festina_http_send_client(void *payload) {
+    FestinaHttpValue *v = FESTINA_HTTP_FROM_PAYLOAD(payload);
+    void *url = festina_parse_url(v->url); /* throws on a malformed url -- fine,
+                                            * the same catchable failure shape
+                                            * every other genuinely-can-fail
+                                            * primitive in this runtime uses */
+    char *protocol = festina_url_protocol(url);
+    char *hostname = festina_url_hostname(url);
+    char *pathname = festina_url_pathname(url);
+    int64_t port_field = festina_url_port(url);
+    int is_tls = strcmp(protocol, "https:") == 0;
+    int port = (port_field != FESTINA_NULL_INT) ? (int)port_field : (is_tls ? 443 : 80);
+
+    struct addrinfo hints, *addr_result = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    int gai_rc = getaddrinfo(hostname, port_str, &hints, &addr_result);
+    if (gai_rc != 0 || !addr_result) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "fetch: could not resolve '%s'", hostname);
+        free(protocol); free(hostname); free(pathname);
+        festina_release_url(url);
+        festina_throw(festina_text_own(msg));
+        return; /* unreachable */
+    }
+
+    FestinaSocket fd = FESTINA_INVALID_SOCKET;
+    for (struct addrinfo *ai = addr_result; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd == FESTINA_INVALID_SOCKET) continue;
+        if (connect(fd, ai->ai_addr, (int)ai->ai_addrlen) == 0) break;
+        festina_close_fd(fd);
+        fd = FESTINA_INVALID_SOCKET;
+    }
+    freeaddrinfo(addr_result);
+    if (fd == FESTINA_INVALID_SOCKET) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "fetch: could not connect to '%s:%d'", hostname, port);
+        free(protocol); free(hostname); free(pathname);
+        festina_release_url(url);
+        festina_throw(festina_text_own(msg));
+        return; /* unreachable */
+    }
+    /* claude.md #162: a blocking client socket, deliberately -- fetch()/
+     * req.send() blocks the whole single-threaded program until it
+     * completes, the same already-established "a slow on request
+     * handler delays every other connection" tradeoff this runtime's
+     * own design already accepts (see festina_runtime.h's top
+     * comment), extended here to "a slow fetch() blocks everything
+     * else too." A finite timeout still matters -- an unresponsive
+     * server must not hang the program forever. */
+#ifdef _WIN32
+    DWORD timeout_ms = 30000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
+#else
+    struct timeval timeout_tv = { 30, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout_tv, sizeof(timeout_tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout_tv, sizeof(timeout_tv));
+#endif
+
+    FestinaClientTransport transport;
+    transport.fd = fd;
+    transport.tls = NULL;
+    if (is_tls) {
+        if (!g_tls_client_connect) {
+            festina_close_fd(fd);
+            free(protocol); free(hostname); free(pathname);
+            festina_release_url(url);
+            festina_throw(festina_text_own(
+                "fetch: this program was not compiled with TLS support "
+                "(this shouldn't happen -- an https:// URL always links it)"));
+            return; /* unreachable */
+        }
+        transport.tls = g_tls_client_connect((int)fd, hostname);
+        if (!transport.tls) {
+            festina_close_fd(fd);
+            char msg[300];
+            snprintf(msg, sizeof(msg), "fetch: TLS handshake with '%s' failed", hostname);
+            free(protocol); free(hostname); free(pathname);
+            festina_release_url(url);
+            festina_throw(festina_text_own(msg));
+            return; /* unreachable */
+        }
+    }
+
+    char stack_storage[512];
+    FestinaSendBuf buf;
+    festina_sendbuf_init(&buf, stack_storage, sizeof(stack_storage));
+    festina_sendbuf_append(&buf, v->method, strlen(v->method));
+    FESTINA_APPEND_LIT(&buf, " ");
+    festina_sendbuf_append(&buf, pathname, strlen(pathname));
+    FESTINA_APPEND_LIT(&buf, " HTTP/1.1\r\nHost: ");
+    festina_sendbuf_append(&buf, hostname, strlen(hostname));
+    FESTINA_APPEND_LIT(&buf, "\r\n");
+    FestinaMapBlock *hblock = (FestinaMapBlock *)((char *)v->headers - sizeof(int64_t));
+    g_http_send_header_buf = &buf;
+    festina_map_for_each(hblock->count, hblock->entries, festina_write_extra_header);
+    g_http_send_header_buf = NULL;
+    char cl_line[64];
+    int cl_len = snprintf(cl_line, sizeof(cl_line), "Content-Length: %lld\r\n",
+                          (long long)(v->body_len > 0 ? v->body_len : 0));
+    if (cl_len > 0) festina_sendbuf_append(&buf, cl_line, (size_t)cl_len);
+    FESTINA_APPEND_LIT(&buf, "Connection: close\r\n\r\n");
+
+    int ok = festina_client_send_all(&transport, buf.data, buf.len);
+    if (ok && v->body_len > 0 && v->body) {
+        ok = festina_client_send_all(&transport, v->body, (size_t)v->body_len);
+    }
+    festina_sendbuf_free(&buf);
+
+    if (!ok) {
+        if (transport.tls) g_tls_client_close(transport.tls);
+        festina_close_fd(fd);
+        char msg[300];
+        snprintf(msg, sizeof(msg), "fetch: writing the request to '%s' failed", hostname);
+        free(protocol); free(hostname); free(pathname);
+        festina_release_url(url);
+        festina_throw(festina_text_own(msg));
+        return; /* unreachable */
+    }
+
+    uint8_t *resp_data = NULL;
+    size_t resp_len = 0;
+    festina_client_read_all(&transport, &resp_data, &resp_len);
+    if (transport.tls) g_tls_client_close(transport.tls);
+    festina_close_fd(fd);
+    free(protocol); free(hostname); free(pathname);
+    festina_release_url(url);
+
+    int64_t new_code;
+    void *new_headers = NULL;
+    uint8_t *new_body = NULL;
+    int64_t new_body_len = 0;
+    festina_parse_http_response(resp_data, resp_len, &new_code, &new_headers, &new_body, &new_body_len);
+    free(resp_data);
+
+    /* claude.md #162: url/method are left alone -- they still
+     * describe what was SENT. code/headers/body are overwritten with
+     * the response, freeing whatever v held before (the request's own
+     * headers/body, no longer needed once the request has actually
+     * gone out). */
+    v->code = new_code;
+    festina_release_map(v->headers);
+    v->headers = new_headers;
+    free(v->body);
+    v->body = new_body;
+    v->body_len = new_body_len;
 }
 #undef FESTINA_APPEND_LIT
+
+/* ---- http -- async client (claude.md #163) ----
+ *
+ * `req.callback` non-NULL is what makes `req.send()` non-blocking: a
+ * small, lazily-spawned pool of worker threads (POSIX only for now --
+ * see this file's own top-of-file note on Windows http's own staged
+ * rollout; a Windows program simply gets the ordinary blocking
+ * behavior regardless of `callback`, a clear documented limitation
+ * rather than a silent difference nobody could predict) does the
+ * ACTUAL blocking work (reusing festina_http_send_client entirely
+ * unchanged -- every connect/TLS/parse detail stays in ONE place),
+ * while the callback itself only ever runs on the MAIN thread, from
+ * festina_run_http_loop's own per-iteration drain step -- never from
+ * a worker thread directly. That split is load-bearing, not a style
+ * choice: arbitrary Festina code (the callback body) touches
+ * refcounts and globals that are correct ONLY because exactly one
+ * thread ever runs generated Festina code at all; running it from a
+ * worker would reopen every race this runtime's single-threaded
+ * design exists to avoid.
+ *
+ * A network failure inside festina_http_send_client throws
+ * (claude.md #162) -- caught HERE, on the worker's own thread, via a
+ * hand-written __builtin_setjmp frame (verified directly, with a
+ * standalone two-thread harness, to interoperate correctly with
+ * festina_throw's own __builtin_longjmp before this went anywhere
+ * near the real runtime -- see festina_runtime.c's own
+ * g_festina_catch_top doc comment for why that state had to become
+ * __thread-local first) rather than letting it escape across threads.
+ * A failed request still fires the callback -- there's no `try` frame
+ * left to deliver a throw TO by the time a background result comes
+ * back later -- leaving `.code` `null` (explicitly reset here, in
+ * case the literal set it to something else, which would otherwise
+ * make a failure indistinguishable from a real response) and
+ * `.toText()`/`.toBlob()` reading the failure's own message, so
+ * `if r.code == null { ... }` inside the callback is how a program
+ * tells success from failure. */
+
+#if !defined(_WIN32)
+
+#define FESTINA_HTTP_ASYNC_WORKERS 4
+
+typedef struct FestinaAsyncJob {
+    void *payload;   /* the http value, retained (see the dispatch below) */
+    struct FestinaAsyncJob *next;
+} FestinaAsyncJob;
+
+static pthread_mutex_t g_async_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_async_work_cond = PTHREAD_COND_INITIALIZER;
+static FestinaAsyncJob *g_async_queue_head = NULL;   /* work waiting for a worker */
+static FestinaAsyncJob *g_async_queue_tail = NULL;
+static FestinaAsyncJob *g_async_done_head = NULL;    /* finished, awaiting the main thread's drain */
+static FestinaAsyncJob *g_async_done_tail = NULL;
+
+static void *festina_async_worker(void *unused) {
+    (void)unused;
+    for (;;) {
+        pthread_mutex_lock(&g_async_lock);
+        while (!g_async_queue_head) pthread_cond_wait(&g_async_work_cond, &g_async_lock);
+        FestinaAsyncJob *job = g_async_queue_head;
+        g_async_queue_head = job->next;
+        if (!g_async_queue_head) g_async_queue_tail = NULL;
+        pthread_mutex_unlock(&g_async_lock);
+        job->next = NULL;
+
+        void *catch_buf[5];
+        if (__builtin_setjmp(catch_buf) == 0) {
+            festina_try_push(catch_buf);
+            festina_http_send_client(job->payload);
+            festina_try_pop();
+        } else {
+            /* festina_throw already popped the frame it's unwinding to
+             * (see festina_try_pop's own doc comment) -- nothing left
+             * to clean up here beyond collecting the message. */
+            char *msg = festina_try_error();
+            FestinaHttpValue *v = FESTINA_HTTP_FROM_PAYLOAD(job->payload);
+            v->code = FESTINA_NULL_INT;
+            free(v->body);
+            size_t mlen = strlen(msg);
+            v->body = mlen ? malloc(mlen) : NULL;
+            if (v->body) { memcpy(v->body, msg, mlen); v->body_len = (int64_t)mlen; }
+            else v->body_len = 0;
+            free(msg);
+        }
+
+        pthread_mutex_lock(&g_async_lock);
+        if (g_async_done_tail) g_async_done_tail->next = job; else g_async_done_head = job;
+        g_async_done_tail = job;
+        pthread_mutex_unlock(&g_async_lock);
+        char byte = 1;
+        ssize_t rc = write(g_async_wake_fds[1], &byte, 1);
+        (void)rc; /* the read side just needs SOMETHING to notice -- a dropped
+                   * wake byte under EAGAIN (pipe momentarily full) is harmless,
+                   * since festina_async_drain_completed drains the WHOLE done
+                   * list on every call regardless of how many wake bytes arrived */
+    }
+    return NULL; /* unreachable -- worker threads run for the life of the process */
+}
+
+/* Spawns the pool and the wake pipe exactly once, on first use -- a
+ * program that never uses `callback` never creates a single thread,
+ * even though it links this whole file (matching festina_runtime_audio.c's
+ * own "the library is linked whenever the FEATURE might be used, the
+ * thread only actually spawned once a clip really plays" shape). */
+static void festina_async_ensure_pool(void) {
+    pthread_mutex_lock(&g_async_lock);
+    if (g_async_pool_started) { pthread_mutex_unlock(&g_async_lock); return; }
+    g_async_pool_started = 1;
+    pthread_mutex_unlock(&g_async_lock);
+
+    if (pipe(g_async_wake_fds) != 0) festina_fail("out of resources starting the async http worker pool");
+    int flags = fcntl(g_async_wake_fds[0], F_GETFL, 0);
+    fcntl(g_async_wake_fds[0], F_SETFL, flags | O_NONBLOCK);
+    for (int i = 0; i < FESTINA_HTTP_ASYNC_WORKERS; i++) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, festina_async_worker, NULL) != 0) {
+            festina_fail("out of resources starting the async http worker pool");
+        }
+        pthread_detach(t); /* daemon-style -- never joined; the process exiting reclaims them */
+    }
+}
+
+/* codegen's entry point for the CLIENT form of req.send() (zero
+ * arguments) -- replaces the direct festina_http_send_client call
+ * that used to be there. The null-vs-non-null check on `callback` has
+ * to happen at RUNTIME, not compile time -- codegen has no way to
+ * know a variable's own `.callback` field's value in advance, the
+ * same reason every other http method already tolerates whatever
+ * state the value is actually in at the call site. */
+void festina_http_send_client_dispatch(void *payload) {
+    FestinaHttpValue *v = FESTINA_HTTP_FROM_PAYLOAD(payload);
+    if (!v->callback) {
+        festina_http_send_client(payload);
+        return;
+    }
+    festina_async_ensure_pool();
+    festina_retain(payload); /* survives after the caller's own scope releases its reference --
+                              * balanced by festina_release_http in the drain step below */
+    FestinaAsyncJob *job = malloc(sizeof(*job));
+    if (!job) festina_fail("out of memory queuing an async http request");
+    job->payload = payload;
+    job->next = NULL;
+    pthread_mutex_lock(&g_async_lock);
+    g_async_outstanding++;
+    if (g_async_queue_tail) g_async_queue_tail->next = job; else g_async_queue_head = job;
+    g_async_queue_tail = job;
+    pthread_mutex_unlock(&g_async_lock);
+    pthread_cond_signal(&g_async_work_cond);
+}
+
+/* Called once per festina_run_http_loop iteration (mirroring
+ * festina_fire_expired_timers's own unconditional per-iteration
+ * placement) -- runs every completed job's callback on THIS thread
+ * (the main thread), the only thread that ever runs generated Festina
+ * code. Cheap to call when nothing has completed (two NULL checks
+ * under the lock). */
+static void festina_async_drain_completed(void) {
+    if (!g_async_pool_started) return;
+    pthread_mutex_lock(&g_async_lock);
+    FestinaAsyncJob *done = g_async_done_head;
+    g_async_done_head = g_async_done_tail = NULL;
+    pthread_mutex_unlock(&g_async_lock);
+
+    char discard[64];
+    while (read(g_async_wake_fds[0], discard, sizeof(discard)) > 0) { } /* drain the pipe --
+                                                                          * O_NONBLOCK means this
+                                                                          * returns (<=0) once empty
+                                                                          * rather than blocking */
+    while (done) {
+        FestinaAsyncJob *next = done->next;
+        FestinaHttpValue *v = FESTINA_HTTP_FROM_PAYLOAD(done->payload);
+        void (*callback)(void *) = v->callback;
+        if (callback) callback(done->payload);
+        festina_release_http(done->payload);
+        free(done);
+        pthread_mutex_lock(&g_async_lock);
+        g_async_outstanding--;
+        pthread_mutex_unlock(&g_async_lock);
+        done = next;
+    }
+}
+
+#else /* _WIN32 */
+
+/* claude.md #163: Windows doesn't get the worker pool yet -- same
+ * staged rollout every other http feature in this file already has
+ * (see the top-of-file note). `callback` is simply never consulted
+ * here, so req.send() stays exactly as blocking as it always was on
+ * this platform -- a real, documented limitation, not a silent gap:
+ * see api.md. */
+void festina_http_send_client_dispatch(void *payload) {
+    festina_http_send_client(payload);
+}
+
+static void festina_async_drain_completed(void) { }
+
+#endif /* _WIN32 */
 
 /* ---- s:socket ---- */
 
@@ -1388,13 +2502,13 @@ void *festina_socket_state(void *handle) {
 void festina_socket_send_text(void *handle, const char *text) {
     FestinaConn *c = festina_conn_from_handle(handle);
     if (!c || c->mode != FESTINA_CONN_WEBSOCKET) return;
-    festina_ws_send_frame(c->fd, 0x1, text, text ? strlen(text) : 0);
+    festina_ws_send_frame(c, 0x1, text, text ? strlen(text) : 0);
 }
 
 void festina_socket_send_binary(void *handle, const void *data, int64_t len) {
     FestinaConn *c = festina_conn_from_handle(handle);
     if (!c || c->mode != FESTINA_CONN_WEBSOCKET) return;
-    festina_ws_send_frame(c->fd, 0x2, data, len > 0 ? (size_t)len : 0);
+    festina_ws_send_frame(c, 0x2, data, len > 0 ? (size_t)len : 0);
 }
 
 void festina_socket_close(void *handle) {
@@ -1402,7 +2516,7 @@ void festina_socket_close(void *handle) {
     if (!c) return;
     if (c->mode == FESTINA_CONN_WEBSOCKET) {
         uint8_t close_payload[2] = {0x03, 0xE8}; /* 1000, normal closure */
-        festina_ws_send_frame(c->fd, 0x8, close_payload, 2);
+        festina_ws_send_frame(c, 0x8, close_payload, 2);
     }
     festina_conn_teardown(c);
 }

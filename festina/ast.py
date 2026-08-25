@@ -167,6 +167,38 @@ class ForStmt(Node):
         self.column = column
 
 
+class TryStmt(Node):
+    """claude.md #157: try { ... } catch (name:text) { ... }. try_body
+    runs normally; if a throw anywhere inside it (directly, or via a
+    called function -- see festina_throw's own runtime comment for the
+    real, documented leak caveat that second case carries) reaches this
+    try before any nested try of its own catches it first, catch_body
+    runs instead, with catch_var bound to the thrown message as text.
+    Falling off the end of either body (no return/break/continue)
+    continues normally after the whole statement -- this is a plain
+    two-way branch, structurally identical to if/else, not a loop."""
+
+    def __init__(self, try_body, catch_var, catch_body, line=0, column=0):
+        self.try_body = try_body
+        self.catch_var = catch_var
+        self.catch_body = catch_body
+        self.line = line
+        self.column = column
+
+
+class ThrowStmt(Node):
+    """claude.md #157: throw <expr> -- coerced to text exactly like
+    log()/fail() (claude.md #35), then raised via festina_throw. With no
+    enclosing try/catch reachable, behaves exactly like fail(expr):
+    prints to stderr and exits(1) -- throw is a strict superset of
+    fail(), never a stricter or riskier way to end the program."""
+
+    def __init__(self, expr, line=0, column=0):
+        self.expr = expr
+        self.line = line
+        self.column = column
+
+
 class FreeStmt(Node):
     """claude.md #111: `free name` -- release whatever the binding holds
     and null the binding."""
@@ -350,6 +382,20 @@ class Call(Node):
     def __init__(self, callee, args, line=0, column=0):
         self.callee = callee
         self.args = args
+        self.line = line
+        self.column = column
+
+
+class TypeArg(Node):
+    """claude.md #159: wraps a parsed type expression standing in an
+    ast.Call's own `args` list -- exclusively .toStruct(T)/.toArr(T)'s
+    own single "argument", which is a TYPE, not a value expression.
+    Lets semantic.py/codegen.py tell this apart from an ordinary
+    expression argument with a plain isinstance check, the same way
+    every other node kind in `args` already would be."""
+
+    def __init__(self, type_expr, line=0, column=0):
+        self.type_expr = type_expr
         self.line = line
         self.column = column
 

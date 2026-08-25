@@ -1680,21 +1680,51 @@ static void festina_handle_window_event(const FestinaWindowEvent *ev) {
  * of its own. */
 void festina_run_event_loop(void) {
     g_should_stop_looping = 0;
-    while (!g_should_stop_looping) {
+    /* claude.md #161: checked once per iteration alongside
+     * g_should_stop_looping -- the identical shape a real window
+     * close (FESTINA_WEVENT_CLOSE) already uses to end this same
+     * loop, just from a different trigger (a signal, not a window
+     * event). A short `festina_window_events_wait` timeout (this loop
+     * already recomputes one every pass for timers) means a Ctrl-C/
+     * SIGTERM is noticed within one timer tick even with no timer at
+     * all active (timeout defaults to -1/block-forever only when
+     * nothing else is pending, which festina_window_events_wait's own
+     * backend still wakes from on the interrupting signal itself,
+     * same as festina_run_http_loop's poll() does). */
+    while (!g_should_stop_looping && !festina_shutdown_requested()) {
         double earliest = festina_next_timer_deadline();
         double timeout = -1.0;
         if (earliest >= 0.0) {
             timeout = earliest - festina_now_seconds();
             if (timeout < 0.0) timeout = 0.0;
         }
+        /* claude.md #165: this loop's own lifetime is governed by the
+         * window (it only ever exits on a real close or a shutdown
+         * signal), so an outstanding blob/img/aud background load
+         * never needs to keep it ALIVE the way it does for the other
+         * two loops -- it only needs a bounded wait so a completed
+         * load's callback fires promptly rather than waiting for the
+         * next real window/timer event. */
+        if (festina_async_io_outstanding() > 0 && (timeout < 0.0 || timeout > 0.02)) {
+            timeout = 0.02;
+        }
         festina_window_events_wait(timeout);
         festina_window_events_drain(festina_handle_window_event);
         festina_fire_expired_timers();
+        festina_async_io_drain();
     }
     cairo_surface_destroy(g_backing_surface);
     g_backing_surface = NULL;
     festina_window_close();
     g_window_open = 0;
+    /* claude.md #161: a real window close (g_should_stop_looping) just
+     * falls through to whatever main() does next (db_close, ret 0) --
+     * unchanged, exactly as before this entry. A SHUTDOWN signal
+     * instead runs the same clean-exit path close(code) already uses,
+     * so a declared `on exit(code:int)` handler still fires. */
+    if (festina_shutdown_requested()) {
+        festina_program_exit(festina_shutdown_exit_code());
+    }
 }
 
 /* ---- the X11 window backend -- claude.md #123's seam, implemented ----
