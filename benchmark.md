@@ -59,6 +59,11 @@ python3 benchmarks/canvas/run_canvas_benchmark.py --update-doc
 # The MonoGame side needs a .NET SDK and, on first run, network access
 # to restore its NuGet package; without either it is skipped with a note
 # rather than failing the run.
+
+python3 benchmarks/http/run_http_benchmarks.py                # the HTTP server comparison
+python3 benchmarks/http/run_http_benchmarks.py --update-doc
+
+# Needs `wrk` on PATH (not a project dependency -- apt/brew install wrk).
 ```
 
 The runner skips any language toolchain not installed rather than
@@ -197,11 +202,11 @@ _Last run: 2026-08-24 on this machine -- see benchmark.md's "Methodology" sectio
   page by orders of magnitude. The row is worth having because headless
   rendering with no GPU is a real situation — CI, a build server, a
   container — and it is worth reading only with that sentence attached.
-- These are intentionally small, fast benchmarks so they can be re-run
-  on every change worth checking, not a comprehensive suite (no I/O, no
-  concurrency, no realistic mixed workload) — see [todo.md](todo.md)
-  for what's still missing from Festina itself that would make a
-  broader comparison meaningful (HTTP, for one).
+- These five are intentionally small, fast benchmarks so they can be
+  re-run on every change worth checking, not a comprehensive suite (no
+  concurrency, no realistic mixed workload). I/O now has its own
+  section below — see [HTTP](#http-festina-vs-rust-vs-go-vs-bun) —
+  once claude.md #151/#152 gave Festina an actual server to measure.
 
 ## Canvas: Festina vs an HTML `<canvas>` vs MonoGame
 
@@ -280,3 +285,93 @@ as black here against the browser harness's own opaque white fill,
 which the comparison mistook for a real rendering difference until it
 started compositing both sides onto the same white background first.
 <!-- CANVAS_RESULTS_END -->
+
+## HTTP: Festina vs Rust vs Go vs Bun
+
+Four servers (source in [`benchmarks/http/`](benchmarks/http/)), each
+answering the same two routes -- `/` (a fixed plaintext body) and
+`/json` (a small JSON body) -- load-tested with
+[`wrk`](https://github.com/wg/wrk) (not a project dependency; installed
+separately, `apt install wrk`/`brew install wrk`).
+
+**Equivalent logic, not equivalent idiom, the same rule the five
+programs above already follow.** Festina's HTTP server
+(`festina_runtime_http.c`, claude.md #151) is deliberately
+single-threaded (one connection serviced at a time) and has no
+keep-alive (every response closes the connection -- api.md's HTTP
+Limitations). Rust's and Go's servers here are hand-rolled raw-socket
+implementations with a single-threaded, sequential accept loop and the
+same close-after-response behavior -- not `hyper`/`net/http`'s own
+default (multi-threaded, keep-alive-capable) servers, which would be
+measuring a mature framework's concurrency model against Festina's
+single-threaded one rather than the same connection-handling logic in
+four languages. Bun is the one exception: it uses `Bun.serve()`, its
+own native HTTP implementation, since there is no reason to hand-roll
+sockets in a runtime that ships a fast one already (the same "each
+language uses its own normal toolchain" rule the Methodology above
+states) -- with `Connection: close` set explicitly on every response so
+it closes each connection the same way the other three do, rather than
+its own keep-alive support doing the winning here.
+
+Each `wrk` run: 4 threads, 50 open connections, 5 seconds, against one
+route at a time (a JIT-inclined runtime like Bun gets no separate
+warmup here — `wrk`'s own 5-second window includes whatever warmup
+happens inside it, the same "the timed window is the real number"
+approach as the process-startup benchmarks above, since a resident
+server process outlives any of them anyway).
+
+Reproduce locally:
+
+```bash
+python3 benchmarks/http/run_http_benchmarks.py
+python3 benchmarks/http/run_http_benchmarks.py --update-doc
+python3 benchmarks/http/run_http_benchmarks.py --duration 10s --connections 100 --threads 8
+```
+
+<!-- HTTP_BENCHMARK_RESULTS_START -->
+_Last run: 2026-08-25 on this machine, `wrk -t4 -c50 -d5s` per route -- see benchmark.md's HTTP "Methodology" for how to reproduce; absolute numbers vary by hardware and load, relative ordering is the point._
+
+### `plaintext` (`/`)
+
+| Language | Requests/sec | Avg latency | Transfer/sec |
+|---|---|---|---|
+| Festina | 17,044 | 2.84 ms | 1.66 MB/s |
+| Rust | 45,993 | 0.87 ms | 4.25 MB/s |
+| Go | 21,049 | 2.13 ms | 1.95 MB/s |
+| Bun | 20,909 | 2.19 ms | 2.67 MB/s |
+
+### `json` (`/json`)
+
+| Language | Requests/sec | Avg latency | Transfer/sec |
+|---|---|---|---|
+| Festina | 17,545 | 2.70 ms | 2.04 MB/s |
+| Rust | 42,568 | 0.97 ms | 4.75 MB/s |
+| Go | 21,785 | 2.07 ms | 2.43 MB/s |
+| Bun | 21,636 | 2.26 ms | 3.18 MB/s |
+
+<!-- HTTP_BENCHMARK_RESULTS_END -->
+
+### Reading these numbers
+
+- This measures connection-accept + request-parse + respond throughput
+  under load from one client machine talking to one server process on
+  the same machine (no network hop, no TLS) -- not a claim about
+  production capacity, the same disclaimer every other benchmark on
+  this page already carries.
+- **`/json`** exercises more than `/`: Festina's route builds a struct
+  and renders it through the same JSON-via-`.toText()` path every other
+  container response already uses (claude.md #151), not a hand-built
+  string the way `/` sends one -- so a gap between the two routes for
+  Festina specifically reflects that serialization cost, not connection
+  handling.
+- Rust's and Go's numbers here are *not* what those languages'
+  idiomatic HTTP stacks would report -- seeing "Rust is only Nx faster
+  than Festina at HTTP" from this section should be read as "at
+  matching, single-threaded, no-keep-alive connection handling," not as
+  a claim about `hyper`/`axum` or `net/http` in general, which support
+  keep-alive and would show a very different number here purely from
+  not reopening a TCP connection on every single request.
+- No WebSocket throughput benchmark exists yet -- `on message` traffic
+  has a very different shape (persistent connections, small frequent
+  frames) from a request/response load test, and would need its own
+  methodology rather than reusing `wrk`'s HTTP-request model.
