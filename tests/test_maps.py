@@ -94,6 +94,27 @@ class TestMapLiteral:
         program = parser.parse(source)
         semantic.analyze(program)
 
+    def test_mixed_value_types_in_a_map_literal_is_a_compile_error(self, parser, semantic, errors):
+        # claude.md #153: a real, pre-existing gap first noticed (and
+        # left open) by claude.md #151's own testing -- a mismatched
+        # value literal like this used to pass semantic analysis
+        # silently and reach codegen, which then emitted invalid LLVM
+        # IR (a raw i64 where a ptr was required, or vice versa)
+        # instead of a clean compile error. Deliberately no declared
+        # target type here (a bare `var`-less literal has none to check
+        # against either) -- this is MapLit's own inference catching it,
+        # the same as ArrayLit's mirrored check just above this class.
+        program = parser.parse("map[int] m = {'a': 1, 'b': 'two'}")
+        with pytest.raises(errors.CompileError, match="map literal values must all be the same type"):
+            semantic.analyze(program)
+
+    def test_null_values_do_not_count_as_a_mismatch(self, parser, semantic):
+        # Mirrors ArrayLit's own null-tolerant behavior (e.g. `[5, null]`
+        # against a declared arr[int]) -- a null entry carries no
+        # concrete type to conflict with anything.
+        program = parser.parse("map[text] m = {'a': null, 'b': 'x', 'c': null}")
+        semantic.analyze(program)
+
 
 class TestMapIndexing:
     """claude.md #72: npcHealths['npc1'] / npcHealths[key] -- read and

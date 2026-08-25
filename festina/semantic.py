@@ -803,7 +803,25 @@ def analyze(program, filename="<string>"):
             # ArrayLit's own convention exactly: None (needs a declared
             # type for context, e.g. an empty `{}`) if there's nothing
             # to infer it from.
+            #
+            # claude.md #153: value_type used to just get overwritten on
+            # every entry with nothing checking it against the PREVIOUS
+            # entry's own answer -- so a mixed-value literal like
+            # {'a': 1, 'b': 'two'} passed this check silently and reached
+            # codegen, which then emitted invalid LLVM IR (a raw i64
+            # where a ptr was required, or vice versa) instead of a clean
+            # compile error. A real, pre-existing gap, first found and
+            # left open by claude.md #151's own testing (its own
+            # writeup: "map literals never check that every entry shares
+            # one value type... left for its own separate round").
+            # concrete_value_type mirrors ArrayLit's concrete_type above
+            # exactly -- tracks the first non-null value's type purely to
+            # catch a genuine mismatch; value_type itself is left
+            # tracking the *last* entry's type, unchanged from before
+            # this fix, since that's what feeds the returned MapType and
+            # existing null-value corner cases already depend on it.
             value_type = None
+            concrete_value_type = None
             # Duplicate-literal-key detection: "last value wins" for a
             # repeated key (claude.md #72) is fine as a runtime rule when
             # the key is a general text expression -- there's no way to
@@ -836,6 +854,17 @@ def analyze(program, filename="<string>"):
                         )
                     seen_literal_keys[key_expr.value] = key_expr
                 value_type = infer(val_expr, scope)
+                if value_type is not None and value_type is not NULL:
+                    if concrete_value_type is None:
+                        concrete_value_type = value_type
+                    elif value_type != concrete_value_type:
+                        raise CompileError(
+                            f"map literal values must all be the same type, "
+                            f"found {types_mod.type_name(concrete_value_type)} and "
+                            f"{types_mod.type_name(value_type)}",
+                            file=filename, line=getattr(val_expr, "line", 0), column=getattr(val_expr, "column", 0),
+                            category="invalid operand type",
+                        )
             return types_mod.MapType(value_type) if value_type is not None else None
         if isinstance(expr, ast.ArrowFuncExpr):
             # claude.md #142: `void (arg:text) => log(arg)` compiles to
