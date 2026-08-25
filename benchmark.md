@@ -335,24 +335,38 @@ _Last run: 2026-08-25 on this machine, `wrk -t4 -c50 -d5s` per route -- see benc
 
 | Language | Requests/sec | Avg latency | Transfer/sec |
 |---|---|---|---|
-| Festina | 17,044 | 2.84 ms | 1.66 MB/s |
-| Rust | 45,993 | 0.87 ms | 4.25 MB/s |
-| Go | 21,049 | 2.13 ms | 1.95 MB/s |
-| Bun | 20,909 | 2.19 ms | 2.67 MB/s |
+| Festina | 35,384 | 1.26 ms | 3.44 MB/s |
+| Rust | 39,409 | 1.01 ms | 3.65 MB/s |
+| Go | 21,627 | 2.07 ms | 2.00 MB/s |
+| Bun | 19,545 | 2.34 ms | 2.50 MB/s |
 
 ### `json` (`/json`)
 
 | Language | Requests/sec | Avg latency | Transfer/sec |
 |---|---|---|---|
-| Festina | 17,545 | 2.70 ms | 2.04 MB/s |
-| Rust | 42,568 | 0.97 ms | 4.75 MB/s |
-| Go | 21,785 | 2.07 ms | 2.43 MB/s |
-| Bun | 21,636 | 2.26 ms | 3.18 MB/s |
+| Festina | 32,526 | 1.75 ms | 3.78 MB/s |
+| Rust | 38,865 | 1.04 ms | 4.34 MB/s |
+| Go | 22,453 | 2.00 ms | 2.51 MB/s |
+| Bun | 14,374 | 3.46 ms | 2.11 MB/s |
 
 <!-- HTTP_BENCHMARK_RESULTS_END -->
 
 ### Reading these numbers
 
+- **claude.md #155 roughly doubled Festina's own numbers here** (from
+  ~17.6k/17.8k req/s to ~35k/32.5k) -- found by reviewing
+  `festina_runtime_http.c` specifically for this benchmark's own sake,
+  not by guessing at likely hot spots. The single biggest lever:
+  `festina_http_send` used to write a response as 4-5 separate
+  `send()` calls (status line, each extra header, `Content-Length`,
+  `Connection: close`, then the body); with `TCP_NODELAY` set (Nagle's
+  algorithm disabled for low latency), every one of those was its own
+  TCP segment, not just its own syscall. Coalescing the status
+  line/headers into one buffer sent in a single call, plus removing a
+  malloc/free pair the event loop used to pay on every single tick,
+  closed most of the gap to Go/Bun and pulled Festina from behind both
+  to ahead of both, within ~10% of Rust's raw-socket number. Full
+  writeup in claude.md #155.
 - This measures connection-accept + request-parse + respond throughput
   under load from one client machine talking to one server process on
   the same machine (no network hop, no TLS) -- not a claim about
