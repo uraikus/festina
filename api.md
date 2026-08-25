@@ -2222,7 +2222,35 @@ close(1)          // prints "exiting with 1", then exits with status 1
 
 With no `on exit` handler declared, `close(code)` just exits.
 
-## `try` / `catch` / `throw`
+## `troubleshoot()` — structured logging
+
+```festina
+troubleshoot('user_login_failed', {'user_id': '7', 'reason': 'bad_password'})
+// {"timestamp":"2026-08-25T16:18:47Z","level":"info","event":"user_login_failed","fields":{"user_id":"7","reason":"bad_password"}}
+```
+
+`troubleshoot(event, fields)` prints one JSON line to stdout — a
+`timestamp` (UTC, RFC3339-ish), a fixed `"level":"info"`, `event`
+(any type, coerced to text like `log()`/`fail()`), and `fields`
+(**must be `map[text]`** — string tags, not an arbitrary value; wrap
+whatever you need to attach as text first). Meant to be piped into a
+real log aggregator rather than read by eye — every field is always
+present and always in the same shape, unlike `log()`. Both arguments
+are required; pass `{}` for `fields` if there's nothing to attach.
+
+`fail(message)` still works exactly as it always has (unchanged, and
+still what an uncaught `throw` produces too — see
+[try/catch/throw](#try--catch--throw) below). `fail(message, fields)`
+is the structured form: a JSON line to stderr instead of the plain
+`fail: <message>` line — `"level":"error"`, key `"message"` rather
+than `"event"` — then `exit(1)`, same as always:
+
+```festina
+fail('db connection lost', {'host': 'db1', 'retry': 'no'})
+// {"timestamp":"2026-08-25T16:18:57Z","level":"error","message":"db connection lost","fields":{"host":"db1","retry":"no"}}
+```
+
+## <a name="try--catch--throw"></a>`try` / `catch` / `throw`
 
 ```festina
 void func risky(x:int) {

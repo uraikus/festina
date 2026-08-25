@@ -35,6 +35,14 @@ void festina_log_text(const char *v);
 /* claude.md #42: fail() -- prints to stderr and exits(1). */
 void festina_fail(const char *msg);
 
+/* claude.md #158: troubleshoot(event, fields) -- one structured JSON
+ * line to stdout; fail(message, fields) -- the structured 2-argument
+ * form of fail(), a JSON line to stderr then exit(1). `fields_json` is
+ * already-rendered JSON text (codegen's own _to_text on a map[text]
+ * argument). */
+void festina_troubleshoot(const char *event, const char *fields_json);
+void festina_fail_structured(const char *msg, const char *fields_json);
+
 /* claude.md #157: try/catch/throw. See festina_runtime.c's own comment
  * on this whole group for the setjmp/longjmp design and its one
  * documented leak caveat (a throw reached through a called function).

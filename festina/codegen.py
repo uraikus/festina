@@ -1138,6 +1138,11 @@ class CodeGen:
             "declare void @festina_throw(ptr)",
             "declare void @festina_log_text(ptr)",
             "declare void @festina_fail(ptr)",
+            # claude.md #158: troubleshoot()/fail()'s structured form --
+            # both assemble a JSON envelope around already-rendered
+            # text (codegen's own _to_text on each argument).
+            "declare void @festina_troubleshoot(ptr, ptr)",
+            "declare void @festina_fail_structured(ptr, ptr)",
             "declare ptr @festina_str_from_int(i64)",
             "declare ptr @festina_str_from_float(double)",
             "declare ptr @festina_str_from_bool(i8)",
@@ -5459,6 +5464,60 @@ class CodeGen:
         if vtype == TEXT and self._is_owning_text_source(source_expr):
             lines.append(f"  call void @free(ptr {val})")
 
+    def _emit_json_arg_text(self, arg_expr, env, lines, expected_type=None):
+        """claude.md #158: evaluates arg_expr and renders it to text via
+        _to_text -- used by troubleshoot()/fail()'s structured forms to
+        get a JSON-safe piece for whatever type was passed (the exact
+        same conversion log()'s own struct/map/blob path already uses),
+        since (unlike log()'s primitive fast path, which prints an
+        int/float/bool directly with no text conversion at all) every
+        one of these needs a real text representation to splice into
+        the surrounding JSON envelope.
+
+        Returns (text_val, arg_expr, val, vtype) -- text_val is ready to
+        pass to whatever runtime call actually consumes it; the other
+        three are exactly what _cleanup_json_arg_text needs, deferred to
+        its own separate call so the caller controls WHEN cleanup runs
+        relative to that consuming call (seemingly obvious, but a real
+        bug here -- freeing text_val inside this same method, before
+        the caller had even emitted the call actually using it, was
+        caught directly: real garbage bytes in troubleshoot()'s own
+        stdout output rather than the rendered fields JSON -- see
+        _cleanup_json_arg_text's own comment)."""
+        if expected_type is not None:
+            # claude.md #158: threads a fixed expected type (always
+            # map[text] for troubleshoot()/fail()'s own fields argument)
+            # into an ArrayLit/MapLit exactly the way a var declaration's
+            # own init already does -- without this, `troubleshoot('x',
+            # {})` couldn't resolve an empty literal's value type at
+            # all, and `troubleshoot('x', {'a': 'b'})` would infer a
+            # plain map[T] with no connection to this expected shape.
+            val, vtype = self._emit_value_for(arg_expr, env, lines, expected_type)
+        else:
+            val, vtype = self._emit_expr(arg_expr, env, lines)
+        text_val = self._to_text(val, vtype, lines)
+        return text_val, arg_expr, val, vtype
+
+    def _cleanup_json_arg_text(self, text_val, arg_expr, val, vtype, lines):
+        """claude.md #158: the OTHER half of _emit_json_arg_text --
+        called by troubleshoot()'s own codegen AFTER emitting the
+        festina_troubleshoot() call that actually consumes text_val
+        (never by fail(), which always exits right after either form,
+        so, matching every other fail()/exit() call site's own
+        established "dead code past an exiting call" precedent, no
+        cleanup is emitted there at all). Frees text_val unless it's a
+        bare alias of an already-owned text value (_to_text is a no-op
+        passthrough there, so text_val IS val -- freeing it would free
+        something the original binding still owns and will free at its
+        own scope-exit), then releases the ORIGINAL value's own
+        reference via _release_owned_receiver (always safe to call
+        regardless of type -- it no-ops for anything that isn't
+        refcounted, e.g. plain text/int/float/bool) -- exactly the
+        cleanup log()'s own struct/map/blob argument path already does."""
+        if vtype != TEXT or self._is_owning_text_source(arg_expr):
+            lines.append(f"  call void @free(ptr {text_val})")
+        self._release_owned_receiver(arg_expr, val, vtype, lines)
+
     def _free_regex_temp(self, source_expr, val, vtype, lines):
         """claude.md #85: the regex counterpart to _free_text_temp --
         frees a regex_t compiled by a runtime `regex(...)` call and used
@@ -6990,9 +7049,41 @@ class CodeGen:
                 self._free_text_temp(expr.args[0], val, vtype, lines)
                 return "0", None
             if name == "fail":
-                val, vtype = self._emit_expr(expr.args[0], env, lines)
-                text_val = self._to_text(val, vtype, lines)
-                lines.append(f"  call void @festina_fail(ptr {text_val})")
+                # claude.md #158: fail(message) is unchanged (still the
+                # exact "fail: <message>" line an uncaught throw also
+                # produces -- claude.md #157). fail(message, fields), the
+                # new structured form, is a genuinely different runtime
+                # call/output shape, not a superset -- see
+                # festina_fail_structured's own comment. Neither form
+                # calls _cleanup_json_arg_text for either argument: both
+                # always exit(1) right after, so, matching every other
+                # fail()/exit() call site's own established precedent,
+                # anything past the call would be dead code.
+                text_val, *_ = self._emit_json_arg_text(expr.args[0], env, lines)
+                if len(expr.args) == 2:
+                    fields_json, *_ = self._emit_json_arg_text(
+                        expr.args[1], env, lines, expected_type=types_mod.MapType(TEXT))
+                    lines.append(f"  call void @festina_fail_structured(ptr {text_val}, ptr {fields_json})")
+                else:
+                    lines.append(f"  call void @festina_fail(ptr {text_val})")
+                return "0", None
+            if name == "troubleshoot":
+                # claude.md #158: unlike fail(), this always returns
+                # normally, so both arguments' own rendered-text buffers
+                # (and, for the fields argument, the original map[text]
+                # value's own reference) need real cleanup -- but only
+                # AFTER the festina_troubleshoot() call that actually
+                # consumes text_val/fields_json, never before (see
+                # _emit_json_arg_text's own comment on the real bug that
+                # ordering mistake caused).
+                event_text, event_expr, event_val, event_vtype = \
+                    self._emit_json_arg_text(expr.args[0], env, lines)
+                fields_json, fields_expr, fields_val, fields_vtype = \
+                    self._emit_json_arg_text(expr.args[1], env, lines,
+                                              expected_type=types_mod.MapType(TEXT))
+                lines.append(f"  call void @festina_troubleshoot(ptr {event_text}, ptr {fields_json})")
+                self._cleanup_json_arg_text(event_text, event_expr, event_val, event_vtype, lines)
+                self._cleanup_json_arg_text(fields_json, fields_expr, fields_val, fields_vtype, lines)
                 return "0", None
             if name == "close":
                 # claude.md #131: exits the program with `code`, running

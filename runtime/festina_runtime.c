@@ -139,6 +139,74 @@ void festina_fail(const char *msg) {
     exit(1);
 }
 
+/* ---- troubleshoot() / structured fail() -- claude.md #158 ----
+ *
+ * A UTC RFC3339-ish timestamp ("...Z", second precision -- structured
+ * log consumers expect UTC, unlike formatTime's own local-time
+ * convention, claude.md #93), shared by both functions below. */
+static void festina_write_log_timestamp(char *buf, size_t n) {
+    time_t now = time(NULL);
+    struct tm parts;
+#ifdef _WIN32
+    gmtime_s(&parts, &now);
+#else
+    gmtime_r(&now, &parts);
+#endif
+    strftime(buf, n, "%Y-%m-%dT%H:%M:%SZ", &parts);
+}
+
+/* claude.md #158: troubleshoot(event, fields) -- one JSON line to
+ * stdout: {"timestamp":"...","level":"info","event":"...","fields":{...}}.
+ * `fields_json` arrives ALREADY RENDERED as valid JSON text -- codegen
+ * calls the exact same container-to-JSON path .toText() already uses
+ * for any map[T]/arr[T]/struct (see codegen.py's own _json_fn_for via
+ * _to_text), so this function never inspects a Festina value directly,
+ * only assembles the surrounding envelope around two already-text
+ * pieces. NULL-safe on both (an empty/missing fields map renders as
+ * the JSON object "{}"). */
+void festina_troubleshoot(const char *event, const char *fields_json) {
+    char ts[32];
+    festina_write_log_timestamp(ts, sizeof(ts));
+    void *sb = festina_sb_new();
+    festina_sb_append(sb, "{\"timestamp\":\"");
+    festina_sb_append(sb, ts);
+    festina_sb_append(sb, "\",\"level\":\"info\",\"event\":");
+    festina_sb_append_json_text(sb, event);
+    festina_sb_append(sb, ",\"fields\":");
+    festina_sb_append(sb, fields_json ? fields_json : "{}");
+    festina_sb_append(sb, "}");
+    char *line = festina_sb_finish(sb);
+    printf("%s\n", line);
+    fflush(stdout);
+    free(line);
+}
+
+/* claude.md #158: fail(message, fields) -- the 2-argument structured
+ * form. Unlike plain fail(message)'s stable "fail: <message>\n" line
+ * (unchanged, still what an uncaught throw also produces -- claude.md
+ * #157's own "throw is never riskier than fail()" contract depends on
+ * that staying exactly as it is), this prints a full JSON envelope to
+ * stderr instead -- "level":"error", key "message" rather than
+ * "event" (a structured error line reads as an event announcing
+ * itself, not the failure it actually is) -- then exits(1), same as
+ * every other fail() path. */
+void festina_fail_structured(const char *msg, const char *fields_json) {
+    char ts[32];
+    festina_write_log_timestamp(ts, sizeof(ts));
+    void *sb = festina_sb_new();
+    festina_sb_append(sb, "{\"timestamp\":\"");
+    festina_sb_append(sb, ts);
+    festina_sb_append(sb, "\",\"level\":\"error\",\"message\":");
+    festina_sb_append_json_text(sb, msg);
+    festina_sb_append(sb, ",\"fields\":");
+    festina_sb_append(sb, fields_json ? fields_json : "{}");
+    festina_sb_append(sb, "}");
+    char *line = festina_sb_finish(sb);
+    fprintf(stderr, "%s\n", line);
+    free(line); /* harmless either way -- exit() is next -- kept for hygiene */
+    exit(1);
+}
+
 /* ---- try/catch/throw -- claude.md #157 ----
  *
  * setjmp/longjmp exception emulation -- but NOT the classic "wrap

@@ -82,7 +82,7 @@ _REMOVED_BUILTINS = {
 }
 
 BUILTIN_FUNCTIONS = {
-    "log", "fail", "sqlite",
+    "log", "fail", "troubleshoot", "sqlite",
     "drawRect", "drawCircle", "drawText", "drawImage",
     # claude.md #133: drawPixel (with drawRect's own optional trailing
     # `color` argument, see _BUILTIN_SIGNATURE_ALTERNATES below) and
@@ -1483,6 +1483,74 @@ def analyze(program, filename="<string>"):
                         category="invalid function argument type",
                     )
                 return _BOOL
+            if name in ("fail", "troubleshoot"):
+                # claude.md #158: fail(message) is unchanged (1 argument,
+                # any type -- coerced to text at codegen, same as
+                # log()'s own single argument always has been). Both
+                # fail(message, fields) and troubleshoot(event, fields)
+                # add/require a second argument that must be map[text]
+                # specifically -- reusing the exact JSON rendering
+                # map[T]'s own .toText() already has (codegen's
+                # _to_text) rather than inventing a second one, at the
+                # cost of restricting `fields` to string-valued tags
+                # rather than accepting any container shape. `.amortized`
+                # is deliberately ignored here (an `amor map[text]`
+                # fields argument works exactly the same way a plain one
+                # does -- there's nothing about amortized growth that
+                # matters once the map is just being rendered to JSON).
+                min_args = 1 if name == "fail" else 2
+                if len(expr.args) < min_args or len(expr.args) > 2:
+                    shape = "1 or 2" if name == "fail" else "2"
+                    raise CompileError(
+                        f"{name}() expects {shape} argument(s), got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                infer(expr.args[0], scope)  # message/event: any type, coerced to text
+                if len(expr.args) == 2:
+                    fields_expr = expr.args[1]
+                    if isinstance(fields_expr, ast.MapLit):
+                        # claude.md #156's own identical bypass, same
+                        # reason: MapLit's generic infer() always
+                        # returns a plain, non-context-aware map[T] (or,
+                        # for an empty `{}`, no usable type at all --
+                        # infer() has nothing to generalize a value type
+                        # FROM), so `troubleshoot('x', {})` or
+                        # `troubleshoot('x', {'a': 'b'})` would always
+                        # fail the check below despite being exactly
+                        # right. Validated directly against map[text]
+                        # instead of through generic inference.
+                        for key_expr, val_expr in fields_expr.entries:
+                            key_type = infer(key_expr, scope)
+                            if key_type is not None and key_type is not NULL and key_type != _TEXT:
+                                raise CompileError(
+                                    f"{name}()'s fields map key must be text, found "
+                                    f"{types_mod.type_name(key_type)}",
+                                    file=filename, line=getattr(key_expr, "line", 0),
+                                    column=getattr(key_expr, "column", 0),
+                                    category="invalid operand type",
+                                )
+                            val_type = infer(val_expr, scope)
+                            if (val_type is not None and val_type is not NULL
+                                    and val_type != _TEXT):
+                                raise CompileError(
+                                    f"{name}()'s fields map value expects text, found "
+                                    f"{types_mod.type_name(val_type)}",
+                                    file=filename, line=getattr(val_expr, "line", 0),
+                                    column=getattr(val_expr, "column", 0),
+                                    category="invalid operand type",
+                                )
+                    else:
+                        fields_type = infer(fields_expr, scope)
+                        if not (isinstance(fields_type, types_mod.MapType)
+                                and fields_type.value == _TEXT):
+                            raise CompileError(
+                                f"{name}()'s fields argument expects map[text], found "
+                                f"{types_mod.type_name(fields_type) if fields_type is not None else 'null'}",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
+                return None
             if name in BUILTIN_FUNCTIONS:
                 sig = _BUILTIN_SIGNATURES.get(name)
                 alternates = _BUILTIN_SIGNATURE_ALTERNATES.get(name)
