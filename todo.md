@@ -40,20 +40,6 @@ same as macOS's own sanitizer tier is explicitly out of scope).
 
 ## Language & standard library
 
-- **Map literals don't check that every value shares one type.**
-  `{'a': 1, 'b': 'two'}` passes semantic analysis (`_infer_member`'s
-  MapLit branch takes each entry's value type from whichever one was
-  inferred LAST, the same "only the last element's type survives"
-  convention array literals also use for their own value type -- but
-  unlike ArrayLit, nothing here re-checks every OTHER entry against
-  it) and reaches codegen, which then emits genuinely invalid LLVM IR
-  (a raw `i64` operand where a `ptr` is required, or vice versa,
-  depending on which types were mixed) -- an internal compiler error,
-  not a clean "map values must share one type" diagnostic. Found
-  incidentally while testing claude.md #151's own `req.send()`, not
-  something that feature caused; fixing it is ArrayLit's own existing
-  per-entry check (claude.md #63/#65), applied to MapLit's value type
-  the identical way.
 - **Media formats** stay PNG/JPEG + WAV/MP3, deliberately (claude.md
   #101): each new format is a new system dependency for every machine
   that compiles a media-using program. Revisit only with a concrete

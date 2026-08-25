@@ -305,9 +305,136 @@ typedef struct {
 } FestinaMapBlock;
 
 static FestinaConn *g_conns = NULL;
-static int64_t g_conn_count = 0;
+static int64_t g_conn_count = 0;       /* high-water mark: slots [0, g_conn_count) are
+                                         * valid array bounds -- some inside may be
+                                         * dead and sitting on the free list below */
 static int64_t g_conn_capacity = 0;
 static int64_t g_next_conn_id = 1;
+
+/* Dead slots recycled by index rather than compacted out -- a slot's
+ * index has to stay stable for as long as its connection is alive
+ * (the hash index below stores indices, not pointers, precisely so a
+ * table realloc() elsewhere never invalidates it; a moving-compaction
+ * pass would have the same problem for the index it would need to
+ * rewrite on every compaction). A LIFO free list (last torn down,
+ * first reused) keeps cache locality reasonable under steady churn. */
+static int64_t *g_conn_free_slots = NULL;
+static int64_t g_conn_free_count = 0;
+static int64_t g_conn_free_capacity = 0;
+
+/* claude.md #152 (Windows-round follow-up): conn_id -> slot index,
+ * so festina_conn_by_id below is O(1) amortized instead of an O(live
+ * connections) linear scan on every single lookup -- and every public
+ * festina_http_.../festina_socket_... call does at least one such
+ * lookup, several per request once the handler touches req/s more
+ * than once. A small open-addressing table (linear probing, tombstone
+ * deletion) rather than reaching for a library hash map: conn_id is
+ * already a plain int64_t key with no string hashing or collision
+ * behavior to get subtly wrong, and this project has no existing
+ * generic hash-map runtime helper to reuse (map[T]'s own
+ * implementation lives in codegen-emitted IR, not C, and is keyed by
+ * text, not int64_t, so it isn't a fit either). conn_id == -1 marks an
+ * empty slot, -2 a tombstone (conn_id itself is always >= 1, so
+ * neither collides with a real id) -- kept apart so a probe sequence
+ * broken by a deletion still finds keys that were inserted past it. */
+#define FESTINA_CONN_INDEX_EMPTY (-1)
+#define FESTINA_CONN_INDEX_TOMBSTONE (-2)
+
+typedef struct {
+    int64_t conn_id;
+    int64_t slot;
+} FestinaConnIndexEntry;
+
+static FestinaConnIndexEntry *g_conn_index = NULL;
+static int64_t g_conn_index_capacity = 0;
+/* occupied + tombstoned entries -- tombstones count toward the grow
+ * threshold too (an unbounded run of insert/delete pairs would
+ * otherwise fill a table with tombstones and degrade every probe to
+ * O(capacity) without ever tripping a grow), and get swept away for
+ * free the next time festina_conn_index_grow rebuilds the table. */
+static int64_t g_conn_index_used = 0;
+
+static uint64_t festina_conn_index_hash(int64_t conn_id) {
+    /* A cheap integer mixer (splitmix64's own multiplier), not a
+     * plain modulo -- conn_id is sequential, and sequential keys
+     * modulo a power-of-two capacity happen to spread fine today, but
+     * that's a coincidence of this specific key sequence, not a
+     * guarantee the hash function should be relying on. */
+    uint64_t x = (uint64_t)conn_id;
+    x *= 0x9E3779B97F4A7C15ULL;
+    x ^= x >> 32;
+    return x;
+}
+
+static void festina_conn_index_insert_raw(FestinaConnIndexEntry *table, int64_t capacity,
+                                           int64_t conn_id, int64_t slot) {
+    uint64_t mask = (uint64_t)capacity - 1;
+    uint64_t i = festina_conn_index_hash(conn_id) & mask;
+    while (table[i].conn_id != FESTINA_CONN_INDEX_EMPTY &&
+           table[i].conn_id != FESTINA_CONN_INDEX_TOMBSTONE) {
+        i = (i + 1) & mask;
+    }
+    table[i].conn_id = conn_id;
+    table[i].slot = slot;
+}
+
+static void festina_conn_index_grow(void) {
+    int64_t new_capacity = g_conn_index_capacity ? g_conn_index_capacity * 2 : 16;
+    FestinaConnIndexEntry *new_table = malloc((size_t)new_capacity * sizeof(FestinaConnIndexEntry));
+    if (!new_table) festina_fail("out of memory growing the connection index");
+    for (int64_t i = 0; i < new_capacity; i++) new_table[i].conn_id = FESTINA_CONN_INDEX_EMPTY;
+    int64_t live = 0;
+    for (int64_t i = 0; i < g_conn_index_capacity; i++) {
+        if (g_conn_index[i].conn_id >= 0) {
+            festina_conn_index_insert_raw(new_table, new_capacity,
+                                          g_conn_index[i].conn_id, g_conn_index[i].slot);
+            live++;
+        }
+    }
+    free(g_conn_index);
+    g_conn_index = new_table;
+    g_conn_index_capacity = new_capacity;
+    g_conn_index_used = live;  /* tombstones didn't survive the rebuild */
+}
+
+static void festina_conn_index_put(int64_t conn_id, int64_t slot) {
+    /* Grow at a 75% load factor -- checked as (used+1)*4 >= capacity*3
+     * to stay in integer arithmetic, the same style
+     * festina_conn_new_slot's own capacity doubling already uses. */
+    if (g_conn_index_capacity == 0 || (g_conn_index_used + 1) * 4 >= g_conn_index_capacity * 3) {
+        festina_conn_index_grow();
+    }
+    festina_conn_index_insert_raw(g_conn_index, g_conn_index_capacity, conn_id, slot);
+    g_conn_index_used++;
+}
+
+static int64_t festina_conn_index_get(int64_t conn_id) {
+    if (g_conn_index_capacity == 0) return -1;
+    uint64_t mask = (uint64_t)g_conn_index_capacity - 1;
+    uint64_t i = festina_conn_index_hash(conn_id) & mask;
+    for (int64_t probes = 0; probes < g_conn_index_capacity; probes++) {
+        if (g_conn_index[i].conn_id == FESTINA_CONN_INDEX_EMPTY) return -1;
+        if (g_conn_index[i].conn_id == conn_id) return g_conn_index[i].slot;
+        i = (i + 1) & mask;
+    }
+    return -1;  /* unreachable while the load factor above is enforced --
+                 * a full probe of every slot with no empty one found --
+                 * kept as a safe fallback rather than an infinite loop. */
+}
+
+static void festina_conn_index_remove(int64_t conn_id) {
+    if (g_conn_index_capacity == 0) return;
+    uint64_t mask = (uint64_t)g_conn_index_capacity - 1;
+    uint64_t i = festina_conn_index_hash(conn_id) & mask;
+    for (int64_t probes = 0; probes < g_conn_index_capacity; probes++) {
+        if (g_conn_index[i].conn_id == FESTINA_CONN_INDEX_EMPTY) return;  /* not present */
+        if (g_conn_index[i].conn_id == conn_id) {
+            g_conn_index[i].conn_id = FESTINA_CONN_INDEX_TOMBSTONE;
+            return;
+        }
+        i = (i + 1) & mask;
+    }
+}
 
 typedef struct {
     FestinaSocket fd;
@@ -339,10 +466,16 @@ void festina_register_socketclose_handler(void (*fn)(void *)) { g_socketclose_ha
 #define FESTINA_HTTP_MAX_BUFFER (8 * 1024 * 1024)
 
 static FestinaConn *festina_conn_by_id(int64_t conn_id) {
-    for (int64_t i = 0; i < g_conn_count; i++) {
-        if (g_conns[i].alive && g_conns[i].conn_id == conn_id) return &g_conns[i];
-    }
-    return NULL;
+    int64_t slot = festina_conn_index_get(conn_id);
+    if (slot < 0) return NULL;
+    FestinaConn *c = &g_conns[slot];
+    /* Defensive, not load-bearing: correct index maintenance already
+     * guarantees this holds (the index only ever names a live slot's
+     * own conn_id), but a lookup is cheap insurance against the index
+     * and the table it points into ever drifting apart in some future
+     * change that touches one but not the other. */
+    if (!c->alive || c->conn_id != conn_id) return NULL;
+    return c;
 }
 
 /* Looks a handle up to its live connection, or NULL if that
@@ -376,29 +509,37 @@ static void *festina_new_empty_text_map(void) {
 }
 
 static FestinaConn *festina_conn_new_slot(void) {
-    if (g_conn_count == g_conn_capacity) {
-        /* Compact out dead slots first, the same way festina_add_timer
-         * does for g_timers -- a long-running server that accepts and
-         * closes many connections over time shouldn't grow this array
-         * unboundedly. */
-        int64_t write = 0;
-        for (int64_t read = 0; read < g_conn_count; read++) {
-            if (g_conns[read].alive) g_conns[write++] = g_conns[read];
+    int64_t slot;
+    if (g_conn_free_count > 0) {
+        /* Reuse a torn-down connection's own slot -- claude.md #152:
+         * this replaces the old compact-on-full pass (moving every
+         * live connection down to fill the holes dead ones left)
+         * precisely because moving a connection would move its index,
+         * and the hash index above stores indices, not pointers, so
+         * every moved connection's own index entry would need
+         * rewriting on every compaction. A free list sidesteps that
+         * entirely: a dead slot's index is simply handed to the next
+         * new connection, whose OWN (different, newer) conn_id gets
+         * inserted into the index fresh -- the old conn_id was already
+         * removed from the index at teardown, so there's no stale
+         * entry left to collide with the slot's new occupant. */
+        slot = g_conn_free_slots[--g_conn_free_count];
+    } else {
+        if (g_conn_count == g_conn_capacity) {
+            g_conn_capacity = g_conn_capacity ? g_conn_capacity * 2 : 8;
+            FestinaConn *grown = realloc(g_conns, (size_t)g_conn_capacity * sizeof(FestinaConn));
+            if (!grown) festina_fail("out of memory growing the connection table");
+            g_conns = grown;
         }
-        g_conn_count = write;
+        slot = g_conn_count++;
     }
-    if (g_conn_count == g_conn_capacity) {
-        g_conn_capacity = g_conn_capacity ? g_conn_capacity * 2 : 8;
-        FestinaConn *grown = realloc(g_conns, (size_t)g_conn_capacity * sizeof(FestinaConn));
-        if (!grown) festina_fail("out of memory growing the connection table");
-        g_conns = grown;
-    }
-    FestinaConn *c = &g_conns[g_conn_count++];
+    FestinaConn *c = &g_conns[slot];
     memset(c, 0, sizeof(*c));
     c->conn_id = g_next_conn_id++;
     c->alive = 1;
     c->mode = FESTINA_CONN_READING_REQUEST;
     c->content_length = -1;
+    festina_conn_index_put(c->conn_id, slot);
     return c;
 }
 
@@ -417,6 +558,16 @@ static void festina_conn_teardown(FestinaConn *c) {
     free(c->body);
     if (c->state_map) festina_release_map(c->state_map);
     c->alive = 0;
+    festina_conn_index_remove(c->conn_id);
+
+    int64_t slot = c - g_conns;
+    if (g_conn_free_count == g_conn_free_capacity) {
+        g_conn_free_capacity = g_conn_free_capacity ? g_conn_free_capacity * 2 : 8;
+        int64_t *grown = realloc(g_conn_free_slots, (size_t)g_conn_free_capacity * sizeof(int64_t));
+        if (!grown) festina_fail("out of memory growing the connection free-slot list");
+        g_conn_free_slots = grown;
+    }
+    g_conn_free_slots[g_conn_free_count++] = slot;
 }
 
 /* ---- HTTP/1.1 request parsing -- request-line + headers + an
