@@ -811,12 +811,38 @@ class Parser:
             # block instead -- see parse_statement's own LBRACE check,
             # which runs first and never falls through to here), so
             # there's no ambiguity with block syntax to resolve.
+            #
+            # claude.md #162: shorthand entries -- a bare identifier
+            # with no `: value` (JS's own object-literal shorthand,
+            # `{headers}` for `{'headers': headers}`) is recognized
+            # right here at parse time, not deferred to semantic
+            # analysis: after parsing `key`, the NEXT token decides it
+            # (`,`/`}` means shorthand, `:` means an ordinary explicit
+            # entry) -- no lookahead beyond the one token parse_assign_expr
+            # already consumed. Only a bare IDENT can be shorthand
+            # (`key` must already be exactly ast.Identifier -- an
+            # arbitrary computed key expression like `{a.b}` or
+            # `{f()}` has no single name to reuse as both the literal
+            # string key and the value reference, so it still requires
+            # an explicit `: value`, caught below by the ordinary
+            # eat_op(":") failing with its own clear error). This
+            # produces the exact same (key_expr, value_expr) shape an
+            # explicit entry does -- key becomes a TextLit of the
+            # identifier's own name, value an Identifier reference to
+            # it -- so nothing downstream (MapLit's own semantic/codegen
+            # handling, or the new http-literal handling claude.md #162
+            # also adds) needs to know shorthand was ever used at all.
             self.eat("LBRACE")
             entries = []
             while not self.at("RBRACE"):
                 key = self.parse_assign_expr()
-                self.eat_op(":")
-                value = self.parse_assign_expr()
+                if (isinstance(key, ast.Identifier)
+                        and not self.at_op(":")):
+                    value = ast.Identifier(key.name, key.line, key.column)
+                    key = ast.StringLit(key.name)
+                else:
+                    self.eat_op(":")
+                    value = self.parse_assign_expr()
                 entries.append((key, value))
                 if self.at_op(","):
                     self.eat()

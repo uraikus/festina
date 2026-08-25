@@ -242,14 +242,175 @@ long festina_tls_send(void *tls_handle, const void *data, int64_t len) {
     return (long)rc;
 }
 
-/* Registers this file's own seven hooks into festina_runtime_http.c's
- * g_tls_* function pointers -- called from generated code's own
- * main() (festina/codegen.py's _emit_main_and_entry), and ONLY when
- * self.uses_https, exactly mirroring festina_set_audio_decoder's own
- * call-site convention. */
+/* ---- TLS CLIENT (claude.md #162): the https:// half of req.send()'s
+ * zero-argument client form -- festina_runtime_http.c's own
+ * festina_http_send_client dispatches to these four hooks exactly the
+ * way the SERVER side dispatches to festina_tls_handshake/_recv/_send
+ * above, so this translation unit stays the only one that ever
+ * references an mbedTLS symbol by name.
+ *
+ * SCOPE: server certificate verification is BEST-EFFORT, not
+ * guaranteed -- this runtime has no certificate store of its own (no
+ * such thing exists in this language), so it looks for the host
+ * system's own CA bundle at a short list of well-known paths
+ * (Debian/Ubuntu, RHEL/Fedora, Alpine, Homebrew's openssl on both
+ * Intel and Apple Silicon Macs). If one is found, verification is
+ * REQUIRED (a bad/expired/mismatched certificate fails the fetch,
+ * thrown with real diagnostic text). If none is found, verification
+ * is silently skipped rather than failing every single https://
+ * fetch() outright on a machine that simply doesn't have one at any
+ * of these paths (a minimal container image, in particular) -- an
+ * honest tradeoff, not a security feature: a program that genuinely
+ * needs guaranteed certificate verification on such a machine needs
+ * that machine to actually have a CA bundle somewhere findable, which
+ * is true of essentially every real Linux distribution's own base
+ * image. Windows/macOS are not attempted at all here beyond the
+ * Homebrew path above -- both keep their certificate trust store
+ * outside the filesystem entirely (Windows' own CryptoAPI store,
+ * macOS's Keychain), which would need real platform-specific code
+ * this round didn't reach; see setup.md/api.md for the honest
+ * accounting. */
+static const char *const FESTINA_CA_BUNDLE_PATHS[] = {
+    "/etc/ssl/certs/ca-certificates.crt",     /* Debian/Ubuntu */
+    "/etc/pki/tls/certs/ca-bundle.crt",       /* RHEL/Fedora/CentOS */
+    "/etc/ssl/cert.pem",                       /* Alpine, some BSDs */
+    "/usr/local/etc/openssl/cert.pem",         /* Homebrew openssl, Intel Mac */
+    "/opt/homebrew/etc/openssl@3/cert.pem",    /* Homebrew openssl, Apple Silicon */
+    NULL
+};
+
+typedef struct {
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    mbedtls_x509_crt ca_chain;
+    int has_ca_chain;
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    mbedtls_net_context net;
+} FestinaTlsClientConn;
+
+static void festina_tls_client_conn_free(FestinaTlsClientConn *c) {
+    mbedtls_ssl_free(&c->ssl);
+    mbedtls_ssl_config_free(&c->conf);
+    mbedtls_x509_crt_free(&c->ca_chain);
+    mbedtls_ctr_drbg_free(&c->ctr_drbg);
+    mbedtls_entropy_free(&c->entropy);
+    free(c);
+}
+
+void *festina_tls_client_connect(int fd, const char *hostname) {
+    FestinaTlsClientConn *c = calloc(1, sizeof(*c));
+    if (!c) festina_fail("out of memory setting up a TLS client connection");
+    mbedtls_ssl_init(&c->ssl);
+    mbedtls_ssl_config_init(&c->conf);
+    mbedtls_x509_crt_init(&c->ca_chain);
+    mbedtls_entropy_init(&c->entropy);
+    mbedtls_ctr_drbg_init(&c->ctr_drbg);
+    c->net.fd = fd;
+
+    static const char *pers = "festina_fetch_client";
+    int rc = mbedtls_ctr_drbg_seed(&c->ctr_drbg, mbedtls_entropy_func, &c->entropy,
+                                   (const unsigned char *)pers, strlen(pers));
+    if (rc != 0) { festina_tls_client_conn_free(c); return NULL; }
+
+    rc = mbedtls_ssl_config_defaults(&c->conf, MBEDTLS_SSL_IS_CLIENT,
+                                     MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
+    if (rc != 0) { festina_tls_client_conn_free(c); return NULL; }
+    mbedtls_ssl_conf_rng(&c->conf, mbedtls_ctr_drbg_random, &c->ctr_drbg);
+
+    for (int i = 0; FESTINA_CA_BUNDLE_PATHS[i]; i++) {
+        if (mbedtls_x509_crt_parse_file(&c->ca_chain, FESTINA_CA_BUNDLE_PATHS[i]) == 0) {
+            c->has_ca_chain = 1;
+            break;
+        }
+    }
+    if (c->has_ca_chain) {
+        mbedtls_ssl_conf_ca_chain(&c->conf, &c->ca_chain, NULL);
+        mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    } else {
+        mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_NONE);
+    }
+
+    rc = mbedtls_ssl_setup(&c->ssl, &c->conf);
+    if (rc != 0) { festina_tls_client_conn_free(c); return NULL; }
+    mbedtls_ssl_set_hostname(&c->ssl, hostname);
+    mbedtls_ssl_set_bio(&c->ssl, &c->net, mbedtls_net_send, mbedtls_net_recv, NULL);
+
+    /* Blocking handshake -- fetch()/req.send() already blocks the
+     * whole single-threaded program until it completes (see
+     * festina_runtime_http.c's own comment on why that's an accepted
+     * tradeoff, not an oversight), so a plain retry-on-WANT_READ/
+     * _WRITE loop is all this needs -- unlike the SERVER side's
+     * non-blocking, poll()-driven handshake (festina_tls_handshake
+     * above), which has to resume across many event-loop ticks
+     * because it must never block the connections it's sharing a
+     * thread with. */
+    for (;;) {
+        rc = mbedtls_ssl_handshake(&c->ssl);
+        if (rc == 0) break;
+        if (rc != MBEDTLS_ERR_SSL_WANT_READ && rc != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            festina_tls_client_conn_free(c);
+            return NULL;
+        }
+    }
+    if (c->has_ca_chain && mbedtls_ssl_get_verify_result(&c->ssl) != 0) {
+        festina_tls_client_conn_free(c);
+        return NULL;
+    }
+    return c;
+}
+
+long festina_tls_client_recv(void *tls_handle, void *buf, int64_t cap) {
+    FestinaTlsClientConn *c = tls_handle;
+    int rc = mbedtls_ssl_read(&c->ssl, buf, (size_t)cap);
+    if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) return -1;
+    if (rc == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || rc == 0) return 0;
+    if (rc < 0) return -2;
+    return (long)rc;
+}
+
+/* Unlike festina_tls_send (the server side, which leaves WANT_READ/
+ * WANT_WRITE to the caller -- see that function's own comment on why
+ * a plain-socket write that would block is already just failure on
+ * this runtime's non-blocking server connections), this loops until
+ * everything is actually sent or a hard error occurs -- the client
+ * socket has a real read/write timeout (SO_RCVTIMEO/SO_SNDTIMEO, set
+ * by festina_http_send_client before the handshake even starts) to
+ * bound how long that can ever take, so spinning on WANT_READ/
+ * _WRITE here can't hang forever the way it could on the server's own
+ * non-blocking fds. */
+long festina_tls_client_send(void *tls_handle, const void *data, int64_t len) {
+    FestinaTlsClientConn *c = tls_handle;
+    const uint8_t *p = data;
+    size_t sent = 0;
+    while (sent < (size_t)len) {
+        int rc = mbedtls_ssl_write(&c->ssl, p + sent, (size_t)len - sent);
+        if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+        if (rc <= 0) return -2;
+        sent += (size_t)rc;
+    }
+    return (long)sent;
+}
+
+void festina_tls_client_close(void *tls_handle) {
+    FestinaTlsClientConn *c = tls_handle;
+    if (!c) return;
+    mbedtls_ssl_close_notify(&c->ssl);
+    festina_tls_client_conn_free(c);
+}
+
+/* Registers this file's own eleven hooks (seven server + four client)
+ * into festina_runtime_http.c's g_tls_... and g_tls_client_... function
+ * pointers -- called from generated code's own main() (festina/
+ * codegen.py's _emit_main_and_entry), and ONLY when self.uses_https,
+ * exactly mirroring festina_set_audio_decoder's own call-site
+ * convention. */
 void festina_register_tls_hooks(void) {
     festina_set_tls_hooks(
         festina_tls_listener_new, festina_tls_listener_free,
         festina_tls_conn_new, festina_tls_conn_free,
         festina_tls_handshake, festina_tls_recv, festina_tls_send);
+    festina_set_tls_client_hooks(
+        festina_tls_client_connect, festina_tls_client_recv,
+        festina_tls_client_send, festina_tls_client_close);
 }

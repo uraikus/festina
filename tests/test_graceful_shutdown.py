@@ -27,7 +27,7 @@ class TestHttpGracefulShutdown:
             log(`exit code: ${code}`)
         }
         on request(req:http) {
-            req.send('hi', 200)
+            req.send({'code': 200, 'body': 'hi'})
         }
         openPort(__PORT__)
         """)
@@ -75,7 +75,7 @@ class TestHttpGracefulShutdown:
 
     def test_an_in_flight_connection_still_completes_before_exit(self, compile_and_run_server):
         server = compile_and_run_server("""
-        on request(req:http) { req.send('still here', 200) }
+        on request(req:http) { req.send({'code': 200, 'body': 'still here'}) }
         openPort(__PORT__)
         """)
         # Connect BEFORE the signal, but don't send the request until
@@ -107,7 +107,8 @@ class TestHttpGracefulShutdown:
         monkeypatch.setenv("FESTINA_SHUTDOWN_GRACE_SECONDS", "1")
         server = compile_and_run_server("""
         on request(req:http) {
-            if req.path == '/ws' { req.upgrade() }
+            url u = parseURL(req.url)
+            if u.pathname == '/ws' { req.upgrade() }
         }
         on upgrade(s:socket) { }
         openPort(__PORT__)

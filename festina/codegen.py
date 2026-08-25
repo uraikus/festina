@@ -390,7 +390,8 @@ def _is_refcounted(t):
     return (isinstance(t, (types_mod.StructType, types_mod.ArrayType,
                            types_mod.MapType, types_mod.ImageType,
                            types_mod.AudioType, types_mod.RegexType,
-                           types_mod.HttpType, types_mod.SocketType))
+                           types_mod.HttpType, types_mod.SocketType,
+                           types_mod.UrlType))
             or t == BLOB)
 
 FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
@@ -563,6 +564,12 @@ def _llvm_type(t):
         # claude.md #151: a tiny {refcount, conn_id} handle, opaque to
         # codegen -- see festina_runtime.h's own doc comment for the
         # full representation.
+        return "ptr"
+    if isinstance(t, types_mod.UrlType):
+        # claude.md #162: an opaque FestinaUrlValue*, same "codegen
+        # never sees the real struct layout, only a ptr threaded
+        # through dedicated accessor calls" shape http/socket already
+        # have.
         return "ptr"
     if isinstance(t, types_mod.ColorType):
         # claude.md #91: a packed 0xRRGGBB integer (negative for 'none')
@@ -1240,14 +1247,32 @@ class CodeGen:
             # -unit hook wiring aside.
             "declare void @festina_open_secure_port(i64, ptr, i64)",
             "declare void @festina_register_tls_hooks()",
+            # claude.md #162: url / parseURL() -- lives in CORE
+            # (festina_runtime.c), see festina_runtime.h's own doc
+            # comment right above these declarations.
+            "declare ptr @festina_parse_url(ptr)",
+            "declare ptr @festina_url_protocol(ptr)",
+            "declare ptr @festina_url_username(ptr)",
+            "declare ptr @festina_url_password(ptr)",
+            "declare ptr @festina_url_hostname(ptr)",
+            "declare i64 @festina_url_port(ptr)",
+            "declare ptr @festina_url_pathname(ptr)",
+            "declare ptr @festina_url_hash(ptr)",
+            "declare ptr @festina_url_search_params(ptr)",
+            "declare void @festina_release_url(ptr)",
             "declare void @festina_register_request_handler(ptr)",
             "declare void @festina_register_upgrade_handler(ptr)",
             "declare void @festina_register_message_handler(ptr)",
             "declare void @festina_register_socketclose_handler(ptr)",
             "declare void @festina_run_http_loop()",
-            "declare i64 @festina_http_port(ptr)",
+            # claude.md #162: http -- redesigned into a genuine
+            # refcounted value (url/method/code/headers/body), see
+            # festina_runtime.h's own doc comment for the full
+            # rationale.
+            "declare ptr @festina_http_literal_new(ptr, ptr, i64, ptr, ptr, i64)",
+            "declare ptr @festina_http_url(ptr)",
             "declare ptr @festina_http_method(ptr)",
-            "declare ptr @festina_http_path(ptr)",
+            "declare i64 @festina_http_code(ptr)",
             "declare ptr @festina_http_headers(ptr)",
             "declare void @festina_http_ok(ptr)",
             "declare void @festina_http_redirect(ptr, ptr)",
@@ -1256,7 +1281,9 @@ class CodeGen:
             "declare ptr @festina_http_to_img(ptr)",
             "declare ptr @festina_http_to_aud(ptr)",
             "declare ptr @festina_http_to_text(ptr)",
-            "declare void @festina_http_send(ptr, ptr, i64, i64, ptr)",
+            "declare void @festina_http_send(ptr, ptr)",
+            "declare void @festina_http_send_client(ptr)",
+            "declare void @festina_release_http(ptr)",
             # festina_blob_bytes is already declared above (blob's own
             # sqlite-column binding uses it too) -- reused as-is by
             # _emit_sendable_body, not redeclared here.
@@ -3851,11 +3878,31 @@ class CodeGen:
         caller's separate responsibility, exactly like any other
         consumed argument (see exec()'s own argument-cleanup
         pattern) -- this never touches it."""
-        if vtype == BLOB:
+        if vtype == BLOB or isinstance(vtype, (types_mod.ImageType, types_mod.AudioType)):
+            # claude.md #162: an http literal's own 'body' key
+            # additionally accepts img/aud (see semantic.py's
+            # _is_http_body_type -- a real request/response body
+            # uploading or returning a picture/clip is completely
+            # ordinary, unlike socket.send()'s data:any, which never
+            # reaches this img/aud branch at all since
+            # _is_sendable_type -- the ORIGINAL, narrower predicate --
+            # still gates it). festina_image_bytes/_audio_bytes share
+            # festina_blob_bytes's own (handle, len_out) -> borrowed-
+            # bytes-ptr shape exactly (claude.md #101's own sqlite
+            # blob-column binding already established this), so one
+            # branch covers all three.
+            if vtype == BLOB:
+                fn = "festina_blob_bytes"
+            elif isinstance(vtype, types_mod.AudioType):
+                self.uses_audio = True
+                fn = "festina_audio_bytes"
+            else:
+                self.uses_graphics_code = True
+                fn = "festina_image_bytes"
             len_ptr = self.tmp()
             lines.append(f"  {len_ptr} = alloca i64")
             data = self.tmp()
-            lines.append(f"  {data} = call ptr @festina_blob_bytes(ptr {val}, ptr {len_ptr})")
+            lines.append(f"  {data} = call ptr @{fn}(ptr {val}, ptr {len_ptr})")
             len_val = self.tmp()
             lines.append(f"  {len_val} = load i64, ptr {len_ptr}")
             return data, len_val, None
@@ -3863,6 +3910,72 @@ class CodeGen:
         len_val = self.tmp()
         lines.append(f"  {len_val} = call i64 @strlen(ptr {text_val})")
         return text_val, len_val, (text_val if vtype != TEXT else None)
+
+    def _emit_http_lit(self, maplit, env, lines):
+        """claude.md #162: `http x = {...}` -- and `req.send({...})`'s
+        own inline-response form -- build a fresh http value via
+        festina_http_literal_new from a MapLit's entries. semantic.py's
+        own _validate_http_lit already confirmed every key is one of
+        url/method/code/headers/body with the right value type, so
+        this only has to emit+coerce each one and make the single
+        call; entries are evaluated in the SOURCE ORDER they appear
+        (matching every other expression-evaluation-order convention
+        in this compiler), a key simply never mentioned in the literal
+        keeps festina_http_literal_new's own zero-value default for it
+        (empty text for url/method, festina_null_int() for code, an
+        empty map for headers, no body)."""
+        self.uses_http = True
+        url_val = self.string_const("")
+        method_val = self.string_const("")
+        code_val = INT_NULL_CONST
+        headers_val = "null"
+        body_ptr = "null"
+        body_len_val = "0"
+        cleanups = []  # [(callable taking no args)] run AFTER the literal_new call
+        for key_expr, val_expr in maplit.entries:
+            key = key_expr.value
+            if key == "url":
+                v, t = self._emit_expr(val_expr, env, lines)
+                url_val = self._to_text(v, t, lines)
+                cleanups.append(lambda v=v, t=t, e=val_expr: self._free_text_temp(e, v, t, lines))
+            elif key == "method":
+                v, t = self._emit_expr(val_expr, env, lines)
+                method_val = self._to_text(v, t, lines)
+                cleanups.append(lambda v=v, t=t, e=val_expr: self._free_text_temp(e, v, t, lines))
+            elif key == "code":
+                code_val, _ = self._emit_expr(val_expr, env, lines)
+            elif key == "headers":
+                v, t = self._emit_expr(val_expr, env, lines)
+                # claude.md #162: festina_http_literal_new takes
+                # OWNERSHIP of `headers` -- an owning source (a fresh
+                # {...} literal, a call result) hands it in directly;
+                # an aliasing one (an existing map[text] variable, the
+                # `{headers}` shorthand's own common case) needs one
+                # extra retain first, so the original binding keeps its
+                # own valid reference exactly the same way any other
+                # "pass a live container into something that will hold
+                # onto it" call site in this compiler already does.
+                if not self._is_owning_refcounted_source(val_expr):
+                    lines.append(f"  call void @festina_retain(ptr {v})")
+                headers_val = v
+            elif key == "body":
+                v, t = self._emit_expr(val_expr, env, lines)
+                body_ptr, body_len_val, body_temp = self._emit_sendable_body(v, t, lines)
+
+                def _cleanup_body(v=v, t=t, e=val_expr, temp=body_temp):
+                    if temp is not None:
+                        lines.append(f"  call void @free(ptr {temp})")
+                    if _is_refcounted(t) and self._is_owning_refcounted_source(e):
+                        lines.append(f"  call void {self._release_fn_for(t)}(ptr {v})")
+                    else:
+                        self._free_text_temp(e, v, t, lines)
+                cleanups.append(_cleanup_body)
+        out = self.tmp()
+        lines.append(f"  {out} = call ptr @festina_http_literal_new(ptr {url_val}, ptr {method_val}, "
+                     f"i64 {code_val}, ptr {headers_val}, ptr {body_ptr}, i64 {body_len_val})")
+        for cleanup in cleanups:
+            cleanup()
+        return out, types_mod.HttpType()
 
     def _json_append_slot(self, body, sb, ftype, slot_ptr, depth_val):
         """claude.md #114: appends ONE value (stored at `slot_ptr`, of
@@ -4290,6 +4403,15 @@ class CodeGen:
         real null (see the module docstring)."""
         if isinstance(node, ast.ArrayLit):
             return self._emit_array_lit(node, env, lines, expected_type)
+        if isinstance(node, ast.MapLit) and isinstance(expected_type, types_mod.HttpType):
+            # claude.md #162: `http x = {...}` -- checked before the
+            # generic ast.MapLit branch just below, for the identical
+            # reason claude.md #156's own amor-map bypass in
+            # analyze_var_decl (semantic.py) exists: a MapLit's generic
+            # handling demands one homogeneous value type across every
+            # entry, which an http literal's genuinely heterogeneous
+            # field set (text/int/map/body) can never satisfy.
+            return self._emit_http_lit(node, env, lines)
         if isinstance(node, ast.MapLit):
             # claude.md #156: ast.MapLit itself has no amor-vs-plain
             # distinction (the same `{k: v, ...}` syntax either way) --
@@ -5009,23 +5131,58 @@ class CodeGen:
         see semantic.py's own identical fallthrough)."""
         if expr.computed:
             return None
-        if isinstance(obj_type, types_mod.HttpType) and expr.prop in ("port", "method", "path", "headers"):
-            # claude.md #151: a runtime call, same reasoning as
-            # img.width/.height (the real values live behind the
-            # handle, in festina_runtime_http.c's own connection
-            # table, not in any field this compiler could lay out
-            # itself).
+        if isinstance(obj_type, types_mod.UrlType) and expr.prop in (
+                "hash", "hostname", "password", "pathname", "port", "protocol",
+                "searchParams", "username"):
+            # claude.md #162: same "a runtime call, the real value
+            # lives behind the handle" reasoning as http's own fields
+            # right below -- every one of these is a small dedicated
+            # accessor over the FestinaUrlValue* parseURL() built.
+            out = self.tmp()
+            fn_and_type = {
+                "hash": ("festina_url_hash", TEXT),
+                "hostname": ("festina_url_hostname", TEXT),
+                "password": ("festina_url_password", TEXT),
+                "pathname": ("festina_url_pathname", TEXT),
+                "protocol": ("festina_url_protocol", TEXT),
+                "username": ("festina_url_username", TEXT),
+            }
+            if expr.prop == "port":
+                lines.append(f"  {out} = call i64 @festina_url_port(ptr {obj_val})")
+                result_type = INT
+            elif expr.prop == "searchParams":
+                lines.append(f"  {out} = call ptr @festina_url_search_params(ptr {obj_val})")
+                result_type = types_mod.MapType(TEXT)
+            else:
+                fn, result_type = fn_and_type[expr.prop]
+                lines.append(f"  {out} = call ptr @{fn}(ptr {obj_val})")
+            self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
+            # claude.md #162: every one of these hands back a genuinely
+            # FRESH value (an owned text copy, or -- searchParams -- an
+            # already-retained-on-the-way-out map reference), the exact
+            # same _minted_values reasoning http's own fields use just
+            # below (skipping this would double-copy text results and
+            # leak one reference every time .searchParams is read).
+            self._minted_values.add(id(expr))
+            return out, result_type
+        if isinstance(obj_type, types_mod.HttpType) and expr.prop in ("url", "method", "code", "headers"):
+            # claude.md #162: url/method/code are owned dedicated
+            # accessor calls (see festina_runtime_http.c's own
+            # FestinaHttpValue doc comment -- codegen never lays these
+            # fields out itself, same reasoning img.width/.height
+            # already have); headers is now the SAME live map every
+            # read (retained on the way out), not a rebuild.
             self.uses_http = True
             out = self.tmp()
-            if expr.prop == "port":
-                lines.append(f"  {out} = call i64 @festina_http_port(ptr {obj_val})")
-                result_type = INT
+            if expr.prop == "url":
+                lines.append(f"  {out} = call ptr @festina_http_url(ptr {obj_val})")
+                result_type = TEXT
             elif expr.prop == "method":
                 lines.append(f"  {out} = call ptr @festina_http_method(ptr {obj_val})")
                 result_type = TEXT
-            elif expr.prop == "path":
-                lines.append(f"  {out} = call ptr @festina_http_path(ptr {obj_val})")
-                result_type = TEXT
+            elif expr.prop == "code":
+                lines.append(f"  {out} = call i64 @festina_http_code(ptr {obj_val})")
+                result_type = INT
             else:
                 lines.append(f"  {out} = call ptr @festina_http_headers(ptr {obj_val})")
                 result_type = types_mod.MapType(TEXT)
@@ -5034,18 +5191,20 @@ class CodeGen:
             # treatment (_is_owning_refcounted_source /
             # _is_owning_text_source) is "aliasing, not owning" --
             # correct for an ordinary struct field, wrong here:
-            # festina_http_method/_path/_headers each return a
-            # genuinely FRESH value (an owned text copy, or a
-            # brand-new map[text]) with no other reference anywhere.
-            # Marking this node in _minted_values is what tells both
-            # of those ownership checks the truth -- the exact same
-            # mechanism text[i] (claude.md #150) already established
-            # for this identical problem. Skipping this for a text
-            # result would silently double-copy it; skipping it for
-            # the map result would leak one reference every time
-            # .headers is read and its binding later goes out of
-            # scope (an extra, never-undone retain codegen would
-            # otherwise add on top of this already-fresh value).
+            # festina_http_url/_method/_headers each return a
+            # genuinely FRESH value (an owned text copy, or an
+            # already-retained live map) with no other reference
+            # anywhere the caller doesn't already own. Marking this
+            # node in _minted_values is what tells both of those
+            # ownership checks the truth -- the exact same mechanism
+            # text[i] (claude.md #150) already established for this
+            # identical problem. Skipping this for a text result would
+            # silently double-copy it; skipping it for the map result
+            # would leak one reference every time .headers is read and
+            # its binding later goes out of scope (an extra, never-
+            # undone retain codegen would otherwise add on top of this
+            # already-fresh/retained value). `code` (a plain i64) needs
+            # none of this, but doesn't hurt from it either.
             self._minted_values.add(id(expr))
             return out, result_type
         if isinstance(obj_type, types_mod.SocketType) and expr.prop == "state":
@@ -5949,15 +6108,29 @@ class CodeGen:
             # claude.md #118: regfree on the last reference; a cached
             # /pattern/ literal is immortal and no-ops through here.
             return "@festina_regex_free"
-        if isinstance(type_, (types_mod.HttpType, types_mod.SocketType)):
-            # claude.md #151: one shared release function for both --
-            # neither carries anything of its own to free beyond the
-            # tiny handle itself (the underlying connection is owned
-            # separately by festina_runtime_http.c's own connection
-            # table, torn down independently of any handle's
-            # lifetime -- see festina_runtime.h's doc comment).
+        if isinstance(type_, types_mod.HttpType):
+            # claude.md #162: http moved to a real destructor -- url/
+            # method/headers/body all live directly in the value now
+            # (see festina_runtime_http.c's own FestinaHttpValue doc
+            # comment), so releasing one has real contents to free,
+            # unlike the tiny {refcount, conn_id} handle socket still
+            # uses just below.
+            self.uses_http = True
+            return "@festina_release_http"
+        if isinstance(type_, types_mod.SocketType):
+            # claude.md #151: the tiny handle itself is all there is to
+            # free (the underlying connection is owned separately by
+            # festina_runtime_http.c's own connection table, torn down
+            # independently of any handle's lifetime -- see
+            # festina_runtime.h's doc comment).
             self.uses_http = True
             return "@festina_release_conn_handle"
+        if isinstance(type_, types_mod.UrlType):
+            # claude.md #162: lives in CORE (festina_runtime.c), not
+            # festina_runtime_http.c -- parseURL() has nothing to do
+            # with openPort()/on request/fetch() and must not force
+            # uses_http on a program that only ever parses a URL.
+            return "@festina_release_url"
         if type_ == TEXT:
             # claude.md #83: text has no refcount header to dispatch
             # through -- "releasing" one is always just a plain,
@@ -7440,6 +7613,19 @@ class CodeGen:
                 if _is_refcounted(key_vtype) and self._is_owning_refcounted_source(key_expr):
                     lines.append(f"  call void {self._release_fn_for(key_vtype)}(ptr {key_val})")
                 return "0", None
+            if name == "parseURL":
+                # claude.md #162: lives in CORE -- no uses_http/_https
+                # flag to set here at all, unlike openPort/openSecurePort
+                # just above (parseURL has nothing to do with the HTTP
+                # server or fetch() -- see festina_release_url's own
+                # comment in _release_fn_for).
+                text_expr = expr.args[0]
+                text_val, text_vtype = self._emit_expr(text_expr, env, lines)
+                text_val = self._to_text(text_val, text_vtype, lines)
+                out = self.tmp()
+                lines.append(f"  {out} = call ptr @festina_parse_url(ptr {text_val})")
+                self._free_text_temp(text_expr, text_val, text_vtype, lines)
+                return out, types_mod.UrlType()
             # claude.md #95/#135: writes the OFFSCREEN canvas, so it
             # needs no window either way -- this is the headless case
             # the render() split exists for. saveCanvas() with no path
@@ -8039,32 +8225,46 @@ class CodeGen:
             if callee.prop == "send":
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if isinstance(obj_type, types_mod.HttpType):
+                    # claude.md #162: send() is now overloaded by ARITY
+                    # -- see semantic.py's own comment on this same
+                    # branch for the full reasoning.
                     self.uses_http = True
-                    data_val, data_type = self._emit_expr(expr.args[0], env, lines)
-                    data_ptr, len_val, temp = self._emit_sendable_body(data_val, data_type, lines)
-                    if len(expr.args) >= 2:
-                        code_val, _ = self._emit_expr(expr.args[1], env, lines)
-                    else:
-                        code_val = "200"
-                    headers_val = "null"
-                    headers_expr = expr.args[2] if len(expr.args) == 3 else None
-                    headers_type = None
-                    if headers_expr is not None:
-                        headers_val, headers_type = self._emit_expr(headers_expr, env, lines)
-                    lines.append(
-                        f"  call void @festina_http_send(ptr {obj_val}, ptr {data_ptr}, "
-                        f"i64 {len_val}, i64 {code_val}, ptr {headers_val})")
-                    if temp is not None:
-                        lines.append(f"  call void @free(ptr {temp})")
-                    if _is_refcounted(data_type) and self._is_owning_refcounted_source(expr.args[0]):
-                        lines.append(f"  call void {self._release_fn_for(data_type)}(ptr {data_val})")
-                    else:
-                        self._free_text_temp(expr.args[0], data_val, data_type, lines)
-                    if headers_expr is not None:
-                        if _is_refcounted(headers_type) and self._is_owning_refcounted_source(headers_expr):
-                            lines.append(f"  call void {self._release_fn_for(headers_type)}(ptr {headers_val})")
-                        else:
-                            self._free_text_temp(headers_expr, headers_val, headers_type, lines)
+                    if len(expr.args) == 0:
+                        # The CLIENT side -- an outbound request, using
+                        # obj_val's own url/method/headers/body,
+                        # mutating it in place with the response.
+                        # https:// support means every program reaching
+                        # this branch needs mbedTLS linked, the same
+                        # unconditional "the compiler can't know a
+                        # runtime string's scheme in advance" reasoning
+                        # openSecurePort()'s own uses_https already
+                        # established.
+                        self.uses_https = True
+                        lines.append(f"  call void @festina_http_send_client(ptr {obj_val})")
+                        self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                        return "0", None
+                    # The SERVER side -- send obj_val's own live
+                    # connection a response built from expr.args[0], an
+                    # http value either already in hand or constructed
+                    # inline right here (`req.send({...})`) via the
+                    # exact same _emit_http_lit an `http x = {...}`
+                    # VarDecl already uses (routed through
+                    # _emit_value_for with an explicit expected type,
+                    # since a bare _emit_expr on a MapLit has no notion
+                    # of "build an http value" at all).
+                    res_val, res_type = self._emit_value_for(
+                        expr.args[0], env, lines, types_mod.HttpType())
+                    lines.append(f"  call void @festina_http_send(ptr {obj_val}, ptr {res_val})")
+                    if self._is_owning_refcounted_source(expr.args[0]) or isinstance(expr.args[0], ast.MapLit):
+                        # claude.md #162: an inline literal is ALWAYS a
+                        # fresh, owned value (see _emit_http_lit) even
+                        # though it isn't an ast.Call/etc.
+                        # _is_owning_refcounted_source itself would
+                        # recognize -- that predicate was never taught
+                        # about MapLit since no other http-adjacent
+                        # value could be built from one before this
+                        # entry.
+                        lines.append(f"  call void {self._release_fn_for(res_type)}(ptr {res_val})")
                     self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                     return "0", None
                 if isinstance(obj_type, types_mod.SocketType):

@@ -1624,8 +1624,9 @@ failing at runtime; see [wasm.md](wasm.md).
 openPort(8080)
 
 on request(req:http) {
-    if req.path == '/hello' {
-        req.send('hello world')
+    url u = parseURL(req.url)
+    if u.pathname == '/hello' {
+        req.send({'body': 'hello world'})
         return
     }
     req.ok()
@@ -1647,22 +1648,65 @@ delays every *other* connection's own turn. This is built for the kind
 of small, script-shaped server this language already targets, not as a
 general-purpose production server replacement.
 
+### The `http` type
+
+`http` is a genuine value — construct one directly with a literal, the
+same shorthand a `struct` literal never gets (there is no `{...}`
+struct-literal syntax in this language; `http` is the one type built
+this way, because it's the value both the server (`on request`'s own
+`req`) and the client (an outbound `req.send()`, below) share):
+
+```festina
+http {
+    url:text       // e.g. 'http://example.com/path?a=1'
+    method:text    // 'GET', 'POST', ...
+    code:int       // the status code -- null until a response exists
+    headers:map[text]
+    // plus the methods documented below: ok()/redirect()/upgrade()/
+    // send()/toText()/toBlob()/toImg()/toAud()
+}
+```
+
+`url`/`method`/`code`/`headers` are all **read-only** once constructed —
+the only way to set them is the literal itself:
+
+```festina
+map[text] headers = {'E-Tag': now().toText()}
+http res = {'code': 200, 'body': 'ok', headers}    // {headers} is shorthand
+                                                    // for {'headers': headers}
+```
+
+A literal accepts five keys, all optional: `url`/`method` (`text`,
+default `''`), `code` (`int`, default `null`), `headers` (`map[text]`,
+default empty), and `body` — not a real field (there is no `.body` to
+read back later; it feeds straight into the value's content, read back
+through `toText()`/`toBlob()`/`toImg()`/`toAud()`) — accepting anything
+with a body form: `text` (sent as-is), `int`/`float`/`bool`
+(stringified, the same implicit conversion `log()` already does), a
+`struct`/table row/`arr`/`map` (rendered as JSON, the same `.toText()`
+every container already has), `blob` (sent as its own raw bytes), or
+`img`/`aud` (sent as the underlying encoded file bytes — unlike
+`log()`/templates/`s.send()`, a real HTTP body uploading or returning a
+picture or clip is completely ordinary, so neither is rejected here).
+Any other key is a compile-time error.
+
 ### `on request(req:http)`
 
 Fires once per incoming HTTP request, fully parsed (request line,
 headers, and body already buffered — see [Limitations](#http-limitations)
-below for what "fully parsed" doesn't include).
+below for what "fully parsed" doesn't include). `req.code` is `null` (no
+response exists yet); `req.url` is reconstructed from the connection's
+own scheme/`Host` header/path (falling back to `127.0.0.1:<port>` if the
+client sent no `Host` header at all) — parse it with `parseURL()`
+(below) to pull out the path or query parameters.
 
 ```festina
-req.port                              // int -- the port this connection arrived on
+req.url                               // text -- e.g. 'http://127.0.0.1:8080/hello?a=1'
 req.method                            // text -- 'GET', 'POST', ...
-req.path                              // text -- '/hello', never includes the query string separately
+req.code                              // int -- null on a live inbound request
 req.headers                           // map[text] -- header names lowercased; a repeated
                                        // header's last occurrence wins
 ```
-
-All four are read-only — assigning to any of them is a compile-time
-error.
 
 **Responding** — exactly one of the following ends the request; calling
 a second one on the same `req` is a silent no-op (never a crash, never a
@@ -1671,18 +1715,17 @@ double response):
 ```festina
 req.ok()                              // 200, empty body
 req.redirect('https://example.com')   // 302, Location header set
-req.send(data, code, headers)         // see below
+req.send(res)                         // see below
 ```
 
-`req.send(data:any, code:int, headers:map[text])` — `code` defaults to
-`200`, `headers` to none. `data` accepts anything with a body form:
-`text` (sent as-is), `int`/`float`/`bool` (stringified, the same
-implicit conversion `log()` already does), a `struct`/table row/
-`arr`/`map` (rendered as JSON, the same `.toText()` every container
-already has), or `blob` (sent as its own raw bytes, not decoded through
-`.toText()` — the more likely thing to want for a binary response). An
-`img`/`aud` argument is a **compile error**: neither has a body form,
-the same reasoning `log()`/templates already reject them with.
+`req.send(res:http)` — the SERVER form, taking exactly one already-
+constructed `http` value (an existing variable, or an inline literal:
+`req.send({'code': 201, 'body': 'created'})`) and sending it as this
+connection's response. `res.code` defaults to `200` if left unset in
+the literal; `res.headers` defaults to none. (`req.send()` — zero
+arguments — is a *different* call entirely: the CLIENT form, documented
+under [Making outbound requests](#http-client) below; the two are
+told apart purely by arity.)
 
 If `on request`'s own body returns without calling `ok()`/`redirect()`/
 `send()`/`upgrade()` at all, the connection still gets a response — a
@@ -1705,7 +1748,8 @@ matching every other "nothing there" case in this language.
 
 ```festina
 on request(req:http) {
-    if req.path == '/ws' {
+    url u = parseURL(req.url)
+    if u.pathname == '/ws' {
         req.upgrade()
     }
 }
@@ -1745,11 +1789,79 @@ s.state                               // map[text] -- a per-connection scratchpa
                                        // whole lifetime
 s.state['user'] = 'ada'               // read/write like any other map[text]
 
-s.send(data)                          // data:any -- same sendable types as req.send(),
-                                       // minus the code/headers (a frame has neither);
-                                       // blob sends a binary frame, everything else text
+s.send(data)                          // data:any -- same sendable types as an http
+                                       // literal's own 'body' key, minus the code/
+                                       // headers (a frame has neither); blob sends a
+                                       // binary frame, everything else text
 s.close()                             // sends a close frame and ends the connection
 ```
+
+### <a name="http-client"></a>Making outbound requests
+
+There is no separate `fetch()` builtin — `req.send()`, called with
+**zero** arguments, is the client form of the exact same method
+`req.send(res)` uses on the server side (above); which one applies is
+decided purely by how many arguments the call has.
+
+```festina
+img profile = 'profile.png'
+http req = {'url': 'http://example.com', 'method': 'POST', 'body': profile,
+            'headers': {'authorization': 'bearer example'}}
+req.send()                            // blocks until the response arrives, then
+                                       // REPLACES req's own body/code/headers with it
+log(req.code)                         // e.g. 200
+log(req.toText())
+```
+
+`req.send()` resolves `req.url`'s host, connects (TLS automatically for
+an `https://` URL, plain TCP for `http://` — the scheme is read from the
+value at runtime, so both are always linked into any program that calls
+`req.send()` at all), sends `req.method`/`req.headers`/whatever `body`
+the literal was given as one HTTP/1.1 request, and blocks until the
+whole response arrives (this runtime is single-threaded, the same
+tradeoff `setTimeout`/`on request` itself already accepts: a slow
+outbound request delays every other connection's own turn for as long
+as it takes). `req.url`/`req.method` are left untouched; `req.code`,
+`req.headers`, and the body read back through `req.toText()`/
+`toBlob()`/`toImg()`/`toAud()` are all overwritten in place with the
+response. A genuine network failure — the host doesn't resolve, the
+connection is refused, the TLS handshake fails, or the response can't
+be parsed as HTTP — **throws** (catch it with `try`/`catch`, [see
+below](#try--catch--throw)), the same "this can really fail, with real
+diagnostic text" precedent `toStruct()`/`toArr()`'s JSON parsing
+already established, rather than the "test, don't fail" convention most
+of this runtime's I/O uses. There's no timeout to configure — a 30
+second socket timeout bounds the worst case.
+
+Calling `req.send()` a second time on the same value sends a second,
+independent request (using whatever `url`/`method`/`headers`/body it
+currently holds, response overwrite and all) — nothing about the zero-
+argument form is "used up" after the first call.
+
+### <a name="url-type"></a>The `url` type / `parseURL()`
+
+`parseURL(text):url` parses an absolute URL into its components — used
+above to read `req.url`'s path/query on the server side, and to build
+one for `req.send()` on the client side (a plain `text` field works
+there too; `parseURL()`/`url` exist for **reading** one apart, not as
+the only way to spell one). Throws (catch with `try`/`catch`) if the
+text has no `://` or a non-numeric port.
+
+```festina
+url u = parseURL('https://ada:secret@example.com:8443/path?a=1&b=2#frag')
+u.protocol                            // text -- 'https:' (includes the trailing colon,
+                                       // matching how a browser's own URL API spells it)
+u.username                            // text -- 'ada'
+u.password                            // text -- 'secret'
+u.hostname                            // text -- 'example.com'
+u.port                                // int -- 8443 (null if the URL named none)
+u.pathname                            // text -- '/path'
+u.searchParams                        // map[text] -- {'a': '1', 'b': '2'}, percent-decoded
+u.hash                                // text -- '#frag'
+```
+
+Every field is read-only — a `url` is built once, by `parseURL()`, and
+never mutated afterward.
 
 ### <a name="http-limitations"></a>Limitations
 
@@ -1788,7 +1900,7 @@ blob key = 'server.pem'   // a combined PEM file: certificate(s), then the
                            // unencrypted private key, in either order
 
 on request(req:http) {
-    req.send('hello over TLS')
+    req.send({'body': 'hello over TLS'})
 }
 
 openSecurePort(8443, key)
@@ -2313,7 +2425,7 @@ on exit(code:int) {
     log(`shutting down (${code})`)
 }
 on request(req:http) {
-    req.send('hello', 200)
+    req.send({'code': 200, 'body': 'hello'})
 }
 openPort(8080)
 // Ctrl-C now logs "shutting down (130)" instead of just vanishing.

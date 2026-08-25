@@ -49,6 +49,7 @@
                        * used). */
 #endif
 #include <stdarg.h>  /* va_list -- claude.md #159's festina_json_throwf */
+#include <stddef.h>  /* offsetof -- claude.md #162's url accessors */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -744,6 +745,277 @@ char *festina_json_read_text(void *cursor) {
     FestinaJsonCursor *c = cursor;
     if (festina_json_try_null(c)) return NULL;
     return festina_json_parse_string(c);
+}
+
+/* ---- url / parseURL() -- claude.md #162 ----
+ *
+ * Deliberately modeled on the WHATWG URL object's own field names
+ * (hash/hostname/password/pathname/port/protocol/searchParams/
+ * username) rather than inventing new ones, since that's the shape
+ * asked for directly. Absolute URLs only (`scheme://...`) -- no
+ * relative-URL resolution against a base, no IDNA/punycode host
+ * normalization, no exhaustive RFC 3986 validation; a pragmatic
+ * subset that parses the URLs a real program actually constructs
+ * (an API endpoint, a webhook target), not a general-purpose URL
+ * library. parseURL() THROWS (claude.md #157's own catchable
+ * exception mechanism, reused here exactly the way claude.md #159's
+ * JSON parser already reuses it) on a genuinely malformed URL -- no
+ * `://`, or an unparseable port -- rather than returning some
+ * default/empty value a caller could easily miss.
+ *
+ * Refcounted like blob/img/aud/http (the same `{refcount, ...}`
+ * header every one of those shares -- see _is_refcounted's own
+ * comment in codegen.py), constructed once by festina_parse_url and
+ * read through afterward by seven small accessors, one per field --
+ * `port` is the one exception (kept as a public field access via
+ * festina_url_port returning i64 directly, no separate accessor
+ * split needed since it was never text to begin with). */
+typedef struct {
+    int64_t refcount;
+    char *protocol;    /* includes the trailing ':' -- e.g. "https:" --
+                        * matching the WHATWG URL object's own convention */
+    char *username;
+    char *password;
+    char *hostname;
+    int64_t port;       /* festina_null_int() when the URL named no
+                         * explicit port (the scheme's own default
+                         * applies implicitly -- this never guesses
+                         * what that default is) */
+    char *pathname;     /* always starts with '/' */
+    char *hash;         /* includes the leading '#' if present, else "" */
+    void *search_params; /* map[text] payload (see festina_runtime_http.c's
+                          * own festina_new_empty_text_map for the identical
+                          * {refcount, count, entries} shape) -- percent-
+                          * decoded keys/values, '+' decoded to a space in
+                          * the query string specifically (classic
+                          * application/x-www-form-urlencoded convention),
+                          * NOT in the path/hash. */
+} FestinaUrlValue;
+
+static char *festina_url_slice(const char *start, const char *end) {
+    size_t len = (size_t)(end - start);
+    char *out = malloc(len + 1);
+    if (!out) festina_fail("out of memory parsing a URL");
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return out;
+}
+
+/* One hex digit -> its value, or -1 if not a hex digit. */
+static int festina_hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Percent-decodes [start, end) into a fresh, owned, NUL-terminated
+ * string -- '+' becomes a space (query-string convention; callers
+ * that don't want that, e.g. a plain path/hash slice, use
+ * festina_url_slice above instead, never this). A malformed escape
+ * (a trailing '%' or non-hex digits) is passed through literally
+ * rather than rejected -- the same "lenient, never fails the
+ * program" spirit claude.md #159's own JSON parser applies to
+ * unknown-but-harmless input shapes, not to genuinely malformed ones
+ * (which still throw, just not here -- this only ever decodes
+ * already-delimited query text, never a place a throw would help). */
+static char *festina_url_decode(const char *start, const char *end) {
+    size_t len = (size_t)(end - start);
+    char *out = malloc(len + 1);
+    if (!out) festina_fail("out of memory parsing a URL");
+    size_t oi = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = start[i];
+        if (c == '+') {
+            out[oi++] = ' ';
+        } else if (c == '%' && i + 2 < len) {
+            int hi = festina_hex_digit(start[i + 1]);
+            int lo = festina_hex_digit(start[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out[oi++] = (char)((hi << 4) | lo);
+                i += 2;
+            } else {
+                out[oi++] = c;
+            }
+        } else {
+            out[oi++] = c;
+        }
+    }
+    out[oi] = '\0';
+    return out;
+}
+
+/* festina_runtime_http.c has its own helper of this exact name/shape
+ * (a fresh {refcount, count, entries} map[text] block) -- not
+ * reachable from here (a different translation unit), so this is
+ * CORE's own private copy, used by both url search params and by
+ * anything else in this file that ever needs a fresh empty map[text]. */
+typedef struct {
+    int64_t refcount;
+    int64_t count;
+    void *entries;
+} FestinaMapBlockCore;
+
+static void *festina_new_empty_text_map(void) {
+    FestinaMapBlockCore *block = calloc(1, sizeof(FestinaMapBlockCore));
+    if (!block) festina_fail("out of memory allocating a map");
+    block->refcount = 1;
+    return &block->count;
+}
+
+/* Parses `a=1&b=2` (already-decoded of its own leading '?') into a
+ * fresh map[text] -- last-key-wins for a repeated parameter, the
+ * identical "last one wins" convention claude.md #159's own JSON
+ * object parsing already uses for a duplicate key. */
+static void *festina_parse_search_params(const char *query, size_t len) {
+    void *map = festina_new_empty_text_map();
+    FestinaMapBlockCore *block = (FestinaMapBlockCore *)((char *)map - sizeof(int64_t));
+    const char *p = query;
+    const char *end = query + len;
+    while (p < end) {
+        const char *pair_end = memchr(p, '&', (size_t)(end - p));
+        if (!pair_end) pair_end = end;
+        const char *eq = memchr(p, '=', (size_t)(pair_end - p));
+        char *key, *value;
+        if (eq) {
+            key = festina_url_decode(p, eq);
+            value = festina_url_decode(eq + 1, pair_end);
+        } else {
+            key = festina_url_decode(p, pair_end);
+            value = festina_text_own("");
+        }
+        if (key[0] != '\0') {
+            festina_map_set(&block->count, &block->entries, key,
+                            (int64_t)(intptr_t)value);
+        } else {
+            free(value);
+        }
+        free(key);
+        p = (pair_end < end) ? pair_end + 1 : end;
+    }
+    return map;
+}
+
+void *festina_parse_url(const char *text) {
+    if (!text) text = "";
+    const char *scheme_end = strstr(text, "://");
+    if (!scheme_end) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "parseURL: '%s' has no scheme (expected "
+                 "something like 'https://host/path')", text);
+        festina_throw(festina_text_own(msg));
+        return NULL; /* unreachable -- festina_throw never returns */
+    }
+    const char *p = scheme_end + 3;
+
+    FestinaUrlValue *u = calloc(1, sizeof(FestinaUrlValue));
+    if (!u) festina_fail("out of memory parsing a URL");
+    u->refcount = 1;
+    u->port = festina_null_int();
+    {
+        char *scheme = festina_url_slice(text, scheme_end);
+        size_t slen = strlen(scheme);
+        char *with_colon = malloc(slen + 2);
+        if (!with_colon) festina_fail("out of memory parsing a URL");
+        memcpy(with_colon, scheme, slen);
+        with_colon[slen] = ':';
+        with_colon[slen + 1] = '\0';
+        free(scheme);
+        u->protocol = with_colon;
+    }
+
+    /* authority: [user[:password]@]host[:port], up to the first of
+     * '/', '?', '#', or the end of the string. */
+    const char *authority_end = p;
+    while (*authority_end && *authority_end != '/' && *authority_end != '?'
+           && *authority_end != '#') authority_end++;
+    const char *host_start = p;
+    const char *at = memchr(p, '@', (size_t)(authority_end - p));
+    if (at) {
+        const char *colon = memchr(p, ':', (size_t)(at - p));
+        if (colon) {
+            u->username = festina_url_decode(p, colon);
+            u->password = festina_url_decode(colon + 1, at);
+        } else {
+            u->username = festina_url_decode(p, at);
+            u->password = festina_text_own("");
+        }
+        host_start = at + 1;
+    } else {
+        u->username = festina_text_own("");
+        u->password = festina_text_own("");
+    }
+    const char *port_colon = memchr(host_start, ':', (size_t)(authority_end - host_start));
+    if (port_colon) {
+        u->hostname = festina_url_slice(host_start, port_colon);
+        char *port_text = festina_url_slice(port_colon + 1, authority_end);
+        if (port_text[0] != '\0') {
+            char *end_ptr = NULL;
+            long port_val = strtol(port_text, &end_ptr, 10);
+            if (end_ptr == port_text || *end_ptr != '\0' || port_val < 0 || port_val > 65535) {
+                char msg[256];
+                snprintf(msg, sizeof(msg), "parseURL: '%s' has an invalid port", text);
+                free(port_text);
+                festina_throw(festina_text_own(msg));
+                return NULL; /* unreachable */
+            }
+            u->port = port_val;
+        }
+        free(port_text);
+    } else {
+        u->hostname = festina_url_slice(host_start, authority_end);
+    }
+
+    p = authority_end;
+    const char *path_start = p;
+    while (*p && *p != '?' && *p != '#') p++;
+    u->pathname = (p > path_start) ? festina_url_slice(path_start, p) : festina_text_own("/");
+
+    if (*p == '?') {
+        p++;
+        const char *query_start = p;
+        while (*p && *p != '#') p++;
+        u->search_params = festina_parse_search_params(query_start, (size_t)(p - query_start));
+    } else {
+        u->search_params = festina_new_empty_text_map();
+    }
+
+    if (*p == '#') {
+        u->hash = festina_url_slice(p, p + strlen(p));
+    } else {
+        u->hash = festina_text_own("");
+    }
+
+    return &u->protocol;
+}
+
+#define FESTINA_URL_FROM_PAYLOAD(payload) \
+    ((FestinaUrlValue *)((char *)(payload) - offsetof(FestinaUrlValue, protocol)))
+
+char *festina_url_protocol(void *payload) { return festina_text_own(FESTINA_URL_FROM_PAYLOAD(payload)->protocol); }
+char *festina_url_username(void *payload) { return festina_text_own(FESTINA_URL_FROM_PAYLOAD(payload)->username); }
+char *festina_url_password(void *payload) { return festina_text_own(FESTINA_URL_FROM_PAYLOAD(payload)->password); }
+char *festina_url_hostname(void *payload) { return festina_text_own(FESTINA_URL_FROM_PAYLOAD(payload)->hostname); }
+int64_t festina_url_port(void *payload) { return FESTINA_URL_FROM_PAYLOAD(payload)->port; }
+char *festina_url_pathname(void *payload) { return festina_text_own(FESTINA_URL_FROM_PAYLOAD(payload)->pathname); }
+char *festina_url_hash(void *payload) { return festina_text_own(FESTINA_URL_FROM_PAYLOAD(payload)->hash); }
+void *festina_url_search_params(void *payload) {
+    void *sp = FESTINA_URL_FROM_PAYLOAD(payload)->search_params;
+    festina_retain(sp);
+    return sp;
+}
+
+void festina_release_url(void *payload) {
+    if (!festina_release_check(payload)) return;
+    FestinaUrlValue *u = FESTINA_URL_FROM_PAYLOAD(payload);
+    free(u->protocol);
+    free(u->username);
+    free(u->password);
+    free(u->hostname);
+    free(u->pathname);
+    free(u->hash);
+    festina_release_map(u->search_params);
+    free(u);
 }
 
 /* claude.md #131: close(code)/`on exit(code:int)`. Lives in the CORE

@@ -59,7 +59,7 @@ class TestRuntimeBehavior:
         server = compile_and_run_secure_server("""
         blob key = '__CERT_PATH__'
         on request(req:http) {
-            req.send('secure hello', 200)
+            req.send({'code': 200, 'body': 'secure hello'})
         }
         openSecurePort(__PORT__, key)
         """)
@@ -81,13 +81,13 @@ class TestRuntimeBehavior:
         server = compile_and_run_secure_server("""
         blob key = '__CERT_PATH__'
         on request(req:http) {
-            req.send(`${req.method} ${req.path}`, 200)
+            req.send({'code': 200, 'body': `${req.method} ${req.url}`})
         }
         openSecurePort(__PORT__, key)
         """)
         status, _headers, body = server.https_get("/hello")
         assert status == 200
-        assert body == b"GET /hello"
+        assert body.decode() == f"GET https://127.0.0.1:{server.port}/hello"
 
     def test_plaintext_request_to_a_tls_port_does_not_get_a_plaintext_response(
             self, compile_and_run_secure_server):
@@ -121,7 +121,7 @@ class TestRuntimeBehavior:
         # handshakes.)
         server = compile_and_run_secure_server("""
         blob key = '__CERT_PATH__'
-        on request(req:http) { req.send('ok', 200) }
+        on request(req:http) { req.send({'code': 200, 'body': 'ok'}) }
         openSecurePort(__PORT__, key)
         """)
         for _ in range(10):

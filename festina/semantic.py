@@ -149,6 +149,14 @@ BUILTIN_FUNCTIONS = {
     # (a program-authoring mistake, not a runtime condition to test
     # for -- the same line claude.md #59 already draws elsewhere).
     "openSecurePort",
+    # claude.md #162: parseURL(text) -- like mkdir/exec above, a fixed
+    # (text,) -> url signature the standard _BUILTIN_SIGNATURES/
+    # _BUILTIN_RETURN_TYPES tables already handle directly, no bespoke
+    # _infer_call branch needed the way regex()'s own variable-arity
+    # handling requires. There is no separate fetch() builtin --
+    # outbound requests go through http's own zero-argument
+    # req.send() instead (see _HTTP_METHODS' own comment).
+    "parseURL",
 }
 
 _BUILTIN_RETURN_TYPES = {
@@ -156,6 +164,8 @@ _BUILTIN_RETURN_TYPES = {
     # can see what it actually got rather than what it asked for.
     "maxAudioPlayers": types_mod.PrimitiveType("int"),
     "regex": types_mod.RegexType(),
+    # claude.md #162
+    "parseURL": types_mod.UrlType(),
     # claude.md #89: the only two graphics builtins that return anything
     "measureTextWidth": types_mod.PrimitiveType("int"),
     "measureTextHeight": types_mod.PrimitiveType("int"),
@@ -265,6 +275,8 @@ _BUILTIN_SIGNATURES = {
     # claude.md #160: (port, key) -- key is a combined PEM blob (cert
     # + unencrypted private key). See _BUILTIN_FUNCTIONS above.
     "openSecurePort": (_INT, _BLOB),
+    # claude.md #162: parseURL(text) -> url.
+    "parseURL": (_TEXT,),
 }
 
 # claude.md #90: three builtins accept two different shapes. The
@@ -357,6 +369,88 @@ def _is_sendable_type(t):
         return True
     return isinstance(t, (types_mod.StructType, types_mod.TableType,
                           types_mod.ArrayType, types_mod.MapType))
+
+# claude.md #162: an http literal's own `'body':` key accepts
+# everything _is_sendable_type already does, PLUS img/aud -- unlike
+# socket.send()'s data:any (a raw WebSocket frame has no meaningful
+# "media" reading), a real HTTP request/response body uploading or
+# returning a picture/clip is completely ordinary, so the same
+# `img`/`aud` rejection log()/templates/socket.send() all share
+# doesn't apply here.
+def _is_http_body_type(t):
+    return _is_sendable_type(t) or t in (_IMAGE, _AUDIO)
+
+# claude.md #162: the field set `http x = {...}` accepts -- shared
+# between VarDecl's own bypass (mirroring claude.md #156's identical
+# amor-map-literal bypass, see analyze_var_decl) and req.send(res)'s
+# one-argument form, when the caller writes the response inline
+# (`req.send({'code':200, ...})`) rather than through an
+# already-declared http variable. Each entry's KEY must already be a
+# literal text key (ast.StringLit) naming one of these five fields --
+# an arbitrary computed key expression is rejected outright, since
+# there is no way to validate (or, in codegen, build) a heterogeneous
+# literal whose very field set isn't known until runtime, unlike a
+# genuine map[T] literal where every value shares one type regardless
+# of which key produced it.
+_HTTP_LIT_FIELD_TYPES = {
+    "url": _TEXT,
+    "method": _TEXT,
+    "code": _INT,
+    "headers": None,  # checked separately below (map[text])
+    "body": None,     # checked separately below (_is_http_body_type)
+}
+
+
+def _validate_http_lit(maplit, scope, filename, infer):
+    for key_expr, val_expr in maplit.entries:
+        if not isinstance(key_expr, ast.StringLit):
+            raise CompileError(
+                "an http literal's keys must be plain text -- "
+                "'url'/'method'/'code'/'headers'/'body', not a computed expression",
+                file=filename, line=getattr(key_expr, "line", 0),
+                column=getattr(key_expr, "column", 0),
+                category="invalid operand type",
+            )
+        key = key_expr.value
+        if key not in _HTTP_LIT_FIELD_TYPES:
+            raise CompileError(
+                f"http has no field '{key}' to construct -- an http literal "
+                f"accepts 'url', 'method', 'code', 'headers', and 'body'",
+                file=filename, line=getattr(key_expr, "line", 0),
+                column=getattr(key_expr, "column", 0),
+                category="invalid field access",
+            )
+        val_type = infer(val_expr, scope)
+        if val_type is None or val_type is NULL:
+            continue
+        if key == "headers":
+            if val_type != types_mod.MapType(_TEXT):
+                raise CompileError(
+                    f"http literal's 'headers' expects map[text], found "
+                    f"{types_mod.type_name(val_type)}",
+                    file=filename, line=getattr(val_expr, "line", 0),
+                    column=getattr(val_expr, "column", 0),
+                    category="invalid operand type",
+                )
+        elif key == "body":
+            if not _is_http_body_type(val_type):
+                raise CompileError(
+                    f"http literal's 'body' has no body form -- found "
+                    f"{types_mod.type_name(val_type)}",
+                    file=filename, line=getattr(val_expr, "line", 0),
+                    column=getattr(val_expr, "column", 0),
+                    category="invalid operand type",
+                )
+        else:
+            expected = _HTTP_LIT_FIELD_TYPES[key]
+            if val_type != expected:
+                raise CompileError(
+                    f"http literal's '{key}' expects {types_mod.type_name(expected)}, "
+                    f"found {types_mod.type_name(val_type)}",
+                    file=filename, line=getattr(val_expr, "line", 0),
+                    column=getattr(val_expr, "column", 0),
+                    category="invalid operand type",
+                )
 
 # claude.md #56: float -> int, with an explicit rounding decision.
 MATH_ROUNDING_FUNCTIONS = {"floor", "ceil", "round", "trunc"}
@@ -584,6 +678,8 @@ def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None
         return types_mod.RegexType()
     if name == "http":
         return types_mod.HttpType()
+    if name == "url":
+        return types_mod.UrlType()
     if name == "socket":
         return types_mod.SocketType()
     if name == "color":
@@ -1012,13 +1108,27 @@ def analyze(program, filename="<string>"):
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid assignment",
                 )
-            # claude.md #151: http's own three fields (port/method/
+            # claude.md #162: http's own four fields (url/method/code/
             # headers) are read-only too -- same placement/reasoning
             # as .length above (the ArrayType-style generic check
-            # below can't tell a read from a write target either).
+            # below can't tell a read from a write target either). The
+            # only way to SET them is the literal-construction syntax
+            # (`http x = {...}`) at creation time.
             if (isinstance(expr.target, ast.Member) and not expr.target.computed
-                    and expr.target.prop in ("port", "method", "path", "headers")
+                    and expr.target.prop in ("url", "method", "code", "headers")
                     and isinstance(infer(expr.target.obj, scope), types_mod.HttpType)):
+                raise CompileError(
+                    f"'.{expr.target.prop}' is read-only and cannot be assigned to",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid assignment",
+                )
+            # claude.md #162: every url field is read-only, same
+            # placement/reasoning as http's own fields just above -- a
+            # url is built once, by parseURL(), never mutated afterward.
+            if (isinstance(expr.target, ast.Member) and not expr.target.computed
+                    and expr.target.prop in ("hash", "hostname", "password", "pathname",
+                                              "port", "protocol", "searchParams", "username")
+                    and isinstance(infer(expr.target.obj, scope), types_mod.UrlType)):
                 raise CompileError(
                     f"'.{expr.target.prop}' is read-only and cannot be assigned to",
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
@@ -1330,20 +1440,38 @@ def analyze(program, filename="<string>"):
                 file=filename, line=expr.line, column=expr.column,
                 category="invalid field access",
             )
-        if isinstance(obj_type, types_mod.HttpType):
-            # claude.md #151: four read-only fields (port/method/path/
-            # headers -- the request's own properties, set once when
-            # it's parsed, never assignable), the rest are methods
-            # (see _HTTP_METHODS/_infer_call's own `send` branch) --
-            # same strict shape as ImageType's own field/method split
-            # above, for the same reason. `path` is beyond the user's
-            # own literal spec (see festina_runtime.h's own top
-            # comment) -- a request has no way to route on anything
-            # without it.
+        if isinstance(obj_type, types_mod.UrlType):
+            # claude.md #162: every field is read-only (see the
+            # assignment-rejection check right alongside http's own,
+            # earlier in this module) -- a url is built once, by
+            # parseURL(), never mutated afterward.
+            if expr.prop in ("hostname", "password", "pathname", "protocol", "username", "hash"):
+                return _TEXT
             if expr.prop == "port":
                 return _INT
-            if expr.prop in ("method", "path"):
+            if expr.prop == "searchParams":
+                return types_mod.MapType(_TEXT)
+            raise CompileError(
+                f"url has no field '{expr.prop}' (url has .hash, .hostname, "
+                f".password, .pathname, .port, .protocol, .searchParams, and .username)",
+                file=filename, line=expr.line, column=expr.column,
+                category="invalid field access",
+            )
+        if isinstance(obj_type, types_mod.HttpType):
+            # claude.md #162: four read-only fields (url/method/code/
+            # headers), the rest are methods (see _HTTP_METHODS/
+            # _infer_call's own `send` branch) -- same strict shape as
+            # ImageType's own field/method split above, for the same
+            # reason. `url`/`code` replace the old `port`/`path` pair
+            # (claude.md #151) -- a live inbound request reconstructs
+            # `url` from its own scheme/Host header/path (see
+            # festina_runtime_http.c's own comment), and `code` is
+            # `null` on an inbound request or a freshly-constructed
+            # outbound one, set once a response actually exists.
+            if expr.prop in ("url", "method"):
                 return _TEXT
+            if expr.prop == "code":
+                return _INT
             if expr.prop == "headers":
                 return types_mod.MapType(_TEXT)
             if expr.prop in _HTTP_METHODS or expr.prop == "send":
@@ -1354,8 +1482,8 @@ def analyze(program, filename="<string>"):
                     category="invalid field access",
                 )
             raise CompileError(
-                f"http has no field '{expr.prop}' (http has .port, "
-                f".method, .path, .headers, and the methods listed in api.md)",
+                f"http has no field '{expr.prop}' (http has .url, "
+                f".method, .code, .headers, and the methods listed in api.md)",
                 file=filename, line=expr.line, column=expr.column,
                 category="invalid field access",
             )
@@ -2077,42 +2205,51 @@ def analyze(program, filename="<string>"):
             # express, so this is its own bespoke branch, the same
             # reason saveCanvas()/setTimeout() above have theirs.
             if callee.prop == "send" and infer(callee.obj, scope) == _HTTP:
-                if not (1 <= len(expr.args) <= 3):
-                    raise CompileError(
-                        f"send() expects 1 to 3 arguments (data, an optional "
-                        f"status code, an optional headers map), got {len(expr.args)}",
-                        file=filename, line=callee.line, column=callee.column,
-                        category="invalid function argument type",
-                    )
-                data_type = infer(expr.args[0], scope)
-                if (data_type is not None and data_type is not NULL
-                        and not _is_sendable_type(data_type)):
-                    raise CompileError(
-                        f"send()'s data argument has no body form -- found "
-                        f"{types_mod.type_name(data_type)}",
-                        file=filename, line=callee.line, column=callee.column,
-                        category="invalid function argument type",
-                    )
-                if len(expr.args) >= 2:
-                    code_type = infer(expr.args[1], scope)
-                    if code_type is not None and code_type is not NULL and code_type != _INT:
+                # claude.md #162: send() is now overloaded by ARITY,
+                # not just optional trailing arguments the way it used
+                # to be -- `req.send(res:http)` (one argument) is the
+                # SERVER side (unchanged in spirit from before this
+                # entry, just taking one constructed http value now
+                # instead of three separate data/code/headers ones),
+                # `req.send()` (zero arguments) is the CLIENT side: an
+                # outbound request, sent using THIS value's own url/
+                # method/headers/body, which then gets overwritten in
+                # place with the response (mirroring what a bare
+                # `res.toText()` etc. would read afterward) -- the
+                # exact same runtime call either way could in
+                # principle reach (a live, server-accepted connection
+                # calling the zero-arg form, or a plain constructed
+                # value calling the one-arg form) is never rejected at
+                # compile time, only ever a silent no-op at runtime,
+                # the same "never crashes on a value that doesn't
+                # apply" convention every other http method already
+                # has (see festina_runtime_http.c's own comment).
+                if len(expr.args) == 0:
+                    return None
+                if len(expr.args) == 1:
+                    if isinstance(expr.args[0], ast.MapLit):
+                        # claude.md #162: an inline response literal --
+                        # `req.send({'code':200, ...})` -- same bypass
+                        # analyze_var_decl's own http-literal branch
+                        # uses, needed here too since this argument
+                        # position never goes through that function.
+                        _validate_http_lit(expr.args[0], scope, filename, infer)
+                        return None
+                    arg_type = infer(expr.args[0], scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != _HTTP:
                         raise CompileError(
-                            f"send()'s status code argument must be int, found "
-                            f"{types_mod.type_name(code_type)}",
+                            f"send()'s argument expects http, found "
+                            f"{types_mod.type_name(arg_type)}",
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid function argument type",
                         )
-                if len(expr.args) == 3:
-                    headers_type = infer(expr.args[2], scope)
-                    if (headers_type is not None and headers_type is not NULL
-                            and headers_type != types_mod.MapType(_TEXT)):
-                        raise CompileError(
-                            f"send()'s headers argument must be map[text], found "
-                            f"{types_mod.type_name(headers_type)}",
-                            file=filename, line=callee.line, column=callee.column,
-                            category="invalid function argument type",
-                        )
-                return None
+                    return None
+                raise CompileError(
+                    f"send() expects 0 arguments (an outbound client request) "
+                    f"or 1 (a constructed http response), got {len(expr.args)}",
+                    file=filename, line=callee.line, column=callee.column,
+                    category="invalid function argument type",
+                )
             # claude.md #151: socket.send(data:any) -- the same
             # sendable-type check as http.send() above, but always
             # exactly one argument (a WebSocket frame has no status
@@ -2560,6 +2697,15 @@ def analyze(program, filename="<string>"):
                             column=getattr(val_expr, "column", 0),
                             category="invalid operand type",
                         )
+            elif (isinstance(declared_type, types_mod.HttpType)
+                    and isinstance(decl.init, ast.MapLit)):
+                # claude.md #162: same bypass shape as the amor-map
+                # case just above, for the identical reason -- MapLit's
+                # own generic inference demands one homogeneous value
+                # type across every entry, which an http literal's
+                # genuinely heterogeneous field set (text/int/map/body)
+                # can never satisfy.
+                _validate_http_lit(decl.init, scope, filename, infer)
             else:
                 actual_type = infer(decl.init, scope)
                 check_assignable(declared_type, actual_type, decl)
