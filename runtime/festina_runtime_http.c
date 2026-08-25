@@ -323,6 +323,26 @@ typedef struct {
      * pointer aimed at the `count` field (see festina_runtime.h's own
      * doc comment on the http/socket handle representation for why). */
     void *state_map;
+
+    /* claude.md #160: openSecurePort()'s own per-connection TLS state
+     * -- NULL for a plain (non-TLS) connection, an opaque handle
+     * g_tls_conn_new produced for one accepted on a TLS listener. Every
+     * read/write/teardown site below checks `tls` rather than keeping
+     * a separate is_tls flag: a connection is TLS if and only if it
+     * has TLS state, by construction (festina_accept_new_connections
+     * sets it at accept time from the listener's own tls_config, never
+     * changed afterward). tls_handshake_done gates festina_conn_readable's
+     * own dispatch: raw bytes off the wire are still the TLS handshake
+     * itself until this flips, never HTTP/WebSocket data.
+     * tls_wants_write records whether the last handshake attempt
+     * needed to WRITE before it could make more progress (mbedTLS's
+     * own WANT_WRITE) -- festina_run_http_loop's poll-set construction
+     * adds POLLOUT for this connection only when it's set, so a
+     * handshake that stalls on a full TCP send buffer still gets woken
+     * up to retry instead of waiting on a POLLIN that may never come. */
+    void *tls;
+    int tls_handshake_done;
+    int tls_wants_write;
 } FestinaConn;
 
 typedef struct {
@@ -471,6 +491,12 @@ static void festina_conn_index_remove(int64_t conn_id) {
 typedef struct {
     FestinaSocket fd;
     int port;
+    /* claude.md #160: NULL for a plain openPort() listener, an opaque
+     * handle g_tls_listener_new produced for one opened via
+     * openSecurePort() -- every connection accept()ed on this
+     * listener's own fd gets its own per-connection TLS state built
+     * from this shared config (see FestinaConn's own tls field). */
+    void *tls_config;
 } FestinaListener;
 
 static FestinaListener *g_listeners = NULL;
@@ -486,6 +512,40 @@ void festina_register_request_handler(void (*fn)(void *)) { g_request_handler = 
 void festina_register_upgrade_handler(void (*fn)(void *)) { g_upgrade_handler = fn; }
 void festina_register_message_handler(void (*fn)(void *, void *)) { g_message_handler = fn; }
 void festina_register_socketclose_handler(void (*fn)(void *)) { g_socketclose_handler = fn; }
+
+/* claude.md #160: the openSecurePort()/mbedTLS hook table -- NULL
+ * (never called) for a program that never links festina_runtime_https.c
+ * at all (see that file's own top comment for the cross-translation-
+ * unit registration this mirrors from g_audio_decoder/g_image_decoder).
+ * Every site below that touches TLS goes through these seven pointers,
+ * never an mbedTLS symbol directly -- this translation unit has no
+ * mbedTLS #include at all, deliberately, so it stays buildable and
+ * linkable with zero TLS dependency for every program that doesn't
+ * call openSecurePort(). */
+static void *(*g_tls_listener_new)(const uint8_t *pem, int64_t pem_len) = NULL;
+static void (*g_tls_listener_free)(void *tls_config) = NULL;
+static void *(*g_tls_conn_new)(void *tls_config, int fd) = NULL;
+static void (*g_tls_conn_free)(void *tls_state) = NULL;
+static int (*g_tls_handshake)(void *tls_state) = NULL;
+static long (*g_tls_recv)(void *tls_state, void *buf, int64_t cap) = NULL;
+static long (*g_tls_send)(void *tls_state, const void *data, int64_t len) = NULL;
+
+void festina_set_tls_hooks(
+        void *(*listener_new)(const uint8_t *, int64_t),
+        void (*listener_free)(void *),
+        void *(*conn_new)(void *, int),
+        void (*conn_free)(void *),
+        int (*handshake)(void *),
+        long (*recv_fn)(void *, void *, int64_t),
+        long (*send_fn)(void *, const void *, int64_t)) {
+    g_tls_listener_new = listener_new;
+    g_tls_listener_free = listener_free;
+    g_tls_conn_new = conn_new;
+    g_tls_conn_free = conn_free;
+    g_tls_handshake = handshake;
+    g_tls_recv = recv_fn;
+    g_tls_send = send_fn;
+}
 
 /* claude.md #151: an 8MB cap on how much a single connection may
  * buffer (request line + headers + body, or one WebSocket frame's
@@ -582,6 +642,8 @@ static void festina_conn_teardown(FestinaConn *c) {
         g_socketclose_handler(handle);
         festina_release_conn_handle(handle);
     }
+    if (c->tls && g_tls_conn_free) g_tls_conn_free(c->tls);
+    c->tls = NULL;
     festina_close_fd(c->fd);
     free(c->buf);
     free(c->method);
@@ -725,11 +787,33 @@ static char *festina_ws_accept_key(const char *client_key) {
     return festina_base64_encode(digest, 20);
 }
 
-static int festina_send_all(FestinaSocket fd, const void *data, size_t len) {
+/* claude.md #160: takes the FestinaConn itself, not a raw fd -- a TLS
+ * connection's writes have to go through g_tls_send (mbedtls_ssl_write
+ * under the hood), not a plain send() syscall, and c->tls is the only
+ * place that's recorded. Every call site already had the FestinaConn
+ * in hand (`c->fd` was itself always a field access off one), so this
+ * is a signature change with no new bookkeeping needed at any caller. */
+static int festina_send_all(FestinaConn *c, const void *data, size_t len) {
+    if (c->tls) {
+        const uint8_t *p = (const uint8_t *)data;
+        size_t sent = 0;
+        while (sent < len) {
+            /* claude.md #155's own festina_send_all precedent (see the
+             * plain-socket branch below): a write that would block is
+             * treated as outright failure here too, not retried via
+             * the event loop -- g_tls_send already folds mbedTLS's
+             * WANT_READ/WANT_WRITE into that same "just fail" answer
+             * (see festina_runtime_https.c's own comment on why). */
+            long n = g_tls_send(c->tls, p + sent, (int64_t)(len - sent));
+            if (n <= 0) return 0;
+            sent += (size_t)n;
+        }
+        return 1;
+    }
     const uint8_t *p = (const uint8_t *)data;
     size_t sent = 0;
     while (sent < len) {
-        ssize_t n = send(fd, (const char *)(p + sent), (int)(len - sent), 0);
+        ssize_t n = send(c->fd, (const char *)(p + sent), (int)(len - sent), 0);
         if (n < 0) {
             if (festina_socket_was_interrupted()) continue;
             return 0;
@@ -799,7 +883,7 @@ static void festina_sendbuf_free(FestinaSendBuf *b) {
 /* Writes ONE unmasked server->client frame (server frames are never
  * masked per RFC 6455) -- `opcode` 0x1 text, 0x2 binary, 0x8 close,
  * 0xA pong. */
-static void festina_ws_send_frame(FestinaSocket fd, uint8_t opcode, const void *data, size_t len) {
+static void festina_ws_send_frame(FestinaConn *c, uint8_t opcode, const void *data, size_t len) {
     uint8_t header[10];
     size_t header_len = 0;
     header[0] = 0x80 | (opcode & 0x0F); /* FIN=1, no fragmentation from this runtime */
@@ -816,8 +900,8 @@ static void festina_ws_send_frame(FestinaSocket fd, uint8_t opcode, const void *
         for (int i = 0; i < 8; i++) header[2 + i] = (uint8_t)((uint64_t)len >> (56 - 8 * i));
         header_len = 10;
     }
-    if (!festina_send_all(fd, header, header_len)) return;
-    if (len > 0) festina_send_all(fd, data, len);
+    if (!festina_send_all(c, header, header_len)) return;
+    if (len > 0) festina_send_all(c, data, len);
 }
 
 /* Tries to parse and consume ONE complete frame from c->buf. Returns
@@ -937,12 +1021,12 @@ static void festina_dispatch_ws_frame(FestinaConn *c, uint8_t opcode,
         break;
     }
     case 0x8: /* close */
-        festina_ws_send_frame(c->fd, 0x8, payload, payload_len);
+        festina_ws_send_frame(c, 0x8, payload, payload_len);
         free(payload);
         festina_conn_teardown(c);
         break;
     case 0x9: /* ping -- answer with a pong carrying the same payload */
-        festina_ws_send_frame(c->fd, 0xA, payload, payload_len);
+        festina_ws_send_frame(c, 0xA, payload, payload_len);
         free(payload);
         break;
     case 0xA: /* pong -- nothing sent this, but tolerate it anyway */
@@ -957,7 +1041,7 @@ static void festina_dispatch_ws_frame(FestinaConn *c, uint8_t opcode,
         free(payload);
         {
             uint8_t close_payload[2] = {0x03, 0xEB}; /* 1003, big-endian */
-            festina_ws_send_frame(c->fd, 0x8, close_payload, 2);
+            festina_ws_send_frame(c, 0x8, close_payload, 2);
         }
         festina_conn_teardown(c);
         break;
@@ -965,19 +1049,50 @@ static void festina_dispatch_ws_frame(FestinaConn *c, uint8_t opcode,
 }
 
 static void festina_conn_readable(FestinaConn *c) {
+    /* claude.md #160: raw bytes off the wire are still the TLS
+     * handshake itself until this connection's own handshake
+     * completes -- driven here, across however many poll() ticks it
+     * takes (mbedtls_ssl_handshake is itself non-blocking on this
+     * runtime's already-non-blocking fds, returning WANT_READ/
+     * WANT_WRITE rather than blocking to completion). Every one of
+     * THIS function's own call sites (festina_run_http_loop, once per
+     * readable-or-writable poll event) reaches this unconditionally,
+     * same as a plain connection's first readable byte would. */
+    if (c->tls && !c->tls_handshake_done) {
+        int hs = g_tls_handshake(c->tls);
+        if (hs < 0) { festina_conn_teardown(c); return; }
+        if (hs != 1) { c->tls_wants_write = (hs == 2); return; }
+        c->tls_handshake_done = 1;
+        c->tls_wants_write = 0;
+        /* Falls through to the read loop below immediately -- the
+         * handshake's own last flight and the client's first
+         * application-data record can arrive in the same physical
+         * recv(), already fully consumed by mbedTLS's internal BIO
+         * reads during the handshake call above, so waiting for
+         * another POLLIN here could stall forever. */
+    }
     for (;;) {
         festina_conn_ensure_capacity(c, 4096);
         if (c->buf_len >= c->buf_cap) { festina_conn_teardown(c); return; }
-        ssize_t n = recv(c->fd, (char *)(c->buf + c->buf_len), (int)(c->buf_cap - c->buf_len), 0);
-        if (n < 0) {
-            if (festina_socket_would_block()) break;
-            if (festina_socket_was_interrupted()) continue;
-            festina_conn_teardown(c);
-            return;
-        }
-        if (n == 0) { /* peer closed */
-            festina_conn_teardown(c);
-            return;
+        ssize_t n;
+        if (c->tls) {
+            long r = g_tls_recv(c->tls, c->buf + c->buf_len, (int64_t)(c->buf_cap - c->buf_len));
+            if (r == -1) break;                      /* would block */
+            if (r <= -2) { festina_conn_teardown(c); return; } /* fatal */
+            if (r == 0) { festina_conn_teardown(c); return; }  /* peer closed */
+            n = (ssize_t)r;
+        } else {
+            n = recv(c->fd, (char *)(c->buf + c->buf_len), (int)(c->buf_cap - c->buf_len), 0);
+            if (n < 0) {
+                if (festina_socket_would_block()) break;
+                if (festina_socket_was_interrupted()) continue;
+                festina_conn_teardown(c);
+                return;
+            }
+            if (n == 0) { /* peer closed */
+                festina_conn_teardown(c);
+                return;
+            }
         }
         c->buf_len += (size_t)n;
         if (c->buf_len >= (size_t)FESTINA_HTTP_MAX_BUFFER
@@ -1012,7 +1127,7 @@ static void festina_set_nonblocking(FestinaSocket fd) {
 #endif
 }
 
-static void festina_accept_new_connections(FestinaSocket listen_fd, int port) {
+static void festina_accept_new_connections(FestinaSocket listen_fd, int port, void *tls_config) {
     for (;;) {
         FestinaSocket fd = accept(listen_fd, NULL, NULL);
         if (fd == FESTINA_INVALID_SOCKET) {
@@ -1026,11 +1141,36 @@ static void festina_accept_new_connections(FestinaSocket listen_fd, int port) {
         FestinaConn *c = festina_conn_new_slot();
         c->fd = fd;
         c->listen_port = port;
+        if (tls_config) {
+            /* claude.md #160: the fd handed to mbedTLS's own BIO
+             * callbacks has to be a plain `int` (mbedtls_net_context's
+             * one field) -- true of FestinaSocket already on POSIX
+             * (typedef int), and matches mbedTLS's own established
+             * Windows convention of storing a SOCKET truncated to int
+             * (see festina_runtime_https.c's own top comment: not a
+             * new risk this file introduces). */
+            c->tls = g_tls_conn_new(tls_config, (int)fd);
+            if (!c->tls) { festina_conn_teardown(c); continue; }
+        }
     }
 }
 
-void festina_open_port(int64_t port) {
-    if (port < 1 || port > 65535) return; /* never fails the program -- see festina_runtime.h */
+/* claude.md #160: the shared body of festina_open_port/
+ * _open_secure_port -- everything except deciding whether `tls_config`
+ * is non-NULL, which the two public entry points do differently
+ * (plain openPort() always passes NULL; openSecurePort() builds one
+ * via g_tls_listener_new first and passes that). Takes ownership of a
+ * non-NULL tls_config immediately: every early-return path below frees
+ * it via g_tls_listener_free before returning (openPort/closePort's
+ * own established "never fails the program, just silently doesn't
+ * open" contract extends to openSecurePort too -- a bad port number or
+ * a bind()/listen() failure shouldn't leak the TLS config it'll never
+ * use). */
+static void festina_open_port_impl(int64_t port, void *tls_config) {
+    if (port < 1 || port > 65535) { /* never fails the program -- see festina_runtime.h */
+        if (tls_config && g_tls_listener_free) g_tls_listener_free(tls_config);
+        return;
+    }
 #ifdef _WIN32
     /* claude.md #151 (Windows round): Winsock needs an explicit
      * WSAStartup() before any socket call -- idempotent to call more
@@ -1065,10 +1205,16 @@ void festina_open_port(int64_t port) {
     signal(SIGPIPE, SIG_IGN);
 #endif
     for (int64_t i = 0; i < g_listener_count; i++) {
-        if (g_listeners[i].port == (int)port) return; /* already open -- silent no-op */
+        if (g_listeners[i].port == (int)port) { /* already open -- silent no-op */
+            if (tls_config && g_tls_listener_free) g_tls_listener_free(tls_config);
+            return;
+        }
     }
     FestinaSocket fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == FESTINA_INVALID_SOCKET) return;
+    if (fd == FESTINA_INVALID_SOCKET) {
+        if (tls_config && g_tls_listener_free) g_tls_listener_free(tls_config);
+        return;
+    }
 #ifndef _WIN32
     /* claude.md #151 (Windows round): SO_REUSEADDR means something
      * more permissive on Windows (lets a DIFFERENT process bind the
@@ -1084,8 +1230,16 @@ void festina_open_port(int64_t port) {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons((uint16_t)port);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) { festina_close_fd(fd); return; }
-    if (listen(fd, 128) != 0) { festina_close_fd(fd); return; }
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        festina_close_fd(fd);
+        if (tls_config && g_tls_listener_free) g_tls_listener_free(tls_config);
+        return;
+    }
+    if (listen(fd, 128) != 0) {
+        festina_close_fd(fd);
+        if (tls_config && g_tls_listener_free) g_tls_listener_free(tls_config);
+        return;
+    }
     festina_set_nonblocking(fd);
 
     if (g_listener_count == g_listener_capacity) {
@@ -1096,13 +1250,39 @@ void festina_open_port(int64_t port) {
     }
     g_listeners[g_listener_count].fd = fd;
     g_listeners[g_listener_count].port = (int)port;
+    g_listeners[g_listener_count].tls_config = tls_config;
     g_listener_count++;
+}
+
+void festina_open_port(int64_t port) {
+    festina_open_port_impl(port, NULL);
+}
+
+void festina_open_secure_port(int64_t port, const uint8_t *key, int64_t key_len) {
+    /* claude.md #160: never fails the program on a bad port number
+     * (matches festina_open_port_impl's own contract for one), but a
+     * malformed/mismatched certificate or key IS a program-authoring
+     * mistake worth failing loudly for -- g_tls_listener_new itself
+     * calls festina_fail with the real mbedTLS error text on any parse
+     * failure (see festina_runtime_https.c), so nothing further needs
+     * checking here beyond routing to it in the first place. A program
+     * that links no TLS hooks at all (g_tls_listener_new NULL --
+     * unreachable in practice, since codegen only emits a call to this
+     * function when self.uses_https, which is exactly when it also
+     * registers the hooks) is treated the same as an invalid port: a
+     * silent no-op, not a crash. */
+    if (port < 1 || port > 65535 || !g_tls_listener_new) return;
+    void *tls_config = g_tls_listener_new(key, key_len);
+    festina_open_port_impl(port, tls_config);
 }
 
 void festina_close_port(int64_t port) {
     for (int64_t i = 0; i < g_listener_count; i++) {
         if (g_listeners[i].port == (int)port) {
             festina_close_fd(g_listeners[i].fd);
+            if (g_listeners[i].tls_config && g_tls_listener_free) {
+                g_tls_listener_free(g_listeners[i].tls_config);
+            }
             g_listeners[i] = g_listeners[g_listener_count - 1];
             g_listener_count--;
             return;
@@ -1158,7 +1338,13 @@ void festina_run_http_loop(void) {
         for (int64_t i = 0; i < g_conn_count; i++) {
             if (!g_conns[i].alive) continue;
             g_poll_fds[fdi].fd = g_conns[i].fd;
-            g_poll_fds[fdi].events = POLLIN;
+            /* claude.md #160: a connection whose TLS handshake last
+             * stalled wanting to WRITE (a full TCP send buffer, rare
+             * but possible even for small handshake flights) also
+             * needs POLLOUT, or it could wait forever on a POLLIN that
+             * may never come -- see FestinaConn's own tls_wants_write
+             * doc comment. */
+            g_poll_fds[fdi].events = (short)(POLLIN | (g_conns[i].tls_wants_write ? POLLOUT : 0));
             g_poll_conn_ids[fdi - (size_t)g_listener_count] = g_conns[i].conn_id;
             fdi++;
         }
@@ -1181,11 +1367,17 @@ void festina_run_http_loop(void) {
         if (rc > 0) {
             for (int64_t i = 0; i < g_listener_count; i++) {
                 if (g_poll_fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
-                    festina_accept_new_connections(g_poll_fds[i].fd, g_listeners[i].port);
+                    festina_accept_new_connections(g_poll_fds[i].fd, g_listeners[i].port,
+                                                   g_listeners[i].tls_config);
                 }
             }
             for (size_t i = (size_t)g_listener_count; i < nfds; i++) {
-                if (!(g_poll_fds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+                /* claude.md #160: POLLOUT included here too -- a
+                 * mid-handshake connection that requested it (see the
+                 * events-mask construction above) needs to be woken by
+                 * it, exactly the same as POLLIN wakes every other
+                 * connection's own festina_conn_readable call. */
+                if (!(g_poll_fds[i].revents & (POLLIN | POLLOUT | POLLHUP | POLLERR))) continue;
                 FestinaConn *c = festina_conn_by_id(g_poll_conn_ids[i - (size_t)g_listener_count]);
                 if (c) festina_conn_readable(c);
             }
@@ -1246,7 +1438,7 @@ void festina_http_redirect(void *handle, const char *url) {
     FESTINA_APPEND_LIT(&buf, "HTTP/1.1 302 Found\r\nLocation: ");
     if (url) festina_sendbuf_append(&buf, url, strlen(url));
     FESTINA_APPEND_LIT(&buf, "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-    festina_send_all(c->fd, buf.data, buf.len);
+    festina_send_all(c, buf.data, buf.len);
     festina_sendbuf_free(&buf);
 }
 
@@ -1266,7 +1458,7 @@ void festina_http_upgrade(void *handle) {
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Accept: %s\r\n\r\n", accept_key);
     free(accept_key);
-    if (len > 0) festina_send_all(c->fd, response, (size_t)len);
+    if (len > 0) festina_send_all(c, response, (size_t)len);
     c->responded = 1;
     c->mode = FESTINA_CONN_WEBSOCKET;
     /* Any request bytes buffered past the header/body this request
@@ -1369,9 +1561,9 @@ void festina_http_send(void *handle, const void *data, int64_t len,
     if (cl_len > 0) festina_sendbuf_append(&buf, cl_line, (size_t)cl_len);
     FESTINA_APPEND_LIT(&buf, "Connection: close\r\n\r\n");
 
-    festina_send_all(c->fd, buf.data, buf.len);
+    festina_send_all(c, buf.data, buf.len);
     festina_sendbuf_free(&buf);
-    if (len > 0 && data) festina_send_all(c->fd, data, (size_t)len);
+    if (len > 0 && data) festina_send_all(c, data, (size_t)len);
 }
 #undef FESTINA_APPEND_LIT
 
@@ -1388,13 +1580,13 @@ void *festina_socket_state(void *handle) {
 void festina_socket_send_text(void *handle, const char *text) {
     FestinaConn *c = festina_conn_from_handle(handle);
     if (!c || c->mode != FESTINA_CONN_WEBSOCKET) return;
-    festina_ws_send_frame(c->fd, 0x1, text, text ? strlen(text) : 0);
+    festina_ws_send_frame(c, 0x1, text, text ? strlen(text) : 0);
 }
 
 void festina_socket_send_binary(void *handle, const void *data, int64_t len) {
     FestinaConn *c = festina_conn_from_handle(handle);
     if (!c || c->mode != FESTINA_CONN_WEBSOCKET) return;
-    festina_ws_send_frame(c->fd, 0x2, data, len > 0 ? (size_t)len : 0);
+    festina_ws_send_frame(c, 0x2, data, len > 0 ? (size_t)len : 0);
 }
 
 void festina_socket_close(void *handle) {
@@ -1402,7 +1594,7 @@ void festina_socket_close(void *handle) {
     if (!c) return;
     if (c->mode == FESTINA_CONN_WEBSOCKET) {
         uint8_t close_payload[2] = {0x03, 0xE8}; /* 1000, normal closure */
-        festina_ws_send_frame(c->fd, 0x8, close_payload, 2);
+        festina_ws_send_frame(c, 0x8, close_payload, 2);
     }
     festina_conn_teardown(c);
 }

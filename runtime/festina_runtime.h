@@ -1238,6 +1238,45 @@ void festina_release_map(void *payload);
 void festina_open_port(int64_t port);
 void festina_close_port(int64_t port);
 
+/* claude.md #160: openSecurePort(port, key) -- the TLS counterpart to
+ * openPort() above, sharing the same listener table, connection
+ * table, and single-threaded poll() event loop (a TLS listener is
+ * just a FestinaListener with a non-NULL tls_config; a TLS connection
+ * just a FestinaConn with non-NULL tls -- see festina_runtime_http.c's
+ * own struct comments). `key` is a combined PEM blob (certificate,
+ * or a full chain leaf-first, and the matching UNENCRYPTED private
+ * key, in either order) -- see festina_runtime_https.c's own top
+ * comment for the full design writeup (mbedTLS 2.x, server-only, no
+ * client certs, no SNI, no ALPN) and setup.md for the new system
+ * dependency this introduces. Same "never fails the program on a bad
+ * port number" contract as openPort() -- but a malformed/mismatched
+ * certificate or key DOES fail the program (via festina_fail, with
+ * the real mbedTLS error text), the same "test, don't fail" vs. "a
+ * program-authoring mistake" line claude.md #59 already draws for
+ * every other builtin. */
+void festina_open_secure_port(int64_t port, const uint8_t *key, int64_t key_len);
+
+/* claude.md #160: registers festina_runtime_https.c's own seven-
+ * function TLS hook table (see that file's own top comment) --
+ * generated code's own main() calls this, and ONLY this, exactly
+ * once, exactly when self.uses_https (festina/codegen.py's
+ * _emit_main_and_entry), so a program that never calls
+ * openSecurePort() never references (and therefore never needs
+ * linked) a single mbedTLS-touching symbol. festina_set_tls_hooks
+ * itself lives in festina_runtime_http.c (it stores into that file's
+ * own static g_tls_* pointers) and is declared here only so
+ * festina_runtime_https.c -- a different translation unit -- can call
+ * it from festina_register_tls_hooks below. */
+void festina_register_tls_hooks(void);
+void festina_set_tls_hooks(
+    void *(*listener_new)(const uint8_t *pem, int64_t pem_len),
+    void (*listener_free)(void *tls_config),
+    void *(*conn_new)(void *tls_config, int fd),
+    void (*conn_free)(void *tls_state),
+    int (*handshake)(void *tls_state),
+    long (*recv_fn)(void *tls_state, void *buf, int64_t cap),
+    long (*send_fn)(void *tls_state, const void *data, int64_t len));
+
 void festina_register_request_handler(void (*fn)(void *req));
 void festina_register_upgrade_handler(void (*fn)(void *sock));
 void festina_register_message_handler(void (*fn)(void *sock, void *msg));

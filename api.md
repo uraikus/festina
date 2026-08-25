@@ -1776,6 +1776,77 @@ s.close()                             // sends a close frame and ends the connec
   this version. `setTimeout`/`setInterval` combine fine; both are
   serviced from the same loop.
 
+### <a name="opensecureport"></a>`openSecurePort(port:int, key:blob)` — TLS
+
+```festina
+blob key = 'server.pem'   // a combined PEM file: certificate(s), then the
+                           // unencrypted private key, in either order
+
+on request(req:http) {
+    req.send('hello over TLS')
+}
+
+openSecurePort(8443, key)
+```
+
+The TLS counterpart to `openPort()` — same listener/connection table,
+same single-threaded event loop, and the exact same `on request`/
+`on upgrade`/`on message`/`on socketClose` handler surface (a program
+can mix plain `openPort()` and TLS `openSecurePort()` listeners
+freely; a connection's own `req`/`s` behaves identically either way —
+nothing about *reading* a request or *sending* a response differs
+based on which port it arrived on). WebSocket upgrades work the same
+way too (`wss://` on the client side).
+
+`key` is one `blob` — read from a file the same way any other `blob`
+is (`blob key = 'server.pem'`) — holding a PEM-encoded certificate (or
+a full chain, leaf certificate first) **and** the matching
+**unencrypted** private key, concatenated in one file, in either
+order. A bad port number is a silent no-op, the same "test, don't
+fail" convention `openPort()` itself uses — but a certificate/key that
+fails to parse, or a key that doesn't match the certificate, **fails
+the program** (via `fail()`, naming the real underlying problem): that
+is a program-authoring mistake, not a runtime condition worth testing
+for.
+
+Generating a real certificate is outside this language's scope — use
+whatever your deployment already uses (e.g. `openssl req -x509
+-newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes` for a
+self-signed one, or a certificate from a real CA/ACME client for
+production — `cat cert.pem key.pem > server.pem` combines them into
+the one file `openSecurePort` expects).
+
+Built on [mbedTLS](https://www.trustedfirmware.org/projects/mbed-tls/)
+2.x — a new system dependency, but only for a program that actually
+calls `openSecurePort()` (see [setup.md](setup.md)); a program that
+only ever calls `openPort()` never links it, the same binary-slimming
+split every other optional feature in this language already gets.
+
+**Scope, beyond what [Limitations](#http-limitations) above already
+says** (all of it applies here too — HTTP/1.1 request-line + headers +
+`Content-Length` body, no keep-alive, WebSocket text/binary/close
+frames only):
+
+- **Server-side only.** There is no TLS *client* in this language —
+  `openSecurePort()` is the only TLS-related builtin.
+- **One certificate/key pair per listening port, no SNI.** A program
+  needing per-hostname certificates calls `openSecurePort()` once per
+  port instead.
+- **No client-certificate / mutual TLS.** This runtime never asks a
+  connecting client for a certificate.
+- **No ALPN.** Every connection is plain HTTP/1.1-over-TLS — no HTTP/2
+  negotiation.
+- **An encrypted (password-protected) private key is rejected** — the
+  key in `key` must be in the clear.
+- **Linux, plus macOS and Windows behind the same opt-in-flag /
+  real-hardware-verification story `openPort()`'s own Limitations
+  entry above describes** (`FESTINA_ENABLE_MACOS_HTTP=1`/
+  `FESTINA_ENABLE_WINDOWS_HTTP=1` — there is no separate TLS-specific
+  flag, since `openSecurePort()` always brings `openPort()`'s own
+  listener/event-loop machinery along with it). Not available under
+  `--target=wasm32-wasi`, for the identical reason `openPort()` isn't
+  there either.
+
 ## Freeing and deleting
 
 Memory is automatic — but `free` and `delete` exist for the moments you

@@ -143,6 +143,12 @@ BUILTIN_FUNCTIONS = {
     # is a silent no-op; closePort on a port never opened likewise) --
     # the same "test, don't fail" convention as mkdir/exec above.
     "openPort", "closePort",
+    # claude.md #160: the TLS counterpart to openPort -- same "bad
+    # port number is a silent no-op" contract, but unlike openPort a
+    # malformed/mismatched certificate or key DOES fail the program
+    # (a program-authoring mistake, not a runtime condition to test
+    # for -- the same line claude.md #59 already draws elsewhere).
+    "openSecurePort",
 }
 
 _BUILTIN_RETURN_TYPES = {
@@ -256,6 +262,9 @@ _BUILTIN_SIGNATURES = {
     # claude.md #151
     "openPort": (_INT,),
     "closePort": (_INT,),
+    # claude.md #160: (port, key) -- key is a combined PEM blob (cert
+    # + unencrypted private key). See _BUILTIN_FUNCTIONS above.
+    "openSecurePort": (_INT, _BLOB),
 }
 
 # claude.md #90: three builtins accept two different shapes. The

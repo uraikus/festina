@@ -43,7 +43,8 @@ change with you first):
 | `libsqlite3-dev` (headers) | The runtime's core translation unit does `#include <sqlite3.h>` — needed to compile *any* program, since `festina.sqlite` support (`claude.md #8/#28-31`) is always on | Required |
 | `libcairo2-dev` + `libx11-dev` + `libjpeg-dev` (headers) | Only needed to compile a *program that actually uses graphics* (`claude.md #37/#39`'s `img`/`draw*`/`on mouseDown`/etc.) — the graphics runtime translation unit isn't even compiled otherwise. `libjpeg` is `claude.md #101`'s JPEG decoding; Cairo handles PNG on its own | Required only if you'll compile graphics-using programs |
 | `libasound2-dev` + `libmpg123-dev` (headers) | Same story, for `claude.md #38`'s `aud` — ALSA for playback, `libmpg123` for `claude.md #101`'s MP3 decoding (WAV is parsed directly, with no library at all) | Required only if you'll compile audio-using programs |
-| `pkg-config` | Locates sqlite3's (and, conditionally, Cairo/X11's/libjpeg's/ALSA's/libmpg123's) compile/link flags | Required |
+| `libmbedtls-dev` (headers) | Same story, for `claude.md #160`'s `openSecurePort()` — mbedTLS 2.x provides the TLS handshake/record layer; the `festina_runtime_https.c` translation unit isn't even compiled otherwise | Required only if you'll compile programs that call `openSecurePort()` |
+| `pkg-config` | Locates sqlite3's (and, conditionally, Cairo/X11's/libjpeg's/ALSA's/libmpg123's/mbedTLS's) compile/link flags | Required |
 | `llvm` (provides `libLLVM`) | Lets `festina/llvm_backend.py` compile IR directly (the fast path, and the one that makes `gcc` usable at all) | Recommended — without it, the C compiler must specifically be `clang`, since only clang can parse the `.ll` IR text this compiler falls back to handing it directly (verified: `gcc` hands it to `ld`, which fails treating it as a corrupt linker script) |
 
 Missing any of these fails with a specific, actionable error (`claude.md
@@ -68,7 +69,7 @@ Debian/Ubuntu:
 
 ```bash
 sudo apt install clang libsqlite3-dev libcairo2-dev libx11-dev libjpeg-dev \
-                 libasound2-dev libmpg123-dev pkg-config
+                 libasound2-dev libmpg123-dev libmbedtls-dev pkg-config
 ```
 
 `clang` conveniently pulls in `libLLVM` as a dependency, covering both
@@ -81,7 +82,7 @@ macOS (Homebrew), verified on real Apple Silicon CI (`macos-14`,
 
 ```bash
 xcode-select --install                                # Xcode >= 15 -- the floor
-brew install pkg-config sqlite cairo jpeg-turbo mpg123 # graphics + audio tiers
+brew install pkg-config sqlite cairo jpeg-turbo mpg123 mbedtls # graphics + audio + TLS tiers
 ```
 
 There's no `llvm` line: Apple clang, from the CommandLineTools Xcode
@@ -122,6 +123,7 @@ pacman -S mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-python \
 pacman -S mingw-w64-ucrt-x86_64-cairo \
           mingw-w64-ucrt-x86_64-libjpeg-turbo               # graphics tier
 pacman -S mingw-w64-ucrt-x86_64-mpg123                      # audio tier
+pacman -S mingw-w64-ucrt-x86_64-mbedtls                     # TLS tier (openSecurePort)
 ```
 
 `libsystre` is windows.md Phase 0's own POSIX `<regex.h>` provider
@@ -150,9 +152,9 @@ than risking a link-order conflict) — so a core-only or
 offscreen-graphics-only program (`hello.exe`, and anything that never
 calls `aud`) is genuinely copy-anywhere: no MSYS2 install needed on
 the machine that *runs* it, only on the one that *compiled* it. A
-program that uses graphics or audio still needs its own feature DLLs
+program that uses graphics, audio, or openSecurePort() still needs its own feature DLLs
 findable at runtime (`libcairo-2.dll`, `libjpeg-8.dll`,
-`libmpg123-0.dll`, ...) — either run it from an MSYS2 UCRT64 shell
+`libmpg123-0.dll`, `libmbedtls.dll` and friends, ...) — either run it from an MSYS2 UCRT64 shell
 (already on `PATH` there) or copy them alongside the `.exe` from
 `/ucrt64/bin`. Check any specific binary's own dependencies with
 `objdump -p your_program.exe | grep 'DLL Name'` — the Windows analog

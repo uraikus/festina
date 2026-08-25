@@ -156,7 +156,8 @@ corruption**:
 A compiled program links only what it uses. The runtime is split into
 core / graphics (Cairo, X11, libjpeg) / audio (ALSA, libmpg123) / http
 (claude.md #151 — plain POSIX sockets on Linux/macOS, winsock2 on
-Windows; no third-party library on any platform) translation units,
+Windows; no third-party library on any platform) / https (claude.md
+#160 — `openSecurePort()` only, mbedTLS) translation units,
 and the compiler puts a feature's object file and
 libraries on the link line only when the program actually exercises it —
 a `log('hello')` program links none of them. Fewer resident libraries is

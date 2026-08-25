@@ -793,6 +793,15 @@ class CodeGen:
         self.http_upgrade_handler_symbol = None
         self.http_message_handler_symbol = None
         self.http_socketclose_handler_symbol = None
+        self.uses_https = False                # claude.md #160: openSecurePort() specifically --
+                                                # narrower than uses_http (set alongside it, see
+                                                # openSecurePort's own dispatch branch below): a
+                                                # program can use openPort()/on request/... with no
+                                                # TLS involved at all, and that must never pull in
+                                                # mbedTLS. Drives cli.py's own festina_runtime_https.c
+                                                # linking + -lmbedtls/-lmbedx509/-lmbedcrypto (only
+                                                # when true) and the festina_register_tls_hooks()
+                                                # call in main() below (see _emit_main_and_entry).
 
         # claude.md #102: a table column of type aud/img makes the
         # program use that feature, whether or not it ever names a
@@ -1221,6 +1230,16 @@ class CodeGen:
             # representation, http/1.1 and WebSocket scope).
             "declare void @festina_open_port(i64)",
             "declare void @festina_close_port(i64)",
+            # claude.md #160: openSecurePort() -- see
+            # festina_runtime.h's own doc comment right above these
+            # two declarations. festina_register_tls_hooks() is called
+            # from main() only when self.uses_https (see
+            # _emit_main_and_entry) -- see festina_runtime_https.c's
+            # own top comment for why this is the ONLY TLS-related
+            # symbol this module ever references, cross-translation-
+            # -unit hook wiring aside.
+            "declare void @festina_open_secure_port(i64, ptr, i64)",
+            "declare void @festina_register_tls_hooks()",
             "declare void @festina_register_request_handler(ptr)",
             "declare void @festina_register_upgrade_handler(ptr)",
             "declare void @festina_register_message_handler(ptr)",
@@ -7394,6 +7413,30 @@ class CodeGen:
                 fn = "festina_open_port" if name == "openPort" else "festina_close_port"
                 lines.append(f"  call void @{fn}(i64 {val})")
                 return "0", None
+            if name == "openSecurePort":
+                # claude.md #160: the TLS counterpart -- shares uses_http
+                # (same listener/connection table, same event loop) and
+                # adds uses_https on top (the narrower "mbedTLS is
+                # actually needed" signal, see this flag's own comment).
+                # The key argument is always blob (semantic.py's own
+                # _BUILTIN_SIGNATURES entry) -- _emit_sendable_body
+                # already knows how to pull a blob's raw bytes out as
+                # (data_ptr, len_val), the identical shape
+                # http.send()/socket.send() already use for their own
+                # blob-typed `data` argument.
+                self.uses_http = True
+                self.uses_https = True
+                port_val, _ = self._emit_expr(expr.args[0], env, lines)
+                key_expr = expr.args[1]
+                key_val, key_vtype = self._emit_expr(key_expr, env, lines)
+                data_ptr, len_val, temp_to_free = self._emit_sendable_body(key_val, key_vtype, lines)
+                lines.append(f"  call void @festina_open_secure_port(i64 {port_val}, "
+                             f"ptr {data_ptr}, i64 {len_val})")
+                if temp_to_free is not None:
+                    lines.append(f"  call void @free(ptr {temp_to_free})")
+                if _is_refcounted(key_vtype) and self._is_owning_refcounted_source(key_expr):
+                    lines.append(f"  call void {self._release_fn_for(key_vtype)}(ptr {key_val})")
+                return "0", None
             # claude.md #95/#135: writes the OFFSCREEN canvas, so it
             # needs no window either way -- this is the headless case
             # the render() split exists for. saveCanvas() with no path
@@ -8846,6 +8889,20 @@ class CodeGen:
         if self.http_socketclose_handler_symbol is not None:
             main_lines.append(
                 f"  call void @festina_register_socketclose_handler(ptr {self.http_socketclose_handler_symbol})")
+        # claude.md #160: unconditional-when-used, same shape as the
+        # four http handler registrations just above -- deliberately
+        # NOT nested inside the "if self.tables or self.uses_sqlite"
+        # block below (a first draft of this put it there, alongside
+        # the audio/image decoder hooks, and a table-less/sqlite-less
+        # openSecurePort() program silently never registered its TLS
+        # hooks at all -- confirmed directly: the compiled program
+        # exited immediately instead of listening, since that whole
+        # block, database open included, is skipped for a program with
+        # no tables and no sqlite() call). openSecurePort() has nothing
+        # to do with SQLite; only self.uses_https (set by its own
+        # dispatch branch) should gate this.
+        if self.uses_https:
+            main_lines.append("  call void @festina_register_tls_hooks()")
         # self.uses_sqlite/self.uses_graphics are only reliably set by
         # this point because every function body (self.func_defs) and
         # every entry statement (the loop above) has already been
