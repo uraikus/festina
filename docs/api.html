@@ -403,12 +403,15 @@
         <a class="sub" href="#function-hoisting">Functions are hoisted</a>
         <a href="#control-flow">Control flow</a>
         <a href="#strings">Strings</a>
+        <a class="sub" href="#parsing-an-int">Parsing an int</a>
+        <a class="sub" href="#indexing-a-character-out">Indexing a character out</a>
         <a href="#logging-and-rendering">Logging and rendering</a>
         <a href="#structs">Structs</a>
         <a class="sub" href="#a-struct-can-name-itself">A struct can name itself</a>
         <a href="#arrays">Arrays</a>
         <a class="sub" href="#indexing-is-not-bounds-checked">Indexing is not bounds-checked</a>
         <a href="#maps">Maps</a>
+        <a class="sub" href="#amor-maps">amor -- amortized-growth maps</a>
       </div>
       <div class="nav-group">
         <div class="nav-group-title">Standard library</div>
@@ -419,6 +422,7 @@
         <a class="sub" href="#structs-as-query-targets">Structs as query targets</a>
         <a class="sub" href="#database-configuration">Database configuration</a>
         <a href="#environment-variables">Environment variables</a>
+        <a href="#command-line-arguments">Command-line arguments</a>
         <a href="#regex">Regex</a>
         <a class="sub" href="#what-g-does">What g does</a>
         <a class="sub" href="#literals-vs-regex-function">Literals vs regex()</a>
@@ -435,6 +439,11 @@
         <a href="#files">Files</a>
         <a class="sub" href="#blobs-in-the-database">Blobs in the database</a>
         <a href="#directories">Directories</a>
+        <a href="#running-other-programs">Running other programs</a>
+        <a href="#http-and-websocket-servers">HTTP and WebSocket servers</a>
+        <a class="sub" href="#on-request">on request(req:http)</a>
+        <a class="sub" href="#websocket">WebSocket: req.upgrade()</a>
+        <a class="sub" href="#http-limitations">Limitations</a>
         <a href="#freeing-and-deleting">Freeing and deleting</a>
         <a class="sub" href="#free">free</a>
         <a class="sub" href="#delete">delete</a>
@@ -482,9 +491,10 @@
         </p>
         <div class="table-wrap">
         <table class="sig-table">
-          <tr><td>festina compile entry.f -o out</td><td>Compile to a native executable at <code>out</code> (default: <code>entry</code>'s own filename without <code>.f</code>). <code>--emit-llvm</code> prints LLVM IR to stdout instead of linking. <code>--cc</code> picks the C compiler/linker (default: whichever of <code>clang</code>/<code>gcc</code>/<code>cc</code> is found first).</td></tr>
-          <tr><td>festina run entry.f</td><td>Compile to a throwaway temp executable and run it immediately — stdin/stdout/stderr inherited directly (not captured), so an interactive program (graphics/audio/timers) behaves exactly like a normal compile-then-run. Exits with the <em>compiled program's own</em> exit code, so <code>festina run x.f &amp;&amp; ...</code> composes the same way <code>go run</code>/<code>cargo run</code> do. The temp binary is always cleaned up afterward.</td></tr>
+          <tr><td>festina compile entry.f -o out</td><td>Compile to a native executable at <code>out</code> (default: <code>entry</code>'s own filename without <code>.f</code>). <code>--emit-llvm</code> prints LLVM IR to stdout instead of linking. <code>--cc</code> picks the C compiler/linker (default: whichever of <code>clang</code>/<code>gcc</code>/<code>cc</code> is found first). <code>--target=wasm32-wasi</code> cross-compiles to a standalone <code>.wasm</code> binary instead — see <a href="https://github.com/uraikus/festina/blob/main/wasm.md">wasm.md</a> (graphics/audio aren't available under WASI).</td></tr>
+          <tr><td>festina run entry.f</td><td>Compile to a throwaway temp executable and run it immediately — stdin/stdout/stderr inherited directly (not captured), so an interactive program (graphics/audio/timers) behaves exactly like a normal compile-then-run. Exits with the <em>compiled program's own</em> exit code, so <code>festina run x.f &amp;&amp; ...</code> composes the same way <code>go run</code>/<code>cargo run</code> do. The temp binary is always cleaned up afterward. <code>--target=wasm32-wasi</code> runs the compiled <code>.wasm</code> through Node's built-in WASI support instead of executing it directly.</td></tr>
           <tr><td>festina doctor</td><td>Checks every dependency the compiler itself needs (a C compiler, <code>pkg-config</code>, sqlite3/cairo-xlib/alsa dev headers, <code>libLLVM</code>) and reports what's missing and how to install it — the same install hints a real compile failure would give, just checked proactively instead of only on failure. Also reports whether <code>festina</code> itself is resolvable on <code>PATH</code>. Exits 0 if every <em>required</em> dependency is present — graphics/audio are optional.</td></tr>
+          <tr><td>festina doctor --fix</td><td>Same report, then actually fixes what it found: installs missing dependencies via the detected package manager (<code>apt</code> on Linux, Homebrew on macOS, MSYS2's <code>pacman</code> on Windows), and adds <code>festina</code> to <code>PATH</code> if it isn't resolving. Prints the exact command/change first and asks for confirmation (<code>--yes</code>/<code>-y</code> skips that); refuses to guess for any other package manager or overwrite something unrelated already on disk.</td></tr>
           <tr><td>festina help</td><td>Prints this same command list.</td></tr>
         </table>
         </div>
@@ -813,6 +823,41 @@ sentence = words.join(<span class="str">'\t'</span>)              <span class="c
           element as an empty string:
           <code>[1, null, 3].join('-')</code> is <code>'1--3'</code>.
         </p>
+
+        <h3 id="parsing-an-int">Parsing an int <a class="anchor" href="#parsing-an-int">#</a></h3>
+        <pre class="code"><span class="kw">int</span> n = <span class="str">'42'</span>.toInt()          <span class="cm">// 42</span>
+<span class="kw">int</span> m = <span class="str">'  -17abc'</span>.toInt()    <span class="cm">// -17 -- leading whitespace, sign, trailing garbage all ok</span>
+<span class="kw">int</span> bad = <span class="str">'nope'</span>.toInt()      <span class="cm">// null -- not a compile error, not a crash</span>
+<span class="kw">if</span> bad == <span class="kw">null</span> {
+    fail(<span class="str">'not a number'</span>)
+}</pre>
+        <p class="muted">
+          <code>toInt()</code> skips leading whitespace, reads an
+          optional <code>+</code>/<code>-</code>, then digits until the
+          first non-digit (or the end of the text) — whatever comes
+          after the digits is ignored, not an error. Returns
+          <code>null</code> if no digits were found at all. A literal
+          receiver (<code>'42'.toInt()</code>) is computed entirely at
+          compile time; nothing is emitted to parse it at runtime.
+        </p>
+
+        <h3 id="indexing-a-character-out">Indexing a character out <a class="anchor" href="#indexing-a-character-out">#</a></h3>
+        <pre class="code"><span class="kw">text</span> s = <span class="str">'hello'</span>
+log(s[0])              <span class="cm">// h</span>
+log(s[10])              <span class="cm">// null -- out of range, not a crash</span>
+log(s[-1])              <span class="cm">// null -- negative, not a crash</span></pre>
+        <p class="muted">
+          <code>s[i]</code> reads the <code>i</code>-th UTF-8
+          <strong>code point</strong> (not byte — a multi-byte
+          character like <code>é</code> is one index, matching
+          <code>.length</code>'s own code-point count), as a fresh
+          <code>text</code>. Unlike
+          <a href="#indexing-is-not-bounds-checked">array indexing</a>,
+          this is always bounds-checked: an out-of-range or negative
+          index answers <code>null</code> rather than reading past the
+          buffer. Read-only — <code>s[0] = 'x'</code> is a compile-time
+          error, the same way <code>environment.NAME = ...</code> is.
+        </p>
       </section>
 
       <section class="doc-section" id="logging-and-rendering">
@@ -1106,7 +1151,50 @@ npcHealths.forEach(logHealth)   <span class="cm">// (value, key) -- visit order 
           internally — lookup/insert are O(n) over the entry count, a
           deliberate simplicity tradeoff for what's meant to be a small,
           config/game-state-shaped collection, not a large-scale data
-          structure.
+          structure. Also grows by exactly one entry per insert
+          internally, not amortized — see <code>amor map[T]</code>
+          below if that matters for a specific map.
+        </p>
+
+        <h3 id="amor-maps">amor — amortized-growth maps <a class="anchor" href="#amor-maps">#</a></h3>
+        <pre class="code"><span class="kw">amor map[int]</span> hitCounts = {}
+<span class="kw">const amor map[text]</span> labels = {<span class="str">'ok'</span>: <span class="str">'success'</span>}   <span class="cm">// composes with const</span>
+
+<span class="kw">int</span> i = 0
+<span class="kw">while</span> i &lt; 10000 {
+    hitCounts[<span class="str">`key${i}`</span>] = i
+    i = i + 1
+}</pre>
+        <p class="muted">
+          <code>amor map[T]</code> — an "amortized map" — is
+          <code>map[T]</code> with a different internal growth strategy:
+          doubling capacity as needed instead of growing by exactly one
+          entry per insert, so a long run of inserts costs O(log n)
+          reallocations instead of O(n). Same literal syntax, same
+          indexed get/set, <code>.forEach()</code>, <code>delete</code>,
+          and <code>.toText()</code>/JSON rendering as plain
+          <code>map[T]</code> — <code>amor</code> only changes how it
+          grows internally, not what it does.
+        </p>
+        <div class="callout">
+          <strong>Requires an initializer</strong> —
+          <code>amor map[int] m</code> with no <code>= ...</code> is a
+          compile error — unlike plain <code>map[T]</code>, which can
+          start implicitly empty, an amortized map's own declaration
+          always needs a real value to store. Composes with
+          <code>const</code> (<code>const amor map[T] m = ...</code>);
+          as a struct field (<code>m:amor map[int]</code>), no
+          initializer is needed or possible, the same as any other
+          struct field.
+        </div>
+        <p class="muted">
+          <code>amor arr[T]</code> parses and type-checks (also
+          composing with <code>const</code>) but does not yet change
+          how an array grows —
+          <code>push()</code>/<code>unshift()</code>/etc. still realloc
+          to exactly the new size either way, identically to plain
+          <code>arr[T]</code>. Real array amortization is a natural
+          follow-up, not yet built.
         </p>
       </section>
 
@@ -1285,6 +1373,31 @@ log(query[0].whatever)</pre>
           can't be used by itself without a
           <code>.NAME</code>/<code>[keyExpr]</code> — both are also
           compile-time errors, not runtime ones.
+        </p>
+      </section>
+
+      <section class="doc-section" id="command-line-arguments">
+        <h2>Command-line arguments <a class="anchor" href="#command-line-arguments">#</a></h2>
+        <pre class="code">log(argv.length)
+log(argv[0])          <span class="cm">// the program's own path, same as C's argv[0]</span>
+<span class="kw">if</span> argv.length &gt; 1 {
+    log(<span class="str">`first arg: ${argv[1]}`</span>)
+}</pre>
+        <p class="muted">
+          <code>argv</code> is a real <code>arr[text]</code> global,
+          populated from the process's own OS argc/argv before any
+          top-level statement runs — no declaration needed. Unlike
+          <code>environment</code>, it's an ordinary mutable array once
+          populated: <code>argv.push(...)</code>, <code>argv[i] = ...</code>,
+          and every other
+          <a href="#arrays">array</a>/<a href="#growing-arrays">growing array</a>
+          operation work on it normally. Works under
+          <code>--target=wasm32-wasi</code> too (WASI has its own
+          argc/argv), but this checkout's own runner
+          (<code>run_wasi.mjs</code>) only ever passes the compiled
+          module's own path through, so <code>argv</code> there is
+          always a single-element array — see
+          <a href="https://github.com/uraikus/festina/blob/main/wasm.md">wasm.md</a>.
         </p>
       </section>
 
@@ -1969,6 +2082,177 @@ log(names.length)
 log(ls(<span class="str">'./nowhere'</span>).length)           <span class="cm">// 0</span></pre>
       </section>
 
+      <section class="doc-section" id="running-other-programs">
+        <h2>Running other programs <a class="anchor" href="#running-other-programs">#</a></h2>
+        <pre class="code"><span class="kw">arr[text]</span> cmd = [<span class="str">'/bin/echo'</span>, <span class="str">'hello'</span>]
+<span class="kw">int</span> status = exec(cmd)
+log(status)                            <span class="cm">// 0</span></pre>
+        <p class="muted">
+          <code>exec(args:arr[text]):int</code> spawns <code>args[0]</code>
+          (searched on <code>PATH</code> the same way a shell finds it)
+          with the rest of <code>args</code> as its own argv,
+          <strong>inheriting stdin/stdout/stderr directly</strong> — it
+          doesn't capture the child's output, the same "not a sandbox,
+          this really runs it" model <code>sqlite()</code>/the file
+          builtins already use for the filesystem. Blocks until the
+          child exits and returns its real exit code, or <code>-1</code>
+          if the process never started at all (executable not found, no
+          permission) — <code>-1</code> is never a code the child itself
+          could produce, so it's unambiguous. Not available under
+          <code>--target=wasm32-wasi</code> — WASI has no process model
+          to spawn into — rejected at compile time rather than failing
+          at runtime; see
+          <a href="https://github.com/uraikus/festina/blob/main/wasm.md">wasm.md</a>.
+        </p>
+      </section>
+
+      <section class="doc-section" id="http-and-websocket-servers">
+        <h2>HTTP and WebSocket servers <a class="anchor" href="#http-and-websocket-servers">#</a></h2>
+        <pre class="code">openPort(8080)
+
+<span class="kw">on</span> request(req:http) {
+    <span class="kw">if</span> req.path == <span class="str">'/hello'</span> {
+        req.send(<span class="str">'hello world'</span>)
+        <span class="kw">return</span>
+    }
+    req.ok()
+}</pre>
+        <p>
+          <code>openPort(port:int)</code> starts listening for HTTP
+          connections on <code>port</code>; <code>closePort(port:int)</code>
+          stops. Neither fails the program — an already-open port, a
+          privileged or in-use one, or closing a port never opened are
+          all silent no-ops, the same "test, don't fail" convention
+          <code>mkdir()</code>/<code>exec()</code> already use. A
+          program is free to open more than one port.
+        </p>
+        <div class="callout">
+          Every connection is serviced from a <strong>single
+          thread</strong>, the same "one thread total" model
+          <code>setTimeout</code>/<code>setInterval</code> and graphics
+          event handlers already use — connections are multiplexed, not
+          run in parallel, so ordinary globals need no locking to
+          read/write safely across requests. The tradeoff: a slow
+          <code>on request</code>/<code>on message</code> handler
+          delays every <em>other</em> connection's own turn. This is
+          built for the kind of small, script-shaped server this
+          language already targets, not a general-purpose production
+          server replacement.
+        </div>
+
+        <h3 id="on-request">on request(req:http) <a class="anchor" href="#on-request">#</a></h3>
+        <p>
+          Fires once per incoming HTTP request, fully parsed (request
+          line, headers, and body already buffered — see
+          <a href="#http-limitations">Limitations</a> below for what
+          "fully parsed" doesn't include).
+        </p>
+        <pre class="code">req.port                              <span class="cm">// int -- the port this connection arrived on</span>
+req.method                            <span class="cm">// text -- 'GET', 'POST', ...</span>
+req.path                              <span class="cm">// text -- '/hello', never includes the query string separately</span>
+req.headers                           <span class="cm">// map[text] -- header names lowercased; a repeated</span>
+                                       <span class="cm">// header's last occurrence wins</span></pre>
+        <p class="muted">All four are read-only — assigning to any of them is a compile-time error.</p>
+        <p>
+          <strong>Responding</strong> — exactly one of the following
+          ends the request; calling a second one on the same
+          <code>req</code> is a silent no-op (never a crash, never a
+          double response):
+        </p>
+        <pre class="code">req.ok()                              <span class="cm">// 200, empty body</span>
+req.redirect(<span class="str">'https://example.com'</span>)   <span class="cm">// 302, Location header set</span>
+req.send(data, code, headers)         <span class="cm">// see below</span></pre>
+        <p class="muted">
+          <code>req.send(data:any, code:int, headers:map[text])</code> —
+          <code>code</code> defaults to <code>200</code>,
+          <code>headers</code> to none. <code>data</code> accepts
+          anything with a body form: <code>text</code> (sent as-is),
+          <code>int</code>/<code>float</code>/<code>bool</code>
+          (stringified, the same implicit conversion <code>log()</code>
+          already does), a <code>struct</code>/table row/<code>arr</code>/<code>map</code>
+          (rendered as JSON, the same <code>.toText()</code> every
+          container already has), or <code>blob</code> (sent as its own
+          raw bytes, not decoded through <code>.toText()</code> — the
+          more likely thing to want for a binary response). An
+          <code>img</code>/<code>aud</code> argument is a
+          <strong>compile error</strong>: neither has a body form, the
+          same reasoning <code>log()</code>/templates already reject
+          them with. If <code>on request</code>'s own body returns
+          without calling
+          <code>ok()</code>/<code>redirect()</code>/<code>send()</code>/<code>upgrade()</code>
+          at all, the connection still gets a response — a plain
+          <code>200</code> with an empty body — rather than hanging the
+          client forever.
+        </p>
+        <p><strong>Reading the body:</strong></p>
+        <pre class="code"><span class="kw">text</span> t = req.toText()                 <span class="cm">// the raw bytes, as text</span>
+<span class="kw">blob</span> b = req.toBlob()                 <span class="cm">// the raw bytes, as a blob</span>
+<span class="kw">img</span> i = req.toImg()                   <span class="cm">// decoded as an image (null if it isn't one)</span>
+<span class="kw">aud</span> a = req.toAud()                   <span class="cm">// decoded as audio (null if it isn't one)</span></pre>
+        <p class="muted">A request with no body answers an empty <code>text</code>/<code>blob</code> (never <code>null</code>), matching every other "nothing there" case in this language.</p>
+
+        <h3 id="websocket">WebSocket: req.upgrade() <a class="anchor" href="#websocket">#</a></h3>
+        <pre class="code"><span class="kw">on</span> request(req:http) {
+    <span class="kw">if</span> req.path == <span class="str">'/ws'</span> {
+        req.upgrade()
+    }
+}
+
+<span class="kw">on</span> upgrade(s:socket) {
+    log(<span class="str">'client connected'</span>)
+}
+
+<span class="kw">on</span> message(s:socket, msg:blob) {
+    s.send(<span class="str">`you said: ${msg.toText()}`</span>)
+}
+
+<span class="kw">on</span> socketClose(s:socket) {
+    log(<span class="str">'client disconnected'</span>)
+}</pre>
+        <p class="muted">
+          <code>req.upgrade()</code> performs the WebSocket handshake
+          (RFC 6455) immediately and switches the connection over —
+          nothing else about the request matters afterward (a call to
+          <code>ok()</code>/<code>send()</code>/etc. on the same
+          <code>req</code> is now a no-op, same as any second response
+          attempt). If the request isn't actually a valid WebSocket
+          handshake (missing/mismatched headers), <code>upgrade()</code>
+          is a silent no-op and the connection falls through to the
+          normal "no response sent" default (<code>200</code>, empty
+          body) — never a crash.
+        </p>
+        <p class="muted">
+          Once upgraded, <code>on upgrade(s:socket)</code> fires once
+          for that connection, then
+          <code>on message(s:socket, msg:blob)</code> fires once per
+          message received — <strong>always as a <code>blob</code></strong>,
+          whether the peer sent a text or binary frame (call
+          <code>.toText()</code> if you know it's always text).
+          <code>on socketClose(s)</code> fires exactly once when the
+          connection ends, however it ends (the peer closed it, sent a
+          close frame, or the read failed) — never for a plain HTTP
+          connection that never upgraded.
+        </p>
+        <pre class="code">s.state                               <span class="cm">// map[text] -- a per-connection scratchpad,</span>
+                                       <span class="cm">// starts empty, persists for the connection's</span>
+                                       <span class="cm">// whole lifetime</span>
+s.state[<span class="str">'user'</span>] = <span class="str">'ada'</span>               <span class="cm">// read/write like any other map[text]</span>
+
+s.send(data)                          <span class="cm">// data:any -- same sendable types as req.send(),</span>
+                                       <span class="cm">// minus the code/headers (a frame has neither);</span>
+                                       <span class="cm">// blob sends a binary frame, everything else text</span>
+s.close()                             <span class="cm">// sends a close frame and ends the connection</span></pre>
+
+        <h3 id="http-limitations">Limitations <a class="anchor" href="#http-limitations">#</a></h3>
+        <ul>
+          <li><strong>HTTP/1.1 request-line + headers + a <code>Content-Length</code> body only.</strong> No chunked transfer-encoding, no HTTP/1.0-specific behavior.</li>
+          <li><strong>No keep-alive.</strong> Every response closes the connection afterward — each request is its own TCP connection, start to finish.</li>
+          <li><strong>No WebSocket fragmentation, ping/pong sent by this runtime, or extensions.</strong> A fragmented message (a frame with <code>FIN=0</code>, or a continuation frame) closes the connection rather than being silently dropped or misread. A received ping is answered with a pong automatically; a received pong is ignored. <code>permessage-deflate</code> and every other WebSocket extension are unsupported.</li>
+          <li><strong>Linux and macOS, plus Windows behind an opt-in flag.</strong> Linux/macOS use plain POSIX sockets; Windows uses a real winsock2 port (built, CI-compiled — see <a href="https://github.com/uraikus/festina/blob/main/windows.md">windows.md</a>) gated behind <code>FESTINA_ENABLE_WINDOWS_HTTP=1</code> pending real-hardware verification, the same shape audio/graphics already use there. Not available under <code>--target=wasm32-wasi</code> at all — WASI Preview 1 has no listening-socket support — rejected at compile time; see <a href="https://github.com/uraikus/festina/blob/main/wasm.md">wasm.md</a>.</li>
+          <li><strong>Cannot be combined with graphics</strong> (<code>render()</code>, or an <code>on mouseDown</code>/.../<code>close</code> handler) in the same program — the server's own event loop and the graphics event loop are mutually exclusive in this version. <code>setTimeout</code>/<code>setInterval</code> combine fine; both are serviced from the same loop.</li>
+        </ul>
+      </section>
+
       <section class="doc-section" id="freeing-and-deleting">
         <h2>Freeing and deleting <a class="anchor" href="#freeing-and-deleting">#</a></h2>
         <p>
@@ -2221,7 +2505,8 @@ music.isPlaying()                     <span class="cm">// true the instant play(
 music.stop()                          <span class="cm">// silence this clip, everywhere</span>
 
 stopAudioPlayer(ch)                   <span class="cm">// stop one channel</span>
-stopAudioPlayer()                     <span class="cm">// stop every channel</span></pre>
+stopAudioPlayer()                     <span class="cm">// stop every channel</span>
+isAudioPlayerPlaying(ch)              <span class="cm">// true while THAT CHANNEL plays anything</span></pre>
         <p>
           A path declares the clip, the same way <code>blob</code>,
           <code>color</code>, <code>font</code> and <code>img</code> are
@@ -2268,7 +2553,20 @@ stopAudioPlayer(hum)           <span class="cm">// stop exactly that one</span><
           the pool picks on its own is just as addressable afterward as
           one you name by hand. <code>isPlaying()</code> is clip-wide,
           like <code>stop()</code>: "is this sound audible anywhere" and
-          "silence it everywhere" are one question asked two ways.
+          "silence it everywhere" are one question asked two ways. For
+          the other question — "is <em>this specific channel</em> still
+          playing anything" — there's <code>isAudioPlayerPlaying(n)</code>:
+        </p>
+        <pre class="code"><span class="kw">int</span> hum = engine.playLoop()
+<span class="cm">// ...later, with no reference to `engine` in scope anymore...</span>
+<span class="kw">if</span> isAudioPlayerPlaying(hum) { stopAudioPlayer(hum) }</pre>
+        <p class="muted">
+          It answers about the channel, not the clip — if a different
+          clip has since taken that channel over
+          (<code>play(n)</code>/<code>playLoop(n)</code>, or automatic
+          stealing), it reports on whatever's playing there
+          <em>now</em>, which <code>engine.isPlaying()</code> couldn't
+          do once <code>engine</code> itself said false.
         </p>
 
         <h3 id="overlapping-sounds">Overlapping sounds <a class="anchor" href="#overlapping-sounds">#</a></h3>
@@ -2334,6 +2632,7 @@ stopAudioPlayer(0)                  <span class="cm">// stop that channel, relea
           <tr><td>stopAudioPlayer(n)</td><td>Stop channel <code>n</code> and release it.</td></tr>
           <tr><td>stopAudioPlayer()</td><td>Stop every channel.</td></tr>
           <tr><td>clip.isPlaying()</td><td>True while any channel is playing that clip.</td></tr>
+          <tr><td>isAudioPlayerPlaying(n)</td><td>True while channel <code>n</code> is playing anything, regardless of clip.</td></tr>
         </table>
         </div>
         <p class="muted">
@@ -2360,8 +2659,9 @@ stopAudioPlayer(0)                  <span class="cm">// stop that channel, relea
           left the pool is allowed to touch, and the alternative would be
           breaking a reservation you asked for. <code>isPlaying()</code>
           is about the <strong>clip</strong>, not one playback of it: it
-          is true while any channel is playing that clip. To address a
-          single playback, name its channel.
+          is true while any channel is playing that clip. To ask about
+          a single playback, name its channel with
+          <code>isAudioPlayerPlaying(n)</code> instead.
         </p>
       </section>
 

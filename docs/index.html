@@ -376,7 +376,7 @@
 <header class="hero">
   <div class="wrap">
     <div class="badges">
-      <span class="badge">1462 tests passing</span>
+      <span class="badge">1639 tests passing</span>
       <span class="badge">MIT license</span>
       <span class="badge">Linux · macOS · Windows</span>
     </div>
@@ -384,8 +384,9 @@
     <p class="lede">
       Drop the interpreter, the runtime overhead, and the boilerplate.
       Festina compiles through LLVM to a real, standalone executable —
-      with SQLite, graphics, audio, and event-driven timers built
-      directly into the language, not bolted on as libraries.
+      with SQLite, graphics, audio, event-driven timers, and an
+      HTTP/WebSocket server built directly into the language, not
+      bolted on as libraries.
     </p>
     <div class="cta-row">
       <a class="btn btn-primary" href="#why">Why Festina</a>
@@ -456,6 +457,12 @@ Hello, Festina!</pre>
 <section id="get-started">
   <div class="wrap">
     <h2>Get started</h2>
+    <p class="section-intro">
+      One line, on Linux/macOS/MSYS2 UCRT64 bash on Windows — it clones
+      the source and checks/installs build dependencies for you:
+    </p>
+    <pre class="code"><span class="mut">$</span> curl -fsSL https://raw.githubusercontent.com/uraikus/festina/main/install.sh | sh</pre>
+    <p class="section-intro">Or from an existing checkout:</p>
     <pre class="code"><span class="mut">$</span> sudo apt install clang libsqlite3-dev libcairo2-dev libx11-dev libasound2-dev pkg-config
 <span class="mut">$</span> bin/festina compile examples/hello.f -o hello
 <span class="mut">$</span> ./hello</pre>
@@ -464,8 +471,12 @@ Hello, Festina!</pre>
     <p class="section-intro">
       Not sure your machine has everything Festina needs?
       <code>bin/festina doctor</code> checks every dependency above and
-      tells you exactly what's missing and how to install it — including
-      whether <code>festina</code> itself is on <code>PATH</code> yet.
+      tells you exactly what's missing and how to install it —
+      including whether <code>festina</code> itself is on
+      <code>PATH</code> yet. Add <code>--fix</code> and it installs
+      whatever's missing for you (via <code>apt</code>/Homebrew/MSYS2's
+      <code>pacman</code>, whichever this machine has) and adds
+      <code>festina</code> to <code>PATH</code> too.
     </p>
     <p class="section-intro">
       That's the whole loop — see
@@ -562,10 +573,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>hello</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">1.2 ms</td><td class="num">65.3 ms</td><td class="num">1.45 MB</td></tr>
-          <tr><td>Rust</td><td class="num">1.4 ms</td><td class="num">73.1 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">1.3 ms</td><td class="num">147.5 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">9.3 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">1.4 ms</td><td class="num">70.9 ms</td><td class="num">1.46 MB</td></tr>
+          <tr><td>Rust</td><td class="num">1.5 ms</td><td class="num">97.0 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">1.3 ms</td><td class="num">320.1 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">10.6 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -576,10 +587,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>fib(32)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">7.2 ms</td><td class="num">71.5 ms</td><td class="num">1.45 MB</td></tr>
-          <tr><td>Rust</td><td class="num">8.8 ms</td><td class="num">83.3 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">13.7 ms</td><td class="num">131.7 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">28.0 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">7.6 ms</td><td class="num">76.5 ms</td><td class="num">1.46 MB</td></tr>
+          <tr><td>Rust</td><td class="num">8.1 ms</td><td class="num">105.6 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">14.5 ms</td><td class="num">241.9 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">28.5 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -590,10 +601,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>loop_sum (100M)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">551.1 ms</td><td class="num">80.1 ms</td><td class="num">1.45 MB</td></tr>
-          <tr><td>Rust</td><td class="num">582.0 ms</td><td class="num">85.9 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">533.2 ms</td><td class="num">138.3 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">10474.8 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">518.4 ms</td><td class="num">161.2 ms</td><td class="num">1.46 MB</td></tr>
+          <tr><td>Rust</td><td class="num">525.0 ms</td><td class="num">132.1 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">460.5 ms</td><td class="num">483.8 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">9082.7 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -604,10 +615,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>array_sum (2M)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">98.5 ms</td><td class="num">87.7 ms</td><td class="num">1.45 MB</td></tr>
-          <tr><td>Rust</td><td class="num">98.7 ms</td><td class="num">101.5 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">98.7 ms</td><td class="num">134.4 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">2455.5 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">92.2 ms</td><td class="num">344.7 ms</td><td class="num">1.47 MB</td></tr>
+          <tr><td>Rust</td><td class="num">90.3 ms</td><td class="num">234.0 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">87.9 ms</td><td class="num">167.9 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">2393.8 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -618,17 +629,17 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>string_concat (15K)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">3.5 ms</td><td class="num">73.8 ms</td><td class="num">1.45 MB</td></tr>
-          <tr><td>Rust</td><td class="num">1.3 ms</td><td class="num">99.4 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">28.2 ms</td><td class="num">129.5 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">11.3 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">3.6 ms</td><td class="num">73.3 ms</td><td class="num">1.46 MB</td></tr>
+          <tr><td>Rust</td><td class="num">1.7 ms</td><td class="num">182.6 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">30.2 ms</td><td class="num">151.0 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">12.7 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
 
     <div class="canvas-highlight">
       <div class="canvas-highlight-head">
-        <span class="canvas-stat">1.9x faster</span>
+        <span class="canvas-stat">2.6x faster</span>
         <h3>than an HTML &lt;canvas&gt;, drawing the same scene</h3>
       </div>
       <p class="section-intro" style="margin:0 0 16px;">
@@ -643,9 +654,9 @@ npcHealths[<span class="str">'npc1'</span>] = 30
             <tr><th>Canvas</th><th class="num">Frame (min)</th><th class="num">Frame (median)</th><th class="num">First frame</th></tr>
           </thead>
           <tbody>
-            <tr class="row-festina"><td>Festina (Cairo)</td><td class="num">31 ms</td><td class="num">32 ms</td><td class="num">16 ms</td></tr>
-            <tr><td>HTML &lt;canvas&gt; (Chromium/Skia)</td><td class="num">60 ms</td><td class="num">62 ms</td><td class="num">240 ms</td></tr>
-            <tr><td>MonoGame (software GL)</td><td class="num">181 ms</td><td class="num">410 ms</td><td class="num">166 ms</td></tr>
+            <tr class="row-festina"><td>Festina (Cairo)</td><td class="num">37 ms</td><td class="num">39 ms</td><td class="num">24 ms</td></tr>
+            <tr><td>HTML &lt;canvas&gt; (Chromium/Skia)</td><td class="num">97 ms</td><td class="num">110 ms</td><td class="num">429 ms</td></tr>
+            <tr><td>MonoGame (software GL)</td><td class="num">252 ms</td><td class="num">270 ms</td><td class="num">181 ms</td></tr>
           </tbody>
         </table>
       </div>
@@ -670,14 +681,73 @@ npcHealths[<span class="str">'npc1'</span>] = 30
       </p>
     </div>
 
+    <h3 style="margin:32px 0 8px;">HTTP: Festina vs Rust vs Go vs Bun</h3>
+    <p class="section-intro">
+      Four servers answering the same two routes — <code>/</code> (plain
+      text) and <code>/json</code> — load-tested with
+      <a href="https://github.com/wg/wrk">wrk</a>. All four are held to
+      the same connection-handling logic: single-threaded, one
+      connection at a time, every response closing the connection —
+      Festina's HTTP server works this way natively (see
+      <a href="api.html#http-limitations">HTTP Limitations</a>), and the
+      Rust/Go servers here are hand-rolled raw sockets matching it
+      rather than <code>hyper</code>'s or <code>net/http</code>'s own
+      multi-threaded, keep-alive-capable defaults. Bun uses
+      <code>Bun.serve()</code> with <code>Connection: close</code> set
+      explicitly, for the same reason.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>plaintext (/)</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Transfer/sec</th></tr>
+        </thead>
+        <tbody>
+          <tr class="row-festina"><td>Festina</td><td class="num">33,370</td><td class="num">1.41 ms</td><td class="num">3.25 MB/s</td></tr>
+          <tr><td>Rust</td><td class="num">38,084</td><td class="num">1.14 ms</td><td class="num">3.52 MB/s</td></tr>
+          <tr><td>Go</td><td class="num">20,653</td><td class="num">2.17 ms</td><td class="num">1.91 MB/s</td></tr>
+          <tr><td>Bun</td><td class="num">14,156</td><td class="num">3.37 ms</td><td class="num">1.81 MB/s</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <br>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>json (/json)</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Transfer/sec</th></tr>
+        </thead>
+        <tbody>
+          <tr class="row-festina"><td>Festina</td><td class="num">32,643</td><td class="num">1.41 ms</td><td class="num">3.80 MB/s</td></tr>
+          <tr><td>Rust</td><td class="num">38,570</td><td class="num">1.06 ms</td><td class="num">4.30 MB/s</td></tr>
+          <tr><td>Go</td><td class="num">21,340</td><td class="num">2.24 ms</td><td class="num">2.38 MB/s</td></tr>
+          <tr><td>Bun</td><td class="num">13,985</td><td class="num">3.09 ms</td><td class="num">2.05 MB/s</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="section-intro" style="margin-top:16px;">
+      Festina clears Go and Bun by a wide margin on both routes and sits
+      within about 10% of Rust's raw-socket number — read that as "at
+      matching, single-threaded, no-keep-alive connection handling," not
+      as a claim about what <code>hyper</code>/<code>axum</code> or
+      <code>net/http</code> would report with keep-alive turned on. The
+      <code>/json</code> route runs Festina's request struct through the
+      same JSON-via-<code>.toText()</code> path every other container
+      response already uses, so the gap between the two routes reflects
+      that serialization cost rather than connection handling. Numbers
+      are one client machine talking to one server process on the same
+      machine — no network hop, no TLS — the same disclaimer every other
+      benchmark on this page carries.
+    </p>
+
     <p class="section-intro" style="margin-top:20px;">
       Short version: Festina holds its own against Rust and Go on
       compute-bound native code and lands right at them on
       allocation-heavy work too, comfortably outruns a JIT on cold
-      single-shot execution, and sits second on <code>string_concat</code>
+      single-shot execution, sits second on <code>string_concat</code>
       — ahead of both Go and Bun and within ~2.4x of Rust's
       spare-capacity-reusing <code>String</code>, the one gap here that's
-      genuinely algorithmic, not an allocator artifact.
+      genuinely algorithmic, not an allocator artifact — and clears Go
+      and Bun on HTTP throughput too, within ~10% of Rust's raw-socket
+      number.
     </p>
   </div>
 </section>
@@ -687,7 +757,7 @@ npcHealths[<span class="str">'npc1'</span>] = 30
     <h2>Project status</h2>
     <div class="status-line">
       <span class="dot"></span>
-      <span><strong>1462 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
+      <span><strong>1639 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
     </div>
     <p class="section-intro">
       The compiler frontend, LLVM codegen backend, and native C runtime are
@@ -698,11 +768,14 @@ npcHealths[<span class="str">'npc1'</span>] = 30
       runs five programs under AddressSanitizer and LeakSanitizer, each
       hammering one ownership mechanism thousands of times, because "the
       answers are right" and "nothing accumulates while producing them"
-      are different claims. See
+      are different claims. Native builds on Linux, macOS, and Windows,
+      plus cross-compiling to
+      <a href="https://github.com/uraikus/festina/blob/main/wasm.md">wasm32-wasi</a>,
+      are all supported today. See
       <a href="https://github.com/uraikus/festina/blob/main/tests/CONTRACT.md">tests/CONTRACT.md</a>
       for exactly what's covered, and
       <a href="https://github.com/uraikus/festina/blob/main/todo.md">todo.md</a>
-      for what's next (macOS, Windows, HTTP).
+      for what's next.
     </p>
   </div>
 </section>
