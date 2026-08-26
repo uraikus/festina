@@ -25,6 +25,35 @@ class TestTernary:
         with pytest.raises(errors.CompileError):
             semantic.analyze(program)
 
+    def test_ternary_with_a_fresh_text_branch_survives_past_the_statement(self, compile_and_run):
+        # claude.md #173: a Ternary used to be treated as "aliasing" no
+        # matter what its own branches were -- correct here (the taken
+        # branch is a template literal, a genuinely fresh buffer) only
+        # by accident, since the leak this used to cause is invisible
+        # without a sanitizer (see tests/stress/ternary_ownership_churn.f
+        # for the ASan-confirmed leak coverage) -- this pins that the
+        # VALUE itself is still correct and usable well past the
+        # ternary's own statement, on both branches.
+        result = compile_and_run("""
+        text a = true ? `fresh ${1 + 1}` : 'literal'
+        text b = false ? `fresh ${1 + 1}` : 'literal'
+        log(a)
+        log(b)
+        """)
+        assert result.stdout.splitlines() == ["fresh 2", "literal"]
+
+    def test_ternary_with_a_fresh_struct_branch_survives_past_the_statement(self, compile_and_run):
+        result = compile_and_run("""
+        struct S { n:int }
+        S func make(v:int) { S s  s.n = v  return s }
+        S shared = make(0)
+        S a = true ? make(7) : shared
+        S b = false ? make(7) : shared
+        log(a.n)
+        log(b.n)
+        """)
+        assert result.stdout.splitlines() == ["7", "0"]
+
 
 class TestEquality:
     """claude.md #18: `==`/`!=` supported; `===`/`!==` are compile errors."""

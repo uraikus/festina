@@ -2780,6 +2780,34 @@ struct field the JSON never mentioned keeps its ordinary zero value (so
 an optional/omitted field doesn't either). `toArr`'s own element type
 is given directly, not in brackets: `.toArr(int)`, not `.toArr(arr[int])`.
 
+A struct field or `toArr` element type may itself be a nested `struct`,
+`arr[T]` or `map[T]`, recursively — the JSON parser recurses into a
+nested value's own shape the exact same way `.toText()`'s own rendering
+already recurses for a nested container. A `map[T]` field parses the
+JSON object's own keys directly into the map (arbitrary keys, not
+matched against a known field set the way a struct's own fields are):
+
+```festina
+struct Point { x:int  y:int }
+struct Line { a:Point  b:Point  label:text }
+struct Scores { name:text  values:map[int] }
+
+Line l = '{"a":{"x":1,"y":2},"b":{"x":3,"y":4},"label":"hi"}'.toStruct(Line)
+arr[Point] pts = '[{"x":1,"y":2},{"x":3,"y":4}]'.toArr(Point)
+arr[arr[int]] grid = '[[1,2],[3,4,5]]'.toArr(arr[int])
+Scores s = '{"name":"ada","values":{"a":1,"b":2}}'.toStruct(Scores)
+```
+
+A self-referencing struct (see [A struct can name itself](#a-struct-can-name-itself)
+above) parses to whatever depth the JSON actually has, one nested call
+per level actually present:
+
+```festina
+struct Node { n:int  next:Node }
+Node head = '{"n":1,"next":{"n":2,"next":{"n":3}}}'.toStruct(Node)
+log(head.next.next.n)   // 3
+```
+
 Malformed JSON, a value that doesn't match the expected shape (a string
 where a number was expected, an object where an array was expected,
 ...), or trailing data after the value all `throw` a descriptive text
@@ -2787,14 +2815,16 @@ message — this is the intended pairing with [`try`/`catch`](#try--catch--throw
 above, e.g. for parsing an untrusted `req.toText()` body in an `on
 request` handler without a bad request taking the whole server down.
 
-**v1 scope cut, documented not silent.** A target struct's fields and
-`toArr`'s own element type must be `int`/`float`/`bool`/`text` —
-nested `struct`/`arr[T]`/`map[T]` aren't parseable yet, rejected at
-compile time with a clear error naming exactly what's unsupported.
-`\u` unicode string escapes are also not yet supported (raw,
-un-escaped non-ASCII UTF-8 bytes in a JSON string are unaffected and
-parse completely normally — this only affects a producer that
-specifically chooses to `\u`-escape).
+**The remaining scope cut, documented not silent.** A target struct's
+fields and `toArr`'s own element type must eventually bottom out at
+`int`/`float`/`bool`/`text` once every nested struct/`arr[T]`/`map[T]`
+is unwrapped — a genuinely un-parseable type (`img`, `aud`, `func[...]`,
+...), anywhere in that nesting, is rejected at compile time with a
+clear error naming exactly what's unsupported, even when the violation
+is several levels deep. `\u` unicode string escapes are also not yet
+supported (raw, un-escaped non-ASCII UTF-8 bytes in a JSON string are
+unaffected and parse completely normally — this only affects a
+producer that specifically chooses to `\u`-escape).
 
 **One real, honest limitation, the same structural class `throw`'s own
 limitation above already is.** A JSON value that fails to parse

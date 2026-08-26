@@ -64,17 +64,12 @@ same as macOS's own sanitizer tier is explicitly out of scope).
   swap the map side already needed at every touchpoint -- plus
   removing `ArrayType.amortized`'s `compare=False` once there's a real
   representation difference to distinguish.
-- **`.toStruct(T)`/`.toArr(T)` only parse scalar shapes** (claude.md
-  #159): a target struct's fields and `toArr`'s own element type must
-  be `int`/`float`/`bool`/`text` -- nested `struct`/`arr[T]`/`map[T]`
-  aren't parseable yet, rejected at compile time. `\u` unicode string
-  escapes aren't supported either (raw UTF-8 bytes are unaffected).
-  Extending this means teaching `_from_json_struct_fn_for`/
-  `_from_json_arr_fn_for` (festina/codegen.py) to recurse into a
-  nested field/element's own from-json function the same way
-  `_json_fn_for` already recurses for rendering -- plus a `map[text]`
-  parsing counterpart (a JSON object with arbitrary keys, rather than
-  known field names) for a `map[T]` target.
+- **`.toStruct(T)`/`.toArr(T)` don't support `\u` unicode string
+  escapes** -- raw, un-escaped UTF-8 bytes in a JSON string are
+  unaffected and parse normally; this only affects a producer that
+  specifically chooses to `\u`-escape. (Nested `struct`/`arr[T]`/
+  `map[T]` field/element shapes -- claude.md #159's own v1 scope cut
+  -- were closed by claude.md #173.)
 
 ## Memory model
 

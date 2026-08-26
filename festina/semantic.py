@@ -734,6 +734,47 @@ def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None
     )
 
 
+_JSON_SCALAR_TYPES = (types_mod.PrimitiveType("int"), types_mod.PrimitiveType("float"),
+                      types_mod.PrimitiveType("bool"), types_mod.PrimitiveType("text"))
+
+
+def _is_json_parseable_type(t, structs, _seen_structs=frozenset()):
+    """claude.md #173 (extends #159): is `t` a valid .toStruct()/
+    .toArr() field/element/target type? v1 (claude.md #159) only
+    allowed int/float/bool/text. This widens that to also allow a
+    nested struct, arr[T] or map[T] -- exactly mirroring codegen's own
+    _from_json_struct_fn_for/_from_json_arr_fn_for/_from_json_map_fn_for,
+    which now recurse into a nested field/element's own from-JSON
+    function the same way JSON *rendering* (_json_fn_for) already
+    recurses for nested containers -- as long as EVERY scalar this type
+    eventually bottoms out at is itself int/float/bool/text. A struct
+    used to check itself (directly or through a cycle of other structs
+    -- claude.md #17 made self-referencing structs legal generally) is
+    treated as valid without re-descending into it again: the check
+    already in progress for that struct, higher up this same recursion,
+    is the one that actually decides it, and re-entering it here would
+    only ever recurse forever without ever reaching a different answer.
+    `map[T]`'s own value can never itself be an ArrayType/MapType --
+    resolve_type_name above already rejects that at the point a map[T]
+    type is RESOLVED, so there is nothing left for this function to
+    reject on that axis; it only ever needs to keep recursing through
+    struct fields, array elements and map values until every leaf is
+    scalar."""
+    if t in _JSON_SCALAR_TYPES:
+        return True
+    if isinstance(t, types_mod.StructType):
+        if t.name in _seen_structs:
+            return True
+        seen = _seen_structs | {t.name}
+        return all(_is_json_parseable_type(ftype, structs, seen)
+                   for ftype in structs.get(t.name, {}).values())
+    if isinstance(t, types_mod.ArrayType):
+        return _is_json_parseable_type(t.element, structs, _seen_structs)
+    if isinstance(t, types_mod.MapType):
+        return _is_json_parseable_type(t.value, structs, _seen_structs)
+    return False
+
+
 def _iter_func_decls(stmts):
     """claude.md #140: yields every ast.FuncDecl reachable from `stmts`,
     however deeply nested -- inside a Block, either arm of an IfStmt, a
@@ -1911,14 +1952,15 @@ def analyze(program, filename="<string>"):
                     )
                 target_type = resolve_type_name(
                     expr.args[0].type_expr, structs, tables, filename, expr.args[0])
-                # claude.md #159 v1 SCOPE CUT (api.md/todo.md document
-                # it too): only int/float/bool/text are supported as a
-                # target struct's own field types or toArr()'s own
-                # element type -- nested struct/arr[T]/map[T] aren't
-                # parseable yet. Rejected here, at compile time, with a
-                # clear message naming exactly what's unsupported --
-                # never silently ignored or left null.
-                _JSON_SCALAR_TYPES = (_INT, _FLOAT, _BOOL, _TEXT)
+                # claude.md #173 (widens claude.md #159's v1 scope cut):
+                # a target struct's own field types and toArr()'s own
+                # element type may now themselves be a nested struct,
+                # arr[T] or map[T], as long as every scalar they
+                # eventually bottom out at is int/float/bool/text --
+                # see _is_json_parseable_type's own doc comment.
+                # Rejected here, at compile time, with a clear message
+                # naming exactly what's unsupported -- never silently
+                # ignored or left null.
                 if callee.prop == "toStruct":
                     if not isinstance(target_type, types_mod.StructType):
                         raise CompileError(
@@ -1928,19 +1970,21 @@ def analyze(program, filename="<string>"):
                             category="invalid function argument type",
                         )
                     for fname, ftype in structs.get(target_type.name, {}).items():
-                        if ftype not in _JSON_SCALAR_TYPES:
+                        if not _is_json_parseable_type(ftype, structs):
                             raise CompileError(
                                 f"toStruct({target_type.name}) doesn't support field "
                                 f"'{fname}' of type {types_mod.type_name(ftype)} yet -- "
-                                f"only int/float/bool/text fields are supported",
+                                f"only int/float/bool/text, a struct, arr[T] or map[T] "
+                                f"built from those (recursively) are supported",
                                 file=filename, line=callee.line, column=callee.column,
                                 category="invalid function argument type",
                             )
                     return target_type
                 else:  # toArr
-                    if target_type not in _JSON_SCALAR_TYPES:
+                    if not _is_json_parseable_type(target_type, structs):
                         raise CompileError(
-                            f"toArr()'s element type must be int/float/bool/text, "
+                            f"toArr()'s element type must be int/float/bool/text, a "
+                            f"struct, arr[T] or map[T] built from those (recursively), "
                             f"found {types_mod.type_name(target_type)}",
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid function argument type",

@@ -4318,6 +4318,29 @@ class CodeGen:
                 f"{types_mod.type_name(ftype)})", file=self.filename)
         return v
 
+    def _emit_json_read_value(self, ftype, cursor_ref, lines):
+        """claude.md #173 (extends claude.md #159): reads ONE JSON
+        value at the cursor into ftype's own Festina representation --
+        a scalar goes straight through _emit_json_read_scalar unchanged;
+        a nested struct/arr[T]/map[T] field/element/target recurses
+        into its own from-json function instead (_from_json_struct_fn_for/
+        _from_json_arr_fn_for/_from_json_map_fn_for), the exact same way
+        JSON *rendering* (_json_fn_for) already recurses for a nested
+        container. semantic.py's _is_json_parseable_type has already
+        confirmed every leaf ftype eventually bottoms out at
+        int/float/bool/text, so the recursion here always terminates."""
+        if isinstance(ftype, types_mod.StructType):
+            fn_name = self._from_json_struct_fn_for(ftype)
+        elif isinstance(ftype, types_mod.ArrayType):
+            fn_name = self._from_json_arr_fn_for(ftype.element)
+        elif isinstance(ftype, types_mod.MapType):
+            fn_name = self._from_json_map_fn_for(ftype)
+        else:
+            return self._emit_json_read_scalar(ftype, cursor_ref, lines)
+        v = self.tmp()
+        lines.append(f"  {v} = call ptr {fn_name}(ptr {cursor_ref})")
+        return v
+
     def _from_json_struct_fn_for(self, struct_type):
         """claude.md #159: returns (generating on first use, cached by
         struct name) `ptr @__festina_from_json_struct_N(ptr %cursor)` --
@@ -4380,13 +4403,29 @@ class CodeGen:
             body.append(f"{match_lbl}:")
             slot = self.tmp()
             body.append(f"  {slot} = getelementptr {struct_ty}, ptr {out}, i32 0, i32 {idx}")
+            # claude.md #173: a duplicate JSON key overwriting an
+            # already-set nested struct/arr[T]/map[T] field must not
+            # leak whatever it already parsed into that field -- the
+            # same "last one wins, and doesn't leak the value it
+            # replaces" contract a map literal's repeated key already
+            # follows. Store-then-release (not release-then-store), the
+            # same ordering claude.md #120's own cycle-trial-safety
+            # comment on _emit_assign requires: a trial deletion
+            # triggered by the release must never see this slot still
+            # pointing at the value whose count it just dropped.
+            old_refcounted = None
             if ftype == TEXT:
                 old = self.tmp()
                 body.append(f"  {old} = load ptr, ptr {slot}")
                 body.append(f"  call void @free(ptr {old})")
-            v = self._emit_json_read_scalar(ftype, "%cursor", body)
+            elif _is_refcounted(ftype):
+                old_refcounted = self.tmp()
+                body.append(f"  {old_refcounted} = load ptr, ptr {slot}")
+            v = self._emit_json_read_value(ftype, "%cursor", body)
             ir_ty = _llvm_type(ftype)
             body.append(f"  store {ir_ty} {v}, ptr {slot}")
+            if old_refcounted is not None:
+                body.append(f"  call void {self._release_fn_for(ftype)}(ptr {old_refcounted})")
             body.append(f"  br label %{keydone_lbl}")
             body.append(f"{next_check_lbl}:")
         # No field matched -- an unrecognized key, skipped whole.
@@ -4403,17 +4442,19 @@ class CodeGen:
         return fn_name
 
     def _from_json_arr_fn_for(self, elem_type):
-        """claude.md #159: the arr[T] counterpart to
+        """claude.md #159 (widened by #172): the arr[T] counterpart to
         _from_json_struct_fn_for -- returns (generating on first use,
         cached by element type name) `ptr @__festina_from_json_arr_N(ptr
         %cursor)`, parsing one JSON array at the cursor into a fresh
-        arr[T] header and returning it. v1 scope cut: T is int/float/
-        bool/text (semantic.py's own check, not re-validated here).
-        Each parsed element is pushed via festina_array_push -- the
-        SAME runtime helper `.push()` itself uses -- never needing an
-        ownership retain/copy first the way `.push(expr)` sometimes
-        does, since festina_json_read_text always returns an already-
-        fresh, uniquely-owned buffer (or NULL), never an alias of
+        arr[T] header and returning it. T is int/float/bool/text, or a
+        nested struct/arr[T]/map[T] built from those (recursively) --
+        semantic.py's _is_json_parseable_type has already confirmed
+        this, not re-validated here. Each parsed element is pushed via
+        festina_array_push -- the SAME runtime helper `.push()` itself
+        uses -- never needing an ownership retain/copy first the way
+        `.push(expr)` sometimes does, since festina_json_read_text and
+        every _from_json_*_fn_for below it always return an already-
+        fresh, uniquely-owned value (or NULL), never an alias of
         something else that would need copying."""
         cache_key = f"arr:{types_mod.type_name(elem_type)}"
         cached = self._from_json_fns.get(cache_key)
@@ -4439,13 +4480,125 @@ class CodeGen:
         body.append(f"  {done_b} = icmp ne i8 {done}, 0")
         body.append(f"  br i1 {done_b}, label %{end_lbl}, label %{elem_lbl}")
         body.append(f"{elem_lbl}:")
-        v = self._emit_json_read_scalar(elem_type, "%cursor", body)
+        v = self._emit_json_read_value(elem_type, "%cursor", body)
         elem_ir = _llvm_type(elem_type)
         elem_size = _elem_size(elem_type)
         slot = self.tmp()
         body.append(f"  {slot} = alloca {elem_ir}")
         body.append(f"  store {elem_ir} {v}, ptr {slot}")
         body.append(f"  call void @festina_array_push(ptr {out}, i64 {elem_size}, ptr {slot})")
+        body.append(f"  br label %{loop_lbl}")
+        body.append(f"{end_lbl}:")
+        body.append(f"  ret ptr {out}")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _from_json_map_value(self, map_ptr, value_type, key_val, value_val, lines, is_amap=False):
+        """claude.md #173: sets one key/value pair on a freshly-built
+        map[value_type] header during .toStruct()/.toArr() JSON parsing
+        (_from_json_map_fn_for below) -- deliberately NOT a call to the
+        general _emit_map_set: that method's own retain-unless-fresh
+        heuristic is built to read an ast.Expr (`value_source_expr`) and
+        decide from ITS shape whether the value already showed up with
+        its own +1, which nothing generated here has -- `value_val` is
+        always fresh and uniquely owned already (festina_json_read_text's
+        own buffer, or another freshly-built struct/arr/map from one of
+        this class's own _from_json_*_fn_for functions), the identical
+        reasoning _from_json_arr_fn_for's own festina_array_push call
+        already relies on, so this never retains. A duplicate JSON key --
+        the only way this map builder is ever asked to overwrite an
+        entry it already set -- still looks up and releases/frees
+        whatever the key already mapped to, AFTER festina_map_set has
+        stored the new value (claude.md #120's own cycle-trial-safety
+        ordering, see _emit_map_set's identical comment), the same
+        "last one wins, and doesn't leak the value it replaces"
+        contract a map literal's own repeated key follows."""
+        llvm_type_name = FESTINA_AMAP_LLVM_TYPE if is_amap else FESTINA_MAP_LLVM_TYPE
+        count_ptr = self.tmp()
+        lines.append(f"  {count_ptr} = getelementptr {llvm_type_name}, ptr {map_ptr}, i32 0, i32 0")
+        entries_ptr = self.tmp()
+        lines.append(f"  {entries_ptr} = getelementptr {llvm_type_name}, ptr {map_ptr}, i32 0, i32 1")
+        capacity_ptr = None
+        if is_amap:
+            capacity_ptr = self.tmp()
+            lines.append(f"  {capacity_ptr} = getelementptr {llvm_type_name}, ptr {map_ptr}, i32 0, i32 2")
+        count_val = self.tmp()
+        lines.append(f"  {count_val} = load i64, ptr {count_ptr}")
+        entries_val = self.tmp()
+        lines.append(f"  {entries_val} = load ptr, ptr {entries_ptr}")
+        old_raw = self.tmp()
+        lines.append(f"  {old_raw} = call i64 @festina_map_get(i64 {count_val}, ptr {entries_val}, "
+                     f"ptr {key_val}, i64 0)")
+        old_ptr = self.tmp()
+        lines.append(f"  {old_ptr} = inttoptr i64 {old_raw} to ptr")
+        raw_val = self._map_value_to_i64(value_val, value_type, lines)
+        if is_amap:
+            lines.append(f"  call void @festina_amap_set(ptr {count_ptr}, ptr {capacity_ptr}, "
+                         f"ptr {entries_ptr}, ptr {key_val}, i64 {raw_val})")
+        else:
+            lines.append(f"  call void @festina_map_set(ptr {count_ptr}, ptr {entries_ptr}, "
+                         f"ptr {key_val}, i64 {raw_val})")
+        if _is_refcounted(value_type):
+            lines.append(f"  call void {self._release_fn_for(value_type)}(ptr {old_ptr})")
+        elif value_type == TEXT:
+            lines.append(f"  call void @free(ptr {old_ptr})")
+
+    def _from_json_map_fn_for(self, map_type):
+        """claude.md #173: the map[T] counterpart to
+        _from_json_struct_fn_for/_from_json_arr_fn_for -- todo.md's own
+        #159 entry named this the missing piece: "a map[text] parsing
+        counterpart (a JSON object with arbitrary keys, rather than
+        known field names) for a map[T] target." Returns (generating on
+        first use, cached by value type name AND amor-ness -- an `amor
+        map[T]` target genuinely needs FESTINA_AMAP_LLVM_TYPE's own
+        extra capacity field, unlike arr[T]'s own amor prefix, which has
+        no runtime representation difference yet, see ArrayType's own
+        doc comment) `ptr @__festina_from_json_map_N(ptr %cursor)`,
+        parsing one JSON object at the cursor into a fresh map[T].
+
+        Unlike _from_json_struct_fn_for's own object-parsing loop (which
+        matches each key against a FIXED set of known field names, and
+        skips anything else), every key here becomes a map entry --
+        there is no fixed field set to match against, exactly the
+        "arbitrary keys" a map[T] target calls for."""
+        is_amap = map_type.amortized
+        cache_key = f"map:{'amor ' if is_amap else ''}{types_mod.type_name(map_type.value)}"
+        cached = self._from_json_fns.get(cache_key)
+        if cached is not None:
+            return cached
+        fn_name = f"@__festina_from_json_map_{self._unique()}"
+        self._from_json_fns[cache_key] = fn_name
+
+        value_type = map_type.value
+        llvm_type_name = FESTINA_AMAP_LLVM_TYPE if is_amap else FESTINA_MAP_LLVM_TYPE
+        body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
+        out = self._emit_fresh_heap_header(llvm_type_name, body)
+        body.append("  call void @festina_json_object_start(ptr %cursor)")
+        first = self.tmp()
+        body.append(f"  {first} = alloca i8")
+        body.append(f"  store i8 1, ptr {first}")
+        loop_lbl = self.label("fromjson.mloop")
+        end_lbl = self.label("fromjson.mend")
+        entry_lbl = self.label("fromjson.mentry")
+        body.append(f"  br label %{loop_lbl}")
+        body.append(f"{loop_lbl}:")
+        done = self.tmp()
+        body.append(f"  {done} = call i8 @festina_json_object_next(ptr %cursor, ptr {first})")
+        done_b = self.tmp()
+        body.append(f"  {done_b} = icmp ne i8 {done}, 0")
+        body.append(f"  br i1 {done_b}, label %{end_lbl}, label %{entry_lbl}")
+        body.append(f"{entry_lbl}:")
+        key_reg = self.tmp()
+        body.append(f"  {key_reg} = call ptr @festina_json_read_key(ptr %cursor)")
+        v = self._emit_json_read_value(value_type, "%cursor", body)
+        self._from_json_map_value(out, value_type, key_reg, v, body, is_amap=is_amap)
+        # claude.md #97: festina_map_set/_amap_set strdup their own copy
+        # of the key -- the same reason _emit_map_set frees its own
+        # key_source_expr afterward -- so key_reg (heap-allocated by
+        # festina_json_read_key) has no owner left once this returns.
+        body.append(f"  call void @free(ptr {key_reg})")
         body.append(f"  br label %{loop_lbl}")
         body.append(f"{end_lbl}:")
         body.append(f"  ret ptr {out}")
@@ -5760,15 +5913,27 @@ class CodeGen:
         doesn't copy" reasoning a Return statement already relies on --
         only when it's a plain function Call. Every other expression
         shape (a bare Identifier reading an existing local/parameter/
-        global, a Member/field read, a Ternary between two such reads,
-        ...) is conservatively treated as "aliasing": something ELSE
-        already references this exact value (or could), so a NEW
-        binding referencing it too needs its own retain. This can only
-        ever retain when it turns out not to have been strictly
-        necessary (over-conservative, never under), never skip a retain
-        a real alias actually needed -- the same directional bias every
-        other stage in this whole effort has taken when a choice wasn't
-        fully provable either way.
+        global, a Member/field read, ...) is conservatively treated as
+        "aliasing": something ELSE already references this exact value
+        (or could), so a NEW binding referencing it too needs its own
+        retain. This can only ever retain when it turns out not to have
+        been strictly necessary (over-conservative, never under), never
+        skip a retain a real alias actually needed -- the same
+        directional bias every other stage in this whole effort has
+        taken when a choice wasn't fully provable either way.
+
+        claude.md #173: a Ternary is owning too -- not because both of
+        its own branches are somehow guaranteed fresh (most aren't),
+        but because _emit_ternary itself now normalizes whichever
+        branch actually ran into a genuine +1 before this function is
+        ever asked about it (retaining a branch whose own source
+        wasn't already owning) -- see _own_ternary_branch's own
+        comment for the real, ASan-confirmed leak treating a fresh
+        ternary branch as merely "aliasing" used to cause: the caller
+        retained the ternary's result exactly once regardless of which
+        branch ran, so a branch that was ALREADY fresh got an extra,
+        unbalanced retain on top of its own +1 every time it was
+        chosen.
 
         Deliberately simple and conservative rather than a full points-
         to analysis: a function call's own return value is "owning"
@@ -5792,7 +5957,7 @@ class CodeGen:
         own return value does (see _emit_array_lit/_emit_map_lit's own
         "fresh, uniquely-owned" comment), nothing else referencing it
         the instant it's produced."""
-        if isinstance(expr, (ast.Call, ast.ArrayLit, ast.MapLit)):
+        if isinstance(expr, (ast.Call, ast.ArrayLit, ast.MapLit, ast.Ternary)):
             return True
         # claude.md #119: an expression whose own emission minted a +1
         # -- a retained computed-index element (`getRows()[0]`), or a
@@ -5877,17 +6042,26 @@ class CodeGen:
 
         Everything else -- a bare Identifier (a local, a global, a
         parameter -- all just aliasing whatever they already point
-        to), a Member/field read, a Ternary, and critically a
-        StringLit itself (a pointer to a `.str.N` global CONSTANT,
-        never allocated at all -- freeing one would corrupt the
-        binary's own static data) -- is "aliasing": conservatively
-        copied via festina_text_own before being stored into a new
-        binding, the same directional bias every prior stage in this
-        whole effort defaults to whenever a choice isn't fully provable
-        either way."""
+        to), a Member/field read, and critically a StringLit itself (a
+        pointer to a `.str.N` global CONSTANT, never allocated at all
+        -- freeing one would corrupt the binary's own static data) --
+        is "aliasing": conservatively copied via festina_text_own
+        before being stored into a new binding, the same directional
+        bias every prior stage in this whole effort defaults to
+        whenever a choice isn't fully provable either way.
+
+        claude.md #173: a Ternary is owning too now -- NOT because a
+        ternary's own two branches are somehow both guaranteed fresh
+        (most aren't), but because _emit_ternary itself now normalizes
+        whichever branch actually ran into a genuinely fresh, owned
+        buffer before this function is ever asked about it (copying it
+        there if the branch's own source wasn't already owning) -- see
+        _own_ternary_branch's own comment for why a Ternary used to be
+        listed under "everything else... is aliasing" just above, and
+        what that got silently wrong."""
         if isinstance(expr, ast.BinOp):
             return expr.op == "+"
-        if isinstance(expr, (ast.Call, ast.TemplateLit)):
+        if isinstance(expr, (ast.Call, ast.TemplateLit, ast.Ternary)):
             return True
         # claude.md #151: a direct _minted_values check, mirroring
         # _is_owning_refcounted_source's own top-level check just
@@ -7167,11 +7341,13 @@ class CodeGen:
 
         self._start_block(then_label, lines)
         cons_val, cons_type = self._emit_expr(expr.cons, env, lines)
+        cons_val = self._own_ternary_branch(cons_val, cons_type, expr.cons, lines)
         then_pred = self.cur_block  # may differ from then_label if expr.cons had its own branches
         lines.append(f"  br label %{end_label}")
 
         self._start_block(else_label, lines)
         alt_val, _ = self._emit_expr(expr.alt, env, lines)
+        alt_val = self._own_ternary_branch(alt_val, cons_type, expr.alt, lines)
         else_pred = self.cur_block
         lines.append(f"  br label %{end_label}")
 
@@ -7180,6 +7356,44 @@ class CodeGen:
         llvm_ty = _llvm_type(cons_type)
         lines.append(f"  {out} = phi {llvm_ty} [ {cons_val}, %{then_pred} ], [ {alt_val}, %{else_pred} ]")
         return out, cons_type
+
+    def _own_ternary_branch(self, val, vtype, source_expr, lines):
+        """claude.md #173: a Ternary used to be treated as "aliasing"
+        no matter what its own branches actually were (see
+        _is_owning_text_source/_is_owning_refcounted_source's own prior
+        comments on Ternary) -- correct whenever BOTH branches are
+        themselves aliasing, but silently wrong the moment either one
+        is a genuinely fresh, owning source (a template literal, a `+`
+        concatenation, a function call, an array/map literal, ...):
+        the caller retained/copied the ternary's overall result exactly
+        once no matter which branch actually ran, so a fresh branch's
+        own already-correct ownership got an EXTRA retain/copy with
+        nothing left to ever balance it -- an unconditional, silent
+        leak on every evaluation that took the fresh branch (found via
+        real ASan/LeakSanitizer runs, not by inspection -- see
+        tests/stress/json_parse_churn.f's own account of finding it).
+
+        Fixed at the root, in EACH branch, rather than at every one of
+        this ternary's own possible consumers: normalize a branch that
+        wasn't already owning into one that is (retain a refcounted
+        branch, copy a text branch) right here, so the phi'd result is
+        ALWAYS owning regardless of which branch ran -- which is
+        exactly what lets Ternary be added to both predicates' owning
+        cases below, the same "the whole point is never having to fix
+        this at each consumer separately" reasoning every earlier
+        ownership-tracking stage in this file already leans on. A
+        non-text, non-refcounted type (int/float/bool/color/font/...)
+        is returned completely unchanged -- neither of those two
+        protocols applies to it at all."""
+        if vtype == TEXT:
+            if not self._is_owning_text_source(source_expr):
+                owned = self.tmp()
+                lines.append(f"  {owned} = call ptr @festina_text_own(ptr {val})")
+                return owned
+        elif _is_refcounted(vtype):
+            if not self._is_owning_refcounted_source(source_expr):
+                lines.append(f"  call void @festina_retain(ptr {val})")
+        return val
 
     def _emit_logical(self, expr, env, lines):
         left_val, _ = self._emit_expr(expr.left, env, lines)  # i8 BOOL value

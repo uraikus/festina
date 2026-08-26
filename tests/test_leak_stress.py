@@ -354,11 +354,24 @@ class TestLeakStress:
             # a genuinely different ownership shape than push/unshift's
             # single-value one collections_churn.f already covers.
             "splice_insert_churn.f",
-            # claude.md #171: blob/img/aud's own `.callback()` -- a value
+            # claude.md #172: blob/img/aud's own `.callback()` -- a value
             # built on a BACKGROUND thread and mutated in place once the
             # main thread drains it, media_churn.f's synchronous loads
             # cannot exercise this at all (there is no worker thread, no
             # placeholder to alias before the real value lands, and no
             # graceful-failure-on-a-worker-thread path to hit).
             "async_io_churn.f",
+            # claude.md #173: .toStruct()/.toArr() JSON parsing --
+            # nested struct/arr[T]/map[T] fields/elements, each
+            # recursing into its own from-json function, including a
+            # self-referencing struct's own function calling itself.
+            "json_parse_churn.f",
+            # claude.md #173: a real, pre-existing leak this round found
+            # (not introduced by it) -- a Ternary between two OWNING
+            # branches (a template literal, a `+` concatenation, a
+            # function call, ...) leaked whichever branch actually ran,
+            # every time, since the caller's own copy/retain landed on
+            # top of an already-correct +1 with nothing left to balance
+            # it. Isolated on its own, independent of JSON parsing.
+            "ternary_ownership_churn.f",
         }
