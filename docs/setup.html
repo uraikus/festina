@@ -1,0 +1,840 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setup — Festina</title>
+<meta name="description" content="How to install Festina, its build/runtime dependencies, and how to run the test suite.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23e8823a'/%3E%3Ctext x='50' y='68' font-size='60' font-family='monospace' font-weight='700' text-anchor='middle' fill='%231a1712'%3Ef%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #fbf9f6;
+    --bg-raised: #ffffff;
+    --bg-sunken: #f1ede6;
+    --text: #211c14;
+    --text-muted: #6b6252;
+    --border: #e4ddd0;
+    --accent: #c15f1e;
+    --accent-strong: #a84f16;
+    --accent-soft: #fbe6d3;
+    --code-bg: #221d16;
+    --code-text: #f2ead9;
+    --code-muted: #9a8f78;
+    --code-string: #d99a5b;
+    --code-keyword: #e8823a;
+    --code-comment: #7d745f;
+    --shadow: 0 1px 2px rgba(35, 25, 10, 0.06), 0 8px 24px rgba(35, 25, 10, 0.05);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #17140f;
+      --bg-raised: #1f1b14;
+      --bg-sunken: #14110c;
+      --text: #f2ead9;
+      --text-muted: #a89c84;
+      --border: #332c20;
+      --accent: #f0904f;
+      --accent-strong: #f7a86b;
+      --accent-soft: #3a2814;
+      --code-bg: #0f0d09;
+      --code-text: #f2ead9;
+      --code-muted: #8a7f68;
+      --code-string: #e8b47c;
+      --code-keyword: #f0904f;
+      --code-comment: #6b6250;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #17140f;
+    --bg-raised: #1f1b14;
+    --bg-sunken: #14110c;
+    --text: #f2ead9;
+    --text-muted: #a89c84;
+    --border: #332c20;
+    --accent: #f0904f;
+    --accent-strong: #f7a86b;
+    --accent-soft: #3a2814;
+    --code-bg: #0f0d09;
+    --code-text: #f2ead9;
+    --code-muted: #8a7f68;
+    --code-string: #e8b47c;
+    --code-keyword: #f0904f;
+    --code-comment: #6b6250;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent-strong); }
+  code, pre, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+
+  code:not(pre code) {
+    background: var(--bg-sunken);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.1em 0.35em;
+    font-size: 0.87em;
+  }
+
+  /* Top bar */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 56px;
+    padding: 0 16px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    font-size: 1.02rem;
+    color: var(--text);
+    text-decoration: none;
+  }
+  .brand .mark {
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    background: var(--accent);
+    color: #1a1508;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: monospace;
+    font-weight: 800;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+  }
+  .brand .sep { color: var(--text-muted); font-weight: 400; }
+  .topbar-links {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    font-size: 0.88rem;
+  }
+  .topbar-links a { color: var(--text-muted); text-decoration: none; }
+  .topbar-links a:hover { color: var(--text); }
+  .menu-btn {
+    display: none;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+
+  /* Layout */
+  .layout {
+    display: grid;
+    grid-template-columns: 260px minmax(0, 1fr);
+    max-width: 1280px;
+    margin: 0 auto;
+  }
+
+  /* Sidebar */
+  aside.sidebar {
+    position: sticky;
+    top: 56px;
+    align-self: start;
+    height: calc(100vh - 56px);
+    overflow-y: auto;
+    padding: 24px 16px 40px;
+    border-right: 1px solid var(--border);
+  }
+  .search-box {
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg-raised);
+    color: var(--text);
+    font-size: 0.85rem;
+    margin-bottom: 16px;
+  }
+  .search-box:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .nav-group { margin-bottom: 4px; }
+  .nav-group-title {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin: 18px 0 6px;
+    padding: 0 10px;
+  }
+  .nav-group:first-of-type .nav-group-title { margin-top: 0; }
+  nav.toc a {
+    display: block;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 0.87rem;
+    color: var(--text-muted);
+    text-decoration: none;
+    line-height: 1.35;
+  }
+  nav.toc a:hover { background: var(--bg-sunken); color: var(--text); }
+  nav.toc a.active {
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-weight: 600;
+  }
+  nav.toc a.sub {
+    padding-left: 22px;
+    font-size: 0.83rem;
+  }
+  nav.toc a[data-hidden="true"] { display: none; }
+
+  /* Main content */
+  main {
+    min-width: 0;
+    padding: 40px 32px 100px;
+  }
+  .content-wrap { max-width: 720px; }
+
+  .page-kicker {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--accent-strong);
+    font-weight: 700;
+    margin: 0 0 8px;
+  }
+  h1.page-title {
+    font-size: 2rem;
+    margin: 0 0 12px;
+    letter-spacing: -0.02em;
+  }
+  .lede {
+    color: var(--text-muted);
+    font-size: 1.02rem;
+    max-width: 640px;
+    margin: 0 0 8px;
+  }
+
+  section.doc-section {
+    padding-top: 40px;
+    margin-top: 24px;
+    border-top: 1px solid var(--border);
+    scroll-margin-top: 72px;
+  }
+  section.doc-section:first-of-type { border-top: none; }
+  h2 {
+    font-size: 1.4rem;
+    margin: 0 0 12px;
+    letter-spacing: -0.01em;
+    scroll-margin-top: 72px;
+  }
+  h3 {
+    font-size: 1.05rem;
+    margin: 28px 0 10px;
+    scroll-margin-top: 72px;
+  }
+  h4 {
+    font-size: 0.92rem;
+    margin: 22px 0 8px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  h2 .anchor, h3 .anchor {
+    opacity: 0;
+    text-decoration: none;
+    color: var(--text-muted);
+    font-size: 0.85em;
+    margin-left: 6px;
+  }
+  h2:hover .anchor, h3:hover .anchor { opacity: 1; }
+
+  p { margin: 0 0 14px; color: var(--text); }
+  p.muted { color: var(--text-muted); }
+
+  pre.code {
+    background: var(--code-bg);
+    color: var(--code-text);
+    border-radius: 10px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    line-height: 1.6;
+    box-shadow: var(--shadow);
+    margin: 0 0 16px;
+  }
+  pre.code .kw { color: var(--code-keyword); }
+  pre.code .str { color: var(--code-string); }
+  pre.code .re { color: var(--code-string); opacity: 0.85; }
+  pre.code .cm { color: var(--code-comment); font-style: italic; }
+  pre.code .mut { color: var(--code-muted); }
+
+  .callout {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 0.92rem;
+    color: var(--text-muted);
+    margin: 0 0 16px;
+  }
+  .callout strong { color: var(--text); }
+
+  .table-wrap {
+    overflow-x: auto;
+    border-radius: 10px;
+    margin: 0 0 16px;
+  }
+  .table-wrap .sig-table { margin: 0; }
+  .sig-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    margin: 0 0 16px;
+  }
+  .sig-table td {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .sig-table td:first-child {
+    white-space: nowrap;
+    font-family: monospace;
+    color: var(--accent-strong);
+  }
+
+  .version-badge {
+    display: inline-block;
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-weight: 700;
+    font-size: 0.85rem;
+    padding: 2px 10px;
+    border-radius: 999px;
+    margin-right: 10px;
+    vertical-align: middle;
+  }
+  .version-date {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    font-weight: 400;
+    vertical-align: middle;
+  }
+  ul.changes { margin: 0 0 16px; padding-left: 20px; }
+  ul.changes li { margin-bottom: 6px; }
+
+  .prevnext {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+  }
+  .prevnext a {
+    flex: 1;
+    text-decoration: none;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    color: var(--text);
+  }
+  .prevnext a:hover { border-color: var(--accent); }
+  .prevnext .label { display: block; font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+  .prevnext .next { text-align: right; }
+
+  @media (max-width: 880px) {
+    .layout { grid-template-columns: 1fr; }
+    .menu-btn { display: inline-block; }
+    aside.sidebar {
+      position: fixed;
+      top: 56px;
+      left: 0;
+      width: 280px;
+      max-width: 85vw;
+      background: var(--bg);
+      z-index: 30;
+      transform: translateX(-100%);
+      transition: transform 0.18s ease;
+      box-shadow: var(--shadow);
+    }
+    aside.sidebar.open { transform: translateX(0); }
+    .sidebar-backdrop {
+      display: none;
+      position: fixed;
+      inset: 56px 0 0 0;
+      background: rgba(0,0,0,0.35);
+      z-index: 25;
+    }
+    .sidebar-backdrop.open { display: block; }
+    main { padding: 32px 20px 80px; }
+    .topbar-links a.hide-narrow { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex; align-items:center; gap:8px;">
+    <button class="menu-btn" id="menuBtn" aria-label="Toggle navigation">☰ Menu</button>
+    <a class="brand" href="index.html"><span class="mark">f</span> Festina <span class="sep">/ Docs</span></a>
+  </div>
+  <div class="topbar-links">
+    <a class="hide-narrow" href="index.html#docs">All docs</a>
+    <a href="https://github.com/uraikus/festina">GitHub</a>
+  </div>
+</div>
+
+<div class="sidebar-backdrop" id="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…">
+    <nav class="toc" id="toc">
+      <div class="nav-group">
+        <a href="#installing-with-one-command">Installing with one command</a>
+        <a href="#use-the-compiler-from-a-checkout">Use the compiler from a checkout</a>
+        <a class="sub" href="#windows-dll-story">The DLL story for Windows</a>
+        <a href="#use-a-packaged-binary">Use a packaged binary</a>
+        <a href="#run-a-compiled-program">Run a compiled program</a>
+        <a class="sub" href="#static-linking-sqlite3">Static-linking sqlite3</a>
+        <a class="sub" href="#compiling-to-wasm">Compiling to WASM</a>
+        <a href="#running-the-test-suite">Running the test suite</a>
+        <a href="#benchmark-toolchains">Benchmark toolchains</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="content-wrap">
+      <p class="page-kicker">Setup</p>
+      <h1 class="page-title">Setup &amp; dependencies</h1>
+      <p class="lede">
+        Three different dependency lists, and they're not the same
+        size: the compiler frontend, a compiled program's own runtime
+        dependencies, and a packaged binary's needs are genuinely
+        different sets — see
+        <a href="api.html#compilation-pipeline">api.md</a> for the
+        pipeline itself, and
+        <a href="security.html#slim-binaries">security.md</a> for why
+        the runtime dependency list below is conditional per program.
+      </p>
+
+      <section class="doc-section" id="installing-with-one-command">
+        <h2>Installing with one command <a class="anchor" href="#installing-with-one-command">#</a></h2>
+        <pre class="code"><span class="mut">$</span> curl -fsSL https://raw.githubusercontent.com/uraikus/festina/main/install.sh <span class="mut">|</span> sh</pre>
+        <p class="muted">
+          <code>install.sh</code> (Linux, macOS, and MSYS2 UCRT64 bash
+          on Windows — the one supported Windows toolchain/shell; a
+          native PowerShell installer would first need to bootstrap
+          MSYS2 itself) clones a fresh checkout into
+          <code>$FESTINA_INSTALL_DIR</code> (default
+          <code>~/.festina</code>; re-running it updates an existing
+          one in place), then hands off entirely to <code>festina
+          doctor --fix</code> below for both dependency
+          checking/installing and adding <code>festina</code> to
+          <code>PATH</code> — there's no prebuilt binary to download
+          here; installing from source is how the one-line install
+          works. <code>--yes</code>/<code>-y</code> as a script
+          argument skips every confirmation prompt, for a fully
+          non-interactive install.
+        </p>
+      </section>
+
+      <section class="doc-section" id="use-the-compiler-from-a-checkout">
+        <h2>Use the compiler from a checkout <a class="anchor" href="#use-the-compiler-from-a-checkout">#</a></h2>
+        <p>
+          <code>bin/festina compile program.f</code> on a fresh system
+          (or <code>bin/festina run program.f</code> to skip the
+          intermediate binary and just run it — see
+          <a href="api.html#cli">api.md</a> for the full command list,
+          including <code>festina doctor</code>, which checks every
+          dependency below for you and tells you exactly what's
+          missing — and <code>festina doctor --fix</code>, which
+          installs it for you via whichever of
+          <code>apt</code>/Homebrew/MSYS2's <code>pacman</code> this
+          machine has and adds <code>festina</code> to <code>PATH</code>
+          too, after confirming each change with you first):
+        </p>
+        <div class="table-wrap">
+          <table class="sig-table">
+            <tr><td>Python 3</td><td>Runs the compiler frontend itself (<code>bin/festina</code> execs <code>python3 -m festina.cli</code>) — only if running from source; see the packaged-binary option below to avoid this entirely. <strong>Required</strong> unless using the packaged binary.</td></tr>
+            <tr><td>C compiler</td><td><code>clang</code> or <code>gcc</code> — compiles the runtime and links the final binary. <strong>Required</strong>, either works.</td></tr>
+            <tr><td>libsqlite3-dev</td><td>The runtime's core translation unit does <code>#include &lt;sqlite3.h&gt;</code> — needed to compile <em>any</em> program, since <code>festina.sqlite</code> support is always on. <strong>Required.</strong></td></tr>
+            <tr><td>libcairo2-dev + libx11-dev + libjpeg-dev</td><td>Only needed to compile a <em>program that actually uses graphics</em> (<code>img</code>/<code>draw*</code>/<code>on mouseDown</code>/etc.) — the graphics runtime translation unit isn't even compiled otherwise. <code>libjpeg</code> decodes JPEG; Cairo handles PNG on its own. Required only if you'll compile graphics-using programs.</td></tr>
+            <tr><td>libasound2-dev + libmpg123-dev</td><td>Same story, for <code>aud</code> — ALSA for playback, <code>libmpg123</code> for MP3 decoding (WAV is parsed directly, with no library at all). Required only if you'll compile audio-using programs.</td></tr>
+            <tr><td>libmbedtls-dev</td><td>Same story, for <code>openSecurePort()</code> — mbedTLS 2.x provides the TLS handshake/record layer; the <code>festina_runtime_https.c</code> translation unit isn't even compiled otherwise. Required only if you'll compile programs that call <code>openSecurePort()</code>.</td></tr>
+            <tr><td>pkg-config</td><td>Locates sqlite3's (and, conditionally, Cairo/X11's/libjpeg's/ALSA's/libmpg123's/mbedTLS's) compile/link flags. <strong>Required.</strong></td></tr>
+            <tr><td>llvm</td><td>Provides <code>libLLVM</code>, letting <code>festina/llvm_backend.py</code> compile IR directly (the fast path, and the one that makes <code>gcc</code> usable at all). Recommended — without it, the C compiler must specifically be <code>clang</code>, since only clang can parse the <code>.ll</code> IR text this compiler falls back to handing it directly (<code>gcc</code> hands it to <code>ld</code>, which fails treating it as a corrupt linker script).</td></tr>
+          </table>
+        </div>
+        <p class="muted">
+          Missing any of these fails with a specific, actionable error
+          rather than a raw traceback — naming the tool and how to get
+          it. If you don't know ahead of time whether every program
+          you'll ever compile needs graphics/audio, the simplest move
+          is installing all seven system packages up front (below) — a
+          <em>compiled program</em> only ends up depending on the ones
+          it actually uses (that's the whole point of
+          <a href="security.html#slim-binaries">security.md</a>'s
+          binary-slimming split); it's only the <em>compiler's own
+          build-time</em> dependency list that's conditional per
+          program.
+        </p>
+        <p class="muted">
+          Notably absent from this list entirely: anything for
+          <code>regex()</code>/<code>.test()</code>/<code>.match()</code>/<code>.replace()</code>
+          — they're built on POSIX extended regular expressions
+          (<code>&lt;regex.h&gt;</code>), already part of libc
+          everywhere this list's C compiler already requires libc, so
+          regex support adds zero new dependencies. Timers are the
+          same story: <code>clock_gettime</code>/<code>nanosleep</code>/<code>select</code>
+          are all POSIX, already part of libc too.
+        </p>
+        <p><strong>Debian/Ubuntu:</strong></p>
+        <pre class="code"><span class="mut">$</span> sudo apt install clang libsqlite3-dev libcairo2-dev libx11-dev libjpeg-dev \
+                 libasound2-dev libmpg123-dev libmbedtls-dev pkg-config</pre>
+        <p class="muted">
+          <code>clang</code> conveniently pulls in <code>libLLVM</code>
+          as a dependency, covering both the fast path and its fallback
+          in one line. (<code>gcc</code> works too for the fast path,
+          but only if <code>libLLVM</code> is separately present —
+          <code>clang</code> is the simpler single recommendation.)
+        </p>
+        <p><strong>macOS (Homebrew):</strong></p>
+        <pre class="code"><span class="mut">$</span> xcode-select --install                                <span class="cm"># Xcode >= 15 -- the floor</span>
+<span class="mut">$</span> brew install pkg-config sqlite cairo jpeg-turbo mpg123 mbedtls <span class="cm"># graphics + audio + TLS tiers</span></pre>
+        <p class="muted">
+          There's no <code>llvm</code> line: Apple clang, from the
+          CommandLineTools Xcode already installs, consumes the
+          generated LLVM IR (<code>.ll</code>) directly, including its
+          opaque-<code>ptr</code> form — brew's own (very large)
+          <code>llvm</code> bottle is unnecessary here, and the libLLVM
+          fast path is a Linux-only convenience covered by the
+          Debian/Ubuntu line above. brew's <code>sqlite</code> is
+          keg-only, so its <code>.pc</code> file needs
+          <code>PKG_CONFIG_PATH</code> set explicitly:
+        </p>
+        <pre class="code"><span class="mut">$</span> export PKG_CONFIG_PATH=<span class="str">"$(brew --prefix sqlite)/lib/pkgconfig:$PKG_CONFIG_PATH"</span></pre>
+        <p class="muted">
+          No <code>XQuartz</code> and no X11 of any kind: graphics on
+          macOS is a native Cocoa window
+          (<code>runtime/festina_runtime_window_mac.m</code>), not an
+          X11 server running under emulation, so there's nothing X11 to
+          install and no window server other than the one macOS already
+          runs. Both the audio (AudioQueue) and graphics (Cocoa)
+          backends compile on every push, but stay gated behind
+          <code>FESTINA_ENABLE_MACOS_AUDIO=1</code><wbr>/<code>FESTINA_ENABLE_MACOS_GRAPHICS=1</code>
+          until confirmed on real hardware — compiling an audio- or
+          window-opening program on darwin without the relevant env var
+          fails with a specific error naming the gate, exactly like the
+          missing-tool errors above; <code>festina doctor</code>
+          reports the same status.
+        </p>
+        <p><strong>Windows (MSYS2 UCRT64)</strong> — this is the one and only supported Windows toolchain, and <strong>MSVC is explicitly out of scope</strong>:</p>
+        <pre class="code"><span class="cm"># From an MSYS2 UCRT64 shell specifically -- not the plain MSYS shell</span>
+<span class="cm"># (festina doctor flags that one as the wrong one) and not</span>
+<span class="cm"># MINGW64/CLANG64 either.</span>
+<span class="mut">$</span> pacman -S mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-python \
+          mingw-w64-ucrt-x86_64-sqlite3 mingw-w64-ucrt-x86_64-pkgconf \
+          mingw-w64-ucrt-x86_64-libsystre                  <span class="cm"># core -- required</span>
+<span class="mut">$</span> pacman -S mingw-w64-ucrt-x86_64-cairo \
+          mingw-w64-ucrt-x86_64-libjpeg-turbo               <span class="cm"># graphics tier</span>
+<span class="mut">$</span> pacman -S mingw-w64-ucrt-x86_64-mpg123                      <span class="cm"># audio tier</span>
+<span class="mut">$</span> pacman -S mingw-w64-ucrt-x86_64-mbedtls                     <span class="cm"># TLS tier (openSecurePort)</span></pre>
+        <p class="muted">
+          <code>libsystre</code> provides MinGW-w64's UCRT with POSIX
+          <code>&lt;regex.h&gt;</code> support (the UCRT itself doesn't
+          ship one) — pkg-config asks for it under the OLD name
+          <code>gnurx</code>, not <code>libsystre</code> (a real, and
+          non-obvious, package-name-vs-pkg-config-name split;
+          <code>festina doctor</code> explains it if missing). No
+          <code>llvm</code> line here either, for the same reason as
+          macOS above: <code>mingw-w64-ucrt-x86_64-clang</code> already
+          covers both the fast path and its fallback, no separate
+          libLLVM package needed.
+        </p>
+        <p class="muted">
+          Graphics (Win32) and HTTP/WebSocket (winsock2) both work out
+          of the box. Audio (waveOut) is the one tier still gated
+          behind <code>FESTINA_ENABLE_WINDOWS_AUDIO=1</code> — not for
+          lack of code, but because <code>windows-latest</code> GitHub
+          Actions runners have no audio device at all, so this gate
+          awaits confirmation on real hardware with one;
+          <code>festina doctor</code> reports its status the same way
+          the macOS audio gate just above does. Graceful shutdown
+          (Ctrl-C/<code>SIGTERM</code> →
+          <code>on exit()</code>, see
+          <a href="api.html#graceful-shutdown">api.md</a>) has one
+          narrower Windows gap of its own: Windows has no real
+          <code>SIGTERM</code> delivery, so the connection-drain grace
+          period only applies to Ctrl-C there.
+        </p>
+
+        <h3 id="windows-dll-story">The DLL story for compiled Windows programs <a class="anchor" href="#windows-dll-story">#</a></h3>
+        <p class="muted">
+          A MinGW-built program can depend on a handful of MSYS2
+          runtime DLLs that aren't part of a bare Windows install.
+          Festina's compiler statically links two of them into every
+          Windows binary it produces — <code>-static-libgcc</code>
+          always, plus a probed static <code>-lwinpthread</code>
+          whenever the program doesn't use <code>aud</code> (audio
+          already links winpthread dynamically via its own
+          <code>-pthread</code> flag, so this is skipped rather than
+          risking a link-order conflict) — so a core-only or
+          offscreen-graphics-only program (<code>hello.exe</code>, and
+          anything that never calls <code>aud</code>) is genuinely
+          copy-anywhere: no MSYS2 install needed on the machine that
+          <em>runs</em> it, only on the one that <em>compiled</em> it.
+          A program that uses graphics, audio, or
+          <code>openSecurePort()</code> still needs its own feature
+          DLLs findable at runtime (<code>libcairo-2.dll</code>,
+          <code>libjpeg-8.dll</code>, <code>libmpg123-0.dll</code>,
+          <code>libmbedtls.dll</code> and friends, ...) — either run it
+          from an MSYS2 UCRT64 shell (already on <code>PATH</code>
+          there) or copy them alongside the <code>.exe</code> from
+          <code>/ucrt64/bin</code>. Check any specific binary's own
+          dependencies with
+          <code>objdump -p your_program.exe | grep 'DLL Name'</code> —
+          the Windows analog of <code>ldd</code> used below.
+        </p>
+      </section>
+
+      <section class="doc-section" id="use-a-packaged-binary">
+        <h2>Use a packaged <code>festina</code> binary <a class="anchor" href="#use-a-packaged-binary">#</a></h2>
+        <p>
+          Built via <code>./scripts/package_compiler.sh</code>, or
+          downloaded from wherever a maintainer published one: the same
+          list above, minus Python 3 — the packaged binary embeds its
+          own interpreter. Building the binary yourself needs one more
+          thing, PyInstaller — a build-time-only dependency, not
+          something the resulting binary or <code>festina/</code>
+          itself needs:
+        </p>
+        <pre class="code"><span class="mut">$</span> pip install -r requirements-build.txt  <span class="cm"># pyinstaller</span>
+<span class="mut">$</span> ./scripts/package_compiler.sh          <span class="cm"># -&gt; ./dist/festina (./dist/festina.exe on Windows)</span>
+<span class="mut">$</span> ./dist/festina compile examples/hello.f -o hello</pre>
+        <p class="muted">
+          On macOS the script also ad-hoc codesigns the result
+          (<code>codesign -s -</code>) so Gatekeeper allows running it
+          locally without a prompt — a self-signature, not an identity;
+          it doesn't make the binary trusted on anyone else's machine.
+          Distributing to other people's Macs is a separate,
+          deliberately out-of-scope decision (real Developer-ID signing
+          + notarization) that only matters once there's an actual
+          distribution channel.
+        </p>
+        <p class="muted">
+          On Windows, <code>--add-data</code> needs a <code>;</code>
+          between source and destination rather than <code>:</code> —
+          a real PyInstaller platform difference the script itself
+          detects and handles, nothing to do by hand — and the
+          resulting binary is <code>festina.exe</code>, automatically,
+          the same way MinGW's linker already appends <code>.exe</code>
+          to every OTHER compiled Festina program.
+        </p>
+      </section>
+
+      <section class="doc-section" id="run-a-compiled-program">
+        <h2>Run a program someone already compiled with Festina <a class="anchor" href="#run-a-compiled-program">#</a></h2>
+        <p>
+          This is the list that shrank: a compiled program only
+          dynamically links what it actually uses. Every program needs
+          libc/libm (plus <code>libsqlite3.so</code>, conditionally —
+          see <a href="#static-linking-sqlite3">Static-linking
+          sqlite3</a> below); a program that never uses graphics
+          functions never links
+          <code>libcairo.so</code>/<code>libX11.so</code> and their own
+          transitive dependencies (fontconfig, freetype, libpng, the
+          X11 client-side stack, ...) at all, and one that never uses
+          audio never links <code>libasound.so</code> — confirmed with
+          <code>ldd</code> on real compiled binaries (see
+          <a href="security.html#slim-binaries">security.md</a> for
+          the full story, including why this needed the runtime split
+          into separate translation units rather than just optimizer
+          flags). Check any specific binary with <code>ldd</code> to
+          see exactly what it needs:
+        </p>
+        <pre class="code"><span class="mut">$</span> ldd ./your_compiled_program</pre>
+        <p class="muted">
+          On Windows, <code>ldd</code> isn't a MinGW/Windows concept —
+          use <code>objdump -p your_program.exe | grep 'DLL Name'</code>
+          instead (see the DLL story note above: a core-only or
+          offscreen-graphics-only program needs nothing beyond what a
+          bare Windows install already has).
+        </p>
+
+        <h3 id="static-linking-sqlite3">Static-linking sqlite3 <a class="anchor" href="#static-linking-sqlite3">#</a></h3>
+        <p class="muted">
+          A Festina program built here doesn't need
+          <code>libsqlite3.so</code> present at runtime if a static
+          <code>libsqlite3.a</code> archive was available in the
+          <em>build</em> environment (falls back to a normal dynamic
+          link otherwise) — check <code>festina: wrote ...</code>
+          compiler output, which notes when it fell back.
+        </p>
+
+        <h3 id="compiling-to-wasm">Compiling to WASM <a class="anchor" href="#compiling-to-wasm">#</a></h3>
+        <p class="muted">
+          <code>festina compile --target=wasm32-wasi program.f -o
+          program.wasm</code> (or <code>festina run
+          --target=wasm32-wasi program.f</code>) cross-compiles to a
+          standalone <code>wasm32-wasi</code> binary instead of a
+          native executable — see <a href="wasm.html">wasm.md</a> for
+          the full design writeup, setup, and known limitations
+          (graphics/audio aren't available under WASI at all).
+        </p>
+      </section>
+
+      <section class="doc-section" id="running-the-test-suite">
+        <h2>Running the test suite <a class="anchor" href="#running-the-test-suite">#</a></h2>
+        <pre class="code"><span class="mut">$</span> pip install -r requirements-dev.txt   <span class="cm"># pytest</span>
+<span class="mut">$</span> pytest tests/                         <span class="cm"># see counts on the homepage</span></pre>
+        <p>
+          Some tests need extra tools that aren't Python packages, so
+          they're not in any requirements file:
+        </p>
+        <div class="table-wrap">
+          <table class="sig-table">
+            <tr><td>pyinstaller</td><td><code>tests/test_packaging.py</code> (2 tests). Install: <code>pip install -r requirements-build.txt</code>.</td></tr>
+            <tr><td>Xvfb + xdotool + xwd</td><td>Interactive graphics tests — clicking, moving the mouse, pressing keys, resizing a real (virtual) window, and reading canvas pixels back to check that colours and fonts actually render (<code>TestGraphics</code>, <code>TestCanvasStyleRendersRealPixels</code>, plus <code>TestTimers</code>'s combined graphics+timers case). Install: <code>sudo apt install xvfb xdotool x11-apps</code> on Debian/Ubuntu (<code>xwd</code> ships in <code>x11-apps</code>) — a real <code>$DISPLAY</code> works too, if one is already available.</td></tr>
+            <tr><td>openbox (+ xprop)</td><td>One regression test for a window-manager interaction a bare Xvfb instance (no WM at all) can never reproduce (<code>TestGraphics::test_graphics_init_does_not_crash_under_a_real_window_manager</code>; 1 test). Install: <code>sudo apt install openbox x11-utils</code> on Debian/Ubuntu — <code>xprop</code> is only used to poll for the WM's own readiness signal instead of a fixed sleep; the test still runs (with a fixed sleep instead) without it.</td></tr>
+            <tr><td>wasi-libc + libclang-rt-*-dev-wasm32 + Node.js</td><td>Real compile-and-run WASM export tests (<code>tests/test_wasm.py</code>'s <code>TestWasmRun</code>; see <a href="wasm.html">wasm.md</a>). Install: <code>sudo apt install wasi-libc libclang-rt-18-dev-wasm32</code> on Debian/Ubuntu (substitute your clang's own version), plus Node.js on PATH — <code>festina doctor</code> reports whether both are present.</td></tr>
+          </table>
+        </div>
+        <p class="muted">
+          Every one of those skips cleanly and independently when its
+          tool isn't present — the suite still passes, just with fewer
+          tests run. Audio's tests (<code>tests/test_audio.py</code>)
+          need none of the above: the null-device technique they use
+          (see <code>conftest.py</code>'s <code>audio_null_env</code>)
+          needs no extra tool install, only the same C compiler
+          everything else here requires.
+        </p>
+        <pre class="code"><span class="mut">$</span> bin/festina compile examples/hello.f -o hello
+<span class="mut">$</span> ./hello</pre>
+      </section>
+
+      <section class="doc-section" id="benchmark-toolchains">
+        <h2>Benchmark toolchains (optional) <a class="anchor" href="#benchmark-toolchains">#</a></h2>
+        <p>
+          Only needed to run <a href="benchmark.html">benchmark.md</a>'s
+          comparisons yourself — not a dependency of Festina itself:
+        </p>
+        <div class="table-wrap">
+          <table class="sig-table">
+            <tr><td>rustc</td><td><a href="https://rustup.rs">rustup.rs</a></td></tr>
+            <tr><td>go</td><td><a href="https://go.dev/dl/">go.dev/dl</a></td></tr>
+            <tr><td>bun</td><td><a href="https://bun.sh">bun.sh</a></td></tr>
+          </table>
+        </div>
+        <pre class="code"><span class="mut">$</span> python3 benchmarks/run_benchmarks.py --update-doc</pre>
+        <p class="muted">skips any of the three not installed rather than failing.</p>
+      </section>
+
+      <div class="prevnext">
+        <a class="prev" href="api.html">
+          <span class="label">← Previous</span>
+          API Reference
+        </a>
+        <a class="next" href="macos.html">
+          <span class="label">Next →</span>
+          macOS
+        </a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+  // Mobile sidebar toggle
+  const sidebar = document.getElementById('sidebar');
+  const backdrop = document.getElementById('backdrop');
+  const menuBtn = document.getElementById('menuBtn');
+  function closeSidebar() {
+    sidebar.classList.remove('open');
+    backdrop.classList.remove('open');
+  }
+  menuBtn.addEventListener('click', () => {
+    sidebar.classList.toggle('open');
+    backdrop.classList.toggle('open');
+  });
+  backdrop.addEventListener('click', closeSidebar);
+  document.getElementById('toc').addEventListener('click', (e) => {
+    if (e.target.tagName === 'A') closeSidebar();
+  });
+
+  // Sidebar filter
+  const filterBox = document.getElementById('navFilter');
+  filterBox.addEventListener('input', () => {
+    const q = filterBox.value.trim().toLowerCase();
+    document.querySelectorAll('#toc a').forEach(a => {
+      const match = !q || a.textContent.toLowerCase().includes(q);
+      a.dataset.hidden = match ? 'false' : 'true';
+    });
+    document.querySelectorAll('.nav-group').forEach(g => {
+      const anyVisible = [...g.querySelectorAll('a')].some(a => a.dataset.hidden !== 'true');
+      g.style.display = anyVisible ? '' : 'none';
+    });
+  });
+
+  // Scrollspy: highlight the section currently at the top of the
+  // viewport. Deliberately a single scroll-driven calculation (not an
+  // IntersectionObserver) so there's exactly one source of truth -- no
+  // risk of two independent observers racing each other for a short
+  // final section that a fixed rootMargin band might otherwise miss.
+  const anchors = [...document.querySelectorAll('#toc a')];
+  const byId = Object.fromEntries(anchors.map(a => [a.getAttribute('href').slice(1), a]));
+  const targets = [...document.querySelectorAll('main [id]')]
+    .filter(t => byId[t.id])
+    .map(t => ({ id: t.id, el: t }));
+
+  let ticking = false;
+  function updateActive() {
+    ticking = false;
+    const offset = 80; // matches scroll-margin-top on headings
+    const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2;
+    let currentId = targets.length ? targets[0].id : null;
+    if (atBottom) {
+      currentId = targets[targets.length - 1].id;
+    } else {
+      for (const t of targets) {
+        if (t.el.getBoundingClientRect().top <= offset) currentId = t.id;
+        else break;
+      }
+    }
+    anchors.forEach(a => a.classList.remove('active'));
+    if (currentId && byId[currentId]) byId[currentId].classList.add('active');
+  }
+  function onScroll() {
+    if (!ticking) {
+      ticking = true;
+      requestAnimationFrame(updateActive);
+    }
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll);
+  updateActive();
+</script>
+
+
+</body>
+</html>

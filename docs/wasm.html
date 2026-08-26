@@ -1,0 +1,921 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebAssembly — Festina</title>
+<meta name="description" content="Cross-compiling Festina to wasm32-wasi: design, setup, limitations, and benchmarks.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23e8823a'/%3E%3Ctext x='50' y='68' font-size='60' font-family='monospace' font-weight='700' text-anchor='middle' fill='%231a1712'%3Ef%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #fbf9f6;
+    --bg-raised: #ffffff;
+    --bg-sunken: #f1ede6;
+    --text: #211c14;
+    --text-muted: #6b6252;
+    --border: #e4ddd0;
+    --accent: #c15f1e;
+    --accent-strong: #a84f16;
+    --accent-soft: #fbe6d3;
+    --code-bg: #221d16;
+    --code-text: #f2ead9;
+    --code-muted: #9a8f78;
+    --code-string: #d99a5b;
+    --code-keyword: #e8823a;
+    --code-comment: #7d745f;
+    --shadow: 0 1px 2px rgba(35, 25, 10, 0.06), 0 8px 24px rgba(35, 25, 10, 0.05);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #17140f;
+      --bg-raised: #1f1b14;
+      --bg-sunken: #14110c;
+      --text: #f2ead9;
+      --text-muted: #a89c84;
+      --border: #332c20;
+      --accent: #f0904f;
+      --accent-strong: #f7a86b;
+      --accent-soft: #3a2814;
+      --code-bg: #0f0d09;
+      --code-text: #f2ead9;
+      --code-muted: #8a7f68;
+      --code-string: #e8b47c;
+      --code-keyword: #f0904f;
+      --code-comment: #6b6250;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #17140f;
+    --bg-raised: #1f1b14;
+    --bg-sunken: #14110c;
+    --text: #f2ead9;
+    --text-muted: #a89c84;
+    --border: #332c20;
+    --accent: #f0904f;
+    --accent-strong: #f7a86b;
+    --accent-soft: #3a2814;
+    --code-bg: #0f0d09;
+    --code-text: #f2ead9;
+    --code-muted: #8a7f68;
+    --code-string: #e8b47c;
+    --code-keyword: #f0904f;
+    --code-comment: #6b6250;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent-strong); }
+  code, pre, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+
+  code:not(pre code) {
+    background: var(--bg-sunken);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.1em 0.35em;
+    font-size: 0.87em;
+  }
+
+  /* Top bar */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 56px;
+    padding: 0 16px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    font-size: 1.02rem;
+    color: var(--text);
+    text-decoration: none;
+  }
+  .brand .mark {
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    background: var(--accent);
+    color: #1a1508;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: monospace;
+    font-weight: 800;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+  }
+  .brand .sep { color: var(--text-muted); font-weight: 400; }
+  .topbar-links {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    font-size: 0.88rem;
+  }
+  .topbar-links a { color: var(--text-muted); text-decoration: none; }
+  .topbar-links a:hover { color: var(--text); }
+  .menu-btn {
+    display: none;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+
+  /* Layout */
+  .layout {
+    display: grid;
+    grid-template-columns: 260px minmax(0, 1fr);
+    max-width: 1280px;
+    margin: 0 auto;
+  }
+
+  /* Sidebar */
+  aside.sidebar {
+    position: sticky;
+    top: 56px;
+    align-self: start;
+    height: calc(100vh - 56px);
+    overflow-y: auto;
+    padding: 24px 16px 40px;
+    border-right: 1px solid var(--border);
+  }
+  .search-box {
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg-raised);
+    color: var(--text);
+    font-size: 0.85rem;
+    margin-bottom: 16px;
+  }
+  .search-box:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .nav-group { margin-bottom: 4px; }
+  .nav-group-title {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin: 18px 0 6px;
+    padding: 0 10px;
+  }
+  .nav-group:first-of-type .nav-group-title { margin-top: 0; }
+  nav.toc a {
+    display: block;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 0.87rem;
+    color: var(--text-muted);
+    text-decoration: none;
+    line-height: 1.35;
+  }
+  nav.toc a:hover { background: var(--bg-sunken); color: var(--text); }
+  nav.toc a.active {
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-weight: 600;
+  }
+  nav.toc a.sub {
+    padding-left: 22px;
+    font-size: 0.83rem;
+  }
+  nav.toc a[data-hidden="true"] { display: none; }
+
+  /* Main content */
+  main {
+    min-width: 0;
+    padding: 40px 32px 100px;
+  }
+  .content-wrap { max-width: 720px; }
+
+  .page-kicker {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--accent-strong);
+    font-weight: 700;
+    margin: 0 0 8px;
+  }
+  h1.page-title {
+    font-size: 2rem;
+    margin: 0 0 12px;
+    letter-spacing: -0.02em;
+  }
+  .lede {
+    color: var(--text-muted);
+    font-size: 1.02rem;
+    max-width: 640px;
+    margin: 0 0 8px;
+  }
+
+  section.doc-section {
+    padding-top: 40px;
+    margin-top: 24px;
+    border-top: 1px solid var(--border);
+    scroll-margin-top: 72px;
+  }
+  section.doc-section:first-of-type { border-top: none; }
+  h2 {
+    font-size: 1.4rem;
+    margin: 0 0 12px;
+    letter-spacing: -0.01em;
+    scroll-margin-top: 72px;
+  }
+  h3 {
+    font-size: 1.05rem;
+    margin: 28px 0 10px;
+    scroll-margin-top: 72px;
+  }
+  h4 {
+    font-size: 0.92rem;
+    margin: 22px 0 8px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  h2 .anchor, h3 .anchor {
+    opacity: 0;
+    text-decoration: none;
+    color: var(--text-muted);
+    font-size: 0.85em;
+    margin-left: 6px;
+  }
+  h2:hover .anchor, h3:hover .anchor { opacity: 1; }
+
+  p { margin: 0 0 14px; color: var(--text); }
+  p.muted { color: var(--text-muted); }
+
+  pre.code {
+    background: var(--code-bg);
+    color: var(--code-text);
+    border-radius: 10px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    line-height: 1.6;
+    box-shadow: var(--shadow);
+    margin: 0 0 16px;
+  }
+  pre.code .kw { color: var(--code-keyword); }
+  pre.code .str { color: var(--code-string); }
+  pre.code .re { color: var(--code-string); opacity: 0.85; }
+  pre.code .cm { color: var(--code-comment); font-style: italic; }
+  pre.code .mut { color: var(--code-muted); }
+
+  .callout {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 0.92rem;
+    color: var(--text-muted);
+    margin: 0 0 16px;
+  }
+  .callout strong { color: var(--text); }
+
+  .table-wrap {
+    overflow-x: auto;
+    border-radius: 10px;
+    margin: 0 0 16px;
+  }
+  .table-wrap .sig-table { margin: 0; }
+  .sig-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    margin: 0 0 16px;
+  }
+  .sig-table td {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .sig-table td:first-child {
+    white-space: nowrap;
+    font-family: monospace;
+    color: var(--accent-strong);
+  }
+
+  .version-badge {
+    display: inline-block;
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-weight: 700;
+    font-size: 0.85rem;
+    padding: 2px 10px;
+    border-radius: 999px;
+    margin-right: 10px;
+    vertical-align: middle;
+  }
+  .version-date {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    font-weight: 400;
+    vertical-align: middle;
+  }
+  ul.changes { margin: 0 0 16px; padding-left: 20px; }
+  ul.changes li { margin-bottom: 6px; }
+
+  .prevnext {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+  }
+  .prevnext a {
+    flex: 1;
+    text-decoration: none;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    color: var(--text);
+  }
+  .prevnext a:hover { border-color: var(--accent); }
+  .prevnext .label { display: block; font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+  .prevnext .next { text-align: right; }
+
+  @media (max-width: 880px) {
+    .layout { grid-template-columns: 1fr; }
+    .menu-btn { display: inline-block; }
+    aside.sidebar {
+      position: fixed;
+      top: 56px;
+      left: 0;
+      width: 280px;
+      max-width: 85vw;
+      background: var(--bg);
+      z-index: 30;
+      transform: translateX(-100%);
+      transition: transform 0.18s ease;
+      box-shadow: var(--shadow);
+    }
+    aside.sidebar.open { transform: translateX(0); }
+    .sidebar-backdrop {
+      display: none;
+      position: fixed;
+      inset: 56px 0 0 0;
+      background: rgba(0,0,0,0.35);
+      z-index: 25;
+    }
+    .sidebar-backdrop.open { display: block; }
+    main { padding: 32px 20px 80px; }
+    .topbar-links a.hide-narrow { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex; align-items:center; gap:8px;">
+    <button class="menu-btn" id="menuBtn" aria-label="Toggle navigation">☰ Menu</button>
+    <a class="brand" href="index.html"><span class="mark">f</span> Festina <span class="sep">/ Docs</span></a>
+  </div>
+  <div class="topbar-links">
+    <a class="hide-narrow" href="index.html#docs">All docs</a>
+    <a href="https://github.com/uraikus/festina">GitHub</a>
+  </div>
+</div>
+
+<div class="sidebar-backdrop" id="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…">
+    <nav class="toc" id="toc">
+      <div class="nav-group">
+        <a href="#why-wasi">Why wasm32-wasi, not bare wasm32</a>
+        <a href="#design">Design</a>
+        <a class="sub" href="#pointer-width">Pointer width</a>
+        <a class="sub" href="#main-entry-point">The main entry point</a>
+        <a class="sub" href="#raw-ir-not-c">Why the entry bridge is raw IR, not C</a>
+        <a href="#wasm-setup">Setup</a>
+        <a href="#usage">Usage</a>
+        <a href="#limitations">Limitations</a>
+        <a href="#benchmarks">Benchmarks</a>
+        <a class="sub" href="#benchmark-methodology">Benchmark methodology</a>
+        <a class="sub" href="#reading-these-numbers">Reading these numbers</a>
+        <a href="#testing">Testing</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="content-wrap">
+      <p class="page-kicker">Platform support</p>
+      <h1 class="page-title">WebAssembly (wasm32-wasi)</h1>
+      <p class="lede">
+        <strong>Implemented and tested.</strong>
+        <code>festina compile --target=wasm32-wasi</code> and
+        <code>festina run --target=wasm32-wasi</code> cross-compile a
+        Festina program to a standalone <code>wasm32-wasi</code> binary
+        — arithmetic, control flow, functions, structs,
+        <code>arr</code>/<code>map</code>, <code>text</code>,
+        <code>regex</code>, and <code>table</code>/<code>sqlite()</code>
+        (SQLite itself, vendored, compiled for wasm32-wasi — see
+        <a href="https://github.com/uraikus/festina/blob/main/runtime/wasm/README.md">runtime/wasm/README.md</a>)
+        all work, verified by real compiles and real executions, not
+        just a clean link. <code>festina doctor</code> reports whether
+        this machine's toolchain can build one; the <code>linux</code>
+        CI job installs that toolchain and Node and actually runs a
+        compiled <code>.wasm</code> example on every push.
+      </p>
+      <p class="lede">
+        <strong>What's out of scope, on purpose:</strong> graphics and
+        audio (WASI has no display server or audio device model at
+        all — not "not yet", genuinely absent), and getting a
+        <code>.wasm</code> running outside a WASI host (a browser tab,
+        for instance) — see <a href="#limitations">Limitations</a>
+        below for the full accounting.
+      </p>
+
+      <section class="doc-section" id="why-wasi">
+        <h2>Why wasm32-wasi, not bare wasm32 <a class="anchor" href="#why-wasi">#</a></h2>
+        <p>
+          Two wasm targets exist in LLVM/clang:
+          <code>wasm32-unknown-unknown</code> (no libc, no syscalls —
+          every I/O call needs hand-written JS glue supplied by
+          whatever embeds the module) and <code>wasm32-wasi</code>
+          (WASI Preview 1 — a real libc, via
+          <a href="https://github.com/WebAssembly/wasi-libc">wasi-libc</a>,
+          sitting on top of a small, capability-based syscall
+          interface). Festina's core runtime
+          (<code>festina_runtime.c</code>) is ordinary POSIX C — file
+          I/O, <code>clock_gettime</code>, <code>regex.h</code>,
+          SQLite's own VFS layer — none of which
+          <code>wasm32-unknown-unknown</code> provides any answer for
+          at all. <code>wasm32-wasi</code> is the only target where the
+          <em>existing</em> runtime source compiles with zero changes:
+          the whole core translation unit compiles against wasi-libc
+          unmodified. The codegen and linking work this target needs
+          (below) is real, but narrow — a 32-bit pointer-width fix and
+          a one-line entry-point bridge, not a rewrite of how Festina
+          generates code.
+        </p>
+      </section>
+
+      <section class="doc-section" id="design">
+        <h2>Design <a class="anchor" href="#design">#</a></h2>
+        <p>
+          <strong>Compiling:</strong> <code>_compile_via_wasm</code> in
+          <code>festina/cli.py</code> hands the same LLVM IR text every
+          other target's <code>_compile_via_clang_ir_frontend</code>
+          fallback path already produces straight to
+          <code>clang --target=wasm32-wasi -O2</code>, linked against
+          three object files (<code>_wasm_runtime_objects</code>):
+        </p>
+        <ol>
+          <li><strong><code>festina_runtime.c</code></strong>, compiled against the vendored <code>runtime/wasm/sqlite3.h</code> instead of a system one — core, the same translation unit every native target uses.</li>
+          <li><strong><code>runtime/wasm/sqlite3.c</code></strong> — SQLite's own single-file amalgamation build, vendored because table/<code>sqlite()</code> support is unconditional core (every compiled program links against sqlite3 symbols whether or not it declares a <code>table</code>), and there is no system <code>libsqlite3</code> for <code>wasm32-wasi</code> to link against at all — see <a href="https://github.com/uraikus/festina/blob/main/runtime/wasm/README.md">runtime/wasm/README.md</a> for exactly why vendoring it (something this project doesn't do for native targets, which link the system's own libsqlite3) is the only option here.</li>
+          <li><strong><code>runtime/festina_runtime_wasm_entry.ll</code></strong> — a small entry-point bridge, see <a href="#main-entry-point">below</a> and <a href="#raw-ir-not-c">below</a>.</li>
+        </ol>
+        <p class="muted">
+          No libLLVM in-process object-emission path is used for wasm
+          at all (unlike native, where it's the fast path when
+          available) — this project has not verified libLLVM can emit
+          wasm32 objects directly, so <code>clang</code> itself always
+          does the compiling, the same "hand clang the .ll text"
+          fallback native already has, just unconditional here rather
+          than a fallback.
+        </p>
+        <p class="muted">
+          <strong>Running:</strong> a <code>.wasm</code> file isn't
+          something any OS execs directly. <code>festina run
+          --target=wasm32-wasi</code> and the benchmark runner both
+          execute a compiled binary through
+          <a href="https://github.com/uraikus/festina/blob/main/runtime/wasm/run_wasi.mjs">runtime/wasm/run_wasi.mjs</a>,
+          a small script built on Node's own built-in
+          <code>node:wasi</code> module (Node is already a listed
+          <a href="setup.html">setup.md</a> dependency for running the
+          compiler frontend itself from a checkout, so this adds no
+          <em>new</em> dependency for that path — though a packaged
+          <code>festina</code> binary user does need Node specifically
+          installed to run a <code>.wasm</code> it produces). The
+          invoking shell's own working directory is passed through as
+          a WASI "preopen", mapped to the wasm program's own
+          <code>/</code> — this is what lets
+          <code>table</code>/<code>sqlite()</code>, <code>blob</code>,
+          <code>mkdir</code>/<code>ls</code> do real file I/O inside
+          the sandbox, resolving relative paths against the same
+          directory a native compiled binary already would.
+        </p>
+
+        <h3 id="pointer-width">Pointer width <a class="anchor" href="#pointer-width">#</a></h3>
+        <p class="muted">
+          Every native target Festina supports is 64-bit;
+          <code>wasm32-wasi</code>'s libc has a 32-bit
+          <code>size_t</code>, and LLVM requires an external
+          <code>declare</code> to match its call sites exactly, with no
+          implicit truncation. <code>CodeGen.__init__</code> takes a
+          <code>target</code> parameter and tracks
+          <code>self.pointer_bits</code> (32 for
+          <code>wasm32-wasi</code>, 64 everywhere else); three helpers
+          (<code>_size_arg</code>, <code>_emit_calloc</code>,
+          <code>_emit_malloc</code>) either pass a size straight
+          through (64-bit targets — a byte-identical no-op there) or
+          emit a <code>trunc i64 ... to i32</code> first for the
+          <code>calloc</code>/<code>malloc</code> call-site ABI
+          boundary specifically. Every other <code>i64</code>/pointer
+          conversion elsewhere in codegen.py
+          (<code>ptrtoint</code>/<code>inttoptr</code>) is genuinely
+          safe across pointer widths in LLVM and needs no
+          target-specific handling.
+        </p>
+
+        <h3 id="main-entry-point">The main entry point <a class="anchor" href="#main-entry-point">#</a></h3>
+        <p class="muted">
+          wasi-libc's own <code>_start</code> doesn't call a function
+          literally named <code>main</code> — ordinary C compilation
+          silently renames a user's <code>main</code> to
+          <code>__main_void</code> (a no-arg <code>main</code>) or
+          <code>__main_argc_argv</code> (an argc/argv-taking
+          <code>main</code>) via macro machinery in the C frontend
+          before the compiler ever sees it. Festina's codegen emits raw
+          LLVM IR text directly (<code>_emit_main_and_entry</code>),
+          which never goes through that renaming, so the literal
+          <code>define i32 @main(...)</code> it always emits links
+          clean on every native target (where <code>main</code> really
+          is the expected symbol) but needs a bridge for wasm32-wasi: a
+          small object,
+          <a href="https://github.com/uraikus/festina/blob/main/runtime/festina_runtime_wasm_entry.ll">runtime/festina_runtime_wasm_entry.ll</a>,
+          linked only for the wasm build, that calls the real
+          <code>main</code> under its own name and re-exports the
+          result as <code>__main_argc_argv</code>. <code>main</code>'s
+          own signature is <code>(i32 %argc, ptr %argv)</code> — the
+          real C ABI entry point on every native target already — so
+          the bridge's argument list follows along unchanged.
+        </p>
+
+        <h3 id="raw-ir-not-c">Why the entry bridge is raw IR, not C <a class="anchor" href="#raw-ir-not-c">#</a></h3>
+        <p class="muted">
+          A C version of the bridge above (<code>extern int main(int,
+          char **); int __main_argc_argv(int argc, char **argv) {
+          return main(argc, argv); }</code>) compiles and links without
+          error, but hangs at runtime: the same C-frontend macro that
+          renames a <em>defined</em> <code>int main(int, char**)</code>
+          to <code>__main_argc_argv</code> for <code>wasm32-wasi</code>
+          also rewrites <em>any reference</em> to the literal identifier
+          <code>main</code> in a translation unit compiled for that
+          target — including an <code>extern</code> declaration and a
+          call built from it. A C bridge's own <code>return main(argc,
+          argv)</code> gets silently rewritten to <code>return
+          __main_argc_argv(argc, argv)</code> — calling itself, not
+          Festina's real <code>main</code> (visible directly in the
+          object's own relocation record:
+          <code>R_WASM_FUNCTION_INDEX_LEB __main_argc_argv+0</code> at
+          the call site, not a reference to <code>main</code> at all).
+          At <code>-O0</code> this produces genuine infinite recursion;
+          at <code>-O2</code> the same self-call becomes a silent
+          infinite loop — indistinguishable from a hang, no error at
+          all.
+        </p>
+        <p class="muted">
+          Writing the bridge as raw LLVM IR text
+          (<code>festina_runtime_wasm_entry.ll</code>, not
+          <code>.c</code>) avoids this entirely: it bypasses the C
+          frontend (and its renaming macro), so <code>declare i32
+          @main(i32, ptr)</code> there can only ever mean the real
+          external symbol — confirmed via relocation inspection
+          (<code>U main</code>, not <code>U __main_argc_argv</code>)
+          and via actual execution (correct exit code, correct
+          <code>argv</code>, no hang). The alternative of renaming
+          codegen's own generated <code>main</code> symbol was rejected
+          for the same reason the bridge itself exists: it would make
+          codegen target-aware for something that's really wasi-libc's
+          own linking convention, not a property of the generated
+          program.
+        </p>
+      </section>
+
+      <section class="doc-section" id="wasm-setup">
+        <h2>Setup <a class="anchor" href="#wasm-setup">#</a></h2>
+        <p>
+          <code>festina doctor</code> reports whether this machine can
+          build for <code>wasm32-wasi</code> (optional, like
+          graphics/audio — a compiler that can't cross-compile to wasm
+          is still a fully working compiler for everything else). On
+          Debian/Ubuntu:
+        </p>
+        <pre class="code"><span class="mut">$</span> apt install wasi-libc libclang-rt-18-dev-wasm32</pre>
+        <p class="muted">
+          (the compiler-rt package name is tied to your installed
+          clang's own version — substitute accordingly, e.g.
+          <code>libclang-rt-19-dev-wasm32</code> for clang 19). Once
+          both are installed, plain <code>clang
+          --target=wasm32-wasi</code> auto-discovers wasi-libc's
+          headers/libs at their standard
+          <code>/usr/include/wasm32-wasi</code> and
+          <code>/usr/lib/wasm32-wasi</code> locations — no manual
+          <code>-I</code>/<code>-L</code>/<code>--sysroot</code> flags.
+          <code>doctor</code>'s own check is a real functional probe
+          (compiling a trivial program with that exact flag), not a
+          guess at install paths, so it stays accurate across distros
+          where those paths differ. Running a compiled
+          <code>.wasm</code> needs Node.js on PATH, for its built-in
+          WASI host.
+        </p>
+      </section>
+
+      <section class="doc-section" id="usage">
+        <h2>Usage <a class="anchor" href="#usage">#</a></h2>
+        <pre class="code"><span class="mut">$</span> festina compile --target=wasm32-wasi program.f -o program.wasm
+<span class="mut">$</span> node runtime/wasm/run_wasi.mjs program.wasm .        <span class="cm"># "." = the preopened directory</span>
+
+<span class="cm"># or, compile-and-run in one step, same as native `festina run`:</span>
+<span class="mut">$</span> festina run --target=wasm32-wasi program.f</pre>
+        <p class="muted">
+          <code>--cc</code> must resolve to <code>clang</code>
+          specifically for a wasm build (checked, with a clear error) —
+          only clang can target <code>wasm32-wasi</code> at all; the
+          gcc/cc fallback native builds have doesn't apply here.
+        </p>
+      </section>
+
+      <section class="doc-section" id="limitations">
+        <h2>Limitations <a class="anchor" href="#limitations">#</a></h2>
+        <p>
+          WASI genuinely has no answer for either of these — not a
+          "not yet", the way macOS/Windows graphics and audio are gated
+          pending real-hardware verification
+          (<a href="macos.html">macos.md</a>,
+          <a href="windows.html">windows.md</a>). Both fail at compile
+          time, before any of the real work (compiling the vendored
+          SQLite amalgamation, linking) happens:
+        </p>
+        <ul>
+          <li><strong>Graphics</strong> — <code>drawRect</code><wbr>/<code>drawCircle</code><wbr>/<code>drawText</code><wbr>/<code>img</code><wbr>/<code>render()</code>, mouse and key events, <code>on mouseDown</code>/<code>on key</code>/... — WASI has no display server or windowing model of any kind.</li>
+          <li><strong>Audio</strong> — <code>aud</code>, <code>play()</code><wbr>/<code>playLoop()</code><wbr>/<code>stopAudioPlayer()</code><wbr>/<code>isAudioPlayerPlaying()</code> — WASI has no audio device model of any kind.</li>
+          <li><strong><code>exec()</code></strong> — WASI has no process model to spawn into at all: no fork/exec/spawn of any kind.</li>
+          <li><strong><code>openPort()</code>/<code>on request</code>/<code>on upgrade</code>/<code>on message</code>/<code>on socketClose</code></strong> — WASI Preview 1 has no listening-socket support of any kind.</li>
+          <li><strong><code>openSecurePort()</code></strong> — needs everything <code>openPort()</code> needs plus mbedTLS, so it's rejected for the identical reason.</li>
+          <li><strong><code>try</code>/<code>catch</code>/<code>throw</code></strong> — LLVM's wasm32 backend has no setjmp/longjmp (SjLj) lowering at all outside emscripten's own exception-handling pass, which this project doesn't use (<code>clang</code> rejects <code>__builtin_longjmp</code> outright for this target).</li>
+        </ul>
+        <p>A few more things worth knowing, that aren't compile-time errors:</p>
+        <ul>
+          <li><strong><code>argv</code> always comes back as a single element.</strong> <code>argv</code> works under wasm32-wasi — WASI has its own real argc/argv, and <code>main</code>'s bridge forwards it the same way it does natively — but <code>run_wasi.mjs</code> hardcodes WASI's own <code>args</code> to <code>[wasmPath]</code> and nothing else, so <code>argv.length</code> is always <code>1</code> for anything run through this project's own runner. A different WASI host that supplies real extra arguments would see them show up in <code>argv</code> correctly; this is <code>run_wasi.mjs</code>'s own limitation, not a language one.</li>
+          <li><strong>Filesystem access is sandboxed to one preopened directory</strong>, WASI's own capability model (<code>runtime/wasm/run_wasi.mjs</code>'s own top comment) — <code>blob</code>, <code>mkdir</code>, <code>ls</code>, and SQLite's own file all resolve against whatever directory the host granted (the invoking shell's cwd, for both <code>festina run --target=wasm32-wasi</code> and the benchmark runner), not the whole real filesystem the way a native binary can see.</li>
+          <li><strong>No ASan/LeakSanitizer coverage for this target.</strong> The rest of this project verifies its memory management with real ASan/LeakSanitizer runs (<code>scripts/leak_stress.sh</code>, <code>tests/test_leak_stress.py</code>); whether sanitizer builds work at all under <code>wasm32-wasi</code> has not been investigated (macOS's own sanitizer tier is out of scope too, for an unrelated reason — LeakSanitizer is unreliable on darwin). This target's own memory-management codegen is instead verified by running real programs end-to-end and checking correct output, not by a sanitizer run.</li>
+          <li><strong>Static linking is the only linking there is.</strong> There's no dynamic-vs-static sqlite3 choice to make for wasm — the vendored amalgamation is always compiled in.</li>
+          <li><strong>No browser support claimed.</strong> Every test and benchmark here runs a compiled <code>.wasm</code> through Node's <code>node:wasi</code> module. A browser has no built-in WASI host — running one there needs a JS-side WASI polyfill (e.g. <code>@wasmer/wasi</code>) that this project has neither vendored nor tested against.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="benchmarks">
+        <h2>Benchmarks <a class="anchor" href="#benchmarks">#</a></h2>
+        <p>
+          The same five programs
+          <a href="benchmark.html">benchmark.md</a> already tracks
+          natively (<code>hello</code><wbr>/<code>fib</code><wbr>/<code>loop_sum</code><wbr>/<code>array_sum</code><wbr>/<code>string_concat</code>
+          — see that page for what each one measures and why), each
+          also implemented in C (<code>benchmarks/*.c</code>) and
+          reused as-is for Go (<code>benchmarks/*.go</code>), all three
+          cross-compiled to <code>wasm32-wasi</code> and run through
+          the <em>identical</em> WASI host
+          (<code>runtime/wasm/run_wasi.mjs</code>/<code>node:wasi</code>)
+          — so these numbers measure each language's generated code
+          and Node's WASI syscall overhead identically, not three
+          different WASI runtimes' own differing overhead. Every
+          language's wasm output is checked to produce byte-identical
+          stdout to its own native build before any run is trusted
+          (<code>hello</code>→<code>hello</code>,
+          <code>fib</code>→<code>2178309</code>,
+          <code>loop_sum</code>→<code>828998288</code>,
+          <code>array_sum</code>→<code>707863693</code>,
+          <code>string_concat</code>→15,000 <code>x</code>s — all three
+          languages agree, natively and under wasm).
+        </p>
+        <p class="muted">
+          Rust is not included here (unlike benchmark.md's native
+          table): rustc dropped <code>wasm32-wasi</code> as a target
+          name (superseded by <code>wasm32-wasip1</code>, which needs
+          the separate <code>rustup target add wasm32-wasip1</code>
+          component, not otherwise needed by this project). C stands in
+          as the systems-language wasm comparison instead; Go uses its
+          own stable <code>GOOS=wasip1 GOARCH=wasm</code> support (Go
+          1.21+) — not <code>GOOS=js GOARCH=wasm</code>, which targets
+          the browser's own different, incompatible ABI, not WASI.
+        </p>
+
+        <h3 id="benchmark-methodology">Benchmark methodology <a class="anchor" href="#benchmark-methodology">#</a></h3>
+        <p class="muted">
+          Same shape as benchmark.md's own native methodology: 1
+          untimed warmup build/run, then the <em>minimum</em> of 7
+          timed runs, for both build and run time.
+          <code>.wasm</code> file size stands in for benchmark.md's
+          "binary size". Reproduce locally:
+        </p>
+        <pre class="code"><span class="mut">$</span> python3 benchmarks/run_wasm_benchmarks.py               <span class="cm"># print results</span>
+<span class="mut">$</span> python3 benchmarks/run_wasm_benchmarks.py --update-doc   <span class="cm"># regenerate this file's tables</span></pre>
+        <p class="muted">
+          Needs a wasm32-wasi-capable clang (see
+          <a href="#wasm-setup">Setup</a> above), Go 1.21+, and
+          Node.js; a missing toolchain is skipped with a note rather
+          than failing the run, same spirit as
+          <code>run_benchmarks.py</code>.
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>hello (wasm32-wasi)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">.wasm size</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">49.9 ms</td><td class="num">76.0 ms</td><td class="num">1.45 MB</td></tr>
+              <tr><td>C</td><td class="num">41.7 ms</td><td class="num">62.9 ms</td><td class="num">45.8 KB</td></tr>
+              <tr><td>Go</td><td class="num">67.7 ms</td><td class="num">124.8 ms</td><td class="num">2.31 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>fib (wasm32-wasi)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">.wasm size</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">59.5 ms</td><td class="num">82.5 ms</td><td class="num">1.45 MB</td></tr>
+              <tr><td>C</td><td class="num">53.0 ms</td><td class="num">72.6 ms</td><td class="num">92.1 KB</td></tr>
+              <tr><td>Go</td><td class="num">105.7 ms</td><td class="num">140.2 ms</td><td class="num">2.31 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>loop_sum (wasm32-wasi)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">.wasm size</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">914.4 ms</td><td class="num">86.7 ms</td><td class="num">1.45 MB</td></tr>
+              <tr><td>C</td><td class="num">891.7 ms</td><td class="num">76.0 ms</td><td class="num">92.1 KB</td></tr>
+              <tr><td>Go</td><td class="num">896.6 ms</td><td class="num">119.7 ms</td><td class="num">2.31 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>array_sum (wasm32-wasi)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">.wasm size</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">210.1 ms</td><td class="num">96.8 ms</td><td class="num">1.45 MB</td></tr>
+              <tr><td>C</td><td class="num">237.3 ms</td><td class="num">81.6 ms</td><td class="num">92.2 KB</td></tr>
+              <tr><td>Go</td><td class="num">279.4 ms</td><td class="num">120.1 ms</td><td class="num">2.31 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>string_concat (wasm32-wasi)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">.wasm size</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">71.6 ms</td><td class="num">86.3 ms</td><td class="num">1.45 MB</td></tr>
+              <tr><td>C</td><td class="num">51.6 ms</td><td class="num">79.1 ms</td><td class="num">93.8 KB</td></tr>
+              <tr><td>Go</td><td class="num">121.2 ms</td><td class="num">119.6 ms</td><td class="num">2.31 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="reading-these-numbers">Reading these numbers <a class="anchor" href="#reading-these-numbers">#</a></h3>
+        <p class="muted">
+          Not a claim that Festina beats C or Go at wasm — this exists
+          to catch regressions and track progress over time, the same
+          disclaimer benchmark.md itself leads with. What the numbers
+          above actually show:
+        </p>
+        <ul>
+          <li><strong>Festina is within a few percent of hand-written C</strong> on <code>fib</code> (both dominated by call overhead, not allocation) and <code>loop_sum</code> (pure arithmetic, all three languages converge to the same ~910ms, suggesting Node's WASI dispatch overhead — not code quality — is the floor on a loop this tight).</li>
+          <li><strong>Festina's <code>.wasm</code> is consistently larger than C's</strong> (the vendored SQLite amalgamation alone dwarfs any of these five tiny programs — every Festina binary pays that cost unconditionally, same as it does natively) but noticeably <em>smaller</em> than Go's (whose runtime — goroutine scheduler, GC — ships in every binary regardless of whether a given program uses any of it).</li>
+          <li><strong>Go is consistently the slowest of the three to start</strong> (<code>hello</code>), most visible on the smallest program, where there's no real work to amortize a heavier runtime-init cost against.</li>
+          <li><strong><code>array_sum</code> is the one case where Festina's own generated code measurably outran hand-written C</strong> in the run that produced the table above — plausible (Festina's escape analysis keeps this benchmark's array off the heap entirely, same as the C version's plain stack array; the two are closer in shape than the numbers might suggest, and re-runs should be expected to vary), but treat any close call between two of these as noise, not a verdict, the same caveat benchmark.md's own native table gives <code>array_sum</code>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="testing">
+        <h2>Testing <a class="anchor" href="#testing">#</a></h2>
+        <p class="muted">
+          <code>tests/test_wasm.py</code> plus the
+          <code>compile_and_run_wasm</code> fixture
+          (<code>tests/conftest.py</code>) — real compiles and real
+          executions through <code>run_wasi.mjs</code>, not just
+          checking that codegen produces plausible IR:
+          arithmetic/control flow/recursion, heap-allocated
+          <code>arr</code>/<code>map</code> (exercising the 32-bit
+          pointer-width codegen path end to end, not just at link
+          time), structs, <code>table</code>/<code>sqlite()</code>
+          against the vendored amalgamation, <code>regex</code>,
+          string concatenation, exit code propagation, the
+          graphics/audio compile-time rejections, and
+          <code>festina doctor</code>'s own WASM check. Skips cleanly
+          (not a failure) on a machine without a working wasm32-wasi
+          clang or without Node — except under
+          <code>FESTINA_STRICT_DEPS=1</code> (the Linux CI job), where
+          that skip becomes a hard failure instead, the same
+          discipline every other optional tier in this suite already
+          has.
+        </p>
+      </section>
+
+      <div class="prevnext">
+        <a class="prev" href="windows.html">
+          <span class="label">← Previous</span>
+          Windows
+        </a>
+        <a class="next" href="security.html">
+          <span class="label">Next →</span>
+          Security
+        </a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+  // Mobile sidebar toggle
+  const sidebar = document.getElementById('sidebar');
+  const backdrop = document.getElementById('backdrop');
+  const menuBtn = document.getElementById('menuBtn');
+  function closeSidebar() {
+    sidebar.classList.remove('open');
+    backdrop.classList.remove('open');
+  }
+  menuBtn.addEventListener('click', () => {
+    sidebar.classList.toggle('open');
+    backdrop.classList.toggle('open');
+  });
+  backdrop.addEventListener('click', closeSidebar);
+  document.getElementById('toc').addEventListener('click', (e) => {
+    if (e.target.tagName === 'A') closeSidebar();
+  });
+
+  // Sidebar filter
+  const filterBox = document.getElementById('navFilter');
+  filterBox.addEventListener('input', () => {
+    const q = filterBox.value.trim().toLowerCase();
+    document.querySelectorAll('#toc a').forEach(a => {
+      const match = !q || a.textContent.toLowerCase().includes(q);
+      a.dataset.hidden = match ? 'false' : 'true';
+    });
+    document.querySelectorAll('.nav-group').forEach(g => {
+      const anyVisible = [...g.querySelectorAll('a')].some(a => a.dataset.hidden !== 'true');
+      g.style.display = anyVisible ? '' : 'none';
+    });
+  });
+
+  // Scrollspy: highlight the section currently at the top of the
+  // viewport. Deliberately a single scroll-driven calculation (not an
+  // IntersectionObserver) so there's exactly one source of truth -- no
+  // risk of two independent observers racing each other for a short
+  // final section that a fixed rootMargin band might otherwise miss.
+  const anchors = [...document.querySelectorAll('#toc a')];
+  const byId = Object.fromEntries(anchors.map(a => [a.getAttribute('href').slice(1), a]));
+  const targets = [...document.querySelectorAll('main [id]')]
+    .filter(t => byId[t.id])
+    .map(t => ({ id: t.id, el: t }));
+
+  let ticking = false;
+  function updateActive() {
+    ticking = false;
+    const offset = 80; // matches scroll-margin-top on headings
+    const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2;
+    let currentId = targets.length ? targets[0].id : null;
+    if (atBottom) {
+      currentId = targets[targets.length - 1].id;
+    } else {
+      for (const t of targets) {
+        if (t.el.getBoundingClientRect().top <= offset) currentId = t.id;
+        else break;
+      }
+    }
+    anchors.forEach(a => a.classList.remove('active'));
+    if (currentId && byId[currentId]) byId[currentId].classList.add('active');
+  }
+  function onScroll() {
+    if (!ticking) {
+      ticking = true;
+      requestAnimationFrame(updateActive);
+    }
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll);
+  updateActive();
+</script>
+
+
+</body>
+</html>

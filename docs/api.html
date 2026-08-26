@@ -507,7 +507,7 @@
         </p>
         <div class="table-wrap">
         <table class="sig-table">
-          <tr><td>festina compile entry.f -o out</td><td>Compile to a native executable at <code>out</code> (default: <code>entry</code>'s own filename without <code>.f</code>). <code>--emit-llvm</code> prints LLVM IR to stdout instead of linking. <code>--cc</code> picks the C compiler/linker (default: whichever of <code>clang</code>/<code>gcc</code>/<code>cc</code> is found first). <code>--target=wasm32-wasi</code> cross-compiles to a standalone <code>.wasm</code> binary instead — see <a href="https://github.com/uraikus/festina/blob/main/wasm.md">wasm.md</a> (graphics/audio aren't available under WASI).</td></tr>
+          <tr><td>festina compile entry.f -o out</td><td>Compile to a native executable at <code>out</code> (default: <code>entry</code>'s own filename without <code>.f</code>). <code>--emit-llvm</code> prints LLVM IR to stdout instead of linking. <code>--cc</code> picks the C compiler/linker (default: whichever of <code>clang</code>/<code>gcc</code>/<code>cc</code> is found first). <code>--target=wasm32-wasi</code> cross-compiles to a standalone <code>.wasm</code> binary instead — see <a href="wasm.html">wasm.md</a> (graphics/audio aren't available under WASI).</td></tr>
           <tr><td>festina run entry.f</td><td>Compile to a throwaway temp executable and run it immediately — stdin/stdout/stderr inherited directly (not captured), so an interactive program (graphics/audio/timers) behaves exactly like a normal compile-then-run. Exits with the <em>compiled program's own</em> exit code, so <code>festina run x.f &amp;&amp; ...</code> composes the same way <code>go run</code>/<code>cargo run</code> do. The temp binary is always cleaned up afterward. <code>--target=wasm32-wasi</code> runs the compiled <code>.wasm</code> through Node's built-in WASI support instead of executing it directly.</td></tr>
           <tr><td>festina doctor</td><td>Checks every dependency the compiler itself needs (a C compiler, <code>pkg-config</code>, sqlite3/cairo-xlib/alsa dev headers, <code>libLLVM</code>) and reports what's missing and how to install it — the same install hints a real compile failure would give, just checked proactively instead of only on failure. Also reports whether <code>festina</code> itself is resolvable on <code>PATH</code>. Exits 0 if every <em>required</em> dependency is present — graphics/audio are optional.</td></tr>
           <tr><td>festina doctor --fix</td><td>Same report, then actually fixes what it found: installs missing dependencies via the detected package manager (<code>apt</code> on Linux, Homebrew on macOS, MSYS2's <code>pacman</code> on Windows), and adds <code>festina</code> to <code>PATH</code> if it isn't resolving. Prints the exact command/change first and asks for confirmation (<code>--yes</code>/<code>-y</code> skips that); refuses to guess for any other package manager or overwrite something unrelated already on disk.</td></tr>
@@ -545,7 +545,7 @@
           graphics (Cairo/X11) and audio (ALSA) runtime object files are
           only passed to the linker when the program calls something from
           them (see
-          <a href="https://github.com/uraikus/festina/blob/main/security.md#slim-binaries">security.md</a>).
+          <a href="security.html#slim-binaries">security.md</a>).
           <code>libsqlite3</code> is always available (statically linked
           when possible), since automatic database support (<code>table</code>,
           <code>sqlite()</code>) is always on.
@@ -1536,7 +1536,7 @@ log(argv[0])          <span class="cm">// the program's own path, same as C's ar
           (<code>run_wasi.mjs</code>) only ever passes the compiled
           module's own path through, so <code>argv</code> there is
           always a single-element array — see
-          <a href="https://github.com/uraikus/festina/blob/main/wasm.md">wasm.md</a>.
+          <a href="wasm.html">wasm.md</a>.
         </p>
       </section>
 
@@ -2299,7 +2299,7 @@ log(status)                            <span class="cm">// 0</span></pre>
           <code>--target=wasm32-wasi</code> — WASI has no process model
           to spawn into — rejected at compile time rather than failing
           at runtime; see
-          <a href="https://github.com/uraikus/festina/blob/main/wasm.md">wasm.md</a>.
+          <a href="wasm.html">wasm.md</a>.
         </p>
       </section>
 
@@ -2721,7 +2721,7 @@ u.hash                                <span class="cm">// text -- '#frag'</span>
         <h3 id="http-limitations">Limitations <a class="anchor" href="#http-limitations">#</a></h3>
         <ul>
           <li><strong>No ping/pong sent by this runtime, and no WebSocket extensions.</strong> A received ping is answered with a pong automatically; a received pong is ignored. <code>permessage-deflate</code> and every other WebSocket extension are unsupported (fragmentation is not an extension — see <a href="#websocket">WebSocket</a> above).</li>
-          <li><strong>Linux, macOS, and Windows.</strong> Linux/macOS use plain POSIX sockets; Windows uses a real winsock2 port (see <a href="https://github.com/uraikus/festina/blob/main/windows.md">windows.md</a>). One Windows-specific caveat, already true of every platform's <a href="#graceful-shutdown">Graceful shutdown</a> story below: Windows has no real <code>SIGTERM</code> delivery, so the connection-drain grace period only applies to Ctrl-C there, not to however a process gets killed the <code>SIGTERM</code> way on Linux/macOS (e.g. <code>taskkill</code> without <code>/F</code> doesn't reach it the same way). Not available under <code>--target=wasm32-wasi</code> at all — WASI Preview 1 has no listening-socket support — rejected at compile time; see <a href="https://github.com/uraikus/festina/blob/main/wasm.md">wasm.md</a>.</li>
+          <li><strong>Linux, macOS, and Windows.</strong> Linux/macOS use plain POSIX sockets; Windows uses a real winsock2 port (see <a href="windows.html">windows.md</a>). One Windows-specific caveat, already true of every platform's <a href="#graceful-shutdown">Graceful shutdown</a> story below: Windows has no real <code>SIGTERM</code> delivery, so the connection-drain grace period only applies to Ctrl-C there, not to however a process gets killed the <code>SIGTERM</code> way on Linux/macOS (e.g. <code>taskkill</code> without <code>/F</code> doesn't reach it the same way). Not available under <code>--target=wasm32-wasi</code> at all — WASI Preview 1 has no listening-socket support — rejected at compile time; see <a href="wasm.html">wasm.md</a>.</li>
           <li>
             <strong>Combining with graphics</strong> (<code>render()</code>, or an <code>on mouseDown</code>/.../<code>close</code> handler) in the same program works, but the two loops don't run side by side — a program that also opens a window blocks in the graphics event loop the whole time, which services the open port from inside itself rather than a separate thread. Practically, that means:
             <ul>
@@ -2789,7 +2789,7 @@ openSecurePort(8443, key)</pre>
           <a href="https://www.trustedfirmware.org/projects/mbed-tls/">mbedTLS</a>
           2.x — a new system dependency, but only for a program that
           actually calls <code>openSecurePort()</code> (see
-          <a href="https://github.com/uraikus/festina/blob/main/setup.md">setup.md</a>);
+          <a href="setup.html">setup.md</a>);
           a program that only ever calls <code>openPort()</code> never
           links it, the same binary-slimming split every other optional
           feature in this language already gets.
@@ -3417,7 +3417,7 @@ log(<span class="str">'still running'</span>)</pre>
           <strong>Not available under <code>--target=wasm32-wasi</code>,
           or on macOS.</strong> WASI has no setjmp/longjmp support at
           all — rejected at compile time; see
-          <a href="https://github.com/uraikus/festina/blob/main/wasm.md">wasm.md</a>.
+          <a href="wasm.html">wasm.md</a>.
           macOS is the same story for a different reason: LLVM's
           AArch64 backend (Apple Silicon, what every current Mac runs
           on) has no SjLj lowering either, so
@@ -3551,7 +3551,7 @@ log(head.next.next.n)   <span class="cm">// 3</span></pre>
           <span class="label">← Back to</span>
           Festina home
         </a>
-        <a class="next" href="https://github.com/uraikus/festina/blob/main/setup.md">
+        <a class="next" href="setup.html">
           <span class="label">Next →</span>
           Setup & dependencies
         </a>

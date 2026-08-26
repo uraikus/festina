@@ -1,0 +1,708 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>macOS — Festina</title>
+<meta name="description" content="Native macOS support: toolchain, audio, graphics, packaging, and what's gated on real-hardware confirmation.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23e8823a'/%3E%3Ctext x='50' y='68' font-size='60' font-family='monospace' font-weight='700' text-anchor='middle' fill='%231a1712'%3Ef%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #fbf9f6;
+    --bg-raised: #ffffff;
+    --bg-sunken: #f1ede6;
+    --text: #211c14;
+    --text-muted: #6b6252;
+    --border: #e4ddd0;
+    --accent: #c15f1e;
+    --accent-strong: #a84f16;
+    --accent-soft: #fbe6d3;
+    --code-bg: #221d16;
+    --code-text: #f2ead9;
+    --code-muted: #9a8f78;
+    --code-string: #d99a5b;
+    --code-keyword: #e8823a;
+    --code-comment: #7d745f;
+    --shadow: 0 1px 2px rgba(35, 25, 10, 0.06), 0 8px 24px rgba(35, 25, 10, 0.05);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #17140f;
+      --bg-raised: #1f1b14;
+      --bg-sunken: #14110c;
+      --text: #f2ead9;
+      --text-muted: #a89c84;
+      --border: #332c20;
+      --accent: #f0904f;
+      --accent-strong: #f7a86b;
+      --accent-soft: #3a2814;
+      --code-bg: #0f0d09;
+      --code-text: #f2ead9;
+      --code-muted: #8a7f68;
+      --code-string: #e8b47c;
+      --code-keyword: #f0904f;
+      --code-comment: #6b6250;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #17140f;
+    --bg-raised: #1f1b14;
+    --bg-sunken: #14110c;
+    --text: #f2ead9;
+    --text-muted: #a89c84;
+    --border: #332c20;
+    --accent: #f0904f;
+    --accent-strong: #f7a86b;
+    --accent-soft: #3a2814;
+    --code-bg: #0f0d09;
+    --code-text: #f2ead9;
+    --code-muted: #8a7f68;
+    --code-string: #e8b47c;
+    --code-keyword: #f0904f;
+    --code-comment: #6b6250;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent-strong); }
+  code, pre, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+
+  code:not(pre code) {
+    background: var(--bg-sunken);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.1em 0.35em;
+    font-size: 0.87em;
+  }
+
+  /* Top bar */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 56px;
+    padding: 0 16px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    font-size: 1.02rem;
+    color: var(--text);
+    text-decoration: none;
+  }
+  .brand .mark {
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    background: var(--accent);
+    color: #1a1508;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: monospace;
+    font-weight: 800;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+  }
+  .brand .sep { color: var(--text-muted); font-weight: 400; }
+  .topbar-links {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    font-size: 0.88rem;
+  }
+  .topbar-links a { color: var(--text-muted); text-decoration: none; }
+  .topbar-links a:hover { color: var(--text); }
+  .menu-btn {
+    display: none;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+
+  /* Layout */
+  .layout {
+    display: grid;
+    grid-template-columns: 260px minmax(0, 1fr);
+    max-width: 1280px;
+    margin: 0 auto;
+  }
+
+  /* Sidebar */
+  aside.sidebar {
+    position: sticky;
+    top: 56px;
+    align-self: start;
+    height: calc(100vh - 56px);
+    overflow-y: auto;
+    padding: 24px 16px 40px;
+    border-right: 1px solid var(--border);
+  }
+  .search-box {
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg-raised);
+    color: var(--text);
+    font-size: 0.85rem;
+    margin-bottom: 16px;
+  }
+  .search-box:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .nav-group { margin-bottom: 4px; }
+  .nav-group-title {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin: 18px 0 6px;
+    padding: 0 10px;
+  }
+  .nav-group:first-of-type .nav-group-title { margin-top: 0; }
+  nav.toc a {
+    display: block;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 0.87rem;
+    color: var(--text-muted);
+    text-decoration: none;
+    line-height: 1.35;
+  }
+  nav.toc a:hover { background: var(--bg-sunken); color: var(--text); }
+  nav.toc a.active {
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-weight: 600;
+  }
+  nav.toc a.sub {
+    padding-left: 22px;
+    font-size: 0.83rem;
+  }
+  nav.toc a[data-hidden="true"] { display: none; }
+
+  /* Main content */
+  main {
+    min-width: 0;
+    padding: 40px 32px 100px;
+  }
+  .content-wrap { max-width: 720px; }
+
+  .page-kicker {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--accent-strong);
+    font-weight: 700;
+    margin: 0 0 8px;
+  }
+  h1.page-title {
+    font-size: 2rem;
+    margin: 0 0 12px;
+    letter-spacing: -0.02em;
+  }
+  .lede {
+    color: var(--text-muted);
+    font-size: 1.02rem;
+    max-width: 640px;
+    margin: 0 0 8px;
+  }
+
+  section.doc-section {
+    padding-top: 40px;
+    margin-top: 24px;
+    border-top: 1px solid var(--border);
+    scroll-margin-top: 72px;
+  }
+  section.doc-section:first-of-type { border-top: none; }
+  h2 {
+    font-size: 1.4rem;
+    margin: 0 0 12px;
+    letter-spacing: -0.01em;
+    scroll-margin-top: 72px;
+  }
+  h3 {
+    font-size: 1.05rem;
+    margin: 28px 0 10px;
+    scroll-margin-top: 72px;
+  }
+  h4 {
+    font-size: 0.92rem;
+    margin: 22px 0 8px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  h2 .anchor, h3 .anchor {
+    opacity: 0;
+    text-decoration: none;
+    color: var(--text-muted);
+    font-size: 0.85em;
+    margin-left: 6px;
+  }
+  h2:hover .anchor, h3:hover .anchor { opacity: 1; }
+
+  p { margin: 0 0 14px; color: var(--text); }
+  p.muted { color: var(--text-muted); }
+
+  pre.code {
+    background: var(--code-bg);
+    color: var(--code-text);
+    border-radius: 10px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    line-height: 1.6;
+    box-shadow: var(--shadow);
+    margin: 0 0 16px;
+  }
+  pre.code .kw { color: var(--code-keyword); }
+  pre.code .str { color: var(--code-string); }
+  pre.code .re { color: var(--code-string); opacity: 0.85; }
+  pre.code .cm { color: var(--code-comment); font-style: italic; }
+  pre.code .mut { color: var(--code-muted); }
+
+  .callout {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 0.92rem;
+    color: var(--text-muted);
+    margin: 0 0 16px;
+  }
+  .callout strong { color: var(--text); }
+
+  .table-wrap {
+    overflow-x: auto;
+    border-radius: 10px;
+    margin: 0 0 16px;
+  }
+  .table-wrap .sig-table { margin: 0; }
+  .sig-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    margin: 0 0 16px;
+  }
+  .sig-table td {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .sig-table td:first-child {
+    white-space: nowrap;
+    font-family: monospace;
+    color: var(--accent-strong);
+  }
+
+  .version-badge {
+    display: inline-block;
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-weight: 700;
+    font-size: 0.85rem;
+    padding: 2px 10px;
+    border-radius: 999px;
+    margin-right: 10px;
+    vertical-align: middle;
+  }
+  .version-date {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    font-weight: 400;
+    vertical-align: middle;
+  }
+  ul.changes { margin: 0 0 16px; padding-left: 20px; }
+  ul.changes li { margin-bottom: 6px; }
+
+  .prevnext {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+  }
+  .prevnext a {
+    flex: 1;
+    text-decoration: none;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    color: var(--text);
+  }
+  .prevnext a:hover { border-color: var(--accent); }
+  .prevnext .label { display: block; font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+  .prevnext .next { text-align: right; }
+
+  @media (max-width: 880px) {
+    .layout { grid-template-columns: 1fr; }
+    .menu-btn { display: inline-block; }
+    aside.sidebar {
+      position: fixed;
+      top: 56px;
+      left: 0;
+      width: 280px;
+      max-width: 85vw;
+      background: var(--bg);
+      z-index: 30;
+      transform: translateX(-100%);
+      transition: transform 0.18s ease;
+      box-shadow: var(--shadow);
+    }
+    aside.sidebar.open { transform: translateX(0); }
+    .sidebar-backdrop {
+      display: none;
+      position: fixed;
+      inset: 56px 0 0 0;
+      background: rgba(0,0,0,0.35);
+      z-index: 25;
+    }
+    .sidebar-backdrop.open { display: block; }
+    main { padding: 32px 20px 80px; }
+    .topbar-links a.hide-narrow { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex; align-items:center; gap:8px;">
+    <button class="menu-btn" id="menuBtn" aria-label="Toggle navigation">☰ Menu</button>
+    <a class="brand" href="index.html"><span class="mark">f</span> Festina <span class="sep">/ Docs</span></a>
+  </div>
+  <div class="topbar-links">
+    <a class="hide-narrow" href="index.html#docs">All docs</a>
+    <a href="https://github.com/uraikus/festina">GitHub</a>
+  </div>
+</div>
+
+<div class="sidebar-backdrop" id="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…">
+    <nav class="toc" id="toc">
+      <div class="nav-group">
+        <a href="#try-catch-throw-unavailable">try/catch/throw is unavailable</a>
+        <a href="#gated-on-real-hardware">Gated on real hardware</a>
+        <a href="#porting-surface">Porting surface</a>
+        <a href="#toolchain">Toolchain</a>
+        <a href="#audio">Audio</a>
+        <a href="#graphics">Graphics</a>
+        <a href="#packaging">Packaging</a>
+        <a href="#shared-with-windows">Shared with Windows</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="content-wrap">
+      <p class="page-kicker">Platform support</p>
+      <h1 class="page-title">macOS</h1>
+      <p class="lede">
+        Native builds work today: toolchain, compiler, audio,
+        graphics, and packaging are all built and CI-verified on Apple
+        Silicon (<code>macos-14</code> GitHub Actions, on every push).
+        What's gated on real-hardware confirmation, and what's a
+        genuine, permanent limitation, are covered below.
+      </p>
+
+      <section class="doc-section" id="try-catch-throw-unavailable">
+        <h2><code>try</code>/<code>catch</code>/<code>throw</code> is unavailable <a class="anchor" href="#try-catch-throw-unavailable">#</a></h2>
+        <p>
+          <code>__builtin_longjmp</code> (which <code>festina_throw</code>
+          uses) is rejected by clang for <code>arm64-apple-macos14</code>
+          — the architecture every current Mac and every macOS CI runner
+          is. LLVM's AArch64 backend has no SjLj lowering at all, the
+          same gap <code>wasm32-wasi</code>'s backend has.
+          <code>try</code>/<code>catch</code>/<code>throw</code> is
+          rejected outright at compile time on darwin
+          (<code>festina/cli.py</code>'s
+          <code>_check_darwin_try_supported</code>) — this is not a
+          hardware-verification gate like audio/graphics below; the
+          backend genuinely doesn't support it. See
+          <a href="api.html#try-catch-throw">api.md</a>'s own
+          Limitations note.
+        </p>
+      </section>
+
+      <section class="doc-section" id="gated-on-real-hardware">
+        <h2>What's gated on real hardware <a class="anchor" href="#gated-on-real-hardware">#</a></h2>
+        <p>
+          Audio playback, windowed mouse/keyboard/window behavior, and
+          <code>openPort()</code>/HTTP each stay behind an explicit
+          opt-in environment variable until confirmed on real Mac
+          hardware:
+        </p>
+        <ul>
+          <li><code>FESTINA_ENABLE_MACOS_AUDIO=1</code> — audio playback (AudioQueue)</li>
+          <li><code>FESTINA_ENABLE_MACOS_GRAPHICS=1</code> — windowed graphics (native Cocoa)</li>
+          <li><code>FESTINA_ENABLE_MACOS_HTTP=1</code> — <code>openPort()</code>/<code>on request</code>/<code>on upgrade</code>/<code>on message</code>/<code>on socketClose</code> (plain POSIX sockets, nothing Linux-specific about them, but not yet run against real macOS hardware) — see <a href="api.html#http-and-websocket-servers">api.md</a></li>
+        </ul>
+        <p class="muted">
+          Everything about each of these compiles and type-checks
+          against real platform headers (AudioToolbox/AppKit/Cocoa) on
+          every CI push; only actually opening a device/window/socket
+          on real hardware is unconfirmed. Offscreen drawing
+          (<code>saveCanvas</code>, no open window) and packaging need
+          no gate at all and work today.
+        </p>
+      </section>
+
+      <section class="doc-section" id="porting-surface">
+        <h2>Porting surface <a class="anchor" href="#porting-surface">#</a></h2>
+        <p>
+          The compiler is pure Python, the generated IR is
+          target-neutral, and the platform-specific API surface of the
+          runtime is small and precisely bounded:
+        </p>
+        <div class="table-wrap">
+          <table class="sig-table">
+            <tr><td>Windowing/events</td><td>20 X11 calls + 2 <code>cairo_xlib_*</code> — <code>festina_runtime_graphics.c</code></td></tr>
+            <tr><td>Audio device</td><td>6 ALSA calls (<code>snd_pcm_open/set_params/writei/recover/close</code>, <code>snd_strerror</code>) — <code>festina_runtime_audio.c</code></td></tr>
+            <tr><td>Core runtime</td><td>none — POSIX only (<code>regex.h</code>, <code>clock_gettime</code>, <code>select</code>, pthread), all in macOS libc — <code>festina_runtime.c</code></td></tr>
+          </table>
+        </div>
+        <p class="muted">
+          Everything else the runtime leans on is portable and
+          Homebrew-packaged: Cairo (drawing), libjpeg, libmpg123,
+          sqlite3 (macOS even ships it).
+        </p>
+      </section>
+
+      <section class="doc-section" id="toolchain">
+        <h2>Toolchain <a class="anchor" href="#toolchain">#</a></h2>
+        <ul>
+          <li><strong><code>festina/llvm_backend.py</code> finds Homebrew's libLLVM</strong> at its keg-only install path (<code>/opt<wbr>/homebrew<wbr>/opt<wbr>/llvm<wbr>/lib<wbr>/libLLVM.dylib</code> on arm64, <code>/usr<wbr>/local<wbr>/opt<wbr>/llvm<wbr>/lib<wbr>/libLLVM.dylib</code> on x86_64) — <code>ctypes.util.find_library("LLVM")</code> alone doesn't see it there. The clang fallback works too: Apple clang (Xcode ≥ 15, the floor) accepts the generated <code>.ll</code> directly, including its opaque-<code>ptr</code> IR.</li>
+          <li><strong>SQLite links statically when possible.</strong> <code>festina/cli.py</code> probes the explicit archive path (<code>pkg-config --variable=libdir sqlite3</code> + <code>/libsqlite3.a</code>, which Homebrew's sqlite provides) rather than the <code>-Wl,-Bstatic/-Bdynamic</code> flags ld64 rejects; falls back to <code>-lsqlite3</code> (the OS-shipped dylib) otherwise.</li>
+          <li><strong><code>festina doctor</code></strong> reports macOS-specific install hints: on darwin, compiling an audio program without <code>FESTINA_ENABLE_MACOS_AUDIO=1</code> fails with a message naming the gate (<code>_check_feature_supported</code>) rather than a pkg-config error naming a library macOS doesn't have.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="audio">
+        <h2>Audio <a class="anchor" href="#audio">#</a></h2>
+        <p>
+          AudioQueue (AudioToolbox, plain C) sits behind a 3-function
+          device seam the portable pool/decoding/channel logic in
+          <code>festina_runtime_audio.c</code> calls through:
+        </p>
+        <ul>
+          <li><code>festina_pcm_open(channels, rate) → handle-or-error</code></li>
+          <li><code>festina_pcm_write(handle, frames, count) → ok</code> (blocking)</li>
+          <li><code>festina_pcm_close(handle)</code></li>
+        </ul>
+        <p class="muted">
+          N preallocated buffers plus a counting semaphore reproduce
+          blocking-push exactly: <code>write</code> copies frames into
+          a free buffer, enqueues it, and blocks on the semaphore when
+          all buffers are in flight; the completion callback posts it.
+          Per-channel queues mirror Linux's per-channel handles
+          one-to-one. Link flags add <code>-framework AudioToolbox</code>;
+          the <code>alsa</code> pkg-config package is dropped on darwin
+          (<code>libmpg123</code> is kept for MP3 decoding). For CI,
+          where there's no real audio device,
+          <code>FESTINA_AUDIO_NULL=1</code> makes
+          <code>festina_pcm_*</code> a timed sink at the shim level.
+        </p>
+      </section>
+
+      <section class="doc-section" id="graphics">
+        <h2>Graphics <a class="anchor" href="#graphics">#</a></h2>
+        <p>
+          The graphics translation unit is mostly portable already: all
+          drawing (rects, circles, text, paths, transforms, gradients,
+          images, clips, resizes, <code>saveCanvas</code>) targets an
+          offscreen Cairo image surface, and libjpeg decoding is
+          platform-free. Only the windowing layer is platform-specific,
+          behind <code>runtime/festina_runtime_window.h</code>:
+        </p>
+        <ul>
+          <li><code>festina_window_open(width, height, title)</code> / <code>festina_window_close(void)</code></li>
+          <li><code>festina_window_present(cairo_surface_t *backing)</code> — hand the offscreen backing surface to the platform to blit</li>
+          <li><code>festina_window_events_wait(double timeout_seconds)</code> — block for at most one OS-native event, bounded by the next timer deadline</li>
+          <li><code>festina_window_events_drain(...)</code> — pump every pending OS event as a normalized <code>MOUSE_DOWN</code><wbr>/<code>MOUSE_UP</code><wbr>/<code>MOUSE_MOVE</code><wbr>/<code>KEY_DOWN</code><wbr>/<code>KEY_UP</code><wbr>/<code>RESIZE</code><wbr>/<code>CLOSE</code> event</li>
+        </ul>
+        <p class="muted">
+          macOS implements this in
+          <code>festina_runtime_window_mac.m</code> (Objective-C, a
+          separate translation unit, linked <code>-framework Cocoa</code>):
+          an <code>NSWindow</code> plus an <code>NSView</code> whose
+          <code>drawRect:</code> blits the Cairo image surface via
+          <code>CGImage</code> (<code>CAIRO_FORMAT_ARGB32</code> maps
+          exactly onto
+          <code>kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst</code>
+          on any little-endian Mac). No XQuartz, no X11 of any kind.
+        </p>
+        <p>Three things worth knowing about the Cocoa backend specifically:</p>
+        <ul>
+          <li><strong>Event loop.</strong> Cocoa requires UI on the main thread and prefers owning the loop; Festina's model (top-level code runs, then <code>festina_run_event_loop()</code> blocks on the main thread) is compatible. <code>festina_window_events_wait</code> peeks with <code>nextEventMatchingMask:<wbr>untilDate:<wbr>...dequeue:<wbr>NO</code> (the timeout carries the timer deadline, the same role <code>select</code>'s timeout plays on Linux); <code>festina_window_events_drain</code> fully pumps the queue into a small ring buffer that window/view delegate callbacks (resize, close) also push into, then drains it through the caller's handler. Timers keep firing from the same loop, unchanged.</li>
+          <li><strong>Key names match Linux's.</strong> <code>on keyDown(key:text)</code> reports the same names on both platforms — Cocoa's characters/keyCodes are mapped through a small keyCode table onto the shared vocabulary pinned in <code>runtime/festina_key_names.h</code> (guarded by <code>tests<wbr>/test_platform.py<wbr>::TestKeyNameVocabulary</code>). Autorepeat maps cleanly onto NSEvent's <code>isARepeat</code>.</li>
+          <li><strong>No Xvfb equivalent exists for macOS CI runners</strong>, so windowed end-to-end tests (real mouse/keyboard dispatch) are Linux-CI-only; macOS CI covers the full offscreen suite plus a compile-only Cocoa type-check against real AppKit/Foundation/CoreGraphics headers. See <a href="https://github.com/uraikus/festina/blob/main/tests/CONTRACT.md">tests/CONTRACT.md</a> for the exact split.</li>
+        </ul>
+        <p class="muted">
+          A Festina program only hits the
+          <code>FESTINA_ENABLE_MACOS_GRAPHICS</code> gate if it would
+          actually open a window (declares <code>render()</code> or
+          any window event handler); an offscreen-only program
+          (<code>saveCanvas</code>, no <code>render()</code>) is never
+          gated on any platform.
+        </p>
+      </section>
+
+      <section class="doc-section" id="packaging">
+        <h2>Packaging <a class="anchor" href="#packaging">#</a></h2>
+        <p>
+          <code>scripts/package_compiler.sh</code> produces a Mach-O
+          binary via PyInstaller and ad-hoc codesigns it
+          (<code>codesign -s -</code>, guarded on <code>uname -s</code>
+          and on <code>codesign</code> being on PATH) so Gatekeeper
+          allows local runs with no prompt — a self-signature, not an
+          identity; it doesn't make the binary trusted on anyone else's
+          machine. Full Developer-ID signing and notarization is a
+          distribution decision deliberately out of scope until there's
+          an actual distribution channel. The <code>macos-14</code> CI
+          job runs this script for real on every push (Apple Silicon
+          runners, so that step <em>is</em> the arm64 build) and
+          smoke-tests the result (compiles and runs
+          <code>examples/hello.f</code>). Universal binaries are a
+          non-goal — arm64 ships; x86_64 without Rosetta is
+          build-from-source. See <a href="setup.html">setup.md</a> for
+          the exact brew line and PATH requirements.
+        </p>
+      </section>
+
+      <section class="doc-section" id="shared-with-windows">
+        <h2>Shared with Windows <a class="anchor" href="#shared-with-windows">#</a></h2>
+        <p>The intersection with <a href="windows.html">windows.md</a>:</p>
+        <ol>
+          <li><strong>The audio device seam</strong> (<code>festina_pcm_open/write/close</code>), with each platform providing its own blocking-push primitive (a counting semaphore for AudioQueue, a condition variable for waveOut, a blocking write on Linux/ALSA).</li>
+          <li><strong>The windowing seam</strong> (<code>festina_window_open<wbr>/close<wbr>/present<wbr>/events_wait<wbr>/events_drain</code> + normalized events, <code>runtime/festina_runtime_window.h</code>) — Linux (X11), macOS (Cocoa), and Windows (Win32) all implement it; <code>present</code> always takes the Cairo <em>image surface</em> (an xlib surface / CGImage / DIB is each platform's own blit of that one thing), and redraw-on-expose is each backend's own job rather than a seam-level event.</li>
+          <li><strong>The key-name vocabulary</strong> — <code>runtime/festina_key_names.h</code>, guarded by <code>tests<wbr>/test_platform.py<wbr>::TestKeyNameVocabulary</code>.</li>
+          <li><strong>The <code>FESTINA_AUDIO_NULL</code> test shim</strong> at the device seam, for CI with no real audio device.</li>
+          <li><strong>The headless CI tier definition</strong> — which suites run with no display/audio device; all three OS jobs use the same selection.</li>
+          <li><strong>The sanitizer tier</strong>: LeakSanitizer is not reliably available on darwin/arm64, so the leak-stress tier stays Linux-only; memory-model verification runs strongest there.</li>
+          <li><strong>Per-platform structure</strong>, filled in per port: <code>_RUNTIME_FEATURES</code> (pkgs/link flags/sources by OS), <code>_find_libllvm</code> candidate paths, <code>_default_output_name</code>, <code>_static_sqlite_attempt</code>, <code>festina doctor</code>'s hint table, and <code>package_compiler.sh</code>'s release matrix.</li>
+          <li><strong>Cross-platform contract tests</strong> that run everywhere — binary-fidelity round trips, forward-slash path handling (<code>tests<wbr>/test_platform.py<wbr>::TestBinaryFidelity</code>), plus the per-OS <code>TestOnMacOS</code>/<code>TestOnWindows</code> suites.</li>
+        </ol>
+        <p class="muted">
+          Not shared: the regex gap and <code>.exe</code> mechanics are
+          Windows-only, the ld64 sqlite probe is macOS-only, and
+          Cocoa's run-loop inversion has no Win32 counterpart.
+        </p>
+      </section>
+
+      <div class="prevnext">
+        <a class="prev" href="setup.html">
+          <span class="label">← Previous</span>
+          Setup &amp; dependencies
+        </a>
+        <a class="next" href="windows.html">
+          <span class="label">Next →</span>
+          Windows
+        </a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+  // Mobile sidebar toggle
+  const sidebar = document.getElementById('sidebar');
+  const backdrop = document.getElementById('backdrop');
+  const menuBtn = document.getElementById('menuBtn');
+  function closeSidebar() {
+    sidebar.classList.remove('open');
+    backdrop.classList.remove('open');
+  }
+  menuBtn.addEventListener('click', () => {
+    sidebar.classList.toggle('open');
+    backdrop.classList.toggle('open');
+  });
+  backdrop.addEventListener('click', closeSidebar);
+  document.getElementById('toc').addEventListener('click', (e) => {
+    if (e.target.tagName === 'A') closeSidebar();
+  });
+
+  // Sidebar filter
+  const filterBox = document.getElementById('navFilter');
+  filterBox.addEventListener('input', () => {
+    const q = filterBox.value.trim().toLowerCase();
+    document.querySelectorAll('#toc a').forEach(a => {
+      const match = !q || a.textContent.toLowerCase().includes(q);
+      a.dataset.hidden = match ? 'false' : 'true';
+    });
+    document.querySelectorAll('.nav-group').forEach(g => {
+      const anyVisible = [...g.querySelectorAll('a')].some(a => a.dataset.hidden !== 'true');
+      g.style.display = anyVisible ? '' : 'none';
+    });
+  });
+
+  // Scrollspy: highlight the section currently at the top of the
+  // viewport. Deliberately a single scroll-driven calculation (not an
+  // IntersectionObserver) so there's exactly one source of truth -- no
+  // risk of two independent observers racing each other for a short
+  // final section that a fixed rootMargin band might otherwise miss.
+  const anchors = [...document.querySelectorAll('#toc a')];
+  const byId = Object.fromEntries(anchors.map(a => [a.getAttribute('href').slice(1), a]));
+  const targets = [...document.querySelectorAll('main [id]')]
+    .filter(t => byId[t.id])
+    .map(t => ({ id: t.id, el: t }));
+
+  let ticking = false;
+  function updateActive() {
+    ticking = false;
+    const offset = 80; // matches scroll-margin-top on headings
+    const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2;
+    let currentId = targets.length ? targets[0].id : null;
+    if (atBottom) {
+      currentId = targets[targets.length - 1].id;
+    } else {
+      for (const t of targets) {
+        if (t.el.getBoundingClientRect().top <= offset) currentId = t.id;
+        else break;
+      }
+    }
+    anchors.forEach(a => a.classList.remove('active'));
+    if (currentId && byId[currentId]) byId[currentId].classList.add('active');
+  }
+  function onScroll() {
+    if (!ticking) {
+      ticking = true;
+      requestAnimationFrame(updateActive);
+    }
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll);
+  updateActive();
+</script>
+
+
+</body>
+</html>

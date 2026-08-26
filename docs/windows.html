@@ -1,0 +1,756 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Windows — Festina</title>
+<meta name="description" content="Native Windows support: toolchain, audio, graphics, packaging, and HTTP/WebSocket.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23e8823a'/%3E%3Ctext x='50' y='68' font-size='60' font-family='monospace' font-weight='700' text-anchor='middle' fill='%231a1712'%3Ef%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #fbf9f6;
+    --bg-raised: #ffffff;
+    --bg-sunken: #f1ede6;
+    --text: #211c14;
+    --text-muted: #6b6252;
+    --border: #e4ddd0;
+    --accent: #c15f1e;
+    --accent-strong: #a84f16;
+    --accent-soft: #fbe6d3;
+    --code-bg: #221d16;
+    --code-text: #f2ead9;
+    --code-muted: #9a8f78;
+    --code-string: #d99a5b;
+    --code-keyword: #e8823a;
+    --code-comment: #7d745f;
+    --shadow: 0 1px 2px rgba(35, 25, 10, 0.06), 0 8px 24px rgba(35, 25, 10, 0.05);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #17140f;
+      --bg-raised: #1f1b14;
+      --bg-sunken: #14110c;
+      --text: #f2ead9;
+      --text-muted: #a89c84;
+      --border: #332c20;
+      --accent: #f0904f;
+      --accent-strong: #f7a86b;
+      --accent-soft: #3a2814;
+      --code-bg: #0f0d09;
+      --code-text: #f2ead9;
+      --code-muted: #8a7f68;
+      --code-string: #e8b47c;
+      --code-keyword: #f0904f;
+      --code-comment: #6b6250;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #17140f;
+    --bg-raised: #1f1b14;
+    --bg-sunken: #14110c;
+    --text: #f2ead9;
+    --text-muted: #a89c84;
+    --border: #332c20;
+    --accent: #f0904f;
+    --accent-strong: #f7a86b;
+    --accent-soft: #3a2814;
+    --code-bg: #0f0d09;
+    --code-text: #f2ead9;
+    --code-muted: #8a7f68;
+    --code-string: #e8b47c;
+    --code-keyword: #f0904f;
+    --code-comment: #6b6250;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent-strong); }
+  code, pre, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+
+  code:not(pre code) {
+    background: var(--bg-sunken);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.1em 0.35em;
+    font-size: 0.87em;
+  }
+
+  /* Top bar */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 56px;
+    padding: 0 16px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    font-size: 1.02rem;
+    color: var(--text);
+    text-decoration: none;
+  }
+  .brand .mark {
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    background: var(--accent);
+    color: #1a1508;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: monospace;
+    font-weight: 800;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+  }
+  .brand .sep { color: var(--text-muted); font-weight: 400; }
+  .topbar-links {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    font-size: 0.88rem;
+  }
+  .topbar-links a { color: var(--text-muted); text-decoration: none; }
+  .topbar-links a:hover { color: var(--text); }
+  .menu-btn {
+    display: none;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+
+  /* Layout */
+  .layout {
+    display: grid;
+    grid-template-columns: 260px minmax(0, 1fr);
+    max-width: 1280px;
+    margin: 0 auto;
+  }
+
+  /* Sidebar */
+  aside.sidebar {
+    position: sticky;
+    top: 56px;
+    align-self: start;
+    height: calc(100vh - 56px);
+    overflow-y: auto;
+    padding: 24px 16px 40px;
+    border-right: 1px solid var(--border);
+  }
+  .search-box {
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg-raised);
+    color: var(--text);
+    font-size: 0.85rem;
+    margin-bottom: 16px;
+  }
+  .search-box:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .nav-group { margin-bottom: 4px; }
+  .nav-group-title {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin: 18px 0 6px;
+    padding: 0 10px;
+  }
+  .nav-group:first-of-type .nav-group-title { margin-top: 0; }
+  nav.toc a {
+    display: block;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 0.87rem;
+    color: var(--text-muted);
+    text-decoration: none;
+    line-height: 1.35;
+  }
+  nav.toc a:hover { background: var(--bg-sunken); color: var(--text); }
+  nav.toc a.active {
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-weight: 600;
+  }
+  nav.toc a.sub {
+    padding-left: 22px;
+    font-size: 0.83rem;
+  }
+  nav.toc a[data-hidden="true"] { display: none; }
+
+  /* Main content */
+  main {
+    min-width: 0;
+    padding: 40px 32px 100px;
+  }
+  .content-wrap { max-width: 720px; }
+
+  .page-kicker {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--accent-strong);
+    font-weight: 700;
+    margin: 0 0 8px;
+  }
+  h1.page-title {
+    font-size: 2rem;
+    margin: 0 0 12px;
+    letter-spacing: -0.02em;
+  }
+  .lede {
+    color: var(--text-muted);
+    font-size: 1.02rem;
+    max-width: 640px;
+    margin: 0 0 8px;
+  }
+
+  section.doc-section {
+    padding-top: 40px;
+    margin-top: 24px;
+    border-top: 1px solid var(--border);
+    scroll-margin-top: 72px;
+  }
+  section.doc-section:first-of-type { border-top: none; }
+  h2 {
+    font-size: 1.4rem;
+    margin: 0 0 12px;
+    letter-spacing: -0.01em;
+    scroll-margin-top: 72px;
+  }
+  h3 {
+    font-size: 1.05rem;
+    margin: 28px 0 10px;
+    scroll-margin-top: 72px;
+  }
+  h4 {
+    font-size: 0.92rem;
+    margin: 22px 0 8px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  h2 .anchor, h3 .anchor {
+    opacity: 0;
+    text-decoration: none;
+    color: var(--text-muted);
+    font-size: 0.85em;
+    margin-left: 6px;
+  }
+  h2:hover .anchor, h3:hover .anchor { opacity: 1; }
+
+  p { margin: 0 0 14px; color: var(--text); }
+  p.muted { color: var(--text-muted); }
+
+  pre.code {
+    background: var(--code-bg);
+    color: var(--code-text);
+    border-radius: 10px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    line-height: 1.6;
+    box-shadow: var(--shadow);
+    margin: 0 0 16px;
+  }
+  pre.code .kw { color: var(--code-keyword); }
+  pre.code .str { color: var(--code-string); }
+  pre.code .re { color: var(--code-string); opacity: 0.85; }
+  pre.code .cm { color: var(--code-comment); font-style: italic; }
+  pre.code .mut { color: var(--code-muted); }
+
+  .callout {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 0.92rem;
+    color: var(--text-muted);
+    margin: 0 0 16px;
+  }
+  .callout strong { color: var(--text); }
+
+  .table-wrap {
+    overflow-x: auto;
+    border-radius: 10px;
+    margin: 0 0 16px;
+  }
+  .table-wrap .sig-table { margin: 0; }
+  .sig-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    margin: 0 0 16px;
+  }
+  .sig-table td {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .sig-table td:first-child {
+    white-space: nowrap;
+    font-family: monospace;
+    color: var(--accent-strong);
+  }
+
+  .version-badge {
+    display: inline-block;
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-weight: 700;
+    font-size: 0.85rem;
+    padding: 2px 10px;
+    border-radius: 999px;
+    margin-right: 10px;
+    vertical-align: middle;
+  }
+  .version-date {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    font-weight: 400;
+    vertical-align: middle;
+  }
+  ul.changes { margin: 0 0 16px; padding-left: 20px; }
+  ul.changes li { margin-bottom: 6px; }
+
+  .prevnext {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+  }
+  .prevnext a {
+    flex: 1;
+    text-decoration: none;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    color: var(--text);
+  }
+  .prevnext a:hover { border-color: var(--accent); }
+  .prevnext .label { display: block; font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+  .prevnext .next { text-align: right; }
+
+  @media (max-width: 880px) {
+    .layout { grid-template-columns: 1fr; }
+    .menu-btn { display: inline-block; }
+    aside.sidebar {
+      position: fixed;
+      top: 56px;
+      left: 0;
+      width: 280px;
+      max-width: 85vw;
+      background: var(--bg);
+      z-index: 30;
+      transform: translateX(-100%);
+      transition: transform 0.18s ease;
+      box-shadow: var(--shadow);
+    }
+    aside.sidebar.open { transform: translateX(0); }
+    .sidebar-backdrop {
+      display: none;
+      position: fixed;
+      inset: 56px 0 0 0;
+      background: rgba(0,0,0,0.35);
+      z-index: 25;
+    }
+    .sidebar-backdrop.open { display: block; }
+    main { padding: 32px 20px 80px; }
+    .topbar-links a.hide-narrow { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex; align-items:center; gap:8px;">
+    <button class="menu-btn" id="menuBtn" aria-label="Toggle navigation">☰ Menu</button>
+    <a class="brand" href="index.html"><span class="mark">f</span> Festina <span class="sep">/ Docs</span></a>
+  </div>
+  <div class="topbar-links">
+    <a class="hide-narrow" href="index.html#docs">All docs</a>
+    <a href="https://github.com/uraikus/festina">GitHub</a>
+  </div>
+</div>
+
+<div class="sidebar-backdrop" id="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…">
+    <nav class="toc" id="toc">
+      <div class="nav-group">
+        <a href="#toolchain-msys2">Toolchain: MSYS2 / MinGW-w64</a>
+        <a href="#toolchain-bring-up">Toolchain bring-up</a>
+        <a href="#audio">Audio</a>
+        <a href="#graphics">Graphics</a>
+        <a href="#packaging">Packaging</a>
+        <a href="#http-websocket">HTTP/WebSocket</a>
+        <a href="#shared-with-macos">Shared with macOS</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="content-wrap">
+      <p class="page-kicker">Platform support</p>
+      <h1 class="page-title">Windows</h1>
+      <p class="lede">
+        Toolchain, graphics, HTTP/WebSocket, and packaging all work
+        today and are confirmed on real Windows CI. Audio compiles and
+        type-checks but stays gated — not for lack of verification, but
+        because <code>windows-latest</code> CI runners have no audio
+        device at all (<code>waveOutOpen</code> fails with
+        <code>MMRESULT 2</code>), so un-gating it would fail every
+        audio test permanently rather than just skip.
+      </p>
+      <p class="lede">
+        The Windows counterpart to <a href="macos.html">macos.md</a>:
+        the two ports share the same two backend seams (audio device,
+        windowing). What Windows needed that macOS didn't is a
+        core-runtime gap:
+      </p>
+      <div class="table-wrap">
+        <table class="sig-table">
+          <tr><td>Core runtime</td><td><code>&lt;regex.h&gt;</code> — 20 call sites; <code>localtime_r</code> — 1 call site (MinGW-w64's UCRT doesn't provide either); everything else is portable (<code>clock_gettime</code>/<code>nanosleep</code>, <code>strdup</code>, binary-mode <code>fopen</code>, <code>remove</code>, <code>getenv</code>). Windows answer: POSIX regex library (below); <code>#ifdef _WIN32</code> to <code>localtime_s</code> (reversed args).</td></tr>
+          <tr><td>Windowing/events</td><td>The 5-function seam macos.md documents. Windows answer: Win32 + the Cairo image-surface blit.</td></tr>
+          <tr><td>Audio device</td><td>The 3-function seam macos.md documents. Windows answer: waveOut.</td></tr>
+        </table>
+      </div>
+
+      <section class="doc-section" id="toolchain-msys2">
+        <h2>Toolchain: MSYS2 / MinGW-w64 <a class="anchor" href="#toolchain-msys2">#</a></h2>
+        <p>
+          One supported toolchain: clang or gcc from MSYS2's MinGW-w64
+          environment. MSVC is explicitly out of scope. This single
+          decision dissolves most of the porting surface:
+        </p>
+        <ul>
+          <li><code>clock_gettime</code>/<code>nanosleep</code> — provided by MinGW-w64 (winpthreads).</li>
+          <li><code>pthread</code> (the audio channel pool's threads) — winpthreads, linked by the same <code>-pthread</code> flag already on the audio link line.</li>
+          <li><code>pkg-config</code> and every library Festina uses are packaged: sqlite3, cairo, libjpeg-turbo, mpg123 all exist as <code>mingw-w64-*</code> packages.</li>
+          <li>The GNU-ld static-sqlite trick (<code>-Wl,-Bstatic</code>) works unchanged — MinGW's ld is GNU ld.</li>
+          <li>The compiler driver flags <code>festina/cli.py</code> emits (<code>-O2 -c -o</code>, <code>-l...</code>) are the same driver dialect.</li>
+        </ul>
+        <p class="muted">
+          MSVC would instead mean no <code>regex.h</code>/POSIX layer,
+          a different driver dialect, no pkg-config culture, and a
+          second CI matrix — all cost, no user-visible gain over
+          shipping MinGW-built binaries (ordinary, dependency-light PE
+          executables any Windows runs).
+        </p>
+      </section>
+
+      <section class="doc-section" id="toolchain-bring-up">
+        <h2>Toolchain bring-up <a class="anchor" href="#toolchain-bring-up">#</a></h2>
+        <p>
+          <code>festina compile hello.f</code> produces a runnable
+          <code>.exe</code>, and the whole non-graphics, non-audio
+          suite passes under MSYS2 on Windows CI.
+        </p>
+        <ol>
+          <li><strong>Regex.</strong> MSYS2's <code>libsystre</code> package provides POSIX <code>&lt;regex.h&gt;</code><wbr>/<code>regcomp</code><wbr>/<code>regexec</code> (a wrapper around TRE) — pkg-config asks for it under the name <code>gnurx</code> (<code>libsystre</code>'s own package declares itself a drop-in replacement for the old <code>libgnurx</code>, and ships its pkgconfig file under that old name). <code>_core_pkgs</code>'s win32-only addition installs <code>libsystre</code>, asks pkg-config for <code>gnurx</code>. <code>gnurx</code>'s ERE behavior matches glibc's under the existing (platform-neutral) regex test suite.</li>
+          <li><strong><code>.exe</code> awareness in <code>festina/cli.py</code>.</strong> <code>_default_output_name</code> appends <code>.exe</code> on <code>win32</code> (and <code>festina run</code> invokes it accordingly). <code>_rename_if_linker_appended_exe</code> runs after linking and renames the linker's real output back to the exact name the caller asked for — MinGW's linker silently appends <code>.exe</code> to a <code>-o</code> name that lacks one, even when the caller asked for an explicit extensionless name.</li>
+          <li><strong><code>festina/llvm_backend.py</code> finds libLLVM's DLL</strong> via <code>_platform_libllvm_paths</code>, covering the MSYS2 candidates (<code>$MSYSTEM_PREFIX</code>, the UCRT64/MinGW64/CLANG64 roots); the clang fallback (MSYS2 clang consumes the generated <code>.ll</code> directly) covers the gap regardless, exactly as on macOS.</li>
+          <li><strong><code>festina doctor</code></strong> reports Windows-specific lines: POSIX regex as a REQUIRED line (checked via pkg-config's <code>gnurx</code> name but hinting the real package to install, <code>libsystre</code>), and detection of the plain <code>MSYS</code> shell (as opposed to UCRT64/MINGW64/CLANG64) via <code>$MSYSTEM</code>, since only UCRT64 is supported. The pacman one-liner (<code>pacman -S mingw-w64-ucrt-x86_64-{clang,sqlite3,pkgconf,libsystre}</code>) is that hint's actual text.</li>
+          <li><strong>CI</strong>: a <code>windows-latest</code> job via the <code>msys2/setup-msys2</code> action runs the whole suite headless the same way the macOS job does, plus compiling and running the four windowless examples as real <code>.exe</code>s. The sanitizer leak tier stays Linux-only, same reasoning as macOS.</li>
+          <li><strong>Filesystem semantics</strong>: every runtime <code>fopen</code> is binary-mode (<code>"rb"</code>/<code>"wb"</code>/<code>"ab"</code>), so blobs and <code>save()</code> round-trip byte-identically with no CRLF hazard, and the CRT accepts the forward-slash paths the examples use (<code>tests<wbr>/test_platform.py<wbr>::TestBinaryFidelity</code>, runs on every platform's CI). <code>stdout</code> needs separate handling: the MinGW/UCRT CRT opens the standard streams in TEXT mode by default, independently of any <code>fopen</code> flag, silently rewriting every <code>\n</code> a compiled program prints to <code>\r\n</code> — handled in <code>festina_runtime_init()</code> (<code>_setmode(_fileno(stdout), _O_BINARY)</code>, <code>#ifdef _WIN32</code>, a no-op everywhere else), called unconditionally as the first thing every compiled program's <code>main()</code> does.</li>
+        </ol>
+      </section>
+
+      <section class="doc-section" id="audio">
+        <h2>Audio <a class="anchor" href="#audio">#</a></h2>
+        <p>
+          Built on the shared 3-function device seam
+          (<code>festina_pcm_open/write/close</code>) macos.md
+          documents — the channel pool, WAV parser, mpg123 decoding,
+          and pthread use all compile under MinGW unchanged.
+        </p>
+        <p class="muted">
+          The Windows implementation is <strong>waveOut</strong>
+          (winmm — plain C, shipped with Windows since forever, no
+          COM): <code>waveOutOpen</code> per channel,
+          <code>waveOutWrite</code> of prepared <code>WAVEHDR</code>
+          blocks, and a condition variable counting free blocks
+          reproduces ALSA's blocking push exactly — the same
+          N-buffers-plus-blocking-primitive shape the macOS AudioQueue
+          shim uses (a <code>pthread_cond_t</code> here rather than a
+          semaphore, since MinGW-w64's UCRT pthreads already ship and a
+          condvar is the more direct match for the "wait until
+          <code>free_count &gt; 0</code>" shape). WASAPI is
+          deliberately not the target: it is COM-based, event-driven,
+          and buys latency Festina's <code>play()</code>/<code>stop()</code>
+          surface doesn't expose. Link: <code>-lwinmm</code>.
+        </p>
+        <p class="muted">
+          Windows always software-mixes, so — like CoreAudio — the
+          EBUSY <code>free_oldest</code> retry loop never fires. The
+          channel-pool white-box harnesses run on Windows CI as-is;
+          <code>FESTINA_AUDIO_NULL=1</code> covers end-to-end
+          play/stop/isPlaying tests with no audio device.
+        </p>
+        <p class="muted">
+          <code>windows-latest</code> CI runners have no audio device
+          at all — <code>waveOutOpen</code> fails outright
+          (<code>MMRESULT 2</code>). This is why
+          <code>FESTINA_ENABLE_WINDOWS_AUDIO=1</code> stays required:
+          un-gating audio would make every test that opens a real
+          device fail permanently in CI, not just skip.
+          <code>festina doctor</code> reports this status the same way
+          the macOS audio gate does.
+        </p>
+      </section>
+
+      <section class="doc-section" id="graphics">
+        <h2>Graphics <a class="anchor" href="#graphics">#</a></h2>
+        <p>
+          Built on the shared windowing seam
+          (<code>festina_window_open/close</code>,
+          <code>festina_window_present</code>,
+          <code>festina_window_events_wait(timeout)</code>,
+          <code>festina_window_events_drain(handler)</code> emitting
+          normalized events) macos.md documents. All drawing stays in
+          portable Cairo (MSYS2's <code>cairo</code> package), libjpeg
+          decoding unchanged (<code>libjpeg-turbo</code>).
+        </p>
+        <p class="muted">
+          The Windows layer is one C file
+          (<code>festina_runtime_window_win32.c</code> — plain C, no
+          Objective-C-style split needed):
+        </p>
+        <ul>
+          <li><strong>Window</strong>: <code>RegisterClassEx</code><wbr>/<code>CreateWindowEx</code><wbr>/<code>ShowWindow</code>, a borderless <code>WS_POPUP</code> window (no title bar/border/system menu — the same "canvas, nothing else" look the X11 and Cocoa backends both request, so the requested width/height is the client size directly on every platform); <code>WM_CLOSE</code> feeds the normalized close event by pushing CLOSE and returning 0 without calling <code>DefWindowProc</code>, letting shared code decide via <code>on close</code> and then <code>festina_window_close()</code>, exactly like the other two backends.</li>
+          <li><strong>Present</strong>: the Cairo ARGB32 image surface is exactly a 32bpp top-down DIB — <code>StretchDIBits</code> from <code>WM_PAINT</code>, no cairo-win32 backend needed (the same blit shape as the mac CGImage path, since the seam's <code>present</code> takes the image surface on every platform).</li>
+          <li><strong>Event loop</strong>: <code>events_wait(timeout)</code> is <code>MsgWaitForMultipleObjects</code> with the timer deadline as its millisecond timeout — the Win32 analog of <code>select</code> on the X connection fd and the Cocoa backend's own peek-with-timeout — and <code>events_drain</code> is the <code>PeekMessage</code><wbr>/<code>TranslateMessage</code><wbr>/<code>DispatchMessage</code> pump, which invokes the WndProc callback that pushes input into a small ring buffer (the same push-then-drain shape the Cocoa backend uses, since Win32 input, like Cocoa's, is callback-driven).</li>
+          <li><strong>Input</strong>: <code>WM_LBUTTONDOWN/UP</code>, <code>WM_MOUSEMOVE</code>, <code>WM_KEYDOWN/UP</code>. No separate <code>WM_CHAR</code> handler: <code>WM_CHAR</code> only ever fires for the down half of a press, which would leave <code>keyUp</code> unable to report the same text a matching <code>keyDown</code> did — <code>ToUnicode</code> (virtual-key code + scancode + current keyboard state) computes the identical shift-aware character synchronously, for both halves. Key names map from virtual-key codes to the shared key-name vocabulary macos.md pins. Autorepeat matches natively: <code>WM_KEYDOWN</code> repeats while held (bit 30 of <code>lParam</code> distinguishes a repeat), one <code>WM_KEYUP</code>. Left/right Shift/Control/Alt need their own scancode-based disambiguation (<code>WM_KEYDOWN</code>/<code>WM_KEYUP</code> report only the generic <code>VK_SHIFT</code>/<code>VK_CONTROL</code>/<code>VK_MENU</code> otherwise) — a standard Win32 technique.</li>
+        </ul>
+        <p class="muted">
+          Unlike macOS, GitHub's Windows runners can create real Win32
+          windows (no Xvfb equivalent needed), so windowed graphics is
+          not gated behind an env var — window creation/rendering is
+          confirmed clean on real Windows CI. Two tests that assert a
+          "no display available" error don't apply on Windows at all
+          (<code>windows-latest</code> always has a live desktop
+          session) and are skipped there rather than asserting a
+          condition that cannot occur. What remains open is narrower:
+          this project's test suite has no Windows equivalent of the
+          Xvfb-backed <code>x_display</code>/<code>xdotool</code>
+          fixtures the windowed-input tests (click/key/resize/close
+          coverage) run under, so automated confirmation that
+          keyboard/mouse/resize/close behave identically to Linux
+          against the pinned event vocabulary awaits either new
+          Windows-native test infrastructure or real hardware.
+        </p>
+      </section>
+
+      <section class="doc-section" id="packaging">
+        <h2>Packaging <a class="anchor" href="#packaging">#</a></h2>
+        <ol>
+          <li><code>scripts/package_compiler.sh</code> (bash, runs under MSYS2) detects MSYS2 via bash's own <code>OSTYPE</code> (<code>"msys"</code>): PyInstaller on Windows emits <code>festina.exe</code>, and the script's <code>--add-data</code> separator switches from <code>:</code> to <code>;</code> there (a documented PyInstaller platform difference).</li>
+          <li><strong>DLL story for compiled programs</strong>, decided per tier: <code>-static-libgcc</code> unconditionally, plus a probed static <code>-lwinpthread</code> (reusing the same <code>_can_link</code> probe-then-fallback machinery the static-sqlite path uses) whenever a program does NOT use <code>aud</code> (audio already links winpthread dynamically via its own <code>-pthread</code> flag, and stacking a second static one risks a link-order conflict). This makes a core-only program (<code>hello.exe</code>) copy-anywhere; graphics/audio programs instead ship alongside their cairo/jpeg/mpg123 DLLs, or run from an MSYS2 shell — documented in <a href="setup.html">setup.md</a>. Pinned by an <code>ldd</code>-equivalent test (<code>objdump -p | grep 'DLL Name'</code>, <code>TestOnWindows<wbr>::test_core_only<wbr>_binary_has_no<wbr>_msys2_runtime<wbr>_dll_dependency</code>), mirroring <code>TestSlimBinaries</code>.</li>
+          <li><a href="setup.html">setup.md</a> has a real Windows section — the MSYS2 environment to use (UCRT64), the pacman one-liner per feature tier, and the explicit MSVC-unsupported statement.</li>
+        </ol>
+        <p class="muted">
+          A "package and smoke-test the standalone compiler binary"
+          Windows CI step mirrors the Linux/macOS jobs' own, verifying
+          the whole chain on every push.
+        </p>
+      </section>
+
+      <section class="doc-section" id="http-websocket">
+        <h2>HTTP/WebSocket <a class="anchor" href="#http-websocket">#</a></h2>
+        <p>
+          <code>festina_runtime_http.c</code> is plain POSIX sockets
+          end to end, with no per-platform "device" abstraction the
+          way audio/graphics have — porting it means going through
+          every socket call site directly. A single file, one
+          <code>#ifdef _WIN32</code> seam near the top
+          (<code>FestinaSocket</code>, <code>FESTINA_INVALID_SOCKET</code>,
+          <code>festina_close_fd</code>,
+          <code>festina_poll</code><wbr>/<code>FestinaPollFd</code>,
+          <code>festina_socket_would_block</code><wbr>/<code>festina_socket_was_interrupted</code>),
+          mirroring <code>festina_runtime_audio.c</code>'s own
+          ALSA-vs-waveOut split (a small per-platform difference
+          handled inline) rather than a second whole-file duplicate.
+          Winsock2 differs from BSD sockets in exactly enough places to
+          matter:
+        </p>
+        <ul>
+          <li>A distinct <code>SOCKET</code> handle type, and it's unsigned — every POSIX-style <code>if (fd &lt; 0)</code> error check silently never fires on it. <code>FESTINA_INVALID_SOCKET</code> (<code>INVALID_SOCKET</code> on Windows, <code>-1</code> on POSIX) and <code>==</code> comparisons replace every such check.</li>
+          <li><code>closesocket()</code> not <code>close()</code>, <code>ioctlsocket()</code>/<code>FIONBIO</code> not <code>fcntl()</code>/<code>O_NONBLOCK</code>, <code>WSAGetLastError()</code> instead of <code>errno</code> (Winsock functions never touch the CRT's <code>errno</code> at all), and <code>recv()</code>/<code>send()</code> taking <code>char*</code>/<code>int</code> where POSIX takes <code>void*</code>/<code>size_t</code>.</li>
+          <li><code>WSAPoll()</code> not <code>poll()</code> — identical field names (<code>.fd</code>/<code>.events</code>/<code>.revents</code>) to POSIX <code>struct pollfd</code>, so one typedef swap (<code>FestinaPollFd</code>) covers every call site.</li>
+          <li>No <code>SIGPIPE</code> on Windows for a broken socket at all — <code>send()</code> just returns an error, never a signal — so the POSIX <code>signal(SIGPIPE, SIG_IGN)</code> mitigation (see <a href="security.html">security.md</a>) has nothing to mirror there; every write already checks its own return value regardless.</li>
+          <li>An explicit <code>WSAStartup()</code> is needed before any socket call, called from <code>festina_open_port</code>'s own entry point, idempotent by design (Winsock reference-counts it internally) so it's safe to call on every <code>openPort()</code>. No matching <code>WSACleanup()</code> — process exit tears everything down.</li>
+          <li><code>SO_REUSEADDR</code> has a more permissive, port-hijacking-enabling meaning on Windows than POSIX, so it is deliberately not set there at all.</li>
+        </ul>
+        <p class="muted">
+          <code>_feature_pkgs_and_flags</code>'s win32 branch links
+          <code>-lws2_32</code> (a system DLL with an import library
+          but no pkg-config file, the same shape
+          <code>winmm</code>/<code>gdi32</code>/<code>user32</code>
+          already are for audio/graphics).
+        </p>
+        <p class="muted">
+          Confirmed on real Windows CI:
+          <code>openPort()</code>/<code>on request</code>/<code>on upgrade</code>/<code>on message</code>/<code>on socketClose</code>
+          all test clean end to end — no gate needed.
+        </p>
+        <div class="callout">
+          <strong>Graceful shutdown has one Windows-specific gap.</strong>
+          Windows has no real <code>SIGTERM</code> delivery at all:
+          <code>subprocess.terminate()</code> (what <code>SIGTERM</code>
+          maps to on Windows) force-kills the process outright — exit
+          code 1, not the conventional 143, <code>on exit()</code>
+          never runs, and an in-flight connection can see a raw
+          <code>ConnectionResetError</code> rather than finishing
+          within the grace period. See
+          <a href="api.html#graceful-shutdown">api.md</a> —
+          <code>openPort()</code> itself works fine; this is a
+          narrower "abrupt shutdown skips the grace period" gap, not a
+          missing feature. <code>SIGINT</code>/Ctrl-C is registered the
+          same way on every platform and the CRT does raise it on
+          Windows, but this project's own test fixtures don't yet
+          exercise it there (Python's
+          <code>Popen.send_signal(signal.SIGINT)</code> needs the child
+          launched with <code>CREATE_NEW_PROCESS_GROUP</code> on
+          Windows, which they don't currently do) — confirming it
+          end-to-end is open work, along with giving
+          <code>SIGTERM</code>-style draining a real Windows equivalent
+          (there is no drop-in one; the nearest analog,
+          <code>SetConsoleCtrlHandler</code>'s
+          <code>CTRL_CLOSE_EVENT</code>, has a much shorter mandatory
+          response window than the 10-second grace period this project
+          uses).
+        </div>
+      </section>
+
+      <section class="doc-section" id="shared-with-macos">
+        <h2>Shared with macOS <a class="anchor" href="#shared-with-macos">#</a></h2>
+        <p class="muted">
+          The full shared-work list — the seams, the key-name
+          vocabulary, the test shims, the per-platform
+          cli/llvm_backend structure — lives in
+          <a href="macos.html#shared-with-windows">macos.md</a>'s
+          "Shared with Windows" section, kept in one place so the two
+          files don't drift.
+        </p>
+      </section>
+
+      <div class="prevnext">
+        <a class="prev" href="macos.html">
+          <span class="label">← Previous</span>
+          macOS
+        </a>
+        <a class="next" href="wasm.html">
+          <span class="label">Next →</span>
+          WebAssembly
+        </a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+  // Mobile sidebar toggle
+  const sidebar = document.getElementById('sidebar');
+  const backdrop = document.getElementById('backdrop');
+  const menuBtn = document.getElementById('menuBtn');
+  function closeSidebar() {
+    sidebar.classList.remove('open');
+    backdrop.classList.remove('open');
+  }
+  menuBtn.addEventListener('click', () => {
+    sidebar.classList.toggle('open');
+    backdrop.classList.toggle('open');
+  });
+  backdrop.addEventListener('click', closeSidebar);
+  document.getElementById('toc').addEventListener('click', (e) => {
+    if (e.target.tagName === 'A') closeSidebar();
+  });
+
+  // Sidebar filter
+  const filterBox = document.getElementById('navFilter');
+  filterBox.addEventListener('input', () => {
+    const q = filterBox.value.trim().toLowerCase();
+    document.querySelectorAll('#toc a').forEach(a => {
+      const match = !q || a.textContent.toLowerCase().includes(q);
+      a.dataset.hidden = match ? 'false' : 'true';
+    });
+    document.querySelectorAll('.nav-group').forEach(g => {
+      const anyVisible = [...g.querySelectorAll('a')].some(a => a.dataset.hidden !== 'true');
+      g.style.display = anyVisible ? '' : 'none';
+    });
+  });
+
+  // Scrollspy: highlight the section currently at the top of the
+  // viewport. Deliberately a single scroll-driven calculation (not an
+  // IntersectionObserver) so there's exactly one source of truth -- no
+  // risk of two independent observers racing each other for a short
+  // final section that a fixed rootMargin band might otherwise miss.
+  const anchors = [...document.querySelectorAll('#toc a')];
+  const byId = Object.fromEntries(anchors.map(a => [a.getAttribute('href').slice(1), a]));
+  const targets = [...document.querySelectorAll('main [id]')]
+    .filter(t => byId[t.id])
+    .map(t => ({ id: t.id, el: t }));
+
+  let ticking = false;
+  function updateActive() {
+    ticking = false;
+    const offset = 80; // matches scroll-margin-top on headings
+    const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2;
+    let currentId = targets.length ? targets[0].id : null;
+    if (atBottom) {
+      currentId = targets[targets.length - 1].id;
+    } else {
+      for (const t of targets) {
+        if (t.el.getBoundingClientRect().top <= offset) currentId = t.id;
+        else break;
+      }
+    }
+    anchors.forEach(a => a.classList.remove('active'));
+    if (currentId && byId[currentId]) byId[currentId].classList.add('active');
+  }
+  function onScroll() {
+    if (!ticking) {
+      ticking = true;
+      requestAnimationFrame(updateActive);
+    }
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll);
+  updateActive();
+</script>
+
+
+</body>
+</html>

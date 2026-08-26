@@ -1,0 +1,640 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security — Festina</title>
+<meta name="description" content="Festina's security posture: attack surface, memory safety, and slim-by-default binaries.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23e8823a'/%3E%3Ctext x='50' y='68' font-size='60' font-family='monospace' font-weight='700' text-anchor='middle' fill='%231a1712'%3Ef%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #fbf9f6;
+    --bg-raised: #ffffff;
+    --bg-sunken: #f1ede6;
+    --text: #211c14;
+    --text-muted: #6b6252;
+    --border: #e4ddd0;
+    --accent: #c15f1e;
+    --accent-strong: #a84f16;
+    --accent-soft: #fbe6d3;
+    --code-bg: #221d16;
+    --code-text: #f2ead9;
+    --code-muted: #9a8f78;
+    --code-string: #d99a5b;
+    --code-keyword: #e8823a;
+    --code-comment: #7d745f;
+    --shadow: 0 1px 2px rgba(35, 25, 10, 0.06), 0 8px 24px rgba(35, 25, 10, 0.05);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #17140f;
+      --bg-raised: #1f1b14;
+      --bg-sunken: #14110c;
+      --text: #f2ead9;
+      --text-muted: #a89c84;
+      --border: #332c20;
+      --accent: #f0904f;
+      --accent-strong: #f7a86b;
+      --accent-soft: #3a2814;
+      --code-bg: #0f0d09;
+      --code-text: #f2ead9;
+      --code-muted: #8a7f68;
+      --code-string: #e8b47c;
+      --code-keyword: #f0904f;
+      --code-comment: #6b6250;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #17140f;
+    --bg-raised: #1f1b14;
+    --bg-sunken: #14110c;
+    --text: #f2ead9;
+    --text-muted: #a89c84;
+    --border: #332c20;
+    --accent: #f0904f;
+    --accent-strong: #f7a86b;
+    --accent-soft: #3a2814;
+    --code-bg: #0f0d09;
+    --code-text: #f2ead9;
+    --code-muted: #8a7f68;
+    --code-string: #e8b47c;
+    --code-keyword: #f0904f;
+    --code-comment: #6b6250;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent-strong); }
+  code, pre, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+
+  code:not(pre code) {
+    background: var(--bg-sunken);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.1em 0.35em;
+    font-size: 0.87em;
+  }
+
+  /* Top bar */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 56px;
+    padding: 0 16px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    font-size: 1.02rem;
+    color: var(--text);
+    text-decoration: none;
+  }
+  .brand .mark {
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    background: var(--accent);
+    color: #1a1508;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: monospace;
+    font-weight: 800;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+  }
+  .brand .sep { color: var(--text-muted); font-weight: 400; }
+  .topbar-links {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    font-size: 0.88rem;
+  }
+  .topbar-links a { color: var(--text-muted); text-decoration: none; }
+  .topbar-links a:hover { color: var(--text); }
+  .menu-btn {
+    display: none;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+
+  /* Layout */
+  .layout {
+    display: grid;
+    grid-template-columns: 260px minmax(0, 1fr);
+    max-width: 1280px;
+    margin: 0 auto;
+  }
+
+  /* Sidebar */
+  aside.sidebar {
+    position: sticky;
+    top: 56px;
+    align-self: start;
+    height: calc(100vh - 56px);
+    overflow-y: auto;
+    padding: 24px 16px 40px;
+    border-right: 1px solid var(--border);
+  }
+  .search-box {
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg-raised);
+    color: var(--text);
+    font-size: 0.85rem;
+    margin-bottom: 16px;
+  }
+  .search-box:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .nav-group { margin-bottom: 4px; }
+  .nav-group-title {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin: 18px 0 6px;
+    padding: 0 10px;
+  }
+  .nav-group:first-of-type .nav-group-title { margin-top: 0; }
+  nav.toc a {
+    display: block;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 0.87rem;
+    color: var(--text-muted);
+    text-decoration: none;
+    line-height: 1.35;
+  }
+  nav.toc a:hover { background: var(--bg-sunken); color: var(--text); }
+  nav.toc a.active {
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-weight: 600;
+  }
+  nav.toc a.sub {
+    padding-left: 22px;
+    font-size: 0.83rem;
+  }
+  nav.toc a[data-hidden="true"] { display: none; }
+
+  /* Main content */
+  main {
+    min-width: 0;
+    padding: 40px 32px 100px;
+  }
+  .content-wrap { max-width: 720px; }
+
+  .page-kicker {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--accent-strong);
+    font-weight: 700;
+    margin: 0 0 8px;
+  }
+  h1.page-title {
+    font-size: 2rem;
+    margin: 0 0 12px;
+    letter-spacing: -0.02em;
+  }
+  .lede {
+    color: var(--text-muted);
+    font-size: 1.02rem;
+    max-width: 640px;
+    margin: 0 0 8px;
+  }
+
+  section.doc-section {
+    padding-top: 40px;
+    margin-top: 24px;
+    border-top: 1px solid var(--border);
+    scroll-margin-top: 72px;
+  }
+  section.doc-section:first-of-type { border-top: none; }
+  h2 {
+    font-size: 1.4rem;
+    margin: 0 0 12px;
+    letter-spacing: -0.01em;
+    scroll-margin-top: 72px;
+  }
+  h3 {
+    font-size: 1.05rem;
+    margin: 28px 0 10px;
+    scroll-margin-top: 72px;
+  }
+  h4 {
+    font-size: 0.92rem;
+    margin: 22px 0 8px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  h2 .anchor, h3 .anchor {
+    opacity: 0;
+    text-decoration: none;
+    color: var(--text-muted);
+    font-size: 0.85em;
+    margin-left: 6px;
+  }
+  h2:hover .anchor, h3:hover .anchor { opacity: 1; }
+
+  p { margin: 0 0 14px; color: var(--text); }
+  p.muted { color: var(--text-muted); }
+
+  pre.code {
+    background: var(--code-bg);
+    color: var(--code-text);
+    border-radius: 10px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    line-height: 1.6;
+    box-shadow: var(--shadow);
+    margin: 0 0 16px;
+  }
+  pre.code .kw { color: var(--code-keyword); }
+  pre.code .str { color: var(--code-string); }
+  pre.code .re { color: var(--code-string); opacity: 0.85; }
+  pre.code .cm { color: var(--code-comment); font-style: italic; }
+  pre.code .mut { color: var(--code-muted); }
+
+  .callout {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 0.92rem;
+    color: var(--text-muted);
+    margin: 0 0 16px;
+  }
+  .callout strong { color: var(--text); }
+
+  .table-wrap {
+    overflow-x: auto;
+    border-radius: 10px;
+    margin: 0 0 16px;
+  }
+  .table-wrap .sig-table { margin: 0; }
+  .sig-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    margin: 0 0 16px;
+  }
+  .sig-table td {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .sig-table td:first-child {
+    white-space: nowrap;
+    font-family: monospace;
+    color: var(--accent-strong);
+  }
+
+  .version-badge {
+    display: inline-block;
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-weight: 700;
+    font-size: 0.85rem;
+    padding: 2px 10px;
+    border-radius: 999px;
+    margin-right: 10px;
+    vertical-align: middle;
+  }
+  .version-date {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    font-weight: 400;
+    vertical-align: middle;
+  }
+  ul.changes { margin: 0 0 16px; padding-left: 20px; }
+  ul.changes li { margin-bottom: 6px; }
+
+  .prevnext {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+  }
+  .prevnext a {
+    flex: 1;
+    text-decoration: none;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    color: var(--text);
+  }
+  .prevnext a:hover { border-color: var(--accent); }
+  .prevnext .label { display: block; font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+  .prevnext .next { text-align: right; }
+
+  @media (max-width: 880px) {
+    .layout { grid-template-columns: 1fr; }
+    .menu-btn { display: inline-block; }
+    aside.sidebar {
+      position: fixed;
+      top: 56px;
+      left: 0;
+      width: 280px;
+      max-width: 85vw;
+      background: var(--bg);
+      z-index: 30;
+      transform: translateX(-100%);
+      transition: transform 0.18s ease;
+      box-shadow: var(--shadow);
+    }
+    aside.sidebar.open { transform: translateX(0); }
+    .sidebar-backdrop {
+      display: none;
+      position: fixed;
+      inset: 56px 0 0 0;
+      background: rgba(0,0,0,0.35);
+      z-index: 25;
+    }
+    .sidebar-backdrop.open { display: block; }
+    main { padding: 32px 20px 80px; }
+    .topbar-links a.hide-narrow { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex; align-items:center; gap:8px;">
+    <button class="menu-btn" id="menuBtn" aria-label="Toggle navigation">☰ Menu</button>
+    <a class="brand" href="index.html"><span class="mark">f</span> Festina <span class="sep">/ Docs</span></a>
+  </div>
+  <div class="topbar-links">
+    <a class="hide-narrow" href="index.html#docs">All docs</a>
+    <a href="https://github.com/uraikus/festina">GitHub</a>
+  </div>
+</div>
+
+<div class="sidebar-backdrop" id="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…">
+    <nav class="toc" id="toc">
+      <div class="nav-group">
+        <a href="#reporting-a-vulnerability">Reporting a vulnerability</a>
+        <a href="#attack-surface">Attack surface</a>
+        <a href="#standing-properties">Standing properties</a>
+        <a href="#memory-safety">Memory safety</a>
+        <a href="#slim-binaries">Slim binaries</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="content-wrap">
+      <p class="page-kicker">Security</p>
+      <h1 class="page-title">Security posture</h1>
+      <p class="lede">
+        Festina compiles to native executables and links a C runtime —
+        the two places a memory-safety or supply-chain issue would
+        actually bite. This page describes the current security
+        posture: the attack surface a compiled program has, the
+        properties the implementation maintains, and how they are
+        verified. The full round-by-round audit and design record
+        lives in
+        <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md</a>
+        and
+        <a href="https://github.com/uraikus/festina/blob/main/tests/CONTRACT.md">tests/CONTRACT.md</a>;
+        this page is the state of the product.
+      </p>
+
+      <section class="doc-section" id="reporting-a-vulnerability">
+        <h2>Reporting a vulnerability <a class="anchor" href="#reporting-a-vulnerability">#</a></h2>
+        <p>
+          Open an issue on the
+          <a href="https://github.com/uraikus/festina">repository</a>
+          describing the problem and, if possible, a minimal Festina
+          program (or runtime input) that reproduces it. There is no
+          dedicated security contact or embargoed-disclosure program;
+          the project is young, and that process will grow if it needs
+          to.
+        </p>
+      </section>
+
+      <section class="doc-section" id="attack-surface">
+        <h2>Attack surface of a compiled program <a class="anchor" href="#attack-surface">#</a></h2>
+        <p>A Festina program's external interfaces are exactly:</p>
+        <ul>
+          <li><strong>The local filesystem</strong> — its SQLite database (<code>festina.sqlite</code>, or <code>DatabaseURL</code>), and any path a <code>blob</code>/<code>img</code>/<code>aud</code> is declared from or <code>save</code>d to. Paths are ordinary text expressions; a program that lets untrusted input choose them has the same exposure as any native program doing the same.</li>
+          <li><strong>The process environment</strong> — <code>environment.NAME</code> is a read-only <code>getenv()</code> wrapper with no parsing of the result.</li>
+          <li><strong>The local X server and ALSA device</strong>, only for programs that actually use graphics or audio — and only those programs link the libraries at all (see <a href="#slim-binaries">Slim binaries</a> below).</li>
+          <li><strong>The network</strong>, for a program that calls <code>openPort()</code> — the one genuinely new external interface this language has, and the first that lets <em>remote, untrusted</em> input reach a compiled program at all (<code>environment</code>/the filesystem above are both local-attacker-only). A program that never calls <code>openPort()</code> gets none of this: <code>festina_runtime_http.c</code> (the HTTP/WebSocket implementation) is linked only when it's actually used, the same per-feature splitting graphics/audio already get (see <a href="#slim-binaries">Slim binaries</a> below). The reverse direction exists too: <code>req.send()</code> (zero arguments) makes a real <em>outbound</em> HTTP/HTTPS connection to whatever <code>req.url</code> names — a program that builds that URL (or the body/headers sent with it) from untrusted input has the same SSRF/data-exfiltration exposure any other language's own outbound-HTTP client would; this runtime does no allowlisting of hosts on its own.</li>
+        </ul>
+        <p>
+          This is a real, structural change from every other builtin:
+          <code>req.url</code>/<code>req.method</code>/<code>req.headers</code>/a
+          WebSocket frame's own payload are the <em>first</em> values
+          in this language that originate entirely from an untrusted,
+          remote party by design, not merely something a local user
+          could feed a program that also happens to read stdin/argv.
+          Concretely:
+        </p>
+        <ul>
+          <li><strong>No TLS.</strong> <code>openPort()</code> is plain HTTP/WebSocket, no certificate, no encryption — traffic is inspectable and modifiable by anything on the network path. A program handling anything sensitive needs a TLS-terminating reverse proxy in front of it, or <code>openSecurePort()</code> (mbedTLS-backed); neither claims to be a hardened public-facing server on its own. <code>req.headers</code>/<code>req.toText()</code>/etc. are exactly as trustworthy as whatever sent them — this language does no authentication, does no input validation of its own, and never will (that's the PROGRAM'S job, using the ordinary building blocks — <code>regex</code>, <code>.replace()</code>, string comparison — every other kind of untrusted text already has).</li>
+          <li><strong>Single-threaded, one request at a time</strong> (see <a href="api.html#http-and-websocket-servers">api.md</a>) — a slow or hung <code>on request</code>/<code>on message</code> handler denies service to every OTHER connection for as long as it runs. This is a real, structural availability property of the design (not a bug to be fixed later), and matters most for a program whose handler does slow work (a large <code>sqlite()</code> query, a big JSON render) in the request path. A <code>callback</code>-carrying outbound <code>req.send()</code> and background <code>blob</code> loading (<code>.callback()</code> on a text path expression) are both narrow, deliberate exceptions at the OS-process level — small background thread pools do the actual network/file I/O — but every piece of GENERATED FESTINA CODE, including either callback, still runs on that same single main thread; this bullet's own claim about <code>on request</code>/<code>on message</code> handlers is unaffected by either, and no Festina-visible global/refcount ever becomes something a program has to reason about concurrently. <code>openPort()</code> may be combined with graphics — a program that does both blocks in the graphics event loop, which also services the open port, so a slow <code>on mouseDown</code>/<code>on request</code> handler denies service to EITHER side while it runs, not just its own; and Ctrl-C/SIGTERM on such a program skips the standalone server's own graceful-shutdown grace period entirely (see api.md's own <a href="api.html#http-limitations">HTTP Limitations</a>) — a documented gap, not a silent one.</li>
+          <li><strong>An 8MB per-connection buffer cap</strong> (request line + headers + body, or one WebSocket frame's payload) bounds a single connection's own memory use, but this runtime does not limit the NUMBER of concurrent connections at all — many simultaneous connections, each near the cap, could still exhaust memory. No rate limiting of any kind exists; a program facing genuinely hostile traffic needs that in front of it (a reverse proxy, a firewall), the same way any other minimal server implementation would. Keep-alive means a connection can legitimately stay open with no request in flight at all (waiting to be reused) — the cap above still applies to whatever a connection is actually buffering, and an idle keep-alive connection is closed automatically after ~15 seconds of nobody using it (see api.md's own <a href="api.html#http-keep-alive">Keep-alive</a> section), so this doesn't add an unbounded-lifetime connection to the list above; it does mean a client that opens many connections and sends just enough on each to avoid the idle timeout can hold more connections open for longer than a plain one-request-then-close server would — the same reverse-proxy/firewall answer above still applies to a client doing that on purpose. WebSocket fragmentation reassembly uses a SEPARATE accumulator from the per-frame cap above (each wire frame is fully consumed out of the connection's own read buffer as soon as it's parsed, so that buffer's cap alone would never bound a message reassembled from many small frames) — explicitly capped at the same 8MB, closing the connection with WebSocket code 1009 ("Message Too Big") if a peer tries to exceed it, rather than growing without bound.</li>
+          <li><strong>The request parser</strong> (HTTP/1.1 headers, chunked-transfer-encoding bodies, WebSocket frames and fragmentation reassembly) is hand-written C parsing untrusted bytes — the single largest category of memory-unsafety risk this language has, audited and stress-tested (ASan + LeakSanitizer, including abrupt-disconnect and malformed-input cases) but, unlike SQLite/Cairo/libjpeg/libmpg123 elsewhere in this runtime, not a widely-deployed, independently-hardened third-party implementation. Treat it with the same caution any from-scratch network-facing parser deserves. A malformed request line closes the connection and frees its resources properly, the same as any other rejected connection.</li>
+        </ul>
+        <p class="muted">
+          Every other builtin's own external interface (filesystem,
+          <code>environment</code>, X11/ALSA) is unchanged: still
+          local-attacker-only, still covered by everything below.
+        </p>
+      </section>
+
+      <section class="doc-section" id="standing-properties">
+        <h2>Standing properties <a class="anchor" href="#standing-properties">#</a></h2>
+        <p>
+          Verified properties of the implementation, with the reasoning
+          that makes each structural rather than incidental:
+        </p>
+        <ul>
+          <li><strong>No SQL injection via identifiers.</strong> Table and column names are embedded into generated SQL (SQL cannot parameterize identifiers), but the lexer's <code>IDENT</code> grammar (<code>[A-Za-z_][A-Za-z0-9_]*</code>) cannot produce a quote, semicolon, or any other metacharacter — there is no Festina syntax that could smuggle a payload. Query <strong>values</strong> are always parameterized through <code>sqlite3_bind_*</code>, including the byte buffers of <code>blob</code>/<code>img</code>/<code>aud</code> parameters.</li>
+          <li><strong>No format-string vulnerabilities.</strong> Untrusted text flows into <code>printf</code>-family calls throughout the runtime (<code>log()</code>, <code>fail()</code>, error messages), and every one passes it as a <code>%s</code> <em>argument</em>, never as the format string.</li>
+          <li><strong>No hand-rolled deserialization.</strong> Query results are read through SQLite's typed column API; media decoding is delegated to Cairo, libjpeg, and libmpg123 rather than reimplemented.</li>
+          <li><strong>Regex is POSIX ERE from libc</strong> (<code>&lt;regex.h&gt;</code>) — no bundled engine to maintain, and pattern compilation failures are clean runtime errors.</li>
+          <li><strong>Database durability model</strong>: the database opens in WAL mode with <code>synchronous=NORMAL</code> — transactions survive an application crash unconditionally; an OS crash or power loss can lose the most recent commits but can never corrupt the file. This is the standard application-embedded SQLite configuration.</li>
+          <li><strong>Schema-sync SQL generation is overflow-checked.</strong> <code>festina_sync_table</code> builds SQL by accumulating into a fixed-size stack buffer; every accumulation step is bounds-checked (<code>festina_check_sql_buffer</code>), and an oversized schema fails loudly instead of overflowing that buffer.</li>
+          <li><strong><code>SIGPIPE</code> is ignored for the lifetime of a process using <code>openPort()</code>.</strong> Writing to a connection the peer has already reset or closed early raises <code>SIGPIPE</code>, whose default disposition terminates the whole process with no error message at all — ignoring it turns that into an ordinary, already-handled write failure (every write already checks its own return value, <code>-1</code>/<code>errno == EPIPE</code>, wherever it matters) instead of a one-line remote denial of service. Windows has no equivalent exposure in the first place: winsock2 has no <code>SIGPIPE</code> for a broken socket at all — <code>send()</code> just returns an error — so this is a Linux/macOS-specific mitigation for a Linux/macOS-specific signal.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="memory-safety">
+        <h2>Memory safety <a class="anchor" href="#memory-safety">#</a></h2>
+        <p>
+          The memory model is escape analysis plus reference counting,
+          with cycle collection by trial deletion for the types that
+          can form one, and <code>free</code>/<code>delete</code> as
+          explicit overrides — continuously exercised under
+          AddressSanitizer, LeakSanitizer and (for the audio thread
+          pool) ThreadSanitizer.
+          <a href="https://github.com/uraikus/festina/blob/main/scripts/leak_stress.sh">scripts/leak_stress.sh</a>
+          runs eleven mixed churn programs (background
+          <code>.callback()</code> loading for
+          <code>blob</code>/<code>img</code>/<code>aud</code>, nested
+          <code>.toStruct()</code>/<code>.toArr()</code> JSON parsing,
+          ternary-branch ownership, <code>amor arr[T]</code>'s
+          amortized growth, and both <code>enum</code> representations,
+          among others) plus one isolation program per data type on
+          every test run, and a canary test proves the harness itself
+          can fail.
+        </p>
+        <p>
+          The knowingly accepted gaps, none of which is remotely
+          triggerable and each of which is a <strong>leak or a
+          documented manual contract, not corruption</strong>:
+        </p>
+        <ul>
+          <li><strong>Array indexing is not bounds-checked</strong> — a deliberate performance choice, documented with its rationale in <a href="api.html#indexing-is-not-bounds-checked">api.md</a>. An out-of-range index in Festina source can read or write out of bounds in the compiled program. This is the one place where a bug in <em>your</em> Festina code has C-like consequences; the index is never attacker-supplied unless your program makes it so.</li>
+          <li><strong><code>free</code> is a decrement on every managed pointer type</strong> — <code>struct</code>, <code>arr</code>, <code>map</code>, <code>blob</code>, <code>img</code>, <code>aud</code>, and <code>regex</code> all carry the same refcount header, so a shared value survives a <code>free</code> through one binding and an alias never dangles. (A <code>text</code> binding always owns its buffer exclusively — copy-on-alias — so freeing it outright is equally safe.) Every runtime release is null-safe, so double-<code>free</code> through a binding is a no-op.</li>
+          <li><strong>One row-array chain shape leaks</strong> (<code>rows()[0]</code> on a call-result array of query rows) — see <a href="todo.html#memory-model">todo.md</a>. A leak, never use-after-free; tests pin that distinction so an "optimization" cannot silently trade one for the other. Reference cycles are collected by trial deletion — a reachable cycle is provably restored intact, so the collector cannot be tricked into freeing live data by a cycle that is still held.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="slim-binaries">
+        <h2>Slim binaries <a class="anchor" href="#slim-binaries">#</a></h2>
+        <p>
+          A compiled program links only what it uses. The runtime is
+          split into core / graphics (Cairo, X11, libjpeg) / audio
+          (ALSA, libmpg123) / http (plain POSIX sockets on
+          Linux/macOS, winsock2 on Windows; no third-party library on
+          any platform) / https (<code>openSecurePort()</code> only,
+          mbedTLS) translation units, and the compiler puts a feature's
+          object file and libraries on the link line only when the
+          program actually exercises it — a <code>log('hello')</code>
+          program links none of them. Fewer resident libraries is a
+          smaller patch surface for any deployment, independent of
+          whether a specific library has a known issue today.
+          Regression-tested via <code>ldd</code> on real compiled
+          binaries for all four graphics/audio combinations
+          (<code>tests/test_codegen.py::TestSlimBinaries</code>).
+        </p>
+      </section>
+
+      <div class="prevnext">
+        <a class="prev" href="wasm.html">
+          <span class="label">← Previous</span>
+          WebAssembly (wasm32-wasi)
+        </a>
+        <a class="next" href="benchmark.html">
+          <span class="label">Next →</span>
+          Benchmarks
+        </a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+  // Mobile sidebar toggle
+  const sidebar = document.getElementById('sidebar');
+  const backdrop = document.getElementById('backdrop');
+  const menuBtn = document.getElementById('menuBtn');
+  function closeSidebar() {
+    sidebar.classList.remove('open');
+    backdrop.classList.remove('open');
+  }
+  menuBtn.addEventListener('click', () => {
+    sidebar.classList.toggle('open');
+    backdrop.classList.toggle('open');
+  });
+  backdrop.addEventListener('click', closeSidebar);
+  document.getElementById('toc').addEventListener('click', (e) => {
+    if (e.target.tagName === 'A') closeSidebar();
+  });
+
+  // Sidebar filter
+  const filterBox = document.getElementById('navFilter');
+  filterBox.addEventListener('input', () => {
+    const q = filterBox.value.trim().toLowerCase();
+    document.querySelectorAll('#toc a').forEach(a => {
+      const match = !q || a.textContent.toLowerCase().includes(q);
+      a.dataset.hidden = match ? 'false' : 'true';
+    });
+    document.querySelectorAll('.nav-group').forEach(g => {
+      const anyVisible = [...g.querySelectorAll('a')].some(a => a.dataset.hidden !== 'true');
+      g.style.display = anyVisible ? '' : 'none';
+    });
+  });
+
+  // Scrollspy: highlight the section currently at the top of the
+  // viewport. Deliberately a single scroll-driven calculation (not an
+  // IntersectionObserver) so there's exactly one source of truth -- no
+  // risk of two independent observers racing each other for a short
+  // final section that a fixed rootMargin band might otherwise miss.
+  const anchors = [...document.querySelectorAll('#toc a')];
+  const byId = Object.fromEntries(anchors.map(a => [a.getAttribute('href').slice(1), a]));
+  const targets = [...document.querySelectorAll('main [id]')]
+    .filter(t => byId[t.id])
+    .map(t => ({ id: t.id, el: t }));
+
+  let ticking = false;
+  function updateActive() {
+    ticking = false;
+    const offset = 80; // matches scroll-margin-top on headings
+    const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2;
+    let currentId = targets.length ? targets[0].id : null;
+    if (atBottom) {
+      currentId = targets[targets.length - 1].id;
+    } else {
+      for (const t of targets) {
+        if (t.el.getBoundingClientRect().top <= offset) currentId = t.id;
+        else break;
+      }
+    }
+    anchors.forEach(a => a.classList.remove('active'));
+    if (currentId && byId[currentId]) byId[currentId].classList.add('active');
+  }
+  function onScroll() {
+    if (!ticking) {
+      ticking = true;
+      requestAnimationFrame(updateActive);
+    }
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll);
+  updateActive();
+</script>
+
+
+</body>
+</html>

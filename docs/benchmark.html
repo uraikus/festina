@@ -1,0 +1,858 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmarks — Festina</title>
+<meta name="description" content="Festina vs. Rust, Go, and Bun on process startup, compute, allocation, string concatenation, canvas drawing, and HTTP throughput.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23e8823a'/%3E%3Ctext x='50' y='68' font-size='60' font-family='monospace' font-weight='700' text-anchor='middle' fill='%231a1712'%3Ef%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #fbf9f6;
+    --bg-raised: #ffffff;
+    --bg-sunken: #f1ede6;
+    --text: #211c14;
+    --text-muted: #6b6252;
+    --border: #e4ddd0;
+    --accent: #c15f1e;
+    --accent-strong: #a84f16;
+    --accent-soft: #fbe6d3;
+    --code-bg: #221d16;
+    --code-text: #f2ead9;
+    --code-muted: #9a8f78;
+    --code-string: #d99a5b;
+    --code-keyword: #e8823a;
+    --code-comment: #7d745f;
+    --shadow: 0 1px 2px rgba(35, 25, 10, 0.06), 0 8px 24px rgba(35, 25, 10, 0.05);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #17140f;
+      --bg-raised: #1f1b14;
+      --bg-sunken: #14110c;
+      --text: #f2ead9;
+      --text-muted: #a89c84;
+      --border: #332c20;
+      --accent: #f0904f;
+      --accent-strong: #f7a86b;
+      --accent-soft: #3a2814;
+      --code-bg: #0f0d09;
+      --code-text: #f2ead9;
+      --code-muted: #8a7f68;
+      --code-string: #e8b47c;
+      --code-keyword: #f0904f;
+      --code-comment: #6b6250;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #17140f;
+    --bg-raised: #1f1b14;
+    --bg-sunken: #14110c;
+    --text: #f2ead9;
+    --text-muted: #a89c84;
+    --border: #332c20;
+    --accent: #f0904f;
+    --accent-strong: #f7a86b;
+    --accent-soft: #3a2814;
+    --code-bg: #0f0d09;
+    --code-text: #f2ead9;
+    --code-muted: #8a7f68;
+    --code-string: #e8b47c;
+    --code-keyword: #f0904f;
+    --code-comment: #6b6250;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent-strong); }
+  code, pre, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+
+  code:not(pre code) {
+    background: var(--bg-sunken);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.1em 0.35em;
+    font-size: 0.87em;
+  }
+
+  /* Top bar */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 56px;
+    padding: 0 16px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    font-size: 1.02rem;
+    color: var(--text);
+    text-decoration: none;
+  }
+  .brand .mark {
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    background: var(--accent);
+    color: #1a1508;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: monospace;
+    font-weight: 800;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+  }
+  .brand .sep { color: var(--text-muted); font-weight: 400; }
+  .topbar-links {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    font-size: 0.88rem;
+  }
+  .topbar-links a { color: var(--text-muted); text-decoration: none; }
+  .topbar-links a:hover { color: var(--text); }
+  .menu-btn {
+    display: none;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+
+  /* Layout */
+  .layout {
+    display: grid;
+    grid-template-columns: 260px minmax(0, 1fr);
+    max-width: 1280px;
+    margin: 0 auto;
+  }
+
+  /* Sidebar */
+  aside.sidebar {
+    position: sticky;
+    top: 56px;
+    align-self: start;
+    height: calc(100vh - 56px);
+    overflow-y: auto;
+    padding: 24px 16px 40px;
+    border-right: 1px solid var(--border);
+  }
+  .search-box {
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg-raised);
+    color: var(--text);
+    font-size: 0.85rem;
+    margin-bottom: 16px;
+  }
+  .search-box:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .nav-group { margin-bottom: 4px; }
+  .nav-group-title {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin: 18px 0 6px;
+    padding: 0 10px;
+  }
+  .nav-group:first-of-type .nav-group-title { margin-top: 0; }
+  nav.toc a {
+    display: block;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 0.87rem;
+    color: var(--text-muted);
+    text-decoration: none;
+    line-height: 1.35;
+  }
+  nav.toc a:hover { background: var(--bg-sunken); color: var(--text); }
+  nav.toc a.active {
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-weight: 600;
+  }
+  nav.toc a.sub {
+    padding-left: 22px;
+    font-size: 0.83rem;
+  }
+  nav.toc a[data-hidden="true"] { display: none; }
+
+  /* Main content */
+  main {
+    min-width: 0;
+    padding: 40px 32px 100px;
+  }
+  .content-wrap { max-width: 720px; }
+
+  .page-kicker {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--accent-strong);
+    font-weight: 700;
+    margin: 0 0 8px;
+  }
+  h1.page-title {
+    font-size: 2rem;
+    margin: 0 0 12px;
+    letter-spacing: -0.02em;
+  }
+  .lede {
+    color: var(--text-muted);
+    font-size: 1.02rem;
+    max-width: 640px;
+    margin: 0 0 8px;
+  }
+
+  section.doc-section {
+    padding-top: 40px;
+    margin-top: 24px;
+    border-top: 1px solid var(--border);
+    scroll-margin-top: 72px;
+  }
+  section.doc-section:first-of-type { border-top: none; }
+  h2 {
+    font-size: 1.4rem;
+    margin: 0 0 12px;
+    letter-spacing: -0.01em;
+    scroll-margin-top: 72px;
+  }
+  h3 {
+    font-size: 1.05rem;
+    margin: 28px 0 10px;
+    scroll-margin-top: 72px;
+  }
+  h4 {
+    font-size: 0.92rem;
+    margin: 22px 0 8px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  h2 .anchor, h3 .anchor {
+    opacity: 0;
+    text-decoration: none;
+    color: var(--text-muted);
+    font-size: 0.85em;
+    margin-left: 6px;
+  }
+  h2:hover .anchor, h3:hover .anchor { opacity: 1; }
+
+  p { margin: 0 0 14px; color: var(--text); }
+  p.muted { color: var(--text-muted); }
+
+  pre.code {
+    background: var(--code-bg);
+    color: var(--code-text);
+    border-radius: 10px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    line-height: 1.6;
+    box-shadow: var(--shadow);
+    margin: 0 0 16px;
+  }
+  pre.code .kw { color: var(--code-keyword); }
+  pre.code .str { color: var(--code-string); }
+  pre.code .re { color: var(--code-string); opacity: 0.85; }
+  pre.code .cm { color: var(--code-comment); font-style: italic; }
+  pre.code .mut { color: var(--code-muted); }
+
+  .callout {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 0.92rem;
+    color: var(--text-muted);
+    margin: 0 0 16px;
+  }
+  .callout strong { color: var(--text); }
+
+  .table-wrap {
+    overflow-x: auto;
+    border-radius: 10px;
+    margin: 0 0 16px;
+  }
+  .table-wrap .sig-table { margin: 0; }
+  .sig-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    margin: 0 0 16px;
+  }
+  .sig-table td {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .sig-table td:first-child {
+    white-space: nowrap;
+    font-family: monospace;
+    color: var(--accent-strong);
+  }
+
+  .version-badge {
+    display: inline-block;
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-weight: 700;
+    font-size: 0.85rem;
+    padding: 2px 10px;
+    border-radius: 999px;
+    margin-right: 10px;
+    vertical-align: middle;
+  }
+  .version-date {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    font-weight: 400;
+    vertical-align: middle;
+  }
+  ul.changes { margin: 0 0 16px; padding-left: 20px; }
+  ul.changes li { margin-bottom: 6px; }
+
+  .prevnext {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+  }
+  .prevnext a {
+    flex: 1;
+    text-decoration: none;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    color: var(--text);
+  }
+  .prevnext a:hover { border-color: var(--accent); }
+  .prevnext .label { display: block; font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+  .prevnext .next { text-align: right; }
+
+  @media (max-width: 880px) {
+    .layout { grid-template-columns: 1fr; }
+    .menu-btn { display: inline-block; }
+    aside.sidebar {
+      position: fixed;
+      top: 56px;
+      left: 0;
+      width: 280px;
+      max-width: 85vw;
+      background: var(--bg);
+      z-index: 30;
+      transform: translateX(-100%);
+      transition: transform 0.18s ease;
+      box-shadow: var(--shadow);
+    }
+    aside.sidebar.open { transform: translateX(0); }
+    .sidebar-backdrop {
+      display: none;
+      position: fixed;
+      inset: 56px 0 0 0;
+      background: rgba(0,0,0,0.35);
+      z-index: 25;
+    }
+    .sidebar-backdrop.open { display: block; }
+    main { padding: 32px 20px 80px; }
+    .topbar-links a.hide-narrow { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex; align-items:center; gap:8px;">
+    <button class="menu-btn" id="menuBtn" aria-label="Toggle navigation">☰ Menu</button>
+    <a class="brand" href="index.html"><span class="mark">f</span> Festina <span class="sep">/ Docs</span></a>
+  </div>
+  <div class="topbar-links">
+    <a class="hide-narrow" href="index.html#docs">All docs</a>
+    <a href="https://github.com/uraikus/festina">GitHub</a>
+  </div>
+</div>
+
+<div class="sidebar-backdrop" id="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…">
+    <nav class="toc" id="toc">
+      <div class="nav-group">
+        <a href="#methodology">Methodology</a>
+        <a href="#results">Results</a>
+        <a href="#reading-these-numbers">Reading these numbers</a>
+        <a href="#canvas">Canvas vs HTML canvas / MonoGame</a>
+        <a href="#http-benchmark">HTTP vs Rust/Go/Bun</a>
+        <a class="sub" href="#http-reading-these-numbers">Reading these numbers</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="content-wrap">
+      <p class="page-kicker">Benchmarks</p>
+      <h1 class="page-title">Festina vs. Rust, Go, and Bun</h1>
+      <p class="lede">
+        How Festina compares to Rust, Go, and Bun on a handful of
+        small, equivalent-logic programs, and to a browser's
+        <code>&lt;canvas&gt;</code> and MonoGame on 2D drawing. Not a
+        claim that Festina is faster than any of these languages in
+        general — a compiled language's real-world performance
+        depends heavily on what's actually being written and how
+        mature its optimizer/runtime is, and Festina's is young. This
+        exists to catch regressions and track progress over time, run
+        against the same few workloads on every change that plausibly
+        affects performance (codegen, runtime, or the standard
+        library), not as a marketing claim.
+      </p>
+      <p class="lede">
+        These same five programs are also benchmarked cross-compiled
+        to <code>wasm32-wasi</code> (against C and Go, also compiled
+        to wasm) — see <a href="wasm.html#benchmarks">wasm.md</a>.
+      </p>
+
+      <section class="doc-section" id="methodology">
+        <h2>Methodology <a class="anchor" href="#methodology">#</a></h2>
+        <p>
+          Five programs, each implemented equivalently in Festina,
+          Rust, Go, and Bun (source in
+          <a href="https://github.com/uraikus/festina/tree/main/benchmarks">benchmarks/</a>),
+          plus a sixth comparing Festina's canvas against a browser's
+          and MonoGame's — see <a href="#canvas">Canvas</a> at the
+          end:
+        </p>
+        <div class="table-wrap">
+          <table class="sig-table">
+            <tr><td>hello</td><td>Process startup + runtime init cost — compile, print one line, exit. Directly reflects <a href="security.html#slim-binaries">the binary-slimming work</a>: fewer dynamically linked libraries means less for the dynamic linker to resolve before <code>main()</code> even runs.</td></tr>
+            <tr><td>fib</td><td>Recursive function-call overhead and raw compute throughput — naive recursive <code>fib(32)</code> (no memoization), ~7 million calls. Deliberately not reducible to a closed form by an optimizer (unlike a linear sum), so this actually measures generated-code quality, not the compiler's algebra.</td></tr>
+            <tr><td>loop_sum</td><td>Tight-loop / branch-free arithmetic throughput — a 100,000,000-iteration polynomial-hash accumulation (<code>total = (total * 1000003 + i) % 1000000007</code>), each iteration depending on the last so it can't be folded into a closed-form constant either — a plain running-sum version of this loop optimizes away entirely, running in ~2ms regardless of iteration count.</td></tr>
+            <tr><td>array_sum</td><td>Allocation-heavy throughput — 2,000,000 iterations, each building a fresh 8-element <code>arr[int]</code> literal (never escaping, so Festina reclaims it at that iteration's own scope-exit — see <a href="todo.html#memory-model">todo.md</a>) and summing its elements into a running total. Directly exercises automatic memory management: every iteration is a genuine allocate-fill-read cycle, not just arithmetic. Each element's value depends on the <em>previous</em> iteration's own running total, the same closed-form-resistance trick <code>loop_sum</code> already uses. The hot loop lives inside a <code>void func run(...)</code>, not bare top-level code — escape analysis only ever analyzes a function/handler's own body, never the top-level statement sequence.</td></tr>
+            <tr><td>string_concat</td><td>String-heavy throughput — 15,000 iterations of naive repeated concatenation (<code>`${s}x`</code>/<code>s = s + "x"</code>), <code>s</code> growing by one character each time. There's no growable string buffer to amortize into, so this is the textbook O(n²) naive-concatenation pattern.</td></tr>
+          </table>
+        </div>
+        <p class="muted">
+          Each language uses its own normal toolchain and optimization
+          settings (<code>festina program.f -o program</code>,
+          <code>rustc -O</code>, <code>go build</code>, <code>bun
+          run</code> — Bun has no separate build step, it's a JIT).
+          All four are checked to produce byte-identical stdout before
+          a run is trusted.
+        </p>
+        <p class="muted">
+          Every benchmark is timed with 1 untimed warmup run (page
+          cache, dynamic linker resolution, ...) followed by 7 timed
+          runs, keeping the <em>minimum</em> — the standard way to
+          reduce OS scheduling noise without pulling in a dedicated
+          benchmarking tool. Binary size is the compiled executable's
+          size on disk (n/a for Bun, which ships no separate binary).
+        </p>
+        <p class="muted">
+          Build time gets one untimed throwaway build per toolchain
+          before any timed one, for the same reason each program gets
+          an untimed warmup run — without it, the first benchmark in
+          the list would absorb the whole toolchain's own cold-start
+          cost and report a build time several times every other
+          program's own.
+        </p>
+        <p><strong>Reproduce locally:</strong></p>
+        <pre class="code"><span class="mut">$</span> python3 benchmarks/run_benchmarks.py               <span class="cm"># print results</span>
+<span class="mut">$</span> python3 benchmarks/run_benchmarks.py --update-doc   <span class="cm"># regenerate this file's table</span>
+
+<span class="mut">$</span> python3 benchmarks/canvas/run_canvas_benchmark.py             <span class="cm"># the canvas comparison</span>
+<span class="mut">$</span> python3 benchmarks/canvas/run_canvas_benchmark.py --update-doc
+
+<span class="cm"># The MonoGame side needs a .NET SDK and, on first run, network access</span>
+<span class="cm"># to restore its NuGet package; without either it is skipped with a note</span>
+<span class="cm"># rather than failing the run.</span>
+
+<span class="mut">$</span> python3 benchmarks/http/run_http_benchmarks.py                <span class="cm"># the HTTP server comparison</span>
+<span class="mut">$</span> python3 benchmarks/http/run_http_benchmarks.py --update-doc
+
+<span class="cm"># Needs `wrk` on PATH (not a project dependency -- apt/brew install wrk).</span></pre>
+        <p class="muted">
+          The runner skips any language toolchain not installed rather
+          than failing — see <a href="setup.html">setup.md</a> for
+          what each one needs.
+        </p>
+      </section>
+
+      <section class="doc-section" id="results">
+        <h2>Results <a class="anchor" href="#results">#</a></h2>
+        <p class="muted">Last run: 2026-08-26 on this machine — absolute numbers vary by hardware, relative ordering is the point.</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>hello</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina</td><td class="num">1.2 ms</td><td class="num">66.3 ms</td><td class="num">1.48 MB</td></tr>
+              <tr><td>Rust</td><td class="num">1.2 ms</td><td class="num">70.0 ms</td><td class="num">3.77 MB</td></tr>
+              <tr><td>Go</td><td class="num">1.2 ms</td><td class="num">128.0 ms</td><td class="num">2.11 MB</td></tr>
+              <tr><td>Bun</td><td class="num">7.7 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>fib(32)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina</td><td class="num">6.2 ms</td><td class="num">71.6 ms</td><td class="num">1.48 MB</td></tr>
+              <tr><td>Rust</td><td class="num">6.9 ms</td><td class="num">70.6 ms</td><td class="num">3.77 MB</td></tr>
+              <tr><td>Go</td><td class="num">9.7 ms</td><td class="num">117.4 ms</td><td class="num">2.11 MB</td></tr>
+              <tr><td>Bun</td><td class="num">20.2 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>loop_sum (100M)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina</td><td class="num">370.8 ms</td><td class="num">89.0 ms</td><td class="num">1.48 MB</td></tr>
+              <tr><td>Rust</td><td class="num">444.0 ms</td><td class="num">70.2 ms</td><td class="num">3.77 MB</td></tr>
+              <tr><td>Go</td><td class="num">368.9 ms</td><td class="num">122.6 ms</td><td class="num">2.11 MB</td></tr>
+              <tr><td>Bun</td><td class="num">7438.6 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>array_sum (2M)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina</td><td class="num">72.3 ms</td><td class="num">90.1 ms</td><td class="num">1.48 MB</td></tr>
+              <tr><td>Rust</td><td class="num">69.5 ms</td><td class="num">103.8 ms</td><td class="num">3.77 MB</td></tr>
+              <tr><td>Go</td><td class="num">68.7 ms</td><td class="num">120.4 ms</td><td class="num">2.11 MB</td></tr>
+              <tr><td>Bun</td><td class="num">1866.8 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>string_concat (15K)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina</td><td class="num">2.9 ms</td><td class="num">71.9 ms</td><td class="num">1.48 MB</td></tr>
+              <tr><td>Rust</td><td class="num">1.1 ms</td><td class="num">94.5 ms</td><td class="num">3.77 MB</td></tr>
+              <tr><td>Go</td><td class="num">29.7 ms</td><td class="num">128.0 ms</td><td class="num">2.11 MB</td></tr>
+              <tr><td>Bun</td><td class="num">10.0 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="doc-section" id="reading-these-numbers">
+        <h2>Reading these numbers <a class="anchor" href="#reading-these-numbers">#</a></h2>
+        <ul>
+          <li><strong><code>hello</code></strong> is dominated by process startup, not language performance — a graphics/audio-free Festina binary (see <a href="security.html#slim-binaries">security.md</a>) dynamically links only libc/libm (plus libz, a transitive dependency of the statically-linked sqlite3), the same ballpark as Go's or Rust's own small dynamic dependency lists here; a graphics- or audio-using Festina program would show up slower purely from the extra shared libraries the dynamic linker has to resolve at startup (<code>libcairo</code>/<code>libX11</code>/<code>libasound</code> and their own transitive dependencies).</li>
+          <li><strong><code>fib</code></strong> and <strong><code>loop_sum</code></strong> are closer to an apples-to-apples compiled-code comparison — Rust and Go both compile through mature, years-optimized backends (LLVM and Go's own <code>gc</code>, respectively); Festina also compiles through LLVM (see <a href="api.html#compilation-pipeline">api.md</a>) but is a much younger frontend with far less codegen-level tuning, so a gap here reflects the compiler's maturity, not a ceiling in the language design. Bun's JIT has to warm up during the run itself, which a single-shot benchmark like this doesn't isolate from the actual computation — a longer-running workload would tell a different story for Bun specifically.</li>
+          <li><strong><code>array_sum</code></strong> lands close to Rust/Go rather than behind them: the per-iteration <code>arr[int]</code> literal provably never escapes its own iteration, so Festina stack-allocates its header the same way a non-escaping struct local does, leaving only the growable data buffer's own <code>malloc</code> (a truly general growable buffer isn't safe to give a fixed-size <code>alloca</code>). The remaining, small gap is ordinary codegen-maturity noise, not an allocation-strategy gap.</li>
+          <li><strong><code>string_concat</code></strong> is where Festina's <code>text</code> ownership model shows up directly: every intermediate buffer this benchmark's naive concatenation builds is genuinely freed once nothing references it any more, so the heap grows linearly with the final string's own length, not quadratically with the number of concatenations — the underlying O(n²) naive-copy algorithm is unchanged, but nothing about it depends on allocator pressure from an unfreed buffer. Festina sits second in this benchmark, ahead of both Go (~9x) and Bun (~3x) and within about 2.4x of Rust. The remaining Rust gap is genuinely algorithmic, not something this benchmark is meant to close: Rust's <code>String</code> <code>+</code> reuses the left operand's own spare capacity in place when it has room (amortized growth, the same idea <code>Vec</code> uses), so it isn't doing the full O(n²) copy at all. Go's <code>+</code> on immutable strings has no spare capacity to grow into either, which is why it lands on the same side of the divide as Festina; Bun's V8 backend uses rope/cons-string representations internally, deferring the copy until the string is actually read, which is why it avoids the quadratic blowup despite naive-looking source. None of this is a bug in any of the four — it's exactly the kind of language/runtime difference this benchmark exists to surface.</li>
+          <li><strong>The canvas comparison</strong> (below) is the one benchmark here that isn't against another <em>language</em>. It's against the thing a 2D game would otherwise most likely be written on: an HTML <code>&lt;canvas&gt;</code>. Circles dominate frame cost, because Cairo tessellates every arc afresh — Festina caches one alpha mask per radius and stamps it thereafter (the same trick a glyph cache uses), which is most of why the frame stays fast. Festina also wins startup by more than an order of magnitude and wins on variance, which for a frame budget is not a footnote.</li>
+          <li><strong>MonoGame</strong> joins the canvas comparison as a third side, and its number is the one on this page most likely to be quoted out of context. It is a GPU framework running here with no GPU, on Mesa's software rasterizer; on real hardware it would batch these 40,000 sprites into a couple of draw calls and beat everything else on this page by orders of magnitude. The row is worth having because headless rendering with no GPU is a real situation — CI, a build server, a container — and it is worth reading only with that sentence attached.</li>
+          <li>These five are intentionally small, fast benchmarks so they can be re-run on every change worth checking, not a comprehensive suite (no concurrency, no realistic mixed workload). I/O has its own section below — see <a href="#http-benchmark">HTTP</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="canvas">
+        <h2>Canvas: Festina vs an HTML <code>&lt;canvas&gt;</code> vs MonoGame <a class="anchor" href="#canvas">#</a></h2>
+        <p class="muted">Last run: 2026-08-24 on this machine. Chromium 141.0.7390.37.</p>
+        <p>
+          20,000 filled rectangles and 20,000 filled circles, fill
+          colour changed between every shape, into an 800x600 surface.
+          Both sides draw <strong>offscreen</strong>, both time their
+          own draw loop with their own monotonic clock, and the
+          browser is forced to rasterize inside the timed region. All
+          three of those matter and all three are easy to get wrong —
+          see
+          <a href="https://github.com/uraikus/festina/blob/main/benchmarks/canvas/run_canvas_benchmark.py">run_canvas_benchmark.py</a>,
+          which documents what each one cost when it was measured the
+          other way.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Canvas</th><th class="num">Frame (min)</th><th class="num">Frame (median)</th><th class="num">First frame</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina (Cairo)</td><td class="num">37 ms</td><td class="num">39 ms</td><td class="num">24 ms</td></tr>
+              <tr><td>HTML &lt;canvas&gt; (Chromium/Skia)</td><td class="num">97 ms</td><td class="num">110 ms</td><td class="num">429 ms</td></tr>
+              <tr><td>MonoGame (software GL)</td><td class="num">252 ms</td><td class="num">270 ms</td><td class="num">181 ms</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout">
+          <strong>Read the MonoGame row with its caveat.</strong>
+          MonoGame is a GPU framework, and this machine has no GPU —
+          its GL context is Mesa's <code>llvmpipe</code>, a software
+          implementation of the whole graphics pipeline. It is
+          therefore paying in software for vertex transform,
+          rasterization setup and per-pixel texture sampling that real
+          hardware does for free. On an actual GPU these 40,000
+          sprites batch into a couple of draw calls and finish in well
+          under a millisecond — which no CPU rasterizer on this page
+          can approach. What this row measures is the headless, no-GPU
+          case (CI, a build server, a container), and nothing else.
+          It is also by far the noisiest row: <code>llvmpipe</code> is
+          multithreaded and so is far more exposed to whatever else
+          the machine is doing than single-threaded Cairo. Consecutive
+          runs of the same binary measured 173, 180, 193, 285 and 498
+          ms. The runner launches the process five times and keeps the
+          best, which lands near the floor most of the time — but
+          treat this number as "a few hundred milliseconds," not as a
+          figure precise to the millisecond the way the other two rows
+          are.
+        </div>
+        <p>On this workload <strong>Festina draws it 2.6x faster</strong>.</p>
+        <p class="muted">
+          Circles account for the overwhelming majority of frame
+          cost: 20,000 rectangles cost about 10 ms, but 20,000 circles
+          cost about 76 ms uncached, because <code>cairo_arc</code> +
+          <code>cairo_fill</code> tessellates the curve into Beziers
+          and scan-converts a general polygon every single time.
+          Rasterizing each radius once into an alpha mask and stamping
+          it thereafter — what a glyph cache does — brings circles
+          down to about 20 ms and the whole frame to about 31 ms. The
+          remaining split is 11 ms of rectangles, 20 ms of circles,
+          and setting the fill colour 20,000 times is too cheap to
+          measure.
+        </p>
+        <p class="muted">
+          Two things are worth reading alongside the headline. The
+          browser's frame time is far noisier — 97 ms at best against
+          a 110 ms median here, and the median moves by 20+ ms between
+          runs of this same script, while Festina's two numbers (37
+          and 39 ms) sit on top of each other. For a frame budget,
+          predictability is not a footnote. And getting to the
+          <em>first</em> frame differs by more than an order of
+          magnitude in the same direction, because one side starts a
+          process and the other starts a browser.
+        </p>
+        <p class="muted">
+          Both outputs were compared cell-by-cell over a 16x16 grid to
+          confirm they drew the same scene — worst per-channel
+          difference 0.2 out of 255. Not byte-for-byte: Cairo and Skia
+          disagree about antialiasing on every curve, and demanding
+          identical bytes would only prove the two rasterizers are the
+          same program. Festina's own offscreen canvas starts
+          transparent (<a href="api.html#gradients-and-transparency">api.md's
+          own "a fresh or cleared canvas is transparent, not
+          white"</a>), so both sides are composited onto the same
+          opaque white background before comparing pixels, to avoid a
+          false mismatch from alpha handling alone.
+        </p>
+      </section>
+
+      <section class="doc-section" id="http-benchmark">
+        <h2>HTTP: Festina vs Rust vs Go vs Bun <a class="anchor" href="#http-benchmark">#</a></h2>
+        <p>
+          Four servers (source in
+          <a href="https://github.com/uraikus/festina/tree/main/benchmarks/http">benchmarks/http/</a>),
+          each answering the same two routes — <code>/</code> (a fixed
+          plaintext body) and <code>/json</code> (a small JSON body) —
+          load-tested with
+          <a href="https://github.com/wg/wrk">wrk</a> (not a project
+          dependency; installed separately, <code>apt install
+          wrk</code>/<code>brew install wrk</code>).
+        </p>
+        <p>
+          <strong>Equivalent logic, not equivalent idiom, the same
+          rule the five programs above already follow.</strong>
+          Festina's HTTP server (<code>festina_runtime_http.c</code>)
+          is deliberately single-threaded (one connection serviced at
+          a time). Rust's and Go's servers here are hand-rolled
+          raw-socket implementations with a single-threaded,
+          sequential accept loop — not <code>hyper</code>/<code>net/http</code>'s
+          own default (multi-threaded) servers, which would be
+          measuring a mature framework's concurrency model against
+          Festina's single-threaded one rather than the same
+          connection-handling logic in four languages. Bun is the one
+          exception: it uses <code>Bun.serve()</code>, its own native
+          HTTP implementation, since there is no reason to hand-roll
+          sockets in a runtime that ships a fast one already (the same
+          "each language uses its own normal toolchain" rule the
+          Methodology above states).
+        </p>
+        <p class="muted">
+          <strong>Every response closes the connection, matched
+          uniformly across all four servers.</strong> Rust's and Go's
+          raw-socket servers close by default; Bun's server sets
+          <code>Connection: close</code> explicitly, to opt out of its
+          own native keep-alive (which none of the raw-socket
+          languages here have an equivalent of). Festina supports
+          HTTP/1.1 keep-alive by default (see
+          <a href="api.html#http-keep-alive">Keep-alive</a>), so the
+          load generator itself sends the fix:
+          <code>run_http_benchmarks.py</code>'s own <code>wrk</code>
+          invocation sends an explicit <code>Connection: close</code>
+          request header uniformly against all four servers —
+          Rust/Go/Bun ignore it (they already always close), and
+          Festina's own documented behavior (an explicit client
+          <code>Connection: close</code> always forces it off,
+          per-request) makes it close too. This keeps the comparison
+          to exactly connection-accept + parse + respond, for all four
+          languages at once, with no per-language server code needed
+          to special-case it.
+        </p>
+        <p class="muted">
+          Each <code>wrk</code> run: 4 threads, 50 open connections, 5
+          seconds, against one route at a time (a JIT-inclined runtime
+          like Bun gets no separate warmup here — <code>wrk</code>'s
+          own 5-second window includes whatever warmup happens inside
+          it, the same "the timed window is the real number" approach
+          as the process-startup benchmarks above, since a resident
+          server process outlives any of them anyway).
+        </p>
+        <p><strong>Reproduce locally:</strong></p>
+        <pre class="code"><span class="mut">$</span> python3 benchmarks/http/run_http_benchmarks.py
+<span class="mut">$</span> python3 benchmarks/http/run_http_benchmarks.py --update-doc
+<span class="mut">$</span> python3 benchmarks/http/run_http_benchmarks.py --duration 10s --connections 100 --threads 8</pre>
+        <p class="muted">Last run: 2026-08-26 on this machine, <code>wrk -t4 -c50 -d5s</code> per route.</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>plaintext (/)</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Transfer/sec</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina</td><td class="num">43,652</td><td class="num">1.05 ms</td><td class="num">4.25 MB/s</td></tr>
+              <tr><td>Rust</td><td class="num">63,513</td><td class="num">0.69 ms</td><td class="num">5.88 MB/s</td></tr>
+              <tr><td>Go</td><td class="num">35,457</td><td class="num">1.30 ms</td><td class="num">3.28 MB/s</td></tr>
+              <tr><td>Bun</td><td class="num">41,798</td><td class="num">1.09 ms</td><td class="num">5.34 MB/s</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>json (/json)</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Transfer/sec</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina</td><td class="num">41,482</td><td class="num">1.33 ms</td><td class="num">4.83 MB/s</td></tr>
+              <tr><td>Rust</td><td class="num">59,877</td><td class="num">0.73 ms</td><td class="num">6.68 MB/s</td></tr>
+              <tr><td>Go</td><td class="num">35,441</td><td class="num">1.27 ms</td><td class="num">3.95 MB/s</td></tr>
+              <tr><td>Bun</td><td class="num">39,580</td><td class="num">1.15 ms</td><td class="num">5.81 MB/s</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="http-reading-these-numbers">Reading these numbers <a class="anchor" href="#http-reading-these-numbers">#</a></h3>
+        <ul>
+          <li><strong><code>festina_http_send</code> coalesces the status line and headers into a single buffered <code>send()</code> call</strong>, rather than writing each piece separately — this matters with <code>TCP_NODELAY</code> set (Nagle's algorithm disabled for low latency), since each separate call would otherwise become its own TCP segment. Festina clears Go on both routes and lands right around Bun's own number, with Rust's raw-socket implementation ahead of all three.</li>
+          <li>This measures connection-accept + request-parse + respond throughput under load from one client machine talking to one server process on the same machine (no network hop, no TLS) — not a claim about production capacity, the same disclaimer every other benchmark on this page already carries.</li>
+          <li><strong><code>/json</code></strong> exercises more than <code>/</code>: Festina's route builds a struct and renders it through the same JSON-via-<code>.toText()</code> path every other container response already uses, not a hand-built string the way <code>/</code> sends one — so a gap between the two routes for Festina specifically reflects that serialization cost, not connection handling.</li>
+          <li>Rust's and Go's numbers here are <em>not</em> what those languages' idiomatic HTTP stacks would report — seeing "Rust is only Nx faster than Festina at HTTP" from this section should be read as "at matching, single-threaded connection handling," not as a claim about <code>hyper</code>/<code>axum</code> or <code>net/http</code> in general, which support keep-alive by default too but add a multi-threaded accept loop and years of tuning this comparison deliberately holds constant.</li>
+          <li>No WebSocket throughput benchmark exists yet — <code>on message</code> traffic has a very different shape (persistent connections, small frequent frames) from a request/response load test, and would need its own methodology rather than reusing <code>wrk</code>'s HTTP-request model.</li>
+        </ul>
+      </section>
+
+      <div class="prevnext">
+        <a class="prev" href="security.html">
+          <span class="label">← Previous</span>
+          Security
+        </a>
+        <a class="next" href="todo.html">
+          <span class="label">Next →</span>
+          Roadmap
+        </a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+  // Mobile sidebar toggle
+  const sidebar = document.getElementById('sidebar');
+  const backdrop = document.getElementById('backdrop');
+  const menuBtn = document.getElementById('menuBtn');
+  function closeSidebar() {
+    sidebar.classList.remove('open');
+    backdrop.classList.remove('open');
+  }
+  menuBtn.addEventListener('click', () => {
+    sidebar.classList.toggle('open');
+    backdrop.classList.toggle('open');
+  });
+  backdrop.addEventListener('click', closeSidebar);
+  document.getElementById('toc').addEventListener('click', (e) => {
+    if (e.target.tagName === 'A') closeSidebar();
+  });
+
+  // Sidebar filter
+  const filterBox = document.getElementById('navFilter');
+  filterBox.addEventListener('input', () => {
+    const q = filterBox.value.trim().toLowerCase();
+    document.querySelectorAll('#toc a').forEach(a => {
+      const match = !q || a.textContent.toLowerCase().includes(q);
+      a.dataset.hidden = match ? 'false' : 'true';
+    });
+    document.querySelectorAll('.nav-group').forEach(g => {
+      const anyVisible = [...g.querySelectorAll('a')].some(a => a.dataset.hidden !== 'true');
+      g.style.display = anyVisible ? '' : 'none';
+    });
+  });
+
+  // Scrollspy: highlight the section currently at the top of the
+  // viewport. Deliberately a single scroll-driven calculation (not an
+  // IntersectionObserver) so there's exactly one source of truth -- no
+  // risk of two independent observers racing each other for a short
+  // final section that a fixed rootMargin band might otherwise miss.
+  const anchors = [...document.querySelectorAll('#toc a')];
+  const byId = Object.fromEntries(anchors.map(a => [a.getAttribute('href').slice(1), a]));
+  const targets = [...document.querySelectorAll('main [id]')]
+    .filter(t => byId[t.id])
+    .map(t => ({ id: t.id, el: t }));
+
+  let ticking = false;
+  function updateActive() {
+    ticking = false;
+    const offset = 80; // matches scroll-margin-top on headings
+    const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2;
+    let currentId = targets.length ? targets[0].id : null;
+    if (atBottom) {
+      currentId = targets[targets.length - 1].id;
+    } else {
+      for (const t of targets) {
+        if (t.el.getBoundingClientRect().top <= offset) currentId = t.id;
+        else break;
+      }
+    }
+    anchors.forEach(a => a.classList.remove('active'));
+    if (currentId && byId[currentId]) byId[currentId].classList.add('active');
+  }
+  function onScroll() {
+    if (!ticking) {
+      ticking = true;
+      requestAnimationFrame(updateActive);
+    }
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll);
+  updateActive();
+</script>
+
+
+</body>
+</html>
