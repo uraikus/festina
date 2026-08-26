@@ -184,8 +184,11 @@ _BUILTIN_RETURN_TYPES = {
     "ls": types_mod.ArrayType(types_mod.PrimitiveType("text")),
     # claude.md #146
     "isAudioPlayerPlaying": types_mod.PrimitiveType("bool"),
-    # claude.md #150
-    "exec": types_mod.PrimitiveType("int"),
+    # claude.md #150/#176: exec() -- NOT here. Its return type depends
+    # on which of its two arities is used (1-arg -> int, 2-arg -> void),
+    # which this fixed dict can't express -- see _infer_call's own
+    # dedicated branch, the same reason setTimeout/saveCanvas aren't
+    # here either.
 }
 
 # claude.md #55: int and float never mix directly in a binary operator.
@@ -266,9 +269,12 @@ _BUILTIN_SIGNATURES = {
     # stopAudioPlayer's optional one (see _BUILTIN_SIGNATURE_ALTERNATES
     # below) -- there's no sensible "any channel" reading for a query.
     "isAudioPlayerPlaying": (_INT,),
-    # claude.md #150: exec(args) -- args[0] the program to run
-    # (PATH-searched), the rest its own argv.
-    "exec": (types_mod.ArrayType(_TEXT),),
+    # claude.md #150/#176: exec() -- NOT here either, for the identical
+    # reason it's absent from _BUILTIN_RETURN_TYPES above: its 2-arg
+    # form's callback argument needs the same structural (not fixed-
+    # type) checking setTimeout's own callback already needs, which
+    # this dict has no way to express. See _infer_call's own dedicated
+    # branch, which owns both of exec()'s arities.
     # claude.md #151
     "openPort": (_INT,),
     "closePort": (_INT,),
@@ -1766,6 +1772,54 @@ def analyze(program, filename="<string>"):
                         category="invalid function argument type",
                     )
                 return _BOOL
+            # claude.md #150/#177: exec(args) -> int (unchanged,
+            # blocking) or exec(args, callback) -> void (new,
+            # non-blocking -- callback receives the real exit code once
+            # the spawned process exits). Return type depends on arity
+            # the same way saveCanvas's own does, so this owns both
+            # shapes in one place rather than splitting exec() across
+            # the generic _BUILTIN_SIGNATURES dict (which can express
+            # neither the arity-dependent return type nor a structurally
+            # -checked callback argument) and a second dedicated branch.
+            if name == "exec":
+                if len(expr.args) not in (1, 2):
+                    raise CompileError(
+                        f"exec() expects 1 argument (args) or 2 (args, and a "
+                        f"callback), got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                args_type = infer(expr.args[0], scope)
+                if (args_type is not None and args_type is not NULL
+                        and args_type != types_mod.ArrayType(_TEXT)):
+                    raise CompileError(
+                        f"exec()'s first argument expects arr[text], found "
+                        f"{types_mod.type_name(args_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                if len(expr.args) == 1:
+                    return _INT
+                # claude.md #177: checked structurally, the same
+                # permissive way blob/img/aud's own `.callback()`
+                # already is -- any func[int]:void-typed EXPRESSION,
+                # not restricted to a bare declared-function name the
+                # way setTimeout's own older callback rule is. First-
+                # class function values (claude.md #141) postdate that
+                # restriction; blob/img/aud's `.callback()` already
+                # established the newer, correct precedent this follows.
+                fn_type = infer(expr.args[1], scope)
+                if (not isinstance(fn_type, types_mod.FuncType)
+                        or len(fn_type.param_types) != 1
+                        or fn_type.return_type is not None
+                        or fn_type.param_types[0] != _INT):
+                    raise CompileError(
+                        f"exec()'s second argument expects func[int]:void, "
+                        f"found {types_mod.type_name(fn_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return None
             if name in ("fail", "troubleshoot"):
                 # claude.md #158: fail(message) is unchanged (1 argument,
                 # any type -- coerced to text at codegen, same as
