@@ -1,40 +1,42 @@
 # Windows support
 
-**Fully implemented and confirmed green on real Windows CI.** The
-first four phases below are built and shipped: toolchain bring-up
-(confirmed on twelve real Windows CI rounds), audio (waveOut),
-windowing (Win32), and packaging. Each of those is CI-compiled and
-type-checked against real Windows headers on every push. A fifth,
-HTTP/WebSocket (winsock2, claude.md #151), is built and verified by
-local MinGW cross-compile only -- it has not yet run through real
-Windows CI at all, unlike the other four.
+**Toolchain, graphics, HTTP/WebSocket, and packaging are fully
+implemented and confirmed on real Windows CI. Audio is built and
+CI-compiled but stays gated -- not for lack of verification, but
+because the CI environment itself cannot verify it (see Phase 1
+below).** Toolchain bring-up (confirmed on twelve real Windows CI
+rounds) and packaging need no gate at all. Windowed graphics (Win32)
+and HTTP/WebSocket (winsock2, claude.md #151) were both gated the same
+way audio still is, pending a real Windows CI run to actually exercise
+them -- claude.md #169 got that run (deliberately triggered to check
+exactly this) and retired both gates: window creation/rendering and
+the full `openPort()`/`on request`/`on upgrade`/`on message`/`on
+socketClose` surface all tested clean. That run also gave real
+confirmation of an ALREADY-documented limitation: HTTP's own
+graceful-shutdown story (SIGTERM -> `on exit()` -> the conventional
+143 exit code, claude.md #161) doesn't carry over -- api.md already
+said Windows has no real SIGTERM delivery, and this is that showing up
+concretely for `openPort()` specifically. Documented below (Phase 4)
+and in [api.md](api.md#graceful-shutdown), not gated -- `openPort()`
+itself works fine, this is a narrower "abrupt shutdown skips the grace
+period" gap, not a missing feature.
 
-**What's genuinely still open** is external to this codebase, not
-missing work in it: confirming audio playback, windowed
-mouse/keyboard/window behavior, and the HTTP/WebSocket server on an
-actual Windows machine, which this project has no access to (every fix
-along the way had to be verified by reasoning from real Windows CI's
-own log output plus the full Linux suite, since there's no local
-Windows/MSYS2 environment to test against directly). All three stay
-behind an explicit opt-in environment variable
-(`FESTINA_ENABLE_WINDOWS_AUDIO=1` / `FESTINA_ENABLE_WINDOWS_GRAPHICS=1`
-/ `FESTINA_ENABLE_WINDOWS_HTTP=1`) until someone with real hardware
-confirms them. Toolchain bring-up (Phase 0) and packaging (Phase 3)
-needed no such gate and are fully confirmed today, including on real
-Windows CI runs.
+**Audio (waveOut) is different: the same CI run that cleared graphics
+and HTTP found windows-latest has no audio device at all** --
+`waveOutOpen` fails outright (`MMRESULT 2`) rather than "works but
+unconfirmed." Un-gating it would make every audio test fail
+permanently in CI, not just skip for lack of new evidence, so
+`FESTINA_ENABLE_WINDOWS_AUDIO=1` stays required until either real
+hardware confirms `examples/audio.f` actually plays, or this project
+builds a null-output test path for waveOut the way ALSA's
+null-plugin trick already covers Linux.
 
 This file is the design writeup and implementation record, kept
 current as a reference -- not a live tracker of unstarted work. See
 [claude.md](claude.md) #126–#129 for the full round-by-round account of
-how each phase was built, including the twelve-round Phase 0 bug hunt
-the "Bugs found along the way" section below summarizes.
-
-A later feature -- `openPort()`/`on request`/`on upgrade`/`on
-message`/`on socketClose` (claude.md #151) -- joined the same gated-
-pending-hardware-verification shape audio/graphics already use, via a
-real winsock2 port (Phase 4 below), rather than staying a hard
-compile-time rejection. See [api.md](api.md#http-and-websocket-servers)
-for the feature itself.
+how Phases 0-3 were built, including the twelve-round Phase 0 bug hunt
+the "Bugs found along the way" section below summarizes, and #169 for
+the real Windows CI run that closed out graphics and HTTP.
 
 The Windows counterpart to [macos.md](macos.md), and deliberately its
 sibling: the two ports share the same two backend seams (audio device,
@@ -264,11 +266,27 @@ depends on symbols from `festina_runtime.c`) against real
 macOS job type-checks the AudioQueue backend.
 
 Confirmed on Windows CI: the channel-pool white-box suite and
-null-shim end-to-end tests are green. Still open, gated behind
-`FESTINA_ENABLE_WINDOWS_AUDIO=1`: `examples/audio.f` actually playing
-on a real Windows machine, which this project has no access to.
+`FESTINA_AUDIO_NULL=1` end-to-end tests (`TestNullAudioDevice`) are
+green. Still open, gated behind `FESTINA_ENABLE_WINDOWS_AUDIO=1`:
+`examples/audio.f` actually playing on a real Windows machine, which
+this project has no access to.
 
-## Phase 2 — Graphics: the shared windowing seam, then Win32 (built, CI-compiled; hardware verification open)
+**claude.md #169 also found windows-latest has no audio device at
+all** -- confirmed by actually un-gating audio for one CI run and
+watching every test that opens a REAL device fail with `waveOutOpen
+failed (MMRESULT 2)`. Most of `tests/test_codegen.py`'s own `TestAudio`
+suite reaches a real device this way because it uses `audio_null_env`
+(an ALSA-only `~/.asoundrc` null-plugin fixture, conftest.py) rather
+than the cross-platform `FESTINA_AUDIO_NULL=1` mechanism just above --
+only `TestNullAudioDevice` uses the latter, and it alone passed clean.
+Migrating those tests to `FESTINA_AUDIO_NULL=1` is real, scoped,
+comparatively cheap follow-up work that could let audio's CI coverage
+extend to Windows (and possibly macOS -- untested there this round)
+without any real hardware at all; it just hasn't been done yet, and
+un-gating audio in `festina/cli.py` still isn't safe until it is (or
+real hardware confirms `examples/audio.f` directly).
+
+## Phase 2 — Graphics: the shared windowing seam, then Win32 (built, confirmed on real Windows CI; input-behavior verification open)
 
 Built on the windowing seam from macos.md Phase 2b
 (`festina_window_open/close`, `festina_window_present`,
@@ -341,17 +359,21 @@ darwin's `.m` file this one compiles as an ordinary translation unit):
   awaiting the real-hardware verification pass this phase's status
   note calls out below.
 
-**A genuine opportunity, not yet taken:** unlike macOS, GitHub's
-Windows runners *can* create real Win32 windows (no Xvfb equivalent
-needed) — in principle the windowed end-to-end tier (window opens,
-resize/close dispatch) could be verified in CI itself, with no
-physical hardware required at all. That hasn't happened yet: the CI
-workflow never sets `FESTINA_ENABLE_WINDOWS_GRAPHICS=1`, so the
-windowed-use gate stays up there exactly as it does everywhere else,
-and this tier has never actually run. Confirming this is real, cheap,
-next-step work — unlike the audio playback / macOS windowing
-verification, which genuinely need physical hardware, lifting this
-gate for one CI job is entirely within reach without any.
+**A genuine opportunity, taken by claude.md #169:** unlike macOS,
+GitHub's Windows runners *can* create real Win32 windows (no Xvfb
+equivalent needed) — the CI workflow was deliberately run once with
+`FESTINA_ENABLE_WINDOWS_GRAPHICS=1` set to check exactly this, and
+window creation/rendering worked with no failures. That run also
+surfaced a real, narrower gap: two tests that assert a "no display
+available" error (`test_missing_display_is_a_clear_runtime_error` and
+its screen-size sibling in `tests/test_codegen.py`) don't apply on
+Windows at all -- windows-latest always has a live desktop session, so
+there is no "missing display" condition to test there the way headless
+Linux has one; the first of the two actually hung for the runtime's
+full 15-second per-program timeout (a real window opened and sat in
+its event loop with nothing to ever close it) rather than erroring.
+Both are now skipped on win32 rather than asserting a condition that
+cannot occur there.
 
 **Built (claude.md #128):** the seam implementation
 (`FestinaWoDev`-style event queue, WndProc, `festina_window_open/
@@ -372,14 +394,19 @@ too. Offscreen drawing (`saveCanvas`, no `render()`) is not gated on
 any platform, including Windows, now that a real `window_win32`
 companion object exists to link against for it.
 
-Confirmed on Windows CI: the seam and Win32 backend compile and
-type-check cleanly against real headers. Still open, gated behind
-`FESTINA_ENABLE_WINDOWS_GRAPHICS=1`: `examples/graphics.f`,
-`tic_tac_toe.f`, `timers.f` actually running in native windows, and
-confirming keyboard/mouse/resize/close behave identically to Linux
-against the pinned event vocabulary — the "genuine opportunity, not
-yet taken" callout above is the cheapest path to closing this out,
-since it needs no physical hardware, just a CI job willing to try it.
+Confirmed on Windows CI: the seam and Win32 backend compile, type-check
+cleanly against real headers, AND (claude.md #169) actually open and
+render a window with no failure -- windowed use is no longer gated.
+Still genuinely open: automated confirmation that keyboard/mouse/
+resize/close behave identically to Linux against the pinned event
+vocabulary specifically -- this project's test suite has no Windows
+equivalent of the Xvfb-backed `x_display`/`xdotool` fixtures the
+windowed-INPUT tests (`TestGraphics`'s own click/key/resize/close
+coverage) actually run under, so that tier still sheds as skips on
+Windows the same way it always has, for a fixture-availability reason
+unrelated to the gate that used to sit in front of it. Un-gating
+graphics did not, and could not, close that specific gap -- only new
+Windows-native test infrastructure (or real hardware) would.
 
 ## Phase 3 — Packaging and distribution (done, CI-verified)
 
@@ -433,7 +460,7 @@ mirrors the linux/macos jobs' own, verifying the whole chain for real
 on every push rather than only ever having been exercised by a human
 packaging a release by hand.
 
-## Phase 4 — HTTP/WebSocket: winsock2 (built, MinGW-cross-compiled; hardware verification open)
+## Phase 4 — HTTP/WebSocket: winsock2 (built, confirmed on real Windows CI; graceful shutdown remains a known gap)
 
 Unlike Phases 1–3, this feature has no shared seam with macOS to build
 on -- `festina_runtime_http.c` is plain POSIX sockets end to end, with
@@ -512,13 +539,37 @@ function once using a Linux-only pkgs/flags table directly for a
 different feature and silently dropping every platform swap; the same
 mistake was about to repeat for `http` and was caught before landing).
 
-Confirmed by MinGW cross-compile: the ported file type-checks cleanly
-against real Windows headers with zero warnings. Still open, gated
-behind `FESTINA_ENABLE_WINDOWS_HTTP=1`: `openPort()`/`on request`/`on
-upgrade`/`on message`/`on socketClose` actually running on a real
-Windows machine, which this project has no access to -- the same
-"awaiting real hardware, not awaiting more code" shape Phases 1 and 2
-are already in.
+Confirmed by MinGW cross-compile at first (the ported file type-checks
+cleanly against real Windows headers with zero warnings), then by a
+real Windows CI run (claude.md #169, deliberately triggered to check
+exactly this): `openPort()`/`on request`/`on upgrade`/`on message`/`on
+socketClose` all tested clean end to end -- no gate anymore.
+
+**That same run also gave real confirmation -- not a new discovery --
+of a limitation api.md already documented before this: graceful
+shutdown's `SIGTERM` half (claude.md #161's SIGTERM -> `on exit()` ->
+the conventional 143 exit code) does not carry over to Windows, since
+Windows has no real `SIGTERM` delivery at all.** Four
+`tests/test_graceful_shutdown.py` tests failed exactly as that
+pre-existing documentation predicts: `subprocess.terminate()` (what
+Python's own `Popen.send_signal(signal.SIGTERM)` maps to on Windows)
+force-kills the process outright (exit code 1, not 143, `on exit`
+never runs), and an in-flight connection can see a raw
+`ConnectionResetError` rather than finishing within the grace period.
+`SIGINT`/Ctrl-C is a separate story this run could NOT actually
+confirm either way: `festina_runtime.c` registers its handler for
+`SIGINT` unconditionally on every platform (the CRT does raise it on
+Windows), but the obvious way to test that from Python --
+`Popen.send_signal(signal.SIGINT)` -- is itself rejected there
+(`ValueError: Unsupported signal: 2`) unless the child was launched
+with `CREATE_NEW_PROCESS_GROUP`, which this test suite's
+process-launching fixtures don't currently do. Two genuinely separate
+follow-ups, neither attempted this round: giving `SIGTERM`-style
+draining a real Windows equivalent (there is no drop-in one --
+Windows' nearest analog, `SetConsoleCtrlHandler`'s `CTRL_CLOSE_EVENT`,
+has a much shorter mandatory response window than 10 seconds), and
+fixing the test fixtures so the already-registered `SIGINT` path can
+actually be exercised on Windows CI at all.
 
 ## Order and shared work, for the record
 
@@ -538,9 +589,14 @@ existing block-with-timeout loop directly), and Phase 3 (small). The
 regex decision was the one Phase 0 item with real uncertainty, settled
 by round twelve's own green Windows CI run confirming `gnurx`'s ERE
 behavior matches glibc's under the existing, platform-neutral regex
-suite. What's left everywhere, exactly as macos.md's own closing note
-says of its port: real Windows hardware to confirm audio playback and
-windowed mouse/keyboard behavior on — plus, unique to this file, the
-cheap CI-only windowed-graphics verification the "genuine opportunity,
-not yet taken" callout above describes, which needs no hardware at
-all, just someone willing to lift the gate for one CI run.
+suite. Phase 4 (HTTP/WebSocket) landed last, well after the other
+three, and claude.md #169 is what finally gave it -- and Phase 2's own
+windowed-graphics claim -- a real Windows CI run instead of resting on
+cross-compile/type-check evidence alone. What's left now is narrower
+than it used to be: real Windows hardware to confirm audio playback
+specifically (the one tier a real CI run showed CANNOT be verified in
+CI at all -- windows-latest has no audio device), real Windows-native
+input-fixture infrastructure (or hardware) to confirm windowed mouse/
+keyboard/resize behavior matches the pinned event vocabulary, and
+closing the graceful-shutdown gap Phase 4's own section above
+documents.

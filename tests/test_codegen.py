@@ -4992,6 +4992,14 @@ class TestGraphics:
         assert result_path == str(out_path)
         assert out_path.exists()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason=(
+        "claude.md #169: windows-latest's real Windows CI run found this "
+        "test hangs there rather than failing -- a live desktop session "
+        "is always present, so deleting DISPLAY (a POSIX/X11-only "
+        "concept the Win32 backend never consults) doesn't reproduce "
+        "'no display available' the way it does on headless Linux; "
+        "render() instead opens a real window and blocks in its event "
+        "loop with nothing to ever close it."))
     def test_missing_display_is_a_clear_runtime_error(self, compile_and_run, monkeypatch):
         # claude.md #95: it is render() that needs a display now, not
         # drawing -- drawing paints an offscreen canvas and is perfectly
@@ -5255,6 +5263,14 @@ class TestScreenSizeAndSetClientSize:
     canvas synchronously (and the real OS window too, when one is
     open)."""
 
+    @pytest.mark.skipif(sys.platform == "win32", reason=(
+        "claude.md #169: this is the X11-specific failure mode -- "
+        "festina_window_screen_size's Win32 counterpart calls "
+        "GetSystemMetrics directly, no display handle to fail opening "
+        "at all, so deleting DISPLAY (meaningless there) doesn't "
+        "reproduce anything; a real Windows CI run confirmed it just "
+        "answers the real resolution instead, which is correct "
+        "behavior, not a bug."))
     def test_screen_size_without_any_display_is_a_clear_runtime_error(
             self, compile_and_run, monkeypatch):
         # festina_window_screen_size answers even with no window open,

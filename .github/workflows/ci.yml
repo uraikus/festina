@@ -168,32 +168,19 @@ jobs:
     # instead of erroring, so libsystre -- not libgnurx -- is the real
     # regex.h provider here. windows.md Phase 1: audio has a real
     # waveOut backend (built, compiled below against real <mmsystem.h>
-    # headers). windows.md Phase 2 (claude.md #128): graphics now has a
-    # real Win32 windowing backend too, compiled below the same way.
-    # Both stay gated pending real-hardware verification, same as macOS
-    # Phase 1/2's own AudioQueue/Cocoa backends, so both tiers still
-    # shed as skips via the same conftest mechanism macOS Phase 0
-    # built -- no parallel test-selection list, same as the macOS job
-    # above.
+    # headers), but stays gated -- a real Windows CI run (claude.md
+    # #169) confirmed windows-latest has no audio device at all, so
+    # un-gating it here would mean permanent, unrelated test failures,
+    # not new coverage. windows.md Phase 2/4 (claude.md #128/#151/#169):
+    # graphics and http/https are NOT gated anymore -- that same run
+    # exercised both end to end for the first time and found them
+    # working (graphics: window creation/rendering; http: openPort()/on
+    # request/on upgrade/on message/on socketClose all clean, with one
+    # documented gap, graceful shutdown, see api.md). Audio's own tier
+    # still sheds as skips via the conftest mechanism macOS Phase 0
+    # built; graphics/http no longer need to.
     runs-on: windows-latest
     timeout-minutes: 30
-    env:
-      # Temporary, for this run only: un-gates all three win32 features
-      # so the test suite's http/websocket tier actually exercises the
-      # winsock2 backend on real Windows CI for the first time (windows.md
-      # Phase 4 / claude.md #151 had only ever been MinGW cross-compiled
-      # before this). Audio/graphics gain no NEW signal from this --
-      # every test that would exercise them depends on Linux-only
-      # fixtures (Xvfb, an ALSA-null-plugin trick) with no Windows
-      # equivalent in this suite, so those two tiers still just skip --
-      # but leaving them un-gated here too is what actually proves the
-      # planned claude.md gate-removal doesn't break anything before it
-      # lands. Deliberately NOT setting FESTINA_STRICT_DEPS=1 here (unlike
-      # the linux job): that would turn the Xvfb/ALSA-only skips above
-      # into failures for reasons unrelated to these three gates.
-      FESTINA_ENABLE_WINDOWS_AUDIO: "1"
-      FESTINA_ENABLE_WINDOWS_GRAPHICS: "1"
-      FESTINA_ENABLE_WINDOWS_HTTP: "1"
     defaults:
       run:
         shell: msys2 {0}
@@ -257,7 +244,10 @@ jobs:
         # only, same reasoning as the audio step just above: this file
         # calls into festina_runtime.c's core symbols, so a standalone
         # link would fail on those, not on anything this step exists
-        # to catch.
+        # to catch. Windowed use itself is no longer gated (claude.md
+        # #169) -- the "Run the test suite" step above already links
+        # and runs graphics programs for real now, this step's own
+        # narrower job is still just the standalone-object type-check.
         run: |
           clang -c -O2 -I runtime \
             $(pkg-config --cflags cairo) $(pkg-config --cflags libjpeg) \
@@ -267,9 +257,8 @@ jobs:
         # is the native Win32 windowing device layer -- compiling it
         # here type-checks it against the real <windows.h> headers on
         # every push, the same way the macOS job's own step does for
-        # festina_runtime_window_mac.m, even while the windows graphics
-        # gate keeps windowed use out of user programs pending real-
-        # hardware mouse/keyboard verification.
+        # festina_runtime_window_mac.m. Windowed use is no longer gated
+        # (claude.md #169) -- same note as the graphics step above.
         run: |
           clang -c -O2 -I runtime \
             $(pkg-config --cflags cairo) \

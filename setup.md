@@ -134,11 +134,16 @@ missing). No `llvm` line here either, for the same reason as macOS
 above: `mingw-w64-ucrt-x86_64-clang` already covers both the fast path
 and its fallback, no separate libLLVM package needed.
 
-Both the audio (waveOut) and graphics (Win32) backends are built and
-CI-compiled on every push, but stay gated behind
-`FESTINA_ENABLE_WINDOWS_AUDIO=1` / `FESTINA_ENABLE_WINDOWS_GRAPHICS=1`
-until confirmed on real hardware — the identical shape as the macOS
-gates just above, and `festina doctor` reports the same status.
+Graphics (Win32) and HTTP/WebSocket (winsock2) both work out of the
+box — confirmed on a real Windows CI run (claude.md #169), not just
+built and compiled. Audio (waveOut) is the one tier still gated behind
+`FESTINA_ENABLE_WINDOWS_AUDIO=1` — not for lack of code, but because
+that same CI run found `windows-latest` has no audio device at all;
+`festina doctor` reports its status the same way the macOS audio gate
+just above does. Graceful shutdown (Ctrl-C/`SIGTERM` → `on exit()`,
+see [api.md](api.md#graceful-shutdown)) has one narrower Windows gap
+of its own: Windows has no real `SIGTERM` delivery, so the
+connection-drain grace period only applies to Ctrl-C there.
 
 ### The DLL story for compiled Windows programs (windows.md Phase 3)
 

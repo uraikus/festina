@@ -348,21 +348,14 @@ class TestFeatureGating:
         with pytest.raises(errors.CompileError):
             cli_mod._check_feature_supported("audio", "win32")
 
-    def test_windowed_graphics_is_gated_on_windows(self, cli_mod, errors):
-        # windows.md Phase 2 / claude.md #128 INVERTED this test the
-        # same way claude.md #123 inverted the darwin one below: the
-        # Win32 windowing seam + backend landed, and -- exactly like
-        # every other gate in this class -- being BUILT and CI-compiled
-        # is not the same claim as being verified against a real
-        # window/mouse/keyboard, so windowed use stays gated until it
-        # has been.
-        with pytest.raises(errors.CompileError) as excinfo:
-            cli_mod._check_feature_supported("graphics", "win32")
-        assert "windows.md Phase 2" in str(excinfo.value)
-        assert excinfo.value.category == "unsupported platform feature"
-
-    def test_the_windows_graphics_gate_is_overridable(self, cli_mod, monkeypatch):
-        monkeypatch.setenv("FESTINA_ENABLE_WINDOWS_GRAPHICS", "1")
+    def test_windowed_graphics_is_not_gated_on_windows(self, cli_mod):
+        # claude.md #169 retired this gate: a real Windows CI run
+        # (triggered specifically to check this) exercised the Win32
+        # windowing backend end to end and found window creation/
+        # rendering working, so windowed use no longer waits behind
+        # FESTINA_ENABLE_WINDOWS_GRAPHICS the way windows.md Phase 2
+        # originally planned -- same shape as graphics on Linux, which
+        # has never been gated at all.
         cli_mod._check_feature_supported("graphics", "win32")   # no raise
 
     def test_windowed_graphics_is_gated_on_darwin(self, cli_mod, errors):
@@ -389,21 +382,32 @@ class TestFeatureGating:
         assert "alsa" not in report, (
             "doctor must not tell a Mac user to install ALSA")
 
-    def test_doctor_on_windows_reports_graphics_and_audio_as_planned_not_missing(
+    def test_doctor_on_windows_reports_audio_as_planned_not_missing(
             self, cli_mod, monkeypatch):
-        # windows.md Phase 1 / Phase 2 (claude.md #128): both audio's
-        # waveOut backend and graphics' Win32 backend are now built but
-        # await real-hardware verification -- doctor must say so rather
-        # than naming Linux-only packages (cairo-xlib, alsa) a Windows
-        # user has no way to install.
+        # windows.md Phase 1: audio's waveOut backend is built but stays
+        # gated -- claude.md #169 found windows-latest has no audio
+        # device at all, so this is the one Windows tier that still
+        # needs the "not yet" framing doctor must say so rather than
+        # naming a Linux-only package (alsa) a Windows user has no way
+        # to install.
         monkeypatch.setattr(sys, "platform", "win32")
         _stub_which_any(cli_mod, monkeypatch)
         lines, _, _missing = cli_mod._doctor_report()
         report = "\n".join(lines)
         assert "windows.md Phase 1" in report
-        assert "windows.md Phase 2" in report
         assert "cairo-xlib" not in report and "alsa" not in report, (
             "doctor must not tell a Windows user to install Linux packages")
+
+    def test_doctor_on_windows_does_not_call_graphics_not_yet(self, cli_mod, monkeypatch):
+        # claude.md #169: graphics is no longer gated on win32, so
+        # doctor must not print the old "windows.md Phase 2 / not yet"
+        # line for it anymore -- it should look like Linux's own
+        # ungated graphics tier there.
+        monkeypatch.setattr(sys, "platform", "win32")
+        _stub_which_any(cli_mod, monkeypatch)
+        lines, _, _missing = cli_mod._doctor_report()
+        report = "\n".join(lines)
+        assert "windows.md Phase 2" not in report
 
     def test_doctor_on_windows_reports_posix_regex_as_required(
             self, cli_mod, monkeypatch):

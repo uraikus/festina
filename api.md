@@ -2049,13 +2049,18 @@ set automatically to match; a program's own `req.send()`/`req.ok()`/
   is ignored. `permessage-deflate` and every other WebSocket extension
   are unsupported (fragmentation, claude.md #168, is not an extension —
   see [WebSockets](#websockets-and-fragmentation) below).
-- **Linux and macOS, plus Windows behind an opt-in flag.** Linux/macOS
-  use plain POSIX sockets; Windows uses a real winsock2 port (built,
-  CI-compiled — see [windows.md](windows.md)) gated behind
-  `FESTINA_ENABLE_WINDOWS_HTTP=1` pending real-hardware verification,
-  the same shape audio/graphics already use there. Not available under
-  `--target=wasm32-wasi` at all — WASI Preview 1 has no listening-socket
-  support — rejected at compile time; see [wasm.md](wasm.md).
+- **Linux, macOS, and Windows.** Linux/macOS use plain POSIX sockets;
+  Windows uses a real winsock2 port, confirmed by a real Windows CI run
+  (claude.md #169 — see [windows.md](windows.md)). One Windows-specific
+  caveat, already true of every platform's [Graceful
+  shutdown](#graceful-shutdown) story below and confirmed directly by
+  that same CI run rather than newly introduced by it: Windows has no
+  real `SIGTERM` delivery, so the connection-drain grace period only
+  applies to Ctrl-C there, not to however a process gets killed the
+  `SIGTERM` way on Linux/macOS (e.g. `taskkill` without `/F` doesn't
+  reach it the same way). Not available under `--target=wasm32-wasi`
+  at all — WASI Preview 1 has no listening-socket support — rejected at
+  compile time; see [wasm.md](wasm.md).
 - **Combining with graphics** (`render()`, or an `on
   mouseDown`/.../`close` handler) in the same program works (claude.md
   #166), but the two loops don't run side by side — a program that also
@@ -2145,14 +2150,15 @@ says** (all of it applies here too):
   negotiation.
 - **An encrypted (password-protected) private key is rejected** — the
   key in `key` must be in the clear.
-- **Linux, plus macOS and Windows behind the same opt-in-flag /
+- **Linux and Windows, plus macOS behind the same opt-in-flag /
   real-hardware-verification story `openPort()`'s own Limitations
-  entry above describes** (`FESTINA_ENABLE_MACOS_HTTP=1`/
-  `FESTINA_ENABLE_WINDOWS_HTTP=1` — there is no separate TLS-specific
-  flag, since `openSecurePort()` always brings `openPort()`'s own
-  listener/event-loop machinery along with it). Not available under
-  `--target=wasm32-wasi`, for the identical reason `openPort()` isn't
-  there either.
+  entry above describes** (`FESTINA_ENABLE_MACOS_HTTP=1` — Windows
+  needs no such flag anymore, and there is no separate TLS-specific
+  flag on either platform, since `openSecurePort()` always brings
+  `openPort()`'s own listener/event-loop machinery along with it,
+  including that same graceful-shutdown gap on Windows). Not available
+  under `--target=wasm32-wasi`, for the identical reason `openPort()`
+  isn't there either.
 
 ## Freeing and deleting
 
@@ -2637,7 +2643,18 @@ feature existed: there is no point in such a program's own execution
 where it could ever notice a shutdown request, so installing a handler
 there would make Ctrl-C *stop working* instead of merely skipping
 cleanup — worse, not better. `SIGTERM` is POSIX only; Windows has no
-real delivery of it (only `SIGINT`/Ctrl-C).
+real delivery of it (only `SIGINT`/Ctrl-C) — confirmed directly by a
+real Windows CI run (claude.md #169): killing a Windows-compiled
+`openPort()` program the way `SIGTERM` would on Linux/macOS force-
+kills it instead (no `on exit`, no connection-drain grace period, no
+143 exit code), exactly as this paragraph already predicted. `SIGINT`
+itself is believed to work there too (the CRT does raise it, and this
+runtime's handler is registered unconditionally on every platform —
+see festina_runtime.c's own comment), but that specific claim is still
+unconfirmed by a real test run: the obvious way to test it from Python
+(`Popen.send_signal(signal.SIGINT)`) is itself rejected on Windows
+unless the child was launched with `CREATE_NEW_PROCESS_GROUP`, which
+this project's test fixtures don't currently do.
 
 ## `troubleshoot()` — structured logging
 

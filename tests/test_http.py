@@ -1406,11 +1406,12 @@ class TestPlatformAndWasmGating:
     """there is no wasm32-wasi backend for http at all -- checked
     without needing a real toolchain (the same tier
     _check_wasm_feature_supported's own graphics/audio/exec tests in
-    test_wasm.py already sit in). darwin AND win32 both gate a
-    backend that EXISTS (built, CI-compiled -- win32's own winsock2
-    port confirmed by a real MinGW cross-compile, claude.md #151's own
-    Windows round) but awaits real-hardware verification, the same
-    shape audio/graphics already established for both platforms.
+    test_wasm.py already sit in). darwin still gates a backend that
+    EXISTS (built, CI-compiled) but awaits real-hardware verification,
+    the same shape audio/graphics established there. win32 no longer
+    does -- claude.md #169 retired that gate once a real Windows CI run
+    (not just the MinGW cross-compile claude.md #151's own Windows
+    round had relied on) exercised the winsock2 backend end to end.
     claude.md #166 lifted the original http/graphics exclusivity
     restriction -- see TestGraphicsAndHttp below for that combination's
     own compile-and-run coverage."""
@@ -1431,14 +1432,18 @@ class TestPlatformAndWasmGating:
         )
         cli_mod.compile_file(str(src), str(tmp_path / "out"), cc="clang")  # no raise
 
-    def test_http_on_windows_is_gated_pending_verification(self, cli_mod, monkeypatch):
-        monkeypatch.delenv("FESTINA_ENABLE_WINDOWS_HTTP", raising=False)
-        with pytest.raises(cli_mod.CompileError) as exc_info:
-            cli_mod._check_feature_supported("http", platform_name="win32")
-        assert exc_info.value.category == "unsupported platform feature"
-
-    def test_http_on_windows_override_env_var_bypasses_the_gate(self, cli_mod, monkeypatch):
-        monkeypatch.setenv("FESTINA_ENABLE_WINDOWS_HTTP", "1")
+    def test_http_is_not_gated_on_windows(self, cli_mod):
+        # claude.md #169 retired this gate: a real Windows CI run
+        # (triggered specifically to check this -- windows.md Phase 4
+        # had only ever been MinGW cross-compiled before) exercised the
+        # winsock2 backend end to end -- openPort()/on request/on
+        # upgrade/on message/on socketClose all tested clean -- so http
+        # no longer waits behind FESTINA_ENABLE_WINDOWS_HTTP the way
+        # claude.md #151 originally set it up. One real gap that same
+        # run found, graceful shutdown, is documented in api.md rather
+        # than gated here -- openPort() itself has always worked with
+        # no shutdown handling at all; on exit()/draining is a layer on
+        # top this gate was never covering.
         cli_mod._check_feature_supported("http", platform_name="win32")  # no raise
 
     def test_http_on_macos_is_gated_pending_verification(self, cli_mod, monkeypatch):
