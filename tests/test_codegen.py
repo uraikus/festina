@@ -5526,6 +5526,56 @@ class TestScreenSizeAndSetClientSize:
             proc.wait(timeout=5)
 
 
+class TestEventHandlersAreHoistedLikeFunctions:
+    """Not a bug, but a real, confirmed footgun -- flagged directly,
+    costing real debugging time before it was traced back to this.
+    `on ...` handlers are registered before the entry file's own top-
+    level code runs at all (codegen.py's own _emit_main_and_entry:
+    every festina_register_*_handler call happens in a fixed block,
+    unconditionally, before `call void @__festina_main()`) -- the
+    identical hoisting api.md's own "Functions are hoisted" note
+    already documents for `func` declarations, just less obviously
+    surprising there (a function only ever runs when something calls
+    it; a handler can be triggered by an ordinary top-level statement
+    written ABOVE its own declaration, e.g. setClientWidth firing `on
+    resize` synchronously, inline, wherever it's called from).
+
+    Confirmed directly (compiled and run, not just reasoned through):
+    a handler declared textually AFTER a call that triggers it still
+    fires, and fires against whatever state existed at that exact
+    point in top-level execution -- which, for a global whose own
+    initializer hasn't run yet, is still its zero/default, not the
+    value the source implies it should already have. Documented in
+    api.md right where event handlers are introduced."""
+
+    def test_a_handler_fires_against_a_not_yet_initialized_global(
+            self, compile_and_run, x_display):
+        # The exact api.md reproduction: setClientWidth (textually
+        # first) fires `on resize` (declared textually AFTER both it
+        # and the array it reads) before `data`'s own initializer has
+        # run -- so the handler sees the zero-length default, not 3.
+        source = (
+            "render()\n"
+            "setClientWidth(400)\n"
+            "log('after setClientWidth')\n"
+            "\n"
+            "arr[int] data = [1, 2, 3]\n"
+            "on resize() {\n"
+            "    log(`data.length=${data.length}`)\n"
+            "}\n"
+            "close(0)\n"
+        )
+        result = compile_and_run(source, env={"DISPLAY": x_display})
+        assert result.returncode == 0, result.stdout
+        # The handler's own output comes FIRST -- it ran synchronously,
+        # inline, at the setClientWidth call site, before the
+        # 'after setClientWidth' line even printed.
+        assert result.stdout.splitlines() == [
+            "data.length=0",
+            "after setClientWidth",
+        ]
+
+
 class TestExampleGraphicsAndGame:
     """Interactive regression coverage for examples/graphics.f,
     examples/tic_tac_toe.f, and examples/layers.f -- the examples that

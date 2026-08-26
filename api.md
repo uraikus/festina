@@ -1135,6 +1135,35 @@ can't fire without one. After the entry file's top-level code finishes,
 if a window was opened, the process blocks handling redraws/input until
 the window closes.
 
+**Event handlers are active as soon as they're declared, regardless of
+where in the file that is** — the same hoisting `text func`/`void func`
+declarations already get (see "Functions are hoisted" above), applied
+to `on ...` too. `setClientWidth`/`setClientHeight` fire `on resize`
+*synchronously, inline*, at the point they're called — not later, and
+not only once the entry file has finished running top to bottom — so a
+call to either one, anywhere above an `on resize` handler that reads
+global state initialized further down the file, can run that handler
+against state that hasn't been set up yet:
+
+```festina
+render()
+setClientWidth(400)     // on resize fires HERE, inline
+
+arr[int] data = [1, 2, 3]   // this hasn't run yet when it fires
+on resize() {
+    log(data.length)        // reads 0, not 3
+}
+```
+
+Nothing about this is specific to `resize` — every event handler is
+registered before the entry file's own top-level code runs at all
+(mouse/key events simply can't fire that early in practice, since
+they need real user input after a window exists, but `on resize` can
+be triggered programmatically by the very first line of the file).
+The fix is ordinary top-to-bottom discipline: declare a handler, and
+initialize whatever global state it reads, before any call that could
+plausibly trigger it.
+
 That split means two useful things:
 
 ```festina

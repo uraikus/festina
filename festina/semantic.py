@@ -2946,6 +2946,43 @@ def analyze(program, filename="<string>"):
                 file=filename, line=decl.line, column=decl.column,
                 category="invalid declaration",
             )
+        # claude.md #178 (new entry): a table-typed value is a BORROWED
+        # handle onto one row of a query result (codegen.py's own
+        # `_emit_free`, "TableType (a borrowed query row)") -- unlike
+        # struct, it has never had its own standalone allocation/auto-
+        # vivify story, since every real row it could ever alias
+        # already exists somewhere (an arr[T] the query result built).
+        # `Table t` with no initializer defaults to null exactly like
+        # any other pointer-shaped type -- but codegen's own field-
+        # write path (_member_ptr_from's TableType branch) computes a
+        # plain `getelementptr i8, ptr %obj, i64 idx*8` off that
+        # pointer with no null check at all (unlike struct fields,
+        # which auto-vivify, and unlike enum values, which fail
+        # loudly) -- so the very first `t.field = ...` on one
+        # segfaulted, confirmed directly (SIGSEGV, not a hang or a
+        # clean crash) by actually compiling and running the
+        # reproduction, not just by reading the code. Rejected here
+        # instead of taught to auto-vivify: doing that would mean
+        # inventing real ownership/allocation semantics for TableType
+        # that do not exist anywhere else in this compiler (it is never
+        # retained, released, or freed -- see FreeStmt's own comment),
+        # a materially bigger change than this bug report calls for.
+        # `struct` already has everything a hand-built row needs
+        # (api.md's own "Structs as query targets" section is exactly
+        # this pattern) and needs no such check, since its local
+        # declaration already always allocates real, zeroed storage
+        # immediately (codegen.py's own VarDecl StructType branch).
+        if isinstance(declared_type, types_mod.TableType) and decl.init is None:
+            raise CompileError(
+                f"'{decl.name}' ({declared_type.name}) requires an initializer -- "
+                f"a table row is a borrowed handle onto one row of a query result, "
+                f"never independently constructed (assign an existing row, e.g. "
+                f"`{declared_type.name} {decl.name} = rows[0]`); to build a value "
+                f"by hand, declare a struct with the same fields instead (see "
+                f"api.md's 'Structs as query targets' section)",
+                file=filename, line=decl.line, column=decl.column,
+                category="invalid declaration",
+            )
         if decl.init is not None:
             # claude.md #137: arr[img]/arr[aud]/arr[blob] declared
             # directly from a literal of paths -- `arr[img] brushes =
