@@ -433,10 +433,16 @@ typedef struct {
     int64_t conn_id;
 } FestinaConnHandleBlock;
 
+/* claude.md #175: count/entries/capacity/tombstones mirror the map[T]
+ * header shape codegen.py now emits (FESTINA_MAP_LLVM_TYPE) exactly,
+ * field for field -- every festina_map_* call below reads and writes
+ * them the same way generated code does. */
 typedef struct {
     int64_t refcount;
     int64_t count;
     void *entries;
+    int64_t capacity;
+    int64_t tombstones;
 } FestinaMapBlock;
 
 /* claude.md #162: http's own real representation -- a genuine value
@@ -1638,8 +1644,8 @@ static void *festina_build_headers_map(FestinaConn *c) {
     FestinaMapBlock *block = (FestinaMapBlock *)((char *)map - sizeof(int64_t));
     for (int64_t i = 0; i < c->header_count; i++) {
         char *owned_value = festina_text_own(c->headers[i].value);
-        festina_map_set(&block->count, &block->entries, c->headers[i].name,
-                        (int64_t)(intptr_t)owned_value);
+        festina_map_set(&block->count, &block->entries, &block->capacity, &block->tombstones,
+                        c->headers[i].name, (int64_t)(intptr_t)owned_value);
     }
     return map;
 }
@@ -2712,7 +2718,7 @@ void festina_http_send(void *req_payload, void *res_payload) {
 
     FestinaMapBlock *block = (FestinaMapBlock *)((char *)res->headers - sizeof(int64_t));
     g_http_send_header_buf = &buf;
-    festina_map_for_each(block->count, block->entries, festina_write_extra_header);
+    festina_map_for_each(block->entries, block->capacity, festina_write_extra_header);
     g_http_send_header_buf = NULL;
 
     char cl_line[64];
@@ -2894,7 +2900,8 @@ static void festina_parse_http_response(const uint8_t *data, size_t len,
             if (strcmp(name, "transfer-encoding") == 0 && strcasecmp(owned_value, "chunked") == 0) {
                 is_chunked = 1;
             }
-            festina_map_set(&hblock->count, &hblock->entries, name, (int64_t)(intptr_t)owned_value);
+            festina_map_set(&hblock->count, &hblock->entries, &hblock->capacity,
+                            &hblock->tombstones, name, (int64_t)(intptr_t)owned_value);
             free(name);
         }
         line = line_end + 1;
@@ -3034,7 +3041,7 @@ void festina_http_send_client(void *payload) {
     FESTINA_APPEND_LIT(&buf, "\r\n");
     FestinaMapBlock *hblock = (FestinaMapBlock *)((char *)v->headers - sizeof(int64_t));
     g_http_send_header_buf = &buf;
-    festina_map_for_each(hblock->count, hblock->entries, festina_write_extra_header);
+    festina_map_for_each(hblock->entries, hblock->capacity, festina_write_extra_header);
     g_http_send_header_buf = NULL;
     char cl_line[64];
     int cl_len = snprintf(cl_line, sizeof(cl_line), "Content-Length: %lld\r\n",

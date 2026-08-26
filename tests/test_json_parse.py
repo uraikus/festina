@@ -39,22 +39,78 @@ class TestSemanticErrors:
         with pytest.raises(errors.CompileError, match="must be a struct name"):
             semantic.analyze(program)
 
-    def test_to_arr_element_type_must_be_scalar(self, parser, semantic, errors):
+    def test_to_arr_of_a_struct_element_now_analyzes(self, parser, semantic):
+        # claude.md #173 widened claude.md #159's own v1 scope cut --
+        # arr[T]'s element type may now itself be a nested struct.
         program = parser.parse("""
         struct Foo { id:int }
         arr[Foo] xs = '[]'.toArr(Foo)
         """)
+        semantic.analyze(program)
+
+    def test_to_arr_element_type_rejects_a_genuinely_unsupported_type(
+            self, parser, semantic, errors):
+        # img/aud/regex/... still don't have a from-JSON shape at all --
+        # this is not a scope cut anymore, it's a real, permanent "there
+        # is no JSON encoding for this" rejection.
+        program = parser.parse("arr[img] xs = '[]'.toArr(img)")
         with pytest.raises(errors.CompileError, match="int/float/bool/text"):
             semantic.analyze(program)
 
-    def test_to_struct_rejects_a_nested_arr_field(self, parser, semantic, errors):
-        # claude.md #159's own v1 scope cut.
+    def test_to_struct_now_accepts_a_nested_arr_field(self, parser, semantic):
+        # claude.md #173: was claude.md #159's own v1 scope cut.
         program = parser.parse("""
         struct Bag { xs:arr[int] }
         Bag b = '{}'.toStruct(Bag)
         """)
+        semantic.analyze(program)
+
+    def test_to_struct_now_accepts_a_nested_struct_field(self, parser, semantic):
+        program = parser.parse("""
+        struct Point { x:int  y:int }
+        struct Line { a:Point  b:Point }
+        Line l = '{}'.toStruct(Line)
+        """)
+        semantic.analyze(program)
+
+    def test_to_struct_now_accepts_a_map_field(self, parser, semantic):
+        program = parser.parse("""
+        struct Bag { scores:map[int] }
+        Bag b = '{}'.toStruct(Bag)
+        """)
+        semantic.analyze(program)
+
+    def test_to_struct_still_rejects_a_genuinely_unsupported_field(
+            self, parser, semantic, errors):
+        program = parser.parse("""
+        struct Bag { pic:img }
+        Bag b = '{}'.toStruct(Bag)
+        """)
         with pytest.raises(errors.CompileError, match="doesn't support field"):
             semantic.analyze(program)
+
+    def test_to_struct_rejects_a_field_nested_inside_an_unsupported_type(
+            self, parser, semantic, errors):
+        # The violation is two levels deep (arr[img], not img itself) --
+        # still caught, since _is_json_parseable_type recurses through
+        # the array to its own element type.
+        program = parser.parse("""
+        struct Bag { pics:arr[img] }
+        Bag b = '{}'.toStruct(Bag)
+        """)
+        with pytest.raises(errors.CompileError, match="doesn't support field"):
+            semantic.analyze(program)
+
+    def test_self_referencing_struct_field_analyzes(self, parser, semantic):
+        # claude.md #17 made the TYPE legal; claude.md #173 is what
+        # makes .toStruct() itself able to reach it without an infinite
+        # compile-time recursion -- see _is_json_parseable_type's own
+        # cycle-safety comment.
+        program = parser.parse("""
+        struct Node { n:int  next:Node }
+        Node n = '{}'.toStruct(Node)
+        """)
+        semantic.analyze(program)
 
     def test_to_struct_resolves_to_the_struct_type(self, parser, semantic, types_mod):
         program = parser.parse("""
@@ -181,6 +237,82 @@ class TestRuntimeBehavior:
         """)
         assert result.returncode == 1
         assert result.stderr.strip().startswith("fail:")
+
+    def test_nested_struct_field_parses(self, compile_and_run):
+        source = """
+        struct Point { x:int  y:int }
+        struct Line { a:Point  b:Point  label:text }
+        Line l = '{"a":{"x":1,"y":2},"b":{"x":3,"y":4},"label":"hi"}'.toStruct(Line)
+        log(`${l.a.x},${l.a.y} ${l.b.x},${l.b.y} ${l.label}`)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "1,2 3,4 hi"
+
+    def test_arr_of_struct_elements_parses(self, compile_and_run):
+        source = """
+        struct Point { x:int  y:int }
+        arr[Point] pts = '[{"x":1,"y":2},{"x":3,"y":4}]'.toArr(Point)
+        log(`${pts.length} ${pts[0].x} ${pts[1].y}`)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "2 1 4"
+
+    def test_nested_arr_of_arr_parses(self, compile_and_run):
+        source = """
+        arr[arr[int]] grid = '[[1,2,3],[4,5]]'.toArr(arr[int])
+        log(`${grid.length} ${grid[0].length} ${grid[1][1]}`)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "2 3 5"
+
+    def test_map_field_parses_arbitrary_keys(self, compile_and_run):
+        source = """
+        struct Scores { name:text  values:map[int] }
+        Scores s = '{"name":"ada","values":{"a":1,"b":2,"c":3}}'.toStruct(Scores)
+        log(`${s.name} ${s.values['a']} ${s.values['b']} ${s.values['c']}`)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "ada 1 2 3"
+
+    def test_arr_of_map_elements_parses(self, compile_and_run):
+        source = """
+        arr[map[int]] maps = '[{"x":1},{"y":2}]'.toArr(map[int])
+        log(`${maps.length} ${maps[0]['x']} ${maps[1]['y']}`)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "2 1 2"
+
+    def test_self_referencing_struct_parses_to_the_actual_depth_present(self, compile_and_run):
+        source = """
+        struct Node { n:int  next:Node }
+        Node head = '{"n":1,"next":{"n":2,"next":{"n":3}}}'.toStruct(Node)
+        log(`${head.n} ${head.next.n} ${head.next.next.n}`)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "1 2 3"
+
+    def test_duplicate_key_on_a_nested_map_field_last_one_wins(self, compile_and_run):
+        # Exercises _from_json_map_value's own overwrite-releases-the-
+        # old-value path (leak coverage lives in
+        # tests/stress/json_parse_churn.f; this pins the observable
+        # VALUE that path leaves behind).
+        source = """
+        struct Wrap { a:map[int] }
+        Wrap w = '{"a":{"x":1,"x":2,"y":3}}'.toStruct(Wrap)
+        log(`${w.a['x']} ${w.a['y']}`)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "2 3"
+
+    def test_duplicate_key_on_a_nested_struct_field_last_one_wins(self, compile_and_run):
+        source = """
+        struct Point { x:int  y:int }
+        struct Wrap { a:Point }
+        Wrap w = '{"a":{"x":1,"y":1},"a":{"x":2,"y":2}}'.toStruct(Wrap)
+        log(`${w.a.x} ${w.a.y}`)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "2 2"
 
     def test_successful_parses_leak_nothing_in_a_loop(self, compile_and_run):
         # claude.md #159's own leak caveat is strictly error-path-only

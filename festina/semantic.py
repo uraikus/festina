@@ -661,17 +661,37 @@ class Scope:
         return None
 
 
+class _EnumInfo:
+    """claude.md #176: the real data an `enum Name = Member1, Member2,
+    ...` declaration carries -- `enums[name]` holds one of these, the
+    same "the Type is just a name-handle, the real data lives in a
+    side dict" split `structs`/`tables` already use for StructType/
+    TableType. `members` is the resolved [Type, ...] list, in
+    declaration order. `is_pure_struct` (every member a StructType)
+    decides the runtime representation codegen picks: a zero-overhead
+    self-tagged struct pointer when true, a heap-boxed {tag, value}
+    pair when false -- and, independently, whether field access
+    (`shape.radius`) is allowed at all (only ever true for a pure-
+    struct enum)."""
+    def __init__(self, members, is_pure_struct):
+        self.members = members
+        self.is_pure_struct = is_pure_struct
+
+
 class AnalyzedProgram:
-    def __init__(self, symbols, structs, tables, imports):
+    def __init__(self, symbols, structs, tables, enums, imports):
         self.symbols = symbols
         self.structs = structs
         self.tables = tables
+        self.enums = enums
         self.imports = imports
 
 
-def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None):
+def resolve_type_name(type_expr, structs, tables, enums=None, filename="<string>", node=None):
+    if enums is None:
+        enums = {}
     if isinstance(type_expr, ast.ArrayTypeExpr):
-        return types_mod.ArrayType(resolve_type_name(type_expr.element, structs, tables, filename, node),
+        return types_mod.ArrayType(resolve_type_name(type_expr.element, structs, tables, enums, filename, node),
                                     amortized=type_expr.amortized)
     if isinstance(type_expr, ast.FuncTypeExpr):
         # claude.md #141: func[T, T, ...]:R -- a first-class function
@@ -682,14 +702,14 @@ def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None
         # function, so this reads it the identical way analyze_func
         # does (`!= "void"` gates the resolve() call).
         param_types = tuple(
-            resolve_type_name(p, structs, tables, filename, node)
+            resolve_type_name(p, structs, tables, enums, filename, node)
             for p in type_expr.param_types
         )
         return_type = (None if type_expr.return_type == "void"
-                        else resolve_type_name(type_expr.return_type, structs, tables, filename, node))
+                        else resolve_type_name(type_expr.return_type, structs, tables, enums, filename, node))
         return types_mod.FuncType(param_types, return_type)
     if isinstance(type_expr, ast.MapTypeExpr):
-        value_type = resolve_type_name(type_expr.value, structs, tables, filename, node)
+        value_type = resolve_type_name(type_expr.value, structs, tables, enums, filename, node)
         # claude.md #72: a map value is stored in one fixed 8-byte slot
         # (see types.MapType's own doc comment) -- an ArrayType (16
         # bytes: length + data pointer) or another MapType simply
@@ -703,7 +723,7 @@ def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None
                 file=filename, line=getattr(node, "line", 0), column=getattr(node, "column", 0),
                 category="unknown type",
             )
-        return types_mod.MapType(value_type, amortized=type_expr.amortized)
+        return types_mod.MapType(value_type)
     name = type_expr
     if name in types_mod.PRIMITIVE_NAMES:
         return types_mod.PrimitiveType(name)
@@ -727,11 +747,54 @@ def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None
         return types_mod.StructType(name)
     if name in tables:
         return types_mod.TableType(name)
+    if name in enums:
+        return types_mod.EnumType(name)
     raise CompileError(
         f"unknown type '{name}'",
         file=filename, line=getattr(node, "line", 0), column=getattr(node, "column", 0),
         category="unknown type",
     )
+
+
+_JSON_SCALAR_TYPES = (types_mod.PrimitiveType("int"), types_mod.PrimitiveType("float"),
+                      types_mod.PrimitiveType("bool"), types_mod.PrimitiveType("text"))
+
+
+def _is_json_parseable_type(t, structs, _seen_structs=frozenset()):
+    """claude.md #173 (extends #159): is `t` a valid .toStruct()/
+    .toArr() field/element/target type? v1 (claude.md #159) only
+    allowed int/float/bool/text. This widens that to also allow a
+    nested struct, arr[T] or map[T] -- exactly mirroring codegen's own
+    _from_json_struct_fn_for/_from_json_arr_fn_for/_from_json_map_fn_for,
+    which now recurse into a nested field/element's own from-JSON
+    function the same way JSON *rendering* (_json_fn_for) already
+    recurses for nested containers -- as long as EVERY scalar this type
+    eventually bottoms out at is itself int/float/bool/text. A struct
+    used to check itself (directly or through a cycle of other structs
+    -- claude.md #17 made self-referencing structs legal generally) is
+    treated as valid without re-descending into it again: the check
+    already in progress for that struct, higher up this same recursion,
+    is the one that actually decides it, and re-entering it here would
+    only ever recurse forever without ever reaching a different answer.
+    `map[T]`'s own value can never itself be an ArrayType/MapType --
+    resolve_type_name above already rejects that at the point a map[T]
+    type is RESOLVED, so there is nothing left for this function to
+    reject on that axis; it only ever needs to keep recursing through
+    struct fields, array elements and map values until every leaf is
+    scalar."""
+    if t in _JSON_SCALAR_TYPES:
+        return True
+    if isinstance(t, types_mod.StructType):
+        if t.name in _seen_structs:
+            return True
+        seen = _seen_structs | {t.name}
+        return all(_is_json_parseable_type(ftype, structs, seen)
+                   for ftype in structs.get(t.name, {}).values())
+    if isinstance(t, types_mod.ArrayType):
+        return _is_json_parseable_type(t.element, structs, _seen_structs)
+    if isinstance(t, types_mod.MapType):
+        return _is_json_parseable_type(t.value, structs, _seen_structs)
+    return False
 
 
 def _iter_func_decls(stmts):
@@ -770,6 +833,7 @@ def analyze(program, filename="<string>"):
     global_scope = Scope()
     structs = {}
     tables = {}
+    enums = {}  # claude.md #176: name -> _EnumInfo
     imports = []
     entry_filename = filename  # see the DatabaseURL check at the bottom
     # claude.md #142: one monotonic counter for every arrow-function
@@ -807,7 +871,7 @@ def analyze(program, filename="<string>"):
     global_scope.define("argv", Symbol("argv", types_mod.ArrayType(_TEXT), "variable", None), None, filename)
 
     def resolve(type_expr, node=None):
-        return resolve_type_name(type_expr, structs, tables, filename, node)
+        return resolve_type_name(type_expr, structs, tables, enums, filename, node)
 
     def check_assignable(declared, actual, node, what="value"):
         if actual is None or actual is NULL or declared is None:
@@ -866,6 +930,16 @@ def analyze(program, filename="<string>"):
                 inner = actual.element if container is types_mod.ArrayType else actual.value
                 if inner is NULL or inner is None:
                     return
+        # claude.md #176: a member type coerces into its enum "pseudo
+        # type" -- e.g. Circle -> Shape for `enum Shape = Circle,
+        # Square`. One check here covers every position this function
+        # already gates (var decl, function param/return, struct
+        # field, array/map element, ...), the same way the container-
+        # null tolerance just above does.
+        if isinstance(declared, types_mod.EnumType):
+            info = enums.get(declared.name)
+            if info is not None and actual in info.members:
+                return
         if declared != actual:
             raise CompileError(
                 f"cannot assign {what} of type {types_mod.type_name(actual)} "
@@ -1320,6 +1394,13 @@ def analyze(program, filename="<string>"):
             if expr.op == "!":
                 return types_mod.PrimitiveType("bool")
             return operand
+        if isinstance(expr, ast.TypeofExpr):
+            # claude.md #176: always text, regardless of the operand's
+            # own type -- infer() runs purely to type-check the operand
+            # (an unknown identifier, say, should still be caught),
+            # nothing about the RESULT depends on what it resolves to.
+            infer(expr.operand, scope)
+            return _TEXT
         return None
 
     def _infer_member(expr, scope):
@@ -1429,6 +1510,31 @@ def analyze(program, filename="<string>"):
                     category="invalid field access",
                 )
             return fields[expr.prop]
+        if isinstance(obj_type, types_mod.EnumType):
+            # claude.md #176: field access only exists for a pure-
+            # struct enum (every member a struct) -- a mixed enum has
+            # no fields to speak of (what would `.radius` even mean on
+            # a Json value that might currently hold an int?). Resolves
+            # to a SINGLE owning member, guaranteed unique by
+            # analyze_enum's own field-collision check at declaration
+            # time, so there's no ambiguity to resolve here, only a
+            # lookup.
+            info = enums.get(obj_type.name)
+            if info is None or not info.is_pure_struct:
+                raise CompileError(
+                    f"cannot access field '{expr.prop}' on '{obj_type.name}' -- field access "
+                    f"only works on an enum whose members are all structs",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            owner = next((m for m in info.members if expr.prop in structs.get(m.name, {})), None)
+            if owner is None:
+                raise CompileError(
+                    f"enum '{obj_type.name}' has no member with field '{expr.prop}'",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            return structs[owner.name][expr.prop]
         if isinstance(obj_type, types_mod.TableType):
             # claude.md #34: a query against a declared table produces
             # arr[TableType(name)] -- field access on a row (e.g.
@@ -1670,11 +1776,7 @@ def analyze(program, filename="<string>"):
                 # map[T]'s own .toText() already has (codegen's
                 # _to_text) rather than inventing a second one, at the
                 # cost of restricting `fields` to string-valued tags
-                # rather than accepting any container shape. `.amortized`
-                # is deliberately ignored here (an `amor map[text]`
-                # fields argument works exactly the same way a plain one
-                # does -- there's nothing about amortized growth that
-                # matters once the map is just being rendered to JSON).
+                # rather than accepting any container shape.
                 min_args = 1 if name == "fail" else 2
                 if len(expr.args) < min_args or len(expr.args) > 2:
                     shape = "1 or 2" if name == "fail" else "2"
@@ -1804,13 +1906,8 @@ def analyze(program, filename="<string>"):
                     )
                 for i, (arg_expr, expected) in enumerate(zip(expr.args, fn_type.param_types)):
                     arg_type = infer(arg_expr, scope)
-                    if arg_type is not None and arg_type is not NULL and arg_type != expected:
-                        raise CompileError(
-                            f"argument {i + 1} of '{name}' expects "
-                            f"{types_mod.type_name(expected)}, found {types_mod.type_name(arg_type)}",
-                            file=filename, line=callee.line, column=callee.column,
-                            category="invalid function argument type",
-                        )
+                    check_assignable(expected, arg_type, callee,
+                                      what=f"argument {i + 1} of '{name}'")
                 return fn_type.return_type
             if sym is None or sym.kind != "function":
                 # claude.md #109: a name this language used to have gets
@@ -1834,13 +1931,8 @@ def analyze(program, filename="<string>"):
             for arg_expr, param in zip(expr.args, func_decl.params):
                 arg_type = infer(arg_expr, scope)
                 param_type = resolve(param.type_expr, callee)
-                if arg_type is not None and arg_type is not NULL and arg_type != param_type:
-                    raise CompileError(
-                        f"argument '{param.name}' of '{name}' expects "
-                        f"{types_mod.type_name(param_type)}, found {types_mod.type_name(arg_type)}",
-                        file=filename, line=callee.line, column=callee.column,
-                        category="invalid function argument type",
-                    )
+                check_assignable(param_type, arg_type, callee,
+                                  what=f"argument '{param.name}' of '{name}'")
             return sym.type
         if isinstance(callee, ast.Member) and not callee.computed:
             # claude.md #56: Math.floor/ceil/round/trunc(x:float) -> int
@@ -1910,15 +2002,16 @@ def analyze(program, filename="<string>"):
                         category="invalid method receiver",
                     )
                 target_type = resolve_type_name(
-                    expr.args[0].type_expr, structs, tables, filename, expr.args[0])
-                # claude.md #159 v1 SCOPE CUT (api.md/todo.md document
-                # it too): only int/float/bool/text are supported as a
-                # target struct's own field types or toArr()'s own
-                # element type -- nested struct/arr[T]/map[T] aren't
-                # parseable yet. Rejected here, at compile time, with a
-                # clear message naming exactly what's unsupported --
-                # never silently ignored or left null.
-                _JSON_SCALAR_TYPES = (_INT, _FLOAT, _BOOL, _TEXT)
+                    expr.args[0].type_expr, structs, tables, enums, filename, expr.args[0])
+                # claude.md #173 (widens claude.md #159's v1 scope cut):
+                # a target struct's own field types and toArr()'s own
+                # element type may now themselves be a nested struct,
+                # arr[T] or map[T], as long as every scalar they
+                # eventually bottom out at is int/float/bool/text --
+                # see _is_json_parseable_type's own doc comment.
+                # Rejected here, at compile time, with a clear message
+                # naming exactly what's unsupported -- never silently
+                # ignored or left null.
                 if callee.prop == "toStruct":
                     if not isinstance(target_type, types_mod.StructType):
                         raise CompileError(
@@ -1928,19 +2021,21 @@ def analyze(program, filename="<string>"):
                             category="invalid function argument type",
                         )
                     for fname, ftype in structs.get(target_type.name, {}).items():
-                        if ftype not in _JSON_SCALAR_TYPES:
+                        if not _is_json_parseable_type(ftype, structs):
                             raise CompileError(
                                 f"toStruct({target_type.name}) doesn't support field "
                                 f"'{fname}' of type {types_mod.type_name(ftype)} yet -- "
-                                f"only int/float/bool/text fields are supported",
+                                f"only int/float/bool/text, a struct, arr[T] or map[T] "
+                                f"built from those (recursively) are supported",
                                 file=filename, line=callee.line, column=callee.column,
                                 category="invalid function argument type",
                             )
                     return target_type
                 else:  # toArr
-                    if target_type not in _JSON_SCALAR_TYPES:
+                    if not _is_json_parseable_type(target_type, structs):
                         raise CompileError(
-                            f"toArr()'s element type must be int/float/bool/text, "
+                            f"toArr()'s element type must be int/float/bool/text, a "
+                            f"struct, arr[T] or map[T] built from those (recursively), "
                             f"found {types_mod.type_name(target_type)}",
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid function argument type",
@@ -2187,17 +2282,18 @@ def analyze(program, filename="<string>"):
             # assignment, a function argument, ...), no special
             # position required.
             #
-            # blob ONLY for now -- img/aud were asked for too, but both
-            # already call festina_fail() (a hard process exit, not
-            # blob's own graceful "empty on failure" contract) on a
-            # corrupt/unreadable file, which a background WORKER thread
-            # calling exit() concurrently with the main thread is a
-            # real, unverified risk this pass doesn't ship; img
-            # additionally needs its decoded cairo_surface_t built on
-            # that same worker thread, a Cairo thread-safety question
-            # not yet confirmed either. Both are a natural, likely
-            # follow-up, not ruled out -- just not done here. See
-            # claude.md #165's own account.
+            # claude.md #171: img/aud now share the same path -- both
+            # runtime loaders (festina_runtime_graphics.c,
+            # festina_runtime_audio.c) grew a non-throwing decode step a
+            # background worker thread can call (a missing file, an
+            # unrecognized format, or corrupt data all just leave the
+            # value as an empty placeholder, matching blob's own
+            # "test, don't fail" contract, rather than calling
+            # festina_fail() concurrently with the main thread), and img's
+            # own Cairo/libjpeg decode into a private surface was
+            # confirmed thread-safe by a real concurrent ThreadSanitizer
+            # run, not just by inspection. See claude.md #171's own
+            # account, and #165's for the original blob-only design.
             if callee.prop == "callback" and infer(callee.obj, scope) == _TEXT:
                 if len(expr.args) != 1:
                     raise CompileError(
@@ -2207,26 +2303,17 @@ def analyze(program, filename="<string>"):
                         category="invalid function argument type",
                     )
                 fn_type = infer(expr.args[0], scope)
-                if (isinstance(fn_type, types_mod.FuncType) and len(fn_type.param_types) == 1
-                        and fn_type.return_type is None
-                        and fn_type.param_types[0] in (_IMAGE, _AUDIO)):
-                    raise CompileError(
-                        f"callback() only supports func[blob]:void for now -- "
-                        f"img/aud background loading isn't implemented yet",
-                        file=filename, line=callee.line, column=callee.column,
-                        category="invalid function argument type",
-                    )
                 if (not isinstance(fn_type, types_mod.FuncType)
                         or len(fn_type.param_types) != 1
                         or fn_type.return_type is not None
-                        or fn_type.param_types[0] != _BLOB):
+                        or fn_type.param_types[0] not in (_BLOB, _IMAGE, _AUDIO)):
                     raise CompileError(
-                        f"callback() expects func[blob]:void, found "
-                        f"{types_mod.type_name(fn_type)}",
+                        f"callback() expects func[blob]:void, func[img]:void, or "
+                        f"func[aud]:void, found {types_mod.type_name(fn_type)}",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
-                return _BLOB
+                return fn_type.param_types[0]
             # claude.md #109: blob's five methods -- the file functions
             # claude.md #93 spelled as free functions taking a path,
             # moved onto the value that already knows the path. Checked
@@ -2641,13 +2728,7 @@ def analyze(program, filename="<string>"):
                 )
             for i, (arg_expr, expected) in enumerate(zip(expr.args, callee_type.param_types)):
                 arg_type = infer(arg_expr, scope)
-                if arg_type is not None and arg_type is not NULL and arg_type != expected:
-                    raise CompileError(
-                        f"argument {i + 1} expects {types_mod.type_name(expected)}, "
-                        f"found {types_mod.type_name(arg_type)}",
-                        file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
-                        category="invalid function argument type",
-                    )
+                check_assignable(expected, arg_type, expr, what=f"argument {i + 1}")
             return callee_type.return_type
         for a in expr.args:
             infer(a, scope)
@@ -2711,12 +2792,84 @@ def analyze(program, filename="<string>"):
             raise
         tables[decl.name] = columns
 
+    def analyze_enum(decl):
+        # claude.md #176: same duplicate-declaration/placeholder-before-
+        # resolving shape analyze_struct/analyze_table already use --
+        # see analyze_struct's own comment for the full reasoning
+        # (a name existing with real content is a duplicate; a bare
+        # placeholder is not).
+        if (structs.get(decl.name) or tables.get(decl.name) is not None
+                or enums.get(decl.name) is not None):
+            raise CompileError(
+                f"'{decl.name}' is already declared",
+                file=filename, line=decl.line, column=decl.column, category="duplicate declaration",
+            )
+        # claude.md #176: unlike struct/table, an enum can never
+        # legitimately self-reference (no enum-of-enum -- checked
+        # below), so there's no "placeholder before resolving" step
+        # needed here the way analyze_struct's own comment explains --
+        # `enums[decl.name]` is already `None` from the pre-scan (or
+        # this is a name the pre-scan somehow missed; harmless either
+        # way), and stays that way until every member has resolved
+        # successfully.
+        try:
+            members = []
+            for m in decl.members:
+                mtype = resolve(m, decl)
+                # claude.md #176: no enum-of-enum -- a member type is
+                # itself a compile-time-fixed, single concrete type
+                # (int, a struct, ...); an EnumType is the one kind of
+                # type that ISN'T single/concrete (that's the whole
+                # point of it), so nesting one inside another would mean
+                # deciding what "the tag" of an enum-typed member even
+                # is, a real design question this round doesn't answer.
+                if isinstance(mtype, types_mod.EnumType):
+                    raise CompileError(
+                        f"enum '{decl.name}' cannot have another enum ('{types_mod.type_name(mtype)}') "
+                        f"as a member",
+                        file=filename, line=decl.line, column=decl.column,
+                        category="invalid declaration",
+                    )
+                if mtype in members:
+                    raise CompileError(
+                        f"enum '{decl.name}' lists '{types_mod.type_name(mtype)}' more than once",
+                        file=filename, line=decl.line, column=decl.column,
+                        category="duplicate declaration",
+                    )
+                members.append(mtype)
+            is_pure_struct = all(isinstance(m, types_mod.StructType) for m in members)
+            # claude.md #176: field access (`shape.radius`) only exists
+            # for a pure-struct enum, and only works at all because it
+            # resolves to a single, unambiguous owning member at
+            # COMPILE time -- so two members declaring the same field
+            # name would make `shape.thatField` genuinely ambiguous.
+            # Rejected here, once, at declaration time, rather than
+            # needing per-access-site disambiguation (or a runtime
+            # ordering rule) later.
+            if is_pure_struct:
+                owner_by_field = {}
+                for m in members:
+                    for fname in structs[m.name]:
+                        if fname in owner_by_field and owner_by_field[fname] != m.name:
+                            raise CompileError(
+                                f"enum '{decl.name}': field '{fname}' is declared by both "
+                                f"'{owner_by_field[fname]}' and '{m.name}' -- field access on "
+                                f"'{decl.name}' would be ambiguous",
+                                file=filename, line=decl.line, column=decl.column,
+                                category="invalid declaration",
+                            )
+                        owner_by_field[fname] = m.name
+        except Exception:
+            del enums[decl.name]
+            raise
+        enums[decl.name] = _EnumInfo(members=members, is_pure_struct=is_pure_struct)
+
     def analyze_var_decl(decl, scope, is_global):
         declared_type = resolve(decl.type_expr, decl)
-        # claude.md #156: `amor map[T]` (local or global) requires an
-        # initializer -- unlike plain map[T]/arr[T], which start
-        # "empty" via a real, immortal, zero-entry static header
-        # (see codegen.py's _global_var_defs), an amortized map local's
+        # claude.md #174: `amor arr[T]` (local or global) requires an
+        # initializer -- unlike plain arr[T]/map[T], which start
+        # "empty" via a real, immortal, zero-entry static header (see
+        # codegen.py's _global_var_defs), an amortized array local's
         # own with-no-initializer path was deliberately never given
         # the equivalent (codegen's own scope boundary: it always
         # heap-allocates through the generic path instead, which needs
@@ -2726,13 +2879,16 @@ def analyze(program, filename="<string>"):
         # clear compile error. Struct fields have no initializer
         # syntax at all, so this can't (and doesn't need to) apply to
         # them -- they rely on auto-vivify instead (see codegen.py's
-        # own comment on that path).
-        if (isinstance(declared_type, types_mod.MapType) and declared_type.amortized
+        # own comment on that path). map[T] has no such requirement any
+        # more -- claude.md #175 removed `amor map[T]`, so every
+        # map[T] declaration (with or without an initializer) takes the
+        # ordinary plain-map path now.
+        if (isinstance(declared_type, types_mod.ArrayType) and declared_type.amortized
                 and decl.init is None):
             raise CompileError(
-                f"'{decl.name}' (amor map[{types_mod.type_name(declared_type.value)}]) "
-                f"requires an initializer -- write e.g. `amor map[{types_mod.type_name(declared_type.value)}] "
-                f"{decl.name} = {{}}` for an empty one",
+                f"'{decl.name}' (amor arr[{types_mod.type_name(declared_type.element)}]) "
+                f"requires an initializer -- write e.g. `amor arr[{types_mod.type_name(declared_type.element)}] "
+                f"{decl.name} = []` for an empty one",
                 file=filename, line=decl.line, column=decl.column,
                 category="invalid declaration",
             )
@@ -2774,47 +2930,35 @@ def analyze(program, filename="<string>"):
                             column=getattr(e, "column", 0),
                             category="invalid operand type",
                         )
-            elif (isinstance(declared_type, types_mod.MapType) and declared_type.amortized
-                    and isinstance(decl.init, ast.MapLit)):
-                # claude.md #156: same bypass shape as the arr[img] case
-                # just above, for the identical reason -- MapLit's own
-                # generic inference (_infer_member's MapLit branch)
-                # always returns a NON-amortized MapType regardless of
-                # context (it has no way to know a declaration wants
-                # `amor`), so the generic infer()+check_assignable()
-                # path below would always reject a `{...}` literal
-                # against an `amor map[T]` declared type. Validates
-                # each entry directly against the declared value type
-                # instead -- the same per-entry key/value checks the
-                # generic inference already does (claude.md #72's key-
-                # must-be-text rule, claude.md #154's mixed-value-type
-                # rule), just checked against a known target type
-                # rather than inferred from the literal's own entries.
-                value_type_name = types_mod.type_name(declared_type.value)
-                for key_expr, val_expr in decl.init.entries:
-                    key_type = infer(key_expr, scope)
-                    if key_type is not None and key_type is not NULL and key_type != _TEXT:
+            elif (isinstance(declared_type, types_mod.ArrayType) and declared_type.amortized
+                    and isinstance(decl.init, ast.ArrayLit)):
+                # claude.md #174: same bypass shape as the arr[img]/
+                # amor-map cases here -- ArrayLit's own generic
+                # inference (just above) always returns a NON-amortized
+                # ArrayType regardless of context, so the generic
+                # infer()+check_assignable() path below would always
+                # reject a `[...]` literal against an `amor arr[T]`
+                # declared type. The media (img/aud/blob) element case
+                # is already covered by the branch just above --
+                # unconditional on `.amortized`, so it already handles
+                # `amor arr[img] pics = [...]` too -- this only ever
+                # runs for a non-media amor arr[T].
+                elem_type_name = types_mod.type_name(declared_type.element)
+                for e in decl.init.elements:
+                    etype = infer(e, scope)
+                    if etype is not None and etype is not NULL and etype != declared_type.element:
                         raise CompileError(
-                            f"map key must be text, found {types_mod.type_name(key_type)}",
-                            file=filename, line=getattr(key_expr, "line", 0),
-                            column=getattr(key_expr, "column", 0),
-                            category="invalid operand type",
-                        )
-                    val_type = infer(val_expr, scope)
-                    if (val_type is not None and val_type is not NULL
-                            and val_type != declared_type.value):
-                        raise CompileError(
-                            f"map literal value expects {value_type_name}, "
-                            f"found {types_mod.type_name(val_type)}",
-                            file=filename, line=getattr(val_expr, "line", 0),
-                            column=getattr(val_expr, "column", 0),
+                            f"array literal element expects {elem_type_name}, "
+                            f"found {types_mod.type_name(etype)}",
+                            file=filename, line=getattr(e, "line", 0),
+                            column=getattr(e, "column", 0),
                             category="invalid operand type",
                         )
             elif (isinstance(declared_type, types_mod.HttpType)
                     and (isinstance(decl.init, ast.MapLit)
                          or _http_send_lit_receiver(decl.init) is not None)):
-                # claude.md #162: same bypass shape as the amor-map
-                # case just above, for the identical reason -- MapLit's
+                # claude.md #162: same bypass shape as the arr[img] case
+                # above, for the identical reason -- MapLit's
                 # own generic inference demands one homogeneous value
                 # type across every entry, which an http literal's
                 # genuinely heterogeneous field set (text/int/map/body)
@@ -2921,6 +3065,8 @@ def analyze(program, filename="<string>"):
             analyze_struct(stmt)
         elif isinstance(stmt, ast.TableDecl):
             analyze_table(stmt)
+        elif isinstance(stmt, ast.EnumDecl):
+            analyze_enum(stmt)
         elif isinstance(stmt, ast.FuncDecl):
             analyze_func(stmt)
         elif isinstance(stmt, ast.EventHandler):
@@ -3126,11 +3272,18 @@ def analyze(program, filename="<string>"):
     # per-declaration registration in analyze_struct/analyze_table stays
     # as it is: this pre-pass only guarantees the name exists, and those
     # still fill in the real field types and still reject a duplicate.
+    # claude.md #176: enum names get the identical treatment -- an
+    # `enum Shape = Circle, Square` declared above `struct Circle`
+    # resolves Circle/Square fine (they're pre-scanned too, in the same
+    # loop), and a struct field/function signature naming `Shape`
+    # before the `enum` line itself resolves fine too, symmetrically.
     for stmt in program.body:
         if isinstance(stmt, ast.StructDecl) and stmt.name not in structs:
             structs[stmt.name] = {}
         elif isinstance(stmt, ast.TableDecl) and stmt.name not in tables:
             tables[stmt.name] = {}
+        elif isinstance(stmt, ast.EnumDecl) and stmt.name not in enums:
+            enums[stmt.name] = None
 
     # claude.md #140: every function's NAME and SIGNATURE is registered
     # before any CALL resolves -- "hoisting", the same declaration-
@@ -3190,4 +3343,4 @@ def analyze(program, filename="<string>"):
                 category="invalid assignment",
             )
 
-    return AnalyzedProgram(global_scope.vars, structs, tables, imports)
+    return AnalyzedProgram(global_scope.vars, structs, tables, enums, imports)

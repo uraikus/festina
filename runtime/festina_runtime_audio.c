@@ -672,14 +672,29 @@ static int festina_decode_wav(const unsigned char *data, size_t len,
 /* MP3, via libmpg123. Feeding the whole buffer at once and reading
  * until the decoder is done is the simplest correct shape, and the
  * whole file is already in memory anyway. */
+static pthread_once_t g_mpg123_init_once = PTHREAD_ONCE_INIT;
+static int g_mpg123_init_ok = 0;
+static void festina_mpg123_init_once(void) {
+    g_mpg123_init_ok = (mpg123_init() == MPG123_OK);
+}
 static int festina_decode_mp3(const unsigned char *data, size_t len,
                                int16_t **out_samples, size_t *out_frames,
                                int *out_channels, unsigned int *out_rate) {
-    static int initialized = 0;
-    if (!initialized) {
-        if (mpg123_init() != MPG123_OK) return 0;
-        initialized = 1;
-    }
+    /* claude.md #171: this used to be a plain `static int initialized`
+     * flag, harmless when festina_decode_mp3 could only ever be called
+     * from the main thread. Extending .callback() to `aud` makes it
+     * reachable from several async-io worker threads at once (a
+     * concurrent `aud.callback()` dispatch racing an ordinary
+     * synchronous `aud a = 'x.mp3'` load on main, or several
+     * background loads racing each other) -- a bare flag read/written
+     * with no synchronization is exactly the kind of thing
+     * ThreadSanitizer flags immediately (and mpg123_init() itself gives
+     * no guarantee about being safe to call from two threads at once).
+     * pthread_once makes the first call -- whichever thread wins -- the
+     * only one that actually calls mpg123_init(), and makes every other
+     * caller, on any thread, block until that one finishes. */
+    pthread_once(&g_mpg123_init_once, festina_mpg123_init_once);
+    if (!g_mpg123_init_ok) return 0;
 
     int err = MPG123_OK;
     mpg123_handle *mh = mpg123_new(NULL, &err);
@@ -884,6 +899,101 @@ void *festina_load_audio(const char *path) {
     return clip;
 }
 
+/* claude.md #171 (extends claude.md #165's `.callback()` to `aud`):
+ * an empty, silent clip -- 1 channel, a sane default rate, zero
+ * frames -- exactly as "unpopulated" as festina_image_load_dispatch's
+ * own 1x1 transparent placeholder, or a background blob load's own
+ * empty bytes/length. play() on it is harmless: festina_audio_thread_main's
+ * very first `frame >= a->frame_count` check (0 >= 0) is true
+ * immediately, so it opens a device, plays nothing, and closes again --
+ * never the "channels/rate are both 0" shape that would otherwise risk
+ * festina_pcm_open() itself failing and calling festina_fail() on
+ * something that was only ever "not loaded yet", not a real error. */
+static void *festina_audio_placeholder(void) {
+    char *raw = calloc(1, sizeof(int64_t) + sizeof(FestinaAudio));
+    if (!raw) festina_fail("out of memory allocating an audio clip");
+    *(int64_t *)raw = 1;
+    FestinaAudio *a = (FestinaAudio *)(raw + sizeof(int64_t));
+    a->samples = NULL;
+    a->frame_count = 0;
+    a->channels = 1;
+    a->sample_rate = 44100;
+    a->bytes = NULL;
+    a->byte_count = 0;
+    a->path = strdup("");
+    if (!a->path) festina_fail("out of memory allocating an audio clip");
+    return a;
+}
+
+/* claude.md #171: runs on a background worker thread (see
+ * festina_runtime_async.c) -- reads and decodes `a->path` (already set,
+ * at construction time, by festina_audio_load_dispatch below) and
+ * fills in samples/frame_count/channels/sample_rate/bytes/byte_count IN
+ * PLACE, mutating the same clip the caller already got back
+ * immediately. Matches festina_blob_load_worker's own contract exactly:
+ * NEVER calls festina_fail() except on genuine out-of-memory (the one
+ * failure category festina_decode_wav/festina_decode_mp3 already
+ * treat as fatal everywhere, worker thread or not -- see
+ * festina_runtime_async.c's own top comment) -- a missing file, an
+ * unrecognized format, and genuinely corrupt WAV/MP3 data are all just
+ * "stays the empty placeholder", the graceful outcome festina_load_audio's
+ * synchronous, festina_fail()-on-any-of-those-three contract deliberately
+ * does NOT give a caller that has no chance to catch it. */
+static void festina_audio_load_worker(void *payload) {
+    FestinaAudio *a = (FestinaAudio *)payload;
+    if (!a->path || !*a->path) return;
+    FILE *f = fopen(a->path, "rb");
+    if (!f) return;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return; }
+    long size = ftell(f);
+    if (size < 0) { fclose(f); return; }
+    rewind(f);
+    unsigned char *data = malloc((size_t)size ? (size_t)size : 1);
+    if (!data) { fclose(f); festina_fail("out of memory loading audio"); }
+    size_t got = fread(data, 1, (size_t)size, f);
+    fclose(f);
+    if (got != (size_t)size) { free(data); return; }
+
+    int16_t *samples = NULL;
+    size_t frames = 0;
+    int channels = 0;
+    unsigned int rate = 0;
+    int ok;
+    if ((size_t)size >= 12 && memcmp(data, "RIFF", 4) == 0 && memcmp(data + 8, "WAVE", 4) == 0) {
+        ok = festina_decode_wav(data, (size_t)size, &samples, &frames, &channels, &rate);
+    } else {
+        ok = festina_decode_mp3(data, (size_t)size, &samples, &frames, &channels, &rate);
+    }
+    if (!ok) { free(data); return; }
+
+    free(a->samples);
+    a->samples = samples;
+    a->frame_count = frames;
+    a->channels = channels;
+    a->sample_rate = rate;
+    free(a->bytes);
+    a->bytes = data;
+    a->byte_count = (size_t)size;
+}
+
+/* claude.md #171: codegen's own entry point for a `.callback()`-carrying
+ * aud construction, mirroring festina_blob_load_dispatch/
+ * festina_image_load_dispatch exactly -- NULL callback is the unchanged,
+ * fully synchronous festina_load_audio path; non-NULL returns the
+ * placeholder above immediately (path already correct) and hands the
+ * real load to the async-io pool. */
+void *festina_audio_load_dispatch(const char *path, void (*callback)(void *)) {
+    if (!callback) return festina_load_audio(path);
+    if (!path) path = "";
+    void *clip = festina_audio_placeholder();
+    FestinaAudio *a = (FestinaAudio *)clip;
+    free(a->path);
+    a->path = strdup(path);
+    if (!a->path) festina_fail("out of memory allocating an audio clip");
+    festina_retain(clip);
+    festina_async_io_dispatch(clip, festina_audio_load_worker, callback, festina_audio_free);
+    return clip;
+}
 
 /* claude.md #98/#99: picks the channel this play() will use. Called
  * with the lock HELD (and may drop/retake it, via the helpers above).

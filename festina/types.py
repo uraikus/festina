@@ -4,7 +4,7 @@ resolution), #13 (unknown types).
 Each category gets its own class so the compiler never has to infer a
 category from a name -- callers construct the specific type they mean.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 PRIMITIVE_NAMES = frozenset({"int", "float", "bool", "text", "blob"})
 
@@ -38,26 +38,46 @@ class TableType:
 
 
 @dataclass(frozen=True)
+class EnumType:
+    """claude.md #176: `enum Name = Member1, Member2, ...` -- a tagged
+    union "pseudo type" over any type. Name-only, exactly like
+    StructType/TableType above -- the real member list (and whether
+    every member is a struct, which decides the runtime representation:
+    a zero-overhead self-tagged struct pointer, or a heap-boxed {tag,
+    value} pair for anything else) lives in a separate `enums` dict
+    (semantic.py's AnalyzedProgram, mirrored in codegen.py's self.enums),
+    the same "StructType is a name-handle, structs holds the real field
+    data" split StructType itself already uses.
+
+    typeof on an EnumType-typed value never returns the enum's OWN
+    name -- it always returns the concrete runtime member's name (the
+    whole reason a runtime tag exists at all). "Shape" itself is never
+    a typeof result; "Circle"/"Square" are."""
+    name: str
+
+    def __repr__(self):
+        return f"EnumType({self.name})"
+
+
+@dataclass(frozen=True)
 class ArrayType:
     """claude.md #156: `amortized` (default False) is set by the `amor`
-    prefix -- `amor arr[T]` -- tracked for parsing/type-checking
-    symmetry with MapType's own identical field (`amor` was asked for
-    on both containers together), but with NO runtime effect yet:
-    array growth (festina_array_resize) isn't amortized the way
-    festina_amap_set makes map growth amortized -- `amor arr[T]`
-    currently compiles and behaves exactly like plain arr[T]. Left as
-    a real, honest scope boundary (see claude.md #156's own writeup)
-    rather than silently accepting the syntax and doing nothing with
-    it, or blocking it outright. `compare=False`: since there's no
-    representation difference yet, an `amor arr[T]` and a plain
-    arr[T] of the same element type are treated as the SAME type for
-    assignment/equality purposes (unlike MapType's own `amortized`,
-    which IS part of that type's identity, since amor map[T] genuinely
-    has a different runtime header) -- revisit this the moment array
-    amortization is actually implemented, since at that point the two
-    genuinely stop being interchangeable."""
+    prefix -- `amor arr[T]` -- originally tracked for parsing/type-
+    checking symmetry with `amor map[T]`, which claude.md #175 later
+    removed outright once plain map[T] itself became a real hash table
+    with intrinsic geometric growth (see MapType's own docstring).
+    claude.md #174 gave `amortized` a real runtime effect for arrays,
+    which #175 didn't touch: `festina_array_resize` grows an
+    `amor arr[T]`'s backing buffer geometrically (doubling), tracked in
+    a THIRD header field (`FESTINA_AMOR_ARRAY_LLVM_TYPE`, a byte-
+    compatible prefix extension of the plain `{length, data}` shape) a
+    plain `arr[T]`'s header doesn't have -- so this is part of the
+    type's real identity, not a comparison-transparent modifier: an
+    `amor arr[T]` and a plain `arr[T]` of the same element type are
+    genuinely different, non-interchangeable representations, and
+    assignment between them is a compile error."""
     element: object  # another Type instance
-    amortized: bool = field(default=False, compare=False)
+    amortized: bool = False
 
     def __repr__(self):
         prefix = "amor " if self.amortized else ""
@@ -163,28 +183,31 @@ class FontType:
 
 @dataclass(frozen=True)
 class MapType:
-    """claude.md #72: map[T] -- keys are always text (never part of the
-    type itself, the same way an array's index isn't), so only the
-    value type distinguishes one map[T] from another. `value` may be
-    any Type except ArrayType/MapType itself -- resolve_type_name
-    rejects those at the point a map[T] type is resolved, since a map's
-    runtime representation (festina_runtime.c's FestinaMapEntry) stores
-    each value in one fixed 8-byte slot, the same convention sqlite
-    query rows already use, and neither an array value (16 bytes: a
-    length plus a data pointer) nor another map value fits in that.
+    """claude.md #72, rebuilt into a real hash table by #175: map[T] --
+    keys are always text (never part of the type itself, the same way
+    an array's index isn't), so only the value type distinguishes one
+    map[T] from another. `value` may be any Type except ArrayType/
+    MapType itself -- resolve_type_name rejects those at the point a
+    map[T] type is resolved, since a map's runtime representation
+    (festina_runtime.c's FestinaMapEntry) stores each value in one
+    fixed 8-byte slot, the same convention sqlite query rows already
+    use, and neither an array value (16 bytes: a length plus a data
+    pointer) nor another map value fits in that.
 
-    claude.md #156: `amortized` (default False) is set by the `amor`
-    prefix -- `amor map[T]` -- and is part of this type's own identity
-    for the identical reason ArrayType's own `amortized` field is: it
-    changes the runtime header layout (an extra tracked-capacity field)
-    and which growth function codegen calls, not just an internal
-    detail invisible at the type level."""
+    Backed by a real open-addressing hash table (linear probing,
+    FNV-1a, tombstone deletion, doubling at 75% load factor -- see
+    festina_map_set's own comment in runtime/festina_runtime.c), not a
+    linear scan. Growth is intrinsic to being a hash table -- every
+    map[T] tracks its own bucket capacity and grows geometrically, the
+    same "amortized" growth claude.md #156's now-removed `amor map[T]`
+    variant used to bolt on separately; there is no distinct amortized
+    map type left to give this a second field for (unlike ArrayType,
+    which still has one -- `amor arr[T]` is unaffected by this
+    change)."""
     value: object  # another Type instance
-    amortized: bool = False
 
     def __repr__(self):
-        prefix = "amor " if self.amortized else ""
-        return f"{prefix}MapType({self.value!r})"
+        return f"MapType({self.value!r})"
 
 
 @dataclass(frozen=True)
@@ -229,6 +252,8 @@ def type_name(t):
         return t.name
     if isinstance(t, TableType):
         return t.name
+    if isinstance(t, EnumType):
+        return t.name
     if isinstance(t, ArrayType):
         prefix = "amor " if t.amortized else ""
         return f"{prefix}arr[{type_name(t.element)}]"
@@ -249,8 +274,7 @@ def type_name(t):
     if isinstance(t, FontType):
         return "font"
     if isinstance(t, MapType):
-        prefix = "amor " if t.amortized else ""
-        return f"{prefix}map[{type_name(t.value)}]"
+        return f"map[{type_name(t.value)}]"
     if isinstance(t, FuncType):
         params = ",".join(type_name(p) for p in t.param_types)
         ret = "void" if t.return_type is None else type_name(t.return_type)

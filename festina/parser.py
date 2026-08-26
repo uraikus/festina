@@ -105,19 +105,29 @@ class Parser:
     # ---- types ----
     def parse_type(self):
         if self.at("amor"):
-            # claude.md #156: amor map[T] / amor arr[T] -- amortized
-            # growth, a modifier on the container type itself rather
-            # than a separate type name (composes with `const` the
-            # same way: `const amor map[text] m`, parsed in
-            # parse_const_decl below). Only map[T]/arr[T] have a growth
-            # strategy to modify at all -- anything else after `amor`
-            # is a clear, direct error rather than a confusing
-            # downstream one.
+            # claude.md #156: amor arr[T] -- amortized growth, a
+            # modifier on the container type itself rather than a
+            # separate type name (composes with `const` the same way:
+            # `const amor arr[int] xs`, parsed in parse_const_decl
+            # below). Only arr[T] has a growth strategy left to modify
+            # -- claude.md #175 removed `amor map[T]`, since plain
+            # map[T] itself became a real hash table with intrinsic
+            # geometric growth, making a separate amortized variant
+            # redundant. Anything after `amor` besides arr[T] -- map[T]
+            # included -- is a clear, direct error rather than a
+            # confusing downstream one (silently parsing `amor map[T]`
+            # and just dropping the `amor` would be worse: it would
+            # look accepted while quietly meaning something the
+            # programmer didn't write).
             amor_tok = self.eat("amor")
-            if not (self.at("arr") or self.at("map")):
+            if self.at("map"):
+                raise self.err(amor_tok, "invalid syntax",
+                                "'amor map[T]' was removed -- map[T] is a hash table now and "
+                                "grows the same way 'amor map[T]' used to; drop the 'amor'")
+            if not self.at("arr"):
                 t = self.peek()
                 raise self.err(amor_tok, "invalid syntax",
-                                f"'amor' must be followed by arr[T] or map[T], found {t.type}({t.value!r})")
+                                f"'amor' must be followed by arr[T], found {t.type}({t.value!r})")
             inner_type = self.parse_type()
             inner_type.amortized = True
             return inner_type
@@ -217,6 +227,8 @@ class Parser:
             return self.parse_struct_decl()
         if t.type == "table":
             return self.parse_table_decl()
+        if t.type == "enum":
+            return self.parse_enum_decl()
         if t.type == "on":
             return self.parse_event_handler()
         if t.type == "if":
@@ -278,9 +290,10 @@ class Parser:
         # new shorthand) already handles the resulting AST shape.
         if t.type == "http" and self.peek(1).type == "LBRACE":
             return self.parse_http_anon_send()
-        # claude.md #165: `blob 'path'.callback(fn)` (also img/aud,
-        # though only blob is actually implemented past semantic.py
-        # for now -- see that module's own comment) -- the anonymous,
+        # claude.md #165 (extended to img/aud by #171): `blob
+        # 'path'.callback(fn)` (also `img 'path'.callback(fn)`/`aud
+        # 'path'.callback(fn)` -- see semantic.py's own comment) --
+        # the anonymous,
         # fire-and-forget counterpart to `http {...}` just above, same
         # "checked before _looks_like_declaration would otherwise
         # misroute it" reasoning. Unlike `http {...}`, no AST
@@ -342,9 +355,14 @@ class Parser:
         if i >= len(self.toks):
             return i
         if self.toks[i].type == "amor":
-            # claude.md #156: amor map[T] / amor arr[T] -- just a
-            # one-token prefix ahead of whatever map[T]/arr[T] itself
-            # spans, not a container needing its own [T] skip.
+            # claude.md #156: amor arr[T] -- just a one-token prefix
+            # ahead of whatever arr[T]/map[T] itself spans, not a
+            # container needing its own [T] skip. Doesn't validate what
+            # follows `amor` is actually arr[T] (parse_type() does
+            # that, and claude.md #175 made `amor map[T]` a parse
+            # error there) -- this only needs to skip past however many
+            # tokens the type expression spans, whatever it turns out
+            # to be.
             return self._type_expr_end(i + 1)
         if self.toks[i].type in ("arr", "map"):
             i += 1
@@ -552,6 +570,26 @@ class Parser:
         self.eat("RBRACE")
         return ast.TableDecl(name_tok.value, fields, t.line, t.column)
 
+    def parse_enum_decl(self):
+        # claude.md #176: `enum Name = Member1, Member2, ...` -- unlike
+        # struct/table, `=`-introduced and comma-SEPARATED (not brace-
+        # delimited), since there's no per-member `:type` to parse --
+        # each member IS a type. Each member goes through parse_type()
+        # itself (not a bare IDENT), so a primitive keyword (`int`,
+        # `text`, ...) works as a member exactly like a struct name
+        # does -- semantic.py's analyze_enum is what actually resolves
+        # and validates each one (unknown name, enum-of-enum, a
+        # duplicate member -- none of that is this parser's job).
+        t = self.eat("enum")
+        name_tok = self.eat("IDENT")
+        self.eat_op("=")
+        members = [self.parse_type()]
+        while self.at_op(","):
+            self.eat()
+            members.append(self.parse_type())
+        self._semi()
+        return ast.EnumDecl(name_tok.value, members, t.line, t.column)
+
     def parse_event_handler(self):
         t = self.eat("on")
         name_tok = self.eat("IDENT")
@@ -739,6 +777,14 @@ class Parser:
             op_tok = self.eat()
             operand = self.parse_unary()
             return ast.UnaryOp(op_tok.value, operand)
+        if self.at("typeof"):
+            # claude.md #176: `typeof <expr>` -- a real reserved
+            # keyword (not a contextual identifier the way `log`/`fail`/
+            # `sqlite` are), since unlike those it has no other use as
+            # a plain callable/member name to preserve.
+            op_tok = self.eat("typeof")
+            operand = self.parse_unary()
+            return ast.TypeofExpr(operand, op_tok.line, op_tok.column)
         return self.parse_call_member()
 
     def parse_call_member(self):

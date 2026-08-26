@@ -107,6 +107,11 @@ build_runtime() {
     "$SAN_CC" -fsanitize=address -g -O1 -c "$ROOT/runtime/$src" "$@" -o "$WORK/rt_$name.o" || return 1
 }
 build_runtime core festina_runtime.c $(pkg-config --cflags sqlite3) || exit 1
+# claude.md #165/#171: blob/img/aud's own `.callback()` -- pure POSIX
+# (pthread only, no pkg-config dependency of its own), so this is
+# linked unconditionally, same as core, rather than probed like
+# graphics/audio below.
+build_runtime async festina_runtime_async.c || exit 1
 GFX_OK=0; AUD_OK=0
 if pkg-config --exists cairo-xlib x11 libjpeg; then
     build_runtime graphics festina_runtime_graphics.c $(pkg-config --cflags cairo-xlib x11 libjpeg) && GFX_OK=1
@@ -115,10 +120,10 @@ if pkg-config --exists alsa libmpg123; then
     build_runtime audio festina_runtime_audio.c $(pkg-config --cflags alsa libmpg123) && AUD_OK=1
 fi
 
-LIBS=(-lsqlite3 -lm)
-OBJS=("$WORK/rt_core.o")
+LIBS=(-lsqlite3 -lm -pthread)
+OBJS=("$WORK/rt_core.o" "$WORK/rt_async.o")
 [ $GFX_OK = 1 ] && { OBJS+=("$WORK/rt_graphics.o"); LIBS+=($(pkg-config --libs cairo-xlib x11 libjpeg)); }
-[ $AUD_OK = 1 ] && { OBJS+=("$WORK/rt_audio.o"); LIBS+=($(pkg-config --libs alsa libmpg123) -pthread); }
+[ $AUD_OK = 1 ] && { OBJS+=("$WORK/rt_audio.o"); LIBS+=($(pkg-config --libs alsa libmpg123)); }
 
 failures=0
 for src in "${PROGRAMS[@]}"; do

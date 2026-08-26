@@ -37,12 +37,15 @@ class ArrayTypeExpr(Node):
 class MapTypeExpr(Node):
     """`map[T]` as it appears in a type position -- claude.md #72. Keys
     are always text, so (mirroring ArrayTypeExpr) only the value type
-    needs spelling out. `amortized` mirrors ArrayTypeExpr's own field
-    exactly -- claude.md #156's `amor map[T]`."""
+    needs spelling out. No `amortized` field -- claude.md #156's `amor
+    map[T]` was removed by claude.md #175 once plain map[T] itself
+    became a real hash table with intrinsic geometric growth; parser.py
+    rejects `amor` immediately followed by `map` at parse time rather
+    than accepting it and losing its meaning. ArrayTypeExpr keeps its
+    own `amortized` field -- `amor arr[T]` is unaffected."""
 
-    def __init__(self, value, amortized=False):
+    def __init__(self, value):
         self.value = value
-        self.amortized = amortized
 
 
 class FuncTypeExpr(Node):
@@ -103,6 +106,19 @@ class TableDecl(Node):
     def __init__(self, name, fields, line=0, column=0):
         self.name = name
         self.fields = fields
+        self.line = line
+        self.column = column
+
+
+class EnumDecl(Node):
+    """claude.md #176: `enum Name = Member1, Member2, ...` -- a tagged
+    union "pseudo type" over any type. `members` is a list of type
+    expressions (each parsed via parse_type, the same as a field's own
+    type -- so a member can be a struct/table name OR a primitive
+    keyword like `int`/`text`, not just a bare struct IDENT)."""
+    def __init__(self, name, members, line=0, column=0):
+        self.name = name
+        self.members = members
         self.line = line
         self.column = column
 
@@ -364,6 +380,22 @@ class PostfixOp(Node):
 
     def __init__(self, op, operand, line=0, column=0):
         self.op = op
+        self.operand = operand
+        self.line = line
+        self.column = column
+
+
+class TypeofExpr(Node):
+    """claude.md #176: `typeof <expr>` -- a prefix operator, always
+    text, returning the operand's concrete runtime type's name (never
+    an enum's own pseudo-type name -- see EnumType/TypeofExpr's own
+    codegen for why). A dedicated node rather than folded into
+    UnaryOp as a third `op` string, the same split PostfixOp itself
+    took from UnaryOp -- semantic.py/codegen.py dispatch on it
+    distinctly, and (unlike UnaryOp) it carries its own line/column
+    for a clear error location."""
+
+    def __init__(self, operand, line=0, column=0):
         self.operand = operand
         self.line = line
         self.column = column

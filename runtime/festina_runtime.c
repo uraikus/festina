@@ -868,14 +868,20 @@ static char *festina_url_decode(const char *start, const char *end) {
 }
 
 /* festina_runtime_http.c has its own helper of this exact name/shape
- * (a fresh {refcount, count, entries} map[text] block) -- not
- * reachable from here (a different translation unit), so this is
- * CORE's own private copy, used by both url search params and by
- * anything else in this file that ever needs a fresh empty map[text]. */
+ * (a fresh {refcount, count, entries, capacity, tombstones} map[text]
+ * block) -- not reachable from here (a different translation unit), so
+ * this is CORE's own private copy, used by both url search params and
+ * by anything else in this file that ever needs a fresh empty
+ * map[text]. claude.md #175: count/entries/capacity/tombstones mirror
+ * the map[T] header shape codegen.py now emits (FESTINA_MAP_LLVM_TYPE)
+ * exactly, field for field, since every festina_map_* call below reads
+ * and writes them the same way generated code does. */
 typedef struct {
     int64_t refcount;
     int64_t count;
     void *entries;
+    int64_t capacity;
+    int64_t tombstones;
 } FestinaMapBlockCore;
 
 static void *festina_new_empty_text_map(void) {
@@ -907,8 +913,8 @@ static void *festina_parse_search_params(const char *query, size_t len) {
             value = festina_text_own("");
         }
         if (key[0] != '\0') {
-            festina_map_set(&block->count, &block->entries, key,
-                            (int64_t)(intptr_t)value);
+            festina_map_set(&block->count, &block->entries, &block->capacity,
+                            &block->tombstones, key, (int64_t)(intptr_t)value);
         } else {
             free(value);
         }
@@ -3622,69 +3628,164 @@ void festina_release(void *payload) {
 }
 
 
-/* ---- maps -- claude.md #72 ---- */
+/* ---- maps -- claude.md #72, rebuilt into a real hash table by #175 ---- */
 
-/* One key/value pair -- `value` is a raw 8-byte payload meaning
- * whatever the compiled program's own map[T] says it means (int64_t
- * bits, a double's raw bits, or a pointer -- see festina/codegen.py's
+/* One bucket slot -- `value` is a raw 8-byte payload meaning whatever
+ * the compiled program's own map[T] says it means (int64_t bits, a
+ * double's raw bits, or a pointer -- see festina/codegen.py's
  * _map_value_to_i64/_i64_to_map_value for the reinterpretation, done
  * entirely on the LLVM IR side, since this runtime has no idea what T
  * a given map's values are, only ever seeing the already-flattened i64
  * payload). The same "one fixed-size slot per value" convention
  * festina_sqlite_collect_rows's row layout and every arr[T]'s own
- * per-element storage already use. */
+ * per-element storage already use.
+ *
+ * `key` doubles as this bucket's occupancy state, the same sentinel
+ * trick festina_conn_index_* (festina_runtime_http.c) already uses for
+ * its own int64_t conn_id key: NULL means the slot has never been used
+ * (a probe stops here -- nothing further down the chain), and the
+ * reserved FESTINA_MAP_TOMBSTONE pointer means a key WAS deleted here
+ * (a probe must keep going -- a live key may sit further down the same
+ * chain). Neither value can ever collide with a real key: every real
+ * key is a strdup() result, never NULL and never the literal address
+ * 1. */
 typedef struct {
-    char *key;      /* owned copy -- see festina_map_set's own comment */
+    char *key;      /* NULL = empty, FESTINA_MAP_TOMBSTONE = deleted,
+                      * else an owned strdup'd copy -- see
+                      * festina_map_set's own comment */
     int64_t value;
 } FestinaMapEntry;
 
-/* Linear scan, not a hash table -- maps in Festina are meant for small,
- * game/config-shaped key sets (see claude.md #72's own worked example:
- * a handful of NPC health/name entries), and this runtime already
- * favors simple, obviously-correct implementations over algorithmic
- * sophistication elsewhere too (arr[T] itself has no hashing or
- * ordered structure either) -- a deliberate, documented tradeoff
- * (claude.md #54's ambiguity rule: correctness over micro-optimizing
- * something the spec doesn't ask for), not an oversight. A map with a
- * genuinely large number of entries would see O(n) get/set cost;
- * revisit if that becomes a real problem for a real program. */
-static FestinaMapEntry *festina_map_find(int64_t count, void *entries, const char *key) {
-    FestinaMapEntry *arr = (FestinaMapEntry *)entries;
-    for (int64_t i = 0; i < count; i++) {
-        if (festina_str_eq(arr[i].key, key)) return &arr[i];
+#define FESTINA_MAP_TOMBSTONE ((char *)1)
+
+/* claude.md #175: FNV-1a over the NUL-terminated key. No generic
+ * string hash existed anywhere in this runtime before this -- the
+ * only other hash table here, festina_conn_index_* in
+ * festina_runtime_http.c, mixes an int64_t conn_id, not text. FNV-1a
+ * is the standard, simplest-adequate choice for short, arbitrary
+ * string keys (map[T] is documented as staying small, config/game-
+ * state shaped) -- no claim of cryptographic strength, none needed. */
+static uint64_t festina_map_hash(const char *key) {
+    uint64_t h = 1469598103934665603ULL; /* FNV offset basis */
+    for (const unsigned char *p = (const unsigned char *)key; *p; p++) {
+        h ^= (uint64_t)*p;
+        h *= 1099511628211ULL; /* FNV prime */
+    }
+    return h;
+}
+
+/* Lookup-only probe: linear probing (claude.md #153's own
+ * festina_conn_index_get is the direct prior art -- same shape, keyed
+ * by text instead of int64_t here). Stops at the first true match or
+ * the first never-used (NULL) slot; a tombstone doesn't stop the probe
+ * since a matching live key may sit further down the same chain. */
+static FestinaMapEntry *festina_map_find(void *entries, int64_t capacity, const char *key) {
+    if (capacity == 0) return NULL;
+    FestinaMapEntry *buckets = (FestinaMapEntry *)entries;
+    uint64_t mask = (uint64_t)capacity - 1;
+    uint64_t i = festina_map_hash(key) & mask;
+    for (int64_t probes = 0; probes < capacity; probes++) {
+        char *k = buckets[i].key;
+        if (k == NULL) return NULL;
+        if (k != FESTINA_MAP_TOMBSTONE && festina_str_eq(k, key)) return &buckets[i];
+        i = (i + 1) & mask;
     }
     return NULL;
 }
 
-/* claude.md #72: npcHealths['npc1'] = 30 -- and the equivalent
+/* Insert-probe: like festina_map_find, but returns the slot a NEW key
+ * should land in when the key isn't already present -- the first
+ * tombstone seen along the chain (reused rather than left dead), or
+ * the terminating empty slot if the chain held no tombstone. Returns
+ * the EXISTING bucket directly if the key is already present (same
+ * probe, no separate lookup needed first). `capacity` must be > 0 --
+ * every caller has already grown the table before calling this. */
+static FestinaMapEntry *festina_map_find_slot(void *entries, int64_t capacity, const char *key) {
+    FestinaMapEntry *buckets = (FestinaMapEntry *)entries;
+    uint64_t mask = (uint64_t)capacity - 1;
+    uint64_t i = festina_map_hash(key) & mask;
+    FestinaMapEntry *first_tombstone = NULL;
+    for (int64_t probes = 0; probes < capacity; probes++) {
+        char *k = buckets[i].key;
+        if (k == NULL) return first_tombstone ? first_tombstone : &buckets[i];
+        if (k == FESTINA_MAP_TOMBSTONE) {
+            if (!first_tombstone) first_tombstone = &buckets[i];
+        } else if (festina_str_eq(k, key)) {
+            return &buckets[i];
+        }
+        i = (i + 1) & mask;
+    }
+    /* Unreachable under the load factor festina_map_set enforces below
+     * (a full-table probe with no empty slot found) -- a safe fallback
+     * rather than a crash/infinite loop, matching
+     * festina_conn_index_get's own identical fallback. */
+    return first_tombstone;
+}
+
+/* Rebuilds into a fresh, larger table -- claude.md #175, modeled
+ * directly on festina_conn_index_grow. Doubles capacity (or starts at
+ * 8 from an empty map), MOVES every live key's existing strdup'd
+ * pointer into the new table (never re-strdup's, never frees a live
+ * key), and drops every tombstone outright (a rebuilt table starts
+ * with none) -- the mechanism that keeps tombstone buildup from
+ * degrading probe chains under heavy insert/delete churn, even when
+ * the live count itself never grows. Accepted tradeoff, the same one
+ * festina_conn_index_grow already carries: capacity never shrinks, so
+ * a map churned at a stable live size still grows its own bucket array
+ * over time rather than compacting in place -- bounded per real
+ * program (tests/test_leak_stress.py's 200-iteration churn tops out
+ * around capacity 256, ~4KB), not worth solving here. */
+static void festina_map_grow(int64_t *entries_count, void **entries, int64_t *capacity,
+                             int64_t *tombstones) {
+    (void)entries_count; /* count itself is untouched by a rebuild */
+    int64_t old_capacity = *capacity;
+    FestinaMapEntry *old_buckets = (FestinaMapEntry *)*entries;
+    int64_t new_capacity = old_capacity ? old_capacity * 2 : 8;
+    FestinaMapEntry *new_buckets = calloc((size_t)new_capacity, sizeof(FestinaMapEntry));
+    if (!new_buckets) festina_fail("out of memory growing a map");
+    for (int64_t i = 0; i < old_capacity; i++) {
+        char *k = old_buckets[i].key;
+        if (k == NULL || k == FESTINA_MAP_TOMBSTONE) continue;
+        FestinaMapEntry *slot = festina_map_find_slot(new_buckets, new_capacity, k);
+        slot->key = k;
+        slot->value = old_buckets[i].value;
+    }
+    free(old_buckets);
+    *entries = new_buckets;
+    *capacity = new_capacity;
+    *tombstones = 0;
+}
+
+/* claude.md #72/#175: npcHealths['npc1'] = 30 -- and the equivalent
  * per-entry calls a map literal itself builds out of (see
- * festina/codegen.py's _emit_map_lit). `count`/`entries` point INTO
- * the map value's own storage (its LLVM alloca/global slot, or --
- * during literal construction -- a scratch header alloca; see
- * _emit_map_set's own comment), not a separate map "object" -- updating
- * an existing key never needs to touch them, but adding a new one may
- * need to grow the backing array, which has to write the new
- * count/entries back into that same slot for the change to actually be
- * visible to the caller (the same "write results back through an
- * out-pointer" shape festina_sqlite_collect_rows already uses for its
- * own row array).
+ * festina/codegen.py's _emit_map_lit). `count`/`entries`/`capacity`/
+ * `tombstones` point INTO the map value's own storage (its LLVM
+ * alloca/global slot, or -- during literal construction -- a scratch
+ * header alloca; see _emit_map_set's own comment), not a separate map
+ * "object" -- updating an existing key never needs to grow anything,
+ * but adding a new one may need to rehash the whole table, which has
+ * to write the new count/entries/capacity/tombstones back into that
+ * same slot for the change to actually be visible to the caller (the
+ * same "write results back through an out-pointer" shape
+ * festina_sqlite_collect_rows already uses for its own row array).
  *
- * Grows by exactly one entry (a realloc to count+1) rather than
- * doubling capacity -- no separate capacity field is tracked anywhere
- * (this function is otherwise stateless between calls), and maps are
- * expected to stay small (see festina_map_find's own comment), so the
- * extra reallocs a doubling strategy would avoid aren't a real cost in
- * practice; tracking one fewer field is worth more here than the
- * micro-optimization would be. */
-void festina_map_set(int64_t *count, void **entries, const char *key, int64_t value) {
+ * Grows (via festina_map_grow) whenever the table would cross 75% load
+ * -- counting tombstones toward "used" the same way
+ * festina_conn_index_put's own identical check does, so tombstone
+ * buildup from delete-heavy churn still triggers a rehash even when
+ * the live count itself stays flat. */
+void festina_map_set(int64_t *count, void **entries, int64_t *capacity, int64_t *tombstones,
+                     const char *key, int64_t value) {
     if (!key) key = "";
-    FestinaMapEntry *found = festina_map_find(*count, *entries, key);
-    if (found) {
-        found->value = value;
+    if (*capacity == 0 || (*count + *tombstones + 1) * 4 >= *capacity * 3) {
+        festina_map_grow(count, entries, capacity, tombstones);
+    }
+    FestinaMapEntry *slot = festina_map_find_slot(*entries, *capacity, key);
+    if (slot->key != NULL && slot->key != FESTINA_MAP_TOMBSTONE) {
+        slot->value = value;
         return;
     }
-    FestinaMapEntry *grown = realloc(*entries, (size_t)(*count + 1) * sizeof(FestinaMapEntry));
-    if (!grown) festina_fail("out of memory growing a map");
+    if (slot->key == FESTINA_MAP_TOMBSTONE) (*tombstones)--;
     /* Copied, not aliased to the caller's own key pointer -- this map
      * may outlive whatever Festina value `key` came from (a local
      * variable going out of scope doesn't free anything in this
@@ -3694,136 +3795,96 @@ void festina_map_set(int64_t *count, void **entries, const char *key, int64_t va
      * reused/interned differently by a future compiler change. Leaks,
      * like every other heap allocation in this runtime -- the same
      * accepted tradeoff, not a new one. */
-    grown[*count].key = strdup(key);
-    if (!grown[*count].key) festina_fail("out of memory growing a map");
-    grown[*count].value = value;
-    *entries = grown;
+    slot->key = strdup(key);
+    if (!slot->key) festina_fail("out of memory growing a map");
+    slot->value = value;
     (*count)++;
 }
 
-/* claude.md #156: amor map[T] -- npcHealths['npc1'] = 30 on an
- * amortized map, and the equivalent per-entry calls an `amor map[T]`
- * literal builds itself out of (see festina/codegen.py's
- * _emit_map_lit, whose own is_amap parameter routes here). Identical
- * to festina_map_set in every way except growth: this one doubles
- * capacity (tracked in the caller's own header, alongside count and
- * entries -- see FESTINA_AMAP_LLVM_TYPE's own comment in codegen.py
- * for why that's a real, distinct header field and not just an unused
- * parameter) instead of realloc-ing to exactly count+1 on every
- * single insert, so N inserts cost O(log N) reallocs instead of O(N)
- * -- the actual point of `amor`, and the fix claude.md #155
- * explicitly left OUT of plain map[T] itself (a language-wide
- * representation change, out of scope for that HTTP-specific round)
- * by adding this as a real, opt-in alternative
- * instead. */
-void festina_amap_set(int64_t *count, int64_t *capacity, void **entries, const char *key, int64_t value) {
+/* claude.md #111/#175: `delete m.key` / `delete m['key']` -- remove
+ * the entry outright, JS-style, rather than setting it to null: a
+ * deleted key stops existing (forEach no longer visits it, count
+ * drops), which null could never express. `release` is the same
+ * per-value-type trampoline festina_map_for_each already uses for
+ * whole-map release (codegen's _emit_map_value_release_trampoline), or
+ * NULL for a value type with nothing to release. The hole is left as a
+ * TOMBSTONE, not compacted -- a hash table's own bucket order was
+ * never insertion order to begin with, so there is nothing to
+ * preserve, and later probes down the same chain still need to see
+ * that a key USED to sit here rather than treating this slot as a
+ * chain-terminating empty one. `capacity` is read-only here -- delete
+ * never grows the table, only festina_map_set does. Returns whether
+ * the key existed; deleting a missing key is a safe no-op, exactly
+ * like JS. */
+int8_t festina_map_delete(int64_t *count, void **entries, int64_t capacity, int64_t *tombstones,
+                          const char *key, void (*release)(int64_t, const char *)) {
     if (!key) key = "";
-    FestinaMapEntry *found = festina_map_find(*count, *entries, key);
-    if (found) {
-        found->value = value;
-        return;
-    }
-    if (*count == *capacity) {
-        int64_t new_capacity = *capacity ? *capacity * 2 : 8;
-        FestinaMapEntry *grown = realloc(*entries, (size_t)new_capacity * sizeof(FestinaMapEntry));
-        if (!grown) festina_fail("out of memory growing an amortized map");
-        *entries = grown;
-        *capacity = new_capacity;
-    }
-    FestinaMapEntry *arr = (FestinaMapEntry *)*entries;
-    /* Same key-ownership reasoning as festina_map_set's own comment:
-     * copied, not aliased, since this map may outlive whatever Festina
-     * value `key` came from. */
-    arr[*count].key = strdup(key);
-    if (!arr[*count].key) festina_fail("out of memory growing an amortized map");
-    arr[*count].value = value;
-    (*count)++;
-}
-
-/* claude.md #111: `delete m.key` / `delete m['key']` -- remove the
- * entry outright, JS-style, rather than setting it to null: a deleted
- * key stops existing (forEach no longer visits it, count drops), which
- * null could never express. `release` is the same per-value-type
- * trampoline festina_map_for_each already uses for whole-map release
- * (codegen's _emit_map_value_release_trampoline), or NULL for a value
- * type with nothing to release. The hole is closed by shifting the
- * tail down one slot -- keeping entry order, which forEach's
- * unspecified-order contract doesn't require but which costs the same
- * as the swap-with-last alternative at these sizes and never surprises
- * anyone. Returns whether the key existed; deleting a missing key is a
- * safe no-op, exactly like JS. */
-int8_t festina_map_delete(int64_t *count, void **entries, const char *key,
-                          void (*release)(int64_t, const char *)) {
-    if (!key) key = "";
-    FestinaMapEntry *arr = (FestinaMapEntry *)*entries;
-    for (int64_t i = 0; i < *count; i++) {
-        if (!festina_str_eq(arr[i].key, key)) continue;
-        /* claude.md #120: the entry is REMOVED before its value is
-         * released. The release may run a cycle trial that traverses
-         * this very map, and an entry still pointing at a value whose
-         * count the release just dropped would be double-counted by
-         * markGray -- the same store-before-release rule every field
-         * write follows now (see codegen's _emit_assign). */
-        int64_t value = arr[i].value;
-        char *owned_key = arr[i].key;
-        memmove(&arr[i], &arr[i + 1],
-                (size_t)(*count - i - 1) * sizeof(FestinaMapEntry));
-        (*count)--;
-        if (release) release(value, owned_key);
-        free(owned_key);
-        return 1;
-    }
-    return 0;
+    FestinaMapEntry *found = festina_map_find(*entries, capacity, key);
+    if (!found) return 0;
+    /* claude.md #120: the entry is REMOVED before its value is
+     * released. The release may run a cycle trial that traverses this
+     * very map, and an entry still pointing at a value whose count the
+     * release just dropped would be double-counted by markGray -- the
+     * same store-before-release rule every field write follows now
+     * (see codegen's _emit_assign). */
+    int64_t value = found->value;
+    char *owned_key = found->key;
+    found->key = FESTINA_MAP_TOMBSTONE;
+    (*count)--;
+    (*tombstones)++;
+    if (release) release(value, owned_key);
+    free(owned_key);
+    return 1;
 }
 
 /* claude.md #72: npcHealths['npc1'] -- "if the key is not present, the
  * result is null." default_value is already the correct null
  * representation for this map's value type, computed by codegen (see
  * _map_missing_default) -- this function has no idea what T is, only
- * ever seeing raw i64 payloads, so it can't make that choice itself. */
-int64_t festina_map_get(int64_t count, void *entries, const char *key, int64_t default_value) {
+ * ever seeing raw i64 payloads, so it can't make that choice itself.
+ * No `count` parameter (unlike before #175) -- a bucket scan is driven
+ * by `capacity`, not a dense [0,count) range, so count was never
+ * needed by a read here in the first place. */
+int64_t festina_map_get(void *entries, int64_t capacity, const char *key, int64_t default_value) {
     if (!key) key = "";
-    FestinaMapEntry *found = festina_map_find(count, entries, key);
+    FestinaMapEntry *found = festina_map_find(entries, capacity, key);
     return found ? found->value : default_value;
 }
 
-/* claude.md #72: npcHealths.forEach(callback). "The order entries are
- * visited in is not specified" -- this iterates in insertion order
- * simply because that's how the backing array happens to be laid out,
- * not a guarantee being made deliberately; nothing here should be
- * relied on beyond every current entry being visited exactly once.
- * `count` is captured once, by the caller, before this loop starts --
- * if `callback` itself mutates this same map (adds a key, changes an
- * existing value) or calls .forEach() again, that's explicitly
- * unspecified behavior here, unlike festina_fire_expired_timers (which
- * *is* deliberately hardened against a timer callback growing/clearing
- * the timer list mid-iteration) -- claude.md #72 was never asked to
- * make that same guarantee for maps. */
-void festina_map_for_each(int64_t count, void *entries, void (*callback)(int64_t, const char *)) {
-    FestinaMapEntry *arr = (FestinaMapEntry *)entries;
-    for (int64_t i = 0; i < count; i++) {
-        callback(arr[i].value, arr[i].key);
+/* claude.md #72/#175: npcHealths.forEach(callback). "The order entries
+ * are visited in is not specified" -- true before this rewrite (plain
+ * insertion order, incidentally) and still true now (bucket order, a
+ * function of each key's hash, not insertion order at all); nothing
+ * here should be relied on beyond every current entry being visited
+ * exactly once. Scans every bucket, skipping the never-used and
+ * tombstoned ones. If `callback` itself mutates this same map (adds a
+ * key, changes an existing value) or calls .forEach() again, that's
+ * explicitly unspecified behavior here, unlike festina_fire_expired_timers
+ * (which *is* deliberately hardened against a timer callback growing/
+ * clearing the timer list mid-iteration) -- claude.md #72 was never
+ * asked to make that same guarantee for maps. */
+void festina_map_for_each(void *entries, int64_t capacity, void (*callback)(int64_t, const char *)) {
+    FestinaMapEntry *buckets = (FestinaMapEntry *)entries;
+    for (int64_t i = 0; i < capacity; i++) {
+        char *k = buckets[i].key;
+        if (k == NULL || k == FESTINA_MAP_TOMBSTONE) continue;
+        callback(buckets[i].value, k);
     }
 }
 
-/* claude.md #74/#75: see this function's own declaration in
+/* claude.md #74/#75/#175: see this function's own declaration in
  * festina_runtime.h. Frees what festina_map_set's own comment already
- * establishes is exclusively owned by each entry -- a strdup'd copy of
- * the key, never aliased with any other Festina-visible value -- before
- * freeing the entries buffer itself. This is the one piece of stage
- * 1/2's own remaining coverage gap (claude.md #74's "This stage does
- * not yet analyze" list) that's actually safe to close without any new
- * aliasing reasoning: unlike a struct/array/map VALUE stored into
- * another value's field (which may still be reachable through the
- * variable it came from -- see codegen.py's own note on why THAT case
- * is deliberately not attempted yet), a map entry's key was never a
- * Festina value at all -- just a private byte-for-byte copy this
- * runtime made for its own internal bookkeeping the moment the entry
- * was created. */
-void festina_map_free_entries(int64_t count, void *entries) {
-    FestinaMapEntry *arr = (FestinaMapEntry *)entries;
-    for (int64_t i = 0; i < count; i++) {
-        free(arr[i].key);
+ * establishes is exclusively owned by each live bucket -- a strdup'd
+ * copy of the key, never aliased with any other Festina-visible value
+ * -- before freeing the entries buffer itself. Scans every bucket
+ * (skipping the never-used and tombstoned ones), not a dense
+ * [0,count) range, for the same reason festina_map_for_each does. */
+void festina_map_free_entries(void *entries, int64_t capacity) {
+    FestinaMapEntry *buckets = (FestinaMapEntry *)entries;
+    for (int64_t i = 0; i < capacity; i++) {
+        if (buckets[i].key != NULL && buckets[i].key != FESTINA_MAP_TOMBSTONE) {
+            free(buckets[i].key);
+        }
     }
     free(entries);
 }
@@ -3878,12 +3939,45 @@ typedef struct {
     void *data;
 } FestinaArrayHeader;
 
-static void festina_array_resize(FestinaArrayHeader *a, int64_t elem_size,
-                                  int64_t new_length) {
+/* claude.md #174: `capacity` is NULL for a plain arr[T] -- exact-size
+ * realloc on every call, this function's own unchanged pre-#174
+ * behavior -- or a pointer into an `amor arr[T]`'s own tracked
+ * capacity field (FESTINA_AMOR_ARRAY_LLVM_TYPE's 3rd field) for
+ * geometric doubling growth instead -- map[T]'s own `capacity` field
+ * (festina_map_set, claude.md #175) tracks bucket-array size the same
+ * way, just always-tracked rather than plain-vs-amor optional, since
+ * every map[T] is a hash table now and none of them can be growth-by-
+ * exactly-one anymore. Growing
+ * (`new_length > *capacity`) doubles (or jumps straight to
+ * `new_length` if even double isn't enough -- a single push never
+ * needs more than one extra slot, but splice_insert's own inline
+ * growth logic, which duplicates this shape rather than calling
+ * through it, can ask for many at once); an amor array's own buffer
+ * is deliberately NEVER freed/shrunk on the way back down to empty
+ * (`new_length <= 0`) or on an ordinary shrink -- the whole point of
+ * amortized growth is not paying a realloc on the very next push
+ * right after a pop, and capacity already covers whatever the buffer
+ * shrinks to, by construction. */
+static void festina_array_resize(FestinaArrayHeader *a, int64_t *capacity,
+                                  int64_t elem_size, int64_t new_length) {
     if (new_length <= 0) {
-        free(a->data);
-        a->data = NULL;
+        if (!capacity) {
+            free(a->data);
+            a->data = NULL;
+        }
         a->length = 0;
+        return;
+    }
+    if (capacity) {
+        if (new_length > *capacity) {
+            int64_t new_cap = *capacity ? *capacity * 2 : 8;
+            if (new_cap < new_length) new_cap = new_length;
+            void *grown = realloc(a->data, (size_t)(new_cap * elem_size));
+            if (!grown) festina_fail("out of memory growing an amortized array");
+            a->data = grown;
+            *capacity = new_cap;
+        }
+        a->length = new_length;
         return;
     }
     void *grown = realloc(a->data, (size_t)(new_length * elem_size));
@@ -3892,19 +3986,19 @@ static void festina_array_resize(FestinaArrayHeader *a, int64_t elem_size,
     a->length = new_length;
 }
 
-void festina_array_push(void *hdr, int64_t elem_size, const void *value) {
+void festina_array_push(void *hdr, int64_t *capacity, int64_t elem_size, const void *value) {
     FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
     if (!a || !value) return;
     int64_t at = a->length;
-    festina_array_resize(a, elem_size, at + 1);
+    festina_array_resize(a, capacity, elem_size, at + 1);
     memcpy((char *)a->data + at * elem_size, value, (size_t)elem_size);
 }
 
-void festina_array_unshift(void *hdr, int64_t elem_size, const void *value) {
+void festina_array_unshift(void *hdr, int64_t *capacity, int64_t elem_size, const void *value) {
     FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
     if (!a || !value) return;
     int64_t was = a->length;
-    festina_array_resize(a, elem_size, was + 1);
+    festina_array_resize(a, capacity, elem_size, was + 1);
     if (was > 0) {
         memmove((char *)a->data + elem_size, a->data, (size_t)(was * elem_size));
     }
@@ -3914,15 +4008,15 @@ void festina_array_unshift(void *hdr, int64_t elem_size, const void *value) {
 /* pop/shift leave *out untouched when there is nothing to remove --
  * codegen has already stored the element type's own null there, so an
  * empty pop() answers null rather than needing a second return value. */
-int8_t festina_array_pop(void *hdr, int64_t elem_size, void *out) {
+int8_t festina_array_pop(void *hdr, int64_t *capacity, int64_t elem_size, void *out) {
     FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
     if (!a || a->length <= 0) return 0;
     memcpy(out, (char *)a->data + (a->length - 1) * elem_size, (size_t)elem_size);
-    festina_array_resize(a, elem_size, a->length - 1);
+    festina_array_resize(a, capacity, elem_size, a->length - 1);
     return 1;
 }
 
-int8_t festina_array_shift(void *hdr, int64_t elem_size, void *out) {
+int8_t festina_array_shift(void *hdr, int64_t *capacity, int64_t elem_size, void *out) {
     FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
     if (!a || a->length <= 0) return 0;
     memcpy(out, a->data, (size_t)elem_size);
@@ -3930,7 +4024,7 @@ int8_t festina_array_shift(void *hdr, int64_t elem_size, void *out) {
     if (rest > 0) {
         memmove(a->data, (char *)a->data + elem_size, (size_t)(rest * elem_size));
     }
-    festina_array_resize(a, elem_size, rest);
+    festina_array_resize(a, capacity, elem_size, rest);
     return 1;
 }
 
@@ -3940,7 +4034,7 @@ int8_t festina_array_shift(void *hdr, int64_t elem_size, void *out) {
  * the common `splice(i, 1)` inside a loop a source of crashes at the
  * boundaries instead of a no-op. `dst` is a header codegen already
  * allocated for the result. */
-void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
+void festina_array_splice(void *hdr, int64_t *capacity, int64_t elem_size, int64_t start,
                            int64_t count, void *dst_hdr) {
     FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
     FestinaArrayHeader *dst = (FestinaArrayHeader *)dst_hdr;
@@ -3970,7 +4064,7 @@ void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
                 (char *)a->data + (start + count) * elem_size,
                 (size_t)(tail * elem_size));
     }
-    festina_array_resize(a, elem_size, len - count);
+    festina_array_resize(a, capacity, elem_size, len - count);
 }
 
 /* claude.md #130: the 3-argument splice(start, count, insertArr) form --
@@ -3986,7 +4080,7 @@ void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
  * ownership split every other array method in this file already
  * follows (codegen decides refcounting, this file only decides bytes).
  */
-void festina_array_splice_insert(void *hdr, int64_t elem_size, int64_t start,
+void festina_array_splice_insert(void *hdr, int64_t *capacity, int64_t elem_size, int64_t start,
                                   int64_t count, const void *insert_data,
                                   int64_t insert_len, void *dst_hdr) {
     FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
@@ -4016,8 +4110,16 @@ void festina_array_splice_insert(void *hdr, int64_t elem_size, int64_t start,
     int64_t new_length = len - count + insert_len;
 
     if (new_length <= 0) {
-        free(a->data);
-        a->data = NULL;
+        /* claude.md #174: an amor array's own buffer is never freed on
+         * the way back to empty -- see festina_array_resize's own
+         * identical comment; this function duplicates that resize
+         * logic rather than calling through it (the memmove has to be
+         * interleaved with the resize, in a different order depending
+         * on whether this call is growing or shrinking). */
+        if (!capacity) {
+            free(a->data);
+            a->data = NULL;
+        }
         a->length = 0;
         return;
     }
@@ -4026,10 +4128,26 @@ void festina_array_splice_insert(void *hdr, int64_t elem_size, int64_t start,
         /* Growing: resize first (realloc preserves the existing bytes
          * up to the old length), then shift the tail right into its
          * final spot -- both source and destination ranges stay within
-         * the just-grown buffer. */
-        void *grown = realloc(a->data, (size_t)(new_length * elem_size));
-        if (!grown) festina_fail("out of memory growing an array");
-        a->data = grown;
+         * the just-grown buffer. claude.md #174: an amor array only
+         * actually reallocs when the new length exceeds its already-
+         * tracked capacity, and then doubles (or jumps straight to
+         * `new_length` if even that isn't enough) rather than growing
+         * to exactly `new_length` -- the same amortized shape
+         * festina_array_resize's own growing branch uses. */
+        if (capacity) {
+            if (new_length > *capacity) {
+                int64_t new_cap = *capacity ? *capacity * 2 : 8;
+                if (new_cap < new_length) new_cap = new_length;
+                void *grown = realloc(a->data, (size_t)(new_cap * elem_size));
+                if (!grown) festina_fail("out of memory growing an amortized array");
+                a->data = grown;
+                *capacity = new_cap;
+            }
+        } else {
+            void *grown = realloc(a->data, (size_t)(new_length * elem_size));
+            if (!grown) festina_fail("out of memory growing an array");
+            a->data = grown;
+        }
         if (tail > 0) {
             memmove((char *)a->data + (start + insert_len) * elem_size,
                     (char *)a->data + (start + count) * elem_size,
@@ -4039,15 +4157,21 @@ void festina_array_splice_insert(void *hdr, int64_t elem_size, int64_t start,
         /* Shrinking (or exactly the same size): shift the tail into
          * its final spot first -- (start + insert_len) + tail ==
          * new_length <= len, so it still fits inside the OLD buffer --
-         * then resize down. */
+         * then resize down. claude.md #174: an amor array's own
+         * capacity already covers `len`, and new_length <= len here,
+         * so it covers new_length too -- nothing to reallocate, the
+         * same "shrinking never frees/reallocs" contract
+         * festina_array_resize's own shrinking case has. */
         if (tail > 0) {
             memmove((char *)a->data + (start + insert_len) * elem_size,
                     (char *)a->data + (start + count) * elem_size,
                     (size_t)(tail * elem_size));
         }
-        void *shrunk = realloc(a->data, (size_t)(new_length * elem_size));
-        if (!shrunk) festina_fail("out of memory in splice()");
-        a->data = shrunk;
+        if (!capacity) {
+            void *shrunk = realloc(a->data, (size_t)(new_length * elem_size));
+            if (!shrunk) festina_fail("out of memory in splice()");
+            a->data = shrunk;
+        }
     }
     a->length = new_length;
 
@@ -4105,15 +4229,16 @@ void festina_release_array(void *payload) {
 
 void festina_release_map(void *payload) {
     if (!festina_release_check(payload)) return;
-    /* payload is {i64 count, ptr entries} -- festina_map_free_entries
-     * already does exactly the right thing for the data half (each
-     * entry's own strdup'd key, then the entries buffer itself -- see
-     * its own comment just above), so this only adds the new header
-     * free on top. Same "map values aren't individually released"
-     * scope limitation as festina_release_array above. */
-    int64_t count = *(int64_t *)payload;
+    /* claude.md #175: payload is {i64 count, ptr entries, i64 capacity,
+     * i64 tombstones} -- count and tombstones aren't needed to free the
+     * data half (festina_map_free_entries scans every bucket up to
+     * capacity itself, same as festina_map_for_each -- see its own
+     * comment just above), so only entries/capacity are read here. Same
+     * "map values aren't individually released" scope limitation as
+     * festina_release_array above. */
     void *entries = *(void **)((char *)payload + sizeof(int64_t));
-    festina_map_free_entries(count, entries);
+    int64_t capacity = *(int64_t *)((char *)payload + 2 * sizeof(int64_t));
+    festina_map_free_entries(entries, capacity);
     free((char *)payload - sizeof(int64_t));
 }
 
@@ -4146,10 +4271,10 @@ static void festina_free_map_text_value(int64_t raw, const char *key) {
 
 void festina_release_text_map(void *payload) {
     if (!festina_release_check(payload)) return;
-    int64_t count = *(int64_t *)payload;
     void *entries = *(void **)((char *)payload + sizeof(int64_t));
-    festina_map_for_each(count, entries, festina_free_map_text_value);
-    festina_map_free_entries(count, entries);
+    int64_t capacity = *(int64_t *)((char *)payload + 2 * sizeof(int64_t));
+    festina_map_for_each(entries, capacity, festina_free_map_text_value);
+    festina_map_free_entries(entries, capacity);
     free((char *)payload - sizeof(int64_t));
 }
 
@@ -4278,9 +4403,16 @@ void festina_cycle_visit_array(void *payload, void (*fn)(void *)) {
 }
 
 void festina_cycle_visit_map(void *payload, void (*fn)(void *)) {
-    int64_t count = *(int64_t *)payload;
+    /* claude.md #175: payload is {i64 count, ptr entries, i64 capacity,
+     * i64 tombstones} -- scans every bucket up to capacity, skipping
+     * the never-used and tombstoned ones, same as festina_map_for_each. */
     FestinaMapEntry *entries = *(FestinaMapEntry **)((char *)payload + sizeof(int64_t));
-    for (int64_t i = 0; i < count; i++) fn((void *)(intptr_t)entries[i].value);
+    int64_t capacity = *(int64_t *)((char *)payload + 2 * sizeof(int64_t));
+    for (int64_t i = 0; i < capacity; i++) {
+        char *k = entries[i].key;
+        if (k == NULL || k == FESTINA_MAP_TOMBSTONE) continue;
+        fn((void *)(intptr_t)entries[i].value);
+    }
 }
 
 /* collectWhite's container disposal: free the container's own storage
@@ -4295,9 +4427,16 @@ void festina_cycle_dispose_array(void *payload) {
 }
 
 void festina_cycle_dispose_map(void *payload) {
-    int64_t count = *(int64_t *)payload;
+    /* claude.md #175: same {count, entries, capacity, tombstones}
+     * layout as festina_cycle_visit_map above -- scans every bucket up
+     * to capacity, freeing each live key. */
     FestinaMapEntry *entries = *(FestinaMapEntry **)((char *)payload + sizeof(int64_t));
-    for (int64_t i = 0; i < count; i++) free(entries[i].key);
+    int64_t capacity = *(int64_t *)((char *)payload + 2 * sizeof(int64_t));
+    for (int64_t i = 0; i < capacity; i++) {
+        if (entries[i].key != NULL && entries[i].key != FESTINA_MAP_TOMBSTONE) {
+            free(entries[i].key);
+        }
+    }
     free(entries);
     free((char *)payload - sizeof(int64_t));
 }

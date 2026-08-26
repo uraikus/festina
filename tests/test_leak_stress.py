@@ -354,4 +354,43 @@ class TestLeakStress:
             # a genuinely different ownership shape than push/unshift's
             # single-value one collections_churn.f already covers.
             "splice_insert_churn.f",
+            # claude.md #172: blob/img/aud's own `.callback()` -- a value
+            # built on a BACKGROUND thread and mutated in place once the
+            # main thread drains it, media_churn.f's synchronous loads
+            # cannot exercise this at all (there is no worker thread, no
+            # placeholder to alias before the real value lands, and no
+            # graceful-failure-on-a-worker-thread path to hit).
+            "async_io_churn.f",
+            # claude.md #173: .toStruct()/.toArr() JSON parsing --
+            # nested struct/arr[T]/map[T] fields/elements, each
+            # recursing into its own from-json function, including a
+            # self-referencing struct's own function calling itself.
+            "json_parse_churn.f",
+            # claude.md #173: a real, pre-existing leak this round found
+            # (not introduced by it) -- a Ternary between two OWNING
+            # branches (a template literal, a `+` concatenation, a
+            # function call, ...) leaked whichever branch actually ran,
+            # every time, since the caller's own copy/retain landed on
+            # top of an already-correct +1 with nothing left to balance
+            # it. Isolated on its own, independent of JSON parsing.
+            "ternary_ownership_churn.f",
+            # claude.md #174: amor arr[T]'s own real amortized (doubling)
+            # growth -- push/pop/shift/unshift/splice (both 2- and
+            # 3-argument forms) at real iteration counts, on a scalar
+            # element type AND a refcounted one, plus the struct-field
+            # auto-vivify path -- exactly the "far larger surface than
+            # map's four operations" collections_churn.f's own arr[T]/
+            # map[T] coverage doesn't exercise, since plain arr[T] has
+            # no capacity field to get wrong in the first place.
+            "amor_array_churn.f",
+            # claude.md #176: enum's own two runtime representations --
+            # a pure-struct enum's widened, self-tagged struct header
+            # (repeated reassignment starting from its own null zero-
+            # value, the exact case that used to segfault before the
+            # release wrapper learned to null-check first) and a mixed
+            # enum's independently heap-allocated {tag, value} box
+            # (alternating which member type is boxed, including a
+            # refcounted `text` member), plus aliasing churn through
+            # two enum-typed locals sharing the same struct pointer.
+            "enum_churn.f",
         }
