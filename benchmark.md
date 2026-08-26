@@ -296,34 +296,44 @@ separately, `apt install wrk`/`brew install wrk`).
 
 **Equivalent logic, not equivalent idiom, the same rule the five
 programs above already follow.** Festina's HTTP server
-(`festina_runtime_http.c`, claude.md #151) was, when this section was
-last measured, deliberately single-threaded (one connection serviced at
-a time) and had no keep-alive (every response closed the connection).
-Rust's and Go's servers here are hand-rolled raw-socket implementations
-with a single-threaded, sequential accept loop and the same
-close-after-response behavior -- not `hyper`/`net/http`'s own default
-(multi-threaded, keep-alive-capable) servers, which would be measuring
-a mature framework's concurrency model against Festina's single-threaded
-one rather than the same connection-handling logic in four languages.
-Bun is the one exception: it uses `Bun.serve()`, its own native HTTP
+(`festina_runtime_http.c`, claude.md #151) is deliberately
+single-threaded (one connection serviced at a time). Rust's and Go's
+servers here are hand-rolled raw-socket implementations with a
+single-threaded, sequential accept loop -- not `hyper`/`net/http`'s own
+default (multi-threaded) servers, which would be measuring a mature
+framework's concurrency model against Festina's single-threaded one
+rather than the same connection-handling logic in four languages. Bun
+is the one exception: it uses `Bun.serve()`, its own native HTTP
 implementation, since there is no reason to hand-roll sockets in a
 runtime that ships a fast one already (the same "each language uses its
-own normal toolchain" rule the Methodology above states) -- with
-`Connection: close` set explicitly on every response so it closes each
-connection the same way the other three do, rather than its own
-keep-alive support doing the winning here.
+own normal toolchain" rule the Methodology above states).
 
-**Stale as of claude.md #167: Festina itself now supports keep-alive**
-(default for HTTP/1.1, see api.md's HTTP Limitations), so the
-deliberately-matched "no keep-alive anywhere" methodology above no
-longer describes Festina's own real connection-handling -- the numbers
-below still reflect the OLD, matched, close-after-every-response
-comparison (none of the four servers, Festina included, were re-run
-after #167 shipped). Rerunning this fairly now would mean adding
-keep-alive to the Rust/Go raw-socket servers too (and letting Bun's own
-default back in, rather than disabling it) to keep the comparison
-apples-to-apples against Festina's NEW behavior -- a real follow-up, not
-done here.
+**Every response still closes the connection -- claude.md #171 restored
+that after claude.md #167 quietly broke the comparison's fairness.**
+Rust/Go hand-roll `Connection: close` into every response regardless of
+what the client asked; Bun's server sets it explicitly on every
+response for the identical reason (to opt OUT of its own native
+keep-alive, which none of the raw-socket languages here have an
+equivalent of). Festina used to match this unconditionally too, simply
+because it had no keep-alive support of its own to opt out of -- but
+claude.md #167 gave it real HTTP/1.1 keep-alive by default, and nobody
+re-ran this section after that landed, so for one release the
+documented numbers here were quietly comparing a keep-alive-capable
+Festina against three servers that still paid full connection setup on
+every request, an apples-to-oranges result nobody caught until claude.md
+#171 traced it down (started because `benchmarks/http/server.f` itself
+had bit-rotted independently, using a `req.path` field and a
+three-argument `req.send()` call neither exists anymore, so the whole
+HTTP benchmark had silently stopped running at all). Fixed at the load
+generator, not the server: `run_http_benchmarks.py`'s own `wrk`
+invocation now sends an explicit `Connection: close` request header
+uniformly against all four servers -- Rust/Go/Bun ignore it (they
+already always close), and Festina's own documented behavior (api.md:
+an explicit client `Connection: close` always forces it off,
+per-request) makes it close too, restoring the original
+"connection-accept + parse + respond" comparison this section was
+always meant to measure, for all four languages at once, without ever
+needing per-language server code to special-case it.
 
 Each `wrk` run: 4 threads, 50 open connections, 5 seconds, against one
 route at a time (a JIT-inclined runtime like Bun gets no separate
@@ -341,25 +351,25 @@ python3 benchmarks/http/run_http_benchmarks.py --duration 10s --connections 100 
 ```
 
 <!-- HTTP_BENCHMARK_RESULTS_START -->
-_Last run: 2026-08-25 on this machine, `wrk -t4 -c50 -d5s` per route -- see benchmark.md's HTTP "Methodology" for how to reproduce; absolute numbers vary by hardware and load, relative ordering is the point._
+_Last run: 2026-08-26 on this machine, `wrk -t4 -c50 -d5s` per route -- see benchmark.md's HTTP "Methodology" for how to reproduce; absolute numbers vary by hardware and load, relative ordering is the point._
 
 ### `plaintext` (`/`)
 
 | Language | Requests/sec | Avg latency | Transfer/sec |
 |---|---|---|---|
-| Festina | 33,370 | 1.41 ms | 3.25 MB/s |
-| Rust | 38,084 | 1.14 ms | 3.52 MB/s |
-| Go | 20,653 | 2.17 ms | 1.91 MB/s |
-| Bun | 14,156 | 3.37 ms | 1.81 MB/s |
+| Festina | 43,652 | 1.05 ms | 4.25 MB/s |
+| Rust | 63,513 | 0.69 ms | 5.88 MB/s |
+| Go | 35,457 | 1.30 ms | 3.28 MB/s |
+| Bun | 41,798 | 1.09 ms | 5.34 MB/s |
 
 ### `json` (`/json`)
 
 | Language | Requests/sec | Avg latency | Transfer/sec |
 |---|---|---|---|
-| Festina | 32,643 | 1.41 ms | 3.80 MB/s |
-| Rust | 38,570 | 1.06 ms | 4.30 MB/s |
-| Go | 21,340 | 2.24 ms | 2.38 MB/s |
-| Bun | 13,985 | 3.09 ms | 2.05 MB/s |
+| Festina | 41,482 | 1.33 ms | 4.83 MB/s |
+| Rust | 59,877 | 0.73 ms | 6.68 MB/s |
+| Go | 35,441 | 1.27 ms | 3.95 MB/s |
+| Bun | 39,580 | 1.15 ms | 5.81 MB/s |
 
 <!-- HTTP_BENCHMARK_RESULTS_END -->
 

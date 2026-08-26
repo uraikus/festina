@@ -169,7 +169,27 @@ def _parse_wrk_output(text):
 
 
 def _run_wrk(url, duration, connections, threads):
-    cmd = ["wrk", f"-t{threads}", f"-c{connections}", f"-d{duration}", "--latency", url]
+    # claude.md #171: an explicit "Connection: close" request header,
+    # sent uniformly against all four servers, is what actually keeps
+    # this a fair "connection-accept + parse + respond" comparison
+    # rather than "whichever server happens to reuse connections wins."
+    # server.f/.rs/.go/.js's own comments already document each
+    # language's HALF of that story (Rust/Go hand-roll it, Bun sets it
+    # explicitly to opt OUT of its own native keep-alive) -- but that
+    # story assumed Festina had no keep-alive of its own to opt out of.
+    # claude.md #167 changed that: Festina now negotiates real
+    # HTTP/1.1 keep-alive by default, and (per api.md) an explicit
+    # client-sent "Connection: close" is the one thing that reliably
+    # forces it off per request, the same lever wrk itself needs here
+    # since it never sends "Connection: close" on its own. Without
+    # this, Festina would get to amortize connection setup across wrk's
+    # whole connection pool while the other three -- which all hardcode
+    # closing after one response -- pay full accept+handshake cost on
+    # every single request, an apples-to-oranges result that would
+    # favor Festina for a reason having nothing to do with request
+    # handling speed.
+    cmd = ["wrk", f"-t{threads}", f"-c{connections}", f"-d{duration}", "--latency",
+           "-H", "Connection: close", url]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
         raise RuntimeError(f"wrk failed against {url}:\n{result.stdout}\n{result.stderr}")
