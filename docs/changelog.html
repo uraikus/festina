@@ -410,6 +410,7 @@
     <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…">
     <nav class="toc" id="toc">
       <div class="nav-group">
+        <a href="#v0-2">0.2 — 2026-08-26</a>
         <a href="#v0-1">0.1 — 2026-08-26</a>
       </div>
     </nav>
@@ -432,6 +433,15 @@
         implementation record predating 0.1 lives in
         <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md</a>.
       </p>
+
+      <section class="doc-section" id="v0-2">
+        <h2><span class="version-badge">0.2</span><span class="version-date">2026-08-26</span> <a class="anchor" href="#v0-2">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>exec(args, callback)</code>: a non-blocking counterpart to <code>exec(args)</code>. Dispatches the same spawn to a background worker thread and returns immediately; <code>callback:func[int]:void</code> receives the real exit code once the child process exits. See <a href="api.html#exec-callback">api.md</a>.</li>
+        </ul>
+      </section>
 
       <section class="doc-section" id="v0-1">
         <h2><span class="version-badge">0.1</span><span class="version-date">2026-08-26</span> <a class="anchor" href="#v0-1">#</a></h2>

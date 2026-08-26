@@ -445,6 +445,7 @@
         <a class="sub" href="#blobs-in-the-database">Blobs in the database</a>
         <a href="#directories">Directories</a>
         <a href="#running-other-programs">Running other programs</a>
+        <a class="sub" href="#exec-callback">exec(args, callback)</a>
         <a href="#http-and-websocket-servers">HTTP and WebSocket servers</a>
         <a class="sub" href="#http-type">The http type</a>
         <a class="sub" href="#on-request">on request(req:http)</a>
@@ -2300,6 +2301,36 @@ log(status)                            <span class="cm">// 0</span></pre>
           to spawn into — rejected at compile time rather than failing
           at runtime; see
           <a href="wasm.html">wasm.md</a>.
+        </p>
+
+        <h3 id="exec-callback">Running without blocking: exec(args, callback) <a class="anchor" href="#exec-callback">#</a></h3>
+        <p class="muted">
+          <code>exec(cmd)</code> blocks the whole program until the
+          child exits. Passing a second, <code>func[int]:void</code>
+          argument instead dispatches the same spawn to a background
+          thread and returns immediately — the real exit code arrives
+          later, through <code>callback</code>, the same non-blocking
+          shape <code>.callback()</code> gives
+          <code>blob</code>/<code>img</code>/<code>aud</code> loads
+          above:
+        </p>
+        <pre class="code"><span class="kw">void</span> func onDone(code:<span class="kw">int</span>) {
+    log(<span class="str">`child exited with ${code}`</span>)
+}
+
+<span class="kw">arr[text]</span> cmd = [<span class="str">'/bin/sh'</span>, <span class="str">'-c'</span>, <span class="str">'sleep 1 && echo done'</span>]
+exec(cmd, onDone)
+log(<span class="str">'dispatched'</span>)                     <span class="cm">// logs BEFORE onDone ever runs</span></pre>
+        <p class="muted">
+          <code>callback</code> receives the exact same value the
+          blocking form would have returned — the real exit code, or
+          <code>-1</code> if the process never started at all. The
+          2-argument form itself returns nothing: there's no handle to
+          hand back (an <code>int</code> can't be mutated in place the
+          way a <code>blob</code> is) and no cancel/kill mechanism to
+          justify one either. Not available under
+          <code>--target=wasm32-wasi</code>, for the identical reason
+          the blocking form isn't.
         </p>
       </section>
 
