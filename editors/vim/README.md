@@ -13,7 +13,9 @@ opt out if you also edit real Fortran `.f` files).
   template literals (`` `${expr}` ``), regex literals (`/pattern/flags`),
   numbers, comments, and a representative set of built-in functions.
 - `ftplugin/festina.vim` -- comment settings (`//`, `/* */`) and
-  C-family indenting for Festina's `{ }`-delimited blocks.
+  4-space indenting (`autoindent`, matching every `.f` file in this
+  repository; not `cindent`, which mis-indents real Festina code --
+  see that file's own comment for what was actually tried).
 
 ## Install
 
