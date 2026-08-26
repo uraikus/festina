@@ -1,15 +1,12 @@
-"""claude.md #165: <text>.callback(fn:func[blob]:void) -- non-blocking
-blob loading, the file-loading counterpart to claude.md #163's http
-client callback. Two spellings: `blob b = 'path'.callback(fn)` (an
-ordinary expression -- no VarDecl-specific bypass needed, unlike
-claude.md #164's `{...}.send()`, since .callback()'s receiver is plain
-text, never a heterogeneous literal) and the anonymous, fire-and-forget
-`blob 'path'.callback(fn)` statement form, parser.py's own sugar.
-
-img/aud were asked for too but are NOT implemented in this pass (see
-semantic.py's own comment on this callback branch for why) -- checked
-here only insofar as they're REJECTED with a clear error rather than a
-confusing one.
+"""claude.md #165 (extended to img/aud by #171): <text>.callback(fn:
+func[T]:void) -- non-blocking blob/img/aud loading, the file-loading
+counterpart to claude.md #163's http client callback. Two spellings:
+`blob b = 'path'.callback(fn)` (an ordinary expression -- no
+VarDecl-specific bypass needed, unlike claude.md #164's `{...}.send()`,
+since .callback()'s receiver is plain text, never a heterogeneous
+literal) and the anonymous, fire-and-forget `blob 'path'.callback(fn)`
+statement form, parser.py's own sugar. Both work identically for `img`
+and `aud`.
 """
 import pytest
 
@@ -51,20 +48,28 @@ class TestAsyncIoSemantics:
         with pytest.raises(errors.CompileError, match="callback\\(\\) expects func\\[blob\\]:void"):
             semantic.analyze(program)
 
-    def test_callback_rejects_img_for_now(self, parser, semantic, errors):
-        program = parser.parse("""
+    def test_callback_works_for_img(self, parser, semantic):
+        source = """
         void func onLoaded(i:img) { }
         img i = 'path.png'.callback(onLoaded)
-        """)
-        with pytest.raises(errors.CompileError, match="isn't implemented yet"):
-            semantic.analyze(program)
+        """
+        semantic.analyze(parser.parse(source))
 
-    def test_callback_rejects_aud_for_now(self, parser, semantic, errors):
-        program = parser.parse("""
+    def test_callback_works_for_aud(self, parser, semantic):
+        source = """
         void func onLoaded(a:aud) { }
         aud a = 'path.mp3'.callback(onLoaded)
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_callback_rejects_mismatched_declared_type(self, parser, semantic, errors):
+        # `fn`'s own signature says img, but the declaration says blob --
+        # ordinary assignment-compatibility, same as any other VarDecl.
+        program = parser.parse("""
+        void func onLoaded(i:img) { }
+        blob b = 'path.png'.callback(onLoaded)
         """)
-        with pytest.raises(errors.CompileError, match="isn't implemented yet"):
+        with pytest.raises(errors.CompileError):
             semantic.analyze(program)
 
     def test_anonymous_statement_form_parses_and_analyzes(self, parser, semantic, ast_mod):
@@ -189,3 +194,181 @@ class TestAsyncIoRuntime:
         server.process.wait(timeout=3)
         out = server.process.stdout.read() if server.process.stdout else ""
         assert "http-loop loaded: via http loop" in out
+
+
+def _make_png(path, w=2, h=2, color=(255, 0, 0)):
+    """A minimal valid PNG, written by hand -- same technique
+    conftest.py's own sprite_sheet_png fixture uses, kept local here
+    since this module only ever needs a trivially small, solid-colour
+    image (never real pixel content) to exercise the decode path."""
+    import struct
+    import zlib
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    r, g, b = color
+    row = bytes([0]) + bytes([r, g, b]) * w  # filter type 0, no alpha
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(row * h))
+           + chunk(b"IEND", b""))
+    path.write_bytes(png)
+
+
+def _make_wav(path, duration_s=0.05, sample_rate=8000):
+    import wave
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(b"\x00\x00" * int(duration_s * sample_rate))
+
+
+class TestAsyncIoImgAudRuntime:
+    """claude.md #171: img/aud's own `.callback()` -- the same
+    non-blocking load TestAsyncIoRuntime above already covers for blob,
+    now exercised for the two media types, including the "test, don't
+    fail" graceful-failure contract festina_image_load_worker/
+    festina_audio_load_worker had to be GIVEN (festina_load_image/
+    festina_load_audio's own synchronous path still calls fail() on
+    exactly the same three failure shapes -- see
+    TestGraphics::test_invalid_image_path_is_a_clear_runtime_error and
+    its neighbor, unaffected by any of this)."""
+
+    def test_img_callback_does_not_block(self, tmp_path, compile_and_run, monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        _make_png(tmp_path / "pic.png")
+        result = compile_and_run("""
+        void func onLoaded(i:img) {
+            log(`loaded: ${i.width}x${i.height}`)
+            close(0)
+        }
+        img i = 'pic.png'.callback(onLoaded)
+        log('dispatched')
+        """)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.index("dispatched") < result.stdout.index("loaded:")
+        assert "loaded: 2x2" in result.stdout
+
+    def test_aud_callback_does_not_block(self, tmp_path, compile_and_run, monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        _make_wav(tmp_path / "clip.wav")
+        result = compile_and_run("""
+        void func onLoaded(a:aud) {
+            log('loaded')
+            close(0)
+        }
+        aud a = 'clip.wav'.callback(onLoaded)
+        log('dispatched')
+        """)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.index("dispatched") < result.stdout.index("loaded")
+
+    def test_img_callback_unreadable_path_is_graceful(self, compile_and_run, monkeypatch):
+        # festina_load_image (the synchronous path) calls festina_fail()
+        # on exactly this input -- the point of .callback() is that its
+        # OWN worker never does, leaving the 1x1 placeholder in place.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        result = compile_and_run("""
+        void func onLoaded(i:img) {
+            log(`w=${i.width} h=${i.height}`)
+            close(0)
+        }
+        img i = 'does/not/exist.png'.callback(onLoaded)
+        """)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "w=1 h=1" in result.stdout
+
+    def test_img_callback_corrupt_data_is_graceful(self, tmp_path, compile_and_run, monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        (tmp_path / "bad.png").write_bytes(b"this is not an image at all")
+        result = compile_and_run("""
+        void func onLoaded(i:img) {
+            log(`w=${i.width}`)
+            close(0)
+        }
+        img i = 'bad.png'.callback(onLoaded)
+        """)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "w=1" in result.stdout
+
+    def test_aud_callback_unreadable_path_is_graceful(self, compile_and_run, monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        result = compile_and_run("""
+        void func onLoaded(a:aud) {
+            log('done')
+            close(0)
+        }
+        aud a = 'does/not/exist.mp3'.callback(onLoaded)
+        """)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "done" in result.stdout
+
+    def test_aud_callback_corrupt_data_is_graceful(self, tmp_path, compile_and_run, monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        (tmp_path / "bad.mp3").write_bytes(b"not audio data at all, just garbage bytes")
+        result = compile_and_run("""
+        void func onLoaded(a:aud) {
+            log('done')
+            close(0)
+        }
+        aud a = 'bad.mp3'.callback(onLoaded)
+        """)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "done" in result.stdout
+
+    def test_sync_img_load_still_fails_loudly(self, tmp_path, compile_and_run, monkeypatch):
+        # The ordinary, non-callback path is completely unaffected --
+        # festina_load_image/festina_image_from_bytes still call
+        # festina_fail() on exactly the inputs they always did.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        (tmp_path / "bad.png").write_bytes(b"nope")
+        result = compile_and_run("img icon = 'bad.png'\nlog('unreachable')")
+        assert result.returncode == 1
+        assert "not a PNG or JPEG" in result.stderr
+        assert "unreachable" not in result.stdout
+
+    def test_concurrent_img_and_aud_callbacks_all_complete(self, tmp_path, compile_and_run,
+                                                             monkeypatch):
+        # Several img AND aud background loads in flight at once,
+        # racing each other and the main thread -- what
+        # festina_decode_mp3's own pthread_once fix and the
+        # ThreadSanitizer-clean img decode path (see
+        # festina_decode_image_surface's own doc comment in
+        # festina_runtime_graphics.c) are actually for.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        for i in range(1, 5):
+            _make_png(tmp_path / f"p{i}.png")
+            _make_wav(tmp_path / f"a{i}.wav")
+        result = compile_and_run("""
+        int done = 0
+        void func onImg(i:img) { done = done + 1; if done == 8 { close(0) } }
+        void func onAud(a:aud) { done = done + 1; if done == 8 { close(0) } }
+        img p1 = 'p1.png'.callback(onImg)
+        img p2 = 'p2.png'.callback(onImg)
+        img p3 = 'p3.png'.callback(onImg)
+        img p4 = 'p4.png'.callback(onImg)
+        aud a1 = 'a1.wav'.callback(onAud)
+        aud a2 = 'a2.wav'.callback(onAud)
+        aud a3 = 'a3.wav'.callback(onAud)
+        aud a4 = 'a4.wav'.callback(onAud)
+        log('all dispatched')
+        """)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "all dispatched" in result.stdout
+
+    def test_anonymous_statement_form_works_for_img(self, tmp_path, compile_and_run, monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        _make_png(tmp_path / "pic.png")
+        result = compile_and_run("""
+        void func onLoaded(i:img) {
+            log('anon img loaded')
+            close(0)
+        }
+        img 'pic.png'.callback(onLoaded)
+        log('anon dispatched')
+        """)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.index("anon dispatched") < result.stdout.index("anon img loaded")

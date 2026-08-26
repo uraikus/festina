@@ -2187,17 +2187,18 @@ def analyze(program, filename="<string>"):
             # assignment, a function argument, ...), no special
             # position required.
             #
-            # blob ONLY for now -- img/aud were asked for too, but both
-            # already call festina_fail() (a hard process exit, not
-            # blob's own graceful "empty on failure" contract) on a
-            # corrupt/unreadable file, which a background WORKER thread
-            # calling exit() concurrently with the main thread is a
-            # real, unverified risk this pass doesn't ship; img
-            # additionally needs its decoded cairo_surface_t built on
-            # that same worker thread, a Cairo thread-safety question
-            # not yet confirmed either. Both are a natural, likely
-            # follow-up, not ruled out -- just not done here. See
-            # claude.md #165's own account.
+            # claude.md #171: img/aud now share the same path -- both
+            # runtime loaders (festina_runtime_graphics.c,
+            # festina_runtime_audio.c) grew a non-throwing decode step a
+            # background worker thread can call (a missing file, an
+            # unrecognized format, or corrupt data all just leave the
+            # value as an empty placeholder, matching blob's own
+            # "test, don't fail" contract, rather than calling
+            # festina_fail() concurrently with the main thread), and img's
+            # own Cairo/libjpeg decode into a private surface was
+            # confirmed thread-safe by a real concurrent ThreadSanitizer
+            # run, not just by inspection. See claude.md #171's own
+            # account, and #165's for the original blob-only design.
             if callee.prop == "callback" and infer(callee.obj, scope) == _TEXT:
                 if len(expr.args) != 1:
                     raise CompileError(
@@ -2207,26 +2208,17 @@ def analyze(program, filename="<string>"):
                         category="invalid function argument type",
                     )
                 fn_type = infer(expr.args[0], scope)
-                if (isinstance(fn_type, types_mod.FuncType) and len(fn_type.param_types) == 1
-                        and fn_type.return_type is None
-                        and fn_type.param_types[0] in (_IMAGE, _AUDIO)):
-                    raise CompileError(
-                        f"callback() only supports func[blob]:void for now -- "
-                        f"img/aud background loading isn't implemented yet",
-                        file=filename, line=callee.line, column=callee.column,
-                        category="invalid function argument type",
-                    )
                 if (not isinstance(fn_type, types_mod.FuncType)
                         or len(fn_type.param_types) != 1
                         or fn_type.return_type is not None
-                        or fn_type.param_types[0] != _BLOB):
+                        or fn_type.param_types[0] not in (_BLOB, _IMAGE, _AUDIO)):
                     raise CompileError(
-                        f"callback() expects func[blob]:void, found "
-                        f"{types_mod.type_name(fn_type)}",
+                        f"callback() expects func[blob]:void, func[img]:void, or "
+                        f"func[aud]:void, found {types_mod.type_name(fn_type)}",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
-                return _BLOB
+                return fn_type.param_types[0]
             # claude.md #109: blob's five methods -- the file functions
             # claude.md #93 spelled as free functions taking a path,
             # moved onto the value that already knows the path. Checked

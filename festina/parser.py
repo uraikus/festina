@@ -278,9 +278,10 @@ class Parser:
         # new shorthand) already handles the resulting AST shape.
         if t.type == "http" and self.peek(1).type == "LBRACE":
             return self.parse_http_anon_send()
-        # claude.md #165: `blob 'path'.callback(fn)` (also img/aud,
-        # though only blob is actually implemented past semantic.py
-        # for now -- see that module's own comment) -- the anonymous,
+        # claude.md #165 (extended to img/aud by #171): `blob
+        # 'path'.callback(fn)` (also `img 'path'.callback(fn)`/`aud
+        # 'path'.callback(fn)` -- see semantic.py's own comment) --
+        # the anonymous,
         # fire-and-forget counterpart to `http {...}` just above, same
         # "checked before _looks_like_declaration would otherwise
         # misroute it" reasoning. Unlike `http {...}`, no AST

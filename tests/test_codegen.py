@@ -6084,6 +6084,29 @@ int8_t festina_release_check(void *payload) {
     return *header == 0;
 }
 
+/* claude.md #171: festina_audio_load_dispatch (compiled into this
+ * translation unit whether or not any harness main() below actually
+ * calls it) references these two core-runtime symbols -- stubbed for
+ * the same no-sqlite3 reason as festina_fail/festina_save_bytes/
+ * festina_release_check above. festina_retain mirrors
+ * festina_release_check's own real semantics; festina_async_io_dispatch
+ * mirrors the core runtime's own no-hook-registered fallback (run the
+ * job inline, synchronously) -- exactly right for a harness that never
+ * links festina_runtime_async.c. */
+void festina_retain(void *payload) {
+    if (!payload) return;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return;
+    (*header)++;
+}
+void festina_async_io_dispatch(void *payload, void (*work_fn)(void *payload),
+                               void (*callback)(void *payload),
+                               void (*release_fn)(void *payload)) {
+    if (work_fn) work_fn(payload);
+    if (callback) callback(payload);
+    if (release_fn) release_fn(payload);
+}
+
 static int active_voices(void *audio) {
     int n = 0;
     pthread_mutex_lock(&g_audio_lock);
@@ -6221,6 +6244,29 @@ int8_t festina_release_check(void *payload) {
     return *header == 0;
 }
 
+/* claude.md #171: festina_audio_load_dispatch (compiled into this
+ * translation unit whether or not any harness main() below actually
+ * calls it) references these two core-runtime symbols -- stubbed for
+ * the same no-sqlite3 reason as festina_fail/festina_save_bytes/
+ * festina_release_check above. festina_retain mirrors
+ * festina_release_check's own real semantics; festina_async_io_dispatch
+ * mirrors the core runtime's own no-hook-registered fallback (run the
+ * job inline, synchronously) -- exactly right for a harness that never
+ * links festina_runtime_async.c. */
+void festina_retain(void *payload) {
+    if (!payload) return;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return;
+    (*header)++;
+}
+void festina_async_io_dispatch(void *payload, void (*work_fn)(void *payload),
+                               void (*callback)(void *payload),
+                               void (*release_fn)(void *payload)) {
+    if (work_fn) work_fn(payload);
+    if (callback) callback(payload);
+    if (release_fn) release_fn(payload);
+}
+
 static int active_voices(void *audio) {
     int n = 0;
     pthread_mutex_lock(&g_audio_lock);
@@ -6305,6 +6351,29 @@ int8_t festina_release_check(void *payload) {
     if (*header < 0) return 0;
     (*header)--;
     return *header == 0;
+}
+
+/* claude.md #171: festina_audio_load_dispatch (compiled into this
+ * translation unit whether or not any harness main() below actually
+ * calls it) references these two core-runtime symbols -- stubbed for
+ * the same no-sqlite3 reason as festina_fail/festina_save_bytes/
+ * festina_release_check above. festina_retain mirrors
+ * festina_release_check's own real semantics; festina_async_io_dispatch
+ * mirrors the core runtime's own no-hook-registered fallback (run the
+ * job inline, synchronously) -- exactly right for a harness that never
+ * links festina_runtime_async.c. */
+void festina_retain(void *payload) {
+    if (!payload) return;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return;
+    (*header)++;
+}
+void festina_async_io_dispatch(void *payload, void (*work_fn)(void *payload),
+                               void (*callback)(void *payload),
+                               void (*release_fn)(void *payload)) {
+    if (work_fn) work_fn(payload);
+    if (callback) callback(payload);
+    if (release_fn) release_fn(payload);
 }
 
 /* Which channel index a clip is playing on, or -1. */

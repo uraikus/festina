@@ -354,4 +354,11 @@ class TestLeakStress:
             # a genuinely different ownership shape than push/unshift's
             # single-value one collections_churn.f already covers.
             "splice_insert_churn.f",
+            # claude.md #171: blob/img/aud's own `.callback()` -- a value
+            # built on a BACKGROUND thread and mutated in place once the
+            # main thread drains it, media_churn.f's synchronous loads
+            # cannot exercise this at all (there is no worker thread, no
+            # placeholder to alias before the real value lands, and no
+            # graceful-failure-on-a-worker-thread path to hit).
+            "async_io_churn.f",
         }

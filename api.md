@@ -1506,10 +1506,11 @@ log(fresh.exists())                   // true
 ### Loading in the background: `.callback()`
 
 `blob key = 'path'` reads the file synchronously, blocking until it's
-done. `.callback()` — on any `text` path expression, not just a
-literal — starts the read in the background instead, returning an
-empty (not-yet-loaded) blob immediately and firing a callback once the
-read actually finishes, from the same main thread everything else in a
+done — and `img`/`aud` work the same way. `.callback()` — on any
+`text` path expression, not just a literal, and for all three types —
+starts the read in the background instead, returning an empty
+(not-yet-loaded) value immediately and firing a callback once the read
+actually finishes, from the same main thread everything else in a
 Festina program runs on:
 
 ```festina
@@ -1521,26 +1522,36 @@ blob b = 'large-file.dat'.callback(onLoaded)
 log('dispatched')                     // logs BEFORE onLoaded ever runs
 ```
 
-`callback` must be `func[blob]:void`, called with the SAME `b` the
-declaration produced, mutated in place with the real bytes once
-they've been read (exactly the shape `req.send()`'s own `callback`
-already has — see [Non-blocking requests](#http-and-websocket-servers)
-above). When the response doesn't need a name, drop the variable and
-write the load as its own statement, prefixed with the target type
-purely for readability (it isn't otherwise required — `.callback()`'s
-own target type is already unambiguous from `callback`'s signature):
+`callback` must be `func[blob]:void`, `func[img]:void`, or
+`func[aud]:void` — whichever matches the declared type — called with
+the SAME value the declaration produced, mutated in place with the
+real content once it's been read (exactly the shape `req.send()`'s own
+`callback` already has — see
+[Non-blocking requests](#http-and-websocket-servers) above). When the
+response doesn't need a name, drop the variable and write the load as
+its own statement, prefixed with the target type purely for
+readability (it isn't otherwise required — `.callback()`'s own target
+type is already unambiguous from `callback`'s signature):
 
 ```festina
 blob 'large-file.dat'.callback(onLoaded)
+img 'sprite.png'.callback(onImageLoaded)
+aud 'theme.mp3'.callback(onClipLoaded)
 ```
 
-An unreadable path behaves exactly like the synchronous form —
-`b.exists()` is `false`, `b.toText()` is empty — there's simply no
-separate "it failed" signal beyond that, matching blob's own existing
-"test, don't fail" contract; the whole point of `callback` is not
-reading `b` until it fires.
-
-**img/aud don't have this yet** — only `blob`.
+An unreadable path, an unrecognized format, or corrupt file data all
+behave exactly like the synchronous form's outcome would if it could
+be observed without crashing the program — `b.exists()` is `false`
+and `b.toText()` is empty for a blob; an `img` stays a 1×1 transparent
+placeholder (`.width`/`.height` both `1`); an `aud` stays silent
+(playing it is a harmless no-op). There's simply no separate "it
+failed" signal beyond that, matching blob's own existing "test, don't
+fail" contract; the whole point of `callback` is not reading the value
+until it fires. This is deliberately narrower than the synchronous
+form: `img icon = 'bad.png'` still fails the program outright on
+exactly those same three problems — `.callback()` only softens the
+failure because a background worker thread has no way to fail the
+program loudly in the first place.
 
 `toText()` hands back an ordinary owned `text`, so it composes with
 everything else:

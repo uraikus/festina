@@ -1426,6 +1426,9 @@ class CodeGen:
             "declare i64 @festina_measure_text_width(ptr)",
             "declare i64 @festina_measure_text_height(ptr)",
             "declare ptr @festina_load_image(ptr)",
+            # claude.md #171: <text>.callback(fn:func[img]:void) -- the
+            # img counterpart of claude.md #165's festina_blob_load_dispatch.
+            "declare ptr @festina_image_load_dispatch(ptr, ptr)",
             "declare i8 @festina_save_canvas(ptr)",  # claude.md #93
             "declare ptr @festina_canvas_to_image()",  # claude.md #135
             # claude.md #94: paths, transforms, gradients, alpha
@@ -1507,6 +1510,9 @@ class CodeGen:
             "declare void @festina_run_timer_loop()",
             # claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying().
             "declare ptr @festina_load_audio(ptr)",
+            # claude.md #171: <text>.callback(fn:func[aud]:void) -- the
+            # aud counterpart of claude.md #165's festina_blob_load_dispatch.
+            "declare ptr @festina_audio_load_dispatch(ptr, ptr)",
             # claude.md #99: play/playLoop, with or without a channel.
             # claude.md #109: play/playLoop hand back the channel they
             # chose, and aud.stop() is back as a clip-wide stop.
@@ -8228,25 +8234,35 @@ class CodeGen:
                         f"ptr {names_global}, i32 {ncols}, ptr {arg_val})")
                     self._free_text_temp(expr.args[0], arg_val, arg_type, lines)
                     return out, BOOL
-            # claude.md #165: <text>.callback(fn:func[blob]:void) -- a
-            # non-blocking blob load. `fn`'s own inferred FuncType is
-            # what tells this apart from an ordinary blob load
-            # entirely (semantic.py already confirmed it's exactly
-            # func[blob]:void -- img/aud aren't supported yet) --
-            # dispatches through festina_blob_load_dispatch, the exact
-            # same null-callback-means-blocking shape
+            # claude.md #165 (extended to img/aud by #171):
+            # <text>.callback(fn:func[T]:void) -- a non-blocking blob/
+            # img/aud load. `fn`'s own inferred FuncType is what tells
+            # this apart from an ordinary load entirely (semantic.py
+            # already confirmed it's exactly func[T]:void for one of
+            # the three) -- dispatches through the matching
+            # festina_*_load_dispatch, the exact same
+            # null-callback-means-blocking shape
             # festina_http_send_client_dispatch already established.
             if callee.prop == "callback":
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if obj_type == TEXT:
-                    fn_val, _fn_type = self._emit_expr(expr.args[0], env, lines)
+                    fn_val, fn_type = self._emit_expr(expr.args[0], env, lines)
                     self.uses_async_io = True
+                    result_type = fn_type.param_types[0]
+                    if isinstance(result_type, types_mod.ImageType):
+                        self.uses_graphics_code = True
+                        dispatch_fn = "festina_image_load_dispatch"
+                    elif isinstance(result_type, types_mod.AudioType):
+                        self.uses_audio = True
+                        dispatch_fn = "festina_audio_load_dispatch"
+                    else:
+                        dispatch_fn = "festina_blob_load_dispatch"
                     out = self.tmp()
                     lines.append(
-                        f"  {out} = call ptr @festina_blob_load_dispatch(ptr {obj_val}, "
+                        f"  {out} = call ptr @{dispatch_fn}(ptr {obj_val}, "
                         f"ptr {fn_val})")
                     self._free_text_temp(callee.obj, obj_val, obj_type, lines)
-                    return out, BLOB
+                    return out, result_type
             # claude.md #110: save()/saveCopy() on blob, img or aud. One
             # branch for all three, dispatched on the receiver's type --
             # the runtime functions differ only in which struct's path

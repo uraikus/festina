@@ -569,6 +569,11 @@ void festina_draw_text(const char *text, int64_t x, int64_t y);
 void festina_draw_pixel(int64_t x, int64_t y);
 void festina_draw_pixel_color(int64_t x, int64_t y, int64_t color);
 void *festina_load_image(const char *path);
+/* claude.md #171: <text>.callback(fn) for img -- the img counterpart of
+ * festina_blob_load_dispatch, see festina_runtime_graphics.c's own doc
+ * comment on festina_image_load_dispatch/festina_image_load_worker for
+ * the full design. */
+void *festina_image_load_dispatch(const char *path, void (*callback)(void *));
 /* claude.md #101: the image counterparts of the two audio entry points
  * above, with one difference -- an image that never came from a file
  * (a clip() or resize() result) has no source bytes, so
@@ -989,6 +994,11 @@ void festina_register_http_service_hooks(void);
  * closes), it does not wait for playback to finish.
  */
 void *festina_load_audio(const char *path);
+/* claude.md #171: <text>.callback(fn) for aud -- the aud counterpart of
+ * festina_blob_load_dispatch, see festina_runtime_audio.c's own doc
+ * comment on festina_audio_load_dispatch/festina_audio_load_worker for
+ * the full design. */
+void *festina_audio_load_dispatch(const char *path, void (*callback)(void *));
 /* claude.md #110: the clip's own path, so save() has somewhere to go.
  * Empty for a clip decoded from bytes (a database column). */
 int8_t festina_audio_save(void *audio, const char *target);

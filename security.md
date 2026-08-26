@@ -167,8 +167,11 @@ cycle collection by trial deletion for the types that can form one
 verified stages and
 continuously exercised under AddressSanitizer, LeakSanitizer and (for
 the audio thread pool) ThreadSanitizer. `scripts/leak_stress.sh` runs
-five mixed churn programs plus one isolation program per data type on
-every test run, and a canary test proves the harness itself can fail.
+six mixed churn programs (claude.md #172: `blob`/`img`/`aud`'s own
+background `.callback()` load among them, several hundred jobs deep
+across the async-io worker pool) plus one isolation program per data
+type on every test run, and a canary test proves the harness itself
+can fail.
 
 The knowingly accepted gaps, none of which is remotely triggerable and
 each of which is a **leak or a documented manual contract, not
