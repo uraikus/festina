@@ -1276,10 +1276,9 @@ void festina_map_free_entries(void *entries, int64_t capacity);
  * plain arr[T] (festina_array_resize's own unchanged exact-size-realloc
  * behavior), or the address of an `amor arr[T]`'s own tracked capacity
  * field (FESTINA_AMOR_ARRAY_LLVM_TYPE's 3rd field, byte-compatible with
- * plain arr[T]'s {length, data} prefix -- the identical trick
- * FESTINA_AMAP_LLVM_TYPE already uses over FESTINA_MAP_LLVM_TYPE) for
- * geometric doubling growth instead. See festina_array_resize's own
- * comment for the full layout reasoning.
+ * plain arr[T]'s {length, data} prefix) for geometric doubling growth
+ * instead. See festina_array_resize's own comment for the full layout
+ * reasoning.
  *
  * Ownership of a removed element TRANSFERS to whoever receives it
  * (pop/shift hand it back, splice hands it to the returned array), so

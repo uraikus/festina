@@ -215,7 +215,7 @@ frame about twice as fast as Chromium's.
 ## Project status
 
 The compiler frontend, LLVM codegen backend, and native C runtime are
-real and tested: **1771 tests, 0 failures** (9 more skip cleanly when
+real and tested: **1785 tests, 0 failures** (9 more skip cleanly when
 their optional tooling isn't installed — see
 [setup.md](setup.md#running-the-test-suite)). Every language construct
 in the [specification](claude.md) is implemented end to end, not just

@@ -353,9 +353,14 @@ class Parser:
         if i >= len(self.toks):
             return i
         if self.toks[i].type == "amor":
-            # claude.md #156: amor map[T] / amor arr[T] -- just a
-            # one-token prefix ahead of whatever map[T]/arr[T] itself
-            # spans, not a container needing its own [T] skip.
+            # claude.md #156: amor arr[T] -- just a one-token prefix
+            # ahead of whatever arr[T]/map[T] itself spans, not a
+            # container needing its own [T] skip. Doesn't validate what
+            # follows `amor` is actually arr[T] (parse_type() does
+            # that, and claude.md #175 made `amor map[T]` a parse
+            # error there) -- this only needs to skip past however many
+            # tokens the type expression spans, whatever it turns out
+            # to be.
             return self._type_expr_end(i + 1)
         if self.toks[i].type in ("arr", "map"):
             i += 1
