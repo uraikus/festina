@@ -104,7 +104,16 @@ could feed a program that also happens to read stdin/argv. Concretely:
   could hold more connections open for longer than the previous
   one-request-then-close model ever allowed — the same reverse-proxy/
   firewall answer above still applies to a client doing that on purpose.
-- **The request parser (HTTP/1.1 headers, WebSocket frames) is new,
+  claude.md #168's WebSocket fragmentation reassembly buffer is a
+  SEPARATE accumulator from the per-frame cap above (each wire frame is
+  fully consumed out of the connection's own read buffer as soon as
+  it's parsed, so that buffer's cap alone would never have bounded a
+  message reassembled from many small frames) — explicitly capped at
+  the same 8MB, closing the connection with WebSocket code 1009
+  ("Message Too Big") if a peer tries to exceed it, rather than growing
+  without bound.
+- **The request parser (HTTP/1.1 headers, chunked-transfer-encoding
+  bodies, WebSocket frames and fragmentation reassembly) is new,
   hand-written C parsing untrusted bytes** — the single largest new
   category of memory-unsafety risk this language has ever taken on,
   audited and stress-tested (ASan + LeakSanitizer, including abrupt-
@@ -112,6 +121,12 @@ could feed a program that also happens to read stdin/argv. Concretely:
   libjpeg/libmpg123 elsewhere in this runtime, not a widely-deployed,
   independently-hardened third-party implementation. Treat it with the
   same caution any new, from-scratch network-facing parser deserves.
+  claude.md #168 also fixed a real, pre-existing bug this same
+  scrutiny turned up: a malformed request line only ever set an
+  internal `alive` flag to 0 without actually closing the socket or
+  freeing the connection slot — a real (if narrow, low-severity) fd/
+  memory leak for any client that sends garbage instead of a valid
+  request, now closed properly like every other rejected connection.
 
 Every other builtin's own external interface (filesystem,
 `environment`, X11/ALSA) is unchanged: still local-attacker-only, still

@@ -364,6 +364,43 @@ typedef struct {
     size_t header_scan_pos;
     size_t body_start_offset;
 
+    /* claude.md #168: `Transfer-Encoding: chunked` request bodies --
+     * is_chunked is decided alongside content_length, right when headers
+     * are parsed (whichever the request actually sent governs; see
+     * festina_try_parse_request's own comment on why Transfer-Encoding
+     * wins if a request somehow sends both). chunk_scan_pos is
+     * festina_chunk_decode_step's own resumable position within `buf`
+     * (mirrors header_scan_pos's shape exactly) -- decoded chunk DATA
+     * accumulates separately in chunk_body/_len/_cap as complete chunks
+     * are found, since the wire encoding (chunk-size lines, trailing
+     * CRLFs) is interleaved with the real body bytes and can't just be
+     * sliced out of `buf` in place. Once the terminating 0-size chunk
+     * and its own final blank line are found, chunk_body/_len are
+     * handed off to become this request's own body/body_len (see
+     * festina_try_parse_request's own tail) and reset here to NULL/0. */
+    int is_chunked;
+    size_t chunk_scan_pos;
+    uint8_t *chunk_body;
+    size_t chunk_body_len;
+    size_t chunk_body_cap;
+
+    /* claude.md #168: WebSocket message fragmentation (RFC 6455 §5.4) --
+     * see festina_ws_process_next_frame's own doc comment for the full
+     * reassembly state machine. ws_frag_active is whether a fragmented
+     * text/binary message is currently being reassembled (a FIN=0
+     * text/binary frame started it, no terminating FIN=1 continuation
+     * frame has arrived yet); ws_frag_opcode is which kind (0x1 text or
+     * 0x2 binary) it is, since continuation frames don't repeat it.
+     * Control frames (close/ping/pong) are never fragmented and are
+     * dispatched immediately regardless of this state -- see RFC 6455's
+     * own allowance for interleaving them between another message's
+     * fragments. */
+    int ws_frag_active;
+    uint8_t ws_frag_opcode;
+    uint8_t *ws_frag_buf;
+    size_t ws_frag_len;
+    size_t ws_frag_cap;
+
     /* socket.state -- lazily created (see festina_socket_state), a
      * live map[text] header block: {refcount, count, entries}, this
      * pointer aimed at the `count` field (see festina_runtime.h's own
@@ -458,6 +495,13 @@ static void *festina_http_value_new(const char *url, const char *method, int64_t
                                      int64_t conn_id, void (*callback)(void *));
 void festina_release_http(void *payload);
 void festina_http_ok(void *payload);
+
+/* claude.md #168: festina_ws_process_one_frame (defined well before
+ * this file's "WebSocket -- construction/dispatch" section) needs to
+ * dispatch a complete -- possibly freshly reassembled -- message the
+ * same way a single-frame one already does. */
+static void festina_dispatch_ws_frame(FestinaConn *c, uint8_t opcode,
+                                      uint8_t *payload, size_t payload_len);
 
 /* claude.md #163: forward-declared here (defined in "http -- async
  * client" further down, well after festina_run_http_loop's own
@@ -777,6 +821,13 @@ static void festina_conn_teardown(FestinaConn *c) {
     free(c->path);
     festina_headers_free(c->headers, c->header_count);
     free(c->body);
+    /* claude.md #168: a connection can be torn down mid-chunked-request
+     * or mid-fragmented-websocket-message (a malformed chunk/frame, an
+     * early disconnect, plain keep-alive teardown after a chunked
+     * request) -- both accumulators need freeing here the same as every
+     * other per-connection buffer above, or they leak. */
+    free(c->chunk_body);
+    free(c->ws_frag_buf);
     /* claude.md #167: festina_release_text_map, not the generic
      * festina_release_map -- socket.state's own values are ordinary
      * owned text (set via `s.state[k] = v`, the same map[text]
@@ -815,7 +866,15 @@ static void festina_conn_teardown(FestinaConn *c) {
  * immediately after a keep-alive reset, so a second buffered request is
  * picked up on the very next pass rather than left to wait. */
 static void festina_conn_reset_for_next_request(FestinaConn *c) {
-    size_t consumed = c->body_start_offset + (c->content_length > 0 ? (size_t)c->content_length : 0);
+    /* claude.md #168: a chunked request's own raw byte count isn't
+     * `body_start_offset + content_length` at all (content_length stays
+     * -1 for one -- see festina_try_parse_request) -- chunk_scan_pos is
+     * where the terminating blank line's own decode left off, exactly
+     * the boundary between this request's raw bytes and whatever comes
+     * next. */
+    size_t consumed = c->is_chunked
+        ? c->chunk_scan_pos
+        : c->body_start_offset + (c->content_length > 0 ? (size_t)c->content_length : 0);
     size_t remaining = consumed < c->buf_len ? c->buf_len - consumed : 0;
     if (remaining > 0) memmove(c->buf, c->buf + consumed, remaining);
     c->buf_len = remaining;
@@ -835,6 +894,16 @@ static void festina_conn_reset_for_next_request(FestinaConn *c) {
     c->headers_parsed = 0;
     c->header_scan_pos = 0;
     c->body_start_offset = 0;
+    /* claude.md #168: chunk_body/_len/_cap are already NULL/0/0 by this
+     * point in the ordinary case (festina_try_parse_request's own
+     * completion tail transfers ownership to c->body/body_len before
+     * ever reaching here) -- reset defensively anyway, the same
+     * always-safe-to-free spirit every other field above already has. */
+    c->is_chunked = 0;
+    c->chunk_scan_pos = 0;
+    free(c->chunk_body); c->chunk_body = NULL;
+    c->chunk_body_len = 0;
+    c->chunk_body_cap = 0;
     c->last_activity = festina_now_seconds();
     c->served_a_request = 1;
 }
@@ -919,11 +988,99 @@ static double festina_earliest_keepalive_deadline(void) {
     return earliest;
 }
 
-/* ---- HTTP/1.1 request parsing -- request-line + headers + an
- * optional Content-Length body only (see festina_runtime.h's own top
- * comment for the full scope decision: no chunked encoding, no
- * pipelining -- see claude.md #167 for keep-alive, which this scope
- * note no longer excludes). ---- */
+/* claude.md #168: the shared chunked-transfer-encoding decoder (RFC
+ * 7230 §4.1) -- decodes as much of a chunked byte stream, starting at
+ * `data[*consumed]`, as `len` bytes currently allow, appending each
+ * complete chunk's own DATA (not the chunk-size line or its own
+ * trailing CRLF) to `*out_body`/`*out_body_len` (grown via realloc as
+ * needed, doubling like every other growable buffer in this file) and
+ * advancing `*consumed` past everything fully decoded so far.
+ *
+ * Used TWO ways from the same primitive: incrementally, by
+ * festina_try_parse_request below (an inbound chunked REQUEST body may
+ * arrive over several separate recv() calls, so `data`/`len` are
+ * `c->buf`/`c->buf_len` and `*consumed` is `c->chunk_scan_pos`, resumed
+ * across calls exactly the way header_scan_pos already is), and once,
+ * in a single pass, by festina_parse_http_response further down (an
+ * outbound chunked RESPONSE body has already been fully read by the
+ * time that function runs -- festina_client_read_all reads until the
+ * peer closes -- so there's nothing to resume across calls there).
+ *
+ * Returns 1 once the terminating 0-size chunk and its own final blank
+ * line have been found (any trailer headers in between are scanned
+ * past and discarded, never merged into the request/response's own
+ * headers map -- real-world trailers are vanishingly rare and this
+ * runtime has no use for them once the body already exists). Returns 0
+ * if it ran out of bytes partway through the current chunk -- for the
+ * incremental caller this just means "wait for more bytes, try again
+ * next time"; for the one-shot caller (which has already seen every
+ * byte the peer will ever send) it means the response arrived
+ * truncated, treated the same lenient way a short Content-Length body
+ * already is elsewhere in this file: whatever decoded so far is simply
+ * what the caller gets, not an error.
+ *
+ * `*ok` is set to 0 only for a genuinely malformed chunk -- an invalid
+ * (non-hex, or absurdly long) chunk-size, or chunk data not actually
+ * followed by the CRLF the encoding requires. The incremental caller
+ * tears the connection down on this; the one-shot caller treats it the
+ * same as a truncated response (not a thrown error -- see that
+ * function's own doc comment on why body issues don't throw). */
+static int festina_chunk_decode_step(const uint8_t *data, size_t len, size_t *consumed,
+                                     uint8_t **out_body, size_t *out_body_len,
+                                     size_t *out_body_cap, int *ok) {
+    *ok = 1;
+    for (;;) {
+        size_t line_start = *consumed;
+        size_t i = line_start;
+        while (i + 1 < len && !(data[i] == '\r' && data[i + 1] == '\n')) i++;
+        if (i + 1 >= len) return 0; /* not enough bytes yet for the chunk-size line */
+        size_t size_len = 0;
+        while (line_start + size_len < i && data[line_start + size_len] != ';') size_len++;
+        if (size_len == 0 || size_len >= 17) { *ok = 0; return 0; } /* empty or absurd */
+        char size_buf[17];
+        memcpy(size_buf, data + line_start, size_len);
+        size_buf[size_len] = '\0';
+        char *endptr;
+        unsigned long long chunk_size = strtoull(size_buf, &endptr, 16);
+        if (endptr == size_buf || *endptr != '\0') { *ok = 0; return 0; } /* not valid hex */
+        size_t data_start = i + 2; /* right past the chunk-size line's own CRLF */
+        if (chunk_size == 0) {
+            /* Last-chunk -- what follows is zero or more trailer header
+             * lines, then one final blank line ends the whole message.
+             * Trailers are scanned past a line at a time and discarded. */
+            size_t p = data_start;
+            for (;;) {
+                size_t line_end = p;
+                while (line_end + 1 < len && !(data[line_end] == '\r' && data[line_end + 1] == '\n')) line_end++;
+                if (line_end + 1 >= len) return 0; /* wait for the rest of the trailer/blank line */
+                if (line_end == p) { *consumed = line_end + 2; return 1; } /* blank line -- done */
+                p = line_end + 2; /* past this trailer line, keep scanning */
+            }
+        }
+        if (data_start + (size_t)chunk_size + 2 > len) return 0; /* wait for the rest of this chunk */
+        if (data[data_start + (size_t)chunk_size] != '\r'
+                || data[data_start + (size_t)chunk_size + 1] != '\n') {
+            *ok = 0; return 0; /* chunk data not properly CRLF-terminated */
+        }
+        if (*out_body_len + (size_t)chunk_size > *out_body_cap) {
+            size_t new_cap = *out_body_cap ? *out_body_cap * 2 : 4096;
+            while (new_cap < *out_body_len + (size_t)chunk_size) new_cap *= 2;
+            uint8_t *grown = realloc(*out_body, new_cap);
+            if (!grown) festina_fail("out of memory decoding a chunked body");
+            *out_body = grown;
+            *out_body_cap = new_cap;
+        }
+        memcpy(*out_body + *out_body_len, data + data_start, (size_t)chunk_size);
+        *out_body_len += (size_t)chunk_size;
+        *consumed = data_start + (size_t)chunk_size + 2;
+        /* Loop -- the next chunk may already be fully buffered too,
+         * the same "drain everything currently available" shape the
+         * resumable header scan above already uses. */
+    }
+}
+
+/* ---- HTTP/1.1 request parsing -- request-line + headers + a
+ * Content-Length OR chunked (claude.md #168) body, no pipelining. ---- */
 static void festina_try_parse_request(FestinaConn *c) {
     if (c->request_ready) return;
 
@@ -966,12 +1123,23 @@ static void festina_try_parse_request(FestinaConn *c) {
         /* Request line: METHOD SP PATH SP VERSION */
         const char *method_start = p;
         while (p < limit && *p != ' ') p++;
-        if (p >= limit) { c->alive = 0; return; } /* malformed -- drop it */
+        /* claude.md #168: festina_conn_teardown, not a bare `c->alive =
+         * 0` -- found while adding the equivalent malformed-chunk check
+         * below and confirmed pre-existing, not new: setting alive=0
+         * alone never actually closes the fd or frees this slot (only
+         * festina_conn_teardown's own bookkeeping does that), so a
+         * malformed request line used to leak both -- the socket sits
+         * open, unpolled, forever, and the connection-table slot never
+         * returns to the free list. festina_conn_teardown is safe to
+         * call this early: every field it frees (method/path/headers/
+         * body/etc) is still NULL at this point in parsing, and
+         * free(NULL) is always a no-op. */
+        if (p >= limit) { festina_conn_teardown(c); return; } /* malformed -- drop it */
         size_t method_len = (size_t)(p - method_start);
         p++; /* past the space */
         const char *path_start = p;
         while (p < limit && *p != ' ') p++;
-        if (p >= limit) { c->alive = 0; return; }
+        if (p >= limit) { festina_conn_teardown(c); return; }
         size_t path_len = (size_t)(p - path_start);
         /* claude.md #167: the rest of the line (HTTP version) now
          * matters for exactly one thing -- keep-alive's own default
@@ -1017,10 +1185,22 @@ static void festina_try_parse_request(FestinaConn *c) {
                                 name_start, name_len, value_start, value_len);
         }
 
+        /* claude.md #168: Transfer-Encoding wins over Content-Length if
+         * a request somehow sends both (invalid per RFC 7230, but this
+         * runtime already leans lenient elsewhere rather than adding a
+         * whole new rejection path for a rare, already-broken client) --
+         * chunked framing is authoritative once present. Exact
+         * case-insensitive match against "chunked" alone, the same
+         * rigor the Connection/Upgrade headers already get here rather
+         * than a comma-separated token parse -- real requests send
+         * exactly this one value in practice. */
+        const char *te = festina_headers_get(c->headers, c->header_count, "transfer-encoding");
+        c->is_chunked = (te && strcasecmp(te, "chunked") == 0);
         const char *cl = festina_headers_get(c->headers, c->header_count, "content-length");
         c->content_length = cl ? strtoll(cl, NULL, 10) : 0;
         if (c->content_length < 0) c->content_length = 0;
         c->body_start_offset = (size_t)((const uint8_t *)limit - c->buf) + 4;
+        if (c->is_chunked) c->chunk_scan_pos = c->body_start_offset;
         /* claude.md #167: `Connection: close` always forces it, exact
          * match, case-insensitive -- the same "exact token, not a
          * comma-separated parse" rigor already used for the Upgrade
@@ -1038,6 +1218,30 @@ static void festina_try_parse_request(FestinaConn *c) {
         c->headers_parsed = 1;
     }
 
+    if (c->is_chunked) {
+        /* claude.md #168: incremental -- may need several calls across
+         * separate recv()s, same as the Content-Length path below.
+         * FESTINA_HTTP_MAX_BUFFER isn't checked again here: it already
+         * bounds `buf` itself (festina_conn_readable's own read loop),
+         * and chunk-encoded bytes are never fewer than the decoded
+         * body they represent (every chunk adds at least "N\r\n"+"\r\n"
+         * of its own overhead), so the existing cap on raw bytes
+         * received already bounds the decoded body too -- no separate
+         * limit needed on chunk_body_len itself. */
+        int ok;
+        int done = festina_chunk_decode_step(c->buf, c->buf_len, &c->chunk_scan_pos,
+                                             &c->chunk_body, &c->chunk_body_len,
+                                             &c->chunk_body_cap, &ok);
+        if (!ok) { festina_conn_teardown(c); return; } /* malformed chunk -- drop the connection */
+        if (!done) return; /* still waiting for more chunks */
+        c->body = c->chunk_body;
+        c->body_len = (int64_t)c->chunk_body_len;
+        c->chunk_body = NULL;
+        c->chunk_body_cap = 0;
+        c->request_ready = 1;
+        return;
+    }
+
     size_t have_body = c->buf_len > c->body_start_offset ? c->buf_len - c->body_start_offset : 0;
     if (have_body < (size_t)c->content_length) return; /* still waiting for the body */
 
@@ -1050,9 +1254,9 @@ static void festina_try_parse_request(FestinaConn *c) {
     c->request_ready = 1;
 }
 
-/* ---- WebSocket framing (RFC 6455) -- text/binary/close/ping/pong
- * only, no fragmentation, no extensions. See festina_runtime.h's own
- * top comment for the full scope decision. ---- */
+/* ---- WebSocket framing (RFC 6455) -- text/binary/close/ping/pong,
+ * with fragmentation reassembly (claude.md #168), no extensions. See
+ * festina_runtime.h's own top comment for the full scope decision. ---- */
 
 #define FESTINA_WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -1188,7 +1392,7 @@ static void festina_ws_send_frame(FestinaConn *c, uint8_t opcode, const void *da
  * was available, 0 if more bytes are still needed. `*opcode`/`*payload`/
  * `*payload_len` are only meaningful when this returns 1; `*payload`
  * is a freshly malloc'd, already-unmasked copy the caller owns. */
-static int festina_ws_try_parse_frame(FestinaConn *c, uint8_t *opcode,
+static int festina_ws_try_parse_frame(FestinaConn *c, int *fin_out, uint8_t *opcode,
                                       uint8_t **payload, size_t *payload_len) {
     if (c->buf_len < 2) return 0;
     uint8_t b0 = c->buf[0];
@@ -1228,11 +1432,160 @@ static int festina_ws_try_parse_frame(FestinaConn *c, uint8_t *opcode,
     memmove(c->buf, c->buf + frame_total, c->buf_len - frame_total);
     c->buf_len -= frame_total;
 
-    *opcode = fin ? op : 0xFF; /* 0xFF: an unsupported fragmented frame,
-                                * see the dispatch site below */
+    /* claude.md #168: reports the wire frame HONESTLY now -- fin/opcode
+     * exactly as sent, no more collapsing FIN=0 into a synthetic 0xFF
+     * "unsupported" opcode. Reassembly (or rejecting a genuinely
+     * malformed fragment sequence) is festina_ws_process_one_frame's
+     * own job now, not this function's. */
+    *fin_out = fin;
+    *opcode = op;
     *payload = out;
     *payload_len = (size_t)len;
     return 1;
+}
+
+/* claude.md #168: appends `len` bytes to this connection's own
+ * in-progress fragmented-message reassembly buffer, growing it as
+ * needed (doubling, like every other growable buffer in this file) --
+ * bounded by FESTINA_HTTP_MAX_BUFFER, the same cap every other
+ * connection-scoped buffer here already has. Unlike a chunked HTTP
+ * body (claude.md #168's other half), nothing else in this runtime
+ * implicitly bounds a reassembled WebSocket message's cumulative size:
+ * each wire frame is fully consumed out of `c->buf` as soon as it's
+ * parsed (festina_ws_try_parse_frame's own memmove above), so `buf`'s
+ * own cap only ever bounds ONE frame at a time, never the sum of many.
+ * Returns 0 (append refused, nothing appended) if growing would exceed
+ * the cap -- the caller closes the connection with WebSocket close
+ * code 1009 ("Message Too Big") in that case, the same real close code
+ * a production WebSocket server would use, rather than silently
+ * truncating the message or growing without bound for a hostile or
+ * simply very large peer. */
+static int festina_ws_frag_append(FestinaConn *c, const uint8_t *data, size_t len) {
+    if (c->ws_frag_len + len > (size_t)FESTINA_HTTP_MAX_BUFFER) return 0;
+    if (c->ws_frag_len + len > c->ws_frag_cap) {
+        size_t new_cap = c->ws_frag_cap ? c->ws_frag_cap * 2 : 4096;
+        while (new_cap < c->ws_frag_len + len) new_cap *= 2;
+        uint8_t *grown = realloc(c->ws_frag_buf, new_cap);
+        if (!grown) festina_fail("out of memory reassembling a websocket message");
+        c->ws_frag_buf = grown;
+        c->ws_frag_cap = new_cap;
+    }
+    memcpy(c->ws_frag_buf + c->ws_frag_len, data, len);
+    c->ws_frag_len += len;
+    return 1;
+}
+
+/* claude.md #168: closes the connection with a WebSocket protocol-error
+ * close frame (code 1002) -- the shared tail every "this shouldn't have
+ * happened" branch in festina_ws_process_one_frame below reaches: a
+ * fragmented control frame, a continuation with nothing being
+ * reassembled, or a new message starting while one is already in
+ * progress. `payload` (if any) is freed here -- every call site below
+ * hands off a frame it has already decided not to use for anything
+ * else. */
+static void festina_ws_protocol_error(FestinaConn *c, uint8_t *payload) {
+    free(payload);
+    uint8_t close_payload[2] = {0x03, 0xEA}; /* 1002, big-endian */
+    festina_ws_send_frame(c, 0x8, close_payload, 2);
+    festina_conn_teardown(c);
+}
+
+/* claude.md #168: parses and handles exactly ONE wire frame, reassembling
+ * a fragmented text/binary message (RFC 6455 §5.4) across however many
+ * calls it takes rather than rejecting FIN=0 outright the way this
+ * runtime used to. A fragmented message is a FIN=0 text/binary frame
+ * (its opcode says which kind), followed by one or more FIN=0
+ * continuation frames (opcode 0x0), ending with a FIN=1 continuation
+ * frame -- dispatched then, with the ORIGINAL opcode and the full
+ * concatenated payload, exactly the same shape a single, ordinary
+ * FIN=1 message already dispatches with (festina_dispatch_ws_frame
+ * itself needed no changes at all). Control frames (close/ping/pong)
+ * are never fragmented and are handled immediately regardless of
+ * whether a text/binary message is mid-reassembly -- RFC 6455 §5.4
+ * explicitly allows interleaving them between another message's own
+ * fragments, and this runtime's own reassembly state is untouched by
+ * one passing through.
+ *
+ * Returns 1 if a complete wire frame was consumed (whether or not that
+ * completed a whole MESSAGE -- a continuation frame that doesn't finish
+ * the reassembly yet still counts, so the caller's own loop keeps
+ * trying in case a further frame is already buffered too), 0 if
+ * there's no complete wire frame available yet. */
+static int festina_ws_process_one_frame(FestinaConn *c) {
+    int fin;
+    uint8_t opcode;
+    uint8_t *payload;
+    size_t payload_len;
+    if (!festina_ws_try_parse_frame(c, &fin, &opcode, &payload, &payload_len)) return 0;
+
+    switch (opcode) {
+    case 0x8: case 0x9: case 0xA: /* close/ping/pong -- never fragmented */
+        if (!fin) { festina_ws_protocol_error(c, payload); return 1; }
+        festina_dispatch_ws_frame(c, opcode, payload, payload_len);
+        return 1;
+
+    case 0x1: case 0x2: /* text/binary -- starts a (possibly new) message */
+        if (c->ws_frag_active) { festina_ws_protocol_error(c, payload); return 1; }
+        if (fin) {
+            /* The ordinary, overwhelmingly common case, unchanged from
+             * before this entry: one complete frame IS the whole
+             * message. */
+            festina_dispatch_ws_frame(c, opcode, payload, payload_len);
+            return 1;
+        }
+        /* FIN=0 -- the first fragment of a new message. */
+        c->ws_frag_active = 1;
+        c->ws_frag_opcode = opcode;
+        c->ws_frag_len = 0;
+        if (payload_len > 0 && !festina_ws_frag_append(c, payload, payload_len)) {
+            free(payload);
+            uint8_t close_payload[2] = {0x03, 0xF1}; /* 1009, big-endian */
+            festina_ws_send_frame(c, 0x8, close_payload, 2);
+            festina_conn_teardown(c);
+            return 1;
+        }
+        free(payload);
+        return 1;
+
+    case 0x0: /* continuation */
+        if (!c->ws_frag_active) { festina_ws_protocol_error(c, payload); return 1; }
+        if (payload_len > 0 && !festina_ws_frag_append(c, payload, payload_len)) {
+            free(payload);
+            uint8_t close_payload[2] = {0x03, 0xF1};
+            festina_ws_send_frame(c, 0x8, close_payload, 2);
+            festina_conn_teardown(c);
+            return 1;
+        }
+        free(payload);
+        if (fin) {
+            /* Reassembly complete -- dispatch with the ORIGINAL opcode
+             * and the full reassembled payload. Ownership of
+             * ws_frag_buf transfers into the dispatch call (it frees
+             * the payload it's handed, same as any other dispatched
+             * frame) -- only the bookkeeping fields are reset here. */
+            uint8_t msg_opcode = c->ws_frag_opcode;
+            uint8_t *msg_payload = c->ws_frag_buf;
+            size_t msg_len = c->ws_frag_len;
+            c->ws_frag_active = 0;
+            c->ws_frag_buf = NULL;
+            c->ws_frag_len = 0;
+            c->ws_frag_cap = 0;
+            festina_dispatch_ws_frame(c, msg_opcode, msg_payload, msg_len);
+        }
+        return 1;
+
+    default:
+        /* A genuinely unrecognized opcode (reserved by the spec) --
+         * unsupported, same close-1003 behavior this runtime already
+         * had for every opcode it doesn't understand. */
+        free(payload);
+        {
+            uint8_t close_payload[2] = {0x03, 0xEB}; /* 1003, big-endian */
+            festina_ws_send_frame(c, 0x8, close_payload, 2);
+        }
+        festina_conn_teardown(c);
+        return 1;
+    }
 }
 
 /* ---- accept/read/dispatch -- the loop body ---- */
@@ -1380,16 +1733,15 @@ static void festina_dispatch_ws_frame(FestinaConn *c, uint8_t opcode,
         free(payload);
         break;
     default:
-        /* 0x0 (continuation) or 0xFF (a fragmented frame this runtime
-         * doesn't reassemble -- see festina_ws_try_parse_frame) --
-         * closed as an unsupported-data protocol error (WebSocket
-         * close code 1003) rather than silently dropping data a
-         * program might be relying on. */
+        /* claude.md #168: unreachable in practice -- festina_ws_process_
+         * one_frame (the only caller) never hands this function anything
+         * but 0x1/0x2 (a complete or freshly-reassembled text/binary
+         * message) or 0x8/0x9/0xA (a control frame); every other opcode,
+         * fragmented or not, is already handled -- and closed on if
+         * genuinely invalid -- before dispatch is ever reached. A real,
+         * safe fallback rather than a silent no-op if that invariant is
+         * ever wrong. */
         free(payload);
-        {
-            uint8_t close_payload[2] = {0x03, 0xEB}; /* 1003, big-endian */
-            festina_ws_send_frame(c, 0x8, close_payload, 2);
-        }
         festina_conn_teardown(c);
         break;
     }
@@ -1477,12 +1829,14 @@ static void festina_conn_readable(FestinaConn *c) {
             if (!c || c->mode != FESTINA_CONN_READING_REQUEST) return;
         }
     } else {
+        /* claude.md #168: festina_ws_process_one_frame handles exactly
+         * one wire frame per call -- including fragmentation
+         * reassembly across however many of them a message takes --
+         * and reports whether one was actually consumed, the same
+         * "keep draining whatever's already buffered" shape this loop
+         * already had. */
         for (;;) {
-            uint8_t opcode;
-            uint8_t *payload;
-            size_t payload_len;
-            if (!festina_ws_try_parse_frame(c, &opcode, &payload, &payload_len)) break;
-            festina_dispatch_ws_frame(c, opcode, payload, payload_len);
+            if (!festina_ws_process_one_frame(c)) break;
             if (!festina_conn_by_id(c->conn_id)) break; /* torn down mid-dispatch */
         }
     }
@@ -2512,6 +2866,7 @@ static void festina_parse_http_response(const uint8_t *data, size_t len,
     void *headers = festina_new_empty_text_map();
     FestinaMapBlock *hblock = (FestinaMapBlock *)((char *)headers - sizeof(int64_t));
     int64_t content_length = -1;
+    int is_chunked = 0;
     const char *line = hdr_start;
     while (line < end) {
         const char *line_end = memchr(line, '\n', (size_t)(end - line));
@@ -2534,12 +2889,36 @@ static void festina_parse_http_response(const uint8_t *data, size_t len,
             memcpy(owned_value, value_start, value_len);
             owned_value[value_len] = '\0';
             if (strcmp(name, "content-length") == 0) content_length = strtoll(owned_value, NULL, 10);
+            /* claude.md #168: same "chunked wins over Content-Length"
+             * precedence as the server-side request parser above. */
+            if (strcmp(name, "transfer-encoding") == 0 && strcasecmp(owned_value, "chunked") == 0) {
+                is_chunked = 1;
+            }
             festina_map_set(&hblock->count, &hblock->entries, name, (int64_t)(intptr_t)owned_value);
             free(name);
         }
         line = line_end + 1;
     }
     *out_headers = headers;
+
+    if (is_chunked) {
+        /* claude.md #168: a single pass, not incremental -- every byte
+         * the server will ever send has already been read by
+         * festina_client_read_all (it reads until the peer closes).
+         * A truncated or malformed chunked body is treated the same
+         * lenient way a short Content-Length one already is just
+         * below: whatever decoded so far is simply the body, not a
+         * thrown error -- see festina_chunk_decode_step's own doc
+         * comment. */
+        size_t consumed = (size_t)(line - (const char *)data);
+        uint8_t *decoded = NULL;
+        size_t decoded_len = 0, decoded_cap = 0;
+        int ok;
+        festina_chunk_decode_step(data, len, &consumed, &decoded, &decoded_len, &decoded_cap, &ok);
+        *out_body = decoded;
+        *out_body_len = (int64_t)decoded_len;
+        return;
+    }
 
     size_t have_body = (size_t)(end - line);
     size_t body_len = (content_length >= 0 && (size_t)content_length < have_body)

@@ -1363,22 +1363,28 @@ void festina_release_text_map(void *payload);
  * .toText()/.toBlob()/.toImg()/.toAud() work identically either way,
  * live or not.
  *
- * DESIGN, http/1.1 scope: request-line + headers + a Content-Length
- * body only -- no chunked transfer-encoding, no HTTP/1.0, no
- * pipelining. Every response closes the connection afterward
- * (`Connection: close`, unconditionally) -- there is no keep-alive in
- * this version, so each request is genuinely its own TCP connection
- * end to end, which is what keeps the per-connection state machine
- * this small (accept -> read one request -> dispatch -> respond ->
- * close, a straight line with no "wait for the next request on this
- * same fd" branch to get wrong). See wasm.md-style Limitations
- * documentation in api.md for the honest accounting of what this
- * does not do.
+ * DESIGN, http/1.1 scope: request-line + headers + a Content-Length OR
+ * chunked (claude.md #168) body, both request and response direction;
+ * no pipelining as a genuine wire optimization (a pipelining client's
+ * own buffered-ahead requests are still all served correctly, just one
+ * at a time, off a single connection -- see festina_conn_readable's
+ * own dispatch loop). claude.md #167 added HTTP/1.1 keep-alive: a
+ * response leaves the connection open for another request unless the
+ * request sent `Connection: close` (HTTP/1.0 still defaults to close
+ * unless it explicitly asks for keep-alive) -- so the per-connection
+ * state machine is accept -> read a request -> dispatch -> respond ->
+ * EITHER reset for another request on the same fd OR close, not the
+ * once-unconditional straight line to close this comment used to
+ * describe. See api.md's own http Limitations section (and its
+ * Keep-alive subsection) for the honest, current accounting of what
+ * this does and doesn't do.
  *
- * DESIGN, WebSocket scope: RFC 6455 text/binary data frames and close
- * frames only -- no fragmentation (a fragmented message is dropped,
- * not reassembled), no ping/pong keepalive sent by this runtime
- * (a received ping/pong is read and ignored, never crashes the
+ * DESIGN, WebSocket scope: RFC 6455 text/binary data frames, close
+ * frames, and fragmentation (claude.md #168 -- reassembled correctly
+ * now, including a control frame interleaved between another message's
+ * own fragments per §5.4), but no ping/pong keepalive SENT by this
+ * runtime (a received ping is answered with a pong automatically, a
+ * received pong is read and ignored, neither ever crashes the
  * connection), no permessage-deflate or any other extension. A
  * received frame -- text or binary -- always reaches `on message` as
  * a `blob` (never as `text` directly): the language has no "this

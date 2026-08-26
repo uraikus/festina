@@ -14,6 +14,7 @@ there is no Windows backend and no wasm32-wasi backend (see the
 platform/wasm-rejection tests near the bottom).
 """
 import os
+import struct
 import subprocess
 import sys
 import time
@@ -577,6 +578,151 @@ class TestHttpKeepAlive:
         assert data.endswith(b"hello")
 
 
+class TestChunkedTransferEncoding:
+    """claude.md #168: `Transfer-Encoding: chunked` -- previously
+    unsupported in either direction (api.md's own former "No chunked
+    transfer-encoding" limitation). Server-side (an incoming request
+    body) needs raw sockets -- `server.http_post` only ever sends
+    Content-Length bodies -- so every test here builds the wire bytes
+    by hand, the same way TestHttpKeepAlive's own pipelining test does."""
+
+    def test_a_chunked_request_body_is_decoded(self, compile_and_run_server):
+        import socket as _socket
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.send({'code': 200, 'body': req.toText()}) }
+        """)
+        sock = _socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        sock.sendall(
+            b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+            b"Connection: close\r\n\r\n"
+            b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+        )
+        data = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        sock.close()
+        assert data.endswith(b"hello world")
+
+    def test_a_chunked_request_body_arriving_in_separate_writes_is_decoded(
+            self, compile_and_run_server):
+        # claude.md #155's own split-arrival concern, now for chunked
+        # framing too -- festina_chunk_decode_step has to resume across
+        # calls correctly, the same way header/body parsing already did.
+        import socket as _socket
+        import time as _time
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.send({'code': 200, 'body': req.toText()}) }
+        """)
+        sock = _socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        sock.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+                     b"Connection: close\r\n\r\n")
+        _time.sleep(0.2)
+        sock.sendall(b"3\r\nfoo\r\n")
+        _time.sleep(0.2)
+        sock.sendall(b"3\r\nbar\r\n0\r\n\r\n")
+        data = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        sock.close()
+        assert data.endswith(b"foobar")
+
+    def test_chunked_combines_with_keep_alive(self, compile_and_run_server):
+        import socket as _socket
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.send({'code': 200, 'body': req.toText()}) }
+        """)
+        sock = _socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        sock.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"3\r\nfoo\r\n0\r\n\r\n")
+        sock.settimeout(5)
+        resp1 = sock.recv(4096)
+        assert resp1.endswith(b"foo")
+        assert b"Connection: keep-alive" in resp1
+        # A second, ordinary request on the SAME connection -- proves
+        # the chunked request's own raw byte count was tracked
+        # correctly for the keep-alive reset (a wrong count would
+        # either desync the next request's own parse or leave stray
+        # bytes behind).
+        sock.sendall(b"GET /again HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        resp2 = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            resp2 += chunk
+        sock.close()
+        assert resp2.endswith(b"200 Festina\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+
+    def test_a_malformed_chunk_size_drops_the_connection_cleanly(self, compile_and_run_server):
+        import socket as _socket
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.send({'code': 200, 'body': req.toText()}) }
+        """)
+        sock = _socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        sock.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n")
+        sock.sendall(b"ZZZ\r\nbad\r\n0\r\n\r\n")  # not valid hex
+        sock.settimeout(5)
+        # A real close (EOF), not a hang -- claude.md #168 also fixed a
+        # pre-existing bug where a malformed request only ever set
+        # alive=0 without actually closing the fd.
+        assert sock.recv(16) == b""
+        sock.close()
+
+    def test_a_chunked_response_from_an_upstream_server_is_decoded(self, compile_and_run):
+        # The client side (claude.md #162's req.send()) against a real,
+        # independent server that responds chunked -- a small
+        # hand-rolled one-shot socket server, deliberately not reusing
+        # this project's own http implementation for either side of
+        # this test, the same "never let a shared bug cancel itself
+        # out" discipline the WebSocket client tests already follow.
+        # compile_and_run, not compile_and_run_server -- this program
+        # never calls openPort() at all (it's a CLIENT), so the
+        # server fixture's own "poll until this port accepts
+        # connections" readiness check would never succeed.
+        import socket as _socket
+        import threading
+
+        upstream = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        upstream.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        upstream.bind(("127.0.0.1", 0))
+        upstream.listen(1)
+        upstream_port = upstream.getsockname()[1]
+
+        def _serve_one():
+            conn, _ = upstream.accept()
+            conn.recv(4096)
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                b"Connection: close\r\n\r\n"
+                b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+            )
+            conn.close()
+            upstream.close()
+
+        thread = threading.Thread(target=_serve_one, daemon=True)
+        thread.start()
+
+        result = compile_and_run(f"""
+        http req = {{'url': 'http://127.0.0.1:{upstream_port}/'}}
+        req.send()
+        log(`code: ${{req.code}}`)
+        log(`body: ${{req.toText()}}`)
+        """)
+        thread.join(timeout=5)
+        assert "code: 200" in result.stdout
+        assert "body: hello world" in result.stdout
+
+
 class TestHttpClient:
     """claude.md #162: `req.send()` -- ZERO arguments -- is the CLIENT
     side, mutating an http value in place with the response (there is
@@ -1044,6 +1190,179 @@ class TestWebSocketServer:
         assert b.recv_frame()[1] == b"unset"  # b's own state was never touched
         a.close()
         b.close()
+
+
+def _ws_mask_frame(fin, opcode, payload):
+    """A trimmed, FIN-controllable sibling of conftest.py's own
+    `_WsConn._send_frame` -- that one always sets FIN=1 (this project's
+    own server never sends a fragmented frame itself, see
+    festina_ws_send_frame's own comment), so it can't build the FIN=0
+    fragments TestWebSocketFragmentation needs to send. Deliberately a
+    separate, standalone implementation rather than importing
+    conftest's private helper, matching this file's own established
+    "each test module stays self-contained" style (see
+    _find_festina_window's own doc comment below for the same call made
+    once already)."""
+    b0 = (0x80 if fin else 0x00) | opcode
+    length = len(payload)
+    if length <= 125:
+        header = bytes([b0, 0x80 | length])
+    elif length <= 65535:
+        header = bytes([b0, 0x80 | 126]) + struct.pack(">H", length)
+    else:
+        header = bytes([b0, 0x80 | 127]) + struct.pack(">Q", length)
+    mask = os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return header + mask + masked
+
+
+def _ws_recv_frame(sock):
+    """A trimmed sibling of conftest.py's own `_WsConn.recv_frame` --
+    same reasoning as _ws_mask_frame above for not importing it."""
+    hdr = sock.recv(2)
+    opcode = hdr[0] & 0x0F
+    length = hdr[1] & 0x7F
+    if length == 126:
+        length = struct.unpack(">H", sock.recv(2))[0]
+    elif length == 127:
+        length = struct.unpack(">Q", sock.recv(8))[0]
+    payload = b""
+    while len(payload) < length:
+        chunk = sock.recv(length - len(payload))
+        if not chunk:
+            break
+        payload += chunk
+    return opcode, payload
+
+
+class TestWebSocketFragmentation:
+    """claude.md #168: RFC 6455 §5.4 message fragmentation -- previously
+    unsupported (a FIN=0 frame closed the connection outright as an
+    unsupported-data protocol error, api.md's own former "No WebSocket
+    fragmentation" limitation). Needs raw frame control conftest.py's
+    own `_WsConn` doesn't offer (it always sends FIN=1) -- every test
+    here does its own handshake via `server.ws_connect` (to reuse its
+    already-verified Sec-WebSocket-Accept checking) but drops to
+    `_ws_mask_frame`/`_ws_recv_frame` for the frames that matter."""
+
+    def test_a_fragmented_text_message_is_reassembled(self, compile_and_run_server):
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.upgrade() }
+        on message(s:socket, msg:blob) { s.send(`echo:${msg.toText()}`) }
+        """)
+        ws, status_line, _, _ = server.ws_connect("/ws")
+        assert b"101" in status_line
+        ws.sock.sendall(_ws_mask_frame(fin=False, opcode=0x1, payload=b"Hello, "))
+        ws.sock.sendall(_ws_mask_frame(fin=True, opcode=0x0, payload=b"World!"))
+        opcode, payload = _ws_recv_frame(ws.sock)
+        assert opcode == 0x1
+        assert payload == b"echo:Hello, World!"
+        ws.close()
+
+    def test_a_fragmented_binary_message_is_reassembled(self, compile_and_run_server):
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.upgrade() }
+        on message(s:socket, msg:blob) { s.send(msg) }
+        """)
+        ws, _, _, _ = server.ws_connect("/ws")
+        ws.sock.sendall(_ws_mask_frame(fin=False, opcode=0x2, payload=b"\x00\x01"))
+        ws.sock.sendall(_ws_mask_frame(fin=False, opcode=0x0, payload=b"\x02\x03"))
+        ws.sock.sendall(_ws_mask_frame(fin=True, opcode=0x0, payload=b"\x04\x05"))
+        opcode, payload = _ws_recv_frame(ws.sock)
+        assert opcode == 0x2
+        assert payload == b"\x00\x01\x02\x03\x04\x05"
+        ws.close()
+
+    def test_a_control_frame_interleaved_between_fragments_is_answered_immediately(
+            self, compile_and_run_server):
+        # RFC 6455 §5.4: control frames MAY be injected in the middle
+        # of a fragmented message. The ping's own pong must arrive
+        # BEFORE the still-in-progress message is reassembled, and the
+        # message itself must still reassemble correctly afterward --
+        # neither disturbs the other's own state.
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.upgrade() }
+        on message(s:socket, msg:blob) { s.send(`echo:${msg.toText()}`) }
+        """)
+        ws, _, _, _ = server.ws_connect("/ws")
+        ws.sock.sendall(_ws_mask_frame(fin=False, opcode=0x1, payload=b"part1-"))
+        ws.sock.sendall(_ws_mask_frame(fin=True, opcode=0x9, payload=b"pingdata"))
+        opcode, payload = _ws_recv_frame(ws.sock)
+        assert (opcode, payload) == (0xA, b"pingdata")
+        ws.sock.sendall(_ws_mask_frame(fin=True, opcode=0x0, payload=b"part2"))
+        opcode, payload = _ws_recv_frame(ws.sock)
+        assert (opcode, payload) == (0x1, b"echo:part1-part2")
+        ws.close()
+
+    def test_an_orphan_continuation_frame_is_a_protocol_error(self, compile_and_run_server):
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.upgrade() }
+        on message(s:socket, msg:blob) { s.send(msg) }
+        """)
+        ws, _, _, _ = server.ws_connect("/ws")
+        ws.sock.sendall(_ws_mask_frame(fin=True, opcode=0x0, payload=b"orphan"))
+        ws.sock.settimeout(5)
+        opcode, payload = _ws_recv_frame(ws.sock)
+        assert opcode == 0x8  # close
+        assert struct.unpack(">H", payload[:2])[0] == 1002  # protocol error
+        ws.close()
+
+    def test_a_fragmented_control_frame_is_a_protocol_error(self, compile_and_run_server):
+        # RFC 6455 §5.4: control frames MUST NOT be fragmented.
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.upgrade() }
+        on message(s:socket, msg:blob) { s.send(msg) }
+        """)
+        ws, _, _, _ = server.ws_connect("/ws")
+        ws.sock.sendall(_ws_mask_frame(fin=False, opcode=0x9, payload=b"bad"))
+        ws.sock.settimeout(5)
+        opcode, payload = _ws_recv_frame(ws.sock)
+        assert opcode == 0x8
+        assert struct.unpack(">H", payload[:2])[0] == 1002
+        ws.close()
+
+    def test_a_new_message_cannot_start_mid_reassembly(self, compile_and_run_server):
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.upgrade() }
+        on message(s:socket, msg:blob) { s.send(msg) }
+        """)
+        ws, _, _, _ = server.ws_connect("/ws")
+        ws.sock.sendall(_ws_mask_frame(fin=False, opcode=0x1, payload=b"first-"))
+        # A second text frame before the first one's own continuation
+        # finished -- not a valid continuation at all.
+        ws.sock.sendall(_ws_mask_frame(fin=True, opcode=0x1, payload=b"second"))
+        ws.sock.settimeout(5)
+        opcode, payload = _ws_recv_frame(ws.sock)
+        assert opcode == 0x8
+        assert struct.unpack(">H", payload[:2])[0] == 1002
+        ws.close()
+
+    def test_an_oversized_fragmented_message_is_closed_as_too_big(self, compile_and_run_server):
+        # FESTINA_HTTP_MAX_BUFFER (8MB) bounds a reassembled message's
+        # cumulative size the same way it bounds everything else this
+        # runtime buffers per-connection -- large fragments, not many
+        # small ones, to keep this test's own wall-clock cost down.
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.upgrade() }
+        on message(s:socket, msg:blob) { s.send(msg) }
+        """)
+        ws, _, _, _ = server.ws_connect("/ws")
+        chunk = b"x" * (1024 * 1024)  # 1MB
+        ws.sock.sendall(_ws_mask_frame(fin=False, opcode=0x1, payload=chunk))
+        for i in range(8):  # 8 more MB -> 9MB total, past the 8MB cap
+            ws.sock.sendall(_ws_mask_frame(fin=(i == 7), opcode=0x0, payload=chunk))
+        ws.sock.settimeout(10)
+        opcode, payload = _ws_recv_frame(ws.sock)
+        assert opcode == 0x8
+        assert struct.unpack(">H", payload[:2])[0] == 1009  # message too big
+        ws.close()
 
 
 class TestPlatformAndWasmGating:

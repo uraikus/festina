@@ -1736,7 +1736,11 @@ Any other key is a compile-time error.
 
 Fires once per incoming HTTP request, fully parsed (request line,
 headers, and body already buffered — see [Limitations](#http-limitations)
-below for what "fully parsed" doesn't include). `req.code` is `null` (no
+below for what "fully parsed" doesn't include). A `Transfer-Encoding:
+chunked` body (claude.md #168) is decoded transparently into the same
+buffered body a `Content-Length` request already gets — `req.toText()`/
+`.toBlob()`/etc. don't need to know or care which one a client actually
+sent. `req.code` is `null` (no
 response exists yet); `req.url` is reconstructed from the connection's
 own scheme/`Host` header/path (falling back to `127.0.0.1:<port>` if the
 client sent no `Host` header at all) — parse it with `parseURL()`
@@ -1786,7 +1790,7 @@ aud a = req.toAud()                   // decoded as audio (null if it isn't one)
 A request with no body answers an empty `text`/`blob` (never `null`),
 matching every other "nothing there" case in this language.
 
-### WebSocket: `req.upgrade()`
+### <a name="websockets-and-fragmentation"></a>WebSocket: `req.upgrade()`
 
 ```festina
 on request(req:http) {
@@ -1824,6 +1828,20 @@ then `on message(s:socket, msg:blob)` fires once per message received
 fires exactly once when the connection ends, however it ends (the peer
 closed it, sent a close frame, or the read failed) — never for a plain
 HTTP connection that never upgraded.
+
+**Fragmentation (claude.md #168) is invisible to `on message`.** A peer
+may split one logical message across several WebSocket frames (RFC 6455
+§5.4) — this runtime reassembles them itself, so `on message` fires
+exactly once per MESSAGE either way, with the full, already-concatenated
+`blob`; there's no way to observe the individual fragments, and no
+reason to want to. A ping/pong or close frame arriving in the middle of
+another message's own fragments is answered/handled immediately without
+disturbing that reassembly (the RFC's own explicit allowance for
+interleaving control frames this way). A message whose peer never sends
+the closing fragment, an out-of-place continuation frame, or a
+reassembled message over 8MB, all close the connection with a real
+WebSocket close code (1002 protocol error, or 1009 message too big) —
+never a hang or a silent drop.
 
 ```festina
 s.state                               // map[text] -- a per-connection scratchpad,
@@ -1866,14 +1884,17 @@ outbound request delays every other connection's own turn for as long
 as it takes). `req.url`/`req.method` are left untouched; `req.code`,
 `req.headers`, and the body read back through `req.toText()`/
 `toBlob()`/`toImg()`/`toAud()` are all overwritten in place with the
-response. A genuine network failure — the host doesn't resolve, the
-connection is refused, the TLS handshake fails, or the response can't
-be parsed as HTTP — **throws** (catch it with `try`/`catch`, [see
-below](#try--catch--throw)), the same "this can really fail, with real
-diagnostic text" precedent `toStruct()`/`toArr()`'s JSON parsing
-already established, rather than the "test, don't fail" convention most
-of this runtime's I/O uses. There's no timeout to configure — a 30
-second socket timeout bounds the worst case.
+response. A `Transfer-Encoding: chunked` response (claude.md #168, common
+against a real server whose body length isn't known upfront) is decoded
+transparently too, exactly like the server side above — `req.code`/
+`req.toText()`/etc. read the same either way. A genuine network failure
+— the host doesn't resolve, the connection is refused, the TLS handshake
+fails, or the response can't be parsed as HTTP — **throws** (catch it
+with `try`/`catch`, [see below](#try--catch--throw)), the same "this can
+really fail, with real diagnostic text" precedent `toStruct()`/
+`toArr()`'s JSON parsing already established, rather than the "test,
+don't fail" convention most of this runtime's I/O uses. There's no
+timeout to configure — a 30 second socket timeout bounds the worst case.
 
 Calling `req.send()` a second time on the same value sends a second,
 independent request (using whatever `url`/`method`/`headers`/body it
@@ -2023,14 +2044,11 @@ set automatically to match; a program's own `req.send()`/`req.ok()`/
 
 ### <a name="http-limitations"></a>Limitations
 
-- **HTTP/1.1 request-line + headers + a `Content-Length` body only.**
-  No chunked transfer-encoding.
-- **No WebSocket fragmentation, ping/pong sent by this runtime, or
-  extensions.** A fragmented message (a frame with `FIN=0`, or a
-  continuation frame) closes the connection rather than being silently
-  dropped or misread. A received ping is answered with a pong
-  automatically; a received pong is ignored. `permessage-deflate` and
-  every other WebSocket extension are unsupported.
+- **No ping/pong sent by this runtime, and no WebSocket extensions.** A
+  received ping is answered with a pong automatically; a received pong
+  is ignored. `permessage-deflate` and every other WebSocket extension
+  are unsupported (fragmentation, claude.md #168, is not an extension —
+  see [WebSockets](#websockets-and-fragmentation) below).
 - **Linux and macOS, plus Windows behind an opt-in flag.** Linux/macOS
   use plain POSIX sockets; Windows uses a real winsock2 port (built,
   CI-compiled — see [windows.md](windows.md)) gated behind
@@ -2114,9 +2132,7 @@ only ever calls `openPort()` never links it, the same binary-slimming
 split every other optional feature in this language already gets.
 
 **Scope, beyond what [Limitations](#http-limitations) above already
-says** (all of it applies here too — HTTP/1.1 request-line + headers +
-`Content-Length` body, no keep-alive, WebSocket text/binary/close
-frames only):
+says** (all of it applies here too):
 
 - **Server-side only.** There is no TLS *client* in this language —
   `openSecurePort()` is the only TLS-related builtin.
