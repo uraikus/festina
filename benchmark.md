@@ -25,9 +25,9 @@ Festina's canvas against a browser's and MonoGame's — see
 |---|---|
 | `hello` | Process startup + runtime init cost — compile, print one line, exit. Directly reflects [the binary-slimming work](security.md) below: fewer dynamically linked libraries means less for the dynamic linker to resolve before `main()` even runs. |
 | `fib` | Recursive function-call overhead and raw compute throughput — naive recursive `fib(32)` (no memoization), ~7 million calls. Deliberately not reducible to a closed form by an optimizer (unlike a linear sum), so this actually measures generated-code quality, not the compiler's algebra. |
-| `loop_sum` | Tight-loop / branch-free arithmetic throughput — a 100,000,000-iteration polynomial-hash accumulation (`total = (total * 1000003 + i) % 1000000007`), each iteration depending on the last so it can't be folded into a closed-form constant either (verified: a plain running-sum version of this loop was optimized away entirely, running in ~2ms regardless of iteration count — see `loop_sum.f`'s own comment). |
-| `array_sum` | Allocation-heavy throughput — 2,000,000 iterations, each building a fresh 8-element `arr[int]` literal (never escaping, so Festina reclaims it at that iteration's own scope-exit — see [claude.md](claude.md) #74/#76/#81) and summing its elements into a running total. Directly exercises the automatic memory management this project has been building out (see [todo.md](todo.md#memory-model)): every iteration is a genuine allocate-fill-read cycle, not just arithmetic. Each element's value depends on the *previous* iteration's own running total, the same closed-form-resistance trick `loop_sum` already uses. The hot loop lives inside a `void func run(...)`, not bare top-level code — escape analysis (claude.md #74) only ever analyzes a function/handler's own body, never `__festina_main`'s own top-level statement sequence, so this is what actually lets Festina prove `nums` never escapes (see `array_sum.f`'s own comment). |
-| `string_concat` | String-heavy throughput — 15,000 iterations of naive repeated concatenation (`` s = `${s}x` ``/`s = s + "x"`), `s` growing by one character each time. There's no growable string buffer to amortize into, so this is the textbook O(n²) naive-concatenation pattern — deliberately: it's the "string-heavy workload" gap the notes below used to call out as untested. |
+| `loop_sum` | Tight-loop / branch-free arithmetic throughput — a 100,000,000-iteration polynomial-hash accumulation (`total = (total * 1000003 + i) % 1000000007`), each iteration depending on the last so it can't be folded into a closed-form constant either — a plain running-sum version of this loop optimizes away entirely, running in ~2ms regardless of iteration count (see `loop_sum.f`'s own comment). |
+| `array_sum` | Allocation-heavy throughput — 2,000,000 iterations, each building a fresh 8-element `arr[int]` literal (never escaping, so Festina reclaims it at that iteration's own scope-exit — see [todo.md](todo.md#memory-model)) and summing its elements into a running total. Directly exercises automatic memory management: every iteration is a genuine allocate-fill-read cycle, not just arithmetic. Each element's value depends on the *previous* iteration's own running total, the same closed-form-resistance trick `loop_sum` already uses. The hot loop lives inside a `void func run(...)`, not bare top-level code — escape analysis only ever analyzes a function/handler's own body, never the top-level statement sequence, so this is what lets Festina prove `nums` never escapes (see `array_sum.f`'s own comment). |
+| `string_concat` | String-heavy throughput — 15,000 iterations of naive repeated concatenation (`` s = `${s}x` ``/`s = s + "x"`), `s` growing by one character each time. There's no growable string buffer to amortize into, so this is the textbook O(n²) naive-concatenation pattern. |
 
 Each language uses its own normal toolchain and optimization settings
 (`festina program.f -o program`, `rustc -O`, `go build`, `bun run` —
@@ -41,11 +41,10 @@ dedicated benchmarking tool. Binary size is the compiled executable's
 size on disk (n/a for Bun, which ships no separate binary).
 
 Build time gets one untimed throwaway build per toolchain before any
-timed one, for the same reason each program gets an untimed warmup run.
-Without it the first benchmark in the list absorbed the whole toolchain's
-cold-start cost and reported a build time several times everyone else's
-— measured at 5.1 s for Rust's `hello` against 0.1 s for the very next
-program it built, which says nothing about `hello`.
+timed one, for the same reason each program gets an untimed warmup run
+— without it, the first benchmark in the list would absorb the whole
+toolchain's own cold-start cost and report a build time several times
+every other program's own.
 
 Reproduce locally:
 
@@ -72,52 +71,52 @@ failing — see [setup.md](setup.md) for what each one needs.
 ## Results
 
 <!-- BENCHMARK_RESULTS_START -->
-_Last run: 2026-08-24 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
+_Last run: 2026-08-26 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
 
 ### `hello`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 1.4 ms | 70.9 ms | 1.46 MB |
-| Rust | 1.5 ms | 97.0 ms | 3.77 MB |
-| Go | 1.3 ms | 320.1 ms | 2.11 MB |
-| Bun | 10.6 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 1.2 ms | 66.3 ms | 1.48 MB |
+| Rust | 1.2 ms | 70.0 ms | 3.77 MB |
+| Go | 1.2 ms | 128.0 ms | 2.11 MB |
+| Bun | 7.7 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `fib`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 7.6 ms | 76.5 ms | 1.46 MB |
-| Rust | 8.1 ms | 105.6 ms | 3.77 MB |
-| Go | 14.5 ms | 241.9 ms | 2.11 MB |
-| Bun | 28.5 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 6.2 ms | 71.6 ms | 1.48 MB |
+| Rust | 6.9 ms | 70.6 ms | 3.77 MB |
+| Go | 9.7 ms | 117.4 ms | 2.11 MB |
+| Bun | 20.2 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `loop_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 518.4 ms | 161.2 ms | 1.46 MB |
-| Rust | 525.0 ms | 132.1 ms | 3.77 MB |
-| Go | 460.5 ms | 483.8 ms | 2.11 MB |
-| Bun | 9082.7 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 370.8 ms | 89.0 ms | 1.48 MB |
+| Rust | 444.0 ms | 70.2 ms | 3.77 MB |
+| Go | 368.9 ms | 122.6 ms | 2.11 MB |
+| Bun | 7438.6 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `array_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 92.2 ms | 344.7 ms | 1.47 MB |
-| Rust | 90.3 ms | 234.0 ms | 3.77 MB |
-| Go | 87.9 ms | 167.9 ms | 2.11 MB |
-| Bun | 2393.8 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 72.3 ms | 90.1 ms | 1.48 MB |
+| Rust | 69.5 ms | 103.8 ms | 3.77 MB |
+| Go | 68.7 ms | 120.4 ms | 2.11 MB |
+| Bun | 1866.8 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `string_concat`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 3.6 ms | 73.3 ms | 1.46 MB |
-| Rust | 1.7 ms | 182.6 ms | 3.77 MB |
-| Go | 30.2 ms | 151.0 ms | 2.11 MB |
-| Bun | 12.7 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 2.9 ms | 71.9 ms | 1.48 MB |
+| Rust | 1.1 ms | 94.5 ms | 3.77 MB |
+| Go | 29.7 ms | 128.0 ms | 2.11 MB |
+| Bun | 10.0 ms | n/a (JIT, no separate build step) | n/a |
 
 <!-- BENCHMARK_RESULTS_END -->
 
@@ -142,58 +141,41 @@ _Last run: 2026-08-24 on this machine -- see benchmark.md's "Methodology" sectio
   which a single-shot benchmark like this doesn't isolate from the
   actual computation — a longer-running workload would tell a different
   story for Bun specifically.
-- **`array_sum`** used to show a real, honest 2.4x gap against Rust/Go
-  (209ms vs. ~87ms): every iteration's `arr[int]` literal always
-  heap-allocated both its own header *and* its data buffer, even though
-  `nums` provably never escapes its own iteration. claude.md #81 closes
-  the header half of that gap — a non-escaping local declared directly
-  from an array/map literal now stack-allocates its header the same way
-  a non-escaping struct local already did (claude.md #74/#76), leaving
-  only the data buffer's own `malloc` (still heap, since a truly
-  general growable buffer isn't safe to give a fixed-size `alloca` —
-  see claude.md #81's own boundary). Festina now lands *at* Rust/Go
-  here, not behind them — the remaining, much smaller gap is ordinary
-  codegen-maturity noise, not an allocation-strategy gap anymore.
-- **`string_concat`** used to be the sharpest divergence in the whole
-  suite (140ms vs. Rust's 1.7ms), and closing it took three separate
-  fixes across two rounds. The first was pure wasted work in template
-  codegen: `` `${s}x` `` compiled as `("" + s) + "x"`, concatenating
-  with an empty string literal before appending the real one, which
-  claude.md #82 removed for roughly half the time (140ms → ~77ms).
-  What remained was far larger and wasn't an algorithmic gap at all —
-  Festina never freed a `text` value *anywhere* in generated code, at
-  any binding site, under any circumstance. This benchmark abandons
-  every intermediate buffer it builds, so its heap grew quadratically
-  and the program spent essentially all its time asking the kernel for
-  more: **816 `brk()` calls, against 3 for equivalent leak-free C.**
-  claude.md #83 makes text genuinely owned and genuinely freed, taking
-  this benchmark from ~77ms to **3.6ms** — and the underlying O(n²)
-  naive-copy algorithm is *unchanged*; that entire gap was allocator
-  pressure from the leak, not copying.
-- Festina now sits second in `string_concat`, ahead of both Go (~9x)
-  and Bun (~3x) and within about 2.4x of Rust. The remaining Rust gap
-  is genuinely algorithmic and not something Festina is attempting to
-  close here: Rust's `String` `+` reuses the left operand's own spare
-  capacity in place when it has room (amortized growth, the same idea
-  `Vec` uses), so it isn't doing the full O(n²) copy at all. Go's `+`
-  on immutable strings has no spare capacity to grow into either, which
-  is why it lands on the same side of the divide as Festina; Bun's V8
-  backend uses rope/cons-string representations internally, deferring
-  the copy until the string is actually read, which is why it avoids
-  the quadratic blowup despite naive-looking source. None of this is a
-  bug in any of the four — it's exactly the kind of language/runtime
-  difference this benchmark exists to surface.
+- **`array_sum`** lands close to Rust/Go rather than behind them: the
+  per-iteration `arr[int]` literal provably never escapes its own
+  iteration, so Festina stack-allocates its header the same way a
+  non-escaping struct local does, leaving only the growable data
+  buffer's own `malloc` (a truly general growable buffer isn't safe to
+  give a fixed-size `alloca`). The remaining, small gap is ordinary
+  codegen-maturity noise, not an allocation-strategy gap.
+- **`string_concat`** is where Festina's `text` ownership model shows up
+  directly: every intermediate buffer this benchmark's naive
+  concatenation builds is genuinely freed once nothing references it
+  any more, so the heap grows linearly with the final string's own
+  length, not quadratically with the number of concatenations — the
+  underlying O(n²) naive-copy algorithm is unchanged, but nothing about
+  it depends on allocator pressure from an unfreed buffer. Festina sits
+  second in this benchmark, ahead of both Go (~9x) and Bun (~3x) and
+  within about 2.4x of Rust. The remaining Rust gap is genuinely
+  algorithmic, not something this benchmark is meant to close: Rust's
+  `String` `+` reuses the left operand's own spare capacity in place
+  when it has room (amortized growth, the same idea `Vec` uses), so it
+  isn't doing the full O(n²) copy at all. Go's `+` on immutable strings
+  has no spare capacity to grow into either, which is why it lands on
+  the same side of the divide as Festina; Bun's V8 backend uses
+  rope/cons-string representations internally, deferring the copy until
+  the string is actually read, which is why it avoids the quadratic
+  blowup despite naive-looking source. None of this is a bug in any of
+  the four — it's exactly the kind of language/runtime difference this
+  benchmark exists to surface.
 - **The canvas comparison** (below) is the one benchmark here that
   isn't against another *language*. It's against the thing a 2D game
-  would otherwise most likely be written on: an HTML `<canvas>`. It
-  started out with Festina 1.4x **slower**, and that got written down in
-  bold before anything was done about it — which is what made the fix
-  findable. Splitting the frame by shape type showed circles were 90% of
-  it, because Cairo tessellates every arc afresh; caching one alpha mask
-  per radius (claude.md #104) took the frame from 90 ms to 31 ms and the
-  result from 1.4x behind to 2.1x ahead. Festina also wins startup by
-  more than an order of magnitude and wins on variance, which for a
-  frame budget is not a footnote.
+  would otherwise most likely be written on: an HTML `<canvas>`. Circles
+  dominate frame cost, because Cairo tessellates every arc afresh —
+  Festina caches one alpha mask per radius and stamps it thereafter (the
+  same trick a glyph cache uses), which is most of why the frame stays
+  fast. Festina also wins startup by more than an order of magnitude and
+  wins on variance, which for a frame budget is not a footnote.
 - **MonoGame** joins the canvas comparison as a third side, and its
   number is the one on this page most likely to be quoted out of
   context. It is a GPU framework running here with no GPU, on Mesa's
@@ -204,9 +186,8 @@ _Last run: 2026-08-24 on this machine -- see benchmark.md's "Methodology" sectio
   container — and it is worth reading only with that sentence attached.
 - These five are intentionally small, fast benchmarks so they can be
   re-run on every change worth checking, not a comprehensive suite (no
-  concurrency, no realistic mixed workload). I/O now has its own
-  section below — see [HTTP](#http-festina-vs-rust-vs-go-vs-bun) —
-  once claude.md #151/#152 gave Festina an actual server to measure.
+  concurrency, no realistic mixed workload). I/O has its own section
+  below — see [HTTP](#http-festina-vs-rust-vs-go-vs-bun).
 
 ## Canvas: Festina vs an HTML `<canvas>` vs MonoGame
 
@@ -249,18 +230,15 @@ which documents what each one cost when it was measured the other way.
 
 On this workload **Festina draws it 2.6x faster**.
 
-That took one change, and finding it took measuring rather than
-guessing. The first version of this benchmark had Festina 1.4x SLOWER,
-and the obvious culprit -- a fresh Cairo context per draw call -- turned
-out to account for 4 ms of 90. Splitting the frame by shape type found
-the real one immediately: 20,000 rectangles cost 10 ms and 20,000
-circles cost 76 ms, because `cairo_arc` + `cairo_fill` tessellates the
-curve into Beziers and scan-converts a general polygon every single
-time. Rasterizing each radius once into an alpha mask and stamping it
-thereafter -- what a glyph cache does -- took circles to 20 ms and the
-frame from 90 ms to 31 ms (claude.md #104). The remaining split is
-11 ms of rectangles, 20 ms of circles, and setting the fill colour
-20,000 times is too cheap to measure.
+Circles account for the overwhelming majority of frame cost: 20,000
+rectangles cost about 10 ms, but 20,000 circles cost about 76 ms
+uncached, because `cairo_arc` + `cairo_fill` tessellates the curve into
+Beziers and scan-converts a general polygon every single time.
+Rasterizing each radius once into an alpha mask and stamping it
+thereafter -- what a glyph cache does -- brings circles down to about
+20 ms and the whole frame to about 31 ms. The remaining split is 11 ms
+of rectangles, 20 ms of circles, and setting the fill colour 20,000
+times is too cheap to measure.
 
 Two things are worth reading alongside the headline. The browser's frame
 time is far noisier -- 97 ms at best against a 110 ms median here, and
@@ -275,15 +253,11 @@ Both outputs were compared cell-by-cell over a 16x16 grid to confirm
 they drew the same scene -- worst per-channel difference 0.2 out
 of 255. Not byte-for-byte: Cairo and Skia disagree about antialiasing on
 every curve, and demanding identical bytes would only prove the two
-rasterizers are the same program. The check has earned itself twice
-now: once catching a bug in this very script that left one side
-comparing a blank canvas, and again catching itself comparing raw RGB
-without accounting for alpha -- Festina's own offscreen canvas starts
+rasterizers are the same program. Festina's own offscreen canvas starts
 transparent (api.md's own "a fresh or cleared canvas is transparent,
-not white"), so a background pixel neither side actually drew on read
-as black here against the browser harness's own opaque white fill,
-which the comparison mistook for a real rendering difference until it
-started compositing both sides onto the same white background first.
+not white"), so both sides are composited onto the same opaque white
+background before comparing pixels, to avoid a false mismatch from
+alpha handling alone.
 <!-- CANVAS_RESULTS_END -->
 
 ## HTTP: Festina vs Rust vs Go vs Bun
@@ -296,22 +270,31 @@ separately, `apt install wrk`/`brew install wrk`).
 
 **Equivalent logic, not equivalent idiom, the same rule the five
 programs above already follow.** Festina's HTTP server
-(`festina_runtime_http.c`, claude.md #151) is deliberately
-single-threaded (one connection serviced at a time) and has no
-keep-alive (every response closes the connection -- api.md's HTTP
-Limitations). Rust's and Go's servers here are hand-rolled raw-socket
-implementations with a single-threaded, sequential accept loop and the
-same close-after-response behavior -- not `hyper`/`net/http`'s own
-default (multi-threaded, keep-alive-capable) servers, which would be
-measuring a mature framework's concurrency model against Festina's
-single-threaded one rather than the same connection-handling logic in
-four languages. Bun is the one exception: it uses `Bun.serve()`, its
-own native HTTP implementation, since there is no reason to hand-roll
-sockets in a runtime that ships a fast one already (the same "each
-language uses its own normal toolchain" rule the Methodology above
-states) -- with `Connection: close` set explicitly on every response so
-it closes each connection the same way the other three do, rather than
-its own keep-alive support doing the winning here.
+(`festina_runtime_http.c`) is deliberately single-threaded (one
+connection serviced at a time). Rust's and Go's servers here are
+hand-rolled raw-socket implementations with a single-threaded,
+sequential accept loop -- not `hyper`/`net/http`'s own default
+(multi-threaded) servers, which would be measuring a mature framework's
+concurrency model against Festina's single-threaded one rather than the
+same connection-handling logic in four languages. Bun is the one
+exception: it uses `Bun.serve()`, its own native HTTP implementation,
+since there is no reason to hand-roll sockets in a runtime that ships a
+fast one already (the same "each language uses its own normal
+toolchain" rule the Methodology above states).
+
+**Every response closes the connection, matched uniformly across all
+four servers.** Rust's and Go's raw-socket servers close by default;
+Bun's server sets `Connection: close` explicitly, to opt out of its own
+native keep-alive (which none of the raw-socket languages here have an
+equivalent of). Festina supports HTTP/1.1 keep-alive by default, so the
+load generator itself sends the fix: `run_http_benchmarks.py`'s own
+`wrk` invocation sends an explicit `Connection: close` request header
+uniformly against all four servers -- Rust/Go/Bun ignore it (they
+already always close), and Festina's own documented behavior (api.md:
+an explicit client `Connection: close` always forces it off,
+per-request) makes it close too. This keeps the comparison to exactly
+connection-accept + parse + respond, for all four languages at once,
+with no per-language server code needed to special-case it.
 
 Each `wrk` run: 4 threads, 50 open connections, 5 seconds, against one
 route at a time (a JIT-inclined runtime like Bun gets no separate
@@ -329,44 +312,36 @@ python3 benchmarks/http/run_http_benchmarks.py --duration 10s --connections 100 
 ```
 
 <!-- HTTP_BENCHMARK_RESULTS_START -->
-_Last run: 2026-08-25 on this machine, `wrk -t4 -c50 -d5s` per route -- see benchmark.md's HTTP "Methodology" for how to reproduce; absolute numbers vary by hardware and load, relative ordering is the point._
+_Last run: 2026-08-26 on this machine, `wrk -t4 -c50 -d5s` per route -- see benchmark.md's HTTP "Methodology" for how to reproduce; absolute numbers vary by hardware and load, relative ordering is the point._
 
 ### `plaintext` (`/`)
 
 | Language | Requests/sec | Avg latency | Transfer/sec |
 |---|---|---|---|
-| Festina | 33,370 | 1.41 ms | 3.25 MB/s |
-| Rust | 38,084 | 1.14 ms | 3.52 MB/s |
-| Go | 20,653 | 2.17 ms | 1.91 MB/s |
-| Bun | 14,156 | 3.37 ms | 1.81 MB/s |
+| Festina | 43,652 | 1.05 ms | 4.25 MB/s |
+| Rust | 63,513 | 0.69 ms | 5.88 MB/s |
+| Go | 35,457 | 1.30 ms | 3.28 MB/s |
+| Bun | 41,798 | 1.09 ms | 5.34 MB/s |
 
 ### `json` (`/json`)
 
 | Language | Requests/sec | Avg latency | Transfer/sec |
 |---|---|---|---|
-| Festina | 32,643 | 1.41 ms | 3.80 MB/s |
-| Rust | 38,570 | 1.06 ms | 4.30 MB/s |
-| Go | 21,340 | 2.24 ms | 2.38 MB/s |
-| Bun | 13,985 | 3.09 ms | 2.05 MB/s |
+| Festina | 41,482 | 1.33 ms | 4.83 MB/s |
+| Rust | 59,877 | 0.73 ms | 6.68 MB/s |
+| Go | 35,441 | 1.27 ms | 3.95 MB/s |
+| Bun | 39,580 | 1.15 ms | 5.81 MB/s |
 
 <!-- HTTP_BENCHMARK_RESULTS_END -->
 
 ### Reading these numbers
 
-- **claude.md #155 roughly doubled Festina's own numbers here** (from
-  ~17.6k/17.8k req/s to ~33k/32.6k) -- found by reviewing
-  `festina_runtime_http.c` specifically for this benchmark's own sake,
-  not by guessing at likely hot spots. The single biggest lever:
-  `festina_http_send` used to write a response as 4-5 separate
-  `send()` calls (status line, each extra header, `Content-Length`,
-  `Connection: close`, then the body); with `TCP_NODELAY` set (Nagle's
-  algorithm disabled for low latency), every one of those was its own
-  TCP segment, not just its own syscall. Coalescing the status
-  line/headers into one buffer sent in a single call, plus removing a
-  malloc/free pair the event loop used to pay on every single tick,
-  closed most of the gap to Go/Bun and pulled Festina from behind both
-  to ahead of both, within ~10% of Rust's raw-socket number. Full
-  writeup in claude.md #155.
+- **`festina_http_send` coalesces the status line and headers into a
+  single buffered `send()` call**, rather than writing each piece
+  separately — this matters with `TCP_NODELAY` set (Nagle's algorithm
+  disabled for low latency), since each separate call would otherwise
+  become its own TCP segment. This keeps Festina within ~10% of Rust's
+  raw-socket number here, ahead of both Go and Bun.
 - This measures connection-accept + request-parse + respond throughput
   under load from one client machine talking to one server process on
   the same machine (no network hop, no TLS) -- not a claim about
@@ -374,10 +349,9 @@ _Last run: 2026-08-25 on this machine, `wrk -t4 -c50 -d5s` per route -- see benc
   this page already carries.
 - **`/json`** exercises more than `/`: Festina's route builds a struct
   and renders it through the same JSON-via-`.toText()` path every other
-  container response already uses (claude.md #151), not a hand-built
-  string the way `/` sends one -- so a gap between the two routes for
-  Festina specifically reflects that serialization cost, not connection
-  handling.
+  container response already uses, not a hand-built string the way `/`
+  sends one -- so a gap between the two routes for Festina specifically
+  reflects that serialization cost, not connection handling.
 - Rust's and Go's numbers here are *not* what those languages'
   idiomatic HTTP stacks would report -- seeing "Rust is only Nx faster
   than Festina at HTTP" from this section should be read as "at

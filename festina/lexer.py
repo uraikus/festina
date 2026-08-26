@@ -14,10 +14,18 @@ SPEC_KEYWORDS = frozenset({
     "import", "if", "else", "on", "fail", "log", "sqlite",
     "for", "while",  # claude.md #60, #61
     "map",  # claude.md #72
-    "amor",  # claude.md #156: amor map[T] / amor arr[T] -- amortized growth
+    "amor",  # claude.md #156: amor arr[T] -- amortized growth (claude.md
+             # #175 removed the map[T] half; the keyword itself stays,
+             # `amor map[T]` is now a clear parse error instead)
     "break", "continue",  # claude.md #73
     "http", "socket",  # claude.md #151
     "try", "catch",  # claude.md #157
+    "enum", "typeof",  # claude.md #176: enum Name = Member, ... -- a
+                        # tagged union "pseudo type" over any type
+                        # (struct-only members get a real, zero-overhead
+                        # runtime tag; anything else is heap-boxed) --
+                        # and typeof <expr>, a prefix operator returning
+                        # the concrete runtime type's name as text.
 })
 
 # Extra control tokens the parser needs distinct token types for, so it

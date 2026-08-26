@@ -1089,6 +1089,42 @@ static cairo_surface_t *festina_decode_jpeg(const unsigned char *data, size_t le
     return surface;
 }
 
+/* claude.md #171: festina_image_from_bytes's own decode step, pulled
+ * out so a background worker thread (see festina_image_load_worker
+ * below) can share it -- unlike festina_image_from_bytes itself, this
+ * NEVER calls festina_fail, on any input: empty, a format it doesn't
+ * recognize, or genuinely corrupt PNG/JPEG data all just come back as
+ * NULL, with `*out_recognized_format` telling the two "no image" cases
+ * apart for the caller's own error message (festina_image_from_bytes
+ * below is unchanged, just now this plus the fail() calls its own
+ * synchronous-path contract has always made). Cairo/libjpeg decoding
+ * into a fresh, private surface and scratch buffers here touches no
+ * shared mutable state (no font/text subsystem, no shared cairo_t,
+ * nothing this runtime's own g_backing_surface or any window touches)
+ * -- confirmed safe to call from several threads at once by a real
+ * concurrent ThreadSanitizer run (see test_async_io.py's own img/aud
+ * coverage), not just by inspection. */
+static cairo_surface_t *festina_decode_image_surface(const unsigned char *bytes, int64_t len,
+                                                     int *out_recognized_format) {
+    if (out_recognized_format) *out_recognized_format = 0;
+    if (!bytes || len <= 0) return NULL;
+    if (len >= 8 && memcmp(bytes, "\x89PNG\r\n\x1a\n", 8) == 0) {
+        if (out_recognized_format) *out_recognized_format = 1;
+        FestinaByteReader reader = { bytes, (size_t)len, 0 };
+        cairo_surface_t *img = cairo_image_surface_create_from_png_stream(festina_png_read, &reader);
+        if (cairo_surface_status(img) != CAIRO_STATUS_SUCCESS) {
+            cairo_surface_destroy(img);
+            return NULL;
+        }
+        return img;
+    }
+    if (len >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) {
+        if (out_recognized_format) *out_recognized_format = 1;
+        return festina_decode_jpeg(bytes, (size_t)len);
+    }
+    return NULL;
+}
+
 void *festina_image_from_bytes(const void *data, int64_t len, const char *label) {
     const unsigned char *bytes = (const unsigned char *)data;
     if (!label) label = "<blob>";
@@ -1098,17 +1134,9 @@ void *festina_image_from_bytes(const void *data, int64_t len, const char *label)
         festina_fail(msg);
     }
 
-    cairo_surface_t *img = NULL;
-    if (len >= 8 && memcmp(bytes, "\x89PNG\r\n\x1a\n", 8) == 0) {
-        FestinaByteReader reader = { bytes, (size_t)len, 0 };
-        img = cairo_image_surface_create_from_png_stream(festina_png_read, &reader);
-        if (cairo_surface_status(img) != CAIRO_STATUS_SUCCESS) {
-            cairo_surface_destroy(img);
-            img = NULL;
-        }
-    } else if (len >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) {
-        img = festina_decode_jpeg(bytes, (size_t)len);
-    } else {
+    int recognized = 0;
+    cairo_surface_t *img = festina_decode_image_surface(bytes, len, &recognized);
+    if (!recognized) {
         char msg[512];
         snprintf(msg, sizeof(msg),
                  "could not load image '%s': not a PNG or JPEG "
@@ -1163,6 +1191,73 @@ void *festina_load_image(const char *path) {
     free(loaded->path);
     loaded->path = strdup(path);
     if (!loaded->path) festina_fail("out of memory loading an image");
+    return box;
+}
+
+/* Reads a whole file with no festina_fail() on any recoverable failure
+ * -- a local, non-throwing counterpart of festina_load_image's own
+ * fopen/fseek/fread block, used only by festina_image_load_worker
+ * below (see festina_runtime_async.c's own top comment: nothing an
+ * async-io work_fn calls is allowed to call festina_fail, except on
+ * genuine out-of-memory -- the one case this still treats as fatal,
+ * matching festina_blob_load_worker's own precedent exactly). */
+static unsigned char *festina_read_image_file_noflail(const char *path, int64_t *out_len) {
+    *out_len = 0;
+    if (!path || !*path) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long size = ftell(f);
+    if (size < 0) { fclose(f); return NULL; }
+    rewind(f);
+    unsigned char *data = malloc((size_t)size ? (size_t)size : 1);
+    if (!data) { fclose(f); festina_fail("out of memory loading an image"); }
+    size_t got = fread(data, 1, (size_t)size, f);
+    fclose(f);
+    if (got != (size_t)size) { free(data); return NULL; }
+    *out_len = (int64_t)size;
+    return data;
+}
+
+/* claude.md #171: runs on a background worker thread -- reads and
+ * decodes `box->path` (already set, at construction time, by
+ * festina_image_load_dispatch below) and, only on a genuinely
+ * successful decode, replaces box->surface/bytes/byte_count IN PLACE
+ * on the SAME box the caller is already holding, exactly the pattern
+ * festina_blob_load_worker established. A missing file, an
+ * unrecognized format, or corrupt image data all leave the box exactly
+ * as it started: the 1x1 transparent placeholder, empty bytes -- as
+ * "unpopulated" as a background blob load's own empty bytes/length
+ * leaves it, never a crash the caller has no chance to catch. */
+static void festina_image_load_worker(void *payload) {
+    FestinaImageBox *box = (FestinaImageBox *)payload;
+    int64_t len = 0;
+    unsigned char *bytes = festina_read_image_file_noflail(box->path, &len);
+    if (!bytes) return;
+    cairo_surface_t *decoded = festina_decode_image_surface(bytes, len, NULL);
+    if (!decoded) { free(bytes); return; }
+    cairo_surface_destroy(box->surface);
+    box->surface = decoded;
+    free(box->bytes);
+    box->bytes = bytes;
+    box->byte_count = (size_t)len;
+}
+
+/* claude.md #171: codegen's own entry point for a `.callback()`-carrying
+ * img construction, mirroring festina_blob_load_dispatch exactly --
+ * NULL callback is the unchanged, fully synchronous festina_load_image
+ * path; non-NULL builds the 1x1 placeholder above, sets its path, and
+ * returns it immediately while the real decode runs in the background. */
+void *festina_image_load_dispatch(const char *path, void (*callback)(void *)) {
+    if (!callback) return festina_load_image(path);
+    if (!path) path = "";
+    cairo_surface_t *placeholder = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+    FestinaImageBox *box = festina_image_box(placeholder);
+    free(box->path);
+    box->path = strdup(path);
+    if (!box->path) festina_fail("out of memory allocating an image");
+    festina_retain(box);
+    festina_async_io_dispatch(box, festina_image_load_worker, callback, festina_image_free);
     return box;
 }
 
@@ -1677,7 +1772,12 @@ static void festina_handle_window_event(const FestinaWindowEvent *ev) {
  * unloading). Timer state itself lives in festina_runtime.c, reached
  * only through festina_next_timer_deadline()/festina_fire_expired_timers()
  * (festina_runtime_internal.h) -- this file owns no timer bookkeeping
- * of its own. */
+ * of its own. claude.md #166: also the loop a combined graphics+http
+ * program blocks in -- since main() only ever enters ONE blocking loop
+ * (see festina/codegen.py's _emit_main_and_entry), openPort() being
+ * used at all doesn't change which loop that is once graphics is also
+ * in play; it just adds http servicing to this one, through the hook
+ * seam declared in festina_runtime.h. */
 void festina_run_event_loop(void) {
     g_should_stop_looping = 0;
     /* claude.md #161: checked once per iteration alongside
@@ -1708,10 +1808,23 @@ void festina_run_event_loop(void) {
         if (festina_async_io_outstanding() > 0 && (timeout < 0.0 || timeout > 0.02)) {
             timeout = 0.02;
         }
+        /* claude.md #166: an open openPort()/openSecurePort() listener
+         * (or a live connection, or a pending background client
+         * request) gets exactly the same bounded-wait treatment --
+         * this is what makes combining http with graphics possible at
+         * all: this loop stays the ONE thing main() blocks in, and http
+         * work just gets serviced from inside it, at the cost of the
+         * same up-to-20ms latency already accepted for background
+         * blob/img/aud loads. A no-op call (both hooks default to
+         * "nothing registered") for a program that never uses http. */
+        if (festina_http_service_outstanding() > 0 && (timeout < 0.0 || timeout > 0.02)) {
+            timeout = 0.02;
+        }
         festina_window_events_wait(timeout);
         festina_window_events_drain(festina_handle_window_event);
         festina_fire_expired_timers();
         festina_async_io_drain();
+        festina_http_service_ready();
     }
     cairo_surface_destroy(g_backing_surface);
     g_backing_surface = NULL;

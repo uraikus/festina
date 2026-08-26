@@ -16,6 +16,7 @@ Two kinds of tests here:
   is on PATH, since that's an environment limitation, not a missing
   Festina feature.
 """
+import json
 import os
 import shutil
 import sqlite3
@@ -1074,69 +1075,27 @@ class TestMaps:
         result = compile_and_run(source)
         assert result.stdout.strip() == "origin: (0,0)"
 
-
-class TestAmorMap:
-    """claude.md #156: amor map[T] -- an "amortized map", the `amor`
-    prefix modifier (composes with `const`: `const amor map[T] x`).
-    Same {key: value, ...} literal syntax, same indexed get/set/
-    forEach/delete/toText surface as plain map[T] -- only the growth
-    strategy differs internally (festina_amap_set's own doubling
-    capacity in place of festina_map_set's realloc-by-exactly-one),
-    which these tests can't observe directly, so they exercise the
-    same observable behavior plain map[T] already has, plus enough
-    entries to force several real capacity doublings."""
-
-    def test_literal_init_indexed_get_and_set(self, compile_and_run):
+    def test_json_renders_a_multi_key_map(self, compile_and_run):
+        # claude.md #175: map[T] is a real hash table now -- bucket
+        # order is a function of each key's hash, not insertion order,
+        # so (unlike the single-key case above) a multi-key map's own
+        # JSON key order is genuinely unspecified. Compared via
+        # json.loads, not exact string equality.
         source = """
-        amor map[int] scores = {'a': 1, 'b': 2}
-        scores['c'] = 3
-        scores['a'] = 10
-        log(scores['a'])
-        log(scores['b'])
-        log(scores['c'])
-        log(scores['missing'])
-        """
-        result = compile_and_run(source)
-        assert result.stdout.splitlines() == ["10", "2", "3", "-9223372036854775808"]
-
-    def test_forEach_visits_every_entry(self, compile_and_run):
-        source = """
-        amor map[int] m = {'a': 1, 'b': 2, 'c': 3}
-        int total = 0
-        void func addUp(v:int, key:text) {
-            total = total + v
-        }
-        m.forEach(addUp)
-        log(total)
-        """
-        result = compile_and_run(source)
-        assert result.stdout.strip() == "6"
-
-    def test_delete_removes_the_entry(self, compile_and_run):
-        source = """
-        amor map[text] m = {'a': 'x', 'b': 'y'}
-        delete m['a']
-        log(m['a'])
-        log(m['b'])
-        """
-        result = compile_and_run(source)
-        assert result.stdout.splitlines() == ["", "y"]
-
-    def test_toText_renders_json(self, compile_and_run):
-        source = """
-        amor map[int] m = {'a': 1, 'b': 2}
+        map[int] m = {'a': 1, 'b': 2, 'c': 3, 'd': 4}
         log(m)
         """
         result = compile_and_run(source)
-        assert result.stdout.strip() == '{"a":1,"b":2}'
+        assert json.loads(result.stdout.strip()) == {"a": 1, "b": 2, "c": 3, "d": 4}
 
     def test_many_inserts_survive_real_capacity_growth(self, compile_and_run):
-        # claude.md #156's own point: festina_amap_set doubles capacity
-        # rather than growing by exactly one per insert -- 200 entries
-        # forces several real doublings (8 -> 16 -> ... -> 256), not
-        # just the empty/one-entry cases the other tests above cover.
+        # claude.md #175: map[T] is a real hash table now -- growth is
+        # intrinsic (doubling capacity on crossing a 75% load factor),
+        # not the old realloc-by-exactly-one. 200 entries forces
+        # several real rehashes (8 -> 16 -> ... -> 256), not just the
+        # empty/one-entry cases the other tests above cover.
         source = """
-        amor map[int] m = {}
+        map[int] m = {}
         int i = 0
         while i < 200 {
             m[`key${i}`] = i
@@ -1149,34 +1108,227 @@ class TestAmorMap:
         result = compile_and_run(source)
         assert result.stdout.splitlines() == ["0", "100", "199"]
 
-    def test_const_amor_map_composes(self, compile_and_run):
+    def test_interleaved_insert_delete_forces_rehash_with_tombstones_present(self, compile_and_run):
+        # claude.md #175: a failure mode a linear scan never had --
+        # festina_map_grow's rehash must correctly skip every tombstone
+        # (from the deletes below) and move only live entries, even
+        # when a rehash is triggered while tombstones are still
+        # present in the table (deleting doesn't shrink capacity, so
+        # the inserts after the deletes below force at least one such
+        # rehash). Verifies every surviving key reads back correctly
+        # and every deleted one reads back null, after the churn.
         source = """
-        const amor map[text] m = {'x': 'y'}
-        log(m['x'])
+        map[int] m = {}
+        int i = 0
+        while i < 30 {
+            m[`key${i}`] = i
+            i = i + 1
+        }
+        i = 0
+        while i < 15 {
+            delete m[`key${i}`]
+            i = i + 1
+        }
+        i = 30
+        while i < 60 {
+            m[`key${i}`] = i
+            i = i + 1
+        }
+        log(m['key5'])
+        log(m['key20'])
+        log(m['key45'])
+        log(m['key59'])
         """
         result = compile_and_run(source)
-        assert result.stdout.strip() == "y"
+        assert result.stdout.splitlines() == [
+            "-9223372036854775808", "20", "45", "59",
+        ]
+
+    def test_json_skips_a_tombstoned_bucket(self, compile_and_run):
+        # claude.md #175: the direct test of _json_fn_for's own rewrite
+        # -- JSON rendering must skip a bucket a prior delete left
+        # tombstoned rather than emitting a phantom entry for it, and
+        # must not get its leading-comma logic wrong when the first
+        # LIVE bucket in table order isn't index 0 (which a deleted-
+        # then-refilled table makes likely).
+        source = """
+        map[int] m = {'a': 1, 'b': 2, 'c': 3}
+        delete m['b']
+        m['d'] = 4
+        log(m)
+        """
+        result = compile_and_run(source)
+        assert json.loads(result.stdout.strip()) == {"a": 1, "c": 3, "d": 4}
+
+
+class TestAmorArray:
+    """claude.md #174: amor arr[T] -- an "amortized array", the
+    array-typed counterpart of TestAmorMap above and the runtime effect
+    claude.md #156 originally left `amor arr[T]` without. Same
+    push/pop/shift/unshift/splice/indexing/`.length` surface as plain
+    arr[T] -- only the growth strategy differs internally
+    (festina_array_resize's own capacity-aware doubling in place of a
+    plain arr[T]'s exact-size realloc), which these tests can't observe
+    directly, so they exercise the same observable behavior plain
+    arr[T] already has, plus enough pushes to force several real
+    capacity doublings."""
+
+    def test_literal_init_index_and_length(self, compile_and_run):
+        source = """
+        amor arr[int] xs = [1, 2, 3]
+        log(xs.length)
+        log(xs[0])
+        log(xs[2])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["3", "1", "3"]
+
+    def test_push_pop_shift_unshift(self, compile_and_run):
+        source = """
+        amor arr[int] xs = [1, 2, 3]
+        xs.push(4)
+        int popped = xs.pop()
+        int shifted = xs.shift()
+        xs.unshift(99)
+        log(xs.length)
+        log(popped)
+        log(shifted)
+        log(xs[0])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["3", "4", "1", "99"]
+
+    def test_splice_two_and_three_argument_forms(self, compile_and_run):
+        source = """
+        amor arr[int] xs = [1, 2, 3, 4, 5]
+        arr[int] removed = xs.splice(1, 2)
+        log(removed.length)
+        log(removed[0])
+        log(xs.length)
+        arr[int] removed2 = xs.splice(0, 1, [100, 200])
+        log(removed2[0])
+        log(xs[0])
+        log(xs[1])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["2", "2", "3", "1", "100", "200"]
+
+    def test_many_pushes_survive_real_capacity_growth(self, compile_and_run):
+        # claude.md #174's own point: festina_array_resize doubles
+        # capacity rather than growing by exactly one per push -- 500
+        # pushes forces several real doublings (8 -> 16 -> ... -> 512),
+        # not just the empty/few-element cases the other tests cover.
+        source = """
+        amor arr[int] xs = []
+        int i = 0
+        while i < 500 {
+            xs.push(i)
+            i = i + 1
+        }
+        log(xs.length)
+        log(xs[0])
+        log(xs[250])
+        log(xs[499])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["500", "0", "250", "499"]
+
+    def test_const_amor_arr_composes(self, compile_and_run):
+        source = """
+        const amor arr[int] xs = [1, 2, 3]
+        log(xs.length)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "3"
 
     def test_struct_field_auto_vivifies(self, compile_and_run):
-        # claude.md #156: a struct field has no initializer syntax at
-        # all, so an `amor map[T]` field relies entirely on the same
-        # lazy-build-on-first-touch auto-vivify path plain map[T]
-        # fields already use -- exercising this catches the real risk
-        # this feature's own review found: building the WRONG (smaller,
-        # plain-map-shaped) header for a field the rest of codegen
+        # claude.md #156's own map version of this test (just above)
+        # found a real review-caught risk: building the WRONG (smaller,
+        # plain-array-shaped) header for a field the rest of codegen
         # treats as amor-shaped would silently corrupt memory the
-        # moment festina_amap_set first touched the missing capacity
-        # field, not raise a clean error.
+        # moment festina_array_resize's own amor path first touched the
+        # missing capacity field. The identical risk for arr[T].
         source = """
-        struct Bag { m:amor map[int] }
+        struct Bag { xs:amor arr[int] }
         Bag b
-        b.m['a'] = 1
-        b.m['b'] = 2
-        log(b.m['a'])
-        log(b.m['b'])
+        b.xs.push(1)
+        b.xs.push(2)
+        b.xs.push(3)
+        log(b.xs.length)
+        log(b.xs[0])
+        log(b.xs[2])
         """
         result = compile_and_run(source)
-        assert result.stdout.splitlines() == ["1", "2"]
+        assert result.stdout.splitlines() == ["3", "1", "3"]
+
+    def test_text_elements_retain_and_release_correctly(self, compile_and_run):
+        source = """
+        amor arr[text] xs = ['a', 'b', 'c']
+        xs.push(`d${1}`)
+        log(xs.length)
+        log(xs[0])
+        log(xs[3])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["4", "a", "d1"]
+
+    def test_refcounted_elements_survive_many_pushes(self, compile_and_run):
+        # A struct element specifically -- exercises the retain path on
+        # every push (claude.md #80), not just raw bytes, across enough
+        # real capacity growth to matter.
+        source = """
+        struct P { n:int }
+        amor arr[P] ps = []
+        int i = 0
+        while i < 300 {
+            P p
+            p.n = i
+            ps.push(p)
+            i = i + 1
+        }
+        log(ps.length)
+        log(ps[0].n)
+        log(ps[299].n)
+        P alias = ps[150]
+        log(alias.n)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["300", "0", "299", "150"]
+
+    def test_media_element_array_composes(self, compile_and_run, sprite_sheet_png):
+        # claude.md #137's own text-path-to-media-element allowance for
+        # arr[img]/arr[aud]/arr[blob] literals, combined with `amor`.
+        source = f"""
+        amor arr[img] pics = ['{sprite_sheet_png}', '{sprite_sheet_png}']
+        log(pics.length)
+        pics.push(pics[0])
+        log(pics.length)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["2", "3"]
+
+    def test_amor_and_plain_are_not_assignable(self, parser, semantic, errors):
+        program = parser.parse("""
+        amor arr[int] xs = [1, 2, 3]
+        arr[int] ys = xs
+        """)
+        with pytest.raises(errors.CompileError, match="cannot assign"):
+            semantic.analyze(program)
+
+    def test_no_initializer_is_a_clear_error(self, parser, semantic, errors):
+        program = parser.parse("amor arr[int] xs")
+        with pytest.raises(errors.CompileError, match="requires an initializer"):
+            semantic.analyze(program)
+
+    def test_nested_amor_arr_of_arr(self, compile_and_run):
+        source = """
+        amor arr[arr[int]] grid = [[1, 2], [3, 4]]
+        grid.push([5, 6])
+        log(grid.length)
+        log(grid[2][1])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["3", "6"]
 
 
 class TestLoops:
@@ -2647,10 +2799,15 @@ class TestAutomaticMemoryReclamation:
         f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
         f_body = "\n".join(ir.splitlines()[f_start:])
         p_storage_line = next(l for l in f_body.splitlines() if l.strip().startswith("%p.storage."))
-        q_raw_line = next(l for l in f_body.splitlines() if l.strip().startswith("%q.raw."))
         assert "alloca %struct.Point" in p_storage_line
-        assert "call ptr @calloc(" in q_raw_line
-        assert "%p.raw." not in f_body
+        # claude.md #176: q's own calloc now goes through the shared
+        # _emit_fresh_heap_header (anonymous %tN temps, not a
+        # %q.raw.<uid>-named one -- struct allocation sites share this
+        # one implementation now so enum tagging only has to live in a
+        # single place) -- p, the safe/stack-allocated position, must
+        # never reach @calloc at all, so exactly one call proves q (and
+        # only q) was heap-allocated.
+        assert f_body.count("call ptr @calloc(") == 1
         assert "call void @festina_release(" in f_body
 
     def test_transitive_chain_produces_correct_output(self, compile_and_run):
@@ -4992,6 +5149,14 @@ class TestGraphics:
         assert result_path == str(out_path)
         assert out_path.exists()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason=(
+        "claude.md #169: windows-latest's real Windows CI run found this "
+        "test hangs there rather than failing -- a live desktop session "
+        "is always present, so deleting DISPLAY (a POSIX/X11-only "
+        "concept the Win32 backend never consults) doesn't reproduce "
+        "'no display available' the way it does on headless Linux; "
+        "render() instead opens a real window and blocks in its event "
+        "loop with nothing to ever close it."))
     def test_missing_display_is_a_clear_runtime_error(self, compile_and_run, monkeypatch):
         # claude.md #95: it is render() that needs a display now, not
         # drawing -- drawing paints an offscreen canvas and is perfectly
@@ -5255,6 +5420,17 @@ class TestScreenSizeAndSetClientSize:
     canvas synchronously (and the real OS window too, when one is
     open)."""
 
+    @pytest.mark.skipif(sys.platform in ("win32", "darwin"), reason=(
+        "claude.md #169/#170: this is the X11-specific failure mode -- "
+        "festina_window_screen_size's Win32 counterpart calls "
+        "GetSystemMetrics directly, and its Cocoa counterpart queries "
+        "NSScreen directly, neither with a display handle to fail "
+        "opening at all, so deleting DISPLAY (meaningless on both) "
+        "doesn't reproduce anything; a real Windows CI run confirmed "
+        "it just answers the real resolution instead (#169), which is "
+        "correct behavior, not a bug -- macOS CI confirmed the "
+        "identical thing the moment claude.md #170 let it actually "
+        "reach this test for the first time."))
     def test_screen_size_without_any_display_is_a_clear_runtime_error(
             self, compile_and_run, monkeypatch):
         # festina_window_screen_size answers even with no window open,
@@ -6065,6 +6241,29 @@ int8_t festina_release_check(void *payload) {
     return *header == 0;
 }
 
+/* claude.md #171: festina_audio_load_dispatch (compiled into this
+ * translation unit whether or not any harness main() below actually
+ * calls it) references these two core-runtime symbols -- stubbed for
+ * the same no-sqlite3 reason as festina_fail/festina_save_bytes/
+ * festina_release_check above. festina_retain mirrors
+ * festina_release_check's own real semantics; festina_async_io_dispatch
+ * mirrors the core runtime's own no-hook-registered fallback (run the
+ * job inline, synchronously) -- exactly right for a harness that never
+ * links festina_runtime_async.c. */
+void festina_retain(void *payload) {
+    if (!payload) return;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return;
+    (*header)++;
+}
+void festina_async_io_dispatch(void *payload, void (*work_fn)(void *payload),
+                               void (*callback)(void *payload),
+                               void (*release_fn)(void *payload)) {
+    if (work_fn) work_fn(payload);
+    if (callback) callback(payload);
+    if (release_fn) release_fn(payload);
+}
+
 static int active_voices(void *audio) {
     int n = 0;
     pthread_mutex_lock(&g_audio_lock);
@@ -6202,6 +6401,29 @@ int8_t festina_release_check(void *payload) {
     return *header == 0;
 }
 
+/* claude.md #171: festina_audio_load_dispatch (compiled into this
+ * translation unit whether or not any harness main() below actually
+ * calls it) references these two core-runtime symbols -- stubbed for
+ * the same no-sqlite3 reason as festina_fail/festina_save_bytes/
+ * festina_release_check above. festina_retain mirrors
+ * festina_release_check's own real semantics; festina_async_io_dispatch
+ * mirrors the core runtime's own no-hook-registered fallback (run the
+ * job inline, synchronously) -- exactly right for a harness that never
+ * links festina_runtime_async.c. */
+void festina_retain(void *payload) {
+    if (!payload) return;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return;
+    (*header)++;
+}
+void festina_async_io_dispatch(void *payload, void (*work_fn)(void *payload),
+                               void (*callback)(void *payload),
+                               void (*release_fn)(void *payload)) {
+    if (work_fn) work_fn(payload);
+    if (callback) callback(payload);
+    if (release_fn) release_fn(payload);
+}
+
 static int active_voices(void *audio) {
     int n = 0;
     pthread_mutex_lock(&g_audio_lock);
@@ -6286,6 +6508,29 @@ int8_t festina_release_check(void *payload) {
     if (*header < 0) return 0;
     (*header)--;
     return *header == 0;
+}
+
+/* claude.md #171: festina_audio_load_dispatch (compiled into this
+ * translation unit whether or not any harness main() below actually
+ * calls it) references these two core-runtime symbols -- stubbed for
+ * the same no-sqlite3 reason as festina_fail/festina_save_bytes/
+ * festina_release_check above. festina_retain mirrors
+ * festina_release_check's own real semantics; festina_async_io_dispatch
+ * mirrors the core runtime's own no-hook-registered fallback (run the
+ * job inline, synchronously) -- exactly right for a harness that never
+ * links festina_runtime_async.c. */
+void festina_retain(void *payload) {
+    if (!payload) return;
+    int64_t *header = (int64_t *)((char *)payload - sizeof(int64_t));
+    if (*header < 0) return;
+    (*header)++;
+}
+void festina_async_io_dispatch(void *payload, void (*work_fn)(void *payload),
+                               void (*callback)(void *payload),
+                               void (*release_fn)(void *payload)) {
+    if (work_fn) work_fn(payload);
+    if (callback) callback(payload);
+    if (release_fn) release_fn(payload);
 }
 
 /* Which channel index a clip is playing on, or -1. */
@@ -13945,3 +14190,222 @@ class TestTextIndexing:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "abcdef\n"
+
+
+class TestEnums:
+    """claude.md #176: enum + typeof end to end -- both representations
+    (pure-struct self-tagging, mixed heap-boxed), typeof, coercion,
+    field access and its runtime festina_fail safety net, and retain/
+    release correctness for enum-typed locals.
+
+    See tests/test_enums.py for the lexer/parser/semantic-only coverage
+    of the same section (declaration rules, coercion type-checking,
+    field-access type-checking)."""
+
+    def test_worked_example_extracts_the_right_metric_for_a_circle(self, compile_and_run):
+        source = """
+        struct Circle { radius:int }
+        struct Square { area:int }
+
+        enum Shape = Circle, Square
+
+        int func extractShapeMetric(shape:Shape) {
+            if typeof shape == 'Circle' {
+                return shape.radius
+            } else {
+                return shape.area
+            }
+        }
+
+        Circle c
+        c.radius = 5
+        log(extractShapeMetric(c))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "5"
+
+    def test_worked_example_extracts_the_right_metric_for_a_square(self, compile_and_run):
+        source = """
+        struct Circle { radius:int }
+        struct Square { area:int }
+
+        enum Shape = Circle, Square
+
+        int func extractShapeMetric(shape:Shape) {
+            if typeof shape == 'Circle' {
+                return shape.radius
+            } else {
+                return shape.area
+            }
+        }
+
+        Square s
+        s.area = 42
+        log(extractShapeMetric(s))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "42"
+
+    def test_typeof_on_every_non_enum_type(self, compile_and_run):
+        # claude.md #176: for anything not EnumType-typed, typeof is a
+        # pure compile-time constant -- the runtime type IS the static
+        # type, always.
+        source = """
+        struct Point { x:int }
+        int i = 1
+        float f = 1.5
+        bool b = true
+        text t = 'hi'
+        arr[int] a = [1, 2]
+        Point p
+        log(typeof i)
+        log(typeof f)
+        log(typeof b)
+        log(typeof t)
+        log(typeof a)
+        log(typeof p)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "int\nfloat\nbool\ntext\narr[int]\nPoint\n"
+
+    def test_typeof_on_a_pure_struct_enum_returns_the_runtime_variant(self, compile_and_run):
+        source = """
+        struct Circle { radius:int }
+        struct Square { area:int }
+        enum Shape = Circle, Square
+        Circle c
+        Square sq
+        Shape a = c
+        Shape b = sq
+        log(typeof a)
+        log(typeof b)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "Circle\nSquare\n"
+
+    def test_field_mismatch_fails_loudly_instead_of_corrupting(self, compile_and_run):
+        source = """
+        struct Circle { radius:int }
+        struct Square { area:int }
+        enum Shape = Circle, Square
+        Square s
+        s.area = 42
+        Shape shape = s
+        log(shape.radius)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 1
+        assert "field 'radius' is only valid when this Shape value is a Circle" in result.stderr
+
+    def test_typeof_on_a_null_enum_value_fails_loudly(self, compile_and_run):
+        # claude.md #176: an enum-typed value defaults to null until
+        # assigned (no auto-vivify) -- typeof must fail loudly rather
+        # than dereference the null tag pointer.
+        source = """
+        struct Circle { radius:int }
+        struct Square { area:int }
+        enum Shape = Circle, Square
+        Shape shape
+        log(typeof shape)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 1
+        assert "typeof applied to a null Shape value" in result.stderr
+
+    def test_field_access_on_a_null_enum_value_fails_loudly(self, compile_and_run):
+        source = """
+        struct Circle { radius:int }
+        struct Square { area:int }
+        enum Shape = Circle, Square
+        Shape shape
+        log(shape.radius)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 1
+        assert "field 'radius' accessed on a null Shape value" in result.stderr
+
+    def test_mixed_enum_round_trips_each_member_type_through_typeof(self, compile_and_run):
+        source = """
+        struct User { id:int name:text }
+        enum Json = int, text, User
+
+        int i = 5
+        Json a = i
+        log(typeof a)
+
+        text t = 'hello'
+        Json b = t
+        log(typeof b)
+
+        User u
+        u.id = 1
+        u.name = 'pat'
+        Json c = u
+        log(typeof c)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "int\ntext\nUser\n"
+
+    def test_enum_typed_locals_alias_the_same_struct(self, compile_and_run):
+        # claude.md #176: a pure-struct enum value IS the member
+        # struct's own pointer -- assigning it into another enum-typed
+        # slot shares that exact pointer, the same aliasing every other
+        # struct assignment already has.
+        source = """
+        struct Circle { radius:int }
+        struct Square { area:int }
+        enum Shape = Circle, Square
+        Circle c
+        c.radius = 5
+        Shape a = c
+        Shape b = a
+        c.radius = 9
+        log(b.radius)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "9"
+
+    def test_reassigning_a_pure_struct_enum_local_releases_the_old_value(self, compile_and_run):
+        # Regression test: an enum-typed global/local starts out null
+        # (no auto-vivify), and the FIRST reassignment used to release
+        # that null value by unconditionally reading its tag at
+        # payload-16 -- a real segfault fixed by null-checking before
+        # ever reading the tag (see _release_fn_for_enum's own
+        # comment). Every later iteration exercises the ordinary
+        # struct-to-struct reassignment release path too.
+        source = """
+        struct Circle { radius:int }
+        struct Square { area:int }
+        enum Shape = Circle, Square
+        Shape shape
+        for int i = 0, i < 5, i++ {
+            Circle c
+            c.radius = i
+            shape = c
+        }
+        log(shape.radius)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "4"
+
+    def test_reassigning_a_mixed_enum_local_releases_the_old_box(self, compile_and_run):
+        # Same regression coverage as the pure-struct case above, for
+        # the heap-boxed mixed representation's own release wrapper.
+        source = """
+        enum Choice = int, text
+        Choice c
+        for int i = 0, i < 5, i++ {
+            c = `item${i}`
+        }
+        log(typeof c)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "text"

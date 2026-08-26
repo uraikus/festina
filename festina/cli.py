@@ -66,6 +66,7 @@ import subprocess
 import sys
 import tempfile
 
+from . import __version__
 from . import imports as imports_mod
 from . import semantic as semantic_mod
 from . import codegen as codegen_mod
@@ -914,18 +915,21 @@ def _check_feature_supported(feature, platform_name=None):
     not exist on their OS. `platform_name` is injectable so every
     branch is unit-testable from any platform (tests/test_platform.py).
 
-    Every branch here now gates a backend that EXISTS (built,
+    Every remaining branch here gates a backend that EXISTS (built,
     CI-compiled) but awaits real-hardware verification, overridable via
-    an env var for exactly that verification -- windows.md Phase 2's
-    graphics gate joined this shape alongside Phase 1's own audio gate
-    and every darwin gate (claude.md #128); claude.md #151's own
-    darwin AND win32 http gates joined them the same way (the win32
-    http backend needed real winsock2 porting work first -- see
-    festina_runtime_http.c's own top comment -- unlike audio/graphics,
-    which already had a real win32 backend by the time #151 started).
-    There is no remaining "nothing built yet, raises unconditionally"
-    branch left on any platform. All raise the same category so the
-    conftest skip picks them up uniformly.
+    an env var for exactly that verification -- every darwin gate, plus
+    win32 audio (windows.md Phase 1). win32 graphics and win32 http
+    (windows.md Phase 2/4, claude.md #151) started the same way but
+    were both retired by claude.md #169 once a real Windows CI run
+    actually exercised each end to end -- graphics compiles AND now
+    runs unconditionally there; http/https likewise, with one
+    documented gap (graceful shutdown, see the http darwin branch's own
+    win32 comment below). win32 audio stays gated: that same CI run
+    showed windows-latest has no audio device at all, so "un-gated"
+    there would mean "permanently failing," not "unverified" -- a
+    materially different problem from graphics/http, which is why it
+    alone still needs FESTINA_ENABLE_WINDOWS_AUDIO. All raises here use
+    the same category so the conftest skip picks them up uniformly.
 
     `feature` here is a narrower question than "is this object file
     linked" (see needs_graphics/wants_window in compile_file): audio
@@ -981,30 +985,22 @@ def _check_feature_supported(feature, platform_name=None):
             "offscreen canvas and saveCanvas() work today with no "
             "window involved at all.",
             category="unsupported platform feature")
-    if feature == "graphics" and platform_name == "win32":
-        # windows.md Phase 2 / claude.md #128: the Win32 windowing
-        # backend now EXISTS (built, compiled by windows CI against
-        # real <windows.h> headers) -- same shape as the darwin
-        # graphics gate above, INVERTED from the "nothing built yet"
-        # unconditional raise this branch used to be (claude.md #126
-        # round six). Because a real window_win32 companion object now
-        # provides festina_window_open and friends, offscreen-only use
-        # (drawRect()+saveCanvas(), no render(), no event handler) also
-        # links again on win32 -- _runtime_objects_and_link_libs's
-        # win32-only offscreen-gate-exemption carve-out is retired
-        # along with this branch's old unconditional raise; see that
-        # function's own updated docstring.
-        if os.environ.get("FESTINA_ENABLE_WINDOWS_GRAPHICS"):
-            return
-        raise CompileError(
-            "windowed graphics (render(), or an on mouseDown/mouseUp/"
-            "mouse/keyDown/keyUp/resize/close handler) is not yet "
-            "verified on Windows -- the Win32 backend is built "
-            "(windows.md Phase 2) but awaits real-hardware verification; "
-            "set FESTINA_ENABLE_WINDOWS_GRAPHICS=1 to try it. Drawing to "
-            "an offscreen canvas and saveCanvas() work today with no "
-            "window involved at all.",
-            category="unsupported platform feature")
+    # windows.md Phase 2 / claude.md #169: windowed graphics is NOT
+    # gated on win32 anymore -- a real Windows CI run (the http/
+    # websocket tier's own first-ever real run, see the http branch
+    # below) exercised the Win32 backend end to end for the first time
+    # and found no failure in window creation/rendering itself (the
+    # only two failures the run turned up were both about a DIFFERENT
+    # thing: the "no display available" tests' own assumption that a
+    # display can be absent, which windows-latest's always-on desktop
+    # session simply falsifies -- see TestGraphics/
+    # TestScreenSizeAndSetClientSize's own win32 skip in
+    # tests/test_codegen.py). Real mouse/keyboard/resize verification
+    # is still open -- this project's test suite has no Windows
+    # equivalent of the Xvfb fixture the windowed-behavior tests
+    # actually run under, so that specific claim stays unconfirmed --
+    # but "does a window open and render at all" is no longer a
+    # guess.
     if feature == "http" and platform_name == "darwin":
         # claude.md #151: the whole implementation (festina_runtime_http.c)
         # is plain POSIX sockets + poll() -- nothing Linux-specific
@@ -1023,24 +1019,62 @@ def _check_feature_supported(feature, platform_name=None):
             "but has not been run against real macOS hardware; set "
             "FESTINA_ENABLE_MACOS_HTTP=1 to try it.",
             category="unsupported platform feature")
-    if feature == "http" and platform_name == "win32":
-        # claude.md #151 (Windows round): the winsock2 port now EXISTS
-        # (built, compiled by this project's own MinGW cross-compile
-        # check -- see festina_runtime_http.c's own top comment for
-        # the real porting work that needed: a distinct SOCKET handle
-        # type, closesocket()/WSAPoll()/ioctlsocket() in place of
-        # close()/poll()/fcntl(), WSAGetLastError() in place of errno)
-        # -- same "exists, awaiting real-hardware verification" shape
-        # every other Windows gate here already has, not the
-        # "genuinely absent" shape exec()'s own wasm rejection is.
-        if os.environ.get("FESTINA_ENABLE_WINDOWS_HTTP"):
-            return
-        raise CompileError(
-            "openPort()/on request/on upgrade/on message/on socketClose "
-            "are not yet verified on Windows -- the winsock2 backend is "
-            "built (claude.md #151) but awaits real-hardware "
-            "verification; set FESTINA_ENABLE_WINDOWS_HTTP=1 to try it.",
-            category="unsupported platform feature")
+    # claude.md #169: http/https is NOT gated on win32 anymore -- the
+    # winsock2 port (claude.md #151) finally got a real Windows CI run
+    # (previously only local MinGW cross-compile, per windows.md Phase
+    # 4's own long-standing caveat), and openPort()/on request/on
+    # upgrade/on message/on socketClose all tested clean end to end.
+    # That same run also confirmed (not newly discovered -- api.md
+    # already documented "SIGTERM is POSIX only" before this) that
+    # graceful shutdown (SIGTERM -> on exit() -> the conventional 143
+    # exit code, claude.md #161) doesn't carry over to Windows the way
+    # it does on Linux/macOS -- documented as a known limitation in
+    # api.md's Graceful shutdown section and
+    # windows.md Phase 4, not something this gate exists to cover
+    # (openPort() itself has always worked with no explicit shutdown
+    # handling at all; on exit()/graceful draining is a layer on top).
+
+
+def _check_darwin_try_supported(platform_name=None):
+    """claude.md #170: try/catch/throw is NOT supported on macOS, full
+    stop -- no env var to try it anyway, unlike every branch in
+    `_check_feature_supported` above. This is the identical "genuinely
+    absent, not a hardware-verification gate" shape
+    `_check_wasm_feature_supported("try")` is already in, not a new
+    category of restriction: confirmed directly (not just reasoned
+    about) that clang rejects `__builtin_longjmp` outright when
+    targeting `arm64-apple-macos14` -- the real architecture every
+    macOS CI runner (and every Apple Silicon Mac sold since 2020) is --
+    with the exact same "not supported for the current target" message
+    wasm32-wasi gives, even though the identical builtin compiles fine
+    for `x86_64-apple-macos14`. LLVM's AArch64 backend simply has no
+    SjLj lowering, the same gap wasm32's backend has.
+
+    `festina_throw` (festina_runtime.c) already carries a `__wasi__`
+    stub for exactly this reason; claude.md #170 extended that same
+    `#if` to `__APPLE__` too, which is what actually keeps this
+    translation unit -- compiled unconditionally into EVERY program,
+    try/catch or not -- compiling at all on macOS. This function is
+    what turns "silently degrades every throw to fail()'s own
+    behavior" into the same clear, honest compile-time rejection
+    wasm32 already gets, rather than a surprising, platform-dependent
+    semantic change a program's own author would have no way to
+    notice. `platform_name` is injectable for the same
+    unit-testability reason `_check_feature_supported` above already
+    documents."""
+    platform_name = platform_name or sys.platform
+    if platform_name != "darwin":
+        return
+    raise CompileError(
+        "try/catch/throw is not supported on macOS -- LLVM's AArch64 "
+        "backend (Apple Silicon, what every current Mac and this "
+        "project's own macOS CI runs on) has no SjLj lowering at all "
+        "(confirmed directly: clang rejects __builtin_longjmp outright "
+        "for that target), the identical situation wasm32-wasi is "
+        "already in. There is no override -- unlike audio/graphics/http "
+        "above, this isn't awaiting hardware verification, the backend "
+        "genuinely doesn't exist. See macos.md.",
+        category="unsupported platform feature")
 
 
 def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=False,
@@ -1147,24 +1181,20 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", targ
     # that case.
     needs_graphics = gen.uses_graphics or gen.uses_graphics_code
 
-    # claude.md #151: openPort()/on request/.../on socketClose together
-    # with anything that opens a real window -- rejected outright,
-    # before any of the real linking work below, rather than silently
-    # producing a binary whose http loop never runs at all (main()'s
-    # own loop-selection picks ONE blocking loop, graphics winning
-    # over http when both are present -- see _emit_main_and_entry's
-    # own comment). This single-threaded server was never designed to
-    # also drive an X11/Cocoa/Win32 event loop; that combination may
-    # be revisited later, but isn't attempted here.
-    if gen.uses_http and gen.uses_graphics:
-        raise CompileError(
-            "openPort()/on request/on upgrade/on message/on socketClose "
-            "cannot be combined with graphics (render(), or an on "
-            "mouseDown/mouseUp/mouse/keyDown/keyUp/resize/close handler) "
-            "in the same program -- the http server's own event loop and "
-            "the graphics event loop are mutually exclusive in this "
-            "version.",
-            file=entry_path, category="unsupported platform feature")
+    # claude.md #151 originally rejected openPort()/on request/.../on
+    # socketClose together with anything that opens a real window
+    # outright, before any of the real linking work below -- main()'s
+    # own loop-selection picked exactly ONE blocking loop
+    # (festina_run_event_loop when graphics is in play, otherwise
+    # festina_run_http_loop), so a program combining both would have
+    # had one of them silently never run at all. claude.md #166 lifts
+    # this: festina_run_event_loop now also services http through a
+    # hook seam (festina_set_http_service_hooks, festina_runtime.c),
+    # the same shape claude.md #165's async-io hooks already
+    # established, so no compile-time rejection is needed any more --
+    # codegen's own loop-selection (_emit_main_and_entry) is unchanged,
+    # it just always resolves to the graphics loop when both are used,
+    # and that loop now knows what to do with an open port.
 
     if target == "wasm32-wasi":
         _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio,
@@ -1172,6 +1202,9 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", targ
                            needs_try=gen.uses_try, needs_https=gen.uses_https,
                            needs_async_io=gen.uses_async_io)
         return output_path
+
+    if gen.uses_try:
+        _check_darwin_try_supported()
 
     runtime_objects, link_libs = _runtime_objects_and_link_libs(
         cc, needs_graphics, gen.uses_audio, wants_window=gen.uses_graphics,
@@ -1537,29 +1570,28 @@ def _doctor_report():
     if sys.platform == "darwin":
         # claude.md #123: windowed use (render(), any event handler)
         # additionally needs the Cocoa backend's real-hardware
-        # verification pass -- see festina/cli.py's own gate.
+        # verification pass -- see festina/cli.py's own gate. windows.md
+        # Phase 2's own counterpart line was retired by claude.md #169:
+        # a real Windows CI run exercised the Win32 backend end to end
+        # (window creation/rendering, not gated as "not yet" anymore),
+        # so win32 has nothing extra to say here now -- it falls through
+        # to the "not yet" audio line below only for that feature.
         lines.append("  [   not yet       ] windowed graphics (render(), on mouseDown/.../close) -- "
                      "the Cocoa backend is built but awaits real-hardware verification, "
                      "macos.md Phase 2 (set FESTINA_ENABLE_MACOS_GRAPHICS=1 to try it); "
-                     "offscreen drawing + saveCanvas() work today")
-    elif sys.platform == "win32":
-        # windows.md Phase 2 (claude.md #128): the Win32 counterpart --
-        # built and CI-compiled, same shape as darwin's line above, no
-        # longer the "not yet built at all" honesty this used to be.
-        lines.append("  [   not yet       ] windowed graphics (render(), on mouseDown/.../close) -- "
-                     "the Win32 backend is built but awaits real-hardware verification, "
-                     "windows.md Phase 2 (set FESTINA_ENABLE_WINDOWS_GRAPHICS=1 to try it); "
                      "offscreen drawing + saveCanvas() work today")
 
     # macos.md Phase 0: the audio lines are platform-aware -- on macOS
     # there is no ALSA to install, and telling a Mac user to go get it
     # would be worse than saying the true thing: the AudioQueue backend
     # is built but awaits real-hardware verification (macos.md Phase 1).
-    # windows.md Phase 1: the waveOut backend is now the same shape --
-    # built and CI-compiled, awaiting its own real-hardware verification
-    # pass, same as graphics now is too (windows.md Phase 2, claude.md
-    # #128 -- both windows lines follow the identical built-but-gated
-    # pattern now, nothing left in the "not yet built at all" shape).
+    # windows.md Phase 1: the waveOut backend is the same shape -- built
+    # and CI-compiled, awaiting its own real-hardware verification pass.
+    # Unlike graphics/http (claude.md #169), this one stays gated: a
+    # real Windows CI run showed windows-latest has no audio device at
+    # all (waveOutOpen fails MMRESULT 2 unconditionally there), so
+    # un-gating it would mean every audio program fails outright on that
+    # environment, not just "unverified."
     if sys.platform == "darwin":
         lines.append("  [   not yet       ] audio (aud/.play()) -- the AudioQueue "
                      "backend is built but awaits real-hardware verification, "
@@ -1986,6 +2018,7 @@ def _build_arg_parser():
     cc_help = "C compiler/linker to invoke (default: clang, gcc, or cc, whichever is found first)"
 
     ap = argparse.ArgumentParser(prog="festina", description="Compile and run Festina programs.")
+    ap.add_argument("--version", action="version", version=f"festina {__version__}")
     # dest="command", not required=True: an unrecognized/missing
     # subcommand falls through to main()'s own help-and-exit-1 handling
     # below, rather than argparse's own less friendly "the following

@@ -397,7 +397,7 @@ class TestFirstClassFunctions:
         cb(5)
         """
         program = parser.parse(source)
-        with pytest.raises(errors.CompileError, match="expects text"):
+        with pytest.raises(errors.CompileError, match="cannot assign argument 1"):
             semantic.analyze(program)
 
     def test_calling_a_func_typed_variable_with_the_wrong_arity_is_rejected(self, parser, semantic, errors):
@@ -430,7 +430,7 @@ class TestFirstClassFunctions:
         h.fn('not an int')
         """
         program = parser.parse(source)
-        with pytest.raises(errors.CompileError, match="expects int"):
+        with pytest.raises(errors.CompileError, match="cannot assign argument 1"):
             semantic.analyze(program)
 
     def test_a_local_variable_can_shadow_a_global_functions_own_name(self, parser, semantic):

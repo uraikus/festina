@@ -28,14 +28,15 @@ if argv.length > 1 {
 
 on request(req:http) {
     map[text] headers = {}
-    if req.path == '/json' {
+    url u = parseURL(req.url)
+    if u.pathname == '/json' {
         headers['Content-Type'] = 'application/json'
         JsonMessage m
         m.message = 'Hello, world!'
-        req.send(m, 200, headers)
+        req.send({'code': 200, 'body': m, 'headers': headers})
     } else {
         headers['Content-Type'] = 'text/plain'
-        req.send('Hello, world!', 200, headers)
+        req.send({'code': 200, 'body': 'Hello, world!', 'headers': headers})
     }
 }
 

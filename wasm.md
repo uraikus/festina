@@ -18,10 +18,7 @@ tab, for instance) — see [Limitations](#limitations) below for the full
 accounting.
 
 This file is the design writeup, implementation record, and benchmark
-results, kept current as a reference — see [claude.md](claude.md) #148
-and #150 for the round-by-round account of how it was built, including
-the three real bugs the "Bug 1"/"Bug 2"/"Bug 3" subsections under
-[Design](#design) below document.
+results, kept current as a reference.
 
 ## Why wasm32-wasi, not bare wasm32
 
@@ -33,12 +30,12 @@ sitting on top of a small, capability-based syscall interface). Festina's
 core runtime (`festina_runtime.c`) is ordinary POSIX C — file I/O,
 `clock_gettime`, `regex.h`, SQLite's own VFS layer — none of which
 `wasm32-unknown-unknown` provides any answer for at all.
-`wasm32-wasi` was the only target where the *existing* runtime source
-had a chance of compiling with zero changes, and it did: the whole
-core translation unit compiles against wasi-libc unmodified. The actual
-codegen and linking work this feature needed (below) was real, but
-narrow — a 32-bit pointer-width fix and a one-line entry-point bridge,
-not a rewrite of how Festina generates code.
+`wasm32-wasi` is the only target where the *existing* runtime source
+compiles with zero changes: the whole core translation unit compiles
+against wasi-libc unmodified. The codegen and linking work this target
+needs (below) is real, but narrow — a 32-bit pointer-width fix and a
+one-line entry-point bridge, not a rewrite of how Festina generates
+code.
 
 ## Design
 
@@ -53,16 +50,15 @@ fallback path already produces straight to
    translation unit every native target uses.
 2. **`runtime/wasm/sqlite3.c`** — SQLite's own single-file amalgamation
    build, vendored because table/`sqlite()` support is unconditional
-   core (claude.md #10/#28-31: every compiled program links against
-   sqlite3 symbols whether or not it declares a `table`), and there is
-   no system `libsqlite3` for `wasm32-wasi` to link against at all —
-   see [`runtime/wasm/README.md`](runtime/wasm/README.md) for exactly
-   where this copy came from and why vendoring it (something this
-   project explicitly chose *not* to do for native targets, which link
-   the system's own libsqlite3) is the only option here.
+   core (every compiled program links against sqlite3 symbols whether
+   or not it declares a `table`), and there is no system `libsqlite3`
+   for `wasm32-wasi` to link against at all — see
+   [`runtime/wasm/README.md`](runtime/wasm/README.md) for exactly why
+   vendoring it (something this project doesn't do for native targets,
+   which link the system's own libsqlite3) is the only option here.
 3. **`runtime/festina_runtime_wasm_entry.ll`** — a small entry-point
-   bridge, see [below](#bug-2-__main_argc_argv-not-main) and
-   [below](#bug-3-the-bridge-has-to-be-raw-ir-not-c).
+   bridge, see [below](#the-main-entry-point) and
+   [below](#why-the-entry-bridge-is-raw-ir-not-c).
 
 No libLLVM in-process object-emission path is used for wasm at all
 (unlike native, where it's the fast path when available) — this
@@ -86,26 +82,21 @@ The invoking shell's own working directory is passed through as a WASI
 sandbox, resolving relative paths against the same directory a native
 compiled binary already would.
 
-### Bug 1: the 32-bit calloc/malloc ABI
+### Pointer width
 
-Every native target Festina supports is 64-bit; codegen.py hardcoded
-`i64` for the external `calloc`/`malloc` declarations it emits (correct
-everywhere else). `wasm32-wasi`'s libc genuinely has a 32-bit
-`size_t` — LLVM requires an external `declare` to match its call sites
-exactly, with no implicit truncation, so this linked with only a
-signature-mismatch *warning*, then crashed with `RuntimeError:
-unreachable` the first time an actual array/map/struct allocation ran.
-Fixed narrowly: `CodeGen.__init__` gained a `target` parameter and a
-`self.pointer_bits` (32 for `wasm32-wasi`, 64 everywhere else); three
-new helpers (`_size_arg`, `_emit_calloc`, `_emit_malloc`) either pass a
-size straight through (64-bit targets — a byte-identical no-op,
-confirmed by the full native test suite) or emit a `trunc i64 ... to
-i32` first. Every other `i64`/pointer conversion elsewhere in codegen.py
-(`ptrtoint`/`inttoptr`) was audited and left alone — those are
-genuinely safe across pointer widths in LLVM; only the calloc/malloc
-*call-site ABI boundary* needed a real fix.
+Every native target Festina supports is 64-bit; `wasm32-wasi`'s libc
+has a 32-bit `size_t`, and LLVM requires an external `declare` to match
+its call sites exactly, with no implicit truncation. `CodeGen.__init__`
+takes a `target` parameter and tracks `self.pointer_bits` (32 for
+`wasm32-wasi`, 64 everywhere else); three helpers (`_size_arg`,
+`_emit_calloc`, `_emit_malloc`) either pass a size straight through
+(64-bit targets — a byte-identical no-op there) or emit a `trunc i64
+... to i32` first for the `calloc`/`malloc` call-site ABI boundary
+specifically. Every other `i64`/pointer conversion elsewhere in
+codegen.py (`ptrtoint`/`inttoptr`) is genuinely safe across pointer
+widths in LLVM and needs no target-specific handling.
 
-### Bug 2: `__main_argc_argv`, not `main`
+### The `main` entry point
 
 wasi-libc's own `_start` doesn't call a function literally named
 `main` — ordinary C compilation silently renames a user's `main` to
@@ -113,68 +104,44 @@ wasi-libc's own `_start` doesn't call a function literally named
 argc/argv-taking `main`) via macro machinery in the C frontend before
 the compiler ever sees it. Festina's codegen emits raw LLVM IR text
 directly (`_emit_main_and_entry`), which never goes through that
-renaming at all, so the literal `define i32 @main(...)` it always
-emits links clean on every native target (where `main` really is the
-expected symbol) but left `wasm-ld: undefined symbol: main` on a real
-wasm32-wasi link. Fixed with the smallest fix that doesn't make codegen
-itself target-aware for something that's really wasi-libc's own
-linking convention: a small bridge object,
+renaming, so the literal `define i32 @main(...)` it always emits links
+clean on every native target (where `main` really is the expected
+symbol) but needs a bridge for wasm32-wasi: a small object,
 [`runtime/festina_runtime_wasm_entry.ll`](runtime/festina_runtime_wasm_entry.ll),
 linked only for the wasm build, that calls the real `main` under its
-own name and re-exports the result as `__main_argc_argv`.
+own name and re-exports the result as `__main_argc_argv`. `main`'s own
+signature is `(i32 %argc, ptr %argv)` — the real C ABI entry point on
+every native target already — so the bridge's argument list follows
+along unchanged.
 
-`main`'s own signature changed from `()` to `(i32 %argc, ptr %argv)`
-with claude.md #150's `argv` global — this needed no native-side
-change at all (this signature already IS the real C ABI entry point on
-every native target), just this bridge's own argument list following
-along, and a second, non-obvious bug the change surfaced — see below.
+### Why the entry bridge is raw IR, not C
 
-### Bug 3: the bridge has to be raw IR, not C
+A C version of the bridge above (`extern int main(int, char **); int
+__main_argc_argv(int argc, char **argv) { return main(argc, argv); }`)
+compiles and links without error, but hangs at runtime: the same
+C-frontend macro that renames a *defined* `int main(int, char**)` to
+`__main_argc_argv` for `wasm32-wasi` also rewrites *any reference* to
+the literal identifier `main` in a translation unit compiled for that
+target — including an `extern` declaration and a call built from it.
+A C bridge's own `return main(argc, argv)` gets silently rewritten to
+`return __main_argc_argv(argc, argv)` — calling itself, not Festina's
+real `main` (visible directly in the object's own relocation record:
+`R_WASM_FUNCTION_INDEX_LEB __main_argc_argv+0` at the call site, not a
+reference to `main` at all). At `-O0` this produces genuine infinite
+recursion; at `-O2` the same self-call becomes a silent infinite
+loop — indistinguishable from a hang, no error at all.
 
-The bridge above was originally written in C, the same as the
-original `__main_void` version this project shipped with: `extern int
-main(int, char **); int __main_argc_argv(int argc, char **argv) {
-return main(argc, argv); }`. It compiled and linked without any error
-or warning, then hung at actual runtime — every wasm32-wasi build
-after the `argv` change silently stopped producing output at all.
-
-Root cause, confirmed directly via `llvm-objdump -r`'s relocation
-output, not guessed at: the *same* C-frontend macro that renames a
-*defined* `int main(int, char**)` to `__main_argc_argv` for
-`wasm32-wasi` also rewrites *any reference* to the literal identifier
-`main` in a translation unit compiled for that target — including an
-`extern` declaration and a call built from it. The bridge's own
-`return main(argc, argv)` was silently rewritten to `return
-__main_argc_argv(argc, argv)` — calling **itself**, not Festina's real
-`main` — visible directly in the object's relocation record
-(`R_WASM_FUNCTION_INDEX_LEB __main_argc_argv+0` at the call site, not a
-reference to `main` at all). At `-O0` this produced genuine, visible
-infinite recursion (a `RuntimeError: memory access out of bounds` trap,
-`main` calling `main` calling `main` in the stack trace); at `-O2`
-(this project's real build flags) the same self-call instead became a
-silent infinite loop — indistinguishable from a hang, no error at all.
-Confirmed as the actual root cause by rebuilding an otherwise-identical
-C bridge under a *different* function name (`real_main`, unaffected by
-the macro) and watching the hang disappear.
-
-This is why the void-arg bridge never hit this bug even though it's
-the same macro: renaming a *defined* `int main(void)` targets a
-*different* name (`__original_main`), not the bridge's own
-(`__main_void`), so that bridge's own reference to `main` was never
-self-referential in the first place. Only the argc/argv bridge's
-identically-named `__main_argc_argv` collided with its own reference.
-
-Fixed by writing the bridge as raw LLVM IR text
-(`festina_runtime_wasm_entry.ll`, not `.c`) instead — this bypasses the
-C frontend (and its renaming macro) entirely, so `declare i32
-@main(i32, ptr)` there can only ever mean the real external symbol,
-confirmed via the same relocation inspection (`U main`, not `U
+Writing the bridge as raw LLVM IR text
+(`festina_runtime_wasm_entry.ll`, not `.c`) avoids this entirely: it
+bypasses the C frontend (and its renaming macro), so `declare i32
+@main(i32, ptr)` there can only ever mean the real external symbol —
+confirmed via relocation inspection (`U main`, not `U
 __main_argc_argv`) and via actual execution (correct exit code,
-correct `argv`, no hang). Renaming codegen's own generated `main`
-symbol was the other option considered and rejected, same reasoning as
-Bug 2's own fix: it would make codegen target-aware for something
-that's really wasi-libc's own linking convention, not a property of
-the generated program.
+correct `argv`, no hang). The alternative of renaming codegen's own
+generated `main` symbol was rejected for the same reason the bridge
+itself exists: it would make codegen target-aware for something that's
+really wasi-libc's own linking convention, not a property of the
+generated program.
 
 ## Setup
 
@@ -226,30 +193,28 @@ fail at compile time, before any of the real work
 - **Audio** — `aud`, `play()`/`playLoop()`/`stopAudioPlayer()`/
   `isAudioPlayerPlaying()` — WASI has no audio device model of any
   kind.
-- **`exec()`** (claude.md #150) — WASI has no process model to spawn
-  into at all: no fork/exec/spawn of any kind.
+- **`exec()`** — WASI has no process model to spawn into at all: no
+  fork/exec/spawn of any kind.
 - **`openPort()`/`on request`/`on upgrade`/`on message`/`on
-  socketClose`** (claude.md #151) — WASI Preview 1 has no listening-
-  socket support of any kind.
-- **`openSecurePort()`** (claude.md #160) — needs everything `openPort()`
-  needs plus mbedTLS, so it's rejected for the identical reason.
-- **`try`/`catch`/`throw`** (claude.md #157) — LLVM's wasm32 backend
-  has no setjmp/longjmp (SjLj) lowering at all outside emscripten's own
-  exception-handling pass, which this project doesn't use; confirmed
-  directly, not assumed (`clang` rejects `__builtin_longjmp` outright
-  for this target).
+  socketClose`** — WASI Preview 1 has no listening-socket support of
+  any kind.
+- **`openSecurePort()`** — needs everything `openPort()` needs plus
+  mbedTLS, so it's rejected for the identical reason.
+- **`try`/`catch`/`throw`** — LLVM's wasm32 backend has no
+  setjmp/longjmp (SjLj) lowering at all outside emscripten's own
+  exception-handling pass, which this project doesn't use (`clang`
+  rejects `__builtin_longjmp` outright for this target).
 
 A few more things worth knowing, that aren't compile-time errors:
 
-- **`argv` always comes back as a single element.** `argv` (claude.md
-  #150) works under wasm32-wasi — WASI has its own real argc/argv, and
-  main()'s bridge forwards it the same way it does natively (see Bug 2
-  above) — but `run_wasi.mjs` hardcodes WASI's own `args` to
-  `[wasmPath]` and nothing else, so `argv.length` is always `1` for
-  anything run through this project's own runner. A different WASI
-  host that supplies real extra arguments would see them show up in
-  `argv` correctly; this is `run_wasi.mjs`'s own limitation, not a
-  language one.
+- **`argv` always comes back as a single element.** `argv` works under
+  wasm32-wasi — WASI has its own real argc/argv, and `main`'s bridge
+  forwards it the same way it does natively — but `run_wasi.mjs`
+  hardcodes WASI's own `args` to `[wasmPath]` and nothing else, so
+  `argv.length` is always `1` for anything run through this project's
+  own runner. A different WASI host that supplies real extra arguments
+  would see them show up in `argv` correctly; this is `run_wasi.mjs`'s
+  own limitation, not a language one.
 - **Filesystem access is sandboxed to one preopened directory**, WASI's
   own capability model (`runtime/wasm/run_wasi.mjs`'s own top comment)
   — `blob`, `mkdir`, `ls`, and SQLite's own file all resolve against
@@ -260,16 +225,14 @@ A few more things worth knowing, that aren't compile-time errors:
   project verifies its memory management with real
   ASan/LeakSanitizer runs (`scripts/leak_stress.sh`,
   `tests/test_leak_stress.py`); whether sanitizer builds work at all
-  under `wasm32-wasi` has not been investigated, matching the
-  precedent macOS's own port already set (its sanitizer tier is
-  explicitly out of scope too — LeakSanitizer is unreliable on darwin).
-  The 32-bit calloc/malloc fix above was verified by running real
-  programs end-to-end (correct output, not just a clean link), not by
-  a sanitizer run.
+  under `wasm32-wasi` has not been investigated (macOS's own sanitizer
+  tier is out of scope too, for an unrelated reason — LeakSanitizer is
+  unreliable on darwin). This target's own memory-management codegen is
+  instead verified by running real programs end-to-end and checking
+  correct output, not by a sanitizer run.
 - **Static linking is the only linking there is.** There's no
-  dynamic-vs-static sqlite3 choice to make for wasm (unlike native,
-  see [claude.md](claude.md) #147) — the vendored amalgamation is
-  always compiled in.
+  dynamic-vs-static sqlite3 choice to make for wasm — the vendored
+  amalgamation is always compiled in.
 - **No browser support claimed.** Every test and benchmark here runs a
   compiled `.wasm` through Node's `node:wasi` module. A browser has no
   built-in WASI host — running one there needs a JS-side WASI
@@ -281,14 +244,13 @@ A few more things worth knowing, that aren't compile-time errors:
 The same five programs [benchmark.md](benchmark.md) already tracks
 natively (`hello`/`fib`/`loop_sum`/`array_sum`/`string_concat` — see
 that file for what each one measures and why), each also implemented
-in C (`benchmarks/*.c`, new for this comparison) and reused as-is for
-Go (`benchmarks/*.go`), all three cross-compiled to `wasm32-wasi` and
-run through the *identical* WASI host
-(`runtime/wasm/run_wasi.mjs`/`node:wasi`) — so these numbers measure
-each language's generated code and Node's WASI syscall overhead
-identically, not three different WASI runtimes' own differing
-overhead. Every language's wasm output was checked to produce
-byte-identical stdout to its own native build before any run was
+in C (`benchmarks/*.c`) and reused as-is for Go (`benchmarks/*.go`),
+all three cross-compiled to `wasm32-wasi` and run through the
+*identical* WASI host (`runtime/wasm/run_wasi.mjs`/`node:wasi`) — so
+these numbers measure each language's generated code and Node's WASI
+syscall overhead identically, not three different WASI runtimes' own
+differing overhead. Every language's wasm output is checked to produce
+byte-identical stdout to its own native build before any run is
 trusted (`hello`→`hello`, `fib`→`2178309`, `loop_sum`→`828998288`,
 `array_sum`→`707863693`, `string_concat`→15,000 `x`s — all three
 languages agree, natively and under wasm).
@@ -296,11 +258,10 @@ languages agree, natively and under wasm).
 Rust is not included here (unlike benchmark.md's native table): rustc
 dropped `wasm32-wasi` as a target name (superseded by
 `wasm32-wasip1`, which needs the separate `rustup target add
-wasm32-wasip1` component — not installed in the environment this was
-authored in, and not a dependency this project otherwise has reason to
-take on). C stands in as the systems-language wasm comparison instead;
-Go uses its own stable `GOOS=wasip1 GOARCH=wasm` support (Go 1.21+) —
-not `GOOS=js GOARCH=wasm`, which targets the browser's own different,
+wasm32-wasip1` component, not otherwise needed by this project). C
+stands in as the systems-language wasm comparison instead; Go uses its
+own stable `GOOS=wasip1 GOARCH=wasm` support (Go 1.21+) — not
+`GOOS=js GOARCH=wasm`, which targets the browser's own different,
 incompatible ABI, not WASI.
 
 ### Benchmark methodology
@@ -378,21 +339,20 @@ benchmark.md itself leads with. What the numbers above actually show:
 - **Festina's `.wasm` is consistently larger than C's** (the vendored
   SQLite amalgamation alone dwarfs any of these five tiny programs —
   every Festina binary pays that cost unconditionally, same as it does
-  natively, see claude.md #10/#28-31) but noticeably *smaller* than
-  Go's (whose runtime — goroutine scheduler, GC — ships in every binary
-  regardless of whether a given program uses any of it).
+  natively) but noticeably *smaller* than Go's (whose runtime —
+  goroutine scheduler, GC — ships in every binary regardless of whether
+  a given program uses any of it).
 - **Go is consistently the slowest of the three to start** (`hello`),
   most visible on the smallest program, where there's no real work to
   amortize a heavier runtime-init cost against.
 - **`array_sum` is the one case where Festina's own generated code
   measurably outran hand-written C** in the run that produced the
-  table above — plausible (Festina's escape analysis, claude.md
-  #74/#76/#81, keeps this benchmark's array off the heap entirely,
-  same as the C version's plain stack array; the two are closer in
-  shape than the numbers might suggest, and re-runs should be expected
-  to vary), but treat any close call between two of these as noise, not
-  a verdict, the same caveat benchmark.md's own native table gives
-  `array_sum`.
+  table above — plausible (Festina's escape analysis keeps this
+  benchmark's array off the heap entirely, same as the C version's
+  plain stack array; the two are closer in shape than the numbers
+  might suggest, and re-runs should be expected to vary), but treat any
+  close call between two of these as noise, not a verdict, the same
+  caveat benchmark.md's own native table gives `array_sum`.
 
 ## Testing
 
@@ -400,12 +360,11 @@ benchmark.md itself leads with. What the numbers above actually show:
 (`tests/conftest.py`) — real compiles and real executions through
 `run_wasi.mjs`, not just checking that codegen produces plausible IR:
 arithmetic/control flow/recursion, heap-allocated `arr`/`map`
-(the direct regression test for the calloc/malloc fix actually
-*executing* correctly, not just linking), structs, `table`/`sqlite()`
-against the vendored amalgamation, `regex`, string concatenation, exit
-code propagation, the graphics/audio compile-time rejections, and
-`festina doctor`'s own WASM check. Skips cleanly (not a failure) on a
-machine without a working wasm32-wasi clang or without Node — except
-under `FESTINA_STRICT_DEPS=1` (the Linux CI job), where that skip
-becomes a hard failure instead, the same discipline every other
-optional tier in this suite already has.
+(exercising the 32-bit pointer-width codegen path end to end, not just
+at link time), structs, `table`/`sqlite()` against the vendored
+amalgamation, `regex`, string concatenation, exit code propagation, the
+graphics/audio compile-time rejections, and `festina doctor`'s own WASM
+check. Skips cleanly (not a failure) on a machine without a working
+wasm32-wasi clang or without Node — except under `FESTINA_STRICT_DEPS=1`
+(the Linux CI job), where that skip becomes a hard failure instead, the
+same discipline every other optional tier in this suite already has.

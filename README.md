@@ -1,14 +1,17 @@
 # Festina
 
-**A fast, simple, JavaScript-inspired language that compiles straight to native code.**
+**A fast, simple, statically typed language that compiles straight to native code.**
 
-Keep the syntax you already know. Drop the interpreter, the runtime
-overhead, and the boilerplate. Festina compiles through LLVM to a real,
-standalone executable — with SQLite, graphics, audio, JS-style timers,
-and an HTTP/WebSocket server built directly into the language, not
-bolted on as libraries.
+Familiar, readable syntax — template strings, ternaries, arrow
+functions, ordinary control flow — checked at compile time and backed
+by real static types, not a runtime doing the work for you. Festina
+compiles through LLVM to a real, standalone executable — with SQLite,
+graphics, audio, timers, and an HTTP/WebSocket server built directly
+into the language, not bolted on as libraries.
 
-[![Tests](https://img.shields.io/badge/tests-1748%20passing-brightgreen)](tests/CONTRACT.md)
+Version 0.1 — see [CHANGELOG.md](CHANGELOG.md).
+
+[![Tests](https://img.shields.io/badge/tests-1843%20passing-brightgreen)](tests/CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ```festina
@@ -51,10 +54,9 @@ bin/festina compile examples/greet.f -o greet && ./greet
 - **Automatic memory, manual override.** Values are reclaimed for you —
   and `free spritesheet` / `delete map.key` exist for the moments you
   know the lifetime better than the compiler does.
-- **JavaScript syntax, none of the surprises.** Template strings,
-  ternaries, familiar control flow — but every condition is a real
-  `bool`, and everything is statically typed and checked before it
-  runs.
+- **Readable syntax, real guarantees.** Template strings, ternaries,
+  familiar control flow — but every condition is a real `bool`, and
+  everything is statically typed and checked before it runs.
 - **Slim by default.** A compiled program only links what it actually
   uses — skip graphics and audio in your source, and the binary skips
   Cairo, X11, and ALSA too. See [security.md](security.md#slim-binaries).
@@ -149,14 +151,14 @@ notes.write('hello')
 log(notes.toText())
 notes.saveCopy('notes.bak')           // img and aud save the same way
 
-// Timers, JS-style
+// Timers
 setTimeout(showMessage, 1000)
 setInterval(tick, 500)
 
-// Regex -- JS-style literal syntax
+// Regex -- a /pattern/flags literal
 'room 42'.replace(/[0-9]+/, 'N')
 
-// Maps -- text-keyed, JS-object-literal-flavored
+// Maps -- text-keyed literals
 map[int] npcHealths = {'npc1': 10, 'npc2': 15}
 npcHealths['npc1'] = 30
 
@@ -215,7 +217,7 @@ frame about twice as fast as Chromium's.
 ## Project status
 
 The compiler frontend, LLVM codegen backend, and native C runtime are
-real and tested: **1748 tests, 0 failures** (8 more skip cleanly when
+real and tested: **1843 tests, 0 failures** (9 more skip cleanly when
 their optional tooling isn't installed — see
 [setup.md](setup.md#running-the-test-suite)). Every language construct
 in the [specification](claude.md) is implemented end to end, not just
@@ -241,6 +243,7 @@ scripts/leak_stress.sh       # just the sanitizer stress runs
 | **Security** | [security.md](security.md) |
 | **Benchmarks vs. Rust/Go/Bun** | [benchmark.md](benchmark.md) |
 | **Roadmap** | [todo.md](todo.md) |
+| **Changelog** | [CHANGELOG.md](CHANGELOG.md) |
 | **Full spec-compliance test suite** | [tests/CONTRACT.md](tests/CONTRACT.md) |
 | **Language specification** | [claude.md](claude.md) |
 
@@ -253,11 +256,11 @@ Festina intentionally favors:
 - Simple language rules over extensive syntax
 - Compile-time work over runtime work
 - Native representations over unnecessary abstraction
-- Familiar syntax without JavaScript's dynamic semantics
+- Readable, familiar syntax with none of the dynamic-typing surprises
 
-Festina is not JavaScript with a different compiler — it's a compiled
-language that borrows syntax and ideas from JavaScript where they make
-development easier.
+Festina is a compiled language, checked and typed at every step — its
+syntax is meant to read easily and get out of your way, not to trade
+away safety or performance for flexibility.
 
 ## License
 

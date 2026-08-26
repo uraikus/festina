@@ -255,51 +255,76 @@ class TestMapForEach:
 
 
 class TestAmorPrefix:
-    """claude.md #156: `amor map[T]` / `amor arr[T]` -- an "amortized"
-    growth modifier, composing with `const` the same way (`const amor
-    map[text] m`). Parser/semantic-level coverage only -- see
-    tests/test_codegen.py::TestAmorMap for real compile-and-run
-    coverage of amor map[T]'s own observable behavior."""
+    """claude.md #156: `amor arr[T]` -- an "amortized" growth modifier,
+    composing with `const` the same way (`const amor arr[int] xs`).
+    Parser/semantic-level coverage only -- see
+    tests/test_codegen.py::TestAmorArray for real compile-and-run
+    coverage of its own observable behavior (claude.md #174 gave it a
+    real runtime effect).
 
-    def test_amor_map_parses_as_a_var_decl(self, parser):
-        parser.parse("amor map[int] scores = {}")
+    `amor map[T]` was removed by claude.md #175: once plain map[T]
+    itself became a real hash table with intrinsic geometric growth,
+    a separate amortized variant did nothing a plain map[T] didn't
+    already do -- see test_amor_map_is_a_parse_error below, and
+    tests/test_codegen.py::TestMaps for the 200-insert growth-through-
+    rehashing coverage that used to live in a now-removed
+    TestAmorMap."""
+
+    def test_amor_map_is_a_parse_error(self, parser, errors):
+        # claude.md #175: `amor map[T]` no longer parses at all --
+        # map[T] is a hash table now and grows the same way `amor
+        # map[T]` used to, so there is nothing left for `amor` to mean
+        # on a map.
+        with pytest.raises(errors.CompileError, match="amor map"):
+            parser.parse("amor map[int] scores = {}")
 
     def test_amor_arr_parses_as_a_var_decl(self, parser):
         parser.parse("amor arr[int] xs = []")
-
-    def test_const_amor_map_parses(self, parser):
-        parser.parse("const amor map[text] m = {'x': 'y'}")
-
-    def test_amor_map_resolves_to_an_amortized_maptype(self, parser, semantic, types_mod):
-        program = parser.parse("amor map[int] m = {'a': 1}")
-        decl = program.body[0]
-        resolved = semantic.resolve_type_name(decl.type_expr, {}, {})
-        assert resolved == types_mod.MapType(types_mod.PrimitiveType("int"), amortized=True)
-        assert resolved != types_mod.MapType(types_mod.PrimitiveType("int"))
 
     def test_amor_must_be_followed_by_arr_or_map(self, parser):
         with pytest.raises(Exception):
             parser.parse("amor int x = 1")
 
-    def test_amor_map_without_an_initializer_is_a_compile_error(self, parser, semantic, errors):
-        # claude.md #156: unlike plain map[T] (which starts "empty" via
-        # a real immortal static header -- see codegen.py's
-        # _global_var_defs), amor map[T] never got that treatment (a
+    def test_amor_arr_resolves_to_an_amortized_arraytype(self, parser, semantic, types_mod):
+        # claude.md #174: `amor arr[T]`'s own `amortized` flag is now
+        # part of its real type identity (no more `compare=False`),
+        # matching MapType's own since claude.md #156.
+        program = parser.parse("amor arr[int] xs = [1]")
+        decl = program.body[0]
+        resolved = semantic.resolve_type_name(decl.type_expr, {}, {})
+        assert resolved == types_mod.ArrayType(types_mod.PrimitiveType("int"), amortized=True)
+        assert resolved != types_mod.ArrayType(types_mod.PrimitiveType("int"))
+
+    def test_amor_arr_without_an_initializer_is_a_compile_error(self, parser, semantic, errors):
+        # claude.md #174: unlike plain arr[T]/map[T] (which start
+        # "empty" via a real immortal static header -- see codegen.py's
+        # _global_var_defs), amor arr[T] never got that treatment (a
         # deliberate scope boundary: it always heap-allocates through
         # the same generic path blob/img/aud/etc. use, which needs a
         # real value to store) -- requiring an initializer here is
         # what keeps that boundary from being reachable as an
         # uninitialized-pointer bug instead of a clear compile error.
-        program = parser.parse("amor map[int] m")
+        program = parser.parse("amor arr[int] xs")
         with pytest.raises(errors.CompileError, match="requires an initializer"):
             semantic.analyze(program)
 
-    def test_amor_map_literal_rejects_a_mismatched_value_type(self, parser, semantic, errors):
-        program = parser.parse("amor map[int] m = {'a': 1, 'b': 'two'}")
+    def test_amor_arr_literal_rejects_a_mismatched_element_type(self, parser, semantic, errors):
+        program = parser.parse("amor arr[int] xs = [1, 'two']")
         with pytest.raises(errors.CompileError):
             semantic.analyze(program)
 
-    def test_amor_map_literal_with_a_variable_key_parses(self, parser, semantic):
-        source = "text npc2Id = 'npc2'\namor map[int] m = {'npc1': 10, npc2Id: 15}"
+    def test_amor_arr_literal_with_a_variable_element_parses(self, parser, semantic):
+        source = "int n = 5\namor arr[int] xs = [1, n, 3]"
         program = parser.parse(source)
         semantic.analyze(program)
+
+    def test_amor_arr_and_plain_arr_are_not_the_same_type(self, parser, semantic, errors):
+        # claude.md #174: assignment between the two is a genuine type
+        # mismatch -- confirmed by a real end-to-end compile-time
+        # rejection, not just the type-equality check above.
+        program = parser.parse("""
+        amor arr[int] xs = [1, 2, 3]
+        arr[int] ys = xs
+        """)
+        with pytest.raises(errors.CompileError, match="cannot assign"):
+            semantic.analyze(program)
