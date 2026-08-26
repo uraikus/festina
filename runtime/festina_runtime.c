@@ -370,23 +370,30 @@ char *festina_try_error(void) {
  * setjmp cares about its own call site's frame lifetime; longjmp has
  * no equivalent restriction.
  *
- * wasm32-wasi gets a stub, the identical shape festina_process_exec's
- * own wasm32-wasi branch already uses just below (see this file's own
- * top-of-file comment on why): __builtin_longjmp is flatly rejected by
- * clang for this target ("not supported for the current target",
- * confirmed directly -- LLVM's wasm32 backend has no SjLj lowering at
- * all outside emscripten's own EH pass, which this project doesn't
- * use), so this whole file would fail to compile for EVERY program,
- * try/throw or not, without this split -- this translation unit is
- * still compiled UNCONDITIONALLY for every wasm build. try/throw is
- * rejected outright at compile time instead (festina/cli.py's
- * _check_wasm_feature_supported, gated on codegen's own uses_try) --
- * this stub degrading every throw to fail()'s own behavior instead of
- * a hard compile error would be surprising, silently platform-
- * dependent semantics rather than a clear, honest "not supported
- * here"; it exists purely so this file compiles, never to be reached
- * by a real program. */
-#if !defined(__wasi__)
+ * wasm32-wasi AND macOS both get a stub, the identical shape
+ * festina_process_exec's own wasm32-wasi branch already uses just
+ * below (see this file's own top-of-file comment on why):
+ * __builtin_longjmp is flatly rejected by clang for both targets
+ * ("not supported for the current target", confirmed directly for
+ * each -- LLVM's wasm32 backend has no SjLj lowering at all outside
+ * emscripten's own EH pass, which this project doesn't use; LLVM's
+ * AArch64 backend (claude.md #170, found via a real macos-14 CI run --
+ * Apple Silicon, what every current Mac and every GitHub macOS runner
+ * actually is -- compiling this file unconditionally, try/throw or
+ * not) has no SjLj lowering either, even though the identical builtin
+ * compiles fine for x86_64-apple-macos, an architecture this project
+ * doesn't target), so this whole file would fail to compile for EVERY
+ * program on either platform, try/throw or not, without this split --
+ * this translation unit is still compiled UNCONDITIONALLY on both.
+ * try/throw is rejected outright at compile time instead (festina/
+ * cli.py's _check_wasm_feature_supported for wasm32-wasi, gated on
+ * codegen's own uses_try; _check_darwin_try_supported for macOS, same
+ * gate, same reasoning) -- this stub degrading every throw to fail()'s
+ * own behavior instead of a hard compile error would be surprising,
+ * silently platform-dependent semantics rather than a clear, honest
+ * "not supported here"; it exists purely so this file compiles, never
+ * to be reached by a real program on either platform. */
+#if !defined(__wasi__) && !defined(__APPLE__)
 void festina_throw(const char *msg) {
     if (g_festina_catch_top == NULL) {
         festina_fail(msg);

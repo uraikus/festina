@@ -1034,6 +1034,48 @@ def _check_feature_supported(feature, platform_name=None):
     # handling at all; on exit()/graceful draining is a layer on top).
 
 
+def _check_darwin_try_supported(platform_name=None):
+    """claude.md #170: try/catch/throw is NOT supported on macOS, full
+    stop -- no env var to try it anyway, unlike every branch in
+    `_check_feature_supported` above. This is the identical "genuinely
+    absent, not a hardware-verification gate" shape
+    `_check_wasm_feature_supported("try")` is already in, not a new
+    category of restriction: confirmed directly (not just reasoned
+    about) that clang rejects `__builtin_longjmp` outright when
+    targeting `arm64-apple-macos14` -- the real architecture every
+    macOS CI runner (and every Apple Silicon Mac sold since 2020) is --
+    with the exact same "not supported for the current target" message
+    wasm32-wasi gives, even though the identical builtin compiles fine
+    for `x86_64-apple-macos14`. LLVM's AArch64 backend simply has no
+    SjLj lowering, the same gap wasm32's backend has.
+
+    `festina_throw` (festina_runtime.c) already carries a `__wasi__`
+    stub for exactly this reason; claude.md #170 extended that same
+    `#if` to `__APPLE__` too, which is what actually keeps this
+    translation unit -- compiled unconditionally into EVERY program,
+    try/catch or not -- compiling at all on macOS. This function is
+    what turns "silently degrades every throw to fail()'s own
+    behavior" into the same clear, honest compile-time rejection
+    wasm32 already gets, rather than a surprising, platform-dependent
+    semantic change a program's own author would have no way to
+    notice. `platform_name` is injectable for the same
+    unit-testability reason `_check_feature_supported` above already
+    documents."""
+    platform_name = platform_name or sys.platform
+    if platform_name != "darwin":
+        return
+    raise CompileError(
+        "try/catch/throw is not supported on macOS -- LLVM's AArch64 "
+        "backend (Apple Silicon, what every current Mac and this "
+        "project's own macOS CI runs on) has no SjLj lowering at all "
+        "(confirmed directly: clang rejects __builtin_longjmp outright "
+        "for that target), the identical situation wasm32-wasi is "
+        "already in. There is no override -- unlike audio/graphics/http "
+        "above, this isn't awaiting hardware verification, the backend "
+        "genuinely doesn't exist. See macos.md.",
+        category="unsupported platform feature")
+
+
 def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=False,
                                     uses_http=False, uses_https=False, uses_async_io=False):
     """Every program links core (log/fail/sqlite/regex/timers -- see
@@ -1159,6 +1201,9 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", targ
                            needs_try=gen.uses_try, needs_https=gen.uses_https,
                            needs_async_io=gen.uses_async_io)
         return output_path
+
+    if gen.uses_try:
+        _check_darwin_try_supported()
 
     runtime_objects, link_libs = _runtime_objects_and_link_libs(
         cc, needs_graphics, gen.uses_audio, wants_window=gen.uses_graphics,

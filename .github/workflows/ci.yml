@@ -55,6 +55,7 @@ jobs:
             clang pkg-config libsqlite3-dev \
             libcairo2-dev libx11-dev libjpeg-dev \
             libasound2-dev libmpg123-dev \
+            libmbedtls-dev \
             wasi-libc libclang-rt-18-dev-wasm32 \
             xvfb xdotool openbox fonts-dejavu-core
           pip install -r requirements-dev.txt -r requirements-build.txt

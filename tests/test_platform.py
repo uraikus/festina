@@ -438,6 +438,39 @@ class TestFeatureGating:
         assert "wrong shell" not in "\n".join(lines)
 
 
+class TestDarwinTryGating:
+    """claude.md #170: try/catch/throw is a hard, non-overridable
+    rejection on darwin -- LLVM's AArch64 backend (what every real
+    macOS CI runner and every Apple Silicon Mac is) has no SjLj
+    lowering at all, confirmed directly the same way wasm32-wasi's own
+    identical rejection was (clang rejects __builtin_longjmp outright
+    for that target). Unlike TestFeatureGating's audio/graphics/http
+    gates just above, there is no FESTINA_ENABLE_* env var here --
+    nothing to try, the backend genuinely doesn't exist, the same
+    "genuinely absent" shape _check_wasm_feature_supported already
+    established."""
+
+    def test_rejected_on_darwin(self, cli_mod, errors):
+        with pytest.raises(errors.CompileError) as excinfo:
+            cli_mod._check_darwin_try_supported("darwin")
+        assert excinfo.value.category == "unsupported platform feature"
+        assert "macos.md" in str(excinfo.value)
+
+    def test_not_gated_on_linux(self, cli_mod):
+        cli_mod._check_darwin_try_supported("linux")   # no raise
+
+    def test_not_gated_on_windows(self, cli_mod):
+        cli_mod._check_darwin_try_supported("win32")   # no raise
+
+    def test_defaults_to_live_sys_platform(self, cli_mod, monkeypatch):
+        # No platform_name passed -- must consult sys.platform itself,
+        # the same injectable-but-defaults-live shape every other gate
+        # in this module already has.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        with pytest.raises(cli_mod.CompileError):
+            cli_mod._check_darwin_try_supported()
+
+
 class TestDetectPackageManager:
     """`festina doctor --fix`: which of the three package managers
     setup.md documents (apt/Debian-Ubuntu, Homebrew/macOS, MSYS2's
@@ -929,6 +962,21 @@ class TestOnMacOS:
         result = compile_and_run("log('hello from darwin')")
         assert result.returncode == 0
         assert result.stdout.strip() == "hello from darwin"
+
+    def test_try_catch_is_rejected(self, cli_mod, errors, tmp_path):
+        # claude.md #170: confirmed for real on this exact CI job --
+        # LLVM's AArch64 backend has no SjLj lowering, so a program
+        # using try/catch must fail at compile time with a clear
+        # message, not crash or hang trying to compile
+        # __builtin_longjmp's nonexistent lowering. Goes through
+        # compile_file itself (not just _check_darwin_try_supported
+        # directly, TestDarwinTryGating's own job above) to confirm the
+        # real wiring, on real hardware.
+        src = tmp_path / "main.f"
+        src.write_text("try { log('x') } catch (e:text) { log(e) }\n", encoding="utf-8")
+        with pytest.raises(errors.CompileError) as excinfo:
+            cli_mod.compile_file(str(src), str(tmp_path / "out"))
+        assert excinfo.value.category == "unsupported platform feature"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="runs on the Windows CI job")

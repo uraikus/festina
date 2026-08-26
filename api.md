@@ -2736,8 +2736,19 @@ allocates minimal, or accept the same class of leak this language
 already accepts elsewhere (e.g. the one documented row-array chain
 shape in [security.md](security.md)).
 
-**Not available under `--target=wasm32-wasi`** — WASI has no setjmp/
-longjmp support at all — rejected at compile time; see [wasm.md](wasm.md).
+**Not available under `--target=wasm32-wasi`, or on macOS.** WASI has
+no setjmp/longjmp support at all — rejected at compile time; see
+[wasm.md](wasm.md). macOS is the same story for a different reason:
+LLVM's AArch64 backend (Apple Silicon, what every current Mac runs on)
+has no SjLj lowering either — confirmed directly, not just reasoned
+about (claude.md #170) — so `try`/`catch`/`throw` anywhere in a program
+is rejected outright at compile time there too, no override. A program
+that never writes `try`/`catch`/`throw` is completely unaffected on
+macOS (a `.toStruct()`/`.toArr()` parse failure, for example, still
+behaves exactly like the documented "no enclosing try" case above —
+prints and exits(1) — since that was always the fallback for an
+uncaught throw anyway); what's actually unavailable there is catching
+one.
 
 ## `.toStruct()` / `.toArr()` — parsing JSON
 
