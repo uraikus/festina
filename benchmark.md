@@ -72,52 +72,52 @@ failing — see [setup.md](setup.md) for what each one needs.
 ## Results
 
 <!-- BENCHMARK_RESULTS_START -->
-_Last run: 2026-08-24 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
+_Last run: 2026-08-26 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
 
 ### `hello`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 1.4 ms | 70.9 ms | 1.46 MB |
-| Rust | 1.5 ms | 97.0 ms | 3.77 MB |
-| Go | 1.3 ms | 320.1 ms | 2.11 MB |
-| Bun | 10.6 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 1.2 ms | 66.3 ms | 1.48 MB |
+| Rust | 1.2 ms | 70.0 ms | 3.77 MB |
+| Go | 1.2 ms | 128.0 ms | 2.11 MB |
+| Bun | 7.7 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `fib`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 7.6 ms | 76.5 ms | 1.46 MB |
-| Rust | 8.1 ms | 105.6 ms | 3.77 MB |
-| Go | 14.5 ms | 241.9 ms | 2.11 MB |
-| Bun | 28.5 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 6.2 ms | 71.6 ms | 1.48 MB |
+| Rust | 6.9 ms | 70.6 ms | 3.77 MB |
+| Go | 9.7 ms | 117.4 ms | 2.11 MB |
+| Bun | 20.2 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `loop_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 518.4 ms | 161.2 ms | 1.46 MB |
-| Rust | 525.0 ms | 132.1 ms | 3.77 MB |
-| Go | 460.5 ms | 483.8 ms | 2.11 MB |
-| Bun | 9082.7 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 370.8 ms | 89.0 ms | 1.48 MB |
+| Rust | 444.0 ms | 70.2 ms | 3.77 MB |
+| Go | 368.9 ms | 122.6 ms | 2.11 MB |
+| Bun | 7438.6 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `array_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 92.2 ms | 344.7 ms | 1.47 MB |
-| Rust | 90.3 ms | 234.0 ms | 3.77 MB |
-| Go | 87.9 ms | 167.9 ms | 2.11 MB |
-| Bun | 2393.8 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 72.3 ms | 90.1 ms | 1.48 MB |
+| Rust | 69.5 ms | 103.8 ms | 3.77 MB |
+| Go | 68.7 ms | 120.4 ms | 2.11 MB |
+| Bun | 1866.8 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `string_concat`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 3.6 ms | 73.3 ms | 1.46 MB |
-| Rust | 1.7 ms | 182.6 ms | 3.77 MB |
-| Go | 30.2 ms | 151.0 ms | 2.11 MB |
-| Bun | 12.7 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 2.9 ms | 71.9 ms | 1.48 MB |
+| Rust | 1.1 ms | 94.5 ms | 3.77 MB |
+| Go | 29.7 ms | 128.0 ms | 2.11 MB |
+| Bun | 10.0 ms | n/a (JIT, no separate build step) | n/a |
 
 <!-- BENCHMARK_RESULTS_END -->
 
