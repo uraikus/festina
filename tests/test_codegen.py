@@ -5263,14 +5263,17 @@ class TestScreenSizeAndSetClientSize:
     canvas synchronously (and the real OS window too, when one is
     open)."""
 
-    @pytest.mark.skipif(sys.platform == "win32", reason=(
-        "claude.md #169: this is the X11-specific failure mode -- "
+    @pytest.mark.skipif(sys.platform in ("win32", "darwin"), reason=(
+        "claude.md #169/#170: this is the X11-specific failure mode -- "
         "festina_window_screen_size's Win32 counterpart calls "
-        "GetSystemMetrics directly, no display handle to fail opening "
-        "at all, so deleting DISPLAY (meaningless there) doesn't "
-        "reproduce anything; a real Windows CI run confirmed it just "
-        "answers the real resolution instead, which is correct "
-        "behavior, not a bug."))
+        "GetSystemMetrics directly, and its Cocoa counterpart queries "
+        "NSScreen directly, neither with a display handle to fail "
+        "opening at all, so deleting DISPLAY (meaningless on both) "
+        "doesn't reproduce anything; a real Windows CI run confirmed "
+        "it just answers the real resolution instead (#169), which is "
+        "correct behavior, not a bug -- macOS CI confirmed the "
+        "identical thing the moment claude.md #170 let it actually "
+        "reach this test for the first time."))
     def test_screen_size_without_any_display_is_a_clear_runtime_error(
             self, compile_and_run, monkeypatch):
         # festina_window_screen_size answers even with no window open,

@@ -1423,6 +1423,18 @@ class TestPlatformAndWasmGating:
         # festina_run_http_loop). No CompileError any more -- see
         # TestGraphicsAndHttp for proof both actually WORK together,
         # not just that compilation succeeds.
+        #
+        # claude.md #170: this program opens a real window (on
+        # mouseDown), so on darwin it must go through compile_file_or_skip
+        # like every other real-window-opening test -- the darwin
+        # graphics gate (still active; unrelated to claude.md #169's
+        # win32 one) would otherwise surface as a raw macOS CI failure
+        # instead of the skip every other platform-conditional windowed
+        # test already gets. Never actually reached before this,
+        # because the macOS job's own #157 regression (fixed alongside
+        # this) meant the whole suite failed to even compile the
+        # runtime until now.
+        from tests.conftest import compile_file_or_skip
         src = tmp_path / "main.f"
         src.write_text(
             "openPort(8080)\n"
@@ -1430,7 +1442,7 @@ class TestPlatformAndWasmGating:
             "on mouseDown(x:int, y:int) { }\n",
             encoding="utf-8",
         )
-        cli_mod.compile_file(str(src), str(tmp_path / "out"), cc="clang")  # no raise
+        compile_file_or_skip(cli_mod, str(src), str(tmp_path / "out"), cc="clang")  # no raise
 
     def test_http_is_not_gated_on_windows(self, cli_mod):
         # claude.md #169 retired this gate: a real Windows CI run
