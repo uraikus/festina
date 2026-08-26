@@ -5,65 +5,29 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Festina — a fast, simple language that compiles to native code</title>
 <meta name="description" content="Festina is a fast, statically typed language that compiles through LLVM to a native executable, with SQLite, graphics, audio, and timers built in.">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23e8823a'/%3E%3Ctext x='50' y='68' font-size='60' font-family='monospace' font-weight='700' text-anchor='middle' fill='%231a1712'%3Ef%3C/text%3E%3C/svg%3E">
+<meta name="theme-color" content="#7c1f1b">
+<meta name="color-scheme" content="light">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%237c1f1b'/%3E%3Ctext x='50' y='68' font-size='60' font-family='Georgia, serif' font-weight='700' text-anchor='middle' fill='%23f1e8d2'%3Ef%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,440;0,9..144,560;1,9..144,440&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #fbf9f6;
-    --bg-raised: #ffffff;
-    --bg-sunken: #f1ede6;
-    --text: #211c14;
-    --text-muted: #6b6252;
-    --border: #e4ddd0;
-    --accent: #c15f1e;
-    --accent-strong: #a84f16;
-    --accent-soft: #fbe6d3;
-    --code-bg: #221d16;
-    --code-text: #f2ead9;
-    --code-muted: #9a8f78;
-    --code-string: #d99a5b;
-    --code-keyword: #e8823a;
-    --code-comment: #7d745f;
-    --shadow: 0 1px 2px rgba(35, 25, 10, 0.06), 0 8px 24px rgba(35, 25, 10, 0.05);
-  }
-
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      --bg: #17140f;
-      --bg-raised: #1f1b14;
-      --bg-sunken: #14110c;
-      --text: #f2ead9;
-      --text-muted: #a89c84;
-      --border: #332c20;
-      --accent: #f0904f;
-      --accent-strong: #f7a86b;
-      --accent-soft: #3a2814;
-      --code-bg: #0f0d09;
-      --code-text: #f2ead9;
-      --code-muted: #8a7f68;
-      --code-string: #e8b47c;
-      --code-keyword: #f0904f;
-      --code-comment: #6b6250;
-      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
-    }
-  }
-
-  :root[data-theme="dark"] {
-    --bg: #17140f;
-    --bg-raised: #1f1b14;
-    --bg-sunken: #14110c;
-    --text: #f2ead9;
-    --text-muted: #a89c84;
-    --border: #332c20;
-    --accent: #f0904f;
-    --accent-strong: #f7a86b;
-    --accent-soft: #3a2814;
-    --code-bg: #0f0d09;
-    --code-text: #f2ead9;
-    --code-muted: #8a7f68;
-    --code-string: #e8b47c;
-    --code-keyword: #f0904f;
-    --code-comment: #6b6250;
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+    --primary: #7c1f1b;
+    --alternate: #93731f;
+    --bg: #f1e8d2;
+    --bg-raised: #fbf6e9;
+    --bg-deep: #e3d6b2;
+    --ink: #2a2018;
+    --ink-soft: #6b5c46;
+    --line: rgba(42, 32, 24, .2);
+    --code-bg: #2a1c16;
+    --code-text: #f1e8d2;
+    --code-muted: #a3927a;
+    --code-string: #dd8f72;
+    --code-keyword: #d9ab4a;
+    --code-comment: #8c7c65;
+    --shadow: 0 1px 2px rgba(42, 24, 16, 0.08), 0 8px 24px rgba(42, 24, 16, 0.10);
   }
 
   * { box-sizing: border-box; }
@@ -73,15 +37,31 @@
   body {
     margin: 0;
     background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink);
+    font-family: 'IBM Plex Sans', -apple-system, 'Segoe UI', sans-serif;
     line-height: 1.6;
     -webkit-font-smoothing: antialiased;
   }
 
-  a { color: var(--accent-strong); }
+  a { color: var(--primary); }
 
-  code, pre, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+  code, pre, .mono { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+
+  code:not(pre code) {
+    background: var(--bg-deep);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 0.1em 0.35em;
+    font-size: 0.87em;
+  }
+
+  h1, h2, h3, h4 {
+    font-family: 'Fraunces', Georgia, serif;
+    font-weight: 480;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+    margin: 0 0 8px;
+  }
 
   .wrap {
     max-width: 920px;
@@ -89,123 +69,138 @@
     padding: 0 24px;
   }
 
-  /* Nav */
-  nav {
+  .eyebrow {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.76rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--alternate);
+  }
+
+  /* Header */
+  header.site {
     position: sticky;
     top: 0;
     z-index: 10;
-    background: color-mix(in srgb, var(--bg) 88%, transparent);
-    backdrop-filter: blur(8px);
-    border-bottom: 1px solid var(--border);
-  }
-  nav .wrap {
     display: flex;
     align-items: center;
     justify-content: space-between;
     height: 60px;
+    padding: 0 24px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
   }
-  .brand {
+  .wordmark {
     display: flex;
     align-items: center;
     gap: 10px;
     font-weight: 700;
     font-size: 1.05rem;
-    color: var(--text);
+    color: var(--ink);
     text-decoration: none;
   }
-  .brand .mark {
+  .wordmark .mark {
     width: 26px;
     height: 26px;
-    border-radius: 7px;
-    background: var(--accent);
-    color: #1a1508;
+    border-radius: 4px;
+    background: var(--primary);
+    color: var(--bg);
     display: flex;
     align-items: center;
     justify-content: center;
-    font-family: monospace;
-    font-weight: 800;
-    font-size: 0.95rem;
+    font-family: 'Fraunces', Georgia, serif;
+    font-weight: 700;
+    font-size: 1rem;
   }
-  .navlinks {
+  .wordmark span.name { font-family: 'Fraunces', Georgia, serif; font-weight: 560; }
+  #menu {
+    display: none;
+    width: 22px;
+    cursor: pointer;
+  }
+  #links {
     display: flex;
-    gap: 22px;
-    font-size: 0.92rem;
+    align-items: center;
+    gap: 24px;
+    transition: height .4s;
   }
-  .navlinks a { color: var(--text-muted); text-decoration: none; }
-  .navlinks a:hover { color: var(--text); }
+  header.site .link {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.75rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    text-decoration: none;
+    padding-bottom: 3px;
+    border-bottom: 1px solid transparent;
+    transition: color .2s, border-color .2s;
+  }
+  header.site .link:hover { color: var(--primary); border-color: var(--primary); }
 
   /* Hero */
-  header.hero {
-    padding: 72px 0 40px;
+  .hero {
+    padding: 88px 24px 56px;
+    text-align: center;
+    border-bottom: 1px double var(--line);
   }
-  .badges {
+  .hero h1 {
+    font-size: clamp(2rem, 5vw, 3rem);
+    line-height: 1.15;
+    max-width: 18ch;
+    margin: 18px auto 20px;
+  }
+  .hero h1 em { font-style: italic; color: var(--primary); }
+  .hero .motto {
+    font-family: 'Fraunces', serif;
+    font-style: italic;
+    font-size: 1.05rem;
+    color: var(--ink-soft);
+    max-width: 46ch;
+    margin: 0 auto 30px;
+  }
+  .ctas {
     display: flex;
-    gap: 8px;
-    margin-bottom: 20px;
+    gap: 14px;
+    justify-content: center;
     flex-wrap: wrap;
+    margin-bottom: 44px;
   }
-  .badge {
-    font-size: 0.76rem;
-    font-weight: 600;
-    padding: 4px 10px;
-    border-radius: 999px;
-    background: var(--bg-sunken);
-    border: 1px solid var(--border);
-    color: var(--text-muted);
-  }
-  h1 {
-    font-size: clamp(2.1rem, 5vw, 3rem);
-    line-height: 1.1;
-    margin: 0 0 16px;
-    letter-spacing: -0.02em;
-  }
-  h1 .accent { color: var(--accent-strong); }
-  .lede {
-    font-size: 1.15rem;
-    color: var(--text-muted);
-    max-width: 640px;
-    margin: 0 0 32px;
-  }
-  .cta-row {
-    display: flex;
-    gap: 12px;
-    margin-bottom: 40px;
-    flex-wrap: wrap;
-  }
-  .btn {
+  .button, a.button {
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    padding: 10px 18px;
-    border-radius: 8px;
-    font-weight: 600;
-    font-size: 0.92rem;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.78rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
     text-decoration: none;
-    border: 1px solid transparent;
+    padding: 12px 22px;
+    border: 1px solid var(--primary);
+    background: var(--primary);
+    color: var(--bg);
+    transition: all .2s;
   }
-  .btn-primary {
-    background: var(--accent);
-    color: #1a1508;
-  }
-  .btn-primary:hover { background: var(--accent-strong); }
-  .btn-ghost {
+  .button.invert, a.button.invert {
     background: transparent;
-    color: var(--text);
-    border-color: var(--border);
+    color: var(--primary);
   }
-  .btn-ghost:hover { border-color: var(--accent); color: var(--accent-strong); }
+  .button:hover { background: color-mix(in srgb, var(--primary) 84%, black); }
+  .button.invert:hover { background: var(--bg-deep); }
+
+  .hero-code { max-width: 640px; margin: 0 auto; text-align: left; }
 
   /* Code blocks */
   pre.code {
     background: var(--code-bg);
     color: var(--code-text);
-    border-radius: 12px;
     padding: 20px 22px;
     overflow-x: auto;
     font-size: 0.86rem;
     line-height: 1.65;
     box-shadow: var(--shadow);
     margin: 0 0 16px;
+    text-align: left;
   }
   pre.code .kw { color: var(--code-keyword); }
   pre.code .str { color: var(--code-string); }
@@ -218,78 +213,96 @@
     justify-content: space-between;
     align-items: center;
     margin: 0 0 8px;
-    font-size: 0.78rem;
-    color: var(--text-muted);
+    font-size: 0.72rem;
+    color: var(--ink-soft);
     text-transform: uppercase;
-    letter-spacing: 0.06em;
+    letter-spacing: 0.08em;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
   }
 
   /* Sections */
-  section { padding: 48px 0; border-top: 1px solid var(--border); }
+  section { padding: 64px 0; border-top: 1px solid var(--line); }
   section:first-of-type { border-top: none; }
-  h2 {
-    font-size: 1.5rem;
-    margin: 0 0 8px;
-    letter-spacing: -0.01em;
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 18px;
+    margin-bottom: 40px;
   }
+  .section-head h2 { font-size: 1.6rem; margin: 0; white-space: nowrap; }
+  .section-head hr {
+    flex-grow: 1;
+    border: none;
+    border-top: 1px solid var(--line);
+    margin: 0;
+  }
+  h2 { font-size: 1.5rem; }
   .section-intro {
-    color: var(--text-muted);
+    color: var(--ink-soft);
     max-width: 640px;
     margin: 0 0 28px;
   }
 
-  .grid {
+  /* Ledger (numbered entries) */
+  .ledger { padding-top: 64px; }
+  .entry {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-    gap: 16px;
+    grid-template-columns: 80px 1fr;
+    gap: 26px;
+    padding: 32px 0;
+    border-top: 1px solid var(--line);
   }
-  .card {
-    background: var(--bg-raised);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 20px;
+  .entry:last-child { border-bottom: 1px solid var(--line); }
+  .numeral {
+    font-family: 'Fraunces', serif;
+    font-size: 48px;
+    font-weight: 300;
+    font-style: italic;
+    color: var(--primary);
+    line-height: 1;
+    transition: color .25s;
   }
-  .card h3 {
+  .entry:hover .numeral { color: var(--alternate); }
+  .entry h3 {
+    font-size: 1.2rem;
     margin: 0 0 8px;
-    font-size: 1rem;
+    display: inline-block;
+    border-bottom: 1px solid transparent;
+    transition: border-color .25s;
   }
-  .card p {
-    margin: 0;
-    color: var(--text-muted);
-    font-size: 0.92rem;
-  }
+  .entry:hover h3 { border-color: var(--primary); }
+  .entry p { margin: 0; color: var(--ink-soft); font-size: 0.94rem; }
 
+  /* Tables */
   table {
     width: 100%;
     border-collapse: collapse;
     font-size: 0.9rem;
     background: var(--bg-raised);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    overflow: hidden;
+    border: 1px solid var(--line);
   }
   th, td {
     text-align: left;
     padding: 10px 14px;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--line);
   }
   th {
-    color: var(--text-muted);
-    font-weight: 600;
-    font-size: 0.8rem;
+    color: var(--ink-soft);
+    font-weight: 500;
+    font-size: 0.72rem;
     text-transform: uppercase;
-    letter-spacing: 0.04em;
-    background: var(--bg-sunken);
+    letter-spacing: 0.06em;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    background: var(--bg-deep);
   }
   tr:last-child td { border-bottom: none; }
-  .table-wrap { overflow-x: auto; border-radius: 12px; }
+  .table-wrap { overflow-x: auto; }
   td.num, th.num { text-align: right; }
-  .row-festina td:first-child { color: var(--accent-strong); font-weight: 700; }
+  .row-festina td:first-child { color: var(--primary); font-weight: 600; }
 
   .canvas-highlight {
     background: var(--bg-raised);
-    border: 1px solid var(--border);
-    border-radius: 12px;
+    border: 1px solid var(--line);
     padding: 24px;
     margin: 32px 0;
   }
@@ -301,24 +314,22 @@
     margin-bottom: 16px;
   }
   .canvas-stat {
-    font-size: 2.2rem;
-    font-weight: 800;
-    color: var(--accent-strong);
-    letter-spacing: -0.02em;
+    font-family: 'Fraunces', serif;
+    font-style: italic;
+    font-size: 2.1rem;
+    font-weight: 400;
+    color: var(--primary);
   }
-  .canvas-highlight-head h3 {
-    margin: 0;
-    font-size: 1.05rem;
-  }
+  .canvas-highlight-head h3 { margin: 0; font-size: 1.05rem; }
 
   .docs-table a { text-decoration: none; font-weight: 600; }
-  .docs-table td:last-child { color: var(--text-muted); }
+  .docs-table td:last-child { color: var(--ink-soft); }
 
   ul.philosophy {
     columns: 2;
     gap: 32px;
     padding-left: 20px;
-    color: var(--text-muted);
+    color: var(--ink-soft);
   }
   ul.philosophy li { break-inside: avoid; margin-bottom: 8px; }
 
@@ -333,67 +344,93 @@
     width: 9px;
     height: 9px;
     border-radius: 50%;
-    background: #4caf6e;
+    background: var(--alternate);
     flex-shrink: 0;
-    box-shadow: 0 0 0 3px color-mix(in srgb, #4caf6e 20%, transparent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--alternate) 22%, transparent);
   }
 
+  /* Footer */
   footer {
-    padding: 40px 0 60px;
-    color: var(--text-muted);
-    font-size: 0.88rem;
-    display: flex;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 12px;
+    padding: 48px 24px 60px;
+    text-align: center;
   }
-  footer a { color: var(--text-muted); }
-  footer a:hover { color: var(--accent-strong); }
+  footer .motto {
+    font-family: 'Fraunces', serif;
+    font-style: italic;
+    font-size: 1rem;
+    margin-bottom: 16px;
+    color: var(--ink);
+  }
+  footer nav { margin-bottom: 14px; }
+  footer nav a {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    text-decoration: none;
+    color: var(--ink-soft);
+    margin: 0 12px;
+  }
+  footer nav a:hover { color: var(--primary); }
+  footer p { color: var(--ink-soft); font-size: 0.82rem; margin: 0; }
 
-  @media (max-width: 560px) {
-    .navlinks { display: none; }
+  @media screen and (max-width: 768px) {
+    .entry { grid-template-columns: 1fr; gap: 8px; }
+    .numeral { font-size: 30px; }
+    header.site { padding: 0 14px; }
+    #menu { display: block; margin: 15px auto; }
+    #links {
+      position: absolute;
+      top: 60px;
+      left: 0;
+      right: 0;
+      flex-direction: column;
+      align-items: center;
+      gap: 14px;
+      height: 0;
+      overflow: hidden;
+      background: var(--bg);
+    }
+    #links[data-expanded] {
+      height: auto;
+      padding: 16px 0 20px;
+      border-bottom: 1px solid var(--line);
+    }
     ul.philosophy { columns: 1; }
+    .hero { padding: 56px 20px 40px; }
   }
 </style>
 </head>
 <body>
 
-<nav>
-  <div class="wrap">
-    <a class="brand" href="#top"><span class="mark">f</span> Festina</a>
-    <div class="navlinks">
-      <a href="#why">Why</a>
-      <a href="#examples">Examples</a>
-      <a href="#benchmarks">Benchmarks</a>
-      <a href="api.html">API Reference</a>
-      <a href="#docs">Docs</a>
-      <a href="https://github.com/uraikus/festina">GitHub</a>
-    </div>
-  </div>
-</nav>
+<header class="site">
+  <a class="wordmark" href="#top"><span class="mark">f</span><span class="name">Festina</span></a>
+  <div id="menu"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512" width="20" fill="currentColor"><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></div>
+  <nav id="links">
+    <a class="link" href="#why">Why</a>
+    <a class="link" href="#examples">Examples</a>
+    <a class="link" href="#benchmarks">Benchmarks</a>
+    <a class="link" href="api.html">API Reference</a>
+    <a class="link" href="#docs">Docs</a>
+    <a class="link" href="https://github.com/uraikus/festina">GitHub</a>
+  </nav>
+</header>
 
 <div id="top"></div>
-<header class="hero">
-  <div class="wrap">
-    <div class="badges">
-      <span class="badge">Version 0.1</span>
-      <span class="badge">1843 tests passing</span>
-      <span class="badge">MIT license</span>
-      <span class="badge">Linux · macOS · Windows</span>
-    </div>
-    <h1>A fast, simple language<br>that compiles to <span class="accent">native code</span>.</h1>
-    <p class="lede">
-      Drop the interpreter, the runtime overhead, and the boilerplate.
-      Festina compiles through LLVM to a real, standalone executable —
-      with SQLite, graphics, audio, event-driven timers, and an
-      HTTP/WebSocket server built directly into the language, not
-      bolted on as libraries.
-    </p>
-    <div class="cta-row">
-      <a class="btn btn-primary" href="#why">Why Festina</a>
-      <a class="btn btn-ghost" href="https://github.com/uraikus/festina">View on GitHub</a>
-    </div>
+<section class="hero">
+  <span class="eyebrow">Version 0.1 · MIT Licensed · Linux · macOS · Windows</span>
+  <h1>A fast, simple language <em>that compiles to native code.</em></h1>
+  <p class="motto">
+    Drop the interpreter, the runtime overhead, and the boilerplate —
+    SQLite, graphics, audio, timers, and an HTTP/WebSocket server, built
+    directly into the language.
+  </p>
+  <div class="ctas">
+    <a class="button" href="#why">Why Festina</a>
+    <a class="button invert" href="https://github.com/uraikus/festina">View on GitHub</a>
+  </div>
 
+  <div class="hero-code">
     <pre class="code"><span class="kw">table</span> People {
     id:<span class="kw">int</span>
     name:<span class="kw">text</span>
@@ -416,38 +453,57 @@ Hello, Festina!</pre>
       JIT-shaped to execute.
     </p>
   </div>
-</header>
+</section>
 
-<section id="why">
+<section class="ledger" id="why">
   <div class="wrap">
-    <h2>Why Festina</h2>
-    <p class="section-intro">Decisions that shape everything else about the language.</p>
-    <div class="grid">
-      <div class="card">
+    <div class="section-head"><h2>Why Festina</h2><hr></div>
+
+    <div class="entry">
+      <div class="numeral">I</div>
+      <div>
         <h3>Native compilation, not a VM</h3>
         <p>Every Festina program compiles through LLVM to a real executable. No interpreter, no JIT warmup, no runtime shipped alongside your code.</p>
       </div>
-      <div class="card">
+    </div>
+    <div class="entry">
+      <div class="numeral">II</div>
+      <div>
         <h3>A database that's just... there</h3>
         <p>Declare a <code>table</code>, and <code>festina.sqlite</code> is created, migrated, and kept in sync automatically — no ORM, no migration scripts.</p>
       </div>
-      <div class="card">
+    </div>
+    <div class="entry">
+      <div class="numeral">III</div>
+      <div>
         <h3>Graphics and audio, wired in</h3>
         <p>A real canvas (<code>drawRect</code>, <code>on mouseDown</code>, paths, gradients, typed <code>color</code>/<code>font</code> values, …) and layered audio playback with channels (<code>aud music = 'music.mp3'</code>, then <code>music.play()</code>), backed by Cairo/X11 and ALSA.</p>
       </div>
-      <div class="card">
+    </div>
+    <div class="entry">
+      <div class="numeral">IV</div>
+      <div>
         <h3>Automatic memory, manual override</h3>
         <p>Values are reclaimed for you — and <code>free spritesheet</code> / <code>delete map.key</code> exist for the moments you know the lifetime better than the compiler does.</p>
       </div>
-      <div class="card">
+    </div>
+    <div class="entry">
+      <div class="numeral">V</div>
+      <div>
         <h3>Readable syntax, real guarantees</h3>
         <p>Template strings, ternaries, familiar control flow — but every condition is a real <code>bool</code>, and everything is statically typed and checked before it runs.</p>
       </div>
-      <div class="card">
+    </div>
+    <div class="entry">
+      <div class="numeral">VI</div>
+      <div>
         <h3>Slim by default</h3>
         <p>A compiled program only links what it actually uses — skip graphics and audio in your source, and the binary skips Cairo, X11, and ALSA too.</p>
       </div>
-      <div class="card">
+    </div>
+    <div class="entry">
+      <div class="numeral">VII</div>
+      <div>
         <h3>Minimal setup, by design</h3>
         <p>The fewest dependencies that get the job done, failing loudly and clearly the moment one is actually missing.</p>
       </div>
@@ -833,11 +889,32 @@ npcHealths[<span class="str">'npc1'</span>] = 30
 </section>
 
 <footer>
-  <div class="wrap" style="display:flex; justify-content:space-between; flex-wrap:wrap; gap:12px; width:100%;">
-    <span>MIT License</span>
-    <span><a href="https://github.com/uraikus/festina">github.com/uraikus/festina</a></span>
-  </div>
+  <p class="motto">Native performance, familiar syntax, nothing bolted on.</p>
+  <nav>
+    <a href="https://github.com/uraikus/festina">GitHub</a>
+    <a href="https://github.com/uraikus/festina/blob/main/LICENSE">MIT License</a>
+    <a href="api.html">API Reference</a>
+    <a href="#docs">Docs</a>
+  </nav>
+  <p><b>Copyright Festina <span id="year">2026</span></b></p>
 </footer>
+
+<script>
+  'use strict';
+  var menu = document.getElementById('menu');
+  var links = document.getElementById('links');
+  if (menu) {
+    menu.onclick = function () {
+      if (links.hasAttribute('data-expanded')) {
+        links.removeAttribute('data-expanded');
+      } else {
+        links.setAttribute('data-expanded', '');
+      }
+    };
+  }
+  var year = document.getElementById('year');
+  if (year) year.textContent = new Date().getFullYear();
+</script>
 
 </body>
 </html>
