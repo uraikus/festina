@@ -348,21 +348,14 @@ class TestFeatureGating:
         with pytest.raises(errors.CompileError):
             cli_mod._check_feature_supported("audio", "win32")
 
-    def test_windowed_graphics_is_gated_on_windows(self, cli_mod, errors):
-        # windows.md Phase 2 / claude.md #128 INVERTED this test the
-        # same way claude.md #123 inverted the darwin one below: the
-        # Win32 windowing seam + backend landed, and -- exactly like
-        # every other gate in this class -- being BUILT and CI-compiled
-        # is not the same claim as being verified against a real
-        # window/mouse/keyboard, so windowed use stays gated until it
-        # has been.
-        with pytest.raises(errors.CompileError) as excinfo:
-            cli_mod._check_feature_supported("graphics", "win32")
-        assert "windows.md Phase 2" in str(excinfo.value)
-        assert excinfo.value.category == "unsupported platform feature"
-
-    def test_the_windows_graphics_gate_is_overridable(self, cli_mod, monkeypatch):
-        monkeypatch.setenv("FESTINA_ENABLE_WINDOWS_GRAPHICS", "1")
+    def test_windowed_graphics_is_not_gated_on_windows(self, cli_mod):
+        # claude.md #169 retired this gate: a real Windows CI run
+        # (triggered specifically to check this) exercised the Win32
+        # windowing backend end to end and found window creation/
+        # rendering working, so windowed use no longer waits behind
+        # FESTINA_ENABLE_WINDOWS_GRAPHICS the way windows.md Phase 2
+        # originally planned -- same shape as graphics on Linux, which
+        # has never been gated at all.
         cli_mod._check_feature_supported("graphics", "win32")   # no raise
 
     def test_windowed_graphics_is_gated_on_darwin(self, cli_mod, errors):
@@ -389,21 +382,32 @@ class TestFeatureGating:
         assert "alsa" not in report, (
             "doctor must not tell a Mac user to install ALSA")
 
-    def test_doctor_on_windows_reports_graphics_and_audio_as_planned_not_missing(
+    def test_doctor_on_windows_reports_audio_as_planned_not_missing(
             self, cli_mod, monkeypatch):
-        # windows.md Phase 1 / Phase 2 (claude.md #128): both audio's
-        # waveOut backend and graphics' Win32 backend are now built but
-        # await real-hardware verification -- doctor must say so rather
-        # than naming Linux-only packages (cairo-xlib, alsa) a Windows
-        # user has no way to install.
+        # windows.md Phase 1: audio's waveOut backend is built but stays
+        # gated -- claude.md #169 found windows-latest has no audio
+        # device at all, so this is the one Windows tier that still
+        # needs the "not yet" framing doctor must say so rather than
+        # naming a Linux-only package (alsa) a Windows user has no way
+        # to install.
         monkeypatch.setattr(sys, "platform", "win32")
         _stub_which_any(cli_mod, monkeypatch)
         lines, _, _missing = cli_mod._doctor_report()
         report = "\n".join(lines)
         assert "windows.md Phase 1" in report
-        assert "windows.md Phase 2" in report
         assert "cairo-xlib" not in report and "alsa" not in report, (
             "doctor must not tell a Windows user to install Linux packages")
+
+    def test_doctor_on_windows_does_not_call_graphics_not_yet(self, cli_mod, monkeypatch):
+        # claude.md #169: graphics is no longer gated on win32, so
+        # doctor must not print the old "windows.md Phase 2 / not yet"
+        # line for it anymore -- it should look like Linux's own
+        # ungated graphics tier there.
+        monkeypatch.setattr(sys, "platform", "win32")
+        _stub_which_any(cli_mod, monkeypatch)
+        lines, _, _missing = cli_mod._doctor_report()
+        report = "\n".join(lines)
+        assert "windows.md Phase 2" not in report
 
     def test_doctor_on_windows_reports_posix_regex_as_required(
             self, cli_mod, monkeypatch):
@@ -432,6 +436,39 @@ class TestFeatureGating:
         monkeypatch.setenv("MSYSTEM", "UCRT64")
         lines, _, _missing = cli_mod._doctor_report()
         assert "wrong shell" not in "\n".join(lines)
+
+
+class TestDarwinTryGating:
+    """claude.md #170: try/catch/throw is a hard, non-overridable
+    rejection on darwin -- LLVM's AArch64 backend (what every real
+    macOS CI runner and every Apple Silicon Mac is) has no SjLj
+    lowering at all, confirmed directly the same way wasm32-wasi's own
+    identical rejection was (clang rejects __builtin_longjmp outright
+    for that target). Unlike TestFeatureGating's audio/graphics/http
+    gates just above, there is no FESTINA_ENABLE_* env var here --
+    nothing to try, the backend genuinely doesn't exist, the same
+    "genuinely absent" shape _check_wasm_feature_supported already
+    established."""
+
+    def test_rejected_on_darwin(self, cli_mod, errors):
+        with pytest.raises(errors.CompileError) as excinfo:
+            cli_mod._check_darwin_try_supported("darwin")
+        assert excinfo.value.category == "unsupported platform feature"
+        assert "macos.md" in str(excinfo.value)
+
+    def test_not_gated_on_linux(self, cli_mod):
+        cli_mod._check_darwin_try_supported("linux")   # no raise
+
+    def test_not_gated_on_windows(self, cli_mod):
+        cli_mod._check_darwin_try_supported("win32")   # no raise
+
+    def test_defaults_to_live_sys_platform(self, cli_mod, monkeypatch):
+        # No platform_name passed -- must consult sys.platform itself,
+        # the same injectable-but-defaults-live shape every other gate
+        # in this module already has.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        with pytest.raises(cli_mod.CompileError):
+            cli_mod._check_darwin_try_supported()
 
 
 class TestDetectPackageManager:
@@ -925,6 +962,21 @@ class TestOnMacOS:
         result = compile_and_run("log('hello from darwin')")
         assert result.returncode == 0
         assert result.stdout.strip() == "hello from darwin"
+
+    def test_try_catch_is_rejected(self, cli_mod, errors, tmp_path):
+        # claude.md #170: confirmed for real on this exact CI job --
+        # LLVM's AArch64 backend has no SjLj lowering, so a program
+        # using try/catch must fail at compile time with a clear
+        # message, not crash or hang trying to compile
+        # __builtin_longjmp's nonexistent lowering. Goes through
+        # compile_file itself (not just _check_darwin_try_supported
+        # directly, TestDarwinTryGating's own job above) to confirm the
+        # real wiring, on real hardware.
+        src = tmp_path / "main.f"
+        src.write_text("try { log('x') } catch (e:text) { log(e) }\n", encoding="utf-8")
+        with pytest.raises(errors.CompileError) as excinfo:
+            cli_mod.compile_file(str(src), str(tmp_path / "out"))
+        assert excinfo.value.category == "unsupported platform feature"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="runs on the Windows CI job")

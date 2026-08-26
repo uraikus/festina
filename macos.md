@@ -1,22 +1,43 @@
 # macOS support
 
-**Fully implemented and CI-verified on every push.** All four phases
-below are built and shipped: toolchain bring-up, audio (AudioQueue),
-windowing (native Cocoa, no XQuartz needed), and packaging (a
-codesigned arm64 binary). The `macos-14` GitHub Actions job compiles
-and runs the whole non-hardware-dependent suite natively on Apple
-Silicon on every single push, and has done so since claude.md #121.
+**Fully implemented, and CI-verified on every push again as of
+claude.md #170.** All four phases below are built and shipped:
+toolchain bring-up, audio (AudioQueue), windowing (native Cocoa, no
+XQuartz needed), and packaging (a codesigned arm64 binary). The
+`macos-14` GitHub Actions job compiles and runs the whole
+non-hardware-dependent suite natively on Apple Silicon on every push.
 
-**What's genuinely still open** is external to this codebase, not
-missing work in it: confirming audio playback and windowed
-mouse/keyboard/window behavior on a *real* Mac, which this project has
-no access to. Both stay behind an explicit opt-in environment variable
-(`FESTINA_ENABLE_MACOS_AUDIO=1` / `FESTINA_ENABLE_MACOS_GRAPHICS=1`)
-until someone with real hardware confirms them — everything else about
-each phase, including the CI compile-type-check against real
-AudioToolbox/AppKit/Cocoa headers on every push, is done today.
-Offscreen drawing (`saveCanvas`, no open window) and packaging need no
-gate at all and work right now.
+**A real regression, invisible for a long stretch, closed by claude.md
+#170:** from roughly claude.md #157 (try/catch/throw) onward, the
+macOS job had actually been failing on every single push --
+`festina_runtime.c` is compiled unconditionally for every program, and
+`__builtin_longjmp` (which `festina_throw` uses) is flatly rejected by
+clang for `arm64-apple-macos14` specifically -- the real architecture
+every current Mac and every macOS CI runner is (confirmed directly:
+the identical builtin compiles fine for `x86_64-apple-macos14`, an
+architecture this project doesn't target). LLVM's AArch64 backend
+simply has no SjLj lowering, the same gap wasm32-wasi's backend
+already has -- nobody had actually looked at a real macOS CI run
+closely enough to notice, the same way an unrelated missing
+`libmbedtls-dev` apt package went unnoticed on the linux job over the
+same period. Fixed the identical way wasm32-wasi's own SjLj gap
+already was: `festina_throw` gets a stub on `__APPLE__` too (so this
+file compiles at all, on every program), and try/catch/throw is now
+rejected outright at compile time on darwin (`festina/cli.py`'s
+`_check_darwin_try_supported`, no override -- the backend genuinely
+doesn't exist, not a hardware-verification gate like audio/graphics
+below). See [api.md](api.md#try--catch--throw)'s own Limitations note.
+
+**What's genuinely still open** beyond that is external to this
+codebase, not missing work in it: confirming audio playback and
+windowed mouse/keyboard/window behavior on a *real* Mac, which this
+project has no access to. Both stay behind an explicit opt-in
+environment variable (`FESTINA_ENABLE_MACOS_AUDIO=1` /
+`FESTINA_ENABLE_MACOS_GRAPHICS=1`) until someone with real hardware
+confirms them — everything else about each phase, including the CI
+compile-type-check against real AudioToolbox/AppKit/Cocoa headers on
+every push, is done today. Offscreen drawing (`saveCanvas`, no open
+window) and packaging need no gate at all and work right now.
 
 This file is the design writeup and implementation record, kept
 current as a reference -- not a live tracker of unstarted work. See

@@ -866,6 +866,27 @@ void festina_async_io_dispatch(void *payload, void (*work_fn)(void *payload),
                                void (*callback)(void *payload),
                                void (*release_fn)(void *payload));
 
+/* claude.md #166: the http-servicing hook seam -- see this trio's own
+ * doc comment in festina_runtime.c for the full reasoning. Lets
+ * festina_run_event_loop (festina_runtime_graphics.c) service an open
+ * openPort()/openSecurePort() listener without a direct reference into
+ * festina_runtime_http.c, the same "always-safe default, no-op unless
+ * registered" shape as festina_set_async_io_hooks just above. This is
+ * what makes openPort() combinable with graphics -- previously rejected
+ * outright at compile time (festina/cli.py). */
+void festina_set_http_service_hooks(int64_t (*outstanding_fn)(void), void (*ready_fn)(void));
+int64_t festina_http_service_outstanding(void);
+void festina_http_service_ready(void);
+/* codegen's own conditional call site (uses_http, mirroring
+ * uses_async_io's own festina_register_async_io_hooks() call) -- defined
+ * in festina_runtime_http.c, registers ITS OWN outstanding/ready
+ * functions via festina_set_http_service_hooks above. Registered
+ * whenever a program uses http at all (not just when it ALSO uses
+ * graphics) -- harmless either way, since festina_run_event_loop is the
+ * only thing that ever calls through these hooks, and it's simply never
+ * linked into a program that doesn't open a window. */
+void festina_register_http_service_hooks(void);
+
 /*
  * claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying().
  *
@@ -1269,6 +1290,14 @@ int64_t festina_array_index_of(void *hdr, int64_t elem_size,
                                 const void *value, int8_t is_text);
 void festina_release_array(void *payload);
 void festina_release_map(void *payload);
+/* claude.md #167: the value-aware counterpart to festina_release_map,
+ * for a map[text]-shaped payload this runtime built directly in C
+ * (never through codegen, which already generates its own value-aware
+ * wrapper per Festina-level map[text] variable) -- frees each entry's
+ * own owned text VALUE before deferring to the same entries/header
+ * cleanup festina_release_map itself uses. See that function's own doc
+ * comment for why the generic one is wrong for this shape. */
+void festina_release_text_map(void *payload);
 
 /* claude.md #151: openPort/on request/on upgrade/on message/on
  * socketClose -- a single-threaded HTTP + WebSocket server, in its
@@ -1334,22 +1363,28 @@ void festina_release_map(void *payload);
  * .toText()/.toBlob()/.toImg()/.toAud() work identically either way,
  * live or not.
  *
- * DESIGN, http/1.1 scope: request-line + headers + a Content-Length
- * body only -- no chunked transfer-encoding, no HTTP/1.0, no
- * pipelining. Every response closes the connection afterward
- * (`Connection: close`, unconditionally) -- there is no keep-alive in
- * this version, so each request is genuinely its own TCP connection
- * end to end, which is what keeps the per-connection state machine
- * this small (accept -> read one request -> dispatch -> respond ->
- * close, a straight line with no "wait for the next request on this
- * same fd" branch to get wrong). See wasm.md-style Limitations
- * documentation in api.md for the honest accounting of what this
- * does not do.
+ * DESIGN, http/1.1 scope: request-line + headers + a Content-Length OR
+ * chunked (claude.md #168) body, both request and response direction;
+ * no pipelining as a genuine wire optimization (a pipelining client's
+ * own buffered-ahead requests are still all served correctly, just one
+ * at a time, off a single connection -- see festina_conn_readable's
+ * own dispatch loop). claude.md #167 added HTTP/1.1 keep-alive: a
+ * response leaves the connection open for another request unless the
+ * request sent `Connection: close` (HTTP/1.0 still defaults to close
+ * unless it explicitly asks for keep-alive) -- so the per-connection
+ * state machine is accept -> read a request -> dispatch -> respond ->
+ * EITHER reset for another request on the same fd OR close, not the
+ * once-unconditional straight line to close this comment used to
+ * describe. See api.md's own http Limitations section (and its
+ * Keep-alive subsection) for the honest, current accounting of what
+ * this does and doesn't do.
  *
- * DESIGN, WebSocket scope: RFC 6455 text/binary data frames and close
- * frames only -- no fragmentation (a fragmented message is dropped,
- * not reassembled), no ping/pong keepalive sent by this runtime
- * (a received ping/pong is read and ignored, never crashes the
+ * DESIGN, WebSocket scope: RFC 6455 text/binary data frames, close
+ * frames, and fragmentation (claude.md #168 -- reassembled correctly
+ * now, including a control frame interleaved between another message's
+ * own fragments per §5.4), but no ping/pong keepalive SENT by this
+ * runtime (a received ping is answered with a pong automatically, a
+ * received pong is read and ignored, neither ever crashes the
  * connection), no permessage-deflate or any other extension. A
  * received frame -- text or binary -- always reaches `on message` as
  * a `blob` (never as `text` directly): the language has no "this

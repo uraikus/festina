@@ -1736,7 +1736,11 @@ Any other key is a compile-time error.
 
 Fires once per incoming HTTP request, fully parsed (request line,
 headers, and body already buffered — see [Limitations](#http-limitations)
-below for what "fully parsed" doesn't include). `req.code` is `null` (no
+below for what "fully parsed" doesn't include). A `Transfer-Encoding:
+chunked` body (claude.md #168) is decoded transparently into the same
+buffered body a `Content-Length` request already gets — `req.toText()`/
+`.toBlob()`/etc. don't need to know or care which one a client actually
+sent. `req.code` is `null` (no
 response exists yet); `req.url` is reconstructed from the connection's
 own scheme/`Host` header/path (falling back to `127.0.0.1:<port>` if the
 client sent no `Host` header at all) — parse it with `parseURL()`
@@ -1786,7 +1790,7 @@ aud a = req.toAud()                   // decoded as audio (null if it isn't one)
 A request with no body answers an empty `text`/`blob` (never `null`),
 matching every other "nothing there" case in this language.
 
-### WebSocket: `req.upgrade()`
+### <a name="websockets-and-fragmentation"></a>WebSocket: `req.upgrade()`
 
 ```festina
 on request(req:http) {
@@ -1824,6 +1828,20 @@ then `on message(s:socket, msg:blob)` fires once per message received
 fires exactly once when the connection ends, however it ends (the peer
 closed it, sent a close frame, or the read failed) — never for a plain
 HTTP connection that never upgraded.
+
+**Fragmentation (claude.md #168) is invisible to `on message`.** A peer
+may split one logical message across several WebSocket frames (RFC 6455
+§5.4) — this runtime reassembles them itself, so `on message` fires
+exactly once per MESSAGE either way, with the full, already-concatenated
+`blob`; there's no way to observe the individual fragments, and no
+reason to want to. A ping/pong or close frame arriving in the middle of
+another message's own fragments is answered/handled immediately without
+disturbing that reassembly (the RFC's own explicit allowance for
+interleaving control frames this way). A message whose peer never sends
+the closing fragment, an out-of-place continuation frame, or a
+reassembled message over 8MB, all close the connection with a real
+WebSocket close code (1002 protocol error, or 1009 message too big) —
+never a hang or a silent drop.
 
 ```festina
 s.state                               // map[text] -- a per-connection scratchpad,
@@ -1866,14 +1884,17 @@ outbound request delays every other connection's own turn for as long
 as it takes). `req.url`/`req.method` are left untouched; `req.code`,
 `req.headers`, and the body read back through `req.toText()`/
 `toBlob()`/`toImg()`/`toAud()` are all overwritten in place with the
-response. A genuine network failure — the host doesn't resolve, the
-connection is refused, the TLS handshake fails, or the response can't
-be parsed as HTTP — **throws** (catch it with `try`/`catch`, [see
-below](#try--catch--throw)), the same "this can really fail, with real
-diagnostic text" precedent `toStruct()`/`toArr()`'s JSON parsing
-already established, rather than the "test, don't fail" convention most
-of this runtime's I/O uses. There's no timeout to configure — a 30
-second socket timeout bounds the worst case.
+response. A `Transfer-Encoding: chunked` response (claude.md #168, common
+against a real server whose body length isn't known upfront) is decoded
+transparently too, exactly like the server side above — `req.code`/
+`req.toText()`/etc. read the same either way. A genuine network failure
+— the host doesn't resolve, the connection is refused, the TLS handshake
+fails, or the response can't be parsed as HTTP — **throws** (catch it
+with `try`/`catch`, [see below](#try--catch--throw)), the same "this can
+really fail, with real diagnostic text" precedent `toStruct()`/
+`toArr()`'s JSON parsing already established, rather than the "test,
+don't fail" convention most of this runtime's I/O uses. There's no
+timeout to configure — a 30 second socket timeout bounds the worst case.
 
 Calling `req.send()` a second time on the same value sends a second,
 independent request (using whatever `url`/`method`/`headers`/body it
@@ -1992,30 +2013,77 @@ u.hash                                // text -- '#frag'
 Every field is read-only — a `url` is built once, by `parseURL()`, and
 never mutated afterward.
 
+### Keep-alive (claude.md #167)
+
+A server connection stays open for another request once a response
+finishes, instead of closing after every single one — ordinary HTTP/1.1
+semantics, nothing to opt into:
+
+- **HTTP/1.1 requests default to keep-alive**, matching every real
+  client (browsers, `curl`, `http.client`, ...). Send `Connection:
+  close` on the request to close after that one response anyway.
+- **HTTP/1.0 requests default to close**, unless the request itself
+  sends `Connection: keep-alive`.
+- **An idle connection — nothing in flight, just open and waiting to be
+  reused — is closed automatically after about 15 seconds** with no new
+  request. A slow client still sending its OWN request (headers or body
+  trickling in) is never affected by this; only genuinely idle time
+  between requests counts.
+- Combines with everything else `openPort()` already does, including
+  claude.md #166's graphics combination and WebSocket upgrades (an `on
+  upgrade` connection leaves HTTP request/response handling behind
+  entirely, so keep-alive has nothing to do there — it was never
+  "closing" a WebSocket connection to begin with).
+
+Nothing about handling a single request changes — `on request` fires
+once per request exactly as before, `req.headers`/`req.toText()`/etc.
+describe just that one request, and a fresh `req` value arrives for the
+next one on the same connection. The `Connection` response header is
+set automatically to match; a program's own `req.send()`/`req.ok()`/
+`req.redirect()` never need to think about it.
+
 ### <a name="http-limitations"></a>Limitations
 
-- **HTTP/1.1 request-line + headers + a `Content-Length` body only.**
-  No chunked transfer-encoding, no HTTP/1.0-specific behavior.
-- **No keep-alive.** Every response closes the connection afterward —
-  each request is its own TCP connection, start to finish.
-- **No WebSocket fragmentation, ping/pong sent by this runtime, or
-  extensions.** A fragmented message (a frame with `FIN=0`, or a
-  continuation frame) closes the connection rather than being silently
-  dropped or misread. A received ping is answered with a pong
-  automatically; a received pong is ignored. `permessage-deflate` and
-  every other WebSocket extension are unsupported.
-- **Linux and macOS, plus Windows behind an opt-in flag.** Linux/macOS
-  use plain POSIX sockets; Windows uses a real winsock2 port (built,
-  CI-compiled — see [windows.md](windows.md)) gated behind
-  `FESTINA_ENABLE_WINDOWS_HTTP=1` pending real-hardware verification,
-  the same shape audio/graphics already use there. Not available under
-  `--target=wasm32-wasi` at all — WASI Preview 1 has no listening-socket
-  support — rejected at compile time; see [wasm.md](wasm.md).
-- **Cannot be combined with graphics** (`render()`, or an `on
-  mouseDown`/.../`close` handler) in the same program — the server's
-  own event loop and the graphics event loop are mutually exclusive in
-  this version. `setTimeout`/`setInterval` combine fine; both are
-  serviced from the same loop.
+- **No ping/pong sent by this runtime, and no WebSocket extensions.** A
+  received ping is answered with a pong automatically; a received pong
+  is ignored. `permessage-deflate` and every other WebSocket extension
+  are unsupported (fragmentation, claude.md #168, is not an extension —
+  see [WebSockets](#websockets-and-fragmentation) below).
+- **Linux, macOS, and Windows.** Linux/macOS use plain POSIX sockets;
+  Windows uses a real winsock2 port, confirmed by a real Windows CI run
+  (claude.md #169 — see [windows.md](windows.md)). One Windows-specific
+  caveat, already true of every platform's [Graceful
+  shutdown](#graceful-shutdown) story below and confirmed directly by
+  that same CI run rather than newly introduced by it: Windows has no
+  real `SIGTERM` delivery, so the connection-drain grace period only
+  applies to Ctrl-C there, not to however a process gets killed the
+  `SIGTERM` way on Linux/macOS (e.g. `taskkill` without `/F` doesn't
+  reach it the same way). Not available under `--target=wasm32-wasi`
+  at all — WASI Preview 1 has no listening-socket support — rejected at
+  compile time; see [wasm.md](wasm.md).
+- **Combining with graphics** (`render()`, or an `on
+  mouseDown`/.../`close` handler) in the same program works (claude.md
+  #166), but the two loops don't run side by side — a program that also
+  opens a window blocks in the graphics event loop the whole time, which
+  services the open port from inside itself rather than a separate
+  thread. Practically, that means:
+  - **Up to ~20ms of added latency** accepting a connection or reading
+    the next byte while the window is open — the graphics loop only
+    checks for http work on its own regular wake, the same bound
+    already accepted for a background `blob`/`img`/`aud` `.callback()`
+    load (see [Files](#files) below). Negligible for interactive use;
+    worth knowing if you're benchmarking raw request latency.
+  - **No graceful-shutdown grace period.** The http-only server drains
+    already-open connections for up to 10 seconds after Ctrl-C/SIGTERM
+    (see [Graceful shutdown](#graceful-shutdown) below) before exiting;
+    a combined program instead closes the window and exits immediately,
+    the same instant it always has, with no equivalent drain window for
+    an in-flight request. A future version may close this gap; it isn't
+    closed yet.
+
+  `setTimeout`/`setInterval` combine fine with either shape; all three
+  (timers, an open port, and a window) are serviced from the same loop
+  once graphics is involved.
 
 See [Graceful shutdown](#graceful-shutdown) below (under `close()`/`on
 exit`) for what Ctrl-C/`SIGTERM` do to a running server — the port
@@ -2069,9 +2137,7 @@ only ever calls `openPort()` never links it, the same binary-slimming
 split every other optional feature in this language already gets.
 
 **Scope, beyond what [Limitations](#http-limitations) above already
-says** (all of it applies here too — HTTP/1.1 request-line + headers +
-`Content-Length` body, no keep-alive, WebSocket text/binary/close
-frames only):
+says** (all of it applies here too):
 
 - **Server-side only.** There is no TLS *client* in this language —
   `openSecurePort()` is the only TLS-related builtin.
@@ -2084,14 +2150,15 @@ frames only):
   negotiation.
 - **An encrypted (password-protected) private key is rejected** — the
   key in `key` must be in the clear.
-- **Linux, plus macOS and Windows behind the same opt-in-flag /
+- **Linux and Windows, plus macOS behind the same opt-in-flag /
   real-hardware-verification story `openPort()`'s own Limitations
-  entry above describes** (`FESTINA_ENABLE_MACOS_HTTP=1`/
-  `FESTINA_ENABLE_WINDOWS_HTTP=1` — there is no separate TLS-specific
-  flag, since `openSecurePort()` always brings `openPort()`'s own
-  listener/event-loop machinery along with it). Not available under
-  `--target=wasm32-wasi`, for the identical reason `openPort()` isn't
-  there either.
+  entry above describes** (`FESTINA_ENABLE_MACOS_HTTP=1` — Windows
+  needs no such flag anymore, and there is no separate TLS-specific
+  flag on either platform, since `openSecurePort()` always brings
+  `openPort()`'s own listener/event-loop machinery along with it,
+  including that same graceful-shutdown gap on Windows). Not available
+  under `--target=wasm32-wasi`, for the identical reason `openPort()`
+  isn't there either.
 
 ## Freeing and deleting
 
@@ -2576,7 +2643,18 @@ feature existed: there is no point in such a program's own execution
 where it could ever notice a shutdown request, so installing a handler
 there would make Ctrl-C *stop working* instead of merely skipping
 cleanup — worse, not better. `SIGTERM` is POSIX only; Windows has no
-real delivery of it (only `SIGINT`/Ctrl-C).
+real delivery of it (only `SIGINT`/Ctrl-C) — confirmed directly by a
+real Windows CI run (claude.md #169): killing a Windows-compiled
+`openPort()` program the way `SIGTERM` would on Linux/macOS force-
+kills it instead (no `on exit`, no connection-drain grace period, no
+143 exit code), exactly as this paragraph already predicted. `SIGINT`
+itself is believed to work there too (the CRT does raise it, and this
+runtime's handler is registered unconditionally on every platform —
+see festina_runtime.c's own comment), but that specific claim is still
+unconfirmed by a real test run: the obvious way to test it from Python
+(`Popen.send_signal(signal.SIGINT)`) is itself rejected on Windows
+unless the child was launched with `CREATE_NEW_PROCESS_GROUP`, which
+this project's test fixtures don't currently do.
 
 ## `troubleshoot()` — structured logging
 
@@ -2658,8 +2736,19 @@ allocates minimal, or accept the same class of leak this language
 already accepts elsewhere (e.g. the one documented row-array chain
 shape in [security.md](security.md)).
 
-**Not available under `--target=wasm32-wasi`** — WASI has no setjmp/
-longjmp support at all — rejected at compile time; see [wasm.md](wasm.md).
+**Not available under `--target=wasm32-wasi`, or on macOS.** WASI has
+no setjmp/longjmp support at all — rejected at compile time; see
+[wasm.md](wasm.md). macOS is the same story for a different reason:
+LLVM's AArch64 backend (Apple Silicon, what every current Mac runs on)
+has no SjLj lowering either — confirmed directly, not just reasoned
+about (claude.md #170) — so `try`/`catch`/`throw` anywhere in a program
+is rejected outright at compile time there too, no override. A program
+that never writes `try`/`catch`/`throw` is completely unaffected on
+macOS (a `.toStruct()`/`.toArr()` parse failure, for example, still
+behaves exactly like the documented "no enclosing try" case above —
+prints and exits(1) — since that was always the fallback for an
+uncaught throw anyway); what's actually unavailable there is catching
+one.
 
 ## `.toStruct()` / `.toArr()` — parsing JSON
 

@@ -77,7 +77,15 @@ could feed a program that also happens to read stdin/argv. Concretely:
   thread; this bullet's own claim about `on request`/`on message`
   handlers is unaffected by either, and no Festina-visible
   global/refcount ever becomes something a program has to reason about
-  concurrently.
+  concurrently. claude.md #166 lifts the earlier restriction against
+  combining `openPort()` with graphics — a program that does both blocks
+  in the graphics event loop, which now also services the open port, so
+  a slow `on mouseDown`/`on request` handler denies service to
+  EITHER side while it runs, not just its own; and Ctrl-C/SIGTERM on
+  such a program skips the standalone server's own graceful-shutdown
+  grace period entirely (see api.md's own [http
+  limitations](api.md#http-limitations)) — a documented gap, not a
+  silent one.
 - **An 8MB per-connection buffer cap** (request line + headers + body,
   or one WebSocket frame's payload) bounds a single connection's own
   memory use, but this runtime does not limit the NUMBER of concurrent
@@ -85,8 +93,27 @@ could feed a program that also happens to read stdin/argv. Concretely:
   cap, could still exhaust memory. No rate limiting of any kind exists;
   a program facing genuinely hostile traffic needs that in front of it
   (a reverse proxy, a firewall), the same way any other minimal server
-  implementation would.
-- **The request parser (HTTP/1.1 headers, WebSocket frames) is new,
+  implementation would. claude.md #167's keep-alive means a connection
+  can now legitimately stay open with no request in flight at all
+  (waiting to be reused) — the cap above still applies to whatever a
+  connection is actually buffering, and an idle keep-alive connection is
+  closed automatically after ~15 seconds of nobody using it (see api.md's
+  own Keep-alive section), so this doesn't add an unbounded-lifetime
+  connection to the list above; it does mean a client that opens many
+  connections and sends just enough on each to avoid the idle timeout
+  could hold more connections open for longer than the previous
+  one-request-then-close model ever allowed — the same reverse-proxy/
+  firewall answer above still applies to a client doing that on purpose.
+  claude.md #168's WebSocket fragmentation reassembly buffer is a
+  SEPARATE accumulator from the per-frame cap above (each wire frame is
+  fully consumed out of the connection's own read buffer as soon as
+  it's parsed, so that buffer's cap alone would never have bounded a
+  message reassembled from many small frames) — explicitly capped at
+  the same 8MB, closing the connection with WebSocket code 1009
+  ("Message Too Big") if a peer tries to exceed it, rather than growing
+  without bound.
+- **The request parser (HTTP/1.1 headers, chunked-transfer-encoding
+  bodies, WebSocket frames and fragmentation reassembly) is new,
   hand-written C parsing untrusted bytes** — the single largest new
   category of memory-unsafety risk this language has ever taken on,
   audited and stress-tested (ASan + LeakSanitizer, including abrupt-
@@ -94,6 +121,12 @@ could feed a program that also happens to read stdin/argv. Concretely:
   libjpeg/libmpg123 elsewhere in this runtime, not a widely-deployed,
   independently-hardened third-party implementation. Treat it with the
   same caution any new, from-scratch network-facing parser deserves.
+  claude.md #168 also fixed a real, pre-existing bug this same
+  scrutiny turned up: a malformed request line only ever set an
+  internal `alive` flag to 0 without actually closing the socket or
+  freeing the connection slot — a real (if narrow, low-severity) fd/
+  memory leak for any client that sends garbage instead of a valid
+  request, now closed properly like every other rejected connection.
 
 Every other builtin's own external interface (filesystem,
 `environment`, X11/ALSA) is unchanged: still local-attacker-only, still
@@ -225,3 +258,17 @@ in claude.md and tests/CONTRACT.md:
   a broken socket at all — `send()` just returns an error — so the
   Windows port (windows.md) needed no equivalent fix, only the same
   return-value check every platform already does.
+- **Every `map[text]` this runtime ever built directly in C leaked its
+  own values** (claude.md #167, found while verifying keep-alive under
+  Valgrind, then confirmed pre-existing and unrelated to it): a request
+  header, a socket's own `state`, a URL's own `searchParams` — every one
+  of those maps' VALUES is owned, heap-allocated text, but all four were
+  released through the generic, deliberately value-blind
+  `festina_release_map` (correct for `map[int]`/`map[bool]`, wrong for
+  `map[text]`) instead of the value-aware release codegen already
+  generates for every Festina-visible `map[text]` variable. A leak, not
+  a use-after-free or corruption — confirmed with a debug-symbol build
+  under Valgrind, isolated from keep-alive by reproducing byte-for-byte
+  on a single plain request against the code exactly as it stood before
+  that entry. Fixed with `festina_release_text_map`, a C-side equivalent
+  of codegen's own wrapper, used at all four sites.

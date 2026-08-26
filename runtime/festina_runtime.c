@@ -370,23 +370,30 @@ char *festina_try_error(void) {
  * setjmp cares about its own call site's frame lifetime; longjmp has
  * no equivalent restriction.
  *
- * wasm32-wasi gets a stub, the identical shape festina_process_exec's
- * own wasm32-wasi branch already uses just below (see this file's own
- * top-of-file comment on why): __builtin_longjmp is flatly rejected by
- * clang for this target ("not supported for the current target",
- * confirmed directly -- LLVM's wasm32 backend has no SjLj lowering at
- * all outside emscripten's own EH pass, which this project doesn't
- * use), so this whole file would fail to compile for EVERY program,
- * try/throw or not, without this split -- this translation unit is
- * still compiled UNCONDITIONALLY for every wasm build. try/throw is
- * rejected outright at compile time instead (festina/cli.py's
- * _check_wasm_feature_supported, gated on codegen's own uses_try) --
- * this stub degrading every throw to fail()'s own behavior instead of
- * a hard compile error would be surprising, silently platform-
- * dependent semantics rather than a clear, honest "not supported
- * here"; it exists purely so this file compiles, never to be reached
- * by a real program. */
-#if !defined(__wasi__)
+ * wasm32-wasi AND macOS both get a stub, the identical shape
+ * festina_process_exec's own wasm32-wasi branch already uses just
+ * below (see this file's own top-of-file comment on why):
+ * __builtin_longjmp is flatly rejected by clang for both targets
+ * ("not supported for the current target", confirmed directly for
+ * each -- LLVM's wasm32 backend has no SjLj lowering at all outside
+ * emscripten's own EH pass, which this project doesn't use; LLVM's
+ * AArch64 backend (claude.md #170, found via a real macos-14 CI run --
+ * Apple Silicon, what every current Mac and every GitHub macOS runner
+ * actually is -- compiling this file unconditionally, try/throw or
+ * not) has no SjLj lowering either, even though the identical builtin
+ * compiles fine for x86_64-apple-macos, an architecture this project
+ * doesn't target), so this whole file would fail to compile for EVERY
+ * program on either platform, try/throw or not, without this split --
+ * this translation unit is still compiled UNCONDITIONALLY on both.
+ * try/throw is rejected outright at compile time instead (festina/
+ * cli.py's _check_wasm_feature_supported for wasm32-wasi, gated on
+ * codegen's own uses_try; _check_darwin_try_supported for macOS, same
+ * gate, same reasoning) -- this stub degrading every throw to fail()'s
+ * own behavior instead of a hard compile error would be surprising,
+ * silently platform-dependent semantics rather than a clear, honest
+ * "not supported here"; it exists purely so this file compiles, never
+ * to be reached by a real program on either platform. */
+#if !defined(__wasi__) && !defined(__APPLE__)
 void festina_throw(const char *msg) {
     if (g_festina_catch_top == NULL) {
         festina_fail(msg);
@@ -1029,7 +1036,12 @@ void festina_release_url(void *payload) {
     free(u->hostname);
     free(u->pathname);
     free(u->hash);
-    festina_release_map(u->search_params);
+    /* claude.md #167: festina_release_text_map, not the generic
+     * festina_release_map -- search_params' own values are owned text
+     * (festina_parse_search_params builds each one via
+     * festina_url_decode, the same shape festina_text_own produces),
+     * see that function's own doc comment for the leak this fixes. */
+    festina_release_text_map(u->search_params);
     free(u);
 }
 
@@ -3423,6 +3435,47 @@ void festina_async_io_dispatch(void *payload, void (*work_fn)(void *),
     if (release_fn) release_fn(payload);
 }
 
+/* claude.md #166: the http-servicing hook seam -- lets
+ * festina_run_event_loop (festina_runtime_graphics.c, linked only when a
+ * program opens a window) service an open openPort()/openSecurePort()
+ * listener without a direct cross-translation-unit reference into
+ * festina_runtime_http.c (linked only when a program uses http) --
+ * mirrors festina_set_async_io_hooks immediately above exactly, for the
+ * identical reason (a program using graphics but not http must never be
+ * forced to link http.o just because festina_run_event_loop names one
+ * of its symbols directly).
+ *
+ * This is what lifts claude.md #151's original "openPort() cannot be
+ * combined with graphics" restriction: previously, main()'s own loop-
+ * selection picked exactly one of festina_run_event_loop/
+ * festina_run_http_loop, so a program using both would have one of them
+ * silently never run at all -- rejected outright at compile time instead
+ * (festina/cli.py). Now festina_run_event_loop also drains ready http
+ * work each iteration (festina_http_service_ready below), bounding its
+ * own wait the same way it already bounds it for outstanding async-io
+ * work -- an open port adds up to FESTINA_ASYNC_IO_POLL_SECONDS of
+ * latency to accepting a connection or reading the next byte while a
+ * window is open, the same tradeoff already accepted for background
+ * blob/img/aud loads. festina_run_http_loop itself is UNCHANGED and
+ * still the loop used for a program that opens a port but never a
+ * window -- these hooks are purely additive. */
+static int64_t (*g_http_service_outstanding_fn)(void) = NULL;
+static void (*g_http_service_ready_fn)(void) = NULL;
+
+void festina_set_http_service_hooks(int64_t (*outstanding_fn)(void),
+                                    void (*ready_fn)(void)) {
+    g_http_service_outstanding_fn = outstanding_fn;
+    g_http_service_ready_fn = ready_fn;
+}
+
+int64_t festina_http_service_outstanding(void) {
+    return g_http_service_outstanding_fn ? g_http_service_outstanding_fn() : 0;
+}
+
+void festina_http_service_ready(void) {
+    if (g_http_service_ready_fn) g_http_service_ready_fn();
+}
+
 /* claude.md #165: bounds a sleep/poll timeout that would otherwise be
  * "block forever" (no active timer) to a short, regular wake -- the
  * only way festina_run_timer_loop's own plain nanosleep (no fd to
@@ -4060,6 +4113,42 @@ void festina_release_map(void *payload) {
      * scope limitation as festina_release_array above. */
     int64_t count = *(int64_t *)payload;
     void *entries = *(void **)((char *)payload + sizeof(int64_t));
+    festina_map_free_entries(count, entries);
+    free((char *)payload - sizeof(int64_t));
+}
+
+/* claude.md #167: found while chasing an unrelated keep-alive leak,
+ * confirmed pre-existing and unrelated to it (reproduces identically on
+ * a single plain request against the code exactly as it stood before
+ * this entry) -- festina_release_map above is deliberately value-blind
+ * (see its own doc comment), correct for a map[T] whose values need no
+ * freeing (map[int], map[bool], ...) but WRONG for one whose values are
+ * themselves owned, heap-allocated text -- every codegen-generated
+ * map[text] variable already gets a DIFFERENT, value-aware release
+ * function instead of the generic one (_release_fn_for_map in
+ * codegen.py, which frees each value through festina_map_for_each
+ * before deferring to festina_map_free_entries for the rest) precisely
+ * because of this. This runtime builds a handful of map[text] values
+ * directly in C, never through codegen, and every one of them was
+ * calling the wrong (generic) release: an inbound request's own
+ * `req.headers` and any http value's `.headers` in general
+ * (festina_runtime_http.c's festina_release_http and its outbound-
+ * response overwrite site), `socket.state` (festina_conn_teardown), and
+ * `url.searchParams` (festina_release_url, just below) all leaked every
+ * value they ever held. This is the C-side equivalent of codegen's own
+ * wrapper -- frees each value via festina_map_for_each first, then
+ * defers to the exact same festina_map_free_entries/header-free
+ * festina_release_map itself uses. */
+static void festina_free_map_text_value(int64_t raw, const char *key) {
+    (void)key;
+    free((void *)(intptr_t)raw);
+}
+
+void festina_release_text_map(void *payload) {
+    if (!festina_release_check(payload)) return;
+    int64_t count = *(int64_t *)payload;
+    void *entries = *(void **)((char *)payload + sizeof(int64_t));
+    festina_map_for_each(count, entries, festina_free_map_text_value);
     festina_map_free_entries(count, entries);
     free((char *)payload - sizeof(int64_t));
 }
