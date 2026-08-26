@@ -28,6 +28,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   linux:
@@ -176,6 +177,23 @@ jobs:
     # above.
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      # Temporary, for this run only: un-gates all three win32 features
+      # so the test suite's http/websocket tier actually exercises the
+      # winsock2 backend on real Windows CI for the first time (windows.md
+      # Phase 4 / claude.md #151 had only ever been MinGW cross-compiled
+      # before this). Audio/graphics gain no NEW signal from this --
+      # every test that would exercise them depends on Linux-only
+      # fixtures (Xvfb, an ALSA-null-plugin trick) with no Windows
+      # equivalent in this suite, so those two tiers still just skip --
+      # but leaving them un-gated here too is what actually proves the
+      # planned claude.md gate-removal doesn't break anything before it
+      # lands. Deliberately NOT setting FESTINA_STRICT_DEPS=1 here (unlike
+      # the linux job): that would turn the Xvfb/ALSA-only skips above
+      # into failures for reasons unrelated to these three gates.
+      FESTINA_ENABLE_WINDOWS_AUDIO: "1"
+      FESTINA_ENABLE_WINDOWS_GRAPHICS: "1"
+      FESTINA_ENABLE_WINDOWS_HTTP: "1"
     defaults:
       run:
         shell: msys2 {0}
