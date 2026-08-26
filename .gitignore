@@ -150,7 +150,12 @@ __pycache__/
 # Festina -- created automatically at runtime by any compiled program
 # that declares a table (claude.md #29), including if you run one of
 # examples/*.f from the repo root while trying things out manually.
+# -shm/-wal are SQLite's own WAL-mode companion files (claude.md #33:
+# the db is opened in WAL mode) -- transient, churn on every run, and
+# meaningless to version control the same way the main file is.
 festina.sqlite
+festina.sqlite-shm
+festina.sqlite-wal
 
 # benchmark.md's build outputs -- benchmarks/run_benchmarks.py builds
 # into a temp dir itself, so these only appear if a binary is compiled

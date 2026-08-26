@@ -52,8 +52,20 @@ syn keyword festinaInclude import
 " ---- `func` declarations: `<type> func name(...)` / `void func
 " name(...)`. `func` itself is already festinaType above (it also
 " doubles as the func[T]:U type keyword); this only picks out the
-" declared name right after it. ----
-syn match festinaFuncName "\<func\s\+\zs[A-Za-z_][A-Za-z0-9_]*\ze\s*("
+" declared name right after it.
+"
+" The lookbehind `\%(...\)\@<=` (rather than `\zs`) is deliberate: a
+" `\zs`-based match's nominal START position is still `\<func` itself,
+" competing directly with festinaType's own "func" keyword entry at
+" that exact column -- and a `:syn keyword` always wins a same-
+" position tie against a `:syn match`, regardless of definition order
+" (`:help :syn-priority`), so a `\zs` version of this pattern never
+" highlights anything at all. The lookbehind instead makes the name
+" itself the match's real start, one column past where "func" was
+" already fully consumed by the keyword -- confirmed directly with
+" `synstack()`: the `\zs` version left a declared function's own name
+" with no highlight whatsoever; this version correctly gets Function. ----
+syn match festinaFuncName "\%(\<func\s\+\)\@<=[A-Za-z_][A-Za-z0-9_]*\ze\s*("
 
 " ---- A representative set of built-in global functions
 " (festina/semantic.py's _BUILTIN_RETURN_TYPES/_BUILTIN_SIGNATURES and
