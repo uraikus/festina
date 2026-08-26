@@ -578,6 +578,33 @@ class TestHttpKeepAlive:
         assert data.endswith(b"hello")
 
 
+def _recv_one_http_response(sock):
+    """Reads exactly one HTTP/1.1 response off a raw, still-OPEN socket
+    -- robust against the response arriving across more than one
+    recv() call (real, if rare, under load -- TCP makes no promise a
+    small response arrives in a single read), unlike a bare
+    `sock.recv(4096)`. Needed anywhere the connection is expected to
+    stay open afterward (keep-alive) -- there's no EOF to "read until"
+    the way TestHttpServer's/TestChunkedTransferEncoding's own
+    Connection-close tests already do."""
+    import re
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            return data
+        data += chunk
+    header_block, _, rest = data.partition(b"\r\n\r\n")
+    m = re.search(rb"Content-Length:\s*(\d+)", header_block, re.IGNORECASE)
+    content_length = int(m.group(1)) if m else 0
+    while len(rest) < content_length:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        rest += chunk
+    return header_block + b"\r\n\r\n" + rest
+
+
 class TestChunkedTransferEncoding:
     """claude.md #168: `Transfer-Encoding: chunked` -- previously
     unsupported in either direction (api.md's own former "No chunked
@@ -644,7 +671,7 @@ class TestChunkedTransferEncoding:
         sock.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
                      b"3\r\nfoo\r\n0\r\n\r\n")
         sock.settimeout(5)
-        resp1 = sock.recv(4096)
+        resp1 = _recv_one_http_response(sock)
         assert resp1.endswith(b"foo")
         assert b"Connection: keep-alive" in resp1
         # A second, ordinary request on the SAME connection -- proves
@@ -1216,22 +1243,32 @@ def _ws_mask_frame(fin, opcode, payload):
     return header + mask + masked
 
 
+def _ws_recv_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
 def _ws_recv_frame(sock):
     """A trimmed sibling of conftest.py's own `_WsConn.recv_frame` --
-    same reasoning as _ws_mask_frame above for not importing it."""
-    hdr = sock.recv(2)
+    same reasoning as _ws_mask_frame above for not importing it. Every
+    read goes through _ws_recv_exact, not a bare sock.recv() -- TCP
+    makes no promise even a 2-byte header arrives in a single read, and
+    a bare recv() here flaked under full-suite load once already (see
+    _recv_one_http_response's own doc comment above, the identical
+    lesson for HTTP responses)."""
+    hdr = _ws_recv_exact(sock, 2)
     opcode = hdr[0] & 0x0F
     length = hdr[1] & 0x7F
     if length == 126:
-        length = struct.unpack(">H", sock.recv(2))[0]
+        length = struct.unpack(">H", _ws_recv_exact(sock, 2))[0]
     elif length == 127:
-        length = struct.unpack(">Q", sock.recv(8))[0]
-    payload = b""
-    while len(payload) < length:
-        chunk = sock.recv(length - len(payload))
-        if not chunk:
-            break
-        payload += chunk
+        length = struct.unpack(">Q", _ws_recv_exact(sock, 8))[0]
+    payload = _ws_recv_exact(sock, length)
     return opcode, payload
 
 
