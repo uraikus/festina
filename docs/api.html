@@ -408,10 +408,14 @@
         <a href="#logging-and-rendering">Logging and rendering</a>
         <a href="#structs">Structs</a>
         <a class="sub" href="#a-struct-can-name-itself">A struct can name itself</a>
+        <a href="#enums">Enums</a>
+        <a class="sub" href="#typeof">typeof</a>
+        <a class="sub" href="#enum-field-access">Field access</a>
+        <a class="sub" href="#enum-representation">Representation and cost</a>
         <a href="#arrays">Arrays</a>
         <a class="sub" href="#indexing-is-not-bounds-checked">Indexing is not bounds-checked</a>
+        <a class="sub" href="#amor-arrays">amor -- amortized-growth arrays</a>
         <a href="#maps">Maps</a>
-        <a class="sub" href="#amor-maps">amor -- amortized-growth maps</a>
       </div>
       <div class="nav-group">
         <div class="nav-group-title">Standard library</div>
@@ -449,6 +453,7 @@
         <a class="sub" href="#non-blocking-requests">Non-blocking requests</a>
         <a class="sub" href="#http-send-shorthand">Shorthand: {...}.send()</a>
         <a class="sub" href="#url-type">The url type / parseURL()</a>
+        <a class="sub" href="#http-keep-alive">Keep-alive</a>
         <a class="sub" href="#http-limitations">Limitations</a>
         <a class="sub" href="#opensecureport">openSecurePort() -- TLS</a>
         <a href="#freeing-and-deleting">Freeing and deleting</a>
@@ -1079,6 +1084,116 @@ a.next = a      <span class="cm">// reclaimed when `a` goes away, cycle and all<
         </p>
       </section>
 
+      <section class="doc-section" id="enums">
+        <h2>Enums <a class="anchor" href="#enums">#</a></h2>
+        <pre class="code"><span class="kw">struct</span> Circle { radius:<span class="kw">int</span> }
+<span class="kw">struct</span> Square { area:<span class="kw">int</span> }
+
+<span class="kw">enum</span> Shape = Circle, Square
+
+<span class="kw">int</span> func extractShapeMetric(shape:Shape) {
+    <span class="kw">if</span> typeof shape == <span class="str">'Circle'</span> {
+        <span class="kw">return</span> shape.radius
+    } <span class="kw">else</span> {
+        <span class="kw">return</span> shape.area
+    }
+}
+
+<span class="kw">Circle</span> c
+c.radius = 5
+log(extractShapeMetric(c))   <span class="cm">// 5</span></pre>
+        <p>
+          <code>enum Name = Member1, Member2, ...</code> declares a
+          tagged union: a <code>Shape</code>-typed value can hold a
+          <code>Circle</code> <em>or</em> a <code>Square</code>, and the
+          language remembers which one it actually is at runtime. A
+          member may be any type — a struct, a primitive, an
+          <code>arr[T]</code>/<code>map[T]</code>, or any other built-in
+          type — not only structs.
+        </p>
+        <p class="muted">
+          Assigning a member value into an enum-typed slot (a variable,
+          a function parameter/return, a struct field, an array/map
+          element) is an automatic, one-directional coercion — the
+          reverse never happens implicitly:
+        </p>
+        <pre class="code"><span class="kw">Shape</span> shape = c        <span class="cm">// Circle -&gt; Shape, fine</span>
+<span class="kw">Circle</span> back = shape     <span class="cm">// compile error -- Shape is not a Circle</span></pre>
+
+        <h3 id="typeof">typeof <a class="anchor" href="#typeof">#</a></h3>
+        <p>
+          <code>typeof &lt;expr&gt;</code> reads a value's own concrete
+          runtime type as <code>text</code>. For anything not
+          enum-typed, the answer is always the value's own static type
+          — <code>typeof 5</code> is <code>'int'</code>, <code>typeof
+          myUser</code> is <code>'User'</code> — since nothing outside an
+          enum can hold more than one type at runtime. On an
+          enum-typed value, <code>typeof</code> returns whichever
+          member is actually stored — <strong>never</strong> the enum's
+          own name, so <code>typeof shape</code> above is
+          <code>'Circle'</code> or <code>'Square'</code>, never
+          <code>'Shape'</code>:
+        </p>
+        <pre class="code">log(typeof shape)             <span class="cm">// 'Circle'</span>
+log(typeof shape == <span class="str">'Circle'</span>) <span class="cm">// true</span></pre>
+
+        <h3 id="enum-field-access">Field access <a class="anchor" href="#enum-field-access">#</a></h3>
+        <p>
+          <code>shape.radius</code> reads straight through to the field
+          of whichever member struct <code>shape</code> currently holds
+          — but only when <strong>every</strong> member of the enum is
+          a struct, and no two members declare a field with the same
+          name (rejected at the <code>enum</code> declaration itself,
+          since <code>shape.radius</code> would otherwise be ambiguous).
+          A member with no field of that name at all is also rejected
+          at compile time. Field access on a <em>mixed</em> enum (any
+          non-struct member) is a compile error — there is no single
+          field layout to read through when the value might currently
+          be an <code>int</code>.
+        </p>
+        <p class="muted">
+          Reading a field the currently-held variant doesn't actually
+          have — a missing <code>typeof</code> guard, or a wrong one —
+          fails loudly at runtime (<code>fail</code>) rather than
+          silently reading whatever bytes happen to sit at that offset
+          in a different struct's layout. Reaching either
+          <code>typeof</code> or field access on an enum-typed value
+          that was declared but never assigned (it reads
+          <code>null</code>, like any other reference-typed value with
+          no auto-vivify) fails the same loud way instead of crashing.
+        </p>
+        <pre class="code"><span class="kw">struct</span> Circle { radius:<span class="kw">int</span> }
+<span class="kw">struct</span> Square { area:<span class="kw">int</span> }
+<span class="kw">enum</span> Shape = Circle, Square
+
+<span class="kw">Square</span> s
+s.area = 42
+<span class="kw">Shape</span> shape = s
+log(shape.radius)   <span class="cm">// fail: field 'radius' is only valid when this Shape value is a Circle</span></pre>
+        <p class="muted">
+          Guard with <code>typeof</code> before reading a field whose
+          presence depends on which variant you actually have:
+        </p>
+        <pre class="code"><span class="kw">if</span> typeof shape == <span class="str">'Circle'</span> {
+    log(shape.radius)
+} <span class="kw">else</span> {
+    log(shape.area)
+}</pre>
+
+        <h3 id="enum-representation">Representation and cost <a class="anchor" href="#enum-representation">#</a></h3>
+        <p class="muted">
+          A pure-struct enum (every member a struct) is zero-overhead: a
+          <code>Shape</code>-typed value <em>is</em> whichever member
+          struct's own pointer it currently holds, self-tagged in that
+          struct's own heap header — no extra allocation, no wrapping. A
+          mixed enum (any non-struct member) gets a small heap-boxed
+          <code>{tag, value}</code> wrapper instead, refcounted the same
+          way a struct is. Either way, reassigning or letting an
+          enum-typed value go out of scope releases whatever it held
+          exactly like any other refcounted value.
+        </p>
+      </section>
+
       <section class="doc-section" id="arrays">
         <h2>Arrays <a class="anchor" href="#arrays">#</a></h2>
         <pre class="code"><span class="kw">arr[int]</span> numbers = [1, 2, 3]
@@ -1128,6 +1243,52 @@ numbers[0] = 10</pre>
           <a href="#growing-arrays">Growing arrays</a> below). Indexing is
           the only unchecked operation in the language.
         </p>
+
+        <h3 id="amor-arrays">amor — amortized-growth arrays <a class="anchor" href="#amor-arrays">#</a></h3>
+        <pre class="code"><span class="kw">amor arr[int]</span> scores = []
+<span class="kw">const amor arr[text]</span> tags = [<span class="str">'a'</span>, <span class="str">'b'</span>]   <span class="cm">// composes with const</span>
+
+<span class="kw">int</span> i = 0
+<span class="kw">while</span> i &lt; 10000 {
+    scores.push(i)
+    i = i + 1
+}</pre>
+        <p class="muted">
+          <code>amor arr[T]</code> — an "amortized array" — is
+          <code>arr[T]</code> with a different internal growth strategy:
+          doubling capacity as needed instead of growing by exactly one
+          element per push, so a long run of pushes costs O(log n)
+          reallocations instead of O(n). Same literal syntax, same
+          indexed get/set, same methods
+          (<code>push()</code><wbr>/<code>pop()</code><wbr>/<code>shift()</code><wbr>/<code>unshift()</code><wbr>/<code>splice()</code>),
+          and the same <code>.toText()</code>/JSON rendering as plain
+          <code>arr[T]</code> — <code>amor</code> only changes how the
+          value grows internally, never what it does or looks like from
+          the outside.
+        </p>
+        <div class="callout">
+          <strong>Requires an initializer</strong> —
+          <code>amor arr[int] xs</code> with no <code>= ...</code> is a
+          compile error — unlike a plain <code>arr[T]</code>, which can
+          start implicitly empty, an amortized array's own declaration
+          always needs a real value to store. Composes with
+          <code>const</code> (<code>const amor arr[T] xs = ...</code>);
+          as a struct field (<code>xs:amor arr[int]</code>), no
+          initializer is needed or possible, the same as any other
+          struct field — it starts empty the first time the field is
+          actually touched.
+        </div>
+        <p class="muted">
+          An <code>amor arr[T]</code> and the plain <code>arr[T]</code>
+          of the same element type are two genuinely different types,
+          the same way <code>int</code> and <code>float</code> are —
+          assigning one to the other, or passing one where the other is
+          expected, is a compile error. Convert by copying
+          element-by-element (a loop, or
+          <code>arr[T] plain = amorXs.splice(0, amorXs.length)</code>,
+          which empties the amortized array into a fresh plain one) if
+          you need to cross that boundary.
+        </p>
       </section>
 
       <section class="doc-section" id="maps">
@@ -1158,54 +1319,21 @@ npcHealths.forEach(logHealth)   <span class="cm">// (value, key) -- visit order 
           already-declared function taking exactly
           <code>(value, key:text)</code> and returning nothing, the same
           "bare name of a declared function" restriction
-          <code>setTimeout</code>'s callback has. Not a hash table
-          internally — lookup/insert are O(n) over the entry count, a
-          deliberate simplicity tradeoff for what's meant to be a small,
-          config/game-state-shaped collection, not a large-scale data
-          structure. Also grows by exactly one entry per insert
-          internally, not amortized — see <code>amor map[T]</code>
-          below if that matters for a specific map.
+          <code>setTimeout</code>'s callback has. A genuine hash table
+          internally — open addressing (linear probing), FNV-1a
+          hashing, tombstone deletion, doubling capacity whenever the
+          table crosses 75% load — average O(1) get/set/delete rather
+          than a scan over every entry, growing geometrically the same
+          way <a href="#amor-arrays">amortized
+          arrays</a> do, without needing a separate opt-in type for it.
         </p>
-
-        <h3 id="amor-maps">amor — amortized-growth maps <a class="anchor" href="#amor-maps">#</a></h3>
-        <pre class="code"><span class="kw">amor map[int]</span> hitCounts = {}
-<span class="kw">const amor map[text]</span> labels = {<span class="str">'ok'</span>: <span class="str">'success'</span>}   <span class="cm">// composes with const</span>
-
-<span class="kw">int</span> i = 0
-<span class="kw">while</span> i &lt; 10000 {
-    hitCounts[<span class="str">`key${i}`</span>] = i
-    i = i + 1
-}</pre>
         <p class="muted">
-          <code>amor map[T]</code> — an "amortized map" — is
-          <code>map[T]</code> with a different internal growth strategy:
-          doubling capacity as needed instead of growing by exactly one
-          entry per insert, so a long run of inserts costs O(log n)
-          reallocations instead of O(n). Same literal syntax, same
-          indexed get/set, <code>.forEach()</code>, <code>delete</code>,
-          and <code>.toText()</code>/JSON rendering as plain
-          <code>map[T]</code> — <code>amor</code> only changes how it
-          grows internally, not what it does.
-        </p>
-        <div class="callout">
-          <strong>Requires an initializer</strong> —
-          <code>amor map[int] m</code> with no <code>= ...</code> is a
-          compile error — unlike plain <code>map[T]</code>, which can
-          start implicitly empty, an amortized map's own declaration
-          always needs a real value to store. Composes with
-          <code>const</code> (<code>const amor map[T] m = ...</code>);
-          as a struct field (<code>m:amor map[int]</code>), no
-          initializer is needed or possible, the same as any other
-          struct field.
-        </div>
-        <p class="muted">
-          <code>amor arr[T]</code> parses and type-checks (also
-          composing with <code>const</code>) but does not yet change
-          how an array grows —
-          <code>push()</code>/<code>unshift()</code>/etc. still realloc
-          to exactly the new size either way, identically to plain
-          <code>arr[T]</code>. Real array amortization is a natural
-          follow-up, not yet built.
+          <code>map[T]</code> has no <code>amor</code> variant — a plain
+          <code>map[T]</code> already grows geometrically as an
+          intrinsic part of being a hash table, so there is nothing left
+          for <code>amor map[T]</code> to opt into; the <code>amor</code>
+          keyword only ever applies to <code>arr[T]</code> (see
+          <a href="#amor-arrays">Arrays</a> above).
         </p>
       </section>
 
@@ -2010,12 +2138,14 @@ log(fresh.exists())                   <span class="cm">// true</span></pre>
         <h3 id="loading-in-the-background">Loading in the background: .callback() <a class="anchor" href="#loading-in-the-background">#</a></h3>
         <p>
           <code>blob key = 'path'</code> reads the file synchronously,
-          blocking until it's done. <code>.callback()</code> — on any
-          <code>text</code> path expression, not just a literal —
-          starts the read in the background instead, returning an empty
-          (not-yet-loaded) blob immediately and firing a callback once
-          the read actually finishes, from the same main thread
-          everything else in a Festina program runs on:
+          blocking until it's done — and <code>img</code>/<code>aud</code>
+          work the same way. <code>.callback()</code> — on any
+          <code>text</code> path expression, not just a literal, and
+          for all three types — starts the read in the background
+          instead, returning an empty (not-yet-loaded) value
+          immediately and firing a callback once the read actually
+          finishes, from the same main thread everything else in a
+          Festina program runs on:
         </p>
         <pre class="code"><span class="kw">void</span> func onLoaded(b:blob) {
     log(<span class="str">`loaded: ${b.toText()}`</span>)
@@ -2025,10 +2155,12 @@ log(fresh.exists())                   <span class="cm">// true</span></pre>
 log(<span class="str">'dispatched'</span>)                     <span class="cm">// logs BEFORE onLoaded ever runs</span></pre>
         <p class="muted">
           <code>callback</code> must be <code>func[blob]:void</code>,
-          called with the SAME <code>b</code> the declaration produced,
-          mutated in place with the real bytes once they've been read
-          (exactly the shape <code>req.send()</code>'s own
-          <code>callback</code> already has — see
+          <code>func[img]:void</code>, or <code>func[aud]:void</code> —
+          whichever matches the declared type — called with the SAME
+          value the declaration produced, mutated in place with the
+          real content once it's been read (exactly the shape
+          <code>req.send()</code>'s own <code>callback</code> already
+          has — see
           <a href="#non-blocking-requests">Non-blocking requests</a>
           above). When the response doesn't need a name, drop the
           variable and write the load as its own statement, prefixed
@@ -2037,17 +2169,28 @@ log(<span class="str">'dispatched'</span>)                     <span class="cm">
           type is already unambiguous from <code>callback</code>'s
           signature):
         </p>
-        <pre class="code"><span class="kw">blob</span> <span class="str">'large-file.dat'</span>.callback(onLoaded)</pre>
+        <pre class="code"><span class="kw">blob</span> <span class="str">'large-file.dat'</span>.callback(onLoaded)
+<span class="kw">img</span> <span class="str">'sprite.png'</span>.callback(onImageLoaded)
+<span class="kw">aud</span> <span class="str">'theme.mp3'</span>.callback(onClipLoaded)</pre>
         <p class="muted">
-          An unreadable path behaves exactly like the synchronous form
-          — <code>b.exists()</code> is <code>false</code>,
-          <code>b.toText()</code> is empty — there's simply no separate
-          "it failed" signal beyond that, matching blob's own existing
-          "test, don't fail" contract; the whole point of
-          <code>callback</code> is not reading <code>b</code> until it
-          fires.
+          An unreadable path, an unrecognized format, or corrupt file
+          data all behave exactly like the synchronous form's outcome
+          would if it could be observed without crashing the program —
+          <code>b.exists()</code> is <code>false</code> and
+          <code>b.toText()</code> is empty for a blob; an
+          <code>img</code> stays a 1×1 transparent placeholder
+          (<code>.width</code>/<code>.height</code> both <code>1</code>);
+          an <code>aud</code> stays silent (playing it is a harmless
+          no-op). There's simply no separate "it failed" signal beyond
+          that, matching blob's own existing "test, don't fail"
+          contract; the whole point of <code>callback</code> is not
+          reading the value until it fires. This is deliberately
+          narrower than the synchronous form: <code>img icon =
+          'bad.png'</code> still fails the program outright on exactly
+          those same three problems — <code>.callback()</code> only
+          softens the failure because a background worker thread has no
+          way to fail the program loudly in the first place.
         </p>
-        <p class="muted"><strong>img/aud don't have this yet</strong> — only <code>blob</code>.</p>
 
         <p><code>toText()</code> hands back an ordinary owned <code>text</code>, so it composes with everything else:</p>
         <pre class="code"><span class="kw">blob</span> data = <span class="str">'data.csv'</span>
@@ -2252,7 +2395,13 @@ log(status)                            <span class="cm">// 0</span></pre>
           Fires once per incoming HTTP request, fully parsed (request
           line, headers, and body already buffered — see
           <a href="#http-limitations">Limitations</a> below for what
-          "fully parsed" doesn't include). <code>req.code</code> is
+          "fully parsed" doesn't include). A
+          <code>Transfer-Encoding: chunked</code> body is decoded
+          transparently into the same buffered body a
+          <code>Content-Length</code> request already gets —
+          <code>req.toText()</code>/<code>.toBlob()</code>/etc. don't
+          need to know or care which one a client actually sent.
+          <code>req.code</code> is
           <code>null</code> (no response exists yet); <code>req.url</code>
           is reconstructed from the connection's own scheme/<code>Host</code>
           header/path (falling back to <code>127.0.0.1:&lt;port&gt;</code>
@@ -2341,6 +2490,24 @@ req.send(res)                         <span class="cm">// see below</span></pre>
           connection ends, however it ends (the peer closed it, sent a
           close frame, or the read failed) — never for a plain HTTP
           connection that never upgraded.
+        </p>
+        <p class="muted">
+          <strong>Fragmentation is invisible to <code>on message</code>.</strong>
+          A peer may split one logical message across several WebSocket
+          frames (RFC 6455 §5.4) — this runtime reassembles them
+          itself, so <code>on message</code> fires exactly once per
+          MESSAGE either way, with the full, already-concatenated
+          <code>blob</code>; there's no way to observe the individual
+          fragments, and no reason to want to. A ping/pong or close
+          frame arriving in the middle of another message's own
+          fragments is answered/handled immediately without disturbing
+          that reassembly (the RFC's own explicit allowance for
+          interleaving control frames this way). A message whose peer
+          never sends the closing fragment, an out-of-place
+          continuation frame, or a reassembled message over 8MB, all
+          close the connection with a real WebSocket close code (1002
+          protocol error, or 1009 message too big) — never a hang or a
+          silent drop.
         </p>
         <pre class="code">s.state                               <span class="cm">// map[text] -- a per-connection scratchpad,</span>
                                        <span class="cm">// starts empty, persists for the connection's</span>
@@ -2527,13 +2694,42 @@ u.hash                                <span class="cm">// text -- '#frag'</span>
           by <code>parseURL()</code>, and never mutated afterward.
         </p>
 
+        <h3 id="http-keep-alive">Keep-alive <a class="anchor" href="#http-keep-alive">#</a></h3>
+        <p>
+          A server connection stays open for another request once a
+          response finishes, instead of closing after every single one
+          — ordinary HTTP/1.1 semantics, nothing to opt into:
+        </p>
+        <ul>
+          <li><strong>HTTP/1.1 requests default to keep-alive</strong>, matching every real client (browsers, <code>curl</code>, <code>http.client</code>, ...). Send <code>Connection: close</code> on the request to close after that one response anyway.</li>
+          <li><strong>HTTP/1.0 requests default to close</strong>, unless the request itself sends <code>Connection: keep-alive</code>.</li>
+          <li><strong>An idle connection — nothing in flight, just open and waiting to be reused — is closed automatically after about 15 seconds</strong> with no new request. A slow client still sending its OWN request (headers or body trickling in) is never affected by this; only genuinely idle time between requests counts.</li>
+          <li>Combines with everything else <code>openPort()</code> already does, including combining <code>openPort()</code> with graphics and WebSocket upgrades (an <code>on upgrade</code> connection leaves HTTP request/response handling behind entirely, so keep-alive has nothing to do there — it was never "closing" a WebSocket connection to begin with).</li>
+        </ul>
+        <p class="muted">
+          Nothing about handling a single request changes —
+          <code>on request</code> fires once per request exactly as
+          before, <code>req.headers</code>/<code>req.toText()</code>/etc.
+          describe just that one request, and a fresh <code>req</code>
+          value arrives for the next one on the same connection. The
+          <code>Connection</code> response header is set automatically
+          to match; a program's own
+          <code>req.send()</code>/<code>req.ok()</code>/<code>req.redirect()</code>
+          never need to think about it.
+        </p>
+
         <h3 id="http-limitations">Limitations <a class="anchor" href="#http-limitations">#</a></h3>
         <ul>
-          <li><strong>HTTP/1.1 request-line + headers + a <code>Content-Length</code> body only.</strong> No chunked transfer-encoding, no HTTP/1.0-specific behavior.</li>
-          <li><strong>No keep-alive.</strong> Every response closes the connection afterward — each request is its own TCP connection, start to finish.</li>
-          <li><strong>No WebSocket fragmentation, ping/pong sent by this runtime, or extensions.</strong> A fragmented message (a frame with <code>FIN=0</code>, or a continuation frame) closes the connection rather than being silently dropped or misread. A received ping is answered with a pong automatically; a received pong is ignored. <code>permessage-deflate</code> and every other WebSocket extension are unsupported.</li>
-          <li><strong>Linux and macOS, plus Windows behind an opt-in flag.</strong> Linux/macOS use plain POSIX sockets; Windows uses a real winsock2 port (built, CI-compiled — see <a href="https://github.com/uraikus/festina/blob/main/windows.md">windows.md</a>) gated behind <code>FESTINA_ENABLE_WINDOWS_HTTP=1</code> pending real-hardware verification, the same shape audio/graphics already use there. Not available under <code>--target=wasm32-wasi</code> at all — WASI Preview 1 has no listening-socket support — rejected at compile time; see <a href="https://github.com/uraikus/festina/blob/main/wasm.md">wasm.md</a>.</li>
-          <li><strong>Cannot be combined with graphics</strong> (<code>render()</code>, or an <code>on mouseDown</code>/.../<code>close</code> handler) in the same program — the server's own event loop and the graphics event loop are mutually exclusive in this version. <code>setTimeout</code>/<code>setInterval</code> combine fine; both are serviced from the same loop.</li>
+          <li><strong>No ping/pong sent by this runtime, and no WebSocket extensions.</strong> A received ping is answered with a pong automatically; a received pong is ignored. <code>permessage-deflate</code> and every other WebSocket extension are unsupported (fragmentation is not an extension — see <a href="#websocket">WebSocket</a> above).</li>
+          <li><strong>Linux, macOS, and Windows.</strong> Linux/macOS use plain POSIX sockets; Windows uses a real winsock2 port (see <a href="https://github.com/uraikus/festina/blob/main/windows.md">windows.md</a>). One Windows-specific caveat, already true of every platform's <a href="#graceful-shutdown">Graceful shutdown</a> story below: Windows has no real <code>SIGTERM</code> delivery, so the connection-drain grace period only applies to Ctrl-C there, not to however a process gets killed the <code>SIGTERM</code> way on Linux/macOS (e.g. <code>taskkill</code> without <code>/F</code> doesn't reach it the same way). Not available under <code>--target=wasm32-wasi</code> at all — WASI Preview 1 has no listening-socket support — rejected at compile time; see <a href="https://github.com/uraikus/festina/blob/main/wasm.md">wasm.md</a>.</li>
+          <li>
+            <strong>Combining with graphics</strong> (<code>render()</code>, or an <code>on mouseDown</code>/.../<code>close</code> handler) in the same program works, but the two loops don't run side by side — a program that also opens a window blocks in the graphics event loop the whole time, which services the open port from inside itself rather than a separate thread. Practically, that means:
+            <ul>
+              <li><strong>Up to ~20ms of added latency</strong> accepting a connection or reading the next byte while the window is open — the graphics loop only checks for http work on its own regular wake, the same bound already accepted for a background <code>blob</code>/<code>img</code>/<code>aud</code> <code>.callback()</code> load (see <a href="#loading-in-the-background">Files</a> above). Negligible for interactive use; worth knowing if you're benchmarking raw request latency.</li>
+              <li><strong>No graceful-shutdown grace period.</strong> The http-only server drains already-open connections for up to 10 seconds after Ctrl-C/SIGTERM (see <a href="#graceful-shutdown">Graceful shutdown</a> below) before exiting; a combined program instead closes the window and exits immediately, with no equivalent drain window for an in-flight request.</li>
+            </ul>
+            <code>setTimeout</code>/<code>setInterval</code> combine fine with either shape; all three (timers, an open port, and a window) are serviced from the same loop once graphics is involved.
+          </li>
         </ul>
         <p class="muted">
           See <a href="#graceful-shutdown">Graceful shutdown</a> below
@@ -2600,9 +2796,7 @@ openSecurePort(8443, key)</pre>
         </p>
         <p class="muted">
           <strong>Scope, beyond what <a href="#http-limitations">Limitations</a>
-          above already says</strong> (all of it applies here too —
-          HTTP/1.1 request-line + headers + <code>Content-Length</code>
-          body, no keep-alive, WebSocket text/binary/close frames only):
+          above already says</strong> (all of it applies here too):
         </p>
         <ul>
           <li><strong>Server-side only.</strong> There is no TLS <em>client</em> in this language — <code>openSecurePort()</code> is the only TLS-related builtin.</li>
@@ -2610,7 +2804,7 @@ openSecurePort(8443, key)</pre>
           <li><strong>No client-certificate / mutual TLS.</strong> This runtime never asks a connecting client for a certificate.</li>
           <li><strong>No ALPN.</strong> Every connection is plain HTTP/1.1-over-TLS — no HTTP/2 negotiation.</li>
           <li><strong>An encrypted (password-protected) private key is rejected</strong> — the key in <code>key</code> must be in the clear.</li>
-          <li><strong>Linux, plus macOS and Windows behind the same opt-in-flag / real-hardware-verification story <code>openPort()</code>'s own Limitations entry above describes</strong> (<code>FESTINA_ENABLE_MACOS_HTTP=1</code><wbr>/<code>FESTINA_ENABLE_WINDOWS_HTTP=1</code> — there is no separate TLS-specific flag, since <code>openSecurePort()</code> always brings <code>openPort()</code>'s own listener/event-loop machinery along with it). Not available under <code>--target=wasm32-wasi</code>, for the identical reason <code>openPort()</code> isn't there either.</li>
+          <li><strong>Linux and Windows, plus macOS behind the same opt-in-flag / real-hardware-verification story <code>openPort()</code>'s own Limitations entry above describes</strong> (<code>FESTINA_ENABLE_MACOS_HTTP=1</code> — Windows needs no such flag anymore, and there is no separate TLS-specific flag on either platform, since <code>openSecurePort()</code> always brings <code>openPort()</code>'s own listener/event-loop machinery along with it, including that same graceful-shutdown gap on Windows). Not available under <code>--target=wasm32-wasi</code>, for the identical reason <code>openPort()</code> isn't there either.</li>
         </ul>
       </section>
 
@@ -2806,6 +3000,14 @@ xs.indexOf(3)       <span class="cm">// -&gt; first index holding 3, or -1</span
           either way only the <strong>removed</strong> elements come
           back, never the inserted ones.
         </p>
+        <p class="muted">
+          <code>push()</code><wbr>/<code>unshift()</code><wbr>/<code>pop()</code><wbr>/<code>shift()</code><wbr>/<code>splice()</code>
+          each resize the backing buffer to exactly the new length
+          internally, not amortized — see
+          <a href="#amor-arrays">amor — amortized-growth arrays</a>
+          above if that matters for a specific array (a long run of
+          pushes in particular).
+        </p>
         <p>
           <code>pop()</code>/<code>shift()</code> on an empty array
           return <code>null</code> — not zero, so an empty pop is
@@ -2957,9 +3159,9 @@ log(maxAudioPlayers())         <span class="cm">// -&gt; 4, i.e. what was actual
           that has been playing longest is closest to finishing anyway —
           dropping the <em>new</em> play instead would silence a
           rapid-fire effect at exactly the moment it fires fastest.
-          <code>setMaxAudioPlayers(1)</code> is the way to ask for the old
-          behaviour back: one channel, restarted from the beginning on
-          every <code>play()</code>.
+          <code>setMaxAudioPlayers(1)</code> restricts the pool to a
+          single channel, so every <code>play()</code> restarts
+          playback from the beginning on that one channel.
         </p>
 
         <h3 id="channels-and-looping">Channels and looping <a class="anchor" href="#channels-and-looping">#</a></h3>
@@ -3081,7 +3283,7 @@ close(1)          <span class="cm">// prints "exiting with 1", then exits with s
     req.send({<span class="str">'code'</span>: 200, <span class="str">'body'</span>: <span class="str">'hello'</span>})
 }
 openPort(8080)
-<span class="cm">// Ctrl-C now logs "shutting down (130)" instead of just vanishing.</span></pre>
+<span class="cm">// Ctrl-C logs "shutting down (130)" before the process exits.</span></pre>
         <p class="muted">
           For an HTTP/WebSocket server specifically, shutdown is
           <strong>graceful</strong> in the way that matters: every
@@ -3098,14 +3300,23 @@ openPort(8080)
           A plain script with no <code>openPort()</code>/timers/graphics
           — just top-level code, or your own hand-written loop — keeps
           the OS's own default <code>SIGINT</code>/<code>SIGTERM</code>
-          behavior (an immediate kill, <code>on exit</code> not run)
-          exactly as any other program's does: there is no point in such
-          a program's own execution where it could ever notice a
-          shutdown request, so installing a handler there would make
-          Ctrl-C <em>stop working</em> instead of merely skipping
-          cleanup — worse, not better. <code>SIGTERM</code> is POSIX
-          only; Windows has no real delivery of it (only
-          <code>SIGINT</code>/Ctrl-C).
+          behavior (an immediate kill, <code>on exit</code> not run):
+          there is no point in such a program's own execution where it
+          could ever notice a shutdown request, so installing a handler
+          there would make Ctrl-C <em>stop working</em> instead of
+          merely skipping cleanup. <code>SIGTERM</code> is POSIX only;
+          Windows has no real delivery of it (only <code>SIGINT</code>/
+          Ctrl-C) — killing a Windows-compiled <code>openPort()</code>
+          program the way <code>SIGTERM</code> would on Linux/macOS
+          force-kills it instead (no <code>on exit</code>, no
+          connection-drain grace period, no 143 exit code).
+          <code>SIGINT</code> is registered the same way on every
+          platform (the CRT does raise it on Windows too), but
+          confirming it end to end on Windows needs the child process
+          launched with <code>CREATE_NEW_PROCESS_GROUP</code> for
+          Python's <code>Popen.send_signal(signal.SIGINT)</code> to even
+          reach it there — this project's test fixtures don't currently
+          do that.
         </p>
       </section>
 
@@ -3203,10 +3414,23 @@ log(<span class="str">'still running'</span>)</pre>
           leak this language already accepts elsewhere.
         </div>
         <p class="muted">
-          <strong>Not available under <code>--target=wasm32-wasi</code></strong>
-          — WASI has no setjmp/longjmp support at all — rejected at
-          compile time; see
+          <strong>Not available under <code>--target=wasm32-wasi</code>,
+          or on macOS.</strong> WASI has no setjmp/longjmp support at
+          all — rejected at compile time; see
           <a href="https://github.com/uraikus/festina/blob/main/wasm.md">wasm.md</a>.
+          macOS is the same story for a different reason: LLVM's
+          AArch64 backend (Apple Silicon, what every current Mac runs
+          on) has no SjLj lowering either, so
+          <code>try</code>/<code>catch</code>/<code>throw</code>
+          anywhere in a program is rejected outright at compile time
+          there too, no override. A program that never writes
+          <code>try</code>/<code>catch</code>/<code>throw</code> is
+          completely unaffected on macOS (a
+          <code>.toStruct()</code>/<code>.toArr()</code> parse failure,
+          for example, still behaves exactly like the documented "no
+          enclosing try" case above — prints and exits(1) — since that
+          was always the fallback for an uncaught throw anyway); what's
+          actually unavailable there is catching one.
         </p>
       </section>
 
@@ -3231,6 +3455,34 @@ Person p = <span class="str">'{"id": 7, "name": "Ada", "active": true, "score": 
           <code>.toArr(int)</code>, not <code>.toArr(arr[int])</code>.
         </p>
         <p class="muted">
+          A struct field or <code>toArr</code> element type may itself
+          be a nested <code>struct</code>, <code>arr[T]</code> or
+          <code>map[T]</code>, recursively — the JSON parser recurses
+          into a nested value's own shape the exact same way
+          <code>.toText()</code>'s own rendering already recurses for a
+          nested container. A <code>map[T]</code> field parses the JSON
+          object's own keys directly into the map (arbitrary keys, not
+          matched against a known field set the way a struct's own
+          fields are):
+        </p>
+        <pre class="code"><span class="kw">struct</span> Point { x:<span class="kw">int</span>  y:<span class="kw">int</span> }
+<span class="kw">struct</span> Line { a:Point  b:Point  label:<span class="kw">text</span> }
+<span class="kw">struct</span> Scores { name:<span class="kw">text</span>  values:<span class="kw">map[int]</span> }
+
+Line l = <span class="str">'{"a":{"x":1,"y":2},"b":{"x":3,"y":4},"label":"hi"}'</span>.toStruct(Line)
+<span class="kw">arr[Point]</span> pts = <span class="str">'[{"x":1,"y":2},{"x":3,"y":4}]'</span>.toArr(Point)
+<span class="kw">arr[arr[int]]</span> grid = <span class="str">'[[1,2],[3,4,5]]'</span>.toArr(<span class="kw">arr[int]</span>)
+Scores s = <span class="str">'{"name":"ada","values":{"a":1,"b":2}}'</span>.toStruct(Scores)</pre>
+        <p class="muted">
+          A self-referencing struct (see
+          <a href="#a-struct-can-name-itself">A struct can name
+          itself</a> above) parses to whatever depth the JSON actually
+          has, one nested call per level actually present:
+        </p>
+        <pre class="code"><span class="kw">struct</span> Node { n:<span class="kw">int</span>  next:Node }
+Node head = <span class="str">'{"n":1,"next":{"n":2,"next":{"n":3}}}'</span>.toStruct(Node)
+log(head.next.next.n)   <span class="cm">// 3</span></pre>
+        <p class="muted">
           Malformed JSON, a value that doesn't match the expected shape
           (a string where a number was expected, an object where an
           array was expected, ...), or trailing data after the value all
@@ -3242,16 +3494,20 @@ Person p = <span class="str">'{"id": 7, "name": "Ada", "active": true, "score": 
           request taking the whole server down.
         </p>
         <div class="callout">
-          <strong>v1 scope cut, documented not silent.</strong> A target
-          struct's fields and <code>toArr</code>'s own element type must
-          be <code>int</code>/<code>float</code>/<code>bool</code>/<code>text</code>
-          — nested <code>struct</code>/<code>arr[T]</code>/<code>map[T]</code>
-          aren't parseable yet, rejected at compile time with a clear
-          error naming exactly what's unsupported. <code>\u</code>
-          unicode string escapes are also not yet supported (raw,
-          un-escaped non-ASCII UTF-8 bytes in a JSON string are
-          unaffected and parse completely normally — this only affects
-          a producer that specifically chooses to <code>\u</code>-escape).
+          <strong>The remaining scope cut, documented not silent.</strong>
+          A target struct's fields and <code>toArr</code>'s own element
+          type must eventually bottom out at
+          <code>int</code>/<code>float</code>/<code>bool</code>/<code>text</code>
+          once every nested struct/<code>arr[T]</code>/<code>map[T]</code>
+          is unwrapped — a genuinely un-parseable type (<code>img</code>,
+          <code>aud</code>, <code>func[...]</code>, ...), anywhere in
+          that nesting, is rejected at compile time with a clear error
+          naming exactly what's unsupported, even when the violation is
+          several levels deep. <code>\u</code> unicode string escapes
+          are also not yet supported (raw, un-escaped non-ASCII UTF-8
+          bytes in a JSON string are unaffected and parse completely
+          normally — this only affects a producer that specifically
+          chooses to <code>\u</code>-escape).
         </div>
         <p class="muted">
           <strong>One real, honest limitation, the same structural class

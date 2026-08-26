@@ -376,7 +376,8 @@
 <header class="hero">
   <div class="wrap">
     <div class="badges">
-      <span class="badge">1748 tests passing</span>
+      <span class="badge">Version 0.1</span>
+      <span class="badge">1843 tests passing</span>
       <span class="badge">MIT license</span>
       <span class="badge">Linux · macOS · Windows</span>
     </div>
@@ -439,7 +440,7 @@ Hello, Festina!</pre>
         <p>Values are reclaimed for you — and <code>free spritesheet</code> / <code>delete map.key</code> exist for the moments you know the lifetime better than the compiler does.</p>
       </div>
       <div class="card">
-        <h3>Familiar syntax, none of the surprises</h3>
+        <h3>Readable syntax, real guarantees</h3>
         <p>Template strings, ternaries, familiar control flow — but every condition is a real <code>bool</code>, and everything is statically typed and checked before it runs.</p>
       </div>
       <div class="card">
@@ -573,10 +574,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>hello</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">1.4 ms</td><td class="num">70.9 ms</td><td class="num">1.46 MB</td></tr>
-          <tr><td>Rust</td><td class="num">1.5 ms</td><td class="num">97.0 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">1.3 ms</td><td class="num">320.1 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">10.6 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">1.2 ms</td><td class="num">66.3 ms</td><td class="num">1.48 MB</td></tr>
+          <tr><td>Rust</td><td class="num">1.2 ms</td><td class="num">70.0 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">1.2 ms</td><td class="num">128.0 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">7.7 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -587,10 +588,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>fib(32)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">7.6 ms</td><td class="num">76.5 ms</td><td class="num">1.46 MB</td></tr>
-          <tr><td>Rust</td><td class="num">8.1 ms</td><td class="num">105.6 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">14.5 ms</td><td class="num">241.9 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">28.5 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">6.2 ms</td><td class="num">71.6 ms</td><td class="num">1.48 MB</td></tr>
+          <tr><td>Rust</td><td class="num">6.9 ms</td><td class="num">70.6 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">9.7 ms</td><td class="num">117.4 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">20.2 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -601,10 +602,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>loop_sum (100M)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">518.4 ms</td><td class="num">161.2 ms</td><td class="num">1.46 MB</td></tr>
-          <tr><td>Rust</td><td class="num">525.0 ms</td><td class="num">132.1 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">460.5 ms</td><td class="num">483.8 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">9082.7 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">370.8 ms</td><td class="num">89.0 ms</td><td class="num">1.48 MB</td></tr>
+          <tr><td>Rust</td><td class="num">444.0 ms</td><td class="num">70.2 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">368.9 ms</td><td class="num">122.6 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">7438.6 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -615,10 +616,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>array_sum (2M)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">92.2 ms</td><td class="num">344.7 ms</td><td class="num">1.47 MB</td></tr>
-          <tr><td>Rust</td><td class="num">90.3 ms</td><td class="num">234.0 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">87.9 ms</td><td class="num">167.9 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">2393.8 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">72.3 ms</td><td class="num">90.1 ms</td><td class="num">1.48 MB</td></tr>
+          <tr><td>Rust</td><td class="num">69.5 ms</td><td class="num">103.8 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">68.7 ms</td><td class="num">120.4 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">1866.8 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -629,10 +630,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>string_concat (15K)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">3.6 ms</td><td class="num">73.3 ms</td><td class="num">1.46 MB</td></tr>
-          <tr><td>Rust</td><td class="num">1.7 ms</td><td class="num">182.6 ms</td><td class="num">3.77 MB</td></tr>
-          <tr><td>Go</td><td class="num">30.2 ms</td><td class="num">151.0 ms</td><td class="num">2.11 MB</td></tr>
-          <tr><td>Bun</td><td class="num">12.7 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">2.9 ms</td><td class="num">71.9 ms</td><td class="num">1.48 MB</td></tr>
+          <tr><td>Rust</td><td class="num">1.1 ms</td><td class="num">94.5 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">29.7 ms</td><td class="num">128.0 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">10.0 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
         </tbody>
       </table>
     </div>
@@ -687,14 +688,21 @@ npcHealths[<span class="str">'npc1'</span>] = 30
       text) and <code>/json</code> — load-tested with
       <a href="https://github.com/wg/wrk">wrk</a>. All four are held to
       the same connection-handling logic: single-threaded, one
-      connection at a time, every response closing the connection —
-      Festina's HTTP server works this way natively (see
-      <a href="api.html#http-limitations">HTTP Limitations</a>), and the
-      Rust/Go servers here are hand-rolled raw sockets matching it
-      rather than <code>hyper</code>'s or <code>net/http</code>'s own
-      multi-threaded, keep-alive-capable defaults. Bun uses
-      <code>Bun.serve()</code> with <code>Connection: close</code> set
-      explicitly, for the same reason.
+      connection at a time. Festina's HTTP server works this way
+      natively (see <a href="api.html#http-limitations">HTTP
+      Limitations</a>), and the Rust/Go servers here are hand-rolled raw
+      sockets matching it rather than <code>hyper</code>'s or
+      <code>net/http</code>'s own multi-threaded defaults. Every
+      response closes the connection, matched uniformly across all
+      four: Rust's and Go's raw-socket servers close by default,
+      Bun's server sets <code>Connection: close</code> explicitly to
+      opt out of its own native keep-alive, and since Festina supports
+      HTTP/1.1 keep-alive by default (see
+      <a href="api.html#http-keep-alive">Keep-alive</a>), the load
+      generator itself sends an explicit <code>Connection: close</code>
+      request header against all four servers uniformly, which Festina
+      honors per-request the same way any other client's explicit
+      close request would be.
     </p>
     <div class="table-wrap">
       <table>
@@ -702,10 +710,10 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>plaintext (/)</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Transfer/sec</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">33,370</td><td class="num">1.41 ms</td><td class="num">3.25 MB/s</td></tr>
-          <tr><td>Rust</td><td class="num">38,084</td><td class="num">1.14 ms</td><td class="num">3.52 MB/s</td></tr>
-          <tr><td>Go</td><td class="num">20,653</td><td class="num">2.17 ms</td><td class="num">1.91 MB/s</td></tr>
-          <tr><td>Bun</td><td class="num">14,156</td><td class="num">3.37 ms</td><td class="num">1.81 MB/s</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">43,652</td><td class="num">1.05 ms</td><td class="num">4.25 MB/s</td></tr>
+          <tr><td>Rust</td><td class="num">63,513</td><td class="num">0.69 ms</td><td class="num">5.88 MB/s</td></tr>
+          <tr><td>Go</td><td class="num">35,457</td><td class="num">1.30 ms</td><td class="num">3.28 MB/s</td></tr>
+          <tr><td>Bun</td><td class="num">41,798</td><td class="num">1.09 ms</td><td class="num">5.34 MB/s</td></tr>
         </tbody>
       </table>
     </div>
@@ -716,19 +724,20 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><th>json (/json)</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Transfer/sec</th></tr>
         </thead>
         <tbody>
-          <tr class="row-festina"><td>Festina</td><td class="num">32,643</td><td class="num">1.41 ms</td><td class="num">3.80 MB/s</td></tr>
-          <tr><td>Rust</td><td class="num">38,570</td><td class="num">1.06 ms</td><td class="num">4.30 MB/s</td></tr>
-          <tr><td>Go</td><td class="num">21,340</td><td class="num">2.24 ms</td><td class="num">2.38 MB/s</td></tr>
-          <tr><td>Bun</td><td class="num">13,985</td><td class="num">3.09 ms</td><td class="num">2.05 MB/s</td></tr>
+          <tr class="row-festina"><td>Festina</td><td class="num">41,482</td><td class="num">1.33 ms</td><td class="num">4.83 MB/s</td></tr>
+          <tr><td>Rust</td><td class="num">59,877</td><td class="num">0.73 ms</td><td class="num">6.68 MB/s</td></tr>
+          <tr><td>Go</td><td class="num">35,441</td><td class="num">1.27 ms</td><td class="num">3.95 MB/s</td></tr>
+          <tr><td>Bun</td><td class="num">39,580</td><td class="num">1.15 ms</td><td class="num">5.81 MB/s</td></tr>
         </tbody>
       </table>
     </div>
     <p class="section-intro" style="margin-top:16px;">
-      Festina clears Go and Bun by a wide margin on both routes and sits
-      within about 10% of Rust's raw-socket number — read that as "at
-      matching, single-threaded, no-keep-alive connection handling," not
-      as a claim about what <code>hyper</code>/<code>axum</code> or
-      <code>net/http</code> would report with keep-alive turned on. The
+      Festina clears Go on both routes and lands right around Bun's own
+      number, with Rust ahead of all three — read that as "at matching
+      connection-handling logic," not as a claim about what
+      <code>hyper</code>/<code>axum</code> or <code>net/http</code>
+      would report with their own concurrency and keep-alive defaults
+      turned on, or about Bun's own native <code>Bun.serve()</code>. The
       <code>/json</code> route runs Festina's request struct through the
       same JSON-via-<code>.toText()</code> path every other container
       response already uses, so the gap between the two routes reflects
@@ -746,8 +755,8 @@ npcHealths[<span class="str">'npc1'</span>] = 30
       — ahead of both Go and Bun and within ~2.4x of Rust's
       spare-capacity-reusing <code>String</code>, the one gap here that's
       genuinely algorithmic, not an allocator artifact — and clears Go
-      and Bun on HTTP throughput too, within ~10% of Rust's raw-socket
-      number.
+      on HTTP throughput too, landing right around Bun's own number,
+      with Rust's raw-socket implementation ahead of all three.
     </p>
   </div>
 </section>
@@ -757,7 +766,7 @@ npcHealths[<span class="str">'npc1'</span>] = 30
     <h2>Project status</h2>
     <div class="status-line">
       <span class="dot"></span>
-      <span><strong>1748 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
+      <span><strong>1843 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
     </div>
     <p class="section-intro">
       The compiler frontend, LLVM codegen backend, and native C runtime are
@@ -765,8 +774,8 @@ npcHealths[<span class="str">'npc1'</span>] = 30
       project has committed to is implemented end to end, not just parsed.
       That includes a leak stress suite —
       <a href="https://github.com/uraikus/festina/blob/main/scripts/leak_stress.sh">scripts/leak_stress.sh</a>
-      runs five programs under AddressSanitizer and LeakSanitizer, each
-      hammering one ownership mechanism thousands of times, because "the
+      runs mixed churn programs plus one isolation program per data type
+      under AddressSanitizer and LeakSanitizer, because "the
       answers are right" and "nothing accumulates while producing them"
       are different claims. Native builds on Linux, macOS, and Windows,
       plus cross-compiling to
@@ -791,6 +800,7 @@ npcHealths[<span class="str">'npc1'</span>] = 30
           <tr><td><a href="https://github.com/uraikus/festina/blob/main/security.md">security.md</a></td><td>Security & audit history</td></tr>
           <tr><td><a href="https://github.com/uraikus/festina/blob/main/benchmark.md">benchmark.md</a></td><td>Benchmarks vs. Rust/Go/Bun</td></tr>
           <tr><td><a href="https://github.com/uraikus/festina/blob/main/todo.md">todo.md</a></td><td>Roadmap</td></tr>
+          <tr><td><a href="https://github.com/uraikus/festina/blob/main/CHANGELOG.md">CHANGELOG.md</a></td><td>Version history</td></tr>
           <tr><td><a href="https://github.com/uraikus/festina/blob/main/tests/CONTRACT.md">tests/CONTRACT.md</a></td><td>Full spec-compliance test suite</td></tr>
           <tr><td><a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md</a></td><td>Language specification</td></tr>
         </tbody>
