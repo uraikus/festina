@@ -2799,10 +2799,15 @@ class TestAutomaticMemoryReclamation:
         f_start = next(i for i, l in enumerate(ir.splitlines()) if l.startswith("define void @f("))
         f_body = "\n".join(ir.splitlines()[f_start:])
         p_storage_line = next(l for l in f_body.splitlines() if l.strip().startswith("%p.storage."))
-        q_raw_line = next(l for l in f_body.splitlines() if l.strip().startswith("%q.raw."))
         assert "alloca %struct.Point" in p_storage_line
-        assert "call ptr @calloc(" in q_raw_line
-        assert "%p.raw." not in f_body
+        # claude.md #176: q's own calloc now goes through the shared
+        # _emit_fresh_heap_header (anonymous %tN temps, not a
+        # %q.raw.<uid>-named one -- struct allocation sites share this
+        # one implementation now so enum tagging only has to live in a
+        # single place) -- p, the safe/stack-allocated position, must
+        # never reach @calloc at all, so exactly one call proves q (and
+        # only q) was heap-allocated.
+        assert f_body.count("call ptr @calloc(") == 1
         assert "call void @festina_release(" in f_body
 
     def test_transitive_chain_produces_correct_output(self, compile_and_run):
@@ -14185,3 +14190,222 @@ class TestTextIndexing:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "abcdef\n"
+
+
+class TestEnums:
+    """claude.md #176: enum + typeof end to end -- both representations
+    (pure-struct self-tagging, mixed heap-boxed), typeof, coercion,
+    field access and its runtime festina_fail safety net, and retain/
+    release correctness for enum-typed locals.
+
+    See tests/test_enums.py for the lexer/parser/semantic-only coverage
+    of the same section (declaration rules, coercion type-checking,
+    field-access type-checking)."""
+
+    def test_worked_example_extracts_the_right_metric_for_a_circle(self, compile_and_run):
+        source = """
+        struct Circle { radius:int }
+        struct Square { area:int }
+
+        enum Shape = Circle, Square
+
+        int func extractShapeMetric(shape:Shape) {
+            if typeof shape == 'Circle' {
+                return shape.radius
+            } else {
+                return shape.area
+            }
+        }
+
+        Circle c
+        c.radius = 5
+        log(extractShapeMetric(c))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "5"
+
+    def test_worked_example_extracts_the_right_metric_for_a_square(self, compile_and_run):
+        source = """
+        struct Circle { radius:int }
+        struct Square { area:int }
+
+        enum Shape = Circle, Square
+
+        int func extractShapeMetric(shape:Shape) {
+            if typeof shape == 'Circle' {
+                return shape.radius
+            } else {
+                return shape.area
+            }
+        }
+
+        Square s
+        s.area = 42
+        log(extractShapeMetric(s))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "42"
+
+    def test_typeof_on_every_non_enum_type(self, compile_and_run):
+        # claude.md #176: for anything not EnumType-typed, typeof is a
+        # pure compile-time constant -- the runtime type IS the static
+        # type, always.
+        source = """
+        struct Point { x:int }
+        int i = 1
+        float f = 1.5
+        bool b = true
+        text t = 'hi'
+        arr[int] a = [1, 2]
+        Point p
+        log(typeof i)
+        log(typeof f)
+        log(typeof b)
+        log(typeof t)
+        log(typeof a)
+        log(typeof p)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "int\nfloat\nbool\ntext\narr[int]\nPoint\n"
+
+    def test_typeof_on_a_pure_struct_enum_returns_the_runtime_variant(self, compile_and_run):
+        source = """
+        struct Circle { radius:int }
+        struct Square { area:int }
+        enum Shape = Circle, Square
+        Circle c
+        Square sq
+        Shape a = c
+        Shape b = sq
+        log(typeof a)
+        log(typeof b)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "Circle\nSquare\n"
+
+    def test_field_mismatch_fails_loudly_instead_of_corrupting(self, compile_and_run):
+        source = """
+        struct Circle { radius:int }
+        struct Square { area:int }
+        enum Shape = Circle, Square
+        Square s
+        s.area = 42
+        Shape shape = s
+        log(shape.radius)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 1
+        assert "field 'radius' is only valid when this Shape value is a Circle" in result.stderr
+
+    def test_typeof_on_a_null_enum_value_fails_loudly(self, compile_and_run):
+        # claude.md #176: an enum-typed value defaults to null until
+        # assigned (no auto-vivify) -- typeof must fail loudly rather
+        # than dereference the null tag pointer.
+        source = """
+        struct Circle { radius:int }
+        struct Square { area:int }
+        enum Shape = Circle, Square
+        Shape shape
+        log(typeof shape)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 1
+        assert "typeof applied to a null Shape value" in result.stderr
+
+    def test_field_access_on_a_null_enum_value_fails_loudly(self, compile_and_run):
+        source = """
+        struct Circle { radius:int }
+        struct Square { area:int }
+        enum Shape = Circle, Square
+        Shape shape
+        log(shape.radius)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 1
+        assert "field 'radius' accessed on a null Shape value" in result.stderr
+
+    def test_mixed_enum_round_trips_each_member_type_through_typeof(self, compile_and_run):
+        source = """
+        struct User { id:int name:text }
+        enum Json = int, text, User
+
+        int i = 5
+        Json a = i
+        log(typeof a)
+
+        text t = 'hello'
+        Json b = t
+        log(typeof b)
+
+        User u
+        u.id = 1
+        u.name = 'pat'
+        Json c = u
+        log(typeof c)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "int\ntext\nUser\n"
+
+    def test_enum_typed_locals_alias_the_same_struct(self, compile_and_run):
+        # claude.md #176: a pure-struct enum value IS the member
+        # struct's own pointer -- assigning it into another enum-typed
+        # slot shares that exact pointer, the same aliasing every other
+        # struct assignment already has.
+        source = """
+        struct Circle { radius:int }
+        struct Square { area:int }
+        enum Shape = Circle, Square
+        Circle c
+        c.radius = 5
+        Shape a = c
+        Shape b = a
+        c.radius = 9
+        log(b.radius)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "9"
+
+    def test_reassigning_a_pure_struct_enum_local_releases_the_old_value(self, compile_and_run):
+        # Regression test: an enum-typed global/local starts out null
+        # (no auto-vivify), and the FIRST reassignment used to release
+        # that null value by unconditionally reading its tag at
+        # payload-16 -- a real segfault fixed by null-checking before
+        # ever reading the tag (see _release_fn_for_enum's own
+        # comment). Every later iteration exercises the ordinary
+        # struct-to-struct reassignment release path too.
+        source = """
+        struct Circle { radius:int }
+        struct Square { area:int }
+        enum Shape = Circle, Square
+        Shape shape
+        for int i = 0, i < 5, i++ {
+            Circle c
+            c.radius = i
+            shape = c
+        }
+        log(shape.radius)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "4"
+
+    def test_reassigning_a_mixed_enum_local_releases_the_old_box(self, compile_and_run):
+        # Same regression coverage as the pure-struct case above, for
+        # the heap-boxed mixed representation's own release wrapper.
+        source = """
+        enum Choice = int, text
+        Choice c
+        for int i = 0, i < 5, i++ {
+            c = `item${i}`
+        }
+        log(typeof c)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "text"

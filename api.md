@@ -584,6 +584,110 @@ immortal, so every release that reaches it is a safe no-op.
 The one thing not reclaimed is text globals at process exit, where the
 operating system reclaims everything anyway.
 
+## Enums
+
+```festina
+struct Circle { radius:int }
+struct Square { area:int }
+
+enum Shape = Circle, Square
+
+int func extractShapeMetric(shape:Shape) {
+    if typeof shape == 'Circle' {
+        return shape.radius
+    } else {
+        return shape.area
+    }
+}
+
+Circle c
+c.radius = 5
+log(extractShapeMetric(c))   // 5
+```
+
+`enum Name = Member1, Member2, ...` declares a tagged union: a
+`Shape`-typed value can hold a `Circle` *or* a `Square`, and the
+language remembers which one it actually is at runtime. A member may
+be any type — a struct, a primitive, an `arr[T]`/`map[T]`, or any other
+built-in type — not only structs.
+
+Assigning a member value into an enum-typed slot (a variable, a
+function parameter/return, a struct field, an array/map element) is an
+automatic, one-directional coercion — the reverse never happens
+implicitly:
+
+```festina
+Shape shape = c        // Circle -> Shape, fine
+Circle back = shape     // compile error -- Shape is not a Circle
+```
+
+### `typeof`
+
+`typeof <expr>` reads a value's own concrete runtime type as `text`.
+For anything not enum-typed, the answer is always the value's own
+static type — `typeof 5` is `'int'`, `typeof myUser` is `'User'` — since
+nothing outside an enum can hold more than one type at runtime. On an
+enum-typed value, `typeof` returns whichever member is actually stored
+— **never** the enum's own name, so `typeof shape` above is `'Circle'`
+or `'Square'`, never `'Shape'`:
+
+```festina
+log(typeof shape)             // 'Circle'
+log(typeof shape == 'Circle') // true
+```
+
+### Field access
+
+`shape.radius` reads straight through to the field of whichever member
+struct `shape` currently holds — but only when **every** member of the
+enum is a struct, and no two members declare a field with the same
+name (rejected at the `enum` declaration itself, since `shape.radius`
+would otherwise be ambiguous). A member with no field of that name at
+all is also rejected at compile time. Field access on a *mixed* enum
+(any non-struct member) is a compile error — there is no single field
+layout to read through when the value might currently be an `int`.
+
+Reading a field the currently-held variant doesn't actually have — a
+missing `typeof` guard, or a wrong one — fails loudly at runtime
+(`fail`) rather than silently reading whatever bytes happen to sit at
+that offset in a different struct's layout. Reaching either `typeof`
+or field access on an enum-typed value that was declared but never
+assigned (it reads `null`, like any other reference-typed value with
+no auto-vivify) fails the same loud way instead of crashing.
+
+```festina
+struct Circle { radius:int }
+struct Square { area:int }
+enum Shape = Circle, Square
+
+Square s
+s.area = 42
+Shape shape = s
+log(shape.radius)   // fail: field 'radius' is only valid when this Shape value is a Circle
+```
+
+Guard with `typeof` before reading a field whose presence depends on
+which variant you actually have:
+
+```festina
+if typeof shape == 'Circle' {
+    log(shape.radius)
+} else {
+    log(shape.area)
+}
+```
+
+### Representation and cost
+
+A pure-struct enum (every member a struct) is zero-overhead: a
+`Shape`-typed value *is* whichever member struct's own pointer it
+currently holds, self-tagged in that struct's own heap header — no
+extra allocation, no wrapping. A mixed enum (any non-struct member)
+gets a small heap-boxed `{tag, value}` wrapper instead, refcounted the
+same way a struct is. Either way, reassigning or letting an enum-typed
+value go out of scope releases whatever it held exactly like any other
+refcounted value.
+
 ## Arrays
 
 ```festina

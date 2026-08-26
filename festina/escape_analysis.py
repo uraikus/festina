@@ -225,6 +225,17 @@ def _walk_expr(expr, escaping, escaping_params):
     if isinstance(expr, ast.PostfixOp):
         _walk_expr(expr.operand, escaping, escaping_params)
         return
+    if isinstance(expr, ast.TypeofExpr):
+        # claude.md #176: typeof's operand is walked exactly like any
+        # other operator's -- it's read (its tag pointer extracted),
+        # never retained or stored anywhere, but this module's own
+        # unconditional "operand of any operator escapes" default
+        # costs nothing worse than a missed optimization if applied
+        # here too (an unneeded extra retain/release pair), so there's
+        # no reason to special-case it narrower than UnaryOp/PostfixOp
+        # already are.
+        _walk_expr(expr.operand, escaping, escaping_params)
+        return
     if isinstance(expr, ast.Member):
         _walk_member_obj(expr, escaping, escaping_params)
         if expr.computed:

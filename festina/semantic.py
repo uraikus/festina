@@ -661,17 +661,37 @@ class Scope:
         return None
 
 
+class _EnumInfo:
+    """claude.md #176: the real data an `enum Name = Member1, Member2,
+    ...` declaration carries -- `enums[name]` holds one of these, the
+    same "the Type is just a name-handle, the real data lives in a
+    side dict" split `structs`/`tables` already use for StructType/
+    TableType. `members` is the resolved [Type, ...] list, in
+    declaration order. `is_pure_struct` (every member a StructType)
+    decides the runtime representation codegen picks: a zero-overhead
+    self-tagged struct pointer when true, a heap-boxed {tag, value}
+    pair when false -- and, independently, whether field access
+    (`shape.radius`) is allowed at all (only ever true for a pure-
+    struct enum)."""
+    def __init__(self, members, is_pure_struct):
+        self.members = members
+        self.is_pure_struct = is_pure_struct
+
+
 class AnalyzedProgram:
-    def __init__(self, symbols, structs, tables, imports):
+    def __init__(self, symbols, structs, tables, enums, imports):
         self.symbols = symbols
         self.structs = structs
         self.tables = tables
+        self.enums = enums
         self.imports = imports
 
 
-def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None):
+def resolve_type_name(type_expr, structs, tables, enums=None, filename="<string>", node=None):
+    if enums is None:
+        enums = {}
     if isinstance(type_expr, ast.ArrayTypeExpr):
-        return types_mod.ArrayType(resolve_type_name(type_expr.element, structs, tables, filename, node),
+        return types_mod.ArrayType(resolve_type_name(type_expr.element, structs, tables, enums, filename, node),
                                     amortized=type_expr.amortized)
     if isinstance(type_expr, ast.FuncTypeExpr):
         # claude.md #141: func[T, T, ...]:R -- a first-class function
@@ -682,14 +702,14 @@ def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None
         # function, so this reads it the identical way analyze_func
         # does (`!= "void"` gates the resolve() call).
         param_types = tuple(
-            resolve_type_name(p, structs, tables, filename, node)
+            resolve_type_name(p, structs, tables, enums, filename, node)
             for p in type_expr.param_types
         )
         return_type = (None if type_expr.return_type == "void"
-                        else resolve_type_name(type_expr.return_type, structs, tables, filename, node))
+                        else resolve_type_name(type_expr.return_type, structs, tables, enums, filename, node))
         return types_mod.FuncType(param_types, return_type)
     if isinstance(type_expr, ast.MapTypeExpr):
-        value_type = resolve_type_name(type_expr.value, structs, tables, filename, node)
+        value_type = resolve_type_name(type_expr.value, structs, tables, enums, filename, node)
         # claude.md #72: a map value is stored in one fixed 8-byte slot
         # (see types.MapType's own doc comment) -- an ArrayType (16
         # bytes: length + data pointer) or another MapType simply
@@ -727,6 +747,8 @@ def resolve_type_name(type_expr, structs, tables, filename="<string>", node=None
         return types_mod.StructType(name)
     if name in tables:
         return types_mod.TableType(name)
+    if name in enums:
+        return types_mod.EnumType(name)
     raise CompileError(
         f"unknown type '{name}'",
         file=filename, line=getattr(node, "line", 0), column=getattr(node, "column", 0),
@@ -811,6 +833,7 @@ def analyze(program, filename="<string>"):
     global_scope = Scope()
     structs = {}
     tables = {}
+    enums = {}  # claude.md #176: name -> _EnumInfo
     imports = []
     entry_filename = filename  # see the DatabaseURL check at the bottom
     # claude.md #142: one monotonic counter for every arrow-function
@@ -848,7 +871,7 @@ def analyze(program, filename="<string>"):
     global_scope.define("argv", Symbol("argv", types_mod.ArrayType(_TEXT), "variable", None), None, filename)
 
     def resolve(type_expr, node=None):
-        return resolve_type_name(type_expr, structs, tables, filename, node)
+        return resolve_type_name(type_expr, structs, tables, enums, filename, node)
 
     def check_assignable(declared, actual, node, what="value"):
         if actual is None or actual is NULL or declared is None:
@@ -907,6 +930,16 @@ def analyze(program, filename="<string>"):
                 inner = actual.element if container is types_mod.ArrayType else actual.value
                 if inner is NULL or inner is None:
                     return
+        # claude.md #176: a member type coerces into its enum "pseudo
+        # type" -- e.g. Circle -> Shape for `enum Shape = Circle,
+        # Square`. One check here covers every position this function
+        # already gates (var decl, function param/return, struct
+        # field, array/map element, ...), the same way the container-
+        # null tolerance just above does.
+        if isinstance(declared, types_mod.EnumType):
+            info = enums.get(declared.name)
+            if info is not None and actual in info.members:
+                return
         if declared != actual:
             raise CompileError(
                 f"cannot assign {what} of type {types_mod.type_name(actual)} "
@@ -1361,6 +1394,13 @@ def analyze(program, filename="<string>"):
             if expr.op == "!":
                 return types_mod.PrimitiveType("bool")
             return operand
+        if isinstance(expr, ast.TypeofExpr):
+            # claude.md #176: always text, regardless of the operand's
+            # own type -- infer() runs purely to type-check the operand
+            # (an unknown identifier, say, should still be caught),
+            # nothing about the RESULT depends on what it resolves to.
+            infer(expr.operand, scope)
+            return _TEXT
         return None
 
     def _infer_member(expr, scope):
@@ -1470,6 +1510,31 @@ def analyze(program, filename="<string>"):
                     category="invalid field access",
                 )
             return fields[expr.prop]
+        if isinstance(obj_type, types_mod.EnumType):
+            # claude.md #176: field access only exists for a pure-
+            # struct enum (every member a struct) -- a mixed enum has
+            # no fields to speak of (what would `.radius` even mean on
+            # a Json value that might currently hold an int?). Resolves
+            # to a SINGLE owning member, guaranteed unique by
+            # analyze_enum's own field-collision check at declaration
+            # time, so there's no ambiguity to resolve here, only a
+            # lookup.
+            info = enums.get(obj_type.name)
+            if info is None or not info.is_pure_struct:
+                raise CompileError(
+                    f"cannot access field '{expr.prop}' on '{obj_type.name}' -- field access "
+                    f"only works on an enum whose members are all structs",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            owner = next((m for m in info.members if expr.prop in structs.get(m.name, {})), None)
+            if owner is None:
+                raise CompileError(
+                    f"enum '{obj_type.name}' has no member with field '{expr.prop}'",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            return structs[owner.name][expr.prop]
         if isinstance(obj_type, types_mod.TableType):
             # claude.md #34: a query against a declared table produces
             # arr[TableType(name)] -- field access on a row (e.g.
@@ -1841,13 +1906,8 @@ def analyze(program, filename="<string>"):
                     )
                 for i, (arg_expr, expected) in enumerate(zip(expr.args, fn_type.param_types)):
                     arg_type = infer(arg_expr, scope)
-                    if arg_type is not None and arg_type is not NULL and arg_type != expected:
-                        raise CompileError(
-                            f"argument {i + 1} of '{name}' expects "
-                            f"{types_mod.type_name(expected)}, found {types_mod.type_name(arg_type)}",
-                            file=filename, line=callee.line, column=callee.column,
-                            category="invalid function argument type",
-                        )
+                    check_assignable(expected, arg_type, callee,
+                                      what=f"argument {i + 1} of '{name}'")
                 return fn_type.return_type
             if sym is None or sym.kind != "function":
                 # claude.md #109: a name this language used to have gets
@@ -1871,13 +1931,8 @@ def analyze(program, filename="<string>"):
             for arg_expr, param in zip(expr.args, func_decl.params):
                 arg_type = infer(arg_expr, scope)
                 param_type = resolve(param.type_expr, callee)
-                if arg_type is not None and arg_type is not NULL and arg_type != param_type:
-                    raise CompileError(
-                        f"argument '{param.name}' of '{name}' expects "
-                        f"{types_mod.type_name(param_type)}, found {types_mod.type_name(arg_type)}",
-                        file=filename, line=callee.line, column=callee.column,
-                        category="invalid function argument type",
-                    )
+                check_assignable(param_type, arg_type, callee,
+                                  what=f"argument '{param.name}' of '{name}'")
             return sym.type
         if isinstance(callee, ast.Member) and not callee.computed:
             # claude.md #56: Math.floor/ceil/round/trunc(x:float) -> int
@@ -1947,7 +2002,7 @@ def analyze(program, filename="<string>"):
                         category="invalid method receiver",
                     )
                 target_type = resolve_type_name(
-                    expr.args[0].type_expr, structs, tables, filename, expr.args[0])
+                    expr.args[0].type_expr, structs, tables, enums, filename, expr.args[0])
                 # claude.md #173 (widens claude.md #159's v1 scope cut):
                 # a target struct's own field types and toArr()'s own
                 # element type may now themselves be a nested struct,
@@ -2673,13 +2728,7 @@ def analyze(program, filename="<string>"):
                 )
             for i, (arg_expr, expected) in enumerate(zip(expr.args, callee_type.param_types)):
                 arg_type = infer(arg_expr, scope)
-                if arg_type is not None and arg_type is not NULL and arg_type != expected:
-                    raise CompileError(
-                        f"argument {i + 1} expects {types_mod.type_name(expected)}, "
-                        f"found {types_mod.type_name(arg_type)}",
-                        file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
-                        category="invalid function argument type",
-                    )
+                check_assignable(expected, arg_type, expr, what=f"argument {i + 1}")
             return callee_type.return_type
         for a in expr.args:
             infer(a, scope)
@@ -2742,6 +2791,78 @@ def analyze(program, filename="<string>"):
             del tables[decl.name]
             raise
         tables[decl.name] = columns
+
+    def analyze_enum(decl):
+        # claude.md #176: same duplicate-declaration/placeholder-before-
+        # resolving shape analyze_struct/analyze_table already use --
+        # see analyze_struct's own comment for the full reasoning
+        # (a name existing with real content is a duplicate; a bare
+        # placeholder is not).
+        if (structs.get(decl.name) or tables.get(decl.name) is not None
+                or enums.get(decl.name) is not None):
+            raise CompileError(
+                f"'{decl.name}' is already declared",
+                file=filename, line=decl.line, column=decl.column, category="duplicate declaration",
+            )
+        # claude.md #176: unlike struct/table, an enum can never
+        # legitimately self-reference (no enum-of-enum -- checked
+        # below), so there's no "placeholder before resolving" step
+        # needed here the way analyze_struct's own comment explains --
+        # `enums[decl.name]` is already `None` from the pre-scan (or
+        # this is a name the pre-scan somehow missed; harmless either
+        # way), and stays that way until every member has resolved
+        # successfully.
+        try:
+            members = []
+            for m in decl.members:
+                mtype = resolve(m, decl)
+                # claude.md #176: no enum-of-enum -- a member type is
+                # itself a compile-time-fixed, single concrete type
+                # (int, a struct, ...); an EnumType is the one kind of
+                # type that ISN'T single/concrete (that's the whole
+                # point of it), so nesting one inside another would mean
+                # deciding what "the tag" of an enum-typed member even
+                # is, a real design question this round doesn't answer.
+                if isinstance(mtype, types_mod.EnumType):
+                    raise CompileError(
+                        f"enum '{decl.name}' cannot have another enum ('{types_mod.type_name(mtype)}') "
+                        f"as a member",
+                        file=filename, line=decl.line, column=decl.column,
+                        category="invalid declaration",
+                    )
+                if mtype in members:
+                    raise CompileError(
+                        f"enum '{decl.name}' lists '{types_mod.type_name(mtype)}' more than once",
+                        file=filename, line=decl.line, column=decl.column,
+                        category="duplicate declaration",
+                    )
+                members.append(mtype)
+            is_pure_struct = all(isinstance(m, types_mod.StructType) for m in members)
+            # claude.md #176: field access (`shape.radius`) only exists
+            # for a pure-struct enum, and only works at all because it
+            # resolves to a single, unambiguous owning member at
+            # COMPILE time -- so two members declaring the same field
+            # name would make `shape.thatField` genuinely ambiguous.
+            # Rejected here, once, at declaration time, rather than
+            # needing per-access-site disambiguation (or a runtime
+            # ordering rule) later.
+            if is_pure_struct:
+                owner_by_field = {}
+                for m in members:
+                    for fname in structs[m.name]:
+                        if fname in owner_by_field and owner_by_field[fname] != m.name:
+                            raise CompileError(
+                                f"enum '{decl.name}': field '{fname}' is declared by both "
+                                f"'{owner_by_field[fname]}' and '{m.name}' -- field access on "
+                                f"'{decl.name}' would be ambiguous",
+                                file=filename, line=decl.line, column=decl.column,
+                                category="invalid declaration",
+                            )
+                        owner_by_field[fname] = m.name
+        except Exception:
+            del enums[decl.name]
+            raise
+        enums[decl.name] = _EnumInfo(members=members, is_pure_struct=is_pure_struct)
 
     def analyze_var_decl(decl, scope, is_global):
         declared_type = resolve(decl.type_expr, decl)
@@ -2944,6 +3065,8 @@ def analyze(program, filename="<string>"):
             analyze_struct(stmt)
         elif isinstance(stmt, ast.TableDecl):
             analyze_table(stmt)
+        elif isinstance(stmt, ast.EnumDecl):
+            analyze_enum(stmt)
         elif isinstance(stmt, ast.FuncDecl):
             analyze_func(stmt)
         elif isinstance(stmt, ast.EventHandler):
@@ -3149,11 +3272,18 @@ def analyze(program, filename="<string>"):
     # per-declaration registration in analyze_struct/analyze_table stays
     # as it is: this pre-pass only guarantees the name exists, and those
     # still fill in the real field types and still reject a duplicate.
+    # claude.md #176: enum names get the identical treatment -- an
+    # `enum Shape = Circle, Square` declared above `struct Circle`
+    # resolves Circle/Square fine (they're pre-scanned too, in the same
+    # loop), and a struct field/function signature naming `Shape`
+    # before the `enum` line itself resolves fine too, symmetrically.
     for stmt in program.body:
         if isinstance(stmt, ast.StructDecl) and stmt.name not in structs:
             structs[stmt.name] = {}
         elif isinstance(stmt, ast.TableDecl) and stmt.name not in tables:
             tables[stmt.name] = {}
+        elif isinstance(stmt, ast.EnumDecl) and stmt.name not in enums:
+            enums[stmt.name] = None
 
     # claude.md #140: every function's NAME and SIGNATURE is registered
     # before any CALL resolves -- "hoisting", the same declaration-
@@ -3213,4 +3343,4 @@ def analyze(program, filename="<string>"):
                 category="invalid assignment",
             )
 
-    return AnalyzedProgram(global_scope.vars, structs, tables, imports)
+    return AnalyzedProgram(global_scope.vars, structs, tables, enums, imports)

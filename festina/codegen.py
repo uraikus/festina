@@ -404,11 +404,19 @@ def _is_refcounted(t):
     # ArrayType already matches both the plain and amortized case, so
     # no separate entry is needed here. MapType has no such field any
     # more -- claude.md #175 removed `amor map[T]` outright.
+    # claude.md #176: EnumType joined this family too -- both of its
+    # runtime representations own a reference to their own current
+    # payload (either the pointer IS the payload, self-tagged struct
+    # case, or a small heap-boxed {tag, value} wrapper owns it, mixed
+    # case), so an enum-typed value needs the identical retain-on-
+    # alias/release-on-reassignment/release-at-scope-exit treatment
+    # every other refcounted type already gets, with no special-casing
+    # needed anywhere else in this generic protocol.
     return (isinstance(t, (types_mod.StructType, types_mod.ArrayType,
                            types_mod.MapType, types_mod.ImageType,
                            types_mod.AudioType, types_mod.RegexType,
                            types_mod.HttpType, types_mod.SocketType,
-                           types_mod.UrlType))
+                           types_mod.UrlType, types_mod.EnumType))
             or t == BLOB)
 
 FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
@@ -454,6 +462,21 @@ FESTINA_MAP_LLVM_TYPE = "%struct._FestinaMap"
 # claude.md #91: the compiled shape of a `font` value -- see _llvm_type's
 # own FontType branch and _emit_font_constant.
 FESTINA_FONT_LLVM_TYPE = "%struct._FestinaFont"
+# claude.md #176: the "mixed" enum representation -- an enum with at
+# least one non-struct member (int/text/arr[T]/map[T]/any built-in
+# handle type) is a small, independently heap-allocated, ordinary-
+# refcounted-header box around this payload, `{ ptr tag, i64 value }` --
+# `tag` an interned type-name string constant (see _enum_tag_const),
+# `value` the member's own value reinterpreted through the identical
+# i64 marshaling map[T]'s own values already use
+# (_map_value_to_i64/_i64_to_map_value). ONE universal shape for every
+# mixed enum, regardless of which specific enum or how many members it
+# has -- the same "one fixed-size slot, T-agnostic" convention map[T]
+# entries already use. A PURE-STRUCT enum (every member a struct) needs
+# no shape of its own at all -- it's just a `ptr` to whichever member
+# struct it currently holds, self-tagged in that struct's own widened
+# header (see _emit_fresh_heap_header's own comment) instead.
+FESTINA_ENUM_BOX_LLVM_TYPE = "%struct._FestinaEnumBox"
 
 # claude.md #57: division/modulo by zero returns null; null has no spare
 # bit pattern in a plain i64/double, so it's a reserved sentinel instead
@@ -555,6 +578,18 @@ def _llvm_type(t):
         return {"int": "i64", "float": "double", "bool": "i8",
                 "text": "ptr", "blob": "ptr"}[t.name]
     if isinstance(t, types_mod.StructType):
+        return "ptr"
+    if isinstance(t, types_mod.EnumType):
+        # claude.md #176: always `ptr`, regardless of which of the two
+        # representations this specific enum happens to use -- a pure-
+        # struct enum value IS whichever member struct's own pointer it
+        # currently holds (self-tagged, no wrapping); a mixed enum
+        # value is a `ptr` to its own small heap-boxed {tag, value}
+        # pair. Either way, from this generic "what LLVM shape does a
+        # scalar-passed value of this type have" question's own point
+        # of view, it's just `ptr` -- the same answer ColorType/
+        # FontType/FuncType already give for their own, different
+        # reasons.
         return "ptr"
     if isinstance(t, types_mod.ArrayType):
         # claude.md #79: like StructType, always a `ptr` to the value's
@@ -729,6 +764,20 @@ class CodeGen:
         self.structs = analyzed.structs       # name -> {field: Type}
         self.struct_order = list(analyzed.structs.keys())
         self.tables = analyzed.tables          # name -> {field: festina-type-name}
+        self.enums = analyzed.enums            # claude.md #176: name -> semantic._EnumInfo
+        # claude.md #176: any struct that's a member of at least one
+        # PURE-STRUCT enum needs its own per-instance heap header
+        # widened by one word (a hidden type tag) -- computed once, up
+        # front, so every struct allocation site can just check
+        # membership. A struct that only ever appears in a MIXED
+        # enum's member list is untouched -- that case's tag lives in
+        # the enum's own heap-boxed wrapper instead (see
+        # _release_fn_for_enum/_coerce's own enum-construction
+        # comments), not in the struct's own header.
+        self._tagged_structs = set()
+        for _info in self.enums.values():
+            if _info.is_pure_struct:
+                self._tagged_structs.update(m.name for m in _info.members)
         self.string_constants = {}             # text -> global name
         self.tmp_counter = 0
         self.label_counter = 0
@@ -752,6 +801,9 @@ class CodeGen:
         self._map_release_fns = {}             # claude.md #80: the map[T] counterpart to
                                                 # self._array_release_fns -- see
                                                 # _release_fn_for_map's own comment.
+        self._enum_release_fns = {}            # claude.md #176: enum name -> LLVM function name of
+                                                # its own lazily-generated release dispatcher -- see
+                                                # _release_fn_for_enum's own comment.
         self._table_row_release_fns = {}       # claude.md #85: table name -> LLVM function name of its
                                                 # own lazily-generated per-row release function, freeing
                                                 # one sqlite result row's text/blob columns and then the
@@ -1659,6 +1711,10 @@ class CodeGen:
             # literal -- size in px, slant, weight, family. Layout must
             # match FestinaFont in runtime/festina_runtime.h.
             f"{FESTINA_FONT_LLVM_TYPE} = type {{ i64, i64, i64, ptr }}",
+            # claude.md #176: see FESTINA_ENUM_BOX_LLVM_TYPE's own
+            # comment -- the one universal payload shape every "mixed"
+            # enum's heap box uses.
+            f"{FESTINA_ENUM_BOX_LLVM_TYPE} = type {{ ptr, i64 }}",
         ]
         for name in self.struct_order:
             fields = self.struct_fields(name)
@@ -1692,8 +1748,24 @@ class CodeGen:
                 # currently points to is always safe, whatever that is.
                 struct_ty = self.struct_llvm_name(type_.name)
                 header = f"{ref}.header"
-                lines.append(f"{header} = global {{i64, {struct_ty}}} {{i64 -1, {struct_ty} zeroinitializer}}")
-                lines.append(f"{ref} = global ptr getelementptr({{i64, {struct_ty}}}, ptr {header}, i32 0, i32 1)")
+                if type_.name in self._tagged_structs:
+                    # claude.md #176: the widened {tag, refcount,
+                    # payload} header, in static-global form -- see
+                    # _emit_fresh_heap_header's own comment for why tag
+                    # comes before refcount (so the refcount word stays
+                    # at the identical `payload - 8` offset either way).
+                    # The refcount field is still the immortal `-1`
+                    # sentinel; the tag is a REAL constant (this global
+                    # already knows its own concrete struct type, same
+                    # as any other tagged-struct construction site).
+                    tag_const = self._enum_tag_const(type_)
+                    lines.append(f"{header} = global {{ptr, i64, {struct_ty}}} "
+                                 f"{{ptr {tag_const}, i64 -1, {struct_ty} zeroinitializer}}")
+                    lines.append(f"{ref} = global ptr getelementptr({{ptr, i64, {struct_ty}}}, "
+                                 f"ptr {header}, i32 0, i32 2)")
+                else:
+                    lines.append(f"{header} = global {{i64, {struct_ty}}} {{i64 -1, {struct_ty} zeroinitializer}}")
+                    lines.append(f"{ref} = global ptr getelementptr({{i64, {struct_ty}}}, ptr {header}, i32 0, i32 1)")
                 continue
             array_is_amortized = isinstance(type_, types_mod.ArrayType) and type_.amortized
             if isinstance(type_, (types_mod.ArrayType, types_mod.MapType)) and not array_is_amortized:
@@ -1770,6 +1842,8 @@ class CodeGen:
             return  # already reflected in self.structs (from semantic analysis)
         if isinstance(stmt, ast.TableDecl):
             return  # already reflected in self.tables; schema sync emitted in main()
+        if isinstance(stmt, ast.EnumDecl):
+            return  # claude.md #176: already reflected in self.enums (from semantic analysis)
         if isinstance(stmt, ast.FuncDecl):
             self._emit_func(stmt)
             return
@@ -1788,7 +1862,7 @@ class CodeGen:
 
     def _resolve(self, type_expr, node):
         return semantic_mod.resolve_type_name(
-            type_expr, self.structs, self.tables, self.filename, node)
+            type_expr, self.structs, self.tables, self.enums, self.filename, node)
 
     # ---- functions ----
 
@@ -2850,16 +2924,15 @@ class CodeGen:
                     # binding's own reference), and offset the visible
                     # `backing` pointer past it so every existing GEP-
                     # based field access downstream is unaffected.
-                    size_val = self._sizeof(struct_ty, lines)
-                    total_size = self.tmp()
-                    lines.append(f"  {total_size} = add i64 {size_val}, 8")
-                    raw = f"%{stmt.name}.raw.{uid}"
-                    count_arg = self._size_arg("1", lines)
-                    size_arg = self._size_arg(total_size, lines)
-                    lines.append(f"  {raw} = call ptr @calloc(i{self.pointer_bits} {count_arg}, "
-                                  f"i{self.pointer_bits} {size_arg})")
-                    lines.append(f"  store i64 1, ptr {raw}")
-                    lines.append(f"  {backing} = getelementptr i8, ptr {raw}, i64 8")
+                    # claude.md #176: routed through _emit_fresh_heap_header
+                    # (widening to 16 extra bytes, tag first/refcount
+                    # second, when this struct is a pure-struct enum
+                    # member -- see that function's own comment) rather
+                    # than the manual calloc this used to inline, so the
+                    # tagging logic lives in exactly one place.
+                    type_tag = (self._enum_tag_const(type_)
+                                if type_.name in self._tagged_structs else None)
+                    backing = self._emit_fresh_heap_header(struct_ty, lines, type_tag=type_tag)
                 lines.append(f"  {slot} = alloca ptr")
                 lines.append(f"  store ptr {backing}, ptr {slot}")
                 env.define(stmt.name, slot, type_)
@@ -3498,6 +3571,48 @@ class CodeGen:
             lines.append(f"  {out} = call ptr @festina_load_image(ptr {val})")
             self._free_text_temp(source_expr, val, TEXT, lines)
             return out
+        # claude.md #176: a member type coercing into its enum "pseudo
+        # type" -- e.g. Circle -> Shape for `enum Shape = Circle,
+        # Square`. semantic.py's check_assignable already confirmed
+        # from_type is a real member of to_type before codegen ever
+        # runs (see AnalyzedProgram.enums/self.enums).
+        if isinstance(to_type, types_mod.EnumType):
+            info = self.enums.get(to_type.name)
+            if info is not None and from_type in info.members:
+                if info.is_pure_struct:
+                    # A pure-struct enum value already IS whichever
+                    # member struct's own pointer it holds -- self-
+                    # tagged in that struct's own widened header at
+                    # CONSTRUCTION time (see _emit_fresh_heap_header),
+                    # not here. Nothing to build; identity.
+                    return val
+                # Mixed enum: build a fresh, independently-refcounted
+                # heap box {tag, value} (FESTINA_ENUM_BOX_LLVM_TYPE).
+                # The inner value gets the identical "retain/copy
+                # unless the source is already a fresh, uniquely-owned
+                # value" treatment every other fresh-container
+                # construction site in this file already follows
+                # (_emit_map_set, array/map literal construction) --
+                # the box is a genuinely NEW owner of it.
+                stored_val = val
+                if _is_refcounted(from_type):
+                    if not self._refcounted_source_is_fresh(source_expr, from_type, from_type):
+                        lines.append(f"  call void @festina_retain(ptr {val})")
+                elif from_type == TEXT:
+                    if not self._is_owning_text_source(source_expr):
+                        owned = self.tmp()
+                        lines.append(f"  {owned} = call ptr @festina_text_own(ptr {val})")
+                        stored_val = owned
+                tag_const = self._enum_tag_const(from_type)
+                box = self._emit_fresh_heap_header(FESTINA_ENUM_BOX_LLVM_TYPE, lines)
+                tag_ptr = self.tmp()
+                lines.append(f"  {tag_ptr} = getelementptr {FESTINA_ENUM_BOX_LLVM_TYPE}, ptr {box}, i32 0, i32 0")
+                lines.append(f"  store ptr {tag_const}, ptr {tag_ptr}")
+                val_ptr = self.tmp()
+                lines.append(f"  {val_ptr} = getelementptr {FESTINA_ENUM_BOX_LLVM_TYPE}, ptr {box}, i32 0, i32 1")
+                raw_val = self._map_value_to_i64(stored_val, from_type, lines)
+                lines.append(f"  store i64 {raw_val}, ptr {val_ptr}")
+                return box
         return val
 
     def _bool_cond(self, val, lines):
@@ -3820,6 +3935,8 @@ class CodeGen:
             return self._emit_binop(expr, env, lines)
         if isinstance(expr, ast.UnaryOp):
             return self._emit_unary(expr, env, lines)
+        if isinstance(expr, ast.TypeofExpr):
+            return self._emit_typeof(expr, env, lines)
         if isinstance(expr, ast.PostfixOp):
             return self._emit_postfix(expr, env, lines)
         if isinstance(expr, ast.Call):
@@ -4806,7 +4923,7 @@ class CodeGen:
         lines.append(f"  {out} = call ptr @malloc({ir_ty} {size})")
         return out
 
-    def _emit_fresh_heap_header(self, payload_llvm_ty, lines):
+    def _emit_fresh_heap_header(self, payload_llvm_ty, lines, type_tag=None):
         """claude.md #79: allocates a fresh, uniquely-owned (refcount=1)
         heap block for a refcounted value's own header -- an escaping
         struct local's own calloc (_emit_stmt's VarDecl handling) and
@@ -4819,8 +4936,32 @@ class CodeGen:
         block, so the payload's own fields all start at their zero
         value (0/null) exactly like a global's own `zeroinitializer`
         storage does -- the caller only needs to fill in whichever
-        fields it actually has a value for."""
+        fields it actually has a value for.
+
+        claude.md #176: `type_tag`, when given, is a `ptr` operand (an
+        interned type-name string constant -- see string_const) for a
+        struct that's a member of at least one pure-struct enum (see
+        self._tagged_structs). The header widens from `{refcount}` to
+        `{type_tag, refcount}` -- IN THAT ORDER, tag first (base+0),
+        refcount second (base+8) -- so the refcount word stays at
+        EXACTLY `payload - 8` regardless of whether a given struct is
+        tagged, and festina_retain/festina_release_check (which only
+        ever look at `payload - 8`) need zero changes either way. The
+        tag word sits one further word back, at `payload - 16` -- read
+        by _emit_typeof and the field-access tag check, never by the
+        generic runtime functions."""
         size_val = self._sizeof(payload_llvm_ty, lines)
+        if type_tag is not None:
+            total_size = self.tmp()
+            lines.append(f"  {total_size} = add i64 {size_val}, 16")
+            raw = self._emit_calloc("1", total_size, lines)
+            lines.append(f"  store ptr {type_tag}, ptr {raw}")
+            refcount_ptr = self.tmp()
+            lines.append(f"  {refcount_ptr} = getelementptr i8, ptr {raw}, i64 8")
+            lines.append(f"  store i64 1, ptr {refcount_ptr}")
+            payload = self.tmp()
+            lines.append(f"  {payload} = getelementptr i8, ptr {raw}, i64 16")
+            return payload
         total_size = self.tmp()
         lines.append(f"  {total_size} = add i64 {size_val}, 8")
         raw = self._emit_calloc("1", total_size, lines)
@@ -4828,6 +4969,16 @@ class CodeGen:
         payload = self.tmp()
         lines.append(f"  {payload} = getelementptr i8, ptr {raw}, i64 8")
         return payload
+
+    def _enum_tag_const(self, type_):
+        """claude.md #176: the interned `ptr` constant that IS a given
+        type's own runtime tag -- string_const's own global-constant
+        interning (the exact mechanism every text literal already uses),
+        called once per concrete type name. Reading this tag back at
+        runtime (see _emit_typeof) is already reading a valid `text`
+        value -- there is no separate type-id -> name lookup table
+        anywhere; the tag itself always simply IS the answer."""
+        return self.string_const(types_mod.type_name(type_))
 
     def _array_capacity_arg(self, obj_val, obj_type, lines):
         """claude.md #174: an `amor arr[T]` passes the ADDRESS of its
@@ -5888,6 +6039,69 @@ class CodeGen:
             out = self.tmp()
             lines.append(f"  {out} = getelementptr i8, ptr {obj_val}, i64 {idx * 8}")
             return out, ftype
+        if isinstance(obj_type, types_mod.EnumType):
+            # claude.md #176: field access only reaches here for a
+            # PURE-STRUCT enum (semantic.py's own _infer_member already
+            # rejected a mixed enum's field access at compile time), so
+            # `obj_val` already IS the self-tagged member struct's own
+            # pointer -- no unwrapping needed, only a runtime check that
+            # it's really the ONE member semantic.py resolved `prop`
+            # against (analyze_enum's own field-collision check already
+            # guarantees there's only ever one candidate).
+            info = self.enums[obj_type.name]
+            owner = next((m for m in info.members if expr.prop in self.structs.get(m.name, {})), None)
+            if owner is None:
+                raise CodegenError(
+                    f"internal error: enum '{obj_type.name}' has no member with field "
+                    f"'{expr.prop}' (semantic.py should have already rejected this)",
+                    file=self.filename, line=expr.line, column=expr.column)
+            # claude.md #176: an enum-typed value defaults to null until
+            # assigned (no auto-vivify), so `obj_val` can genuinely be
+            # null here -- guarded before the tag GEP/load below (which
+            # would otherwise dereference near address -16) the same
+            # "fail loudly, never silently misread memory" way a tag
+            # MISMATCH already is, just below.
+            is_null = self.tmp()
+            lines.append(f"  {is_null} = icmp eq ptr {obj_val}, null")
+            null_label = self.label("enumfield.null")
+            nonnull_label = self.label("enumfield.nonnull")
+            lines.append(f"  br i1 {is_null}, label %{null_label}, label %{nonnull_label}")
+            self._start_block(null_label, lines)
+            null_msg = self.string_const(
+                f"field '{expr.prop}' accessed on a null {obj_type.name} value")
+            lines.append(f"  call void @festina_fail(ptr {null_msg})")
+            lines.append("  unreachable")
+            self._start_block(nonnull_label, lines)
+            tag_ptr = self.tmp()
+            lines.append(f"  {tag_ptr} = getelementptr i8, ptr {obj_val}, i64 -16")
+            tag = self.tmp()
+            lines.append(f"  {tag} = load ptr, ptr {tag_ptr}")
+            owner_const = self._enum_tag_const(owner)
+            matches = self.tmp()
+            lines.append(f"  {matches} = icmp eq ptr {tag}, {owner_const}")
+            ok_label = self.label("enumfield.ok")
+            mismatch_label = self.label("enumfield.mismatch")
+            lines.append(f"  br i1 {matches}, label %{ok_label}, label %{mismatch_label}")
+            self._start_block(mismatch_label, lines)
+            # claude.md #176: fails loudly rather than silently reading
+            # whatever bytes happen to sit at this offset in a
+            # DIFFERENT member struct's own layout -- the runtime
+            # safety net for a missing/wrong `typeof` guard. A fixed,
+            # compile-time message (no runtime string formatting) --
+            # it doesn't need to name the actual mismatched variant to
+            # be a clear, immediate, unambiguous failure.
+            msg = self.string_const(
+                f"field '{expr.prop}' is only valid when this {obj_type.name} value is a "
+                f"{owner.name}")
+            lines.append(f"  call void @festina_fail(ptr {msg})")
+            lines.append("  unreachable")
+            self._start_block(ok_label, lines)
+            idx = self.struct_field_index(owner.name, expr.prop)
+            ftype = self.struct_fields(owner.name)[idx][1]
+            out = self.tmp()
+            struct_ty = self.struct_llvm_name(owner.name)
+            lines.append(f"  {out} = getelementptr {struct_ty}, ptr {obj_val}, i32 0, i32 {idx}")
+            return out, ftype
         if not isinstance(obj_type, types_mod.StructType):
             raise CodegenError(f"cannot access field '{expr.prop}' on {types_mod.type_name(obj_type)}",
                                 file=self.filename, line=expr.line, column=expr.column)
@@ -6352,6 +6566,20 @@ class CodeGen:
             return True
         if isinstance(source_expr, ast.RegexLit):
             return True
+        # claude.md #176: a mixed enum's own coercion (_coerce's enum
+        # branch) always builds a brand-new heap box, exactly as fresh
+        # as festina_blob_open's own handle above, for the identical
+        # reason -- the RESULT this function is being asked about is
+        # never the same allocation `source_expr` itself produced. A
+        # PURE-STRUCT enum's own coercion is a plain identity pass-
+        # through (see _coerce) -- no new allocation happens, so
+        # freshness of the result is exactly freshness of the original
+        # source, and this falls through to the generic check below
+        # unchanged.
+        if isinstance(target_type, types_mod.EnumType):
+            info = self.enums.get(target_type.name)
+            if info is not None and not info.is_pure_struct and source_type in info.members:
+                return True
         return self._is_owning_refcounted_source(source_expr)
 
     def _emit_local_retain_release(self, ref, val, source_expr, ttype, lines,
@@ -6502,6 +6730,8 @@ class CodeGen:
             # the same way regardless of whether elem_type is text or
             # one of the other three refcounted types).
             return "@free"
+        if isinstance(type_, types_mod.EnumType):
+            return self._release_fn_for_enum(type_)
         raise CodegenError(f"cannot release a value of type {types_mod.type_name(type_)}")
 
     def _struct_has_own_managed_field(self, name):
@@ -6573,7 +6803,14 @@ class CodeGen:
         reference CYCLE never reaches zero, so it is never freed. See
         todo.md's "What's still ahead" -- that needs a tracing
         collector, and there isn't one."""
-        if not self._struct_has_own_managed_field(type_.name):
+        # claude.md #176: a TAGGED struct (a pure-struct enum member)
+        # always needs its own wrapper, even with no managed field of
+        # its own -- its true allocation base sits 16 bytes back from
+        # the payload, not 8, so the plain generic @festina_release
+        # (which always frees at payload-8) would free the wrong
+        # address entirely.
+        tagged = type_.name in self._tagged_structs
+        if not self._struct_has_own_managed_field(type_.name) and not tagged:
             return "@festina_release"
         if type_.name in self._struct_release_fns:
             return self._struct_release_fns[type_.name]
@@ -6606,8 +6843,13 @@ class CodeGen:
         body.append(f"  br i1 {cond}, label %{free_label}, label %{alive_label}")
         body.append(f"{free_label}:")
         self._emit_release_struct_field_refs("%payload", type_, body)
+        # claude.md #176: a tagged struct's true allocation base is 16
+        # bytes back (tag word, then refcount word, then payload -- see
+        # _emit_fresh_heap_header's own comment); every other struct
+        # keeps the original 8-byte (refcount-only) offset.
+        header_offset = -16 if tagged else -8
         header = self.tmp()
-        body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
+        body.append(f"  {header} = getelementptr i8, ptr %payload, i64 {header_offset}")
         body.append(f"  call void @free(ptr {header})")
         body.append(f"  br label %{done_label}")
         if cyclic:
@@ -6921,6 +7163,138 @@ class CodeGen:
         self.func_defs.extend(body)
         return fn_name
 
+    def _release_fn_for_enum(self, type_):
+        """claude.md #176: the enum counterpart to _release_fn_for_struct/
+        _release_fn_for_map -- returns the LLVM function name to call to
+        release a value of enum type `type_`, generating (once per enum
+        name, cached in self._enum_release_fns) whichever of the two
+        shapes below this specific enum needs.
+
+        Pure-struct case: the enum value already IS its current
+        member's own struct pointer -- self-tagged, no separate
+        allocation of its own (see _emit_fresh_heap_header's own
+        comment) -- so there is nothing here for THIS function to
+        release directly. Reads the tag at payload-16 and dispatches
+        straight to the matched member's own already-correct
+        _release_fn_for(member_type), which already does its own
+        festina_release_check/field-cascade/free at the right offset.
+        No duplicate release-check needed, or possible -- this
+        function's own job is purely "which member is this," not
+        "should this be freed."
+
+        Mixed case: the enum value is its OWN independent heap
+        allocation (FESTINA_ENUM_BOX_LLVM_TYPE's {tag, value} payload,
+        the ordinary refcount-header-immediately-before-payload
+        convention every other generated wrapper in this file already
+        uses) -- a real release-check-then-free this function IS
+        responsible for, same shape _release_fn_for_map's own wrapper
+        uses. Releases the inner value first (dispatched by tag, same
+        matching as the pure-struct case) when that member's own type
+        needs it, then frees the box.
+
+        claude.md #120 scope note: an enum-typed edge is NOT walked by
+        the cycle collector (_managed_type_children has no EnumType
+        case) -- a genuine reference cycle routed THROUGH an enum-typed
+        field would leak rather than being collected. Ordinary
+        (acyclic) release is completely unaffected by this; only the
+        trial-deletion cycle-breaking machinery doesn't extend through
+        an enum edge yet. A narrow, stated scope cut (see todo.md),
+        not a silently dropped one -- the identical category of gap
+        this project already accepts elsewhere (e.g. the table-row-off-
+        an-array leak), not a new kind of risk."""
+        info = self.enums[type_.name]
+        if type_.name in self._enum_release_fns:
+            return self._enum_release_fns[type_.name]
+        fn_name = f"@__festina_release_enum_{type_.name}"
+        self._enum_release_fns[type_.name] = fn_name
+        body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
+        if info.is_pure_struct:
+            # claude.md #176: an enum-typed value defaults to null until
+            # assigned (no auto-vivify -- see analyze_enum's own scope-
+            # cut note), and this wrapper is called unconditionally on
+            # every reassignment/scope-exit release site the same way
+            # every other release function is (see
+            # _emit_global_retain_release's own "always safe to call
+            # unconditionally" comment) -- so, exactly like
+            # festina_release_check itself, this must check for null
+            # BEFORE ever reading payload-16, not just before freeing.
+            # The mixed-representation branch below needs no matching
+            # guard: it already routes its only payload dereferences
+            # through festina_release_check(payload) first, which is
+            # null-safe on its own (see its own doc comment).
+            null_check = self.tmp()
+            body.append(f"  {null_check} = icmp eq ptr %payload, null")
+            null_label = self.label("relenum.null")
+            nonnull_label = self.label("relenum.nonnull")
+            body.append(f"  br i1 {null_check}, label %{null_label}, label %{nonnull_label}")
+            body.append(f"{null_label}:")
+            body.append("  ret void")
+            body.append(f"{nonnull_label}:")
+            tag_ptr = self.tmp()
+            body.append(f"  {tag_ptr} = getelementptr i8, ptr %payload, i64 -16")
+            tag = self.tmp()
+            body.append(f"  {tag} = load ptr, ptr {tag_ptr}")
+            for i, member in enumerate(info.members):
+                const = self._enum_tag_const(member)
+                match_label = self.label(f"relenum.match{i}")
+                cont_label = self.label(f"relenum.cont{i}")
+                cmp = self.tmp()
+                body.append(f"  {cmp} = icmp eq ptr {tag}, {const}")
+                body.append(f"  br i1 {cmp}, label %{match_label}, label %{cont_label}")
+                body.append(f"{match_label}:")
+                body.append(f"  call void {self._release_fn_for(member)}(ptr %payload)")
+                body.append("  ret void")
+                body.append(f"{cont_label}:")
+            # Unreachable in a correct program -- construction (see
+            # _coerce's own enum branch) always writes a valid member
+            # tag, and no member is ever added or removed after
+            # analyze_enum resolves this enum's own member list.
+            body.append("  unreachable")
+        else:
+            should_free = self.tmp()
+            body.append(f"  {should_free} = call i8 @festina_release_check(ptr %payload)")
+            cond = self.tmp()
+            body.append(f"  {cond} = icmp ne i8 {should_free}, 0")
+            free_label = self.label("relenum.free")
+            done_label = self.label("relenum.done")
+            body.append(f"  br i1 {cond}, label %{free_label}, label %{done_label}")
+            body.append(f"{free_label}:")
+            tag_ptr = self.tmp()
+            body.append(f"  {tag_ptr} = getelementptr {FESTINA_ENUM_BOX_LLVM_TYPE}, ptr %payload, i32 0, i32 0")
+            tag = self.tmp()
+            body.append(f"  {tag} = load ptr, ptr {tag_ptr}")
+            val_ptr = self.tmp()
+            body.append(f"  {val_ptr} = getelementptr {FESTINA_ENUM_BOX_LLVM_TYPE}, ptr %payload, i32 0, i32 1")
+            raw_val = self.tmp()
+            body.append(f"  {raw_val} = load i64, ptr {val_ptr}")
+            for i, member in enumerate(info.members):
+                if not (_is_refcounted(member) or member == TEXT):
+                    continue
+                const = self._enum_tag_const(member)
+                match_label = self.label(f"relenum.vmatch{i}")
+                cont_label = self.label(f"relenum.vcont{i}")
+                cmp = self.tmp()
+                body.append(f"  {cmp} = icmp eq ptr {tag}, {const}")
+                body.append(f"  br i1 {cmp}, label %{match_label}, label %{cont_label}")
+                body.append(f"{match_label}:")
+                inner = self._i64_to_map_value(raw_val, member, body)
+                if member == TEXT:
+                    body.append(f"  call void @free(ptr {inner})")
+                else:
+                    body.append(f"  call void {self._release_fn_for(member)}(ptr {inner})")
+                body.append(f"  br label %{cont_label}")
+                body.append(f"{cont_label}:")
+            header = self.tmp()
+            body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
+            body.append(f"  call void @free(ptr {header})")
+            body.append(f"  br label %{done_label}")
+            body.append(f"{done_label}:")
+            body.append("  ret void")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
     def _emit_map_value_release_trampoline(self, value_type):
         """claude.md #80: generates a small function matching
         festina_map_for_each's own fixed callback signature
@@ -7150,8 +7524,12 @@ class CodeGen:
                 elif ftype == TEXT:
                     fval = load_field(body, i)
                     body.append(f"  call void @free(ptr {fval})")
+            # claude.md #176: same tagged-struct offset correction as
+            # _release_fn_for_struct's own free path -- a tagged
+            # struct's true allocation base sits 16 bytes back, not 8.
+            hdr_offset = -16 if type_.name in self._tagged_structs else -8
             hdr = self.tmp()
-            body.append(f"  {hdr} = getelementptr i8, ptr %p, i64 -8")
+            body.append(f"  {hdr} = getelementptr i8, ptr %p, i64 {hdr_offset}")
             body.append(f"  call void @free(ptr {hdr})")
             body.append(f"  br label %{done}")
             body.append(f"{done}:")
@@ -7762,6 +8140,56 @@ class CodeGen:
                 lines.append(f"  {out} = sub i64 0, {val}")
             return out, vtype
         return val, vtype  # unary '+' is a no-op
+
+    def _emit_typeof(self, expr, env, lines):
+        """claude.md #176: `typeof <expr>` -- always text.
+
+        Non-enum operand: the runtime type IS the static type, always
+        (Festina has no other source of runtime polymorphism) -- a
+        pure compile-time constant, no runtime work at all. This is
+        what makes `typeof myName == 'text'` free.
+
+        Enum operand: reads the tag -- pure-struct representation:
+        payload-16 (past the widened header, see
+        _emit_fresh_heap_header's own comment); mixed representation:
+        field 0 of the {tag, value} box (FESTINA_ENUM_BOX_LLVM_TYPE).
+        That tag pointer IS the text result already (see
+        _enum_tag_const's own comment: the tag is never a small
+        integer needing a lookup table, it's always a `ptr` directly
+        to the interned type-name constant) -- and it's always the
+        CONCRETE runtime member's own name, never the enum's own name
+        ("Shape" is never a typeof result; "Circle"/"Square" are)."""
+        val, vtype = self._emit_expr(expr.operand, env, lines)
+        if not isinstance(vtype, types_mod.EnumType):
+            return self.string_const(types_mod.type_name(vtype)), TEXT
+        info = self.enums[vtype.name]
+        # claude.md #176: an enum-typed value defaults to null until
+        # assigned (no auto-vivify) -- guarded here the same way field
+        # access on an enum value is, since both read the tag at a
+        # fixed negative offset (or box field 0) from the value's own
+        # pointer, which is exactly what's unsafe to do when that
+        # pointer is null. `typeof shape == 'Circle'` is the documented
+        # safe-guard idiom BEFORE field access, so typeof itself failing
+        # loudly on null (rather than crashing) is what keeps that
+        # idiom actually safe to write.
+        is_null = self.tmp()
+        lines.append(f"  {is_null} = icmp eq ptr {val}, null")
+        null_label = self.label("typeof.null")
+        nonnull_label = self.label("typeof.nonnull")
+        lines.append(f"  br i1 {is_null}, label %{null_label}, label %{nonnull_label}")
+        self._start_block(null_label, lines)
+        null_msg = self.string_const(f"typeof applied to a null {vtype.name} value")
+        lines.append(f"  call void @festina_fail(ptr {null_msg})")
+        lines.append("  unreachable")
+        self._start_block(nonnull_label, lines)
+        tag_ptr = self.tmp()
+        if info.is_pure_struct:
+            lines.append(f"  {tag_ptr} = getelementptr i8, ptr {val}, i64 -16")
+        else:
+            lines.append(f"  {tag_ptr} = getelementptr {FESTINA_ENUM_BOX_LLVM_TYPE}, ptr {val}, i32 0, i32 0")
+        tag = self.tmp()
+        lines.append(f"  {tag} = load ptr, ptr {tag_ptr}")
+        return tag, TEXT
 
     def _emit_postfix(self, expr, env, lines):
         # claude.md #66: postfix ++/-- -- semantic.py has already

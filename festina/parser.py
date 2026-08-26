@@ -227,6 +227,8 @@ class Parser:
             return self.parse_struct_decl()
         if t.type == "table":
             return self.parse_table_decl()
+        if t.type == "enum":
+            return self.parse_enum_decl()
         if t.type == "on":
             return self.parse_event_handler()
         if t.type == "if":
@@ -568,6 +570,26 @@ class Parser:
         self.eat("RBRACE")
         return ast.TableDecl(name_tok.value, fields, t.line, t.column)
 
+    def parse_enum_decl(self):
+        # claude.md #176: `enum Name = Member1, Member2, ...` -- unlike
+        # struct/table, `=`-introduced and comma-SEPARATED (not brace-
+        # delimited), since there's no per-member `:type` to parse --
+        # each member IS a type. Each member goes through parse_type()
+        # itself (not a bare IDENT), so a primitive keyword (`int`,
+        # `text`, ...) works as a member exactly like a struct name
+        # does -- semantic.py's analyze_enum is what actually resolves
+        # and validates each one (unknown name, enum-of-enum, a
+        # duplicate member -- none of that is this parser's job).
+        t = self.eat("enum")
+        name_tok = self.eat("IDENT")
+        self.eat_op("=")
+        members = [self.parse_type()]
+        while self.at_op(","):
+            self.eat()
+            members.append(self.parse_type())
+        self._semi()
+        return ast.EnumDecl(name_tok.value, members, t.line, t.column)
+
     def parse_event_handler(self):
         t = self.eat("on")
         name_tok = self.eat("IDENT")
@@ -755,6 +777,14 @@ class Parser:
             op_tok = self.eat()
             operand = self.parse_unary()
             return ast.UnaryOp(op_tok.value, operand)
+        if self.at("typeof"):
+            # claude.md #176: `typeof <expr>` -- a real reserved
+            # keyword (not a contextual identifier the way `log`/`fail`/
+            # `sqlite` are), since unlike those it has no other use as
+            # a plain callable/member name to preserve.
+            op_tok = self.eat("typeof")
+            operand = self.parse_unary()
+            return ast.TypeofExpr(operand, op_tok.line, op_tok.column)
         return self.parse_call_member()
 
     def parse_call_member(self):

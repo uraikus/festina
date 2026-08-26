@@ -38,6 +38,28 @@ class TableType:
 
 
 @dataclass(frozen=True)
+class EnumType:
+    """claude.md #176: `enum Name = Member1, Member2, ...` -- a tagged
+    union "pseudo type" over any type. Name-only, exactly like
+    StructType/TableType above -- the real member list (and whether
+    every member is a struct, which decides the runtime representation:
+    a zero-overhead self-tagged struct pointer, or a heap-boxed {tag,
+    value} pair for anything else) lives in a separate `enums` dict
+    (semantic.py's AnalyzedProgram, mirrored in codegen.py's self.enums),
+    the same "StructType is a name-handle, structs holds the real field
+    data" split StructType itself already uses.
+
+    typeof on an EnumType-typed value never returns the enum's OWN
+    name -- it always returns the concrete runtime member's name (the
+    whole reason a runtime tag exists at all). "Shape" itself is never
+    a typeof result; "Circle"/"Square" are."""
+    name: str
+
+    def __repr__(self):
+        return f"EnumType({self.name})"
+
+
+@dataclass(frozen=True)
 class ArrayType:
     """claude.md #156: `amortized` (default False) is set by the `amor`
     prefix -- `amor arr[T]` -- originally tracked for parsing/type-
@@ -229,6 +251,8 @@ def type_name(t):
     if isinstance(t, StructType):
         return t.name
     if isinstance(t, TableType):
+        return t.name
+    if isinstance(t, EnumType):
         return t.name
     if isinstance(t, ArrayType):
         prefix = "amor " if t.amortized else ""

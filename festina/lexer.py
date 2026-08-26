@@ -20,6 +20,12 @@ SPEC_KEYWORDS = frozenset({
     "break", "continue",  # claude.md #73
     "http", "socket",  # claude.md #151
     "try", "catch",  # claude.md #157
+    "enum", "typeof",  # claude.md #176: enum Name = Member, ... -- a
+                        # tagged union "pseudo type" over any type
+                        # (struct-only members get a real, zero-overhead
+                        # runtime tag; anything else is heap-boxed) --
+                        # and typeof <expr>, a prefix operator returning
+                        # the concrete runtime type's name as text.
 })
 
 # Extra control tokens the parser needs distinct token types for, so it

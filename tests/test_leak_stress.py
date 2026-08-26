@@ -383,4 +383,14 @@ class TestLeakStress:
             # map[T] coverage doesn't exercise, since plain arr[T] has
             # no capacity field to get wrong in the first place.
             "amor_array_churn.f",
+            # claude.md #176: enum's own two runtime representations --
+            # a pure-struct enum's widened, self-tagged struct header
+            # (repeated reassignment starting from its own null zero-
+            # value, the exact case that used to segfault before the
+            # release wrapper learned to null-check first) and a mixed
+            # enum's independently heap-allocated {tag, value} box
+            # (alternating which member type is boxed, including a
+            # refcounted `text` member), plus aliasing churn through
+            # two enum-typed locals sharing the same struct pointer.
+            "enum_churn.f",
         }
