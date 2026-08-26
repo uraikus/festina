@@ -184,7 +184,7 @@ _BUILTIN_RETURN_TYPES = {
     "ls": types_mod.ArrayType(types_mod.PrimitiveType("text")),
     # claude.md #146
     "isAudioPlayerPlaying": types_mod.PrimitiveType("bool"),
-    # claude.md #150/#176: exec() -- NOT here. Its return type depends
+    # claude.md #150/#177: exec() -- NOT here. Its return type depends
     # on which of its two arities is used (1-arg -> int, 2-arg -> void),
     # which this fixed dict can't express -- see _infer_call's own
     # dedicated branch, the same reason setTimeout/saveCanvas aren't
@@ -269,7 +269,7 @@ _BUILTIN_SIGNATURES = {
     # stopAudioPlayer's optional one (see _BUILTIN_SIGNATURE_ALTERNATES
     # below) -- there's no sensible "any channel" reading for a query.
     "isAudioPlayerPlaying": (_INT,),
-    # claude.md #150/#176: exec() -- NOT here either, for the identical
+    # claude.md #150/#177: exec() -- NOT here either, for the identical
     # reason it's absent from _BUILTIN_RETURN_TYPES above: its 2-arg
     # form's callback argument needs the same structural (not fixed-
     # type) checking setTimeout's own callback already needs, which
