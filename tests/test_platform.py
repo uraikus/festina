@@ -897,6 +897,70 @@ class TestKeyNameVocabulary:
                 f"key rule already covers -- it must not be a named key")
 
 
+class TestNativeWindowPresentFlushesBeforeRawRead:
+    """A real bug, found by report rather than by inspection: img.clip()
+    (and, by the same mechanism, saveCanvas()-then-composite --
+    layers.f's own recommended idiom) reliably materialized pixel data
+    only on its FIRST use in a process; every later use reported
+    correct dimensions but read back blank, unless some unrelated draw
+    call happened to run first.
+
+    Root cause: the macOS and Windows windowing backends both present
+    the canvas by reading g_last_backing's pixels directly --
+    cairo_image_surface_get_data(), a RAW memory read entirely outside
+    cairo's own drawing API, unlike the X11 backend (whose own
+    festina_window_present reads g_backing_surface only through
+    cairo_set_source_surface+cairo_paint, cairo mediating the read the
+    same way it mediates every write). Cairo's own documented contract
+    for cairo_image_surface_get_data() requires a cairo_surface_flush()
+    first, "to ensure that all pending drawing operations are
+    finished" -- and neither backend's own WM_PAINT/drawRect: callback
+    (dispatched asynchronously, an arbitrary amount of further cairo
+    drawing after whatever last touched that exact surface) ever called
+    one. Missing flush precisely explains "correct dimensions, blank
+    pixels" -- the header fields cairo always keeps current regardless,
+    but the buffer isn't guaranteed current -- and precisely explains
+    "unless something else draws onto the result first": an unrelated
+    later cairo operation elsewhere in the program happening to trigger
+    a flush of its own is not something a caller can rely on.
+
+    Verified structurally rather than by running an actual GUI (no
+    macOS/Windows hardware in this CI job -- see this class's own
+    module docstring for why that's the established pattern here):
+    every cairo_image_surface_get_data(g_last_backing) call in each
+    backend must be preceded, within the same function, by
+    cairo_surface_flush(g_last_backing)."""
+
+    _BACKENDS = (
+        os.path.join(_REPO_ROOT, "runtime", "festina_runtime_window_win32.c"),
+        os.path.join(_REPO_ROOT, "runtime", "festina_runtime_window_mac.m"),
+    )
+
+    def test_every_raw_backing_read_is_preceded_by_a_flush(self):
+        for path in self._BACKENDS:
+            with open(path, encoding="utf-8") as f:
+                source = f.read()
+            get_data_positions = [
+                m.start() for m in re.finditer(
+                    r"cairo_image_surface_get_data\(g_last_backing\)", source)
+            ]
+            assert get_data_positions, (
+                f"{path} no longer reads g_last_backing's raw pixels at all -- "
+                f"if the backend was rewritten to go through cairo's own API "
+                f"instead (like the X11 backend already does), this whole "
+                f"class is obsolete and should be removed, not left stale")
+            flush_positions = [
+                m.start() for m in re.finditer(
+                    r"cairo_surface_flush\(g_last_backing\)", source)
+            ]
+            for pos in get_data_positions:
+                assert any(fpos < pos for fpos in flush_positions), (
+                    f"{path}: cairo_image_surface_get_data(g_last_backing) at "
+                    f"offset {pos} has no cairo_surface_flush(g_last_backing) "
+                    f"before it -- this is the exact bug that reads back "
+                    f"correct dimensions but blank/stale pixels")
+
+
 class TestBinaryFidelity:
     """The program-level contract that makes the Windows port's CRLF
     question a non-question: every runtime fopen is binary-mode, so

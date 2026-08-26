@@ -202,7 +202,24 @@ static cairo_surface_t *g_last_backing = NULL;
  * 4-byte aligned, the one alignment DIBs require), which is also
  * cairo's own ARGB32 stride for every width -- so no separate stride
  * parameter is needed here the way the CGImage path's DataProvider
- * needed one. */
+ * needed one.
+ *
+ * cairo_image_surface_get_data() below is a RAW memory read, entirely
+ * outside cairo's own drawing API -- unlike the X11 backend's own
+ * festina_window_present (which reads g_backing_surface only through
+ * cairo_set_source_surface+cairo_paint, cairo mediating the read the
+ * same way it mediates the write), this reaches straight into the
+ * surface's pixel buffer. Cairo's own documented contract for
+ * cairo_image_surface_get_data() requires a cairo_surface_flush()
+ * first "to ensure that all pending drawing operations are finished"
+ * -- WM_PAINT can fire asynchronously, an arbitrary amount of program
+ * logic (and cairo drawing) after whatever last touched this exact
+ * surface, so the flush belongs HERE, at the point of the raw read,
+ * not back in festina_window_present at present() time. Missing this
+ * is exactly the shape of bug that reads back correct dimensions
+ * (the header fields cairo always keeps current) but stale or blank
+ * pixel content until some unrelated later draw call happens to
+ * trigger a flush of its own. */
 static void festina_win32_paint(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
@@ -213,6 +230,7 @@ static void festina_win32_paint(HWND hwnd) {
         EndPaint(hwnd, &ps);
         return;
     }
+    cairo_surface_flush(g_last_backing);
     int width = cairo_image_surface_get_width(g_last_backing);
     int height = cairo_image_surface_get_height(g_last_backing);
     unsigned char *data = cairo_image_surface_get_data(g_last_backing);
