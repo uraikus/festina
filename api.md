@@ -1777,6 +1777,32 @@ unambiguous. Not available under `--target=wasm32-wasi` — WASI has no
 process model to spawn into — rejected at compile time rather than
 failing at runtime; see [wasm.md](wasm.md).
 
+### Running without blocking: `exec(args, callback)`
+
+`exec(cmd)` blocks the whole program until the child exits. Passing a
+second, `func[int]:void` argument instead dispatches the same spawn to
+a background thread and returns immediately — the real exit code
+arrives later, through `callback`, the same non-blocking shape
+`.callback()` gives `blob`/`img`/`aud` loads above:
+
+```festina
+void func onDone(code:int) {
+    log(`child exited with ${code}`)
+}
+
+arr[text] cmd = ['/bin/sh', '-c', 'sleep 1 && echo done']
+exec(cmd, onDone)
+log('dispatched')                     // logs BEFORE onDone ever runs
+```
+
+`callback` receives the exact same value the blocking form would have
+returned — the real exit code, or `-1` if the process never started at
+all. The 2-argument form itself returns nothing: there's no handle to
+hand back (an `int` can't be mutated in place the way a `blob` is) and
+no cancel/kill mechanism to justify one either. Not available under
+`--target=wasm32-wasi`, for the identical reason the blocking form
+isn't.
+
 ## HTTP and WebSocket servers
 
 ```festina
