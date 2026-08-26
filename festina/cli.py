@@ -66,6 +66,7 @@ import subprocess
 import sys
 import tempfile
 
+from . import __version__
 from . import imports as imports_mod
 from . import semantic as semantic_mod
 from . import codegen as codegen_mod
@@ -2017,6 +2018,7 @@ def _build_arg_parser():
     cc_help = "C compiler/linker to invoke (default: clang, gcc, or cc, whichever is found first)"
 
     ap = argparse.ArgumentParser(prog="festina", description="Compile and run Festina programs.")
+    ap.add_argument("--version", action="version", version=f"festina {__version__}")
     # dest="command", not required=True: an unrecognized/missing
     # subcommand falls through to main()'s own help-and-exit-1 handling
     # below, rather than argparse's own less friendly "the following

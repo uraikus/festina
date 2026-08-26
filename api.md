@@ -17,7 +17,7 @@ flag to distinguish them:
 |---|---|
 | `festina compile entry.f -o out` | Compile to a native executable at `out` (default: `entry`'s own filename without `.f`). `--emit-llvm` prints LLVM IR to stdout instead of linking. `--cc` picks the C compiler/linker (default: whichever of `clang`/`gcc`/`cc` is found first). `--target=wasm32-wasi` cross-compiles to a standalone `.wasm` binary instead — see [wasm.md](wasm.md) for setup, usage, and limitations (graphics/audio aren't available under WASI). |
 | `festina run entry.f` | Compile to a throwaway temp executable and run it immediately — stdin/stdout/stderr inherited directly (not captured), so an interactive program (graphics/audio/timers) behaves exactly like a normal compile-then-run. Exits with the *compiled program's own* exit code, so `festina run x.f && ...` composes the same way `go run`/`cargo run` do. The temp binary is always cleaned up afterward. `--target=wasm32-wasi` runs the compiled `.wasm` through Node's built-in WASI support instead of executing it directly. |
-| `festina doctor` | Checks every dependency the compiler itself needs (a C compiler, `pkg-config`, sqlite3/cairo-xlib/alsa dev headers, `libLLVM`) and reports what's missing and how to install it — the same install hints a real compile failure would give (`claude.md #59`), just checked proactively instead of only on failure. Also reports whether `festina` itself is resolvable on `PATH`, and if not, exactly how to add it (the checkout's `bin/` directory, or a packaged binary — see [setup.md](setup.md)). Exits 0 if every *required* dependency is present — graphics/audio are optional, since a compiler that can't build a graphics program is still a fully working compiler for everything else (see [security.md](security.md#slim-binaries)). |
+| `festina doctor` | Checks every dependency the compiler itself needs (a C compiler, `pkg-config`, sqlite3/cairo-xlib/alsa dev headers, `libLLVM`) and reports what's missing and how to install it — the same install hints a real compile failure would give, just checked proactively instead of only on failure. Also reports whether `festina` itself is resolvable on `PATH`, and if not, exactly how to add it (the checkout's `bin/` directory, or a packaged binary — see [setup.md](setup.md)). Exits 0 if every *required* dependency is present — graphics/audio are optional, since a compiler that can't build a graphics program is still a fully working compiler for everything else (see [security.md](security.md#slim-binaries)). |
 | `festina doctor --fix` | Same report, then actually fixes what it found instead of leaving the printed hint for a human to act on by hand: installs whatever dependencies are missing (required and optional both) via the detected package manager — `apt` on Linux, Homebrew on macOS, MSYS2's `pacman` on Windows — and, if `festina` itself isn't resolving on `PATH`, adds it (a symlink for a packaged binary, an `export PATH=...` line appended to `~/.bashrc`/`~/.zshrc` for a checkout, `setx` on Windows). Prints the exact command/change first and asks for confirmation (`--yes`/`-y` skips that, for every prompt this can raise); refuses to guess for any other package manager, overwrite something unrelated already on disk, or run non-interactively without `--yes`, rather than doing nothing or making a change nobody agreed to. The exit code reflects the dependency side only — not being on `PATH` has never been a required check. |
 | `festina help` | Prints this same command list. |
 
@@ -323,12 +323,12 @@ arr[text] words = sentence.split(' ')    // or a regex: .split(/\s+/g)
 sentence = words.join('\t')              // join works on text/int/float/bool arrays
 ```
 
-`split` follows JS: empty pieces between adjacent separators are kept
+`split` keeps empty pieces between adjacent separators
 (`'a,,b'.split(',')` has three pieces), a separator at the edge yields
 an edge empty, an empty-match regex splits between characters, and an
 empty text separator splits per UTF-8 code point. `join` renders a
 `null` element as an empty string (`[1, null, 3].join('-')` is
-`'1--3'`), also JS's choice.
+`'1--3'`).
 
 ### Parsing an int
 
@@ -341,7 +341,7 @@ if bad == null {
 }
 ```
 
-`toInt()` follows JS's `parseInt()`: skips leading whitespace, reads an
+`toInt()` skips leading whitespace, reads an
 optional `+`/`-`, then digits until the first non-digit (or the end of
 the text) — whatever comes after the digits is ignored, not an error.
 Returns `null` if no digits were found at all. A literal receiver
@@ -499,38 +499,37 @@ reclaimed automatically as soon as control leaves the block it was
 declared in — for a value declared inside a loop body, that means
 every iteration, not deferred until the function eventually returns;
 `break`/`continue` reclaim it too, the same as reaching the end of that
-iteration normally would. Passing a value to another function no
-longer unconditionally prevents this: if that function's own body
-never itself lets the value outlive the call (only reads/writes
-through its own fields, or passes it on to some other function that
-in turn doesn't retain it either), the original value is still
-reclaimed exactly the same way. A struct reclaimed this way is a real
-stack allocation, not a heap allocation freed afterward — faster, not
-just eventually cleaned up, and with each recursive call still getting
-its own independent copy the same way any other stack-local value
-would. A `map[T]` reclaimed this way frees each of its own entries
-completely, keys included, not just the entries themselves. A value
-that does escape a function entirely isn't necessarily lost, either: a
-struct-typed global variable's value is reference counted and freed
-once nothing references it anymore, on every reassignment (including
-its own initial declaration) — a global repeatedly reassigned in a
-loop no longer leaks every value but the last. A struct-typed local
-that escapes gets the same treatment at its own scope-exit — declared
-with an initializer, or reassigned after declaration, no longer exclude
-it either, since every new value a local ever comes to hold (through an
-initializer or a plain reassignment) is now retained first whenever
-that value might already be referenced elsewhere. Being returned no
-longer excludes a local either — a function's own `return` retains the
-value it hands back under the same rule, so a struct local that's ever
+iteration normally would. Passing a value to another function doesn't
+unconditionally prevent this: if that function's own body never itself
+lets the value outlive the call (only reads/writes through its own
+fields, or passes it on to some other function that in turn doesn't
+retain it either), the original value is still reclaimed the same way.
+A struct reclaimed this way is a real stack allocation, not a heap
+allocation freed afterward — faster, not just eventually cleaned up,
+and each recursive call gets its own independent copy the same way any
+other stack-local value would. A `map[T]` reclaimed this way frees
+each of its own entries completely, keys included, not just the
+entries themselves. A value that escapes a function entirely isn't
+lost either: a struct-typed global variable's value is reference
+counted and freed once nothing references it anymore, on every
+reassignment (including its own initial declaration) — a global
+repeatedly reassigned in a loop only ever holds the most recent value
+in memory, never accumulating earlier ones. A struct-typed local that
+escapes gets the same treatment at its own scope-exit, whether it was
+declared with an initializer or reassigned after declaration: every
+new value a local ever comes to hold (through an initializer or a
+plain reassignment) is retained first whenever that value might
+already be referenced elsewhere. A function's own `return` retains the
+value it hands back under the same rule, so a struct local that's
 returned, a struct-typed parameter returned straight through, and a
-`cond ? a : b` between two locals are all now correctly reclaimed
+`cond ? a : b` between two locals are all correctly reclaimed
 (whichever value wasn't actually returned is freed; the one that was
 survives with exactly the right reference count). A call result
 discarded outright, never bound to any variable at all (`someFunc();`
 used as a bare statement), is reclaimed too — released immediately at
 the point it's discarded, since a function's own return value is
 always freshly produced and nothing else can be referencing it yet.
-Every struct value is now correctly reclaimed once nothing references
+Every struct value is correctly reclaimed once nothing references
 it anymore, whichever of these shapes produced it. This includes a
 struct's own struct-typed *fields*: `outer.field = value` retains
 `value` the same way any other binding does, and freeing `outer`
@@ -538,13 +537,13 @@ recursively frees whatever its own struct-typed fields still hold too,
 however many levels deep a program actually nests structs.
 
 An escaping `arr[T]`/`map[T]` value is reclaimed the same way: two
-variables made to alias each other (`map[T] b = a`) now share one
+variables made to alias each other (`map[T] b = a`) share one
 underlying value, not independent copies — so growing `b` (adding a
 new key) is correctly visible through `a` too, not just the data each
 started out with. Assigning `[1, 2, 3]`/`{...}` into a fresh binding,
 returning an array/map, passing one to another function, storing one
 in a struct field — every one of these is reclaimed once nothing
-references it anymore, the identical rule struct values already
+references it anymore, the identical rule struct values
 follow. This includes an `arr[T]`/`map[T]`'s own elements/values, when
 their own type is itself reclaimed this way (a struct, `arr[T]`, or
 `map[T]`): `boxes[0] = replacement`/`boxes['key'] = replacement`
@@ -568,8 +567,8 @@ that rebuilds a string each iteration (`` s = `${s}x` ``) frees the
 previous buffer every time instead of accumulating them.
 
 Query results are reclaimed too: the rows an `arr[Table]` holds, and
-each row's own text columns, are freed when that array is — so a
-program that queries repeatedly no longer grows without bound. A single
+each row's own text columns, are freed when that array is — so
+repeated queries don't grow memory without bound. A single
 row read out of one (`People p = rows[0]`) borrows from the array
 rather than owning a copy, so it stays valid exactly as long as the
 array does.
@@ -768,8 +767,8 @@ npcHealths.forEach(logHealth)   // (value, key) -- visit order is unspecified
 ```
 
 An unquoted identifier key (`npc2Id` above) is a reference to that
-variable's own text value, not bareword-as-string-name shorthand the
-way a plain JS object literal has. `map[T]`'s `T` may be any type
+variable's own text value, not bareword-as-string-name shorthand.
+`map[T]`'s `T` may be any type
 except `arr[...]`/`map[...]` itself (a map value is stored in one
 fixed-size slot, which those two don't fit in). `.forEach()`'s callback
 must be an already-declared function taking exactly `(value, key:text)`
@@ -1014,7 +1013,7 @@ always a single-element array — see [wasm.md](wasm.md).
 ## Regex
 
 ```festina
-regex digits = /[0-9]+/                    // JS-style literal, POSIX extended regex underneath
+regex digits = /[0-9]+/                    // a /pattern/flags literal, POSIX extended regex underneath
 regex ci     = /^hello$/i                  // 'i' = case-insensitive
 regex all    = /[0-9]/g                    // 'g' = replace every match
 regex both   = /test/gi                    // flags combine
@@ -1029,7 +1028,7 @@ digits.test('room 42')                     // -> bool
 Only `i` and `g` are accepted; any other flag letter is a compile-time
 error. `\w`/`\d`/`\s` (and their negations) and `\b` work as expected
 on every platform — the runtime expands them to portable POSIX classes
-before compiling, so they no longer depend on glibc's GNU extensions —
+before compiling, with no dependency on glibc's own GNU extensions —
 but there are no capture groups, backreferences, or non-greedy
 quantifiers (POSIX ERE's own limits). Inside `[...]` a backslash is a
 literal, per POSIX.
@@ -1044,26 +1043,22 @@ literal, per POSIX.
 'a-b-c'.replace('-', '_')      // 'a_b-c' -- a text search has no flags
 ```
 
-A plain-text search replaces the first match only, exactly like JS's
-`String.prototype.replace` with a string argument. There is no
+A plain-text search replaces the first match only. There is no
 `.replaceAll()` — replacing every occurrence is spelled `/search/g`.
 
-It deliberately does **not** do two things JS's `g` does:
+`g` deliberately does **not** do two things a global-match flag might
+suggest:
 
-- **`.test()` does not become stateful.** In JS a `/g` regex carries a
-  `lastIndex` that advances on each `.test()`, so the same test against
-  the same string returns `true`, then `false`. Here it returns the same
-  answer every time.
-- **`.match()` still returns `text`, not an array.** JS's `/g` changes
-  `.match()`'s return type. A return type can't depend on a flag that
-  `regex(pattern, flags)` only knows at run time, so `g` is ignored by
-  `.match()`.
+- **`.test()` does not become stateful.** The same test against the
+  same string always returns the same answer — there's no internal
+  position that advances between calls.
+- **`.match()` still returns `text`, not an array.** A return type
+  can't depend on a flag that `regex(pattern, flags)` only knows at
+  run time, so `g` is ignored by `.match()`.
 
 A pattern/flags that aren't known until runtime (built from a variable
 or a template) can't use the literal syntax — the global `regex(pattern,
-flags)` function is still available for that case, the same split
-JavaScript itself has between a `/pattern/` literal and `new
-RegExp(...)`:
+flags)` function is available for that case:
 
 ```festina
 text userPattern = someInput()
@@ -1156,9 +1151,9 @@ drawSprites()
 render()
 ```
 
-Batching matters — drawing used to blit the whole canvas per call, so a
-frame of 2000 rectangles took ~1.6s. Behind one `render()` the same
-frame takes ~1ms.
+Batching matters: presenting on every individual draw call, rather than
+once per frame, would blit the whole canvas on each of 2000 rectangles
+— around 1.6s. Behind one `render()` call, the same frame takes ~1ms.
 
 **A fresh or cleared canvas is transparent, not white** — matching the
 HTML5 `<canvas>` model this otherwise mirrors. `clearCanvas`/`clearRect`/
@@ -1862,7 +1857,7 @@ Any other key is a compile-time error.
 Fires once per incoming HTTP request, fully parsed (request line,
 headers, and body already buffered — see [Limitations](#http-limitations)
 below for what "fully parsed" doesn't include). A `Transfer-Encoding:
-chunked` body (claude.md #168) is decoded transparently into the same
+chunked` body is decoded transparently into the same
 buffered body a `Content-Length` request already gets — `req.toText()`/
 `.toBlob()`/etc. don't need to know or care which one a client actually
 sent. `req.code` is `null` (no
@@ -1954,7 +1949,7 @@ fires exactly once when the connection ends, however it ends (the peer
 closed it, sent a close frame, or the read failed) — never for a plain
 HTTP connection that never upgraded.
 
-**Fragmentation (claude.md #168) is invisible to `on message`.** A peer
+**Fragmentation is invisible to `on message`.** A peer
 may split one logical message across several WebSocket frames (RFC 6455
 §5.4) — this runtime reassembles them itself, so `on message` fires
 exactly once per MESSAGE either way, with the full, already-concatenated
@@ -2009,7 +2004,7 @@ outbound request delays every other connection's own turn for as long
 as it takes). `req.url`/`req.method` are left untouched; `req.code`,
 `req.headers`, and the body read back through `req.toText()`/
 `toBlob()`/`toImg()`/`toAud()` are all overwritten in place with the
-response. A `Transfer-Encoding: chunked` response (claude.md #168, common
+response. A `Transfer-Encoding: chunked` response (common
 against a real server whose body length isn't known upfront) is decoded
 transparently too, exactly like the server side above — `req.code`/
 `req.toText()`/etc. read the same either way. A genuine network failure
@@ -2138,7 +2133,7 @@ u.hash                                // text -- '#frag'
 Every field is read-only — a `url` is built once, by `parseURL()`, and
 never mutated afterward.
 
-### Keep-alive (claude.md #167)
+### Keep-alive
 
 A server connection stays open for another request once a response
 finishes, instead of closing after every single one — ordinary HTTP/1.1
@@ -2155,7 +2150,7 @@ semantics, nothing to opt into:
   trickling in) is never affected by this; only genuinely idle time
   between requests counts.
 - Combines with everything else `openPort()` already does, including
-  claude.md #166's graphics combination and WebSocket upgrades (an `on
+  combining `openPort()` with graphics and WebSocket upgrades (an `on
   upgrade` connection leaves HTTP request/response handling behind
   entirely, so keep-alive has nothing to do there — it was never
   "closing" a WebSocket connection to begin with).
@@ -2172,14 +2167,12 @@ set automatically to match; a program's own `req.send()`/`req.ok()`/
 - **No ping/pong sent by this runtime, and no WebSocket extensions.** A
   received ping is answered with a pong automatically; a received pong
   is ignored. `permessage-deflate` and every other WebSocket extension
-  are unsupported (fragmentation, claude.md #168, is not an extension —
+  are unsupported (fragmentation is not an extension —
   see [WebSockets](#websockets-and-fragmentation) below).
 - **Linux, macOS, and Windows.** Linux/macOS use plain POSIX sockets;
-  Windows uses a real winsock2 port, confirmed by a real Windows CI run
-  (claude.md #169 — see [windows.md](windows.md)). One Windows-specific
-  caveat, already true of every platform's [Graceful
-  shutdown](#graceful-shutdown) story below and confirmed directly by
-  that same CI run rather than newly introduced by it: Windows has no
+  Windows uses a real winsock2 port (see [windows.md](windows.md)). One
+  Windows-specific caveat, already true of every platform's [Graceful
+  shutdown](#graceful-shutdown) story below: Windows has no
   real `SIGTERM` delivery, so the connection-drain grace period only
   applies to Ctrl-C there, not to however a process gets killed the
   `SIGTERM` way on Linux/macOS (e.g. `taskkill` without `/F` doesn't
@@ -2187,8 +2180,8 @@ set automatically to match; a program's own `req.send()`/`req.ok()`/
   at all — WASI Preview 1 has no listening-socket support — rejected at
   compile time; see [wasm.md](wasm.md).
 - **Combining with graphics** (`render()`, or an `on
-  mouseDown`/.../`close` handler) in the same program works (claude.md
-  #166), but the two loops don't run side by side — a program that also
+  mouseDown`/.../`close` handler) in the same program works, but the
+  two loops don't run side by side — a program that also
   opens a window blocks in the graphics event loop the whole time, which
   services the open port from inside itself rather than a separate
   thread. Practically, that means:
@@ -2202,9 +2195,7 @@ set automatically to match; a program's own `req.send()`/`req.ok()`/
     already-open connections for up to 10 seconds after Ctrl-C/SIGTERM
     (see [Graceful shutdown](#graceful-shutdown) below) before exiting;
     a combined program instead closes the window and exits immediately,
-    the same instant it always has, with no equivalent drain window for
-    an in-flight request. A future version may close this gap; it isn't
-    closed yet.
+    with no equivalent drain window for an in-flight request.
 
   `setTimeout`/`setInterval` combine fine with either shape; all three
   (timers, an open port, and a window) are serviced from the same loop
@@ -2330,14 +2321,14 @@ delete example.data
 delete example['more-data']
 ```
 
-On a **map**, `delete` removes the entry, JS-style — the key stops
+On a **map**, `delete` removes the entry entirely — the key stops
 existing (`forEach` no longer visits it), which setting `null` could
 never express. Deleting a missing key is a safe no-op. The key can be a
 computed expression: `delete m[`k${i}`]`.
 
 On a **struct or query-row field**, `delete` releases the value and the
 field reads `null` afterwards. On a query row it *also* marks the column
-undefined — see below. (One inherited caveat: a struct field whose own
+undefined — see below. (One caveat: a struct field whose own
 type is struct/arr/map auto-vivifies on the next reach-through, per the
 zero-value rule, so it re-appears empty rather than staying null.)
 
@@ -2416,9 +2407,8 @@ int ms = now()                        // milliseconds since the Unix epoch
 log(formatTime(ms, '%Y-%m-%d %H:%M')) // strftime, local time -> text
 ```
 
-`now()` uses the same unit and origin as JavaScript's `Date.now()`, and
-the same unit `setTimeout` already takes, so timing a block is just
-subtraction:
+`now()` returns milliseconds since the Unix epoch, the same unit
+`setTimeout` already takes, so timing a block is just subtraction:
 
 ```festina
 int started = now()
@@ -2469,15 +2459,13 @@ xs.splice(1, 0, [8, 9])           // insert [8, 9] at index 1, remove nothing
 xs.indexOf(3)       // -> first index holding 3, or -1
 ```
 
-All six behave as their JavaScript namesakes do, including `splice`'s
-clamping — a negative start counts back from the end, and an oversized
-range clamps rather than failing, so `splice(i, 1)` at a boundary is a
-no-op. `splice` takes an optional third argument — `splice(start, count,
-insertArr)` — in place of JavaScript's variadic `...items` (Festina has
-no variadic calls, so the items to insert are one explicit `arr[T]`
-instead of a spread list); either way only the REMOVED elements come
-back, never the inserted ones, exactly as JavaScript's own `splice()`
-answers.
+`splice` clamps rather than failing — a negative start counts back from
+the end, and an oversized range clamps to what's actually there, so
+`splice(i, 1)` at a boundary is a no-op. It takes an optional third
+argument — `splice(start, count, insertArr)` — to insert as well as
+remove (Festina has no variadic calls, so the items to insert are one
+explicit `arr[T]` rather than a spread list); either way only the
+REMOVED elements are returned, never the inserted ones.
 
 `push()`/`unshift()`/`pop()`/`shift()`/`splice()` each resize the
 backing buffer to exactly the new length internally, not amortized —
@@ -2530,9 +2518,8 @@ setTimeout(tick, 1000)
 clearInterval(id)          // clearTimeout()/clearInterval() are interchangeable
 ```
 
-JS-style scheduling. The program keeps running as long as a `setTimeout`
-is pending or a `setInterval` is uncleared — exactly like an uncleared
-JS interval keeping a process alive. Combines with graphics: if a
+The program keeps running as long as a `setTimeout`
+is pending or a `setInterval` is uncleared. Combines with graphics: if a
 program uses both, one event loop multiplexes X11 events and timer
 deadlines together so neither blocks the other.
 
@@ -2589,10 +2576,9 @@ stopAudioPlayer(hum)           // stop exactly that one
 ```
 
 `play()` and `playLoop()` both return the channel they used, or `-1` if
-nothing played (which happens only when every channel is reserved). Before
-that, a channel the pool assigned on its own was one you could not name,
-so the pool was addressable only by picking channels by hand — that is,
-by not using the pool.
+nothing played (which happens only when every channel is reserved) —
+so a channel the pool assigns on its own can still be named and
+addressed later, the same as one picked by hand.
 
 `isPlaying()` is clip-wide, like `stop()`: "is this sound audible
 anywhere" and "silence it everywhere" are one question asked two ways.
@@ -2639,8 +2625,9 @@ playing longest is closest to finishing anyway — dropping the *new* play
 instead would silence a rapid-fire effect at exactly the moment it fires
 fastest.
 
-`setMaxAudioPlayers(1)` is the way to ask for the old behaviour back:
-one channel, restarted from the beginning on every `play()`.
+`setMaxAudioPlayers(1)` restricts the pool to a single channel, so
+every `play()` restarts playback from the beginning on that one
+channel.
 
 ### Channels and looping
 
@@ -2740,12 +2727,10 @@ With no `on exit` handler declared, `close(code)` just exits.
 ### <a name="graceful-shutdown"></a>Graceful shutdown (Ctrl-C / `SIGTERM`)
 
 A program that uses `openPort()`/`openSecurePort()`, `setTimeout`/
-`setInterval`, or graphics now stops the same clean way `close(code)`
-already does when it receives `SIGINT` (Ctrl-C) or `SIGTERM` — a
-declared `on exit(code:int)` fires (passed a conventional
-`128 + signal` code: `130` for `SIGINT`, `143` for `SIGTERM`), then the
-process exits — instead of the OS's own default, abrupt,
-no-cleanup-at-all termination:
+`setInterval`, or graphics stops the same clean way `close(code)`
+does when it receives `SIGINT` (Ctrl-C) or `SIGTERM`: a declared
+`on exit(code:int)` fires (passed a conventional `128 + signal` code:
+`130` for `SIGINT`, `143` for `SIGTERM`), then the process exits.
 
 ```festina
 on exit(code:int) {
@@ -2755,7 +2740,7 @@ on request(req:http) {
     req.send({'code': 200, 'body': 'hello'})
 }
 openPort(8080)
-// Ctrl-C now logs "shutting down (130)" instead of just vanishing.
+// Ctrl-C logs "shutting down (130)" before the process exits.
 ```
 
 For an HTTP/WebSocket server specifically, shutdown is **graceful** in
@@ -2769,23 +2754,20 @@ for a long-lived WebSocket connection that never closes.
 **Only installed where it can actually take effect.** A plain script
 with no `openPort()`/timers/graphics — just top-level code, or your own
 hand-written loop — keeps the OS's own default `SIGINT`/`SIGTERM`
-behavior (an immediate kill, `on exit` not run) exactly as before this
-feature existed: there is no point in such a program's own execution
-where it could ever notice a shutdown request, so installing a handler
-there would make Ctrl-C *stop working* instead of merely skipping
-cleanup — worse, not better. `SIGTERM` is POSIX only; Windows has no
-real delivery of it (only `SIGINT`/Ctrl-C) — confirmed directly by a
-real Windows CI run (claude.md #169): killing a Windows-compiled
-`openPort()` program the way `SIGTERM` would on Linux/macOS force-
-kills it instead (no `on exit`, no connection-drain grace period, no
-143 exit code), exactly as this paragraph already predicted. `SIGINT`
-itself is believed to work there too (the CRT does raise it, and this
-runtime's handler is registered unconditionally on every platform —
-see festina_runtime.c's own comment), but that specific claim is still
-unconfirmed by a real test run: the obvious way to test it from Python
-(`Popen.send_signal(signal.SIGINT)`) is itself rejected on Windows
-unless the child was launched with `CREATE_NEW_PROCESS_GROUP`, which
-this project's test fixtures don't currently do.
+behavior (an immediate kill, `on exit` not run): there is no point in
+such a program's own execution where it could ever notice a shutdown
+request, so installing a handler there would make Ctrl-C *stop
+working* instead of merely skipping cleanup. `SIGTERM` is POSIX only;
+Windows has no real delivery of it (only `SIGINT`/Ctrl-C) — killing a
+Windows-compiled `openPort()` program the way `SIGTERM` would on
+Linux/macOS force-kills it instead (no `on exit`, no connection-drain
+grace period, no 143 exit code). `SIGINT` is registered the same way
+on every platform (the CRT does raise it on Windows too — see
+`festina_runtime.c`'s own comment), but confirming it end to end on
+Windows needs the child process launched with
+`CREATE_NEW_PROCESS_GROUP` for Python's
+`Popen.send_signal(signal.SIGINT)` to even reach it there — this
+project's test fixtures don't currently do that.
 
 ## `troubleshoot()` — structured logging
 
@@ -2857,8 +2839,8 @@ early `return` from that same function. But a function that merely
 *calls* something which eventually throws, without itself containing a
 `throw` or a `try`, never gets the chance to run any of its own
 cleanup: whatever `struct`/`arr`/`map`/`text`/etc. locals it declared
-leak. This is a leak, never a crash or corrupted state — confirmed
-directly (not just reasoned about) via Valgrind: 0 bytes leaked
+leak. This is a leak, never a crash or corrupted state — measured
+directly under Valgrind: 0 bytes leaked
 throwing from the function a `try` calls directly, and 0 bytes leaked
 one level deeper still; a real, reproducible leak, one allocation per
 call, the moment a genuine *intermediate* frame sits between the `try`
@@ -2871,8 +2853,7 @@ shape in [security.md](security.md)).
 no setjmp/longjmp support at all — rejected at compile time; see
 [wasm.md](wasm.md). macOS is the same story for a different reason:
 LLVM's AArch64 backend (Apple Silicon, what every current Mac runs on)
-has no SjLj lowering either — confirmed directly, not just reasoned
-about (claude.md #170) — so `try`/`catch`/`throw` anywhere in a program
+has no SjLj lowering either, so `try`/`catch`/`throw` anywhere in a program
 is rejected outright at compile time there too, no override. A program
 that never writes `try`/`catch`/`throw` is completely unaffected on
 macOS (a `.toStruct()`/`.toArr()` parse failure, for example, still
@@ -2952,8 +2933,8 @@ limitation above already is.** A JSON value that fails to parse
 to be the wrong type, having already parsed the first two; an array
 whose fourth element fails, having already collected three — leaks
 whatever was already built for that one call. A **successful** parse
-leaks nothing (confirmed directly under Valgrind, including 30 repeated
-calls in a loop, not just reasoned about) — this is strictly an
+leaks nothing (measured directly under Valgrind, including 30 repeated
+calls in a loop) — this is strictly an
 error-path leak, bounded to at most one partially-built value per
 failed call, never unbounded or accumulating across successful ones.
 
