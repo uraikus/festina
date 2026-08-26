@@ -99,6 +99,10 @@ That's the whole loop — see [setup.md](setup.md) for the full dependency
 breakdown (what's required vs. only-if-you-use-it), packaged-binary
 installs, and running the test suite.
 
+Editing `.f` files in Vim or Neovim? See
+[editors/vim](editors/vim/README.md) for syntax highlighting (Vim's
+own bundled Fortran filetype otherwise claims the `.f` extension).
+
 ## A familiar language, statically typed
 
 ```festina
