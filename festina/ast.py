@@ -37,12 +37,15 @@ class ArrayTypeExpr(Node):
 class MapTypeExpr(Node):
     """`map[T]` as it appears in a type position -- claude.md #72. Keys
     are always text, so (mirroring ArrayTypeExpr) only the value type
-    needs spelling out. `amortized` mirrors ArrayTypeExpr's own field
-    exactly -- claude.md #156's `amor map[T]`."""
+    needs spelling out. No `amortized` field -- claude.md #156's `amor
+    map[T]` was removed by claude.md #175 once plain map[T] itself
+    became a real hash table with intrinsic geometric growth; parser.py
+    rejects `amor` immediately followed by `map` at parse time rather
+    than accepting it and losing its meaning. ArrayTypeExpr keeps its
+    own `amortized` field -- `amor arr[T]` is unaffected."""
 
-    def __init__(self, value, amortized=False):
+    def __init__(self, value):
         self.value = value
-        self.amortized = amortized
 
 
 class FuncTypeExpr(Node):

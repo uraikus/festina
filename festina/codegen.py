@@ -398,11 +398,12 @@ def _is_refcounted(t):
     the tiny handle itself, dispatched through
     festina_release_conn_handle (_release_fn_for), shared by both
     types since neither has more than the one shape."""
-    # claude.md #156: MapType/ArrayType's own `amortized` field (set by
-    # the `amor` prefix) changes internal representation and growth
+    # claude.md #174: ArrayType's own `amortized` field (set by the
+    # `amor` prefix) changes internal representation and growth
     # behavior, not refcounted-ness -- an isinstance check against
-    # either class already matches both the plain and amortized case,
-    # so no separate entry is needed here.
+    # ArrayType already matches both the plain and amortized case, so
+    # no separate entry is needed here. MapType has no such field any
+    # more -- claude.md #175 removed `amor map[T]` outright.
     return (isinstance(t, (types_mod.StructType, types_mod.ArrayType,
                            types_mod.MapType, types_mod.ImageType,
                            types_mod.AudioType, types_mod.RegexType,
@@ -414,9 +415,12 @@ FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
 # claude.md #174: amor arr[T] -- an "amortized array". Byte-compatible
 # with FESTINA_ARRAY_LLVM_TYPE's own {i64 length, ptr data} prefix
 # (same two fields, same order, same offsets), with one trailing i64
-# capacity field FESTINA_ARRAY_LLVM_TYPE doesn't have -- the identical
-# common-PREFIX-not-an-inserted-field trick FESTINA_AMAP_LLVM_TYPE
-# already uses over FESTINA_MAP_LLVM_TYPE, for the same reason: every
+# capacity field FESTINA_ARRAY_LLVM_TYPE doesn't have -- a common-
+# PREFIX-not-an-inserted-field trick, kept for arrays even though
+# claude.md #175 later gave map[T] itself a single universal capacity-
+# tracking header instead of a separate amortized variant (there is no
+# plain arr[T]-vs-amor-arr[T] merge here -- arrays are unaffected by
+# that change). For the same reason as always: every
 # array runtime function/codegen touchpoint that only ever reads
 # length/data (indexing, `.length`, iteration, JSON rendering, the
 # retain/release element cascade, ...) is directly reusable on an
@@ -428,27 +432,25 @@ FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
 # full layout reasoning.
 FESTINA_AMOR_ARRAY_LLVM_TYPE = "%struct._FestinaAmorArray"
 
-# claude.md #72: map[T] -- same two-field shape as _FestinaArray above
-# (i64 count, ptr to the backing storage) but kept as its own distinct
-# LLVM type name rather than reusing FESTINA_ARRAY_LLVM_TYPE outright:
-# the two are never interchangeable (a map's `ptr` field points at an
-# array of FestinaMapEntry {key, value} pairs, not raw element values,
-# and only festina_map_set/_get/_for_each know how to read it), so
+# claude.md #72, rebuilt into a real hash table by #175: map[T] --
+# kept as its own distinct LLVM type name rather than reusing
+# FESTINA_ARRAY_LLVM_TYPE: the two are never interchangeable (a map's
+# `ptr` field points at an open-addressing hash table of FestinaMapEntry
+# {key, value} buckets, not raw element values, and only
+# festina_map_set/_get/_for_each/_delete know how to read it), so
 # giving them separate names catches an accidental mix-up in the IR
-# itself rather than relying on convention alone.
-FESTINA_MAP_LLVM_TYPE = "%struct._FestinaMap"
-# claude.md #156: amap[T] -- an "amortized map". Byte-compatible with
-# FESTINA_MAP_LLVM_TYPE's own {i64 count, ptr entries} prefix (same two
-# fields, same order, same offsets), with one trailing i64 capacity
-# field FESTINA_MAP_LLVM_TYPE doesn't have -- deliberately a common
-# PREFIX, not an inserted field, so every map runtime function that
-# only ever touches count/entries (festina_map_get/_for_each/_delete,
-# festina_release_map, festina_map_free_entries) is directly reusable
-# on an amap's own payload unchanged; only the growth function
-# (festina_amap_set, in place of festina_map_set) needs to know
-# capacity exists at all. See festina_amap_set's own comment in
+# itself rather than relying on convention alone. `{ i64 count, ptr
+# entries, i64 capacity, i64 tombstones }` -- count is the live entry
+# count, capacity the bucket array's length (a power of two), tombstones
+# the count of deleted-but-not-yet-reclaimed buckets. A single universal
+# shape: unlike claude.md #156's now-removed `amor map[T]`, plain
+# map[T] itself grows geometrically (doubling capacity, same as
+# festina_conn_index's own prior-art hash table in
+# festina_runtime_http.c) as an intrinsic part of being a hash table,
+# so there is no separate "amortized" variant left to give a byte-
+# compatible-prefix shape to. See festina_map_set's own comment in
 # runtime/festina_runtime.c for the full layout reasoning.
-FESTINA_AMAP_LLVM_TYPE = "%struct._FestinaAmap"
+FESTINA_MAP_LLVM_TYPE = "%struct._FestinaMap"
 # claude.md #91: the compiled shape of a `font` value -- see _llvm_type's
 # own FontType branch and _emit_font_constant.
 FESTINA_FONT_LLVM_TYPE = "%struct._FestinaFont"
@@ -615,9 +617,8 @@ def _llvm_type(t):
         return "ptr"
     if isinstance(t, types_mod.MapType):
         # claude.md #79: see the ArrayType branch above -- identical
-        # reasoning, FESTINA_MAP_LLVM_TYPE's own `{i64, ptr}` shape
-        # (or, when t.amortized, FESTINA_AMAP_LLVM_TYPE's `{i64, ptr,
-        # i64}` -- claude.md #156) still describes the storage this
+        # reasoning, FESTINA_MAP_LLVM_TYPE's own `{i64, ptr, i64, i64}`
+        # shape (claude.md #175) still describes the storage this
         # points at, an implementation detail invisible at this level.
         return "ptr"
     if isinstance(t, types_mod.FuncType):
@@ -1252,9 +1253,12 @@ class CodeGen:
             # claude.md #110: save()/saveCopy(), one pair per handle type.
             "declare i8 @festina_blob_save(ptr, ptr)",
             "declare i8 @festina_blob_save_copy(ptr, ptr)",
-            # claude.md #111: `delete m[key]`, and the guard that lets
+            # claude.md #111/#175: `delete m[key]` -- count_ptr/
+            # tombstones_ptr are out-params (delete may remove a live
+            # entry or convert one to a tombstone), capacity is read-only
+            # (delete never grows the table) -- and the guard that lets
             # `free` work on a regex without corrupting a literal cache.
-            "declare i8 @festina_map_delete(ptr, ptr, ptr, ptr)",
+            "declare i8 @festina_map_delete(ptr, ptr, i64, ptr, ptr, ptr)",
             "declare void @festina_regex_mark_cached(ptr)",
             "declare ptr @festina_read_file(ptr)",
             "declare i8 @festina_write_file(ptr, ptr)",
@@ -1608,33 +1612,27 @@ class CodeGen:
             "declare void @festina_release_map(ptr)",
             # claude.md #71: environment.NAME / environment[keyExpr].
             "declare ptr @festina_getenv(ptr)",
-            # claude.md #72: map[T] -- count_ptr/entries_ptr (the two
-            # fields of a FESTINA_MAP_LLVM_TYPE value's storage slot,
-            # always passed by address so festina_map_set can grow the
-            # backing array in place) are always `ptr`/`ptr` regardless
+            # claude.md #72, rebuilt into a real hash table by #175:
+            # map[T] -- count_ptr/entries_ptr/capacity_ptr/tombstones_ptr
+            # (all four fields of a FESTINA_MAP_LLVM_TYPE value's storage
+            # slot, always passed by address so festina_map_set can
+            # rehash the whole table in place) are always `ptr` regardless
             # of T; the value itself is always passed/returned as a raw
             # i64 (every map value type's bit pattern fits in 8 bytes --
             # see types.MapType's doc comment -- codegen reinterprets
             # to/from the real LLVM type at each call site, see
-            # _map_value_to_i64/_i64_to_map_value).
-            "declare void @festina_map_set(ptr, ptr, ptr, i64)",
-            "declare i64 @festina_map_get(i64, ptr, ptr, i64)",
-            "declare void @festina_map_for_each(i64, ptr, ptr)",
-            # claude.md #74/#75: frees each entry's own strdup'd key
-            # (never a plain free()-the-buffer-alone away from leaking
-            # them -- see festina_map_free_entries's own doc comment)
-            # before freeing the entries buffer itself -- see
+            # _map_value_to_i64/_i64_to_map_value). festina_map_get/
+            # _for_each only ever read, and only ever need entries/
+            # capacity (a bucket scan is driven by capacity, not count).
+            "declare void @festina_map_set(ptr, ptr, ptr, ptr, ptr, i64)",
+            "declare i64 @festina_map_get(ptr, i64, ptr, i64)",
+            "declare void @festina_map_for_each(ptr, i64, ptr)",
+            # claude.md #74/#75/#175: frees each live bucket's own
+            # strdup'd key (never a plain free()-the-buffer-alone away
+            # from leaking them -- see festina_map_free_entries's own doc
+            # comment) before freeing the entries buffer itself -- see
             # _emit_free_active_locals's MapType branch.
-            "declare void @festina_map_free_entries(i64, ptr)",
-            # claude.md #156: amap[T] -- the one genuinely new runtime
-            # function this type needed. count_ptr/capacity_ptr/
-            # entries_ptr (three fields now, not two -- see
-            # FESTINA_AMAP_LLVM_TYPE's own comment) are always passed by
-            # address so festina_amap_set can grow the backing array
-            # (and its own tracked capacity) in place. Every other map
-            # runtime function above is reused for amap[T] unchanged --
-            # see festina_amap_set's own comment in festina_runtime.c.
-            "declare void @festina_amap_set(ptr, ptr, ptr, ptr, i64)",
+            "declare void @festina_map_free_entries(ptr, i64)",
             # claude.md #56: Math.floor/ceil/round/trunc, via LLVM's
             # built-in intrinsics rather than a runtime C function.
             "declare i64 @llvm.fptosi.sat.i64.f64(double)",
@@ -1647,15 +1645,15 @@ class CodeGen:
     def _struct_type_defs(self):
         # claude.md #26: every arr[T] -- regardless of T -- lowers to the
         # same fixed-size {length, data} header; see the module docstring.
-        # claude.md #72: every map[T] -- regardless of T -- lowers to the
-        # identical-shaped {count, entries} header, for the same reason
-        # (see FESTINA_MAP_LLVM_TYPE's own comment on why it's still a
-        # distinct name rather than reusing _FestinaArray outright).
+        # claude.md #72/#175: every map[T] -- regardless of T -- lowers
+        # to the identical-shaped {count, entries, capacity, tombstones}
+        # header, for the same reason (see FESTINA_MAP_LLVM_TYPE's own
+        # comment on why it's still a distinct name rather than reusing
+        # _FestinaArray outright).
         lines = [
             f"{FESTINA_ARRAY_LLVM_TYPE} = type {{ i64, ptr }}",
             f"{FESTINA_AMOR_ARRAY_LLVM_TYPE} = type {{ i64, ptr, i64 }}",
-            f"{FESTINA_MAP_LLVM_TYPE} = type {{ i64, ptr }}",
-            f"{FESTINA_AMAP_LLVM_TYPE} = type {{ i64, ptr, i64 }}",
+            f"{FESTINA_MAP_LLVM_TYPE} = type {{ i64, ptr, i64, i64 }}",
             # claude.md #91: a `font` value points at one of these,
             # emitted as read-only data from the declaration's own
             # literal -- size in px, slant, weight, family. Layout must
@@ -1697,21 +1695,18 @@ class CodeGen:
                 lines.append(f"{header} = global {{i64, {struct_ty}}} {{i64 -1, {struct_ty} zeroinitializer}}")
                 lines.append(f"{ref} = global ptr getelementptr({{i64, {struct_ty}}}, ptr {header}, i32 0, i32 1)")
                 continue
-            map_is_amortized = isinstance(type_, types_mod.MapType) and type_.amortized
             array_is_amortized = isinstance(type_, types_mod.ArrayType) and type_.amortized
-            if (isinstance(type_, (types_mod.ArrayType, types_mod.MapType))
-                    and not map_is_amortized and not array_is_amortized):
+            if isinstance(type_, (types_mod.ArrayType, types_mod.MapType)) and not array_is_amortized:
                 # claude.md #79: identical treatment to the StructType
                 # branch just above -- see its own comment for the full
                 # reasoning (immortal sentinel refcount, no special-
                 # casing needed at a global's first-ever reassignment).
-                # Only the payload shape differs (FESTINA_ARRAY_LLVM_TYPE/
-                # FESTINA_MAP_LLVM_TYPE's `{i64, ptr}` in place of a
-                # user struct's own field list).
+                # Only the payload shape differs (FESTINA_ARRAY_LLVM_TYPE's
+                # `{i64, ptr}` or FESTINA_MAP_LLVM_TYPE's `{i64, ptr, i64,
+                # i64}` in place of a user struct's own field list).
                 #
-                # claude.md #156 (extended by #174): `amor map[T]`/
-                # `amor arr[T]` are BOTH deliberately excluded -- an
-                # amortized global of either kind falls through to the
+                # claude.md #174: `amor arr[T]` is deliberately excluded
+                # -- an amortized array global falls through to the
                 # generic `global ptr null` case below instead, exactly
                 # like a blob/img/aud/http/socket global already does.
                 # Safe ONLY because semantic.py requires an amortized
@@ -1722,8 +1717,11 @@ class CodeGen:
                 # real value before any user code could observe it, the
                 # same reasoning that already makes a bare blob/img/aud/
                 # http/socket global safe. Skipping this path also
-                # sidesteps needing FESTINA_AMAP_LLVM_TYPE/
-                # FESTINA_AMOR_ARRAY_LLVM_TYPE awareness here at all.
+                # sidesteps needing FESTINA_AMOR_ARRAY_LLVM_TYPE awareness
+                # here at all. map[T] has no such exclusion any more --
+                # claude.md #175 removed `amor map[T]` outright, so every
+                # map[T] global takes this immortal-sentinel path, the
+                # same as a struct.
                 payload_ty = (FESTINA_ARRAY_LLVM_TYPE if isinstance(type_, types_mod.ArrayType)
                               else FESTINA_MAP_LLVM_TYPE)
                 header = f"{ref}.header"
@@ -1931,23 +1929,26 @@ class CodeGen:
                                 _llvm_type(elem_type), lines)
                         lines.append(f"  call void @free(ptr {data_ptr})")
                     else:
-                        # claude.md #74/#75: unlike an array's plain
+                        # claude.md #74/#75/#175: unlike an array's plain
                         # data buffer, a map's entries buffer has its
-                        # own nested allocation per entry (each key is
-                        # its own strdup'd copy -- see festina_map_set's
-                        # own comment) that a plain free() of the
-                        # entries pointer alone would leak.
-                        # festina_map_free_entries frees each entry's
-                        # key first, then the entries buffer itself.
+                        # own nested allocation per live bucket (each key
+                        # is its own strdup'd copy -- see
+                        # festina_map_set's own comment) that a plain
+                        # free() of the entries pointer alone would leak.
+                        # festina_map_free_entries frees each live
+                        # bucket's key first, then the entries buffer
+                        # itself -- scanned by capacity, not count (a
+                        # bucket scan is driven by capacity, not a dense
+                        # [0,count) range).
                         value_type = type_.type_.value
-                        count_ptr = self.tmp()
-                        lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
-                        count_val = self.tmp()
-                        lines.append(f"  {count_val} = load i64, ptr {count_ptr}")
                         field_ptr = self.tmp()
                         lines.append(f"  {field_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
                         entries_ptr = self.tmp()
                         lines.append(f"  {entries_ptr} = load ptr, ptr {field_ptr}")
+                        cap_ptr = self.tmp()
+                        lines.append(f"  {cap_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 2")
+                        cap_val = self.tmp()
+                        lines.append(f"  {cap_val} = load i64, ptr {cap_ptr}")
                         if (_is_refcounted(value_type)
                                 or value_type == TEXT):
                             # claude.md #80 (widened by #83 to text):
@@ -1958,8 +1959,8 @@ class CodeGen:
                             # see _release_fn_for_map's own comment.
                             trampoline_name = self._emit_map_value_release_trampoline(value_type)
                             lines.append(
-                                f"  call void @festina_map_for_each(i64 {count_val}, ptr {entries_ptr}, ptr {trampoline_name})")
-                        lines.append(f"  call void @festina_map_free_entries(i64 {count_val}, ptr {entries_ptr})")
+                                f"  call void @festina_map_for_each(ptr {entries_ptr}, i64 {cap_val}, ptr {trampoline_name})")
+                        lines.append(f"  call void @festina_map_free_entries(ptr {entries_ptr}, i64 {cap_val})")
                 elif _is_refcounted(type_) or type_ == TEXT:
                     # claude.md #77/#79: release (not free) -- this
                     # value is refcounted (see _emit_stmt's own VarDecl
@@ -2415,29 +2416,36 @@ class CodeGen:
         obj_val, obj_type = self._emit_expr(tgt.obj, env, lines)
 
         if isinstance(obj_type, types_mod.MapType):
-            # claude.md #156: festina_map_delete only ever touches
-            # count/entries (fields 0/1, identical offsets in both
-            # FESTINA_MAP_LLVM_TYPE and FESTINA_AMAP_LLVM_TYPE), so it's
-            # directly reusable for `amor map[T]` too -- only the GEP's
-            # own struct type name needs to match the real value.
-            llvm_type_name = FESTINA_AMAP_LLVM_TYPE if obj_type.amortized else FESTINA_MAP_LLVM_TYPE
+            # claude.md #175: count_ptr/tombstones_ptr are out-params
+            # (delete removes a live entry or converts it to a
+            # tombstone); capacity is read-only (delete never grows the
+            # table).
             if tgt.computed:
                 key_val, key_type = self._emit_expr(tgt.prop, env, lines)
             else:
                 key_val, key_type = self.string_const(tgt.prop), None
             count_ptr = self.tmp()
-            lines.append(f"  {count_ptr} = getelementptr {llvm_type_name}, "
+            lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, "
                          f"ptr {obj_val}, i32 0, i32 0")
             entries_ptr = self.tmp()
-            lines.append(f"  {entries_ptr} = getelementptr {llvm_type_name}, "
+            lines.append(f"  {entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, "
                          f"ptr {obj_val}, i32 0, i32 1")
+            cap_ptr = self.tmp()
+            lines.append(f"  {cap_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, "
+                         f"ptr {obj_val}, i32 0, i32 2")
+            cap_val = self.tmp()
+            lines.append(f"  {cap_val} = load i64, ptr {cap_ptr}")
+            tomb_ptr = self.tmp()
+            lines.append(f"  {tomb_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, "
+                         f"ptr {obj_val}, i32 0, i32 3")
             value_type = obj_type.value
             if _is_refcounted(value_type) or value_type == TEXT:
                 tramp = self._emit_map_value_release_trampoline(value_type)
             else:
                 tramp = "null"
             lines.append(f"  call i8 @festina_map_delete(ptr {count_ptr}, "
-                         f"ptr {entries_ptr}, ptr {key_val}, ptr {tramp})")
+                         f"ptr {entries_ptr}, i64 {cap_val}, ptr {tomb_ptr}, "
+                         f"ptr {key_val}, ptr {tramp})")
             if tgt.computed:
                 self._free_text_temp(tgt.prop, key_val, key_type, lines)
             return
@@ -3749,8 +3757,7 @@ class CodeGen:
                 obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
                 if isinstance(obj_type, types_mod.MapType):
                     key_val, key_type = self._emit_expr(expr.prop, env, lines)
-                    out = self._emit_map_get(obj_val, obj_type.value, key_val, lines,
-                                             is_amap=obj_type.amortized)
+                    out = self._emit_map_get(obj_val, obj_type.value, key_val, lines)
                     # claude.md #97: festina_map_get only READS the key
                     # (it strcmp's against each entry's own copy), so a
                     # key this expression allocated -- `m[`k${i}`]` --
@@ -4252,42 +4259,50 @@ class CodeGen:
 
         elif isinstance(type_, types_mod.MapType):
             value_type = type_.value
-            # claude.md #156: same GEP-type-name swap every other map
-            # touchpoint needs -- count/entries sit at identical
-            # offsets either way.
-            map_llvm_type = FESTINA_AMAP_LLVM_TYPE if type_.amortized else FESTINA_MAP_LLVM_TYPE
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('{')})")
+            # claude.md #175: a hash table's buckets aren't a dense
+            # [0,count) run any more -- most slots in a capacity-sized
+            # array are empty or tombstoned. Loop bound is `capacity`,
+            # not `count`; each slot's key is checked (NULL = empty,
+            # the reserved 1-valued pointer = tombstone -- see
+            # FESTINA_MAP_TOMBSTONE in festina_runtime.c) and skipped
+            # before it's treated as live. The `iv > 0` "not the first
+            # entry" comma test no longer works either, since the first
+            # LIVE bucket isn't reliably index 0 -- replaced with an
+            # "emitted anything yet" flag set right after each real
+            # append. The FestinaMapEntry stride itself (16 bytes: an
+            # 8-byte key pointer, an 8-byte value) is unchanged by
+            # #175, so the same offset math still applies once a slot
+            # is known live.
             cnt_p = self.tmp()
-            body.append(f"  {cnt_p} = getelementptr {map_llvm_type}, ptr %v, i32 0, i32 0")
-            n = self.tmp()
-            body.append(f"  {n} = load i64, ptr {cnt_p}")
+            body.append(f"  {cnt_p} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr %v, i32 0, i32 2")
+            cap = self.tmp()
+            body.append(f"  {cap} = load i64, ptr {cnt_p}")
             ent_p = self.tmp()
-            body.append(f"  {ent_p} = getelementptr {map_llvm_type}, ptr %v, i32 0, i32 1")
+            body.append(f"  {ent_p} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr %v, i32 0, i32 1")
             ents = self.tmp()
             body.append(f"  {ents} = load ptr, ptr {ent_p}")
+            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('{')})")
             i_slot = self.tmp()
             body.append(f"  {i_slot} = alloca i64")
             body.append(f"  store i64 0, ptr {i_slot}")
+            emitted_slot = self.tmp()
+            body.append(f"  {emitted_slot} = alloca i8")
+            body.append(f"  store i8 0, ptr {emitted_slot}")
             cond = self.label("json.mcond")
             loop = self.label("json.mbody")
+            live_lbl = self.label("json.mlive")
             sep = self.label("json.msep")
             kv_lbl = self.label("json.mkv")
+            next_lbl = self.label("json.mnext")
             done = self.label("json.mdone")
             body.append(f"  br label %{cond}")
             body.append(f"{cond}:")
             iv = self.tmp()
             body.append(f"  {iv} = load i64, ptr {i_slot}")
             more = self.tmp()
-            body.append(f"  {more} = icmp slt i64 {iv}, {n}")
+            body.append(f"  {more} = icmp slt i64 {iv}, {cap}")
             body.append(f"  br i1 {more}, label %{loop}, label %{done}")
             body.append(f"{loop}:")
-            nonfirst = self.tmp()
-            body.append(f"  {nonfirst} = icmp sgt i64 {iv}, 0")
-            body.append(f"  br i1 {nonfirst}, label %{sep}, label %{kv_lbl}")
-            body.append(f"{sep}:")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(',')})")
-            body.append(f"  br label %{kv_lbl}")
-            body.append(f"{kv_lbl}:")
             # A FestinaMapEntry is {char *key, int64_t value}: 16 bytes.
             off = self.tmp()
             body.append(f"  {off} = mul i64 {iv}, 16")
@@ -4295,11 +4310,31 @@ class CodeGen:
             body.append(f"  {entp} = getelementptr i8, ptr {ents}, i64 {off}")
             keyv = self.tmp()
             body.append(f"  {keyv} = load ptr, ptr {entp}")
+            is_null = self.tmp()
+            body.append(f"  {is_null} = icmp eq ptr {keyv}, null")
+            is_tomb = self.tmp()
+            body.append(f"  {is_tomb} = icmp eq ptr {keyv}, inttoptr (i64 1 to ptr)")
+            skip = self.tmp()
+            body.append(f"  {skip} = or i1 {is_null}, {is_tomb}")
+            body.append(f"  br i1 {skip}, label %{next_lbl}, label %{live_lbl}")
+            body.append(f"{live_lbl}:")
+            emitted = self.tmp()
+            body.append(f"  {emitted} = load i8, ptr {emitted_slot}")
+            nonfirst = self.tmp()
+            body.append(f"  {nonfirst} = icmp ne i8 {emitted}, 0")
+            body.append(f"  br i1 {nonfirst}, label %{sep}, label %{kv_lbl}")
+            body.append(f"{sep}:")
+            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(',')})")
+            body.append(f"  br label %{kv_lbl}")
+            body.append(f"{kv_lbl}:")
             body.append(f"  call void @festina_sb_append_json_text(ptr %sb, ptr {keyv})")
             body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(':')})")
             vslot = self.tmp()
             body.append(f"  {vslot} = getelementptr i8, ptr {entp}, i64 8")
             self._json_append_slot(body, "%sb", value_type, vslot, "%depth")
+            body.append(f"  store i8 1, ptr {emitted_slot}")
+            body.append(f"  br label %{next_lbl}")
+            body.append(f"{next_lbl}:")
             nx = self.tmp()
             body.append(f"  {nx} = add i64 {iv}, 1")
             body.append(f"  store i64 {nx}, ptr {i_slot}")
@@ -4520,8 +4555,8 @@ class CodeGen:
         self.func_defs.extend(body)
         return fn_name
 
-    def _from_json_map_value(self, map_ptr, value_type, key_val, value_val, lines, is_amap=False):
-        """claude.md #173: sets one key/value pair on a freshly-built
+    def _from_json_map_value(self, map_ptr, value_type, key_val, value_val, lines):
+        """claude.md #173/#175: sets one key/value pair on a freshly-built
         map[value_type] header during .toStruct()/.toArr() JSON parsing
         (_from_json_map_fn_for below) -- deliberately NOT a call to the
         general _emit_map_set: that method's own retain-unless-fresh
@@ -4540,31 +4575,26 @@ class CodeGen:
         ordering, see _emit_map_set's identical comment), the same
         "last one wins, and doesn't leak the value it replaces"
         contract a map literal's own repeated key follows."""
-        llvm_type_name = FESTINA_AMAP_LLVM_TYPE if is_amap else FESTINA_MAP_LLVM_TYPE
         count_ptr = self.tmp()
-        lines.append(f"  {count_ptr} = getelementptr {llvm_type_name}, ptr {map_ptr}, i32 0, i32 0")
+        lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 0")
         entries_ptr = self.tmp()
-        lines.append(f"  {entries_ptr} = getelementptr {llvm_type_name}, ptr {map_ptr}, i32 0, i32 1")
-        capacity_ptr = None
-        if is_amap:
-            capacity_ptr = self.tmp()
-            lines.append(f"  {capacity_ptr} = getelementptr {llvm_type_name}, ptr {map_ptr}, i32 0, i32 2")
-        count_val = self.tmp()
-        lines.append(f"  {count_val} = load i64, ptr {count_ptr}")
+        lines.append(f"  {entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 1")
+        capacity_ptr = self.tmp()
+        lines.append(f"  {capacity_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 2")
+        tombstones_ptr = self.tmp()
+        lines.append(f"  {tombstones_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 3")
         entries_val = self.tmp()
         lines.append(f"  {entries_val} = load ptr, ptr {entries_ptr}")
+        capacity_val = self.tmp()
+        lines.append(f"  {capacity_val} = load i64, ptr {capacity_ptr}")
         old_raw = self.tmp()
-        lines.append(f"  {old_raw} = call i64 @festina_map_get(i64 {count_val}, ptr {entries_val}, "
+        lines.append(f"  {old_raw} = call i64 @festina_map_get(ptr {entries_val}, i64 {capacity_val}, "
                      f"ptr {key_val}, i64 0)")
         old_ptr = self.tmp()
         lines.append(f"  {old_ptr} = inttoptr i64 {old_raw} to ptr")
         raw_val = self._map_value_to_i64(value_val, value_type, lines)
-        if is_amap:
-            lines.append(f"  call void @festina_amap_set(ptr {count_ptr}, ptr {capacity_ptr}, "
-                         f"ptr {entries_ptr}, ptr {key_val}, i64 {raw_val})")
-        else:
-            lines.append(f"  call void @festina_map_set(ptr {count_ptr}, ptr {entries_ptr}, "
-                         f"ptr {key_val}, i64 {raw_val})")
+        lines.append(f"  call void @festina_map_set(ptr {count_ptr}, ptr {entries_ptr}, "
+                     f"ptr {capacity_ptr}, ptr {tombstones_ptr}, ptr {key_val}, i64 {raw_val})")
         if _is_refcounted(value_type):
             lines.append(f"  call void {self._release_fn_for(value_type)}(ptr {old_ptr})")
         elif value_type == TEXT:
@@ -4576,20 +4606,16 @@ class CodeGen:
         #159 entry named this the missing piece: "a map[text] parsing
         counterpart (a JSON object with arbitrary keys, rather than
         known field names) for a map[T] target." Returns (generating on
-        first use, cached by value type name AND amor-ness -- an `amor
-        map[T]` target genuinely needs FESTINA_AMAP_LLVM_TYPE's own
-        extra capacity field, unlike arr[T]'s own amor prefix, which has
-        no runtime representation difference yet, see ArrayType's own
-        doc comment) `ptr @__festina_from_json_map_N(ptr %cursor)`,
-        parsing one JSON object at the cursor into a fresh map[T].
+        first use, cached by value type name) `ptr
+        @__festina_from_json_map_N(ptr %cursor)`, parsing one JSON
+        object at the cursor into a fresh map[T].
 
         Unlike _from_json_struct_fn_for's own object-parsing loop (which
         matches each key against a FIXED set of known field names, and
         skips anything else), every key here becomes a map entry --
         there is no fixed field set to match against, exactly the
         "arbitrary keys" a map[T] target calls for."""
-        is_amap = map_type.amortized
-        cache_key = f"map:{'amor ' if is_amap else ''}{types_mod.type_name(map_type.value)}"
+        cache_key = f"map:{types_mod.type_name(map_type.value)}"
         cached = self._from_json_fns.get(cache_key)
         if cached is not None:
             return cached
@@ -4597,9 +4623,8 @@ class CodeGen:
         self._from_json_fns[cache_key] = fn_name
 
         value_type = map_type.value
-        llvm_type_name = FESTINA_AMAP_LLVM_TYPE if is_amap else FESTINA_MAP_LLVM_TYPE
         body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
-        out = self._emit_fresh_heap_header(llvm_type_name, body)
+        out = self._emit_fresh_heap_header(FESTINA_MAP_LLVM_TYPE, body)
         body.append("  call void @festina_json_object_start(ptr %cursor)")
         first = self.tmp()
         body.append(f"  {first} = alloca i8")
@@ -4618,9 +4643,9 @@ class CodeGen:
         key_reg = self.tmp()
         body.append(f"  {key_reg} = call ptr @festina_json_read_key(ptr %cursor)")
         v = self._emit_json_read_value(value_type, "%cursor", body)
-        self._from_json_map_value(out, value_type, key_reg, v, body, is_amap=is_amap)
-        # claude.md #97: festina_map_set/_amap_set strdup their own copy
-        # of the key -- the same reason _emit_map_set frees its own
+        self._from_json_map_value(out, value_type, key_reg, v, body)
+        # claude.md #97: festina_map_set strdup's its own copy of the
+        # key -- the same reason _emit_map_set frees its own
         # key_source_expr afterward -- so key_reg (heap-allocated by
         # festina_json_read_key) has no owner left once this returns.
         body.append(f"  call void @free(ptr {key_reg})")
@@ -4685,12 +4710,7 @@ class CodeGen:
                 lines.append(f"  call void @festina_http_send_client_dispatch(ptr {out})")
                 return out, out_type
         if isinstance(node, ast.MapLit):
-            # claude.md #156: ast.MapLit itself has no amor-vs-plain
-            # distinction (the same `{k: v, ...}` syntax either way) --
-            # only the expected type (already known here) says which
-            # header shape/growth function to build.
-            is_amap = isinstance(expected_type, types_mod.MapType) and expected_type.amortized
-            return self._emit_map_lit(node, env, lines, expected_type, is_amap=is_amap)
+            return self._emit_map_lit(node, env, lines, expected_type)
         # claude.md #91: `color red = 'red'` / `font body = '13px arial'`.
         # Resolving here rather than in the VarDecl branch means every
         # position that knows its expected type gets it for free --
@@ -4810,10 +4830,9 @@ class CodeGen:
         return payload
 
     def _array_capacity_arg(self, obj_val, obj_type, lines):
-        """claude.md #174: the capacity-tracking counterpart to
-        _emit_map_set's own is_amap-gated capacity GEP -- an `amor
-        arr[T]` passes the ADDRESS of its own capacity field (the
-        third FESTINA_AMOR_ARRAY_LLVM_TYPE field) so
+        """claude.md #174: an `amor arr[T]` passes the ADDRESS of its
+        own capacity field (the third FESTINA_AMOR_ARRAY_LLVM_TYPE
+        field) so
         festina_array_resize can grow it geometrically in place; a
         plain arr[T] passes a literal `null`, which
         festina_array_resize treats exactly as it always has --
@@ -5032,8 +5051,7 @@ class CodeGen:
         # _emit_stmt's VarDecl handling, the only caller that ever
         # passes one (a non-escaping local declared directly from an
         # array literal -- claude.md #81). Never a caller-supplied
-        # `header` when `is_amor` is true -- claude.md #174, mirroring
-        # `amor map[T]`'s identical exclusion: see
+        # `header` when `is_amor` is true -- claude.md #174: see
         # _is_stack_allocatable_array_or_map_decl's own comment.
         #
         # claude.md #26: "Arrays may contain supported primitive types,
@@ -5048,7 +5066,8 @@ class CodeGen:
         # declaration's own expected type, ArrayType.amortized
         # included) decides which; ast.ArrayLit itself has no
         # amor-vs-plain distinction, the same `[...]` syntax either
-        # way. Mirrors _emit_map_lit's own `is_amap` parameter exactly.
+        # way -- map[T] no longer has an analogous parameter on
+        # _emit_map_lit since claude.md #175 removed `amor map[T]`.
         llvm_type_name = FESTINA_AMOR_ARRAY_LLVM_TYPE if is_amor else FESTINA_ARRAY_LLVM_TYPE
         expected_elem = expected_type.element if isinstance(expected_type, types_mod.ArrayType) else None
 
@@ -5146,44 +5165,29 @@ class CodeGen:
 
         return header, types_mod.ArrayType(elem_type, amortized=is_amor)
 
-    def _emit_map_lit(self, expr, env, lines, expected_type=None, header=None, is_amap=False):
-        """claude.md #72: { key: value, ... } -- built the same way
+    def _emit_map_lit(self, expr, env, lines, expected_type=None, header=None):
+        """claude.md #72/#175: { key: value, ... } -- built the same way
         _emit_array_lit builds an array literal: a header (fresh heap by
         default, or the caller's own pre-allocated `header` -- see
         _emit_array_lit's own comment on that parameter, claude.md #81)
-        that festina_map_set mutates count/entries on in place as each
-        entry is added (see _emit_map_set), one festina_map_set call per
-        entry in source order (so a repeated key naturally ends up "last
-        one wins", with no separate dedup pass needed).
+        that festina_map_set mutates in place as each entry is added
+        (see _emit_map_set), one festina_map_set call per entry in
+        source order (so a repeated key naturally ends up "last one
+        wins", with no separate dedup pass needed).
 
         `header`, when given, must already be zero-initialized (its own
-        count/entries fields both starting at 0/null) -- true of both a
-        fresh calloc'd heap header and a `store {ty} zeroinitializer`
-        stack one, so this method itself never needs to care which.
-
-        claude.md #156: `is_amap` builds an `amor map[T]` header
-        (FESTINA_AMAP_LLVM_TYPE, tracking a capacity field
-        FESTINA_MAP_LLVM_TYPE doesn't) instead of a plain map[T] one --
-        the caller (_emit_value_for, which already knows the
-        declaration's own expected type, MapType.amortized included)
-        decides which; ast.MapLit itself has no amor-vs-plain
-        distinction, the same `{k: v, ...}` syntax either way. Never
-        called with a caller-supplied `header` when `is_amap` is true:
-        `amor map[T]` never gets the non-escaping-local stack-header
-        optimization claude.md #81 gave plain map[T] (a deliberate
-        scope boundary -- see _is_stack_allocatable_array_or_map_decl's
-        own note), so it always takes the fresh-heap-header branch
-        below."""
-        llvm_type_name = FESTINA_AMAP_LLVM_TYPE if is_amap else FESTINA_MAP_LLVM_TYPE
+        count/entries/capacity/tombstones fields all starting at
+        0/null/0/0) -- true of both a fresh calloc'd heap header and a
+        `store {ty} zeroinitializer` stack one, so this method itself
+        never needs to care which."""
         expected_value = (expected_type.value
-                          if isinstance(expected_type, types_mod.MapType)
-                          and expected_type.amortized == is_amap else None)
+                          if isinstance(expected_type, types_mod.MapType) else None)
 
         # claude.md #79: a fresh, uniquely-owned heap header when
         # `header` wasn't already supplied -- see _emit_array_lit's own
         # comment just above for the full reasoning, identical here.
         if header is None:
-            header = self._emit_fresh_heap_header(llvm_type_name, lines)
+            header = self._emit_fresh_heap_header(FESTINA_MAP_LLVM_TYPE, lines)
 
         value_type = expected_value
         for key_expr, val_expr in expr.entries:
@@ -5203,7 +5207,7 @@ class CodeGen:
             value_type = value_type or vtype
             self._emit_map_set(header, value_type, key_val, val_val, val_expr, lines,
                                 key_source_expr=key_expr,
-                                value_pre_coerce_type=pre_coerce_type, is_amap=is_amap)
+                                value_pre_coerce_type=pre_coerce_type)
 
         if value_type is None:
             raise CodegenError(
@@ -5211,7 +5215,7 @@ class CodeGen:
                 file=self.filename, line=getattr(expr, "line", 0),
             )
 
-        return header, types_mod.MapType(value_type, amortized=is_amap)
+        return header, types_mod.MapType(value_type)
 
     def _map_value_to_i64(self, val, value_type, lines):
         """Reinterprets an already-emitted value of the given map value
@@ -5271,53 +5275,48 @@ class CodeGen:
         # blob/struct/etc. the same way it is everywhere else.
         return "0"
 
-    def _emit_map_get(self, obj_val, value_type, key_val, lines, is_amap=False):
-        """claude.md #72: npcHealths['npc1'] -- count/entries are read
-        straight out of the already-emitted map's own storage
+    def _emit_map_get(self, obj_val, value_type, key_val, lines):
+        """claude.md #72/#175: npcHealths['npc1'] -- entries/capacity
+        are read straight out of the already-emitted map's own storage
         (claude.md #79: `obj_val` is now a `ptr` to that storage, not
-        the {count,entries} value itself, so this needs a GEP+load per
-        field, the same two-step pattern struct field reads already
-        use -- not addressable via extractvalue anymore). No
-        addressability needed for a READ regardless, unlike a write;
-        see _emit_map_set.
-
-        claude.md #156: `is_amap` only changes the GEP's own struct
-        type name (FESTINA_AMAP_LLVM_TYPE in place of
-        FESTINA_MAP_LLVM_TYPE) -- count/entries sit at the identical
-        offsets (fields 0/1) in both, and festina_map_get itself is
-        capacity-agnostic (it only ever reads count/entries), so
-        nothing else here differs for a read."""
-        llvm_type_name = FESTINA_AMAP_LLVM_TYPE if is_amap else FESTINA_MAP_LLVM_TYPE
-        count_ptr = self.tmp()
-        lines.append(f"  {count_ptr} = getelementptr {llvm_type_name}, ptr {obj_val}, i32 0, i32 0")
-        count = self.tmp()
-        lines.append(f"  {count} = load i64, ptr {count_ptr}")
+        the header value itself, so this needs a GEP+load per field,
+        the same two-step pattern struct field reads already use --
+        not addressable via extractvalue anymore). No addressability
+        needed for a READ regardless, unlike a write; see
+        _emit_map_set. No `count` GEP -- festina_map_get scans buckets
+        by capacity, not a dense [0,count) range, so count was never
+        needed by a read."""
         entries_ptr = self.tmp()
-        lines.append(f"  {entries_ptr} = getelementptr {llvm_type_name}, ptr {obj_val}, i32 0, i32 1")
+        lines.append(f"  {entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 1")
         entries = self.tmp()
         lines.append(f"  {entries} = load ptr, ptr {entries_ptr}")
+        capacity_ptr = self.tmp()
+        lines.append(f"  {capacity_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 2")
+        capacity = self.tmp()
+        lines.append(f"  {capacity} = load i64, ptr {capacity_ptr}")
         default = self._map_missing_default(value_type)
         raw = self.tmp()
-        lines.append(f"  {raw} = call i64 @festina_map_get(i64 {count}, ptr {entries}, ptr {key_val}, i64 {default})")
+        lines.append(f"  {raw} = call i64 @festina_map_get(ptr {entries}, i64 {capacity}, ptr {key_val}, i64 {default})")
         return self._i64_to_map_value(raw, value_type, lines), value_type
 
     def _emit_map_set(self, map_ptr, value_type, key_val, value_val, value_source_expr, lines,
-                       key_source_expr=None, value_pre_coerce_type=None, is_amap=False):
-        """claude.md #72: npcHealths['npc1'] = 30 (and the equivalent
-        per-entry calls a map literal builds itself out of -- see
-        _emit_map_lit). Unlike a read, this needs the map's own actual
-        header ADDRESS (`map_ptr`, a `ptr` to its {count, entries}
-        storage), not just its value, since festina_map_set can grow
-        the backing entries array and has to write the new
-        count/entries back into that same storage for the change to
-        actually stick. claude.md #79: since every arr[T]/map[T] value
-        is now itself a `ptr` to that storage (not the storage inline),
-        `map_ptr` here is always already that pointer -- the LOADED
-        value of a variable's own slot/global, a struct field's own
-        loaded value, or (during literal construction) the literal's
-        own fresh heap header -- never a slot or field's own ADDRESS a
-        further load would still be needed for; see _try_addressable's
-        own comment for where that load actually happens.
+                       key_source_expr=None, value_pre_coerce_type=None):
+        """claude.md #72/#175: npcHealths['npc1'] = 30 (and the
+        equivalent per-entry calls a map literal builds itself out of
+        -- see _emit_map_lit). Unlike a read, this needs the map's own
+        actual header ADDRESS (`map_ptr`, a `ptr` to its {count,
+        entries, capacity, tombstones} storage), not just its value,
+        since festina_map_set can rehash the whole table and has to
+        write the new count/entries/capacity/tombstones back into that
+        same storage for the change to actually stick. claude.md #79:
+        since every arr[T]/map[T] value is now itself a `ptr` to that
+        storage (not the storage inline), `map_ptr` here is always
+        already that pointer -- the LOADED value of a variable's own
+        slot/global, a struct field's own loaded value, or (during
+        literal construction) the literal's own fresh heap header --
+        never a slot or field's own ADDRESS a further load would still
+        be needed for; see _try_addressable's own comment for where
+        that load actually happens.
 
         claude.md #80: when `value_type` is itself refcounted, retains
         `value_val` (unless `value_source_expr` is "owning") and
@@ -5337,32 +5336,23 @@ class CodeGen:
         very literal building this map, which is exactly a `map[key] =
         v` re-set applied to a key this same construction already
         set -- correctly release the value it replaces, not just skip
-        it.
-
-        claude.md #156: `is_amap` swaps the GEP's struct type name AND
-        additionally GEPs a THIRD field (capacity, index 2 -- only
-        FESTINA_AMAP_LLVM_TYPE has one) to pass into festina_amap_set
-        in place of festina_map_set -- the one real difference between
-        the two: amap's own growth needs to read/write a tracked
-        capacity, not just realloc to exactly the new count the way
-        festina_map_set does."""
-        llvm_type_name = FESTINA_AMAP_LLVM_TYPE if is_amap else FESTINA_MAP_LLVM_TYPE
+        it."""
         count_ptr = self.tmp()
-        lines.append(f"  {count_ptr} = getelementptr {llvm_type_name}, ptr {map_ptr}, i32 0, i32 0")
+        lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 0")
         entries_ptr = self.tmp()
-        lines.append(f"  {entries_ptr} = getelementptr {llvm_type_name}, ptr {map_ptr}, i32 0, i32 1")
-        capacity_ptr = None
-        if is_amap:
-            capacity_ptr = self.tmp()
-            lines.append(f"  {capacity_ptr} = getelementptr {llvm_type_name}, ptr {map_ptr}, i32 0, i32 2")
+        lines.append(f"  {entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 1")
+        capacity_ptr = self.tmp()
+        lines.append(f"  {capacity_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 2")
+        tombstones_ptr = self.tmp()
+        lines.append(f"  {tombstones_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {map_ptr}, i32 0, i32 3")
         deferred_release = None
         if _is_refcounted(value_type):
-            count_val = self.tmp()
-            lines.append(f"  {count_val} = load i64, ptr {count_ptr}")
             entries_val = self.tmp()
             lines.append(f"  {entries_val} = load ptr, ptr {entries_ptr}")
+            capacity_val = self.tmp()
+            lines.append(f"  {capacity_val} = load i64, ptr {capacity_ptr}")
             old_raw = self.tmp()
-            lines.append(f"  {old_raw} = call i64 @festina_map_get(i64 {count_val}, ptr {entries_val}, ptr {key_val}, i64 0)")
+            lines.append(f"  {old_raw} = call i64 @festina_map_get(ptr {entries_val}, i64 {capacity_val}, ptr {key_val}, i64 0)")
             old_ptr = self.tmp()
             lines.append(f"  {old_ptr} = inttoptr i64 {old_raw} to ptr")
             # claude.md #118: the freshness test (with the caller's
@@ -5384,12 +5374,12 @@ class CodeGen:
             # is no fixed address to load an old value from directly"
             # shape, copying (festina_text_own) instead of retaining
             # and freeing (a plain @free) instead of releasing.
-            count_val = self.tmp()
-            lines.append(f"  {count_val} = load i64, ptr {count_ptr}")
             entries_val = self.tmp()
             lines.append(f"  {entries_val} = load ptr, ptr {entries_ptr}")
+            capacity_val = self.tmp()
+            lines.append(f"  {capacity_val} = load i64, ptr {capacity_ptr}")
             old_raw = self.tmp()
-            lines.append(f"  {old_raw} = call i64 @festina_map_get(i64 {count_val}, ptr {entries_val}, ptr {key_val}, i64 0)")
+            lines.append(f"  {old_raw} = call i64 @festina_map_get(ptr {entries_val}, i64 {capacity_val}, ptr {key_val}, i64 0)")
             old_ptr = self.tmp()
             lines.append(f"  {old_ptr} = inttoptr i64 {old_raw} to ptr")
             if not self._is_owning_text_source(value_source_expr):
@@ -5398,11 +5388,8 @@ class CodeGen:
                 value_val = owned
             lines.append(f"  call void @free(ptr {old_ptr})")
         raw_val = self._map_value_to_i64(value_val, value_type, lines)
-        if is_amap:
-            lines.append(f"  call void @festina_amap_set(ptr {count_ptr}, ptr {capacity_ptr}, "
-                         f"ptr {entries_ptr}, ptr {key_val}, i64 {raw_val})")
-        else:
-            lines.append(f"  call void @festina_map_set(ptr {count_ptr}, ptr {entries_ptr}, ptr {key_val}, i64 {raw_val})")
+        lines.append(f"  call void @festina_map_set(ptr {count_ptr}, ptr {entries_ptr}, "
+                     f"ptr {capacity_ptr}, ptr {tombstones_ptr}, ptr {key_val}, i64 {raw_val})")
         if deferred_release is not None:
             release_fn, old_ptr = deferred_release
             lines.append(f"  call void {release_fn}(ptr {old_ptr})")
@@ -5825,31 +5812,20 @@ class CodeGen:
             # claude.md #174: a struct field has no initializer syntax
             # at all -- every field starts null regardless of type, so
             # `amor arr[T]` fields rely ENTIRELY on this auto-vivify
-            # path, the identical reasoning `amor map[T]` fields
-            # already needed it for (see the MapType branch just
-            # below). Building the wrong (smaller, plain-array-shaped)
+            # path. Building the wrong (smaller, plain-array-shaped)
             # header here for a field the rest of codegen treats as
             # FESTINA_AMOR_ARRAY_LLVM_TYPE-shaped would be a real
             # buffer overflow the moment festina_array_resize's own
             # amor path first touched its capacity field -- caught by
             # reasoning through this path directly, not by a failing
-            # test (the same way claude.md #156's own map version of
-            # this bug was caught).
+            # test (the same way claude.md #156's own now-obsolete map
+            # version of this bug was originally caught, back when
+            # `amor map[T]` still existed as a separate representation).
             payload_ty = FESTINA_AMOR_ARRAY_LLVM_TYPE if ftype.amortized else FESTINA_ARRAY_LLVM_TYPE
-        elif ftype.amortized:
-            # claude.md #156: a struct field has no initializer syntax
-            # at all -- every field starts null regardless of type, so
-            # `amor map[T]` fields rely ENTIRELY on this auto-vivify
-            # path (the "requires an initializer" rule elsewhere only
-            # applies to var decls, which DO have initializer syntax).
-            # Building the wrong (smaller, plain-map-shaped) header here
-            # for a field the rest of codegen treats as
-            # FESTINA_AMAP_LLVM_TYPE-shaped would be a real buffer
-            # overflow the moment festina_amap_set first touched its
-            # capacity field -- caught by reasoning through this path
-            # directly, not by a failing test.
-            payload_ty = FESTINA_AMAP_LLVM_TYPE
         else:
+            # claude.md #175: every map[T] field -- there is no
+            # amortized variant to distinguish any more, so this is
+            # always FESTINA_MAP_LLVM_TYPE's single universal shape.
             payload_ty = FESTINA_MAP_LLVM_TYPE
         # calloc'd, so every field lands on its own zero -- an empty
         # arr[T]/map[T] is exactly {length 0, data null}.
@@ -6324,14 +6300,19 @@ class CodeGen:
         possibly-heap value the way `_emit_assign`'s general retain/
         release machinery would otherwise need to account for.
 
-        claude.md #156 (extended by #174): `amor map[T]`/`amor arr[T]`
-        are both unconditionally excluded -- this optimization was
-        never extended to either (a deliberate scope boundary; each
-        always heap-allocates instead, through the same generic
-        with-initializer path blob/img/aud/etc. already use)."""
+        claude.md #174: `amor arr[T]` is unconditionally excluded --
+        this optimization was never extended to it (a deliberate scope
+        boundary; it always heap-allocates instead, through the same
+        generic with-initializer path blob/img/aud/etc. already use).
+        map[T] has no such exclusion any more -- claude.md #175 removed
+        `amor map[T]` outright, so every non-escaping map[T] local is
+        eligible on the same terms as a plain arr[T] one; a hash
+        table's own growth (rehashing into a fresh bucket array,
+        writing the new entries/capacity/tombstones back through the
+        header's own out-pointers) works exactly the same whether the
+        header itself lives on the stack or the heap, so nothing about
+        #175's representation change disqualifies this optimization."""
         if self._current_escaping_names is None or stmt.name in self._current_escaping_names:
-            return False
-        if isinstance(type_, types_mod.MapType) and type_.amortized:
             return False
         if isinstance(type_, types_mod.ArrayType) and type_.amortized:
             return False
@@ -6890,16 +6871,10 @@ class CodeGen:
         festina_release_map's own C implementation already does) and
         frees the header.
 
-        claude.md #156: the plain-`@festina_release_map` fast path
-        just below is ALREADY correct for `amor map[T]` too, unchanged
-        -- it only ever reads count/entries (offsets 0/8, identical in
-        both header shapes) and frees the whole allocation by its base
-        pointer, which correctly reclaims the trailing capacity field
-        along with everything else regardless of whether one exists.
-        The generated-wrapper path below needs its GEP type name to
-        match, and its own cache key already distinguishes `amor
-        map[T]` from plain map[T] for free -- type_name(type_) spells
-        the `amor` prefix when type_.amortized (see types.py)."""
+        claude.md #175: the plain-`@festina_release_map` fast path
+        just below reads entries/capacity (offsets 8/16) and frees the
+        whole allocation by its base pointer, which correctly reclaims
+        the trailing tombstones field along with everything else."""
         value_type = type_.value
         if not (_is_refcounted(value_type)
                 or value_type == TEXT):
@@ -6911,7 +6886,6 @@ class CodeGen:
         self._map_release_fns[key] = fn_name
         trampoline_name = self._emit_map_value_release_trampoline(value_type)
         cyclic = self._is_cyclic_type(type_)
-        llvm_type_name = FESTINA_AMAP_LLVM_TYPE if type_.amortized else FESTINA_MAP_LLVM_TYPE
         body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
         should_free = self.tmp()
         body.append(f"  {should_free} = call i8 @festina_release_check(ptr %payload)")
@@ -6924,16 +6898,16 @@ class CodeGen:
         alive_label = self.label("relmap.alive") if cyclic else done_label
         body.append(f"  br i1 {cond}, label %{free_label}, label %{alive_label}")
         body.append(f"{free_label}:")
-        count_ptr = self.tmp()
-        body.append(f"  {count_ptr} = getelementptr {llvm_type_name}, ptr %payload, i32 0, i32 0")
-        count_val = self.tmp()
-        body.append(f"  {count_val} = load i64, ptr {count_ptr}")
         entries_field_ptr = self.tmp()
-        body.append(f"  {entries_field_ptr} = getelementptr {llvm_type_name}, ptr %payload, i32 0, i32 1")
+        body.append(f"  {entries_field_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr %payload, i32 0, i32 1")
         entries_ptr = self.tmp()
         body.append(f"  {entries_ptr} = load ptr, ptr {entries_field_ptr}")
-        body.append(f"  call void @festina_map_for_each(i64 {count_val}, ptr {entries_ptr}, ptr {trampoline_name})")
-        body.append(f"  call void @festina_map_free_entries(i64 {count_val}, ptr {entries_ptr})")
+        cap_ptr = self.tmp()
+        body.append(f"  {cap_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr %payload, i32 0, i32 2")
+        cap_val = self.tmp()
+        body.append(f"  {cap_val} = load i64, ptr {cap_ptr}")
+        body.append(f"  call void @festina_map_for_each(ptr {entries_ptr}, i64 {cap_val}, ptr {trampoline_name})")
+        body.append(f"  call void @festina_map_free_entries(ptr {entries_ptr}, i64 {cap_val})")
         header = self.tmp()
         body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
         body.append(f"  call void @free(ptr {header})")
@@ -7345,7 +7319,7 @@ class CodeGen:
                                        source_expr=expr.value)
                     self._emit_map_set(obj_val, obj_type.value, key_val, val, expr.value, lines,
                                         key_source_expr=expr.target.prop,
-                                        value_pre_coerce_type=vtype, is_amap=obj_type.amortized)
+                                        value_pre_coerce_type=vtype)
                     return val, obj_type.value
                 if not isinstance(obj_type, types_mod.ArrayType):
                     raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",
@@ -8801,22 +8775,20 @@ class CodeGen:
                     callback_name = f"@{expr.args[0].name}"
                     trampoline_name = self._emit_map_foreach_trampoline(obj_type.value, callback_name)
                     # claude.md #79: obj_val is now a `ptr` to the map's
-                    # own storage, not the {count,entries} value itself
-                    # -- GEP+load per field, same as _emit_map_get.
-                    # claude.md #156: festina_map_for_each is capacity-
-                    # agnostic (count/entries only), reused unchanged
-                    # for `amor map[T]` -- just the GEP type name.
-                    llvm_type_name = FESTINA_AMAP_LLVM_TYPE if obj_type.amortized else FESTINA_MAP_LLVM_TYPE
-                    count_ptr = self.tmp()
-                    lines.append(f"  {count_ptr} = getelementptr {llvm_type_name}, ptr {obj_val}, i32 0, i32 0")
-                    count = self.tmp()
-                    lines.append(f"  {count} = load i64, ptr {count_ptr}")
+                    # own storage, not the header value itself -- GEP+
+                    # load per field, same as _emit_map_get. claude.md
+                    # #175: festina_map_for_each scans by capacity, not
+                    # count, so no count GEP is needed here at all.
                     entries_ptr = self.tmp()
-                    lines.append(f"  {entries_ptr} = getelementptr {llvm_type_name}, ptr {obj_val}, i32 0, i32 1")
+                    lines.append(f"  {entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 1")
                     entries = self.tmp()
                     lines.append(f"  {entries} = load ptr, ptr {entries_ptr}")
+                    capacity_ptr = self.tmp()
+                    lines.append(f"  {capacity_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 2")
+                    capacity = self.tmp()
+                    lines.append(f"  {capacity} = load i64, ptr {capacity_ptr}")
                     lines.append(
-                        f"  call void @festina_map_for_each(i64 {count}, ptr {entries}, ptr {trampoline_name})")
+                        f"  call void @festina_map_for_each(ptr {entries}, i64 {capacity}, ptr {trampoline_name})")
                     return "0", None
         if isinstance(callee, ast.Member):
             # claude.md #141: an indirect call through a func[...]:...

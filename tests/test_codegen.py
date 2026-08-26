@@ -16,6 +16,7 @@ Two kinds of tests here:
   is on PATH, since that's an environment limitation, not a missing
   Festina feature.
 """
+import json
 import os
 import shutil
 import sqlite3
@@ -1074,69 +1075,27 @@ class TestMaps:
         result = compile_and_run(source)
         assert result.stdout.strip() == "origin: (0,0)"
 
-
-class TestAmorMap:
-    """claude.md #156: amor map[T] -- an "amortized map", the `amor`
-    prefix modifier (composes with `const`: `const amor map[T] x`).
-    Same {key: value, ...} literal syntax, same indexed get/set/
-    forEach/delete/toText surface as plain map[T] -- only the growth
-    strategy differs internally (festina_amap_set's own doubling
-    capacity in place of festina_map_set's realloc-by-exactly-one),
-    which these tests can't observe directly, so they exercise the
-    same observable behavior plain map[T] already has, plus enough
-    entries to force several real capacity doublings."""
-
-    def test_literal_init_indexed_get_and_set(self, compile_and_run):
+    def test_json_renders_a_multi_key_map(self, compile_and_run):
+        # claude.md #175: map[T] is a real hash table now -- bucket
+        # order is a function of each key's hash, not insertion order,
+        # so (unlike the single-key case above) a multi-key map's own
+        # JSON key order is genuinely unspecified. Compared via
+        # json.loads, not exact string equality.
         source = """
-        amor map[int] scores = {'a': 1, 'b': 2}
-        scores['c'] = 3
-        scores['a'] = 10
-        log(scores['a'])
-        log(scores['b'])
-        log(scores['c'])
-        log(scores['missing'])
-        """
-        result = compile_and_run(source)
-        assert result.stdout.splitlines() == ["10", "2", "3", "-9223372036854775808"]
-
-    def test_forEach_visits_every_entry(self, compile_and_run):
-        source = """
-        amor map[int] m = {'a': 1, 'b': 2, 'c': 3}
-        int total = 0
-        void func addUp(v:int, key:text) {
-            total = total + v
-        }
-        m.forEach(addUp)
-        log(total)
-        """
-        result = compile_and_run(source)
-        assert result.stdout.strip() == "6"
-
-    def test_delete_removes_the_entry(self, compile_and_run):
-        source = """
-        amor map[text] m = {'a': 'x', 'b': 'y'}
-        delete m['a']
-        log(m['a'])
-        log(m['b'])
-        """
-        result = compile_and_run(source)
-        assert result.stdout.splitlines() == ["", "y"]
-
-    def test_toText_renders_json(self, compile_and_run):
-        source = """
-        amor map[int] m = {'a': 1, 'b': 2}
+        map[int] m = {'a': 1, 'b': 2, 'c': 3, 'd': 4}
         log(m)
         """
         result = compile_and_run(source)
-        assert result.stdout.strip() == '{"a":1,"b":2}'
+        assert json.loads(result.stdout.strip()) == {"a": 1, "b": 2, "c": 3, "d": 4}
 
     def test_many_inserts_survive_real_capacity_growth(self, compile_and_run):
-        # claude.md #156's own point: festina_amap_set doubles capacity
-        # rather than growing by exactly one per insert -- 200 entries
-        # forces several real doublings (8 -> 16 -> ... -> 256), not
-        # just the empty/one-entry cases the other tests above cover.
+        # claude.md #175: map[T] is a real hash table now -- growth is
+        # intrinsic (doubling capacity on crossing a 75% load factor),
+        # not the old realloc-by-exactly-one. 200 entries forces
+        # several real rehashes (8 -> 16 -> ... -> 256), not just the
+        # empty/one-entry cases the other tests above cover.
         source = """
-        amor map[int] m = {}
+        map[int] m = {}
         int i = 0
         while i < 200 {
             m[`key${i}`] = i
@@ -1149,34 +1108,57 @@ class TestAmorMap:
         result = compile_and_run(source)
         assert result.stdout.splitlines() == ["0", "100", "199"]
 
-    def test_const_amor_map_composes(self, compile_and_run):
+    def test_interleaved_insert_delete_forces_rehash_with_tombstones_present(self, compile_and_run):
+        # claude.md #175: a failure mode a linear scan never had --
+        # festina_map_grow's rehash must correctly skip every tombstone
+        # (from the deletes below) and move only live entries, even
+        # when a rehash is triggered while tombstones are still
+        # present in the table (deleting doesn't shrink capacity, so
+        # the inserts after the deletes below force at least one such
+        # rehash). Verifies every surviving key reads back correctly
+        # and every deleted one reads back null, after the churn.
         source = """
-        const amor map[text] m = {'x': 'y'}
-        log(m['x'])
+        map[int] m = {}
+        int i = 0
+        while i < 30 {
+            m[`key${i}`] = i
+            i = i + 1
+        }
+        i = 0
+        while i < 15 {
+            delete m[`key${i}`]
+            i = i + 1
+        }
+        i = 30
+        while i < 60 {
+            m[`key${i}`] = i
+            i = i + 1
+        }
+        log(m['key5'])
+        log(m['key20'])
+        log(m['key45'])
+        log(m['key59'])
         """
         result = compile_and_run(source)
-        assert result.stdout.strip() == "y"
+        assert result.stdout.splitlines() == [
+            "-9223372036854775808", "20", "45", "59",
+        ]
 
-    def test_struct_field_auto_vivifies(self, compile_and_run):
-        # claude.md #156: a struct field has no initializer syntax at
-        # all, so an `amor map[T]` field relies entirely on the same
-        # lazy-build-on-first-touch auto-vivify path plain map[T]
-        # fields already use -- exercising this catches the real risk
-        # this feature's own review found: building the WRONG (smaller,
-        # plain-map-shaped) header for a field the rest of codegen
-        # treats as amor-shaped would silently corrupt memory the
-        # moment festina_amap_set first touched the missing capacity
-        # field, not raise a clean error.
+    def test_json_skips_a_tombstoned_bucket(self, compile_and_run):
+        # claude.md #175: the direct test of _json_fn_for's own rewrite
+        # -- JSON rendering must skip a bucket a prior delete left
+        # tombstoned rather than emitting a phantom entry for it, and
+        # must not get its leading-comma logic wrong when the first
+        # LIVE bucket in table order isn't index 0 (which a deleted-
+        # then-refilled table makes likely).
         source = """
-        struct Bag { m:amor map[int] }
-        Bag b
-        b.m['a'] = 1
-        b.m['b'] = 2
-        log(b.m['a'])
-        log(b.m['b'])
+        map[int] m = {'a': 1, 'b': 2, 'c': 3}
+        delete m['b']
+        m['d'] = 4
+        log(m)
         """
         result = compile_and_run(source)
-        assert result.stdout.splitlines() == ["1", "2"]
+        assert json.loads(result.stdout.strip()) == {"a": 1, "c": 3, "d": 4}
 
 
 class TestAmorArray:

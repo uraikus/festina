@@ -105,19 +105,29 @@ class Parser:
     # ---- types ----
     def parse_type(self):
         if self.at("amor"):
-            # claude.md #156: amor map[T] / amor arr[T] -- amortized
-            # growth, a modifier on the container type itself rather
-            # than a separate type name (composes with `const` the
-            # same way: `const amor map[text] m`, parsed in
-            # parse_const_decl below). Only map[T]/arr[T] have a growth
-            # strategy to modify at all -- anything else after `amor`
-            # is a clear, direct error rather than a confusing
-            # downstream one.
+            # claude.md #156: amor arr[T] -- amortized growth, a
+            # modifier on the container type itself rather than a
+            # separate type name (composes with `const` the same way:
+            # `const amor arr[int] xs`, parsed in parse_const_decl
+            # below). Only arr[T] has a growth strategy left to modify
+            # -- claude.md #175 removed `amor map[T]`, since plain
+            # map[T] itself became a real hash table with intrinsic
+            # geometric growth, making a separate amortized variant
+            # redundant. Anything after `amor` besides arr[T] -- map[T]
+            # included -- is a clear, direct error rather than a
+            # confusing downstream one (silently parsing `amor map[T]`
+            # and just dropping the `amor` would be worse: it would
+            # look accepted while quietly meaning something the
+            # programmer didn't write).
             amor_tok = self.eat("amor")
-            if not (self.at("arr") or self.at("map")):
+            if self.at("map"):
+                raise self.err(amor_tok, "invalid syntax",
+                                "'amor map[T]' was removed -- map[T] is a hash table now and "
+                                "grows the same way 'amor map[T]' used to; drop the 'amor'")
+            if not self.at("arr"):
                 t = self.peek()
                 raise self.err(amor_tok, "invalid syntax",
-                                f"'amor' must be followed by arr[T] or map[T], found {t.type}({t.value!r})")
+                                f"'amor' must be followed by arr[T], found {t.type}({t.value!r})")
             inner_type = self.parse_type()
             inner_type.amortized = True
             return inner_type

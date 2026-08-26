@@ -354,10 +354,12 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
                                   int64_t *out_length, void **out_data);
 int8_t festina_row_undefined(void *row, const char **col_names,
                              int32_t col_count, const char *name);
-/* claude.md #111: `delete m[key]` -- removes the entry, releasing its
- * value through the same per-type trampoline whole-map release uses.
+/* claude.md #111/#175: `delete m[key]` -- removes the entry, releasing
+ * its value through the same per-type trampoline whole-map release
+ * uses. `capacity` is read-only (delete never grows the table).
  * Returns whether the key existed; a missing key is a safe no-op. */
-int8_t festina_map_delete(int64_t *count, void **entries, const char *key,
+int8_t festina_map_delete(int64_t *count, void **entries, int64_t capacity,
+                          int64_t *tombstones, const char *key,
                           void (*release)(int64_t, const char *));
 /* claude.md #111/#118: marks a /pattern/ literal's cached compilation
  * as immortal (the same negative-header sentinel every other immortal
@@ -1192,19 +1194,22 @@ int8_t festina_blob_save(void *payload, const char *target);
 int8_t festina_blob_save_copy(void *payload, const char *target);
 
 /*
- * claude.md #72: map[T] -- { key: value, ... } literals,
- * npcHealths[key] read/write, npcHealths.forEach(callback).
+ * claude.md #72, rebuilt into a real hash table by #175: map[T] --
+ * { key: value, ... } literals, npcHealths[key] read/write,
+ * npcHealths.forEach(callback).
  *
- * A map value is a `{ i64 count, ptr entries }` pair at the LLVM level
- * (festina/codegen.py's FESTINA_MAP_LLVM_TYPE) -- the same two-field
- * shape as arr[T]'s own `{ i64 length, ptr data }`, just never
- * interchangeable with it (see FESTINA_MAP_LLVM_TYPE's own comment):
- * `entries` points to a flat array of FestinaMapEntry { key, value }
- * pairs (opaque to codegen, only ever passed straight through as a
- * `void *`), found by a linear scan (festina_map_find in
- * festina_runtime.c -- not a hash table; see that function's own
- * comment on why that's a deliberate, documented tradeoff, not an
- * oversight).
+ * A map value is a `{ i64 count, ptr entries, i64 capacity, i64
+ * tombstones }` header at the LLVM level (festina/codegen.py's
+ * FESTINA_MAP_LLVM_TYPE): `entries` points to an OPEN-ADDRESSING hash
+ * table of FestinaMapEntry { key, value } buckets (opaque to codegen,
+ * only ever passed straight through as a `void *`), linear-probed and
+ * FNV-1a hashed (festina_map_find/_find_slot/_map_hash in
+ * festina_runtime.c) -- the same shape as this runtime's other hash
+ * table, festina_conn_index_* in festina_runtime_http.c, just keyed by
+ * text instead of int64_t. `count` is the live entry count, `capacity`
+ * the bucket array's length (a power of two), `tombstones` the count
+ * of deleted-but-not-yet-reclaimed buckets (grown away on the next
+ * rehash -- see festina_map_grow's own comment).
  *
  * Every map value type's payload -- int, float, bool, text, blob,
  * struct, table, img, aud, regex (never another arr[T]/map[T]; see
@@ -1220,13 +1225,15 @@ int8_t festina_blob_save_copy(void *payload, const char *target);
  * function pointer directly without a real calling-convention mismatch
  * on plenty of real ABIs.
  *
- * festina_map_set takes `count`/`entries` BY ADDRESS (pointers into the
- * map value's own storage slot, not the map "object" -- there isn't a
- * separate one), since adding a new key may need to grow the backing
- * array and the caller needs to see that change; festina_map_get and
- * festina_map_for_each only ever read, so they take `count`/`entries`
- * directly (already extracted from an ordinary map value with
- * `extractvalue`, no addressability needed).
+ * festina_map_set takes `count`/`entries`/`capacity`/`tombstones` BY
+ * ADDRESS (pointers into the map value's own storage slot, not the map
+ * "object" -- there isn't a separate one), since adding a new key may
+ * need to rehash the whole table and the caller needs to see that
+ * change; festina_map_get and festina_map_for_each only ever read, so
+ * they take `entries`/`capacity` directly (already extracted from an
+ * ordinary map value with `extractvalue`, no addressability needed --
+ * neither needs `count`, since a bucket scan is driven by `capacity`,
+ * not a dense `[0,count)` range).
  *
  * A missing key: "the result is null" (claude.md #72) --
  * festina_map_get returns `default_value` outright when the key isn't
@@ -1236,20 +1243,21 @@ int8_t festina_blob_save_copy(void *payload, const char *target);
  * note; this function has no idea what T is, so it can't make that
  * choice itself).
  */
-void festina_map_set(int64_t *count, void **entries, const char *key, int64_t value);
-int64_t festina_map_get(int64_t count, void *entries, const char *key, int64_t default_value);
-void festina_map_for_each(int64_t count, void *entries, void (*callback)(int64_t, const char *));
+void festina_map_set(int64_t *count, void **entries, int64_t *capacity, int64_t *tombstones,
+                     const char *key, int64_t value);
+int64_t festina_map_get(void *entries, int64_t capacity, const char *key, int64_t default_value);
+void festina_map_for_each(void *entries, int64_t capacity, void (*callback)(int64_t, const char *));
 
-/* claude.md #74/#75: called by generated code when a map[T] local,
- * proven never to escape its declaring function, goes out of scope.
- * Frees each entry's own strdup'd key (see festina_map_set's own
- * comment -- always a private copy, never aliased with anything
- * Festina-visible, so this is always safe regardless of anything
- * escape analysis does or doesn't know) and then the entries buffer
- * itself. A no-op for a map that was declared but never grown
- * (entries is NULL, count is 0 -- the loop below simply doesn't run,
- * and free(NULL) is a defined no-op). */
-void festina_map_free_entries(int64_t count, void *entries);
+/* claude.md #74/#75/#175: called by generated code when a map[T]
+ * local, proven never to escape its declaring function, goes out of
+ * scope. Frees each live bucket's own strdup'd key (see
+ * festina_map_set's own comment -- always a private copy, never
+ * aliased with anything Festina-visible, so this is always safe
+ * regardless of anything escape analysis does or doesn't know) and
+ * then the entries buffer itself. A no-op for a map that was declared
+ * but never grown (entries is NULL, capacity is 0 -- the loop below
+ * simply doesn't run, and free(NULL) is a defined no-op). */
+void festina_map_free_entries(void *entries, int64_t capacity);
 
 /*
  * claude.md #79: releases an arr[T]/map[T] value -- see each
