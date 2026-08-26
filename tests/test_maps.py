@@ -258,8 +258,10 @@ class TestAmorPrefix:
     """claude.md #156: `amor map[T]` / `amor arr[T]` -- an "amortized"
     growth modifier, composing with `const` the same way (`const amor
     map[text] m`). Parser/semantic-level coverage only -- see
-    tests/test_codegen.py::TestAmorMap for real compile-and-run
-    coverage of amor map[T]'s own observable behavior."""
+    tests/test_codegen.py::TestAmorMap/TestAmorArray for real
+    compile-and-run coverage of each one's own observable behavior
+    (claude.md #174 gave `amor arr[T]` a real runtime effect, matching
+    `amor map[T]`'s own since #156)."""
 
     def test_amor_map_parses_as_a_var_decl(self, parser):
         parser.parse("amor map[int] scores = {}")
@@ -303,3 +305,44 @@ class TestAmorPrefix:
         source = "text npc2Id = 'npc2'\namor map[int] m = {'npc1': 10, npc2Id: 15}"
         program = parser.parse(source)
         semantic.analyze(program)
+
+    def test_amor_arr_resolves_to_an_amortized_arraytype(self, parser, semantic, types_mod):
+        # claude.md #174: `amor arr[T]`'s own `amortized` flag is now
+        # part of its real type identity (no more `compare=False`),
+        # matching MapType's own since claude.md #156.
+        program = parser.parse("amor arr[int] xs = [1]")
+        decl = program.body[0]
+        resolved = semantic.resolve_type_name(decl.type_expr, {}, {})
+        assert resolved == types_mod.ArrayType(types_mod.PrimitiveType("int"), amortized=True)
+        assert resolved != types_mod.ArrayType(types_mod.PrimitiveType("int"))
+
+    def test_amor_arr_without_an_initializer_is_a_compile_error(self, parser, semantic, errors):
+        # claude.md #174: the identical initializer requirement
+        # amor map[T] already has, for the identical reason -- see
+        # test_amor_map_without_an_initializer_is_a_compile_error's own
+        # comment.
+        program = parser.parse("amor arr[int] xs")
+        with pytest.raises(errors.CompileError, match="requires an initializer"):
+            semantic.analyze(program)
+
+    def test_amor_arr_literal_rejects_a_mismatched_element_type(self, parser, semantic, errors):
+        program = parser.parse("amor arr[int] xs = [1, 'two']")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_amor_arr_literal_with_a_variable_element_parses(self, parser, semantic):
+        source = "int n = 5\namor arr[int] xs = [1, n, 3]"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_amor_arr_and_plain_arr_are_not_the_same_type(self, parser, semantic, errors):
+        # claude.md #174: assignment between the two is now a genuine
+        # type mismatch, the identical rule amor map[T]/map[T] already
+        # follows -- confirmed by a real end-to-end compile-time
+        # rejection, not just the type-equality check above.
+        program = parser.parse("""
+        amor arr[int] xs = [1, 2, 3]
+        arr[int] ys = xs
+        """)
+        with pytest.raises(errors.CompileError, match="cannot assign"):
+            semantic.analyze(program)

@@ -2772,6 +2772,18 @@ def analyze(program, filename="<string>"):
                 file=filename, line=decl.line, column=decl.column,
                 category="invalid declaration",
             )
+        # claude.md #174: `amor arr[T]` needs the identical initializer
+        # requirement `amor map[T]` already has above, for the identical
+        # reason -- see that check's own comment.
+        if (isinstance(declared_type, types_mod.ArrayType) and declared_type.amortized
+                and decl.init is None):
+            raise CompileError(
+                f"'{decl.name}' (amor arr[{types_mod.type_name(declared_type.element)}]) "
+                f"requires an initializer -- write e.g. `amor arr[{types_mod.type_name(declared_type.element)}] "
+                f"{decl.name} = []` for an empty one",
+                file=filename, line=decl.line, column=decl.column,
+                category="invalid declaration",
+            )
         if decl.init is not None:
             # claude.md #137: arr[img]/arr[aud]/arr[blob] declared
             # directly from a literal of paths -- `arr[img] brushes =
@@ -2806,6 +2818,30 @@ def analyze(program, filename="<string>"):
                             f"array literal element expects "
                             f"{types_mod.type_name(elem)} (or text, naming a "
                             f"path), found {types_mod.type_name(etype)}",
+                            file=filename, line=getattr(e, "line", 0),
+                            column=getattr(e, "column", 0),
+                            category="invalid operand type",
+                        )
+            elif (isinstance(declared_type, types_mod.ArrayType) and declared_type.amortized
+                    and isinstance(decl.init, ast.ArrayLit)):
+                # claude.md #174: same bypass shape as the arr[img]/
+                # amor-map cases here -- ArrayLit's own generic
+                # inference (just above) always returns a NON-amortized
+                # ArrayType regardless of context, so the generic
+                # infer()+check_assignable() path below would always
+                # reject a `[...]` literal against an `amor arr[T]`
+                # declared type. The media (img/aud/blob) element case
+                # is already covered by the branch just above --
+                # unconditional on `.amortized`, so it already handles
+                # `amor arr[img] pics = [...]` too -- this only ever
+                # runs for a non-media amor arr[T].
+                elem_type_name = types_mod.type_name(declared_type.element)
+                for e in decl.init.elements:
+                    etype = infer(e, scope)
+                    if etype is not None and etype is not NULL and etype != declared_type.element:
+                        raise CompileError(
+                            f"array literal element expects {elem_type_name}, "
+                            f"found {types_mod.type_name(etype)}",
                             file=filename, line=getattr(e, "line", 0),
                             column=getattr(e, "column", 0),
                             category="invalid operand type",

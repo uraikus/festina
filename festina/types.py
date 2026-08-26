@@ -4,7 +4,7 @@ resolution), #13 (unknown types).
 Each category gets its own class so the compiler never has to infer a
 category from a name -- callers construct the specific type they mean.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 PRIMITIVE_NAMES = frozenset({"int", "float", "bool", "text", "blob"})
 
@@ -42,22 +42,21 @@ class ArrayType:
     """claude.md #156: `amortized` (default False) is set by the `amor`
     prefix -- `amor arr[T]` -- tracked for parsing/type-checking
     symmetry with MapType's own identical field (`amor` was asked for
-    on both containers together), but with NO runtime effect yet:
-    array growth (festina_array_resize) isn't amortized the way
-    festina_amap_set makes map growth amortized -- `amor arr[T]`
-    currently compiles and behaves exactly like plain arr[T]. Left as
-    a real, honest scope boundary (see claude.md #156's own writeup)
-    rather than silently accepting the syntax and doing nothing with
-    it, or blocking it outright. `compare=False`: since there's no
-    representation difference yet, an `amor arr[T]` and a plain
-    arr[T] of the same element type are treated as the SAME type for
-    assignment/equality purposes (unlike MapType's own `amortized`,
-    which IS part of that type's identity, since amor map[T] genuinely
-    has a different runtime header) -- revisit this the moment array
-    amortization is actually implemented, since at that point the two
-    genuinely stop being interchangeable."""
+    on both containers together). claude.md #174 gave it a real
+    runtime effect: `festina_array_resize` grows an `amor arr[T]`'s
+    backing buffer geometrically (doubling), tracked in a THIRD header
+    field (`FESTINA_AMOR_ARRAY_LLVM_TYPE`, a byte-compatible prefix
+    extension of the plain `{length, data}` shape, the identical trick
+    `FESTINA_AMAP_LLVM_TYPE` already uses over `FESTINA_MAP_LLVM_TYPE`)
+    a plain `arr[T]`'s header doesn't have -- so, exactly like
+    MapType's own `amortized` field, this is now part of the type's
+    real identity, not a comparison-transparent modifier: an
+    `amor arr[T]` and a plain `arr[T]` of the same element type are
+    genuinely different, non-interchangeable representations, and
+    assignment between them is a compile error the same way it already
+    is for `amor map[T]`/`map[T]`."""
     element: object  # another Type instance
-    amortized: bool = field(default=False, compare=False)
+    amortized: bool = False
 
     def __repr__(self):
         prefix = "amor " if self.amortized else ""

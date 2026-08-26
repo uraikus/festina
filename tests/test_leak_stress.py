@@ -374,4 +374,13 @@ class TestLeakStress:
             # top of an already-correct +1 with nothing left to balance
             # it. Isolated on its own, independent of JSON parsing.
             "ternary_ownership_churn.f",
+            # claude.md #174: amor arr[T]'s own real amortized (doubling)
+            # growth -- push/pop/shift/unshift/splice (both 2- and
+            # 3-argument forms) at real iteration counts, on a scalar
+            # element type AND a refcounted one, plus the struct-field
+            # auto-vivify path -- exactly the "far larger surface than
+            # map's four operations" collections_churn.f's own arr[T]/
+            # map[T] coverage doesn't exercise, since plain arr[T] has
+            # no capacity field to get wrong in the first place.
+            "amor_array_churn.f",
         }

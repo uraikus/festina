@@ -677,37 +677,49 @@ collection, not a large-scale data structure. Also grows by exactly one
 entry per insert internally, not amortized — see `amor map[T]` below
 if that matters for a specific map.
 
-### `amor` — amortized-growth maps
+### `amor` — amortized-growth maps and arrays
 
 ```festina
 amor map[int] hitCounts = {}
 const amor map[text] labels = {'ok': 'success'}   // composes with const
 
+amor arr[int] scores = []
+const amor arr[text] tags = ['a', 'b']            // composes with const, same as map
+
 int i = 0
 while i < 10000 {
     hitCounts[`key${i}`] = i
+    scores.push(i)
     i = i + 1
 }
 ```
 
-`amor map[T]` — an "amortized map" — is `map[T]` with a different
-internal growth strategy: doubling capacity as needed instead of
-growing by exactly one entry per insert, so a long run of inserts costs
-O(log n) reallocations instead of O(n). Same literal syntax, same
-indexed get/set, `.forEach()`, `delete`, and `.toText()`/JSON rendering
-as plain `map[T]` — `amor` only changes how it grows internally, not
-what it does. **Requires an initializer** (`amor map[int] m` with no
-`= ...` is a compile error) — unlike plain `map[T]`, which can start
-implicitly empty, an amortized map's own declaration always needs a
-real value to store. Composes with `const` (`const amor map[T] m =
-...`); as a struct field (`m:amor map[int]`), no initializer is needed
-or possible, the same as any other struct field.
+`amor map[T]`/`amor arr[T]` — an "amortized map"/"amortized array" —
+are `map[T]`/`arr[T]` with a different internal growth strategy:
+doubling capacity as needed instead of growing by exactly one
+entry/element per insert, so a long run of inserts/pushes costs O(log
+n) reallocations instead of O(n). Same literal syntax, same indexed
+get/set, same methods (`.forEach()`/`delete` for maps;
+`push()`/`pop()`/`shift()`/`unshift()`/`splice()` for arrays), and the
+same `.toText()`/JSON rendering as the plain versions — `amor` only
+changes how the value grows internally, never what it does or looks
+like from the outside. **Requires an initializer** (`amor map[int] m`
+or `amor arr[int] xs` with no `= ...` is a compile error) — unlike a
+plain `map[T]`/`arr[T]`, which can start implicitly empty, an
+amortized value's own declaration always needs a real value to store.
+Composes with `const` (`const amor map[T] m = ...`, `const amor
+arr[T] xs = ...`); as a struct field (`m:amor map[int]`,
+`xs:amor arr[int]`), no initializer is needed or possible, the same as
+any other struct field — it starts empty the first time the field is
+actually touched.
 
-`amor arr[T]` parses and type-checks (also composing with `const`) but
-does not yet change how an array grows — `push()`/`unshift()`/etc.
-still realloc to exactly the new size either way, identically to plain
-`arr[T]`. Real array amortization is a natural follow-up, not yet
-built.
+An `amor map[T]`/`amor arr[T]` and the plain `map[T]`/`arr[T]` of the
+same value/element type are two genuinely different types, the same
+way `int` and `float` are — assigning one to the other, or passing one
+where the other is expected, is a compile error. Convert by copying
+element-by-element (a loop, or `arr[T] plain = amorXs.splice(0,
+amorXs.length)`, which empties the amortized array into a fresh plain
+one) if you need to cross that boundary.
 
 ## Built-in SQLite
 
@@ -2364,6 +2376,12 @@ no variadic calls, so the items to insert are one explicit `arr[T]`
 instead of a spread list); either way only the REMOVED elements come
 back, never the inserted ones, exactly as JavaScript's own `splice()`
 answers.
+
+`push()`/`unshift()`/`pop()`/`shift()`/`splice()` each resize the
+backing buffer to exactly the new length internally, not amortized —
+see [`amor` — amortized-growth maps and arrays](#amor--amortized-growth-maps-and-arrays)
+below if that matters for a specific array (a long run of pushes in
+particular).
 
 `pop()`/`shift()` on an empty array return `null` — not zero, so an
 empty pop is distinguishable from popping a real `0`:

@@ -411,6 +411,22 @@ def _is_refcounted(t):
             or t == BLOB)
 
 FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
+# claude.md #174: amor arr[T] -- an "amortized array". Byte-compatible
+# with FESTINA_ARRAY_LLVM_TYPE's own {i64 length, ptr data} prefix
+# (same two fields, same order, same offsets), with one trailing i64
+# capacity field FESTINA_ARRAY_LLVM_TYPE doesn't have -- the identical
+# common-PREFIX-not-an-inserted-field trick FESTINA_AMAP_LLVM_TYPE
+# already uses over FESTINA_MAP_LLVM_TYPE, for the same reason: every
+# array runtime function/codegen touchpoint that only ever reads
+# length/data (indexing, `.length`, iteration, JSON rendering, the
+# retain/release element cascade, ...) is directly reusable on an
+# amor array's own payload unchanged -- only the five growable-buffer
+# operations (push/pop/shift/unshift/splice) that can actually GROW
+# the backing buffer need to know capacity exists at all, and thread it
+# through festina_array_resize's own capacity-aware counterpart. See
+# that function's own comment in runtime/festina_runtime.c for the
+# full layout reasoning.
+FESTINA_AMOR_ARRAY_LLVM_TYPE = "%struct._FestinaAmorArray"
 
 # claude.md #72: map[T] -- same two-field shape as _FestinaArray above
 # (i64 count, ptr to the backing storage) but kept as its own distinct
@@ -1572,14 +1588,21 @@ class CodeGen:
             # values that escape -- see _release_fn_for and each
             # function's own doc comment in runtime/festina_runtime.c.
             "declare void @festina_release_array(ptr)",
-            # claude.md #96: array methods
-            "declare void @festina_array_push(ptr, i64, ptr)",
-            "declare void @festina_array_unshift(ptr, i64, ptr)",
-            "declare i8 @festina_array_pop(ptr, i64, ptr)",
-            "declare i8 @festina_array_shift(ptr, i64, ptr)",
-            "declare void @festina_array_splice(ptr, i64, i64, i64, ptr)",
+            # claude.md #96: array methods. claude.md #174: each gained
+            # a `ptr capacity` 2nd parameter -- NULL for a plain arr[T]
+            # (festina_array_resize's own unchanged exact-size-realloc
+            # behavior), or the address of an `amor arr[T]`'s own
+            # tracked capacity field (FESTINA_AMOR_ARRAY_LLVM_TYPE's 3rd
+            # field) for geometric doubling growth instead -- see
+            # _array_capacity_arg's own comment and festina_array_resize's
+            # in runtime/festina_runtime.c.
+            "declare void @festina_array_push(ptr, ptr, i64, ptr)",
+            "declare void @festina_array_unshift(ptr, ptr, i64, ptr)",
+            "declare i8 @festina_array_pop(ptr, ptr, i64, ptr)",
+            "declare i8 @festina_array_shift(ptr, ptr, i64, ptr)",
+            "declare void @festina_array_splice(ptr, ptr, i64, i64, i64, ptr)",
             # claude.md #130: the 3-argument splice(start, count, insertArr) form.
-            "declare void @festina_array_splice_insert(ptr, i64, i64, i64, ptr, i64, ptr)",
+            "declare void @festina_array_splice_insert(ptr, ptr, i64, i64, i64, ptr, i64, ptr)",
             # claude.md #97
             "declare i64 @festina_array_index_of(ptr, i64, ptr, i8)",
             "declare void @festina_release_map(ptr)",
@@ -1630,6 +1653,7 @@ class CodeGen:
         # distinct name rather than reusing _FestinaArray outright).
         lines = [
             f"{FESTINA_ARRAY_LLVM_TYPE} = type {{ i64, ptr }}",
+            f"{FESTINA_AMOR_ARRAY_LLVM_TYPE} = type {{ i64, ptr, i64 }}",
             f"{FESTINA_MAP_LLVM_TYPE} = type {{ i64, ptr }}",
             f"{FESTINA_AMAP_LLVM_TYPE} = type {{ i64, ptr, i64 }}",
             # claude.md #91: a `font` value points at one of these,
@@ -1674,8 +1698,9 @@ class CodeGen:
                 lines.append(f"{ref} = global ptr getelementptr({{i64, {struct_ty}}}, ptr {header}, i32 0, i32 1)")
                 continue
             map_is_amortized = isinstance(type_, types_mod.MapType) and type_.amortized
+            array_is_amortized = isinstance(type_, types_mod.ArrayType) and type_.amortized
             if (isinstance(type_, (types_mod.ArrayType, types_mod.MapType))
-                    and not map_is_amortized):
+                    and not map_is_amortized and not array_is_amortized):
                 # claude.md #79: identical treatment to the StructType
                 # branch just above -- see its own comment for the full
                 # reasoning (immortal sentinel refcount, no special-
@@ -1684,25 +1709,21 @@ class CodeGen:
                 # FESTINA_MAP_LLVM_TYPE's `{i64, ptr}` in place of a
                 # user struct's own field list).
                 #
-                # claude.md #156: `amor map[T]` deliberately excluded --
-                # an amortized MAP global falls through to the generic
-                # `global ptr null` case below instead, exactly like a
-                # blob/img/aud/http/socket global already does. Safe
-                # ONLY because semantic.py requires an amortized
+                # claude.md #156 (extended by #174): `amor map[T]`/
+                # `amor arr[T]` are BOTH deliberately excluded -- an
+                # amortized global of either kind falls through to the
+                # generic `global ptr null` case below instead, exactly
+                # like a blob/img/aud/http/socket global already does.
+                # Safe ONLY because semantic.py requires an amortized
                 # declaration to have an initializer (unlike plain
                 # arr[T]/map[T], which can be declared bare and start
                 # "empty" via this immortal-sentinel trick) -- top-level
                 # init code always runs and overwrites this null with a
-                # real value before any user code could observe it,
-                # the same reasoning that already makes a bare
-                # blob/img/aud/http/socket global safe. Skipping this
-                # path also sidesteps needing FESTINA_AMAP_LLVM_TYPE
-                # awareness here at all. `amor arr[T]` is NOT excluded:
-                # array amortization isn't implemented yet (claude.md
-                # #156's own scope note -- `amor` on arr[T] currently
-                # parses/type-checks but has no runtime effect, same
-                # header and growth as plain arr[T]), so it takes this
-                # branch completely unchanged.
+                # real value before any user code could observe it, the
+                # same reasoning that already makes a bare blob/img/aud/
+                # http/socket global safe. Skipping this path also
+                # sidesteps needing FESTINA_AMAP_LLVM_TYPE/
+                # FESTINA_AMOR_ARRAY_LLVM_TYPE awareness here at all.
                 payload_ty = (FESTINA_ARRAY_LLVM_TYPE if isinstance(type_, types_mod.ArrayType)
                               else FESTINA_MAP_LLVM_TYPE)
                 header = f"{ref}.header"
@@ -4486,7 +4507,11 @@ class CodeGen:
         slot = self.tmp()
         body.append(f"  {slot} = alloca {elem_ir}")
         body.append(f"  store {elem_ir} {v}, ptr {slot}")
-        body.append(f"  call void @festina_array_push(ptr {out}, i64 {elem_size}, ptr {slot})")
+        # claude.md #174: `null` capacity -- a JSON-parsed array is
+        # always plain (there is no `.toArr(amor T)` syntax to request
+        # an amortized one), so this always takes festina_array_resize's
+        # unchanged, pre-#174 exact-size-realloc path.
+        body.append(f"  call void @festina_array_push(ptr {out}, ptr null, i64 {elem_size}, ptr {slot})")
         body.append(f"  br label %{loop_lbl}")
         body.append(f"{end_lbl}:")
         body.append(f"  ret ptr {out}")
@@ -4618,7 +4643,14 @@ class CodeGen:
         int/float/bool, none of which have a spare bit pattern for a
         real null (see the module docstring)."""
         if isinstance(node, ast.ArrayLit):
-            return self._emit_array_lit(node, env, lines, expected_type)
+            # claude.md #174: ast.ArrayLit itself has no amor-vs-plain
+            # distinction (the same `[...]` syntax either way) -- only
+            # the expected type (already known here) says which header
+            # shape/growth function to build, the identical reasoning
+            # the ast.MapLit branch just below already has for `amor
+            # map[T]`.
+            is_amor = isinstance(expected_type, types_mod.ArrayType) and expected_type.amortized
+            return self._emit_array_lit(node, env, lines, expected_type, is_amor=is_amor)
         if isinstance(node, ast.MapLit) and isinstance(expected_type, types_mod.HttpType):
             # claude.md #162: `http x = {...}` -- checked before the
             # generic ast.MapLit branch just below, for the identical
@@ -4777,6 +4809,27 @@ class CodeGen:
         lines.append(f"  {payload} = getelementptr i8, ptr {raw}, i64 8")
         return payload
 
+    def _array_capacity_arg(self, obj_val, obj_type, lines):
+        """claude.md #174: the capacity-tracking counterpart to
+        _emit_map_set's own is_amap-gated capacity GEP -- an `amor
+        arr[T]` passes the ADDRESS of its own capacity field (the
+        third FESTINA_AMOR_ARRAY_LLVM_TYPE field) so
+        festina_array_resize can grow it geometrically in place; a
+        plain arr[T] passes a literal `null`, which
+        festina_array_resize treats exactly as it always has --
+        "resize to exactly the requested length," this feature's own
+        unchanged pre-#174 behavior. Shared by every one of
+        push/pop/shift/unshift/splice/splice_insert's own call sites
+        in _emit_array_method below, so the same GEP shape is used
+        everywhere rather than risking one touchpoint drifting from
+        the others."""
+        if not obj_type.amortized:
+            return "null"
+        cap_ptr = self.tmp()
+        lines.append(f"  {cap_ptr} = getelementptr {FESTINA_AMOR_ARRAY_LLVM_TYPE}, "
+                     f"ptr {obj_val}, i32 0, i32 2")
+        return cap_ptr
+
     def _null_value(self, type_):
         """claude.md #96: the NULL of a type, as opposed to its zero.
 
@@ -4826,7 +4879,8 @@ class CodeGen:
             lines.append(f"  {slot} = alloca {elem_ir}")
             lines.append(f"  store {elem_ir} {val}, ptr {slot}")
             fn = "festina_array_push" if name == "push" else "festina_array_unshift"
-            lines.append(f"  call void @{fn}(ptr {obj_val}, i64 {elem_size}, ptr {slot})")
+            cap_arg = self._array_capacity_arg(obj_val, obj_type, lines)
+            lines.append(f"  call void @{fn}(ptr {obj_val}, ptr {cap_arg}, i64 {elem_size}, ptr {slot})")
             # JS hands back the new length; reading it costs one load.
             len_ptr = self.tmp()
             lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 0")
@@ -4844,8 +4898,9 @@ class CodeGen:
             # nothing to remove, so this is what an empty array answers.
             lines.append(f"  store {elem_ir} {self._null_value(elem_type)}, ptr {slot}")
             fn = "festina_array_pop" if name == "pop" else "festina_array_shift"
+            cap_arg = self._array_capacity_arg(obj_val, obj_type, lines)
             lines.append(
-                f"  call i8 @{fn}(ptr {obj_val}, i64 {elem_size}, ptr {slot})")
+                f"  call i8 @{fn}(ptr {obj_val}, ptr {cap_arg}, i64 {elem_size}, ptr {slot})")
             out = self.tmp()
             lines.append(f"  {out} = load {elem_ir}, ptr {slot}")
             return out, elem_type
@@ -4896,8 +4951,9 @@ class CodeGen:
             lines.append(f"  {insert_data_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {insert_val}, i32 0, i32 1")
             insert_data = self.tmp()
             lines.append(f"  {insert_data} = load ptr, ptr {insert_data_ptr}")
+            cap_arg = self._array_capacity_arg(obj_val, obj_type, lines)
             lines.append(
-                f"  call void @festina_array_splice_insert(ptr {obj_val}, i64 {elem_size}, "
+                f"  call void @festina_array_splice_insert(ptr {obj_val}, ptr {cap_arg}, i64 {elem_size}, "
                 f"i64 {start_val}, i64 {count_val}, ptr {insert_data}, i64 {insert_len}, ptr {dst})")
             # The call above may have realloc'd this array's own data
             # buffer, so its pointer has to be reloaded AFTER the call,
@@ -4909,8 +4965,9 @@ class CodeGen:
             self._emit_retain_or_own_range(data_ptr_now, elem_ir, elem_type, start_val, insert_len, lines)
             self._release_owned_receiver(expr.args[2], insert_val, insert_type, lines)
         else:
+            cap_arg = self._array_capacity_arg(obj_val, obj_type, lines)
             lines.append(
-                f"  call void @festina_array_splice(ptr {obj_val}, i64 {elem_size}, "
+                f"  call void @festina_array_splice(ptr {obj_val}, ptr {cap_arg}, i64 {elem_size}, "
                 f"i64 {start_val}, i64 {count_val}, ptr {dst})")
         return dst, types_mod.ArrayType(elem_type)
 
@@ -4967,19 +5024,32 @@ class CodeGen:
         lines.append(f"  br label %{loop_cond}")
         lines.append(f"{loop_end}:")
 
-    def _emit_array_lit(self, expr, env, lines, expected_type=None, header=None):
+    def _emit_array_lit(self, expr, env, lines, expected_type=None, header=None, is_amor=False):
         # `header`, when given, is an already-allocated (and, for a
         # `ptr` field, zero-initialized) FESTINA_ARRAY_LLVM_TYPE slot to
         # build directly into instead of allocating a fresh heap header
         # -- see this method's own header-allocation comment below, and
         # _emit_stmt's VarDecl handling, the only caller that ever
         # passes one (a non-escaping local declared directly from an
-        # array literal -- claude.md #81).
+        # array literal -- claude.md #81). Never a caller-supplied
+        # `header` when `is_amor` is true -- claude.md #174, mirroring
+        # `amor map[T]`'s identical exclusion: see
+        # _is_stack_allocatable_array_or_map_decl's own comment.
         #
         # claude.md #26: "Arrays may contain supported primitive types,
         # structs, tables, and other array types" -- table elements are
         # rejected by _llvm_type(TableType) below, since there's no way
         # to construct a Table-typed value without sqlite() queries yet.
+        #
+        # claude.md #174: `is_amor` builds an `amor arr[T]` header
+        # (FESTINA_AMOR_ARRAY_LLVM_TYPE, tracking a capacity field
+        # FESTINA_ARRAY_LLVM_TYPE doesn't) instead of a plain arr[T]
+        # one -- the caller (_emit_value_for, which already knows the
+        # declaration's own expected type, ArrayType.amortized
+        # included) decides which; ast.ArrayLit itself has no
+        # amor-vs-plain distinction, the same `[...]` syntax either
+        # way. Mirrors _emit_map_lit's own `is_amap` parameter exactly.
+        llvm_type_name = FESTINA_AMOR_ARRAY_LLVM_TYPE if is_amor else FESTINA_ARRAY_LLVM_TYPE
         expected_elem = expected_type.element if isinstance(expected_type, types_mod.ArrayType) else None
 
         values = []
@@ -4991,7 +5061,8 @@ class CodeGen:
         elem_type = expected_elem
         for e in expr.elements:
             if isinstance(e, ast.ArrayLit) and isinstance(expected_elem, types_mod.ArrayType):
-                val, vtype = self._emit_array_lit(e, env, lines, expected_elem)
+                elem_is_amor = expected_elem.amortized
+                val, vtype = self._emit_array_lit(e, env, lines, expected_elem, is_amor=elem_is_amor)
             else:
                 val, vtype = self._emit_value_for(e, env, lines, expected_elem)
             pre_coerce_types.append(vtype)
@@ -5022,9 +5093,9 @@ class CodeGen:
         # non-escaping local declared directly from a literal, which
         # passes its own pre-allocated stack slot in as `header`.
         if header is None:
-            header = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, lines)
+            header = self._emit_fresh_heap_header(llvm_type_name, lines)
         len_ptr = self.tmp()
-        lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
+        lines.append(f"  {len_ptr} = getelementptr {llvm_type_name}, ptr {header}, i32 0, i32 0")
         lines.append(f"  store i64 {n}, ptr {len_ptr}")
 
         if n == 0:
@@ -5059,10 +5130,21 @@ class CodeGen:
                 lines.append(f"  store {elem_llvm_ty} {val}, ptr {elem_ptr}")
 
         data_field_ptr = self.tmp()
-        lines.append(f"  {data_field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
+        lines.append(f"  {data_field_ptr} = getelementptr {llvm_type_name}, ptr {header}, i32 0, i32 1")
         lines.append(f"  store ptr {data_ptr}, ptr {data_field_ptr}")
 
-        return header, types_mod.ArrayType(elem_type)
+        if is_amor:
+            # claude.md #174: this literal's own backing buffer was
+            # malloc'd for EXACTLY `n` elements (no slack) -- capacity
+            # starts at exactly `n` too, so the very next push()
+            # correctly triggers real growth (doubling from `n`, not
+            # from a false 0 that would claim room this buffer doesn't
+            # actually have).
+            cap_ptr = self.tmp()
+            lines.append(f"  {cap_ptr} = getelementptr {llvm_type_name}, ptr {header}, i32 0, i32 2")
+            lines.append(f"  store i64 {n}, ptr {cap_ptr}")
+
+        return header, types_mod.ArrayType(elem_type, amortized=is_amor)
 
     def _emit_map_lit(self, expr, env, lines, expected_type=None, header=None, is_amap=False):
         """claude.md #72: { key: value, ... } -- built the same way
@@ -5740,7 +5822,20 @@ class CodeGen:
         if isinstance(ftype, types_mod.StructType):
             payload_ty = self.struct_llvm_name(ftype.name)
         elif isinstance(ftype, types_mod.ArrayType):
-            payload_ty = FESTINA_ARRAY_LLVM_TYPE
+            # claude.md #174: a struct field has no initializer syntax
+            # at all -- every field starts null regardless of type, so
+            # `amor arr[T]` fields rely ENTIRELY on this auto-vivify
+            # path, the identical reasoning `amor map[T]` fields
+            # already needed it for (see the MapType branch just
+            # below). Building the wrong (smaller, plain-array-shaped)
+            # header here for a field the rest of codegen treats as
+            # FESTINA_AMOR_ARRAY_LLVM_TYPE-shaped would be a real
+            # buffer overflow the moment festina_array_resize's own
+            # amor path first touched its capacity field -- caught by
+            # reasoning through this path directly, not by a failing
+            # test (the same way claude.md #156's own map version of
+            # this bug was caught).
+            payload_ty = FESTINA_AMOR_ARRAY_LLVM_TYPE if ftype.amortized else FESTINA_ARRAY_LLVM_TYPE
         elif ftype.amortized:
             # claude.md #156: a struct field has no initializer syntax
             # at all -- every field starts null regardless of type, so
@@ -6229,16 +6324,16 @@ class CodeGen:
         possibly-heap value the way `_emit_assign`'s general retain/
         release machinery would otherwise need to account for.
 
-        claude.md #156: `amor map[T]` is unconditionally excluded --
-        this optimization was never extended to it (a deliberate scope
-        boundary; it always heap-allocates instead, through the same
-        generic with-initializer path blob/img/aud/etc. already use).
-        `amor arr[T]` is NOT excluded: array amortization isn't
-        implemented yet, so it's still plain arr[T] in every codegen
-        respect, including this one."""
+        claude.md #156 (extended by #174): `amor map[T]`/`amor arr[T]`
+        are both unconditionally excluded -- this optimization was
+        never extended to either (a deliberate scope boundary; each
+        always heap-allocates instead, through the same generic
+        with-initializer path blob/img/aud/etc. already use)."""
         if self._current_escaping_names is None or stmt.name in self._current_escaping_names:
             return False
         if isinstance(type_, types_mod.MapType) and type_.amortized:
+            return False
+        if isinstance(type_, types_mod.ArrayType) and type_.amortized:
             return False
         if stmt.init is None:
             return True

@@ -167,9 +167,12 @@ cycle collection by trial deletion for the types that can form one
 verified stages and
 continuously exercised under AddressSanitizer, LeakSanitizer and (for
 the audio thread pool) ThreadSanitizer. `scripts/leak_stress.sh` runs
-six mixed churn programs (claude.md #172: `blob`/`img`/`aud`'s own
-background `.callback()` load among them, several hundred jobs deep
-across the async-io worker pool) plus one isolation program per data
+ten mixed churn programs (claude.md #172: `blob`/`img`/`aud`'s own
+background `.callback()` load, several hundred jobs deep across the
+async-io worker pool; claude.md #173: nested `.toStruct()`/`.toArr()`
+JSON parsing and, isolated separately, the ternary ownership fix that
+round also found; claude.md #174: `amor arr[T]`'s own real amortized
+growth) plus one isolation program per data
 type on every test run, and a canary test proves the harness itself
 can fail.
 

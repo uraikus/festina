@@ -1179,6 +1179,176 @@ class TestAmorMap:
         assert result.stdout.splitlines() == ["1", "2"]
 
 
+class TestAmorArray:
+    """claude.md #174: amor arr[T] -- an "amortized array", the
+    array-typed counterpart of TestAmorMap above and the runtime effect
+    claude.md #156 originally left `amor arr[T]` without. Same
+    push/pop/shift/unshift/splice/indexing/`.length` surface as plain
+    arr[T] -- only the growth strategy differs internally
+    (festina_array_resize's own capacity-aware doubling in place of a
+    plain arr[T]'s exact-size realloc), which these tests can't observe
+    directly, so they exercise the same observable behavior plain
+    arr[T] already has, plus enough pushes to force several real
+    capacity doublings."""
+
+    def test_literal_init_index_and_length(self, compile_and_run):
+        source = """
+        amor arr[int] xs = [1, 2, 3]
+        log(xs.length)
+        log(xs[0])
+        log(xs[2])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["3", "1", "3"]
+
+    def test_push_pop_shift_unshift(self, compile_and_run):
+        source = """
+        amor arr[int] xs = [1, 2, 3]
+        xs.push(4)
+        int popped = xs.pop()
+        int shifted = xs.shift()
+        xs.unshift(99)
+        log(xs.length)
+        log(popped)
+        log(shifted)
+        log(xs[0])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["3", "4", "1", "99"]
+
+    def test_splice_two_and_three_argument_forms(self, compile_and_run):
+        source = """
+        amor arr[int] xs = [1, 2, 3, 4, 5]
+        arr[int] removed = xs.splice(1, 2)
+        log(removed.length)
+        log(removed[0])
+        log(xs.length)
+        arr[int] removed2 = xs.splice(0, 1, [100, 200])
+        log(removed2[0])
+        log(xs[0])
+        log(xs[1])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["2", "2", "3", "1", "100", "200"]
+
+    def test_many_pushes_survive_real_capacity_growth(self, compile_and_run):
+        # claude.md #174's own point: festina_array_resize doubles
+        # capacity rather than growing by exactly one per push -- 500
+        # pushes forces several real doublings (8 -> 16 -> ... -> 512),
+        # not just the empty/few-element cases the other tests cover.
+        source = """
+        amor arr[int] xs = []
+        int i = 0
+        while i < 500 {
+            xs.push(i)
+            i = i + 1
+        }
+        log(xs.length)
+        log(xs[0])
+        log(xs[250])
+        log(xs[499])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["500", "0", "250", "499"]
+
+    def test_const_amor_arr_composes(self, compile_and_run):
+        source = """
+        const amor arr[int] xs = [1, 2, 3]
+        log(xs.length)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "3"
+
+    def test_struct_field_auto_vivifies(self, compile_and_run):
+        # claude.md #156's own map version of this test (just above)
+        # found a real review-caught risk: building the WRONG (smaller,
+        # plain-array-shaped) header for a field the rest of codegen
+        # treats as amor-shaped would silently corrupt memory the
+        # moment festina_array_resize's own amor path first touched the
+        # missing capacity field. The identical risk for arr[T].
+        source = """
+        struct Bag { xs:amor arr[int] }
+        Bag b
+        b.xs.push(1)
+        b.xs.push(2)
+        b.xs.push(3)
+        log(b.xs.length)
+        log(b.xs[0])
+        log(b.xs[2])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["3", "1", "3"]
+
+    def test_text_elements_retain_and_release_correctly(self, compile_and_run):
+        source = """
+        amor arr[text] xs = ['a', 'b', 'c']
+        xs.push(`d${1}`)
+        log(xs.length)
+        log(xs[0])
+        log(xs[3])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["4", "a", "d1"]
+
+    def test_refcounted_elements_survive_many_pushes(self, compile_and_run):
+        # A struct element specifically -- exercises the retain path on
+        # every push (claude.md #80), not just raw bytes, across enough
+        # real capacity growth to matter.
+        source = """
+        struct P { n:int }
+        amor arr[P] ps = []
+        int i = 0
+        while i < 300 {
+            P p
+            p.n = i
+            ps.push(p)
+            i = i + 1
+        }
+        log(ps.length)
+        log(ps[0].n)
+        log(ps[299].n)
+        P alias = ps[150]
+        log(alias.n)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["300", "0", "299", "150"]
+
+    def test_media_element_array_composes(self, compile_and_run, sprite_sheet_png):
+        # claude.md #137's own text-path-to-media-element allowance for
+        # arr[img]/arr[aud]/arr[blob] literals, combined with `amor`.
+        source = f"""
+        amor arr[img] pics = ['{sprite_sheet_png}', '{sprite_sheet_png}']
+        log(pics.length)
+        pics.push(pics[0])
+        log(pics.length)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["2", "3"]
+
+    def test_amor_and_plain_are_not_assignable(self, parser, semantic, errors):
+        program = parser.parse("""
+        amor arr[int] xs = [1, 2, 3]
+        arr[int] ys = xs
+        """)
+        with pytest.raises(errors.CompileError, match="cannot assign"):
+            semantic.analyze(program)
+
+    def test_no_initializer_is_a_clear_error(self, parser, semantic, errors):
+        program = parser.parse("amor arr[int] xs")
+        with pytest.raises(errors.CompileError, match="requires an initializer"):
+            semantic.analyze(program)
+
+    def test_nested_amor_arr_of_arr(self, compile_and_run):
+        source = """
+        amor arr[arr[int]] grid = [[1, 2], [3, 4]]
+        grid.push([5, 6])
+        log(grid.length)
+        log(grid[2][1])
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["3", "6"]
+
+
 class TestLoops:
     """claude.md #60 (for loops), #61 (while loops), #66 (postfix ++/--)."""
 

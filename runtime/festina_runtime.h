@@ -1264,6 +1264,15 @@ void festina_map_free_entries(int64_t count, void *entries);
  * BYTES with the element size passed in, so one set of functions covers
  * every arr[T] instead of a family per element type.
  *
+ * claude.md #174: each gained a `capacity` 2nd parameter -- NULL for a
+ * plain arr[T] (festina_array_resize's own unchanged exact-size-realloc
+ * behavior), or the address of an `amor arr[T]`'s own tracked capacity
+ * field (FESTINA_AMOR_ARRAY_LLVM_TYPE's 3rd field, byte-compatible with
+ * plain arr[T]'s {length, data} prefix -- the identical trick
+ * FESTINA_AMAP_LLVM_TYPE already uses over FESTINA_MAP_LLVM_TYPE) for
+ * geometric doubling growth instead. See festina_array_resize's own
+ * comment for the full layout reasoning.
+ *
  * Ownership of a removed element TRANSFERS to whoever receives it
  * (pop/shift hand it back, splice hands it to the returned array), so
  * nothing here releases anything -- that would free a value the caller
@@ -1271,12 +1280,15 @@ void festina_map_free_entries(int64_t count, void *entries);
  * nothing to remove, because codegen has already stored the element
  * type's own null there. splice clamps exactly as JavaScript's does,
  * negative start included, so `splice(i, 1)` at a boundary is a no-op
- * rather than a crash. */
-void festina_array_push(void *hdr, int64_t elem_size, const void *value);
-void festina_array_unshift(void *hdr, int64_t elem_size, const void *value);
-int8_t festina_array_pop(void *hdr, int64_t elem_size, void *out);
-int8_t festina_array_shift(void *hdr, int64_t elem_size, void *out);
-void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
+ * rather than a crash. `dst_hdr` (the removed-elements result array) is
+ * always a plain, freshly malloc'd-to-exactly-the-right-size array
+ * regardless of whether the SOURCE array is amor or plain -- it never
+ * grows again after being built, so it needs no capacity of its own. */
+void festina_array_push(void *hdr, int64_t *capacity, int64_t elem_size, const void *value);
+void festina_array_unshift(void *hdr, int64_t *capacity, int64_t elem_size, const void *value);
+int8_t festina_array_pop(void *hdr, int64_t *capacity, int64_t elem_size, void *out);
+int8_t festina_array_shift(void *hdr, int64_t *capacity, int64_t elem_size, void *out);
+void festina_array_splice(void *hdr, int64_t *capacity, int64_t elem_size, int64_t start,
                            int64_t count, void *dst_hdr);
 /* claude.md #130: the 3-argument splice(start, count, insertArr) form --
  * JavaScript's splice(start, deleteCount, ...items), spelled with an
@@ -1287,7 +1299,7 @@ void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
  * their place -- codegen retains/copies each inserted element itself
  * afterward (see codegen.py's _emit_retain_or_own_range), since this
  * function only moves bytes and has no notion of a Festina type. */
-void festina_array_splice_insert(void *hdr, int64_t elem_size, int64_t start,
+void festina_array_splice_insert(void *hdr, int64_t *capacity, int64_t elem_size, int64_t start,
                                   int64_t count, const void *insert_data,
                                   int64_t insert_len, void *dst_hdr);
 /* claude.md #97: the first index holding `value`, or -1 if absent.

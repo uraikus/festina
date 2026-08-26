@@ -3878,12 +3878,43 @@ typedef struct {
     void *data;
 } FestinaArrayHeader;
 
-static void festina_array_resize(FestinaArrayHeader *a, int64_t elem_size,
-                                  int64_t new_length) {
+/* claude.md #174: `capacity` is NULL for a plain arr[T] -- exact-size
+ * realloc on every call, this function's own unchanged pre-#174
+ * behavior -- or a pointer into an `amor arr[T]`'s own tracked
+ * capacity field (FESTINA_AMOR_ARRAY_LLVM_TYPE's 3rd field) for
+ * geometric doubling growth instead, the identical NULL-means-plain
+ * shape festina_amap_set's own `capacity` parameter already
+ * established for map[T] (see that function's own comment). Growing
+ * (`new_length > *capacity`) doubles (or jumps straight to
+ * `new_length` if even double isn't enough -- a single push never
+ * needs more than one extra slot, but splice_insert's own inline
+ * growth logic, which duplicates this shape rather than calling
+ * through it, can ask for many at once); an amor array's own buffer
+ * is deliberately NEVER freed/shrunk on the way back down to empty
+ * (`new_length <= 0`) or on an ordinary shrink -- the whole point of
+ * amortized growth is not paying a realloc on the very next push
+ * right after a pop, and capacity already covers whatever the buffer
+ * shrinks to, by construction. */
+static void festina_array_resize(FestinaArrayHeader *a, int64_t *capacity,
+                                  int64_t elem_size, int64_t new_length) {
     if (new_length <= 0) {
-        free(a->data);
-        a->data = NULL;
+        if (!capacity) {
+            free(a->data);
+            a->data = NULL;
+        }
         a->length = 0;
+        return;
+    }
+    if (capacity) {
+        if (new_length > *capacity) {
+            int64_t new_cap = *capacity ? *capacity * 2 : 8;
+            if (new_cap < new_length) new_cap = new_length;
+            void *grown = realloc(a->data, (size_t)(new_cap * elem_size));
+            if (!grown) festina_fail("out of memory growing an amortized array");
+            a->data = grown;
+            *capacity = new_cap;
+        }
+        a->length = new_length;
         return;
     }
     void *grown = realloc(a->data, (size_t)(new_length * elem_size));
@@ -3892,19 +3923,19 @@ static void festina_array_resize(FestinaArrayHeader *a, int64_t elem_size,
     a->length = new_length;
 }
 
-void festina_array_push(void *hdr, int64_t elem_size, const void *value) {
+void festina_array_push(void *hdr, int64_t *capacity, int64_t elem_size, const void *value) {
     FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
     if (!a || !value) return;
     int64_t at = a->length;
-    festina_array_resize(a, elem_size, at + 1);
+    festina_array_resize(a, capacity, elem_size, at + 1);
     memcpy((char *)a->data + at * elem_size, value, (size_t)elem_size);
 }
 
-void festina_array_unshift(void *hdr, int64_t elem_size, const void *value) {
+void festina_array_unshift(void *hdr, int64_t *capacity, int64_t elem_size, const void *value) {
     FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
     if (!a || !value) return;
     int64_t was = a->length;
-    festina_array_resize(a, elem_size, was + 1);
+    festina_array_resize(a, capacity, elem_size, was + 1);
     if (was > 0) {
         memmove((char *)a->data + elem_size, a->data, (size_t)(was * elem_size));
     }
@@ -3914,15 +3945,15 @@ void festina_array_unshift(void *hdr, int64_t elem_size, const void *value) {
 /* pop/shift leave *out untouched when there is nothing to remove --
  * codegen has already stored the element type's own null there, so an
  * empty pop() answers null rather than needing a second return value. */
-int8_t festina_array_pop(void *hdr, int64_t elem_size, void *out) {
+int8_t festina_array_pop(void *hdr, int64_t *capacity, int64_t elem_size, void *out) {
     FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
     if (!a || a->length <= 0) return 0;
     memcpy(out, (char *)a->data + (a->length - 1) * elem_size, (size_t)elem_size);
-    festina_array_resize(a, elem_size, a->length - 1);
+    festina_array_resize(a, capacity, elem_size, a->length - 1);
     return 1;
 }
 
-int8_t festina_array_shift(void *hdr, int64_t elem_size, void *out) {
+int8_t festina_array_shift(void *hdr, int64_t *capacity, int64_t elem_size, void *out) {
     FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
     if (!a || a->length <= 0) return 0;
     memcpy(out, a->data, (size_t)elem_size);
@@ -3930,7 +3961,7 @@ int8_t festina_array_shift(void *hdr, int64_t elem_size, void *out) {
     if (rest > 0) {
         memmove(a->data, (char *)a->data + elem_size, (size_t)(rest * elem_size));
     }
-    festina_array_resize(a, elem_size, rest);
+    festina_array_resize(a, capacity, elem_size, rest);
     return 1;
 }
 
@@ -3940,7 +3971,7 @@ int8_t festina_array_shift(void *hdr, int64_t elem_size, void *out) {
  * the common `splice(i, 1)` inside a loop a source of crashes at the
  * boundaries instead of a no-op. `dst` is a header codegen already
  * allocated for the result. */
-void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
+void festina_array_splice(void *hdr, int64_t *capacity, int64_t elem_size, int64_t start,
                            int64_t count, void *dst_hdr) {
     FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
     FestinaArrayHeader *dst = (FestinaArrayHeader *)dst_hdr;
@@ -3970,7 +4001,7 @@ void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
                 (char *)a->data + (start + count) * elem_size,
                 (size_t)(tail * elem_size));
     }
-    festina_array_resize(a, elem_size, len - count);
+    festina_array_resize(a, capacity, elem_size, len - count);
 }
 
 /* claude.md #130: the 3-argument splice(start, count, insertArr) form --
@@ -3986,7 +4017,7 @@ void festina_array_splice(void *hdr, int64_t elem_size, int64_t start,
  * ownership split every other array method in this file already
  * follows (codegen decides refcounting, this file only decides bytes).
  */
-void festina_array_splice_insert(void *hdr, int64_t elem_size, int64_t start,
+void festina_array_splice_insert(void *hdr, int64_t *capacity, int64_t elem_size, int64_t start,
                                   int64_t count, const void *insert_data,
                                   int64_t insert_len, void *dst_hdr) {
     FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
@@ -4016,8 +4047,16 @@ void festina_array_splice_insert(void *hdr, int64_t elem_size, int64_t start,
     int64_t new_length = len - count + insert_len;
 
     if (new_length <= 0) {
-        free(a->data);
-        a->data = NULL;
+        /* claude.md #174: an amor array's own buffer is never freed on
+         * the way back to empty -- see festina_array_resize's own
+         * identical comment; this function duplicates that resize
+         * logic rather than calling through it (the memmove has to be
+         * interleaved with the resize, in a different order depending
+         * on whether this call is growing or shrinking). */
+        if (!capacity) {
+            free(a->data);
+            a->data = NULL;
+        }
         a->length = 0;
         return;
     }
@@ -4026,10 +4065,26 @@ void festina_array_splice_insert(void *hdr, int64_t elem_size, int64_t start,
         /* Growing: resize first (realloc preserves the existing bytes
          * up to the old length), then shift the tail right into its
          * final spot -- both source and destination ranges stay within
-         * the just-grown buffer. */
-        void *grown = realloc(a->data, (size_t)(new_length * elem_size));
-        if (!grown) festina_fail("out of memory growing an array");
-        a->data = grown;
+         * the just-grown buffer. claude.md #174: an amor array only
+         * actually reallocs when the new length exceeds its already-
+         * tracked capacity, and then doubles (or jumps straight to
+         * `new_length` if even that isn't enough) rather than growing
+         * to exactly `new_length` -- the same amortized shape
+         * festina_array_resize's own growing branch uses. */
+        if (capacity) {
+            if (new_length > *capacity) {
+                int64_t new_cap = *capacity ? *capacity * 2 : 8;
+                if (new_cap < new_length) new_cap = new_length;
+                void *grown = realloc(a->data, (size_t)(new_cap * elem_size));
+                if (!grown) festina_fail("out of memory growing an amortized array");
+                a->data = grown;
+                *capacity = new_cap;
+            }
+        } else {
+            void *grown = realloc(a->data, (size_t)(new_length * elem_size));
+            if (!grown) festina_fail("out of memory growing an array");
+            a->data = grown;
+        }
         if (tail > 0) {
             memmove((char *)a->data + (start + insert_len) * elem_size,
                     (char *)a->data + (start + count) * elem_size,
@@ -4039,15 +4094,21 @@ void festina_array_splice_insert(void *hdr, int64_t elem_size, int64_t start,
         /* Shrinking (or exactly the same size): shift the tail into
          * its final spot first -- (start + insert_len) + tail ==
          * new_length <= len, so it still fits inside the OLD buffer --
-         * then resize down. */
+         * then resize down. claude.md #174: an amor array's own
+         * capacity already covers `len`, and new_length <= len here,
+         * so it covers new_length too -- nothing to reallocate, the
+         * same "shrinking never frees/reallocs" contract
+         * festina_array_resize's own shrinking case has. */
         if (tail > 0) {
             memmove((char *)a->data + (start + insert_len) * elem_size,
                     (char *)a->data + (start + count) * elem_size,
                     (size_t)(tail * elem_size));
         }
-        void *shrunk = realloc(a->data, (size_t)(new_length * elem_size));
-        if (!shrunk) festina_fail("out of memory in splice()");
-        a->data = shrunk;
+        if (!capacity) {
+            void *shrunk = realloc(a->data, (size_t)(new_length * elem_size));
+            if (!shrunk) festina_fail("out of memory in splice()");
+            a->data = shrunk;
+        }
     }
     a->length = new_length;
 
