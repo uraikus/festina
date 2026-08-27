@@ -2004,7 +2004,7 @@ class TestAutomaticMemoryReclamation:
 
     def test_event_handler_locals_are_analyzed_too(self, parser, semantic, codegen):
         source = """
-        on mouseDown(x:int, y:int) {
+        on mouseDown(x:int, y:int, button:int) {
             arr[int] p = [x]
             log(p[0])
         }
@@ -2015,7 +2015,7 @@ class TestAutomaticMemoryReclamation:
     def test_event_handler_struct_local_is_stack_allocated_too(self, parser, semantic, codegen):
         source = """
         struct Point { x:int y:int }
-        on mouseDown(x:int, y:int) {
+        on mouseDown(x:int, y:int, button:int) {
             Point p
             p.x = x
             log(p.x)
@@ -5114,15 +5114,24 @@ class TestGraphics:
         drawText('Hello', 20, 20)
         drawImage(icon, 10, 10)
         log(`${clientWidth}x${clientHeight}`)
+        log(`${devicePixelRatio}`)
+        showCursor()
+        hideCursor()
 
-        on mouseDown(x:int, y:int) {
-            log(`press at ${x}, ${y}`)
+        on mouseDown(x:int, y:int, button:int) {
+            log(`press at ${x}, ${y} (${button})`)
         }
-        on mouseUp(x:int, y:int) {
-            log(`release at ${x}, ${y}`)
+        on mouseUp(x:int, y:int, button:int) {
+            log(`release at ${x}, ${y} (${button})`)
         }
         on mouse(x:int, y:int) {
             log(`mouse at ${x}, ${y}`)
+        }
+        on mouseWheelUp(x:int, y:int) {
+            log(`wheel up at ${x}, ${y}`)
+        }
+        on mouseWheelDown(x:int, y:int) {
+            log(`wheel down at ${x}, ${y}`)
         }
         on key(key:text) {
             log(`key ${key}`)
@@ -5212,8 +5221,8 @@ class TestGraphics:
         # so a program declaring both handlers sees two distinct events
         # from it -- which is the whole point of the split. `on click`
         # used to collapse them into the single line this once asserted.
-        source = ("on mouseDown(x:int, y:int) {\n    log(`down ${x} ${y}`)\n}\n"
-                  "on mouseUp(x:int, y:int) {\n    log(`up ${x} ${y}`)\n}\n")
+        source = ("on mouseDown(x:int, y:int, button:int) {\n    log(`down ${x} ${y}`)\n}\n"
+                  "on mouseUp(x:int, y:int, button:int) {\n    log(`up ${x} ${y}`)\n}\n")
         proc, stdout_path = run_graphics_program(source)
         try:
             wid = _find_window(x_display)
@@ -5233,8 +5242,8 @@ class TestGraphics:
         # then let go. `on click` could not express this at all -- it
         # only ever saw the press. Here the two events report the two
         # ends of the drag, which is what makes it reconstructible.
-        source = ("on mouseDown(x:int, y:int) {\n    log(`down ${x} ${y}`)\n}\n"
-                  "on mouseUp(x:int, y:int) {\n    log(`up ${x} ${y}`)\n}\n")
+        source = ("on mouseDown(x:int, y:int, button:int) {\n    log(`down ${x} ${y}`)\n}\n"
+                  "on mouseUp(x:int, y:int, button:int) {\n    log(`up ${x} ${y}`)\n}\n")
         proc, stdout_path = run_graphics_program(source)
         try:
             wid = _find_window(x_display)
@@ -5408,6 +5417,125 @@ class TestGraphics:
                 f"(the XSetInputFocus BadMatch regression?) -- stdout:\n"
                 f"{stdout_path.read_text()}"
             )
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
+class TestMouseWheelButtonAndCursor:
+    """claude.md #182: which button (mouseDown/mouseUp), the scroll
+    wheel no longer also firing a spurious click, and showCursor()/
+    hideCursor()."""
+
+    def test_wheel_scrolling_no_longer_fires_a_spurious_click(
+            self, run_graphics_program, x_display):
+        # Real, reproduced regression this entry's own X11 fix guards:
+        # before it, every button's press/release (X11's own core-
+        # protocol convention represents the wheel as buttons 4/5) fell
+        # through to mouseDown/mouseUp completely unfiltered, so
+        # scrolling over the canvas silently fired a mouseDown+mouseUp
+        # pair at the wheel's own position. Declaring both mouseDown/
+        # mouseUp AND mouseWheelUp/mouseWheelDown and scrolling once up
+        # confirms only the wheel handler fires.
+        source = (
+            "on mouseDown(x:int, y:int, button:int) { log('click') }\n"
+            "on mouseUp(x:int, y:int, button:int) { log('click') }\n"
+            "on mouseWheelUp(x:int, y:int) { log(`wheel ${x} ${y}`) }\n"
+        )
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            subprocess.run(["xdotool", "mousemove", "--window", wid, "60", "70"], env=env, check=True)
+            subprocess.run(["xdotool", "click", "--window", wid, "4"], env=env, check=True)
+            text = _wait_for_output(stdout_path, lambda t: "wheel" in t)
+            # A real chance for a spurious click line to arrive too.
+            time.sleep(0.3)
+            with open(stdout_path) as f:
+                assert f.read().splitlines() == ["wheel 60 70"], (
+                    "scrolling the wheel fired mouseDown/mouseUp as well")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_wheel_up_and_down_fire_exactly_once_per_notch(
+            self, run_graphics_program, x_display):
+        source = (
+            "on mouseWheelUp(x:int, y:int) { log('up') }\n"
+            "on mouseWheelDown(x:int, y:int) { log('down') }\n"
+        )
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            subprocess.run(["xdotool", "mousemove", "--window", wid, "10", "10"], env=env, check=True)
+            subprocess.run(["xdotool", "click", "--window", wid, "4"], env=env, check=True)
+            subprocess.run(["xdotool", "click", "--window", wid, "4"], env=env, check=True)
+            subprocess.run(["xdotool", "click", "--window", wid, "5"], env=env, check=True)
+            text = _wait_for_output(stdout_path, lambda t: t.count("\n") >= 3)
+            assert text.splitlines() == ["up", "up", "down"]
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_left_middle_and_right_click_report_the_right_button_number(
+            self, run_graphics_program, x_display):
+        # claude.md #182: FestinaWindowEvent's own X11-derived numbering
+        # (1/2/3 = left/middle/right) -- X11 already produces this
+        # natively, so this is really confirming codegen/the runtime
+        # thread the value through correctly end to end, not X11 itself.
+        source = "on mouseDown(x:int, y:int, button:int) { log(`btn ${button}`) }\n"
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            subprocess.run(["xdotool", "mousemove", "--window", wid, "40", "40"], env=env, check=True)
+            for button in ("1", "2", "3"):
+                subprocess.run(["xdotool", "click", "--window", wid, button], env=env, check=True)
+            text = _wait_for_output(stdout_path, lambda t: t.count("\n") >= 3)
+            assert text.splitlines() == ["btn 1", "btn 2", "btn 3"]
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_show_and_hide_cursor_do_not_crash_and_are_no_ops_when_redundant(
+            self, run_graphics_program, x_display):
+        # There's no practical way to inspect the real X11 cursor image
+        # from a test (it's not exposed as a queryable window property
+        # the way _NET_FRAME_EXTENTS is for decorations) -- this
+        # confirms the one thing that IS observable: calling
+        # hideCursor()/showCursor(), including redundantly, never
+        # crashes the program and normal execution continues right
+        # after.
+        source = (
+            "hideCursor()\n"
+            "hideCursor()\n"  # redundant -- must not crash or misbehave
+            "showCursor()\n"
+            "showCursor()\n"  # redundant too
+            "render()\n"
+            "log('still running')\n"
+        )
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            _find_window(x_display)
+            text = _wait_for_output(stdout_path, lambda t: "still running" in t)
+            assert text.strip() == "still running"
+            assert proc.poll() is None
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_hide_cursor_before_the_window_opens_does_not_crash(
+            self, run_graphics_program, x_display):
+        # claude.md #182: the pre-window "just record the desired state"
+        # path (see g_cursor_visible's own comment) -- hideCursor()
+        # called before render() ever runs.
+        source = "hideCursor()\nrender()\nlog('booted')\n"
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            _find_window(x_display)
+            text = _wait_for_output(stdout_path, lambda t: "booted" in t)
+            assert text.strip() == "booted"
         finally:
             proc.terminate()
             proc.wait(timeout=5)
@@ -6067,7 +6195,7 @@ class TestTimers:
             "void func tick() {\n"
             "    log('tick')\n"
             "}\n"
-            "on mouseDown(x:int, y:int) {\n"
+            "on mouseDown(x:int, y:int, button:int) {\n"
             "    log(`click ${x} ${y}`)\n"
             "}\n"
             "drawRect(0, 0, 10, 10)\n"

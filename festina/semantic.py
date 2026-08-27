@@ -121,6 +121,9 @@ BUILTIN_FUNCTIONS = {
     # as render() the only two things here that need a real GUI (see
     # codegen.py's own uses_graphics condition).
     "enterFullscreen", "exitFullscreen",
+    # claude.md #182: showCursor()/hideCursor() -- toggles the mouse
+    # cursor's visibility over the canvas.
+    "showCursor", "hideCursor",
     # claude.md #94: single-value queries, so a scalar result needs no
     # throwaway `table` declaration (which would create a real table).
     "sqliteInt", "sqliteFloat", "sqliteText",
@@ -267,6 +270,9 @@ _BUILTIN_SIGNATURES = {
     # claude.md #180
     "enterFullscreen": (),
     "exitFullscreen": (),
+    # claude.md #182
+    "showCursor": (),
+    "hideCursor": (),
     # claude.md #131
     "close": (_INT,),
     # claude.md #132
@@ -543,9 +549,23 @@ _EVENT_SIGNATURES = {
     # release, and dragging -- or charging a shot, or hold-to-aim --
     # needs to tell them apart; `on click` fired on press and collapsed
     # the two, so there was nothing to listen for on the way up.
-    "mouseDown": ((_INT, _INT), "(x:int, y:int)"),
-    "mouseUp": ((_INT, _INT), "(x:int, y:int)"),
+    # claude.md #182: `button` reports which physical button, X11's own
+    # numbering (see FestinaWindowEvent's own doc comment in
+    # festina_runtime_window.h) -- `mouse` (continuous movement,
+    # unaffected) stays (x, y) only, since a move has no button of its
+    # own to report.
+    "mouseDown": ((_INT, _INT, _INT), "(x:int, y:int, button:int)"),
+    "mouseUp": ((_INT, _INT, _INT), "(x:int, y:int, button:int)"),
     "mouse": ((_INT, _INT), "(x:int, y:int)"),
+    # claude.md #181: the scroll wheel -- one event per notch/step,
+    # split by direction rather than a single `on mouseWheel(delta)`
+    # the same way `on mouseDown`/`on mouseUp` are split by direction
+    # (up/down) rather than one `on click` -- see that entry's own
+    # reasoning, which applies identically here. `x`/`y` report the
+    # pointer's position at the moment of the scroll, same convention
+    # as every other pointer event above.
+    "mouseWheelUp": ((_INT, _INT), "(x:int, y:int)"),
+    "mouseWheelDown": ((_INT, _INT), "(x:int, y:int)"),
     # claude.md #98: one `on key` became two, so a program can tell a
     # press from a release -- holding a movement key and letting it go
     # had no expressible difference before.
@@ -599,6 +619,21 @@ _SCREEN_SIZE_GLOBALS = ("screenWidth", "screenHeight")
 # every touch point below; combined once here so those touch points
 # don't need to know there happen to be two separate families.
 _SIZE_GLOBALS = _CLIENT_SIZE_GLOBALS + _SCREEN_SIZE_GLOBALS
+
+# claude.md #181: devicePixelRatio -- how many actual device pixels
+# back one canvas/CSS pixel (1.0 on a standard display, typically 2.0
+# on a Retina/HiDPi one), read-only the identical way as _SIZE_GLOBALS
+# just above -- a genuinely different QUESTION (a display's pixel
+# density, not a width/height), and the wrong TYPE to fold into that
+# same tuple (float, not int, so it needs its own Symbol registration
+# below rather than sharing _SIZE_GLOBALS' single int-typed loop) even
+# though it shares every other read-only-global touch point with it.
+_DEVICE_PIXEL_RATIO_GLOBALS = ("devicePixelRatio",)
+
+# The read-only-assignment check below needs both families in one set;
+# the type-registration loop above still needs them kept apart (float
+# vs int), so this combination exists only for that one shared check.
+_READONLY_SCALAR_GLOBALS = _SIZE_GLOBALS + _DEVICE_PIXEL_RATIO_GLOBALS
 
 # claude.md #71: `environment` -- unlike clientWidth/clientHeight above,
 # this is never a valid *value* on its own (only environment.NAME or
@@ -869,6 +904,11 @@ def analyze(program, filename="<string>"):
     # see _SIZE_GLOBALS above.
     for _name in _SIZE_GLOBALS:
         global_scope.define(_name, Symbol(_name, _INT, "constant", None), None, filename)
+    # claude.md #181: devicePixelRatio -- see _DEVICE_PIXEL_RATIO_GLOBALS
+    # above for why this isn't folded into the loop just above (float,
+    # not int).
+    for _name in _DEVICE_PIXEL_RATIO_GLOBALS:
+        global_scope.define(_name, Symbol(_name, _FLOAT, "constant", None), None, filename)
     # claude.md #71: environment, see _ENVIRONMENT_NAME above -- type is
     # irrelevant (never consulted), only here so redeclaring it is a
     # duplicate-declaration error like any other reserved global.
@@ -1200,12 +1240,13 @@ def analyze(program, filename="<string>"):
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid assignment",
                 )
-            # claude.md #39/#139: clientWidth/clientHeight/screenWidth/
-            # screenHeight are read-only too -- same reasoning and same
-            # "catch it before the generic target_type/value_type check
-            # below" placement as .length above, since that check alone
-            # has no way to tell a read from a write target.
-            if isinstance(expr.target, ast.Identifier) and expr.target.name in _SIZE_GLOBALS:
+            # claude.md #39/#139/#181: clientWidth/clientHeight/
+            # screenWidth/screenHeight/devicePixelRatio are read-only
+            # too -- same reasoning and same "catch it before the
+            # generic target_type/value_type check below" placement as
+            # .length above, since that check alone has no way to tell
+            # a read from a write target.
+            if isinstance(expr.target, ast.Identifier) and expr.target.name in _READONLY_SCALAR_GLOBALS:
                 raise CompileError(
                     f"'{expr.target.name}' is read-only and cannot be assigned to",
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
