@@ -1648,6 +1648,63 @@ void festina_draw_image(void *img, int64_t x, int64_t y) {
     cairo_destroy(cr);
 }
 
+/* claude.md #185 (uraikus/festina#76 item 3): drawImage(img, x, y, w,
+ * h) -- draws the WHOLE source image scaled to fit a w x h box at
+ * (x, y). The gap this closes: previously the only way to change an
+ * image's displayed size at all was img.resize(), which mutates in
+ * place -- so drawing one stored sprite at two different sizes (a
+ * small palette icon and a full-size stamp) meant keeping two separate
+ * copies around, generated or resized by hand.
+ *
+ * A plain scale-then-paint, not a resample into a fresh surface --
+ * Cairo's own source-pattern filtering (CAIRO_FILTER_GOOD, the default
+ * for an image pattern) does the interpolation, so this needs no image
+ * processing of its own, and costs nothing extra when w/h happen to
+ * match the source size exactly. */
+void festina_draw_image_scaled(void *img, int64_t x, int64_t y, int64_t w, int64_t h) {
+    festina_backing_require();
+    if (!img || w <= 0 || h <= 0) return;
+    cairo_surface_t *surface = ((FestinaImageBox *)img)->surface;
+    int src_w = cairo_image_surface_get_width(surface);
+    int src_h = cairo_image_surface_get_height(surface);
+    if (src_w <= 0 || src_h <= 0) return;
+    cairo_t *cr = festina_canvas_context();
+    cairo_save(cr);
+    cairo_translate(cr, (double)x, (double)y);
+    cairo_scale(cr, (double)w / (double)src_w, (double)h / (double)src_h);
+    cairo_set_source_surface(cr, surface, 0, 0);
+    cairo_paint_with_alpha(cr, g_fill_alpha);
+    cairo_restore(cr);
+    cairo_destroy(cr);
+}
+
+/* claude.md #185: the full 8-argument canvas-style form -- a SOURCE
+ * rect (sx, sy, sw, sh) cut out of the image and scaled to fit a
+ * DESTINATION rect (dx, dy, dw, dh), the variable-size paint-brush-
+ * from-one-fixed-size-source case #76 itself named.
+ *
+ * A source rect reaching past the image's own edge behaves exactly
+ * like festina_image_clip's own "the overlap is copied, the rest stays
+ * transparent" rule -- clipping to the DESTINATION rect (not the
+ * source) is what keeps that transparent overflow from spilling past
+ * the intended box instead of just fading out inside it. */
+void festina_draw_image_region(void *img, int64_t sx, int64_t sy, int64_t sw, int64_t sh,
+                                int64_t dx, int64_t dy, int64_t dw, int64_t dh) {
+    festina_backing_require();
+    if (!img || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+    cairo_surface_t *surface = ((FestinaImageBox *)img)->surface;
+    cairo_t *cr = festina_canvas_context();
+    cairo_save(cr);
+    cairo_rectangle(cr, (double)dx, (double)dy, (double)dw, (double)dh);
+    cairo_clip(cr);
+    cairo_translate(cr, (double)dx, (double)dy);
+    cairo_scale(cr, (double)dw / (double)sw, (double)dh / (double)sh);
+    cairo_set_source_surface(cr, surface, -(double)sx, -(double)sy);
+    cairo_paint_with_alpha(cr, g_fill_alpha);
+    cairo_restore(cr);
+    cairo_destroy(cr);
+}
+
 void festina_register_mouse_down_handler(void (*handler)(int64_t, int64_t, int64_t)) {
     g_mouse_down_handler = handler;
 }

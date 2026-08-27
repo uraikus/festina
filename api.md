@@ -764,6 +764,9 @@ void func logHealth(h:int, key:text) {
     log(`${key} ${h.toText()}`)
 }
 npcHealths.forEach(logHealth)   // (value, key) -- visit order is unspecified
+
+arr[text] ids = npcHealths.keys()     // a plain snapshot, walkable with a for loop
+arr[int] hps = npcHealths.values()    // no callback, no extra globals needed
 ```
 
 An unquoted identifier key (`npc2Id` above) is a reference to that
@@ -773,7 +776,15 @@ except `arr[...]`/`map[...]` itself (a map value is stored in one
 fixed-size slot, which those two don't fit in). `.forEach()`'s callback
 must be an already-declared function taking exactly `(value, key:text)`
 and returning nothing, the same "bare name of a declared function"
-restriction `setTimeout`'s callback has. A genuine hash table
+restriction `setTimeout`'s callback has — since it takes no closures,
+collecting matching entries into your own accumulator otherwise means
+promoting that accumulator to a global just so the callback can reach
+it. `.keys()`/`.values()` sidestep that for the common case: both take
+no arguments and return an ordinary, independent snapshot array (`arr[text]`/
+`arr[T]`) taken once, at the call — a later change to the map (`delete`,
+a new key, `free`) never retroactively changes what was already
+returned. Order matches `.forEach()`'s own: unspecified, a function of
+each key's hash rather than insertion order. A genuine hash table
 internally — open addressing (linear probing), FNV-1a hashing,
 tombstone deletion, doubling capacity whenever the table crosses 75%
 load — average O(1) get/set/delete rather than a scan over every
@@ -1099,6 +1110,8 @@ drawText('Hello', 20, 20)
 
 img profile = 'profile.png'              // PNG or JPEG
 drawImage(profile, 0, 0)
+drawImage(profile, 0, 0, 64, 64)         // scaled to fit a 64x64 box
+drawImage(profile, 0, 0, 32, 32, 100, 100, 64, 64)  // source rect, scaled into dest rect
 log(`${profile.width}x${profile.height}`)
 
 saveCanvas('screenshot.png')             // -> bool; writes what you drew
@@ -1127,6 +1140,18 @@ on keyUp(key:text)             { ... }
 on resize()                    { ... }
 on close()                     { ... }
 ```
+
+`drawImage` has three forms. `drawImage(img, x, y)` draws it at its
+stored size. `drawImage(img, x, y, w, h)` scales the whole image to fit
+a `w`×`h` box at `(x, y)` — unlike `img.resize()`, this doesn't touch
+the image itself, so the same `img` can be drawn at as many different
+sizes as you like. `drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh)` adds
+a source rectangle — cuts a `sw`×`sh` region out of the image starting
+at `(sx, sy)` and scales *that* into the `dw`×`dh` destination box —
+the way a sprite sheet or a variable-size paint brush pulls one piece
+out of a larger stored image without a separate `.clip()` call first.
+A source region reaching past the image's own edge behaves like
+`.clip()`'s own: the overlap is drawn, the rest is simply not there.
 
 **Drawing is offscreen. `render()` puts it on screen.**
 
@@ -2687,6 +2712,37 @@ Elements are owned the same way any other binding owns them: pushing a
 `text` copies it, so the array and the variable don't share a buffer.
 Removing transfers ownership to whoever receives it. `indexOf()` takes
 no ownership at all — an index isn't a reference.
+
+### Sorting: `sort(cmpFn)`
+
+```festina
+int func byAsc(a:int, b:int) { return a - b }
+
+arr[int] xs = [5, 3, 8, 1]
+xs.sort(byAsc)         // in place -- xs is now [1,3,5,8]
+```
+
+`sort()` takes a comparator, `cmpFn:func[T,T]:int`, and sorts in place —
+JavaScript's/C `qsort()`'s convention: return negative if the first
+argument belongs before the second, positive if after, `0` if they're
+equal. Sorting is **stable** — two elements the comparator calls equal
+keep their original relative order, so sorting a list twice by two
+different keys ("sort by name, then re-sort by score" to get "score
+descending, ties broken by name") behaves the way it reads.
+
+The comparator can be any `func[T,T]:int`-typed expression, not just the
+bare name of a declared function — a variable holding a function value
+works too, the same first-class-function rule every other callback
+(`.callback()`, `exec(args, callback)`) already follows.
+
+```festina
+struct Enemy { name:text y:int }
+
+int func byDepth(a:Enemy, b:Enemy) { return a.y - b.y }
+
+arr[Enemy] enemies = [...]
+enemies.sort(byDepth)   // back-to-front draw order by Y position
+```
 
 ## Timers
 

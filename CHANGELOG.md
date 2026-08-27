@@ -9,6 +9,24 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.4] - 2026-08-27
+
+### Added
+
+- `arr[T].sort(cmpFn)`: an in-place, stable, comparator-based sort —
+  `cmpFn:func[T,T]:int`, JavaScript's/C `qsort()`'s own convention.
+  See [api.md](api.md#sorting-sortcmpfn).
+- `drawImage(img, x, y, w, h)`: scales the whole image to fit a `w`×`h`
+  box, without mutating the source image the way `img.resize()` does.
+- `drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh)`: the full
+  canvas-style form — a source rect cut out of the image, scaled into
+  a destination rect. See
+  [api.md](api.md#drawing-is-offscreen-render-puts-it-on-screen).
+- `map[T].keys()`/`map[T].values()`: a plain, independent snapshot
+  array (`arr[text]`/`arr[T]`), no callback needed — sidesteps
+  `.forEach()`'s bare/no-closures callback restriction for the common
+  "collect entries matching a condition" case.
+
 ## [0.3.1] - 2026-08-27
 
 ### Fixed

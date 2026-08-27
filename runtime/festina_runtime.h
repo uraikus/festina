@@ -725,6 +725,13 @@ void festina_image_draw_circle(void *img, int64_t x, int64_t y, int64_t r);
 void festina_image_draw_text(void *img, const char *text, int64_t x, int64_t y);
 void festina_image_free(void *img);
 void festina_draw_image(void *img, int64_t x, int64_t y);
+/* claude.md #185 (uraikus/festina#76 item 3): drawImage(img, x, y, w,
+ * h) -- the WHOLE image scaled to fit w x h at (x, y). */
+void festina_draw_image_scaled(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
+/* claude.md #185: the canvas-style 8-argument form -- a source rect
+ * (sx, sy, sw, sh) scaled to fit a destination rect (dx, dy, dw, dh). */
+void festina_draw_image_region(void *img, int64_t sx, int64_t sy, int64_t sw, int64_t sh,
+                                int64_t dx, int64_t dy, int64_t dw, int64_t dh);
 /* claude.md #89/#90: canvas drawing style -- process-global state set by
  * fillStyle()/borderColor()/lineWidth()/font() and read by every later
  * draw call, the same "set it, then draw" model the HTML canvas 2D
@@ -1314,6 +1321,14 @@ void festina_map_set(int64_t *count, void **entries, int64_t *capacity, int64_t 
                      const char *key, int64_t value);
 int64_t festina_map_get(void *entries, int64_t capacity, const char *key, int64_t default_value);
 void festina_map_for_each(void *entries, int64_t capacity, void (*callback)(int64_t, const char *));
+/* claude.md #186 (uraikus/festina#76 item 7): map[T].keys() -> arr[text]
+ * and map[T].values() -> arr[T] -- `dst` is always a fresh header
+ * codegen already allocated (_emit_fresh_heap_header); these only fill
+ * in its length/data fields. See the implementation's own comment for
+ * values()'s `elem_size`/`is_refcounted`/`is_text` arguments. */
+void festina_map_keys(void *entries, int64_t capacity, void *dst);
+void festina_map_values(void *entries, int64_t capacity, int64_t elem_size,
+                         int8_t is_refcounted, int8_t is_text, void *dst);
 
 /* claude.md #74/#75/#175: called by generated code when a map[T]
  * local, proven never to escape its declaring function, goes out of
@@ -1384,6 +1399,16 @@ void festina_array_splice_insert(void *hdr, int64_t *capacity, int64_t elem_size
  * buffers still match. */
 int64_t festina_array_index_of(void *hdr, int64_t elem_size,
                                 const void *value, int8_t is_text);
+/* claude.md #184 (uraikus/festina#76 item 2): in-place, stable sort.
+ * `cmp` is always codegen's own generated per-element-type trampoline
+ * (_emit_sort_comparator_trampoline); `userdata` is the real Festina
+ * comparator function value, a bare pointer passed straight through
+ * unchanged on every comparison -- not qsort()/qsort_r()/qsort_s(),
+ * whose userdata-carrying variants disagree on argument order across
+ * glibc/BSD/Windows. See the implementation's own comment. */
+void festina_array_sort(void *hdr, int64_t elem_size,
+                         int (*cmp)(const void *, const void *, void *),
+                         void *userdata);
 void festina_release_array(void *payload);
 void festina_release_map(void *payload);
 /* claude.md #167: the value-aware counterpart to festina_release_map,

@@ -4349,6 +4349,163 @@ int64_t festina_array_index_of(void *hdr, int64_t elem_size,
     return -1;
 }
 
+/* claude.md #184 (uraikus/festina#76 item 2): in-place, STABLE sort
+ * over an arr[T]'s raw elem_size-byte slots -- JS's own
+ * Array.prototype.sort contract, arguably the more surprising outcome
+ * NOT to have (two equal-by-cmp elements swapping relative order would
+ * be a visible behavior change if the array is ever re-sorted by a
+ * different key later).
+ *
+ * Not plain qsort(): its comparator signature has no user-data slot at
+ * all, and the portable-looking fixes (qsort_r/qsort_s) are NOT
+ * actually portable across the platforms this runtime targets --
+ * glibc's qsort_r takes the userdata argument last, BSD's takes it
+ * first, and Windows's qsort_s again differs from both. Rather than
+ * `#ifdef`ing three incompatible call shapes, this is a small
+ * hand-rolled bottom-up merge sort whose OWN comparator signature
+ * carries userdata as a real parameter from the start -- codegen's
+ * `cmp` is always its own generated trampoline
+ * (_emit_sort_comparator_trampoline), and `userdata` is the real
+ * Festina comparator function VALUE (already a bare pointer, claude.md
+ * #141), passed straight through unchanged on every call.
+ *
+ * `cmp` means exactly what a C qsort() comparator's return value
+ * means: negative if *a sorts before *b, positive if after, zero if
+ * equal. */
+void festina_array_sort(void *hdr, int64_t elem_size,
+                         int (*cmp)(const void *, const void *, void *),
+                         void *userdata) {
+    FestinaArrayHeader *a = (FestinaArrayHeader *)hdr;
+    if (!a || a->length <= 1 || !a->data || !cmp) return;
+    int64_t n = a->length;
+    char *base = (char *)a->data;
+    char *scratch = malloc((size_t)(n * elem_size));
+    if (!scratch) festina_fail("out of memory sorting an array");
+    for (int64_t width = 1; width < n; width *= 2) {
+        for (int64_t lo = 0; lo < n; lo += 2 * width) {
+            int64_t mid = lo + width < n ? lo + width : n;
+            int64_t hi = lo + 2 * width < n ? lo + 2 * width : n;
+            int64_t i = lo, j = mid, k = lo;
+            while (i < mid && j < hi) {
+                const void *ea = base + i * elem_size;
+                const void *eb = base + j * elem_size;
+                /* <= (not <) keeps this stable: a tie is resolved in
+                 * favor of the left run, which always holds the
+                 * earlier original elements. */
+                if (cmp(ea, eb, userdata) <= 0) {
+                    memcpy(scratch + k * elem_size, ea, (size_t)elem_size);
+                    i++;
+                } else {
+                    memcpy(scratch + k * elem_size, eb, (size_t)elem_size);
+                    j++;
+                }
+                k++;
+            }
+            while (i < mid) {
+                memcpy(scratch + k * elem_size, base + i * elem_size, (size_t)elem_size);
+                i++; k++;
+            }
+            while (j < hi) {
+                memcpy(scratch + k * elem_size, base + j * elem_size, (size_t)elem_size);
+                j++; k++;
+            }
+        }
+        memcpy(base, scratch, (size_t)(n * elem_size));
+    }
+    free(scratch);
+}
+
+/* claude.md #186 (uraikus/festina#76 item 7): map[T].keys() -> arr[text]
+ * and map[T].values() -> arr[T] -- a plain, independent snapshot array,
+ * built once and then walked with an ordinary `for` loop. The actual
+ * pain point the issue names: map[T].forEach's callback is bare/no-
+ * closures (claude.md #72), so every "collect entries matching a
+ * condition" call site had to promote its own accumulator state into
+ * extra globals purely so the callback could reach it. `keys()`/
+ * `values()` sidestep that entirely for exactly this shape -- no
+ * callback needed at all.
+ *
+ * Both scan by CAPACITY, not count, the same live-entry test
+ * festina_map_for_each already uses (a slot is live when its key is
+ * neither NULL -- never used -- nor FESTINA_MAP_TOMBSTONE -- deleted).
+ * `dst` is always a header codegen already allocated fresh via
+ * _emit_fresh_heap_header (refcount=1, `{length: 0, data: NULL}`
+ * zeroed) -- these two functions only ever fill in its `length`/`data`
+ * fields, the same division of labor festina_array_splice's own `dst`
+ * output parameter already has. */
+void festina_map_keys(void *entries, int64_t capacity, void *dst) {
+    FestinaMapEntry *buckets = (FestinaMapEntry *)entries;
+    FestinaArrayHeader *out = (FestinaArrayHeader *)dst;
+    int64_t count = 0;
+    for (int64_t i = 0; i < capacity; i++) {
+        char *k = buckets[i].key;
+        if (k && k != FESTINA_MAP_TOMBSTONE) count++;
+    }
+    if (count == 0) return;
+    char **data = malloc((size_t)count * sizeof(char *));
+    if (!data) festina_fail("out of memory in festina_map_keys");
+    int64_t out_i = 0;
+    for (int64_t i = 0; i < capacity; i++) {
+        char *k = buckets[i].key;
+        if (!k || k == FESTINA_MAP_TOMBSTONE) continue;
+        /* A fresh copy, not the map's own internal key pointer -- the
+         * map keeps managing that one's lifetime independently (it can
+         * be deleted, or the whole map released) long after this array
+         * is handed back, so sharing the pointer would leave either
+         * side able to invalidate the other's. */
+        data[out_i++] = festina_text_own(k);
+    }
+    out->length = count;
+    out->data = data;
+}
+
+/* claude.md #186: values() shares keys()'s own scan, but the element
+ * representation depends on T -- `elem_size` (1 for bool, 8 for
+ * everything else, exactly _elem_size's own domain) picks the write
+ * width, and `is_refcounted`/`is_text` (mutually exclusive, both
+ * compile-time known from T) pick the ownership operation, matching
+ * .push()'s own rule (claude.md #96): a struct/arr/map/img/aud/regex/
+ * blob value collected here is RETAINED (the map keeps its own live
+ * reference to the same pointer, so without this the returned array
+ * and the map would silently share ownership, and whichever released
+ * first would leave the other dangling); a text value is COPIED
+ * (festina_text_own, text having no shared representation to retain in
+ * the first place); anything else (int/float/bool/color) is a plain
+ * value needing neither. */
+void festina_map_values(void *entries, int64_t capacity, int64_t elem_size,
+                         int8_t is_refcounted, int8_t is_text, void *dst) {
+    FestinaMapEntry *buckets = (FestinaMapEntry *)entries;
+    FestinaArrayHeader *out = (FestinaArrayHeader *)dst;
+    int64_t count = 0;
+    for (int64_t i = 0; i < capacity; i++) {
+        char *k = buckets[i].key;
+        if (k && k != FESTINA_MAP_TOMBSTONE) count++;
+    }
+    if (count == 0) return;
+    char *data = malloc((size_t)count * (size_t)elem_size);
+    if (!data) festina_fail("out of memory in festina_map_values");
+    int64_t out_i = 0;
+    for (int64_t i = 0; i < capacity; i++) {
+        char *k = buckets[i].key;
+        if (!k || k == FESTINA_MAP_TOMBSTONE) continue;
+        int64_t v = buckets[i].value;
+        if (is_refcounted) {
+            festina_retain((void *)(intptr_t)v);
+        } else if (is_text) {
+            v = (int64_t)(intptr_t)festina_text_own((const char *)(intptr_t)v);
+        }
+        if (elem_size == 1) {
+            int8_t b = (int8_t)v;
+            memcpy(data + out_i * elem_size, &b, 1);
+        } else {
+            memcpy(data + out_i * elem_size, &v, sizeof(v));
+        }
+        out_i++;
+    }
+    out->length = count;
+    out->data = data;
+}
+
 void festina_release_array(void *payload) {
     if (!festina_release_check(payload)) return;
     /* payload is {i64 length, ptr data} -- skip past the i64 to reach

@@ -1161,6 +1161,121 @@ class TestMaps:
         assert json.loads(result.stdout.strip()) == {"a": 1, "c": 3, "d": 4}
 
 
+class TestMapKeysAndValues:
+    """claude.md #186 (uraikus/festina#76 item 7): map[T].keys() ->
+    arr[text], map[T].values() -> arr[T] -- a plain snapshot array,
+    walkable with an ordinary `for` loop, sidestepping forEach()'s own
+    bare/no-closures callback restriction (claude.md #72) for the
+    common "collect entries matching a condition" case."""
+
+    def test_keys_and_values_on_an_int_valued_map(self, compile_and_run):
+        source = """
+        map[int] scores
+        scores['alice'] = 10
+        scores['bob'] = 20
+        scores['carol'] = 30
+        arr[text] ks = scores.keys()
+        log(ks.length)
+        log(ks.indexOf('alice') >= 0)
+        log(ks.indexOf('bob') >= 0)
+        log(ks.indexOf('carol') >= 0)
+        log(ks.indexOf('dave') >= 0)
+        int func cmpInt(a:int, b:int) { return a - b }
+        arr[int] vs = scores.values()
+        vs.sort(cmpInt)
+        log(vs)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            "3", "true", "true", "true", "false", "[10,20,30]"]
+
+    def test_empty_map_answers_empty_arrays(self, compile_and_run):
+        source = """
+        map[int] empty
+        arr[text] ks = empty.keys()
+        arr[int] vs = empty.values()
+        log(ks.length)
+        log(vs.length)
+        """
+        result = compile_and_run(source)
+        assert result.stdout == "0\n0\n"
+
+    def test_keys_snapshot_is_independent_of_a_later_delete(self, compile_and_run):
+        # The whole point of a plain array over forEach: it's collected
+        # ONCE. A later mutation of the source map must not retroactively
+        # change what was already handed back.
+        source = """
+        map[int] m
+        m['a'] = 1
+        m['b'] = 2
+        arr[text] ks = m.keys()
+        delete m['a']
+        log(ks.length)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "2"
+
+    def test_values_on_a_text_valued_map_copies_independently_of_the_map(self, compile_and_run):
+        # text has no shared representation to retain -- each collected
+        # value must be its OWN copy, still readable after the source
+        # map (and whatever it held) is freed.
+        source = """
+        map[text] names
+        names['x'] = 'hello'
+        names['y'] = 'world'
+        arr[text] vs = names.values()
+        free names
+        log(vs[0] == 'hello' || vs[0] == 'world')
+        log(vs[1] == 'hello' || vs[1] == 'world')
+        """
+        result = compile_and_run(source)
+        assert result.stdout == "true\ntrue\n"
+
+    def test_values_on_a_struct_valued_map_retains_independently_of_the_map(self, compile_and_run):
+        source = """
+        struct P { v:int }
+        map[P] m
+        P a
+        a.v = 1
+        P b
+        b.v = 2
+        m['a'] = a
+        m['b'] = b
+        arr[P] vs = m.values()
+        free m
+        log(vs[0].v + vs[1].v)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "3"
+
+    def test_values_on_a_bool_valued_map(self, compile_and_run):
+        # arr[bool]'s one-byte element stride (claude.md #97) has to
+        # come out right here too, not just from arr[T]'s own methods.
+        source = """
+        map[bool] flags
+        flags['a'] = true
+        flags['b'] = false
+        arr[bool] vs = flags.values()
+        int trues = 0
+        for int i = 0, i < vs.length, i++ {
+            if (vs[i]) { trues = trues + 1 }
+        }
+        log(vs.length)
+        log(trues)
+        """
+        result = compile_and_run(source)
+        assert result.stdout == "2\n1\n"
+
+    def test_wrong_arity_is_a_compile_error(self, parser, semantic, errors):
+        for source in [
+            "map[int] m\nm.keys(1)",
+            "map[int] m\nm.values(1)",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
 class TestAmorArray:
     """claude.md #174: amor arr[T] -- an "amortized array", the
     array-typed counterpart of TestAmorMap above and the runtime effect
@@ -13643,6 +13758,92 @@ class TestCanvasPathsRenderRealPixels:
         finally:
             proc.terminate()
 
+    def test_draw_image_with_destination_size_scales_the_whole_image(
+            self, run_graphics_program, x_display):
+        # claude.md #185 (uraikus/festina#76 item 3): drawImage(img, x,
+        # y, w, h) -- a 10x10 solid blue square drawn at 40x40 should
+        # cover pixel (25, 25) (inside the scaled box) with blue, and
+        # leave a point well outside it (60, 60) showing the red
+        # background instead.
+        source = """
+        setClientWidth(10)
+        setClientHeight(10)
+        color red = 'red'
+        color blue = 'blue'
+
+        clearCanvas()
+        fillStyle(blue)
+        drawRect(0, 0, 10, 10)
+        img sq = saveCanvas()   // exactly a 10x10 blue image, no transparent margin
+
+        setClientWidth(400)
+        setClientHeight(200)
+        clearCanvas()
+        fillStyle(red)
+        drawRect(0, 0, 400, 200)
+        drawImage(sq, 0, 0, 40, 40)
+        render()
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            got = _xwd_pixels(x_display, wid, [(20, 20), (60, 60)])
+            assert got[0] == (0, 0, 255), "scaled drawImage should cover (20,20) with blue"
+            assert got[1] == (255, 0, 0), "outside the scaled box should still be red"
+        finally:
+            proc.terminate()
+
+    def test_draw_image_with_source_and_dest_rects(self, run_graphics_program, x_display):
+        # claude.md #185: the full 8-argument canvas-style form. The
+        # source image is left half blue, right half green; cutting out
+        # just the right (green) half and drawing it scaled elsewhere
+        # should show green there, not blue.
+        source = """
+        setClientWidth(20)
+        setClientHeight(20)
+        color blue = 'blue'
+        color green = 'green'
+        color red = 'red'
+
+        clearCanvas()
+        fillStyle(blue)
+        drawRect(0, 0, 10, 20)
+        fillStyle(green)
+        drawRect(10, 0, 10, 20)
+        img sheet = saveCanvas()   // exactly a 20x20 image, no transparent margin
+
+        setClientWidth(400)
+        setClientHeight(200)
+        clearCanvas()
+        fillStyle(red)
+        drawRect(0, 0, 400, 200)
+        // source rect: the right (green) 10x20 half; dest: 100,100 40x40
+        drawImage(sheet, 10, 0, 10, 20, 100, 100, 40, 40)
+        render()
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            got = _xwd_pixels(x_display, wid, [(120, 120), (200, 20)])
+            assert got[0] == (0, 128, 0), "the clipped source rect should paint green, not blue"
+            assert got[1] == (255, 0, 0), "outside the destination rect should still be red"
+        finally:
+            proc.terminate()
+
+    def test_draw_image_wrong_arity_is_a_compile_error(self, parser, semantic, errors):
+        # 3, 5, and 9 are the only valid shapes -- anything else (4, 6,
+        # 8 args) is a real mistake, not a fourth form nobody wrote yet.
+        for source in [
+            "img sq\ndrawImage(sq, 0)",
+            "img sq\ndrawImage(sq, 0, 0, 0)",
+            "img sq\ndrawImage(sq, 0, 0, 0, 0, 0, 0)",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
 
 class TestRenderClearAndHeadless:
     """claude.md #95: drawing paints an offscreen canvas; `render()` is
@@ -14100,6 +14301,118 @@ class TestArrayIndexOf:
             "arr[int] xs = [1]\nlog(xs.indexOf())",
             "arr[int] xs = [1]\nlog(xs.indexOf(1, 2))",
             "arr[int] xs = [1]\nlog(xs.indexOf('a'))",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
+class TestArraySort:
+    """claude.md #184 (uraikus/festina#76 item 2): xs.sort(cmpFn), a
+    comparator-based sort taking cmpFn:func[T,T]:int, JS/C-qsort style
+    -- negative/zero/positive meaning first-before-second/equal/
+    first-after-second, exactly like a C qsort() comparator. In place,
+    void, and STABLE (unlike qsort(), which makes no such promise) --
+    see festina_array_sort's own runtime comment on why."""
+
+    def test_sorts_ints_ascending_and_descending(self, compile_and_run):
+        source = """
+        int func byAsc(a:int, b:int) { return a - b }
+        int func byDesc(a:int, b:int) { return b - a }
+        arr[int] xs = [5, 3, 8, 1, 9, 2]
+        xs.sort(byAsc)
+        log(xs)
+        xs.sort(byDesc)
+        log(xs)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "[1,2,3,5,8,9]\n[9,8,5,3,2,1]\n"
+
+    def test_empty_and_single_element_arrays_are_no_ops(self, compile_and_run):
+        source = """
+        int func byAsc(a:int, b:int) { return a - b }
+        arr[int] empty = []
+        empty.sort(byAsc)
+        log(empty.length)
+        arr[int] one = [42]
+        one.sort(byAsc)
+        log(one)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "0\n[42]\n"
+
+    def test_stable_for_equal_elements(self, compile_and_run):
+        # Two structs that compare equal (same y) must keep their
+        # original relative order -- 'tree' was pushed before 'player'
+        # and both have y=5, so 'tree' must still come first.
+        source = """
+        struct Sprite { name:text y:int }
+        int func byY(p:Sprite, q:Sprite) { return p.y - q.y }
+        Sprite a
+        a.name = 'tree'
+        a.y = 5
+        Sprite b
+        b.name = 'player'
+        b.y = 5
+        Sprite c
+        c.name = 'rock'
+        c.y = 2
+        arr[Sprite] sprites = [a, b, c]
+        sprites.sort(byY)
+        log(`${sprites[0].name},${sprites[1].name},${sprites[2].name}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "rock,tree,player\n"
+
+    def test_sorts_floats_and_bools(self, compile_and_run):
+        source = """
+        int func byFloat(a:float, b:float) {
+            if (a < b) { return -1 }
+            if (a > b) { return 1 }
+            return 0
+        }
+        arr[float] fs = [3.5, 1.5, 2.5]
+        fs.sort(byFloat)
+        log(fs)
+        int func byBool(a:bool, b:bool) {
+            if (a == b) { return 0 }
+            if (a) { return 1 }
+            return -1
+        }
+        arr[bool] bs = [true, false, true, false]
+        bs.sort(byBool)
+        log(bs)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "[1.5,2.5,3.5]\n[false,false,true,true]\n"
+
+    def test_arbitrary_expression_callback_not_just_a_bare_name(self, compile_and_run):
+        # claude.md #165/#171's own permissive rule -- unlike setTimeout's
+        # older bare-name-only convention, any func-typed EXPRESSION works.
+        source = """
+        int func byAsc(a:int, b:int) { return a - b }
+        func[int,int]:int cmp = byAsc
+        arr[int] xs = [3, 1, 2]
+        xs.sort(cmp)
+        log(xs)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "[1,2,3]\n"
+
+    def test_wrong_arity_or_signature_is_a_compile_error(self, parser, semantic, errors):
+        for source in [
+            "int func byAsc(a:int, b:int) { return a - b }\n"
+            "arr[int] xs = [1]\nxs.sort()",
+            "int func byAsc(a:int, b:int) { return a - b }\n"
+            "arr[int] xs = [1]\nxs.sort(byAsc, byAsc)",
+            "text func bad(a:text, b:text) { return a }\n"
+            "arr[int] xs = [1]\nxs.sort(bad)",
+            "arr[int] xs = [1]\nxs.sort(5)",
         ]:
             program = parser.parse(source, filename="main.f")
             with pytest.raises(errors.CompileError):

@@ -231,7 +231,9 @@ _BUILTIN_SIGNATURES = {
     # now have a second, 1-argument-longer form with a trailing `color`.
     "drawCircle": (_INT, _INT, _INT),
     "drawText": (_TEXT, _INT, _INT),
-    "drawImage": (types_mod.ImageType(), _INT, _INT),
+    # claude.md #185: drawImage's own fixed 3-argument entry moved to
+    # _BUILTIN_SIGNATURE_ALTERNATES below, alongside its new 5- and
+    # 9-argument forms.
     "setMaxAudioPlayers": (_INT,),  # claude.md #98
     "maxAudioPlayers": (),
     # claude.md #89: a colour is text (a name, #rgb/#rrggbb, or 'none'),
@@ -336,6 +338,18 @@ _BUILTIN_SIGNATURE_ALTERNATES = {
     # fillStyle, exactly like every other draw call already does.
     "drawRect": [(_INT, _INT, _INT, _INT), (_INT, _INT, _INT, _INT, _COLOR)],
     "drawPixel": [(_INT, _INT), (_INT, _INT, _COLOR)],
+    # claude.md #185 (uraikus/festina#76 item 3): drawImage(img, x, y)
+    # is unchanged; drawImage(img, x, y, w, h) scales the WHOLE image
+    # to fit a w x h box; drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh)
+    # is the full canvas-style form -- a SOURCE rect cut out of the
+    # image, scaled to fit a DESTINATION rect. All three share the
+    # first argument's image type, so len() alone (3 vs. 5 vs. 9) picks
+    # the right one with no ambiguity.
+    "drawImage": [
+        (types_mod.ImageType(), _INT, _INT),
+        (types_mod.ImageType(), _INT, _INT, _INT, _INT),
+        (types_mod.ImageType(), _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT),
+    ],
 }
 _REGEX = types_mod.RegexType()
 _AUDIO = types_mod.AudioType()
@@ -2606,10 +2620,41 @@ def analyze(program, filename="<string>"):
             # and the int-ness of every argument are enforced.
             # claude.md #96: array methods, JS-shaped.
             if callee.prop in ("push", "pop", "shift", "unshift", "splice",
-                               "indexOf"):
+                               "indexOf", "sort"):
                 obj_type = infer(callee.obj, scope)
                 if isinstance(obj_type, types_mod.ArrayType):
                     elem = obj_type.element
+                    # claude.md #184 (uraikus/festina#76 item 2):
+                    # sort(cmpFn) -> void, in place, JS/C-qsort style --
+                    # cmpFn:func[T,T]:int, negative/zero/positive meaning
+                    # exactly what C's own qsort() comparator already
+                    # means (first-before-second / equal / first-after-
+                    # second). Checked structurally off cmpFn's own
+                    # signature, the same permissive "any func-typed
+                    # expression" rule blob/img/aud's `.callback()`
+                    # established (claude.md #165/#171) -- not restricted
+                    # to a bare declared-function name the way
+                    # setTimeout's own older convention is.
+                    if callee.prop == "sort":
+                        if len(expr.args) != 1:
+                            raise CompileError(
+                                "sort() expects exactly 1 argument (the "
+                                f"comparator), got {len(expr.args)}",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
+                        fn_type = infer(expr.args[0], scope)
+                        if (not isinstance(fn_type, types_mod.FuncType)
+                                or fn_type.param_types != (elem, elem)
+                                or fn_type.return_type != _INT):
+                            raise CompileError(
+                                f"sort() expects func[{types_mod.type_name(elem)}, "
+                                f"{types_mod.type_name(elem)}]:int, found "
+                                f"{types_mod.type_name(fn_type)}",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
+                        return None
                     # claude.md #97: indexOf(value) -> int, -1 when absent.
                     # The argument has to be assignable to the element type
                     # for the same reason push()'s does: a search for a
@@ -2808,6 +2853,27 @@ def analyze(program, filename="<string>"):
                             category="invalid function argument type",
                         )
                     return None
+            # claude.md #186 (uraikus/festina#76 item 7): map[T].keys()
+            # -> arr[text], map[T].values() -> arr[T] -- a plain
+            # snapshot array, walkable with an ordinary `for` loop, no
+            # callback needed at all. Exists specifically to sidestep
+            # forEach()'s own bare/no-closures callback restriction
+            # (claude.md #72) for the common "collect entries matching
+            # a condition" case, where that restriction otherwise pushes
+            # every call site's own accumulator state into extra
+            # globals purely so the callback can reach it.
+            if callee.prop in ("keys", "values"):
+                obj_type = infer(callee.obj, scope)
+                if isinstance(obj_type, types_mod.MapType):
+                    if expr.args:
+                        raise CompileError(
+                            f"{callee.prop}() takes no arguments, got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    if callee.prop == "keys":
+                        return types_mod.ArrayType(_TEXT)
+                    return types_mod.ArrayType(obj_type.value)
         # Member call, e.g. someUnknownMethod() on a struct-shaped
         # receiver -- validates the member access itself (so an unknown
         # method on a real type still fails with a specific message

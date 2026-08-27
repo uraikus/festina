@@ -873,6 +873,15 @@ class CodeGen:
                                                 # the payload) is right here, unlike
                                                 # _emit_map_value_release_trampoline's own fresh-
                                                 # per-call-site shape.
+        self._sort_trampolines = {}            # claude.md #184: types_mod.type_name(element) ->
+                                                # LLVM symbol name for that element type's qsort()
+                                                # comparator trampoline -- one per DISTINCT element
+                                                # type a program calls .sort() on (the trampoline has
+                                                # to decode that type's own raw slot, so unlike
+                                                # _exec_callback_trampoline above it can't be a single
+                                                # shared symbol), cached the same way
+                                                # _array_release_fns below already keys per-type
+                                                # helpers.
         self.uses_exec = False                 # claude.md #150: any exec() call anywhere -- unlike
                                                 # uses_graphics/uses_audio, festina_process_exec is
                                                 # unconditional core (no extra library to
@@ -1555,6 +1564,9 @@ class CodeGen:
             "declare i8 @festina_image_save(ptr, ptr)",
             "declare i8 @festina_image_save_copy(ptr, ptr)",
             "declare void @festina_draw_image(ptr, i64, i64)",
+            # claude.md #185 (uraikus/festina#76 item 3)
+            "declare void @festina_draw_image_scaled(ptr, i64, i64, i64, i64)",
+            "declare void @festina_draw_image_region(ptr, i64, i64, i64, i64, i64, i64, i64, i64)",
             # claude.md #106: `on click` became mouseDown + mouseUp.
             "declare void @festina_register_mouse_down_handler(ptr)",
             "declare void @festina_register_mouse_up_handler(ptr)",
@@ -1685,6 +1697,8 @@ class CodeGen:
             "declare void @festina_array_splice_insert(ptr, ptr, i64, i64, i64, ptr, i64, ptr)",
             # claude.md #97
             "declare i64 @festina_array_index_of(ptr, i64, ptr, i8)",
+            # claude.md #184 (uraikus/festina#76 item 2)
+            "declare void @festina_array_sort(ptr, i64, ptr, ptr)",
             "declare void @festina_release_map(ptr)",
             # claude.md #71: environment.NAME / environment[keyExpr].
             "declare ptr @festina_getenv(ptr)",
@@ -1703,6 +1717,9 @@ class CodeGen:
             "declare void @festina_map_set(ptr, ptr, ptr, ptr, ptr, i64)",
             "declare i64 @festina_map_get(ptr, i64, ptr, i64)",
             "declare void @festina_map_for_each(ptr, i64, ptr)",
+            # claude.md #186 (uraikus/festina#76 item 7)
+            "declare void @festina_map_keys(ptr, i64, ptr)",
+            "declare void @festina_map_values(ptr, i64, i64, i8, i8, ptr)",
             # claude.md #74/#75/#175: frees each live bucket's own
             # strdup'd key (never a plain free()-the-buffer-alone away
             # from leaking them -- see festina_map_free_entries's own doc
@@ -5139,6 +5156,23 @@ class CodeGen:
             self._free_text_temp(expr.args[0], val, elem_type, lines)
             return out, INT
 
+        if name == "sort":
+            # claude.md #184 (uraikus/festina#76 item 2): in-place,
+            # stable sort. The comparator is a plain first-class
+            # function value -- already a bare `ptr` (claude.md #141),
+            # not a heap-allocated Festina value, so unlike an
+            # arr[T]/map[T]/struct/text argument nothing here needs
+            # retaining, copying, or releasing; it's read once and
+            # handed straight to the runtime as opaque userdata for
+            # festina_array_sort's own trampoline
+            # (_emit_sort_comparator_trampoline) to call back through.
+            cmp_val, _ = self._emit_expr(expr.args[0], env, lines)
+            trampoline_name = self._emit_sort_comparator_trampoline(elem_type)
+            lines.append(
+                f"  call void @festina_array_sort(ptr {obj_val}, i64 {elem_size}, "
+                f"ptr {trampoline_name}, ptr {cmp_val})")
+            return "0", None
+
         # splice(start, count) -> arr[T] of the removed elements
         start_val, _ = self._emit_expr(expr.args[0], env, lines)
         count_val, _ = self._emit_expr(expr.args[1], env, lines)
@@ -7409,6 +7443,53 @@ class CodeGen:
         self._exec_callback_trampoline = trampoline_name
         return trampoline_name
 
+    def _emit_sort_comparator_trampoline(self, elem_type):
+        """claude.md #184 (uraikus/festina#76 item 2): bridges
+        festina_array_sort's own `int(*)(const void*, const void*,
+        void*)` comparator ABI -- given a real userdata slot from the
+        start, unlike plain C qsort(), specifically so this trampoline
+        would never need the process-global-variable workaround a
+        userdata-less comparator would otherwise force -- to a real
+        `func[T,T]:int` Festina value.
+
+        Unlike _emit_exec_callback_trampoline just above, `userdata`
+        IS the callback pointer itself, not a payload struct to read
+        one back out of: .sort()'s comparator argument is evaluated
+        once, at the call site, into an ordinary `ptr` value (first-
+        class function values already ARE bare pointers, claude.md
+        #141), and festina_array_sort hands that same pointer back on
+        every single comparison unchanged, so there's nothing else to
+        carry alongside it.
+
+        Cached per element type (types_mod.type_name(elem_type), the
+        same keying _array_release_fns already uses) rather than
+        shared like _exec_callback_trampoline's one symbol, because
+        decoding the two raw comparison slots needs THIS type's own
+        LLVM type -- an i64 slot decodes differently than an i8 or
+        double or ptr one, and the indirect call's own argument types
+        have to match the real comparator's signature exactly."""
+        key = types_mod.type_name(elem_type)
+        if key in self._sort_trampolines:
+            return self._sort_trampolines[key]
+        elem_ir = _llvm_type(elem_type)
+        uid = self._unique()
+        trampoline_name = f"@__festina_sortcmp_{uid}"
+        body = [f"define i32 {trampoline_name}(ptr %a, ptr %b, ptr %userdata) {{", "entry:"]
+        av = self.tmp()
+        body.append(f"  {av} = load {elem_ir}, ptr %a")
+        bv = self.tmp()
+        body.append(f"  {bv} = load {elem_ir}, ptr %b")
+        r = self.tmp()
+        body.append(f"  {r} = call i64 %userdata({elem_ir} {av}, {elem_ir} {bv})")
+        r32 = self.tmp()
+        body.append(f"  {r32} = trunc i64 {r} to i32")
+        body.append(f"  ret i32 {r32}")
+        body.append("}")
+        self.func_defs.extend(body)
+        self.func_defs.append("")
+        self._sort_trampolines[key] = trampoline_name
+        return trampoline_name
+
     # ---- cycle collection -- claude.md #120 ----
 
     def _is_cyclic_type(self, t):
@@ -8952,7 +9033,7 @@ class CodeGen:
                     return out, TEXT
             # claude.md #96: array methods.
             if callee.prop in ("push", "pop", "shift", "unshift", "splice",
-                               "indexOf"):
+                               "indexOf", "sort"):
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if isinstance(obj_type, types_mod.ArrayType):
                     result = self._emit_array_method(
@@ -9346,6 +9427,35 @@ class CodeGen:
                     lines.append(
                         f"  call void @festina_map_for_each(ptr {entries}, i64 {capacity}, ptr {trampoline_name})")
                     return "0", None
+            # claude.md #186 (uraikus/festina#76 item 7): map[T].keys()
+            # -> arr[text], map[T].values() -> arr[T]. No receiver
+            # release here, matching forEach's own precedent just above
+            # (every existing call site is a plain named map variable,
+            # never a chained call-result temporary).
+            if callee.prop in ("keys", "values"):
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.MapType):
+                    entries_ptr = self.tmp()
+                    lines.append(f"  {entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 1")
+                    entries = self.tmp()
+                    lines.append(f"  {entries} = load ptr, ptr {entries_ptr}")
+                    capacity_ptr = self.tmp()
+                    lines.append(f"  {capacity_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 2")
+                    capacity = self.tmp()
+                    lines.append(f"  {capacity} = load i64, ptr {capacity_ptr}")
+                    dst = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, lines)
+                    if callee.prop == "keys":
+                        lines.append(
+                            f"  call void @festina_map_keys(ptr {entries}, i64 {capacity}, ptr {dst})")
+                        return dst, types_mod.ArrayType(TEXT)
+                    elem_type = obj_type.value
+                    elem_size = _elem_size(elem_type)
+                    is_refcounted = 1 if _is_refcounted(elem_type) else 0
+                    is_text = 1 if elem_type == TEXT else 0
+                    lines.append(
+                        f"  call void @festina_map_values(ptr {entries}, i64 {capacity}, "
+                        f"i64 {elem_size}, i8 {is_refcounted}, i8 {is_text}, ptr {dst})")
+                    return dst, types_mod.ArrayType(elem_type)
         if isinstance(callee, ast.Member):
             # claude.md #141: an indirect call through a func[...]:...
             # -typed struct field (h.cb(...)), array element
@@ -9734,8 +9844,24 @@ class CodeGen:
             text, x, y = args
             lines.append(f"  call void @festina_draw_text(ptr {text}, i64 {x}, i64 {y})")
         elif name == "drawImage":
-            img, x, y = args
-            lines.append(f"  call void @festina_draw_image(ptr {img}, i64 {x}, i64 {y})")
+            # claude.md #185 (uraikus/festina#76 item 3): three shapes,
+            # picked by argument count -- semantic.py's own
+            # _BUILTIN_SIGNATURE_ALTERNATES entry already confirmed
+            # exactly one of these matches.
+            if len(args) == 3:
+                img, x, y = args
+                lines.append(f"  call void @festina_draw_image(ptr {img}, i64 {x}, i64 {y})")
+            elif len(args) == 5:
+                img, x, y, w, h = args
+                lines.append(
+                    f"  call void @festina_draw_image_scaled(ptr {img}, "
+                    f"i64 {x}, i64 {y}, i64 {w}, i64 {h})")
+            else:
+                img, sx, sy, sw, sh, dx, dy, dw, dh = args
+                lines.append(
+                    f"  call void @festina_draw_image_region(ptr {img}, "
+                    f"i64 {sx}, i64 {sy}, i64 {sw}, i64 {sh}, "
+                    f"i64 {dx}, i64 {dy}, i64 {dw}, i64 {dh})")
         free_text_temps()
         return "0", None
 
