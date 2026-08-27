@@ -142,8 +142,8 @@ font  title = 'bold 24px sans-serif'
 fillStyle(brand)
 changeFont(title)
 drawRect(0, 0, 100, 100)
-on mouseDown(x:int, y:int) { log(`pressed ${x}, ${y}`) }
-on mouseUp(x:int, y:int)   { log(`released ${x}, ${y}`) }
+on mouseDown(x:int, y:int, button:int) { log(`pressed ${x}, ${y}`) }
+on mouseUp(x:int, y:int, button:int)   { log(`released ${x}, ${y}`) }
 
 // Audio
 aud music = 'music.wav'

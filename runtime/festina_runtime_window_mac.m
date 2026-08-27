@@ -179,10 +179,31 @@ static cairo_surface_t *g_last_backing = NULL;
     return YES;
 }
 
-- (void)mouseDown:(NSEvent *)event {
+/* claude.md #182: AppKit's own buttonNumber is 0-indexed and ordered
+ * left/right/middle (0/1/2) -- a genuinely different numbering AND
+ * ordering than X11's 1/2/3 left/middle/right, which
+ * FestinaWindowEvent's own `button` field standardizes on (see its doc
+ * comment in festina_runtime_window.h). mouseDown:/mouseUp: only ever
+ * fire for buttonNumber 0 and rightMouseDown:/rightMouseUp: only for
+ * buttonNumber 1, so those two call sites hardcode 1/3 directly with
+ * no lookup needed; this translation is only for otherMouseDown:/
+ * otherMouseUp:, which fire for every buttonNumber 2 and up. Buttons 3
+ * and 4 are, empirically, "back"/"forward" on most multi-button mice
+ * (there's no OS-level guarantee of this -- Apple documents no fixed
+ * meaning past 0/1/2), mapped to X11's own 8/9 for exactly those same
+ * two physical buttons; anything past that is genuinely unstandardized
+ * anywhere, reported as buttonNumber + 1 on a best-effort basis only. */
+static int64_t festina_mac_other_button_number(NSInteger buttonNumber) {
+    if (buttonNumber == 2) return 2;   /* middle */
+    if (buttonNumber == 3) return 8;   /* back, empirically */
+    if (buttonNumber == 4) return 9;   /* forward, empirically */
+    return (int64_t)buttonNumber + 1;
+}
+
+- (void)festinaMouseButtonEvent:(NSEvent *)event kind:(FestinaWindowEventKind)kind button:(int64_t)button {
     NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
     FestinaWindowEvent ev = {0};
-    ev.kind = FESTINA_WEVENT_MOUSE_DOWN;
+    ev.kind = kind;
     ev.x = (int64_t)p.x;
     /* claude.md #37: Festina's own coordinates put y=0 at the TOP, the
      * X11/canvas convention every draw call already uses -- AppKit's
@@ -190,16 +211,34 @@ static cairo_surface_t *g_last_backing = NULL;
      * that difference has to be corrected, not scattered across every
      * event kind's own math. */
     ev.y = (int64_t)([self bounds].size.height - p.y);
+    ev.button = button;
     festina_mac_push(ev, NULL);
 }
 
+- (void)mouseDown:(NSEvent *)event {
+    [self festinaMouseButtonEvent:event kind:FESTINA_WEVENT_MOUSE_DOWN button:1];
+}
+
 - (void)mouseUp:(NSEvent *)event {
-    NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
-    FestinaWindowEvent ev = {0};
-    ev.kind = FESTINA_WEVENT_MOUSE_UP;
-    ev.x = (int64_t)p.x;
-    ev.y = (int64_t)([self bounds].size.height - p.y);
-    festina_mac_push(ev, NULL);
+    [self festinaMouseButtonEvent:event kind:FESTINA_WEVENT_MOUSE_UP button:1];
+}
+
+- (void)rightMouseDown:(NSEvent *)event {
+    [self festinaMouseButtonEvent:event kind:FESTINA_WEVENT_MOUSE_DOWN button:3];
+}
+
+- (void)rightMouseUp:(NSEvent *)event {
+    [self festinaMouseButtonEvent:event kind:FESTINA_WEVENT_MOUSE_UP button:3];
+}
+
+- (void)otherMouseDown:(NSEvent *)event {
+    [self festinaMouseButtonEvent:event kind:FESTINA_WEVENT_MOUSE_DOWN
+                            button:festina_mac_other_button_number([event buttonNumber])];
+}
+
+- (void)otherMouseUp:(NSEvent *)event {
+    [self festinaMouseButtonEvent:event kind:FESTINA_WEVENT_MOUSE_UP
+                            button:festina_mac_other_button_number([event buttonNumber])];
 }
 
 - (void)festinaMouseMoved:(NSEvent *)event {
@@ -222,6 +261,28 @@ static cairo_surface_t *g_last_backing = NULL;
      * `on mouse` firing, matching X11's MotionNotify (which the X11
      * backend reports identically whether or not a button is down). */
     [self festinaMouseMoved:event];
+}
+
+- (void)scrollWheel:(NSEvent *)event {
+    /* claude.md #181: one call handles both a real scroll wheel and a
+     * trackpad's two-finger scroll -- AppKit reports both through the
+     * same scrollWheel: method and the same deltaY sign convention
+     * (already normalized for the user's own "natural scrolling"
+     * preference, so this needs no special-casing for it). Positive
+     * deltaY is scroll-up, negative is scroll-down -- exactly
+     * mouseWheelUp/mouseWheelDown's own split (see semantic.py's
+     * _EVENT_SIGNATURES). A near-zero deltaY (a pure horizontal swipe,
+     * or a trackpad's own momentum/inertia phase reporting a residual
+     * near-0 value) fires neither -- there's no horizontal wheel event
+     * to report it as. */
+    CGFloat deltaY = [event deltaY];
+    if (deltaY == 0.0) return;
+    NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
+    FestinaWindowEvent ev = {0};
+    ev.kind = deltaY > 0 ? FESTINA_WEVENT_MOUSE_WHEEL_UP : FESTINA_WEVENT_MOUSE_WHEEL_DOWN;
+    ev.x = (int64_t)p.x;
+    ev.y = (int64_t)([self bounds].size.height - p.y);
+    festina_mac_push(ev, NULL);
 }
 
 - (void)keyDown:(NSEvent *)event {
@@ -486,10 +547,11 @@ void festina_window_screen_size(int64_t *out_width, int64_t *out_height) {
          * intent this call exists for. Reported in POINTS, not backing
          * pixels, consistent with every other size this backend already
          * hands to/from Festina code (festina_window_open's own width/
-         * height are points too -- there's no backingScaleFactor
-         * handling anywhere in this file), so a Retina display's
-         * doubled pixel density doesn't leak through as a mismatched
-         * unit here. */
+         * height are points too, and this backend does no actual
+         * backing-pixel-resolution rendering anywhere -- claude.md
+         * #181's devicePixelRatio below is purely informational), so a
+         * Retina display's doubled pixel density doesn't leak through
+         * as a mismatched unit here. */
         NSScreen *screen = [NSScreen mainScreen];
         if (!screen) {
             *out_width = 0;
@@ -499,6 +561,21 @@ void festina_window_screen_size(int64_t *out_width, int64_t *out_height) {
         NSRect frame = [screen frame];
         *out_width = (int64_t)frame.size.width;
         *out_height = (int64_t)frame.size.height;
+    }
+}
+
+/* claude.md #181: devicePixelRatio -- backingScaleFactor is exactly
+ * this ratio already (2.0 on Retina, 1.0 otherwise), the one place in
+ * this file that reads it -- everything else stays in POINTS (see
+ * festina_window_screen_size's own comment just above), this call
+ * included; it just also reports the multiplier a program would need
+ * to convert those points to actual device pixels, same "mainScreen,
+ * or nothing key yet" fallback shape. */
+double festina_window_device_pixel_ratio(void) {
+    @autoreleasepool {
+        NSScreen *screen = [NSScreen mainScreen];
+        if (!screen) return 1.0;
+        return (double)[screen backingScaleFactor];
     }
 }
 
@@ -543,6 +620,26 @@ void festina_window_set_fullscreen(int8_t fullscreen) {
         BOOL want_full = fullscreen != 0;
         if (is_full != want_full) {
             [g_window toggleFullScreen:nil];
+        }
+    }
+}
+
+/* claude.md #182: [NSCursor hide]/[NSCursor unhide] are AppKit's own
+ * direct API for this -- unlike X11 (which needs the manual invisible-
+ * cursor workaround, see that backend's own comment) or Win32 (whose
+ * ShowCursor is itself counter-based). NSCursor's hide/unhide ARE also
+ * counter-based internally, but that's harmless here specifically
+ * because the only caller, festina_hide_cursor/festina_show_cursor in
+ * festina_runtime_graphics.c, already guards against a redundant call
+ * with the identical state (see g_cursor_visible's own comment) -- so
+ * this is only ever reached on a genuine state transition, one hide
+ * per one unhide, never imbalanced. */
+void festina_window_set_cursor_visible(int8_t visible) {
+    @autoreleasepool {
+        if (visible) {
+            [NSCursor unhide];
+        } else {
+            [NSCursor hide];
         }
     }
 }

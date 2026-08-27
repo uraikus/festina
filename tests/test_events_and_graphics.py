@@ -28,11 +28,11 @@ class TestEvents:
     def test_mouse_button_event_handlers_parse(self, parser):
         # claude.md #106: `on click` became a press and a release.
         source = """
-        on mouseDown(x:int, y:int) {
+        on mouseDown(x:int, y:int, button:int) {
             log(`Mouse pressed on canvas at ${x}, ${y}`)
         }
 
-        on mouseUp(x:int, y:int) {
+        on mouseUp(x:int, y:int, button:int) {
             log(`Mouse released on canvas at ${x}, ${y}`)
         }
         """

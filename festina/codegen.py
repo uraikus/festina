@@ -40,7 +40,7 @@ below), regex()/.test()/.match()/.replace() (POSIX
 extended regular expressions via the festina_runtime C helpers -- no
 bundled regex engine, see festina_runtime.h's doc comment on why),
 img/drawRect/drawCircle/drawText/drawImage/`on mouseDown`/`on
-mouseUp`/`on mouse` (a
+mouseUp`/`on mouse`/`on mouseWheelUp`/`on mouseWheelDown` (a
 real X11 window rendered via Cairo -- see the "Graphics" note below),
 setTimeout/setInterval/clearTimeout/clearInterval (see the "Timers"
 note below), and aud/loadAudio()/.play()/.stop()/.isPlaying() (a real
@@ -56,7 +56,8 @@ Cairo's Xlib surface backend), not a file written to disk -- "Graphics
 are backed by Cairo" plus #40's mouse events firing against "the
 canvas" only make sense together as an actual window. Opened lazily
 (CodeGen.uses_graphics, set by any draw* call or an `on
-mouseDown`/`on mouseUp`/`on mouse` handler, but deliberately NOT by loadImage() alone -- decoding a
+mouseDown`/`on mouseUp`/`on mouse`/`on mouseWheelUp`/`on mouseWheelDown`
+handler, but deliberately NOT by loadImage() alone -- decoding a
 PNG needs no window; see _emit_graphics_call's own note) in main()
 before __festina_main() runs, exactly
 the same "only pay for what you use" pattern uses_sqlite already
@@ -70,8 +71,8 @@ a fixed 800x600 and every shape/text draws in solid black -- claude.md
 has no syntax for declaring a size or a color, so both are
 implementation-defined defaults, not derived from the spec; the size
 can change afterwards, though, if the window is resized (see `on
-resize` below). `on mouseDown`/`on mouseUp`/`on mouse`/`on key`/`on
-resize`/`on close`
+resize` below). `on mouseDown`/`on mouseUp`/`on mouse`/`on
+mouseWheelUp`/`on mouseWheelDown`/`on key`/`on resize`/`on close`
 each compile to a real function (_emit_event_handler) registered with
 the runtime as a fixed-signature function pointer (see
 _EVENT_SIGNATURES in semantic.py, and festina_runtime.h's declarations,
@@ -872,6 +873,15 @@ class CodeGen:
                                                 # the payload) is right here, unlike
                                                 # _emit_map_value_release_trampoline's own fresh-
                                                 # per-call-site shape.
+        self._sort_trampolines = {}            # claude.md #184: types_mod.type_name(element) ->
+                                                # LLVM symbol name for that element type's qsort()
+                                                # comparator trampoline -- one per DISTINCT element
+                                                # type a program calls .sort() on (the trampoline has
+                                                # to decode that type's own raw slot, so unlike
+                                                # _exec_callback_trampoline above it can't be a single
+                                                # shared symbol), cached the same way
+                                                # _array_release_fns below already keys per-type
+                                                # helpers.
         self.uses_exec = False                 # claude.md #150: any exec() call anywhere -- unlike
                                                 # uses_graphics/uses_audio, festina_process_exec is
                                                 # unconditional core (no extra library to
@@ -1470,7 +1480,7 @@ class CodeGen:
             # claude.md #111: collect_rows takes the declared column
             # NAMES too (result columns are matched by name now), and
             # row.undefined() reads the presence mask it records.
-            "declare void @festina_sqlite_collect_rows(ptr, i32, ptr, ptr, ptr, ptr)",
+            "declare void @festina_sqlite_collect_rows(ptr, i32, ptr, ptr, ptr, ptr, i8)",
             "declare i8 @festina_row_undefined(ptr, ptr, i32, ptr)",
             # claude.md #67-68, #107: regex(), .test(), .match(), .replace().
             "declare ptr @festina_regex_compile(ptr, ptr)",
@@ -1490,9 +1500,13 @@ class CodeGen:
             "declare void @festina_draw_rect(i64, i64, i64, i64)",
             # claude.md #133
             "declare void @festina_draw_rect_color(i64, i64, i64, i64, i64)",
+            # claude.md #188 (uraikus/festina#76 item 8)
+            "declare void @festina_draw_rect_colors(i64, i64, i64, i64, i64, i64)",
             "declare void @festina_draw_pixel(i64, i64)",
             "declare void @festina_draw_pixel_color(i64, i64, i64)",
             "declare void @festina_draw_circle(i64, i64, i64)",
+            "declare void @festina_draw_circle_color(i64, i64, i64, i64)",
+            "declare void @festina_draw_circle_colors(i64, i64, i64, i64, i64)",
             "declare void @festina_draw_text(ptr, i64, i64)",
             # claude.md #89/#90: canvas drawing style + text metrics.
             # Colours and fonts are resolved at compile time (see
@@ -1542,22 +1556,35 @@ class CodeGen:
             "declare i64 @festina_image_width(ptr)",
             "declare i64 @festina_image_height(ptr)",
             "declare ptr @festina_image_clip(ptr, i64, i64, i64, i64)",
+            # claude.md #188 (uraikus/festina#76 item 4)
+            "declare ptr @festina_blank_image(i64, i64)",
             "declare void @festina_image_resize(ptr, i64, i64)",
             # claude.md #134: drawRect/drawPixel/drawCircle/drawText as img methods.
             "declare void @festina_image_draw_rect(ptr, i64, i64, i64, i64)",
             "declare void @festina_image_draw_rect_color(ptr, i64, i64, i64, i64, i64)",
+            # claude.md #188 (uraikus/festina#76 item 8)
+            "declare void @festina_image_draw_rect_colors(ptr, i64, i64, i64, i64, i64, i64)",
             "declare void @festina_image_draw_pixel(ptr, i64, i64)",
             "declare void @festina_image_draw_pixel_color(ptr, i64, i64, i64)",
             "declare void @festina_image_draw_circle(ptr, i64, i64, i64)",
+            "declare void @festina_image_draw_circle_color(ptr, i64, i64, i64, i64)",
+            "declare void @festina_image_draw_circle_colors(ptr, i64, i64, i64, i64, i64)",
             "declare void @festina_image_draw_text(ptr, ptr, i64, i64)",
             "declare void @festina_image_free(ptr)",
             "declare i8 @festina_image_save(ptr, ptr)",
             "declare i8 @festina_image_save_copy(ptr, ptr)",
             "declare void @festina_draw_image(ptr, i64, i64)",
+            # claude.md #185 (uraikus/festina#76 item 3)
+            "declare void @festina_draw_image_scaled(ptr, i64, i64, i64, i64)",
+            "declare void @festina_draw_image_region(ptr, i64, i64, i64, i64, i64, i64, i64, i64)",
             # claude.md #106: `on click` became mouseDown + mouseUp.
             "declare void @festina_register_mouse_down_handler(ptr)",
             "declare void @festina_register_mouse_up_handler(ptr)",
             "declare void @festina_register_mouse_handler(ptr)",
+            # claude.md #181: the scroll wheel, split by direction --
+            # see _EVENT_SIGNATURES' own comment in semantic.py.
+            "declare void @festina_register_mouse_wheel_up_handler(ptr)",
+            "declare void @festina_register_mouse_wheel_down_handler(ptr)",
             # claude.md #98: `on key` became `on keyDown` + `on keyUp`.
             "declare void @festina_register_key_down_handler(ptr)",
             "declare void @festina_register_key_up_handler(ptr)",
@@ -1577,11 +1604,16 @@ class CodeGen:
             # claude.md #139
             "declare i64 @festina_screen_width()",
             "declare i64 @festina_screen_height()",
+            # claude.md #181
+            "declare double @festina_device_pixel_ratio()",
             "declare void @festina_set_client_width(i64)",
             "declare void @festina_set_client_height(i64)",
             # claude.md #180
             "declare void @festina_enter_fullscreen()",
             "declare void @festina_exit_fullscreen()",
+            # claude.md #182
+            "declare void @festina_show_cursor()",
+            "declare void @festina_hide_cursor()",
             # claude.md #69: setTimeout/setInterval/clearTimeout/clearInterval
             # -- see the module docstring's "Timers" note.
             "declare i64 @festina_set_timeout(ptr, i64)",
@@ -1675,6 +1707,8 @@ class CodeGen:
             "declare void @festina_array_splice_insert(ptr, ptr, i64, i64, i64, ptr, i64, ptr)",
             # claude.md #97
             "declare i64 @festina_array_index_of(ptr, i64, ptr, i8)",
+            # claude.md #184 (uraikus/festina#76 item 2)
+            "declare void @festina_array_sort(ptr, i64, ptr, ptr)",
             "declare void @festina_release_map(ptr)",
             # claude.md #71: environment.NAME / environment[keyExpr].
             "declare ptr @festina_getenv(ptr)",
@@ -1693,6 +1727,9 @@ class CodeGen:
             "declare void @festina_map_set(ptr, ptr, ptr, ptr, ptr, i64)",
             "declare i64 @festina_map_get(ptr, i64, ptr, i64)",
             "declare void @festina_map_for_each(ptr, i64, ptr)",
+            # claude.md #186 (uraikus/festina#76 item 7)
+            "declare void @festina_map_keys(ptr, i64, ptr)",
+            "declare void @festina_map_values(ptr, i64, i64, i8, i8, ptr)",
             # claude.md #74/#75/#175: frees each live bucket's own
             # strdup'd key (never a plain free()-the-buffer-alone away
             # from leaking them -- see festina_map_free_entries's own doc
@@ -2354,15 +2391,17 @@ class CodeGen:
         ordinary callable -- an event handler is a listener, not
         something Festina code calls by name) exactly like _emit_func,
         minus a return type (event handlers never return a value).
-        mouseDown/mouseUp/mouse/key/resize/close additionally get
+        mouseDown/mouseUp/mouse/mouseWheelUp/mouseWheelDown/key/resize/
+        close additionally get
         registered with the runtime as a function pointer (see
         festina_runtime.h's doc comment on
         festina_register_mouse_down_handler/_mouse_up_handler/_mouse_handler/
-        _key_handler/_resize_handler/_close_handler) -- the only event
+        _mouse_wheel_up_handler/_mouse_wheel_down_handler/_key_handler/
+        _resize_handler/_close_handler) -- the only event
         sources this runtime actually generates (claude.md #40's own
         examples; semantic.py's _EVENT_SIGNATURES enforces the fixed
         signature each one needs, matching the runtime's fixed function
-        pointer type for it). claude.md #131: `exit` is a seventh
+        pointer type for it). claude.md #131: `exit` is a ninth
         recognized name, but not a graphics event -- it fires from the
         close(code) builtin (see _emit_call's own "close" branch),
         which works with or without a window, so its registration is
@@ -2396,8 +2435,8 @@ class CodeGen:
         self.func_defs.extend(func)
         self.func_defs.append("")
 
-        if decl.name in ("mouseDown", "mouseUp", "mouse", "keyDown", "keyUp",
-                          "resize", "close"):
+        if decl.name in ("mouseDown", "mouseUp", "mouse", "mouseWheelUp", "mouseWheelDown",
+                          "keyDown", "keyUp", "resize", "close"):
             self.uses_graphics = True
             self.event_handlers[decl.name] = symbol
         elif decl.name == "exit":
@@ -3734,6 +3773,18 @@ class CodeGen:
                 out = self.tmp()
                 lines.append(f"  {out} = call i64 @{fn}()")
                 return out, INT
+            # claude.md #181: devicePixelRatio -- the display's own
+            # pixel density, exactly the same "needs a live connection,
+            # uses_graphics_code only" shape as screenWidth/screenHeight
+            # just above (a display property, not the in-memory canvas
+            # size clientWidth/clientHeight answer), just float-typed
+            # rather than int since a ratio like 1.5 is meaningful here
+            # in a way a pixel count never is.
+            if expr.name == "devicePixelRatio":
+                self.uses_graphics_code = True
+                out = self.tmp()
+                lines.append(f"  {out} = call double @festina_device_pixel_ratio()")
+                return out, FLOAT
             if expr.name in self.func_decls:
                 # claude.md #141: a bare reference to a function's own
                 # NAME, not immediately called -- the function's own
@@ -5115,6 +5166,23 @@ class CodeGen:
             self._free_text_temp(expr.args[0], val, elem_type, lines)
             return out, INT
 
+        if name == "sort":
+            # claude.md #184 (uraikus/festina#76 item 2): in-place,
+            # stable sort. The comparator is a plain first-class
+            # function value -- already a bare `ptr` (claude.md #141),
+            # not a heap-allocated Festina value, so unlike an
+            # arr[T]/map[T]/struct/text argument nothing here needs
+            # retaining, copying, or releasing; it's read once and
+            # handed straight to the runtime as opaque userdata for
+            # festina_array_sort's own trampoline
+            # (_emit_sort_comparator_trampoline) to call back through.
+            cmp_val, _ = self._emit_expr(expr.args[0], env, lines)
+            trampoline_name = self._emit_sort_comparator_trampoline(elem_type)
+            lines.append(
+                f"  call void @festina_array_sort(ptr {obj_val}, i64 {elem_size}, "
+                f"ptr {trampoline_name}, ptr {cmp_val})")
+            return "0", None
+
         # splice(start, count) -> arr[T] of the removed elements
         start_val, _ = self._emit_expr(expr.args[0], env, lines)
         count_val, _ = self._emit_expr(expr.args[1], env, lines)
@@ -6048,6 +6116,20 @@ class CodeGen:
             # claude.md #32-34: a table-typed value is one query result
             # row -- flat `field_index * 8` byte offset, not a named
             # struct GEP; see the module docstring's "Query rows" note.
+            # claude.md #188 (uraikus/festina#76 item 5): `.rowid` is
+            # not a declared column at all (see festina_runtime.c's own
+            # festina_sqlite_collect_rows doc comment on why it's kept
+            # fully separate from col_count/table_field_index) -- it
+            # lives at the FIXED offset right after the presence mask,
+            # `(declared column count + 1) * 8`, only ever populated
+            # when want_rowid=1 (true for every TableType row, false
+            # for a struct query target, which never reaches this
+            # branch at all).
+            if expr.prop == "rowid":
+                idx = len(self.table_fields(obj_type.name)) + 1
+                out = self.tmp()
+                lines.append(f"  {out} = getelementptr i8, ptr {obj_val}, i64 {idx * 8}")
+                return out, INT
             idx = self.table_field_index(obj_type.name, expr.prop)
             ftype = self.table_fields(obj_type.name)[idx][1]
             out = self.tmp()
@@ -7385,6 +7467,53 @@ class CodeGen:
         self._exec_callback_trampoline = trampoline_name
         return trampoline_name
 
+    def _emit_sort_comparator_trampoline(self, elem_type):
+        """claude.md #184 (uraikus/festina#76 item 2): bridges
+        festina_array_sort's own `int(*)(const void*, const void*,
+        void*)` comparator ABI -- given a real userdata slot from the
+        start, unlike plain C qsort(), specifically so this trampoline
+        would never need the process-global-variable workaround a
+        userdata-less comparator would otherwise force -- to a real
+        `func[T,T]:int` Festina value.
+
+        Unlike _emit_exec_callback_trampoline just above, `userdata`
+        IS the callback pointer itself, not a payload struct to read
+        one back out of: .sort()'s comparator argument is evaluated
+        once, at the call site, into an ordinary `ptr` value (first-
+        class function values already ARE bare pointers, claude.md
+        #141), and festina_array_sort hands that same pointer back on
+        every single comparison unchanged, so there's nothing else to
+        carry alongside it.
+
+        Cached per element type (types_mod.type_name(elem_type), the
+        same keying _array_release_fns already uses) rather than
+        shared like _exec_callback_trampoline's one symbol, because
+        decoding the two raw comparison slots needs THIS type's own
+        LLVM type -- an i64 slot decodes differently than an i8 or
+        double or ptr one, and the indirect call's own argument types
+        have to match the real comparator's signature exactly."""
+        key = types_mod.type_name(elem_type)
+        if key in self._sort_trampolines:
+            return self._sort_trampolines[key]
+        elem_ir = _llvm_type(elem_type)
+        uid = self._unique()
+        trampoline_name = f"@__festina_sortcmp_{uid}"
+        body = [f"define i32 {trampoline_name}(ptr %a, ptr %b, ptr %userdata) {{", "entry:"]
+        av = self.tmp()
+        body.append(f"  {av} = load {elem_ir}, ptr %a")
+        bv = self.tmp()
+        body.append(f"  {bv} = load {elem_ir}, ptr %b")
+        r = self.tmp()
+        body.append(f"  {r} = call i64 %userdata({elem_ir} {av}, {elem_ir} {bv})")
+        r32 = self.tmp()
+        body.append(f"  {r32} = trunc i64 {r} to i32")
+        body.append(f"  ret i32 {r32}")
+        body.append("}")
+        self.func_defs.extend(body)
+        self.func_defs.append("")
+        self._sort_trampolines[key] = trampoline_name
+        return trampoline_name
+
     # ---- cycle collection -- claude.md #120 ----
 
     def _is_cyclic_type(self, t):
@@ -8182,6 +8311,61 @@ class CodeGen:
         lines.append(f"  {out} = phi {llvm_ty} [ {null_const}, %{zero_pred} ], [ {result}, %{nonzero_pred} ]")
         return out
 
+    def _emit_floor_div(self, a_val, b_val, lines):
+        """claude.md #188 (uraikus/festina#76 item 1): Math.floorDiv(a,
+        b) -- rounds toward NEGATIVE INFINITY, unlike `/`'s own `sdiv`
+        (LLVM's -- and the hardware's -- integer division truncates
+        toward ZERO). The two only disagree when the operands have
+        different signs and the division isn't exact, e.g. -7 sdiv 2 is
+        -3 (truncated), but floor(-7/2) is -4 -- the standard `sdiv`
+        result minus one whenever the remainder is nonzero AND the
+        remainder's sign differs from the divisor's (Python's `//`/
+        Java's Math.floorDiv use the identical rule).
+
+        Shares claude.md #57's own by-zero convention (returns null,
+        via real control flow -- see _emit_divmod's own comment on why
+        a `select` alone wouldn't do, `sdiv`/`srem` by zero being
+        undefined behavior at the hardware level) rather than
+        introducing a second one just for this function."""
+        is_zero = self.tmp()
+        lines.append(f"  {is_zero} = icmp eq i64 {b_val}, 0")
+
+        zero_label = self.label("floordivzero")
+        nonzero_label = self.label("floordivnonzero")
+        end_label = self.label("floordivend")
+        lines.append(f"  br i1 {is_zero}, label %{zero_label}, label %{nonzero_label}")
+
+        self._start_block(zero_label, lines)
+        zero_pred = self.cur_block
+        lines.append(f"  br label %{end_label}")
+
+        self._start_block(nonzero_label, lines)
+        q = self.tmp()
+        lines.append(f"  {q} = sdiv i64 {a_val}, {b_val}")
+        r = self.tmp()
+        lines.append(f"  {r} = srem i64 {a_val}, {b_val}")
+        r_nonzero = self.tmp()
+        lines.append(f"  {r_nonzero} = icmp ne i64 {r}, 0")
+        r_neg = self.tmp()
+        lines.append(f"  {r_neg} = icmp slt i64 {r}, 0")
+        b_neg = self.tmp()
+        lines.append(f"  {b_neg} = icmp slt i64 {b_val}, 0")
+        signs_differ = self.tmp()
+        lines.append(f"  {signs_differ} = xor i1 {r_neg}, {b_neg}")
+        need_adjust = self.tmp()
+        lines.append(f"  {need_adjust} = and i1 {r_nonzero}, {signs_differ}")
+        q_minus_1 = self.tmp()
+        lines.append(f"  {q_minus_1} = sub i64 {q}, 1")
+        result = self.tmp()
+        lines.append(f"  {result} = select i1 {need_adjust}, i64 {q_minus_1}, i64 {q}")
+        nonzero_pred = self.cur_block
+        lines.append(f"  br label %{end_label}")
+
+        self._start_block(end_label, lines)
+        out = self.tmp()
+        lines.append(f"  {out} = phi i64 [ {INT_NULL_CONST}, %{zero_pred} ], [ {result}, %{nonzero_pred} ]")
+        return out
+
     def _emit_unary(self, expr, env, lines):
         val, vtype = self._emit_expr(expr.operand, env, lines)
         out = self.tmp()
@@ -8417,6 +8601,15 @@ class CodeGen:
                 # things here that need a GUI, below.
                 "enterFullscreen": ("festina_enter_fullscreen", []),
                 "exitFullscreen": ("festina_exit_fullscreen", []),
+                # claude.md #182: showCursor()/hideCursor() -- unlike
+                # render()/enterFullscreen()/exitFullscreen() just
+                # above, these don't force a window open: a cursor is
+                # meaningless with none, so calling either before one
+                # exists just records the desired state (see
+                # g_cursor_hidden's own comment in
+                # festina_runtime_graphics.c) for whenever one does.
+                "showCursor": ("festina_show_cursor", []),
+                "hideCursor": ("festina_hide_cursor", []),
             }
             if name in _CANVAS_OPS:
                 fn, arg_irs = _CANVAS_OPS[name]
@@ -8570,7 +8763,7 @@ class CodeGen:
             if name == "regex":
                 return self._emit_regex_call(expr, env, lines)
             if name in ("drawRect", "drawCircle", "drawText", "drawImage", "loadImage",
-                        "drawPixel",
+                        "drawPixel", "blankImage",
                         "fillStyle", "borderColor", "lineWidth", "changeFont",
                         "measureTextWidth", "measureTextHeight"):
                 return self._emit_graphics_call(name, expr, env, lines)
@@ -8716,6 +8909,14 @@ class CodeGen:
                 return out, ret_type
             raise CodegenError(f"unknown function '{name}'", file=self.filename, line=callee.line)
         if isinstance(callee, ast.Member) and not callee.computed:
+            # claude.md #188 (uraikus/festina#76 item 1):
+            # Math.floorDiv(a:int, b:int) -> int
+            if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
+                    and callee.prop == "floorDiv"):
+                a, _ = self._emit_expr(expr.args[0], env, lines)
+                b, _ = self._emit_expr(expr.args[1], env, lines)
+                out = self._emit_floor_div(a, b, lines)
+                return out, INT
             # claude.md #56: Math.floor/ceil/round/trunc(x:float) -> int
             # claude.md #93: Math.sqrt/sin/pow/min/... and Math.random()
             if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
@@ -8919,7 +9120,7 @@ class CodeGen:
                     return out, TEXT
             # claude.md #96: array methods.
             if callee.prop in ("push", "pop", "shift", "unshift", "splice",
-                               "indexOf"):
+                               "indexOf", "sort"):
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if isinstance(obj_type, types_mod.ArrayType):
                     result = self._emit_array_method(
@@ -8967,7 +9168,16 @@ class CodeGen:
                     emitted = [self._emit_expr(a, env, lines) for a in expr.args]
                     arg_vals = [v for v, _ in emitted]
                     if callee.prop == "drawRect":
-                        if len(arg_vals) == 5:
+                        # claude.md #188 (uraikus/festina#76 item 8): a
+                        # 6th argument is a further optional trailing
+                        # BORDER colour, mirroring the free-function
+                        # form.
+                        if len(arg_vals) == 6:
+                            x, y, w, h, fill, border = arg_vals
+                            lines.append(
+                                f"  call void @festina_image_draw_rect_colors(ptr {obj_val}, "
+                                f"i64 {x}, i64 {y}, i64 {w}, i64 {h}, i64 {fill}, i64 {border})")
+                        elif len(arg_vals) == 5:
                             x, y, w, h, color = arg_vals
                             lines.append(
                                 f"  call void @festina_image_draw_rect_color(ptr {obj_val}, "
@@ -8988,10 +9198,23 @@ class CodeGen:
                             lines.append(
                                 f"  call void @festina_image_draw_pixel(ptr {obj_val}, i64 {x}, i64 {y})")
                     elif callee.prop == "drawCircle":
-                        x, y, r = arg_vals
-                        lines.append(
-                            f"  call void @festina_image_draw_circle(ptr {obj_val}, "
-                            f"i64 {x}, i64 {y}, i64 {r})")
+                        # claude.md #188: the same fill/fill+border
+                        # trailing-colour forms drawRect has, newly.
+                        if len(arg_vals) == 5:
+                            x, y, r, fill, border = arg_vals
+                            lines.append(
+                                f"  call void @festina_image_draw_circle_colors(ptr {obj_val}, "
+                                f"i64 {x}, i64 {y}, i64 {r}, i64 {fill}, i64 {border})")
+                        elif len(arg_vals) == 4:
+                            x, y, r, color = arg_vals
+                            lines.append(
+                                f"  call void @festina_image_draw_circle_color(ptr {obj_val}, "
+                                f"i64 {x}, i64 {y}, i64 {r}, i64 {color})")
+                        else:
+                            x, y, r = arg_vals
+                            lines.append(
+                                f"  call void @festina_image_draw_circle(ptr {obj_val}, "
+                                f"i64 {x}, i64 {y}, i64 {r})")
                     else:  # drawText
                         text, x, y = arg_vals
                         lines.append(
@@ -9313,6 +9536,35 @@ class CodeGen:
                     lines.append(
                         f"  call void @festina_map_for_each(ptr {entries}, i64 {capacity}, ptr {trampoline_name})")
                     return "0", None
+            # claude.md #186 (uraikus/festina#76 item 7): map[T].keys()
+            # -> arr[text], map[T].values() -> arr[T]. No receiver
+            # release here, matching forEach's own precedent just above
+            # (every existing call site is a plain named map variable,
+            # never a chained call-result temporary).
+            if callee.prop in ("keys", "values"):
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.MapType):
+                    entries_ptr = self.tmp()
+                    lines.append(f"  {entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 1")
+                    entries = self.tmp()
+                    lines.append(f"  {entries} = load ptr, ptr {entries_ptr}")
+                    capacity_ptr = self.tmp()
+                    lines.append(f"  {capacity_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {obj_val}, i32 0, i32 2")
+                    capacity = self.tmp()
+                    lines.append(f"  {capacity} = load i64, ptr {capacity_ptr}")
+                    dst = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, lines)
+                    if callee.prop == "keys":
+                        lines.append(
+                            f"  call void @festina_map_keys(ptr {entries}, i64 {capacity}, ptr {dst})")
+                        return dst, types_mod.ArrayType(TEXT)
+                    elem_type = obj_type.value
+                    elem_size = _elem_size(elem_type)
+                    is_refcounted = 1 if _is_refcounted(elem_type) else 0
+                    is_text = 1 if elem_type == TEXT else 0
+                    lines.append(
+                        f"  call void @festina_map_values(ptr {entries}, i64 {capacity}, "
+                        f"i64 {elem_size}, i8 {is_refcounted}, i8 {is_text}, ptr {dst})")
+                    return dst, types_mod.ArrayType(elem_type)
         if isinstance(callee, ast.Member):
             # claude.md #141: an indirect call through a func[...]:...
             # -typed struct field (h.cb(...)), array element
@@ -9619,6 +9871,15 @@ class CodeGen:
             free_text_temps()
             return out, types_mod.ImageType()
 
+        # claude.md #188 (uraikus/festina#76 item 4): blankImage(w, h)
+        # -> img. Shares loadImage's own reasoning for NOT setting
+        # self.uses_graphics -- creating a Cairo surface needs no X
+        # server, unlike drawing onto a window.
+        if name == "blankImage":
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_blank_image(i64 {args[0]}, i64 {args[1]})")
+            return out, types_mod.ImageType()
+
         # claude.md #89: style setters and text metrics deliberately do
         # NOT set self.uses_graphics, for the same reason loadImage()
         # doesn't (see this method's own docstring): none of them draws
@@ -9675,8 +9936,15 @@ class CodeGen:
         if name == "drawRect":
             # claude.md #133: a 5th argument is an optional trailing
             # `color` -- paint with it for this call only, instead of
-            # the current fillStyle.
-            if len(args) == 5:
+            # the current fillStyle. claude.md #188 (uraikus/
+            # festina#76 item 8): a 6th is a further optional trailing
+            # BORDER colour, same "this call only" override.
+            if len(args) == 6:
+                x, y, w, h, fill, border = args
+                lines.append(
+                    f"  call void @festina_draw_rect_colors(i64 {x}, i64 {y}, "
+                    f"i64 {w}, i64 {h}, i64 {fill}, i64 {border})")
+            elif len(args) == 5:
                 x, y, w, h, color = args
                 lines.append(
                     f"  call void @festina_draw_rect_color(i64 {x}, i64 {y}, "
@@ -9695,14 +9963,44 @@ class CodeGen:
                 x, y = args
                 lines.append(f"  call void @festina_draw_pixel(i64 {x}, i64 {y})")
         elif name == "drawCircle":
-            x, y, r = args
-            lines.append(f"  call void @festina_draw_circle(i64 {x}, i64 {y}, i64 {r})")
+            # claude.md #188 (uraikus/festina#76 item 8): the same
+            # fill/fill+border trailing-colour forms drawRect has,
+            # newly -- drawCircle previously took no colour override.
+            if len(args) == 5:
+                x, y, r, fill, border = args
+                lines.append(
+                    f"  call void @festina_draw_circle_colors(i64 {x}, i64 {y}, "
+                    f"i64 {r}, i64 {fill}, i64 {border})")
+            elif len(args) == 4:
+                x, y, r, color = args
+                lines.append(
+                    f"  call void @festina_draw_circle_color(i64 {x}, i64 {y}, "
+                    f"i64 {r}, i64 {color})")
+            else:
+                x, y, r = args
+                lines.append(f"  call void @festina_draw_circle(i64 {x}, i64 {y}, i64 {r})")
         elif name == "drawText":
             text, x, y = args
             lines.append(f"  call void @festina_draw_text(ptr {text}, i64 {x}, i64 {y})")
         elif name == "drawImage":
-            img, x, y = args
-            lines.append(f"  call void @festina_draw_image(ptr {img}, i64 {x}, i64 {y})")
+            # claude.md #185 (uraikus/festina#76 item 3): three shapes,
+            # picked by argument count -- semantic.py's own
+            # _BUILTIN_SIGNATURE_ALTERNATES entry already confirmed
+            # exactly one of these matches.
+            if len(args) == 3:
+                img, x, y = args
+                lines.append(f"  call void @festina_draw_image(ptr {img}, i64 {x}, i64 {y})")
+            elif len(args) == 5:
+                img, x, y, w, h = args
+                lines.append(
+                    f"  call void @festina_draw_image_scaled(ptr {img}, "
+                    f"i64 {x}, i64 {y}, i64 {w}, i64 {h})")
+            else:
+                img, sx, sy, sw, sh, dx, dy, dw, dh = args
+                lines.append(
+                    f"  call void @festina_draw_image_region(ptr {img}, "
+                    f"i64 {sx}, i64 {sy}, i64 {sw}, i64 {sh}, "
+                    f"i64 {dx}, i64 {dy}, i64 {dw}, i64 {dh})")
         free_text_temps()
         return "0", None
 
@@ -9936,9 +10234,13 @@ class CodeGen:
         lines.append(f"  {n_slot} = alloca i64")
         data_slot = self.tmp()
         lines.append(f"  {data_slot} = alloca ptr")
+        # claude.md #188 (uraikus/festina#76 item 5): want_rowid=1 --
+        # only a TableType-shaped row (never a struct-query row, see
+        # _emit_sqlite_collect_struct's own call just below) carries a
+        # `.rowid` slot at all.
         lines.append(
             f"  call void @festina_sqlite_collect_rows(ptr {stmt_val}, i32 {ncols}, "
-            f"ptr {types_global}, ptr {names_global}, ptr {n_slot}, ptr {data_slot})"
+            f"ptr {types_global}, ptr {names_global}, ptr {n_slot}, ptr {data_slot}, i8 1)"
         )
         n_val = self.tmp()
         lines.append(f"  {n_val} = load i64, ptr {n_slot}")
@@ -10180,6 +10482,8 @@ class CodeGen:
             register_fn = {"mouseDown": "festina_register_mouse_down_handler",
                             "mouseUp": "festina_register_mouse_up_handler",
                             "mouse": "festina_register_mouse_handler",
+                            "mouseWheelUp": "festina_register_mouse_wheel_up_handler",
+                            "mouseWheelDown": "festina_register_mouse_wheel_down_handler",
                             "keyDown": "festina_register_key_down_handler",
                             "keyUp": "festina_register_key_up_handler",
                             "resize": "festina_register_resize_handler",
@@ -10396,9 +10700,12 @@ class CodeGen:
         lines.append(f"  {n_slot} = alloca i64")
         data_slot = self.tmp()
         lines.append(f"  {data_slot} = alloca ptr")
+        # claude.md #188: want_rowid=0 -- a struct query result isn't a
+        # table row (no `.rowid` concept), and _emit_row_to_struct_fn's
+        # own field-by-index conversion below has no rowid slot to read.
         lines.append(
             f"  call void @festina_sqlite_collect_rows(ptr {stmt_val}, i32 {ncols}, "
-            f"ptr {types_global}, ptr {names_global}, ptr {n_slot}, ptr {data_slot})"
+            f"ptr {types_global}, ptr {names_global}, ptr {n_slot}, ptr {data_slot}, i8 0)"
         )
         n_val = self.tmp()
         lines.append(f"  {n_val} = load i64, ptr {n_slot}")

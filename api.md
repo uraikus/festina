@@ -143,6 +143,9 @@ Math.log(x)     Math.log2(x)   Math.log10(x)
 // (float, float) -> float
 Math.pow(a, b)  Math.min(a, b)  Math.max(a, b)  Math.atan2(y, x)
 
+// (int, int) -> int
+Math.floorDiv(a, b)
+
 // no arguments -> float
 Math.random()   // in [0, 1)
 
@@ -150,9 +153,24 @@ Math.random()   // in [0, 1)
 Math.PI   Math.E
 ```
 
-Only the rounding four return `int`; everything else returns `float`,
-because "which integer" and "which real number" are different questions
-— `Math.sqrt(2.0)` is a float.
+Only the rounding four (and `Math.floorDiv`) return `int`; everything
+else returns `float`, because "which integer" and "which real number"
+are different questions — `Math.sqrt(2.0)` is a float.
+
+`Math.floorDiv(a, b)` rounds toward **negative infinity**, unlike `/`'s
+own truncate-toward-zero — the two only disagree when the operands have
+different signs and the division isn't exact:
+
+```festina
+log(Math.floorDiv(-7, 2))   // -4, not -3 -- -7 / 2 truncates to -3.5 -> -3
+log(7 / 2)                  // 3.5 (float) -- ordinary division still promotes
+```
+
+Grid/tile code is the common case: `Math.floorDiv(worldX, tileSize)`
+gives the containing tile's index correctly for negative coordinates
+too, where `Math.floor(worldX / tileSize)` would otherwise need the
+extra `.toFloat()`/rounding step spelled out by hand. Like `/`/`%`,
+dividing by zero returns `null` rather than crashing.
 
 `Math.random()` is seeded once from the clock and is suitable for
 gameplay and sampling — **not** for anything security-related. It
@@ -764,6 +782,9 @@ void func logHealth(h:int, key:text) {
     log(`${key} ${h.toText()}`)
 }
 npcHealths.forEach(logHealth)   // (value, key) -- visit order is unspecified
+
+arr[text] ids = npcHealths.keys()     // a plain snapshot, walkable with a for loop
+arr[int] hps = npcHealths.values()    // no callback, no extra globals needed
 ```
 
 An unquoted identifier key (`npc2Id` above) is a reference to that
@@ -773,7 +794,15 @@ except `arr[...]`/`map[...]` itself (a map value is stored in one
 fixed-size slot, which those two don't fit in). `.forEach()`'s callback
 must be an already-declared function taking exactly `(value, key:text)`
 and returning nothing, the same "bare name of a declared function"
-restriction `setTimeout`'s callback has. A genuine hash table
+restriction `setTimeout`'s callback has — since it takes no closures,
+collecting matching entries into your own accumulator otherwise means
+promoting that accumulator to a global just so the callback can reach
+it. `.keys()`/`.values()` sidestep that for the common case: both take
+no arguments and return an ordinary, independent snapshot array (`arr[text]`/
+`arr[T]`) taken once, at the call — a later change to the map (`delete`,
+a new key, `free`) never retroactively changes what was already
+returned. Order matches `.forEach()`'s own: unspecified, a function of
+each key's hash rather than insertion order. A genuine hash table
 internally — open addressing (linear probing), FNV-1a hashing,
 tombstone deletion, doubling capacity whenever the table crosses 75%
 load — average O(1) get/set/delete rather than a scan over every
@@ -919,6 +948,29 @@ both bury it.
 A `SELECT ... AS alias` renames a column *away* from its declared name,
 so an aliased column simply doesn't match; alias *to* a declared name to
 remap a computed value into a column deliberately.
+
+### `row.rowid` — a table row's own database identity
+
+Every ordinary SQLite table already has a `rowid` — this exposes it,
+read-only, so upserting by key doesn't mean hand-tracking the next id
+yourself:
+
+```festina
+table examples { id:int  name:text }
+sqlite('INSERT INTO examples (id, name) VALUES (?, ?)', [1, 'ada'])
+arr[examples] rows = sqlite('SELECT rowid, id, name FROM examples')
+log(rows[0].rowid)   // 1
+```
+
+Like any other column, `rowid` only lands if the query's own SQL
+selects it by that name — `SELECT *` does **not** implicitly include
+it, so a query that never asks for `rowid` reads it as `null`, the
+same "the query never mentioned this" signal `undefined()` gives an
+ordinary column. It is not itself a declared column, so it never
+participates in schema sync and `undefined('rowid')` doesn't apply to
+it. It doesn't exist on a struct query target — `rowid` is a table
+row's own identity, not a property `sqlite()` can produce for an
+arbitrary result shape.
 
 ### Structs as query targets
 
@@ -1092,14 +1144,22 @@ bind each pattern to its own variable outside the loop if that matters.
 ```festina
 drawRect(0, 0, 100, 100)
 drawRect(0, 0, 100, 100, blue)           // optional trailing color -- this call only
+drawRect(0, 0, 100, 100, blue, red)      // trailing fill AND border color -- this call only
 drawPixel(10, 10)                        // one pixel, current fillStyle
 drawPixel(10, 10, blue)                  // one pixel, this call only
 drawCircle(50, 50, 25)
+drawCircle(50, 50, 25, blue)             // fill override, this call only
+drawCircle(50, 50, 25, blue, red)        // fill AND border override, this call only
 drawText('Hello', 20, 20)
 
 img profile = 'profile.png'              // PNG or JPEG
 drawImage(profile, 0, 0)
+drawImage(profile, 0, 0, 64, 64)         // scaled to fit a 64x64 box
+drawImage(profile, 0, 0, 32, 32, 100, 100, 64, 64)  // source rect, scaled into dest rect
 log(`${profile.width}x${profile.height}`)
+
+img brush = blankImage(64, 64)           // a fresh, fully-transparent image
+brush.drawCircle(32, 32, 30, blue)       // draw onto it like any other img
 
 saveCanvas('screenshot.png')             // -> bool; writes what you drew
 img snap = saveCanvas()                  // -> img; a snapshot, no file written
@@ -1113,17 +1173,52 @@ clearPixel(10, 10)                        // erase one pixel to transparent
 log(`canvas is ${clientWidth}x${clientHeight}`)
 
 log(`screen is ${screenWidth}x${screenHeight}`)  // the physical display, read-only
+log(`device pixel ratio is ${devicePixelRatio}`) // 1.0 normally, ~2.0 on Retina/HiDPI
 setClientWidth(1024)                             // resizes the canvas (and window, if open)
 setClientHeight(768)
 
-on mouseDown(x:int, y:int) { ... }
-on mouseUp(x:int, y:int)   { ... }
-on mouse(x:int, y:int)     { ... }
-on keyDown(key:text)       { ... }
-on keyUp(key:text)         { ... }
-on resize()                { ... }
-on close()                 { ... }
+on mouseDown(x:int, y:int, button:int) { ... }
+on mouseUp(x:int, y:int, button:int)   { ... }
+on mouse(x:int, y:int)         { ... }
+on mouseWheelUp(x:int, y:int)  { ... }
+on mouseWheelDown(x:int, y:int){ ... }
+on keyDown(key:text)           { ... }
+on keyUp(key:text)             { ... }
+on resize()                    { ... }
+on close()                     { ... }
 ```
+
+`drawImage` has three forms. `drawImage(img, x, y)` draws it at its
+stored size. `drawImage(img, x, y, w, h)` scales the whole image to fit
+a `w`×`h` box at `(x, y)` — unlike `img.resize()`, this doesn't touch
+the image itself, so the same `img` can be drawn at as many different
+sizes as you like. `drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh)` adds
+a source rectangle — cuts a `sw`×`sh` region out of the image starting
+at `(sx, sy)` and scales *that* into the `dw`×`dh` destination box —
+the way a sprite sheet or a variable-size paint brush pulls one piece
+out of a larger stored image without a separate `.clip()` call first.
+A source region reaching past the image's own edge behaves like
+`.clip()`'s own: the overlap is drawn, the rest is simply not there.
+
+`blankImage(w, h)` returns a fresh, fully-transparent `img` at the
+given size — with no existing image or canvas to derive it from,
+unlike `.clip()`/`.resize()`/`saveCanvas()`, every one of which copies
+from something that already exists. Useful for building up a
+procedural image (a generated icon, a variable-size paint brush) from
+nothing, without touching the real on-screen canvas along the way.
+
+`drawRect`/`drawCircle` (and their `img` method equivalents) each
+accept a further optional trailing `borderColor`, after the fill
+color — paints the border with it for that one call only, leaving the
+current `borderColor()` untouched for every other shape, the same
+"this call only, then restore" contract the fill-color argument
+already has. `drawCircle` gained BOTH trailing forms here — it
+previously had no per-call color override at all. This is the direct
+fix for global draw style silently leaking between unrelated shapes:
+a border color left over from a previous, unrelated `drawRect`/
+`drawCircle` call no longer has to be reset with `borderColor()` or
+`saveState()`/`restoreState()` by hand before every shape that needs
+its own.
 
 **Drawing is offscreen. `render()` puts it on screen.**
 
@@ -1131,7 +1226,7 @@ Every drawing call paints an offscreen canvas that needs no display at
 all. `render()` is the one call that shows it, opening a real, decorated
 window (title bar, and the OS's normal minimize/maximize/close controls
 — like any other window, resizable by dragging an edge) the first time
-it runs — 800×600 by default. Declaring one of the seven event handlers
+it runs — 800×600 by default. Declaring one of the nine event handlers
 means a window
 will exist too, since they can't fire without one — but not necessarily
 *at that point*: if the entry file never itself calls `render()`, the
@@ -1209,6 +1304,17 @@ That transparency is real alpha in whatever `saveCanvas()` produces
 solid colour — useful for drawing a sprite or icon with a transparent
 background to compose elsewhere.
 
+**That real alpha channel is only real *off-screen*.** `render()`
+composites the canvas onto an ordinary opaque on-screen window, so a
+transparent region reads back as solid white once it's on screen, even
+though the same content saved or snapshotted via `saveCanvas()` still
+carries its real alpha. That makes two very different bugs look
+identical on screen — "my background never drew" and "my background
+drew transparent, which paints as opaque white" — so if a shape seems
+to be missing, check whether it's actually there but transparent
+(`saveCanvas()` it and inspect the alpha) before assuming the draw call
+itself did nothing.
+
 **`saveCanvas()` with no argument returns an `img` instead of writing a
 file** — a snapshot of the canvas at that instant, not a live view of
 it: drawing or clearing the canvas afterward never changes what the
@@ -1232,6 +1338,16 @@ screen it's on. Both are read-only. Unlike `clientWidth`/`clientHeight`,
 reading them still needs an X server (there's no window yet to answer
 from, and no other way to ask "how big is the screen"), so this is one
 of the few graphics reads that fails without a display.
+
+**`devicePixelRatio`** reports how many actual device pixels back one
+canvas pixel — `1.0` on a standard display, typically `2.0` (or a
+fractional value like `1.5`) on a Retina/HiDPi one. Read-only, same
+"needs a display" requirement as `screenWidth`/`screenHeight` just
+above, since it's a property of the physical display too. Purely
+informational — the canvas itself is never actually rendered at the
+higher resolution, so this doesn't change how big anything you draw
+appears; it just tells a program what's true about the display it's
+running on, the same way `screenWidth`/`screenHeight` do.
 
 **`setClientWidth(int)`/`setClientHeight(int)`** resize the canvas —
 and the real OS window too, if one is already open. Both apply
@@ -1296,11 +1412,30 @@ Exiting always restores the exact window the program had immediately
 before entering — same size and position, not just "some reasonable
 windowed size".
 
+**`showCursor()`/`hideCursor()`** toggle the mouse cursor's visibility
+over the canvas — useful for a game that draws its own cursor/reticle,
+or one that just doesn't want the OS pointer cluttering the screen.
+Unlike `render()`/`enterFullscreen()`/`exitFullscreen()`, neither forces
+a window open — a cursor is meaningless without one, so calling either
+before the window exists just records the desired state for whenever it
+does, the same "picks the initial state" pattern `setClientWidth`/
+`enterFullscreen` already have:
+
+```festina
+hideCursor()
+drawImage(reticle, mouseX - 8, mouseY - 8)   // your own cursor instead
+render()
+```
+
+Calling `hideCursor()` while already hidden (or `showCursor()` while
+already shown) is a no-op.
+
 ### Mouse events
 
 `on mouseDown` fires when a button goes down, `on mouseUp` when it comes
 back up, and `on mouse` continuously while the pointer moves. All three
-report the pointer position at the moment the event happened.
+report the pointer position at the moment the event happened;
+`mouseDown`/`mouseUp` also report *which* button.
 
 A click is a press *and* a release, and they are separate events for the
 same reason `keyDown` and `keyUp` are: holding the button down and
@@ -1311,16 +1446,43 @@ see both ends of it.
 int startX = 0
 int startY = 0
 
-on mouseDown(x:int, y:int) { startX = x  startY = y }
-on mouseUp(x:int, y:int)   { log(`dragged ${x - startX}, ${y - startY}`) }
+on mouseDown(x:int, y:int, button:int) { startX = x  startY = y }
+on mouseUp(x:int, y:int, button:int)   { log(`dragged ${x - startX}, ${y - startY}`) }
 ```
 
 Press and release report *different* coordinates whenever the pointer
 moved in between — that difference is the drag. A program that only
 wants "was clicked" can just use `on mouseDown` and ignore the release.
 
-Which button was pressed is not reported; every button dispatches the
-same handler.
+`button` is `1` for the left button, `2` for middle, `3` for right, `8`
+for back and `9` for forward (on a mouse that has them) — any other
+physical button reports its own platform-specific number, best-effort.
+`on mouse` (continuous movement) has no button of its own to report, so
+it stays a plain `(x:int, y:int)`.
+
+```festina
+on mouseDown(x:int, y:int, button:int) {
+    if button == 1 { log('left click') }
+    if button == 3 { log('right click, e.g. for a context menu') }
+}
+```
+
+**`on mouseWheelUp`/`on mouseWheelDown`** fire once per scroll wheel
+notch (or, on a trackpad, once per equivalent step of a two-finger
+scroll), split by direction the same way `mouseDown`/`mouseUp` are
+split by press/release rather than one combined event. Both report the
+pointer's position at the moment of the scroll, the same convention as
+every other mouse event above — but, unlike `mouseDown`/`mouseUp`, no
+button, since the wheel isn't one:
+
+```festina
+on mouseWheelUp(x:int, y:int)   { log(`zoom in at ${x}, ${y}`) }
+on mouseWheelDown(x:int, y:int) { log(`zoom out at ${x}, ${y}`) }
+```
+
+How far one scroll "step" is is up to the OS/input device, not
+something a program can read — there's no delta or magnitude, only
+direction.
 
 ### Keyboard events
 
@@ -1643,6 +1805,16 @@ fillAlpha(0.5)                                 // 0.0 transparent .. 1.0 opaque
 A gradient replaces the flat fill until the next `fillStyle()`. Two
 stops rather than an arbitrary list — that covers essentially every
 gradient a program draws, and needs no separate gradient type.
+
+`fillAlpha` applies uniformly to whatever's drawn next — every fill
+(`drawRect`/`drawPixel`/`drawCircle`/`drawText`, whether onto the
+canvas or directly onto an `img`'s own surface) **and** `drawImage`:
+
+```festina
+fillAlpha(0.4)
+drawImage(sprite, 100, 100)   // blends 40% into whatever's underneath
+fillAlpha(1.0)
+```
 
 ### Text metrics
 
@@ -2618,6 +2790,37 @@ Elements are owned the same way any other binding owns them: pushing a
 `text` copies it, so the array and the variable don't share a buffer.
 Removing transfers ownership to whoever receives it. `indexOf()` takes
 no ownership at all — an index isn't a reference.
+
+### Sorting: `sort(cmpFn)`
+
+```festina
+int func byAsc(a:int, b:int) { return a - b }
+
+arr[int] xs = [5, 3, 8, 1]
+xs.sort(byAsc)         // in place -- xs is now [1,3,5,8]
+```
+
+`sort()` takes a comparator, `cmpFn:func[T,T]:int`, and sorts in place —
+JavaScript's/C `qsort()`'s convention: return negative if the first
+argument belongs before the second, positive if after, `0` if they're
+equal. Sorting is **stable** — two elements the comparator calls equal
+keep their original relative order, so sorting a list twice by two
+different keys ("sort by name, then re-sort by score" to get "score
+descending, ties broken by name") behaves the way it reads.
+
+The comparator can be any `func[T,T]:int`-typed expression, not just the
+bare name of a declared function — a variable holding a function value
+works too, the same first-class-function rule every other callback
+(`.callback()`, `exec(args, callback)`) already follows.
+
+```festina
+struct Enemy { name:text y:int }
+
+int func byDepth(a:Enemy, b:Enemy) { return a.y - b.y }
+
+arr[Enemy] enemies = [...]
+enemies.sort(byDepth)   // back-to-front draw order by Y position
+```
 
 ## Timers
 

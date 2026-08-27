@@ -24,7 +24,7 @@ text func greet(user:User) {
     return message
 }
 
-on mouseDown(x:int, y:int) {
+on mouseDown(x:int, y:int, button:int) {
     log(`Pressed at ${x}, ${y}`)
 }
 

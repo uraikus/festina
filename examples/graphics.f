@@ -85,16 +85,16 @@ log(`canvas started at ${clientWidth}x${clientHeight}`)
 // Holding the button down and moving before letting go is a drag, and
 // the only way to express one is to see both ends of it: mouseDown
 // reports where the button went down, mouseUp where it came back up.
-on mouseDown(x:int, y:int) {
-    log(`pressed at ${x}, ${y}`)
+on mouseDown(x:int, y:int, button:int) {
+    log(`pressed at ${x}, ${y} (button ${button})`)
     drawCircle(x, y, 5)   // a small dot marking where the press landed
     render()              // show it
 }
 
-on mouseUp(x:int, y:int) {
+on mouseUp(x:int, y:int, button:int) {
     // The coordinates differ from the press above whenever the pointer
     // moved in between, which is exactly what makes a drag visible.
-    log(`released at ${x}, ${y}`)
+    log(`released at ${x}, ${y} (button ${button})`)
 }
 
 on mouse(x:int, y:int) {

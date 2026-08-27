@@ -368,9 +368,16 @@ char *festina_sqlite_scalar_text(sqlite3_stmt *stmt);
  * reordered SELECTs used to silently misalign), and each row carries a
  * hidden presence bitmask one slot past its columns, read by
  * festina_row_undefined. */
+/* claude.md #188 (uraikus/festina#76 item 5): `want_rowid` adds one
+ * MORE hidden slot past the presence mask, holding the query's own
+ * `rowid` result column (by name, matched the identical way as every
+ * declared column) -- always false for a struct query target
+ * (claude.md #112), which has no rowid concept. See the .c doc
+ * comment. */
 void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
                                   const char **col_types, const char **col_names,
-                                  int64_t *out_length, void **out_data);
+                                  int64_t *out_length, void **out_data,
+                                  int8_t want_rowid);
 int8_t festina_row_undefined(void *row, const char **col_names,
                              int32_t col_count, const char *name);
 /* claude.md #111/#175: `delete m[key]` -- removes the entry, releasing
@@ -500,9 +507,11 @@ char *festina_regex_replace(void *compiled, const char *text,
  * (see the "Timers" note further down -- it handles both graphics and
  * timer events, not just graphics despite its history) is the blocking
  * event loop while a window is open (Expose -> repaint from the
- * backing store, ButtonPress -> the registered click handler if any,
- * MotionNotify -> the registered mouse handler if any, KeyPress -> the
- * registered key handler if any, ConfigureNotify with a genuine size
+ * backing store, ButtonPress -> the registered click handler if any
+ * (buttons 4/5 -> the registered scroll-wheel handler instead, see
+ * claude.md #181), MotionNotify -> the registered mouse handler if
+ * any, KeyPress -> the registered key handler if any, ConfigureNotify
+ * with a genuine size
  * change -> resize the backing store and call the registered resize
  * handler if any, the window's close button -> call the registered
  * close handler if any, then return). claude.md #178 (uraikus/
@@ -517,8 +526,9 @@ char *festina_regex_replace(void *compiled, const char *text,
  * never itself calls render()) -- either way, only ever reached when
  * the program actually uses a graphics function, references
  * clientWidth/clientHeight, calls enterFullscreen()/exitFullscreen(),
- * or declares an `on mouseDown`/`mouseUp`/`mouse`/`key`/`resize`/
- * `close` handler (see CodeGen.uses_graphics in festina/codegen.py) --
+ * or declares an `on mouseDown`/`mouseUp`/`mouse`/`mouseWheelUp`/
+ * `mouseWheelDown`/`key`/`resize`/`close` handler (see
+ * CodeGen.uses_graphics in festina/codegen.py) --
  * a program that doesn't never opens a window, exactly like
  * festina_db_open() only ever runs for a program that declares a
  * `table`.
@@ -532,8 +542,9 @@ char *festina_regex_replace(void *compiled, const char *text,
  * blob out of a database column has no extension, and an extension was
  * never evidence of anything anyway.
  *
- * festina_register_mouse_down_handler/_mouse_up_handler/_mouse_handler
- * take a fixed `void (*)(int64_t, int64_t)` signature,
+ * festina_register_mouse_down_handler/_mouse_up_handler/_mouse_handler/
+ * _mouse_wheel_up_handler/_mouse_wheel_down_handler take a fixed
+ * `void (*)(int64_t, int64_t)` signature,
  * festina_register_key_down_handler/_key_up_handler take a fixed
  * `void (*)(const char *)` signature, and
  * festina_register_resize_handler/_close_handler take a fixed
@@ -541,7 +552,7 @@ char *festina_regex_replace(void *compiled, const char *text,
  * #40's own worked example declares for that event exactly
  * (`on mouseDown(x:int, y:int)`, `on keyDown(key:text)`, `on resize()`,
  * ...); festina/semantic.py's _EVENT_SIGNATURES enforces that any
- * handler for one of these seven names is actually declared that way
+ * handler for one of these nine names is actually declared that way
  * before codegen ever emits a call here, so a mismatch would otherwise
  * be a silent ABI mismatch rather than a caught compile error. Both key
  * handlers' text comes from the same festina_key_name helper --
@@ -593,7 +604,18 @@ void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h);
  * draw call uses. Border/alpha are unaffected either way -- only the
  * FILL colour is a per-call override. */
 void festina_draw_rect_color(int64_t x, int64_t y, int64_t w, int64_t h, int64_t color);
+/* claude.md #188 (uraikus/festina#76 item 8): drawRect(x, y, w, h,
+ * fillColor, borderColor) -- overrides BOTH colours for this call
+ * only. `border_color < 0` means no border, matching
+ * borderColor('none')'s own encoding. See the .c doc comment. */
+void festina_draw_rect_colors(int64_t x, int64_t y, int64_t w, int64_t h,
+                               int64_t fill_color, int64_t border_color);
 void festina_draw_circle(int64_t x, int64_t y, int64_t r);
+/* claude.md #188: the same per-call fill/fill+border override forms
+ * drawRect already has. */
+void festina_draw_circle_color(int64_t x, int64_t y, int64_t r, int64_t color);
+void festina_draw_circle_colors(int64_t x, int64_t y, int64_t r,
+                                 int64_t fill_color, int64_t border_color);
 void festina_draw_text(const char *text, int64_t x, int64_t y);
 /* claude.md #133: a single pixel, filled with the current fillStyle
  * (or, for the _color form, `color` for this call only) -- antialiasing
@@ -703,6 +725,10 @@ void festina_stroke_path(void);
 int64_t festina_image_width(void *img);
 int64_t festina_image_height(void *img);
 void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
+/* claude.md #188 (uraikus/festina#76 item 4): blankImage(w, h) -- a
+ * fresh, fully-transparent img at a given size, with no existing image
+ * to derive it from. See the .c doc comment. */
+void *festina_blank_image(int64_t w, int64_t h);
 /* claude.md #135: saveCanvas() with no path -> a fresh img, a snapshot
  * of the canvas at this instant (see the .c doc comment for why a
  * snapshot rather than a live alias). */
@@ -715,12 +741,27 @@ void festina_image_resize(void *img, int64_t w, int64_t h);
  * lineWidth/font state every canvas draw call reads. */
 void festina_image_draw_rect(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
 void festina_image_draw_rect_color(void *img, int64_t x, int64_t y, int64_t w, int64_t h, int64_t color);
+/* claude.md #188 (uraikus/festina#76 item 8): the img-method
+ * counterparts of festina_draw_rect_colors/festina_draw_circle_color/
+ * _colors above. */
+void festina_image_draw_rect_colors(void *img, int64_t x, int64_t y, int64_t w, int64_t h,
+                                     int64_t fill_color, int64_t border_color);
 void festina_image_draw_pixel(void *img, int64_t x, int64_t y);
 void festina_image_draw_pixel_color(void *img, int64_t x, int64_t y, int64_t color);
 void festina_image_draw_circle(void *img, int64_t x, int64_t y, int64_t r);
+void festina_image_draw_circle_color(void *img, int64_t x, int64_t y, int64_t r, int64_t color);
+void festina_image_draw_circle_colors(void *img, int64_t x, int64_t y, int64_t r,
+                                       int64_t fill_color, int64_t border_color);
 void festina_image_draw_text(void *img, const char *text, int64_t x, int64_t y);
 void festina_image_free(void *img);
 void festina_draw_image(void *img, int64_t x, int64_t y);
+/* claude.md #185 (uraikus/festina#76 item 3): drawImage(img, x, y, w,
+ * h) -- the WHOLE image scaled to fit w x h at (x, y). */
+void festina_draw_image_scaled(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
+/* claude.md #185: the canvas-style 8-argument form -- a source rect
+ * (sx, sy, sw, sh) scaled to fit a destination rect (dx, dy, dw, dh). */
+void festina_draw_image_region(void *img, int64_t sx, int64_t sy, int64_t sw, int64_t sh,
+                                int64_t dx, int64_t dy, int64_t dw, int64_t dh);
 /* claude.md #89/#90: canvas drawing style -- process-global state set by
  * fillStyle()/borderColor()/lineWidth()/font() and read by every later
  * draw call, the same "set it, then draw" model the HTML canvas 2D
@@ -770,10 +811,21 @@ int64_t festina_measure_text_height(const char *text);
  * same split claude.md #98 made for the keyboard and for the same
  * reason -- a click is a press and a release, and dragging needs to
  * tell them apart. Both take the same fixed signature and both report
- * the pointer position at the moment the button changed state. */
-void festina_register_mouse_down_handler(void (*handler)(int64_t, int64_t));
-void festina_register_mouse_up_handler(void (*handler)(int64_t, int64_t));
+ * the pointer position at the moment the button changed state, plus
+ * (claude.md #182) which button -- see FestinaWindowEvent's own doc
+ * comment in festina_runtime_window.h for the numbering convention.
+ * `on mouse` (continuous movement) has no button of its own to report,
+ * so it keeps the plain 2-argument signature. */
+void festina_register_mouse_down_handler(void (*handler)(int64_t, int64_t, int64_t));
+void festina_register_mouse_up_handler(void (*handler)(int64_t, int64_t, int64_t));
 void festina_register_mouse_handler(void (*handler)(int64_t, int64_t));
+/* claude.md #181: the scroll wheel, split by direction the same way
+ * mouseDown/mouseUp are split by press/release -- see semantic.py's
+ * _EVENT_SIGNATURES' own comment. Same fixed `(x, y)` signature as the
+ * three mouse handlers just above (the pointer's position at the
+ * moment of the scroll). */
+void festina_register_mouse_wheel_up_handler(void (*handler)(int64_t, int64_t));
+void festina_register_mouse_wheel_down_handler(void (*handler)(int64_t, int64_t));
 /* claude.md #98: `on key` became `on keyDown` + `on keyUp`, so what
  * was one registration is now two -- both taking the same fixed
  * `void (*)(const char *)` signature and both fed the same key name,
@@ -792,6 +844,11 @@ int64_t festina_client_height(void);
  * own comments on festina_set_client_size for the full design. */
 int64_t festina_screen_width(void);
 int64_t festina_screen_height(void);
+/* claude.md #181: devicePixelRatio -- through the windowing seam's own
+ * festina_window_device_pixel_ratio, the same "answers even with no
+ * window open" shape as festina_screen_width/_height just above. See
+ * festina_runtime_window.h's own doc comment for the full design. */
+double festina_device_pixel_ratio(void);
 void festina_set_client_width(int64_t width);
 void festina_set_client_height(int64_t height);
 /* claude.md #180: enterFullscreen()/exitFullscreen() -- toggles true OS
@@ -802,6 +859,13 @@ void festina_set_client_height(int64_t height);
  * festina_exit_fullscreen for the full design. */
 void festina_enter_fullscreen(void);
 void festina_exit_fullscreen(void);
+/* claude.md #182: showCursor()/hideCursor() -- toggles the mouse
+ * cursor's visibility over the canvas, through the windowing seam's own
+ * festina_window_set_cursor_visible. See
+ * festina_runtime_graphics.c's own comments on festina_show_cursor/
+ * festina_hide_cursor for the full design. */
+void festina_show_cursor(void);
+void festina_hide_cursor(void);
 
 /*
  * setTimeout/setInterval/clearTimeout/clearInterval -- claude.md #69.
@@ -1287,6 +1351,14 @@ void festina_map_set(int64_t *count, void **entries, int64_t *capacity, int64_t 
                      const char *key, int64_t value);
 int64_t festina_map_get(void *entries, int64_t capacity, const char *key, int64_t default_value);
 void festina_map_for_each(void *entries, int64_t capacity, void (*callback)(int64_t, const char *));
+/* claude.md #186 (uraikus/festina#76 item 7): map[T].keys() -> arr[text]
+ * and map[T].values() -> arr[T] -- `dst` is always a fresh header
+ * codegen already allocated (_emit_fresh_heap_header); these only fill
+ * in its length/data fields. See the implementation's own comment for
+ * values()'s `elem_size`/`is_refcounted`/`is_text` arguments. */
+void festina_map_keys(void *entries, int64_t capacity, void *dst);
+void festina_map_values(void *entries, int64_t capacity, int64_t elem_size,
+                         int8_t is_refcounted, int8_t is_text, void *dst);
 
 /* claude.md #74/#75/#175: called by generated code when a map[T]
  * local, proven never to escape its declaring function, goes out of
@@ -1357,6 +1429,16 @@ void festina_array_splice_insert(void *hdr, int64_t *capacity, int64_t elem_size
  * buffers still match. */
 int64_t festina_array_index_of(void *hdr, int64_t elem_size,
                                 const void *value, int8_t is_text);
+/* claude.md #184 (uraikus/festina#76 item 2): in-place, stable sort.
+ * `cmp` is always codegen's own generated per-element-type trampoline
+ * (_emit_sort_comparator_trampoline); `userdata` is the real Festina
+ * comparator function value, a bare pointer passed straight through
+ * unchanged on every comparison -- not qsort()/qsort_r()/qsort_s(),
+ * whose userdata-carrying variants disagree on argument order across
+ * glibc/BSD/Windows. See the implementation's own comment. */
+void festina_array_sort(void *hdr, int64_t elem_size,
+                         int (*cmp)(const void *, const void *, void *),
+                         void *userdata);
 void festina_release_array(void *payload);
 void festina_release_map(void *payload);
 /* claude.md #167: the value-aware counterpart to festina_release_map,

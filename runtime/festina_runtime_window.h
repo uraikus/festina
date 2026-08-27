@@ -70,6 +70,10 @@ typedef enum {
     FESTINA_WEVENT_MOUSE_DOWN,
     FESTINA_WEVENT_MOUSE_UP,
     FESTINA_WEVENT_MOUSE_MOVE,
+    /* claude.md #181: one notch/step of the scroll wheel, split by
+     * direction -- see semantic.py's _EVENT_SIGNATURES' own comment. */
+    FESTINA_WEVENT_MOUSE_WHEEL_UP,
+    FESTINA_WEVENT_MOUSE_WHEEL_DOWN,
     FESTINA_WEVENT_KEY_DOWN,
     FESTINA_WEVENT_KEY_UP,
     FESTINA_WEVENT_RESIZE,
@@ -78,7 +82,16 @@ typedef enum {
 
 typedef struct {
     FestinaWindowEventKind kind;
-    int64_t x, y;            /* MOUSE_DOWN/MOUSE_UP/MOUSE_MOVE */
+    int64_t x, y;            /* MOUSE_DOWN/MOUSE_UP/MOUSE_MOVE/MOUSE_WHEEL_UP/MOUSE_WHEEL_DOWN */
+    /* claude.md #182: which button -- MOUSE_DOWN/MOUSE_UP only. X11's
+     * own long-standing numbering, adopted as the one canonical
+     * convention every backend normalizes into (X11 already reports it
+     * this way natively; Cocoa/Win32 each have their own different
+     * numbering/ordering translated to match -- see each backend's own
+     * button-mapping comment): 1 = left, 2 = middle, 3 = right, 8 =
+     * back, 9 = forward. Any other physical button reports its own
+     * platform-raw number, best-effort, past those five. */
+    int64_t button;
     const char *key_name;    /* KEY_DOWN/KEY_UP -- borrowed, see above */
     int64_t width, height;   /* RESIZE -- the window's new content size */
 } FestinaWindowEvent;
@@ -109,6 +122,20 @@ void festina_window_events_drain(void (*handler)(const FestinaWindowEvent *event
 void festina_window_screen_size(int64_t *out_width, int64_t *out_height);
 void festina_window_resize(int64_t width, int64_t height);
 
+/* claude.md #181: devicePixelRatio -- how many actual device pixels
+ * back one canvas pixel (1.0 on a standard display, typically 2.0 on a
+ * Retina/HiDPi one). Same "independent of whether a window is open"
+ * contract as festina_window_screen_size just above, and for the same
+ * reason -- a display's pixel density is a property of the display, not
+ * of any one window on it, so this must answer even before the first
+ * render()/on-handler-declaration opens one. NOT the same thing as this
+ * runtime actually rendering the backing canvas at that higher
+ * resolution -- it doesn't (the canvas stays one pixel per Festina
+ * drawing-call unit everywhere) -- this is purely informational, the
+ * same "tell a program what's true, let it decide what to do with that"
+ * spirit screenWidth/screenHeight already have. */
+double festina_window_device_pixel_ratio(void);
+
 /* claude.md #180: enterFullscreen()/exitFullscreen(). Toggles the OPEN
  * window in and out of true OS fullscreen -- covering the whole screen,
  * no decorations -- restoring its prior geometry on exit. A no-op if no
@@ -126,5 +153,13 @@ void festina_window_resize(int64_t width, int64_t height);
  * OS negotiation (X11's async ClientMessage protocol; AppKit's own
  * animated transition), not a Festina-driven resize like those two. */
 void festina_window_set_fullscreen(int8_t fullscreen);
+
+/* claude.md #182: showCursor()/hideCursor(). Toggles the mouse cursor's
+ * visibility while it's over the OPEN window -- a no-op if none is
+ * open, the identical "portable code already handles the no-window-yet
+ * case, this function's only job is the native OS call" shape
+ * festina_window_resize/festina_window_set_fullscreen both already
+ * have (see their own comments). */
+void festina_window_set_cursor_visible(int8_t visible);
 
 #endif /* FESTINA_RUNTIME_WINDOW_H */

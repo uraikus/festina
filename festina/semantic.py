@@ -121,6 +121,9 @@ BUILTIN_FUNCTIONS = {
     # as render() the only two things here that need a real GUI (see
     # codegen.py's own uses_graphics condition).
     "enterFullscreen", "exitFullscreen",
+    # claude.md #182: showCursor()/hideCursor() -- toggles the mouse
+    # cursor's visibility over the canvas.
+    "showCursor", "hideCursor",
     # claude.md #94: single-value queries, so a scalar result needs no
     # throwaway `table` declaration (which would create a real table).
     "sqliteInt", "sqliteFloat", "sqliteText",
@@ -156,6 +159,11 @@ BUILTIN_FUNCTIONS = {
     # (a program-authoring mistake, not a runtime condition to test
     # for -- the same line claude.md #59 already draws elsewhere).
     "openSecurePort",
+    # claude.md #188 (uraikus/festina#76 item 4): blankImage(w, h) ->
+    # img -- a fresh, fully-transparent image, with no existing image
+    # or canvas to derive it from (unlike .clip()/.resize()/
+    # saveCanvas(), every one of which copies from something).
+    "blankImage",
     # claude.md #162: parseURL(text) -- like mkdir/exec above, a fixed
     # (text,) -> url signature the standard _BUILTIN_SIGNATURES/
     # _BUILTIN_RETURN_TYPES tables already handle directly, no bespoke
@@ -171,6 +179,8 @@ _BUILTIN_RETURN_TYPES = {
     # can see what it actually got rather than what it asked for.
     "maxAudioPlayers": types_mod.PrimitiveType("int"),
     "regex": types_mod.RegexType(),
+    # claude.md #188 (uraikus/festina#76 item 4)
+    "blankImage": types_mod.ImageType(),
     # claude.md #162
     "parseURL": types_mod.UrlType(),
     # claude.md #89: the only two graphics builtins that return anything
@@ -226,9 +236,15 @@ _BUILTIN_SIGNATURES = {
     # claude.md #133: drawRect's own fixed entry moved to
     # _BUILTIN_SIGNATURE_ALTERNATES below, alongside drawPixel -- both
     # now have a second, 1-argument-longer form with a trailing `color`.
-    "drawCircle": (_INT, _INT, _INT),
+    # claude.md #188 (uraikus/festina#76 item 8): drawCircle's own
+    # fixed entry moved there too, alongside its new fill/fill+border
+    # trailing-color forms.
     "drawText": (_TEXT, _INT, _INT),
-    "drawImage": (types_mod.ImageType(), _INT, _INT),
+    # claude.md #188 (uraikus/festina#76 item 4)
+    "blankImage": (_INT, _INT),
+    # claude.md #185: drawImage's own fixed 3-argument entry moved to
+    # _BUILTIN_SIGNATURE_ALTERNATES below, alongside its new 5- and
+    # 9-argument forms.
     "setMaxAudioPlayers": (_INT,),  # claude.md #98
     "maxAudioPlayers": (),
     # claude.md #89: a colour is text (a name, #rgb/#rrggbb, or 'none'),
@@ -267,6 +283,9 @@ _BUILTIN_SIGNATURES = {
     # claude.md #180
     "enterFullscreen": (),
     "exitFullscreen": (),
+    # claude.md #182
+    "showCursor": (),
+    "hideCursor": (),
     # claude.md #131
     "close": (_INT,),
     # claude.md #132
@@ -328,8 +347,30 @@ _BUILTIN_SIGNATURE_ALTERNATES = {
     # claude.md #133: an optional trailing `color` -- present, paints
     # with it for this one call only; absent, uses the current
     # fillStyle, exactly like every other draw call already does.
-    "drawRect": [(_INT, _INT, _INT, _INT), (_INT, _INT, _INT, _INT, _COLOR)],
+    # claude.md #188 (uraikus/festina#76 item 8): drawRect grows a
+    # SECOND optional trailing colour, a border override -- present,
+    # strokes with it for this one call only (no border at all if it's
+    # `none`); absent (the 5-argument form), uses the current
+    # borderColor, exactly the split fillStyle()/borderColor()
+    # themselves keep. drawCircle gains the identical two-color shape,
+    # NEWLY -- it previously had no per-call colour override at all.
+    "drawRect": [(_INT, _INT, _INT, _INT), (_INT, _INT, _INT, _INT, _COLOR),
+                 (_INT, _INT, _INT, _INT, _COLOR, _COLOR)],
     "drawPixel": [(_INT, _INT), (_INT, _INT, _COLOR)],
+    "drawCircle": [(_INT, _INT, _INT), (_INT, _INT, _INT, _COLOR),
+                    (_INT, _INT, _INT, _COLOR, _COLOR)],
+    # claude.md #185 (uraikus/festina#76 item 3): drawImage(img, x, y)
+    # is unchanged; drawImage(img, x, y, w, h) scales the WHOLE image
+    # to fit a w x h box; drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh)
+    # is the full canvas-style form -- a SOURCE rect cut out of the
+    # image, scaled to fit a DESTINATION rect. All three share the
+    # first argument's image type, so len() alone (3 vs. 5 vs. 9) picks
+    # the right one with no ambiguity.
+    "drawImage": [
+        (types_mod.ImageType(), _INT, _INT),
+        (types_mod.ImageType(), _INT, _INT, _INT, _INT),
+        (types_mod.ImageType(), _INT, _INT, _INT, _INT, _INT, _INT, _INT, _INT),
+    ],
 }
 _REGEX = types_mod.RegexType()
 _AUDIO = types_mod.AudioType()
@@ -515,10 +556,15 @@ MATH_FLOAT_FUNCTIONS = {"sqrt", "sin", "cos", "tan", "asin", "acos", "atan",
                         "exp", "log", "log2", "log10", "abs"}
 # claude.md #93: (float, float) -> float.
 MATH_FLOAT2_FUNCTIONS = {"pow", "min", "max", "atan2"}
+# claude.md #188 (uraikus/festina#76 item 1): (int, int) -> int -- the
+# one Math function that takes INT arguments rather than float, kept in
+# its own set for exactly that reason (every check above this one
+# assumes float args and an int-or-float result; floorDiv is neither).
+MATH_INT2_FUNCTIONS = {"floorDiv"}
 # Every name reachable as Math.<name>(...), for the "is this a Math
-# call at all" test; the three sets above decide arity and result type.
+# call at all" test; the sets above decide arity and result type.
 MATH_FUNCTIONS = (MATH_ROUNDING_FUNCTIONS | MATH_FLOAT_FUNCTIONS
-                  | MATH_FLOAT2_FUNCTIONS | {"random"})
+                  | MATH_FLOAT2_FUNCTIONS | MATH_INT2_FUNCTIONS | {"random"})
 # claude.md #93: Math.PI / Math.E -- constants, not calls. Trigonometry
 # is unusable without at least PI, and making a program spell out
 # 3.14159... is exactly the kind of thing a standard library exists to
@@ -543,9 +589,23 @@ _EVENT_SIGNATURES = {
     # release, and dragging -- or charging a shot, or hold-to-aim --
     # needs to tell them apart; `on click` fired on press and collapsed
     # the two, so there was nothing to listen for on the way up.
-    "mouseDown": ((_INT, _INT), "(x:int, y:int)"),
-    "mouseUp": ((_INT, _INT), "(x:int, y:int)"),
+    # claude.md #182: `button` reports which physical button, X11's own
+    # numbering (see FestinaWindowEvent's own doc comment in
+    # festina_runtime_window.h) -- `mouse` (continuous movement,
+    # unaffected) stays (x, y) only, since a move has no button of its
+    # own to report.
+    "mouseDown": ((_INT, _INT, _INT), "(x:int, y:int, button:int)"),
+    "mouseUp": ((_INT, _INT, _INT), "(x:int, y:int, button:int)"),
     "mouse": ((_INT, _INT), "(x:int, y:int)"),
+    # claude.md #181: the scroll wheel -- one event per notch/step,
+    # split by direction rather than a single `on mouseWheel(delta)`
+    # the same way `on mouseDown`/`on mouseUp` are split by direction
+    # (up/down) rather than one `on click` -- see that entry's own
+    # reasoning, which applies identically here. `x`/`y` report the
+    # pointer's position at the moment of the scroll, same convention
+    # as every other pointer event above.
+    "mouseWheelUp": ((_INT, _INT), "(x:int, y:int)"),
+    "mouseWheelDown": ((_INT, _INT), "(x:int, y:int)"),
     # claude.md #98: one `on key` became two, so a program can tell a
     # press from a release -- holding a movement key and letting it go
     # had no expressible difference before.
@@ -599,6 +659,21 @@ _SCREEN_SIZE_GLOBALS = ("screenWidth", "screenHeight")
 # every touch point below; combined once here so those touch points
 # don't need to know there happen to be two separate families.
 _SIZE_GLOBALS = _CLIENT_SIZE_GLOBALS + _SCREEN_SIZE_GLOBALS
+
+# claude.md #181: devicePixelRatio -- how many actual device pixels
+# back one canvas/CSS pixel (1.0 on a standard display, typically 2.0
+# on a Retina/HiDPi one), read-only the identical way as _SIZE_GLOBALS
+# just above -- a genuinely different QUESTION (a display's pixel
+# density, not a width/height), and the wrong TYPE to fold into that
+# same tuple (float, not int, so it needs its own Symbol registration
+# below rather than sharing _SIZE_GLOBALS' single int-typed loop) even
+# though it shares every other read-only-global touch point with it.
+_DEVICE_PIXEL_RATIO_GLOBALS = ("devicePixelRatio",)
+
+# The read-only-assignment check below needs both families in one set;
+# the type-registration loop above still needs them kept apart (float
+# vs int), so this combination exists only for that one shared check.
+_READONLY_SCALAR_GLOBALS = _SIZE_GLOBALS + _DEVICE_PIXEL_RATIO_GLOBALS
 
 # claude.md #71: `environment` -- unlike clientWidth/clientHeight above,
 # this is never a valid *value* on its own (only environment.NAME or
@@ -869,6 +944,11 @@ def analyze(program, filename="<string>"):
     # see _SIZE_GLOBALS above.
     for _name in _SIZE_GLOBALS:
         global_scope.define(_name, Symbol(_name, _INT, "constant", None), None, filename)
+    # claude.md #181: devicePixelRatio -- see _DEVICE_PIXEL_RATIO_GLOBALS
+    # above for why this isn't folded into the loop just above (float,
+    # not int).
+    for _name in _DEVICE_PIXEL_RATIO_GLOBALS:
+        global_scope.define(_name, Symbol(_name, _FLOAT, "constant", None), None, filename)
     # claude.md #71: environment, see _ENVIRONMENT_NAME above -- type is
     # irrelevant (never consulted), only here so redeclaring it is a
     # duplicate-declaration error like any other reserved global.
@@ -1200,12 +1280,13 @@ def analyze(program, filename="<string>"):
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid assignment",
                 )
-            # claude.md #39/#139: clientWidth/clientHeight/screenWidth/
-            # screenHeight are read-only too -- same reasoning and same
-            # "catch it before the generic target_type/value_type check
-            # below" placement as .length above, since that check alone
-            # has no way to tell a read from a write target.
-            if isinstance(expr.target, ast.Identifier) and expr.target.name in _SIZE_GLOBALS:
+            # claude.md #39/#139/#181: clientWidth/clientHeight/
+            # screenWidth/screenHeight/devicePixelRatio are read-only
+            # too -- same reasoning and same "catch it before the
+            # generic target_type/value_type check below" placement as
+            # .length above, since that check alone has no way to tell
+            # a read from a write target.
+            if isinstance(expr.target, ast.Identifier) and expr.target.name in _READONLY_SCALAR_GLOBALS:
                 raise CompileError(
                     f"'{expr.target.name}' is read-only and cannot be assigned to",
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
@@ -1258,6 +1339,23 @@ def analyze(program, filename="<string>"):
                     and isinstance(infer(expr.target.obj, scope), types_mod.UrlType)):
                 raise CompileError(
                     f"'.{expr.target.prop}' is read-only and cannot be assigned to",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid assignment",
+                )
+            # claude.md #188 (uraikus/festina#76 item 5): row.rowid is
+            # read-only too, same placement/reasoning as .length/http's
+            # own fields/url's own fields above -- it's the row's own
+            # database identity, not ordinary column data, so mutating
+            # it in memory would never mean anything (unlike an ordinary
+            # column, there is no corresponding `UPDATE` this language
+            # performs on assignment -- a table row is a plain in-memory
+            # snapshot either way, see the module docstring's "Query
+            # rows" note).
+            if (isinstance(expr.target, ast.Member) and not expr.target.computed
+                    and expr.target.prop == "rowid"
+                    and isinstance(infer(expr.target.obj, scope), types_mod.TableType)):
+                raise CompileError(
+                    "'.rowid' is read-only and cannot be assigned to",
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid assignment",
                 )
@@ -1560,6 +1658,21 @@ def analyze(program, filename="<string>"):
             # (see analyze_table above), so each lookup resolves on demand.
             columns = tables.get(obj_type.name, {})
             if expr.prop not in columns:
+                # claude.md #188 (uraikus/festina#76 item 5): row.rowid
+                # -- not a declared column at all (no CREATE TABLE
+                # side effect, no schema-sync ALTER TABLE consideration
+                # -- see codegen.py's own _table_arrays_for_select vs.
+                # _table_arrays split for why keeping it OUT of the
+                # `columns` dict entirely matters), but always
+                # readable: SQLite gives every ordinary rowid table one
+                # for free, and this just exposes it. Populated only
+                # when the query's own SQL actually selected a result
+                # column literally named `rowid` -- e.g. `SELECT
+                # rowid, * FROM t` -- otherwise reads as int's own null,
+                # the same "the query never mentioned this" signal
+                # `.undefined()` already gives an ordinary column.
+                if expr.prop == "rowid":
+                    return _INT
                 raise CompileError(
                     f"table '{obj_type.name}' has no field '{expr.prop}'",
                     file=filename, line=expr.line, column=expr.column,
@@ -1999,6 +2112,33 @@ def analyze(program, filename="<string>"):
                                   what=f"argument '{param.name}' of '{name}'")
             return sym.type
         if isinstance(callee, ast.Member) and not callee.computed:
+            # claude.md #188 (uraikus/festina#76 item 1):
+            # Math.floorDiv(a:int, b:int) -> int -- floor-toward-
+            # negative-infinity integer division, JS's Math.floorDiv
+            # doesn't exist but Python's `//`/Java's Math.floorDiv do,
+            # and this follows their exact rounding direction (not C's
+            # own truncate-toward-zero `/`). Checked in its own branch,
+            # ahead of the generic Math float-argument check just below,
+            # since this is the one Math function taking INT arguments.
+            if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
+                    and callee.prop in MATH_INT2_FUNCTIONS):
+                if len(expr.args) != 2:
+                    raise CompileError(
+                        f"Math.{callee.prop}() expects exactly 2 argument(s), "
+                        f"got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                for arg in expr.args:
+                    arg_type = infer(arg, scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != _INT:
+                        raise CompileError(
+                            f"Math.{callee.prop}() expects int argument(s), "
+                            f"found {types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return _INT
             # claude.md #56: Math.floor/ceil/round/trunc(x:float) -> int
             if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
                     and callee.prop in MATH_FUNCTIONS):
@@ -2565,10 +2705,41 @@ def analyze(program, filename="<string>"):
             # and the int-ness of every argument are enforced.
             # claude.md #96: array methods, JS-shaped.
             if callee.prop in ("push", "pop", "shift", "unshift", "splice",
-                               "indexOf"):
+                               "indexOf", "sort"):
                 obj_type = infer(callee.obj, scope)
                 if isinstance(obj_type, types_mod.ArrayType):
                     elem = obj_type.element
+                    # claude.md #184 (uraikus/festina#76 item 2):
+                    # sort(cmpFn) -> void, in place, JS/C-qsort style --
+                    # cmpFn:func[T,T]:int, negative/zero/positive meaning
+                    # exactly what C's own qsort() comparator already
+                    # means (first-before-second / equal / first-after-
+                    # second). Checked structurally off cmpFn's own
+                    # signature, the same permissive "any func-typed
+                    # expression" rule blob/img/aud's `.callback()`
+                    # established (claude.md #165/#171) -- not restricted
+                    # to a bare declared-function name the way
+                    # setTimeout's own older convention is.
+                    if callee.prop == "sort":
+                        if len(expr.args) != 1:
+                            raise CompileError(
+                                "sort() expects exactly 1 argument (the "
+                                f"comparator), got {len(expr.args)}",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
+                        fn_type = infer(expr.args[0], scope)
+                        if (not isinstance(fn_type, types_mod.FuncType)
+                                or fn_type.param_types != (elem, elem)
+                                or fn_type.return_type != _INT):
+                            raise CompileError(
+                                f"sort() expects func[{types_mod.type_name(elem)}, "
+                                f"{types_mod.type_name(elem)}]:int, found "
+                                f"{types_mod.type_name(fn_type)}",
+                                file=filename, line=callee.line, column=callee.column,
+                                category="invalid function argument type",
+                            )
+                        return None
                     # claude.md #97: indexOf(value) -> int, -1 when absent.
                     # The argument has to be assignable to the element type
                     # for the same reason push()'s does: a search for a
@@ -2665,9 +2836,18 @@ def analyze(program, filename="<string>"):
             # all -- see codegen.py's _emit_image_draw_method.
             if (callee.prop in ("drawRect", "drawPixel", "drawCircle", "drawText")
                     and infer(callee.obj, scope) == _IMAGE):
+                # claude.md #188 (uraikus/festina#76 item 8): the same
+                # optional-trailing-fill-and-border-colour forms the
+                # free-function versions gained, in _BUILTIN_SIGNATURE_
+                # ALTERNATES above -- drawCircle joins drawRect/drawPixel
+                # here too, newly, having had no per-call colour override
+                # at all before this.
                 alternates = {
-                    "drawRect": [(_INT, _INT, _INT, _INT), (_INT, _INT, _INT, _INT, _COLOR)],
+                    "drawRect": [(_INT, _INT, _INT, _INT), (_INT, _INT, _INT, _INT, _COLOR),
+                                 (_INT, _INT, _INT, _INT, _COLOR, _COLOR)],
                     "drawPixel": [(_INT, _INT), (_INT, _INT, _COLOR)],
+                    "drawCircle": [(_INT, _INT, _INT), (_INT, _INT, _INT, _COLOR),
+                                    (_INT, _INT, _INT, _COLOR, _COLOR)],
                 }.get(callee.prop)
                 if alternates is not None:
                     sig = next((a for a in alternates if len(a) == len(expr.args)), None)
@@ -2680,8 +2860,7 @@ def analyze(program, filename="<string>"):
                             category="invalid function argument type",
                         )
                 else:
-                    sig = {"drawCircle": (_INT, _INT, _INT),
-                           "drawText": (_TEXT, _INT, _INT)}[callee.prop]
+                    sig = {"drawText": (_TEXT, _INT, _INT)}[callee.prop]
                     if len(expr.args) != len(sig):
                         raise CompileError(
                             f"{callee.prop}() expects {len(sig)} argument(s), "
@@ -2767,6 +2946,27 @@ def analyze(program, filename="<string>"):
                             category="invalid function argument type",
                         )
                     return None
+            # claude.md #186 (uraikus/festina#76 item 7): map[T].keys()
+            # -> arr[text], map[T].values() -> arr[T] -- a plain
+            # snapshot array, walkable with an ordinary `for` loop, no
+            # callback needed at all. Exists specifically to sidestep
+            # forEach()'s own bare/no-closures callback restriction
+            # (claude.md #72) for the common "collect entries matching
+            # a condition" case, where that restriction otherwise pushes
+            # every call site's own accumulator state into extra
+            # globals purely so the callback can reach it.
+            if callee.prop in ("keys", "values"):
+                obj_type = infer(callee.obj, scope)
+                if isinstance(obj_type, types_mod.MapType):
+                    if expr.args:
+                        raise CompileError(
+                            f"{callee.prop}() takes no arguments, got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    if callee.prop == "keys":
+                        return types_mod.ArrayType(_TEXT)
+                    return types_mod.ArrayType(obj_type.value)
         # Member call, e.g. someUnknownMethod() on a struct-shaped
         # receiver -- validates the member access itself (so an unknown
         # method on a real type still fails with a specific message
