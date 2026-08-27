@@ -5525,6 +5525,314 @@ class TestScreenSizeAndSetClientSize:
             proc.terminate()
             proc.wait(timeout=5)
 
+    def test_setting_client_size_before_the_window_opens_is_honored_as_its_initial_size(
+            self, run_graphics_program, x_display):
+        # claude.md #178 (uraikus/festina#79): a program that calls
+        # setClientWidth/setClientHeight near the top of its own boot
+        # sequence -- the documented, `on resize`-safe pattern
+        # TestEventHandlersAreHoistedLikeFunctions below already
+        # exercises for a DIFFERENT reason -- used to open a real,
+        # on-screen window at the hardcoded 800x600 default FIRST
+        # (main()'s own prologue called festina_graphics_init()
+        # unconditionally before __festina_main() ever ran, and that
+        # function itself then overwrote g_canvas_width/height back to
+        # the hardcoded default even if a pre-window setClientWidth/
+        # setClientHeight call had already changed them), then resized
+        # itself out from under that -- each resize taking
+        # festina_set_client_size's real, `g_window_open`-gated branch
+        # (an actual XResizeWindow plus an `on resize` firing) since the
+        # window was already open by the time either call ran. Fixed by
+        # no longer opening the window before __festina_main() at all
+        # (only registering handlers there) and having
+        # festina_graphics_init() read g_canvas_width/height as they
+        # already stand instead of resetting them -- so a size chosen
+        # before the window exists is simply the window's initial size:
+        # no flash of the wrong dimensions, and no `on resize` firing at
+        # all for a size the program never asked to actually SEE change.
+        source = (
+            "on resize() {\n"
+            "    log(`unexpected resize: ${clientWidth}x${clientHeight}`)\n"
+            "}\n"
+            "log('step0: process start')\n"
+            "setClientWidth(1024)\n"
+            "log(`step1: ${clientWidth}x${clientHeight}`)\n"
+            "setClientHeight(700)\n"
+            "log(`step2: ${clientWidth}x${clientHeight}`)\n"
+            "render()\n"
+        )
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            geometry = subprocess.run(
+                ["xdotool", "getwindowgeometry", "--shell", wid],
+                env=env, capture_output=True, text=True, check=True,
+            ).stdout
+            dims = dict(line.split("=", 1) for line in geometry.splitlines() if "=" in line)
+            # The window opened DIRECTLY at the fully-requested size --
+            # not the 800x600 default, and not the 1024x600 intermediate
+            # size #79's own repro observed.
+            assert (dims["WIDTH"], dims["HEIGHT"]) == ("1024", "700")
+            text = _wait_for_output(stdout_path, lambda t: "step2:" in t)
+            # Neither setClientWidth nor setClientHeight fired `on
+            # resize` -- there was no window yet for either call to
+            # resize out from under itself.
+            assert text.splitlines() == [
+                "step0: process start",
+                "step1: 1024x600",
+                "step2: 1024x700",
+            ]
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
+class TestFullscreenAndDecorations:
+    """claude.md #180: the window opens fully decorated (title bar, and
+    the OS's normal minimize/maximize/close controls -- like any other
+    window, resizable by dragging an edge) instead of the borderless
+    "canvas, nothing else" look claude.md #95 originally gave it, and
+    enterFullscreen()/exitFullscreen() toggle true OS fullscreen on top
+    of that -- X11's own _NET_WM_STATE_FULLSCREEN convention, honored by
+    every EWMH-compliant window manager.
+
+    Decorations can only be confirmed against a REAL window manager
+    (`x_display_with_wm`, openbox) -- a bare Xvfb instance draws no
+    frame around any window regardless of what a program's own Motif
+    hints ask for, so a decoration check against the bare `x_display`
+    fixture every other test in this file uses could never fail even if
+    codegen regressed back to requesting a borderless window; the
+    fullscreen tests below need a real WM for the identical reason (a
+    bare Xvfb has nothing to interpret the _NET_WM_STATE ClientMessage
+    at all, let alone actually resize/reposition the window in
+    response)."""
+
+    def test_the_window_is_really_decorated_under_a_real_window_manager(
+            self, run_graphics_program, x_display_with_wm):
+        # _NET_FRAME_EXTENTS is the window manager's own report of how
+        # many pixels of chrome (title bar, border) it drew around the
+        # window -- (0, 0, 0, 0) or absent entirely means "no decoration
+        # was drawn", the exact claude.md #95 look this entry retires.
+        # xprop is already a dependency of x_display_with_wm itself.
+        source = "drawRect(0, 0, 10, 10)\nrender()"
+        proc, stdout_path = run_graphics_program(source, display=x_display_with_wm)
+        try:
+            wid = _find_window(x_display_with_wm)
+            env = dict(os.environ, DISPLAY=x_display_with_wm)
+            # openbox needs a moment after mapping to actually reparent
+            # the window into its own decorated frame and publish this
+            # property -- polled rather than assumed instant, the same
+            # reasoning x_display_with_wm's own readiness wait uses.
+            deadline = time.time() + 10
+            extents = None
+            while time.time() < deadline:
+                probe = subprocess.run(
+                    ["xprop", "-id", wid, "_NET_FRAME_EXTENTS"],
+                    env=env, capture_output=True, text=True,
+                )
+                if probe.returncode == 0 and "_NET_FRAME_EXTENTS" in probe.stdout:
+                    extents = probe.stdout
+                    break
+                time.sleep(0.1)
+            assert extents is not None, "window manager never published _NET_FRAME_EXTENTS"
+            # "= 0, 0, 0, 0" would mean a real property existed but
+            # reported no chrome at all -- still a decoration failure,
+            # so check the actual numbers, not just the property's
+            # presence.
+            numbers = extents.split("=", 1)[1]
+            assert any(int(n.strip()) > 0 for n in numbers.split(",")), (
+                f"window manager drew no decoration: {extents!r}")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_enter_and_exit_fullscreen_are_zero_arg_builtins(self, parser, semantic, errors):
+        for source in ["enterFullscreen(1)", "exitFullscreen(1)"]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+    def test_calling_either_alone_still_opens_a_window(self, parser, semantic, codegen):
+        # claude.md #95/#180: neither call draws anything, but both are
+        # meaningless without a real OS window -- there is no "headless
+        # fullscreen" the way there's a headless canvas -- so each has
+        # to join render() as something that makes self.uses_graphics
+        # true (see codegen.py's own _CANVAS_OPS handling), observable
+        # here as festina_run_event_loop() appearing in the emitted IR
+        # even with no render()/handler in sight.
+        for source in ["enterFullscreen()", "exitFullscreen()"]:
+            program = parser.parse(source, filename="main.f")
+            analyzed = semantic.analyze(program, filename="main.f")
+            ir = codegen.generate_ir(program, analyzed, filename="main.f")
+            assert "call void @festina_run_event_loop()" in ir
+
+    def test_entering_and_exiting_fullscreen_resizes_the_real_window_and_fires_on_resize(
+            self, run_graphics_program, x_display_with_wm):
+        # The real, end-to-end confirmation: toggling fullscreen via a
+        # simulated keypress against a real window (openbox), reading
+        # the window's ACTUAL on-screen geometry back via xdotool
+        # (rather than trusting clientWidth/clientHeight alone, which
+        # this same bug class could misreport if the real window and
+        # Festina's own idea of its size ever disagreed) at each step.
+        source = (
+            "on resize() {\n"
+            "    log(`resize ${clientWidth}x${clientHeight}`)\n"
+            "}\n"
+            "on keyDown(key:text) {\n"
+            "    if key == 'i' { enterFullscreen() }\n"
+            "    if key == 'o' { exitFullscreen() }\n"
+            "}\n"
+            "render()\n"
+        )
+        proc, stdout_path = run_graphics_program(source, display=x_display_with_wm)
+        try:
+            wid = _find_window(x_display_with_wm)
+            env = dict(os.environ, DISPLAY=x_display_with_wm)
+            screen = subprocess.run(["xdotool", "getdisplaygeometry"], env=env,
+                                     capture_output=True, text=True, check=True)
+            screen_w, screen_h = screen.stdout.split()
+
+            subprocess.run(["xdotool", "windowfocus", wid], env=env, check=True)
+            subprocess.run(["xdotool", "key", "--window", wid, "i"], env=env, check=True)
+            text = _wait_for_output(stdout_path, lambda t: "resize" in t)
+            assert text.strip() == f"resize {screen_w}x{screen_h}"
+            geo = subprocess.run(["xdotool", "getwindowgeometry", "--shell", wid],
+                                  env=env, capture_output=True, text=True, check=True).stdout
+            dims = dict(line.split("=", 1) for line in geo.splitlines() if "=" in line)
+            assert (dims["WIDTH"], dims["HEIGHT"]) == (screen_w, screen_h)
+
+            subprocess.run(["xdotool", "key", "--window", wid, "o"], env=env, check=True)
+            text = _wait_for_output(stdout_path, lambda t: t.count("resize") >= 2)
+            assert text.splitlines() == [
+                f"resize {screen_w}x{screen_h}",
+                "resize 800x600",
+            ]
+            geo = subprocess.run(["xdotool", "getwindowgeometry", "--shell", wid],
+                                  env=env, capture_output=True, text=True, check=True).stdout
+            dims = dict(line.split("=", 1) for line in geo.splitlines() if "=" in line)
+            assert (dims["WIDTH"], dims["HEIGHT"]) == ("800", "600")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_entering_fullscreen_before_the_window_opens_skips_the_windowed_flash(
+            self, run_graphics_program, x_display_with_wm):
+        # claude.md #178's own fix, extended: enterFullscreen() called
+        # before any window exists just records the desired state (see
+        # g_is_fullscreen's own comment in festina_runtime_graphics.c)
+        # for festina_graphics_init to apply once one actually opens --
+        # so the window should open DIRECTLY at the screen's own size,
+        # never at 800x600 first.
+        source = "enterFullscreen()\ndrawRect(0, 0, 10, 10)\nrender()"
+        proc, stdout_path = run_graphics_program(source, display=x_display_with_wm)
+        try:
+            wid = _find_window(x_display_with_wm)
+            env = dict(os.environ, DISPLAY=x_display_with_wm)
+            screen = subprocess.run(["xdotool", "getdisplaygeometry"], env=env,
+                                     capture_output=True, text=True, check=True)
+            screen_w, screen_h = screen.stdout.split()
+            # Give the window manager a moment to finish reacting, the
+            # same generous wait test_resize_dispatches_to_handler_and_
+            # updates_client_size's own sibling tests already budget for
+            # a real WM round trip.
+            time.sleep(0.5)
+            geo = subprocess.run(["xdotool", "getwindowgeometry", "--shell", wid],
+                                  env=env, capture_output=True, text=True, check=True).stdout
+            dims = dict(line.split("=", 1) for line in geo.splitlines() if "=" in line)
+            assert (dims["WIDTH"], dims["HEIGHT"]) == (screen_w, screen_h)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_redundant_calls_are_no_ops(self, run_graphics_program, x_display_with_wm):
+        # Calling enterFullscreen() twice (or exitFullscreen() while not
+        # fullscreen) must not fire a second, redundant `on resize` --
+        # the same "no-op if already in the requested state" discipline
+        # claude.md #139's own setClientWidth/setClientHeight regression
+        # test already pins for THAT pair of builtins.
+        source = (
+            "int resizeCount = 0\n"
+            "on resize() {\n"
+            "    resizeCount = resizeCount + 1\n"
+            "    log(`resize count=${resizeCount}`)\n"
+            "}\n"
+            "on keyDown(key:text) {\n"
+            "    if key == 'i' { enterFullscreen() enterFullscreen() }\n"
+            "    if key == 'o' { exitFullscreen() exitFullscreen() }\n"
+            "}\n"
+            "render()\n"
+            "exitFullscreen()\n"  # never entered -- must not crash or fire
+        )
+        proc, stdout_path = run_graphics_program(source, display=x_display_with_wm)
+        try:
+            wid = _find_window(x_display_with_wm)
+            env = dict(os.environ, DISPLAY=x_display_with_wm)
+            subprocess.run(["xdotool", "windowfocus", wid], env=env, check=True)
+            subprocess.run(["xdotool", "key", "--window", wid, "i"], env=env, check=True)
+            text = _wait_for_output(stdout_path, lambda t: "count=1" in t)
+            subprocess.run(["xdotool", "key", "--window", wid, "o"], env=env, check=True)
+            text = _wait_for_output(stdout_path, lambda t: "count=2" in t)
+            # A real chance for a spurious THIRD firing to arrive.
+            time.sleep(0.5)
+            with open(stdout_path) as f:
+                assert f.read().splitlines() == [
+                    "resize count=1",
+                    "resize count=2",
+                ], "a redundant enterFullscreen()/exitFullscreen() call fired an extra resize"
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
+class TestEventHandlersAreHoistedLikeFunctions:
+    """Not a bug, but a real, confirmed footgun -- flagged directly,
+    costing real debugging time before it was traced back to this.
+    `on ...` handlers are registered before the entry file's own top-
+    level code runs at all (codegen.py's own _emit_main_and_entry:
+    every festina_register_*_handler call happens in a fixed block,
+    unconditionally, before `call void @__festina_main()`) -- the
+    identical hoisting api.md's own "Functions are hoisted" note
+    already documents for `func` declarations, just less obviously
+    surprising there (a function only ever runs when something calls
+    it; a handler can be triggered by an ordinary top-level statement
+    written ABOVE its own declaration, e.g. setClientWidth firing `on
+    resize` synchronously, inline, wherever it's called from).
+
+    Confirmed directly (compiled and run, not just reasoned through):
+    a handler declared textually AFTER a call that triggers it still
+    fires, and fires against whatever state existed at that exact
+    point in top-level execution -- which, for a global whose own
+    initializer hasn't run yet, is still its zero/default, not the
+    value the source implies it should already have. Documented in
+    api.md right where event handlers are introduced."""
+
+    def test_a_handler_fires_against_a_not_yet_initialized_global(
+            self, compile_and_run, x_display):
+        # The exact api.md reproduction: setClientWidth (textually
+        # first) fires `on resize` (declared textually AFTER both it
+        # and the array it reads) before `data`'s own initializer has
+        # run -- so the handler sees the zero-length default, not 3.
+        source = (
+            "render()\n"
+            "setClientWidth(400)\n"
+            "log('after setClientWidth')\n"
+            "\n"
+            "arr[int] data = [1, 2, 3]\n"
+            "on resize() {\n"
+            "    log(`data.length=${data.length}`)\n"
+            "}\n"
+            "close(0)\n"
+        )
+        result = compile_and_run(source, env={"DISPLAY": x_display})
+        assert result.returncode == 0, result.stdout
+        # The handler's own output comes FIRST -- it ran synchronously,
+        # inline, at the setClientWidth call site, before the
+        # 'after setClientWidth' line even printed.
+        assert result.stdout.splitlines() == [
+            "data.length=0",
+            "after setClientWidth",
+        ]
+
 
 class TestExampleGraphicsAndGame:
     """Interactive regression coverage for examples/graphics.f,
@@ -11828,7 +12136,14 @@ class TestColorAndFontTypes:
         log(measureTextWidth('hello'))
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @festina_graphics_init()" not in ir
+        # claude.md #178: festina_graphics_init() is no longer emitted by
+        # codegen at all -- see test_render_is_what_opens_the_window's own
+        # comment -- so the meaningful check is that nothing here reaches
+        # for a window in the first place: no render() (which lazily opens
+        # one) and no festina_run_event_loop() (which self.uses_graphics
+        # would otherwise cause main() to call after __festina_main()).
+        assert "call void @festina_render()" not in ir
+        assert "call void @festina_run_event_loop()" not in ir
 
     def test_drawing_alone_no_longer_opens_a_canvas_window(
             self, parser, semantic, codegen):
@@ -11840,7 +12155,8 @@ class TestColorAndFontTypes:
         drawRect(0, 0, 10, 10)
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @festina_graphics_init()" not in ir
+        assert "call void @festina_render()" not in ir
+        assert "call void @festina_run_event_loop()" not in ir
 
     def test_render_is_what_opens_the_window(self, parser, semantic, codegen):
         source = """
@@ -11850,7 +12166,21 @@ class TestColorAndFontTypes:
         render()
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @festina_graphics_init()" in ir
+        # claude.md #178 (uraikus/festina#79): festina_graphics_init() is
+        # no longer called eagerly from main()'s own prologue (that used
+        # to open the window, at the hardcoded 800x600 default, before
+        # __festina_main() -- and any setClientWidth/setClientHeight call
+        # it makes -- ever ran). It's purely an internal, self-guarded C
+        # runtime call now, reached lazily from festina_render()'s own
+        # `if (!g_window_open)` check (or festina_run_event_loop()'s
+        # matching fallback for a program that never calls render() at
+        # all) -- invisible at the LLVM IR level either way. So the
+        # observable signal that THIS program opens a window is simply
+        # that it calls festina_render() -- see
+        # TestScreenSizeAndSetClientSize's own
+        # test_setting_client_size_before_the_window_opens_is_honored_as_its_initial_size
+        # for the real runtime behavior this enables.
+        assert "call void @festina_render()" in ir
 
     def test_text_metrics_follow_the_declared_font(self, compile_and_run):
         source = """
@@ -13028,9 +13358,15 @@ class TestCanvasPathsTransformsAndGradients:
 
     def test_path_calls_do_not_open_a_canvas(self, parser, semantic, codegen):
         # claude.md #95: a path paints the offscreen canvas like any
-        # other drawing -- only render() needs a window.
+        # other drawing -- only render() needs a window. claude.md #178:
+        # festina_graphics_init() itself is never emitted directly any
+        # more (see test_render_is_what_opens_the_window's own comment
+        # in TestColorAndFontTypes), so festina_render()/
+        # festina_run_event_loop()'s absence is what actually shows
+        # this program never reaches for a window.
         ir = self._ir(parser, semantic, codegen, "beginPath()\nmoveTo(0,0)\nfillPath()")
-        assert "call void @festina_graphics_init()" not in ir
+        assert "call void @festina_render()" not in ir
+        assert "call void @festina_run_event_loop()" not in ir
 
     def test_transforms_and_state_open_nothing(self, parser, semantic, codegen):
         # Pure state, exactly like claude.md #89's own style setters --
@@ -13045,7 +13381,8 @@ class TestCanvasPathsTransformsAndGradients:
         resetTransform()
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @festina_graphics_init()" not in ir
+        assert "call void @festina_render()" not in ir
+        assert "call void @festina_run_event_loop()" not in ir
 
     def test_building_a_path_with_none_open_fails_clearly(self, compile_and_run):
         result = compile_and_run("moveTo(10, 10)")
@@ -13169,7 +13506,8 @@ class TestRenderClearAndHeadless:
 
     def test_clearing_alone_does_not_open_a_window(self, parser, semantic, codegen):
         ir = self._ir(parser, semantic, codegen, "clearCanvas()\nclearRect(0,0,5,5)")
-        assert "call void @festina_graphics_init()" not in ir
+        assert "call void @festina_render()" not in ir
+        assert "call void @festina_run_event_loop()" not in ir
 
     def test_saving_a_canvas_needs_no_display(self, compile_and_run, tmp_path):
         # The capability the split exists for.

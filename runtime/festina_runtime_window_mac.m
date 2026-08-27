@@ -261,7 +261,27 @@ static cairo_surface_t *g_last_backing = NULL;
      * which is exactly kCGBitmapByteOrder32Little combined with
      * kCGImageAlphaPremultipliedFirst: the standard, well-known
      * cairo/CoreGraphics interop recipe (also how cairo's own Quartz
-     * backend reads a CGImage back the other way). */
+     * backend reads a CGImage back the other way).
+     *
+     * cairo_image_surface_get_data() below is a RAW memory read,
+     * entirely outside cairo's own drawing API -- unlike the X11
+     * backend's own festina_window_present (which reads
+     * g_backing_surface only through cairo_set_source_surface+
+     * cairo_paint, cairo mediating the read the same way it mediates
+     * the write), this reaches straight into the surface's pixel
+     * buffer. Cairo's own documented contract for
+     * cairo_image_surface_get_data() requires a cairo_surface_flush()
+     * first "to ensure that all pending drawing operations are
+     * finished" -- drawRect: can fire asynchronously, an arbitrary
+     * amount of program logic (and cairo drawing) after whatever last
+     * touched this exact surface, so the flush belongs HERE, at the
+     * point of the raw read, not back in festina_window_present at
+     * present() time. Missing this is exactly the shape of bug that
+     * reads back correct dimensions (the header fields cairo always
+     * keeps current) but stale or blank pixel content until some
+     * unrelated later draw call happens to trigger a flush of its
+     * own. */
+    cairo_surface_flush(g_last_backing);
     int width = cairo_image_surface_get_width(g_last_backing);
     int height = cairo_image_surface_get_height(g_last_backing);
     int stride = cairo_image_surface_get_stride(g_last_backing);
@@ -327,15 +347,47 @@ void festina_window_open(int64_t width, int64_t height, const char *title) {
         rect.origin.y = 0;
         rect.size.width = (CGFloat)width;
         rect.size.height = (CGFloat)height;
+        /* claude.md #180: a real, decorated window -- title bar, and
+         * the standard close/miniaturize/zoom buttons -- rather than
+         * the borderless "canvas, nothing else" look
+         * NSWindowStyleMaskBorderless used to request. Resizable too,
+         * since a normal window's own zoom button and drag-to-resize
+         * both need it -- initWithContentRect: computes the outer frame
+         * FROM this content rect regardless of styleMask, so `rect`
+         * here still means exactly what it always did: the canvas's
+         * own content size, no adjustment needed the way the Win32
+         * backend's own CreateWindowExW/SetWindowPos calls now need
+         * (see that file's own comment). */
         g_window = [[NSWindow alloc] initWithContentRect:rect
-                                                styleMask:NSWindowStyleMaskBorderless
+                                                styleMask:NSWindowStyleMaskTitled
+                                                    | NSWindowStyleMaskClosable
+                                                    | NSWindowStyleMaskMiniaturizable
+                                                    | NSWindowStyleMaskResizable
                                                   backing:NSBackingStoreBuffered
                                                     defer:NO];
         if (!g_window) {
             festina_fail("could not create a macOS window -- claude.md #39's "
                           "graphics functions need a running window server");
         }
+        /* claude.md #180: opts this window into AppKit's own native
+         * fullscreen (the green zoom button's Option-click / menu-bar
+         * "Enter Full Screen" affordance, and what festina_window_
+         * set_fullscreen's [g_window toggleFullScreen:nil] below relies
+         * on) -- a window has to explicitly claim this behavior, it is
+         * not implied by NSWindowStyleMaskResizable alone. */
+        [g_window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
         g_view = [[FestinaView alloc] initWithFrame:rect];
+        /* claude.md #180: the view now needs to actually track the
+         * window's content size as it changes -- previously true only
+         * via festina_window_resize's own explicit setContentSize:
+         * call, but a titled+resizable window can ALSO change size
+         * from the user dragging an edge or clicking zoom/fullscreen,
+         * none of which go through that function at all. Without this,
+         * windowDidResize: below (which reports whatever size [g_view
+         * frame] happens to be) would report a stale size after any
+         * such user-driven resize -- the view's frame does not follow
+         * the window's content size on its own by default. */
+        [g_view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
         NSTrackingArea *tracking = [[NSTrackingArea alloc]
             initWithRect:rect
                  options:NSTrackingMouseMoved | NSTrackingActiveAlways | NSTrackingInVisibleRect
@@ -465,5 +517,32 @@ void festina_window_resize(int64_t width, int64_t height) {
          * implementation of this same function already has. */
         [g_window setContentSize:size];
         [g_window displayIfNeeded];
+    }
+}
+
+/* claude.md #180: AppKit's own native fullscreen -- the same feature
+ * the green zoom button's Option-click, or the Full Screen menu item,
+ * already offer any titled window opted into it (see
+ * NSWindowCollectionBehaviorFullScreenPrimary in festina_window_open
+ * above). toggleFullScreen: is AppKit's ENTIRE API surface for this --
+ * there is no separate enterFullScreen/exitFullScreen selector pair to
+ * call directly, so this checks the window's OWN current styleMask
+ * (rather than trusting a separately-tracked flag that could drift out
+ * of sync with it, e.g. if the user exits fullscreen via Escape or the
+ * menu rather than through Festina's own exitFullscreen()) and only
+ * toggles when that disagrees with what's being asked for -- the same
+ * "no-op if already in the requested state" contract every other
+ * backend's own festina_window_set_fullscreen already has. The resize
+ * this produces reaches windowDidResize: (see the delegate above) the
+ * same way any other AppKit-driven resize does, once the (animated)
+ * transition completes. */
+void festina_window_set_fullscreen(int8_t fullscreen) {
+    @autoreleasepool {
+        if (!g_window) return;
+        BOOL is_full = ([g_window styleMask] & NSWindowStyleMaskFullScreen) != 0;
+        BOOL want_full = fullscreen != 0;
+        if (is_full != want_full) {
+            [g_window toggleFullScreen:nil];
+        }
     }
 }

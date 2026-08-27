@@ -114,6 +114,13 @@ BUILTIN_FUNCTIONS = {
     "translate", "rotate", "scale", "resetTransform",
     "saveState", "restoreState",
     "fillAlpha", "fillLinearGradient", "fillRadialGradient",
+    # claude.md #180: the window now opens fully decorated (title bar,
+    # minimize/maximize/close, like any other window -- claude.md #95's
+    # own "undecorated" language is retired) -- enterFullscreen()/
+    # exitFullscreen() toggle true OS fullscreen on top of that, same
+    # as render() the only two things here that need a real GUI (see
+    # codegen.py's own uses_graphics condition).
+    "enterFullscreen", "exitFullscreen",
     # claude.md #94: single-value queries, so a scalar result needs no
     # throwaway `table` declaration (which would create a real table).
     "sqliteInt", "sqliteFloat", "sqliteText",
@@ -184,7 +191,7 @@ _BUILTIN_RETURN_TYPES = {
     "ls": types_mod.ArrayType(types_mod.PrimitiveType("text")),
     # claude.md #146
     "isAudioPlayerPlaying": types_mod.PrimitiveType("bool"),
-    # claude.md #150/#176: exec() -- NOT here. Its return type depends
+    # claude.md #150/#177: exec() -- NOT here. Its return type depends
     # on which of its two arities is used (1-arg -> int, 2-arg -> void),
     # which this fixed dict can't express -- see _infer_call's own
     # dedicated branch, the same reason setTimeout/saveCanvas aren't
@@ -257,6 +264,9 @@ _BUILTIN_SIGNATURES = {
     "fillAlpha": (_FLOAT,),
     "fillLinearGradient": (_INT, _INT, types_mod.ColorType(), _INT, _INT, types_mod.ColorType()),
     "fillRadialGradient": (_INT, _INT, _INT, types_mod.ColorType(), types_mod.ColorType()),
+    # claude.md #180
+    "enterFullscreen": (),
+    "exitFullscreen": (),
     # claude.md #131
     "close": (_INT,),
     # claude.md #132
@@ -269,7 +279,7 @@ _BUILTIN_SIGNATURES = {
     # stopAudioPlayer's optional one (see _BUILTIN_SIGNATURE_ALTERNATES
     # below) -- there's no sensible "any channel" reading for a query.
     "isAudioPlayerPlaying": (_INT,),
-    # claude.md #150/#176: exec() -- NOT here either, for the identical
+    # claude.md #150/#177: exec() -- NOT here either, for the identical
     # reason it's absent from _BUILTIN_RETURN_TYPES above: its 2-arg
     # form's callback argument needs the same structural (not fixed-
     # type) checking setTimeout's own callback already needs, which
@@ -2943,6 +2953,43 @@ def analyze(program, filename="<string>"):
                 f"'{decl.name}' (amor arr[{types_mod.type_name(declared_type.element)}]) "
                 f"requires an initializer -- write e.g. `amor arr[{types_mod.type_name(declared_type.element)}] "
                 f"{decl.name} = []` for an empty one",
+                file=filename, line=decl.line, column=decl.column,
+                category="invalid declaration",
+            )
+        # claude.md #178 (new entry): a table-typed value is a BORROWED
+        # handle onto one row of a query result (codegen.py's own
+        # `_emit_free`, "TableType (a borrowed query row)") -- unlike
+        # struct, it has never had its own standalone allocation/auto-
+        # vivify story, since every real row it could ever alias
+        # already exists somewhere (an arr[T] the query result built).
+        # `Table t` with no initializer defaults to null exactly like
+        # any other pointer-shaped type -- but codegen's own field-
+        # write path (_member_ptr_from's TableType branch) computes a
+        # plain `getelementptr i8, ptr %obj, i64 idx*8` off that
+        # pointer with no null check at all (unlike struct fields,
+        # which auto-vivify, and unlike enum values, which fail
+        # loudly) -- so the very first `t.field = ...` on one
+        # segfaulted, confirmed directly (SIGSEGV, not a hang or a
+        # clean crash) by actually compiling and running the
+        # reproduction, not just by reading the code. Rejected here
+        # instead of taught to auto-vivify: doing that would mean
+        # inventing real ownership/allocation semantics for TableType
+        # that do not exist anywhere else in this compiler (it is never
+        # retained, released, or freed -- see FreeStmt's own comment),
+        # a materially bigger change than this bug report calls for.
+        # `struct` already has everything a hand-built row needs
+        # (api.md's own "Structs as query targets" section is exactly
+        # this pattern) and needs no such check, since its local
+        # declaration already always allocates real, zeroed storage
+        # immediately (codegen.py's own VarDecl StructType branch).
+        if isinstance(declared_type, types_mod.TableType) and decl.init is None:
+            raise CompileError(
+                f"'{decl.name}' ({declared_type.name}) requires an initializer -- "
+                f"a table row is a borrowed handle onto one row of a query result, "
+                f"never independently constructed (assign an existing row, e.g. "
+                f"`{declared_type.name} {decl.name} = rows[0]`); to build a value "
+                f"by hand, declare a struct with the same fields instead (see "
+                f"api.md's 'Structs as query targets' section)",
                 file=filename, line=decl.line, column=decl.column,
                 category="invalid declaration",
             )

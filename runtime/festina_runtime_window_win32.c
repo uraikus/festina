@@ -183,6 +183,25 @@ static const wchar_t *FESTINA_WIN32_CLASS_NAME = L"FestinaWindowClass";
 
 static HWND g_hwnd = NULL;
 static cairo_surface_t *g_last_backing = NULL;
+/* claude.md #180: Win32 has no single native "fullscreen mode" API the
+ * way AppKit's toggleFullScreen: is -- this backend has to fake it
+ * itself, the well-known "borderless popup sized to the monitor"
+ * recipe (Raymond Chen's "How do I switch a window between full-screen
+ * and windowed?" writes up the exact same shape). g_win32_is_fullscreen
+ * tracks whether it currently has, so festina_window_set_fullscreen can
+ * both no-op a redundant call AND know whether to save (entering) or
+ * restore (exiting) the two fields below. g_prev_style/g_prev_placement
+ * remember exactly what the window looked like right before entering,
+ * so exiting restores it EXACTLY -- not just "some reasonable windowed
+ * size" -- the same way AppKit's own native fullscreen and X11's WM
+ * both remember and restore a window's prior geometry automatically
+ * (something this backend has no such automatic help for). Reset on
+ * festina_window_close (see below) so a closed-then-reopened window in
+ * the same process never inherits stale bookkeeping from a previous
+ * one. */
+static int g_win32_is_fullscreen = 0;
+static LONG g_prev_style = 0;
+static WINDOWPLACEMENT g_prev_placement;
 
 /* claude.md #123: redraw-on-demand is entirely this backend's own
  * concern -- see festina_runtime_window.h's own note. Repaints from
@@ -202,7 +221,24 @@ static cairo_surface_t *g_last_backing = NULL;
  * 4-byte aligned, the one alignment DIBs require), which is also
  * cairo's own ARGB32 stride for every width -- so no separate stride
  * parameter is needed here the way the CGImage path's DataProvider
- * needed one. */
+ * needed one.
+ *
+ * cairo_image_surface_get_data() below is a RAW memory read, entirely
+ * outside cairo's own drawing API -- unlike the X11 backend's own
+ * festina_window_present (which reads g_backing_surface only through
+ * cairo_set_source_surface+cairo_paint, cairo mediating the read the
+ * same way it mediates the write), this reaches straight into the
+ * surface's pixel buffer. Cairo's own documented contract for
+ * cairo_image_surface_get_data() requires a cairo_surface_flush()
+ * first "to ensure that all pending drawing operations are finished"
+ * -- WM_PAINT can fire asynchronously, an arbitrary amount of program
+ * logic (and cairo drawing) after whatever last touched this exact
+ * surface, so the flush belongs HERE, at the point of the raw read,
+ * not back in festina_window_present at present() time. Missing this
+ * is exactly the shape of bug that reads back correct dimensions
+ * (the header fields cairo always keeps current) but stale or blank
+ * pixel content until some unrelated later draw call happens to
+ * trigger a flush of its own. */
 static void festina_win32_paint(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
@@ -213,6 +249,7 @@ static void festina_win32_paint(HWND hwnd) {
         EndPaint(hwnd, &ps);
         return;
     }
+    cairo_surface_flush(g_last_backing);
     int width = cairo_image_surface_get_width(g_last_backing);
     int height = cairo_image_surface_get_height(g_last_backing);
     unsigned char *data = cairo_image_surface_get_data(g_last_backing);
@@ -331,19 +368,33 @@ void festina_window_open(int64_t width, int64_t height, const char *title) {
      * deliberately ignored rather than treated as fatal. */
     RegisterClassExW(&wc);
 
-    /* WS_POPUP: a plain borderless window, no title bar/border/system
-     * menu -- the same "canvas, nothing else" look the X11 backend
-     * requests via the Motif no-decorations hint and the Cocoa backend
-     * requests via NSWindowStyleMaskBorderless. With no border, the
-     * requested width/height IS the client size, matching both other
-     * backends' own convention of passing content size directly. */
+    /* claude.md #180: WS_OVERLAPPEDWINDOW -- a real, decorated window
+     * (title bar, system menu, and the standard minimize/maximize/close
+     * buttons, resizable by dragging an edge) -- rather than the
+     * borderless "canvas, nothing else" look WS_POPUP used to request
+     * (the same change the X11 backend's Motif hints and the Cocoa
+     * backend's styleMask both make, see their own comments). Unlike
+     * WS_POPUP, the window's OUTER size (what CreateWindowExW's own
+     * width/height parameters mean) is no longer the same as its
+     * client size once real chrome exists around it -- AdjustWindowRect
+     * converts the requested CONTENT size into the outer size this
+     * call actually needs, so `width`/`height` here keep meaning
+     * exactly what they always did to callers (the canvas's own
+     * content size), matching X11/Cocoa's own convention where the
+     * window manager/AppKit handles that translation invisibly instead
+     * (see festina_window_resize's own updated comment below for the
+     * same adjustment on the resize path). */
+    RECT outer = {0, 0, (int)width, (int)height};
+    AdjustWindowRect(&outer, WS_OVERLAPPEDWINDOW, FALSE);
+
     int wtitle_len = MultiByteToWideChar(CP_UTF8, 0, title, -1, NULL, 0);
     wchar_t *wtitle = malloc((size_t)wtitle_len * sizeof(wchar_t));
     if (wtitle) MultiByteToWideChar(CP_UTF8, 0, title, -1, wtitle, wtitle_len);
 
     g_hwnd = CreateWindowExW(0, FESTINA_WIN32_CLASS_NAME, wtitle ? wtitle : L"Festina",
-                              WS_POPUP, CW_USEDEFAULT, CW_USEDEFAULT,
-                              (int)width, (int)height, NULL, NULL, instance, NULL);
+                              WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                              outer.right - outer.left, outer.bottom - outer.top,
+                              NULL, NULL, instance, NULL);
     free(wtitle);
     if (!g_hwnd) {
         festina_fail("could not create a Windows window -- claude.md #39's "
@@ -353,6 +404,10 @@ void festina_window_open(int64_t width, int64_t height, const char *title) {
     g_last_backing = NULL;
     g_pending_head = 0;
     g_pending_count = 0;
+    /* claude.md #180: a fresh HWND is never fullscreen yet, regardless
+     * of whatever a PREVIOUS window in this same process left behind --
+     * see this flag's own comment at its declaration. */
+    g_win32_is_fullscreen = 0;
 
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateWindow(g_hwnd);
@@ -366,6 +421,10 @@ void festina_window_close(void) {
         g_hwnd = NULL;
     }
     g_last_backing = NULL;
+    /* claude.md #180: see g_win32_is_fullscreen's own comment -- stale
+     * bookkeeping from this HWND must not leak into whatever HWND a
+     * later festina_window_open creates. */
+    g_win32_is_fullscreen = 0;
 }
 
 void festina_window_present(cairo_surface_t *backing) {
@@ -431,11 +490,66 @@ void festina_window_resize(int64_t width, int64_t height) {
     /* SWP_NOMOVE | SWP_NOZORDER: change only the size, leaving the
      * window's position and stacking order untouched -- x/y are
      * ignored by Win32 when SWP_NOMOVE is set, so 0/0 below is a
-     * don't-care placeholder, not an actual move to the origin. With
-     * WS_POPUP (no border, see festina_window_open's own comment on
-     * why), the window's outer size IS its client size, so `width`/
-     * `height` here need no adjustment the way a bordered window's
-     * AdjustWindowRect would require. */
-    SetWindowPos(g_hwnd, NULL, 0, 0, (int)width, (int)height,
+     * don't-care placeholder, not an actual move to the origin.
+     *
+     * claude.md #180: with WS_OVERLAPPEDWINDOW's real chrome (unlike
+     * the borderless WS_POPUP this used to be), the window's outer size
+     * is no longer its client size -- AdjustWindowRect converts the
+     * requested CONTENT size into the outer size SetWindowPos actually
+     * needs, the identical adjustment festina_window_open's own
+     * CreateWindowExW call now makes (see its own comment). Reads the
+     * window's CURRENT style rather than hardcoding WS_OVERLAPPEDWINDOW,
+     * so this keeps behaving correctly even if called while the window
+     * happens to be in fullscreen's own temporary WS_POPUP state. */
+    RECT outer = {0, 0, (int)width, (int)height};
+    AdjustWindowRect(&outer, (DWORD)GetWindowLongW(g_hwnd, GWL_STYLE), FALSE);
+    SetWindowPos(g_hwnd, NULL, 0, 0, outer.right - outer.left, outer.bottom - outer.top,
                  SWP_NOMOVE | SWP_NOZORDER);
+}
+
+/* claude.md #180: Win32 has no single native fullscreen API -- this is
+ * the well-known "borderless popup sized to the monitor" recipe (see
+ * g_win32_is_fullscreen's own comment at its declaration for the full
+ * rationale). Entering: remember the current style and placement
+ * (GetWindowPlacement, not just the window rect -- it also captures
+ * whether the window was maximized, which a plain rect can't), switch
+ * to a borderless popup, then resize/move to exactly cover the monitor
+ * this window is currently on. Exiting: restore both, in that order --
+ * the style has to be a normal, decorated one again BEFORE
+ * SetWindowPlacement repositions it, since SetWindowPlacement's own
+ * restore behavior depends on the window already being a kind that CAN
+ * be un-maximized/positioned normally. SWP_FRAMECHANGED on every
+ * SetWindowPos here is required whenever GWL_STYLE changes -- without
+ * it Win32 caches the old frame and the visible chrome doesn't actually
+ * update to match. A no-op if already in the requested state, the same
+ * guard every other backend's own festina_window_set_fullscreen
+ * already has. */
+void festina_window_set_fullscreen(int8_t fullscreen) {
+    if (!g_hwnd) return;
+    int want_full = fullscreen != 0;
+    if (want_full == g_win32_is_fullscreen) return;
+
+    if (want_full) {
+        g_prev_style = GetWindowLongW(g_hwnd, GWL_STYLE);
+        g_prev_placement.length = sizeof(g_prev_placement);
+        GetWindowPlacement(g_hwnd, &g_prev_placement);
+
+        MONITORINFO mi;
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            SetWindowLongW(g_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+            SetWindowPos(g_hwnd, HWND_TOP,
+                         mi.rcMonitor.left, mi.rcMonitor.top,
+                         mi.rcMonitor.right - mi.rcMonitor.left,
+                         mi.rcMonitor.bottom - mi.rcMonitor.top,
+                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            g_win32_is_fullscreen = 1;
+        }
+    } else {
+        SetWindowLongW(g_hwnd, GWL_STYLE, g_prev_style);
+        SetWindowPos(g_hwnd, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        SetWindowPlacement(g_hwnd, &g_prev_placement);
+        g_win32_is_fullscreen = 0;
+    }
 }

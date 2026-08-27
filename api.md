@@ -1128,12 +1128,50 @@ on close()                 { ... }
 **Drawing is offscreen. `render()` puts it on screen.**
 
 Every drawing call paints an offscreen canvas that needs no display at
-all. `render()` is the one call that shows it, opening a real X11 window
-(via Cairo's Xlib backend) the first time it runs — undecorated, 800×600.
-Declaring one of the seven event handlers opens a window too, since they
-can't fire without one. After the entry file's top-level code finishes,
-if a window was opened, the process blocks handling redraws/input until
-the window closes.
+all. `render()` is the one call that shows it, opening a real, decorated
+window (title bar, and the OS's normal minimize/maximize/close controls
+— like any other window, resizable by dragging an edge) the first time
+it runs — 800×600 by default. Declaring one of the seven event handlers
+means a window
+will exist too, since they can't fire without one — but not necessarily
+*at that point*: if the entry file never itself calls `render()`, the
+window instead opens lazily right after the entry file's own top-level
+code finishes, just before the process starts blocking on redraws/input.
+Either way, whatever `clientWidth`/`clientHeight` (or `setClientWidth`/
+`setClientHeight`, below) already are BY THEN is the size the window
+opens at — see `setClientWidth`/`setClientHeight`'s own note just below
+for why this matters. After the entry file's top-level code finishes, if
+a window was opened, the process blocks handling redraws/input until the
+window closes.
+
+**Event handlers are active as soon as they're declared, regardless of
+where in the file that is** — the same hoisting `text func`/`void func`
+declarations already get (see "Functions are hoisted" above), applied
+to `on ...` too. `setClientWidth`/`setClientHeight` fire `on resize`
+*synchronously, inline*, at the point they're called — not later, and
+not only once the entry file has finished running top to bottom — so a
+call to either one, anywhere above an `on resize` handler that reads
+global state initialized further down the file, can run that handler
+against state that hasn't been set up yet:
+
+```festina
+render()
+setClientWidth(400)     // on resize fires HERE, inline
+
+arr[int] data = [1, 2, 3]   // this hasn't run yet when it fires
+on resize() {
+    log(data.length)        // reads 0, not 3
+}
+```
+
+Nothing about this is specific to `resize` — every event handler is
+registered before the entry file's own top-level code runs at all
+(mouse/key events simply can't fire that early in practice, since
+they need real user input after a window exists, but `on resize` can
+be triggered programmatically by the very first line of the file).
+The fix is ordinary top-to-bottom discipline: declare a handler, and
+initialize whatever global state it reads, before any call that could
+plausibly trigger it.
 
 That split means two useful things:
 
@@ -1208,6 +1246,55 @@ render()
 setClientWidth(1024)   // window resizes; on resize fires once
 setClientHeight(768)   // fires again
 ```
+
+**Calling either one *before* any window exists just picks the
+window's initial size** — it opens directly at whatever `clientWidth`/
+`clientHeight` already are by then, not the 800×600 default, and `on
+resize` does not fire (there's no real resize, since the window never
+existed at any other size to begin with):
+
+```festina
+on resize() {
+    log('resized')   // never runs for the two lines below
+}
+
+setClientWidth(1024)    // no window yet -- just updates clientWidth
+setClientHeight(700)    // same
+render()                 // opens directly at 1024x700
+```
+
+This is the reasonable, documented pattern — set the size you want,
+*then* start drawing — and it behaves exactly like you'd expect: no
+window flashes open at the 800×600 default first and then jumps to the
+requested size a moment later.
+
+**`enterFullscreen()`/`exitFullscreen()`** toggle true OS fullscreen —
+the window covers the whole screen, decorations included, exactly like
+using the OS's own fullscreen control (macOS's green zoom button,
+double-clicking a Windows title bar's maximize equivalent, or an X11
+window manager's own fullscreen keybinding) would. Calling either one
+before the window has ever opened just picks the window's initial
+state, the same as `setClientWidth`/`setClientHeight` above — a program
+that wants to launch straight into fullscreen calls `enterFullscreen()`
+before its first `render()`, and never sees a normal window at all:
+
+```festina
+enterFullscreen()
+drawRect(0, 0, 100, 100)
+render()                 // opens directly in fullscreen
+```
+
+Unlike `setClientWidth`/`setClientHeight`, the resulting size change is
+**not** immediate — entering or exiting fullscreen is a real negotiation
+with the OS/window manager, not something Festina does to itself, so
+`clientWidth`/`clientHeight` (and `on resize`, if declared) only update
+once that negotiation finishes, on the next pass through the event
+loop — not synchronously at the `enterFullscreen()`/`exitFullscreen()`
+call site the way `setClientWidth` is. Calling `enterFullscreen()` while
+already fullscreen (or `exitFullscreen()` while not) is a no-op.
+Exiting always restores the exact window the program had immediately
+before entering — same size and position, not just "some reasonable
+windowed size".
 
 ### Mouse events
 
