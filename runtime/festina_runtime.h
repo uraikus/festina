@@ -500,9 +500,11 @@ char *festina_regex_replace(void *compiled, const char *text,
  * (see the "Timers" note further down -- it handles both graphics and
  * timer events, not just graphics despite its history) is the blocking
  * event loop while a window is open (Expose -> repaint from the
- * backing store, ButtonPress -> the registered click handler if any,
- * MotionNotify -> the registered mouse handler if any, KeyPress -> the
- * registered key handler if any, ConfigureNotify with a genuine size
+ * backing store, ButtonPress -> the registered click handler if any
+ * (buttons 4/5 -> the registered scroll-wheel handler instead, see
+ * claude.md #181), MotionNotify -> the registered mouse handler if
+ * any, KeyPress -> the registered key handler if any, ConfigureNotify
+ * with a genuine size
  * change -> resize the backing store and call the registered resize
  * handler if any, the window's close button -> call the registered
  * close handler if any, then return). claude.md #178 (uraikus/
@@ -517,8 +519,9 @@ char *festina_regex_replace(void *compiled, const char *text,
  * never itself calls render()) -- either way, only ever reached when
  * the program actually uses a graphics function, references
  * clientWidth/clientHeight, calls enterFullscreen()/exitFullscreen(),
- * or declares an `on mouseDown`/`mouseUp`/`mouse`/`key`/`resize`/
- * `close` handler (see CodeGen.uses_graphics in festina/codegen.py) --
+ * or declares an `on mouseDown`/`mouseUp`/`mouse`/`mouseWheelUp`/
+ * `mouseWheelDown`/`key`/`resize`/`close` handler (see
+ * CodeGen.uses_graphics in festina/codegen.py) --
  * a program that doesn't never opens a window, exactly like
  * festina_db_open() only ever runs for a program that declares a
  * `table`.
@@ -532,8 +535,9 @@ char *festina_regex_replace(void *compiled, const char *text,
  * blob out of a database column has no extension, and an extension was
  * never evidence of anything anyway.
  *
- * festina_register_mouse_down_handler/_mouse_up_handler/_mouse_handler
- * take a fixed `void (*)(int64_t, int64_t)` signature,
+ * festina_register_mouse_down_handler/_mouse_up_handler/_mouse_handler/
+ * _mouse_wheel_up_handler/_mouse_wheel_down_handler take a fixed
+ * `void (*)(int64_t, int64_t)` signature,
  * festina_register_key_down_handler/_key_up_handler take a fixed
  * `void (*)(const char *)` signature, and
  * festina_register_resize_handler/_close_handler take a fixed
@@ -541,7 +545,7 @@ char *festina_regex_replace(void *compiled, const char *text,
  * #40's own worked example declares for that event exactly
  * (`on mouseDown(x:int, y:int)`, `on keyDown(key:text)`, `on resize()`,
  * ...); festina/semantic.py's _EVENT_SIGNATURES enforces that any
- * handler for one of these seven names is actually declared that way
+ * handler for one of these nine names is actually declared that way
  * before codegen ever emits a call here, so a mismatch would otherwise
  * be a silent ABI mismatch rather than a caught compile error. Both key
  * handlers' text comes from the same festina_key_name helper --
@@ -770,10 +774,21 @@ int64_t festina_measure_text_height(const char *text);
  * same split claude.md #98 made for the keyboard and for the same
  * reason -- a click is a press and a release, and dragging needs to
  * tell them apart. Both take the same fixed signature and both report
- * the pointer position at the moment the button changed state. */
-void festina_register_mouse_down_handler(void (*handler)(int64_t, int64_t));
-void festina_register_mouse_up_handler(void (*handler)(int64_t, int64_t));
+ * the pointer position at the moment the button changed state, plus
+ * (claude.md #182) which button -- see FestinaWindowEvent's own doc
+ * comment in festina_runtime_window.h for the numbering convention.
+ * `on mouse` (continuous movement) has no button of its own to report,
+ * so it keeps the plain 2-argument signature. */
+void festina_register_mouse_down_handler(void (*handler)(int64_t, int64_t, int64_t));
+void festina_register_mouse_up_handler(void (*handler)(int64_t, int64_t, int64_t));
 void festina_register_mouse_handler(void (*handler)(int64_t, int64_t));
+/* claude.md #181: the scroll wheel, split by direction the same way
+ * mouseDown/mouseUp are split by press/release -- see semantic.py's
+ * _EVENT_SIGNATURES' own comment. Same fixed `(x, y)` signature as the
+ * three mouse handlers just above (the pointer's position at the
+ * moment of the scroll). */
+void festina_register_mouse_wheel_up_handler(void (*handler)(int64_t, int64_t));
+void festina_register_mouse_wheel_down_handler(void (*handler)(int64_t, int64_t));
 /* claude.md #98: `on key` became `on keyDown` + `on keyUp`, so what
  * was one registration is now two -- both taking the same fixed
  * `void (*)(const char *)` signature and both fed the same key name,
@@ -792,6 +807,11 @@ int64_t festina_client_height(void);
  * own comments on festina_set_client_size for the full design. */
 int64_t festina_screen_width(void);
 int64_t festina_screen_height(void);
+/* claude.md #181: devicePixelRatio -- through the windowing seam's own
+ * festina_window_device_pixel_ratio, the same "answers even with no
+ * window open" shape as festina_screen_width/_height just above. See
+ * festina_runtime_window.h's own doc comment for the full design. */
+double festina_device_pixel_ratio(void);
 void festina_set_client_width(int64_t width);
 void festina_set_client_height(int64_t height);
 /* claude.md #180: enterFullscreen()/exitFullscreen() -- toggles true OS
@@ -802,6 +822,13 @@ void festina_set_client_height(int64_t height);
  * festina_exit_fullscreen for the full design. */
 void festina_enter_fullscreen(void);
 void festina_exit_fullscreen(void);
+/* claude.md #182: showCursor()/hideCursor() -- toggles the mouse
+ * cursor's visibility over the canvas, through the windowing seam's own
+ * festina_window_set_cursor_visible. See
+ * festina_runtime_graphics.c's own comments on festina_show_cursor/
+ * festina_hide_cursor for the full design. */
+void festina_show_cursor(void);
+void festina_hide_cursor(void);
 
 /*
  * setTimeout/setInterval/clearTimeout/clearInterval -- claude.md #69.

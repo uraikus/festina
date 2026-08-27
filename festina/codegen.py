@@ -40,7 +40,7 @@ below), regex()/.test()/.match()/.replace() (POSIX
 extended regular expressions via the festina_runtime C helpers -- no
 bundled regex engine, see festina_runtime.h's doc comment on why),
 img/drawRect/drawCircle/drawText/drawImage/`on mouseDown`/`on
-mouseUp`/`on mouse` (a
+mouseUp`/`on mouse`/`on mouseWheelUp`/`on mouseWheelDown` (a
 real X11 window rendered via Cairo -- see the "Graphics" note below),
 setTimeout/setInterval/clearTimeout/clearInterval (see the "Timers"
 note below), and aud/loadAudio()/.play()/.stop()/.isPlaying() (a real
@@ -56,7 +56,8 @@ Cairo's Xlib surface backend), not a file written to disk -- "Graphics
 are backed by Cairo" plus #40's mouse events firing against "the
 canvas" only make sense together as an actual window. Opened lazily
 (CodeGen.uses_graphics, set by any draw* call or an `on
-mouseDown`/`on mouseUp`/`on mouse` handler, but deliberately NOT by loadImage() alone -- decoding a
+mouseDown`/`on mouseUp`/`on mouse`/`on mouseWheelUp`/`on mouseWheelDown`
+handler, but deliberately NOT by loadImage() alone -- decoding a
 PNG needs no window; see _emit_graphics_call's own note) in main()
 before __festina_main() runs, exactly
 the same "only pay for what you use" pattern uses_sqlite already
@@ -70,8 +71,8 @@ a fixed 800x600 and every shape/text draws in solid black -- claude.md
 has no syntax for declaring a size or a color, so both are
 implementation-defined defaults, not derived from the spec; the size
 can change afterwards, though, if the window is resized (see `on
-resize` below). `on mouseDown`/`on mouseUp`/`on mouse`/`on key`/`on
-resize`/`on close`
+resize` below). `on mouseDown`/`on mouseUp`/`on mouse`/`on
+mouseWheelUp`/`on mouseWheelDown`/`on key`/`on resize`/`on close`
 each compile to a real function (_emit_event_handler) registered with
 the runtime as a fixed-signature function pointer (see
 _EVENT_SIGNATURES in semantic.py, and festina_runtime.h's declarations,
@@ -1558,6 +1559,10 @@ class CodeGen:
             "declare void @festina_register_mouse_down_handler(ptr)",
             "declare void @festina_register_mouse_up_handler(ptr)",
             "declare void @festina_register_mouse_handler(ptr)",
+            # claude.md #181: the scroll wheel, split by direction --
+            # see _EVENT_SIGNATURES' own comment in semantic.py.
+            "declare void @festina_register_mouse_wheel_up_handler(ptr)",
+            "declare void @festina_register_mouse_wheel_down_handler(ptr)",
             # claude.md #98: `on key` became `on keyDown` + `on keyUp`.
             "declare void @festina_register_key_down_handler(ptr)",
             "declare void @festina_register_key_up_handler(ptr)",
@@ -1577,11 +1582,16 @@ class CodeGen:
             # claude.md #139
             "declare i64 @festina_screen_width()",
             "declare i64 @festina_screen_height()",
+            # claude.md #181
+            "declare double @festina_device_pixel_ratio()",
             "declare void @festina_set_client_width(i64)",
             "declare void @festina_set_client_height(i64)",
             # claude.md #180
             "declare void @festina_enter_fullscreen()",
             "declare void @festina_exit_fullscreen()",
+            # claude.md #182
+            "declare void @festina_show_cursor()",
+            "declare void @festina_hide_cursor()",
             # claude.md #69: setTimeout/setInterval/clearTimeout/clearInterval
             # -- see the module docstring's "Timers" note.
             "declare i64 @festina_set_timeout(ptr, i64)",
@@ -2354,15 +2364,17 @@ class CodeGen:
         ordinary callable -- an event handler is a listener, not
         something Festina code calls by name) exactly like _emit_func,
         minus a return type (event handlers never return a value).
-        mouseDown/mouseUp/mouse/key/resize/close additionally get
+        mouseDown/mouseUp/mouse/mouseWheelUp/mouseWheelDown/key/resize/
+        close additionally get
         registered with the runtime as a function pointer (see
         festina_runtime.h's doc comment on
         festina_register_mouse_down_handler/_mouse_up_handler/_mouse_handler/
-        _key_handler/_resize_handler/_close_handler) -- the only event
+        _mouse_wheel_up_handler/_mouse_wheel_down_handler/_key_handler/
+        _resize_handler/_close_handler) -- the only event
         sources this runtime actually generates (claude.md #40's own
         examples; semantic.py's _EVENT_SIGNATURES enforces the fixed
         signature each one needs, matching the runtime's fixed function
-        pointer type for it). claude.md #131: `exit` is a seventh
+        pointer type for it). claude.md #131: `exit` is a ninth
         recognized name, but not a graphics event -- it fires from the
         close(code) builtin (see _emit_call's own "close" branch),
         which works with or without a window, so its registration is
@@ -2396,8 +2408,8 @@ class CodeGen:
         self.func_defs.extend(func)
         self.func_defs.append("")
 
-        if decl.name in ("mouseDown", "mouseUp", "mouse", "keyDown", "keyUp",
-                          "resize", "close"):
+        if decl.name in ("mouseDown", "mouseUp", "mouse", "mouseWheelUp", "mouseWheelDown",
+                          "keyDown", "keyUp", "resize", "close"):
             self.uses_graphics = True
             self.event_handlers[decl.name] = symbol
         elif decl.name == "exit":
@@ -3734,6 +3746,18 @@ class CodeGen:
                 out = self.tmp()
                 lines.append(f"  {out} = call i64 @{fn}()")
                 return out, INT
+            # claude.md #181: devicePixelRatio -- the display's own
+            # pixel density, exactly the same "needs a live connection,
+            # uses_graphics_code only" shape as screenWidth/screenHeight
+            # just above (a display property, not the in-memory canvas
+            # size clientWidth/clientHeight answer), just float-typed
+            # rather than int since a ratio like 1.5 is meaningful here
+            # in a way a pixel count never is.
+            if expr.name == "devicePixelRatio":
+                self.uses_graphics_code = True
+                out = self.tmp()
+                lines.append(f"  {out} = call double @festina_device_pixel_ratio()")
+                return out, FLOAT
             if expr.name in self.func_decls:
                 # claude.md #141: a bare reference to a function's own
                 # NAME, not immediately called -- the function's own
@@ -8417,6 +8441,15 @@ class CodeGen:
                 # things here that need a GUI, below.
                 "enterFullscreen": ("festina_enter_fullscreen", []),
                 "exitFullscreen": ("festina_exit_fullscreen", []),
+                # claude.md #182: showCursor()/hideCursor() -- unlike
+                # render()/enterFullscreen()/exitFullscreen() just
+                # above, these don't force a window open: a cursor is
+                # meaningless with none, so calling either before one
+                # exists just records the desired state (see
+                # g_cursor_hidden's own comment in
+                # festina_runtime_graphics.c) for whenever one does.
+                "showCursor": ("festina_show_cursor", []),
+                "hideCursor": ("festina_hide_cursor", []),
             }
             if name in _CANVAS_OPS:
                 fn, arg_irs = _CANVAS_OPS[name]
@@ -10180,6 +10213,8 @@ class CodeGen:
             register_fn = {"mouseDown": "festina_register_mouse_down_handler",
                             "mouseUp": "festina_register_mouse_up_handler",
                             "mouse": "festina_register_mouse_handler",
+                            "mouseWheelUp": "festina_register_mouse_wheel_up_handler",
+                            "mouseWheelDown": "festina_register_mouse_wheel_down_handler",
                             "keyDown": "festina_register_key_down_handler",
                             "keyUp": "festina_register_key_up_handler",
                             "resize": "festina_register_resize_handler",

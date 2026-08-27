@@ -1113,16 +1113,19 @@ clearPixel(10, 10)                        // erase one pixel to transparent
 log(`canvas is ${clientWidth}x${clientHeight}`)
 
 log(`screen is ${screenWidth}x${screenHeight}`)  // the physical display, read-only
+log(`device pixel ratio is ${devicePixelRatio}`) // 1.0 normally, ~2.0 on Retina/HiDPI
 setClientWidth(1024)                             // resizes the canvas (and window, if open)
 setClientHeight(768)
 
-on mouseDown(x:int, y:int) { ... }
-on mouseUp(x:int, y:int)   { ... }
-on mouse(x:int, y:int)     { ... }
-on keyDown(key:text)       { ... }
-on keyUp(key:text)         { ... }
-on resize()                { ... }
-on close()                 { ... }
+on mouseDown(x:int, y:int, button:int) { ... }
+on mouseUp(x:int, y:int, button:int)   { ... }
+on mouse(x:int, y:int)         { ... }
+on mouseWheelUp(x:int, y:int)  { ... }
+on mouseWheelDown(x:int, y:int){ ... }
+on keyDown(key:text)           { ... }
+on keyUp(key:text)             { ... }
+on resize()                    { ... }
+on close()                     { ... }
 ```
 
 **Drawing is offscreen. `render()` puts it on screen.**
@@ -1131,7 +1134,7 @@ Every drawing call paints an offscreen canvas that needs no display at
 all. `render()` is the one call that shows it, opening a real, decorated
 window (title bar, and the OS's normal minimize/maximize/close controls
 — like any other window, resizable by dragging an edge) the first time
-it runs — 800×600 by default. Declaring one of the seven event handlers
+it runs — 800×600 by default. Declaring one of the nine event handlers
 means a window
 will exist too, since they can't fire without one — but not necessarily
 *at that point*: if the entry file never itself calls `render()`, the
@@ -1233,6 +1236,16 @@ reading them still needs an X server (there's no window yet to answer
 from, and no other way to ask "how big is the screen"), so this is one
 of the few graphics reads that fails without a display.
 
+**`devicePixelRatio`** reports how many actual device pixels back one
+canvas pixel — `1.0` on a standard display, typically `2.0` (or a
+fractional value like `1.5`) on a Retina/HiDPi one. Read-only, same
+"needs a display" requirement as `screenWidth`/`screenHeight` just
+above, since it's a property of the physical display too. Purely
+informational — the canvas itself is never actually rendered at the
+higher resolution, so this doesn't change how big anything you draw
+appears; it just tells a program what's true about the display it's
+running on, the same way `screenWidth`/`screenHeight` do.
+
 **`setClientWidth(int)`/`setClientHeight(int)`** resize the canvas —
 and the real OS window too, if one is already open. Both apply
 immediately: `setClientWidth(400)` is followed by `clientWidth` already
@@ -1296,11 +1309,30 @@ Exiting always restores the exact window the program had immediately
 before entering — same size and position, not just "some reasonable
 windowed size".
 
+**`showCursor()`/`hideCursor()`** toggle the mouse cursor's visibility
+over the canvas — useful for a game that draws its own cursor/reticle,
+or one that just doesn't want the OS pointer cluttering the screen.
+Unlike `render()`/`enterFullscreen()`/`exitFullscreen()`, neither forces
+a window open — a cursor is meaningless without one, so calling either
+before the window exists just records the desired state for whenever it
+does, the same "picks the initial state" pattern `setClientWidth`/
+`enterFullscreen` already have:
+
+```festina
+hideCursor()
+drawImage(reticle, mouseX - 8, mouseY - 8)   // your own cursor instead
+render()
+```
+
+Calling `hideCursor()` while already hidden (or `showCursor()` while
+already shown) is a no-op.
+
 ### Mouse events
 
 `on mouseDown` fires when a button goes down, `on mouseUp` when it comes
 back up, and `on mouse` continuously while the pointer moves. All three
-report the pointer position at the moment the event happened.
+report the pointer position at the moment the event happened;
+`mouseDown`/`mouseUp` also report *which* button.
 
 A click is a press *and* a release, and they are separate events for the
 same reason `keyDown` and `keyUp` are: holding the button down and
@@ -1311,16 +1343,43 @@ see both ends of it.
 int startX = 0
 int startY = 0
 
-on mouseDown(x:int, y:int) { startX = x  startY = y }
-on mouseUp(x:int, y:int)   { log(`dragged ${x - startX}, ${y - startY}`) }
+on mouseDown(x:int, y:int, button:int) { startX = x  startY = y }
+on mouseUp(x:int, y:int, button:int)   { log(`dragged ${x - startX}, ${y - startY}`) }
 ```
 
 Press and release report *different* coordinates whenever the pointer
 moved in between — that difference is the drag. A program that only
 wants "was clicked" can just use `on mouseDown` and ignore the release.
 
-Which button was pressed is not reported; every button dispatches the
-same handler.
+`button` is `1` for the left button, `2` for middle, `3` for right, `8`
+for back and `9` for forward (on a mouse that has them) — any other
+physical button reports its own platform-specific number, best-effort.
+`on mouse` (continuous movement) has no button of its own to report, so
+it stays a plain `(x:int, y:int)`.
+
+```festina
+on mouseDown(x:int, y:int, button:int) {
+    if button == 1 { log('left click') }
+    if button == 3 { log('right click, e.g. for a context menu') }
+}
+```
+
+**`on mouseWheelUp`/`on mouseWheelDown`** fire once per scroll wheel
+notch (or, on a trackpad, once per equivalent step of a two-finger
+scroll), split by direction the same way `mouseDown`/`mouseUp` are
+split by press/release rather than one combined event. Both report the
+pointer's position at the moment of the scroll, the same convention as
+every other mouse event above — but, unlike `mouseDown`/`mouseUp`, no
+button, since the wheel isn't one:
+
+```festina
+on mouseWheelUp(x:int, y:int)   { log(`zoom in at ${x}, ${y}`) }
+on mouseWheelDown(x:int, y:int) { log(`zoom out at ${x}, ${y}`) }
+```
+
+How far one scroll "step" is is up to the OS/input device, not
+something a program can read — there's no delta or magnitude, only
+direction.
 
 ### Keyboard events
 

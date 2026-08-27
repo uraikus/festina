@@ -104,8 +104,11 @@ class TestEventHandlers:
     @pytest.mark.parametrize("name", ["mouseDown", "mouseUp"])
     def test_mouse_button_handlers_parse_and_analyze(self, parser, semantic, name):
         # claude.md #106: `on click` split into two, the same way
-        # claude.md #98 split `on key`.
-        source = f"on {name}(x:int, y:int) {{\n    log(x)\n}}"
+        # claude.md #98 split `on key`. claude.md #182: `button` is a
+        # third, required argument -- `mouse` (continuous movement,
+        # tested separately below) has no button of its own to report,
+        # so it keeps the plain 2-argument signature.
+        source = f"on {name}(x:int, y:int, button:int) {{\n    log(x)\n}}"
         program = parser.parse(source)
         semantic.analyze(program)
 
@@ -158,7 +161,39 @@ class TestEventHandlers:
 
     @pytest.mark.parametrize("name", ["mouseDown", "mouseUp", "mouse"])
     def test_wrong_parameter_type_is_a_compile_error(self, parser, semantic, errors, name):
-        source = f"on {name}(x:text, y:int) {{\n    log(x)\n}}"
+        # claude.md #182: mouseDown/mouseUp need the (otherwise correct
+        # arity) trailing button:int too, so the wrong TYPE on x is the
+        # only thing tripping the check, not a conflated wrong arity --
+        # `mouse` has no button argument at all, so it keeps its plain
+        # 2-argument form.
+        params = "x:text, y:int, button:int" if name != "mouse" else "x:text, y:int"
+        source = f"on {name}({params}) {{\n    log(x)\n}}"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match=name):
+            semantic.analyze(program)
+
+    @pytest.mark.parametrize("name", ["mouseDown", "mouseUp"])
+    def test_mouse_button_handler_now_requires_button_argument(self, parser, semantic, errors, name):
+        # claude.md #182's own regression: the OLD, pre-#182 2-argument
+        # form (still correct for `mouse`, which has no button of its
+        # own) is now rejected for mouseDown/mouseUp specifically.
+        source = f"on {name}(x:int, y:int) {{\n    log(x)\n}}"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match=name):
+            semantic.analyze(program)
+
+    @pytest.mark.parametrize("name", ["mouseWheelUp", "mouseWheelDown"])
+    def test_mouse_wheel_handlers_parse_and_analyze(self, parser, semantic, name):
+        # claude.md #181: split by direction, the same way mouseDown/
+        # mouseUp are split by press/release rather than one combined
+        # event -- see semantic.py's _EVENT_SIGNATURES' own comment.
+        source = f"on {name}(x:int, y:int) {{\n    log(x)\n}}"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    @pytest.mark.parametrize("name", ["mouseWheelUp", "mouseWheelDown"])
+    def test_mouse_wheel_wrong_parameter_count_is_a_compile_error(self, parser, semantic, errors, name):
+        source = f"on {name}(x:int) {{\n    log(x)\n}}"
         program = parser.parse(source)
         with pytest.raises(errors.CompileError, match=name):
             semantic.analyze(program)
@@ -264,6 +299,44 @@ class TestScreenSize:
         program = parser.parse(f"int {name} = 5")
         with pytest.raises(errors.CompileError, match="already declared"):
             semantic.analyze(program)
+
+
+class TestDevicePixelRatio:
+    """claude.md #181: devicePixelRatio -- a read-only global, same
+    registration shape as screenWidth/screenHeight just above (a
+    physical-display property, not the in-memory canvas size
+    clientWidth/clientHeight answer) -- except FLOAT-typed, not int,
+    since a ratio like 1.5 is meaningful here in a way a pixel count
+    never is. See semantic.py's _DEVICE_PIXEL_RATIO_GLOBALS."""
+
+    def test_device_pixel_ratio_is_a_valid_float_identifier(self, parser, semantic, types_mod):
+        program = parser.parse("float r = devicePixelRatio")
+        analyzed = semantic.analyze(program)
+        assert analyzed.symbols["r"].type == types_mod.PrimitiveType("float")
+
+    def test_usable_inside_a_template_literal(self, parser, semantic):
+        source = "log(`ratio: ${devicePixelRatio}`)"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_assigning_to_it_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("devicePixelRatio = 2.0")
+        with pytest.raises(errors.CompileError, match="read-only"):
+            semantic.analyze(program)
+
+    def test_declaring_a_variable_with_the_same_name_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("float devicePixelRatio = 1.0")
+        with pytest.raises(errors.CompileError, match="already declared"):
+            semantic.analyze(program)
+
+    def test_mixing_with_int_promotes_to_float(self, parser, semantic, types_mod):
+        # claude.md #55: int and float never mix directly -- reading
+        # devicePixelRatio into an arithmetic expression with an int
+        # should promote the whole thing to float, the same rule any
+        # other float-typed value already follows.
+        program = parser.parse("float scaled = devicePixelRatio * 2")
+        analyzed = semantic.analyze(program)
+        assert analyzed.symbols["scaled"].type == types_mod.PrimitiveType("float")
 
 
 class TestSetClientSize:

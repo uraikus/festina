@@ -1439,7 +1439,7 @@ class TestPlatformAndWasmGating:
         src.write_text(
             "openPort(8080)\n"
             "on request(req:http) { req.ok() }\n"
-            "on mouseDown(x:int, y:int) { }\n",
+            "on mouseDown(x:int, y:int, button:int) { }\n",
             encoding="utf-8",
         )
         compile_file_or_skip(cli_mod, str(src), str(tmp_path / "out"), cc="clang")  # no raise
@@ -1576,7 +1576,7 @@ class TestGraphicsAndHttp:
         source = (
             f"openPort({port})\n"
             "on request(req:http) { req.send({'code': 200, 'body': 'ok'}) }\n"
-            "on mouseDown(x:int, y:int) { log(`down ${x} ${y}`) }\n"
+            "on mouseDown(x:int, y:int, button:int) { log(`down ${x} ${y}`) }\n"
         )
         proc, stdout_path = run_graphics_program(source)
         try:

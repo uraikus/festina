@@ -274,6 +274,15 @@ static LRESULT CALLBACK festina_win32_wndproc(HWND hwnd, UINT msg, WPARAM wparam
     case WM_PAINT:
         festina_win32_paint(hwnd);
         return 0;
+    /* claude.md #182: Win32 already delivers left/right/middle/extra
+     * buttons as entirely separate messages (unlike X11, where every
+     * button arrives through the same ButtonPress/ButtonRelease and has
+     * to be told apart by ev.xbutton.button) -- each case here just
+     * needs to report the right `button` number in
+     * FestinaWindowEvent's own X11-derived convention (see its doc
+     * comment in festina_runtime_window.h): 1/2/3 for left/middle/
+     * right, 8/9 for the two "extra" back/forward buttons most mice
+     * have. */
     case WM_LBUTTONDOWN:
         memset(&ev, 0, sizeof(ev));
         ev.kind = FESTINA_WEVENT_MOUSE_DOWN;
@@ -283,6 +292,7 @@ static LRESULT CALLBACK festina_win32_wndproc(HWND hwnd, UINT msg, WPARAM wparam
          * needed here the way the Cocoa backend's mouseDown: needs one. */
         ev.x = (short)LOWORD(lparam);
         ev.y = (short)HIWORD(lparam);
+        ev.button = 1;
         festina_win32_push(ev, NULL);
         return 0;
     case WM_LBUTTONUP:
@@ -290,8 +300,59 @@ static LRESULT CALLBACK festina_win32_wndproc(HWND hwnd, UINT msg, WPARAM wparam
         ev.kind = FESTINA_WEVENT_MOUSE_UP;
         ev.x = (short)LOWORD(lparam);
         ev.y = (short)HIWORD(lparam);
+        ev.button = 1;
         festina_win32_push(ev, NULL);
         return 0;
+    case WM_RBUTTONDOWN:
+        memset(&ev, 0, sizeof(ev));
+        ev.kind = FESTINA_WEVENT_MOUSE_DOWN;
+        ev.x = (short)LOWORD(lparam);
+        ev.y = (short)HIWORD(lparam);
+        ev.button = 3;
+        festina_win32_push(ev, NULL);
+        return 0;
+    case WM_RBUTTONUP:
+        memset(&ev, 0, sizeof(ev));
+        ev.kind = FESTINA_WEVENT_MOUSE_UP;
+        ev.x = (short)LOWORD(lparam);
+        ev.y = (short)HIWORD(lparam);
+        ev.button = 3;
+        festina_win32_push(ev, NULL);
+        return 0;
+    case WM_MBUTTONDOWN:
+        memset(&ev, 0, sizeof(ev));
+        ev.kind = FESTINA_WEVENT_MOUSE_DOWN;
+        ev.x = (short)LOWORD(lparam);
+        ev.y = (short)HIWORD(lparam);
+        ev.button = 2;
+        festina_win32_push(ev, NULL);
+        return 0;
+    case WM_MBUTTONUP:
+        memset(&ev, 0, sizeof(ev));
+        ev.kind = FESTINA_WEVENT_MOUSE_UP;
+        ev.x = (short)LOWORD(lparam);
+        ev.y = (short)HIWORD(lparam);
+        ev.button = 2;
+        festina_win32_push(ev, NULL);
+        return 0;
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+        /* XBUTTON1/XBUTTON2 (back/forward on most mice that have them)
+         * live in the HIGH word of wParam -- the same field
+         * GET_XBUTTON_WPARAM extracts, read directly here rather than
+         * pulling in <windowsx.h> for that one macro (this file's own
+         * existing convention, see WM_MOUSEWHEEL's identical choice
+         * just below). MSDN documents that a window MUST return TRUE
+         * for WM_XBUTTONDOWN/WM_XBUTTONUP specifically if it handled
+         * them -- every other message here returns 0, but this pair is
+         * the one real exception to that. */
+        memset(&ev, 0, sizeof(ev));
+        ev.kind = msg == WM_XBUTTONDOWN ? FESTINA_WEVENT_MOUSE_DOWN : FESTINA_WEVENT_MOUSE_UP;
+        ev.x = (short)LOWORD(lparam);
+        ev.y = (short)HIWORD(lparam);
+        ev.button = HIWORD(wparam) == 1 ? 8 : 9;
+        festina_win32_push(ev, NULL);
+        return TRUE;
     case WM_MOUSEMOVE:
         memset(&ev, 0, sizeof(ev));
         ev.kind = FESTINA_WEVENT_MOUSE_MOVE;
@@ -299,6 +360,31 @@ static LRESULT CALLBACK festina_win32_wndproc(HWND hwnd, UINT msg, WPARAM wparam
         ev.y = (short)HIWORD(lparam);
         festina_win32_push(ev, NULL);
         return 0;
+    case WM_MOUSEWHEEL: {
+        /* claude.md #181: unlike every other mouse message here,
+         * WM_MOUSEWHEEL's lParam is in SCREEN coordinates, not client
+         * -- ScreenToClient converts it to the same client-relative,
+         * top-left-origin convention every other event above already
+         * uses. The wheel delta itself lives in the HIGH word of
+         * wParam, a signed multiple of WHEEL_DELTA (120) -- its sign
+         * alone is what matters here (mouseWheelUp/mouseWheelDown
+         * split by direction, not by how far one physical notch
+         * travels; see semantic.py's _EVENT_SIGNATURES), so this reads
+         * it directly rather than pulling in <windowsx.h> just for the
+         * GET_WHEEL_DELTA_WPARAM macro. */
+        short wheel_delta = (short)HIWORD(wparam);
+        if (wheel_delta == 0) return 0;
+        POINT pt;
+        pt.x = (short)LOWORD(lparam);
+        pt.y = (short)HIWORD(lparam);
+        ScreenToClient(hwnd, &pt);
+        memset(&ev, 0, sizeof(ev));
+        ev.kind = wheel_delta > 0 ? FESTINA_WEVENT_MOUSE_WHEEL_UP : FESTINA_WEVENT_MOUSE_WHEEL_DOWN;
+        ev.x = pt.x;
+        ev.y = pt.y;
+        festina_win32_push(ev, NULL);
+        return 0;
+    }
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN: {
         /* claude.md #98: WM_KEYDOWN repeats natively while a key is
@@ -485,6 +571,23 @@ void festina_window_screen_size(int64_t *out_width, int64_t *out_height) {
     *out_height = GetSystemMetrics(SM_CYSCREEN);
 }
 
+/* claude.md #181: devicePixelRatio -- LOGPIXELSX/96.0, the broadly
+ * compatible way to ask (works back to any Windows version, needs no
+ * per-monitor-DPI-awareness manifest declaration the newer GetDpiFor*
+ * APIs require to report anything other than the system default, and
+ * this program declares no such manifest). Queried off the screen DC
+ * rather than the window's own -- needs no window open, matching
+ * festina_window_screen_size's own contract just above -- and
+ * GetDeviceCaps' LOGPIXELSX/Y are defined to always be equal (Windows
+ * has never supported non-square pixels), so X alone is enough. */
+double festina_window_device_pixel_ratio(void) {
+    HDC screen_dc = GetDC(NULL);
+    if (!screen_dc) return 1.0;
+    int dpi = GetDeviceCaps(screen_dc, LOGPIXELSX);
+    ReleaseDC(NULL, screen_dc);
+    return dpi > 0 ? (double)dpi / 96.0 : 1.0;
+}
+
 void festina_window_resize(int64_t width, int64_t height) {
     if (!g_hwnd) return;
     /* SWP_NOMOVE | SWP_NOZORDER: change only the size, leaving the
@@ -552,4 +655,14 @@ void festina_window_set_fullscreen(int8_t fullscreen) {
         SetWindowPlacement(g_hwnd, &g_prev_placement);
         g_win32_is_fullscreen = 0;
     }
+}
+
+/* claude.md #182: ShowCursor's own display counter is exactly why the
+ * portable caller (festina_hide_cursor/festina_show_cursor,
+ * festina_runtime_graphics.c) already guards against a redundant call
+ * with the same state before ever reaching here (see g_cursor_visible's
+ * own comment) -- each actual call here is a clean +1/-1 on that
+ * counter, one hide matched by one show, never left imbalanced. */
+void festina_window_set_cursor_visible(int8_t visible) {
+    ShowCursor(visible ? TRUE : FALSE);
 }

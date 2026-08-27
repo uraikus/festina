@@ -72,15 +72,28 @@ static int g_window_open = 0;      /* claude.md #123: portable stand-in for "is
  * that opens DIRECTLY in fullscreen -- no flash of a normal window
  * first -- the identical fix #178 already made for canvas size. */
 static int g_is_fullscreen = 0;
+/* claude.md #182: showCursor()/hideCursor()'s own desired/current-state
+ * flag, the identical double-duty shape g_is_fullscreen just above
+ * (and g_canvas_width/g_canvas_height before it, claude.md #178) --
+ * default VISIBLE (1), so a program that never touches this at all
+ * behaves exactly as before this existed. */
+static int g_cursor_visible = 1;
 static cairo_surface_t *g_backing_surface = NULL;
 /* claude.md #106: `on click` split into `on mouseDown` and `on mouseUp`,
  * exactly as claude.md #98 split `on key`. A click is a press and a
  * release, and a program that needs to tell them apart -- dragging,
  * charging a shot, holding to aim -- could not, because the two were
  * collapsed into one event that fired on press. */
-static void (*g_mouse_down_handler)(int64_t, int64_t) = NULL;
-static void (*g_mouse_up_handler)(int64_t, int64_t) = NULL;
+/* claude.md #182: `button` (X11's own numbering, see FestinaWindowEvent's
+ * own doc comment in festina_runtime_window.h). `on mouse` stays
+ * 2-argument -- a move has no button of its own to report. */
+static void (*g_mouse_down_handler)(int64_t, int64_t, int64_t) = NULL;
+static void (*g_mouse_up_handler)(int64_t, int64_t, int64_t) = NULL;
 static void (*g_mouse_handler)(int64_t, int64_t) = NULL;
+/* claude.md #181: the scroll wheel, split by direction -- see
+ * semantic.py's _EVENT_SIGNATURES' own comment. */
+static void (*g_mouse_wheel_up_handler)(int64_t, int64_t) = NULL;
+static void (*g_mouse_wheel_down_handler)(int64_t, int64_t) = NULL;
 /* claude.md #98: `on key` split into `on keyDown` and `on keyUp`. */
 static void (*g_key_down_handler)(const char *) = NULL;
 static void (*g_key_up_handler)(const char *) = NULL;
@@ -664,6 +677,12 @@ void festina_graphics_init(void) {
     /* claude.md #180: apply an enterFullscreen() call that already ran
      * before the window existed -- see g_is_fullscreen's own comment. */
     if (g_is_fullscreen) festina_window_set_fullscreen(1);
+    /* claude.md #182: apply a hideCursor() call that already ran before
+     * the window existed -- see g_cursor_visible's own comment. Only
+     * the HIDE case needs applying: a freshly opened window's own
+     * native cursor already starts visible, matching g_cursor_visible's
+     * own default. */
+    if (!g_cursor_visible) festina_window_set_cursor_visible(0);
     /* claude.md #95: whatever was already drawn headlessly is kept --
      * a program may well have drawn before its first render(). */
     festina_backing_require();
@@ -692,6 +711,28 @@ void festina_exit_fullscreen(void) {
     if (!g_is_fullscreen) return;
     g_is_fullscreen = 0;
     if (g_window_open) festina_window_set_fullscreen(0);
+}
+
+/* claude.md #182: showCursor()/hideCursor() -- the identical shape
+ * enterFullscreen()/exitFullscreen() just above already established:
+ * g_cursor_visible tracks both the pre-window desired state and the
+ * live one, festina_graphics_init applies a hidden request once a
+ * window actually opens (see its own comment), and each call here
+ * no-ops if already in the requested state. Unlike fullscreen, this
+ * doesn't need to force a window open (see codegen.py's own
+ * _CANVAS_OPS handling) -- a cursor is meaningless with no window, but
+ * that's a reason to let the call be a harmless no-op, not a reason to
+ * open one just to hide nothing over it. */
+void festina_show_cursor(void) {
+    if (g_cursor_visible) return;
+    g_cursor_visible = 1;
+    if (g_window_open) festina_window_set_cursor_visible(1);
+}
+
+void festina_hide_cursor(void) {
+    if (!g_cursor_visible) return;
+    g_cursor_visible = 0;
+    if (g_window_open) festina_window_set_cursor_visible(0);
 }
 
 /* claude.md #93: writes the canvas to a PNG. Cairo's PNG *writer* has
@@ -1594,16 +1635,24 @@ void festina_draw_image(void *img, int64_t x, int64_t y) {
     cairo_destroy(cr);
 }
 
-void festina_register_mouse_down_handler(void (*handler)(int64_t, int64_t)) {
+void festina_register_mouse_down_handler(void (*handler)(int64_t, int64_t, int64_t)) {
     g_mouse_down_handler = handler;
 }
 
-void festina_register_mouse_up_handler(void (*handler)(int64_t, int64_t)) {
+void festina_register_mouse_up_handler(void (*handler)(int64_t, int64_t, int64_t)) {
     g_mouse_up_handler = handler;
 }
 
 void festina_register_mouse_handler(void (*handler)(int64_t, int64_t)) {
     g_mouse_handler = handler;
+}
+
+void festina_register_mouse_wheel_up_handler(void (*handler)(int64_t, int64_t)) {
+    g_mouse_wheel_up_handler = handler;
+}
+
+void festina_register_mouse_wheel_down_handler(void (*handler)(int64_t, int64_t)) {
+    g_mouse_wheel_down_handler = handler;
 }
 
 void festina_register_key_down_handler(void (*handler)(const char *)) {
@@ -1651,6 +1700,13 @@ int64_t festina_screen_height(void) {
     int64_t w = 0, h = 0;
     festina_window_screen_size(&w, &h);
     return h;
+}
+
+/* claude.md #181: devicePixelRatio -- through the seam
+ * (festina_window_device_pixel_ratio), the identical one-property-one-
+ * call thin-wrapper shape as festina_screen_width/_height just above. */
+double festina_device_pixel_ratio(void) {
+    return festina_window_device_pixel_ratio();
 }
 
 /* claude.md #139: setClientWidth/setClientHeight's shared portable
@@ -1746,13 +1802,19 @@ static void festina_handle_window_event(const FestinaWindowEvent *ev) {
          * moment they happened, which is what makes a drag
          * expressible -- press and release report different
          * coordinates when the pointer moved in between. */
-        if (g_mouse_down_handler) g_mouse_down_handler(ev->x, ev->y);
+        if (g_mouse_down_handler) g_mouse_down_handler(ev->x, ev->y, ev->button);
         break;
     case FESTINA_WEVENT_MOUSE_UP:
-        if (g_mouse_up_handler) g_mouse_up_handler(ev->x, ev->y);
+        if (g_mouse_up_handler) g_mouse_up_handler(ev->x, ev->y, ev->button);
         break;
     case FESTINA_WEVENT_MOUSE_MOVE:
         if (g_mouse_handler) g_mouse_handler(ev->x, ev->y);
+        break;
+    case FESTINA_WEVENT_MOUSE_WHEEL_UP:
+        if (g_mouse_wheel_up_handler) g_mouse_wheel_up_handler(ev->x, ev->y);
+        break;
+    case FESTINA_WEVENT_MOUSE_WHEEL_DOWN:
+        if (g_mouse_wheel_down_handler) g_mouse_wheel_down_handler(ev->x, ev->y);
         break;
     case FESTINA_WEVENT_KEY_DOWN:
         if (g_key_down_handler) g_key_down_handler(ev->key_name);
@@ -2099,6 +2161,38 @@ void festina_window_screen_size(int64_t *out_width, int64_t *out_height) {
     XCloseDisplay(tmp);
 }
 
+/* claude.md #181: unlike screenWidth/screenHeight's unambiguous
+ * DisplayWidth/DisplayHeight, X11 has no single canonical "what's the
+ * pixel ratio" call -- the obvious-looking alternative (deriving a DPI
+ * from DisplayWidth/DisplayWidthMM's physical millimeter size) is a
+ * well-known unreliable heuristic in practice (many real monitors
+ * report inaccurate EDID physical dimensions), which is why GTK/Qt/
+ * every serious X11 toolkit instead reads the `Xft.dpi` X resource --
+ * the actual standard mechanism a desktop environment's own display
+ * settings write when a user picks a scale factor. Falls back to 1.0
+ * (no scaling) if unset, which is also the CORRECT answer for the
+ * common case: a plain X11 setup with no HiDPi configuration at all.
+ * Same reuse-the-open-connection-or-open-a-throwaway-one shape as
+ * festina_window_screen_size just above. */
+double festina_window_device_pixel_ratio(void) {
+    Display *display = g_display;
+    Display *tmp = NULL;
+    if (!display) {
+        tmp = XOpenDisplay(NULL);
+        display = tmp;
+    }
+    double ratio = 1.0;
+    if (display) {
+        char *dpi_str = XGetDefault(display, "Xft", "dpi");
+        if (dpi_str) {
+            double dpi = atof(dpi_str);
+            if (dpi > 0) ratio = dpi / 96.0;
+        }
+    }
+    if (tmp) XCloseDisplay(tmp);
+    return ratio;
+}
+
 /* claude.md #139: a no-op with no window open -- festina_set_client_
  * size (festina_runtime_graphics.c's own portable half) already
  * updates the canvas's own size for whenever one does; this function's
@@ -2147,6 +2241,40 @@ void festina_window_set_fullscreen(int8_t fullscreen) {
     xev.xclient.data.l[3] = 1;
     XSendEvent(g_display, DefaultRootWindow(g_display), False,
                SubstructureRedirectMask | SubstructureNotifyMask, &xev);
+    XFlush(g_display);
+}
+
+/* claude.md #182: X11's core protocol has no direct "hide the cursor"
+ * call (XFixesHideCursor exists, but pulling in libXfixes as a whole
+ * new link dependency for one call isn't worth it -- claude.md #59's
+ * own "smallest dependency that does the job" reasoning) -- the
+ * standard, dependency-free workaround (used by SDL's own X11 backend,
+ * among others) is defining a real cursor that's simply fully
+ * transparent: a 1x1 bitmap with every pixel masked out, so nothing of
+ * it is ever actually drawn. XUndefineCursor removes the per-window
+ * override entirely, falling back to whatever cursor the window's
+ * parent (ultimately the root window's own default) already shows --
+ * the correct way to "restore" it, since this never had a cursor of
+ * its own before this call existed. */
+void festina_window_set_cursor_visible(int8_t visible) {
+    if (!g_display) return;
+    if (visible) {
+        XUndefineCursor(g_display, g_window);
+        XFlush(g_display);
+        return;
+    }
+    char data[1] = {0};
+    Pixmap blank = XCreateBitmapFromData(g_display, g_window, data, 1, 1);
+    XColor dummy;
+    memset(&dummy, 0, sizeof(dummy));
+    Cursor invisible = XCreatePixmapCursor(g_display, blank, blank, &dummy, &dummy, 0, 0);
+    XDefineCursor(g_display, g_window, invisible);
+    /* Safe to free both immediately: the server keeps its own copy for
+     * as long as the cursor stays defined on the window, exactly like
+     * every other server-side X11 resource (windows, GCs, ...) already
+     * works in this file. */
+    XFreeCursor(g_display, invisible);
+    XFreePixmap(g_display, blank);
     XFlush(g_display);
 }
 
@@ -2241,7 +2369,42 @@ void festina_window_events_drain(void (*handler)(const FestinaWindowEvent *event
             XFlush(g_display);
             continue;
         } else if (ev.type == ButtonPress || ev.type == ButtonRelease) {
-            wev.kind = ev.type == ButtonPress ? FESTINA_WEVENT_MOUSE_DOWN : FESTINA_WEVENT_MOUSE_UP;
+            /* claude.md #181: X11's core protocol has no dedicated
+             * scroll-wheel event -- by long-standing, universal
+             * convention (predating XInput2's real smooth-scroll
+             * events, but still what every application and toolkit
+             * still honors for a simple wheel), the wheel is reported
+             * as buttons 4 (up) and 5 (down), delivered as an ordinary
+             * ButtonPress immediately followed by its own ButtonRelease
+             * -- there's no separate "hold the wheel down" gesture the
+             * way there is for a real mouse button. Firing on the
+             * PRESS half only (and swallowing the paired release
+             * entirely, rather than letting it fall through to
+             * mouseUp) is what makes this "one wheel event per notch",
+             * not two, and is also the fix for a real pre-existing
+             * quirk this uncovered: every button's press/release used
+             * to reach mouseDown/mouseUp completely unfiltered, so
+             * scrolling over the canvas already silently fired a
+             * mouseDown+mouseUp pair at the wheel's own position --
+             * harmless-looking but wrong, now corrected as part of
+             * giving the wheel its own real event instead. */
+            if (ev.xbutton.button == 4 || ev.xbutton.button == 5) {
+                if (ev.type == ButtonRelease) continue;
+                wev.kind = ev.xbutton.button == 4
+                    ? FESTINA_WEVENT_MOUSE_WHEEL_UP : FESTINA_WEVENT_MOUSE_WHEEL_DOWN;
+            } else {
+                /* claude.md #182: X11's own button numbering (1=left,
+                 * 2=middle, 3=right, 8=back, 9=forward on any mouse
+                 * that reports them) is reported directly here with no
+                 * translation needed at all -- it's the very numbering
+                 * FestinaWindowEvent's own `button` field standardizes
+                 * on (see its doc comment), specifically because X11
+                 * already produces it natively; Cocoa/Win32 each
+                 * translate their own different numbering into this
+                 * one instead. */
+                wev.kind = ev.type == ButtonPress ? FESTINA_WEVENT_MOUSE_DOWN : FESTINA_WEVENT_MOUSE_UP;
+                wev.button = ev.xbutton.button;
+            }
             wev.x = ev.xbutton.x;
             wev.y = ev.xbutton.y;
             handler(&wev);

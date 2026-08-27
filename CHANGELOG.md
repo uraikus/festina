@@ -9,6 +9,31 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.3] - 2026-08-27
+
+### Added
+
+- `on mouseWheelUp(x:int, y:int)`/`on mouseWheelDown(x:int, y:int)`:
+  scroll wheel events, split by direction. Fixes a real pre-existing
+  bug on X11/Linux where scrolling the wheel silently also fired a
+  spurious `mouseDown`+`mouseUp` pair.
+- `devicePixelRatio:float`: a read-only global reporting the display's
+  pixel density (`1.0` normally, ~`2.0` on Retina/HiDPI).
+- `showCursor()`/`hideCursor()`: toggle the mouse cursor's visibility
+  over the canvas.
+- Real right-click and middle-click support on macOS and Windows —
+  previously only the left button worked on either platform.
+
+### Changed
+
+- **Breaking:** `on mouseDown`/`on mouseUp` now require a third
+  argument, `button:int` — `on mouseDown(x:int, y:int, button:int)`.
+  `1` = left, `2` = middle, `3` = right, `8` = back, `9` = forward.
+  `on mouse` (continuous movement) is unaffected.
+
+See [api.md](api.md#mouse-events) and
+[api.md](api.md#drawing-is-offscreen-render-puts-it-on-screen).
+
 ## [0.2.3] - 2026-08-27
 
 ### Added

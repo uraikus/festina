@@ -81,7 +81,7 @@ bool func boardFull() {
 // fires on the press, which is when this game has always placed a mark.
 // A board game wants the press; something draggable would want the
 // matching `on mouseUp` too.
-on mouseDown(x:int, y:int) {
+on mouseDown(x:int, y:int, button:int) {
     if gameOver {
         return
     }
