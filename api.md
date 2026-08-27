@@ -1703,6 +1703,16 @@ A gradient replaces the flat fill until the next `fillStyle()`. Two
 stops rather than an arbitrary list — that covers essentially every
 gradient a program draws, and needs no separate gradient type.
 
+`fillAlpha` applies uniformly to whatever's drawn next — every fill
+(`drawRect`/`drawPixel`/`drawCircle`/`drawText`, whether onto the
+canvas or directly onto an `img`'s own surface) **and** `drawImage`:
+
+```festina
+fillAlpha(0.4)
+drawImage(sprite, 100, 100)   // blends 40% into whatever's underneath
+fillAlpha(1.0)
+```
+
 ### Text metrics
 
 ```festina

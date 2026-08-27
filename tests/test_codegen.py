@@ -13599,6 +13599,50 @@ class TestCanvasPathsRenderRealPixels:
         finally:
             proc.terminate()
 
+    def test_fill_alpha_applies_to_draw_image_too(self, run_graphics_program, x_display):
+        # claude.md #183 (uraikus/festina#78): drawImage used to always
+        # cairo_paint at full opacity, completely ignoring fillAlpha --
+        # every OTHER draw call (a canvas fill, and a fill drawn
+        # directly onto an img's own surface) already respected it, so
+        # this was a real inconsistency, not intentional scoping. Same
+        # "50% colour over white should blend" shape as
+        # test_paths_transforms_and_gradients_render_correctly just
+        # above, applied to an image blit instead of a fill.
+        source = """
+        color red = 'red'
+        color white = 'white'
+
+        clearCanvas()
+        fillStyle(white)
+        drawRect(0, 0, 60, 60)
+        img sq = saveCanvas()
+
+        clearCanvas()
+        fillStyle(red)
+        drawRect(0, 0, 400, 200)
+
+        fillAlpha(0.5)
+        drawImage(sq, 0, 0)     // should blend 50% into the red beneath
+        fillAlpha(1.0)
+        drawImage(sq, 200, 0)   // full opacity -- untouched white
+        render()
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            got = _xwd_pixels(x_display, wid, [(30, 30), (230, 30)])
+            # 0.5*255 + 0.5*0 = 127.5 for the G/B channels -- rounds to
+            # 128 on this path (Cairo's own compositing, not this
+            # test's arithmetic); R stays 255 either way since both the
+            # white square and the red background already have R=255.
+            assert got[0] == (255, 128, 128), (
+                "fillAlpha(0.5) did not blend the drawImage'd square with the red beneath")
+            assert got[1] == (255, 255, 255), (
+                "fillAlpha(1.0) should leave the second drawImage fully opaque")
+        finally:
+            proc.terminate()
+
 
 class TestRenderClearAndHeadless:
     """claude.md #95: drawing paints an offscreen canvas; `render()` is

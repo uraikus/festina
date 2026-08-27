@@ -9,6 +9,16 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.3.1] - 2026-08-27
+
+### Fixed
+
+- `fillAlpha` had no effect on `drawImage` — two images drawn back to
+  back under different `fillAlpha` values came out pixel-for-pixel
+  identical. `drawImage` now respects it, blending the image into
+  whatever's underneath exactly like every other draw call. See
+  [api.md](api.md#gradients-and-transparency).
+
 ## [0.3] - 2026-08-27
 
 ### Added

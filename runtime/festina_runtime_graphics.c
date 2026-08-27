@@ -1626,12 +1626,25 @@ void festina_image_free(void *img) {
     free((char *)img - sizeof(int64_t));
 }
 
+/* claude.md #183 (see uraikus/festina#78): drawImage used to always
+ * `cairo_paint`, unconditionally full opacity, completely ignoring
+ * `g_fill_alpha` -- every OTHER draw path already carries it (see
+ * festina_set_fill_source's own `cairo_set_source_rgba(..., g_fill_
+ * alpha)`, and its own `cairo_paint_with_alpha` call for a gradient
+ * fill just above, the direct precedent this now follows for the
+ * identical reason: cairo_set_source_surface has no alpha channel of
+ * its own to carry it the way cairo_set_source_rgba does, so applying
+ * the alpha has to happen at PAINT time instead of source-setup time).
+ * `cairo_paint_with_alpha(cr, 1.0)` is defined to behave identically to
+ * plain `cairo_paint`, so this is a strict extension, not a behavior
+ * change for the (overwhelmingly common) case where fillAlpha was
+ * never touched. */
 void festina_draw_image(void *img, int64_t x, int64_t y) {
     festina_backing_require();
     if (!img) return;
     cairo_t *cr = festina_canvas_context();
     cairo_set_source_surface(cr, ((FestinaImageBox *)img)->surface, (double)x, (double)y);
-    cairo_paint(cr);
+    cairo_paint_with_alpha(cr, g_fill_alpha);
     cairo_destroy(cr);
 }
 
