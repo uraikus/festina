@@ -469,11 +469,14 @@ char *festina_regex_replace(void *compiled, const char *text,
  * everywhere this runtime already needs Cairo (verified in this
  * project's own dev environment), so this adds one new dependency
  * (libX11) rather than a whole GUI toolkit, per claude.md #59. The
- * window is undecorated (Motif WM hints -- a widely honored
- * convention, though not part of the core X11 protocol, so a given
- * window manager could still ignore it) so it shows only the canvas,
- * nothing else -- no title bar, menu, or other chrome drawn by this
- * runtime.
+ * window is fully decorated (Motif WM hints request MWM_DECOR_ALL -- a
+ * widely honored convention, though not part of the core X11 protocol,
+ * so a given window manager could still draw its own default instead)
+ * -- a title bar and the window manager's normal minimize/maximize/
+ * close controls, like any other window, resizable by dragging an
+ * edge. claude.md #180 added enterFullscreen()/exitFullscreen() on top
+ * of that, toggling true OS fullscreen (X11's own _NET_WM_STATE_
+ * FULLSCREEN convention, honored the same way).
  *
  * Canvas size starts at a fixed 800x600 (FESTINA_CANVAS_WIDTH/HEIGHT in
  * festina_runtime.c) -- claude.md has no syntax for declaring a canvas
@@ -502,13 +505,23 @@ char *festina_regex_replace(void *compiled, const char *text,
  * registered key handler if any, ConfigureNotify with a genuine size
  * change -> resize the backing store and call the registered resize
  * handler if any, the window's close button -> call the registered
- * close handler if any, then return). festina_graphics_init is only
- * ever called by generated code when the program actually uses a
- * graphics function, references clientWidth/clientHeight, or declares
- * an `on mouseDown`/`mouseUp`/`mouse`/`key`/`resize`/`close` handler (see
- * CodeGen.uses_graphics in festina/codegen.py) -- a program that
- * doesn't never opens a window, exactly like festina_db_open() only
- * ever runs for a program that declares a `table`.
+ * close handler if any, then return). claude.md #178 (uraikus/
+ * festina#79): festina_graphics_init is NOT called directly by
+ * generated code any more -- main()'s own prologue only registers
+ * event handlers before __festina_main() runs now, so a pre-window
+ * setClientWidth/setClientHeight call is honored as the window's
+ * initial size rather than overwritten by an eagerly-opened default
+ * one. It is instead called lazily, self-guarded (a no-op if already
+ * open), from festina_render()'s own first call and from
+ * festina_run_event_loop()'s own top (the fallback for a program that
+ * never itself calls render()) -- either way, only ever reached when
+ * the program actually uses a graphics function, references
+ * clientWidth/clientHeight, calls enterFullscreen()/exitFullscreen(),
+ * or declares an `on mouseDown`/`mouseUp`/`mouse`/`key`/`resize`/
+ * `close` handler (see CodeGen.uses_graphics in festina/codegen.py) --
+ * a program that doesn't never opens a window, exactly like
+ * festina_db_open() only ever runs for a program that declares a
+ * `table`.
  *
  * festina_load_image supports PNG (via Cairo's own built-in decoder)
  * and, since claude.md #101, JPEG (via libjpeg) -- claude.md #37:
@@ -781,6 +794,14 @@ int64_t festina_screen_width(void);
 int64_t festina_screen_height(void);
 void festina_set_client_width(int64_t width);
 void festina_set_client_height(int64_t height);
+/* claude.md #180: enterFullscreen()/exitFullscreen() -- toggles true OS
+ * fullscreen on the open window (or records the desired state for
+ * festina_graphics_init to apply once one opens), through the windowing
+ * seam's own festina_window_set_fullscreen. See
+ * festina_runtime_graphics.c's own comments on festina_enter_fullscreen/
+ * festina_exit_fullscreen for the full design. */
+void festina_enter_fullscreen(void);
+void festina_exit_fullscreen(void);
 
 /*
  * setTimeout/setInterval/clearTimeout/clearInterval -- claude.md #69.

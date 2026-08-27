@@ -114,6 +114,13 @@ BUILTIN_FUNCTIONS = {
     "translate", "rotate", "scale", "resetTransform",
     "saveState", "restoreState",
     "fillAlpha", "fillLinearGradient", "fillRadialGradient",
+    # claude.md #180: the window now opens fully decorated (title bar,
+    # minimize/maximize/close, like any other window -- claude.md #95's
+    # own "undecorated" language is retired) -- enterFullscreen()/
+    # exitFullscreen() toggle true OS fullscreen on top of that, same
+    # as render() the only two things here that need a real GUI (see
+    # codegen.py's own uses_graphics condition).
+    "enterFullscreen", "exitFullscreen",
     # claude.md #94: single-value queries, so a scalar result needs no
     # throwaway `table` declaration (which would create a real table).
     "sqliteInt", "sqliteFloat", "sqliteText",
@@ -257,6 +264,9 @@ _BUILTIN_SIGNATURES = {
     "fillAlpha": (_FLOAT,),
     "fillLinearGradient": (_INT, _INT, types_mod.ColorType(), _INT, _INT, types_mod.ColorType()),
     "fillRadialGradient": (_INT, _INT, _INT, types_mod.ColorType(), types_mod.ColorType()),
+    # claude.md #180
+    "enterFullscreen": (),
+    "exitFullscreen": (),
     # claude.md #131
     "close": (_INT,),
     # claude.md #132

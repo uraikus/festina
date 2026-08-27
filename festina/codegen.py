@@ -1579,6 +1579,9 @@ class CodeGen:
             "declare i64 @festina_screen_height()",
             "declare void @festina_set_client_width(i64)",
             "declare void @festina_set_client_height(i64)",
+            # claude.md #180
+            "declare void @festina_enter_fullscreen()",
+            "declare void @festina_exit_fullscreen()",
             # claude.md #69: setTimeout/setInterval/clearTimeout/clearInterval
             # -- see the module docstring's "Timers" note.
             "declare i64 @festina_set_timeout(ptr, i64)",
@@ -8408,14 +8411,21 @@ class CodeGen:
                 "fillAlpha": ("festina_set_alpha", ["double"]),
                 "fillLinearGradient": ("festina_fill_linear_gradient", ["i64"] * 6),
                 "fillRadialGradient": ("festina_fill_radial_gradient", ["i64"] * 5),
+                # claude.md #180: enterFullscreen()/exitFullscreen() --
+                # meaningless without a real OS window (there is no
+                # "headless fullscreen"), so both join render() as the
+                # things here that need a GUI, below.
+                "enterFullscreen": ("festina_enter_fullscreen", []),
+                "exitFullscreen": ("festina_exit_fullscreen", []),
             }
             if name in _CANVAS_OPS:
                 fn, arg_irs = _CANVAS_OPS[name]
                 self.uses_graphics_code = True
-                # claude.md #95: render() is the ONLY thing here that
-                # needs a GUI. Everything else paints the offscreen
-                # canvas, which needs no X server at all.
-                if name == "render":
+                # claude.md #95/#180: render() and the two fullscreen
+                # calls are the only things here that need a GUI.
+                # Everything else paints the offscreen canvas, which
+                # needs no X server at all.
+                if name in ("render", "enterFullscreen", "exitFullscreen"):
                     self.uses_graphics = True
                 # A gradient's colour arguments are `color`-typed
                 # (semantic enforces it), so they arrive as the packed
