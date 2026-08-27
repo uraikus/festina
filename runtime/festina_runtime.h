@@ -368,9 +368,16 @@ char *festina_sqlite_scalar_text(sqlite3_stmt *stmt);
  * reordered SELECTs used to silently misalign), and each row carries a
  * hidden presence bitmask one slot past its columns, read by
  * festina_row_undefined. */
+/* claude.md #188 (uraikus/festina#76 item 5): `want_rowid` adds one
+ * MORE hidden slot past the presence mask, holding the query's own
+ * `rowid` result column (by name, matched the identical way as every
+ * declared column) -- always false for a struct query target
+ * (claude.md #112), which has no rowid concept. See the .c doc
+ * comment. */
 void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
                                   const char **col_types, const char **col_names,
-                                  int64_t *out_length, void **out_data);
+                                  int64_t *out_length, void **out_data,
+                                  int8_t want_rowid);
 int8_t festina_row_undefined(void *row, const char **col_names,
                              int32_t col_count, const char *name);
 /* claude.md #111/#175: `delete m[key]` -- removes the entry, releasing
@@ -597,7 +604,18 @@ void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h);
  * draw call uses. Border/alpha are unaffected either way -- only the
  * FILL colour is a per-call override. */
 void festina_draw_rect_color(int64_t x, int64_t y, int64_t w, int64_t h, int64_t color);
+/* claude.md #188 (uraikus/festina#76 item 8): drawRect(x, y, w, h,
+ * fillColor, borderColor) -- overrides BOTH colours for this call
+ * only. `border_color < 0` means no border, matching
+ * borderColor('none')'s own encoding. See the .c doc comment. */
+void festina_draw_rect_colors(int64_t x, int64_t y, int64_t w, int64_t h,
+                               int64_t fill_color, int64_t border_color);
 void festina_draw_circle(int64_t x, int64_t y, int64_t r);
+/* claude.md #188: the same per-call fill/fill+border override forms
+ * drawRect already has. */
+void festina_draw_circle_color(int64_t x, int64_t y, int64_t r, int64_t color);
+void festina_draw_circle_colors(int64_t x, int64_t y, int64_t r,
+                                 int64_t fill_color, int64_t border_color);
 void festina_draw_text(const char *text, int64_t x, int64_t y);
 /* claude.md #133: a single pixel, filled with the current fillStyle
  * (or, for the _color form, `color` for this call only) -- antialiasing
@@ -707,6 +725,10 @@ void festina_stroke_path(void);
 int64_t festina_image_width(void *img);
 int64_t festina_image_height(void *img);
 void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
+/* claude.md #188 (uraikus/festina#76 item 4): blankImage(w, h) -- a
+ * fresh, fully-transparent img at a given size, with no existing image
+ * to derive it from. See the .c doc comment. */
+void *festina_blank_image(int64_t w, int64_t h);
 /* claude.md #135: saveCanvas() with no path -> a fresh img, a snapshot
  * of the canvas at this instant (see the .c doc comment for why a
  * snapshot rather than a live alias). */
@@ -719,12 +741,27 @@ void festina_image_resize(void *img, int64_t w, int64_t h);
  * lineWidth/font state every canvas draw call reads. */
 void festina_image_draw_rect(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
 void festina_image_draw_rect_color(void *img, int64_t x, int64_t y, int64_t w, int64_t h, int64_t color);
+/* claude.md #188 (uraikus/festina#76 item 8): the img-method
+ * counterparts of festina_draw_rect_colors/festina_draw_circle_color/
+ * _colors above. */
+void festina_image_draw_rect_colors(void *img, int64_t x, int64_t y, int64_t w, int64_t h,
+                                     int64_t fill_color, int64_t border_color);
 void festina_image_draw_pixel(void *img, int64_t x, int64_t y);
 void festina_image_draw_pixel_color(void *img, int64_t x, int64_t y, int64_t color);
 void festina_image_draw_circle(void *img, int64_t x, int64_t y, int64_t r);
+void festina_image_draw_circle_color(void *img, int64_t x, int64_t y, int64_t r, int64_t color);
+void festina_image_draw_circle_colors(void *img, int64_t x, int64_t y, int64_t r,
+                                       int64_t fill_color, int64_t border_color);
 void festina_image_draw_text(void *img, const char *text, int64_t x, int64_t y);
 void festina_image_free(void *img);
 void festina_draw_image(void *img, int64_t x, int64_t y);
+/* claude.md #185 (uraikus/festina#76 item 3): drawImage(img, x, y, w,
+ * h) -- the WHOLE image scaled to fit w x h at (x, y). */
+void festina_draw_image_scaled(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
+/* claude.md #185: the canvas-style 8-argument form -- a source rect
+ * (sx, sy, sw, sh) scaled to fit a destination rect (dx, dy, dw, dh). */
+void festina_draw_image_region(void *img, int64_t sx, int64_t sy, int64_t sw, int64_t sh,
+                                int64_t dx, int64_t dy, int64_t dw, int64_t dh);
 /* claude.md #89/#90: canvas drawing style -- process-global state set by
  * fillStyle()/borderColor()/lineWidth()/font() and read by every later
  * draw call, the same "set it, then draw" model the HTML canvas 2D
@@ -1314,6 +1351,14 @@ void festina_map_set(int64_t *count, void **entries, int64_t *capacity, int64_t 
                      const char *key, int64_t value);
 int64_t festina_map_get(void *entries, int64_t capacity, const char *key, int64_t default_value);
 void festina_map_for_each(void *entries, int64_t capacity, void (*callback)(int64_t, const char *));
+/* claude.md #186 (uraikus/festina#76 item 7): map[T].keys() -> arr[text]
+ * and map[T].values() -> arr[T] -- `dst` is always a fresh header
+ * codegen already allocated (_emit_fresh_heap_header); these only fill
+ * in its length/data fields. See the implementation's own comment for
+ * values()'s `elem_size`/`is_refcounted`/`is_text` arguments. */
+void festina_map_keys(void *entries, int64_t capacity, void *dst);
+void festina_map_values(void *entries, int64_t capacity, int64_t elem_size,
+                         int8_t is_refcounted, int8_t is_text, void *dst);
 
 /* claude.md #74/#75/#175: called by generated code when a map[T]
  * local, proven never to escape its declaring function, goes out of
@@ -1384,6 +1429,16 @@ void festina_array_splice_insert(void *hdr, int64_t *capacity, int64_t elem_size
  * buffers still match. */
 int64_t festina_array_index_of(void *hdr, int64_t elem_size,
                                 const void *value, int8_t is_text);
+/* claude.md #184 (uraikus/festina#76 item 2): in-place, stable sort.
+ * `cmp` is always codegen's own generated per-element-type trampoline
+ * (_emit_sort_comparator_trampoline); `userdata` is the real Festina
+ * comparator function value, a bare pointer passed straight through
+ * unchanged on every comparison -- not qsort()/qsort_r()/qsort_s(),
+ * whose userdata-carrying variants disagree on argument order across
+ * glibc/BSD/Windows. See the implementation's own comment. */
+void festina_array_sort(void *hdr, int64_t elem_size,
+                         int (*cmp)(const void *, const void *, void *),
+                         void *userdata);
 void festina_release_array(void *payload);
 void festina_release_map(void *payload);
 /* claude.md #167: the value-aware counterpart to festina_release_map,

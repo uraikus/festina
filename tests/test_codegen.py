@@ -1161,6 +1161,121 @@ class TestMaps:
         assert json.loads(result.stdout.strip()) == {"a": 1, "c": 3, "d": 4}
 
 
+class TestMapKeysAndValues:
+    """claude.md #186 (uraikus/festina#76 item 7): map[T].keys() ->
+    arr[text], map[T].values() -> arr[T] -- a plain snapshot array,
+    walkable with an ordinary `for` loop, sidestepping forEach()'s own
+    bare/no-closures callback restriction (claude.md #72) for the
+    common "collect entries matching a condition" case."""
+
+    def test_keys_and_values_on_an_int_valued_map(self, compile_and_run):
+        source = """
+        map[int] scores
+        scores['alice'] = 10
+        scores['bob'] = 20
+        scores['carol'] = 30
+        arr[text] ks = scores.keys()
+        log(ks.length)
+        log(ks.indexOf('alice') >= 0)
+        log(ks.indexOf('bob') >= 0)
+        log(ks.indexOf('carol') >= 0)
+        log(ks.indexOf('dave') >= 0)
+        int func cmpInt(a:int, b:int) { return a - b }
+        arr[int] vs = scores.values()
+        vs.sort(cmpInt)
+        log(vs)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            "3", "true", "true", "true", "false", "[10,20,30]"]
+
+    def test_empty_map_answers_empty_arrays(self, compile_and_run):
+        source = """
+        map[int] empty
+        arr[text] ks = empty.keys()
+        arr[int] vs = empty.values()
+        log(ks.length)
+        log(vs.length)
+        """
+        result = compile_and_run(source)
+        assert result.stdout == "0\n0\n"
+
+    def test_keys_snapshot_is_independent_of_a_later_delete(self, compile_and_run):
+        # The whole point of a plain array over forEach: it's collected
+        # ONCE. A later mutation of the source map must not retroactively
+        # change what was already handed back.
+        source = """
+        map[int] m
+        m['a'] = 1
+        m['b'] = 2
+        arr[text] ks = m.keys()
+        delete m['a']
+        log(ks.length)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "2"
+
+    def test_values_on_a_text_valued_map_copies_independently_of_the_map(self, compile_and_run):
+        # text has no shared representation to retain -- each collected
+        # value must be its OWN copy, still readable after the source
+        # map (and whatever it held) is freed.
+        source = """
+        map[text] names
+        names['x'] = 'hello'
+        names['y'] = 'world'
+        arr[text] vs = names.values()
+        free names
+        log(vs[0] == 'hello' || vs[0] == 'world')
+        log(vs[1] == 'hello' || vs[1] == 'world')
+        """
+        result = compile_and_run(source)
+        assert result.stdout == "true\ntrue\n"
+
+    def test_values_on_a_struct_valued_map_retains_independently_of_the_map(self, compile_and_run):
+        source = """
+        struct P { v:int }
+        map[P] m
+        P a
+        a.v = 1
+        P b
+        b.v = 2
+        m['a'] = a
+        m['b'] = b
+        arr[P] vs = m.values()
+        free m
+        log(vs[0].v + vs[1].v)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "3"
+
+    def test_values_on_a_bool_valued_map(self, compile_and_run):
+        # arr[bool]'s one-byte element stride (claude.md #97) has to
+        # come out right here too, not just from arr[T]'s own methods.
+        source = """
+        map[bool] flags
+        flags['a'] = true
+        flags['b'] = false
+        arr[bool] vs = flags.values()
+        int trues = 0
+        for int i = 0, i < vs.length, i++ {
+            if (vs[i]) { trues = trues + 1 }
+        }
+        log(vs.length)
+        log(trues)
+        """
+        result = compile_and_run(source)
+        assert result.stdout == "2\n1\n"
+
+    def test_wrong_arity_is_a_compile_error(self, parser, semantic, errors):
+        for source in [
+            "map[int] m\nm.keys(1)",
+            "map[int] m\nm.values(1)",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
 class TestAmorArray:
     """claude.md #174: amor arr[T] -- an "amortized array", the
     array-typed counterpart of TestAmorMap above and the runtime effect
@@ -8998,6 +9113,87 @@ class TestUndefinedAndNameMatchedColumns:
             semantic.analyze(program)
 
 
+class TestRowRowid:
+    """claude.md #188 (uraikus/festina#76 item 5): a table row's own
+    `rowid`, exposed read-only -- SQLite already computes one for free
+    on every ordinary rowid table, so this is a thin wrapper, not a new
+    schema concept. Only populated when the query's own SQL explicitly
+    selects a result column named `rowid` (`SELECT rowid, ...`) -- a
+    bare `SELECT *` does not implicitly include it, so this is int's
+    own null in that case, the same "the query never mentioned this"
+    signal `.undefined()` already gives an ordinary column."""
+
+    def test_rowid_reads_back_the_real_sqlite_rowid(self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Users {{ name:text }}
+        sqlite('INSERT INTO Users (name) VALUES (?)', ['ada'])
+        sqlite('INSERT INTO Users (name) VALUES (?)', ['grace'])
+        arr[Users] rows = sqlite('SELECT rowid, name FROM Users ORDER BY rowid')
+        log(rows[0].rowid)
+        log(rows[0].name)
+        log(rows[1].rowid)
+        log(rows[1].name)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "ada", "2", "grace"]
+
+    def test_rowid_is_null_when_the_query_never_selected_it(self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Users {{ name:text }}
+        sqlite('INSERT INTO Users (name) VALUES (?)', ['ada'])
+        arr[Users] rows = sqlite('SELECT name FROM Users')
+        log(rows[0].rowid == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+
+    def test_undefined_and_delete_are_unaffected_by_rowid(self, compile_and_run, tmp_path):
+        # rowid isn't a declared column at all -- it must not shift or
+        # otherwise disturb the presence mask an ordinary column's
+        # undefined()/delete already rely on.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Users {{ name:text  age:int }}
+        sqlite('INSERT INTO Users (name, age) VALUES (?, ?)', ['ada', 30])
+        arr[Users] rows = sqlite('SELECT rowid, name FROM Users')
+        log(rows[0].undefined('age'))
+        log(rows[0].undefined('name'))
+        delete rows[0].name
+        log(rows[0].name == null)
+        log(rows[0].undefined('name'))
+        log(rows[0].rowid == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false", "true", "true", "false"]
+
+    def test_a_struct_query_target_has_no_rowid(self, parser, semantic, errors):
+        # claude.md #112: a struct landing spot isn't a table row at
+        # all -- rowid is deliberately a TableType-only concept, and an
+        # extra unmatched result column (the SQL selecting rowid) is
+        # simply not looked at, the same as any other result column the
+        # struct's own fields don't name.
+        program = parser.parse(
+            "struct Row { name:text }\n"
+            "table Users { name:text }\n"
+            "arr[Row] rows = sqlite('SELECT rowid, name FROM Users')\n"
+            "log(rows[0].rowid)")
+        with pytest.raises(errors.CompileError, match="no field 'rowid'"):
+            semantic.analyze(program)
+
+    def test_rowid_is_read_only(self, parser, semantic, errors):
+        program = parser.parse(
+            "table T { id:int }\n"
+            "arr[T] rows = sqlite('SELECT rowid, id FROM T')\n"
+            "rows[0].rowid = 5")
+        with pytest.raises(errors.CompileError, match="read-only"):
+            semantic.analyze(program)
+
+
 class TestSaveAndSaveCopy:
     """claude.md #110: save()/saveCopy() on blob, img and aud.
 
@@ -12619,6 +12815,65 @@ class TestImageClipResizeAndSize:
             assert "must both be positive" in result.stdout + result.stderr
 
 
+class TestBlankImage:
+    """claude.md #188 (uraikus/festina#76 item 4): blankImage(w, h) --
+    a fresh, fully-transparent img with no existing image or canvas to
+    derive it from, closing the gap `.clip()`/`.resize()`/saveCanvas()
+    leave (every one of them copies FROM something that already
+    exists) -- previously getting an independently-resizable, blank
+    image meant bouncing through the canvas by hand."""
+
+    def test_blank_image_has_the_requested_size(self, compile_and_run):
+        source = """
+        img brush = blankImage(32, 24)
+        log(brush.width)
+        log(brush.height)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "32\n24\n"
+
+    def test_blank_image_is_fully_transparent(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "blank.png")
+        source = f"""
+        img brush = blankImage(10, 10)
+        log(brush.save('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+        _, _, pixel_rgba = _decode_png_rgba(out)
+        assert pixel_rgba(5, 5) == (0, 0, 0, 0)
+
+    def test_blank_image_composes_with_clip_and_resize(self, compile_and_run):
+        source = """
+        img brush = blankImage(20, 20)
+        img piece = brush.clip(0, 0, 10, 10)
+        log(piece.width)
+        brush.resize(40, 40)
+        log(brush.width)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "10\n40\n"
+
+    def test_a_non_positive_size_fails_clearly(self, compile_and_run):
+        for call in ["blankImage(0, 8)", "blankImage(8, -1)"]:
+            result = compile_and_run(f"img brush = {call}\nlog(brush.width)")
+            assert result.returncode != 0
+            assert "must both be positive" in result.stdout + result.stderr
+
+    def test_wrong_arity_or_types_is_a_compile_error(self, parser, semantic, errors):
+        for source in [
+            "img b = blankImage(8)",
+            "img b = blankImage(8, 8, 8)",
+            "img b = blankImage(8.0, 8)",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
 class TestImageDrawMethods:
     """claude.md #134: drawRect/drawPixel/drawCircle/drawText as methods
     on img -- the same four canvas-level drawing builtins (claude.md
@@ -13036,6 +13291,48 @@ class TestMathFileAndTime:
         assert result.returncode == 0
         assert result.stdout == "true\ntrue\n"
 
+    # ---- claude.md #188 (uraikus/festina#76 item 1): Math.floorDiv ----
+
+    def test_floor_div_rounds_toward_negative_infinity(self, compile_and_run):
+        # Unlike `/`'s own truncate-toward-zero: -7/2 truncates to -3,
+        # but floors to -4. The two only ever disagree when the signs
+        # differ and the division isn't exact.
+        source = """
+        log(Math.floorDiv(7, 2))
+        log(Math.floorDiv(-7, 2))
+        log(Math.floorDiv(7, -2))
+        log(Math.floorDiv(-7, -2))
+        log(Math.floorDiv(6, 2))
+        log(Math.floorDiv(0, 5))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "3\n-4\n-4\n3\n3\n0\n"
+
+    def test_floor_div_by_zero_returns_null(self, compile_and_run):
+        # claude.md #57's own by-zero convention, shared rather than
+        # given a second one just for this function.
+        source = "log(Math.floorDiv(5, 0) == null)"
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_floor_div_wrong_arity_or_types_is_a_compile_error(self, parser, semantic, errors):
+        for source in [
+            "log(Math.floorDiv(1))",
+            "log(Math.floorDiv(1, 2, 3))",
+            "log(Math.floorDiv(1.0, 2))",
+            "log(Math.floorDiv(1, 2.0))",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+    def test_math_floor_div_bare_reference_is_rejected(self, parser, semantic, errors):
+        program = parser.parse("log(Math.floorDiv)", filename="main.f")
+        with pytest.raises(errors.CompileError, match="call it"):
+            semantic.analyze(program, filename="main.f")
+
 
 def _png_raw(path):
     """Shared decode step behind _decode_png/_decode_png_rgba below --
@@ -13329,6 +13626,102 @@ class TestDrawPixelClearCircleAndColorOverrides:
                 semantic.analyze(program, filename="main.f")
 
 
+class TestDrawRectAndCircleBorderColorOverride:
+    """claude.md #188 (uraikus/festina#76 item 8): a further optional
+    trailing `borderColor` argument on drawRect/drawCircle -- present,
+    strokes with it for this one call only; absent, uses the current
+    borderColor, the same "this call only, then restore" shape the
+    existing trailing FILL colour already has (claude.md #133).
+    drawCircle gains BOTH trailing forms here, newly -- it previously
+    had no per-call colour override at all."""
+
+    def test_draw_rect_fill_and_border_override_do_not_leak(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        color blue = 'blue'
+        color green = 'green'
+        fillStyle(green)
+        borderColor(green)
+        lineWidth(6)
+        drawRect(0, 0, 20, 20, red, blue)
+        drawRect(40, 0, 20, 20)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(10, 10) == (255, 0, 0), "fill override should win"
+        # A few px in from the edge -- comfortably inside the (6px-wide,
+        # centered-on-the-path) stroke, past Cairo's own antialiased
+        # boundary right at x=0.
+        assert pixel(2, 10) == (0, 0, 255), "border override should win at the edge"
+        assert pixel(50, 10) == (0, 128, 0), "fillStyle(green) should still apply after"
+        assert pixel(42, 10) == (0, 128, 0), "borderColor(green) should still apply after"
+
+    def test_draw_rect_border_none_paints_no_border(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        color blue = 'blue'
+        color none = 'none'
+        borderColor(blue)
+        drawRect(0, 0, 20, 20, red, none)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(0, 10) == (255, 0, 0), "border('none') should leave the fill showing at the edge"
+
+    def test_draw_circle_gains_fill_and_border_override(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        color blue = 'blue'
+        lineWidth(6)
+        drawCircle(30, 30, 20, red)
+        drawCircle(80, 30, 20, red, blue)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(30, 30) == (255, 0, 0), "center should be the fill override"
+        assert pixel(80, 30) == (255, 0, 0), "center of the second circle: fill override"
+        # The stroke is centered on the circle's own path (radius 20),
+        # so its top point (y = 30 - 20 = 10) is comfortably inside a
+        # 6px-wide ring there.
+        assert pixel(80, 10) == (0, 0, 255), "top edge of the second circle: border override"
+
+    def test_img_draw_rect_and_circle_gain_the_same_overrides(self, compile_and_run):
+        source = """
+        color red = 'red'
+        color blue = 'blue'
+        img sq = blankImage(20, 20)
+        sq.drawRect(0, 0, 20, 20, red, blue)
+        sq.drawCircle(10, 10, 5, red, blue)
+        log('ok')
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "ok\n"
+
+    def test_wrong_arity_or_types_is_a_compile_error(self, parser, semantic, errors):
+        for source in [
+            "color red = 'red'\ndrawRect(0, 0, 10, 10, red, red, red)",
+            "color red = 'red'\ndrawCircle(0, 0, 10, red, red, red)",
+            "drawRect(0, 0, 10, 10, 1, 2)",
+            "drawCircle(0, 0, 10, 1, 2)",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
 class TestScalarQueries:
     """claude.md #94: sqliteInt/sqliteFloat/sqliteText take one value out
     of a query without a `table` declaration to hold it.
@@ -13598,6 +13991,136 @@ class TestCanvasPathsRenderRealPixels:
             assert got[7] == (255, 127, 127), "50% red over white should blend"
         finally:
             proc.terminate()
+
+    def test_fill_alpha_applies_to_draw_image_too(self, run_graphics_program, x_display):
+        # claude.md #183 (uraikus/festina#78): drawImage used to always
+        # cairo_paint at full opacity, completely ignoring fillAlpha --
+        # every OTHER draw call (a canvas fill, and a fill drawn
+        # directly onto an img's own surface) already respected it, so
+        # this was a real inconsistency, not intentional scoping. Same
+        # "50% colour over white should blend" shape as
+        # test_paths_transforms_and_gradients_render_correctly just
+        # above, applied to an image blit instead of a fill.
+        source = """
+        color red = 'red'
+        color white = 'white'
+
+        clearCanvas()
+        fillStyle(white)
+        drawRect(0, 0, 60, 60)
+        img sq = saveCanvas()
+
+        clearCanvas()
+        fillStyle(red)
+        drawRect(0, 0, 400, 200)
+
+        fillAlpha(0.5)
+        drawImage(sq, 0, 0)     // should blend 50% into the red beneath
+        fillAlpha(1.0)
+        drawImage(sq, 200, 0)   // full opacity -- untouched white
+        render()
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            got = _xwd_pixels(x_display, wid, [(30, 30), (230, 30)])
+            # 0.5*255 + 0.5*0 = 127.5 for the G/B channels -- rounds to
+            # 128 on this path (Cairo's own compositing, not this
+            # test's arithmetic); R stays 255 either way since both the
+            # white square and the red background already have R=255.
+            assert got[0] == (255, 128, 128), (
+                "fillAlpha(0.5) did not blend the drawImage'd square with the red beneath")
+            assert got[1] == (255, 255, 255), (
+                "fillAlpha(1.0) should leave the second drawImage fully opaque")
+        finally:
+            proc.terminate()
+
+    def test_draw_image_with_destination_size_scales_the_whole_image(
+            self, run_graphics_program, x_display):
+        # claude.md #185 (uraikus/festina#76 item 3): drawImage(img, x,
+        # y, w, h) -- a 10x10 solid blue square drawn at 40x40 should
+        # cover pixel (25, 25) (inside the scaled box) with blue, and
+        # leave a point well outside it (60, 60) showing the red
+        # background instead.
+        source = """
+        setClientWidth(10)
+        setClientHeight(10)
+        color red = 'red'
+        color blue = 'blue'
+
+        clearCanvas()
+        fillStyle(blue)
+        drawRect(0, 0, 10, 10)
+        img sq = saveCanvas()   // exactly a 10x10 blue image, no transparent margin
+
+        setClientWidth(400)
+        setClientHeight(200)
+        clearCanvas()
+        fillStyle(red)
+        drawRect(0, 0, 400, 200)
+        drawImage(sq, 0, 0, 40, 40)
+        render()
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            got = _xwd_pixels(x_display, wid, [(20, 20), (60, 60)])
+            assert got[0] == (0, 0, 255), "scaled drawImage should cover (20,20) with blue"
+            assert got[1] == (255, 0, 0), "outside the scaled box should still be red"
+        finally:
+            proc.terminate()
+
+    def test_draw_image_with_source_and_dest_rects(self, run_graphics_program, x_display):
+        # claude.md #185: the full 8-argument canvas-style form. The
+        # source image is left half blue, right half green; cutting out
+        # just the right (green) half and drawing it scaled elsewhere
+        # should show green there, not blue.
+        source = """
+        setClientWidth(20)
+        setClientHeight(20)
+        color blue = 'blue'
+        color green = 'green'
+        color red = 'red'
+
+        clearCanvas()
+        fillStyle(blue)
+        drawRect(0, 0, 10, 20)
+        fillStyle(green)
+        drawRect(10, 0, 10, 20)
+        img sheet = saveCanvas()   // exactly a 20x20 image, no transparent margin
+
+        setClientWidth(400)
+        setClientHeight(200)
+        clearCanvas()
+        fillStyle(red)
+        drawRect(0, 0, 400, 200)
+        // source rect: the right (green) 10x20 half; dest: 100,100 40x40
+        drawImage(sheet, 10, 0, 10, 20, 100, 100, 40, 40)
+        render()
+        """
+        proc, _stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            time.sleep(0.5)
+            got = _xwd_pixels(x_display, wid, [(120, 120), (200, 20)])
+            assert got[0] == (0, 128, 0), "the clipped source rect should paint green, not blue"
+            assert got[1] == (255, 0, 0), "outside the destination rect should still be red"
+        finally:
+            proc.terminate()
+
+    def test_draw_image_wrong_arity_is_a_compile_error(self, parser, semantic, errors):
+        # 3, 5, and 9 are the only valid shapes -- anything else (4, 6,
+        # 8 args) is a real mistake, not a fourth form nobody wrote yet.
+        for source in [
+            "img sq\ndrawImage(sq, 0)",
+            "img sq\ndrawImage(sq, 0, 0, 0)",
+            "img sq\ndrawImage(sq, 0, 0, 0, 0, 0, 0)",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
 
 
 class TestRenderClearAndHeadless:
@@ -14056,6 +14579,118 @@ class TestArrayIndexOf:
             "arr[int] xs = [1]\nlog(xs.indexOf())",
             "arr[int] xs = [1]\nlog(xs.indexOf(1, 2))",
             "arr[int] xs = [1]\nlog(xs.indexOf('a'))",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
+class TestArraySort:
+    """claude.md #184 (uraikus/festina#76 item 2): xs.sort(cmpFn), a
+    comparator-based sort taking cmpFn:func[T,T]:int, JS/C-qsort style
+    -- negative/zero/positive meaning first-before-second/equal/
+    first-after-second, exactly like a C qsort() comparator. In place,
+    void, and STABLE (unlike qsort(), which makes no such promise) --
+    see festina_array_sort's own runtime comment on why."""
+
+    def test_sorts_ints_ascending_and_descending(self, compile_and_run):
+        source = """
+        int func byAsc(a:int, b:int) { return a - b }
+        int func byDesc(a:int, b:int) { return b - a }
+        arr[int] xs = [5, 3, 8, 1, 9, 2]
+        xs.sort(byAsc)
+        log(xs)
+        xs.sort(byDesc)
+        log(xs)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "[1,2,3,5,8,9]\n[9,8,5,3,2,1]\n"
+
+    def test_empty_and_single_element_arrays_are_no_ops(self, compile_and_run):
+        source = """
+        int func byAsc(a:int, b:int) { return a - b }
+        arr[int] empty = []
+        empty.sort(byAsc)
+        log(empty.length)
+        arr[int] one = [42]
+        one.sort(byAsc)
+        log(one)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "0\n[42]\n"
+
+    def test_stable_for_equal_elements(self, compile_and_run):
+        # Two structs that compare equal (same y) must keep their
+        # original relative order -- 'tree' was pushed before 'player'
+        # and both have y=5, so 'tree' must still come first.
+        source = """
+        struct Sprite { name:text y:int }
+        int func byY(p:Sprite, q:Sprite) { return p.y - q.y }
+        Sprite a
+        a.name = 'tree'
+        a.y = 5
+        Sprite b
+        b.name = 'player'
+        b.y = 5
+        Sprite c
+        c.name = 'rock'
+        c.y = 2
+        arr[Sprite] sprites = [a, b, c]
+        sprites.sort(byY)
+        log(`${sprites[0].name},${sprites[1].name},${sprites[2].name}`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "rock,tree,player\n"
+
+    def test_sorts_floats_and_bools(self, compile_and_run):
+        source = """
+        int func byFloat(a:float, b:float) {
+            if (a < b) { return -1 }
+            if (a > b) { return 1 }
+            return 0
+        }
+        arr[float] fs = [3.5, 1.5, 2.5]
+        fs.sort(byFloat)
+        log(fs)
+        int func byBool(a:bool, b:bool) {
+            if (a == b) { return 0 }
+            if (a) { return 1 }
+            return -1
+        }
+        arr[bool] bs = [true, false, true, false]
+        bs.sort(byBool)
+        log(bs)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "[1.5,2.5,3.5]\n[false,false,true,true]\n"
+
+    def test_arbitrary_expression_callback_not_just_a_bare_name(self, compile_and_run):
+        # claude.md #165/#171's own permissive rule -- unlike setTimeout's
+        # older bare-name-only convention, any func-typed EXPRESSION works.
+        source = """
+        int func byAsc(a:int, b:int) { return a - b }
+        func[int,int]:int cmp = byAsc
+        arr[int] xs = [3, 1, 2]
+        xs.sort(cmp)
+        log(xs)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "[1,2,3]\n"
+
+    def test_wrong_arity_or_signature_is_a_compile_error(self, parser, semantic, errors):
+        for source in [
+            "int func byAsc(a:int, b:int) { return a - b }\n"
+            "arr[int] xs = [1]\nxs.sort()",
+            "int func byAsc(a:int, b:int) { return a - b }\n"
+            "arr[int] xs = [1]\nxs.sort(byAsc, byAsc)",
+            "text func bad(a:text, b:text) { return a }\n"
+            "arr[int] xs = [1]\nxs.sort(bad)",
+            "arr[int] xs = [1]\nxs.sort(5)",
         ]:
             program = parser.parse(source, filename="main.f")
             with pytest.raises(errors.CompileError):

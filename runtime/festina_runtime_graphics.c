@@ -647,6 +647,53 @@ static void festina_fill_and_border_with_color(cairo_t *cr, int64_t color) {
     g_fill_gradient = save_gradient;
 }
 
+/* claude.md #188 (uraikus/festina#76 item 8): drawRect(x, y, w, h,
+ * fillColor, borderColor)/drawCircle(x, y, r, fillColor, borderColor)
+ * -- the border-colour counterpart to festina_fill_and_border_with_
+ * color just above, overriding BOTH colours for this call only, then
+ * restoring whatever fillStyle()/borderColor() were already set to.
+ * This is what closes the "global, mutable draw style silently leaks
+ * between shapes" gap #76 itself reported: a border colour left over
+ * from a previous, unrelated draw call no longer has to be reset by
+ * hand (or via saveState()/restoreState()) before every shape that
+ * needs its own.
+ *
+ * `border_color < 0` means no border for this one call, matching
+ * borderColor('none')'s own encoding (claude.md #91) -- and, like
+ * festina_fill_and_border_with_color's own fill-only override, this
+ * does NOT also touch g_line_width: a border colour given while
+ * lineWidth() is still 0 draws nothing, the exact same "nothing to
+ * stroke" case plain borderColor() already has, not a new special
+ * case to invent here. */
+static void festina_fill_and_border_with_colors(cairo_t *cr, int64_t fill_color, int64_t border_color) {
+    double save_fill_r = g_fill_r, save_fill_g = g_fill_g, save_fill_b = g_fill_b;
+    int save_fill_none = g_fill_none;
+    cairo_pattern_t *save_gradient = g_fill_gradient;
+    double save_border_r = g_border_r, save_border_g = g_border_g, save_border_b = g_border_b;
+    int save_border_set = g_border_set;
+
+    g_fill_gradient = NULL;
+    if (fill_color < 0) {
+        g_fill_none = 1;
+    } else {
+        g_fill_none = 0;
+        festina_unpack_rgb(fill_color, &g_fill_r, &g_fill_g, &g_fill_b);
+    }
+    if (border_color < 0) {
+        g_border_set = 0;
+    } else {
+        g_border_set = 1;
+        festina_unpack_rgb(border_color, &g_border_r, &g_border_g, &g_border_b);
+    }
+    festina_fill_and_border(cr);
+
+    g_fill_r = save_fill_r; g_fill_g = save_fill_g; g_fill_b = save_fill_b;
+    g_fill_none = save_fill_none;
+    g_fill_gradient = save_gradient;
+    g_border_r = save_border_r; g_border_g = save_border_g; g_border_b = save_border_b;
+    g_border_set = save_border_set;
+}
+
 /* claude.md #123: opens the platform window through the seam, exactly
  * once -- self-guarding (returns immediately if already open) rather
  * than relying on every call site to check first, since this is a
@@ -876,6 +923,18 @@ void festina_draw_rect_color(int64_t x, int64_t y, int64_t w, int64_t h, int64_t
     cairo_destroy(cr);
 }
 
+/* claude.md #188 (uraikus/festina#76 item 8): drawRect(x, y, w, h,
+ * fillColor, borderColor) -- see festina_fill_and_border_with_colors'
+ * own comment. */
+void festina_draw_rect_colors(int64_t x, int64_t y, int64_t w, int64_t h,
+                               int64_t fill_color, int64_t border_color) {
+    festina_backing_require();
+    cairo_t *cr = festina_canvas_context();
+    cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
+    festina_fill_and_border_with_colors(cr, fill_color, border_color);
+    cairo_destroy(cr);
+}
+
 /* claude.md #133: a single pixel, filled with the current fillStyle.
  * Antialiasing is disabled around the fill so an integer-aligned 1x1
  * rectangle paints exactly one pixel deterministically -- with it left
@@ -1017,6 +1076,29 @@ void festina_draw_circle(int64_t x, int64_t y, int64_t r) {
     }
     cairo_arc(cr, (double)x, (double)y, (double)r, 0.0, 2.0 * 3.14159265358979323846);
     festina_fill_and_border(cr); /* claude.md #89 */
+    cairo_destroy(cr);
+}
+
+/* claude.md #188 (uraikus/festina#76 item 8): drawCircle(x, y, r,
+ * fillColor)/drawCircle(x, y, r, fillColor, borderColor) -- same
+ * per-call override as drawRect's own color/colors forms; no fast-path
+ * mask cache here (unlike plain festina_draw_circle just above) since
+ * an occasional colour override is not the hot path that optimization
+ * exists for. */
+void festina_draw_circle_color(int64_t x, int64_t y, int64_t r, int64_t color) {
+    festina_backing_require();
+    cairo_t *cr = festina_canvas_context();
+    cairo_arc(cr, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0.0, 2.0 * 3.14159265358979323846);
+    festina_fill_and_border_with_color(cr, color);
+    cairo_destroy(cr);
+}
+
+void festina_draw_circle_colors(int64_t x, int64_t y, int64_t r,
+                                 int64_t fill_color, int64_t border_color) {
+    festina_backing_require();
+    cairo_t *cr = festina_canvas_context();
+    cairo_arc(cr, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0.0, 2.0 * 3.14159265358979323846);
+    festina_fill_and_border_with_colors(cr, fill_color, border_color);
     cairo_destroy(cr);
 }
 
@@ -1445,6 +1527,25 @@ void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h) 
     return festina_image_box(out);
 }
 
+/* claude.md #188 (uraikus/festina#76 item 4): blankImage(w, h) -- a
+ * fresh, fully-transparent img at a given size, with no existing image
+ * or canvas to derive it from. Cairo's own cairo_image_surface_create
+ * already zero-initializes every byte (documented guarantee), which
+ * for ARGB32 IS fully transparent, so there's nothing else to paint
+ * here -- unlike clip()/resize()/saveCanvas() just below, every one of
+ * which copies FROM something that already exists. Closes the gap
+ * those three leave: getting an independently-resizable, genuinely
+ * blank image used to mean bouncing through the canvas by hand
+ * (clearCanvas(); saveCanvas()), even when nothing needed to be drawn
+ * yet -- and unlike that workaround, this never touches the real
+ * on-screen canvas at all, so it costs nothing when a program is
+ * midway through a frame. */
+void *festina_blank_image(int64_t w, int64_t h) {
+    festina_check_image_size("blankImage", w, h);
+    cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, (int)w, (int)h);
+    return festina_image_box(out);
+}
+
 /* claude.md #135: saveCanvas() with no path -> img, a SNAPSHOT of the
  * canvas at this instant rather than a live view of it -- built the
  * exact same way festina_image_clip just above builds any other fresh
@@ -1545,6 +1646,17 @@ void festina_image_draw_rect_color(void *img, int64_t x, int64_t y, int64_t w, i
     festina_image_bytes_now_stale(img);
 }
 
+/* claude.md #188 (uraikus/festina#76 item 8) */
+void festina_image_draw_rect_colors(void *img, int64_t x, int64_t y, int64_t w, int64_t h,
+                                     int64_t fill_color, int64_t border_color) {
+    if (!img) return;
+    cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
+    cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
+    festina_fill_and_border_with_colors(cr, fill_color, border_color);
+    cairo_destroy(cr);
+    festina_image_bytes_now_stale(img);
+}
+
 /* See festina_draw_pixel's own comment (just above festina_draw_circle
  * in this file) for why antialiasing is disabled around the fill. */
 void festina_image_draw_pixel(void *img, int64_t x, int64_t y) {
@@ -1598,6 +1710,26 @@ void festina_image_draw_circle(void *img, int64_t x, int64_t y, int64_t r) {
     festina_image_bytes_now_stale(img);
 }
 
+/* claude.md #188 (uraikus/festina#76 item 8) */
+void festina_image_draw_circle_color(void *img, int64_t x, int64_t y, int64_t r, int64_t color) {
+    if (!img) return;
+    cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
+    cairo_arc(cr, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0.0, 2.0 * 3.14159265358979323846);
+    festina_fill_and_border_with_color(cr, color);
+    cairo_destroy(cr);
+    festina_image_bytes_now_stale(img);
+}
+
+void festina_image_draw_circle_colors(void *img, int64_t x, int64_t y, int64_t r,
+                                       int64_t fill_color, int64_t border_color) {
+    if (!img) return;
+    cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
+    cairo_arc(cr, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0.0, 2.0 * 3.14159265358979323846);
+    festina_fill_and_border_with_colors(cr, fill_color, border_color);
+    cairo_destroy(cr);
+    festina_image_bytes_now_stale(img);
+}
+
 void festina_image_draw_text(void *img, const char *text, int64_t x, int64_t y) {
     if (!img || !text) return;
     cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
@@ -1626,12 +1758,82 @@ void festina_image_free(void *img) {
     free((char *)img - sizeof(int64_t));
 }
 
+/* claude.md #183 (see uraikus/festina#78): drawImage used to always
+ * `cairo_paint`, unconditionally full opacity, completely ignoring
+ * `g_fill_alpha` -- every OTHER draw path already carries it (see
+ * festina_set_fill_source's own `cairo_set_source_rgba(..., g_fill_
+ * alpha)`, and its own `cairo_paint_with_alpha` call for a gradient
+ * fill just above, the direct precedent this now follows for the
+ * identical reason: cairo_set_source_surface has no alpha channel of
+ * its own to carry it the way cairo_set_source_rgba does, so applying
+ * the alpha has to happen at PAINT time instead of source-setup time).
+ * `cairo_paint_with_alpha(cr, 1.0)` is defined to behave identically to
+ * plain `cairo_paint`, so this is a strict extension, not a behavior
+ * change for the (overwhelmingly common) case where fillAlpha was
+ * never touched. */
 void festina_draw_image(void *img, int64_t x, int64_t y) {
     festina_backing_require();
     if (!img) return;
     cairo_t *cr = festina_canvas_context();
     cairo_set_source_surface(cr, ((FestinaImageBox *)img)->surface, (double)x, (double)y);
-    cairo_paint(cr);
+    cairo_paint_with_alpha(cr, g_fill_alpha);
+    cairo_destroy(cr);
+}
+
+/* claude.md #185 (uraikus/festina#76 item 3): drawImage(img, x, y, w,
+ * h) -- draws the WHOLE source image scaled to fit a w x h box at
+ * (x, y). The gap this closes: previously the only way to change an
+ * image's displayed size at all was img.resize(), which mutates in
+ * place -- so drawing one stored sprite at two different sizes (a
+ * small palette icon and a full-size stamp) meant keeping two separate
+ * copies around, generated or resized by hand.
+ *
+ * A plain scale-then-paint, not a resample into a fresh surface --
+ * Cairo's own source-pattern filtering (CAIRO_FILTER_GOOD, the default
+ * for an image pattern) does the interpolation, so this needs no image
+ * processing of its own, and costs nothing extra when w/h happen to
+ * match the source size exactly. */
+void festina_draw_image_scaled(void *img, int64_t x, int64_t y, int64_t w, int64_t h) {
+    festina_backing_require();
+    if (!img || w <= 0 || h <= 0) return;
+    cairo_surface_t *surface = ((FestinaImageBox *)img)->surface;
+    int src_w = cairo_image_surface_get_width(surface);
+    int src_h = cairo_image_surface_get_height(surface);
+    if (src_w <= 0 || src_h <= 0) return;
+    cairo_t *cr = festina_canvas_context();
+    cairo_save(cr);
+    cairo_translate(cr, (double)x, (double)y);
+    cairo_scale(cr, (double)w / (double)src_w, (double)h / (double)src_h);
+    cairo_set_source_surface(cr, surface, 0, 0);
+    cairo_paint_with_alpha(cr, g_fill_alpha);
+    cairo_restore(cr);
+    cairo_destroy(cr);
+}
+
+/* claude.md #185: the full 8-argument canvas-style form -- a SOURCE
+ * rect (sx, sy, sw, sh) cut out of the image and scaled to fit a
+ * DESTINATION rect (dx, dy, dw, dh), the variable-size paint-brush-
+ * from-one-fixed-size-source case #76 itself named.
+ *
+ * A source rect reaching past the image's own edge behaves exactly
+ * like festina_image_clip's own "the overlap is copied, the rest stays
+ * transparent" rule -- clipping to the DESTINATION rect (not the
+ * source) is what keeps that transparent overflow from spilling past
+ * the intended box instead of just fading out inside it. */
+void festina_draw_image_region(void *img, int64_t sx, int64_t sy, int64_t sw, int64_t sh,
+                                int64_t dx, int64_t dy, int64_t dw, int64_t dh) {
+    festina_backing_require();
+    if (!img || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+    cairo_surface_t *surface = ((FestinaImageBox *)img)->surface;
+    cairo_t *cr = festina_canvas_context();
+    cairo_save(cr);
+    cairo_rectangle(cr, (double)dx, (double)dy, (double)dw, (double)dh);
+    cairo_clip(cr);
+    cairo_translate(cr, (double)dx, (double)dy);
+    cairo_scale(cr, (double)dw / (double)sw, (double)dh / (double)sh);
+    cairo_set_source_surface(cr, surface, -(double)sx, -(double)sy);
+    cairo_paint_with_alpha(cr, g_fill_alpha);
+    cairo_restore(cr);
     cairo_destroy(cr);
 }
 

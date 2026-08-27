@@ -401,4 +401,18 @@ class TestLeakStress:
             # the callback rather than leaking the payload it already
             # allocated), with argv length varying pass to pass.
             "exec_callback_churn.f",
+            # claude.md #184: .sort()'s own comparator trampoline path --
+            # the indirect call back into Festina code happens on EVERY
+            # comparison, thousands of times per pass, for both a text-
+            # keyed struct element type (a refcounted slot the merge
+            # sort's scratch-buffer copy could double-free or drop) and
+            # a scalar int element type, including already-sorted and
+            # single-element arrays (the zero-swap edge cases).
+            "sort_churn.f",
+            # claude.md #186: map[T].keys()/.values() -- .values()'s own
+            # retain-or-copy ownership work on a refcounted/text value
+            # type, confirmed independent of the SOURCE map's own
+            # lifetime (freeing/deleting from the map right after
+            # collecting must leave the returned array untouched).
+            "map_keys_values_churn.f",
         }
