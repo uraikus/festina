@@ -63,6 +63,15 @@ static int g_window_open = 0;      /* claude.md #123: portable stand-in for "is
                                      * there a live platform window" -- the shared
                                      * code's own guard, since g_display/g_window
                                      * no longer exist here at all. */
+/* claude.md #180: enterFullscreen()/exitFullscreen()'s own desired/
+ * current-state flag -- does double duty exactly like g_canvas_width/
+ * g_canvas_height already do (claude.md #178's own comment on those):
+ * "the requested state before a window exists" and "the current state
+ * once one does" are the same variable, on purpose, so a program that
+ * calls enterFullscreen() before ever drawing anything gets a window
+ * that opens DIRECTLY in fullscreen -- no flash of a normal window
+ * first -- the identical fix #178 already made for canvas size. */
+static int g_is_fullscreen = 0;
 static cairo_surface_t *g_backing_surface = NULL;
 /* claude.md #106: `on click` split into `on mouseDown` and `on mouseUp`,
  * exactly as claude.md #98 split `on key`. A click is a press and a
@@ -626,17 +635,63 @@ static void festina_fill_and_border_with_color(cairo_t *cr, int64_t color) {
 }
 
 /* claude.md #123: opens the platform window through the seam, exactly
- * once. Portable now -- every platform-specific concern (connect
- * retries, decorations, input focus, ...) lives in that platform's own
- * festina_window_open implementation; see festina_runtime_window.h. */
+ * once -- self-guarding (returns immediately if already open) rather
+ * than relying on every call site to check first, since this is a
+ * public runtime entry point with more than one caller (festina_render,
+ * festina_run_event_loop). Portable now -- every platform-specific
+ * concern (connect retries, decorations, input focus, ...) lives in
+ * that platform's own festina_window_open implementation; see
+ * festina_runtime_window.h.
+ *
+ * Opens at g_canvas_width/g_canvas_height AS THEY ALREADY STAND, not the
+ * hardcoded FESTINA_CANVAS_WIDTH/_HEIGHT default -- claude.md #178 (see
+ * uraikus/festina#79): festina_set_client_size already lets
+ * setClientWidth/setClientHeight update those globals before any window
+ * exists (it only touches the live window/backing store inside its own
+ * `if (g_window_open)` branch), so a program that calls either near the
+ * top of its own boot sequence -- the documented, `on resize`-safe
+ * pattern #75 recommends -- had that request silently overwritten back
+ * to 800x600 right here, every time, then "corrected" a moment later by
+ * whatever real resize festina_set_client_size fires once the window
+ * DOES exist. Reading the current globals instead means a size chosen
+ * before the window opens is simply the window's initial size, with no
+ * flash of the wrong dimensions and no spurious `on resize` firing for
+ * a size the program never actually asked to see. */
 void festina_graphics_init(void) {
-    festina_window_open(FESTINA_CANVAS_WIDTH, FESTINA_CANVAS_HEIGHT, "Festina");
+    if (g_window_open) return;
+    festina_window_open(g_canvas_width, g_canvas_height, "Festina");
     g_window_open = 1;
-    g_canvas_width = FESTINA_CANVAS_WIDTH;
-    g_canvas_height = FESTINA_CANVAS_HEIGHT;
+    /* claude.md #180: apply an enterFullscreen() call that already ran
+     * before the window existed -- see g_is_fullscreen's own comment. */
+    if (g_is_fullscreen) festina_window_set_fullscreen(1);
     /* claude.md #95: whatever was already drawn headlessly is kept --
      * a program may well have drawn before its first render(). */
     festina_backing_require();
+}
+
+/* claude.md #180: enterFullscreen()/exitFullscreen() -- see
+ * g_is_fullscreen's own comment for why the same flag tracks both "what
+ * was requested before a window existed" and "what's true now that one
+ * does", and festina_runtime_window.h's own doc comment on
+ * festina_window_set_fullscreen for why the resulting size change
+ * surfaces asynchronously (a real RESIZE event, on the next
+ * events_drain pump) rather than synchronously the way setClientWidth/
+ * setClientHeight's own g_canvas_width/height update is. No-ops if
+ * already in the requested state, the same guard festina_set_client_
+ * size already uses for a same-value call -- redundantly calling the
+ * platform seam twice would be at best wasted work and at worst (X11's
+ * ClientMessage toggle-by-convention on some window managers) a second,
+ * unwanted state flip. */
+void festina_enter_fullscreen(void) {
+    if (g_is_fullscreen) return;
+    g_is_fullscreen = 1;
+    if (g_window_open) festina_window_set_fullscreen(1);
+}
+
+void festina_exit_fullscreen(void) {
+    if (!g_is_fullscreen) return;
+    g_is_fullscreen = 0;
+    if (g_window_open) festina_window_set_fullscreen(0);
 }
 
 /* claude.md #93: writes the canvas to a PNG. Cairo's PNG *writer* has
@@ -1777,8 +1832,20 @@ static void festina_handle_window_event(const FestinaWindowEvent *ev) {
  * (see festina/codegen.py's _emit_main_and_entry), openPort() being
  * used at all doesn't change which loop that is once graphics is also
  * in play; it just adds http servicing to this one, through the hook
- * seam declared in festina_runtime.h. */
+ * seam declared in festina_runtime.h.
+ *
+ * claude.md #178 (see uraikus/festina#79): main() no longer opens the
+ * window eagerly before __festina_main() runs -- codegen.py's own
+ * prologue only registers the event handlers there, letting any
+ * setClientWidth/setClientHeight call the program's top-level code
+ * makes run first, against no window at all. This lazy fallback (the
+ * same guard festina_render() already used) is what still guarantees a
+ * window exists by the time this loop needs one: a program that
+ * declares a handler or sets its client size but never itself calls
+ * render()/draws anything still gets a real window here, at whatever
+ * size was last requested (or the 800x600 default, if none was). */
 void festina_run_event_loop(void) {
+    if (!g_window_open) festina_graphics_init();
     g_should_stop_looping = 0;
     /* claude.md #161: checked once per iteration alongside
      * g_should_stop_looping -- the identical shape a real window
@@ -1938,11 +2005,22 @@ void festina_window_open(int64_t width, int64_t height, const char *title) {
                                     (unsigned int)width, (unsigned int)height, 0,
                                     BlackPixel(g_display, screen), WhitePixel(g_display, screen));
 
+    /* claude.md #180: request full decorations -- title bar, and the
+     * WM's own minimize/maximize/close buttons -- rather than the
+     * borderless "canvas, nothing else" look this used to request via
+     * decorations=0 (MWM_DECOR_ALL, decorations=1, is the explicit ask
+     * for the WM's normal chrome, not just the absence of the old
+     * override). Still set explicitly rather than left unset, matching
+     * this window's own previous convention of stating what it wants
+     * rather than assuming a WM's default -- some WMs default borderless
+     * windows to fully undecorated too, so simply omitting this property
+     * wouldn't reliably produce a decorated window on every WM the way
+     * asking for one explicitly does. */
     Atom mwm_hints_atom = XInternAtom(g_display, "_MOTIF_WM_HINTS", False);
     FestinaMotifWmHints hints;
     memset(&hints, 0, sizeof(hints));
     hints.flags = 2; /* MWM_HINTS_DECORATIONS */
-    hints.decorations = 0;
+    hints.decorations = 1; /* MWM_DECOR_ALL */
     XChangeProperty(g_display, g_window, mwm_hints_atom, mwm_hints_atom, 32,
                      PropModeReplace, (unsigned char *)&hints,
                      sizeof(hints) / sizeof(long));
@@ -2033,6 +2111,42 @@ void festina_window_resize(int64_t width, int64_t height) {
     if (!g_display) return;
     XResizeWindow(g_display, g_window, (unsigned int)width, (unsigned int)height);
     cairo_xlib_surface_set_size(g_window_surface, (int)width, (int)height);
+    XFlush(g_display);
+}
+
+/* claude.md #180: the standard EWMH way to ask the window manager for
+ * real fullscreen -- a _NET_WM_STATE ClientMessage sent to the ROOT
+ * window (not the client window itself; that is what tells the WM to
+ * treat this as a state-change REQUEST rather than a property it should
+ * just record), asking it to add or remove _NET_WM_STATE_FULLSCREEN.
+ * Honored by every EWMH-compliant window manager (which is effectively
+ * all of them; see https://specifications.freedesktop.org/wm-spec/) --
+ * this backend never draws the fullscreen chrome/geometry itself the
+ * way the Windows backend has to (see that file's own comment), since
+ * X11's own WM already owns that job for every other window too.
+ * data.l[0]: 1 = _NET_WM_STATE_ADD, 0 = _NET_WM_STATE_REMOVE. data.l[3]:
+ * source indication -- 1 means "a normal application", the value the
+ * spec asks a well-behaved client to send. A no-op with no window open,
+ * matching festina_window_resize's own guard just above -- the portable
+ * caller (festina_enter_fullscreen/festina_exit_fullscreen) already
+ * only reaches this when g_window_open is true, but the same defensive
+ * check costs nothing and keeps this function safe to call on its own. */
+void festina_window_set_fullscreen(int8_t fullscreen) {
+    if (!g_display) return;
+    Atom net_wm_state = XInternAtom(g_display, "_NET_WM_STATE", False);
+    Atom net_wm_state_fullscreen = XInternAtom(g_display, "_NET_WM_STATE_FULLSCREEN", False);
+    XEvent xev;
+    memset(&xev, 0, sizeof(xev));
+    xev.type = ClientMessage;
+    xev.xclient.window = g_window;
+    xev.xclient.message_type = net_wm_state;
+    xev.xclient.format = 32;
+    xev.xclient.data.l[0] = fullscreen ? 1 : 0;
+    xev.xclient.data.l[1] = (long)net_wm_state_fullscreen;
+    xev.xclient.data.l[2] = 0;
+    xev.xclient.data.l[3] = 1;
+    XSendEvent(g_display, DefaultRootWindow(g_display), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &xev);
     XFlush(g_display);
 }
 

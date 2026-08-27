@@ -109,4 +109,22 @@ void festina_window_events_drain(void (*handler)(const FestinaWindowEvent *event
 void festina_window_screen_size(int64_t *out_width, int64_t *out_height);
 void festina_window_resize(int64_t width, int64_t height);
 
+/* claude.md #180: enterFullscreen()/exitFullscreen(). Toggles the OPEN
+ * window in and out of true OS fullscreen -- covering the whole screen,
+ * no decorations -- restoring its prior geometry on exit. A no-op if no
+ * window is open, mirroring festina_window_resize's own contract just
+ * above: portable code (festina_enter_fullscreen/festina_exit_
+ * fullscreen in festina_runtime_graphics.c) already handles the "no
+ * window yet" case by recording the desired state for
+ * festina_graphics_init to apply once one actually opens, the identical
+ * split festina_set_client_size/festina_window_resize already use for
+ * setClientWidth/setClientHeight. The resulting size change is reported
+ * the same way any other native, WM-driven resize already is -- through
+ * this backend's own RESIZE event, whenever the next events_drain pump
+ * happens to run -- rather than synchronously the way setClientWidth/
+ * setClientHeight are, since going fullscreen is a real window-manager/
+ * OS negotiation (X11's async ClientMessage protocol; AppKit's own
+ * animated transition), not a Festina-driven resize like those two. */
+void festina_window_set_fullscreen(int8_t fullscreen);
+
 #endif /* FESTINA_RUNTIME_WINDOW_H */
