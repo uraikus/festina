@@ -5525,6 +5525,67 @@ class TestScreenSizeAndSetClientSize:
             proc.terminate()
             proc.wait(timeout=5)
 
+    def test_setting_client_size_before_the_window_opens_is_honored_as_its_initial_size(
+            self, run_graphics_program, x_display):
+        # claude.md #178 (uraikus/festina#79): a program that calls
+        # setClientWidth/setClientHeight near the top of its own boot
+        # sequence -- the documented, `on resize`-safe pattern
+        # TestEventHandlersAreHoistedLikeFunctions below already
+        # exercises for a DIFFERENT reason -- used to open a real,
+        # on-screen window at the hardcoded 800x600 default FIRST
+        # (main()'s own prologue called festina_graphics_init()
+        # unconditionally before __festina_main() ever ran, and that
+        # function itself then overwrote g_canvas_width/height back to
+        # the hardcoded default even if a pre-window setClientWidth/
+        # setClientHeight call had already changed them), then resized
+        # itself out from under that -- each resize taking
+        # festina_set_client_size's real, `g_window_open`-gated branch
+        # (an actual XResizeWindow plus an `on resize` firing) since the
+        # window was already open by the time either call ran. Fixed by
+        # no longer opening the window before __festina_main() at all
+        # (only registering handlers there) and having
+        # festina_graphics_init() read g_canvas_width/height as they
+        # already stand instead of resetting them -- so a size chosen
+        # before the window exists is simply the window's initial size:
+        # no flash of the wrong dimensions, and no `on resize` firing at
+        # all for a size the program never asked to actually SEE change.
+        source = (
+            "on resize() {\n"
+            "    log(`unexpected resize: ${clientWidth}x${clientHeight}`)\n"
+            "}\n"
+            "log('step0: process start')\n"
+            "setClientWidth(1024)\n"
+            "log(`step1: ${clientWidth}x${clientHeight}`)\n"
+            "setClientHeight(700)\n"
+            "log(`step2: ${clientWidth}x${clientHeight}`)\n"
+            "render()\n"
+        )
+        proc, stdout_path = run_graphics_program(source)
+        try:
+            wid = _find_window(x_display)
+            env = dict(os.environ, DISPLAY=x_display)
+            geometry = subprocess.run(
+                ["xdotool", "getwindowgeometry", "--shell", wid],
+                env=env, capture_output=True, text=True, check=True,
+            ).stdout
+            dims = dict(line.split("=", 1) for line in geometry.splitlines() if "=" in line)
+            # The window opened DIRECTLY at the fully-requested size --
+            # not the 800x600 default, and not the 1024x600 intermediate
+            # size #79's own repro observed.
+            assert (dims["WIDTH"], dims["HEIGHT"]) == ("1024", "700")
+            text = _wait_for_output(stdout_path, lambda t: "step2:" in t)
+            # Neither setClientWidth nor setClientHeight fired `on
+            # resize` -- there was no window yet for either call to
+            # resize out from under itself.
+            assert text.splitlines() == [
+                "step0: process start",
+                "step1: 1024x600",
+                "step2: 1024x700",
+            ]
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
 
 class TestEventHandlersAreHoistedLikeFunctions:
     """Not a bug, but a real, confirmed footgun -- flagged directly,
@@ -11878,7 +11939,14 @@ class TestColorAndFontTypes:
         log(measureTextWidth('hello'))
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @festina_graphics_init()" not in ir
+        # claude.md #178: festina_graphics_init() is no longer emitted by
+        # codegen at all -- see test_render_is_what_opens_the_window's own
+        # comment -- so the meaningful check is that nothing here reaches
+        # for a window in the first place: no render() (which lazily opens
+        # one) and no festina_run_event_loop() (which self.uses_graphics
+        # would otherwise cause main() to call after __festina_main()).
+        assert "call void @festina_render()" not in ir
+        assert "call void @festina_run_event_loop()" not in ir
 
     def test_drawing_alone_no_longer_opens_a_canvas_window(
             self, parser, semantic, codegen):
@@ -11890,7 +11958,8 @@ class TestColorAndFontTypes:
         drawRect(0, 0, 10, 10)
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @festina_graphics_init()" not in ir
+        assert "call void @festina_render()" not in ir
+        assert "call void @festina_run_event_loop()" not in ir
 
     def test_render_is_what_opens_the_window(self, parser, semantic, codegen):
         source = """
@@ -11900,7 +11969,21 @@ class TestColorAndFontTypes:
         render()
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @festina_graphics_init()" in ir
+        # claude.md #178 (uraikus/festina#79): festina_graphics_init() is
+        # no longer called eagerly from main()'s own prologue (that used
+        # to open the window, at the hardcoded 800x600 default, before
+        # __festina_main() -- and any setClientWidth/setClientHeight call
+        # it makes -- ever ran). It's purely an internal, self-guarded C
+        # runtime call now, reached lazily from festina_render()'s own
+        # `if (!g_window_open)` check (or festina_run_event_loop()'s
+        # matching fallback for a program that never calls render() at
+        # all) -- invisible at the LLVM IR level either way. So the
+        # observable signal that THIS program opens a window is simply
+        # that it calls festina_render() -- see
+        # TestScreenSizeAndSetClientSize's own
+        # test_setting_client_size_before_the_window_opens_is_honored_as_its_initial_size
+        # for the real runtime behavior this enables.
+        assert "call void @festina_render()" in ir
 
     def test_text_metrics_follow_the_declared_font(self, compile_and_run):
         source = """
@@ -13078,9 +13161,15 @@ class TestCanvasPathsTransformsAndGradients:
 
     def test_path_calls_do_not_open_a_canvas(self, parser, semantic, codegen):
         # claude.md #95: a path paints the offscreen canvas like any
-        # other drawing -- only render() needs a window.
+        # other drawing -- only render() needs a window. claude.md #178:
+        # festina_graphics_init() itself is never emitted directly any
+        # more (see test_render_is_what_opens_the_window's own comment
+        # in TestColorAndFontTypes), so festina_render()/
+        # festina_run_event_loop()'s absence is what actually shows
+        # this program never reaches for a window.
         ir = self._ir(parser, semantic, codegen, "beginPath()\nmoveTo(0,0)\nfillPath()")
-        assert "call void @festina_graphics_init()" not in ir
+        assert "call void @festina_render()" not in ir
+        assert "call void @festina_run_event_loop()" not in ir
 
     def test_transforms_and_state_open_nothing(self, parser, semantic, codegen):
         # Pure state, exactly like claude.md #89's own style setters --
@@ -13095,7 +13184,8 @@ class TestCanvasPathsTransformsAndGradients:
         resetTransform()
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "call void @festina_graphics_init()" not in ir
+        assert "call void @festina_render()" not in ir
+        assert "call void @festina_run_event_loop()" not in ir
 
     def test_building_a_path_with_none_open_fails_clearly(self, compile_and_run):
         result = compile_and_run("moveTo(10, 10)")
@@ -13219,7 +13309,8 @@ class TestRenderClearAndHeadless:
 
     def test_clearing_alone_does_not_open_a_window(self, parser, semantic, codegen):
         ir = self._ir(parser, semantic, codegen, "clearCanvas()\nclearRect(0,0,5,5)")
-        assert "call void @festina_graphics_init()" not in ir
+        assert "call void @festina_render()" not in ir
+        assert "call void @festina_run_event_loop()" not in ir
 
     def test_saving_a_canvas_needs_no_display(self, compile_and_run, tmp_path):
         # The capability the split exists for.

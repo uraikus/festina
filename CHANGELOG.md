@@ -9,6 +9,18 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.2.2] - 2026-08-27
+
+### Fixed
+
+- A program calling `setClientWidth`/`setClientHeight` near the top of
+  its own boot sequence briefly opened a real, on-screen window at the
+  hardcoded 800×600 default before correcting itself, since the window
+  used to open (and its size reset back to that default) before the
+  program's own top-level code ever ran. The window now opens lazily,
+  after any such call has already taken effect, directly at the
+  requested size. See [api.md](api.md#graphics).
+
 ## [0.2.1] - 2026-08-26
 
 ### Fixed

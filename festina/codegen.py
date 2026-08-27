@@ -10145,7 +10145,28 @@ class CodeGen:
                     f"ptr {names_global}, ptr {types_global}, i32 {ncols})"
                 )
         if self.uses_graphics:
-            main_lines.append("  call void @festina_graphics_init()")
+            # claude.md #178 (uraikus/festina#79): deliberately NOT a
+            # call to festina_graphics_init() here -- that used to run
+            # unconditionally before __festina_main(), which opened the
+            # real window at the hardcoded 800x600 default before the
+            # program's own top-level setClientWidth/setClientHeight
+            # calls (the documented, `on resize`-safe boot pattern #75
+            # recommends) ever got a chance to run, forcing every such
+            # program through a visible open-then-resize instead of
+            # opening at the right size the first time. Handler
+            # registration has no such ordering dependency (it only
+            # ever stores a function pointer -- see
+            # festina_register_resize_handler and friends in
+            # festina_runtime_graphics.c, none of which touch the
+            # window), so it still happens here, before
+            # __festina_main() runs, same as before. The window itself
+            # now opens lazily -- from festina_render()'s own existing
+            # guard if the program calls it, or from
+            # festina_run_event_loop()'s matching fallback below
+            # otherwise -- always reading whatever g_canvas_width/
+            # g_canvas_height already are by then, honoring any
+            # pre-window setClientWidth/setClientHeight call instead of
+            # overwriting it.
             register_fn = {"mouseDown": "festina_register_mouse_down_handler",
                             "mouseUp": "festina_register_mouse_up_handler",
                             "mouse": "festina_register_mouse_handler",

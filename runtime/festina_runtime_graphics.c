@@ -626,14 +626,32 @@ static void festina_fill_and_border_with_color(cairo_t *cr, int64_t color) {
 }
 
 /* claude.md #123: opens the platform window through the seam, exactly
- * once. Portable now -- every platform-specific concern (connect
- * retries, decorations, input focus, ...) lives in that platform's own
- * festina_window_open implementation; see festina_runtime_window.h. */
+ * once -- self-guarding (returns immediately if already open) rather
+ * than relying on every call site to check first, since this is a
+ * public runtime entry point with more than one caller (festina_render,
+ * festina_run_event_loop). Portable now -- every platform-specific
+ * concern (connect retries, decorations, input focus, ...) lives in
+ * that platform's own festina_window_open implementation; see
+ * festina_runtime_window.h.
+ *
+ * Opens at g_canvas_width/g_canvas_height AS THEY ALREADY STAND, not the
+ * hardcoded FESTINA_CANVAS_WIDTH/_HEIGHT default -- claude.md #178 (see
+ * uraikus/festina#79): festina_set_client_size already lets
+ * setClientWidth/setClientHeight update those globals before any window
+ * exists (it only touches the live window/backing store inside its own
+ * `if (g_window_open)` branch), so a program that calls either near the
+ * top of its own boot sequence -- the documented, `on resize`-safe
+ * pattern #75 recommends -- had that request silently overwritten back
+ * to 800x600 right here, every time, then "corrected" a moment later by
+ * whatever real resize festina_set_client_size fires once the window
+ * DOES exist. Reading the current globals instead means a size chosen
+ * before the window opens is simply the window's initial size, with no
+ * flash of the wrong dimensions and no spurious `on resize` firing for
+ * a size the program never actually asked to see. */
 void festina_graphics_init(void) {
-    festina_window_open(FESTINA_CANVAS_WIDTH, FESTINA_CANVAS_HEIGHT, "Festina");
+    if (g_window_open) return;
+    festina_window_open(g_canvas_width, g_canvas_height, "Festina");
     g_window_open = 1;
-    g_canvas_width = FESTINA_CANVAS_WIDTH;
-    g_canvas_height = FESTINA_CANVAS_HEIGHT;
     /* claude.md #95: whatever was already drawn headlessly is kept --
      * a program may well have drawn before its first render(). */
     festina_backing_require();
@@ -1777,8 +1795,20 @@ static void festina_handle_window_event(const FestinaWindowEvent *ev) {
  * (see festina/codegen.py's _emit_main_and_entry), openPort() being
  * used at all doesn't change which loop that is once graphics is also
  * in play; it just adds http servicing to this one, through the hook
- * seam declared in festina_runtime.h. */
+ * seam declared in festina_runtime.h.
+ *
+ * claude.md #178 (see uraikus/festina#79): main() no longer opens the
+ * window eagerly before __festina_main() runs -- codegen.py's own
+ * prologue only registers the event handlers there, letting any
+ * setClientWidth/setClientHeight call the program's top-level code
+ * makes run first, against no window at all. This lazy fallback (the
+ * same guard festina_render() already used) is what still guarantees a
+ * window exists by the time this loop needs one: a program that
+ * declares a handler or sets its client size but never itself calls
+ * render()/draws anything still gets a real window here, at whatever
+ * size was last requested (or the 800x600 default, if none was). */
 void festina_run_event_loop(void) {
+    if (!g_window_open) festina_graphics_init();
     g_should_stop_looping = 0;
     /* claude.md #161: checked once per iteration alongside
      * g_should_stop_looping -- the identical shape a real window
