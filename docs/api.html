@@ -442,6 +442,7 @@
         <a class="sub" href="#what-g-does">What g does</a>
         <a class="sub" href="#literals-vs-regex-function">Literals vs regex()</a>
         <a href="#graphics">Graphics</a>
+        <a class="sub" href="#fullscreen">enterFullscreen()/exitFullscreen()</a>
         <a class="sub" href="#mouse-events">Mouse events</a>
         <a class="sub" href="#keyboard-events">Keyboard events</a>
         <a class="sub" href="#images">Images</a>
@@ -1671,12 +1672,54 @@ setClientHeight(768)
           <strong>Drawing is offscreen. <code>render()</code> puts it on
           screen.</strong> Every drawing call paints an offscreen canvas
           that needs no display at all. <code>render()</code> is the one
-          call that shows it, opening a real X11 window (via Cairo's
-          Xlib backend) the first time it runs — undecorated, 800×600.
-          Declaring one of the seven event handlers opens a window too,
-          since they can't fire without one. After the entry file's
-          top-level code finishes, if a window was opened, the process
-          blocks handling redraws/input until the window closes.
+          call that shows it, opening a real, decorated window (title
+          bar, and the OS's normal minimize/maximize/close controls —
+          like any other window, resizable by dragging an edge) the
+          first time it runs — 800×600 by default. Declaring one of the
+          seven event handlers means a window will exist too, since they
+          can't fire without one — but not necessarily <em>at that
+          point</em>: if the entry file never itself calls
+          <code>render()</code>, the window instead opens lazily right
+          after the entry file's own top-level code finishes, just
+          before the process starts blocking on redraws/input. Either
+          way, whatever <code>clientWidth</code>/<code>clientHeight</code>
+          (or <code>setClientWidth</code>/<code>setClientHeight</code>,
+          below) already are BY THEN is the size the window opens at —
+          see <code>setClientWidth</code>/<code>setClientHeight</code>'s
+          own note just below for why this matters. After the entry
+          file's top-level code finishes, if a window was opened, the
+          process blocks handling redraws/input until the window
+          closes.
+        </div>
+
+        <div class="callout">
+          <strong>Event handlers are active as soon as they're
+          declared, regardless of where in the file that is</strong> —
+          the same hoisting <code>text func</code>/<code>void func</code>
+          declarations already get, applied to <code>on ...</code> too.
+          <code>setClientWidth</code>/<code>setClientHeight</code> fire
+          <code>on resize</code> <em>synchronously, inline</em>, at the
+          point they're called — not later, and not only once the entry
+          file has finished running top to bottom — so a call to either
+          one, anywhere above an <code>on resize</code> handler that
+          reads global state initialized further down the file, can run
+          that handler against state that hasn't been set up yet:
+          <pre class="code" style="margin:10px 0 6px;">render()
+setClientWidth(400)     <span class="cm">// on resize fires HERE, inline</span>
+
+<span class="kw">arr</span>[<span class="kw">int</span>] data = [1, 2, 3]   <span class="cm">// this hasn't run yet when it fires</span>
+<span class="kw">on</span> resize() {
+    log(data.length)        <span class="cm">// reads 0, not 3</span>
+}</pre>
+          Nothing about this is specific to <code>resize</code> — every
+          event handler is registered before the entry file's own
+          top-level code runs at all (mouse/key events simply can't
+          fire that early in practice, since they need real user input
+          after a window exists, but <code>on resize</code> can be
+          triggered programmatically by the very first line of the
+          file). The fix is ordinary top-to-bottom discipline: declare
+          a handler, and initialize whatever global state it reads,
+          before any call that could plausibly trigger it.
         </div>
         <p>That split means two useful things:</p>
         <pre class="code"><span class="cm">// No display needed. No window. Exits on its own.</span>
@@ -1749,6 +1792,63 @@ snap.save(<span class="str">'before-clear.png'</span>)   <span class="cm">// sti
         <pre class="code">render()
 setClientWidth(1024)   <span class="cm">// window resizes; on resize fires once</span>
 setClientHeight(768)   <span class="cm">// fires again</span></pre>
+
+        <div class="callout">
+          <strong>Calling either one <em>before</em> any window exists
+          just picks the window's initial size</strong> — it opens
+          directly at whatever <code>clientWidth</code>/<code>clientHeight</code>
+          already are by then, not the 800×600 default, and
+          <code>on resize</code> does not fire (there's no real resize,
+          since the window never existed at any other size to begin
+          with):
+          <pre class="code" style="margin:10px 0 6px;"><span class="kw">on</span> resize() {
+    log(<span class="str">'resized'</span>)   <span class="cm">// never runs for the two lines below</span>
+}
+
+setClientWidth(1024)    <span class="cm">// no window yet -- just updates clientWidth</span>
+setClientHeight(700)    <span class="cm">// same</span>
+render()                 <span class="cm">// opens directly at 1024x700</span></pre>
+          This is the reasonable, documented pattern — set the size you
+          want, <em>then</em> start drawing — and it behaves exactly
+          like you'd expect: no window flashes open at the 800×600
+          default first and then jumps to the requested size a moment
+          later.
+        </div>
+
+        <h3 id="fullscreen">enterFullscreen()/exitFullscreen() <a class="anchor" href="#fullscreen">#</a></h3>
+        <p>
+          <strong><code>enterFullscreen()</code>/<code>exitFullscreen()</code></strong>
+          toggle true OS fullscreen — the window covers the whole
+          screen, decorations included, exactly like using the OS's own
+          fullscreen control (macOS's green zoom button, double-clicking
+          a Windows title bar's maximize equivalent, or an X11 window
+          manager's own fullscreen keybinding) would. Calling either one
+          before the window has ever opened just picks the window's
+          initial state, the same as <code>setClientWidth</code>/<code>setClientHeight</code>
+          above — a program that wants to launch straight into
+          fullscreen calls <code>enterFullscreen()</code> before its
+          first <code>render()</code>, and never sees a normal window at
+          all:
+        </p>
+        <pre class="code">enterFullscreen()
+drawRect(0, 0, 100, 100)
+render()                 <span class="cm">// opens directly in fullscreen</span></pre>
+        <p class="muted">
+          Unlike <code>setClientWidth</code>/<code>setClientHeight</code>,
+          the resulting size change is <strong>not</strong> immediate —
+          entering or exiting fullscreen is a real negotiation with the
+          OS/window manager, not something Festina does to itself, so
+          <code>clientWidth</code>/<code>clientHeight</code> (and
+          <code>on resize</code>, if declared) only update once that
+          negotiation finishes, on the next pass through the event loop
+          — not synchronously at the <code>enterFullscreen()</code>/<code>exitFullscreen()</code>
+          call site the way <code>setClientWidth</code> is. Calling
+          <code>enterFullscreen()</code> while already fullscreen (or
+          <code>exitFullscreen()</code> while not) is a no-op. Exiting
+          always restores the exact window the program had immediately
+          before entering — same size and position, not just "some
+          reasonable windowed size".
+        </p>
 
         <h3 id="mouse-events">Mouse events <a class="anchor" href="#mouse-events">#</a></h3>
         <p>

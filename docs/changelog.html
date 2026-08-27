@@ -401,6 +401,9 @@
     <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…">
     <nav class="toc" id="toc">
       <div class="nav-group">
+        <a href="#v0-2-3">0.2.3 — 2026-08-27</a>
+        <a href="#v0-2-2">0.2.2 — 2026-08-27</a>
+        <a href="#v0-2-1">0.2.1 — 2026-08-26</a>
         <a href="#v0-2">0.2 — 2026-08-26</a>
         <a href="#v0-1">0.1 — 2026-08-26</a>
       </div>
@@ -424,6 +427,44 @@
         implementation record predating 0.1 lives in
         <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md</a>.
       </p>
+
+      <section class="doc-section" id="v0-2-3">
+        <h2><span class="version-badge">0.2.3</span><span class="version-date">2026-08-27</span> <a class="anchor" href="#v0-2-3">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>enterFullscreen()</code>/<code>exitFullscreen()</code>: toggle true OS fullscreen on the graphics window. See <a href="api.html#graphics">api.md</a>.</li>
+        </ul>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li>The graphics window is now fully decorated — a title bar and the OS's normal minimize/maximize/close controls, resizable by dragging an edge — instead of the previous borderless, canvas-only look.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-2-2">
+        <h2><span class="version-badge">0.2.2</span><span class="version-date">2026-08-27</span> <a class="anchor" href="#v0-2-2">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li>A program calling <code>setClientWidth</code>/<code>setClientHeight</code> near the top of its own boot sequence briefly opened a real, on-screen window at the hardcoded 800×600 default before correcting itself, since the window used to open (and its size reset back to that default) before the program's own top-level code ever ran. The window now opens lazily, after any such call has already taken effect, directly at the requested size. See <a href="api.html#graphics">api.md</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-2-1">
+        <h2><span class="version-badge">0.2.1</span><span class="version-date">2026-08-26</span> <a class="anchor" href="#v0-2-1">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li>The macOS and Windows windowing backends could present stale or blank pixel content — most visibly, <code>img.clip()</code> (including the <code>saveCanvas().clip(...)</code> idiom) reliably showing the clipped region only on its first use in a process. Both backends now flush the surface before reading its pixels directly, as Cairo's own API requires.</li>
+          <li>Assigning a field on a manually-declared table row (not obtained from a query) segfaulted. A table row is a borrowed handle onto one row of a query result, not an independently constructible value — declaring one with no initializer is now a clear compile-time error, pointing at <code>struct</code> as the way to build a value by hand (see <a href="api.html#structs-as-query-targets">api.md</a>).</li>
+        </ul>
+
+        <h3>Documentation</h3>
+        <ul class="changes">
+          <li>Clarified that <code>on ...</code> event handlers are active as soon as they're declared, regardless of position in the file — the same hoisting <code>func</code> declarations already get. See <a href="api.html#graphics">api.md</a>.</li>
+        </ul>
+      </section>
 
       <section class="doc-section" id="v0-2">
         <h2><span class="version-badge">0.2</span><span class="version-date">2026-08-26</span> <a class="anchor" href="#v0-2">#</a></h2>
