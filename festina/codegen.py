@@ -1480,7 +1480,7 @@ class CodeGen:
             # claude.md #111: collect_rows takes the declared column
             # NAMES too (result columns are matched by name now), and
             # row.undefined() reads the presence mask it records.
-            "declare void @festina_sqlite_collect_rows(ptr, i32, ptr, ptr, ptr, ptr)",
+            "declare void @festina_sqlite_collect_rows(ptr, i32, ptr, ptr, ptr, ptr, i8)",
             "declare i8 @festina_row_undefined(ptr, ptr, i32, ptr)",
             # claude.md #67-68, #107: regex(), .test(), .match(), .replace().
             "declare ptr @festina_regex_compile(ptr, ptr)",
@@ -1500,9 +1500,13 @@ class CodeGen:
             "declare void @festina_draw_rect(i64, i64, i64, i64)",
             # claude.md #133
             "declare void @festina_draw_rect_color(i64, i64, i64, i64, i64)",
+            # claude.md #188 (uraikus/festina#76 item 8)
+            "declare void @festina_draw_rect_colors(i64, i64, i64, i64, i64, i64)",
             "declare void @festina_draw_pixel(i64, i64)",
             "declare void @festina_draw_pixel_color(i64, i64, i64)",
             "declare void @festina_draw_circle(i64, i64, i64)",
+            "declare void @festina_draw_circle_color(i64, i64, i64, i64)",
+            "declare void @festina_draw_circle_colors(i64, i64, i64, i64, i64)",
             "declare void @festina_draw_text(ptr, i64, i64)",
             # claude.md #89/#90: canvas drawing style + text metrics.
             # Colours and fonts are resolved at compile time (see
@@ -1552,13 +1556,19 @@ class CodeGen:
             "declare i64 @festina_image_width(ptr)",
             "declare i64 @festina_image_height(ptr)",
             "declare ptr @festina_image_clip(ptr, i64, i64, i64, i64)",
+            # claude.md #188 (uraikus/festina#76 item 4)
+            "declare ptr @festina_blank_image(i64, i64)",
             "declare void @festina_image_resize(ptr, i64, i64)",
             # claude.md #134: drawRect/drawPixel/drawCircle/drawText as img methods.
             "declare void @festina_image_draw_rect(ptr, i64, i64, i64, i64)",
             "declare void @festina_image_draw_rect_color(ptr, i64, i64, i64, i64, i64)",
+            # claude.md #188 (uraikus/festina#76 item 8)
+            "declare void @festina_image_draw_rect_colors(ptr, i64, i64, i64, i64, i64, i64)",
             "declare void @festina_image_draw_pixel(ptr, i64, i64)",
             "declare void @festina_image_draw_pixel_color(ptr, i64, i64, i64)",
             "declare void @festina_image_draw_circle(ptr, i64, i64, i64)",
+            "declare void @festina_image_draw_circle_color(ptr, i64, i64, i64, i64)",
+            "declare void @festina_image_draw_circle_colors(ptr, i64, i64, i64, i64, i64)",
             "declare void @festina_image_draw_text(ptr, ptr, i64, i64)",
             "declare void @festina_image_free(ptr)",
             "declare i8 @festina_image_save(ptr, ptr)",
@@ -6106,6 +6116,20 @@ class CodeGen:
             # claude.md #32-34: a table-typed value is one query result
             # row -- flat `field_index * 8` byte offset, not a named
             # struct GEP; see the module docstring's "Query rows" note.
+            # claude.md #188 (uraikus/festina#76 item 5): `.rowid` is
+            # not a declared column at all (see festina_runtime.c's own
+            # festina_sqlite_collect_rows doc comment on why it's kept
+            # fully separate from col_count/table_field_index) -- it
+            # lives at the FIXED offset right after the presence mask,
+            # `(declared column count + 1) * 8`, only ever populated
+            # when want_rowid=1 (true for every TableType row, false
+            # for a struct query target, which never reaches this
+            # branch at all).
+            if expr.prop == "rowid":
+                idx = len(self.table_fields(obj_type.name)) + 1
+                out = self.tmp()
+                lines.append(f"  {out} = getelementptr i8, ptr {obj_val}, i64 {idx * 8}")
+                return out, INT
             idx = self.table_field_index(obj_type.name, expr.prop)
             ftype = self.table_fields(obj_type.name)[idx][1]
             out = self.tmp()
@@ -8287,6 +8311,61 @@ class CodeGen:
         lines.append(f"  {out} = phi {llvm_ty} [ {null_const}, %{zero_pred} ], [ {result}, %{nonzero_pred} ]")
         return out
 
+    def _emit_floor_div(self, a_val, b_val, lines):
+        """claude.md #188 (uraikus/festina#76 item 1): Math.floorDiv(a,
+        b) -- rounds toward NEGATIVE INFINITY, unlike `/`'s own `sdiv`
+        (LLVM's -- and the hardware's -- integer division truncates
+        toward ZERO). The two only disagree when the operands have
+        different signs and the division isn't exact, e.g. -7 sdiv 2 is
+        -3 (truncated), but floor(-7/2) is -4 -- the standard `sdiv`
+        result minus one whenever the remainder is nonzero AND the
+        remainder's sign differs from the divisor's (Python's `//`/
+        Java's Math.floorDiv use the identical rule).
+
+        Shares claude.md #57's own by-zero convention (returns null,
+        via real control flow -- see _emit_divmod's own comment on why
+        a `select` alone wouldn't do, `sdiv`/`srem` by zero being
+        undefined behavior at the hardware level) rather than
+        introducing a second one just for this function."""
+        is_zero = self.tmp()
+        lines.append(f"  {is_zero} = icmp eq i64 {b_val}, 0")
+
+        zero_label = self.label("floordivzero")
+        nonzero_label = self.label("floordivnonzero")
+        end_label = self.label("floordivend")
+        lines.append(f"  br i1 {is_zero}, label %{zero_label}, label %{nonzero_label}")
+
+        self._start_block(zero_label, lines)
+        zero_pred = self.cur_block
+        lines.append(f"  br label %{end_label}")
+
+        self._start_block(nonzero_label, lines)
+        q = self.tmp()
+        lines.append(f"  {q} = sdiv i64 {a_val}, {b_val}")
+        r = self.tmp()
+        lines.append(f"  {r} = srem i64 {a_val}, {b_val}")
+        r_nonzero = self.tmp()
+        lines.append(f"  {r_nonzero} = icmp ne i64 {r}, 0")
+        r_neg = self.tmp()
+        lines.append(f"  {r_neg} = icmp slt i64 {r}, 0")
+        b_neg = self.tmp()
+        lines.append(f"  {b_neg} = icmp slt i64 {b_val}, 0")
+        signs_differ = self.tmp()
+        lines.append(f"  {signs_differ} = xor i1 {r_neg}, {b_neg}")
+        need_adjust = self.tmp()
+        lines.append(f"  {need_adjust} = and i1 {r_nonzero}, {signs_differ}")
+        q_minus_1 = self.tmp()
+        lines.append(f"  {q_minus_1} = sub i64 {q}, 1")
+        result = self.tmp()
+        lines.append(f"  {result} = select i1 {need_adjust}, i64 {q_minus_1}, i64 {q}")
+        nonzero_pred = self.cur_block
+        lines.append(f"  br label %{end_label}")
+
+        self._start_block(end_label, lines)
+        out = self.tmp()
+        lines.append(f"  {out} = phi i64 [ {INT_NULL_CONST}, %{zero_pred} ], [ {result}, %{nonzero_pred} ]")
+        return out
+
     def _emit_unary(self, expr, env, lines):
         val, vtype = self._emit_expr(expr.operand, env, lines)
         out = self.tmp()
@@ -8684,7 +8763,7 @@ class CodeGen:
             if name == "regex":
                 return self._emit_regex_call(expr, env, lines)
             if name in ("drawRect", "drawCircle", "drawText", "drawImage", "loadImage",
-                        "drawPixel",
+                        "drawPixel", "blankImage",
                         "fillStyle", "borderColor", "lineWidth", "changeFont",
                         "measureTextWidth", "measureTextHeight"):
                 return self._emit_graphics_call(name, expr, env, lines)
@@ -8830,6 +8909,14 @@ class CodeGen:
                 return out, ret_type
             raise CodegenError(f"unknown function '{name}'", file=self.filename, line=callee.line)
         if isinstance(callee, ast.Member) and not callee.computed:
+            # claude.md #188 (uraikus/festina#76 item 1):
+            # Math.floorDiv(a:int, b:int) -> int
+            if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
+                    and callee.prop == "floorDiv"):
+                a, _ = self._emit_expr(expr.args[0], env, lines)
+                b, _ = self._emit_expr(expr.args[1], env, lines)
+                out = self._emit_floor_div(a, b, lines)
+                return out, INT
             # claude.md #56: Math.floor/ceil/round/trunc(x:float) -> int
             # claude.md #93: Math.sqrt/sin/pow/min/... and Math.random()
             if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
@@ -9081,7 +9168,16 @@ class CodeGen:
                     emitted = [self._emit_expr(a, env, lines) for a in expr.args]
                     arg_vals = [v for v, _ in emitted]
                     if callee.prop == "drawRect":
-                        if len(arg_vals) == 5:
+                        # claude.md #188 (uraikus/festina#76 item 8): a
+                        # 6th argument is a further optional trailing
+                        # BORDER colour, mirroring the free-function
+                        # form.
+                        if len(arg_vals) == 6:
+                            x, y, w, h, fill, border = arg_vals
+                            lines.append(
+                                f"  call void @festina_image_draw_rect_colors(ptr {obj_val}, "
+                                f"i64 {x}, i64 {y}, i64 {w}, i64 {h}, i64 {fill}, i64 {border})")
+                        elif len(arg_vals) == 5:
                             x, y, w, h, color = arg_vals
                             lines.append(
                                 f"  call void @festina_image_draw_rect_color(ptr {obj_val}, "
@@ -9102,10 +9198,23 @@ class CodeGen:
                             lines.append(
                                 f"  call void @festina_image_draw_pixel(ptr {obj_val}, i64 {x}, i64 {y})")
                     elif callee.prop == "drawCircle":
-                        x, y, r = arg_vals
-                        lines.append(
-                            f"  call void @festina_image_draw_circle(ptr {obj_val}, "
-                            f"i64 {x}, i64 {y}, i64 {r})")
+                        # claude.md #188: the same fill/fill+border
+                        # trailing-colour forms drawRect has, newly.
+                        if len(arg_vals) == 5:
+                            x, y, r, fill, border = arg_vals
+                            lines.append(
+                                f"  call void @festina_image_draw_circle_colors(ptr {obj_val}, "
+                                f"i64 {x}, i64 {y}, i64 {r}, i64 {fill}, i64 {border})")
+                        elif len(arg_vals) == 4:
+                            x, y, r, color = arg_vals
+                            lines.append(
+                                f"  call void @festina_image_draw_circle_color(ptr {obj_val}, "
+                                f"i64 {x}, i64 {y}, i64 {r}, i64 {color})")
+                        else:
+                            x, y, r = arg_vals
+                            lines.append(
+                                f"  call void @festina_image_draw_circle(ptr {obj_val}, "
+                                f"i64 {x}, i64 {y}, i64 {r})")
                     else:  # drawText
                         text, x, y = arg_vals
                         lines.append(
@@ -9762,6 +9871,15 @@ class CodeGen:
             free_text_temps()
             return out, types_mod.ImageType()
 
+        # claude.md #188 (uraikus/festina#76 item 4): blankImage(w, h)
+        # -> img. Shares loadImage's own reasoning for NOT setting
+        # self.uses_graphics -- creating a Cairo surface needs no X
+        # server, unlike drawing onto a window.
+        if name == "blankImage":
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_blank_image(i64 {args[0]}, i64 {args[1]})")
+            return out, types_mod.ImageType()
+
         # claude.md #89: style setters and text metrics deliberately do
         # NOT set self.uses_graphics, for the same reason loadImage()
         # doesn't (see this method's own docstring): none of them draws
@@ -9818,8 +9936,15 @@ class CodeGen:
         if name == "drawRect":
             # claude.md #133: a 5th argument is an optional trailing
             # `color` -- paint with it for this call only, instead of
-            # the current fillStyle.
-            if len(args) == 5:
+            # the current fillStyle. claude.md #188 (uraikus/
+            # festina#76 item 8): a 6th is a further optional trailing
+            # BORDER colour, same "this call only" override.
+            if len(args) == 6:
+                x, y, w, h, fill, border = args
+                lines.append(
+                    f"  call void @festina_draw_rect_colors(i64 {x}, i64 {y}, "
+                    f"i64 {w}, i64 {h}, i64 {fill}, i64 {border})")
+            elif len(args) == 5:
                 x, y, w, h, color = args
                 lines.append(
                     f"  call void @festina_draw_rect_color(i64 {x}, i64 {y}, "
@@ -9838,8 +9963,22 @@ class CodeGen:
                 x, y = args
                 lines.append(f"  call void @festina_draw_pixel(i64 {x}, i64 {y})")
         elif name == "drawCircle":
-            x, y, r = args
-            lines.append(f"  call void @festina_draw_circle(i64 {x}, i64 {y}, i64 {r})")
+            # claude.md #188 (uraikus/festina#76 item 8): the same
+            # fill/fill+border trailing-colour forms drawRect has,
+            # newly -- drawCircle previously took no colour override.
+            if len(args) == 5:
+                x, y, r, fill, border = args
+                lines.append(
+                    f"  call void @festina_draw_circle_colors(i64 {x}, i64 {y}, "
+                    f"i64 {r}, i64 {fill}, i64 {border})")
+            elif len(args) == 4:
+                x, y, r, color = args
+                lines.append(
+                    f"  call void @festina_draw_circle_color(i64 {x}, i64 {y}, "
+                    f"i64 {r}, i64 {color})")
+            else:
+                x, y, r = args
+                lines.append(f"  call void @festina_draw_circle(i64 {x}, i64 {y}, i64 {r})")
         elif name == "drawText":
             text, x, y = args
             lines.append(f"  call void @festina_draw_text(ptr {text}, i64 {x}, i64 {y})")
@@ -10095,9 +10234,13 @@ class CodeGen:
         lines.append(f"  {n_slot} = alloca i64")
         data_slot = self.tmp()
         lines.append(f"  {data_slot} = alloca ptr")
+        # claude.md #188 (uraikus/festina#76 item 5): want_rowid=1 --
+        # only a TableType-shaped row (never a struct-query row, see
+        # _emit_sqlite_collect_struct's own call just below) carries a
+        # `.rowid` slot at all.
         lines.append(
             f"  call void @festina_sqlite_collect_rows(ptr {stmt_val}, i32 {ncols}, "
-            f"ptr {types_global}, ptr {names_global}, ptr {n_slot}, ptr {data_slot})"
+            f"ptr {types_global}, ptr {names_global}, ptr {n_slot}, ptr {data_slot}, i8 1)"
         )
         n_val = self.tmp()
         lines.append(f"  {n_val} = load i64, ptr {n_slot}")
@@ -10557,9 +10700,12 @@ class CodeGen:
         lines.append(f"  {n_slot} = alloca i64")
         data_slot = self.tmp()
         lines.append(f"  {data_slot} = alloca ptr")
+        # claude.md #188: want_rowid=0 -- a struct query result isn't a
+        # table row (no `.rowid` concept), and _emit_row_to_struct_fn's
+        # own field-by-index conversion below has no rowid slot to read.
         lines.append(
             f"  call void @festina_sqlite_collect_rows(ptr {stmt_val}, i32 {ncols}, "
-            f"ptr {types_global}, ptr {names_global}, ptr {n_slot}, ptr {data_slot})"
+            f"ptr {types_global}, ptr {names_global}, ptr {n_slot}, ptr {data_slot}, i8 0)"
         )
         n_val = self.tmp()
         lines.append(f"  {n_val} = load i64, ptr {n_slot}")

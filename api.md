@@ -143,6 +143,9 @@ Math.log(x)     Math.log2(x)   Math.log10(x)
 // (float, float) -> float
 Math.pow(a, b)  Math.min(a, b)  Math.max(a, b)  Math.atan2(y, x)
 
+// (int, int) -> int
+Math.floorDiv(a, b)
+
 // no arguments -> float
 Math.random()   // in [0, 1)
 
@@ -150,9 +153,24 @@ Math.random()   // in [0, 1)
 Math.PI   Math.E
 ```
 
-Only the rounding four return `int`; everything else returns `float`,
-because "which integer" and "which real number" are different questions
-— `Math.sqrt(2.0)` is a float.
+Only the rounding four (and `Math.floorDiv`) return `int`; everything
+else returns `float`, because "which integer" and "which real number"
+are different questions — `Math.sqrt(2.0)` is a float.
+
+`Math.floorDiv(a, b)` rounds toward **negative infinity**, unlike `/`'s
+own truncate-toward-zero — the two only disagree when the operands have
+different signs and the division isn't exact:
+
+```festina
+log(Math.floorDiv(-7, 2))   // -4, not -3 -- -7 / 2 truncates to -3.5 -> -3
+log(7 / 2)                  // 3.5 (float) -- ordinary division still promotes
+```
+
+Grid/tile code is the common case: `Math.floorDiv(worldX, tileSize)`
+gives the containing tile's index correctly for negative coordinates
+too, where `Math.floor(worldX / tileSize)` would otherwise need the
+extra `.toFloat()`/rounding step spelled out by hand. Like `/`/`%`,
+dividing by zero returns `null` rather than crashing.
 
 `Math.random()` is seeded once from the clock and is suitable for
 gameplay and sampling — **not** for anything security-related. It
@@ -931,6 +949,29 @@ A `SELECT ... AS alias` renames a column *away* from its declared name,
 so an aliased column simply doesn't match; alias *to* a declared name to
 remap a computed value into a column deliberately.
 
+### `row.rowid` — a table row's own database identity
+
+Every ordinary SQLite table already has a `rowid` — this exposes it,
+read-only, so upserting by key doesn't mean hand-tracking the next id
+yourself:
+
+```festina
+table examples { id:int  name:text }
+sqlite('INSERT INTO examples (id, name) VALUES (?, ?)', [1, 'ada'])
+arr[examples] rows = sqlite('SELECT rowid, id, name FROM examples')
+log(rows[0].rowid)   // 1
+```
+
+Like any other column, `rowid` only lands if the query's own SQL
+selects it by that name — `SELECT *` does **not** implicitly include
+it, so a query that never asks for `rowid` reads it as `null`, the
+same "the query never mentioned this" signal `undefined()` gives an
+ordinary column. It is not itself a declared column, so it never
+participates in schema sync and `undefined('rowid')` doesn't apply to
+it. It doesn't exist on a struct query target — `rowid` is a table
+row's own identity, not a property `sqlite()` can produce for an
+arbitrary result shape.
+
 ### Structs as query targets
 
 A query doesn't have to land in a table's row type. Any **struct** whose
@@ -1103,9 +1144,12 @@ bind each pattern to its own variable outside the loop if that matters.
 ```festina
 drawRect(0, 0, 100, 100)
 drawRect(0, 0, 100, 100, blue)           // optional trailing color -- this call only
+drawRect(0, 0, 100, 100, blue, red)      // trailing fill AND border color -- this call only
 drawPixel(10, 10)                        // one pixel, current fillStyle
 drawPixel(10, 10, blue)                  // one pixel, this call only
 drawCircle(50, 50, 25)
+drawCircle(50, 50, 25, blue)             // fill override, this call only
+drawCircle(50, 50, 25, blue, red)        // fill AND border override, this call only
 drawText('Hello', 20, 20)
 
 img profile = 'profile.png'              // PNG or JPEG
@@ -1113,6 +1157,9 @@ drawImage(profile, 0, 0)
 drawImage(profile, 0, 0, 64, 64)         // scaled to fit a 64x64 box
 drawImage(profile, 0, 0, 32, 32, 100, 100, 64, 64)  // source rect, scaled into dest rect
 log(`${profile.width}x${profile.height}`)
+
+img brush = blankImage(64, 64)           // a fresh, fully-transparent image
+brush.drawCircle(32, 32, 30, blue)       // draw onto it like any other img
 
 saveCanvas('screenshot.png')             // -> bool; writes what you drew
 img snap = saveCanvas()                  // -> img; a snapshot, no file written
@@ -1152,6 +1199,26 @@ the way a sprite sheet or a variable-size paint brush pulls one piece
 out of a larger stored image without a separate `.clip()` call first.
 A source region reaching past the image's own edge behaves like
 `.clip()`'s own: the overlap is drawn, the rest is simply not there.
+
+`blankImage(w, h)` returns a fresh, fully-transparent `img` at the
+given size — with no existing image or canvas to derive it from,
+unlike `.clip()`/`.resize()`/`saveCanvas()`, every one of which copies
+from something that already exists. Useful for building up a
+procedural image (a generated icon, a variable-size paint brush) from
+nothing, without touching the real on-screen canvas along the way.
+
+`drawRect`/`drawCircle` (and their `img` method equivalents) each
+accept a further optional trailing `borderColor`, after the fill
+color — paints the border with it for that one call only, leaving the
+current `borderColor()` untouched for every other shape, the same
+"this call only, then restore" contract the fill-color argument
+already has. `drawCircle` gained BOTH trailing forms here — it
+previously had no per-call color override at all. This is the direct
+fix for global draw style silently leaking between unrelated shapes:
+a border color left over from a previous, unrelated `drawRect`/
+`drawCircle` call no longer has to be reset with `borderColor()` or
+`saveState()`/`restoreState()` by hand before every shape that needs
+its own.
 
 **Drawing is offscreen. `render()` puts it on screen.**
 
@@ -1236,6 +1303,17 @@ That transparency is real alpha in whatever `saveCanvas()` produces
 (a file or the `img` snapshot both), not something flattened to a
 solid colour — useful for drawing a sprite or icon with a transparent
 background to compose elsewhere.
+
+**That real alpha channel is only real *off-screen*.** `render()`
+composites the canvas onto an ordinary opaque on-screen window, so a
+transparent region reads back as solid white once it's on screen, even
+though the same content saved or snapshotted via `saveCanvas()` still
+carries its real alpha. That makes two very different bugs look
+identical on screen — "my background never drew" and "my background
+drew transparent, which paints as opaque white" — so if a shape seems
+to be missing, check whether it's actually there but transparent
+(`saveCanvas()` it and inspect the alpha) before assuming the draw call
+itself did nothing.
 
 **`saveCanvas()` with no argument returns an `img` instead of writing a
 file** — a snapshot of the canvas at that instant, not a live view of

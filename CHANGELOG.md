@@ -9,6 +9,33 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.5] - 2026-08-27
+
+### Added
+
+- `Math.floorDiv(a, b)`: integer division rounding toward negative
+  infinity (unlike `/`'s own truncate-toward-zero), for tile/grid
+  calculations that previously needed `Math.floor(a / b)` spelled out
+  by hand.
+- `blankImage(w, h)`: a fresh, fully-transparent `img` at a given
+  size, with no existing image or canvas needed to derive it from.
+- `row.rowid`: a table row's own SQLite identity, read-only — only
+  populated when the query's own SQL explicitly selects `rowid`.
+- `drawRect`/`drawCircle` (and their `img`-method equivalents) accept
+  a further optional trailing `borderColor` argument, after the fill
+  color — overrides it for that one call only. `drawCircle` also
+  gains the fill-only override it previously lacked entirely.
+
+### Documentation
+
+- Clarified that the canvas's own real alpha channel is only real
+  off-screen — a transparent region reads back as opaque white once
+  `render()` puts it on screen, even though the same content saved via
+  `saveCanvas()` still carries its real alpha.
+
+See [api.md](api.md#types) and
+[api.md](api.md#drawing-is-offscreen-render-puts-it-on-screen).
+
 ## [0.4] - 2026-08-27
 
 ### Added

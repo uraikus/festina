@@ -2817,10 +2817,28 @@ void festina_sqlite_exec(sqlite3_stmt *stmt) {
  mentioned this column" is real (a program deciding whether to trust a
  * value needs it) and nothing else records it. Columns past the 64th
  * are always reported as present; a table that wide has other
- * problems first. */
+ * problems first.
+ *
+ * claude.md #188 (uraikus/festina#76 item 5): `want_rowid` adds ONE
+ * MORE hidden slot, after the presence mask, holding the query's own
+ * `rowid` result column (matched by name, the identical mechanism
+ * every declared column already uses) -- int's own null if the SQL
+ * never selected one (`SELECT rowid, ...` is required; a bare
+ * `SELECT *` does not implicitly include it). This is what
+ * festina/codegen.py's row.rowid reads. Deliberately a caller-chosen
+ * FLAG rather than something col_count/col_names/col_types already
+ * imply: this same function also collects rows for a `struct` query
+ * target (claude.md #112), which has no rowid concept and must keep
+ * its existing row layout completely unchanged -- and even for a
+ * `table` row, col_count/col_names/col_types stay exactly the
+ * DECLARED schema (the same arrays schema sync's own CREATE TABLE/
+ * ALTER TABLE reads), never widened to include `rowid`, so
+ * festina_row_undefined's own presence-mask offset (row[col_count])
+ * is completely unaffected by this flag either way. */
 void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
                                   const char **col_types, const char **col_names,
-                                  int64_t *out_length, void **out_data) {
+                                  int64_t *out_length, void **out_data,
+                                  int8_t want_rowid) {
     /* Which RESULT column serves each declared column, or -1. Computed
      * once -- the mapping is a property of the statement, not the row. */
     int32_t *src = malloc((size_t)(col_count > 0 ? col_count : 1) * sizeof(int32_t));
@@ -2831,6 +2849,16 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
         for (int r = 0; r < result_cols; r++) {
             const char *rn = sqlite3_column_name(stmt, r);
             if (rn && sqlite3_stricmp(rn, col_names[c]) == 0) { src[c] = r; break; }
+        }
+    }
+    /* Same by-name search, once, for the synthetic rowid slot -- never
+     * part of col_names, so it can never collide with (or be shadowed
+     * by) a real declared column of that name. */
+    int32_t rowid_src = -1;
+    if (want_rowid) {
+        for (int r = 0; r < result_cols; r++) {
+            const char *rn = sqlite3_column_name(stmt, r);
+            if (rn && sqlite3_stricmp(rn, "rowid") == 0) { rowid_src = r; break; }
         }
     }
     int64_t capacity = 8;
@@ -2848,8 +2876,11 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
         }
 
         /* +1: the presence mask lives after the columns, so every
-         * existing field offset is untouched. */
-        int64_t *row = malloc(((size_t)col_count + 1) * sizeof(int64_t));
+         * existing field offset is untouched. +1 more, only when
+         * want_rowid, for the rowid slot right after THAT -- so a
+         * struct-query row (want_rowid always false) allocates exactly
+         * what it always has. */
+        int64_t *row = malloc(((size_t)col_count + 1 + (want_rowid ? 1 : 0)) * sizeof(int64_t));
         if (!row) festina_fail("out of memory in festina_sqlite_collect_rows");
         uint64_t present = 0;
 
@@ -2917,6 +2948,11 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
         /* Columns past 64 report as present -- see the doc comment. */
         if (col_count > 64) present = ~(uint64_t)0;
         memcpy(&row[col_count], &present, sizeof(uint64_t));
+        if (want_rowid) {
+            int64_t rid = (rowid_src >= 0 && sqlite3_column_type(stmt, rowid_src) != SQLITE_NULL)
+                ? sqlite3_column_int64(stmt, rowid_src) : festina_null_int();
+            row[col_count + 1] = rid;
+        }
         rows[count++] = row;
     }
     free(src);

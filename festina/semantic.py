@@ -159,6 +159,11 @@ BUILTIN_FUNCTIONS = {
     # (a program-authoring mistake, not a runtime condition to test
     # for -- the same line claude.md #59 already draws elsewhere).
     "openSecurePort",
+    # claude.md #188 (uraikus/festina#76 item 4): blankImage(w, h) ->
+    # img -- a fresh, fully-transparent image, with no existing image
+    # or canvas to derive it from (unlike .clip()/.resize()/
+    # saveCanvas(), every one of which copies from something).
+    "blankImage",
     # claude.md #162: parseURL(text) -- like mkdir/exec above, a fixed
     # (text,) -> url signature the standard _BUILTIN_SIGNATURES/
     # _BUILTIN_RETURN_TYPES tables already handle directly, no bespoke
@@ -174,6 +179,8 @@ _BUILTIN_RETURN_TYPES = {
     # can see what it actually got rather than what it asked for.
     "maxAudioPlayers": types_mod.PrimitiveType("int"),
     "regex": types_mod.RegexType(),
+    # claude.md #188 (uraikus/festina#76 item 4)
+    "blankImage": types_mod.ImageType(),
     # claude.md #162
     "parseURL": types_mod.UrlType(),
     # claude.md #89: the only two graphics builtins that return anything
@@ -229,8 +236,12 @@ _BUILTIN_SIGNATURES = {
     # claude.md #133: drawRect's own fixed entry moved to
     # _BUILTIN_SIGNATURE_ALTERNATES below, alongside drawPixel -- both
     # now have a second, 1-argument-longer form with a trailing `color`.
-    "drawCircle": (_INT, _INT, _INT),
+    # claude.md #188 (uraikus/festina#76 item 8): drawCircle's own
+    # fixed entry moved there too, alongside its new fill/fill+border
+    # trailing-color forms.
     "drawText": (_TEXT, _INT, _INT),
+    # claude.md #188 (uraikus/festina#76 item 4)
+    "blankImage": (_INT, _INT),
     # claude.md #185: drawImage's own fixed 3-argument entry moved to
     # _BUILTIN_SIGNATURE_ALTERNATES below, alongside its new 5- and
     # 9-argument forms.
@@ -336,8 +347,18 @@ _BUILTIN_SIGNATURE_ALTERNATES = {
     # claude.md #133: an optional trailing `color` -- present, paints
     # with it for this one call only; absent, uses the current
     # fillStyle, exactly like every other draw call already does.
-    "drawRect": [(_INT, _INT, _INT, _INT), (_INT, _INT, _INT, _INT, _COLOR)],
+    # claude.md #188 (uraikus/festina#76 item 8): drawRect grows a
+    # SECOND optional trailing colour, a border override -- present,
+    # strokes with it for this one call only (no border at all if it's
+    # `none`); absent (the 5-argument form), uses the current
+    # borderColor, exactly the split fillStyle()/borderColor()
+    # themselves keep. drawCircle gains the identical two-color shape,
+    # NEWLY -- it previously had no per-call colour override at all.
+    "drawRect": [(_INT, _INT, _INT, _INT), (_INT, _INT, _INT, _INT, _COLOR),
+                 (_INT, _INT, _INT, _INT, _COLOR, _COLOR)],
     "drawPixel": [(_INT, _INT), (_INT, _INT, _COLOR)],
+    "drawCircle": [(_INT, _INT, _INT), (_INT, _INT, _INT, _COLOR),
+                    (_INT, _INT, _INT, _COLOR, _COLOR)],
     # claude.md #185 (uraikus/festina#76 item 3): drawImage(img, x, y)
     # is unchanged; drawImage(img, x, y, w, h) scales the WHOLE image
     # to fit a w x h box; drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh)
@@ -535,10 +556,15 @@ MATH_FLOAT_FUNCTIONS = {"sqrt", "sin", "cos", "tan", "asin", "acos", "atan",
                         "exp", "log", "log2", "log10", "abs"}
 # claude.md #93: (float, float) -> float.
 MATH_FLOAT2_FUNCTIONS = {"pow", "min", "max", "atan2"}
+# claude.md #188 (uraikus/festina#76 item 1): (int, int) -> int -- the
+# one Math function that takes INT arguments rather than float, kept in
+# its own set for exactly that reason (every check above this one
+# assumes float args and an int-or-float result; floorDiv is neither).
+MATH_INT2_FUNCTIONS = {"floorDiv"}
 # Every name reachable as Math.<name>(...), for the "is this a Math
-# call at all" test; the three sets above decide arity and result type.
+# call at all" test; the sets above decide arity and result type.
 MATH_FUNCTIONS = (MATH_ROUNDING_FUNCTIONS | MATH_FLOAT_FUNCTIONS
-                  | MATH_FLOAT2_FUNCTIONS | {"random"})
+                  | MATH_FLOAT2_FUNCTIONS | MATH_INT2_FUNCTIONS | {"random"})
 # claude.md #93: Math.PI / Math.E -- constants, not calls. Trigonometry
 # is unusable without at least PI, and making a program spell out
 # 3.14159... is exactly the kind of thing a standard library exists to
@@ -1316,6 +1342,23 @@ def analyze(program, filename="<string>"):
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid assignment",
                 )
+            # claude.md #188 (uraikus/festina#76 item 5): row.rowid is
+            # read-only too, same placement/reasoning as .length/http's
+            # own fields/url's own fields above -- it's the row's own
+            # database identity, not ordinary column data, so mutating
+            # it in memory would never mean anything (unlike an ordinary
+            # column, there is no corresponding `UPDATE` this language
+            # performs on assignment -- a table row is a plain in-memory
+            # snapshot either way, see the module docstring's "Query
+            # rows" note).
+            if (isinstance(expr.target, ast.Member) and not expr.target.computed
+                    and expr.target.prop == "rowid"
+                    and isinstance(infer(expr.target.obj, scope), types_mod.TableType)):
+                raise CompileError(
+                    "'.rowid' is read-only and cannot be assigned to",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid assignment",
+                )
             # claude.md #22: a `const`-declared variable cannot be
             # reassigned -- the whole point of "constant," and needed
             # for "Constants should be available for compiler
@@ -1615,6 +1658,21 @@ def analyze(program, filename="<string>"):
             # (see analyze_table above), so each lookup resolves on demand.
             columns = tables.get(obj_type.name, {})
             if expr.prop not in columns:
+                # claude.md #188 (uraikus/festina#76 item 5): row.rowid
+                # -- not a declared column at all (no CREATE TABLE
+                # side effect, no schema-sync ALTER TABLE consideration
+                # -- see codegen.py's own _table_arrays_for_select vs.
+                # _table_arrays split for why keeping it OUT of the
+                # `columns` dict entirely matters), but always
+                # readable: SQLite gives every ordinary rowid table one
+                # for free, and this just exposes it. Populated only
+                # when the query's own SQL actually selected a result
+                # column literally named `rowid` -- e.g. `SELECT
+                # rowid, * FROM t` -- otherwise reads as int's own null,
+                # the same "the query never mentioned this" signal
+                # `.undefined()` already gives an ordinary column.
+                if expr.prop == "rowid":
+                    return _INT
                 raise CompileError(
                     f"table '{obj_type.name}' has no field '{expr.prop}'",
                     file=filename, line=expr.line, column=expr.column,
@@ -2054,6 +2112,33 @@ def analyze(program, filename="<string>"):
                                   what=f"argument '{param.name}' of '{name}'")
             return sym.type
         if isinstance(callee, ast.Member) and not callee.computed:
+            # claude.md #188 (uraikus/festina#76 item 1):
+            # Math.floorDiv(a:int, b:int) -> int -- floor-toward-
+            # negative-infinity integer division, JS's Math.floorDiv
+            # doesn't exist but Python's `//`/Java's Math.floorDiv do,
+            # and this follows their exact rounding direction (not C's
+            # own truncate-toward-zero `/`). Checked in its own branch,
+            # ahead of the generic Math float-argument check just below,
+            # since this is the one Math function taking INT arguments.
+            if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
+                    and callee.prop in MATH_INT2_FUNCTIONS):
+                if len(expr.args) != 2:
+                    raise CompileError(
+                        f"Math.{callee.prop}() expects exactly 2 argument(s), "
+                        f"got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                for arg in expr.args:
+                    arg_type = infer(arg, scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != _INT:
+                        raise CompileError(
+                            f"Math.{callee.prop}() expects int argument(s), "
+                            f"found {types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return _INT
             # claude.md #56: Math.floor/ceil/round/trunc(x:float) -> int
             if (isinstance(callee.obj, ast.Identifier) and callee.obj.name == "Math"
                     and callee.prop in MATH_FUNCTIONS):
@@ -2751,9 +2836,18 @@ def analyze(program, filename="<string>"):
             # all -- see codegen.py's _emit_image_draw_method.
             if (callee.prop in ("drawRect", "drawPixel", "drawCircle", "drawText")
                     and infer(callee.obj, scope) == _IMAGE):
+                # claude.md #188 (uraikus/festina#76 item 8): the same
+                # optional-trailing-fill-and-border-colour forms the
+                # free-function versions gained, in _BUILTIN_SIGNATURE_
+                # ALTERNATES above -- drawCircle joins drawRect/drawPixel
+                # here too, newly, having had no per-call colour override
+                # at all before this.
                 alternates = {
-                    "drawRect": [(_INT, _INT, _INT, _INT), (_INT, _INT, _INT, _INT, _COLOR)],
+                    "drawRect": [(_INT, _INT, _INT, _INT), (_INT, _INT, _INT, _INT, _COLOR),
+                                 (_INT, _INT, _INT, _INT, _COLOR, _COLOR)],
                     "drawPixel": [(_INT, _INT), (_INT, _INT, _COLOR)],
+                    "drawCircle": [(_INT, _INT, _INT), (_INT, _INT, _INT, _COLOR),
+                                    (_INT, _INT, _INT, _COLOR, _COLOR)],
                 }.get(callee.prop)
                 if alternates is not None:
                     sig = next((a for a in alternates if len(a) == len(expr.args)), None)
@@ -2766,8 +2860,7 @@ def analyze(program, filename="<string>"):
                             category="invalid function argument type",
                         )
                 else:
-                    sig = {"drawCircle": (_INT, _INT, _INT),
-                           "drawText": (_TEXT, _INT, _INT)}[callee.prop]
+                    sig = {"drawText": (_TEXT, _INT, _INT)}[callee.prop]
                     if len(expr.args) != len(sig):
                         raise CompileError(
                             f"{callee.prop}() expects {len(sig)} argument(s), "

@@ -9113,6 +9113,87 @@ class TestUndefinedAndNameMatchedColumns:
             semantic.analyze(program)
 
 
+class TestRowRowid:
+    """claude.md #188 (uraikus/festina#76 item 5): a table row's own
+    `rowid`, exposed read-only -- SQLite already computes one for free
+    on every ordinary rowid table, so this is a thin wrapper, not a new
+    schema concept. Only populated when the query's own SQL explicitly
+    selects a result column named `rowid` (`SELECT rowid, ...`) -- a
+    bare `SELECT *` does not implicitly include it, so this is int's
+    own null in that case, the same "the query never mentioned this"
+    signal `.undefined()` already gives an ordinary column."""
+
+    def test_rowid_reads_back_the_real_sqlite_rowid(self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Users {{ name:text }}
+        sqlite('INSERT INTO Users (name) VALUES (?)', ['ada'])
+        sqlite('INSERT INTO Users (name) VALUES (?)', ['grace'])
+        arr[Users] rows = sqlite('SELECT rowid, name FROM Users ORDER BY rowid')
+        log(rows[0].rowid)
+        log(rows[0].name)
+        log(rows[1].rowid)
+        log(rows[1].name)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["1", "ada", "2", "grace"]
+
+    def test_rowid_is_null_when_the_query_never_selected_it(self, compile_and_run, tmp_path):
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Users {{ name:text }}
+        sqlite('INSERT INTO Users (name) VALUES (?)', ['ada'])
+        arr[Users] rows = sqlite('SELECT name FROM Users')
+        log(rows[0].rowid == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "true"
+
+    def test_undefined_and_delete_are_unaffected_by_rowid(self, compile_and_run, tmp_path):
+        # rowid isn't a declared column at all -- it must not shift or
+        # otherwise disturb the presence mask an ordinary column's
+        # undefined()/delete already rely on.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table Users {{ name:text  age:int }}
+        sqlite('INSERT INTO Users (name, age) VALUES (?, ?)', ['ada', 30])
+        arr[Users] rows = sqlite('SELECT rowid, name FROM Users')
+        log(rows[0].undefined('age'))
+        log(rows[0].undefined('name'))
+        delete rows[0].name
+        log(rows[0].name == null)
+        log(rows[0].undefined('name'))
+        log(rows[0].rowid == null)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false", "true", "true", "false"]
+
+    def test_a_struct_query_target_has_no_rowid(self, parser, semantic, errors):
+        # claude.md #112: a struct landing spot isn't a table row at
+        # all -- rowid is deliberately a TableType-only concept, and an
+        # extra unmatched result column (the SQL selecting rowid) is
+        # simply not looked at, the same as any other result column the
+        # struct's own fields don't name.
+        program = parser.parse(
+            "struct Row { name:text }\n"
+            "table Users { name:text }\n"
+            "arr[Row] rows = sqlite('SELECT rowid, name FROM Users')\n"
+            "log(rows[0].rowid)")
+        with pytest.raises(errors.CompileError, match="no field 'rowid'"):
+            semantic.analyze(program)
+
+    def test_rowid_is_read_only(self, parser, semantic, errors):
+        program = parser.parse(
+            "table T { id:int }\n"
+            "arr[T] rows = sqlite('SELECT rowid, id FROM T')\n"
+            "rows[0].rowid = 5")
+        with pytest.raises(errors.CompileError, match="read-only"):
+            semantic.analyze(program)
+
+
 class TestSaveAndSaveCopy:
     """claude.md #110: save()/saveCopy() on blob, img and aud.
 
@@ -12734,6 +12815,65 @@ class TestImageClipResizeAndSize:
             assert "must both be positive" in result.stdout + result.stderr
 
 
+class TestBlankImage:
+    """claude.md #188 (uraikus/festina#76 item 4): blankImage(w, h) --
+    a fresh, fully-transparent img with no existing image or canvas to
+    derive it from, closing the gap `.clip()`/`.resize()`/saveCanvas()
+    leave (every one of them copies FROM something that already
+    exists) -- previously getting an independently-resizable, blank
+    image meant bouncing through the canvas by hand."""
+
+    def test_blank_image_has_the_requested_size(self, compile_and_run):
+        source = """
+        img brush = blankImage(32, 24)
+        log(brush.width)
+        log(brush.height)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "32\n24\n"
+
+    def test_blank_image_is_fully_transparent(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "blank.png")
+        source = f"""
+        img brush = blankImage(10, 10)
+        log(brush.save('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+        _, _, pixel_rgba = _decode_png_rgba(out)
+        assert pixel_rgba(5, 5) == (0, 0, 0, 0)
+
+    def test_blank_image_composes_with_clip_and_resize(self, compile_and_run):
+        source = """
+        img brush = blankImage(20, 20)
+        img piece = brush.clip(0, 0, 10, 10)
+        log(piece.width)
+        brush.resize(40, 40)
+        log(brush.width)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "10\n40\n"
+
+    def test_a_non_positive_size_fails_clearly(self, compile_and_run):
+        for call in ["blankImage(0, 8)", "blankImage(8, -1)"]:
+            result = compile_and_run(f"img brush = {call}\nlog(brush.width)")
+            assert result.returncode != 0
+            assert "must both be positive" in result.stdout + result.stderr
+
+    def test_wrong_arity_or_types_is_a_compile_error(self, parser, semantic, errors):
+        for source in [
+            "img b = blankImage(8)",
+            "img b = blankImage(8, 8, 8)",
+            "img b = blankImage(8.0, 8)",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
 class TestImageDrawMethods:
     """claude.md #134: drawRect/drawPixel/drawCircle/drawText as methods
     on img -- the same four canvas-level drawing builtins (claude.md
@@ -13151,6 +13291,48 @@ class TestMathFileAndTime:
         assert result.returncode == 0
         assert result.stdout == "true\ntrue\n"
 
+    # ---- claude.md #188 (uraikus/festina#76 item 1): Math.floorDiv ----
+
+    def test_floor_div_rounds_toward_negative_infinity(self, compile_and_run):
+        # Unlike `/`'s own truncate-toward-zero: -7/2 truncates to -3,
+        # but floors to -4. The two only ever disagree when the signs
+        # differ and the division isn't exact.
+        source = """
+        log(Math.floorDiv(7, 2))
+        log(Math.floorDiv(-7, 2))
+        log(Math.floorDiv(7, -2))
+        log(Math.floorDiv(-7, -2))
+        log(Math.floorDiv(6, 2))
+        log(Math.floorDiv(0, 5))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "3\n-4\n-4\n3\n3\n0\n"
+
+    def test_floor_div_by_zero_returns_null(self, compile_and_run):
+        # claude.md #57's own by-zero convention, shared rather than
+        # given a second one just for this function.
+        source = "log(Math.floorDiv(5, 0) == null)"
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_floor_div_wrong_arity_or_types_is_a_compile_error(self, parser, semantic, errors):
+        for source in [
+            "log(Math.floorDiv(1))",
+            "log(Math.floorDiv(1, 2, 3))",
+            "log(Math.floorDiv(1.0, 2))",
+            "log(Math.floorDiv(1, 2.0))",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+    def test_math_floor_div_bare_reference_is_rejected(self, parser, semantic, errors):
+        program = parser.parse("log(Math.floorDiv)", filename="main.f")
+        with pytest.raises(errors.CompileError, match="call it"):
+            semantic.analyze(program, filename="main.f")
+
 
 def _png_raw(path):
     """Shared decode step behind _decode_png/_decode_png_rgba below --
@@ -13438,6 +13620,102 @@ class TestDrawPixelClearCircleAndColorOverrides:
             "drawRect(0, 0, 10, 10, 10, 10)",
             "clearCircle(0, 0)",
             "clearPixel(0)",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
+class TestDrawRectAndCircleBorderColorOverride:
+    """claude.md #188 (uraikus/festina#76 item 8): a further optional
+    trailing `borderColor` argument on drawRect/drawCircle -- present,
+    strokes with it for this one call only; absent, uses the current
+    borderColor, the same "this call only, then restore" shape the
+    existing trailing FILL colour already has (claude.md #133).
+    drawCircle gains BOTH trailing forms here, newly -- it previously
+    had no per-call colour override at all."""
+
+    def test_draw_rect_fill_and_border_override_do_not_leak(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        color blue = 'blue'
+        color green = 'green'
+        fillStyle(green)
+        borderColor(green)
+        lineWidth(6)
+        drawRect(0, 0, 20, 20, red, blue)
+        drawRect(40, 0, 20, 20)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(10, 10) == (255, 0, 0), "fill override should win"
+        # A few px in from the edge -- comfortably inside the (6px-wide,
+        # centered-on-the-path) stroke, past Cairo's own antialiased
+        # boundary right at x=0.
+        assert pixel(2, 10) == (0, 0, 255), "border override should win at the edge"
+        assert pixel(50, 10) == (0, 128, 0), "fillStyle(green) should still apply after"
+        assert pixel(42, 10) == (0, 128, 0), "borderColor(green) should still apply after"
+
+    def test_draw_rect_border_none_paints_no_border(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        color blue = 'blue'
+        color none = 'none'
+        borderColor(blue)
+        drawRect(0, 0, 20, 20, red, none)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(0, 10) == (255, 0, 0), "border('none') should leave the fill showing at the edge"
+
+    def test_draw_circle_gains_fill_and_border_override(self, compile_and_run, tmp_path):
+        out = str(tmp_path / "canvas.png")
+        source = f"""
+        color red = 'red'
+        color blue = 'blue'
+        lineWidth(6)
+        drawCircle(30, 30, 20, red)
+        drawCircle(80, 30, 20, red, blue)
+        log(saveCanvas('{out}'))
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+        _, _, pixel = _decode_png(out)
+        assert pixel(30, 30) == (255, 0, 0), "center should be the fill override"
+        assert pixel(80, 30) == (255, 0, 0), "center of the second circle: fill override"
+        # The stroke is centered on the circle's own path (radius 20),
+        # so its top point (y = 30 - 20 = 10) is comfortably inside a
+        # 6px-wide ring there.
+        assert pixel(80, 10) == (0, 0, 255), "top edge of the second circle: border override"
+
+    def test_img_draw_rect_and_circle_gain_the_same_overrides(self, compile_and_run):
+        source = """
+        color red = 'red'
+        color blue = 'blue'
+        img sq = blankImage(20, 20)
+        sq.drawRect(0, 0, 20, 20, red, blue)
+        sq.drawCircle(10, 10, 5, red, blue)
+        log('ok')
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "ok\n"
+
+    def test_wrong_arity_or_types_is_a_compile_error(self, parser, semantic, errors):
+        for source in [
+            "color red = 'red'\ndrawRect(0, 0, 10, 10, red, red, red)",
+            "color red = 'red'\ndrawCircle(0, 0, 10, red, red, red)",
+            "drawRect(0, 0, 10, 10, 1, 2)",
+            "drawCircle(0, 0, 10, 1, 2)",
         ]:
             program = parser.parse(source, filename="main.f")
             with pytest.raises(errors.CompileError):
