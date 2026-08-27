@@ -434,6 +434,7 @@
         <a class="sub" href="#storing-images-audio-and-files">Storing images, audio and files</a>
         <a class="sub" href="#query-performance">Query performance</a>
         <a class="sub" href="#partial-queries-and-undefined">Partial queries and undefined()</a>
+        <a class="sub" href="#row-rowid">row.rowid</a>
         <a class="sub" href="#structs-as-query-targets">Structs as query targets</a>
         <a class="sub" href="#database-configuration">Database configuration</a>
         <a href="#environment-variables">Environment variables</a>
@@ -477,6 +478,7 @@
         <a class="sub" href="#single-value-queries">Single-value queries</a>
         <a class="sub" href="#json-and-full-text-search">JSON and full-text search</a>
         <a href="#growing-arrays">Growing arrays</a>
+        <a class="sub" href="#sorting-sortcmpfn">Sorting: sort(cmpFn)</a>
         <a href="#timers">Timers</a>
         <a href="#audio">Audio</a>
         <a class="sub" href="#stopping-a-sound">Stopping a sound</a>
@@ -658,16 +660,40 @@ Math.log(x)     Math.log2(x)   Math.log10(x)
 <span class="cm">// (float, float) -&gt; float</span>
 Math.pow(a, b)  Math.min(a, b)  Math.max(a, b)  Math.atan2(y, x)
 
+<span class="cm">// (int, int) -&gt; int</span>
+Math.floorDiv(a, b)
+
 <span class="cm">// no arguments -&gt; float</span>
 Math.random()   <span class="cm">// in [0, 1)</span>
 
 <span class="cm">// constants</span>
 Math.PI   Math.E</pre>
         <p class="muted">
-          Only the rounding four return <code>int</code>; everything else
-          returns <code>float</code>, because "which integer" and "which
-          real number" are different questions — <code>Math.sqrt(2.0)</code>
-          is a float. <code>Math.random()</code> is seeded once from the
+          Only the rounding four (and <code>Math.floorDiv</code>) return
+          <code>int</code>; everything else returns <code>float</code>,
+          because "which integer" and "which real number" are different
+          questions — <code>Math.sqrt(2.0)</code> is a float.
+        </p>
+        <p>
+          <code>Math.floorDiv(a, b)</code> rounds toward
+          <strong>negative infinity</strong>, unlike <code>/</code>'s own
+          truncate-toward-zero — the two only disagree when the operands
+          have different signs and the division isn't exact:
+        </p>
+        <pre class="code">log(Math.floorDiv(-7, 2))   <span class="cm">// -4, not -3 -- -7 / 2 truncates to -3.5 -> -3</span>
+log(7 / 2)                  <span class="cm">// 3.5 (float) -- ordinary division still promotes</span></pre>
+        <p class="muted">
+          Grid/tile code is the common case:
+          <code>Math.floorDiv(worldX, tileSize)</code> gives the
+          containing tile's index correctly for negative coordinates too,
+          where <code>Math.floor(worldX / tileSize)</code> would
+          otherwise need the extra <code>.toFloat()</code>/rounding step
+          spelled out by hand. Like <code>/</code>/<code>%</code>,
+          dividing by zero returns <code>null</code> rather than
+          crashing.
+        </p>
+        <p class="muted">
+          <code>Math.random()</code> is seeded once from the
           clock and is suitable for gameplay and sampling —
           <strong>not</strong> for anything security-related. It returns a
           value in <code>[0, 1)</code>, so
@@ -1320,7 +1346,10 @@ npcHealths[<span class="str">'npc3'</span>] = 5      <span class="cm">// adds a 
 <span class="kw">void func</span> logHealth(h:<span class="kw">int</span>, key:<span class="kw">text</span>) {
     log(<span class="str">`${key} ${h.toText()}`</span>)
 }
-npcHealths.forEach(logHealth)   <span class="cm">// (value, key) -- visit order is unspecified</span></pre>
+npcHealths.forEach(logHealth)   <span class="cm">// (value, key) -- visit order is unspecified</span>
+
+<span class="kw">arr</span>[<span class="kw">text</span>] ids = npcHealths.keys()     <span class="cm">// a plain snapshot, walkable with a for loop</span>
+<span class="kw">arr</span>[<span class="kw">int</span>] hps = npcHealths.values()    <span class="cm">// no callback, no extra globals needed</span></pre>
         <p class="muted">
           An unquoted identifier key (<code>npc2Id</code> above) is a
           reference to that variable's own text value, not
@@ -1332,7 +1361,19 @@ npcHealths.forEach(logHealth)   <span class="cm">// (value, key) -- visit order 
           already-declared function taking exactly
           <code>(value, key:text)</code> and returning nothing, the same
           "bare name of a declared function" restriction
-          <code>setTimeout</code>'s callback has. A genuine hash table
+          <code>setTimeout</code>'s callback has — since it takes no
+          closures, collecting matching entries into your own
+          accumulator otherwise means promoting that accumulator to a
+          global just so the callback can reach it.
+          <code>.keys()</code>/<code>.values()</code> sidestep that for
+          the common case: both take no arguments and return an
+          ordinary, independent snapshot array
+          (<code>arr[text]</code>/<code>arr[T]</code>) taken once, at
+          the call — a later change to the map (<code>delete</code>, a
+          new key, <code>free</code>) never retroactively changes what
+          was already returned. Order matches <code>.forEach()</code>'s
+          own: unspecified, a function of each key's hash rather than
+          insertion order. A genuine hash table
           internally — open addressing (linear probing), FNV-1a
           hashing, tombstone deletion, doubling capacity whenever the
           table crosses 75% load — average O(1) get/set/delete rather
@@ -1452,6 +1493,31 @@ rows[0].file.playLoop(0)          <span class="cm">// straight out of the databa
           <em>away</em> from its declared name, so an aliased column
           simply doesn't match; alias <em>to</em> a declared name to
           remap a computed value into a column deliberately.
+        </p>
+
+        <h3 id="row-rowid">row.rowid — a table row's own database identity <a class="anchor" href="#row-rowid">#</a></h3>
+        <p>
+          Every ordinary SQLite table already has a <code>rowid</code> —
+          this exposes it, read-only, so upserting by key doesn't mean
+          hand-tracking the next id yourself:
+        </p>
+        <pre class="code"><span class="kw">table</span> examples { id:<span class="kw">int</span>  name:<span class="kw">text</span> }
+sqlite(<span class="str">'INSERT INTO examples (id, name) VALUES (?, ?)'</span>, [1, <span class="str">'ada'</span>])
+<span class="kw">arr[examples]</span> rows = sqlite(<span class="str">'SELECT rowid, id, name FROM examples'</span>)
+log(rows[0].rowid)   <span class="cm">// 1</span></pre>
+        <p class="muted">
+          Like any other column, <code>rowid</code> only lands if the
+          query's own SQL selects it by that name —
+          <code>SELECT *</code> does <strong>not</strong> implicitly
+          include it, so a query that never asks for <code>rowid</code>
+          reads it as <code>null</code>, the same "the query never
+          mentioned this" signal <code>undefined()</code> gives an
+          ordinary column. It is not itself a declared column, so it
+          never participates in schema sync and
+          <code>undefined('rowid')</code> doesn't apply to it. It
+          doesn't exist on a struct query target — <code>rowid</code> is
+          a table row's own identity, not a property <code>sqlite()</code>
+          can produce for an arbitrary result shape.
         </p>
 
         <h3 id="structs-as-query-targets">Structs as query targets <a class="anchor" href="#structs-as-query-targets">#</a></h3>
@@ -1637,14 +1703,22 @@ digits.test(<span class="str">'room 42'</span>)                     <span class=
         <h2>Graphics <a class="anchor" href="#graphics">#</a></h2>
         <pre class="code">drawRect(0, 0, 100, 100)
 drawRect(0, 0, 100, 100, blue)           <span class="cm">// optional trailing color -- this call only</span>
+drawRect(0, 0, 100, 100, blue, red)      <span class="cm">// trailing fill AND border color -- this call only</span>
 drawPixel(10, 10)                        <span class="cm">// one pixel, current fillStyle</span>
 drawPixel(10, 10, blue)                  <span class="cm">// one pixel, this call only</span>
 drawCircle(50, 50, 25)
+drawCircle(50, 50, 25, blue)             <span class="cm">// fill override, this call only</span>
+drawCircle(50, 50, 25, blue, red)        <span class="cm">// fill AND border override, this call only</span>
 drawText(<span class="str">'Hello'</span>, 20, 20)
 
 <span class="kw">img</span> profile = <span class="str">'profile.png'</span>              <span class="cm">// PNG or JPEG</span>
 drawImage(profile, 0, 0)
+drawImage(profile, 0, 0, 64, 64)         <span class="cm">// scaled to fit a 64x64 box</span>
+drawImage(profile, 0, 0, 32, 32, 100, 100, 64, 64)  <span class="cm">// source rect, scaled into dest rect</span>
 log(<span class="str">`${profile.width}x${profile.height}`</span>)
+
+<span class="kw">img</span> brush = blankImage(64, 64)           <span class="cm">// a fresh, fully-transparent image</span>
+brush.drawCircle(32, 32, 30, blue)       <span class="cm">// draw onto it like any other img</span>
 
 saveCanvas(<span class="str">'screenshot.png'</span>)             <span class="cm">// -&gt; bool; writes what you drew</span>
 <span class="kw">img</span> snap = saveCanvas()                  <span class="cm">// -&gt; img; a snapshot, no file written</span>
@@ -1658,16 +1732,65 @@ clearPixel(10, 10)                        <span class="cm">// erase one pixel to
 log(<span class="str">`canvas is ${clientWidth}x${clientHeight}`</span>)
 
 log(<span class="str">`screen is ${screenWidth}x${screenHeight}`</span>)  <span class="cm">// the physical display, read-only</span>
+log(<span class="str">`device pixel ratio is ${devicePixelRatio}`</span>) <span class="cm">// 1.0 normally, ~2.0 on Retina/HiDPI</span>
 setClientWidth(1024)                             <span class="cm">// resizes the canvas (and window, if open)</span>
 setClientHeight(768)
 
-<span class="kw">on</span> mouseDown(x:<span class="kw">int</span>, y:<span class="kw">int</span>) { ... }
-<span class="kw">on</span> mouseUp(x:<span class="kw">int</span>, y:<span class="kw">int</span>)   { ... }
-<span class="kw">on</span> mouse(x:<span class="kw">int</span>, y:<span class="kw">int</span>)     { ... }
-<span class="kw">on</span> keyDown(key:<span class="kw">text</span>)       { ... }
-<span class="kw">on</span> keyUp(key:<span class="kw">text</span>)         { ... }
-<span class="kw">on</span> resize()                { ... }
-<span class="kw">on</span> close()                 { ... }</pre>
+<span class="kw">on</span> mouseDown(x:<span class="kw">int</span>, y:<span class="kw">int</span>, button:<span class="kw">int</span>) { ... }
+<span class="kw">on</span> mouseUp(x:<span class="kw">int</span>, y:<span class="kw">int</span>, button:<span class="kw">int</span>)   { ... }
+<span class="kw">on</span> mouse(x:<span class="kw">int</span>, y:<span class="kw">int</span>)         { ... }
+<span class="kw">on</span> mouseWheelUp(x:<span class="kw">int</span>, y:<span class="kw">int</span>)  { ... }
+<span class="kw">on</span> mouseWheelDown(x:<span class="kw">int</span>, y:<span class="kw">int</span>){ ... }
+<span class="kw">on</span> keyDown(key:<span class="kw">text</span>)           { ... }
+<span class="kw">on</span> keyUp(key:<span class="kw">text</span>)             { ... }
+<span class="kw">on</span> resize()                    { ... }
+<span class="kw">on</span> close()                     { ... }</pre>
+        <p>
+          <code>drawImage</code> has three forms.
+          <code>drawImage(img, x, y)</code> draws it at its stored size.
+          <code>drawImage(img, x, y, w, h)</code> scales the whole image
+          to fit a <code>w</code>×<code>h</code> box at <code>(x, y)</code>
+          — unlike <code>img.resize()</code>, this doesn't touch the
+          image itself, so the same <code>img</code> can be drawn at as
+          many different sizes as you like.
+          <code>drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh)</code>
+          adds a source rectangle — cuts a <code>sw</code>×<code>sh</code>
+          region out of the image starting at <code>(sx, sy)</code> and
+          scales <em>that</em> into the <code>dw</code>×<code>dh</code>
+          destination box — the way a sprite sheet or a variable-size
+          paint brush pulls one piece out of a larger stored image
+          without a separate <code>.clip()</code> call first. A source
+          region reaching past the image's own edge behaves like
+          <code>.clip()</code>'s own: the overlap is drawn, the rest is
+          simply not there.
+        </p>
+        <p>
+          <code>blankImage(w, h)</code> returns a fresh, fully-transparent
+          <code>img</code> at the given size — with no existing image or
+          canvas to derive it from, unlike
+          <code>.clip()</code>/<code>.resize()</code>/<code>saveCanvas()</code>,
+          every one of which copies from something that already exists.
+          Useful for building up a procedural image (a generated icon, a
+          variable-size paint brush) from nothing, without touching the
+          real on-screen canvas along the way.
+        </p>
+        <p>
+          <code>drawRect</code>/<code>drawCircle</code> (and their
+          <code>img</code> method equivalents) each accept a further
+          optional trailing <code>borderColor</code>, after the fill
+          color — paints the border with it for that one call only,
+          leaving the current <code>borderColor()</code> untouched for
+          every other shape, the same "this call only, then restore"
+          contract the fill-color argument already has.
+          <code>drawCircle</code> gained BOTH trailing forms here — it
+          previously had no per-call color override at all. This is the
+          direct fix for global draw style silently leaking between
+          unrelated shapes: a border color left over from a previous,
+          unrelated <code>drawRect</code>/<code>drawCircle</code> call no
+          longer has to be reset with <code>borderColor()</code> or
+          <code>saveState()</code>/<code>restoreState()</code> by hand
+          before every shape that needs its own.
+        </p>
         <div class="callout">
           <strong>Drawing is offscreen. <code>render()</code> puts it on
           screen.</strong> Every drawing call paints an offscreen canvas
@@ -1676,7 +1799,7 @@ setClientHeight(768)
           bar, and the OS's normal minimize/maximize/close controls —
           like any other window, resizable by dragging an edge) the
           first time it runs — 800×600 by default. Declaring one of the
-          seven event handlers means a window will exist too, since they
+          nine event handlers means a window will exist too, since they
           can't fire without one — but not necessarily <em>at that
           point</em>: if the entry file never itself calls
           <code>render()</code>, the window instead opens lazily right
@@ -1754,6 +1877,21 @@ saveCanvas(<span class="str">'sprite.png'</span>)    <span class="cm">// a real 
           transparent background to compose elsewhere.
         </div>
 
+        <div class="callout">
+          <strong>That real alpha channel is only real
+          <em>off-screen</em>.</strong> <code>render()</code> composites
+          the canvas onto an ordinary opaque on-screen window, so a
+          transparent region reads back as solid white once it's on
+          screen, even though the same content saved or snapshotted via
+          <code>saveCanvas()</code> still carries its real alpha. That
+          makes two very different bugs look identical on screen — "my
+          background never drew" and "my background drew transparent,
+          which paints as opaque white" — so if a shape seems to be
+          missing, check whether it's actually there but transparent
+          (<code>saveCanvas()</code> it and inspect the alpha) before
+          assuming the draw call itself did nothing.
+        </div>
+
         <p>
           <strong><code>saveCanvas()</code> with no argument returns an
           <code>img</code> instead of writing a file</strong> — a
@@ -1777,6 +1915,20 @@ snap.save(<span class="str">'before-clear.png'</span>)   <span class="cm">// sti
           from, and no other way to ask "how big is the screen"), so
           this is one of the few graphics reads that fails without a
           display.
+        </p>
+        <p class="muted">
+          <strong>devicePixelRatio</strong> reports how many actual
+          device pixels back one canvas pixel — <code>1.0</code> on a
+          standard display, typically <code>2.0</code> (or a fractional
+          value like <code>1.5</code>) on a Retina/HiDPI one. Read-only,
+          same "needs a display" requirement as
+          <code>screenWidth</code>/<code>screenHeight</code> just above,
+          since it's a property of the physical display too. Purely
+          informational — the canvas itself is never actually rendered
+          at the higher resolution, so this doesn't change how big
+          anything you draw appears; it just tells a program what's
+          true about the display it's running on, the same way
+          <code>screenWidth</code>/<code>screenHeight</code> do.
         </p>
         <p class="muted">
           <strong>setClientWidth(int)</strong>/<strong>setClientHeight(int)</strong>
@@ -1850,13 +2002,34 @@ render()                 <span class="cm">// opens directly in fullscreen</span>
           reasonable windowed size".
         </p>
 
+        <p>
+          <strong><code>showCursor()</code>/<code>hideCursor()</code></strong>
+          toggle the mouse cursor's visibility over the canvas — useful
+          for a game that draws its own cursor/reticle, or one that just
+          doesn't want the OS pointer cluttering the screen. Unlike
+          <code>render()</code><wbr>/<code>enterFullscreen()</code><wbr>/<code>exitFullscreen()</code>,
+          neither forces a window open — a cursor is meaningless without
+          one, so calling either before the window exists just records
+          the desired state for whenever it does, the same "picks the
+          initial state" pattern <code>setClientWidth</code>/<code>enterFullscreen</code>
+          already have:
+        </p>
+        <pre class="code">hideCursor()
+drawImage(reticle, mouseX - 8, mouseY - 8)   <span class="cm">// your own cursor instead</span>
+render()</pre>
+        <p class="muted">
+          Calling <code>hideCursor()</code> while already hidden (or
+          <code>showCursor()</code> while already shown) is a no-op.
+        </p>
+
         <h3 id="mouse-events">Mouse events <a class="anchor" href="#mouse-events">#</a></h3>
         <p>
           <code>on mouseDown</code> fires when a button goes down,
           <code>on mouseUp</code> when it comes back up, and
           <code>on mouse</code> continuously while the pointer moves. All
           three report the pointer position at the moment the event
-          happened.
+          happened; <code>mouseDown</code>/<code>mouseUp</code> also
+          report <em>which</em> button.
         </p>
         <p>
           A click is a press <em>and</em> a release, and they are
@@ -1868,15 +2041,44 @@ render()                 <span class="cm">// opens directly in fullscreen</span>
         <pre class="code"><span class="kw">int</span> startX = 0
 <span class="kw">int</span> startY = 0
 
-<span class="kw">on</span> mouseDown(x:<span class="kw">int</span>, y:<span class="kw">int</span>) { startX = x  startY = y }
-<span class="kw">on</span> mouseUp(x:<span class="kw">int</span>, y:<span class="kw">int</span>)   { log(<span class="str">`dragged ${x - startX}, ${y - startY}`</span>) }</pre>
+<span class="kw">on</span> mouseDown(x:<span class="kw">int</span>, y:<span class="kw">int</span>, button:<span class="kw">int</span>) { startX = x  startY = y }
+<span class="kw">on</span> mouseUp(x:<span class="kw">int</span>, y:<span class="kw">int</span>, button:<span class="kw">int</span>)   { log(<span class="str">`dragged ${x - startX}, ${y - startY}`</span>) }</pre>
         <p class="muted">
           Press and release report <em>different</em> coordinates
           whenever the pointer moved in between — that difference is the
           drag. A program that only wants "was clicked" can just use
-          <code>on mouseDown</code> and ignore the release. Which button
-          was pressed is not reported; every button dispatches the same
-          handler.
+          <code>on mouseDown</code> and ignore the release.
+        </p>
+        <p>
+          <code>button</code> is <code>1</code> for the left button,
+          <code>2</code> for middle, <code>3</code> for right,
+          <code>8</code> for back and <code>9</code> for forward (on a
+          mouse that has them) — any other physical button reports its
+          own platform-specific number, best-effort. <code>on mouse</code>
+          (continuous movement) has no button of its own to report, so
+          it stays a plain <code>(x:int, y:int)</code>.
+        </p>
+        <pre class="code"><span class="kw">on</span> mouseDown(x:<span class="kw">int</span>, y:<span class="kw">int</span>, button:<span class="kw">int</span>) {
+    <span class="kw">if</span> button == 1 { log(<span class="str">'left click'</span>) }
+    <span class="kw">if</span> button == 3 { log(<span class="str">'right click, e.g. for a context menu'</span>) }
+}</pre>
+        <p>
+          <strong><code>on mouseWheelUp</code>/<code>on mouseWheelDown</code></strong>
+          fire once per scroll wheel notch (or, on a trackpad, once per
+          equivalent step of a two-finger scroll), split by direction
+          the same way <code>mouseDown</code>/<code>mouseUp</code> are
+          split by press/release rather than one combined event. Both
+          report the pointer's position at the moment of the scroll, the
+          same convention as every other mouse event above — but, unlike
+          <code>mouseDown</code>/<code>mouseUp</code>, no button, since
+          the wheel isn't one:
+        </p>
+        <pre class="code"><span class="kw">on</span> mouseWheelUp(x:<span class="kw">int</span>, y:<span class="kw">int</span>)   { log(<span class="str">`zoom in at ${x}, ${y}`</span>) }
+<span class="kw">on</span> mouseWheelDown(x:<span class="kw">int</span>, y:<span class="kw">int</span>) { log(<span class="str">`zoom out at ${x}, ${y}`</span>) }</pre>
+        <p class="muted">
+          How far one scroll "step" is is up to the OS/input device, not
+          something a program can read — there's no delta or magnitude,
+          only direction.
         </p>
 
         <h3 id="keyboard-events">Keyboard events <a class="anchor" href="#keyboard-events">#</a></h3>
@@ -2191,6 +2393,16 @@ fillAlpha(0.5)                                 <span class="cm">// 0.0 transpare
           list — that covers essentially every gradient a program draws,
           and needs no separate gradient type.
         </p>
+        <p>
+          <code>fillAlpha</code> applies uniformly to whatever's drawn
+          next — every fill
+          (<code>drawRect</code>/<code>drawPixel</code>/<code>drawCircle</code>/<code>drawText</code>,
+          whether onto the canvas or directly onto an <code>img</code>'s
+          own surface) <strong>and</strong> <code>drawImage</code>:
+        </p>
+        <pre class="code">fillAlpha(0.4)
+drawImage(sprite, 100, 100)   <span class="cm">// blends 40% into whatever's underneath</span>
+fillAlpha(1.0)</pre>
 
         <h3 id="text-metrics">Text metrics <a class="anchor" href="#text-metrics">#</a></h3>
         <pre class="code"><span class="kw">int</span> w = measureTextWidth(<span class="str">'Hello'</span>)
@@ -3179,6 +3391,38 @@ queue.splice(queue.indexOf(target), 1)   <span class="cm">// remove by value</sp
           whoever receives it. <code>indexOf()</code> takes no ownership
           at all — an index isn't a reference.
         </p>
+
+        <h3 id="sorting-sortcmpfn">Sorting: sort(cmpFn) <a class="anchor" href="#sorting-sortcmpfn">#</a></h3>
+        <pre class="code"><span class="kw">int func</span> byAsc(a:<span class="kw">int</span>, b:<span class="kw">int</span>) { <span class="kw">return</span> a - b }
+
+<span class="kw">arr[int]</span> xs = [5, 3, 8, 1]
+xs.sort(byAsc)         <span class="cm">// in place -- xs is now [1,3,5,8]</span></pre>
+        <p>
+          <code>sort()</code> takes a comparator,
+          <code>cmpFn:func[T,T]:int</code>, and sorts in place —
+          JavaScript's/C <code>qsort()</code>'s convention: return
+          negative if the first argument belongs before the second,
+          positive if after, <code>0</code> if they're equal. Sorting is
+          <strong>stable</strong> — two elements the comparator calls
+          equal keep their original relative order, so sorting a list
+          twice by two different keys ("sort by name, then re-sort by
+          score" to get "score descending, ties broken by name") behaves
+          the way it reads.
+        </p>
+        <p class="muted">
+          The comparator can be any <code>func[T,T]:int</code>-typed
+          expression, not just the bare name of a declared function — a
+          variable holding a function value works too, the same
+          first-class-function rule every other callback
+          (<code>.callback()</code>, <code>exec(args, callback)</code>)
+          already follows.
+        </p>
+        <pre class="code"><span class="kw">struct</span> Enemy { name:<span class="kw">text</span> y:<span class="kw">int</span> }
+
+<span class="kw">int func</span> byDepth(a:Enemy, b:Enemy) { <span class="kw">return</span> a.y - b.y }
+
+<span class="kw">arr[Enemy]</span> enemies = [...]
+enemies.sort(byDepth)   <span class="cm">// back-to-front draw order by Y position</span></pre>
       </section>
 
       <section class="doc-section" id="timers">

@@ -401,6 +401,10 @@
     <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…">
     <nav class="toc" id="toc">
       <div class="nav-group">
+        <a href="#v0-5">0.5 — 2026-08-27</a>
+        <a href="#v0-4">0.4 — 2026-08-27</a>
+        <a href="#v0-3-1">0.3.1 — 2026-08-27</a>
+        <a href="#v0-3">0.3 — 2026-08-27</a>
         <a href="#v0-2-3">0.2.3 — 2026-08-27</a>
         <a href="#v0-2-2">0.2.2 — 2026-08-27</a>
         <a href="#v0-2-1">0.2.1 — 2026-08-26</a>
@@ -427,6 +431,61 @@
         implementation record predating 0.1 lives in
         <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md</a>.
       </p>
+
+      <section class="doc-section" id="v0-5">
+        <h2><span class="version-badge">0.5</span><span class="version-date">2026-08-27</span> <a class="anchor" href="#v0-5">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>Math.floorDiv(a, b)</code>: integer division rounding toward negative infinity (unlike <code>/</code>'s own truncate-toward-zero), for tile/grid calculations that previously needed <code>Math.floor(a / b)</code> spelled out by hand.</li>
+          <li><code>blankImage(w, h)</code>: a fresh, fully-transparent <code>img</code> at a given size, with no existing image or canvas needed to derive it from.</li>
+          <li><code>row.rowid</code>: a table row's own SQLite identity, read-only — only populated when the query's own SQL explicitly selects <code>rowid</code>.</li>
+          <li><code>drawRect</code>/<code>drawCircle</code> (and their <code>img</code>-method equivalents) accept a further optional trailing <code>borderColor</code> argument, after the fill color — overrides it for that one call only. <code>drawCircle</code> also gains the fill-only override it previously lacked entirely.</li>
+        </ul>
+
+        <h3>Documentation</h3>
+        <ul class="changes">
+          <li>Clarified that the canvas's own real alpha channel is only real off-screen — a transparent region reads back as opaque white once <code>render()</code> puts it on screen, even though the same content saved via <code>saveCanvas()</code> still carries its real alpha. See <a href="api.html#types">api.md</a> and <a href="api.html#graphics">api.md</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-4">
+        <h2><span class="version-badge">0.4</span><span class="version-date">2026-08-27</span> <a class="anchor" href="#v0-4">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>arr[T].sort(cmpFn)</code>: an in-place, stable, comparator-based sort — <code>cmpFn:func[T,T]:int</code>, JavaScript's/C <code>qsort()</code>'s own convention. See <a href="api.html#sorting-sortcmpfn">api.md</a>.</li>
+          <li><code>drawImage(img, x, y, w, h)</code>: scales the whole image to fit a <code>w</code>×<code>h</code> box, without mutating the source image the way <code>img.resize()</code> does.</li>
+          <li><code>drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh)</code>: the full canvas-style form — a source rect cut out of the image, scaled into a destination rect. See <a href="api.html#graphics">api.md</a>.</li>
+          <li><code>map[T].keys()</code>/<code>map[T].values()</code>: a plain, independent snapshot array (<code>arr[text]</code>/<code>arr[T]</code>), no callback needed — sidesteps <code>.forEach()</code>'s bare/no-closures callback restriction for the common "collect entries matching a condition" case.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-3-1">
+        <h2><span class="version-badge">0.3.1</span><span class="version-date">2026-08-27</span> <a class="anchor" href="#v0-3-1">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><code>fillAlpha</code> had no effect on <code>drawImage</code> — two images drawn back to back under different <code>fillAlpha</code> values came out pixel-for-pixel identical. <code>drawImage</code> now respects it, blending the image into whatever's underneath exactly like every other draw call. See <a href="api.html#gradients-and-transparency">api.md</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-3">
+        <h2><span class="version-badge">0.3</span><span class="version-date">2026-08-27</span> <a class="anchor" href="#v0-3">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>on mouseWheelUp(x:int, y:int)</code>/<code>on mouseWheelDown(x:int, y:int)</code>: scroll wheel events, split by direction. Fixes a real pre-existing bug on X11/Linux where scrolling the wheel silently also fired a spurious <code>mouseDown</code>+<code>mouseUp</code> pair.</li>
+          <li><code>devicePixelRatio:float</code>: a read-only global reporting the display's pixel density (<code>1.0</code> normally, ~<code>2.0</code> on Retina/HiDPI).</li>
+          <li><code>showCursor()</code>/<code>hideCursor()</code>: toggle the mouse cursor's visibility over the canvas.</li>
+          <li>Real right-click and middle-click support on macOS and Windows — previously only the left button worked on either platform.</li>
+        </ul>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li><strong>Breaking:</strong> <code>on mouseDown</code>/<code>on mouseUp</code> now require a third argument, <code>button:int</code> — <code>on mouseDown(x:int, y:int, button:int)</code>. <code>1</code> = left, <code>2</code> = middle, <code>3</code> = right, <code>8</code> = back, <code>9</code> = forward. <code>on mouse</code> (continuous movement) is unaffected. See <a href="api.html#mouse-events">api.md</a> and <a href="api.html#graphics">api.md</a>.</li>
+        </ul>
+      </section>
 
       <section class="doc-section" id="v0-2-3">
         <h2><span class="version-badge">0.2.3</span><span class="version-date">2026-08-27</span> <a class="anchor" href="#v0-2-3">#</a></h2>

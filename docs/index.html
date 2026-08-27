@@ -421,7 +421,7 @@
 
 <div id="top"></div>
 <section class="hero">
-  <span class="eyebrow">Version 0.2.3 · MIT Licensed · Linux · macOS · Windows</span>
+  <span class="eyebrow">Version 0.5 · MIT Licensed · Linux · macOS · Windows</span>
   <h1>A fast, simple language <em>that compiles to native code.</em></h1>
   <p class="motto">
     Drop the interpreter, the runtime overhead, and the boilerplate —
@@ -594,8 +594,8 @@ Hello, Festina!</pre>
 fillStyle(brand)
 changeFont(title)
 drawRect(0, 0, 100, 100)
-<span class="kw">on</span> mouseDown(x:<span class="kw">int</span>, y:<span class="kw">int</span>) { log(<span class="str">`pressed ${x}, ${y}`</span>) }
-<span class="kw">on</span> mouseUp(x:<span class="kw">int</span>, y:<span class="kw">int</span>)   { log(<span class="str">`released ${x}, ${y}`</span>) }
+<span class="kw">on</span> mouseDown(x:<span class="kw">int</span>, y:<span class="kw">int</span>, button:<span class="kw">int</span>) { log(<span class="str">`pressed ${x}, ${y}`</span>) }
+<span class="kw">on</span> mouseUp(x:<span class="kw">int</span>, y:<span class="kw">int</span>, button:<span class="kw">int</span>)   { log(<span class="str">`released ${x}, ${y}`</span>) }
 
 <span class="cm">// Audio</span>
 <span class="kw">aud</span> music = <span class="str">'music.wav'</span>
