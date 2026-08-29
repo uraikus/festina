@@ -9,6 +9,29 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.6] - 2026-08-29
+
+### Added
+
+- `getPixelColor(x, y)`: reads one pixel back off the canvas as a
+  `color` — `null` for a coordinate outside the canvas, or a fully
+  transparent pixel. Correctly undoes Cairo's premultiplied alpha, so
+  a pixel painted under `fillAlpha` reads back as the color that was
+  actually painted, not one darkened by the alpha in effect at the
+  time.
+- `img.getPixelColor(x, y)`: the same, reading an `img`'s own surface.
+
+### Fixed
+
+- `color == null` (and `!=`) generated invalid LLVM IR and failed to
+  compile at all, for any program that tried it — entirely
+  independent of the above. `color` is an `i64`-shaped value, and the
+  bare `null` literal was routed through the "null" *pointer* keyword
+  unconditionally. Now resolves to `color`'s own existing `-1`/'none'
+  sentinel, the same value an uninitialized `color` already reads as.
+
+See [api.md](api.md#drawing-is-offscreen-render-puts-it-on-screen).
+
 ## [0.5] - 2026-08-27
 
 ### Added

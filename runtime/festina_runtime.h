@@ -624,6 +624,11 @@ void festina_draw_text(const char *text, int64_t x, int64_t y);
  * blending. No border: a 1x1 shape has nothing meaningful to stroke. */
 void festina_draw_pixel(int64_t x, int64_t y);
 void festina_draw_pixel_color(int64_t x, int64_t y, int64_t color);
+/* claude.md #189: getPixelColor(x, y) -- reads one canvas pixel back
+ * as a packed `color`, 'none' (-1) out of bounds or where nothing
+ * opaque has been painted. See the .c doc comment for the
+ * premultiplied-alpha unpacking this needs. */
+int64_t festina_get_pixel_color(int64_t x, int64_t y);
 void *festina_load_image(const char *path);
 /* claude.md #171: <text>.callback(fn) for img -- the img counterpart of
  * festina_blob_load_dispatch, see festina_runtime_graphics.c's own doc
@@ -724,6 +729,9 @@ void festina_fill_path(void);
 void festina_stroke_path(void);
 int64_t festina_image_width(void *img);
 int64_t festina_image_height(void *img);
+/* claude.md #189: img.getPixelColor(x, y) -- the img-method
+ * counterpart of festina_get_pixel_color above. */
+int64_t festina_image_get_pixel_color(void *img, int64_t x, int64_t y);
 void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
 /* claude.md #188 (uraikus/festina#76 item 4): blankImage(w, h) -- a
  * fresh, fully-transparent img at a given size, with no existing image

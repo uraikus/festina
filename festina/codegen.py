@@ -1558,6 +1558,9 @@ class CodeGen:
             "declare ptr @festina_image_clip(ptr, i64, i64, i64, i64)",
             # claude.md #188 (uraikus/festina#76 item 4)
             "declare ptr @festina_blank_image(i64, i64)",
+            # claude.md #189
+            "declare i64 @festina_get_pixel_color(i64, i64)",
+            "declare i64 @festina_image_get_pixel_color(ptr, i64, i64)",
             "declare void @festina_image_resize(ptr, i64, i64)",
             # claude.md #134: drawRect/drawPixel/drawCircle/drawText as img methods.
             "declare void @festina_image_draw_rect(ptr, i64, i64, i64, i64)",
@@ -4901,6 +4904,18 @@ class CodeGen:
         if isinstance(expected_type, (types_mod.ColorType, types_mod.FontType)):
             what = types_mod.type_name(expected_type)
             line = getattr(node, "line", 0)
+            if isinstance(node, ast.NullLit) and isinstance(expected_type, types_mod.ColorType):
+                # claude.md #189: checked ahead of the "must come from a
+                # literal" rule just below -- `null` isn't a text
+                # literal to resolve at all, it's color's own existing
+                # null-vs-zero-less sentinel (`-1`/'none', the same
+                # value _zero_value already gives an uninitialized
+                # color). A bare `null` against a FontType-expected
+                # position falls through unchanged -- FontType's own
+                # LLVM shape is a plain pointer, so the generic "null"
+                # keyword the code below already produces is already
+                # correct for it.
+                return "-1", expected_type
             if isinstance(node, ast.StringLit):
                 if isinstance(expected_type, types_mod.ColorType):
                     return (self._emit_color_value(node, node.value, line, what),
@@ -4929,6 +4944,10 @@ class CodeGen:
                 return FLOAT_NULL_CONST, FLOAT
             if expected_type == BOOL:
                 return BOOL_NULL_CONST, BOOL
+            # ColorType is handled above, ahead of the "must come from a
+            # literal" check the ColorType/FontType branch otherwise
+            # applies -- a bare `null` is never a text literal to
+            # resolve, so it can't reach here as ColorType at all.
             return "null", expected_type
         if isinstance(node, ast.Call):
             # sqlite()'s codegen needs to know the *declared* target type
@@ -8763,7 +8782,7 @@ class CodeGen:
             if name == "regex":
                 return self._emit_regex_call(expr, env, lines)
             if name in ("drawRect", "drawCircle", "drawText", "drawImage", "loadImage",
-                        "drawPixel", "blankImage",
+                        "drawPixel", "blankImage", "getPixelColor",
                         "fillStyle", "borderColor", "lineWidth", "changeFont",
                         "measureTextWidth", "measureTextHeight"):
                 return self._emit_graphics_call(name, expr, env, lines)
@@ -9155,6 +9174,20 @@ class CodeGen:
                         f"i64 {arg_vals[0]}, i64 {arg_vals[1]})")
                     self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                     return "0", None
+            # claude.md #189: img.getPixelColor(x, y) -> color -- the
+            # img-method counterpart of the canvas-level
+            # getPixelColor(x, y).
+            if callee.prop == "getPixelColor":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.ImageType):
+                    x_val, _ = self._emit_expr(expr.args[0], env, lines)
+                    y_val, _ = self._emit_expr(expr.args[1], env, lines)
+                    out = self.tmp()
+                    lines.append(
+                        f"  {out} = call i64 @festina_image_get_pixel_color(ptr {obj_val}, "
+                        f"i64 {x_val}, i64 {y_val})")
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                    return out, types_mod.ColorType()
             # claude.md #134: drawRect/drawPixel/drawCircle/drawText as
             # methods on img -- the same four canvas-level drawing
             # builtins (claude.md #37/#39/#133), retargeted at the
@@ -9879,6 +9912,14 @@ class CodeGen:
             out = self.tmp()
             lines.append(f"  {out} = call ptr @festina_blank_image(i64 {args[0]}, i64 {args[1]})")
             return out, types_mod.ImageType()
+
+        # claude.md #189: getPixelColor(x, y) -> color. Reads the
+        # canvas's own backing store directly, so (like every other
+        # function in this method) it needs no window, only Cairo.
+        if name == "getPixelColor":
+            out = self.tmp()
+            lines.append(f"  {out} = call i64 @festina_get_pixel_color(i64 {args[0]}, i64 {args[1]})")
+            return out, types_mod.ColorType()
 
         # claude.md #89: style setters and text metrics deliberately do
         # NOT set self.uses_graphics, for the same reason loadImage()

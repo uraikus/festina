@@ -12874,6 +12874,81 @@ class TestBlankImage:
                 semantic.analyze(program, filename="main.f")
 
 
+class TestGetPixelColor:
+    """claude.md #189: getPixelColor(x, y) -> color, and its img-method
+    counterpart img.getPixelColor(x, y) -- reads one pixel back off the
+    canvas's own offscreen backing store, or an img's own surface,
+    needing no window/display the same way saveCanvas() doesn't
+    (claude.md #95). Out of bounds, or a fully transparent pixel,
+    reads as `null` -- color's own existing 'none' sentinel (-1),
+    reused rather than inventing a second reserved value."""
+
+    def test_reads_back_a_painted_pixel(self, compile_and_run):
+        source = """
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 50, 50)
+        color c = getPixelColor(10, 10)
+        log(c == red)
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_unpainted_and_out_of_bounds_read_as_null(self, compile_and_run):
+        source = """
+        color red = 'red'
+        fillStyle(red)
+        drawRect(0, 0, 10, 10)
+        log(getPixelColor(50, 50) == null)    // unpainted, in bounds
+        log(getPixelColor(-1, 0) == null)     // out of bounds
+        log(getPixelColor(9999, 9999) == null) // way out of bounds
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\ntrue\n"
+
+    def test_undoes_premultiplied_alpha_to_answer_the_paint_color(self, compile_and_run):
+        # Cairo's ARGB32 stores premultiplied alpha -- reading the raw
+        # channel values back without undoing that would answer a
+        # darkened colour, not the one fillStyle/fillAlpha actually
+        # asked for.
+        source = """
+        color red = 'red'
+        fillStyle(red)
+        fillAlpha(0.5)
+        drawRect(0, 0, 10, 10)
+        log(getPixelColor(5, 5) == red)
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_img_get_pixel_color(self, compile_and_run):
+        source = """
+        color blue = 'blue'
+        img sq = blankImage(20, 20)
+        sq.drawRect(0, 0, 20, 20, blue)
+        log(sq.getPixelColor(5, 5) == blue)
+        log(sq.getPixelColor(100, 100) == null)
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\n"
+
+    def test_wrong_arity_or_types_is_a_compile_error(self, parser, semantic, errors):
+        for source in [
+            "log(getPixelColor(1))",
+            "log(getPixelColor(1, 2, 3))",
+            "log(getPixelColor(1.0, 2))",
+            "img sq\nlog(sq.getPixelColor(1))",
+            "img sq\nlog(sq.getPixelColor('a', 1))",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
 class TestImageDrawMethods:
     """claude.md #134: drawRect/drawPixel/drawCircle/drawText as methods
     on img -- the same four canvas-level drawing builtins (claude.md
