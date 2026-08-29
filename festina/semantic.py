@@ -164,6 +164,11 @@ BUILTIN_FUNCTIONS = {
     # or canvas to derive it from (unlike .clip()/.resize()/
     # saveCanvas(), every one of which copies from something).
     "blankImage",
+    # claude.md #189: getPixelColor(x, y) -> color -- reads one pixel
+    # back off the canvas. img.getPixelColor(x, y) is the img-method
+    # counterpart, checked separately below (img methods aren't part
+    # of this free-function set).
+    "getPixelColor",
     # claude.md #162: parseURL(text) -- like mkdir/exec above, a fixed
     # (text,) -> url signature the standard _BUILTIN_SIGNATURES/
     # _BUILTIN_RETURN_TYPES tables already handle directly, no bespoke
@@ -181,6 +186,8 @@ _BUILTIN_RETURN_TYPES = {
     "regex": types_mod.RegexType(),
     # claude.md #188 (uraikus/festina#76 item 4)
     "blankImage": types_mod.ImageType(),
+    # claude.md #189
+    "getPixelColor": types_mod.ColorType(),
     # claude.md #162
     "parseURL": types_mod.UrlType(),
     # claude.md #89: the only two graphics builtins that return anything
@@ -242,6 +249,8 @@ _BUILTIN_SIGNATURES = {
     "drawText": (_TEXT, _INT, _INT),
     # claude.md #188 (uraikus/festina#76 item 4)
     "blankImage": (_INT, _INT),
+    # claude.md #189
+    "getPixelColor": (_INT, _INT),
     # claude.md #185: drawImage's own fixed 3-argument entry moved to
     # _BUILTIN_SIGNATURE_ALTERNATES below, alongside its new 5- and
     # 9-argument forms.
@@ -2826,6 +2835,29 @@ def analyze(program, filename="<string>"):
                             category="invalid function argument type",
                         )
                 return types_mod.ImageType() if callee.prop == "clip" else None
+            # claude.md #189: img.getPixelColor(x, y) -> color -- the
+            # img-method counterpart of the canvas-level
+            # getPixelColor(x, y), checked in its own branch (rather
+            # than folded into the drawRect/.../drawText block just
+            # below) since every one of those returns nothing, and this
+            # returns a color.
+            if callee.prop == "getPixelColor" and infer(callee.obj, scope) == _IMAGE:
+                if len(expr.args) != 2:
+                    raise CompileError(
+                        f"getPixelColor() expects 2 arguments, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                for i, arg in enumerate(expr.args):
+                    arg_type = infer(arg, scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != _INT:
+                        raise CompileError(
+                            f"getPixelColor()'s argument {i + 1} expects int, "
+                            f"found {types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return _COLOR
             # claude.md #134: drawRect/drawPixel/drawCircle/drawText as
             # methods on img -- the same four canvas-level drawing
             # builtins claude.md #37/#39/#133 already give, now also

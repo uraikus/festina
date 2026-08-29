@@ -1161,6 +1161,9 @@ log(`${profile.width}x${profile.height}`)
 img brush = blankImage(64, 64)           // a fresh, fully-transparent image
 brush.drawCircle(32, 32, 30, blue)       // draw onto it like any other img
 
+color picked = getPixelColor(10, 10)     // read one canvas pixel back
+color picked2 = brush.getPixelColor(32, 32)  // or one img pixel
+
 saveCanvas('screenshot.png')             // -> bool; writes what you drew
 img snap = saveCanvas()                  // -> img; a snapshot, no file written
 
@@ -1219,6 +1222,29 @@ a border color left over from a previous, unrelated `drawRect`/
 `drawCircle` call no longer has to be reset with `borderColor()` or
 `saveState()`/`restoreState()` by hand before every shape that needs
 its own.
+
+`getPixelColor(x, y)` reads one pixel back off the canvas, and
+`img.getPixelColor(x, y)` reads one back off an `img`'s own surface —
+useful for a color picker, or any effect that needs to know what's
+already been drawn somewhere. Both answer `null` for a coordinate
+outside the canvas/image's own bounds, and for a fully transparent
+pixel (nothing painted there, or painted then cleared) — the same
+`null` a `color` variable with no assigned color already reads as.
+Where a pixel was painted at less than full opacity (`fillAlpha`), the
+answer is the color that was actually painted, not one darkened by
+whatever alpha was in effect — Cairo stores color and alpha together
+(premultiplied), and this un-does that before handing the color back.
+
+```festina
+bool pickerOn = true
+color picker
+
+on mouse(x:int, y:int) {
+    if pickerOn {
+        picker = getPixelColor(x, y)
+    }
+}
+```
 
 **Drawing is offscreen. `render()` puts it on screen.**
 
