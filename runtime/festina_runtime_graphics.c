@@ -980,6 +980,65 @@ void festina_draw_pixel_color(int64_t x, int64_t y, int64_t color) {
     cairo_destroy(cr);
 }
 
+/* claude.md #189 (getPixelColor): reads one pixel back off an ARGB32
+ * surface (the canvas's own backing store, or an img's) as a packed
+ * `color` -- the exact reverse of festina_unpack_rgb, and the direct
+ * runtime counterpart of `pack_color`'s own `(r<<16)|(g<<8)|b` in
+ * codegen.py (claude.md #91).
+ *
+ * `cairo_surface_flush` first: direct pixel access needs every pending
+ * drawing operation actually committed to memory first, the same
+ * requirement claude.md #178's own mac/Windows present-path flush
+ * fixed for reading a window surface -- here it's the offscreen
+ * backing/image surface instead, but the underlying Cairo contract is
+ * identical.
+ *
+ * Out of bounds, or a NULL surface (an img handle that was never
+ * given one), reads as `color`'s own 'none' -- consistent with
+ * `festina_image_clip`'s own "past the edge is simply not there"
+ * rule, not a crash.
+ *
+ * ARGB32 stores PREMULTIPLIED alpha (Cairo's own documented format),
+ * so a translucent pixel's stored R/G/B are already scaled down by its
+ * own alpha -- e.g. opaque red drawn at fillAlpha(0.5) over nothing
+ * stores roughly half-brightness red, not full red. Dividing back out
+ * by alpha (rounding to the nearest integer, not truncating) is what
+ * makes getPixelColor answer the colour that was actually PAINTED,
+ * not one darkened by whatever fillAlpha happened to be in effect
+ * when it landed. A fully transparent pixel (alpha 0, nothing ever
+ * painted there, or painted then cleared) has no real colour to
+ * recover at all -- premultiplied R/G/B are always 0/0/0 regardless of
+ * what was last set, so this reads it as 'none' rather than a
+ * meaningless black. */
+static int64_t festina_pixel_color_from_surface(cairo_surface_t *surface, int64_t x, int64_t y) {
+    if (!surface) return -1;
+    int w = cairo_image_surface_get_width(surface);
+    int h = cairo_image_surface_get_height(surface);
+    if (x < 0 || y < 0 || x >= w || y >= h) return -1;
+    cairo_surface_flush(surface);
+    int stride = cairo_image_surface_get_stride(surface);
+    const unsigned char *data = cairo_image_surface_get_data(surface);
+    if (!data) return -1;
+    uint32_t px;
+    memcpy(&px, data + (int64_t)y * stride + (int64_t)x * 4, sizeof(px));
+    uint32_t a = (px >> 24) & 0xff;
+    if (a == 0) return -1;
+    uint32_t r = (px >> 16) & 0xff;
+    uint32_t g = (px >> 8) & 0xff;
+    uint32_t b = px & 0xff;
+    if (a < 255) {
+        r = (r * 255 + a / 2) / a;
+        g = (g * 255 + a / 2) / a;
+        b = (b * 255 + a / 2) / a;
+    }
+    return ((int64_t)r << 16) | ((int64_t)g << 8) | (int64_t)b;
+}
+
+int64_t festina_get_pixel_color(int64_t x, int64_t y) {
+    festina_backing_require();
+    return festina_pixel_color_from_surface(g_backing_surface, x, y);
+}
+
 /* claude.md #104: filled circles, rasterized once per radius.
  *
  * cairo_arc + cairo_fill tessellates the curve into Beziers and
@@ -1503,6 +1562,15 @@ int64_t festina_image_width(void *img) {
 int64_t festina_image_height(void *img) {
     if (!img) return 0;
     return (int64_t)cairo_image_surface_get_height(((FestinaImageBox *)img)->surface);
+}
+
+/* claude.md #189: img.getPixelColor(x, y) -- the img-method
+ * counterpart of the canvas-level getPixelColor(x, y); shares
+ * festina_pixel_color_from_surface's own premultiplied-alpha unpacking
+ * and out-of-bounds/no-colour-here 'none' handling. */
+int64_t festina_image_get_pixel_color(void *img, int64_t x, int64_t y) {
+    if (!img) return -1;
+    return festina_pixel_color_from_surface(((FestinaImageBox *)img)->surface, x, y);
 }
 
 /* claude.md #92: a rectangle lifted out of a larger image -- the
