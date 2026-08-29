@@ -142,6 +142,13 @@ char *festina_str_concat(const char *a, const char *b);
  * in generated IR; byte handling lives here. See the .c doc comment. */
 void *festina_sb_new(void);
 void festina_sb_append(void *sb, const char *s);
+/* claude.md #190: same as festina_sb_append, but for a caller that
+ * already knows the byte length -- skips the runtime strlen() rescan.
+ * Used for every compile-time-known literal (JSON punctuation, a
+ * struct/table field's own pre-baked key) _json_fn_for's generated IR
+ * appends. `len <= 0` is a no-op, matching festina_sb_append's own
+ * NULL-is-a-no-op contract. */
+void festina_sb_append_n(void *sb, const char *s, int64_t len);
 void festina_sb_append_json_text(void *sb, const char *s);
 void festina_sb_append_json_int(void *sb, int64_t v);
 void festina_sb_append_json_float(void *sb, double v);

@@ -1447,6 +1447,8 @@ class CodeGen:
             # claude.md #114: the string builder behind JSON rendering.
             "declare ptr @festina_sb_new()",
             "declare void @festina_sb_append(ptr, ptr)",
+            # claude.md #190
+            "declare void @festina_sb_append_n(ptr, ptr, i64)",
             "declare void @festina_sb_append_json_text(ptr, ptr)",
             "declare void @festina_sb_append_json_int(ptr, i64)",
             "declare void @festina_sb_append_json_float(ptr, double)",
@@ -4253,6 +4255,22 @@ class CodeGen:
             cleanup()
         return out, types_mod.HttpType()
 
+    def _emit_sb_append_const(self, body, sb, text):
+        """claude.md #190: appends a COMPILE-TIME-KNOWN string (JSON
+        punctuation, or a struct/table field's own pre-baked `"key":`
+        constant) to a string builder without the runtime strlen()
+        rescan festina_sb_append's plain-pointer form needs -- the
+        exact byte length is already known here, in Python, the same
+        count _encode_c_string computes for the global's own storage.
+        Used for every literal the generated JSON walker
+        (_json_fn_for) appends, which is the majority of the calls a
+        loop rendering many structs/rows makes -- one `strlen()` per
+        struct field, per row, previously, for a length the compiler
+        had already thrown away."""
+        ref = self.string_const(text)
+        n = len(text.encode("utf-8"))
+        body.append(f"  call void @festina_sb_append_n(ptr {sb}, ptr {ref}, i64 {n})")
+
     def _json_append_slot(self, body, sb, ftype, slot_ptr, depth_val):
         """claude.md #114: appends ONE value (stored at `slot_ptr`, of
         festina type `ftype`) to the builder -- the shared field/element/
@@ -4318,7 +4336,7 @@ class CodeGen:
         body.append(f"  {isnull} = icmp eq ptr %v, null")
         body.append(f"  br i1 {isnull}, label %{null_lbl}, label %{deep_lbl}")
         body.append(f"{null_lbl}:")
-        body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('null')})")
+        self._emit_sb_append_const(body, "%sb", "null")
         body.append("  ret void")
         body.append(f"{deep_lbl}:")
         toodeep = self.tmp()
@@ -4329,15 +4347,14 @@ class CodeGen:
         if isinstance(type_, types_mod.StructType):
             for idx, (fname, ftype) in enumerate(self.struct_fields(type_.name)):
                 prefix = '{"' if idx == 0 else ',"'
-                body.append(f"  call void @festina_sb_append(ptr %sb, "
-                            f"ptr {self.string_const(prefix + fname + chr(34) + ':')})")
+                self._emit_sb_append_const(body, "%sb", prefix + fname + chr(34) + ':')
                 fp = self.tmp()
                 struct_ty = self.struct_llvm_name(type_.name)
                 body.append(f"  {fp} = getelementptr {struct_ty}, ptr %v, i32 0, i32 {idx}")
                 self._json_append_slot(body, "%sb", ftype, fp, "%depth")
             if not self.struct_fields(type_.name):
-                body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('{')})")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('}')})")
+                self._emit_sb_append_const(body, "%sb", "{")
+            self._emit_sb_append_const(body, "%sb", "}")
 
         elif isinstance(type_, types_mod.TableType):
             # A row: flat 8-byte slots, plus #111's presence mask one
@@ -4349,7 +4366,7 @@ class CodeGen:
             first_slot = self.tmp()
             body.append(f"  {first_slot} = alloca i8")
             body.append(f"  store i8 1, ptr {first_slot}")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('{')})")
+            self._emit_sb_append_const(body, "%sb", "{")
             mask_ptr = self.tmp()
             body.append(f"  {mask_ptr} = getelementptr i8, ptr %v, i64 {ncols * 8}")
             mask = self.tmp()
@@ -4374,12 +4391,11 @@ class CodeGen:
                 body.append(f"  {is_first} = icmp ne i8 {fst}, 0")
                 body.append(f"  br i1 {is_first}, label %{key_lbl}, label %{sep_lbl}")
                 body.append(f"{sep_lbl}:")
-                body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(',')})")
+                self._emit_sb_append_const(body, "%sb", ",")
                 body.append(f"  br label %{key_lbl}")
                 body.append(f"{key_lbl}:")
                 body.append(f"  store i8 0, ptr {first_slot}")
-                body.append(f"  call void @festina_sb_append(ptr %sb, "
-                            f"ptr {self.string_const(chr(34) + fname + chr(34) + ':')})")
+                self._emit_sb_append_const(body, "%sb", chr(34) + fname + chr(34) + ':')
                 slot = self.tmp()
                 body.append(f"  {slot} = getelementptr i8, ptr %v, i64 {idx * 8}")
                 if ftype == BOOL:
@@ -4392,13 +4408,13 @@ class CodeGen:
                     self._json_append_slot(body, "%sb", ftype, slot, "%depth")
                 body.append(f"  br label %{skip_lbl}")
                 body.append(f"{skip_lbl}:")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('}')})")
+            self._emit_sb_append_const(body, "%sb", "}")
 
         elif isinstance(type_, types_mod.ArrayType):
             elem_type = type_.element
             elem_llvm = _llvm_type(elem_type)
             elem_size = _elem_size(elem_type)
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('[')})")
+            self._emit_sb_append_const(body, "%sb", "[")
             len_p = self.tmp()
             body.append(f"  {len_p} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr %v, i32 0, i32 0")
             n = self.tmp()
@@ -4427,7 +4443,7 @@ class CodeGen:
             body.append(f"  {nonfirst} = icmp sgt i64 {iv}, 0")
             body.append(f"  br i1 {nonfirst}, label %{sep}, label %{elem_lbl}")
             body.append(f"{sep}:")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(',')})")
+            self._emit_sb_append_const(body, "%sb", ",")
             body.append(f"  br label %{elem_lbl}")
             body.append(f"{elem_lbl}:")
             off = self.tmp()
@@ -4440,7 +4456,7 @@ class CodeGen:
             body.append(f"  store i64 {nx}, ptr {i_slot}")
             body.append(f"  br label %{cond}")
             body.append(f"{done}:")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(']')})")
+            self._emit_sb_append_const(body, "%sb", "]")
 
         elif isinstance(type_, types_mod.MapType):
             value_type = type_.value
@@ -4466,7 +4482,7 @@ class CodeGen:
             body.append(f"  {ent_p} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr %v, i32 0, i32 1")
             ents = self.tmp()
             body.append(f"  {ents} = load ptr, ptr {ent_p}")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('{')})")
+            self._emit_sb_append_const(body, "%sb", "{")
             i_slot = self.tmp()
             body.append(f"  {i_slot} = alloca i64")
             body.append(f"  store i64 0, ptr {i_slot}")
@@ -4509,11 +4525,11 @@ class CodeGen:
             body.append(f"  {nonfirst} = icmp ne i8 {emitted}, 0")
             body.append(f"  br i1 {nonfirst}, label %{sep}, label %{kv_lbl}")
             body.append(f"{sep}:")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(',')})")
+            self._emit_sb_append_const(body, "%sb", ",")
             body.append(f"  br label %{kv_lbl}")
             body.append(f"{kv_lbl}:")
             body.append(f"  call void @festina_sb_append_json_text(ptr %sb, ptr {keyv})")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(':')})")
+            self._emit_sb_append_const(body, "%sb", ":")
             vslot = self.tmp()
             body.append(f"  {vslot} = getelementptr i8, ptr {entp}, i64 8")
             self._json_append_slot(body, "%sb", value_type, vslot, "%depth")
@@ -4525,7 +4541,7 @@ class CodeGen:
             body.append(f"  store i64 {nx}, ptr {i_slot}")
             body.append(f"  br label %{cond}")
             body.append(f"{done}:")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('}')})")
+            self._emit_sb_append_const(body, "%sb", "}")
 
         body.append("  ret void")
         body.append("}")

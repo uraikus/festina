@@ -1243,40 +1243,90 @@ static void festina_sb_grow(FestinaSB *sb, size_t add) {
     sb->data = grown;
 }
 
+/* claude.md #190: the shared "grow, then copy exactly n bytes, then
+ * keep the buffer NUL-terminated" step both festina_sb_append and
+ * festina_sb_append_n are built from -- the only difference between
+ * them is where n comes from (a runtime strlen() scan vs. a length
+ * the CALLER already knows). Doesn't itself NUL-terminate mid-string
+ * the way festina_sb_append's own old inline version incidentally did
+ * (copying s's own trailing NUL along with it) -- callers that build a
+ * string out of several appends (every one of the JSON-rendering ones)
+ * only need the final byte terminated once, not after every single
+ * piece, so this terminates unconditionally at the new length instead,
+ * which is cheap (one store) and correct for both single-call and
+ * multi-call use. */
+static void festina_sb_append_bytes(FestinaSB *sb, const char *s, size_t n) {
+    festina_sb_grow(sb, n);
+    memcpy(sb->data + sb->len, s, n);
+    sb->len += n;
+    sb->data[sb->len] = '\0';
+}
+
 void festina_sb_append(void *sbv, const char *s) {
     if (!s) return;
-    FestinaSB *sb = (FestinaSB *)sbv;
-    size_t n = strlen(s);
-    festina_sb_grow(sb, n);
-    memcpy(sb->data + sb->len, s, n + 1);
-    sb->len += n;
+    festina_sb_append_bytes((FestinaSB *)sbv, s, strlen(s));
+}
+
+/* claude.md #190: same as festina_sb_append, but for a caller that
+ * already knows the byte length -- every codegen-emitted JSON
+ * punctuation/field-key append (_json_fn_for's own generated IR) comes
+ * from a compile-time string constant, whose exact length is already
+ * known in Python at codegen time (the same count _encode_c_string
+ * computes for the constant's own storage) and was previously thrown
+ * away, forcing this exact runtime strlen() rescan on every call --
+ * once per struct field, per row, in a loop rendering many values.
+ * `len <= 0` is a no-op, matching festina_sb_append's own NULL-is-a-
+ * no-op contract (an empty/negative length has nothing to copy). */
+void festina_sb_append_n(void *sbv, const char *s, int64_t len) {
+    if (!s || len <= 0) return;
+    festina_sb_append_bytes((FestinaSB *)sbv, s, (size_t)len);
 }
 
 /* A JSON string: quoted, with the escapes JSON requires. A NULL text
  * renders as the JSON null literal, unquoted -- the same three-way
- * honesty festina_str_from_bool already applies. */
+ * honesty festina_str_from_bool already applies.
+ *
+ * claude.md #190: scans forward for a RUN of bytes needing no escape
+ * (the overwhelmingly common case -- ordinary printable ASCII, and any
+ * valid UTF-8 continuation/lead byte, both >= 0x20 and neither quote
+ * nor backslash) and copies the whole run in one festina_sb_append_
+ * bytes call, rather than the byte-at-a-time switch/snprintf/strlen/
+ * memcpy sequence the previous version ran unconditionally for EVERY
+ * byte, escaped or not. Falls into the single-character path only for
+ * a byte that actually needs escaping; behavior (including the exact
+ * `\uXXXX` fallback for control characters below 0x20 other than \n/
+ * \r/\t) is unchanged from before -- this only changes how many bytes
+ * move per underlying copy. */
 void festina_sb_append_json_text(void *sbv, const char *s) {
     FestinaSB *sb = (FestinaSB *)sbv;
     if (!s) { festina_sb_append(sb, "null"); return; }
     festina_sb_grow(sb, 2);
     sb->data[sb->len++] = '"';
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+    const unsigned char *p = (const unsigned char *)s;
+    const unsigned char *run_start = p;
+    for (; *p; p++) {
+        unsigned char c = *p;
+        if (c >= 0x20 && c != '"' && c != '\\') continue;  /* safe run continues */
+        if (p > run_start) {
+            festina_sb_append_bytes(sb, (const char *)run_start, (size_t)(p - run_start));
+        }
         char esc[8];
-        const char *out = esc;
-        switch (*p) {
+        const char *out;
+        switch (c) {
         case '"':  out = "\\\""; break;
         case '\\': out = "\\\\"; break;
         case '\n': out = "\\n"; break;
         case '\r': out = "\\r"; break;
         case '\t': out = "\\t"; break;
         default:
-            if (*p < 0x20) { snprintf(esc, sizeof(esc), "\\u%04x", *p); }
-            else { esc[0] = (char)*p; esc[1] = '\0'; }
+            snprintf(esc, sizeof(esc), "\\u%04x", c);
+            out = esc;
         }
-        size_t n = strlen(out);
-        festina_sb_grow(sb, n);
-        memcpy(sb->data + sb->len, out, n);
-        sb->len += n;
+        festina_sb_append_bytes(sb, out, strlen(out));
+        run_start = p + 1;
+    }
+    if (p > run_start) {
+        festina_sb_append_bytes(sb, (const char *)run_start, (size_t)(p - run_start));
     }
     festina_sb_grow(sb, 1);
     sb->data[sb->len++] = '"';

@@ -8507,6 +8507,36 @@ class TestJsonRendering:
         assert result.stdout.strip() == (
             '{"name":"has \\"quotes\\" and\\ttab","score":null,"missing":0}')
 
+    def test_escape_run_boundaries_render_correctly(self, compile_and_run):
+        # claude.md #190: festina_sb_append_json_text now bulk-copies
+        # a "safe run" of bytes instead of handling one byte at a
+        # time, so the exact boundary where a run starts/ends/never-
+        # exists is exactly where a bug would hide: a string starting
+        # AND ending on an escape-needing byte (no leading/trailing
+        # safe run at all), a string of NOTHING but escape-needing
+        # bytes back-to-back (every "run" is zero-length), and an
+        # empty string (no bytes to scan at all).
+        source = r'''
+        struct P {
+            leading:text
+            trailing:text
+            onlyEscapes:text
+            empty:text
+        }
+        P p
+        p.leading = '"start and end with quotes"'
+        p.trailing = 'ab\\'
+        p.onlyEscapes = '"\\\n\t\r'
+        p.empty = ''
+        log(p)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.strip() == (
+            '{"leading":"\\"start and end with quotes\\"",'
+            '"trailing":"ab\\\\",'
+            '"onlyEscapes":"\\"\\\\\\n\\t\\r",'
+            '"empty":""}')
+
     def test_a_table_row_renders_with_database_null_and_omits_undefined(
             self, compile_and_run, tmp_path):
         # A database NULL is the JSON null; a column the query never

@@ -415,4 +415,14 @@ class TestLeakStress:
             # lifetime (freeing/deleting from the map right after
             # collecting must leave the returned array untouched).
             "map_keys_values_churn.f",
+            # claude.md #190: the JSON-rendering optimization itself --
+            # festina_sb_append_n's own length-aware append (no
+            # runtime strlen() rescan) and festina_sb_append_json_
+            # text's run-scanning escape loop (bulk memcpy of
+            # unescaped runs). Exercises every _json_fn_for shape --
+            # struct (nested and empty), arr[T], map[T], a table row --
+            # with text needing real escaping (quotes, backslashes,
+            # control characters, multi-byte UTF-8) so a bug in either
+            # optimization surfaces as a real ASan error.
+            "json_render_churn.f",
         }

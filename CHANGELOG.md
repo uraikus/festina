@@ -9,6 +9,23 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.7] - 2026-08-29
+
+### Changed
+
+- `.toText()` JSON-style rendering (`log()`/template interpolation of a
+  struct, table row, `arr[T]`, or `map[T]`, and explicit `.toText()`
+  calls on any of them) is faster, with no change in output. Every
+  compile-time-known literal the renderer appends (JSON punctuation, a
+  struct field's own baked `"name":` key) now skips a runtime
+  `strlen()` rescan of a length the compiler already knew, and string
+  escaping now bulk-copies runs of bytes that don't need escaping
+  instead of handling one byte at a time. Measured ~2.5x faster
+  (~215ms → ~85ms median over 5 runs) on a 100,000-iteration
+  text-heavy struct-rendering benchmark.
+
+See [claude.md #190](claude.md) for the full measurement methodology.
+
 ## [0.6] - 2026-08-29
 
 ### Added
