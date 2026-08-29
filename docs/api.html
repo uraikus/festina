@@ -1720,6 +1720,9 @@ log(<span class="str">`${profile.width}x${profile.height}`</span>)
 <span class="kw">img</span> brush = blankImage(64, 64)           <span class="cm">// a fresh, fully-transparent image</span>
 brush.drawCircle(32, 32, 30, blue)       <span class="cm">// draw onto it like any other img</span>
 
+<span class="kw">color</span> picked = getPixelColor(10, 10)     <span class="cm">// read one canvas pixel back</span>
+<span class="kw">color</span> picked2 = brush.getPixelColor(32, 32)  <span class="cm">// or one img pixel</span>
+
 saveCanvas(<span class="str">'screenshot.png'</span>)             <span class="cm">// -&gt; bool; writes what you drew</span>
 <span class="kw">img</span> snap = saveCanvas()                  <span class="cm">// -&gt; img; a snapshot, no file written</span>
 
@@ -1791,6 +1794,31 @@ setClientHeight(768)
           <code>saveState()</code>/<code>restoreState()</code> by hand
           before every shape that needs its own.
         </p>
+        <p>
+          <code>getPixelColor(x, y)</code> reads one pixel back off the
+          canvas, and <code>img.getPixelColor(x, y)</code> reads one back
+          off an <code>img</code>'s own surface — useful for a color
+          picker, or any effect that needs to know what's already been
+          drawn somewhere. Both answer <code>null</code> for a
+          coordinate outside the canvas/image's own bounds, and for a
+          fully transparent pixel (nothing painted there, or painted
+          then cleared) — the same <code>null</code> a <code>color</code>
+          variable with no assigned color already reads as. Where a
+          pixel was painted at less than full opacity
+          (<code>fillAlpha</code>), the answer is the color that was
+          actually painted, not one darkened by whatever alpha was in
+          effect — Cairo stores color and alpha together
+          (premultiplied), and this un-does that before handing the
+          color back.
+        </p>
+        <pre class="code"><span class="kw">bool</span> pickerOn = <span class="kw">true</span>
+<span class="kw">color</span> picker
+
+<span class="kw">on</span> mouse(x:<span class="kw">int</span>, y:<span class="kw">int</span>) {
+    <span class="kw">if</span> pickerOn {
+        picker = getPixelColor(x, y)
+    }
+}</pre>
         <div class="callout">
           <strong>Drawing is offscreen. <code>render()</code> puts it on
           screen.</strong> Every drawing call paints an offscreen canvas
