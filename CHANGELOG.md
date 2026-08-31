@@ -9,6 +9,23 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.9] - 2026-08-31
+
+### Added
+
+- `thread NAME { ... }`: an isolated background worker with its own
+  OS thread, its own private state, and message queues to and from
+  the main program. `on load()`/`on message(p:T)`/`on exit(code:int)`
+  handlers; `NAME.postMessage(x)`/`NAME.onMessage(callback)` for
+  message passing (`int`/`float`/`bool`/`text` today); `NAME.kill()`/
+  `NAME.live(callback)`/`NAME.isAlive()` for lifecycle control. Every
+  message crossing the boundary is a deep, independent copy — no two
+  threads ever share a mutable value. A thread's own body can see
+  only its own state/locals, function names, and type names, never a
+  global variable/constant or an ordinary top-level function call.
+  See [api.md](api.md#threads) and
+  [claude.md #195](claude.md)/[#196](claude.md).
+
 ## [0.8] - 2026-08-31
 
 ### Security

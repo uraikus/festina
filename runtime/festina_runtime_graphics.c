@@ -2228,6 +2228,21 @@ void festina_run_event_loop(void) {
         if (festina_async_io_outstanding() > 0 && (timeout < 0.0 || timeout > 0.02)) {
             timeout = 0.02;
         }
+        /* claude.md #195 Phase 2: same bounded-wait treatment, for the
+         * same reason -- a completed thread outbound message should
+         * fire its onMessage() callback promptly rather than waiting
+         * for the next real window/timer event. Unlike
+         * festina_run_timer_loop this loop's own lifetime is still
+         * governed purely by the window (see this loop's own doc
+         * comment on festina_async_io_outstanding just above), so a
+         * live idling thread does not, on its own, keep a GRAPHICS
+         * program's window-driven loop running -- closing the window
+         * still ends it, and festina_program_exit's own
+         * festina_thread_kill_all() cleans up any thread still alive
+         * at that point regardless. */
+        if (festina_thread_outstanding() > 0 && (timeout < 0.0 || timeout > 0.02)) {
+            timeout = 0.02;
+        }
         /* claude.md #166: an open openPort()/openSecurePort() listener
          * (or a live connection, or a pending background client
          * request) gets exactly the same bounded-wait treatment --
@@ -2245,6 +2260,7 @@ void festina_run_event_loop(void) {
         festina_fire_expired_timers();
         festina_async_io_drain();
         festina_http_service_ready();
+        festina_thread_drain();
     }
     cairo_surface_destroy(g_backing_surface);
     g_backing_surface = NULL;

@@ -851,9 +851,9 @@ class _ThreadInfo:
     accepts no messages at all, and `NAME.postMessage(x)` anywhere in
     the program is a compile error). `outbound_type` is inferred from
     every `postMessage(x)` call site found inside this thread's own
-    body (None if it never posts anything; unioned into an implicit,
-    compiler-synthesized EnumType if more than one distinct type
-    appears there -- see _merge_thread_outbound_type). `has_onmessage`
+    body (None if it never posts anything; more than one distinct type
+    across those sites is a compile error, not auto-merged -- see
+    _merge_thread_outbound_type's own doc comment). `has_onmessage`
     and `postmessage_sites` back the symmetric "no dead sends" check at
     the end of analyze(): a thread that posts anything but is never the
     target of a `NAME.onMessage(...)` registration anywhere in the

@@ -433,4 +433,13 @@ class TestLeakStress:
             # .indexOf() of a text->handle coerced element. A leak or
             # invalid free surfaces as a real ASan error.
             "handle_arg_and_arr_churn.f",
+            # claude.md #195/#196: `thread` -- an ownership shape none
+            # of the above can exercise at all, since it's the only one
+            # of them where Festina code runs on more than one OS
+            # thread concurrently. Two message shapes (int, the raw-
+            # bits box; text, the "box IS the owned buffer" path), 20
+            # real kill()/live() cycles (each spawning/joining a real
+            # pthread), and thousands of messages posted up front so a
+            # leaked box or pthread resource is unmissable.
+            "thread_churn.f",
         }

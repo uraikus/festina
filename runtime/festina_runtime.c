@@ -1131,6 +1131,14 @@ void festina_register_exit_handler(void (*handler)(int64_t)) {
 
 void festina_program_exit(int64_t code) {
     if (g_exit_handler) g_exit_handler(code);
+    /* claude.md #195 Phase 2: "if the main thread dies, kill all child
+     * threads" -- run after the program's own exit handler (so that
+     * handler still sees every thread it might itself want to talk to
+     * as alive) and before the real exit() below, so no declared
+     * `thread` ever survives as an orphaned OS thread once the process
+     * is on its way out. A no-op (the hook defaults to unregistered)
+     * for a program with no `thread` declaration at all. */
+    festina_thread_kill_all();
     exit((int)code);
 }
 
@@ -3767,6 +3775,32 @@ void festina_http_service_ready(void) {
     if (g_http_service_ready_fn) g_http_service_ready_fn();
 }
 
+/* claude.md #195 Phase 2: the thread hook seam -- see this trio's own
+ * doc comment in festina_runtime.h for the full reasoning. Mirrors
+ * festina_set_async_io_hooks/festina_set_http_service_hooks exactly. */
+static int64_t (*g_thread_outstanding_fn)(void) = NULL;
+static void (*g_thread_drain_fn)(void) = NULL;
+static void (*g_thread_kill_all_fn)(void) = NULL;
+
+void festina_set_thread_hooks(int64_t (*outstanding_fn)(void), void (*drain_fn)(void),
+                              void (*kill_all_fn)(void)) {
+    g_thread_outstanding_fn = outstanding_fn;
+    g_thread_drain_fn = drain_fn;
+    g_thread_kill_all_fn = kill_all_fn;
+}
+
+int64_t festina_thread_outstanding(void) {
+    return g_thread_outstanding_fn ? g_thread_outstanding_fn() : 0;
+}
+
+void festina_thread_drain(void) {
+    if (g_thread_drain_fn) g_thread_drain_fn();
+}
+
+void festina_thread_kill_all(void) {
+    if (g_thread_kill_all_fn) g_thread_kill_all_fn();
+}
+
 /* claude.md #165: bounds a sleep/poll timeout that would otherwise be
  * "block forever" (no active timer) to a short, regular wake -- the
  * only way festina_run_timer_loop's own plain nanosleep (no fd to
@@ -3808,14 +3842,21 @@ void festina_run_timer_loop(void) {
         }
         double earliest = festina_next_timer_deadline();
         int64_t async_io_outstanding = festina_async_io_outstanding();
-        if (earliest < 0.0 && async_io_outstanding == 0) {
+        /* claude.md #195 Phase 2: a live, idling `thread` (nothing else
+         * async or timed happening at all -- exactly the `peopleWorker`-
+         * style "declare it and let it idle" case) has to keep this
+         * loop running too, or the process would exit right out from
+         * under it the moment __festina_main()'s own top-level
+         * statements finish. */
+        int64_t thread_outstanding = festina_thread_outstanding();
+        if (earliest < 0.0 && async_io_outstanding == 0 && thread_outstanding == 0) {
             return; /* nothing left to wait for */
         }
         double remaining = earliest;
         if (earliest >= 0.0) {
             remaining = earliest - festina_now_seconds();
         }
-        if (async_io_outstanding > 0
+        if ((async_io_outstanding > 0 || thread_outstanding > 0)
                 && (earliest < 0.0 || remaining > FESTINA_ASYNC_IO_POLL_SECONDS)) {
             remaining = FESTINA_ASYNC_IO_POLL_SECONDS;
         }
@@ -3827,6 +3868,11 @@ void festina_run_timer_loop(void) {
         }
         festina_fire_expired_timers();
         festina_async_io_drain();
+        /* claude.md #195 Phase 2: delivers any thread's own pending
+         * outbound message(s) to its registered onMessage() callback,
+         * same placement as festina_async_io_drain just above -- a
+         * no-op for a program with no `thread` declaration at all. */
+        festina_thread_drain();
     }
 }
 

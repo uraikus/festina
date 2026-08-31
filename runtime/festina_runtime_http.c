@@ -2221,8 +2221,14 @@ void festina_run_http_loop(void) {
          * have this kind of work outstanding (e.g. `on request`
          * loading a file in the background while also serving http). */
         int64_t async_io_outstanding = festina_async_io_outstanding();
+        /* claude.md #195 Phase 2: same reasoning as
+         * festina_run_timer_loop's own thread_outstanding check -- a
+         * live, idling `thread` has to keep THIS loop alive too, for a
+         * program that combines http with a `thread` declaration. */
+        int64_t thread_outstanding = festina_thread_outstanding();
         if (nfds == 0 && festina_next_timer_deadline() < 0.0
-                && g_async_outstanding == 0 && async_io_outstanding == 0) {
+                && g_async_outstanding == 0 && async_io_outstanding == 0
+                && thread_outstanding == 0) {
             return; /* nothing left to wait for at all */
         }
 
@@ -2275,7 +2281,7 @@ void festina_run_http_loop(void) {
          * the poll set above) -- bounding the timeout is the only way
          * to notice a completed background blob/img/aud load promptly.
          * Same 20ms granularity festina_run_timer_loop uses. */
-        if (async_io_outstanding > 0 && (timeout_ms < 0 || timeout_ms > 20)) {
+        if ((async_io_outstanding > 0 || thread_outstanding > 0) && (timeout_ms < 0 || timeout_ms > 20)) {
             timeout_ms = 20;
         }
 
@@ -2310,6 +2316,9 @@ void festina_run_http_loop(void) {
         /* claude.md #165: the generic blob/img/aud pool's own drain --
          * a no-op when festina_runtime_async.c was never linked. */
         festina_async_io_drain();
+        /* claude.md #195 Phase 2: same shape, for `thread` -- a no-op
+         * when no `thread` was ever declared. */
+        festina_thread_drain();
         /* claude.md #167: reap any keep-alive connection that's been
          * idle too long -- see its own doc comment. Cheap (a linear
          * scan already the same size as the poll-set-building one just

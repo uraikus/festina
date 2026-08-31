@@ -15820,3 +15820,266 @@ class TestEnums:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip() == "text"
+
+
+class TestThreads:
+    """claude.md #195 Phase 2: `thread NAME { ... }` -- the real,
+    compiled-and-run counterpart to tests/test_threads.py's parser/
+    semantic coverage (that file explicitly defers this class of test
+    here, mirroring TestEnums' own split at the top of this file).
+    Every test drives itself to a deterministic close(0) from inside
+    an onMessage()/live() callback (an ordinary main-thread function
+    call -- ending the process is the only reliable way a test can
+    observe the reply side of a message round trip at all, since no
+    top-level statement ever runs concurrently with the drain step
+    that would deliver one -- see codegen.py's own _emit_main_and_entry
+    doc comment on loop selection)."""
+
+    def test_int_message_round_trip(self, compile_and_run):
+        source = """
+        thread worker {
+            on message(p:int) {
+                postMessage(p * 2)
+            }
+        }
+        void func onReply(x:int) {
+            log(x)
+            close(0)
+        }
+        worker.onMessage(void (x:int) => onReply(x))
+        worker.postMessage(21)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "42"
+
+    def test_text_message_round_trip(self, compile_and_run):
+        source = """
+        thread echoer {
+            on message(p:text) {
+                postMessage(`echo:${p}`)
+            }
+        }
+        void func onReply(x:text) {
+            log(x)
+            close(0)
+        }
+        echoer.onMessage(void (x:text) => onReply(x))
+        echoer.postMessage('hi')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "echo:hi"
+
+    def test_float_message_round_trip(self, compile_and_run):
+        source = """
+        thread worker {
+            on message(p:float) {
+                postMessage(p + 0.5)
+            }
+        }
+        void func onReply(x:float) {
+            log(x)
+            close(0)
+        }
+        worker.onMessage(void (x:float) => onReply(x))
+        worker.postMessage(1.5)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "2"
+
+    def test_bool_message_round_trip(self, compile_and_run):
+        source = """
+        thread worker {
+            on message(p:bool) {
+                postMessage(!p)
+            }
+        }
+        void func onReply(x:bool) {
+            log(x)
+            close(0)
+        }
+        worker.onMessage(void (x:bool) => onReply(x))
+        worker.postMessage(true)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "false"
+
+    def test_on_load_fires_before_any_inbound_message_and_can_post_on_its_own(self, compile_and_run):
+        source = """
+        thread worker {
+            on load() {
+                postMessage('ready')
+            }
+        }
+        void func onReply(x:text) {
+            log(x)
+            close(0)
+        }
+        worker.onMessage(void (x:text) => onReply(x))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "ready"
+
+    def test_thread_private_state_persists_and_accumulates_across_messages(self, compile_and_run):
+        # claude.md #195 Phase 1: `int total = 0` is this thread's own
+        # private state, invisible to the main program -- this proves
+        # it's also real, per-thread, PERSISTENT storage at runtime
+        # (not re-zeroed per message), by summing three messages
+        # in order and checking the final accumulated total. Delivery
+        # order is guaranteed here: both queues are plain FIFOs, and
+        # everything on each side runs on exactly one OS thread (this
+        # thread's own single worker; the main program's own single
+        # thread), so three sends from main arrive, and are answered,
+        # in the order they were sent.
+        source = """
+        thread counter {
+            int total = 0
+            on message(p:int) {
+                total = total + p
+                postMessage(total)
+            }
+        }
+        int repliesSeen = 0
+        int lastVal = 0
+        void func onReply(x:int) {
+            repliesSeen = repliesSeen + 1
+            lastVal = x
+            if repliesSeen == 3 {
+                log(lastVal)
+                close(0)
+            }
+        }
+        counter.onMessage(void (x:int) => onReply(x))
+        counter.postMessage(1)
+        counter.postMessage(2)
+        counter.postMessage(3)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "6"
+
+    def test_kill_then_isalive_is_false_then_live_revives_it(self, compile_and_run):
+        # No `on load`/`on message` handler at all here, deliberately --
+        # this test's own stdout needs to be fully deterministic, and a
+        # worker-thread log() would interleave with the main thread's
+        # own unpredictably (real concurrency, not a bug -- see
+        # test_int_message_round_trip and friends for why every OTHER
+        # test here routes its own assertion through a close()-from-
+        # inside-onMessage() callback instead). kill()/live() are both
+        # BLOCKING (kill() pthread_joins; live() spawns and only then
+        # calls its own callback), so this sequence is deterministic
+        # with no message-passing involved at all.
+        source = """
+        thread worker {
+        }
+        log(worker.isAlive())
+        worker.kill()
+        log(worker.isAlive())
+        worker.live(void (ok:bool) => log(ok))
+        log(worker.isAlive())
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["true", "false", "true", "true"]
+
+    def test_main_thread_death_kills_a_still_idle_child_thread(self, compile_and_run):
+        # claude.md #195: "if the main thread dies, kill all child
+        # threads" -- festina_program_exit runs the exit handler (if
+        # any -- none here) and THEN festina_thread_kill_all()
+        # (synchronous, joins every thread), so 'worker exiting' is
+        # guaranteed to print after 'main done', and this process must
+        # exit cleanly rather than hang on an orphaned OS thread (the
+        # 15s subprocess timeout this fixture's own `compile_and_run`
+        # applies is exactly what would catch a regression here).
+        source = """
+        thread worker {
+            on exit(code:int) {
+                log('worker exiting')
+            }
+        }
+        log('main done')
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "main done\nworker exiting\n"
+
+    def test_two_independent_threads_do_not_collide(self, compile_and_run):
+        source = """
+        thread a {
+            on message(p:int) {
+                postMessage(p + 1)
+            }
+        }
+        thread b {
+            on message(p:int) {
+                postMessage(p + 10)
+            }
+        }
+        int seenA = 0
+        int seenB = 0
+        void func checkDone() {
+            if seenA != 0 && seenB != 0 {
+                log(seenA)
+                log(seenB)
+                close(0)
+            }
+        }
+        void func onA(x:int) {
+            seenA = x
+            checkDone()
+        }
+        void func onB(x:int) {
+            seenB = x
+            checkDone()
+        }
+        a.onMessage(void (x:int) => onA(x))
+        b.onMessage(void (x:int) => onB(x))
+        a.postMessage(1)
+        b.postMessage(1)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["2", "11"]
+
+    def test_a_compound_message_type_is_a_clear_not_yet_error(self, parser, semantic, codegen, errors):
+        # claude.md #195 Phase 1 already accepts struct/arr/map/enum/
+        # blob/img/aud/url as sendable message types at the semantic
+        # level (they'll actually work once Phase 3/4 write their own
+        # deep-clone codegen) -- this checks that trying to COMPILE one
+        # today fails loudly and clearly, naming the phase, rather than
+        # crashing or silently miscompiling.
+        source = """
+        struct Point { x:int y:int }
+        thread worker {
+            on message(p:Point) {
+                log(p.x)
+            }
+        }
+        Point pt
+        worker.postMessage(pt)
+        """
+        program = parser.parse(source)
+        analyzed = semantic.analyze(program)
+        with pytest.raises(errors.CompileError, match="not supported yet"):
+            codegen.generate_ir(program, analyzed)
+
+    def test_a_thread_with_no_onmessage_registration_still_lets_the_process_exit_cleanly(self, compile_and_run):
+        # A `peopleWorker`-style thread -- declared, idling, never
+        # posting or receiving anything -- must not keep the process
+        # alive past an explicit close(), and must not need
+        # festina_run_timer_loop to hang waiting on it either.
+        source = """
+        thread idler {
+        }
+        log('main done')
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "main done"

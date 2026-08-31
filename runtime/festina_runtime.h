@@ -1013,6 +1013,128 @@ void festina_http_service_ready(void);
  * linked into a program that doesn't open a window. */
 void festina_register_http_service_hooks(void);
 
+/* claude.md #195 Phase 2: `thread NAME { ... }` -- one pthread per
+ * declared thread, two mutex+condvar-guarded FIFO queues (inbound,
+ * main -> thread; outbound, thread -> main), living in the new,
+ * conditionally-linked festina_runtime_thread.c (CodeGen.uses_threads,
+ * mirroring every other optional feature's own -pthread-linked object
+ * file -- see festina/cli.py's _RUNTIME_FEATURES["threads"]).
+ *
+ * FestinaThreadHandle is opaque here on purpose -- codegen only ever
+ * carries it around as a plain `ptr` (a global per declared thread,
+ * `@__festina_thread_NAME_handle`), the same way it already treats
+ * every other runtime-owned handle type (blob/img/aud) as an opaque
+ * pointer with no LLVM-visible layout of its own.
+ *
+ * Message payloads cross both queues as a single `void *payload`: for
+ * Phase 2's int/float/bool message types this is a freshly malloc'd
+ * 8-byte box holding the raw bit pattern (codegen picks the right
+ * load/store width for whichever of the three it is); for text it is
+ * simply the malloc'd, NUL-terminated, exclusively-owned string
+ * pointer itself (an ordinary festina_text_own() copy) -- no wrapper
+ * needed, since text is already "a plain owned buffer" the same way a
+ * box is. Either way `free(payload)` alone is exactly correct once a
+ * message has been delivered, with no type-specific release function
+ * needed on this path (Phase 3 revisits this for struct/arr/map/enum,
+ * which DO need one). */
+typedef struct FestinaThreadHandle FestinaThreadHandle;
+
+/* Registers a new thread (its registry slot, queues, and the three
+ * handler function pointers this thread's own `on load`/`on message`/
+ * `on exit` bodies compiled to -- NULL for any of the three that
+ * weren't declared), but does not spawn the OS thread yet -- see
+ * festina_thread_spawn below. Codegen calls this once per declared
+ * `thread`, in main()'s own prologue (_emit_main_and_entry), before
+ * __festina_main() runs any top-level statement. */
+FestinaThreadHandle *festina_thread_register(void (*on_load)(void),
+                                             void (*on_message)(void *payload),
+                                             void (*on_exit)(int64_t code));
+/* Actually starts the OS thread -- on_load() (if any) runs first, on
+ * that new thread, then the worker loop below begins. Split from
+ * festina_thread_register so festina_thread_live() (a kill()'d thread
+ * coming back) can respawn without re-registering a whole new handle
+ * (and therefore a whole new, empty pair of queues) each time. */
+void festina_thread_spawn(FestinaThreadHandle *h);
+/* `NAME.postMessage(x)` from the MAIN thread's own call sites: clones
+ * x into `payload` (codegen's own job, see above) and enqueues it on
+ * h's INBOUND queue, waking the worker if it's blocked waiting. */
+void festina_thread_post(FestinaThreadHandle *h, void *payload);
+/* `postMessage(x)` called from INSIDE this thread's own body: enqueues
+ * on h's own OUTBOUND queue instead -- drained on the MAIN thread only
+ * (see festina_thread_drain below), never processed by the worker
+ * itself. */
+void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload);
+/* `NAME.onMessage(callback)`: registers the trampoline codegen built
+ * for h's own inferred outbound type (unboxes `payload` and makes the
+ * real indirect call through whatever Festina callback value the
+ * call site's own global currently holds -- see
+ * _emit_exec_callback_trampoline's own doc comment in codegen.py for
+ * the shape this mirrors). Only ever called from the main thread,
+ * before festina_thread_drain can ever actually invoke it for a given
+ * message -- see festina_thread_drain's own doc comment on what
+ * happens to anything posted before this call runs. */
+void festina_thread_set_out_callback(FestinaThreadHandle *h, void (*out_callback)(void *payload));
+/* `NAME.kill()`: blocking -- signals the worker to stop, pthread_joins
+ * it, then discards anything still sitting in its inbound queue
+ * (a real, deliberate choice: "kill" means stop now, not "finish
+ * everything already queued first" -- flagged here since the request
+ * this feature was built from doesn't say either way). A no-op if h
+ * is already not alive. isAlive() is guaranteed false the moment this
+ * returns. */
+void festina_thread_kill(FestinaThreadHandle *h);
+/* `NAME.live(callback)`: respawns a killed thread (running on_load()
+ * again) and calls callback(true) once the new OS thread has actually
+ * been created. If h is already alive, this is a no-op that still
+ * calls callback(true) (already alive trivially satisfies "came back
+ * to life"). callback(false) is dead code today: pthread_create
+ * failure goes through festina_fail (an immediate, unrecoverable
+ * abort) the same way every other "out of resources" runtime failure
+ * in this codebase already does, rather than a value this callback
+ * could ever observe -- a real bool parameter is still correct, and
+ * future-proof, either way. */
+void festina_thread_live(FestinaThreadHandle *h, void (*callback)(int8_t alive));
+/* `NAME.isAlive()`: reads the plain flag, no lock -- same "an int-
+ * sized read/write is atomic enough for this runtime's own existing
+ * conventions" reasoning festina_async_io_outstanding's own doc
+ * comment already gives for g_outstanding. */
+int8_t festina_thread_is_alive(FestinaThreadHandle *h);
+
+/* The hook seam every OTHER optional feature in this header already
+ * has one of (mirrors festina_set_async_io_hooks/
+ * festina_set_http_service_hooks exactly, for the identical
+ * cross-translation-unit reason: core must never reference
+ * festina_runtime_thread.c's own symbols directly, or a program with
+ * no `thread` declaration at all would need -pthread and that object
+ * file linked anyway). festina_thread_outstanding() -- true whenever
+ * ANY declared thread is still alive, which is what makes "a thread
+ * should idle" actually keep the process running -- and
+ * festina_thread_drain() -- delivers every declared thread's own
+ * outbound queue to its registered onMessage() callback, one thread's
+ * worth at a time, IF that thread has one registered yet (a message
+ * posted before the corresponding `.onMessage()` call has run -- a
+ * real possibility, since every thread spawns in main()'s prologue,
+ * before __festina_main()'s own top-level statements, one of which is
+ * what registers it -- simply stays queued rather than being silently
+ * dropped; the next drain after registration flushes it) -- are polled
+ * once per iteration by all three of this runtime's blocking loops
+ * (festina_run_timer_loop here, festina_run_http_loop, and
+ * festina_run_event_loop), the same "all three poll the same two
+ * hooks" shape festina_async_io_outstanding/_drain already
+ * established. festina_thread_kill_all() is called from
+ * festina_program_exit, below the exit handler (if any), so a still-
+ * idle declared thread never survives as an orphaned process/OS thread
+ * once the main program is on its way out. */
+void festina_set_thread_hooks(int64_t (*outstanding_fn)(void), void (*drain_fn)(void),
+                              void (*kill_all_fn)(void));
+int64_t festina_thread_outstanding(void);
+void festina_thread_drain(void);
+void festina_thread_kill_all(void);
+/* codegen's own conditional call site (uses_threads, mirroring
+ * uses_async_io's own festina_register_async_io_hooks() call) --
+ * defined in festina_runtime_thread.c, registers ITS OWN outstanding/
+ * drain/kill_all functions via festina_set_thread_hooks above. */
+void festina_register_thread_hooks(void);
+
 /*
  * claude.md #38: aud, loadAudio(), .play()/.stop()/.isPlaying().
  *

@@ -2865,6 +2865,113 @@ is pending or a `setInterval` is uncleared. Combines with graphics: if a
 program uses both, one event loop multiplexes X11 events and timer
 deadlines together so neither blocks the other.
 
+## Threads
+
+```festina
+thread worker {
+    on load() {
+        log('worker: ready')
+    }
+    on message(p:int) {
+        postMessage(p * 2)
+    }
+}
+
+void func onReply(x:int) {
+    log(`main got: ${x}`)
+}
+
+worker.onMessage(void (x:int) => onReply(x))
+worker.postMessage(21)
+```
+
+`thread NAME { ... }` declares an isolated background worker: its own
+OS thread, its own private state, and message queues to and from the
+main program. It starts (and runs `on load()`, if declared) as soon as
+the program starts, and idles until it either receives a message or is
+killed. **A thread's own body can see only its own state/locals,
+function names, and type names — never a global variable or constant,
+and it cannot call an ordinary top-level function** (see "Isolation"
+below).
+
+**Sending and receiving.** `on message(p:T)` declares the type a
+thread accepts (a thread with no `on message` accepts no messages at
+all, and `NAME.postMessage(x)` anywhere is a compile error). From the
+main program, `NAME.postMessage(x)` sends `x` to the thread; from
+inside the thread's own body, the bare `postMessage(x)` sends `x` back
+out to the main program. The main program registers
+`NAME.onMessage(callback)` to receive those: `callback` is checked
+against whatever type the thread's own `postMessage(x)` call sites
+actually send, which must be a single, consistent type — sending more
+than one shape from the same thread is a compile error that says to
+pre-declare a named `enum` covering both (the same convention `on
+message` itself already uses for multiple inbound types). A thread
+that never calls `postMessage` needs no `NAME.onMessage(...)`
+registration at all.
+
+**Every message is a deep, independent copy** — two threads (or a
+thread and the main program) never share a mutable value, which is
+what makes running Festina code on more than one thread safe at all.
+Sendable types today: `int`, `float`, `bool`, `text`.
+`struct`/`arr[T]`/`map[T]`/`enum`/`blob`/`img`/`aud`/`url`/`color`/`font`
+are on the way; `func`, `http`/`socket`, `regex`, and `table` never
+will be (see "Limitations" below).
+
+**Lifecycle.**
+
+```festina
+log(worker.isAlive())        // true
+worker.kill()                 // blocks until the thread has stopped
+log(worker.isAlive())        // false
+worker.live(void (ok:bool) => log(ok))   // respawns it; runs on load() again
+log(worker.isAlive())        // true
+```
+
+- `NAME.kill()` stops the thread (running `on exit(code:int)` first,
+  if declared) and blocks until it has actually stopped.
+- `NAME.live(callback)` respawns a killed thread and calls
+  `callback(true)` once it's running again.
+- `NAME.isAlive()` reads whether the thread is currently running.
+
+If the main program exits (including via `close(code)`), every
+still-alive thread is killed first, so a declared thread never
+survives as an orphaned process.
+
+**Thread-private state:**
+
+```festina
+thread counter {
+    int total = 0
+    on message(p:int) {
+        total = total + p
+        postMessage(total)
+    }
+}
+```
+
+A variable declared directly in a thread's own body (`int total = 0`
+above) is visible to every handler in that one thread and invisible
+everywhere else, including other threads and the main program — it
+persists across messages the same way a global would, just scoped to
+this one thread.
+
+**Isolation.** A thread's body may call `log`/`fail`,
+string/array/map/struct/enum operations, `Math`, time functions, and
+`blankImage()` plus `img`-method drawing/clip/resize/pixel calls (each
+touches only that one private image, never shared state). It may
+**not** call any canvas/window builtin (`drawRect`, `render`,
+`saveCanvas`, ...), `setTimeout`/`setInterval`, `exec()`,
+`mkdir()`/`ls()`, `openPort()`/`openSecurePort()`, `sqlite()`, or any
+ordinary top-level `func` declared outside the thread.
+
+**Limitations (this is still an early phase of this feature).**
+Message types are restricted to `int`/`float`/`bool`/`text` for now —
+see "Sendable types" above. A thread cannot yet open its own SQLite
+database (that, plus a compile-time check rejecting two threads that
+would share the same database file, is planned). Threads are
+singletons, declared once by name — there's no way to spawn more than
+one instance of the same `thread` block.
+
 ## Audio
 
 ```festina
