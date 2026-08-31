@@ -652,7 +652,16 @@ static int festina_decode_wav(const unsigned char *data, size_t len,
         pos += 8 + chunk_size + (chunk_size % 2);
     }
 
-    if (!have_fmt || !is_pcm || !audio || bits_per_sample != 16 || channels < 1) return 0;
+    /* claude.md #192: also reject a zero (or absurd) sample rate. A
+     * fmt chunk claiming rate 0 used to "load" fine, then play() passed
+     * it to the audio device open, which fails -- and the EBUSY-retry
+     * loop misreads every open failure as device contention, halting
+     * every other playing channel one by one before dying with a
+     * misleading "is any audio device available?" fatal. Rejecting it
+     * here turns one malformed asset into a normal load failure instead
+     * of taking down all audio with the wrong diagnosis. */
+    if (!have_fmt || !is_pcm || !audio || bits_per_sample != 16
+            || channels < 1 || channels > 8 || sample_rate < 1) return 0;
 
     int16_t *samples = malloc(audio_size ? audio_size : 1);
     if (!samples) festina_fail("out of memory loading audio");

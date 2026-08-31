@@ -11,7 +11,39 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ## [0.8] - 2026-08-31
 
+### Security
+
+- The HTTP server no longer hangs or aborts on two malformed inputs
+  reachable from a single unauthenticated request: a chunked
+  `chunk-size` near 2^64 (which overflowed size arithmetic into an
+  infinite buffer-growth loop) and a WebSocket frame declaring a
+  ~16-exabyte payload (which reached a failing `malloc` that aborted
+  the process). Both are now rejected against the existing 8MB cap.
+  The chunked-decoder fix also protects the `req.send()` client
+  parsing a hostile server's response.
+- `.toStruct()` no longer overflows the stack on deeply nested JSON in
+  an unknown field (reachable via `req.toStruct()` on a network body);
+  nesting past 1000 levels now throws the same catchable error every
+  other malformed input does.
+
 ### Fixed
+
+- Integer fields in `.toStruct()` keep full 64-bit precision. They
+  were parsed through a `double`, silently corrupting any value past
+  2^53 — and `INT64_MAX` in particular read back as `null`.
+- A finite float equal to nearly `DBL_MAX` renders as its own value in
+  JSON output instead of `null` (the NaN/Infinity guard used a literal
+  slightly below `DBL_MAX`).
+- `img.getPixelColor()` on a JPEG-loaded image returns the real color
+  instead of `null` for every pixel (JPEG surfaces store no alpha
+  channel; the reader had treated the unused byte as alpha 0).
+- A malformed WAV file (sample-rate 0) is now a normal load failure
+  instead of cascading into a shutdown of all other playing audio with
+  a misleading "no audio device" error.
+- Several catchable-error paths no longer leak: a failed `fetch`
+  response (up to 8MB per failed request, once per retry), an invalid
+  `parseURL` port (~5 allocations per call), and a corrupt JPEG
+  decode (its decoded surface, via a `setjmp`-clobbered local).
 
 - Long-running loops that declare locals (a struct, an array, any
   variable) no longer overflow the stack. Codegen emitted each

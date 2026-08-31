@@ -1021,8 +1021,21 @@ static int64_t festina_pixel_color_from_surface(cairo_surface_t *surface, int64_
     if (!data) return -1;
     uint32_t px;
     memcpy(&px, data + (int64_t)y * stride + (int64_t)x * 4, sizeof(px));
-    uint32_t a = (px >> 24) & 0xff;
-    if (a == 0) return -1;
+    /* claude.md #192: a JPEG-loaded image (claude.md #101) is a
+     * CAIRO_FORMAT_RGB24 surface -- a 32-bit pixel whose top byte is
+     * unused and stored as 0, NOT an alpha channel. Reading that top
+     * byte as alpha would make every pixel of a JPEG read back as
+     * fully transparent (alpha 0 -> the -1/'none' sentinel below). For
+     * RGB24 the pixel is always fully opaque; only ARGB32 surfaces
+     * (the canvas, PNGs, clips, resizes) carry real premultiplied
+     * alpha to unpack. */
+    uint32_t a;
+    if (cairo_image_surface_get_format(surface) == CAIRO_FORMAT_RGB24) {
+        a = 255;
+    } else {
+        a = (px >> 24) & 0xff;
+        if (a == 0) return -1;
+    }
     uint32_t r = (px >> 16) & 0xff;
     uint32_t g = (px >> 8) & 0xff;
     uint32_t b = px & 0xff;
@@ -1274,8 +1287,16 @@ static void festina_jpeg_fail(j_common_ptr info) {
 static cairo_surface_t *festina_decode_jpeg(const unsigned char *data, size_t len) {
     struct jpeg_decompress_struct info;
     struct festina_jpeg_error err;
-    cairo_surface_t *surface = NULL;
-    unsigned char *scanline = NULL;
+    /* claude.md #192: both locals are modified between setjmp and the
+     * longjmps below, and read again in the setjmp-return cleanup path,
+     * so they MUST be volatile -- C11 7.13.2.1 leaves a non-volatile
+     * local's value indeterminate after longjmp, and at -O2 clang keeps
+     * them in registers that the longjmp restores to their pre-decode
+     * NULLs, silently leaking the decoded surface and scanline whenever
+     * a truncated/corrupt JPEG errors mid-decode (the graceful
+     * corrupt-image .callback() path, claude.md #172). */
+    cairo_surface_t * volatile surface = NULL;
+    unsigned char * volatile scanline = NULL;
 
     info.err = jpeg_std_error(&err.base);
     err.base.error_exit = festina_jpeg_fail;
