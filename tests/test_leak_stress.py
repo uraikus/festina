@@ -442,4 +442,15 @@ class TestLeakStress:
             # pthread), and thousands of messages posted up front so a
             # leaked box or pthread resource is unmissable.
             "thread_churn.f",
+            # claude.md #199: `thread`'s own private sqlite handle --
+            # an ownership shape thread_churn.f's own workers can't
+            # exercise at all, since none of them touches sqlite: a
+            # SEPARATE sqlite3* handle per DatabaseURL-declared thread,
+            # opened on that thread's own OS thread, with real
+            # INSERT/SELECT traffic overlapping (not just interleaving
+            # by luck) the main program's own concurrent sqlite() calls
+            # against its own, different database file -- the specific
+            # shape needed to catch a leaked/raced prepared-statement
+            # cache entry, which no single-threaded sqlite test could.
+            "thread_db_churn.f",
         }
