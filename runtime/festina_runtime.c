@@ -36,6 +36,7 @@
  */
 #include <ctype.h>   /* isdigit/tolower -- claude.md #159's JSON parser */
 #include <errno.h>
+#include <float.h>   /* DBL_MAX -- claude.md #192's JSON float render bound */
 #include <regex.h>
 #if !defined(__wasi__)
 #include <signal.h>  /* sig_atomic_t/signal/SIGINT/SIGTERM -- claude.md #161's
@@ -464,7 +465,18 @@ typedef struct FestinaJsonCursor {
     const char *s;
     int64_t len;
     int64_t pos;
+    int depth; /* claude.md #192: nesting seen by festina_json_skip_value */
 } FestinaJsonCursor;
+
+/* claude.md #192: the deepest object/array nesting festina_json_skip_value
+ * will descend before throwing rather than recursing further. An unknown
+ * struct field's value is skipped by unbounded C recursion (one frame per
+ * '{'/'['), so hostile input like `{"x":[[[[...` -- reachable through
+ * req.toStruct() on a network body -- would otherwise overflow the C
+ * stack and SIGSEGV instead of throwing the catchable error this parser
+ * promises. 1000 is far past any real document and well short of an 8MB
+ * stack at this function's small frame. */
+#define FESTINA_JSON_MAX_DEPTH 1000
 
 static void festina_json_throwf(const char *fmt, ...) {
     char buf[256];
@@ -644,8 +656,10 @@ static void festina_json_skip_value(FestinaJsonCursor *c) {
     if (p == '"') { char *s = festina_json_parse_string(c); free(s); return; }
     if (p == 't' || p == 'f') { festina_json_parse_bool(c); return; }
     if (p == '{') {
+        if (++c->depth > FESTINA_JSON_MAX_DEPTH)
+            festina_json_throwf("JSON nested too deeply");
         c->pos++;
-        if (festina_json_try_eat(c, '}')) return;
+        if (festina_json_try_eat(c, '}')) { c->depth--; return; }
         for (;;) {
             char *k = festina_json_parse_string(c);
             free(k);
@@ -653,16 +667,20 @@ static void festina_json_skip_value(FestinaJsonCursor *c) {
             festina_json_skip_value(c);
             if (festina_json_try_eat(c, ',')) continue;
             festina_json_expect(c, '}');
+            c->depth--;
             return;
         }
     }
     if (p == '[') {
+        if (++c->depth > FESTINA_JSON_MAX_DEPTH)
+            festina_json_throwf("JSON nested too deeply");
         c->pos++;
-        if (festina_json_try_eat(c, ']')) return;
+        if (festina_json_try_eat(c, ']')) { c->depth--; return; }
         for (;;) {
             festina_json_skip_value(c);
             if (festina_json_try_eat(c, ',')) continue;
             festina_json_expect(c, ']');
+            c->depth--;
             return;
         }
     }
@@ -691,6 +709,7 @@ void *festina_json_cursor_new(const char *text) {
     c->s = text ? text : "";
     c->len = (int64_t)strlen(c->s);
     c->pos = 0;
+    c->depth = 0;
     return c;
 }
 
@@ -748,7 +767,37 @@ void festina_json_skip_field_value(void *cursor) { festina_json_skip_value((Fest
 int64_t festina_json_read_int(void *cursor) {
     FestinaJsonCursor *c = cursor;
     if (festina_json_try_null(c)) return festina_null_int();
-    return (int64_t)festina_json_parse_number(c);
+    /* claude.md #192: parse the token, but for an integer-shaped one
+     * (no '.', 'e', or 'E') read the digits directly with strtoll
+     * rather than going through the double festina_json_parse_number
+     * returns. A double carries only 53 bits of mantissa, so routing
+     * a large int field through it silently corrupts any |n| > 2^53
+     * -- and the specific value INT64_MAX rounds to 2^63, whose
+     * double->int64 conversion is UB that lands on INT64_MIN, which
+     * is exactly festina_null_int(): a valid max-int field would read
+     * back as null. */
+    festina_json_skip_ws(c);
+    int64_t start = c->pos;
+    double as_double = festina_json_parse_number(c);
+    int is_integer_shaped = 1;
+    for (int64_t i = start; i < c->pos; i++) {
+        char ch = c->s[i];
+        if (ch == '.' || ch == 'e' || ch == 'E') { is_integer_shaped = 0; break; }
+    }
+    if (is_integer_shaped) {
+        char buf[64];
+        int64_t n = c->pos - start;
+        if (n < (int64_t)sizeof(buf)) {
+            memcpy(buf, c->s + start, (size_t)n);
+            buf[n] = 0;
+            errno = 0;
+            char *endp = NULL;
+            long long v = strtoll(buf, &endp, 10);
+            if (endp != buf && *endp == '\0' && errno != ERANGE)
+                return (int64_t)v;
+        }
+    }
+    return (int64_t)as_double;
 }
 
 double festina_json_read_float(void *cursor) {
@@ -984,6 +1033,17 @@ void *festina_parse_url(const char *text) {
                 char msg[256];
                 snprintf(msg, sizeof(msg), "parseURL: '%s' has an invalid port", text);
                 free(port_text);
+                /* claude.md #192: a parseURL throw is catchable (claude.md
+                 * #157), so this path can run repeatedly in a retry loop --
+                 * free the half-built value first rather than leaking ~5
+                 * allocations per bad port. protocol/username/password/
+                 * hostname are set by here; pathname/hash/search_params are
+                 * still NULL from calloc (free(NULL) is a no-op). */
+                free(u->protocol);
+                free(u->username);
+                free(u->password);
+                free(u->hostname);
+                free(u);
                 festina_throw(festina_text_own(msg));
                 return NULL; /* unreachable */
             }
@@ -1243,40 +1303,90 @@ static void festina_sb_grow(FestinaSB *sb, size_t add) {
     sb->data = grown;
 }
 
+/* claude.md #190: the shared "grow, then copy exactly n bytes, then
+ * keep the buffer NUL-terminated" step both festina_sb_append and
+ * festina_sb_append_n are built from -- the only difference between
+ * them is where n comes from (a runtime strlen() scan vs. a length
+ * the CALLER already knows). Doesn't itself NUL-terminate mid-string
+ * the way festina_sb_append's own old inline version incidentally did
+ * (copying s's own trailing NUL along with it) -- callers that build a
+ * string out of several appends (every one of the JSON-rendering ones)
+ * only need the final byte terminated once, not after every single
+ * piece, so this terminates unconditionally at the new length instead,
+ * which is cheap (one store) and correct for both single-call and
+ * multi-call use. */
+static void festina_sb_append_bytes(FestinaSB *sb, const char *s, size_t n) {
+    festina_sb_grow(sb, n);
+    memcpy(sb->data + sb->len, s, n);
+    sb->len += n;
+    sb->data[sb->len] = '\0';
+}
+
 void festina_sb_append(void *sbv, const char *s) {
     if (!s) return;
-    FestinaSB *sb = (FestinaSB *)sbv;
-    size_t n = strlen(s);
-    festina_sb_grow(sb, n);
-    memcpy(sb->data + sb->len, s, n + 1);
-    sb->len += n;
+    festina_sb_append_bytes((FestinaSB *)sbv, s, strlen(s));
+}
+
+/* claude.md #190: same as festina_sb_append, but for a caller that
+ * already knows the byte length -- every codegen-emitted JSON
+ * punctuation/field-key append (_json_fn_for's own generated IR) comes
+ * from a compile-time string constant, whose exact length is already
+ * known in Python at codegen time (the same count _encode_c_string
+ * computes for the constant's own storage) and was previously thrown
+ * away, forcing this exact runtime strlen() rescan on every call --
+ * once per struct field, per row, in a loop rendering many values.
+ * `len <= 0` is a no-op, matching festina_sb_append's own NULL-is-a-
+ * no-op contract (an empty/negative length has nothing to copy). */
+void festina_sb_append_n(void *sbv, const char *s, int64_t len) {
+    if (!s || len <= 0) return;
+    festina_sb_append_bytes((FestinaSB *)sbv, s, (size_t)len);
 }
 
 /* A JSON string: quoted, with the escapes JSON requires. A NULL text
  * renders as the JSON null literal, unquoted -- the same three-way
- * honesty festina_str_from_bool already applies. */
+ * honesty festina_str_from_bool already applies.
+ *
+ * claude.md #190: scans forward for a RUN of bytes needing no escape
+ * (the overwhelmingly common case -- ordinary printable ASCII, and any
+ * valid UTF-8 continuation/lead byte, both >= 0x20 and neither quote
+ * nor backslash) and copies the whole run in one festina_sb_append_
+ * bytes call, rather than the byte-at-a-time switch/snprintf/strlen/
+ * memcpy sequence the previous version ran unconditionally for EVERY
+ * byte, escaped or not. Falls into the single-character path only for
+ * a byte that actually needs escaping; behavior (including the exact
+ * `\uXXXX` fallback for control characters below 0x20 other than \n/
+ * \r/\t) is unchanged from before -- this only changes how many bytes
+ * move per underlying copy. */
 void festina_sb_append_json_text(void *sbv, const char *s) {
     FestinaSB *sb = (FestinaSB *)sbv;
     if (!s) { festina_sb_append(sb, "null"); return; }
     festina_sb_grow(sb, 2);
     sb->data[sb->len++] = '"';
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+    const unsigned char *p = (const unsigned char *)s;
+    const unsigned char *run_start = p;
+    for (; *p; p++) {
+        unsigned char c = *p;
+        if (c >= 0x20 && c != '"' && c != '\\') continue;  /* safe run continues */
+        if (p > run_start) {
+            festina_sb_append_bytes(sb, (const char *)run_start, (size_t)(p - run_start));
+        }
         char esc[8];
-        const char *out = esc;
-        switch (*p) {
+        const char *out;
+        switch (c) {
         case '"':  out = "\\\""; break;
         case '\\': out = "\\\\"; break;
         case '\n': out = "\\n"; break;
         case '\r': out = "\\r"; break;
         case '\t': out = "\\t"; break;
         default:
-            if (*p < 0x20) { snprintf(esc, sizeof(esc), "\\u%04x", *p); }
-            else { esc[0] = (char)*p; esc[1] = '\0'; }
+            snprintf(esc, sizeof(esc), "\\u%04x", c);
+            out = esc;
         }
-        size_t n = strlen(out);
-        festina_sb_grow(sb, n);
-        memcpy(sb->data + sb->len, out, n);
-        sb->len += n;
+        festina_sb_append_bytes(sb, out, strlen(out));
+        run_start = p + 1;
+    }
+    if (p > run_start) {
+        festina_sb_append_bytes(sb, (const char *)run_start, (size_t)(p - run_start));
     }
     festina_sb_grow(sb, 1);
     sb->data[sb->len++] = '"';
@@ -1292,8 +1402,12 @@ void festina_sb_append_json_int(void *sbv, int64_t v) {
 
 void festina_sb_append_json_float(void *sbv, double v) {
     /* JSON has no NaN/Infinity, and Festina's float null IS a NaN --
-     * both render as null, which is also what JSON.stringify does. */
-    if (v != v || v > 1.7e308 || v < -1.7e308) {
+     * both render as null, which is also what JSON.stringify does.
+     * claude.md #192: the bound is DBL_MAX, not a hand-typed 1.7e308 --
+     * infinity is the only value strictly past DBL_MAX, whereas the old
+     * literal ALSO caught the finite doubles in (1.7e308, DBL_MAX],
+     * rendering a legitimate ~1.7977e308 as null. */
+    if (v != v || v > DBL_MAX || v < -DBL_MAX) {
         festina_sb_append(sbv, "null");
         return;
     }

@@ -336,6 +336,81 @@ REGEX = types_mod.RegexType()
 AUDIO = types_mod.AudioType()
 
 
+def _hoist_allocas_to_entry(ir_text):
+    """claude.md #191: move every static `alloca` in every emitted
+    function up into that function's ENTRY block.
+
+    An LLVM `alloca` reserves stack space each time it EXECUTES, and
+    that space is only reclaimed when the function returns -- so an
+    alloca emitted inside a loop body (a struct local declared in a
+    `while`, any per-statement scratch slot) grows the stack a little
+    more on every iteration, forever. Measured directly: a loop
+    declaring a six-field struct per iteration overflowed the 8MB
+    stack and segfaulted at ~150k-300k iterations, with completely
+    flat heap usage -- the exact "long-running loop crashes for no
+    visible reason" failure this pass exists to prevent. Hoisted to
+    the entry block, each slot is allocated ONCE per call and reused
+    every iteration, which is also what clang itself emits for a C
+    local declared inside a loop.
+
+    Correctness rests on two facts about this generator's own output:
+    every slot is explicitly stored before it is read AT ITS
+    DECLARATION SITE (those stores stay where they were -- LLVM
+    allocas are undef-initialized anyway, so nothing could ever have
+    relied on a fresh alloca's contents), and no slot's address
+    outlives its scope (escape_analysis is what decides stack vs heap
+    storage for struct/arr/map locals in the first place; a slot
+    whose address escaped its iteration would already have been
+    dangling after the enclosing function returned). Hoisting also
+    hardens the sjlj try/catch path: llvm.eh.sjlj.setjmp records the
+    stack pointer at try entry, and an unwind restores it -- a slot
+    alloca'd INSIDE the try body used to sit below that restored SP;
+    now every slot predates the save.
+
+    Dynamic allocas (a runtime element count operand, e.g.
+    `alloca i64, i64 %n`) are left exactly where they are -- moving
+    one to entry would change how much stack a single execution
+    reserves. This generator currently emits none, but the guard
+    keeps a future one safe by construction.
+    """
+    out = []
+    body = None       # collecting lines inside a define?
+    for line in ir_text.split("\n"):
+        if body is None:
+            out.append(line)
+            if line.startswith("define ") and line.rstrip().endswith("{"):
+                body = []
+            continue
+        if line == "}":
+            hoisted = []
+            kept = []
+            for bline in body:
+                if bline.startswith("  %") and " = alloca " in bline:
+                    operands = bline.split(" = alloca ", 1)[1]
+                    # first comma-chunk is the type (itself possibly a
+                    # %struct.N name); an SSA value in any LATER chunk
+                    # means a dynamic element count -- not hoistable.
+                    if not any("%" in part for part in operands.split(",")[1:]):
+                        hoisted.append(bline)
+                        continue
+                kept.append(bline)
+            # Insertion point: top of the first block -- directly after
+            # the define line, or after its label if the block has an
+            # explicit one (this generator always opens with "entry:"
+            # or straight into instructions).
+            insert_at = 0
+            if kept and not kept[0].startswith(" ") and kept[0].endswith(":"):
+                insert_at = 1
+            out.extend(kept[:insert_at])
+            out.extend(hoisted)
+            out.extend(kept[insert_at:])
+            out.append(line)
+            body = None
+            continue
+        body.append(line)
+    return "\n".join(out)
+
+
 def _http_send_lit_receiver(node):
     """claude.md #164: mirrors semantic.py's own identically-named
     helper exactly (see its doc comment for the full reasoning) --
@@ -1229,7 +1304,11 @@ class CodeGen:
         module.extend(entry_and_main)
         module.append("")
         module.extend(self._string_const_defs())
-        return "\n".join(module) + "\n"
+        # claude.md #191: every static alloca moves to its function's
+        # entry block, so a loop-body local reuses one stack slot per
+        # call instead of growing the stack every iteration (see
+        # _hoist_allocas_to_entry).
+        return _hoist_allocas_to_entry("\n".join(module) + "\n")
 
     def _runtime_declares(self):
         return [
@@ -1447,6 +1526,8 @@ class CodeGen:
             # claude.md #114: the string builder behind JSON rendering.
             "declare ptr @festina_sb_new()",
             "declare void @festina_sb_append(ptr, ptr)",
+            # claude.md #190
+            "declare void @festina_sb_append_n(ptr, ptr, i64)",
             "declare void @festina_sb_append_json_text(ptr, ptr)",
             "declare void @festina_sb_append_json_int(ptr, i64)",
             "declare void @festina_sb_append_json_float(ptr, double)",
@@ -3266,7 +3347,28 @@ class CodeGen:
                 owned = self.tmp()
                 lines.append(f"  {owned} = call ptr @festina_text_own(ptr {text_val})")
                 text_val = owned
-            self._emit_free_active_locals(lines, down_to=self._current_func_frame_base,
+            # claude.md #192: free only down to the NEAREST enclosing try
+            # in this function, not the whole function frame. When a
+            # throw is CAUGHT by such a try, the catch (and the code
+            # after the try/catch) keeps running, and the locals declared
+            # BEFORE that try are still live -- their ordinary scope-exit
+            # release runs after the catch. Freeing them HERE too was a
+            # real double-free: any refcounted local (arr/map/struct/text)
+            # declared before a throwing try was released by the throw and
+            # then again by the normal post-catch scope exit. Only the
+            # locals between that try and the throw are genuinely unwound
+            # (their block-exit release is skipped by the longjmp), so
+            # only those are freed here. With NO enclosing try, the throw
+            # propagates out of the function, the whole frame is abandoned,
+            # and everything down to the base is freed -- exactly as
+            # before (identical to a Return).
+            throw_free_base = self._current_func_frame_base
+            for i in range(len(self._active_free_locals) - 1,
+                           self._current_func_frame_base - 1, -1):
+                if any(isinstance(t, _TryFrameMarker) for (_, t) in self._active_free_locals[i]):
+                    throw_free_base = i
+                    break
+            self._emit_free_active_locals(lines, down_to=throw_free_base,
                                            skip_try_pop=True)
             lines.append(f"  call void @festina_throw(ptr {text_val})")
             return
@@ -4057,6 +4159,17 @@ class CodeGen:
         for part_expr, next_part in zip(expr.exprs, expr.parts[1:]):
             val, vtype = self._emit_expr(part_expr, env, lines)
             piece = self._to_text(val, vtype, lines)
+            # claude.md #192: an interpolated value that this template
+            # OWNS -- a fresh container from a call or literal,
+            # `` `${make()}` ``/`` `${[1,2,3]}` ``/`` `${m.keys()}` `` --
+            # is rendered to `piece` (its own fresh text) and then done
+            # with, but `val` (the container) was never released: a leak
+            # per evaluation, per iteration in a loop. `piece` is freed
+            # below via piece_owned; this releases the container itself.
+            # A no-op for a non-owning value (a plain variable, borrowed)
+            # and for text/int/bool (not refcounted), so it never
+            # double-frees what piece_owned already handles.
+            self._release_owned_receiver(part_expr, val, vtype, lines)
             piece_owned = vtype != TEXT or self._is_owning_text_source(part_expr)
             if result is None:
                 result, result_owned = piece, piece_owned
@@ -4253,6 +4366,22 @@ class CodeGen:
             cleanup()
         return out, types_mod.HttpType()
 
+    def _emit_sb_append_const(self, body, sb, text):
+        """claude.md #190: appends a COMPILE-TIME-KNOWN string (JSON
+        punctuation, or a struct/table field's own pre-baked `"key":`
+        constant) to a string builder without the runtime strlen()
+        rescan festina_sb_append's plain-pointer form needs -- the
+        exact byte length is already known here, in Python, the same
+        count _encode_c_string computes for the global's own storage.
+        Used for every literal the generated JSON walker
+        (_json_fn_for) appends, which is the majority of the calls a
+        loop rendering many structs/rows makes -- one `strlen()` per
+        struct field, per row, previously, for a length the compiler
+        had already thrown away."""
+        ref = self.string_const(text)
+        n = len(text.encode("utf-8"))
+        body.append(f"  call void @festina_sb_append_n(ptr {sb}, ptr {ref}, i64 {n})")
+
     def _json_append_slot(self, body, sb, ftype, slot_ptr, depth_val):
         """claude.md #114: appends ONE value (stored at `slot_ptr`, of
         festina type `ftype`) to the builder -- the shared field/element/
@@ -4318,7 +4447,7 @@ class CodeGen:
         body.append(f"  {isnull} = icmp eq ptr %v, null")
         body.append(f"  br i1 {isnull}, label %{null_lbl}, label %{deep_lbl}")
         body.append(f"{null_lbl}:")
-        body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('null')})")
+        self._emit_sb_append_const(body, "%sb", "null")
         body.append("  ret void")
         body.append(f"{deep_lbl}:")
         toodeep = self.tmp()
@@ -4329,15 +4458,14 @@ class CodeGen:
         if isinstance(type_, types_mod.StructType):
             for idx, (fname, ftype) in enumerate(self.struct_fields(type_.name)):
                 prefix = '{"' if idx == 0 else ',"'
-                body.append(f"  call void @festina_sb_append(ptr %sb, "
-                            f"ptr {self.string_const(prefix + fname + chr(34) + ':')})")
+                self._emit_sb_append_const(body, "%sb", prefix + fname + chr(34) + ':')
                 fp = self.tmp()
                 struct_ty = self.struct_llvm_name(type_.name)
                 body.append(f"  {fp} = getelementptr {struct_ty}, ptr %v, i32 0, i32 {idx}")
                 self._json_append_slot(body, "%sb", ftype, fp, "%depth")
             if not self.struct_fields(type_.name):
-                body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('{')})")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('}')})")
+                self._emit_sb_append_const(body, "%sb", "{")
+            self._emit_sb_append_const(body, "%sb", "}")
 
         elif isinstance(type_, types_mod.TableType):
             # A row: flat 8-byte slots, plus #111's presence mask one
@@ -4349,7 +4477,7 @@ class CodeGen:
             first_slot = self.tmp()
             body.append(f"  {first_slot} = alloca i8")
             body.append(f"  store i8 1, ptr {first_slot}")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('{')})")
+            self._emit_sb_append_const(body, "%sb", "{")
             mask_ptr = self.tmp()
             body.append(f"  {mask_ptr} = getelementptr i8, ptr %v, i64 {ncols * 8}")
             mask = self.tmp()
@@ -4374,12 +4502,11 @@ class CodeGen:
                 body.append(f"  {is_first} = icmp ne i8 {fst}, 0")
                 body.append(f"  br i1 {is_first}, label %{key_lbl}, label %{sep_lbl}")
                 body.append(f"{sep_lbl}:")
-                body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(',')})")
+                self._emit_sb_append_const(body, "%sb", ",")
                 body.append(f"  br label %{key_lbl}")
                 body.append(f"{key_lbl}:")
                 body.append(f"  store i8 0, ptr {first_slot}")
-                body.append(f"  call void @festina_sb_append(ptr %sb, "
-                            f"ptr {self.string_const(chr(34) + fname + chr(34) + ':')})")
+                self._emit_sb_append_const(body, "%sb", chr(34) + fname + chr(34) + ':')
                 slot = self.tmp()
                 body.append(f"  {slot} = getelementptr i8, ptr %v, i64 {idx * 8}")
                 if ftype == BOOL:
@@ -4392,13 +4519,13 @@ class CodeGen:
                     self._json_append_slot(body, "%sb", ftype, slot, "%depth")
                 body.append(f"  br label %{skip_lbl}")
                 body.append(f"{skip_lbl}:")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('}')})")
+            self._emit_sb_append_const(body, "%sb", "}")
 
         elif isinstance(type_, types_mod.ArrayType):
             elem_type = type_.element
             elem_llvm = _llvm_type(elem_type)
             elem_size = _elem_size(elem_type)
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('[')})")
+            self._emit_sb_append_const(body, "%sb", "[")
             len_p = self.tmp()
             body.append(f"  {len_p} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr %v, i32 0, i32 0")
             n = self.tmp()
@@ -4427,7 +4554,7 @@ class CodeGen:
             body.append(f"  {nonfirst} = icmp sgt i64 {iv}, 0")
             body.append(f"  br i1 {nonfirst}, label %{sep}, label %{elem_lbl}")
             body.append(f"{sep}:")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(',')})")
+            self._emit_sb_append_const(body, "%sb", ",")
             body.append(f"  br label %{elem_lbl}")
             body.append(f"{elem_lbl}:")
             off = self.tmp()
@@ -4440,7 +4567,7 @@ class CodeGen:
             body.append(f"  store i64 {nx}, ptr {i_slot}")
             body.append(f"  br label %{cond}")
             body.append(f"{done}:")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(']')})")
+            self._emit_sb_append_const(body, "%sb", "]")
 
         elif isinstance(type_, types_mod.MapType):
             value_type = type_.value
@@ -4466,7 +4593,7 @@ class CodeGen:
             body.append(f"  {ent_p} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr %v, i32 0, i32 1")
             ents = self.tmp()
             body.append(f"  {ents} = load ptr, ptr {ent_p}")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('{')})")
+            self._emit_sb_append_const(body, "%sb", "{")
             i_slot = self.tmp()
             body.append(f"  {i_slot} = alloca i64")
             body.append(f"  store i64 0, ptr {i_slot}")
@@ -4509,11 +4636,11 @@ class CodeGen:
             body.append(f"  {nonfirst} = icmp ne i8 {emitted}, 0")
             body.append(f"  br i1 {nonfirst}, label %{sep}, label %{kv_lbl}")
             body.append(f"{sep}:")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(',')})")
+            self._emit_sb_append_const(body, "%sb", ",")
             body.append(f"  br label %{kv_lbl}")
             body.append(f"{kv_lbl}:")
             body.append(f"  call void @festina_sb_append_json_text(ptr %sb, ptr {keyv})")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const(':')})")
+            self._emit_sb_append_const(body, "%sb", ":")
             vslot = self.tmp()
             body.append(f"  {vslot} = getelementptr i8, ptr {entp}, i64 8")
             self._json_append_slot(body, "%sb", value_type, vslot, "%depth")
@@ -4525,7 +4652,7 @@ class CodeGen:
             body.append(f"  store i64 {nx}, ptr {i_slot}")
             body.append(f"  br label %{cond}")
             body.append(f"{done}:")
-            body.append(f"  call void @festina_sb_append(ptr %sb, ptr {self.string_const('}')})")
+            self._emit_sb_append_const(body, "%sb", "}")
 
         body.append("  ret void")
         body.append("}")
@@ -5123,7 +5250,16 @@ class CodeGen:
             val, vtype = self._emit_value_for(expr.args[0], env, lines, elem_type)
             val = self._coerce(val, vtype, elem_type, lines, source_expr=expr.args[0])
             if _is_refcounted(elem_type):
-                if not self._is_owning_refcounted_source(expr.args[0]):
+                # claude.md #192: freshness is _refcounted_source_is_fresh,
+                # NOT _is_owning_refcounted_source -- `xs.push('a.txt')`
+                # into an arr[blob] mints a FRESH handle (rc=1) from the
+                # text via _coerce above, but its AST node is a StringLit,
+                # so the node-only test judged it non-fresh and added a
+                # retain (rc=2). The array push then owns one reference,
+                # leaving the extra one dangling: one handle leaked per
+                # push. The fresh case needs no retain; a plain aliased
+                # variable (not fresh) still does.
+                if not self._refcounted_source_is_fresh(expr.args[0], vtype, elem_type):
                     lines.append(f"  call void @festina_retain(ptr {val})")
             elif elem_type == TEXT and not self._is_owning_text_source(expr.args[0]):
                 owned = self.tmp()
@@ -5182,6 +5318,14 @@ class CodeGen:
             lines.append(
                 f"  {out} = call i64 @festina_array_index_of(ptr {obj_val}, "
                 f"i64 {elem_size}, ptr {slot}, i8 {is_text})")
+            # claude.md #192: a needle coerced from text to a handle
+            # (`arr[blob].indexOf('x')`) is a fresh reference the search
+            # only borrows -- release it, the same way a call argument's
+            # fresh handle is. _free_text_temp below covers a genuine
+            # text needle; it no-ops on a handle, so both are needed.
+            if _is_refcounted(elem_type) and self._refcounted_source_is_fresh(
+                    expr.args[0], vtype, elem_type):
+                lines.append(f"  call void {self._release_fn_for(elem_type)}(ptr {val})")
             self._free_text_temp(expr.args[0], val, elem_type, lines)
             return out, INT
 
@@ -7057,8 +7201,21 @@ class CodeGen:
         used" rule forbids it -- there is no way to even *write* a
         self-referential arr[T] type in Festina's own grammar."""
         elem_type = type_.element
-        if not (isinstance(elem_type, (types_mod.StructType, types_mod.ArrayType,
-                                       types_mod.MapType, types_mod.TableType))
+        # claude.md #192: the plain generic release (which frees the
+        # buffer and header but NOT the elements) is only correct when
+        # an element has nothing to release. The old predicate listed
+        # struct/arr/map/table/text but MISSED every refcounted HANDLE
+        # element (blob/img/aud/regex/http/socket/url/enum) -- those are
+        # retained on store (push/array-lit/`arr[i]=`) but the plain
+        # release never dropped that reference, leaking every element of
+        # an escaping/reassigned/returned arr[blob], arr[img], etc. The
+        # per-element cascade wrapper below already dispatches each
+        # element through _release_fn_for, which handles all of them;
+        # _is_refcounted is the exact "has a reference to drop" test,
+        # plus TableType (its rows are owned, cascaded specially below)
+        # and TEXT (copied, not refcounted, but still needs freeing).
+        if not (_is_refcounted(elem_type)
+                or isinstance(elem_type, types_mod.TableType)
                 or elem_type == TEXT):
             return "@festina_release_array"
         key = types_mod.type_name(type_)
@@ -7997,23 +8154,55 @@ class CodeGen:
         end_label = self.label("tern.end")
         lines.append(f"  br i1 {cond}, label %{then_label}, label %{else_label}")
 
-        self._start_block(then_label, lines)
-        cons_val, cons_type = self._emit_expr(expr.cons, env, lines)
-        cons_val = self._own_ternary_branch(cons_val, cons_type, expr.cons, lines)
-        then_pred = self.cur_block  # may differ from then_label if expr.cons had its own branches
-        lines.append(f"  br label %{end_label}")
+        # claude.md #192: a bare `null` branch has no LLVM encoding of
+        # its own -- "null" the pointer keyword for a pointer-shaped
+        # type, but a reserved sentinel constant for int/float/bool/
+        # color (see _emit_value_for) -- so it must be emitted AS the
+        # OTHER branch's type, once that's known. This is the ternary
+        # sibling of the color==null fix (#189): before it, `c ? 1 :
+        # null` phi'd a raw "null" against i64 (invalid IR) and `c ?
+        # null : 7` crashed the compiler on cons_type=None. When the
+        # cons branch is the null one, the alt branch is emitted first
+        # so its type drives the whole expression.
+        cons_null = isinstance(expr.cons, ast.NullLit)
+        alt_null = isinstance(expr.alt, ast.NullLit)
 
-        self._start_block(else_label, lines)
-        alt_val, _ = self._emit_expr(expr.alt, env, lines)
-        alt_val = self._own_ternary_branch(alt_val, cons_type, expr.alt, lines)
-        else_pred = self.cur_block
-        lines.append(f"  br label %{end_label}")
+        if cons_null and not alt_null:
+            self._start_block(else_label, lines)
+            alt_val, result_type = self._emit_expr(expr.alt, env, lines)
+            alt_val = self._own_ternary_branch(alt_val, result_type, expr.alt, lines)
+            else_pred = self.cur_block
+            lines.append(f"  br label %{end_label}")
+
+            self._start_block(then_label, lines)
+            cons_val, _ = self._emit_value_for(expr.cons, env, lines, result_type)
+            then_pred = self.cur_block
+            lines.append(f"  br label %{end_label}")
+        else:
+            self._start_block(then_label, lines)
+            cons_val, result_type = self._emit_expr(expr.cons, env, lines)
+            cons_val = self._own_ternary_branch(cons_val, result_type, expr.cons, lines)
+            then_pred = self.cur_block  # may differ from then_label if expr.cons had its own branches
+            lines.append(f"  br label %{end_label}")
+
+            self._start_block(else_label, lines)
+            if alt_null:
+                alt_val, _ = self._emit_value_for(expr.alt, env, lines, result_type)
+            else:
+                # semantic.py guarantees the two non-null branches have
+                # the SAME type here (a ?: is one phi of one type, and a
+                # mismatch -- numeric included -- is a compile error), so
+                # the alt value needs no coercion to result_type.
+                alt_val, _ = self._emit_expr(expr.alt, env, lines)
+                alt_val = self._own_ternary_branch(alt_val, result_type, expr.alt, lines)
+            else_pred = self.cur_block
+            lines.append(f"  br label %{end_label}")
 
         self._start_block(end_label, lines)
         out = self.tmp()
-        llvm_ty = _llvm_type(cons_type)
+        llvm_ty = _llvm_type(result_type)
         lines.append(f"  {out} = phi {llvm_ty} [ {cons_val}, %{then_pred} ], [ {alt_val}, %{else_pred} ]")
-        return out, cons_type
+        return out, result_type
 
     def _own_ternary_branch(self, val, vtype, source_expr, lines):
         """claude.md #173: a Ternary used to be treated as "aliasing"
@@ -8863,7 +9052,11 @@ class CodeGen:
                 arg_temps = []
                 for arg_expr, ptype in zip(expr.args, fn_type.param_types):
                     val, vtype = self._emit_value_for(arg_expr, env, lines, ptype)
-                    val = self._coerce(val, vtype, ptype, lines)
+                    # claude.md #192: source_expr threaded so a text->img/
+                    # blob/aud coercion frees its own text temp (see the
+                    # direct-call path's cleanup comment for the bug this
+                    # closes).
+                    val = self._coerce(val, vtype, ptype, lines, source_expr=arg_expr)
                     arg_vals.append(f"{_llvm_type(ptype)} {val}")
                     arg_temps.append((arg_expr, val, vtype, ptype))
                 args_ir = ", ".join(arg_vals)
@@ -8874,12 +9067,12 @@ class CodeGen:
                 else:
                     out = self.tmp()
                     lines.append(f"  {out} = call {_llvm_type(ret_type)} {fn_ptr}({args_ir})")
-                # claude.md #83/#119: identical post-call argument
+                # claude.md #83/#119/#192: identical post-call argument
                 # cleanup to the direct-call path just below -- see its
                 # own comment for the full reasoning.
                 for arg_expr, val, vtype, ptype in arg_temps:
                     if (_is_refcounted(ptype)
-                            and self._is_owning_refcounted_source(arg_expr)):
+                            and self._refcounted_source_is_fresh(arg_expr, vtype, ptype)):
                         lines.append(
                             f"  call void {self._release_fn_for(ptype)}(ptr {val})")
                     else:
@@ -8892,7 +9085,10 @@ class CodeGen:
                 for arg_expr, param in zip(expr.args, decl.params):
                     ptype = self._resolve(param.type_expr, decl)
                     val, vtype = self._emit_value_for(arg_expr, env, lines, ptype)
-                    val = self._coerce(val, vtype, ptype, lines)
+                    # claude.md #192: source_expr threaded so a
+                    # text->img/blob/aud coercion frees its own text temp
+                    # (see the cleanup comment below).
+                    val = self._coerce(val, vtype, ptype, lines, source_expr=arg_expr)
                     arg_vals.append(f"{_llvm_type(ptype)} {val}")
                     arg_temps.append((arg_expr, val, vtype, ptype))
                 ret_ref, ret_type = env.lookup(name)
@@ -8918,9 +9114,25 @@ class CodeGen:
                 # store retains; a returned alias is retained by the
                 # Return path) -- so the caller's +1 is provably the
                 # last reference nothing else will ever drop.
+                #
+                # claude.md #192: the freshness test is
+                # _refcounted_source_is_fresh, NOT _is_owning_refcounted_
+                # source -- a `show(`x${n}.png`)` where `show` takes an
+                # img mints a FRESH handle from the text path via _coerce
+                # above, exactly as fresh as a call result, but its AST
+                # node is a template/StringLit. The old node-only test
+                # missed it two ways: it never released the minted handle
+                # (a decoded image leaked per call for a literal path),
+                # and for an OWNING text source it fell to the else and
+                # ran _free_text_temp on `val` -- which by then is the img
+                # PAYLOAD, not text -- emitting free() on a handle:
+                # invalid free / heap corruption. The fresh-handle branch
+                # now releases it correctly, and _coerce (given
+                # source_expr above) already freed the arg's own text
+                # temp, so the else runs only for a genuine text arg.
                 for arg_expr, val, vtype, ptype in arg_temps:
                     if (_is_refcounted(ptype)
-                            and self._is_owning_refcounted_source(arg_expr)):
+                            and self._refcounted_source_is_fresh(arg_expr, vtype, ptype)):
                         lines.append(
                             f"  call void {self._release_fn_for(ptype)}(ptr {val})")
                     else:
@@ -9625,7 +9837,10 @@ class CodeGen:
                 arg_temps = []
                 for arg_expr, ptype in zip(expr.args, fn_type.param_types):
                     val, vtype = self._emit_value_for(arg_expr, env, lines, ptype)
-                    val = self._coerce(val, vtype, ptype, lines)
+                    # claude.md #192: source_expr threaded (see the
+                    # direct-call cleanup comment for the heap-corruption
+                    # bug this closes).
+                    val = self._coerce(val, vtype, ptype, lines, source_expr=arg_expr)
                     arg_vals.append(f"{_llvm_type(ptype)} {val}")
                     arg_temps.append((arg_expr, val, vtype, ptype))
                 args_ir = ", ".join(arg_vals)
@@ -9636,11 +9851,11 @@ class CodeGen:
                 else:
                     out = self.tmp()
                     lines.append(f"  {out} = call {_llvm_type(ret_type)} {callee_val}({args_ir})")
-                # claude.md #83/#119: identical post-call argument
+                # claude.md #83/#119/#192: identical post-call argument
                 # cleanup to the other two call forms above.
                 for arg_expr, val, vtype, ptype in arg_temps:
                     if (_is_refcounted(ptype)
-                            and self._is_owning_refcounted_source(arg_expr)):
+                            and self._refcounted_source_is_fresh(arg_expr, vtype, ptype)):
                         lines.append(
                             f"  call void {self._release_fn_for(ptype)}(ptr {val})")
                     else:

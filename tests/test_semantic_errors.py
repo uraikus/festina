@@ -142,6 +142,45 @@ class TestErrorCategories:
         with pytest.raises(errors.CompileError, match="int or float"):
             semantic.analyze(program)
 
+    @pytest.mark.parametrize("branches", [
+        "'yes' : someBlob",   # text vs blob -- rendered blob bytes as text
+        "xs : someMap",       # arr vs map -- walked a map header as an array
+        "1 : 2.5",            # int vs float -- would phi two numeric types
+    ])
+    def test_ternary_branches_must_have_the_same_type(
+            self, parser, semantic, errors, branches):
+        # claude.md #192: a ?: is one phi of one type, so its two
+        # branches must match. The alt branch's type used to be inferred
+        # and discarded, so a mismatch silently compiled and produced
+        # garbage at runtime (a blob handle read as text) or invalid IR.
+        program = parser.parse(
+            "blob someBlob = 'x.txt'\n"
+            "arr[int] xs = [1]\n"
+            "map[int] someMap = {'a': 1}\n"
+            "bool c = true\n"
+            f"log(c ? {branches})")
+        with pytest.raises(errors.CompileError, match="same type"):
+            semantic.analyze(program)
+
+    def test_ternary_allows_null_in_either_branch(self, parser, semantic):
+        # null is valid against every type (claude.md #25), so it must
+        # NOT be rejected by the same-type check -- the result is the
+        # other, concrete branch's type.
+        for src in ["int x = true ? 1 : null", "int x = true ? null : 1"]:
+            semantic.analyze(parser.parse(src))
+
+    @pytest.mark.parametrize("operand", ["1 && true", "true && 2", "i && true"])
+    def test_logical_operators_require_bool_operands(
+            self, parser, semantic, errors, operand):
+        # claude.md #192/#17: values like 0/1/-1 must not silently become
+        # booleans. Operand types used to be inferred and discarded, so
+        # `1 && 2` compiled and printed the raw i8 (the bool-null
+        # sentinel), and an int operand reached codegen's i8 icmp on an
+        # i64 value -> invalid IR.
+        program = parser.parse(f"int i = 5\nbool b = {operand}")
+        with pytest.raises(errors.CompileError, match="must be bool"):
+            semantic.analyze(program)
+
     @pytest.mark.parametrize("name", [
         "drawRect", "drawCircle", "drawText", "drawImage", "regex",
         "setTimeout", "setInterval", "clearTimeout", "clearInterval",

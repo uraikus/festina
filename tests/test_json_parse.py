@@ -207,6 +207,49 @@ class TestRuntimeBehavior:
             "caught: expected '{' at position 0, found 'n'", "done",
         ]
 
+    def test_large_int_fields_keep_full_64_bit_precision(self, compile_and_run):
+        # claude.md #192: an integer field used to be routed through the
+        # double festina_json_parse_number returns, so any |n| > 2^53
+        # lost low bits and, worst of all, INT64_MAX rounded to 2^63
+        # whose double->int64 conversion lands on INT64_MIN -- which IS
+        # the int-null sentinel, so a valid max int read back as null.
+        # Integer-shaped tokens now parse through strtoll directly.
+        source = '''
+        struct T { a:int  b:int  c:int }
+        T v = '{"a":9223372036854775807,"b":-9223372036854775808,"c":9007199254740993}'.toStruct(T)
+        log(v.a)
+        log(v.b)
+        log(v.c)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == [
+            "9223372036854775807",
+            "-9223372036854775808",
+            "9007199254740993",
+        ]
+
+    def test_deeply_nested_unknown_field_throws_instead_of_crashing(
+            self, compile_and_run):
+        # claude.md #192: an unknown struct field's value is skipped by
+        # recursive descent (festina_json_skip_value), one C stack frame
+        # per '{'/'['. Hostile input -- reachable through req.toStruct()
+        # on a network body -- used to overflow the stack and SIGSEGV;
+        # a depth cap now makes it the same catchable throw every other
+        # malformed input is.
+        deep = "[" * 5000 + "]" * 5000
+        source = '''
+        struct T {{ x:int }}
+        try {{
+            T v = '{{"x":1,"junk":{deep}}}'.toStruct(T)
+            log(v.x)
+        }} catch (e:text) {{
+            log('caught')
+        }}
+        '''.format(deep=deep)
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "caught"
+
     def test_type_mismatch_throws(self, compile_and_run):
         source = """
         try {

@@ -154,6 +154,26 @@ class TestArithmeticAndControlFlow:
         result = compile_and_run(source)
         assert result.stdout.strip() == "big"
 
+    def test_ternary_with_a_null_branch(self, compile_and_run):
+        # claude.md #192: a bare `null` branch is emitted AS the other
+        # branch's type -- `c ? 1 : null` used to phi a raw "null"
+        # against i64 (invalid IR) and `c ? null : 7` crashed the
+        # compiler on a None type. The taken null branch yields the
+        # int-null sentinel; the taken concrete branch yields its value.
+        source = """
+        log(true ? 1 : null)
+        log(false ? 1 : null)
+        log(false ? null : 7)
+        log(true ? null : 7)
+        """
+        result = compile_and_run(source)
+        lines = result.stdout.splitlines()
+        assert lines[0] == "1"
+        assert lines[2] == "7"
+        # the null-branch cases print int's own null sentinel
+        assert lines[1] == lines[3]
+        assert lines[1] != "1" and lines[1] != "7"
+
     def test_logical_and_or_short_circuit(self, compile_and_run):
         # claude.md doesn't spell out short-circuit evaluation explicitly,
         # but it's the JavaScript-familiar behavior claude.md #45 asks for
@@ -1892,18 +1912,20 @@ class TestAutomaticMemoryReclamation:
 
     def test_loop_local_struct_is_stack_allocated_and_reused_across_iterations(
             self, parser, semantic, codegen):
-        # claude.md #43/#74/#75: the loop-body/break/continue-scoped
-        # freeing machinery still applies to *when* a struct local's
-        # storage is considered dead, even though "dead" no longer
-        # means "call free() here" for a struct -- it means the very
-        # next textual reach of the same VarDecl (the next iteration)
-        # re-zeros the *same* stack address rather than allocating a
-        # fresh one, since LLVM's alloca reserves one fixed slot for
-        # the whole enclosing function regardless of which basic block
-        # contains it. The alloca and its zeroinitializer store must
-        # both be inside the loop body (so re-zeroing genuinely
-        # happens every iteration, not just once before the loop), and
-        # there must be no calloc/free anywhere in the function at all.
+        # claude.md #43/#74/#75, corrected by #191: a loop-body struct
+        # local reuses ONE stack slot across iterations. This test
+        # originally asserted the alloca itself sat inside the loop
+        # body, on the belief that LLVM reserves one fixed slot per
+        # alloca regardless of block -- that belief was wrong: an
+        # alloca EXECUTES each time it's reached, growing the stack
+        # every iteration until the function returns (measured: a
+        # six-field struct declared in a while body overflowed the
+        # 8MB stack and segfaulted at ~150k-300k iterations). The
+        # alloca now lives in the function's ENTRY block (one slot per
+        # call, genuinely reused), while the zeroinitializer store
+        # stays inside the loop body so each iteration still sees a
+        # fresh zeroed struct -- and there is still no calloc/free
+        # anywhere in the function at all.
         source = """
         struct Point { x:int y:int }
         void func f() {
@@ -1916,13 +1938,54 @@ class TestAutomaticMemoryReclamation:
         """
         ir = self._ir(parser, semantic, codegen, source)
         lines = ir.splitlines()
-        body_start = next(i for i, l in enumerate(lines) if l.strip().startswith("for.body"))
-        body_end = next(i for i in range(body_start, len(lines)) if lines[i].strip().startswith("br label %for.update"))
+        f_start = next(i for i, l in enumerate(lines) if l.startswith("define void @f("))
+        f_end = next(i for i in range(f_start, len(lines)) if lines[i] == "}")
+        body_start = next(i for i in range(f_start, f_end) if lines[i].strip().startswith("for.body"))
+        body_end = next(i for i in range(body_start, f_end) if lines[i].strip().startswith("br label %for.update"))
+        entry_lines = lines[f_start:body_start]
         body_lines = lines[body_start:body_end]
-        assert any("alloca %struct.Point" in l for l in body_lines)
+        # one slot, allocated up front...
+        assert any("alloca %struct.Point" in l for l in entry_lines)
+        assert not any("alloca" in l for l in body_lines)
+        # ...re-zeroed at the declaration site, every iteration.
         assert any("store %struct.Point zeroinitializer" in l for l in body_lines)
         assert "call ptr @calloc(" not in ir
         assert "call void @free(" not in ir
+
+    def test_a_long_running_loop_declaring_locals_does_not_grow_the_stack(
+            self, compile_and_run):
+        # claude.md #191: the regression this whole hoist exists for.
+        # Before it, each iteration's allocas (the struct's storage,
+        # its pointer slot, every scratch temporary) pushed fresh
+        # stack that never popped until function return -- this exact
+        # program segfaulted between 150k and 300k iterations with
+        # completely flat heap usage. 500k iterations now run in a
+        # fixed-size frame.
+        source = '''
+        struct Item {
+            id:int
+            name:text
+            description:text
+            price:float
+            inStock:bool
+            tags:arr[text]
+        }
+        int i = 0
+        while i < 500000 {
+            Item it
+            it.id = i
+            it.name = `item number ${i}`
+            it.description = 'A "quoted" description with\\na newline'
+            it.price = 19.99
+            it.inStock = i % 2 == 0
+            it.tags = ['alpha', 'beta', `gamma-${i}`]
+            i = i + 1
+        }
+        log(i)
+        '''
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == '500000'
 
     def test_nested_if_declared_struct_is_stack_allocated(self, parser, semantic, codegen):
         source = """
@@ -8507,6 +8570,36 @@ class TestJsonRendering:
         assert result.stdout.strip() == (
             '{"name":"has \\"quotes\\" and\\ttab","score":null,"missing":0}')
 
+    def test_escape_run_boundaries_render_correctly(self, compile_and_run):
+        # claude.md #190: festina_sb_append_json_text now bulk-copies
+        # a "safe run" of bytes instead of handling one byte at a
+        # time, so the exact boundary where a run starts/ends/never-
+        # exists is exactly where a bug would hide: a string starting
+        # AND ending on an escape-needing byte (no leading/trailing
+        # safe run at all), a string of NOTHING but escape-needing
+        # bytes back-to-back (every "run" is zero-length), and an
+        # empty string (no bytes to scan at all).
+        source = r'''
+        struct P {
+            leading:text
+            trailing:text
+            onlyEscapes:text
+            empty:text
+        }
+        P p
+        p.leading = '"start and end with quotes"'
+        p.trailing = 'ab\\'
+        p.onlyEscapes = '"\\\n\t\r'
+        p.empty = ''
+        log(p)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.strip() == (
+            '{"leading":"\\"start and end with quotes\\"",'
+            '"trailing":"ab\\\\",'
+            '"onlyEscapes":"\\"\\\\\\n\\t\\r",'
+            '"empty":""}')
+
     def test_a_table_row_renders_with_database_null_and_omits_undefined(
             self, compile_and_run, tmp_path):
         # A database NULL is the JSON null; a column the query never
@@ -8541,6 +8634,30 @@ class TestJsonRendering:
         '''
         result = compile_and_run(source)
         assert result.stdout.splitlines() == ['[1,2]', '{"n":5}']
+
+    def test_interpolating_a_fresh_container_does_not_leak(self, compile_and_run):
+        # claude.md #192: `${make()}` renders a fresh array/struct/map to
+        # text and is then done with the container, but _emit_template
+        # released only the text pieces, never the container itself -- a
+        # leak per evaluation. This pins the OBSERVABLE result (the
+        # rendering is correct); the leak itself is ASan-verified
+        # separately. A tight loop makes a missed release matter.
+        source = '''
+        arr[int] func makeArr() {
+            arr[int] xs = [1, 2, 3]
+            return xs
+        }
+        int i = 0
+        text last = ''
+        while i < 50 {
+            last = `v: ${makeArr()} and ${[9, 8]}`
+            i = i + 1
+        }
+        log(last)
+        '''
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == 'v: [1,2,3] and [9,8]'
 
     def test_a_null_container_renders_as_null(self, compile_and_run):
         source = '''

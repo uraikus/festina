@@ -9,6 +9,100 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.8] - 2026-08-31
+
+### Security
+
+- The HTTP server no longer hangs or aborts on two malformed inputs
+  reachable from a single unauthenticated request: a chunked
+  `chunk-size` near 2^64 (which overflowed size arithmetic into an
+  infinite buffer-growth loop) and a WebSocket frame declaring a
+  ~16-exabyte payload (which reached a failing `malloc` that aborted
+  the process). Both are now rejected against the existing 8MB cap.
+  The chunked-decoder fix also protects the `req.send()` client
+  parsing a hostile server's response.
+- `.toStruct()` no longer overflows the stack on deeply nested JSON in
+  an unknown field (reachable via `req.toStruct()` on a network body);
+  nesting past 1000 levels now throws the same catchable error every
+  other malformed input does.
+
+### Fixed
+
+- A value assigned to a global (or otherwise escaping) only inside a
+  `try` or `catch` body is no longer freed while still referenced —
+  escape analysis didn't look inside try/catch bodies, so such a value
+  was stack-allocated and reclaimed at scope exit (a use-after-free).
+- A refcounted local (array, map, struct, text) declared before a
+  `try` that throws is no longer double-freed. A throw caught in the
+  same function freed that local, and the normal scope exit after the
+  catch freed it again (glibc aborted with "double free detected").
+- The two branches of a `?:` are now required to have the same type;
+  a mismatch (e.g. `c ? 'text' : someBlob`) used to compile and render
+  garbage at runtime. `null` is still allowed in either branch.
+- `&&` and `||` now require bool operands, matching `if`/`while`
+  conditions; `1 && 2` used to compile and print `null`.
+- A `?:` with a `null` branch (`c ? 1 : null`, `c ? null : 7`) now
+  compiles — it produced invalid IR or crashed the compiler before.
+- Passing a text literal or template to an `img`/`blob`/`aud`
+  parameter (`show(`sprite${n}.png`)`) no longer corrupts the heap or
+  leaks the loaded handle — the argument coercion mishandled the
+  freshly minted handle's ownership.
+- An `arr[blob]`, `arr[img]`, or `arr[aud]` no longer leaks its
+  elements when the array is released — element handles were freed as
+  a plain buffer with no per-element release.
+- `.push()`/`.unshift()`/`.indexOf()` of a path string into an
+  `arr[blob]`/`arr[img]`/`arr[aud]` no longer leaks the loaded handle.
+- Interpolating a freshly built container into a template
+  (`` `${make()}` ``, `` `${[1,2,3]}` ``) no longer leaks the
+  container — only the rendered text was being freed.
+
+- Integer fields in `.toStruct()` keep full 64-bit precision. They
+  were parsed through a `double`, silently corrupting any value past
+  2^53 — and `INT64_MAX` in particular read back as `null`.
+- A finite float equal to nearly `DBL_MAX` renders as its own value in
+  JSON output instead of `null` (the NaN/Infinity guard used a literal
+  slightly below `DBL_MAX`).
+- `img.getPixelColor()` on a JPEG-loaded image returns the real color
+  instead of `null` for every pixel (JPEG surfaces store no alpha
+  channel; the reader had treated the unused byte as alpha 0).
+- A malformed WAV file (sample-rate 0) is now a normal load failure
+  instead of cascading into a shutdown of all other playing audio with
+  a misleading "no audio device" error.
+- Several catchable-error paths no longer leak: a failed `fetch`
+  response (up to 8MB per failed request, once per retry), an invalid
+  `parseURL` port (~5 allocations per call), and a corrupt JPEG
+  decode (its decoded surface, via a `setjmp`-clobbered local).
+
+- Long-running loops that declare locals (a struct, an array, any
+  variable) no longer overflow the stack. Codegen emitted each
+  `alloca` at its declaration site — inside the loop body — so every
+  iteration permanently grew the stack until the function returned;
+  a loop declaring a six-field struct segfaulted at roughly
+  150,000–300,000 iterations with flat heap usage. Every static
+  alloca is now hoisted to its function's entry block: one slot per
+  declaration, reused each iteration (verified to 3,000,000
+  iterations). Locals are still re-zeroed at their declaration site
+  every iteration, so behavior is otherwise unchanged.
+
+See [claude.md #191](claude.md) for the full diagnosis.
+
+## [0.7] - 2026-08-29
+
+### Changed
+
+- `.toText()` JSON-style rendering (`log()`/template interpolation of a
+  struct, table row, `arr[T]`, or `map[T]`, and explicit `.toText()`
+  calls on any of them) is faster, with no change in output. Every
+  compile-time-known literal the renderer appends (JSON punctuation, a
+  struct field's own baked `"name":` key) now skips a runtime
+  `strlen()` rescan of a length the compiler already knew, and string
+  escaping now bulk-copies runs of bytes that don't need escaping
+  instead of handling one byte at a time. Measured ~2.5x faster
+  (~215ms → ~85ms median over 5 runs) on a 100,000-iteration
+  text-heavy struct-rendering benchmark.
+
+See [claude.md #190](claude.md) for the full measurement methodology.
+
 ## [0.6] - 2026-08-29
 
 ### Added
