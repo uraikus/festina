@@ -26,6 +26,9 @@ SPEC_KEYWORDS = frozenset({
                         # runtime tag; anything else is heap-boxed) --
                         # and typeof <expr>, a prefix operator returning
                         # the concrete runtime type's name as text.
+    "thread",  # claude.md #195: thread NAME { ... } -- an isolated
+               # background worker with its own OS thread, message
+               # queues, and (optionally) its own sqlite handle.
 })
 
 # Extra control tokens the parser needs distinct token types for, so it

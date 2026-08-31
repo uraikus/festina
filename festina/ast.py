@@ -132,6 +132,28 @@ class EventHandler(Node):
         self.column = column
 
 
+class ThreadDecl(Node):
+    """claude.md #195: `thread NAME { ... }` -- an isolated background
+    worker: its own OS thread, its own private state, and message
+    queues to/from the main program. No signature of its own (no
+    parens) -- `body` is an ordinary block that may contain nested
+    `on load()`/`on message(p:T)`/`on exit(code:int)` handlers (parsed
+    as ordinary EventHandler nodes, same as anywhere else) and
+    thread-private state VarDecls. `NAME` itself becomes a global
+    value semantic.py registers with a `ThreadType`, supporting
+    `.postMessage(x)`/`.onMessage(callback)`/`.kill()`/`.live(callback)`/
+    `.isAlive()`. The thread's inbound message type is whatever its own
+    `on message(p:T)` (if any) declares -- found by semantic analysis,
+    not stored here; there is deliberately no place in this node for a
+    message type, since one would only ever be checked against that
+    handler's own parameter and never used for anything else."""
+    def __init__(self, name, body, line=0, column=0):
+        self.name = name
+        self.body = body
+        self.line = line
+        self.column = column
+
+
 class Block(Node):
     def __init__(self, body):
         self.body = body

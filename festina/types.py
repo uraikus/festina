@@ -60,6 +60,23 @@ class EnumType:
 
 
 @dataclass(frozen=True)
+class ThreadType:
+    """claude.md #195: `thread NAME { ... }` -- name-only, exactly like
+    StructType/TableType/EnumType above. `NAME` itself becomes a global
+    value of this type, supporting exactly five methods: `.postMessage(x)`,
+    `.onMessage(callback)`, `.kill()`, `.live(callback)`, `.isAlive()`.
+    The real inbound/outbound message types (both INFERRED, never
+    declared -- see semantic.py's own thread-analysis comments) live in
+    a separate `threads` dict (semantic.py's AnalyzedProgram, mirrored
+    in codegen.py's self.threads), the same split every other name-only
+    type here already uses."""
+    name: str
+
+    def __repr__(self):
+        return f"ThreadType({self.name})"
+
+
+@dataclass(frozen=True)
 class ArrayType:
     """claude.md #156: `amortized` (default False) is set by the `amor`
     prefix -- `amor arr[T]` -- originally tracked for parsing/type-

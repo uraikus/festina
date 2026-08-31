@@ -229,6 +229,8 @@ class Parser:
             return self.parse_table_decl()
         if t.type == "enum":
             return self.parse_enum_decl()
+        if t.type == "thread":
+            return self.parse_thread_decl()
         if t.type == "on":
             return self.parse_event_handler()
         if t.type == "if":
@@ -589,6 +591,23 @@ class Parser:
             members.append(self.parse_type())
         self._semi()
         return ast.EnumDecl(name_tok.value, members, t.line, t.column)
+
+    def parse_thread_decl(self):
+        # claude.md #195: `thread NAME { ... }` -- no parens, ever
+        # (unlike func/on, which always carry a signature). A thread
+        # declaration has no signature of its own: its inbound message
+        # type is whatever an `on message(p:T)` nested inside its own
+        # body declares (found by semantic analysis, not here), and its
+        # outbound type is inferred from that same body's own
+        # `postMessage(x)` call sites. The body is an ordinary block --
+        # nested `on load()`/`on message(p:T)`/`on exit(code:int)`
+        # handlers and thread-private state VarDecls all parse for free
+        # through parse_block()/parse_statement(), the same reuse
+        # parse_func_decl's own body already gets.
+        t = self.eat("thread")
+        name_tok = self.eat("IDENT")
+        body = self.parse_block()
+        return ast.ThreadDecl(name_tok.value, body, t.line, t.column)
 
     def parse_event_handler(self):
         t = self.eat("on")
