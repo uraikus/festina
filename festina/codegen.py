@@ -3347,7 +3347,28 @@ class CodeGen:
                 owned = self.tmp()
                 lines.append(f"  {owned} = call ptr @festina_text_own(ptr {text_val})")
                 text_val = owned
-            self._emit_free_active_locals(lines, down_to=self._current_func_frame_base,
+            # claude.md #192: free only down to the NEAREST enclosing try
+            # in this function, not the whole function frame. When a
+            # throw is CAUGHT by such a try, the catch (and the code
+            # after the try/catch) keeps running, and the locals declared
+            # BEFORE that try are still live -- their ordinary scope-exit
+            # release runs after the catch. Freeing them HERE too was a
+            # real double-free: any refcounted local (arr/map/struct/text)
+            # declared before a throwing try was released by the throw and
+            # then again by the normal post-catch scope exit. Only the
+            # locals between that try and the throw are genuinely unwound
+            # (their block-exit release is skipped by the longjmp), so
+            # only those are freed here. With NO enclosing try, the throw
+            # propagates out of the function, the whole frame is abandoned,
+            # and everything down to the base is freed -- exactly as
+            # before (identical to a Return).
+            throw_free_base = self._current_func_frame_base
+            for i in range(len(self._active_free_locals) - 1,
+                           self._current_func_frame_base - 1, -1):
+                if any(isinstance(t, _TryFrameMarker) for (_, t) in self._active_free_locals[i]):
+                    throw_free_base = i
+                    break
+            self._emit_free_active_locals(lines, down_to=throw_free_base,
                                            skip_try_pop=True)
             lines.append(f"  call void @festina_throw(ptr {text_val})")
             return
@@ -8092,23 +8113,55 @@ class CodeGen:
         end_label = self.label("tern.end")
         lines.append(f"  br i1 {cond}, label %{then_label}, label %{else_label}")
 
-        self._start_block(then_label, lines)
-        cons_val, cons_type = self._emit_expr(expr.cons, env, lines)
-        cons_val = self._own_ternary_branch(cons_val, cons_type, expr.cons, lines)
-        then_pred = self.cur_block  # may differ from then_label if expr.cons had its own branches
-        lines.append(f"  br label %{end_label}")
+        # claude.md #192: a bare `null` branch has no LLVM encoding of
+        # its own -- "null" the pointer keyword for a pointer-shaped
+        # type, but a reserved sentinel constant for int/float/bool/
+        # color (see _emit_value_for) -- so it must be emitted AS the
+        # OTHER branch's type, once that's known. This is the ternary
+        # sibling of the color==null fix (#189): before it, `c ? 1 :
+        # null` phi'd a raw "null" against i64 (invalid IR) and `c ?
+        # null : 7` crashed the compiler on cons_type=None. When the
+        # cons branch is the null one, the alt branch is emitted first
+        # so its type drives the whole expression.
+        cons_null = isinstance(expr.cons, ast.NullLit)
+        alt_null = isinstance(expr.alt, ast.NullLit)
 
-        self._start_block(else_label, lines)
-        alt_val, _ = self._emit_expr(expr.alt, env, lines)
-        alt_val = self._own_ternary_branch(alt_val, cons_type, expr.alt, lines)
-        else_pred = self.cur_block
-        lines.append(f"  br label %{end_label}")
+        if cons_null and not alt_null:
+            self._start_block(else_label, lines)
+            alt_val, result_type = self._emit_expr(expr.alt, env, lines)
+            alt_val = self._own_ternary_branch(alt_val, result_type, expr.alt, lines)
+            else_pred = self.cur_block
+            lines.append(f"  br label %{end_label}")
+
+            self._start_block(then_label, lines)
+            cons_val, _ = self._emit_value_for(expr.cons, env, lines, result_type)
+            then_pred = self.cur_block
+            lines.append(f"  br label %{end_label}")
+        else:
+            self._start_block(then_label, lines)
+            cons_val, result_type = self._emit_expr(expr.cons, env, lines)
+            cons_val = self._own_ternary_branch(cons_val, result_type, expr.cons, lines)
+            then_pred = self.cur_block  # may differ from then_label if expr.cons had its own branches
+            lines.append(f"  br label %{end_label}")
+
+            self._start_block(else_label, lines)
+            if alt_null:
+                alt_val, _ = self._emit_value_for(expr.alt, env, lines, result_type)
+            else:
+                # semantic.py guarantees the two non-null branches have
+                # the SAME type here (a ?: is one phi of one type, and a
+                # mismatch -- numeric included -- is a compile error), so
+                # the alt value needs no coercion to result_type.
+                alt_val, _ = self._emit_expr(expr.alt, env, lines)
+                alt_val = self._own_ternary_branch(alt_val, result_type, expr.alt, lines)
+            else_pred = self.cur_block
+            lines.append(f"  br label %{end_label}")
 
         self._start_block(end_label, lines)
         out = self.tmp()
-        llvm_ty = _llvm_type(cons_type)
+        llvm_ty = _llvm_type(result_type)
         lines.append(f"  {out} = phi {llvm_ty} [ {cons_val}, %{then_pred} ], [ {alt_val}, %{else_pred} ]")
-        return out, cons_type
+        return out, result_type
 
     def _own_ternary_branch(self, val, vtype, source_expr, lines):
         """claude.md #173: a Ternary used to be treated as "aliasing"

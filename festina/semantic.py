@@ -1426,11 +1426,57 @@ def analyze(program, filename="<string>"):
             cond_type = infer(expr.test, scope)
             check_condition_bool(cond_type, expr)
             cons_type = infer(expr.cons, scope)
-            infer(expr.alt, scope)
-            return cons_type
+            alt_type = infer(expr.alt, scope)
+            # claude.md #192: the two branches must have compatible
+            # types, checked the same way == / != checks its operands
+            # (and for the same reason -- #2's "no implicit coercion").
+            # The alt branch's type used to be inferred and DISCARDED,
+            # with the whole expression typed from the cons branch
+            # alone, so `c ? 'yes' : someBlob` silently compiled and
+            # rendered a blob handle's bytes as text, and `c ? xs :
+            # someMap` treated a map header as an array. null is valid
+            # against everything (#25), and the result is the OTHER,
+            # concrete branch's type (so `c ? null : 7` is int, not
+            # null); int/float mix, coercing to float (#143).
+            if cons_type is None:
+                return alt_type
+            if alt_type is None:
+                return cons_type
+            if cons_type is NULL:
+                return alt_type
+            if alt_type is NULL:
+                return cons_type
+            if cons_type == alt_type:
+                return cons_type
+            # A ?: produces ONE value through a phi of one LLVM type, so
+            # unlike a binary operator (#143, where an int operand is
+            # coerced to float on the spot) the two branches must ALREADY
+            # match -- including int vs float. Rejecting a numeric
+            # mismatch here with a clear message beats codegen emitting a
+            # phi of two different numeric types (invalid IR) or silently
+            # truncating one branch; the fix the message names
+            # (`.toFloat()` on the int branch) is exactly #143's own
+            # explicit conversion.
+            hint = ""
+            if cons_type in _NUMERIC_TYPES and alt_type in _NUMERIC_TYPES:
+                hint = " -- write .toFloat() on the int branch to make both float"
+            raise CompileError(
+                f"the two branches of a ?: must have the same type, found "
+                f"{types_mod.type_name(cons_type)} and {types_mod.type_name(alt_type)}{hint}",
+                file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                category="invalid operand type",
+            )
         if isinstance(expr, ast.LogicalOp):
-            infer(expr.left, scope)
-            infer(expr.right, scope)
+            # claude.md #192: && / || require bool operands, checked the
+            # same way an if/while condition is (claude.md #17: values
+            # like 0/1/-1 must not silently become booleans). The
+            # operand types used to be inferred and discarded, so
+            # `1 && 2` compiled and printed the raw i8 constant (2
+            # happens to be the bool-null sentinel -> "null"), and
+            # `i && true` on an int operand reached codegen's `icmp ne
+            # i8` on an i64 value -> invalid IR.
+            check_condition_bool(infer(expr.left, scope), expr.left)
+            check_condition_bool(infer(expr.right, scope), expr.right)
             return types_mod.PrimitiveType("bool")
         if isinstance(expr, ast.BinOp):
             left = infer(expr.left, scope)

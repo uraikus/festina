@@ -154,6 +154,26 @@ class TestArithmeticAndControlFlow:
         result = compile_and_run(source)
         assert result.stdout.strip() == "big"
 
+    def test_ternary_with_a_null_branch(self, compile_and_run):
+        # claude.md #192: a bare `null` branch is emitted AS the other
+        # branch's type -- `c ? 1 : null` used to phi a raw "null"
+        # against i64 (invalid IR) and `c ? null : 7` crashed the
+        # compiler on a None type. The taken null branch yields the
+        # int-null sentinel; the taken concrete branch yields its value.
+        source = """
+        log(true ? 1 : null)
+        log(false ? 1 : null)
+        log(false ? null : 7)
+        log(true ? null : 7)
+        """
+        result = compile_and_run(source)
+        lines = result.stdout.splitlines()
+        assert lines[0] == "1"
+        assert lines[2] == "7"
+        # the null-branch cases print int's own null sentinel
+        assert lines[1] == lines[3]
+        assert lines[1] != "1" and lines[1] != "7"
+
     def test_logical_and_or_short_circuit(self, compile_and_run):
         # claude.md doesn't spell out short-circuit evaluation explicitly,
         # but it's the JavaScript-familiar behavior claude.md #45 asks for

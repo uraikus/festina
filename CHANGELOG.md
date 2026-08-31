@@ -28,6 +28,22 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Fixed
 
+- A value assigned to a global (or otherwise escaping) only inside a
+  `try` or `catch` body is no longer freed while still referenced —
+  escape analysis didn't look inside try/catch bodies, so such a value
+  was stack-allocated and reclaimed at scope exit (a use-after-free).
+- A refcounted local (array, map, struct, text) declared before a
+  `try` that throws is no longer double-freed. A throw caught in the
+  same function freed that local, and the normal scope exit after the
+  catch freed it again (glibc aborted with "double free detected").
+- The two branches of a `?:` are now required to have the same type;
+  a mismatch (e.g. `c ? 'text' : someBlob`) used to compile and render
+  garbage at runtime. `null` is still allowed in either branch.
+- `&&` and `||` now require bool operands, matching `if`/`while`
+  conditions; `1 && 2` used to compile and print `null`.
+- A `?:` with a `null` branch (`c ? 1 : null`, `c ? null : 7`) now
+  compiles — it produced invalid IR or crashed the compiler before.
+
 - Integer fields in `.toStruct()` keep full 64-bit precision. They
   were parsed through a `double`, silently corrupting any value past
   2^53 — and `INT64_MAX` in particular read back as `null`.
