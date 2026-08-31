@@ -5239,7 +5239,16 @@ class CodeGen:
             val, vtype = self._emit_value_for(expr.args[0], env, lines, elem_type)
             val = self._coerce(val, vtype, elem_type, lines, source_expr=expr.args[0])
             if _is_refcounted(elem_type):
-                if not self._is_owning_refcounted_source(expr.args[0]):
+                # claude.md #192: freshness is _refcounted_source_is_fresh,
+                # NOT _is_owning_refcounted_source -- `xs.push('a.txt')`
+                # into an arr[blob] mints a FRESH handle (rc=1) from the
+                # text via _coerce above, but its AST node is a StringLit,
+                # so the node-only test judged it non-fresh and added a
+                # retain (rc=2). The array push then owns one reference,
+                # leaving the extra one dangling: one handle leaked per
+                # push. The fresh case needs no retain; a plain aliased
+                # variable (not fresh) still does.
+                if not self._refcounted_source_is_fresh(expr.args[0], vtype, elem_type):
                     lines.append(f"  call void @festina_retain(ptr {val})")
             elif elem_type == TEXT and not self._is_owning_text_source(expr.args[0]):
                 owned = self.tmp()
@@ -5298,6 +5307,14 @@ class CodeGen:
             lines.append(
                 f"  {out} = call i64 @festina_array_index_of(ptr {obj_val}, "
                 f"i64 {elem_size}, ptr {slot}, i8 {is_text})")
+            # claude.md #192: a needle coerced from text to a handle
+            # (`arr[blob].indexOf('x')`) is a fresh reference the search
+            # only borrows -- release it, the same way a call argument's
+            # fresh handle is. _free_text_temp below covers a genuine
+            # text needle; it no-ops on a handle, so both are needed.
+            if _is_refcounted(elem_type) and self._refcounted_source_is_fresh(
+                    expr.args[0], vtype, elem_type):
+                lines.append(f"  call void {self._release_fn_for(elem_type)}(ptr {val})")
             self._free_text_temp(expr.args[0], val, elem_type, lines)
             return out, INT
 
@@ -7173,8 +7190,21 @@ class CodeGen:
         used" rule forbids it -- there is no way to even *write* a
         self-referential arr[T] type in Festina's own grammar."""
         elem_type = type_.element
-        if not (isinstance(elem_type, (types_mod.StructType, types_mod.ArrayType,
-                                       types_mod.MapType, types_mod.TableType))
+        # claude.md #192: the plain generic release (which frees the
+        # buffer and header but NOT the elements) is only correct when
+        # an element has nothing to release. The old predicate listed
+        # struct/arr/map/table/text but MISSED every refcounted HANDLE
+        # element (blob/img/aud/regex/http/socket/url/enum) -- those are
+        # retained on store (push/array-lit/`arr[i]=`) but the plain
+        # release never dropped that reference, leaking every element of
+        # an escaping/reassigned/returned arr[blob], arr[img], etc. The
+        # per-element cascade wrapper below already dispatches each
+        # element through _release_fn_for, which handles all of them;
+        # _is_refcounted is the exact "has a reference to drop" test,
+        # plus TableType (its rows are owned, cascaded specially below)
+        # and TEXT (copied, not refcounted, but still needs freeing).
+        if not (_is_refcounted(elem_type)
+                or isinstance(elem_type, types_mod.TableType)
                 or elem_type == TEXT):
             return "@festina_release_array"
         key = types_mod.type_name(type_)
@@ -9011,7 +9041,11 @@ class CodeGen:
                 arg_temps = []
                 for arg_expr, ptype in zip(expr.args, fn_type.param_types):
                     val, vtype = self._emit_value_for(arg_expr, env, lines, ptype)
-                    val = self._coerce(val, vtype, ptype, lines)
+                    # claude.md #192: source_expr threaded so a text->img/
+                    # blob/aud coercion frees its own text temp (see the
+                    # direct-call path's cleanup comment for the bug this
+                    # closes).
+                    val = self._coerce(val, vtype, ptype, lines, source_expr=arg_expr)
                     arg_vals.append(f"{_llvm_type(ptype)} {val}")
                     arg_temps.append((arg_expr, val, vtype, ptype))
                 args_ir = ", ".join(arg_vals)
@@ -9022,12 +9056,12 @@ class CodeGen:
                 else:
                     out = self.tmp()
                     lines.append(f"  {out} = call {_llvm_type(ret_type)} {fn_ptr}({args_ir})")
-                # claude.md #83/#119: identical post-call argument
+                # claude.md #83/#119/#192: identical post-call argument
                 # cleanup to the direct-call path just below -- see its
                 # own comment for the full reasoning.
                 for arg_expr, val, vtype, ptype in arg_temps:
                     if (_is_refcounted(ptype)
-                            and self._is_owning_refcounted_source(arg_expr)):
+                            and self._refcounted_source_is_fresh(arg_expr, vtype, ptype)):
                         lines.append(
                             f"  call void {self._release_fn_for(ptype)}(ptr {val})")
                     else:
@@ -9040,7 +9074,10 @@ class CodeGen:
                 for arg_expr, param in zip(expr.args, decl.params):
                     ptype = self._resolve(param.type_expr, decl)
                     val, vtype = self._emit_value_for(arg_expr, env, lines, ptype)
-                    val = self._coerce(val, vtype, ptype, lines)
+                    # claude.md #192: source_expr threaded so a
+                    # text->img/blob/aud coercion frees its own text temp
+                    # (see the cleanup comment below).
+                    val = self._coerce(val, vtype, ptype, lines, source_expr=arg_expr)
                     arg_vals.append(f"{_llvm_type(ptype)} {val}")
                     arg_temps.append((arg_expr, val, vtype, ptype))
                 ret_ref, ret_type = env.lookup(name)
@@ -9066,9 +9103,25 @@ class CodeGen:
                 # store retains; a returned alias is retained by the
                 # Return path) -- so the caller's +1 is provably the
                 # last reference nothing else will ever drop.
+                #
+                # claude.md #192: the freshness test is
+                # _refcounted_source_is_fresh, NOT _is_owning_refcounted_
+                # source -- a `show(`x${n}.png`)` where `show` takes an
+                # img mints a FRESH handle from the text path via _coerce
+                # above, exactly as fresh as a call result, but its AST
+                # node is a template/StringLit. The old node-only test
+                # missed it two ways: it never released the minted handle
+                # (a decoded image leaked per call for a literal path),
+                # and for an OWNING text source it fell to the else and
+                # ran _free_text_temp on `val` -- which by then is the img
+                # PAYLOAD, not text -- emitting free() on a handle:
+                # invalid free / heap corruption. The fresh-handle branch
+                # now releases it correctly, and _coerce (given
+                # source_expr above) already freed the arg's own text
+                # temp, so the else runs only for a genuine text arg.
                 for arg_expr, val, vtype, ptype in arg_temps:
                     if (_is_refcounted(ptype)
-                            and self._is_owning_refcounted_source(arg_expr)):
+                            and self._refcounted_source_is_fresh(arg_expr, vtype, ptype)):
                         lines.append(
                             f"  call void {self._release_fn_for(ptype)}(ptr {val})")
                     else:
@@ -9773,7 +9826,10 @@ class CodeGen:
                 arg_temps = []
                 for arg_expr, ptype in zip(expr.args, fn_type.param_types):
                     val, vtype = self._emit_value_for(arg_expr, env, lines, ptype)
-                    val = self._coerce(val, vtype, ptype, lines)
+                    # claude.md #192: source_expr threaded (see the
+                    # direct-call cleanup comment for the heap-corruption
+                    # bug this closes).
+                    val = self._coerce(val, vtype, ptype, lines, source_expr=arg_expr)
                     arg_vals.append(f"{_llvm_type(ptype)} {val}")
                     arg_temps.append((arg_expr, val, vtype, ptype))
                 args_ir = ", ".join(arg_vals)
@@ -9784,11 +9840,11 @@ class CodeGen:
                 else:
                     out = self.tmp()
                     lines.append(f"  {out} = call {_llvm_type(ret_type)} {callee_val}({args_ir})")
-                # claude.md #83/#119: identical post-call argument
+                # claude.md #83/#119/#192: identical post-call argument
                 # cleanup to the other two call forms above.
                 for arg_expr, val, vtype, ptype in arg_temps:
                     if (_is_refcounted(ptype)
-                            and self._is_owning_refcounted_source(arg_expr)):
+                            and self._refcounted_source_is_fresh(arg_expr, vtype, ptype)):
                         lines.append(
                             f"  call void {self._release_fn_for(ptype)}(ptr {val})")
                     else:

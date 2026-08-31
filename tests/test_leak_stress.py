@@ -425,4 +425,12 @@ class TestLeakStress:
             # control characters, multi-byte UTF-8) so a bug in either
             # optimization surfaces as a real ASan error.
             "json_render_churn.f",
+            # claude.md #192/#194: the argument-coercion and arr[handle]
+            # ownership fixes -- a text literal/template passed to a
+            # blob/img/aud parameter (previously an invalid free of the
+            # handle payload, or a leaked handle), an escaping arr[blob]
+            # cascading to release each element handle, and .push()/
+            # .indexOf() of a text->handle coerced element. A leak or
+            # invalid free surfaces as a real ASan error.
+            "handle_arg_and_arr_churn.f",
         }

@@ -43,6 +43,15 @@ round-by-round design and implementation record predating 0.1 lives in
   conditions; `1 && 2` used to compile and print `null`.
 - A `?:` with a `null` branch (`c ? 1 : null`, `c ? null : 7`) now
   compiles — it produced invalid IR or crashed the compiler before.
+- Passing a text literal or template to an `img`/`blob`/`aud`
+  parameter (`show(`sprite${n}.png`)`) no longer corrupts the heap or
+  leaks the loaded handle — the argument coercion mishandled the
+  freshly minted handle's ownership.
+- An `arr[blob]`, `arr[img]`, or `arr[aud]` no longer leaks its
+  elements when the array is released — element handles were freed as
+  a plain buffer with no per-element release.
+- `.push()`/`.unshift()`/`.indexOf()` of a path string into an
+  `arr[blob]`/`arr[img]`/`arr[aud]` no longer leaks the loaded handle.
 
 - Integer fields in `.toStruct()` keep full 64-bit precision. They
   were parsed through a `double`, silently corrupting any value past
