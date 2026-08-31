@@ -9,6 +9,19 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.14] - 2026-08-31
+
+### Documentation
+
+- Final consolidation pass closing out `thread NAME { ... }` (claude.md
+  #195-#201): api.md's own "Threads" section no longer calls itself
+  "an early phase" and now documents the thread-private-helper-function
+  restriction it was missing; `todo.md` gains three previously-untracked,
+  already-true open items (singleton threads, no thread-private helper
+  functions, a thread's own sqlite handle not explicitly closed on
+  `kill()`); `README.md`'s own stale top-level test count corrected.
+  No functional changes. See [claude.md #201](claude.md).
+
 ## [0.13] - 2026-08-31
 
 ### Fixed

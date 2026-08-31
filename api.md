@@ -3005,9 +3005,13 @@ declares no `DatabaseURL` of its own); a non-literal main `DatabaseURL`
 (an expression the compiler can't prove anything about) skips this
 check rather than guessing.
 
-**Limitations (this is still an early phase of this feature).**
-Threads are singletons, declared once by name — there's no way to
-spawn more than one instance of the same `thread` block.
+**Limitations.** Threads are singletons, declared once by name — there
+is no way to spawn more than one instance of the same `thread` block
+(a worker pool, say). There is also no way to declare a thread-private
+*helper function* — every top-level `func` is either callable from
+every thread (if it never touches a global or an impure builtin) or
+from none at all; a `func` scoped to one particular thread's own body,
+closing over that thread's own state, isn't supported.
 
 ## Audio
 
