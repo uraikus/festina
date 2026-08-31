@@ -1435,6 +1435,15 @@ class CodeGen:
             "declare void @festina_thread_live(ptr, ptr)",
             "declare i8 @festina_thread_is_alive(ptr)",
             "declare void @festina_register_thread_hooks()",
+            # claude.md #198 Phase 4: `thread`'s own deep-clone of a
+            # blob/img/aud/url message/field -- see each one's own doc
+            # comment on its C definition (festina_runtime.c for
+            # blob/url, festina_runtime_graphics.c for img,
+            # festina_runtime_audio.c for aud).
+            "declare ptr @festina_blob_clone(ptr)",
+            "declare ptr @festina_image_clone(ptr)",
+            "declare ptr @festina_audio_clone(ptr)",
+            "declare ptr @festina_url_clone(ptr)",
             "declare ptr @festina_blob_from_bytes(ptr, i64)",
             "declare void @festina_blob_release(ptr)",
             "declare ptr @festina_blob_to_text(ptr)",
@@ -2607,15 +2616,36 @@ class CodeGen:
     _THREAD_PASSTHROUGH_PTR_TYPES = (types_mod.StructType, types_mod.ArrayType,
                                      types_mod.MapType, types_mod.EnumType)
 
+    def _is_thread_handle_type(self, type_):
+        """claude.md #198 Phase 4: true for blob/img/aud/url -- the
+        four handle-shaped refcounted types this phase teaches the
+        thread boundary to clone, each via its own runtime-written
+        `festina_*_clone` (mirroring how each already has its own
+        runtime-written `festina_*_free`/`_release` reached through
+        _release_fn_for, rather than a codegen-generated cascade the
+        way struct/arr[T]/map[T]/enum get). Kept as its own small
+        predicate, alongside _THREAD_PASSTHROUGH_PTR_TYPES rather than
+        folded into it, because these four dispatch to a DIFFERENT
+        clone mechanism in _emit_thread_clone_value (one runtime call
+        each) than the generic per-type cascade _clone_fn_for
+        generates for the other four -- only their PASSTHROUGH-ness
+        (already `ptr`-shaped, no separate box) is shared."""
+        return type_ == BLOB or isinstance(
+            type_, (types_mod.ImageType, types_mod.AudioType, types_mod.UrlType))
+
     def _thread_payload_is_passthrough(self, type_):
-        """claude.md #197 Phase 3: true for every type whose OWN value is
-        already the exact `ptr` a thread payload needs -- text (an
-        owned buffer, unchanged since Phase 2) and, as of this phase,
-        struct/arr[T]/map[T]/enum (each already `ptr`-shaped per
+        """claude.md #197 Phase 3 (widened by #198 Phase 4): true for
+        every type whose OWN value is already the exact `ptr` a thread
+        payload needs -- text (an owned buffer, unchanged since Phase
+        2), struct/arr[T]/map[T]/enum (each already `ptr`-shaped per
         _llvm_type, and a CLONE of one of these already IS a fresh,
         independent top-level allocation -- see _emit_thread_clone_value
-        -- so there is nothing left for a box to wrap)."""
-        return type_ == TEXT or isinstance(type_, self._THREAD_PASSTHROUGH_PTR_TYPES)
+        -- so there is nothing left for a box to wrap), and, as of this
+        phase, blob/img/aud/url (same reasoning -- each is already
+        `ptr`-shaped, and each's own festina_*_clone already returns a
+        fresh, independent allocation)."""
+        return (type_ == TEXT or self._is_thread_handle_type(type_)
+                or isinstance(type_, self._THREAD_PASSTHROUGH_PTR_TYPES))
 
     def _emit_thread_box(self, val, type_, lines):
         """Turns a thread-sendable value into the single `void *payload`
@@ -2687,18 +2717,24 @@ class CodeGen:
             lines.append(f"  {dest_reg} = add {llvm_ty} {self._emit_thread_unbox(box, type_, lines)}, 0")
 
     def _thread_payload_release_fn(self, type_):
-        """claude.md #197 Phase 3: the function to call, on the
-        receiving side, to release ONE payload once its handler/
-        callback has consumed it -- `@free` for a plain box (int/
-        float/bool/color) or an owned text buffer (`_emit_thread_box`
-        never wraps text in a further box, so its own buffer IS the
-        payload, and `free()` is exactly correct); a real Festina
-        release cascade -- `_release_fn_for(type_)`, unchanged, since
-        every clone this phase produces already carries the ordinary
-        refcount header every other value of that type does -- for
-        struct/arr[T]/map[T]/enum, matching `_release_fn_for`'s own
-        `void(ptr)` signature exactly (no adapter needed: it already
-        IS `void(*)(void*)`). A font needs no release at all (its own
+        """claude.md #197 Phase 3 (widened by #198 Phase 4): the
+        function to call, on the receiving side, to release ONE
+        payload once its handler/callback has consumed it -- `@free`
+        for a plain box (int/float/bool/color) or an owned text buffer
+        (`_emit_thread_box` never wraps text in a further box, so its
+        own buffer IS the payload, and `free()` is exactly correct); a
+        real Festina release cascade -- `_release_fn_for(type_)`,
+        unchanged, since every clone this phase produces already
+        carries the ordinary refcount header every other value of that
+        type does -- for struct/arr[T]/map[T]/enum AND, as of this
+        phase, blob/img/aud/url (each already dispatches through
+        `_release_fn_for` to its own runtime-written destructor --
+        `@festina_blob_release`/`@festina_image_free`/
+        `@festina_audio_free`/`@festina_release_url` -- exactly the
+        same way today's ordinary, non-thread release call sites
+        already do), matching `_release_fn_for`'s own `void(ptr)`
+        signature exactly (no adapter needed: it already IS
+        `void(*)(void*)`). A font needs no release at all (its own
         storage is immortal, process-lifetime, never allocated per-
         message in the first place -- see _emit_thread_box) --
         `@free` is passed anyway rather than NULL, since NULL is never
@@ -2706,32 +2742,37 @@ class CodeGen:
         for one less "maybe-NULL" branch in the C runtime."""
         if type_ == TEXT or isinstance(type_, types_mod.FontType):
             return "@free"
-        if isinstance(type_, self._THREAD_PASSTHROUGH_PTR_TYPES):
+        if self._is_thread_handle_type(type_) or isinstance(type_, self._THREAD_PASSTHROUGH_PTR_TYPES):
             return self._release_fn_for(type_)
         return "@free"
 
     def _is_thread_clonable_type(self, type_, _seen_structs=frozenset()):
-        """claude.md #197 Phase 3: mirrors semantic.py's own
-        _is_thread_sendable_type recursive-walk shape exactly (same
-        cycle guard: a struct already being checked higher up this
-        same recursion is trusted, not re-entered), but answers a
-        narrower, CODEGEN-side question -- can this compiler actually
-        CLONE a value of this type today, not just is it legal per
-        Phase 1's own compile-time rules. Scalars (int/float/bool/
-        color) plus text and font (see _emit_thread_box's own comment
-        on why font needs no real cloning) are always clonable; struct/
-        arr[T]/map[T]/enum are clonable when built recursively from
-        those AND the type is acyclic (_is_cyclic_type) -- a genuine
-        type-level cycle would make the naive recursive clone this
-        phase generates loop forever on a correspondingly cyclic VALUE,
-        unlike release's own refcount-bounded cascade, so it's rejected
-        outright here rather than risking a stack overflow/hang at
-        runtime (a documented, narrower scope cut, not a silent gap --
-        see _check_thread_clonable_type's own error message). blob/img/
-        aud/url are legal message types per Phase 1 but still not
-        clonable here -- that's Phase 4's own work."""
+        """claude.md #197 Phase 3 (widened by #198 Phase 4): mirrors
+        semantic.py's own _is_thread_sendable_type recursive-walk shape
+        exactly (same cycle guard: a struct already being checked
+        higher up this same recursion is trusted, not re-entered), but
+        answers a narrower, CODEGEN-side question -- can this compiler
+        actually CLONE a value of this type today, not just is it
+        legal per Phase 1's own compile-time rules. Scalars (int/
+        float/bool/color) plus text and font (see _emit_thread_box's
+        own comment on why font needs no real cloning) are always
+        clonable; blob/img/aud/url are always clonable too, as of this
+        phase (each has its own runtime-written festina_*_clone -- see
+        _emit_thread_clone_value -- with no cycle risk at all, since
+        none of the four can ever refer back to itself the way a
+        struct/arr[T]/map[T] can); struct/arr[T]/map[T]/enum are
+        clonable when built recursively from those AND the type is
+        acyclic (_is_cyclic_type) -- a genuine type-level cycle would
+        make the naive recursive clone this phase generates loop
+        forever on a correspondingly cyclic VALUE, unlike release's own
+        refcount-bounded cascade, so it's rejected outright here rather
+        than risking a stack overflow/hang at runtime (a documented,
+        narrower scope cut, not a silent gap -- see
+        _check_thread_clonable_type's own error message)."""
         if type_ in (INT, FLOAT, BOOL, TEXT) or isinstance(
                 type_, (types_mod.ColorType, types_mod.FontType)):
+            return True
+        if self._is_thread_handle_type(type_):
             return True
         if isinstance(type_, types_mod.StructType):
             if self._is_cyclic_type(type_):
@@ -2757,23 +2798,23 @@ class CodeGen:
         return False
 
     def _check_thread_clonable_type(self, type_, what, node):
-        # claude.md #197 Phase 3 still doesn't implement EVERY type
-        # Phase 1's own semantic-level _is_thread_sendable_type accepts
-        # -- blob/img/aud/url (Phase 4) and a self-referencing (cyclic)
+        # claude.md #198 Phase 4: the one type Phase 1's own semantic-
+        # level _is_thread_sendable_type accepts that codegen still
+        # can't actually clone is a self-referencing (cyclic)
         # struct/arr[T]/map[T] (see _is_thread_clonable_type's own
-        # comment on why) both fall through to this error rather than a
-        # confusing crash or miscompile -- see this project's own
+        # comment on why) -- it falls through to this error rather than
+        # a confusing crash or miscompile -- see this project's own
         # established convention (e.g. claude.md #170's macOS try/catch
         # rejection) for erroring loudly on a real, documented gap
         # rather than silently mishandling it.
         if not self._is_thread_clonable_type(type_):
             raise CodegenError(
                 f"{what} of type {types_mod.type_name(type_)} is not supported yet -- "
-                f"claude.md #197 Phase 3 does not yet clone blob/img/aud/url across a "
-                f"thread boundary (planned for Phase 4), or a self-referencing "
-                f"struct/arr[T]/map[T] type (cloning it could loop forever on a genuinely "
-                f"cyclic value) -- everything else (int/float/bool/text/color/font, "
-                f"and struct/arr[T]/map[T]/enum built acyclically from those) is "
+                f"claude.md #198 does not yet clone a self-referencing "
+                f"struct/arr[T]/map[T] type across a thread boundary (cloning it could "
+                f"loop forever on a genuinely cyclic value) -- everything else "
+                f"(int/float/bool/text/color/font/blob/img/aud/url, and "
+                f"struct/arr[T]/map[T]/enum built acyclically from those) is "
                 f"supported",
                 file=self.filename, line=getattr(node, "line", 0))
 
@@ -2810,25 +2851,47 @@ class CodeGen:
             lines.append(f"  call void {self._release_fn_for(target_type)}(ptr {val})")
 
     def _emit_thread_clone_value(self, val, type_, lines):
-        """claude.md #197 Phase 3: turns an already-emitted value
-        `val` (borrowed -- this never touches whatever `val` itself
-        aliases) into a fresh, INDEPENDENT copy of the same type,
-        suitable for handing across a thread boundary -- the entire
-        safety argument behind claude.md #195's "deep clone, never a
-        shared pointer" design, made real for the compound types this
-        phase adds. Dispatches to whichever mechanism `type_` actually
-        needs: `festina_text_own` for text (unchanged since Phase 2);
-        a real generated clone cascade (_clone_fn_for) for struct/
-        arr[T]/map[T]/enum; a plain, unretained pointer copy for a font
-        (immortal, process-lifetime storage -- see FontType's own doc
-        comment in types.py, and _emit_thread_box's matching comment);
-        and, for every other (scalar) type, `val` itself unchanged --
-        an int/float/bool/color value is already its own independent
-        copy the moment it's loaded into a register, nothing to clone
-        at all."""
+        """claude.md #197 Phase 3 (widened by #198 Phase 4): turns an
+        already-emitted value `val` (borrowed -- this never touches
+        whatever `val` itself aliases) into a fresh, INDEPENDENT copy
+        of the same type, suitable for handing across a thread
+        boundary -- the entire safety argument behind claude.md #195's
+        "deep clone, never a shared pointer" design, made real for the
+        compound and handle types these phases add. Dispatches to
+        whichever mechanism `type_` actually needs: `festina_text_own`
+        for text (unchanged since Phase 2); one of the four runtime-
+        written `festina_*_clone` functions for blob/img/aud/url, as
+        of this phase (each documented on its own C definition --
+        festina_runtime.c for blob/url, festina_runtime_graphics.c for
+        img, festina_runtime_audio.c for aud); a real generated clone
+        cascade (_clone_fn_for) for struct/arr[T]/map[T]/enum; a plain,
+        unretained pointer copy for a font (immortal, process-lifetime
+        storage -- see FontType's own doc comment in types.py, and
+        _emit_thread_box's matching comment); and, for every other
+        (scalar) type, `val` itself unchanged -- an int/float/bool/
+        color value is already its own independent copy the moment
+        it's loaded into a register, nothing to clone at all."""
         if type_ == TEXT:
             out = self.tmp()
             lines.append(f"  {out} = call ptr @festina_text_own(ptr {val})")
+            return out
+        if type_ == BLOB:
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_blob_clone(ptr {val})")
+            return out
+        if isinstance(type_, types_mod.ImageType):
+            self.uses_graphics_code = True
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_image_clone(ptr {val})")
+            return out
+        if isinstance(type_, types_mod.AudioType):
+            self.uses_audio = True
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_audio_clone(ptr {val})")
+            return out
+        if isinstance(type_, types_mod.UrlType):
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_url_clone(ptr {val})")
             return out
         if isinstance(type_, self._THREAD_PASSTHROUGH_PTR_TYPES):
             out = self.tmp()

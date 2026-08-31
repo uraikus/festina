@@ -2913,11 +2913,11 @@ registration at all.
 thread and the main program) never share a mutable value, which is
 what makes running Festina code on more than one thread safe at all.
 Sendable types today: `int`, `float`, `bool`, `text`, `color`,
-`font`, and `struct`/`arr[T]`/`map[T]`/`enum` built recursively from
-any of those (a self-referencing `struct`/`arr[T]`/`map[T]` type is
-rejected at compile time — cloning it could loop forever on a
-genuinely cyclic value). `blob`/`img`/`aud`/`url` are on the way;
-`func`, `http`/`socket`, `regex`, and `table` never will be (see
+`font`, `blob`, `img`, `aud`, `url`, and `struct`/`arr[T]`/`map[T]`/
+`enum` built recursively from any of those (a self-referencing
+`struct`/`arr[T]`/`map[T]` type is rejected at compile time — cloning
+it could loop forever on a genuinely cyclic value). `func`,
+`http`/`socket`, `regex`, and `table` never will be (see
 "Limitations" below).
 
 **Lifecycle.**
@@ -2968,12 +2968,11 @@ touches only that one private image, never shared state). It may
 ordinary top-level `func` declared outside the thread.
 
 **Limitations (this is still an early phase of this feature).**
-`blob`/`img`/`aud`/`url` message types aren't implemented yet — see
-"Every message is a deep, independent copy" above. A thread cannot
-yet open its own SQLite database (that, plus a compile-time check
-rejecting two threads that would share the same database file, is
-planned). Threads are singletons, declared once by name — there's no
-way to spawn more than one instance of the same `thread` block.
+A thread cannot yet open its own SQLite database (that, plus a
+compile-time check rejecting two threads that would share the same
+database file, is planned). Threads are singletons, declared once by
+name — there's no way to spawn more than one instance of the same
+`thread` block.
 
 ## Audio
 

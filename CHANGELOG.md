@@ -9,6 +9,18 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.11] - 2026-08-31
+
+### Added
+
+- `thread`'s own message types widen to include `blob`/`img`/`aud`/
+  `url` — each deep-cloned (never shared) across the boundary, the
+  same guarantee `struct`/`arr[T]`/`map[T]`/`enum` already got.
+  Drawing/clip/resize/pixel methods on an `img` value (e.g.
+  `pic.drawRect(...)`) work from inside a thread body, verified
+  race-free under ThreadSanitizer. See [api.md](api.md#threads) and
+  [claude.md #198](claude.md).
+
 ## [0.10] - 2026-08-31
 
 ### Added

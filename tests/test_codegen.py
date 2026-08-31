@@ -16077,29 +16077,6 @@ class TestThreads:
         assert result.returncode == 0
         assert result.stdout.strip().splitlines() == ["2", "11"]
 
-    def test_a_blob_message_type_is_a_clear_not_yet_error(self, parser, semantic, codegen, errors):
-        # claude.md #195 Phase 1 already accepts blob/img/aud/url as
-        # sendable message types at the semantic level (they'll
-        # actually work once Phase 4 writes their own clone codegen)
-        # -- this checks that trying to COMPILE one today fails loudly
-        # and clearly, naming the phase, rather than crashing or
-        # silently miscompiling. claude.md #197 Phase 3 lifted this
-        # same restriction for struct/arr[T]/map[T]/enum -- see
-        # TestThreads' own struct/array/map/enum round-trip tests.
-        source = """
-        thread worker {
-            on message(p:blob) {
-                log('got blob')
-            }
-        }
-        blob b = 'nope.dat'
-        worker.postMessage(b)
-        """
-        program = parser.parse(source)
-        analyzed = semantic.analyze(program)
-        with pytest.raises(errors.CompileError, match="not supported yet"):
-            codegen.generate_ir(program, analyzed)
-
     def test_a_self_referencing_struct_message_type_is_a_clear_not_yet_error(self, parser, semantic, codegen, errors):
         # claude.md #197 Phase 3: struct/arr[T]/map[T] are clonable
         # now, but only when ACYCLIC -- a self-referencing struct type
@@ -16252,6 +16229,115 @@ class TestThreads:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip().splitlines() == ["Circle", "99"]
+
+    def test_blob_message_round_trip(self, compile_and_run, tmp_path):
+        # claude.md #198 Phase 4: festina_blob_clone. `b.write(...)`
+        # happens right after postMessage(b) returns -- since
+        # postMessage's own clone runs synchronously on the MAIN
+        # thread before it ever returns (see _emit_thread_box), the
+        # worker's own copy is already fully independent by then,
+        # regardless of how the two threads actually interleave --
+        # proving a genuine deep clone, not a shared handle.
+        (tmp_path / "source.txt").write_text("blob-payload")
+        source = """
+        thread worker {
+            on message(p:blob) {
+                postMessage(p)
+            }
+        }
+        void func onReply(x:blob) {
+            log(x.toText())
+            close(0)
+        }
+        worker.onMessage(void (x:blob) => onReply(x))
+        blob b = 'source.txt'
+        worker.postMessage(b)
+        b.write('mutated-after-send')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "blob-payload"
+
+    def test_image_message_round_trip(self, compile_and_run):
+        # claude.md #198 Phase 4: festina_image_clone (the bytes-round-
+        # trip reuse), plus verifies the img-method allow-list actually
+        # works end to end -- p.drawRect(...) runs INSIDE the thread
+        # body, on that thread's own private clone of the surface, and
+        # the drawn pixels survive the clone back out to the main
+        # thread.
+        source = """
+        thread worker {
+            on message(p:img) {
+                color blue = 'blue'
+                p.drawRect(0, 0, 20, 20, blue)
+                postMessage(p)
+            }
+        }
+        void func onReply(x:img) {
+            color blue = 'blue'
+            log(x.getPixelColor(5, 5) == blue)
+            close(0)
+        }
+        worker.onMessage(void (x:img) => onReply(x))
+        img pic = blankImage(20, 20)
+        worker.postMessage(pic)
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_audio_message_round_trip(self, compile_and_run, tmp_path):
+        # claude.md #198 Phase 4: festina_audio_clone (a direct field-
+        # by-field copy, unlike img's bytes round trip -- see its own
+        # doc comment in festina_runtime_audio.c for why). saveCopy()
+        # writing real, non-empty bytes back out on the MAIN thread
+        # proves the clone that crossed back out of the worker still
+        # carries real, correctly-cloned audio data.
+        _write_wav(tmp_path / "clip.wav", duration_s=0.05)
+        source = """
+        thread worker {
+            on message(p:aud) {
+                postMessage(p)
+            }
+        }
+        void func onReply(x:aud) {
+            x.saveCopy('echo.wav')
+            close(0)
+        }
+        worker.onMessage(void (x:aud) => onReply(x))
+        aud clip = 'clip.wav'
+        worker.postMessage(clip)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        echo = tmp_path / "echo.wav"
+        assert echo.exists()
+        assert echo.stat().st_size > 0
+
+    def test_url_message_round_trip(self, compile_and_run):
+        # claude.md #198 Phase 4: festina_url_clone, including its own
+        # nested map[text] searchParams clone (via the Phase 3-built
+        # festina_map_clone, through the new festina_clone_text_map_
+        # value trampoline).
+        source = """
+        thread worker {
+            on message(p:url) {
+                postMessage(p)
+            }
+        }
+        void func onReply(x:url) {
+            log(x.hostname)
+            log(x.pathname)
+            log(x.searchParams['a'])
+            close(0)
+        }
+        worker.onMessage(void (x:url) => onReply(x))
+        url u = parseURL('https://example.com/path?a=1')
+        worker.postMessage(u)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["example.com", "/path", "1"]
 
     def test_postmessage_of_a_fresh_enum_coercion_does_not_leak_or_double_free(self, compile_and_run):
         # Regression coverage for a real bug found and fixed while

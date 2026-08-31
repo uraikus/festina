@@ -62,9 +62,22 @@ build_runtime() {
 build_runtime core festina_runtime.c $(pkg-config --cflags sqlite3) || exit 1
 build_runtime async festina_runtime_async.c || exit 1
 build_runtime thread festina_runtime_thread.c || exit 1
+# claude.md #198 Phase 4: `thread`'s own blob/img/aud/url clone --
+# festina_runtime_graphics.c/_audio.c only, same conditional probe
+# leak_stress.sh already uses (these two are real, routinely-absent
+# system dependencies, unlike core/async/thread which are pure POSIX).
+GFX_OK=0; AUD_OK=0
+if pkg-config --exists cairo-xlib x11 libjpeg; then
+    build_runtime graphics festina_runtime_graphics.c $(pkg-config --cflags cairo-xlib x11 libjpeg) && GFX_OK=1
+fi
+if pkg-config --exists alsa libmpg123; then
+    build_runtime audio festina_runtime_audio.c $(pkg-config --cflags alsa libmpg123) && AUD_OK=1
+fi
 
 LIBS=(-lsqlite3 -lm -pthread)
 OBJS=("$WORK/rt_core.o" "$WORK/rt_async.o" "$WORK/rt_thread.o")
+[ $GFX_OK = 1 ] && { OBJS+=("$WORK/rt_graphics.o"); LIBS+=($(pkg-config --libs cairo-xlib x11 libjpeg)); }
+[ $AUD_OK = 1 ] && { OBJS+=("$WORK/rt_audio.o"); LIBS+=($(pkg-config --libs alsa libmpg123)); }
 
 PROGRAMS=("$@")
 if [ ${#PROGRAMS[@]} -eq 0 ]; then
@@ -87,6 +100,7 @@ for src in "${PROGRAMS[@]}"; do
     fi
 
     rundir="$WORK/run_$name"; mkdir -p "$rundir"
+    cp "$ROOT"/tests/fixtures/* "$rundir/" 2>/dev/null || true
     if (cd "$rundir" && TSAN_OPTIONS="halt_on_error=1" "$out.bin" > "$out.stdout" 2> "$out.stderr"); then
         echo "ok   $name"
     else

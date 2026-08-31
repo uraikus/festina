@@ -1847,6 +1847,39 @@ void festina_image_free(void *img) {
     free((char *)img - sizeof(int64_t));
 }
 
+/* claude.md #198 Phase 4: `thread`'s own deep-clone of an img message/
+ * field -- deliberately NOT a Cairo surface copy (cairo_surface_t has
+ * no portable "duplicate this" call, and hand-rolling one per surface
+ * TYPE would be real new Cairo-API risk this project has no reason to
+ * take on). Instead round-trips through the SAME encode/decode pair
+ * `.save()` and a database `img` column already use and this project
+ * already has real coverage of -- festina_image_bytes (PNG-encodes on
+ * demand, cached) and festina_image_from_bytes (the decoder every
+ * loadImage()-equivalent entry point already shares) -- lossless
+ * (PNG is lossless regardless of the source format) and, since the
+ * clone never touches the source surface at all, safe to call from a
+ * thread OTHER than whichever one owns the source image (Cairo's own
+ * documented thread-safety model permits concurrent use of DIFFERENT
+ * surfaces on different threads; this never even reaches that surface
+ * concurrently -- festina_image_bytes only WRITES the source's own
+ * lazily-cached PNG bytes if they aren't already cached, which the
+ * codegen-side clone dispatch never races against anything else that
+ * could also be encoding the SAME image at the SAME time). `path` is
+ * copied across afterward, same as festina_load_image's own post-decode
+ * step -- festina_image_from_bytes itself never sets it. */
+void *festina_image_clone(void *img) {
+    if (!img) return NULL;
+    FestinaImageBox *src = (FestinaImageBox *)img;
+    int64_t len = 0;
+    const void *data = festina_image_bytes(img, &len);
+    void *clone = festina_image_from_bytes(data, len, "<thread clone>");
+    FestinaImageBox *dst = (FestinaImageBox *)clone;
+    free(dst->path);
+    dst->path = strdup(src->path ? src->path : "");
+    if (!dst->path) festina_fail("out of memory cloning an image");
+    return clone;
+}
+
 /* claude.md #183 (see uraikus/festina#78): drawImage used to always
  * `cairo_paint`, unconditionally full opacity, completely ignoring
  * `g_fill_alpha` -- every OTHER draw path already carries it (see

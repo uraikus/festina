@@ -91,6 +91,12 @@ void *festina_url_search_params(void *payload);  /* fresh reference --
                                                    * shared-live-value field
                                                    * getter already uses */
 void festina_release_url(void *payload);
+/* claude.md #198 Phase 4: `thread`'s own deep-clone of a url message/
+ * field -- a fresh, independent value (every text field strdup'd,
+ * `search_params` cloned into its own fresh map[text]), never sharing
+ * the source's own refcounted allocation. See its own doc comment in
+ * festina_runtime.c. */
+void *festina_url_clone(void *payload);
 
 /* claude.md #157: try/catch/throw. See festina_runtime.c's own comment
  * on this whole group for the setjmp/longjmp design and its one
@@ -769,6 +775,11 @@ void festina_image_draw_circle_colors(void *img, int64_t x, int64_t y, int64_t r
                                        int64_t fill_color, int64_t border_color);
 void festina_image_draw_text(void *img, const char *text, int64_t x, int64_t y);
 void festina_image_free(void *img);
+/* claude.md #198 Phase 4: `thread`'s own deep-clone of an img message/
+ * field -- round-trips through festina_image_bytes/_from_bytes rather
+ * than copying the Cairo surface directly. See its own doc comment in
+ * festina_runtime_graphics.c. */
+void *festina_image_clone(void *img);
 void festina_draw_image(void *img, int64_t x, int64_t y);
 /* claude.md #185 (uraikus/festina#76 item 3): drawImage(img, x, y, w,
  * h) -- the WHOLE image scaled to fit w x h at (x, y). */
@@ -1278,6 +1289,11 @@ const void *festina_audio_bytes(void *audio, int64_t *out_len);
  * `img` has had since claude.md #92. Stops any channel still playing it
  * first, so "freed while a thread is streaming it" cannot happen. */
 void festina_audio_free(void *audio);
+/* claude.md #198 Phase 4: `thread`'s own deep-clone of an aud message/
+ * field -- a plain field-by-field copy, never touching the channel
+ * pool (a fresh clone has never been played). See its own doc comment
+ * in festina_runtime_audio.c. */
+void *festina_audio_clone(void *audio);
 /* claude.md #38/#99: `channel` names a channel and `explicit_channel`
  * says whether the program actually named one (a bare play() passes 0
  * and gets automatic assignment); `looping` selects playLoop() over
@@ -1405,6 +1421,11 @@ void *festina_blob_open(const char *path);
 void *festina_blob_load_dispatch(const char *path, void (*callback)(void *));
 void *festina_blob_from_bytes(const void *data, int64_t len);
 void festina_blob_release(void *payload);
+/* claude.md #198 Phase 4: `thread`'s own deep-clone of a blob message/
+ * field -- a fresh, independent {path, bytes, length} value, never
+ * sharing the source's own refcounted allocation. See its own doc
+ * comment in festina_runtime.c. */
+void *festina_blob_clone(void *payload);
 char *festina_blob_to_text(void *payload);   /* owned copy, per claude.md #83 */
 const void *festina_blob_bytes(void *payload, int64_t *out_len);
 int8_t festina_blob_write(void *payload, const char *content);

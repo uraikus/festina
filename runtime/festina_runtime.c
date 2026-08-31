@@ -1111,6 +1111,49 @@ void festina_release_url(void *payload) {
     free(u);
 }
 
+/* claude.md #198 Phase 4: `thread`'s own deep-clone of a url message/
+ * field -- a fresh {refcount=1, ...} value with every text field
+ * strdup'd and `search_params` cloned into its own genuinely
+ * independent map[text] (via the generic festina_map_clone --
+ * festina_clone_text_map_value below reinterprets each raw i64 slot
+ * as owned text the same way festina_map_value_to_i64/
+ * _i64_to_map_value already do on the codegen side) rather than
+ * shared -- a url owns no live OS resource, so nothing here needs
+ * anything beyond plain string/map copying. */
+static int64_t festina_clone_text_map_value(int64_t raw) {
+    char *cloned = festina_text_own((const char *)(intptr_t)raw);
+    return (int64_t)(intptr_t)cloned;
+}
+
+void *festina_url_clone(void *payload) {
+    if (!payload) return NULL;
+    FestinaUrlValue *u = FESTINA_URL_FROM_PAYLOAD(payload);
+    FestinaUrlValue *clone = calloc(1, sizeof(FestinaUrlValue));
+    if (!clone) festina_fail("out of memory cloning a url");
+    clone->refcount = 1;
+    clone->protocol = strdup(u->protocol ? u->protocol : "");
+    clone->username = strdup(u->username ? u->username : "");
+    clone->password = strdup(u->password ? u->password : "");
+    clone->hostname = strdup(u->hostname ? u->hostname : "");
+    clone->port = u->port;
+    clone->pathname = strdup(u->pathname ? u->pathname : "");
+    clone->hash = strdup(u->hash ? u->hash : "");
+    if (!clone->protocol || !clone->username || !clone->password || !clone->hostname
+            || !clone->pathname || !clone->hash) {
+        festina_fail("out of memory cloning a url");
+    }
+    FestinaMapBlockCore *src_block =
+        (FestinaMapBlockCore *)((char *)u->search_params - sizeof(int64_t));
+    void *dst_map = festina_new_empty_text_map();
+    FestinaMapBlockCore *dst_block = (FestinaMapBlockCore *)((char *)dst_map - sizeof(int64_t));
+    festina_map_clone(src_block->entries, src_block->capacity,
+                      &dst_block->count, &dst_block->entries,
+                      &dst_block->capacity, &dst_block->tombstones,
+                      festina_clone_text_map_value);
+    clone->search_params = dst_map;
+    return &clone->protocol;
+}
+
 /* claude.md #131: close(code)/`on exit(code:int)`. Lives in the CORE
  * runtime (not festina_runtime_graphics.c, where g_close_handler and
  * the window-close event live) precisely because close() has to work
@@ -2202,6 +2245,26 @@ void festina_blob_release(void *payload) {
     free(b->path);
     free(b->bytes);
     free((char *)payload - sizeof(int64_t));
+}
+
+/* claude.md #198 Phase 4: `thread`'s own deep-clone of a blob message/
+ * field -- malloc a fresh {refcount=1, path, bytes, length} exactly
+ * the way festina_blob_open/_from_bytes already do (via
+ * festina_blob_alloc), with `path`/`bytes` strdup'd/memcpy'd rather
+ * than shared, so the clone is a genuinely independent value with no
+ * live OS resource (a blob owns no open file handle -- it's read
+ * once, at construction) and never touches the source's own refcount
+ * at all. */
+void *festina_blob_clone(void *payload) {
+    if (!payload) return NULL;
+    FestinaBlob *b = (FestinaBlob *)payload;
+    char *path = strdup(b->path ? b->path : "");
+    if (!path) festina_fail("out of memory cloning a blob");
+    char *bytes = malloc((size_t)b->length + 1);
+    if (!bytes) festina_fail("out of memory cloning a blob");
+    memcpy(bytes, b->bytes, (size_t)b->length);
+    bytes[b->length] = '\0';
+    return festina_blob_alloc(path, bytes, b->length);
 }
 
 /* A fresh copy, because every text this runtime hands back is owned by
