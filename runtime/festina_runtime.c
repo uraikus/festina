@@ -4132,6 +4132,30 @@ void festina_map_set(int64_t *count, void **entries, int64_t *capacity, int64_t 
     (*count)++;
 }
 
+/* claude.md #197 Phase 3: the clone-side mirror of festina_map_for_each
+ * -- see this function's own doc comment in festina_runtime.h. Scans
+ * `src_entries` directly (rather than going through
+ * festina_map_for_each's own callback, whose fixed `void(int64_t,
+ * const char*)` signature has no room for the destination's own
+ * count/entries/capacity/tombstones out-parameters) since building the
+ * fresh table is this function's own job, not a per-entry callback's. */
+void festina_map_clone(void *src_entries, int64_t src_capacity,
+                       int64_t *dst_count, void **dst_entries, int64_t *dst_capacity,
+                       int64_t *dst_tombstones, int64_t (*value_clone_fn)(int64_t)) {
+    *dst_count = 0;
+    *dst_entries = NULL;
+    *dst_capacity = 0;
+    *dst_tombstones = 0;
+    if (!src_entries) return;
+    FestinaMapEntry *buckets = (FestinaMapEntry *)src_entries;
+    for (int64_t i = 0; i < src_capacity; i++) {
+        char *k = buckets[i].key;
+        if (k == NULL || k == FESTINA_MAP_TOMBSTONE) continue;
+        int64_t cloned_value = value_clone_fn(buckets[i].value);
+        festina_map_set(dst_count, dst_entries, dst_capacity, dst_tombstones, k, cloned_value);
+    }
+}
+
 /* claude.md #111/#175: `delete m.key` / `delete m['key']` -- remove
  * the entry outright, JS-style, rather than setting it to null: a
  * deleted key stops existing (forEach no longer visits it, count

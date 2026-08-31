@@ -941,6 +941,16 @@ class CodeGen:
                                                 # what _emit_call's bare `postMessage(x)`
                                                 # dispatch (the only thing that needs to know "am
                                                 # I inside a thread body right now") consults.
+        self._struct_clone_fns = {}            # claude.md #197 Phase 3: struct name -> LLVM
+                                                # function name of its own lazily-generated
+                                                # deep-clone wrapper -- see _clone_fn_for_struct's
+                                                # own comment. The clone-side mirror of
+                                                # self._struct_release_fns.
+        self._array_clone_fns = {}             # claude.md #197 Phase 3: the arr[T] counterpart,
+                                                # keyed by types_mod.type_name(ArrayType) the same
+                                                # way self._array_release_fns already is.
+        self._map_clone_fns = {}               # claude.md #197 Phase 3: the map[T] counterpart.
+        self._enum_clone_fns = {}              # claude.md #197 Phase 3: the enum counterpart.
         self.uses_graphics_code = False        # any drawRect/drawCircle/drawText/drawImage/
                                                 # loadImage call anywhere -- a strict superset of
                                                 # uses_graphics (see _emit_graphics_call's doc
@@ -1416,7 +1426,7 @@ class CodeGen:
             "declare ptr @festina_blob_load_dispatch(ptr, ptr)",
             "declare void @festina_register_async_io_hooks()",
             # claude.md #195 Phase 2: `thread NAME { ... }`.
-            "declare ptr @festina_thread_register(ptr, ptr, ptr)",
+            "declare ptr @festina_thread_register(ptr, ptr, ptr, ptr, ptr)",
             "declare void @festina_thread_spawn(ptr)",
             "declare void @festina_thread_post(ptr, ptr)",
             "declare void @festina_thread_post_outbound(ptr, ptr)",
@@ -1854,6 +1864,12 @@ class CodeGen:
             # comment) before freeing the entries buffer itself -- see
             # _emit_free_active_locals's MapType branch.
             "declare void @festina_map_free_entries(ptr, i64)",
+            # claude.md #197 Phase 3: `thread`'s own deep-clone of a
+            # map[T] message/field -- the clone-side mirror of
+            # festina_map_for_each, walking a SOURCE table's own live
+            # buckets and inserting a cloned copy of each into a fresh
+            # destination table (see _clone_fn_for_map's own comment).
+            "declare void @festina_map_clone(ptr, i64, ptr, ptr, ptr, ptr, ptr)",
             # claude.md #56: Math.floor/ceil/round/trunc, via LLVM's
             # built-in intrinsics rather than a runtime C function.
             "declare i64 @llvm.fptosi.sat.i64.f64(double)",
@@ -2588,23 +2604,38 @@ class CodeGen:
 
     # ---- claude.md #195 Phase 2: `thread NAME { ... }` ----
 
+    _THREAD_PASSTHROUGH_PTR_TYPES = (types_mod.StructType, types_mod.ArrayType,
+                                     types_mod.MapType, types_mod.EnumType)
+
+    def _thread_payload_is_passthrough(self, type_):
+        """claude.md #197 Phase 3: true for every type whose OWN value is
+        already the exact `ptr` a thread payload needs -- text (an
+        owned buffer, unchanged since Phase 2) and, as of this phase,
+        struct/arr[T]/map[T]/enum (each already `ptr`-shaped per
+        _llvm_type, and a CLONE of one of these already IS a fresh,
+        independent top-level allocation -- see _emit_thread_clone_value
+        -- so there is nothing left for a box to wrap)."""
+        return type_ == TEXT or isinstance(type_, self._THREAD_PASSTHROUGH_PTR_TYPES)
+
     def _emit_thread_box(self, val, type_, lines):
-        """Turns a Phase-2 (int/float/bool/text) value into the single
-        `void *payload` festina_thread_post/festina_thread_post_outbound
-        both carry -- see festina_runtime.h's own doc comment on
-        FestinaThreadHandle for the exact convention this mirrors: a
-        fresh malloc'd 8-byte box holding the raw bit pattern for a
-        scalar, or -- for text -- the malloc'd, owned string buffer
-        itself, with no separate wrapper (festina_text_own already IS
-        "a plain owned buffer", exactly what a box would otherwise be).
-        Either way `free(payload)` alone, on the receiving side, is
-        exactly correct with no type-specific release function needed
-        (see _emit_thread_unbox's own comment on what that means for
-        text specifically)."""
-        if type_ == TEXT:
-            box = self.tmp()
-            lines.append(f"  {box} = call ptr @festina_text_own(ptr {val})")
-            return box
+        """Turns a thread-sendable value into the single `void *payload`
+        festina_thread_post/festina_thread_post_outbound both carry --
+        see festina_runtime.h's own doc comment on FestinaThreadHandle
+        for the exact convention this mirrors: a fresh malloc'd 8-byte
+        box holding the raw bit pattern for a scalar (int/float/bool/
+        color); a plain, unchanged pointer copy for a font (its own
+        static, process-lifetime storage needs no cloning at all -- see
+        FontType's own doc comment in types.py); and, for text/struct/
+        arr[T]/map[T]/enum, no separate wrapper -- `val` is CLONED
+        in place (_emit_thread_clone_value) and the fresh, independent
+        result IS the payload. Every payload this returns is something
+        this thread's own _thread_payload_release_fn(type_) can
+        correctly release once, on the receiving side, with no
+        type-specific handling needed at any OTHER call site."""
+        if self._thread_payload_is_passthrough(type_):
+            return self._emit_thread_clone_value(val, type_, lines)
+        if isinstance(type_, types_mod.FontType):
+            return val
         box = self.tmp()
         lines.append(f"  {box} = call ptr @malloc(i{self.pointer_bits} 8)")
         llvm_ty = _llvm_type(type_)
@@ -2612,19 +2643,22 @@ class CodeGen:
         return box
 
     def _emit_thread_unbox(self, box, type_, lines):
-        """The mirror of _emit_thread_box -- reads a Phase-2 value back
-        out of a `void *payload`. For a scalar this is a plain load at
-        the box's own known width; for text the box pointer itself IS
-        the text value (no load), so the result is simply an alias of
-        `box` -- ownership transfers to whatever binds this value
-        (an `on message(p:text)` parameter, an onMessage() callback
-        argument), the identical "borrowed unless it escapes" contract
-        an ordinary function parameter already has (_emit_param_bindings
-        retains/copies it only if it escapes) -- the runtime's own
-        `free(payload)` right after the handler/callback returns (see
-        festina_runtime_thread.c) is what balances the box's own
-        allocation either way, so nothing here may ALSO free `box`."""
-        if type_ == TEXT:
+        """The mirror of _emit_thread_box -- reads a value back out of a
+        `void *payload`. For every _thread_payload_is_passthrough type
+        (text/struct/arr[T]/map[T]/enum) the box pointer itself IS the
+        value (no load) -- ownership transfers to whatever binds it (an
+        `on message(p:T)` parameter, an onMessage() callback argument),
+        the identical "borrowed unless it escapes" contract an ordinary
+        function parameter already has (_emit_param_bindings retains/
+        copies it only if it escapes); a font is the same plain-alias
+        shape for the unrelated reason given in _emit_thread_box. For a
+        genuine scalar box (int/float/bool/color) this is a plain load
+        at the box's own known width. Either way, the runtime's own
+        call to _thread_payload_release_fn(type_)'s result -- right
+        after the handler/callback returns (see
+        festina_runtime_thread.c) -- is what balances the box's own
+        allocation, so nothing here may ALSO release/free `box`."""
+        if self._thread_payload_is_passthrough(type_) or isinstance(type_, types_mod.FontType):
             return box
         out = self.tmp()
         llvm_ty = _llvm_type(type_)
@@ -2641,37 +2675,483 @@ class CodeGen:
         to have (`%arg.<name>`), so that helper's own body needs no
         awareness that the value actually came from a thread queue."""
         llvm_ty = _llvm_type(type_)
-        if type_ == TEXT:
-            # A plain load would be wrong (box already IS the text
-            # pointer) -- this is a no-op pointer alias under the
-            # required name, the `ptr` counterpart of the scalar `add
-            # ..., 0`/`fadd ..., 0.0` tricks below.
+        if self._thread_payload_is_passthrough(type_) or isinstance(type_, types_mod.FontType):
+            # A plain load would be wrong for a passthrough type (box
+            # already IS the value) -- this is a no-op pointer alias
+            # under the required name, the `ptr` counterpart of the
+            # scalar `add ..., 0`/`fadd ..., 0.0` tricks below.
             lines.append(f"  {dest_reg} = getelementptr i8, ptr {box}, i64 0")
         elif llvm_ty == "double":
             lines.append(f"  {dest_reg} = fadd double {self._emit_thread_unbox(box, type_, lines)}, 0.0")
         else:
             lines.append(f"  {dest_reg} = add {llvm_ty} {self._emit_thread_unbox(box, type_, lines)}, 0")
 
-    def _check_thread_phase2_type(self, type_, what, node):
-        # claude.md #195 Phase 2 deliberately implements only the
-        # int/float/bool/text slice of what semantic.py's own
-        # _is_thread_sendable_type already accepts as a message type
-        # (struct/arr/map/enum/blob/img/aud/url/color/font are all
-        # legal per Phase 1's own compile-time rules, but their own
-        # deep-clone codegen -- _clone_fn_for_* -- is Phase 3/4 work,
-        # not yet written). A program using one of those today would
-        # otherwise hit a confusing crash or miscompile deep in this
-        # method instead of a clear, honest "not yet" -- see this
-        # project's own established convention (e.g. claude.md #170's
-        # macOS try/catch rejection) for erroring loudly on a real,
-        # documented gap rather than silently mishandling it.
-        if type_ not in (INT, FLOAT, BOOL, TEXT):
+    def _thread_payload_release_fn(self, type_):
+        """claude.md #197 Phase 3: the function to call, on the
+        receiving side, to release ONE payload once its handler/
+        callback has consumed it -- `@free` for a plain box (int/
+        float/bool/color) or an owned text buffer (`_emit_thread_box`
+        never wraps text in a further box, so its own buffer IS the
+        payload, and `free()` is exactly correct); a real Festina
+        release cascade -- `_release_fn_for(type_)`, unchanged, since
+        every clone this phase produces already carries the ordinary
+        refcount header every other value of that type does -- for
+        struct/arr[T]/map[T]/enum, matching `_release_fn_for`'s own
+        `void(ptr)` signature exactly (no adapter needed: it already
+        IS `void(*)(void*)`). A font needs no release at all (its own
+        storage is immortal, process-lifetime, never allocated per-
+        message in the first place -- see _emit_thread_box) --
+        `@free` is passed anyway rather than NULL, since NULL is never
+        called there (a font box is never a fresh allocation), simply
+        for one less "maybe-NULL" branch in the C runtime."""
+        if type_ == TEXT or isinstance(type_, types_mod.FontType):
+            return "@free"
+        if isinstance(type_, self._THREAD_PASSTHROUGH_PTR_TYPES):
+            return self._release_fn_for(type_)
+        return "@free"
+
+    def _is_thread_clonable_type(self, type_, _seen_structs=frozenset()):
+        """claude.md #197 Phase 3: mirrors semantic.py's own
+        _is_thread_sendable_type recursive-walk shape exactly (same
+        cycle guard: a struct already being checked higher up this
+        same recursion is trusted, not re-entered), but answers a
+        narrower, CODEGEN-side question -- can this compiler actually
+        CLONE a value of this type today, not just is it legal per
+        Phase 1's own compile-time rules. Scalars (int/float/bool/
+        color) plus text and font (see _emit_thread_box's own comment
+        on why font needs no real cloning) are always clonable; struct/
+        arr[T]/map[T]/enum are clonable when built recursively from
+        those AND the type is acyclic (_is_cyclic_type) -- a genuine
+        type-level cycle would make the naive recursive clone this
+        phase generates loop forever on a correspondingly cyclic VALUE,
+        unlike release's own refcount-bounded cascade, so it's rejected
+        outright here rather than risking a stack overflow/hang at
+        runtime (a documented, narrower scope cut, not a silent gap --
+        see _check_thread_clonable_type's own error message). blob/img/
+        aud/url are legal message types per Phase 1 but still not
+        clonable here -- that's Phase 4's own work."""
+        if type_ in (INT, FLOAT, BOOL, TEXT) or isinstance(
+                type_, (types_mod.ColorType, types_mod.FontType)):
+            return True
+        if isinstance(type_, types_mod.StructType):
+            if self._is_cyclic_type(type_):
+                return False
+            if type_.name in _seen_structs:
+                return True
+            seen = _seen_structs | {type_.name}
+            return all(self._is_thread_clonable_type(ftype, seen)
+                      for _, ftype in self.struct_fields(type_.name))
+        if isinstance(type_, types_mod.ArrayType):
+            if self._is_cyclic_type(type_):
+                return False
+            return self._is_thread_clonable_type(type_.element, _seen_structs)
+        if isinstance(type_, types_mod.MapType):
+            if self._is_cyclic_type(type_):
+                return False
+            return self._is_thread_clonable_type(type_.value, _seen_structs)
+        if isinstance(type_, types_mod.EnumType):
+            info = self.enums.get(type_.name)
+            if info is None:
+                return True
+            return all(self._is_thread_clonable_type(m, _seen_structs) for m in info.members)
+        return False
+
+    def _check_thread_clonable_type(self, type_, what, node):
+        # claude.md #197 Phase 3 still doesn't implement EVERY type
+        # Phase 1's own semantic-level _is_thread_sendable_type accepts
+        # -- blob/img/aud/url (Phase 4) and a self-referencing (cyclic)
+        # struct/arr[T]/map[T] (see _is_thread_clonable_type's own
+        # comment on why) both fall through to this error rather than a
+        # confusing crash or miscompile -- see this project's own
+        # established convention (e.g. claude.md #170's macOS try/catch
+        # rejection) for erroring loudly on a real, documented gap
+        # rather than silently mishandling it.
+        if not self._is_thread_clonable_type(type_):
             raise CodegenError(
                 f"{what} of type {types_mod.type_name(type_)} is not supported yet -- "
-                f"claude.md #195 Phase 2 only implements int/float/bool/text thread "
-                f"messages; struct/arr/map/enum/blob/img/aud/url message types are "
-                f"planned for a later phase",
+                f"claude.md #197 Phase 3 does not yet clone blob/img/aud/url across a "
+                f"thread boundary (planned for Phase 4), or a self-referencing "
+                f"struct/arr[T]/map[T] type (cloning it could loop forever on a genuinely "
+                f"cyclic value) -- everything else (int/float/bool/text/color/font, "
+                f"and struct/arr[T]/map[T]/enum built acyclically from those) is "
+                f"supported",
                 file=self.filename, line=getattr(node, "line", 0))
+
+    def _emit_thread_postmessage_cleanup(self, source_expr, val, vtype, target_type, lines):
+        """claude.md #197 Phase 3: releases postMessage(x)'s own
+        argument once _emit_thread_box has already produced an
+        independent clone of it -- `val` itself is never touched by
+        the clone, so a borrowed alias (an existing variable, field,
+        element) must be left exactly as it was; only a genuinely
+        FRESH temporary this call site now owns and is done with gets
+        released here.
+
+        Deliberately NOT `self._free_text_temp(source_expr, val,
+        vtype, lines)` whenever `target_type` differs from `vtype` --
+        that helper's own `vtype == TEXT` check is only sound when
+        `val` is STILL text at the point it runs, which a coercion
+        that changes representation (text coerced into a mixed enum's
+        own fresh box, claude.md #176) breaks: `val` here is the
+        POST-coercion value, so blindly freeing it as text would free
+        the wrong allocation with the wrong function -- the exact
+        pitfall claude.md #194 already found and fixed for blob/img/
+        aud argument coercion, reachable here for the first time now
+        that `target_type` can be a compound type. `target_type ==
+        TEXT` is the one case where that pitfall can't apply (a TEXT
+        source coercing into TEXT is always a no-op, never a
+        different allocation), so _free_text_temp is used there
+        unchanged. Otherwise, _refcounted_source_is_fresh -- not the
+        plain node-only _is_owning_refcounted_source check
+        _release_owned_receiver itself uses -- is what correctly
+        recognizes a coercion-minted fresh value for what it is."""
+        if target_type == TEXT:
+            self._free_text_temp(source_expr, val, vtype, lines)
+        elif _is_refcounted(target_type) and self._refcounted_source_is_fresh(source_expr, vtype, target_type):
+            lines.append(f"  call void {self._release_fn_for(target_type)}(ptr {val})")
+
+    def _emit_thread_clone_value(self, val, type_, lines):
+        """claude.md #197 Phase 3: turns an already-emitted value
+        `val` (borrowed -- this never touches whatever `val` itself
+        aliases) into a fresh, INDEPENDENT copy of the same type,
+        suitable for handing across a thread boundary -- the entire
+        safety argument behind claude.md #195's "deep clone, never a
+        shared pointer" design, made real for the compound types this
+        phase adds. Dispatches to whichever mechanism `type_` actually
+        needs: `festina_text_own` for text (unchanged since Phase 2);
+        a real generated clone cascade (_clone_fn_for) for struct/
+        arr[T]/map[T]/enum; a plain, unretained pointer copy for a font
+        (immortal, process-lifetime storage -- see FontType's own doc
+        comment in types.py, and _emit_thread_box's matching comment);
+        and, for every other (scalar) type, `val` itself unchanged --
+        an int/float/bool/color value is already its own independent
+        copy the moment it's loaded into a register, nothing to clone
+        at all."""
+        if type_ == TEXT:
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_text_own(ptr {val})")
+            return out
+        if isinstance(type_, self._THREAD_PASSTHROUGH_PTR_TYPES):
+            out = self.tmp()
+            clone_fn = self._clone_fn_for(type_)
+            lines.append(f"  {out} = call ptr {clone_fn}(ptr {val})")
+            return out
+        return val
+
+    def _clone_fn_for(self, type_):
+        """claude.md #197 Phase 3: the clone-side mirror of
+        _release_fn_for -- the single dispatch point for "the LLVM
+        function name to call to produce a fresh, deep, independent
+        copy of a value of `type_`." Only ever reached for a type
+        _is_thread_clonable_type has already proven acyclic and built
+        entirely from clonable leaves, so none of the four cases below
+        needs its own additional validation."""
+        if isinstance(type_, types_mod.StructType):
+            return self._clone_fn_for_struct(type_)
+        if isinstance(type_, types_mod.ArrayType):
+            return self._clone_fn_for_array(type_)
+        if isinstance(type_, types_mod.MapType):
+            return self._clone_fn_for_map(type_)
+        if isinstance(type_, types_mod.EnumType):
+            return self._clone_fn_for_enum(type_)
+        raise CodegenError(f"cannot clone a value of type {types_mod.type_name(type_)} across a thread boundary")
+
+    def _clone_fn_for_struct(self, type_):
+        """claude.md #197 Phase 3: generates (once per struct name,
+        cached in self._struct_clone_fns -- the cache write happens
+        BEFORE the field loop below, the same load-bearing ordering
+        _release_fn_for_struct's own cache uses, in case two sibling
+        fields share this type) a function that allocates a fresh
+        heap header (_emit_fresh_heap_header -- refcount=1, and, for a
+        pure-struct enum member, the same widened {tag, refcount,
+        payload} shape claude.md #176 already gives one) and copies
+        every field across, recursively cloning any struct/arr[T]/
+        map[T]/enum-typed field via this same dispatch
+        (_emit_thread_clone_value) and copying every scalar/text/
+        color/font field directly.
+
+        No null check: unlike an enum-typed value, a struct-typed one
+        is never actually null in practice -- a global/local struct
+        variable always gets real, zero-initialized static/stack
+        storage the moment it's declared (see _global_var_defs'/
+        _emit_stmt's own StructType handling), never a null pointer."""
+        if type_.name in self._struct_clone_fns:
+            return self._struct_clone_fns[type_.name]
+        fn_name = f"@__festina_clone_struct_{type_.name}"
+        self._struct_clone_fns[type_.name] = fn_name
+        struct_ty = self.struct_llvm_name(type_.name)
+        tagged = type_.name in self._tagged_structs
+        type_tag = self._enum_tag_const(type_) if tagged else None
+        body = [f"define ptr {fn_name}(ptr %src) {{", "entry:"]
+        dst = self._emit_fresh_heap_header(struct_ty, body, type_tag=type_tag)
+        for i, (_, ftype) in enumerate(self.struct_fields(type_.name)):
+            f_llvm_ty = _llvm_type(ftype)
+            src_fptr = self.tmp()
+            body.append(f"  {src_fptr} = getelementptr {struct_ty}, ptr %src, i32 0, i32 {i}")
+            src_fval = self.tmp()
+            body.append(f"  {src_fval} = load {f_llvm_ty}, ptr {src_fptr}")
+            cloned_fval = self._emit_thread_clone_value(src_fval, ftype, body)
+            dst_fptr = self.tmp()
+            body.append(f"  {dst_fptr} = getelementptr {struct_ty}, ptr {dst}, i32 0, i32 {i}")
+            body.append(f"  store {f_llvm_ty} {cloned_fval}, ptr {dst_fptr}")
+        body.append(f"  ret ptr {dst}")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _clone_fn_for_array(self, type_):
+        """claude.md #197 Phase 3: generates (once per element type,
+        cached in self._array_clone_fns the same way
+        self._array_release_fns is) a function that allocates a fresh
+        header + a fresh, identically-sized data buffer, then clones
+        each element across via a plain runtime loop
+        (_emit_clone_array_elements) -- the clone-side mirror of
+        _release_fn_for_array's own element-release loop."""
+        key = types_mod.type_name(type_)
+        if key in self._array_clone_fns:
+            return self._array_clone_fns[key]
+        fn_name = f"@__festina_clone_array_{self._unique()}"
+        self._array_clone_fns[key] = fn_name
+        elem_type = type_.element
+        elem_llvm_ty = _llvm_type(elem_type)
+        body = [f"define ptr {fn_name}(ptr %src) {{", "entry:"]
+        dst = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, body)
+        src_len_ptr = self.tmp()
+        body.append(f"  {src_len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr %src, i32 0, i32 0")
+        len_val = self.tmp()
+        body.append(f"  {len_val} = load i64, ptr {src_len_ptr}")
+        dst_len_ptr = self.tmp()
+        body.append(f"  {dst_len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {dst}, i32 0, i32 0")
+        body.append(f"  store i64 {len_val}, ptr {dst_len_ptr}")
+        src_data_field = self.tmp()
+        body.append(f"  {src_data_field} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr %src, i32 0, i32 1")
+        src_data = self.tmp()
+        body.append(f"  {src_data} = load ptr, ptr {src_data_field}")
+        elem_size = self._sizeof(elem_llvm_ty, body)
+        total_size = self.tmp()
+        body.append(f"  {total_size} = mul i64 {elem_size}, {len_val}")
+        dst_data = self._emit_malloc(total_size, body)
+        dst_data_field = self.tmp()
+        body.append(f"  {dst_data_field} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {dst}, i32 0, i32 1")
+        body.append(f"  store ptr {dst_data}, ptr {dst_data_field}")
+        self._emit_clone_array_elements(src_data, dst_data, len_val, elem_type, elem_llvm_ty, body)
+        body.append(f"  ret ptr {dst}")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _emit_clone_array_elements(self, src_data, dst_data, len_val, elem_type, elem_llvm_ty, lines):
+        """claude.md #197 Phase 3: a plain counted loop from 0 to
+        `len_val`, cloning the element at each index from `src_data`
+        into the freshly allocated `dst_data` -- the clone-side mirror
+        of _emit_release_array_elements' own shared loop."""
+        idx_slot = self.tmp()
+        lines.append(f"  {idx_slot} = alloca i64")
+        lines.append(f"  store i64 0, ptr {idx_slot}")
+        loop_cond = self.label("clonearr.loopcond")
+        loop_body = self.label("clonearr.loopbody")
+        loop_end = self.label("clonearr.loopend")
+        lines.append(f"  br label %{loop_cond}")
+        lines.append(f"{loop_cond}:")
+        idx_val = self.tmp()
+        lines.append(f"  {idx_val} = load i64, ptr {idx_slot}")
+        keep_going = self.tmp()
+        lines.append(f"  {keep_going} = icmp slt i64 {idx_val}, {len_val}")
+        lines.append(f"  br i1 {keep_going}, label %{loop_body}, label %{loop_end}")
+        lines.append(f"{loop_body}:")
+        src_elem_ptr = self.tmp()
+        lines.append(f"  {src_elem_ptr} = getelementptr {elem_llvm_ty}, ptr {src_data}, i64 {idx_val}")
+        src_elem_val = self.tmp()
+        lines.append(f"  {src_elem_val} = load {elem_llvm_ty}, ptr {src_elem_ptr}")
+        cloned = self._emit_thread_clone_value(src_elem_val, elem_type, lines)
+        dst_elem_ptr = self.tmp()
+        lines.append(f"  {dst_elem_ptr} = getelementptr {elem_llvm_ty}, ptr {dst_data}, i64 {idx_val}")
+        lines.append(f"  store {elem_llvm_ty} {cloned}, ptr {dst_elem_ptr}")
+        next_idx = self.tmp()
+        lines.append(f"  {next_idx} = add i64 {idx_val}, 1")
+        lines.append(f"  store i64 {next_idx}, ptr {idx_slot}")
+        lines.append(f"  br label %{loop_cond}")
+        lines.append(f"{loop_end}:")
+
+    def _clone_fn_for_map(self, type_):
+        """claude.md #197 Phase 3: generates (once per value type,
+        cached in self._map_clone_fns) a function that allocates a
+        fresh, empty map header and hands off to the new
+        `festina_map_clone` runtime function (the clone-side mirror of
+        `festina_map_for_each`, which `_release_fn_for_map`'s own
+        wrapper builds on) -- entries are opaque to codegen (see that
+        method's own comment on why), so, exactly like release, this
+        can't just emit a raw GEP loop the way the array version does.
+        `festina_map_clone` walks the source table's own live buckets,
+        strdup's each key, and calls a small per-value-type i64-in/
+        i64-out trampoline (_emit_map_value_clone_trampoline) to
+        produce each cloned value before inserting it into the fresh
+        destination table via festina_map_set (which grows it as
+        needed) -- so the destination's own capacity/tombstone shape
+        never has to match the source's."""
+        key = types_mod.type_name(type_)
+        if key in self._map_clone_fns:
+            return self._map_clone_fns[key]
+        fn_name = f"@__festina_clone_map_{self._unique()}"
+        self._map_clone_fns[key] = fn_name
+        value_type = type_.value
+        value_clone_trampoline = self._emit_map_value_clone_trampoline(value_type)
+        body = [f"define ptr {fn_name}(ptr %src) {{", "entry:"]
+        dst = self._emit_fresh_heap_header(FESTINA_MAP_LLVM_TYPE, body)
+        src_entries_field = self.tmp()
+        body.append(f"  {src_entries_field} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr %src, i32 0, i32 1")
+        src_entries = self.tmp()
+        body.append(f"  {src_entries} = load ptr, ptr {src_entries_field}")
+        src_cap_ptr = self.tmp()
+        body.append(f"  {src_cap_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr %src, i32 0, i32 2")
+        src_cap = self.tmp()
+        body.append(f"  {src_cap} = load i64, ptr {src_cap_ptr}")
+        dst_count_ptr = self.tmp()
+        body.append(f"  {dst_count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {dst}, i32 0, i32 0")
+        dst_entries_ptr = self.tmp()
+        body.append(f"  {dst_entries_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {dst}, i32 0, i32 1")
+        dst_cap_ptr = self.tmp()
+        body.append(f"  {dst_cap_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {dst}, i32 0, i32 2")
+        dst_tomb_ptr = self.tmp()
+        body.append(f"  {dst_tomb_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {dst}, i32 0, i32 3")
+        body.append(
+            f"  call void @festina_map_clone(ptr {src_entries}, i64 {src_cap}, "
+            f"ptr {dst_count_ptr}, ptr {dst_entries_ptr}, ptr {dst_cap_ptr}, ptr {dst_tomb_ptr}, "
+            f"ptr {value_clone_trampoline})")
+        body.append(f"  ret ptr {dst}")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
+
+    def _emit_map_value_clone_trampoline(self, value_type):
+        """claude.md #197 Phase 3: generates a small function matching
+        `festina_map_clone`'s own fixed `int64_t(*)(int64_t)`
+        value-clone callback ABI -- unboxes a map's raw i64 value slot
+        into `value_type`'s real representation
+        (`_i64_to_map_value`, the identical reinterpretation
+        `festina_map_get`'s own caller already applies), clones it
+        (`_emit_thread_clone_value`), and packs the result back down
+        to i64 (`_map_value_to_i64`) for `festina_map_clone` to store
+        into the fresh destination table. Never cached across value
+        types the same way `_emit_map_value_release_trampoline` isn't
+        either -- generated fresh at the one call site
+        `_clone_fn_for_map` needs it from."""
+        uid = self._unique()
+        trampoline_name = f"@__festina_map_clone_value_{uid}"
+        body = [f"define i64 {trampoline_name}(i64 %raw) {{", "entry:"]
+        val = self._i64_to_map_value("%raw", value_type, body)
+        cloned = self._emit_thread_clone_value(val, value_type, body)
+        packed = self._map_value_to_i64(cloned, value_type, body)
+        body.append(f"  ret i64 {packed}")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return trampoline_name
+
+    def _clone_fn_for_enum(self, type_):
+        """claude.md #197 Phase 3: generates (once per enum name,
+        cached in self._enum_clone_fns) whichever of the two shapes
+        this specific enum needs -- the clone-side mirror of
+        _release_fn_for_enum, same pure-struct-vs-mixed split.
+
+        Pure-struct case: an enum-typed value defaults to null until
+        assigned (claude.md #176, no auto-vivify), so this needs the
+        same null check _release_fn_for_enum's own pure-struct branch
+        does (unlike a plain struct clone, which never needs one --
+        see _clone_fn_for_struct's own comment). A non-null value
+        already IS its current member's own struct pointer -- reads
+        the tag at payload-16 and dispatches straight to that member's
+        own _clone_fn_for(member), which already allocates the
+        correctly (tag-widened) header and returns it directly; no
+        separate enum-level allocation of its own, exactly mirroring
+        why release has nothing extra to do here either.
+
+        Mixed case: allocates its own fresh {tag, value} box (the
+        same FESTINA_ENUM_BOX_LLVM_TYPE shape _coerce's own enum
+        branch and _release_fn_for_enum's mixed branch already use),
+        copies the tag across unchanged, and clones the inner value
+        (dispatched by tag, matching the pure-struct case's own
+        dispatch) before storing the freshly cloned, re-packed i64
+        into the new box."""
+        if type_.name in self._enum_clone_fns:
+            return self._enum_clone_fns[type_.name]
+        fn_name = f"@__festina_clone_enum_{type_.name}"
+        self._enum_clone_fns[type_.name] = fn_name
+        info = self.enums[type_.name]
+        body = [f"define ptr {fn_name}(ptr %src) {{", "entry:"]
+        null_check = self.tmp()
+        body.append(f"  {null_check} = icmp eq ptr %src, null")
+        null_label = self.label("cloneenum.null")
+        nonnull_label = self.label("cloneenum.nonnull")
+        body.append(f"  br i1 {null_check}, label %{null_label}, label %{nonnull_label}")
+        body.append(f"{null_label}:")
+        body.append("  ret ptr null")
+        body.append(f"{nonnull_label}:")
+        if info.is_pure_struct:
+            tag_ptr = self.tmp()
+            body.append(f"  {tag_ptr} = getelementptr i8, ptr %src, i64 -16")
+            tag = self.tmp()
+            body.append(f"  {tag} = load ptr, ptr {tag_ptr}")
+            for i, member in enumerate(info.members):
+                const = self._enum_tag_const(member)
+                match_label = self.label(f"cloneenum.match{i}")
+                cont_label = self.label(f"cloneenum.cont{i}")
+                cmp = self.tmp()
+                body.append(f"  {cmp} = icmp eq ptr {tag}, {const}")
+                body.append(f"  br i1 {cmp}, label %{match_label}, label %{cont_label}")
+                body.append(f"{match_label}:")
+                cloned_member = self.tmp()
+                body.append(f"  {cloned_member} = call ptr {self._clone_fn_for(member)}(ptr %src)")
+                body.append(f"  ret ptr {cloned_member}")
+                body.append(f"{cont_label}:")
+            # Unreachable in a correct program -- construction (see
+            # _coerce's own enum branch) always writes a valid member
+            # tag, and no member is ever added or removed after
+            # analyze_enum resolves this enum's own member list.
+            body.append("  unreachable")
+        else:
+            src_tag_ptr = self.tmp()
+            body.append(f"  {src_tag_ptr} = getelementptr {FESTINA_ENUM_BOX_LLVM_TYPE}, ptr %src, i32 0, i32 0")
+            tag = self.tmp()
+            body.append(f"  {tag} = load ptr, ptr {src_tag_ptr}")
+            src_val_ptr = self.tmp()
+            body.append(f"  {src_val_ptr} = getelementptr {FESTINA_ENUM_BOX_LLVM_TYPE}, ptr %src, i32 0, i32 1")
+            raw_val = self.tmp()
+            body.append(f"  {raw_val} = load i64, ptr {src_val_ptr}")
+            dst = self._emit_fresh_heap_header(FESTINA_ENUM_BOX_LLVM_TYPE, body)
+            dst_tag_ptr = self.tmp()
+            body.append(f"  {dst_tag_ptr} = getelementptr {FESTINA_ENUM_BOX_LLVM_TYPE}, ptr {dst}, i32 0, i32 0")
+            body.append(f"  store ptr {tag}, ptr {dst_tag_ptr}")
+            dst_val_ptr = self.tmp()
+            body.append(f"  {dst_val_ptr} = getelementptr {FESTINA_ENUM_BOX_LLVM_TYPE}, ptr {dst}, i32 0, i32 1")
+            done_label = self.label("cloneenum.done")
+            for i, member in enumerate(info.members):
+                const = self._enum_tag_const(member)
+                match_label = self.label(f"cloneenum.vmatch{i}")
+                cont_label = self.label(f"cloneenum.vcont{i}")
+                cmp = self.tmp()
+                body.append(f"  {cmp} = icmp eq ptr {tag}, {const}")
+                body.append(f"  br i1 {cmp}, label %{match_label}, label %{cont_label}")
+                body.append(f"{match_label}:")
+                inner = self._i64_to_map_value(raw_val, member, body)
+                cloned_inner = self._emit_thread_clone_value(inner, member, body)
+                packed = self._map_value_to_i64(cloned_inner, member, body)
+                body.append(f"  store i64 {packed}, ptr {dst_val_ptr}")
+                body.append(f"  br label %{done_label}")
+                body.append(f"{cont_label}:")
+            # Unreachable in a correct program, same reasoning as the
+            # pure-struct branch's own trailing `unreachable` above --
+            # reached only if no member's tag matched, which never
+            # happens for a validly constructed box.
+            body.append("  unreachable")
+            body.append(f"{done_label}:")
+            body.append(f"  ret ptr {dst}")
+        body.append("}")
+        body.append("")
+        self.func_defs.extend(body)
+        return fn_name
 
     def _emit_thread_decl(self, decl):
         """claude.md #195 Phase 2: compiles `thread NAME { ... }` into a
@@ -2702,9 +3182,9 @@ class CodeGen:
             "out_trampoline": None,        # set the first time NAME.onMessage(...) is emitted
         }
         if info.inbound_type is not None:
-            self._check_thread_phase2_type(info.inbound_type, "an 'on message' parameter", decl)
+            self._check_thread_clonable_type(info.inbound_type, "an 'on message' parameter", decl)
         if info.outbound_type is not None:
-            self._check_thread_phase2_type(info.outbound_type, "a postMessage() argument", decl)
+            self._check_thread_clonable_type(info.outbound_type, "a postMessage() argument", decl)
 
         # claude.md #195 Phase 1: state_env holds this thread's own
         # top-of-body VarDecls, backed by the namespaced globals above
@@ -3174,7 +3654,19 @@ class CodeGen:
                                 self._active_free_locals[-1].append(
                                     (ref, _StackStructFieldsOnly(type_)))
                         elif type_ == BLOB or type_ == REGEX or isinstance(
-                                type_, (types_mod.ImageType, types_mod.AudioType)):
+                                type_, (types_mod.ImageType, types_mod.AudioType,
+                                       types_mod.HttpType, types_mod.SocketType,
+                                       types_mod.UrlType, types_mod.EnumType)):
+                            # claude.md #197: EnumType/HttpType/
+                            # SocketType/UrlType join this branch too --
+                            # see the matching widening (and its own,
+                            # longer comment) in _emit_stmt's VarDecl
+                            # handling above, which this tracking branch
+                            # must always agree with (a type scheduled
+                            # for release here that _emit_stmt's own
+                            # VarDecl branch didn't heap-allocate the
+                            # matching way would be a real, silent bug).
+                            #
                             # claude.md #109: a blob local is ALWAYS
                             # scheduled for release, with no
                             # escaping-ness test and no
@@ -3239,8 +3731,35 @@ class CodeGen:
         lines = ctx["lines"]
         if isinstance(stmt, ast.VarDecl):
             type_ = self._resolve(stmt.type_expr, stmt)
+            # claude.md #197: EnumType/HttpType/SocketType/UrlType join
+            # this branch too -- all four are `_is_refcounted`, all
+            # four are `ptr`-shaped with a real refcount header of
+            # their own (an enum's, exactly like a struct's/blob's;
+            # http's/socket's/url's own -- see _release_fn_for's own
+            # per-type comments), and none of them has StructType's or
+            # ArrayType's/MapType's own reason to need a DIFFERENT
+            # branch (a stack-allocation optimization, or opaque
+            # runtime-owned storage) -- so the identical "retain on
+            # alias, always release at scope exit" treatment blob/img/
+            # aud/regex already get here is exactly correct for them
+            # too. A genuine, confirmed pre-existing gap (found via
+            # claude.md #197's own thread stress test: a fresh,
+            # WITH-INITIALIZER enum-typed local declared inside a loop
+            # -- `DataPacket p = `hello${i}`` -- leaked its own box,
+            # and whatever text/refcounted member it held, every
+            # single iteration, reproduced with NO thread code
+            # involved at all) -- claude.md #176's own comment on
+            # `_is_refcounted` already stated the INTENT ("needs the
+            # identical ... treatment every other refcounted type
+            # already gets, with no special-casing needed anywhere
+            # else") but this branch, and _emit_block's matching
+            # tracking branch below, were never actually widened to
+            # match when EnumType (and, earlier, HttpType/SocketType/
+            # UrlType) joined `_is_refcounted`.
             if type_ == BLOB or type_ == REGEX or isinstance(
-                    type_, (types_mod.ImageType, types_mod.AudioType)):
+                    type_, (types_mod.ImageType, types_mod.AudioType,
+                            types_mod.HttpType, types_mod.SocketType,
+                            types_mod.UrlType, types_mod.EnumType)):
                 # claude.md #109: `blob save = 'save.dat'` reads the file
                 # and hands back a fresh handle with a refcount of 1;
                 # `blob other = save` aliases the same handle and needs
@@ -9029,7 +9548,7 @@ class CodeGen:
                 lines.append(f"  {handle} = load ptr, ptr {handle_global}")
                 box = self._emit_thread_box(val, outbound_type, lines)
                 lines.append(f"  call void @festina_thread_post_outbound(ptr {handle}, ptr {box})")
-                self._free_text_temp(expr.args[0], val, vtype, lines)
+                self._emit_thread_postmessage_cleanup(expr.args[0], val, vtype, outbound_type, lines)
                 return "0", None
             if name == "log":
                 val, vtype = self._emit_expr(expr.args[0], env, lines)
@@ -9525,7 +10044,7 @@ class CodeGen:
                     lines.append(f"  {handle} = load ptr, ptr {handle_global}")
                     box = self._emit_thread_box(val, inbound_type, lines)
                     lines.append(f"  call void @festina_thread_post(ptr {handle}, ptr {box})")
-                    self._free_text_temp(expr.args[0], val, vtype, lines)
+                    self._emit_thread_postmessage_cleanup(expr.args[0], val, vtype, inbound_type, lines)
                     return "0", None
                 if callee.prop == "onMessage":
                     # claude.md #195 Phase 2: the callback argument is
@@ -11126,9 +11645,25 @@ class CodeGen:
                 on_load_sym = tinfo["on_load_symbol"]
                 on_message_sym = tinfo["on_message_symbol"]
                 on_exit_sym = tinfo["on_exit_symbol"]
+                # claude.md #197 Phase 3: the two release-function
+                # pointers festina_thread_register now also takes --
+                # `_thread_payload_release_fn` picks `@free` for a
+                # plain box/owned-text payload or a real Festina
+                # release cascade for a struct/arr[T]/map[T]/enum one,
+                # so the runtime worker/drain loops never need to know
+                # which kind of payload they're holding, only that
+                # calling this one function on it is always correct.
+                # A thread with no inbound/outbound type at all still
+                # gets a real (never-called) function pointer here --
+                # `@free` is harmless and avoids a NULL check in C.
+                in_release = (self._thread_payload_release_fn(tinfo["inbound_type"])
+                             if tinfo["inbound_type"] is not None else "@free")
+                out_release = (self._thread_payload_release_fn(tinfo["outbound_type"])
+                              if tinfo["outbound_type"] is not None else "@free")
                 main_lines.append(
                     f"  %__thread_{tname} = call ptr @festina_thread_register("
-                    f"ptr {on_load_sym}, ptr {on_message_sym}, ptr {on_exit_sym})")
+                    f"ptr {on_load_sym}, ptr {on_message_sym}, ptr {on_exit_sym}, "
+                    f"ptr {in_release}, ptr {out_release})")
                 main_lines.append(f"  store ptr %__thread_{tname}, ptr {handle_global}")
                 main_lines.append(f"  call void @festina_thread_spawn(ptr %__thread_{tname})")
         # self.uses_sqlite/self.uses_graphics are only reliably set by

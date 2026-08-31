@@ -70,6 +70,14 @@ struct FestinaThreadHandle {
     void (*on_load)(void);
     void (*on_message)(void *payload);
     void (*on_exit)(int64_t code);
+    /* claude.md #197 Phase 3: the function to call to release ONE
+     * delivered payload, on each queue's own receiving side -- `free`
+     * for a plain box/owned-text payload, or a real Festina release
+     * cascade for a struct/arr[T]/map[T]/enum one (see
+     * festina_thread_register's own doc comment in festina_runtime.h).
+     * Set once, at registration, and never NULL. */
+    void (*in_release)(void *payload);
+    void (*out_release)(void *payload);
 
     struct FestinaThreadHandle *next; /* registry linked list */
 };
@@ -77,28 +85,27 @@ struct FestinaThreadHandle {
 static pthread_mutex_t g_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 static FestinaThreadHandle *g_registry = NULL;
 
-static void festina_thread_free_msg_list(FestinaThreadMsg *m) {
+static void festina_thread_free_msg_list(FestinaThreadMsg *m, void (*release_fn)(void *)) {
     while (m) {
         FestinaThreadMsg *next = m->next;
-        free(m->payload);
+        release_fn(m->payload);
         free(m);
         m = next;
     }
 }
 
-/* claude.md #195 Phase 2: the worker's own whole life, one function --
+/* claude.md #195/#197: the worker's own whole life, one function --
  * on_load() once, then block-and-dispatch messages forever until
  * killed. An uncaught throw inside on_load/on_message/on_exit is not
  * separately guarded here (unlike festina_runtime_http.c's own worker,
- * this file needs no __builtin_setjmp catch-frame machinery at this
- * phase) -- Phase 2 message types (int/float/bool/text) can't
- * themselves throw during cloning the way a later phase's struct/img
- * clone might, and an uncaught festina_throw from Festina code
- * currently terminates the whole process (see festina_throw's own
- * comment) regardless of which thread it happens on, so "only this
- * thread dies" containment is intentionally deferred rather than
- * silently assumed here -- flagged as a real, documented follow-up,
- * not a silent gap. */
+ * this file needs no __builtin_setjmp catch-frame machinery yet) --
+ * cloning itself (codegen's own _clone_fn_for_*) can't throw for any
+ * message type this runtime accepts today, and an uncaught
+ * festina_throw from Festina code currently terminates the whole
+ * process (see festina_throw's own comment) regardless of which
+ * thread it happens on, so "only this thread dies" containment is
+ * intentionally deferred rather than silently assumed here --
+ * flagged as a real, documented follow-up, not a silent gap. */
 static void *festina_thread_main(void *arg) {
     FestinaThreadHandle *h = (FestinaThreadHandle *)arg;
     if (h->on_load) h->on_load();
@@ -121,7 +128,7 @@ static void *festina_thread_main(void *arg) {
 
         msg->next = NULL;
         if (h->on_message) h->on_message(msg->payload);
-        free(msg->payload);
+        h->in_release(msg->payload);
         free(msg);
     }
     if (h->on_exit) h->on_exit(0);
@@ -133,7 +140,9 @@ static void *festina_thread_main(void *arg) {
 
 FestinaThreadHandle *festina_thread_register(void (*on_load)(void),
                                              void (*on_message)(void *payload),
-                                             void (*on_exit)(int64_t code)) {
+                                             void (*on_exit)(int64_t code),
+                                             void (*in_release)(void *payload),
+                                             void (*out_release)(void *payload)) {
     FestinaThreadHandle *h = calloc(1, sizeof(*h));
     if (!h) festina_fail("out of memory registering a thread");
     pthread_mutex_init(&h->in_lock, NULL);
@@ -142,6 +151,8 @@ FestinaThreadHandle *festina_thread_register(void (*on_load)(void),
     h->on_load = on_load;
     h->on_message = on_message;
     h->on_exit = on_exit;
+    h->in_release = in_release;
+    h->out_release = out_release;
     pthread_mutex_lock(&g_registry_lock);
     h->next = g_registry;
     g_registry = h;
@@ -206,7 +217,7 @@ void festina_thread_kill(FestinaThreadHandle *h) {
     h->in_head = h->in_tail = NULL;
     h->kill_requested = 0; /* reset so a later festina_thread_live can reuse this handle */
     pthread_mutex_unlock(&h->in_lock);
-    festina_thread_free_msg_list(leftover);
+    festina_thread_free_msg_list(leftover, h->in_release);
 }
 
 void festina_thread_live(FestinaThreadHandle *h, void (*callback)(int8_t alive)) {
@@ -252,7 +263,7 @@ static void festina_thread_drain_impl(void) {
         while (done) {
             FestinaThreadMsg *next = done->next;
             h->out_callback(done->payload);
-            free(done->payload);
+            h->out_release(done->payload);
             free(done);
             done = next;
         }

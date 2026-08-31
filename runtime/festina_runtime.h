@@ -1033,10 +1033,14 @@ void festina_register_http_service_hooks(void);
  * simply the malloc'd, NUL-terminated, exclusively-owned string
  * pointer itself (an ordinary festina_text_own() copy) -- no wrapper
  * needed, since text is already "a plain owned buffer" the same way a
- * box is. Either way `free(payload)` alone is exactly correct once a
- * message has been delivered, with no type-specific release function
- * needed on this path (Phase 3 revisits this for struct/arr/map/enum,
- * which DO need one). */
+ * box is; claude.md #197 Phase 3 widens this to struct/arr[T]/map[T]/
+ * enum (each already `ptr`-shaped, and a CLONE of one of these is
+ * already a fresh, independent top-level allocation, so it needs no
+ * further wrapper either -- see codegen.py's own
+ * _thread_payload_is_passthrough). Releasing a delivered payload is
+ * therefore no longer always a plain `free()` -- see
+ * festina_thread_register's own `in_release`/`out_release`
+ * parameters below, and codegen.py's _thread_payload_release_fn. */
 typedef struct FestinaThreadHandle FestinaThreadHandle;
 
 /* Registers a new thread (its registry slot, queues, and the three
@@ -1045,10 +1049,25 @@ typedef struct FestinaThreadHandle FestinaThreadHandle;
  * weren't declared), but does not spawn the OS thread yet -- see
  * festina_thread_spawn below. Codegen calls this once per declared
  * `thread`, in main()'s own prologue (_emit_main_and_entry), before
- * __festina_main() runs any top-level statement. */
+ * __festina_main() runs any top-level statement.
+ *
+ * claude.md #197 Phase 3: `in_release`/`out_release` -- the function
+ * to call, on the receiving side, to release ONE delivered payload
+ * once its handler/callback has consumed it: `free` for a plain
+ * scalar box or an owned text buffer, or a real Festina release
+ * cascade (codegen's own _release_fn_for(type_), which already has
+ * the exact `void(*)(void*)` shape these need with no adapter) for a
+ * struct/arr[T]/map[T]/enum message type -- see
+ * codegen.py's own _thread_payload_release_fn. Always a real,
+ * callable function pointer, never NULL (a thread with no inbound/
+ * outbound type at all still gets `free`, simply never actually
+ * invoked on that side, so the runtime never needs a NULL check
+ * before calling either one). */
 FestinaThreadHandle *festina_thread_register(void (*on_load)(void),
                                              void (*on_message)(void *payload),
-                                             void (*on_exit)(int64_t code));
+                                             void (*on_exit)(int64_t code),
+                                             void (*in_release)(void *payload),
+                                             void (*out_release)(void *payload));
 /* Actually starts the OS thread -- on_load() (if any) runs first, on
  * that new thread, then the worker loop below begins. Split from
  * festina_thread_register so festina_thread_live() (a kill()'d thread
@@ -1507,6 +1526,24 @@ void festina_map_values(void *entries, int64_t capacity, int64_t elem_size,
  * but never grown (entries is NULL, capacity is 0 -- the loop below
  * simply doesn't run, and free(NULL) is a defined no-op). */
 void festina_map_free_entries(void *entries, int64_t capacity);
+
+/* claude.md #197 Phase 3: `thread`'s own deep-clone of a map[T]
+ * message/field -- the clone-side mirror of festina_map_for_each.
+ * Walks `src_entries`'s own live buckets, strdup's each key, and
+ * calls `value_clone_fn` (codegen's own per-value-type i64-in/i64-out
+ * trampoline, see _emit_map_value_clone_trampoline) to produce each
+ * cloned value before inserting it into a FRESH destination table via
+ * festina_map_set -- writing the new count/entries/capacity/
+ * tombstones back through the four out-parameters, the same "results
+ * land in an out-pointer" shape festina_sqlite_collect_rows already
+ * uses. The destination starts genuinely empty (not sized to match
+ * `src_capacity`) and grows on its own via festina_map_set's existing
+ * load-factor check, so its own bucket layout never has to mirror the
+ * source's. A no-op (every out-parameter left at its zero value) when
+ * `src_entries` is NULL -- an unpopulated source map. */
+void festina_map_clone(void *src_entries, int64_t src_capacity,
+                       int64_t *dst_count, void **dst_entries, int64_t *dst_capacity,
+                       int64_t *dst_tombstones, int64_t (*value_clone_fn)(int64_t));
 
 /*
  * claude.md #79: releases an arr[T]/map[T] value -- see each

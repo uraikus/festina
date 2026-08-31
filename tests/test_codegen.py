@@ -15821,6 +15821,36 @@ class TestEnums:
         assert result.returncode == 0
         assert result.stdout.strip() == "text"
 
+    def test_a_fresh_with_initializer_enum_local_declared_in_a_loop_is_freed(self, compile_and_run):
+        # claude.md #197: a genuine, pre-existing gap found while
+        # building thread Phase 3 (no thread code involved at all) --
+        # unlike REASSIGNING an already-declared enum-typed variable
+        # (the two tests just above, both go through
+        # _emit_local_retain_release, which already dispatched through
+        # _is_refcounted correctly), DECLARING a fresh, WITH-
+        # INITIALIZER enum-typed local was never scheduled for release
+        # at scope exit at all (_emit_block's own tracking dispatch
+        # only listed BLOB/REGEX/ImageType/AudioType, not EnumType --
+        # claude.md #176's own comment on _is_refcounted claimed "no
+        # special-casing needed anywhere else", which turned out not
+        # to be true here) -- so a fresh mixed-enum box, and the text
+        # buffer boxed inside it, leaked every single iteration. This
+        # only checks correct behavior; the leak itself is verified
+        # via scripts/leak_stress.sh (see tests/test_leak_stress.py's
+        # own ASan/LeakSanitizer coverage, not duplicated here).
+        source = """
+        enum DataPacket = int, text
+        int i = 0
+        while i < 200 {
+            DataPacket p = `hello${i}`
+            i = i + 1
+        }
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
 
 class TestThreads:
     """claude.md #195 Phase 2: `thread NAME { ... }` -- the real,
@@ -16047,27 +16077,206 @@ class TestThreads:
         assert result.returncode == 0
         assert result.stdout.strip().splitlines() == ["2", "11"]
 
-    def test_a_compound_message_type_is_a_clear_not_yet_error(self, parser, semantic, codegen, errors):
-        # claude.md #195 Phase 1 already accepts struct/arr/map/enum/
-        # blob/img/aud/url as sendable message types at the semantic
-        # level (they'll actually work once Phase 3/4 write their own
-        # deep-clone codegen) -- this checks that trying to COMPILE one
-        # today fails loudly and clearly, naming the phase, rather than
-        # crashing or silently miscompiling.
+    def test_a_blob_message_type_is_a_clear_not_yet_error(self, parser, semantic, codegen, errors):
+        # claude.md #195 Phase 1 already accepts blob/img/aud/url as
+        # sendable message types at the semantic level (they'll
+        # actually work once Phase 4 writes their own clone codegen)
+        # -- this checks that trying to COMPILE one today fails loudly
+        # and clearly, naming the phase, rather than crashing or
+        # silently miscompiling. claude.md #197 Phase 3 lifted this
+        # same restriction for struct/arr[T]/map[T]/enum -- see
+        # TestThreads' own struct/array/map/enum round-trip tests.
         source = """
-        struct Point { x:int y:int }
         thread worker {
-            on message(p:Point) {
-                log(p.x)
+            on message(p:blob) {
+                log('got blob')
             }
         }
-        Point pt
-        worker.postMessage(pt)
+        blob b = 'nope.dat'
+        worker.postMessage(b)
         """
         program = parser.parse(source)
         analyzed = semantic.analyze(program)
         with pytest.raises(errors.CompileError, match="not supported yet"):
             codegen.generate_ir(program, analyzed)
+
+    def test_a_self_referencing_struct_message_type_is_a_clear_not_yet_error(self, parser, semantic, codegen, errors):
+        # claude.md #197 Phase 3: struct/arr[T]/map[T] are clonable
+        # now, but only when ACYCLIC -- a self-referencing struct type
+        # is rejected outright (cloning it could loop forever on a
+        # genuinely cyclic runtime value, unlike release's own
+        # refcount-bounded cascade), with the identical "not supported
+        # yet" shape a still-unimplemented type gets, rather than a
+        # stack overflow or hang.
+        source = """
+        struct Node { val:int next:Node }
+        thread worker {
+            on message(p:Node) {
+                log(p.val)
+            }
+        }
+        Node n
+        worker.postMessage(n)
+        """
+        program = parser.parse(source)
+        analyzed = semantic.analyze(program)
+        with pytest.raises(errors.CompileError, match="not supported yet"):
+            codegen.generate_ir(program, analyzed)
+
+    def test_struct_message_round_trip(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int label:text }
+        thread worker {
+            on message(p:Point) {
+                Point out = p
+                out.x = p.x + 1
+                postMessage(out)
+            }
+        }
+        void func onReply(x:Point) {
+            log(x.x)
+            log(x.y)
+            log(x.label)
+            close(0)
+        }
+        worker.onMessage(void (x:Point) => onReply(x))
+        Point pt
+        pt.x = 10
+        pt.y = 20
+        pt.label = 'hello'
+        worker.postMessage(pt)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["11", "20", "hello"]
+
+    def test_array_message_round_trip(self, compile_and_run):
+        source = """
+        thread worker {
+            on message(p:arr[text]) {
+                arr[text] out = []
+                int i = 0
+                while i < p.length {
+                    out.push(`echo:${p[i]}`)
+                    i = i + 1
+                }
+                postMessage(out)
+            }
+        }
+        void func onReply(x:arr[text]) {
+            int i = 0
+            while i < x.length {
+                log(x[i])
+                i = i + 1
+            }
+            close(0)
+        }
+        worker.onMessage(void (x:arr[text]) => onReply(x))
+        arr[text] xs = ['a', 'b', 'c']
+        worker.postMessage(xs)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["echo:a", "echo:b", "echo:c"]
+
+    def test_map_message_round_trip(self, compile_and_run):
+        source = """
+        thread worker {
+            on message(p:map[int]) {
+                map[int] out = {}
+                out['a'] = p['a'] * 2
+                out['b'] = p['b'] * 2
+                postMessage(out)
+            }
+        }
+        void func onReply(x:map[int]) {
+            log(x['a'])
+            log(x['b'])
+            close(0)
+        }
+        worker.onMessage(void (x:map[int]) => onReply(x))
+        map[int] m = {}
+        m['a'] = 5
+        m['b'] = 7
+        worker.postMessage(m)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["10", "14"]
+
+    def test_mixed_enum_message_round_trip(self, compile_and_run):
+        source = """
+        enum DataPacket = int, text
+        thread worker {
+            on message(p:DataPacket) {
+                log(typeof p)
+                DataPacket out = 'echoed'
+                postMessage(out)
+            }
+        }
+        void func onReply(x:DataPacket) {
+            log(typeof x)
+            close(0)
+        }
+        worker.onMessage(void (x:DataPacket) => onReply(x))
+        DataPacket p = 42
+        worker.postMessage(p)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["int", "text"]
+
+    def test_pure_struct_enum_message_round_trip(self, compile_and_run):
+        source = """
+        struct Circle { radius:int }
+        struct Square { side:int }
+        enum Shape = Circle, Square
+        thread worker {
+            on message(p:Shape) {
+                postMessage(p)
+            }
+        }
+        void func onReply(x:Shape) {
+            log(typeof x)
+            if typeof x == 'Circle' {
+                log(x.radius)
+            }
+            close(0)
+        }
+        worker.onMessage(void (x:Shape) => onReply(x))
+        Circle c
+        c.radius = 99
+        Shape s = c
+        worker.postMessage(s)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["Circle", "99"]
+
+    def test_postmessage_of_a_fresh_enum_coercion_does_not_leak_or_double_free(self, compile_and_run):
+        # Regression coverage for a real bug found and fixed while
+        # building this: postMessage(x)'s own cleanup used to always
+        # call _free_text_temp with the PRE-coercion vtype, which is
+        # only correct when the coercion is a no-op (TEXT -> TEXT).
+        # Posting a bare text literal directly into a mixed-enum
+        # inbound type coerces it into a freshly boxed enum value
+        # (claude.md #176) -- the old code would have freed that box
+        # as if it were a plain text buffer. ASan-verified separately
+        # (see claude.md #197); this just checks the program still
+        # runs correctly end to end.
+        source = """
+        enum DataPacket = int, text
+        thread worker {
+            on message(p:DataPacket) {
+                log(typeof p)
+            }
+        }
+        worker.postMessage('direct-literal-hello')
+        worker.postMessage(123)
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
 
     def test_a_thread_with_no_onmessage_registration_still_lets_the_process_exit_cleanly(self, compile_and_run):
         # A `peopleWorker`-style thread -- declared, idling, never

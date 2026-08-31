@@ -9,6 +9,32 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.10] - 2026-08-31
+
+### Added
+
+- `thread`'s own message types widen to `struct`/`arr[T]`/`map[T]`/
+  `enum` — each deep-cloned (never shared) across the boundary,
+  built recursively from any mix of `int`/`float`/`bool`/`text`/
+  `color`/`font`. A self-referencing (cyclic) `struct`/`arr[T]`/
+  `map[T]` type is rejected with a clear error, not a hang; `blob`/
+  `img`/`aud`/`url` message types remain not yet implemented. See
+  [api.md](api.md#threads) and [claude.md #197](claude.md).
+
+### Fixed
+
+- A fresh, with-initializer `enum`-typed local variable — `Choice c
+  = someExpr` declared directly inside a loop or function body, as
+  opposed to reassigning an already-declared one — was never freed
+  at scope exit, leaking its own box (and, for a boxed `text`
+  member, that buffer too) on every declaration. The identical gap
+  is fixed for `http`/`socket`/`url`-typed locals, found by the same
+  audit.
+- `NAME.postMessage(x)`, when `x` coerces into a compound message
+  type (e.g. a `text` literal posted against an `enum` inbound
+  type), no longer frees the coerced result with the wrong release
+  function.
+
 ## [0.9] - 2026-08-31
 
 ### Added
