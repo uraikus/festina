@@ -1892,18 +1892,20 @@ class TestAutomaticMemoryReclamation:
 
     def test_loop_local_struct_is_stack_allocated_and_reused_across_iterations(
             self, parser, semantic, codegen):
-        # claude.md #43/#74/#75: the loop-body/break/continue-scoped
-        # freeing machinery still applies to *when* a struct local's
-        # storage is considered dead, even though "dead" no longer
-        # means "call free() here" for a struct -- it means the very
-        # next textual reach of the same VarDecl (the next iteration)
-        # re-zeros the *same* stack address rather than allocating a
-        # fresh one, since LLVM's alloca reserves one fixed slot for
-        # the whole enclosing function regardless of which basic block
-        # contains it. The alloca and its zeroinitializer store must
-        # both be inside the loop body (so re-zeroing genuinely
-        # happens every iteration, not just once before the loop), and
-        # there must be no calloc/free anywhere in the function at all.
+        # claude.md #43/#74/#75, corrected by #191: a loop-body struct
+        # local reuses ONE stack slot across iterations. This test
+        # originally asserted the alloca itself sat inside the loop
+        # body, on the belief that LLVM reserves one fixed slot per
+        # alloca regardless of block -- that belief was wrong: an
+        # alloca EXECUTES each time it's reached, growing the stack
+        # every iteration until the function returns (measured: a
+        # six-field struct declared in a while body overflowed the
+        # 8MB stack and segfaulted at ~150k-300k iterations). The
+        # alloca now lives in the function's ENTRY block (one slot per
+        # call, genuinely reused), while the zeroinitializer store
+        # stays inside the loop body so each iteration still sees a
+        # fresh zeroed struct -- and there is still no calloc/free
+        # anywhere in the function at all.
         source = """
         struct Point { x:int y:int }
         void func f() {
@@ -1916,13 +1918,54 @@ class TestAutomaticMemoryReclamation:
         """
         ir = self._ir(parser, semantic, codegen, source)
         lines = ir.splitlines()
-        body_start = next(i for i, l in enumerate(lines) if l.strip().startswith("for.body"))
-        body_end = next(i for i in range(body_start, len(lines)) if lines[i].strip().startswith("br label %for.update"))
+        f_start = next(i for i, l in enumerate(lines) if l.startswith("define void @f("))
+        f_end = next(i for i in range(f_start, len(lines)) if lines[i] == "}")
+        body_start = next(i for i in range(f_start, f_end) if lines[i].strip().startswith("for.body"))
+        body_end = next(i for i in range(body_start, f_end) if lines[i].strip().startswith("br label %for.update"))
+        entry_lines = lines[f_start:body_start]
         body_lines = lines[body_start:body_end]
-        assert any("alloca %struct.Point" in l for l in body_lines)
+        # one slot, allocated up front...
+        assert any("alloca %struct.Point" in l for l in entry_lines)
+        assert not any("alloca" in l for l in body_lines)
+        # ...re-zeroed at the declaration site, every iteration.
         assert any("store %struct.Point zeroinitializer" in l for l in body_lines)
         assert "call ptr @calloc(" not in ir
         assert "call void @free(" not in ir
+
+    def test_a_long_running_loop_declaring_locals_does_not_grow_the_stack(
+            self, compile_and_run):
+        # claude.md #191: the regression this whole hoist exists for.
+        # Before it, each iteration's allocas (the struct's storage,
+        # its pointer slot, every scratch temporary) pushed fresh
+        # stack that never popped until function return -- this exact
+        # program segfaulted between 150k and 300k iterations with
+        # completely flat heap usage. 500k iterations now run in a
+        # fixed-size frame.
+        source = '''
+        struct Item {
+            id:int
+            name:text
+            description:text
+            price:float
+            inStock:bool
+            tags:arr[text]
+        }
+        int i = 0
+        while i < 500000 {
+            Item it
+            it.id = i
+            it.name = `item number ${i}`
+            it.description = 'A "quoted" description with\\na newline'
+            it.price = 19.99
+            it.inStock = i % 2 == 0
+            it.tags = ['alpha', 'beta', `gamma-${i}`]
+            i = i + 1
+        }
+        log(i)
+        '''
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == '500000'
 
     def test_nested_if_declared_struct_is_stack_allocated(self, parser, semantic, codegen):
         source = """

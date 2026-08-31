@@ -9,6 +9,23 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.8] - 2026-08-31
+
+### Fixed
+
+- Long-running loops that declare locals (a struct, an array, any
+  variable) no longer overflow the stack. Codegen emitted each
+  `alloca` at its declaration site — inside the loop body — so every
+  iteration permanently grew the stack until the function returned;
+  a loop declaring a six-field struct segfaulted at roughly
+  150,000–300,000 iterations with flat heap usage. Every static
+  alloca is now hoisted to its function's entry block: one slot per
+  declaration, reused each iteration (verified to 3,000,000
+  iterations). Locals are still re-zeroed at their declaration site
+  every iteration, so behavior is otherwise unchanged.
+
+See [claude.md #191](claude.md) for the full diagnosis.
+
 ## [0.7] - 2026-08-29
 
 ### Changed

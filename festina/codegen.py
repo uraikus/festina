@@ -336,6 +336,81 @@ REGEX = types_mod.RegexType()
 AUDIO = types_mod.AudioType()
 
 
+def _hoist_allocas_to_entry(ir_text):
+    """claude.md #191: move every static `alloca` in every emitted
+    function up into that function's ENTRY block.
+
+    An LLVM `alloca` reserves stack space each time it EXECUTES, and
+    that space is only reclaimed when the function returns -- so an
+    alloca emitted inside a loop body (a struct local declared in a
+    `while`, any per-statement scratch slot) grows the stack a little
+    more on every iteration, forever. Measured directly: a loop
+    declaring a six-field struct per iteration overflowed the 8MB
+    stack and segfaulted at ~150k-300k iterations, with completely
+    flat heap usage -- the exact "long-running loop crashes for no
+    visible reason" failure this pass exists to prevent. Hoisted to
+    the entry block, each slot is allocated ONCE per call and reused
+    every iteration, which is also what clang itself emits for a C
+    local declared inside a loop.
+
+    Correctness rests on two facts about this generator's own output:
+    every slot is explicitly stored before it is read AT ITS
+    DECLARATION SITE (those stores stay where they were -- LLVM
+    allocas are undef-initialized anyway, so nothing could ever have
+    relied on a fresh alloca's contents), and no slot's address
+    outlives its scope (escape_analysis is what decides stack vs heap
+    storage for struct/arr/map locals in the first place; a slot
+    whose address escaped its iteration would already have been
+    dangling after the enclosing function returned). Hoisting also
+    hardens the sjlj try/catch path: llvm.eh.sjlj.setjmp records the
+    stack pointer at try entry, and an unwind restores it -- a slot
+    alloca'd INSIDE the try body used to sit below that restored SP;
+    now every slot predates the save.
+
+    Dynamic allocas (a runtime element count operand, e.g.
+    `alloca i64, i64 %n`) are left exactly where they are -- moving
+    one to entry would change how much stack a single execution
+    reserves. This generator currently emits none, but the guard
+    keeps a future one safe by construction.
+    """
+    out = []
+    body = None       # collecting lines inside a define?
+    for line in ir_text.split("\n"):
+        if body is None:
+            out.append(line)
+            if line.startswith("define ") and line.rstrip().endswith("{"):
+                body = []
+            continue
+        if line == "}":
+            hoisted = []
+            kept = []
+            for bline in body:
+                if bline.startswith("  %") and " = alloca " in bline:
+                    operands = bline.split(" = alloca ", 1)[1]
+                    # first comma-chunk is the type (itself possibly a
+                    # %struct.N name); an SSA value in any LATER chunk
+                    # means a dynamic element count -- not hoistable.
+                    if not any("%" in part for part in operands.split(",")[1:]):
+                        hoisted.append(bline)
+                        continue
+                kept.append(bline)
+            # Insertion point: top of the first block -- directly after
+            # the define line, or after its label if the block has an
+            # explicit one (this generator always opens with "entry:"
+            # or straight into instructions).
+            insert_at = 0
+            if kept and not kept[0].startswith(" ") and kept[0].endswith(":"):
+                insert_at = 1
+            out.extend(kept[:insert_at])
+            out.extend(hoisted)
+            out.extend(kept[insert_at:])
+            out.append(line)
+            body = None
+            continue
+        body.append(line)
+    return "\n".join(out)
+
+
 def _http_send_lit_receiver(node):
     """claude.md #164: mirrors semantic.py's own identically-named
     helper exactly (see its doc comment for the full reasoning) --
@@ -1229,7 +1304,11 @@ class CodeGen:
         module.extend(entry_and_main)
         module.append("")
         module.extend(self._string_const_defs())
-        return "\n".join(module) + "\n"
+        # claude.md #191: every static alloca moves to its function's
+        # entry block, so a loop-body local reuses one stack slot per
+        # call instead of growing the stack every iteration (see
+        # _hoist_allocas_to_entry).
+        return _hoist_allocas_to_entry("\n".join(module) + "\n")
 
     def _runtime_declares(self):
         return [
