@@ -4159,6 +4159,17 @@ class CodeGen:
         for part_expr, next_part in zip(expr.exprs, expr.parts[1:]):
             val, vtype = self._emit_expr(part_expr, env, lines)
             piece = self._to_text(val, vtype, lines)
+            # claude.md #192: an interpolated value that this template
+            # OWNS -- a fresh container from a call or literal,
+            # `` `${make()}` ``/`` `${[1,2,3]}` ``/`` `${m.keys()}` `` --
+            # is rendered to `piece` (its own fresh text) and then done
+            # with, but `val` (the container) was never released: a leak
+            # per evaluation, per iteration in a loop. `piece` is freed
+            # below via piece_owned; this releases the container itself.
+            # A no-op for a non-owning value (a plain variable, borrowed)
+            # and for text/int/bool (not refcounted), so it never
+            # double-frees what piece_owned already handles.
+            self._release_owned_receiver(part_expr, val, vtype, lines)
             piece_owned = vtype != TEXT or self._is_owning_text_source(part_expr)
             if result is None:
                 result, result_owned = piece, piece_owned

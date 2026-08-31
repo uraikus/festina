@@ -8635,6 +8635,30 @@ class TestJsonRendering:
         result = compile_and_run(source)
         assert result.stdout.splitlines() == ['[1,2]', '{"n":5}']
 
+    def test_interpolating_a_fresh_container_does_not_leak(self, compile_and_run):
+        # claude.md #192: `${make()}` renders a fresh array/struct/map to
+        # text and is then done with the container, but _emit_template
+        # released only the text pieces, never the container itself -- a
+        # leak per evaluation. This pins the OBSERVABLE result (the
+        # rendering is correct); the leak itself is ASan-verified
+        # separately. A tight loop makes a missed release matter.
+        source = '''
+        arr[int] func makeArr() {
+            arr[int] xs = [1, 2, 3]
+            return xs
+        }
+        int i = 0
+        text last = ''
+        while i < 50 {
+            last = `v: ${makeArr()} and ${[9, 8]}`
+            i = i + 1
+        }
+        log(last)
+        '''
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == 'v: [1,2,3] and [9,8]'
+
     def test_a_null_container_renders_as_null(self, compile_and_run):
         source = '''
         struct P { n:int }

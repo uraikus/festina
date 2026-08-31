@@ -52,6 +52,9 @@ round-by-round design and implementation record predating 0.1 lives in
   a plain buffer with no per-element release.
 - `.push()`/`.unshift()`/`.indexOf()` of a path string into an
   `arr[blob]`/`arr[img]`/`arr[aud]` no longer leaks the loaded handle.
+- Interpolating a freshly built container into a template
+  (`` `${make()}` ``, `` `${[1,2,3]}` ``) no longer leaks the
+  container — only the rendered text was being freed.
 
 - Integer fields in `.toStruct()` keep full 64-bit precision. They
   were parsed through a `double`, silently corrupting any value past
