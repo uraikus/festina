@@ -9,6 +9,17 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.13] - 2026-08-31
+
+### Fixed
+
+- Documented that a `thread`'s own `on exit(code:int)` always receives
+  `code` `0` — including when torn down by main-thread death — never
+  the process's own real exit code. Not a behavior change (this is
+  what the runtime already did); found and clarified while verifying
+  `thread` process-exit interaction end to end. See
+  [api.md](api.md#threads) and [claude.md #200](claude.md).
+
 ## [0.12] - 2026-08-31
 
 ### Added

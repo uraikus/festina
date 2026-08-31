@@ -2931,14 +2931,21 @@ log(worker.isAlive())        // true
 ```
 
 - `NAME.kill()` stops the thread (running `on exit(code:int)` first,
-  if declared) and blocks until it has actually stopped.
+  if declared) and blocks until it has actually stopped. `code` is
+  always `0` here — a thread's own `kill()` carries no exit code of
+  its own to pass through (unlike the main program's own
+  `on exit(code:int)`, which does — see [Graceful shutdown](#graceful-shutdown)).
 - `NAME.live(callback)` respawns a killed thread and calls
   `callback(true)` once it's running again.
 - `NAME.isAlive()` reads whether the thread is currently running.
 
-If the main program exits (including via `close(code)`), every
-still-alive thread is killed first, so a declared thread never
-survives as an orphaned process.
+If the main program exits (including via `close(code)` or a
+SIGINT/SIGTERM-driven [graceful shutdown](#graceful-shutdown)), every
+still-alive thread is killed first (each thread's own
+`on exit(code:int)`, if declared, runs with `code` `0`, the identical
+`kill()` behavior above — the main program's own real exit code isn't
+threaded through), so a declared thread never survives as an orphaned
+process.
 
 **Thread-private state:**
 
