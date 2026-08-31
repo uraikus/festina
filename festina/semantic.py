@@ -686,9 +686,13 @@ _THREAD_EVENT_SIGNATURES = {
 # that one private Cairo surface, confirmed safe for concurrent use of
 # DIFFERENT surfaces on different threads. `blankImage` is deliberately
 # NOT here for the identical reason -- it only ever creates a fresh,
-# private surface, nothing shared. `sqlite` is included unconditionally
-# for now; claude.md #195's own later round narrows this to "allowed
-# only for a thread that declared its own DatabaseURL."
+# private surface, nothing shared. `sqlite`/`sqliteInt`/`sqliteFloat`/
+# `sqliteText` are deliberately NOT here (claude.md #199 Phase 5) --
+# each is gated by its own dedicated check in _infer_call instead,
+# since the answer depends on THIS thread's own `database_url` (a
+# thread that declared its own `DatabaseURL` may call them; one that
+# didn't may not), a per-thread question this flat, unconditional set
+# has no way to represent.
 _THREAD_DISALLOWED_BUILTINS = frozenset({
     "drawRect", "drawCircle", "drawText", "drawImage", "drawPixel",
     "clearRect", "clearCircle", "clearPixel", "clearCanvas",
@@ -706,8 +710,23 @@ _THREAD_DISALLOWED_BUILTINS = frozenset({
     "isAudioPlayerPlaying",
     "setTimeout", "setInterval", "clearTimeout", "clearInterval",
     "exec", "openPort", "closePort", "openSecurePort", "close",
-    "mkdir", "ls", "regex", "sqlite",
+    "mkdir", "ls", "regex",
 })
+
+
+def _is_thread_database_url_stmt(stmt):
+    """claude.md #199 Phase 5: the thread-body counterpart of
+    festina/imports.py's own `_is_database_url_assignment` -- the
+    identical AST-shape match (an ExprStmt wrapping an
+    `Identifier("DatabaseURL") = expr` Assign), duplicated rather than
+    imported since imports.py's own version is scoped to the ENTRY
+    FILE's raw pre-merge statement list, a wholly different stage of
+    the pipeline than a thread body's own (already-parsed,
+    already-merged) statement list this runs over instead."""
+    return (isinstance(stmt, ast.ExprStmt)
+            and isinstance(stmt.expr, ast.Assign)
+            and isinstance(stmt.expr.target, ast.Identifier)
+            and stmt.expr.target.name == "DatabaseURL")
 
 # claude.md #39: clientWidth/clientHeight report the canvas window's
 # current size as read-only global ints (borrowing the name from the
@@ -864,6 +883,15 @@ class _ThreadInfo:
         self.outbound_type = None
         self.has_onmessage = False
         self.postmessage_sites = []
+        # claude.md #199 Phase 5: this thread's own resolved
+        # `DatabaseURL = '<literal>'` first statement (None if it
+        # never declared one) -- a thread with one gets its own
+        # private sqlite handle and may call sqlite()/sqliteInt()/
+        # sqliteFloat()/sqliteText(); one without one may not.
+        # `database_url_node` is kept only for the whole-program
+        # conflict check's own error reporting.
+        self.database_url = None
+        self.database_url_node = None
 
 
 class AnalyzedProgram:
@@ -2054,6 +2082,28 @@ def analyze(program, filename="<string>"):
                     _merge_thread_outbound_type(info, arg_type, callee)
                     info.postmessage_sites.append((callee.line, callee.column))
                     return None
+                if name in _SQLITE_BUILTINS and _current_thread[0].database_url is None:
+                    # claude.md #199 Phase 5: unlike every OTHER
+                    # disallowed builtin (a flat, unconditional "never
+                    # from a thread body"), sqlite()/sqliteInt()/
+                    # sqliteFloat()/sqliteText() are allowed for a
+                    # thread that declared its own private database --
+                    # its own separate sqlite3* handle, never crossing
+                    # threads, is exactly what makes this safe (see
+                    # claude.md #195's own design). A thread that
+                    # didn't gets this error instead of falling through
+                    # to ordinary sqlite() handling below, which would
+                    # otherwise silently reach for the shared
+                    # @__festina_db main uses.
+                    raise CompileError(
+                        f"'{name}()' cannot be called from inside thread "
+                        f"'{_current_thread[0].node.name}' -- it hasn't declared "
+                        f"its own database (a thread's first statement may be "
+                        f"DatabaseURL = '<path>', giving it a private sqlite "
+                        f"handle no other thread or the main program shares)",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
                 if name in _THREAD_DISALLOWED_BUILTINS:
                     raise CompileError(
                         f"'{name}()' cannot be called from inside a thread body -- "
@@ -3879,9 +3929,55 @@ def analyze(program, filename="<string>"):
         threads[decl.name] = info
         thread_state_scope = Scope(functions_scope)
         seen_handlers = set()
+        # claude.md #199 Phase 5: `DatabaseURL = '<literal>'` may be
+        # this thread's own first statement -- checked ONCE, over the
+        # WHOLE body, rather than only at index 0, so a misplaced one
+        # gets this clear positional error instead of falling through
+        # to the generic "may only contain state declarations and
+        # on ... handlers" rejection below (which would be true, but
+        # not point at the actual fix). A thread whose body doesn't
+        # start with one skips this block entirely -- info.database_url
+        # stays None, its default.
+        thread_body = decl.body.body
+        for i, stmt in enumerate(thread_body):
+            if not _is_thread_database_url_stmt(stmt):
+                continue
+            if i != 0:
+                raise CompileError(
+                    f"thread '{decl.name}': DatabaseURL = ... must be the "
+                    f"first statement in the thread's own body",
+                    file=filename, line=stmt.expr.line, column=stmt.expr.column,
+                    category="invalid syntax",
+                )
+            value_expr = stmt.expr.value
+            if not isinstance(value_expr, ast.StringLit):
+                raise CompileError(
+                    f"thread '{decl.name}': DatabaseURL must be a plain string "
+                    f"literal (e.g. DatabaseURL = './{decl.name}.sqlite') -- "
+                    f"unlike the main program's own DatabaseURL, a thread's "
+                    f"own copy can't be a computed expression, since the "
+                    f"whole-program file-conflict check (claude.md #199) has "
+                    f"to be able to prove it's distinct from every other "
+                    f"context's own database file at compile time",
+                    file=filename, line=getattr(value_expr, "line", stmt.expr.line),
+                    column=getattr(value_expr, "column", stmt.expr.column),
+                    category="invalid assignment",
+                )
+            info.database_url = value_expr.value
+            # claude.md #199 Phase 5: the ASSIGN node (`stmt.expr`), not
+            # the bare StringLit `value_expr` -- StringLit (ast.py)
+            # carries no line/column of its own at all (only its
+            # `.value`), so a later error pointing at
+            # info.database_url_node (the whole-program conflict check,
+            # below) would silently fall back past a nonexistent
+            # attribute to a much less precise location. Assign always
+            # carries a real line/column from parsing.
+            info.database_url_node = stmt.expr
+            thread_body = thread_body[1:]
+            break
         _current_thread[0] = info
         try:
-            for stmt in decl.body.body:
+            for stmt in thread_body:
                 if isinstance(stmt, ast.VarDecl):
                     analyze_var_decl(stmt, thread_state_scope, False)
                     continue
@@ -4255,5 +4351,57 @@ def analyze(program, filename="<string>"):
                 file=filename, line=line, column=column,
                 category="invalid declaration",
             )
+
+    # claude.md #199 Phase 5: a thread's own private database and the
+    # main program's are each just a path on disk -- nothing stops one
+    # from silently choosing the SAME file another context already
+    # uses, accidentally sharing the one thing per-thread isolation is
+    # supposed to keep private. Checked once, over the whole program,
+    # the same "can't check until everything's been walked" timing as
+    # the "no dead sends" check just above. Only a LITERAL path can be
+    # compared this way -- main's own DatabaseURL may be an arbitrary
+    # text expression (environment.NAME, a template, ...), and there's
+    # no way to prove a computed value is (or isn't) equal to anything
+    # else at compile time, so a non-literal main DatabaseURL skips
+    # this check entirely rather than guessing; a thread's own
+    # DatabaseURL is always a literal already (enforced above, in
+    # analyze_thread), so every thread that declared one always
+    # participates. Comparison is a plain string match on the resolved
+    # path text, not a filesystem-level "same file" check (no
+    # `os.path.realpath`/symlink resolution, no normalizing `./x` vs
+    # `x`) -- simple and exactly matches the literal text a reader of
+    # both DatabaseURL lines would compare by eye.
+    db_contexts = []  # [(label, resolved_path, file, line, column)]
+    main_database_url = getattr(program, "database_url", None)
+    if main_database_url is None:
+        db_contexts.append(("the main program", "festina.sqlite", entry_filename, 0, 0))
+    elif isinstance(main_database_url, ast.StringLit):
+        db_contexts.append((
+            "the main program", main_database_url.value, entry_filename,
+            getattr(main_database_url, "line", 0),
+            getattr(main_database_url, "column", 0),
+        ))
+    for name, info in threads.items():
+        if info.database_url is not None:
+            db_contexts.append((
+                f"thread '{name}'", info.database_url,
+                getattr(info.node, "file", filename),
+                getattr(info.database_url_node, "line", info.node.line),
+                getattr(info.database_url_node, "column", info.node.column),
+            ))
+    for i in range(len(db_contexts)):
+        for j in range(i + 1, len(db_contexts)):
+            label_a, path_a, _file_a, _line_a, _col_a = db_contexts[i]
+            label_b, path_b, file_b, line_b, col_b = db_contexts[j]
+            if path_a == path_b:
+                raise CompileError(
+                    f"{label_a} and {label_b} would both open the same "
+                    f"database file ('{path_a}') -- every thread with its "
+                    f"own DatabaseURL (and the main program) must use a "
+                    f"genuinely distinct file, per claude.md #195's own "
+                    f"per-thread isolation guarantee",
+                    file=file_b, line=line_b, column=col_b,
+                    category="invalid declaration",
+                )
 
     return AnalyzedProgram(global_scope.vars, structs, tables, enums, imports, threads)

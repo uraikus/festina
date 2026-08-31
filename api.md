@@ -2964,15 +2964,43 @@ string/array/map/struct/enum operations, `Math`, time functions, and
 touches only that one private image, never shared state). It may
 **not** call any canvas/window builtin (`drawRect`, `render`,
 `saveCanvas`, ...), `setTimeout`/`setInterval`, `exec()`,
-`mkdir()`/`ls()`, `openPort()`/`openSecurePort()`, `sqlite()`, or any
-ordinary top-level `func` declared outside the thread.
+`mkdir()`/`ls()`, `openPort()`/`openSecurePort()`, or any ordinary
+top-level `func` declared outside the thread. `sqlite()`/`sqliteInt()`/
+`sqliteFloat()`/`sqliteText()` are allowed **only** for a thread that
+declared its own `DatabaseURL` — see below.
+
+**Per-thread SQLite.** A thread's own first statement may be
+`DatabaseURL = '<literal>'` — a plain string literal only, unlike the
+main program's own `DatabaseURL` (which may be any `text` expression):
+
+```festina
+thread logger {
+    DatabaseURL = './logs.sqlite'
+    table LogEntry { message:text }
+    on message(p:text) {
+        sqlite('INSERT INTO LogEntry (message) VALUES (?)', [p])
+    }
+}
+logger.postMessage('started up')
+```
+
+A thread with its own `DatabaseURL` gets its own private sqlite handle
+— never shared with the main program or any other thread — and may
+call `sqlite()`/`sqliteInt()`/`sqliteFloat()`/`sqliteText()`; every
+`table` declared anywhere in the program is synced against it, the
+same as the main program's own database. A thread that did **not**
+declare its own `DatabaseURL` may not call any of the four at all — a
+clear compile error naming the fix. **Two contexts (a thread and the
+main program, or two threads) may never resolve to the same literal
+database file** — checked at compile time across the whole program,
+including the main program's own default (`'festina.sqlite'`, when it
+declares no `DatabaseURL` of its own); a non-literal main `DatabaseURL`
+(an expression the compiler can't prove anything about) skips this
+check rather than guessing.
 
 **Limitations (this is still an early phase of this feature).**
-A thread cannot yet open its own SQLite database (that, plus a
-compile-time check rejecting two threads that would share the same
-database file, is planned). Threads are singletons, declared once by
-name — there's no way to spawn more than one instance of the same
-`thread` block.
+Threads are singletons, declared once by name — there's no way to
+spawn more than one instance of the same `thread` block.
 
 ## Audio
 

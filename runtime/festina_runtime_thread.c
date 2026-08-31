@@ -279,10 +279,50 @@ static void festina_thread_kill_all_impl(void) {
     }
 }
 
+/* claude.md #199 Phase 5: guards festina_runtime.c's own shared
+ * g_cached_stmts/g_cached_stmt_count/g_cached_stmt_cap (claude.md #113's
+ * literal-SQL prepared-statement cache) -- a single process-wide array,
+ * fine as long as sqlite() only ever ran on the one main thread, but a
+ * real cross-thread data race once a `thread` with its own DatabaseURL
+ * can call sqlite() too, concurrently with main's own queries (or
+ * another such thread's). Deliberately NOT touched by the *slot fast
+ * path itself (festina_sqlite_prepare_cached's own per-CALL-SITE cache
+ * global) -- that global is lexically private to whichever ONE thread's
+ * generated code contains that call site, so it's never actually shared,
+ * needing no lock. Only the registry array core itself is. Lives here,
+ * not in festina_runtime.c, for the identical "a program with no
+ * `thread` declaration must never need -pthread linked" reason every
+ * other pthread-touching symbol in this file does -- see
+ * festina_set_stmt_cache_hooks's own doc comment in festina_runtime.c
+ * for the hook-seam shape this mirrors (festina_set_thread_hooks/
+ * _async_io_hooks/_audio_decoder, all the same "core declares a
+ * NULL-by-default function pointer pair, an optional translation unit
+ * registers the real one" pattern). */
+static pthread_mutex_t g_stmt_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void festina_stmt_cache_lock(void) {
+    pthread_mutex_lock(&g_stmt_cache_mutex);
+}
+
+static void festina_stmt_cache_unlock(void) {
+    pthread_mutex_unlock(&g_stmt_cache_mutex);
+}
+
 /* claude.md #195 Phase 2 (mirrors festina_register_async_io_hooks
  * exactly) -- codegen's own conditional call site, main()'s prologue,
- * whenever CodeGen.uses_threads is set. */
+ * whenever CodeGen.uses_threads is set. claude.md #199 Phase 5 widens
+ * this to also register the statement-cache lock/unlock pair just
+ * above -- correct to do unconditionally here (not gated on whether any
+ * declared thread actually uses its own DatabaseURL): every program
+ * reaching this function at all already declares at least one `thread`,
+ * so main's own top-level code is ALREADY running concurrently with at
+ * least one other OS thread from this point on, which is the only fact
+ * that actually matters for whether the shared statement-cache registry
+ * needs locking -- whether that OTHER thread happens to touch sqlite
+ * itself is irrelevant to whether MAIN's own queries need to be made
+ * safe against a hypothetical one that does. */
 void festina_register_thread_hooks(void) {
     festina_set_thread_hooks(festina_thread_outstanding_impl, festina_thread_drain_impl,
                              festina_thread_kill_all_impl);
+    festina_set_stmt_cache_hooks(festina_stmt_cache_lock, festina_stmt_cache_unlock);
 }

@@ -2546,10 +2546,37 @@ sqlite3 *festina_db_open(const char *path) {
  * cleared) and finalizes an unregistered one exactly as before. The
  * registry is a linear array scanned per finish -- its size is the
  * number of distinct literal sqlite() call sites in the program, a
- * few dozen at the outside, not a per-row or per-call quantity. */
+ * few dozen at the outside, not a per-row or per-call quantity.
+ *
+ * claude.md #199 Phase 5: this registry is process-wide, shared state --
+ * fine as long as sqlite() only ever ran on the one main thread, which
+ * was true of every program until a `thread` could open its own private
+ * database and call sqlite() from its own OS thread, concurrently with
+ * main's own queries (or another such thread's own). g_stmt_cache_lock/
+ * _unlock (NULL by default -- a program with no `thread` declaration at
+ * all pays nothing) are registered by festina_register_thread_hooks
+ * (festina_runtime_thread.c) whenever CodeGen.uses_threads is set --
+ * the same "core declares a NULL-by-default hook pair, an optional
+ * translation unit registers the real one" seam
+ * festina_set_thread_hooks/_async_io_hooks/_audio_decoder already use,
+ * kept here rather than a real pthread_mutex_t directly so this
+ * (always-linked) translation unit never needs -pthread linked for a
+ * program that never declares a `thread` at all. Deliberately NOT
+ * guarding the `*slot` fast path in festina_sqlite_prepare_cached below
+ * -- that global is lexically private to whichever ONE thread's own
+ * generated code contains that call site (a thread's own handler body
+ * never shares an LLVM global with another thread's, or with main's),
+ * so it is never actually touched by two threads and needs no lock. */
 static sqlite3_stmt **g_cached_stmts = NULL;
 static int g_cached_stmt_count = 0;
 static int g_cached_stmt_cap = 0;
+static void (*g_stmt_cache_lock)(void) = NULL;
+static void (*g_stmt_cache_unlock)(void) = NULL;
+
+void festina_set_stmt_cache_hooks(void (*lock_fn)(void), void (*unlock_fn)(void)) {
+    g_stmt_cache_lock = lock_fn;
+    g_stmt_cache_unlock = unlock_fn;
+}
 
 sqlite3_stmt *festina_sqlite_prepare_cached(sqlite3 *db, const char *sql,
                                             void **slot) {
@@ -2560,6 +2587,7 @@ sqlite3_stmt *festina_sqlite_prepare_cached(sqlite3 *db, const char *sql,
         return stmt;
     }
     sqlite3_stmt *stmt = festina_sqlite_prepare(db, sql);
+    if (g_stmt_cache_lock) g_stmt_cache_lock();
     if (g_cached_stmt_count == g_cached_stmt_cap) {
         g_cached_stmt_cap = g_cached_stmt_cap ? g_cached_stmt_cap * 2 : 16;
         sqlite3_stmt **grown = realloc(g_cached_stmts,
@@ -2568,19 +2596,31 @@ sqlite3_stmt *festina_sqlite_prepare_cached(sqlite3 *db, const char *sql,
         g_cached_stmts = grown;
     }
     g_cached_stmts[g_cached_stmt_count++] = stmt;
+    if (g_stmt_cache_unlock) g_stmt_cache_unlock();
     *slot = stmt;
     return stmt;
 }
 
 /* Finalize -- unless the statement is one of the cached ones, in which
  * case reset it for its next use. Every statement consumer ends its
- * statement through this. */
+ * statement through this. claude.md #199 Phase 5: the registry scan
+ * itself runs under the same lock pair festina_sqlite_prepare_cached
+ * uses above, released again before sqlite3_reset/_finalize run (both
+ * operate on `stmt`, never on the shared registry, so neither needs the
+ * lock held). */
 static void festina_sqlite_finish(sqlite3_stmt *stmt) {
+    if (g_stmt_cache_lock) g_stmt_cache_lock();
+    int cached = 0;
     for (int i = 0; i < g_cached_stmt_count; i++) {
         if (g_cached_stmts[i] == stmt) {
-            sqlite3_reset(stmt);
-            return;
+            cached = 1;
+            break;
         }
+    }
+    if (g_stmt_cache_unlock) g_stmt_cache_unlock();
+    if (cached) {
+        sqlite3_reset(stmt);
+        return;
     }
     sqlite3_finalize(stmt);
 }

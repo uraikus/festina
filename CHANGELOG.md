@@ -9,6 +9,31 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.12] - 2026-08-31
+
+### Added
+
+- A `thread`'s own first statement may be `DatabaseURL = '<literal>'`,
+  giving it a private SQLite handle — never shared with the main
+  program or any other thread — so it may call `sqlite()`/
+  `sqliteInt()`/`sqliteFloat()`/`sqliteText()` (a thread that didn't
+  declare one still may not). A compile-time check rejects two
+  contexts (a thread and the main program, or two threads) that would
+  resolve to the same database file, main program's own default
+  included. See [api.md](api.md#threads) and
+  [claude.md #199](claude.md).
+
+### Fixed
+
+- A real (if narrow) data race, found while building the above: the
+  media-decoder registration in `main()`'s own prologue used to run
+  after every declared `thread` was already spawned, and the literal-
+  SQL prepared-statement cache (claude.md #113) had no synchronization
+  at all — both harmless as long as only the main thread ever queried
+  SQLite, which per-thread `DatabaseURL` is what first breaks. Fixed
+  before either was ever reachable; verified race-free under
+  ThreadSanitizer.
+
 ## [0.11] - 2026-08-31
 
 ### Added

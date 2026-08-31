@@ -2,12 +2,18 @@
 worker with its own OS thread and message queues to/from the main
 program.
 
-This file covers Phase 1 only: grammar/AST, the isolation scope (a
-thread body can see its own state, function names, and type names, but
-never a global variable/constant or an ordinary top-level function),
-the sendable-type restriction on messages, and the symmetric "no dead
-sends" rule in both directions. No runtime behavior is implemented yet
-(that's Phase 2 onward) -- every test here is parser/semantic-level.
+This file covers everything checkable at the parser/semantic level
+(every test here is parser.parse()+semantic.analyze() only, no
+compile-and-run): grammar/AST, the isolation scope (a thread body can
+see its own state, function names, and type names, but never a global
+variable/constant or an ordinary top-level function), the
+sendable-type restriction on messages, the symmetric "no dead sends"
+rule in both directions, and (claude.md #199 Phase 5)
+`DatabaseURL = '<literal>'` as a thread's own first statement plus the
+whole-program database-file conflict check. Real runtime behavior
+(message round trips, lifecycle methods, and this same DatabaseURL
+feature exercised through a real compile-and-run) lives in
+`tests/test_codegen.py`'s own `TestThreads`.
 """
 import pytest
 
@@ -136,7 +142,6 @@ class TestThreadIsolation:
         "setTimeout(otherFunc, 100)",
         "exec(['ls'])",
         "openPort(8080)",
-        "sqlite('SELECT 1')",
     ])
     def test_disallowed_builtins_are_rejected_inside_a_thread(
             self, parser, semantic, errors, builtin_call):
@@ -147,6 +152,24 @@ class TestThreadIsolation:
         }}
         """
         with pytest.raises(errors.CompileError, match="cannot be called from inside a thread body"):
+            semantic.analyze(parser.parse(source))
+
+    def test_sqlite_is_rejected_inside_a_thread_with_no_database_url(
+            self, parser, semantic, errors):
+        # claude.md #199 Phase 5: sqlite() moved off the flat,
+        # unconditional _THREAD_DISALLOWED_BUILTINS set above -- it's
+        # allowed for a thread that declared its own DatabaseURL (see
+        # TestThreadDatabaseUrl below), so a thread that DIDN'T gets its
+        # own, more specific error naming the actual fix rather than
+        # the generic "touches state shared with the main program" one.
+        source = """
+        thread myWorker {
+            on load() { sqlite('SELECT 1') }
+        }
+        """
+        with pytest.raises(errors.CompileError,
+                            match="cannot be called from inside thread 'myWorker' -- "
+                                  "it hasn't declared its own database"):
             semantic.analyze(parser.parse(source))
 
     def test_a_state_var_is_visible_across_every_handler_in_the_same_thread(
@@ -433,6 +456,131 @@ class TestThreadLifecycleMethods:
         myWorker.explode()
         """
         with pytest.raises(errors.CompileError, match="has no method 'explode'"):
+            semantic.analyze(parser.parse(source))
+
+
+class TestThreadDatabaseUrl:
+    """claude.md #199 Phase 5: `DatabaseURL = '<literal>'` as a thread's
+    own first statement -- its own private sqlite handle (gating
+    sqlite()/sqliteInt()/sqliteFloat()/sqliteText() is covered by
+    TestThreadIsolation's own test above, since it's really an
+    isolation question), plus the whole-program compile-time conflict
+    check (main included). Every test here declares an obviously
+    thread-specific literal path (never 'festina.sqlite') -- a bare
+    parser.parse()/semantic.analyze() pair, unlike festina.imports.
+    build_program, never sets Program.database_url at all, so the
+    conflict check's own main-program fallback always treats a
+    file-less parse as using the default 'festina.sqlite' path (the
+    right conservative answer when nothing proves otherwise -- see
+    analyze()'s own db_contexts comment)."""
+
+    def test_a_valid_database_url_lets_the_thread_call_sqlite(self, parser, semantic):
+        source = """
+        thread worker {
+            DatabaseURL = 'worker_db.sqlite'
+            on load() { sqlite('SELECT 1') }
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_database_url_after_another_statement_is_rejected(self, parser, semantic, errors):
+        source = """
+        thread worker {
+            on load() { log('hi') }
+            DatabaseURL = 'worker_db.sqlite'
+        }
+        """
+        with pytest.raises(errors.CompileError,
+                            match="must be the first statement in the thread's own body"):
+            semantic.analyze(parser.parse(source))
+
+    @pytest.mark.parametrize("value_expr", [
+        "name",              # a plain identifier
+        "`db_${name}.sqlite`",  # a template literal
+        "name + '.sqlite'",  # a concatenation
+    ])
+    def test_a_non_literal_database_url_is_rejected(self, parser, semantic, errors, value_expr):
+        source = f"""
+        text name = 'worker'
+        thread worker {{
+            DatabaseURL = {value_expr}
+            on load() {{ log('hi') }}
+        }}
+        """
+        with pytest.raises(errors.CompileError,
+                            match="DatabaseURL must be a plain string literal"):
+            semantic.analyze(parser.parse(source))
+
+    def test_two_threads_with_the_same_literal_database_url_are_rejected(
+            self, parser, semantic, errors):
+        source = """
+        thread a {
+            DatabaseURL = 'shared_worker_db.sqlite'
+            on load() { sqlite('SELECT 1') }
+        }
+        thread b {
+            DatabaseURL = 'shared_worker_db.sqlite'
+            on load() { sqlite('SELECT 1') }
+        }
+        """
+        with pytest.raises(errors.CompileError,
+                            match="thread 'a' and thread 'b' would both open the same "
+                                  "database file"):
+            semantic.analyze(parser.parse(source))
+
+    def test_two_threads_with_distinct_literal_database_urls_are_fine(
+            self, parser, semantic):
+        source = """
+        thread a {
+            DatabaseURL = 'worker_a_db.sqlite'
+            on load() { sqlite('SELECT 1') }
+        }
+        thread b {
+            DatabaseURL = 'worker_b_db.sqlite'
+            on load() { sqlite('SELECT 1') }
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_a_thread_sharing_an_explicit_main_database_url_is_rejected(
+            self, parser, semantic, errors, ast_mod):
+        # festina.imports.build_program (not exercised by a bare
+        # parser.parse() call) is what normally sets Program.
+        # database_url from the entry file's own leading `DatabaseURL =
+        # '<expr>'` statement -- set directly here to exercise the
+        # conflict check's MAIN-program-is-explicit-and-literal branch
+        # without going through the full file-based compile pipeline
+        # (see TestThreads.test_a_thread_sharing_the_main_programs_
+        # database_url_is_a_clear_compile_error in test_codegen.py for
+        # that same scenario exercised end to end).
+        source = """
+        thread worker {
+            DatabaseURL = 'shared.sqlite'
+            on load() { sqlite('SELECT 1') }
+        }
+        """
+        program = parser.parse(source)
+        program.database_url = ast_mod.StringLit("shared.sqlite")
+        with pytest.raises(errors.CompileError,
+                            match="the main program and thread 'worker' would both "
+                                  "open the same database file"):
+            semantic.analyze(program)
+
+    def test_a_thread_sharing_the_implicit_default_main_database_is_rejected(
+            self, parser, semantic, errors):
+        # No explicit main DatabaseURL at all (program.database_url is
+        # None, both here -- a bare parse -- and for a real file that
+        # never assigns one) still means the main program opens
+        # 'festina.sqlite' by default, and that default counts too.
+        source = """
+        thread worker {
+            DatabaseURL = 'festina.sqlite'
+            on load() { sqlite('SELECT 1') }
+        }
+        """
+        with pytest.raises(errors.CompileError,
+                            match="the main program and thread 'worker' would both "
+                                  "open the same database file \\('festina.sqlite'\\)"):
             semantic.analyze(parser.parse(source))
 
 

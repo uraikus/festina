@@ -933,12 +933,17 @@ class CodeGen:
                                                 # onmessage_cb_global/out_trampoline (both None
                                                 # until the first `NAME.onMessage(...)` call site
                                                 # is emitted -- see that dispatch below)
-        self._current_thread_ctx = None        # claude.md #195 Phase 2: (thread_name,
-                                                # handle_global, outbound_type) while emitting a
-                                                # thread's own on_load/on_message/on_exit body,
-                                                # else None -- mirrors semantic.py's own
-                                                # _current_thread[0] one-slot box exactly, and is
-                                                # what _emit_call's bare `postMessage(x)`
+        self._current_thread_ctx = None        # claude.md #195 Phase 2 (widened by #199 Phase 5):
+                                                # (thread_name, handle_global, outbound_type,
+                                                # db_global) while emitting a thread's own
+                                                # on_load/on_message/on_exit body, else None --
+                                                # mirrors semantic.py's own _current_thread[0]
+                                                # one-slot box exactly. db_global (claude.md #199)
+                                                # is this thread's own private sqlite handle's
+                                                # global (None if it never declared its own
+                                                # DatabaseURL) -- see _current_sqlite_db_global.
+                                                # _current_thread_ctx is also what _emit_call's
+                                                # bare `postMessage(x)`
                                                 # dispatch (the only thing that needs to know "am
                                                 # I inside a thread body right now") consults.
         self._struct_clone_fns = {}            # claude.md #197 Phase 3: struct name -> LLVM
@@ -3273,10 +3278,21 @@ class CodeGen:
                     on_message_decl = stmt
                 elif stmt.name == "exit":
                     on_exit_decl = stmt
-            # Nothing else can legally appear here -- semantic.py's own
-            # analyze_thread already rejected anything else.
+            # Nothing else can legally appear here EXCEPT a leading
+            # `DatabaseURL = '<literal>'` (claude.md #199 Phase 5) --
+            # semantic.py's own analyze_thread already validated and
+            # consumed that one (info.database_url, read below), so
+            # this loop correctly does nothing for it, the same
+            # "silently skip, nothing left to do" outcome every other
+            # statement kind here would be a real bug for. Anything
+            # ELSE here would already have been rejected by
+            # analyze_thread.
 
-        thread_ctx = (decl.name, handle_global, info.outbound_type)
+        db_global = None
+        if info.database_url is not None:
+            db_global = f"@__festina_thread_{decl.name}_db"
+            self.extra_globals.append(f"{db_global} = global ptr null")
+        thread_ctx = (decl.name, handle_global, info.outbound_type, db_global)
         on_load_symbol = self._emit_thread_on_load(decl.name, state_inits, on_load_decl, state_env, thread_ctx)
         on_message_symbol = self._emit_thread_on_message(
             decl.name, on_message_decl, info.inbound_type, state_env, thread_ctx)
@@ -3289,6 +3305,36 @@ class CodeGen:
         symbol = f"@__festina_thread_{thread_name}_on_load"
         lines = []
         self._start_block(self.label("entry"), lines)
+        # claude.md #199 Phase 5: this thread's own private sqlite
+        # handle -- opened here, once, on this thread's own OS thread,
+        # before EVERYTHING else in this adapter (state var
+        # initializers included, on the off chance one of them itself
+        # queries this thread's own database), mirroring main()'s own
+        # festina_db_open placement in ITS prologue, before
+        # __festina_main() runs anything. Every declared `table` gets
+        # synced here too, exactly the same unconditional-regardless-
+        # of-whether-THIS-thread-actually-queries-it treatment main's
+        # own prologue already gives every table -- simpler than
+        # tracking which tables one particular thread's own queries
+        # actually touch, and harmless: festina_sync_table is a
+        # schema-creation no-op for a table already shaped right.
+        # Deliberately NOT re-registering the audio/image row decoders
+        # here -- main's own prologue already did that, unconditionally,
+        # BEFORE spawning any thread (see that call site's own comment
+        # for why the ordering matters).
+        db_global = thread_ctx[3]
+        if db_global is not None:
+            url_literal = self.analyzed.threads[thread_name].database_url
+            url_val = self.string_const(url_literal)
+            db_tmp = self.tmp()
+            lines.append(f"  {db_tmp} = call ptr @festina_db_open(ptr {url_val})")
+            lines.append(f"  store ptr {db_tmp}, ptr {db_global}")
+            for tname, cols in self.tables.items():
+                names_global, types_global, ncols = self._table_arrays(tname, cols)
+                lines.append(
+                    f"  call void @festina_sync_table(ptr {db_tmp}, ptr {self.string_const(tname)}, "
+                    f"ptr {names_global}, ptr {types_global}, i32 {ncols})"
+                )
         # claude.md #195: state var initializers run here, once, on this
         # thread's own OS thread, before the user's own `on load()` (if
         # any) -- the identical "declaration-with-initializer is just
@@ -9604,7 +9650,7 @@ class CodeGen:
                 # value and hand it to the runtime's own outbound
                 # queue for whichever thread self._current_thread_ctx
                 # names.
-                thread_name, handle_global, outbound_type = self._current_thread_ctx
+                thread_name, handle_global, outbound_type, _db_global = self._current_thread_ctx
                 val, vtype = self._emit_expr(expr.args[0], env, lines)
                 val = self._coerce(val, vtype, outbound_type, lines, source_expr=expr.args[0])
                 handle = self.tmp()
@@ -11335,6 +11381,27 @@ class CodeGen:
                 f"  {stmt_val} = call ptr @festina_sqlite_prepare(ptr {db_val}, ptr {sql_val})")
         return stmt_val
 
+    def _current_sqlite_db_global(self):
+        """claude.md #199 Phase 5: the single dispatch point for "which
+        sqlite3* global should THIS `sqlite()`/`sqliteInt()`/
+        `sqliteFloat()`/`sqliteText()` call site read its handle from"
+        -- `@__festina_db` (the main program's own, unconditionally
+        emitted -- see the module-level global list) everywhere except
+        while emitting one particular thread's own on_load/on_message/
+        on_exit body, where it's that thread's own private
+        `@__festina_thread_NAME_db` instead (semantic.py has already
+        proven, at the point any such call site could exist, that this
+        thread actually declared its own DatabaseURL, so `db_global`
+        here is never None when `_current_thread_ctx` itself is not
+        None and reaches here -- `_check_thread_clonable_type`-style
+        blind trust in an already-proven invariant, not a fresh
+        runtime check)."""
+        if self._current_thread_ctx is not None:
+            db_global = self._current_thread_ctx[3]
+            if db_global is not None:
+                return db_global
+        return "@__festina_db"
+
     def _emit_sqlite_call(self, expr, env, lines, expected_type):
         """`expected_type` is the declared type of wherever this call's
         result flows into (a var's declared type, a param type, a return
@@ -11356,7 +11423,7 @@ class CodeGen:
                 file=self.filename, line=callee.line)
 
         db_val = self.tmp()
-        lines.append(f"  {db_val} = load ptr, ptr @__festina_db")
+        lines.append(f"  {db_val} = load ptr, ptr {self._current_sqlite_db_global()}")
         stmt_val = self._emit_sqlite_prepare(expr, sql_val, db_val, lines)
         # claude.md #83: sqlite3_prepare_v2 compiles the SQL into the
         # statement rather than holding the string, so a temporary
@@ -11482,7 +11549,7 @@ class CodeGen:
                 f"{types_mod.type_name(sql_type)}",
                 file=self.filename, line=callee.line)
         db_val = self.tmp()
-        lines.append(f"  {db_val} = load ptr, ptr @__festina_db")
+        lines.append(f"  {db_val} = load ptr, ptr {self._current_sqlite_db_global()}")
         # claude.md #113: same literal-SQL statement cache the array
         # query path uses -- sqliteInt('SELECT count(*) ...') in a loop
         # is exactly the shape that pays for re-preparing.
@@ -11692,6 +11759,35 @@ class CodeGen:
             # this is what lets festina_run_event_loop service an open
             # port when main() picks it as the one blocking loop below.
             main_lines.append("  call void @festina_register_http_service_hooks()")
+        # claude.md #101 (moved here by claude.md #199 Phase 5): register
+        # the media decoders BEFORE any query can run, so a table with an
+        # aud/img column can turn a stored BLOB back into a handle. This
+        # used to sit inside the "if self.tables or self.uses_sqlite"
+        # block below, AFTER thread spawn just below -- harmless when only
+        # the MAIN program ever queried sqlite (its own festina_db_open
+        # call is also down there, strictly after this), but Phase 5 lets
+        # a THREAD open its own private database and start querying it
+        # from its own on_load(), concurrently with the rest of this very
+        # prologue -- a thread's first query could easily run before
+        # main's prologue reached the old, later position, decoding an
+        # aud/img column before g_audio_decoder/g_image_decoder ever got a
+        # chance to register (or, separately, both main and that thread
+        # racing to store the identical function pointer into the same
+        # global with no synchronization between them -- a genuine
+        # TSan-flagged data race even though the VALUE never actually
+        # differs). Moving registration to before thread
+        # spawn removes both hazards outright: every declared thread's own
+        # on_load only ever starts running after this. Only emitted when
+        # the program already links the feature in question, so the
+        # symbol always exists; harmless to run even for a program with no
+        # `table` declaration at all (the function pointer is simply never
+        # read).
+        if self.uses_audio:
+            main_lines.append(
+                "  call void @festina_set_audio_decoder(ptr @festina_audio_from_bytes)")
+        if self.uses_graphics_code or self.uses_graphics:
+            main_lines.append(
+                "  call void @festina_set_image_decoder(ptr @festina_image_from_bytes)")
         if self.uses_threads:
             # claude.md #195 Phase 2: same placement/reasoning as the
             # three hook registrations just above, plus the real
@@ -11753,20 +11849,9 @@ class CodeGen:
                 url_val = self._coerce(url_val, url_type, TEXT, main_lines)
             else:
                 url_val = self.string_const("festina.sqlite")
-            # claude.md #101: register the media decoders BEFORE any
-            # query can run, so a table with an aud/img column can turn
-            # a stored BLOB back into a handle. Emitted here rather than
-            # called by name from the core runtime, which must not
-            # reference the graphics/audio translation units at all --
-            # that separation is what lets a program using neither link
-            # neither. Only emitted when the program already links the
-            # feature in question, so the symbol always exists.
-            if self.uses_audio:
-                main_lines.append(
-                    "  call void @festina_set_audio_decoder(ptr @festina_audio_from_bytes)")
-            if self.uses_graphics_code or self.uses_graphics:
-                main_lines.append(
-                    "  call void @festina_set_image_decoder(ptr @festina_image_from_bytes)")
+            # claude.md #101/#199: the media-decoder registration that
+            # used to live here moved earlier in this prologue (before
+            # thread spawn) -- see that call site's own comment for why.
             main_lines.append(f"  %db = call ptr @festina_db_open(ptr {url_val})")
             main_lines.append("  store ptr %db, ptr @__festina_db")
             for tname, cols in self.tables.items():

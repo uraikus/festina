@@ -335,6 +335,16 @@ sqlite3_stmt *festina_sqlite_prepare(sqlite3 *db, const char *sql);
  * once and reset+reused ever after. See the .c doc comment. */
 sqlite3_stmt *festina_sqlite_prepare_cached(sqlite3 *db, const char *sql,
                                             void **slot);
+/* claude.md #199 Phase 5: registers the lock/unlock pair guarding the
+ * literal-SQL prepared-statement registry (festina_sqlite_prepare_cached/
+ * festina_sqlite_finish's own shared g_cached_stmts array in
+ * festina_runtime.c) against a real cross-thread race -- called by
+ * festina_register_thread_hooks (festina_runtime_thread.c) whenever
+ * CodeGen.uses_threads is set; NULL/no-op (the default) for a program
+ * with no `thread` declaration at all, which never needs -pthread
+ * linked for this reason (see that file's own doc comment on why this
+ * lives there, not here). */
+void festina_set_stmt_cache_hooks(void (*lock_fn)(void), void (*unlock_fn)(void));
 void festina_sqlite_bind_int(sqlite3_stmt *stmt, int32_t idx, int64_t val);
 void festina_sqlite_bind_float(sqlite3_stmt *stmt, int32_t idx, double val);
 void festina_sqlite_bind_text(sqlite3_stmt *stmt, int32_t idx, const char *val);

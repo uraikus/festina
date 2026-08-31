@@ -16339,6 +16339,86 @@ class TestThreads:
         assert result.returncode == 0
         assert result.stdout.strip().splitlines() == ["example.com", "/path", "1"]
 
+    def test_a_thread_with_its_own_database_url_has_a_genuinely_private_sqlite_handle(
+            self, compile_and_run, tmp_path):
+        # claude.md #199 Phase 5: `DatabaseURL = '<literal>'` as a
+        # thread's own first statement -- its own INSERT/SELECT round
+        # trips correctly through its own private handle, and the main
+        # program's own separate database (a different literal file)
+        # ends up as a genuinely distinct file on disk, with neither
+        # program's own rows visible in the other's file -- not just
+        # "the query returned the right answer" (which a single shared
+        # handle would also satisfy), but "the actual bytes on disk are
+        # two separate databases."
+        source = """
+        DatabaseURL = 'main_only.sqlite'
+        table MainItem { id:int }
+        sqlite('INSERT INTO MainItem (id) VALUES (1)')
+
+        table WorkerItem { id:int label:text }
+        thread worker {
+            DatabaseURL = 'worker_only.sqlite'
+            on message(p:int) {
+                sqlite('INSERT INTO WorkerItem (id, label) VALUES (?, ?)',
+                       [p, `from-worker-${p}`])
+                arr[WorkerItem] rows = sqlite('SELECT * FROM WorkerItem')
+                postMessage(rows[0].label)
+            }
+        }
+        void func onReply(x:text) {
+            log(x)
+            close(0)
+        }
+        worker.onMessage(void (x:text) => onReply(x))
+        worker.postMessage(42)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "from-worker-42"
+        assert (tmp_path / "main_only.sqlite").exists()
+        assert (tmp_path / "worker_only.sqlite").exists()
+        # claude.md #28's own schema-sync unconditionally creates every
+        # declared table in EVERY database that gets opened (main's own
+        # prologue, and this thread's own on_load, both sync the whole
+        # self.tables set) -- but only the context that actually
+        # QUERIED a table ever puts a ROW in it. WorkerItem exists as an
+        # empty table in main's own file; MainItem exists as an empty
+        # table in the worker's own file. Neither file's own MainItem/
+        # WorkerItem row count crosses into the other's.
+        import sqlite3 as _sqlite3
+        main_conn = _sqlite3.connect(str(tmp_path / "main_only.sqlite"))
+        worker_conn = _sqlite3.connect(str(tmp_path / "worker_only.sqlite"))
+        try:
+            assert main_conn.execute("SELECT count(*) FROM MainItem").fetchone() == (1,)
+            assert main_conn.execute("SELECT count(*) FROM WorkerItem").fetchone() == (0,)
+            assert worker_conn.execute("SELECT count(*) FROM WorkerItem").fetchone() == (1,)
+            assert worker_conn.execute("SELECT count(*) FROM MainItem").fetchone() == (0,)
+        finally:
+            main_conn.close()
+            worker_conn.close()
+
+    def test_a_thread_sharing_the_main_programs_database_url_is_a_clear_compile_error(
+            self, compile_and_run, errors):
+        # claude.md #199 Phase 5's own whole-program conflict check,
+        # exercised through the real, file-based compile pipeline (see
+        # test_threads.py's own TestThreadDatabaseUrl for the same
+        # check's unit-level coverage) -- festina.imports.build_program
+        # is what actually sets Program.database_url from the entry
+        # file's own leading `DatabaseURL = ...` statement, so this is
+        # the one scenario that genuinely needs a real compile, not
+        # just parser.parse()+semantic.analyze().
+        source = """
+        DatabaseURL = 'shared.sqlite'
+        thread worker {
+            DatabaseURL = 'shared.sqlite'
+            on load() { sqlite('SELECT 1') }
+        }
+        """
+        with pytest.raises(errors.CompileError,
+                            match="the main program and thread 'worker' would both "
+                                  "open the same database file"):
+            compile_and_run(source)
+
     def test_postmessage_of_a_fresh_enum_coercion_does_not_leak_or_double_free(self, compile_and_run):
         # Regression coverage for a real bug found and fixed while
         # building this: postMessage(x)'s own cleanup used to always
