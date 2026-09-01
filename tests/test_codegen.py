@@ -16588,3 +16588,117 @@ class TestThreadPools:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip().splitlines() == ["false", "true"]
+
+
+class TestThreadPrivateFunctions:
+    """claude.md #210: real, compiled-and-run proof that a thread-
+    private function actually runs, actually mutates the state it
+    closes over, and two pool instances' own private-func-mutated
+    state stays genuinely independent."""
+
+    def test_a_private_function_computes_correctly_and_can_call_another(
+            self, compile_and_run):
+        source = """
+        on message(worker:thread, msg:int) {
+            log(msg)
+            close(0)
+        }
+        thread worker {
+            int func helper(x:int) { return x + 1 }
+            int func triple(x:int) { return helper(x) * 3 }
+            on message(worker:thread, msg:int) {
+                postMessage(triple(msg))
+            }
+        }
+        worker.postMessage(2)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # triple(2) = helper(2) * 3 = (2 + 1) * 3 = 9
+        assert result.stdout.strip() == "9"
+
+    def test_a_private_function_mutates_the_thread_state_it_closes_over(
+            self, compile_and_run):
+        source = """
+        on message(worker:thread, msg:int) {
+            log(msg)
+            close(0)
+        }
+        thread counter {
+            int total = 0
+            void func addToTotal(x:int) {
+                total = total + x
+            }
+            on message(worker:thread, msg:int) {
+                addToTotal(msg)
+                addToTotal(msg)
+                postMessage(total)
+            }
+        }
+        counter.postMessage(5)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "10"
+
+    def test_a_private_function_can_postmessage_another_thread(self, compile_and_run):
+        source = """
+        on message(worker:thread, msg:int) {
+            log(msg)
+            close(0)
+        }
+        thread relay {
+            on message(worker:thread, msg:int) {
+                postMessage(msg + 100)
+            }
+        }
+        thread worker {
+            void func forward(x:int) {
+                relay.postMessage(x)
+            }
+            on message(worker:thread, msg:int) {
+                forward(msg)
+            }
+        }
+        worker.postMessage(9)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "109"
+
+    def test_two_pool_instances_private_functions_mutate_independent_state(
+            self, compile_and_run):
+        source = """
+        int seenA = 0
+        int seenB = 0
+        void func checkDone() {
+            if seenA != 0 && seenB != 0 {
+                log(seenA)
+                log(seenB)
+                close(0)
+            }
+        }
+        on message(worker:thread, msg:int) {
+            if msg < 100 {
+                seenA = msg
+            } else {
+                seenB = msg
+            }
+            checkDone()
+        }
+        thread pool[2] {
+            int total = 0
+            void func addToTotal(x:int) {
+                total = total + x
+            }
+            on message(worker:thread, msg:int) {
+                addToTotal(msg)
+                postMessage(total)
+            }
+        }
+        pool[0].postMessage(3)
+        pool[1].postMessage(200)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["3", "200"]

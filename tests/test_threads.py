@@ -746,3 +746,174 @@ class TestThreadPools:
         thread other { on load() { pool[0].postMessage(1) } }
         """
         semantic.analyze(parser.parse(source))
+
+
+class TestThreadPrivateFunctions:
+    """claude.md #210: a `func` declared directly in a thread's own
+    body -- callable only from that one thread's own handlers/other
+    private funcs, with read/write access to that thread's own state.
+    Ordinary top-level functions remain uncallable from inside a
+    thread (unchanged, claude.md #195's own deliberate cut)."""
+
+    def test_a_private_function_is_accepted_and_callable(self, parser, semantic):
+        source = """
+        thread w {
+            int func double_it(x:int) { return x * 2 }
+            on load() { int y = double_it(5) }
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_ordinary_top_level_functions_are_still_uncallable_from_a_thread(
+            self, parser, semantic, errors):
+        source = """
+        void func helper() { log('hi') }
+        thread w {
+            on load() { helper() }
+        }
+        """
+        with pytest.raises(errors.CompileError, match="cannot be called from inside a thread body"):
+            semantic.analyze(parser.parse(source))
+
+    def test_a_private_function_is_invisible_from_another_thread(
+            self, parser, semantic, errors):
+        source = """
+        thread a {
+            int func helper(x:int) { return x }
+        }
+        thread b {
+            on load() { int y = helper(1) }
+        }
+        """
+        with pytest.raises(errors.CompileError, match="unknown function 'helper'"):
+            semantic.analyze(parser.parse(source))
+
+    def test_a_private_function_is_not_callable_from_main(self, parser, semantic, errors):
+        source = """
+        thread w {
+            int func helper(x:int) { return x }
+        }
+        int y = helper(1)
+        """
+        with pytest.raises(errors.CompileError, match="unknown function 'helper'"):
+            semantic.analyze(parser.parse(source))
+
+    def test_a_same_named_top_level_and_private_function_coexist_without_collision(
+            self, parser, semantic):
+        # Proves the kind/scope split works, not just "doesn't crash":
+        # main's own call resolves to the TOP-LEVEL helper, the
+        # thread's own call resolves to ITS OWN, and neither sees the
+        # other's.
+        source = """
+        void func helper() { log('top') }
+        thread w {
+            void func helper() { log('private') }
+            on load() { helper() }
+        }
+        helper()
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_a_private_function_can_read_and_write_thread_state_declared_before_it(
+            self, parser, semantic):
+        source = """
+        thread w {
+            int total = 0
+            int func bump() {
+                total = total + 1
+                return total
+            }
+            on load() { bump() }
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_a_private_function_reading_state_declared_after_it_is_rejected(
+            self, parser, semantic, errors):
+        # Matches the "declared before referenced" ordering every
+        # other thread-body reference already needs -- private func
+        # SIGNATURES are hoisted (so two private funcs may call each
+        # other in either textual order), but a private func's own
+        # BODY is still analyzed at its own ordinary textual position,
+        # same as a handler's.
+        source = """
+        thread w {
+            int func bump() {
+                total = total + 1
+                return total
+            }
+            int total = 0
+        }
+        """
+        with pytest.raises(errors.CompileError, match="unknown variable 'total'"):
+            semantic.analyze(parser.parse(source))
+
+    def test_two_private_functions_can_call_each_other_in_either_textual_order(
+            self, parser, semantic):
+        source = """
+        thread w {
+            int func a(x:int) { return b(x) }
+            int func b(x:int) { return x + 1 }
+            on load() { int y = a(1) }
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_a_private_function_can_postmessage_another_thread(self, parser, semantic):
+        source = """
+        thread relay { on message(worker:thread, msg:int) { } }
+        thread w {
+            void func forward(x:int) { relay.postMessage(x) }
+            on load() { forward(1) }
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_a_private_function_can_bare_postmessage_to_main(self, parser, semantic):
+        source = """
+        on message(worker:thread, msg:int) { log(msg) }
+        thread w {
+            void func report(x:int) { postMessage(x) }
+            on load() { report(1) }
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_duplicate_private_function_names_are_rejected(self, parser, semantic, errors):
+        source = """
+        thread w {
+            int func helper(x:int) { return x }
+            int func helper(x:int) { return x + 1 }
+        }
+        """
+        with pytest.raises(errors.CompileError, match="already declares a function named"):
+            semantic.analyze(parser.parse(source))
+
+    def test_a_builtin_function_name_cannot_be_used_for_a_private_function(
+            self, parser, semantic, errors):
+        source = "thread w { void func postMessage(x:int) { } }"
+        with pytest.raises(errors.CompileError, match="builtin function name"):
+            semantic.analyze(parser.parse(source))
+
+    def test_a_bare_reference_to_a_private_function_as_a_value_is_rejected(
+            self, parser, semantic, errors):
+        source = """
+        thread w {
+            int func helper(x:int) { return x }
+            on load() { func[int]:int f = helper }
+        }
+        """
+        with pytest.raises(errors.CompileError, match="thread-private function"):
+            semantic.analyze(parser.parse(source))
+
+    def test_a_private_function_works_the_same_way_inside_a_thread_pool(
+            self, parser, semantic):
+        source = """
+        on message(worker:thread, msg:int) { log(msg) }
+        thread pool[2] {
+            int func double_it(x:int) { return x * 2 }
+            on message(worker:thread, msg:int) { postMessage(double_it(msg)) }
+        }
+        pool[0].postMessage(1)
+        """
+        semantic.analyze(parser.parse(source))

@@ -2650,7 +2650,7 @@ class CodeGen:
             elif isinstance(stmt, (ast.WhileStmt, ast.ForStmt)):
                 self._register_all_func_signatures(stmt.body.body)
 
-    def _emit_func(self, decl):
+    def _emit_func(self, decl, symbol=None, outer_env=None, thread_ctx=None):
         # claude.md #140: signature already registered by generate()'s
         # own pre-pass (_register_all_func_signatures) before this ever
         # runs -- re-resolving return_type here is cheap and side-effect
@@ -2660,12 +2660,26 @@ class CodeGen:
         # self.func_decls (which stores the raw ast.FuncDecl, not its
         # resolved return type) into this still fully self-contained
         # function.
+        #
+        # claude.md #210: `symbol`/`outer_env`/`thread_ctx` are all
+        # None for an ordinary top-level function (the only caller
+        # before this phase) -- reused, not duplicated, for a thread-
+        # private helper: `symbol` is its own mangled name, `outer_env`
+        # is that thread's own `state_env` (so the body sees thread
+        # state directly, the same "closes over this thread's own
+        # state" a handler already gets), and `thread_ctx` is set as
+        # `self._current_thread_ctx` around the BODY only (mirroring
+        # `_emit_thread_on_load`/`_on_message`/`_on_exit`'s own
+        # identical save/set/restore pattern exactly), so a private
+        # func's own body may call bare `postMessage(x)` or another
+        # thread's `NAME.postMessage(x)` exactly like a handler can.
+        symbol = symbol if symbol is not None else f"@{decl.name}"
         return_type = None if decl.return_type == "void" else self._resolve(decl.return_type, decl)
         param_types = [self._resolve(p.type_expr, decl) for p in decl.params]
         llvm_ret = "void" if return_type is None else _llvm_type(return_type)
         params_ir = ", ".join(f"{_llvm_type(t)} %arg.{p.name}" for t, p in zip(param_types, decl.params))
 
-        body_env = Env(self.global_env)
+        body_env = Env(outer_env if outer_env is not None else self.global_env)
         body_lines = []
         entry_label = self.label("entry")
         self._start_block(entry_label, body_lines)
@@ -2702,7 +2716,13 @@ class CodeGen:
         self._active_free_locals.append([])
         escaping = self._emit_param_bindings(decl, param_types, body_env, body_lines)
 
-        block = self._emit_analyzed_func_body(decl, body_env, return_type, body_lines, escaping)
+        saved_ctx = self._current_thread_ctx
+        if thread_ctx is not None:
+            self._current_thread_ctx = thread_ctx
+        try:
+            block = self._emit_analyzed_func_body(decl, body_env, return_type, body_lines, escaping)
+        finally:
+            self._current_thread_ctx = saved_ctx
         if not block["terminated"]:
             # claude.md never says whether a non-void function must
             # return a value on every code path (unlike the
@@ -2728,7 +2748,7 @@ class CodeGen:
         self._active_free_locals.pop()
         self._current_func_frame_base = saved_func_frame_base
 
-        func = [f"define {llvm_ret} @{decl.name}({params_ir}) {{"]
+        func = [f"define {llvm_ret} {symbol}({params_ir}) {{"]
         func.extend(block["lines"])
         func.append("}")
         self.func_defs.extend(func)
@@ -3641,6 +3661,31 @@ class CodeGen:
         # wide, declared top-level `on message` type), so thread_ctx
         # only needs to carry the two things still genuinely per-thread.
         thread_ctx = (decl.name, handle_global, db_global)
+        # claude.md #210: thread-private helper functions -- registered
+        # (signature only) BEFORE any body is emitted, the identical
+        # "hoist first" split semantic.py's own thread_functions_scope
+        # pre-pass already uses, so a handler or another private func
+        # may call one declared anywhere in this thread's own body,
+        # regardless of textual order. Each gets a real, separately
+        # mangled LLVM function (`@__festina_thread_NAME_func_fname`),
+        # emitted via the ordinary `_emit_func` -- `outer_env=state_env`
+        # gives its own body direct access to this thread's own state
+        # (the "closes over this thread's own state" requirement),
+        # `thread_ctx=thread_ctx` lets it call bare `postMessage(x)`/
+        # another thread's `NAME.postMessage(x)` exactly like a handler
+        # already can.
+        self.threads[decl.name]["funcs"] = {}
+        private_func_decls = [stmt for stmt in decl.body.body if isinstance(stmt, ast.FuncDecl)]
+        for stmt in private_func_decls:
+            func_ret_type = None if stmt.return_type == "void" else self._resolve(stmt.return_type, stmt)
+            self.threads[decl.name]["funcs"][stmt.name] = {
+                "symbol": f"@__festina_thread_{decl.name}_func_{stmt.name}",
+                "decl": stmt,
+                "ret_type": func_ret_type,
+            }
+        for stmt in private_func_decls:
+            finfo = self.threads[decl.name]["funcs"][stmt.name]
+            self._emit_func(stmt, symbol=finfo["symbol"], outer_env=state_env, thread_ctx=thread_ctx)
         on_load_symbol = self._emit_thread_on_load(decl.name, state_inits, on_load_decl, state_env, thread_ctx)
         on_message_symbol = self._emit_thread_on_message(
             decl.name, on_message_decl, info.inbound_type, state_env, thread_ctx)
@@ -10578,6 +10623,49 @@ class CodeGen:
                     else:
                         self._free_text_temp(arg_expr, val, vtype, lines)
                 return out, ret_type
+            # claude.md #210: a thread-private helper function -- only
+            # reachable when this call site is itself inside a thread
+            # body (`self._current_thread_ctx` set) AND that thread
+            # declared a private func of this name, checked BEFORE the
+            # flat global self.func_decls just below, mirroring
+            # semantic.py's own identical shadowing (a thread's own
+            # `thread_functions_scope` is a CHILD of the top-level
+            # `functions_scope`, so a same-named private func always
+            # wins over a same-named global one for a call site inside
+            # that thread's own body).
+            if self._current_thread_ctx is not None:
+                tfuncs = self.threads[self._current_thread_ctx[0]].get("funcs", {})
+                if name in tfuncs:
+                    finfo = tfuncs[name]
+                    decl = finfo["decl"]
+                    symbol = finfo["symbol"]
+                    ret_type = finfo["ret_type"]
+                    arg_vals = []
+                    arg_temps = []
+                    for arg_expr, param in zip(expr.args, decl.params):
+                        ptype = self._resolve(param.type_expr, decl)
+                        val, vtype = self._emit_value_for(arg_expr, env, lines, ptype)
+                        val = self._coerce(val, vtype, ptype, lines, source_expr=arg_expr)
+                        arg_vals.append(f"{_llvm_type(ptype)} {val}")
+                        arg_temps.append((arg_expr, val, vtype, ptype))
+                    args_ir = ", ".join(arg_vals)
+                    if ret_type is None:
+                        lines.append(f"  call void {symbol}({args_ir})")
+                        out = "0"
+                    else:
+                        out = self.tmp()
+                        lines.append(f"  {out} = call {_llvm_type(ret_type)} {symbol}({args_ir})")
+                    # claude.md #83/#119/#192: identical post-call
+                    # argument cleanup to the ordinary direct-call path
+                    # just below -- see its own comment.
+                    for arg_expr, val, vtype, ptype in arg_temps:
+                        if (_is_refcounted(ptype)
+                                and self._refcounted_source_is_fresh(arg_expr, vtype, ptype)):
+                            lines.append(
+                                f"  call void {self._release_fn_for(ptype)}(ptr {val})")
+                        else:
+                            self._free_text_temp(arg_expr, val, vtype, lines)
+                    return out, ret_type
             if name in self.func_decls:
                 decl = self.func_decls[name]
                 arg_vals = []

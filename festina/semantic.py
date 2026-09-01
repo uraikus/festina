@@ -1690,6 +1690,22 @@ def analyze(program, filename="<string>"):
                                    for p in decl.params)
                 ret_type = resolve(decl.return_type, decl) if decl.return_type != "void" else None
                 return types_mod.FuncType(param_types, ret_type)
+            if sym.kind == "thread_function":
+                # claude.md #210: unlike an ordinary top-level function,
+                # a thread-private helper has no first-class VALUE form
+                # -- it may only ever be CALLED by name (the branch
+                # above, `sym.kind == "function"`, deliberately doesn't
+                # also match "thread_function"). Never explicitly
+                # requested, and closing over one thread's own private
+                # state makes "hand this function pointer to code
+                # outside that thread" a can of worms (claude.md #195's
+                # own isolation model) this phase doesn't need to open.
+                raise CompileError(
+                    f"'{expr.name}' is a thread-private function -- it can only be "
+                    f"called (e.g. '{expr.name}(...)'), not referenced as a value",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid function argument type",
+                )
             return sym.type
         if isinstance(expr, ast.Member):
             return _infer_member(expr, scope)
@@ -2372,8 +2388,9 @@ def analyze(program, filename="<string>"):
                     raise CompileError(
                         f"'{name}()' cannot be called from inside a thread body -- "
                         f"functions declared outside a thread aren't isolated the "
-                        f"same way it is (see claude.md #195); thread-private helper "
-                        f"functions aren't supported yet",
+                        f"same way it is (see claude.md #195); declare '{name}' as a "
+                        f"func directly inside this thread's own body instead "
+                        f"(claude.md #210), if it only needs to be called from here",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
@@ -2662,7 +2679,19 @@ def analyze(program, filename="<string>"):
                     check_assignable(expected, arg_type, callee,
                                       what=f"argument {i + 1} of '{name}'")
                 return fn_type.return_type
-            if sym is None or sym.kind != "function":
+            # claude.md #210: "thread_function" (a thread-private
+            # helper) is accepted here on equal footing with an
+            # ordinary "function" -- everything below reads `sym.node`
+            # generically (a plain FuncDecl either way), so no further
+            # branching is needed. This widening is safe EVERYWHERE
+            # this function runs, not just inside a thread body:
+            # `scope.lookup(name)` is what actually enforces privacy
+            # (a thread-private func's own name was only ever defined
+            # in that ONE thread's own thread_functions_scope, never in
+            # global_scope/functions_scope), so a call site outside
+            # that thread's own body can never even find the symbol to
+            # reach this check in the first place.
+            if sym is None or sym.kind not in ("function", "thread_function"):
                 # claude.md #109: a name this language used to have gets
                 # told what replaced it, not merely that it is unknown.
                 # A user-declared function of the same name still wins,
@@ -4274,6 +4303,46 @@ def analyze(program, filename="<string>"):
             info.database_url_node = stmt.expr
             thread_body = thread_body[1:]
             break
+        # claude.md #210: thread-private helper functions -- a `func`
+        # declared directly in a thread's own body (a sibling of its
+        # state vars/on load/on message/on exit, not nested inside one
+        # of THOSE), callable only from this one thread's own handlers
+        # and other private funcs, with read/write access to this
+        # thread's own state. `thread_functions_scope` is this
+        # thread's OWN, separate function-name namespace -- parented
+        # on `thread_state_scope` (so a private func's own body sees
+        # thread state directly, the same "closes over this thread's
+        # own state" a handler already gets), never on the top-level
+        # `functions_scope` (which would leak every private func into
+        # every OTHER thread, and into main). Two-pass, the identical
+        # "hoist every signature before any call checks" shape
+        # `register_func_signature`'s own whole-program pre-pass
+        # already uses -- but deliberately NOT `_iter_func_decls`
+        # itself, since that recurses into the GLOBAL `functions_scope`
+        # and would defeat the whole point of a SEPARATE, private one.
+        thread_functions_scope = Scope(thread_state_scope)
+        for stmt in thread_body:
+            if not isinstance(stmt, ast.FuncDecl):
+                continue
+            if stmt.name in BUILTIN_FUNCTIONS:
+                raise CompileError(
+                    f"'{stmt.name}' is a builtin function name and cannot be used to "
+                    f"declare a function -- a function declared with this name would be "
+                    f"permanently unreachable, since every call to '{stmt.name}(...)' "
+                    f"resolves to the builtin instead",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="duplicate declaration",
+                )
+            if stmt.name in thread_functions_scope.vars:
+                raise CompileError(
+                    f"thread '{decl.name}' already declares a function named "
+                    f"'{stmt.name}'",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="duplicate declaration",
+                )
+            func_return_type = resolve(stmt.return_type, stmt) if stmt.return_type != "void" else None
+            thread_functions_scope.vars[stmt.name] = Symbol(
+                stmt.name, func_return_type, "thread_function", stmt)
         _current_thread[0] = info
         try:
             for stmt in thread_body:
@@ -4309,17 +4378,41 @@ def analyze(program, filename="<string>"):
                                 file=filename, line=stmt.line, column=stmt.column,
                                 category="invalid function argument type",
                             )
-                    handler_scope = Scope(thread_state_scope)
+                    # claude.md #210: parented on thread_functions_scope
+                    # (not thread_state_scope directly), so a handler
+                    # can call this thread's own private funcs -- which
+                    # transitively still sees thread_state_scope/
+                    # functions_scope too, exactly as before.
+                    handler_scope = Scope(thread_functions_scope)
                     for p in stmt.params:
                         ptype = apply_manually_managed(resolve(p.type_expr, stmt), p.manually_managed)
                         handler_scope.define(p.name, Symbol(p.name, ptype, "parameter"),
                                               stmt, filename)
                     analyze_block(stmt.body, handler_scope, return_type=None)
                     continue
+                if isinstance(stmt, ast.FuncDecl):
+                    # claude.md #210: the BODY half -- the signature was
+                    # already hoisted into thread_functions_scope above,
+                    # the same "hoist first, analyze bodies at their own
+                    # textual position" split register_func_signature/
+                    # analyze_func already use at the top level. Parented
+                    # on thread_functions_scope, not thread_state_scope
+                    # directly, so one private func can call ANOTHER
+                    # (declared anywhere in this thread's body, thanks
+                    # to hoisting -- order among private funcs doesn't
+                    # matter, same as top-level).
+                    func_sym = thread_functions_scope.vars[stmt.name]
+                    func_scope = Scope(thread_functions_scope)
+                    for p in stmt.params:
+                        ptype = apply_manually_managed(resolve(p.type_expr, stmt), p.manually_managed)
+                        func_scope.define(p.name, Symbol(p.name, ptype, "parameter"),
+                                           stmt, filename)
+                    analyze_block(stmt.body, func_scope, return_type=func_sym.type)
+                    continue
                 raise CompileError(
                     f"a thread's own body may only contain state declarations "
-                    f"(e.g. 'map[text] state') and on load()/on message(p:T)/"
-                    f"on exit(code:int) handlers",
+                    f"(e.g. 'map[text] state'), func declarations, and "
+                    f"on load()/on message(p:T)/on exit(code:int) handlers",
                     file=filename, line=getattr(stmt, "line", decl.line),
                     column=getattr(stmt, "column", decl.column),
                     category="invalid declaration",
