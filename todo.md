@@ -47,19 +47,6 @@ and AddressSanitizer/LeakSanitizer coverage for the target.
   for purity and either fully callable from any thread or not callable
   from one at all; there's no way to declare one that's already scoped
   to a single thread. See [api.md](api.md#threads).
-- **`regex?` (and any future manually-managed type with no other way to
-  construct a fresh value) can't be populated from a plain literal** —
-  `regex? r = /pattern/` is a compile error (`regex` and `regex?` are
-  genuinely different types, and a `/pattern/` literal is always plain
-  `regex`), and `regex` has neither a "no literal syntax, fields set
-  individually" escape hatch (like struct) nor a text-coercion one
-  (like `blob`/`img`/`aud`). A manually-managed regex can currently
-  only come from a `regex?`-declared parameter or another already-
-  manually-managed binding. `http?`/`socket?` have the identical
-  shape but no practical gap in consequence — both types only ever
-  come from an event-handler parameter to begin with, never a
-  literal, so `?` on the parameter itself is all a real program needs.
-  See [api.md](api.md#t-manually-managed-values).
 
 ## Memory model
 

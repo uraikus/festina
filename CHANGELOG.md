@@ -9,6 +9,23 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.17] - 2026-09-01
+
+### Fixed
+
+- A manually-managed (`T?`) declaration's own initializer can now be a
+  **fresh construction** of the matching plain type — a `regex`/
+  `arr[T]`/`map[T]` literal, a `regex()` call, or any function call at
+  all (including a struct-returning factory function). Previously
+  `regex? r = /pattern/`, `arr[int]? xs = [1, 2, 3]`, and
+  `Circle? c = makeCircle()` were all compile errors, since a fresh
+  literal or a call's own return value always infers as the plain,
+  unflagged type and `T?`/`T` are genuinely non-interchangeable. Safe
+  because a freshly-constructed value has no other binding referencing
+  it yet — reading an *existing* plain binding into a `T?` position is
+  still, correctly, rejected. See
+  [api.md](api.md#t-manually-managed-values).
+
 ## [0.16] - 2026-09-01
 
 ### Added

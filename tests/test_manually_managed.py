@@ -193,11 +193,6 @@ class TestSemantic:
         ))
 
     def test_manually_managed_regex_test_dispatch_still_works(self, parser, semantic):
-        # claude.md #202: regex? cannot be initialized from a fresh
-        # /pattern/ literal (a documented, accepted gap -- see
-        # todo.md), so this exercises method dispatch through a
-        # parameter instead, the one real way a manually-managed
-        # regex value can exist.
         source = """
         void func testIt(r:regex?) {
             log(r.test('abcdef'))
@@ -205,13 +200,67 @@ class TestSemantic:
         """
         semantic.analyze(parser.parse(source))
 
-    def test_regex_literal_cannot_initialize_a_manually_managed_regex(self, parser, semantic):
-        # claude.md #202: the documented, accepted gap itself -- a
-        # /pattern/ literal always infers as plain `regex`, and
-        # `regex?`/`regex` are genuinely different, non-interchangeable
-        # types.
+    @pytest.mark.parametrize("decl", [
+        "regex? r = /abc/",
+        "regex? r = regex('abc', '')",
+        "arr[int]? xs = [1, 2, 3]",
+        "map[int]? m = {'a': 1}",
+    ])
+    def test_fresh_construction_initializes_a_manually_managed_declaration(
+            self, parser, semantic, decl):
+        # claude.md #204: a regex/array/map literal, or a regex()
+        # call, always infers as the plain (unflagged) type -- there
+        # being no `?`-producing expression syntax anywhere in the
+        # language -- but nothing else could already reference a value
+        # that was just constructed right here, so it may adopt
+        # manually-managed-ness from its own declaration instead of
+        # being rejected as a type mismatch.
+        semantic.analyze(parser.parse(f"void func f() {{ {decl} }}"))
+
+    def test_struct_factory_function_initializes_a_manually_managed_declaration(
+            self, parser, semantic):
+        # claude.md #204: the identical fresh-construction reasoning,
+        # for a struct built by a FACTORY FUNCTION rather than
+        # field-by-field -- struct's own "no literal syntax" escape
+        # hatch only ever covered the no-initializer case.
+        source = """
+        struct Circle { x:int y:int }
+        Circle func make() { Circle c\nc.x = 1\nreturn c }
+        void func f() { Circle? c = make() }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_fresh_construction_still_enforces_the_matching_bare_type(self, parser, semantic):
+        # claude.md #204: the escape hatch only ever matches the BARE
+        # counterpart of the declared type -- a genuine mismatch (not
+        # just manually-managed-ness) is still a real type error.
+        source = """
+        struct Circle { x:int y:int }
+        struct Square { x:int y:int }
+        Circle func make() { Circle c\nc.x = 1\nreturn c }
+        void func f() { Square? s = make() }
+        """
         with pytest.raises(Exception):
-            semantic.analyze(parser.parse("void func f() { regex? r = /abc/ }"))
+            semantic.analyze(parser.parse(source))
+
+    def test_an_existing_plain_binding_still_cannot_initialize_a_manually_managed_one(
+            self, parser, semantic):
+        # claude.md #204: the escape hatch is scoped to FRESH
+        # construction only (Call/ArrayLit/MapLit/RegexLit) -- reading
+        # an existing, already-live plain binding is still rejected,
+        # since something else (this binding's own ordinary,
+        # automatically-managed lifecycle) already references that
+        # value, exactly the aliasing hazard "no implicit decay" exists
+        # to prevent.
+        source = """
+        struct Circle { x:int y:int }
+        void func f() {
+            Circle c
+            Circle? d = c
+        }
+        """
+        with pytest.raises(Exception):
+            semantic.analyze(parser.parse(source))
 
     def test_manually_managed_thread_message_type_is_accepted(self, parser, semantic):
         # claude.md #202 Phase 2: a manually-managed message type is a
@@ -372,3 +421,36 @@ class TestRuntime:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.splitlines() == ["99", "99"]
+
+    def test_fresh_construction_escape_hatch_compiles_and_runs(self, compile_and_run):
+        # claude.md #204: a real compile-and-run of every fresh-
+        # construction shape the escape hatch covers -- a struct
+        # factory function, an array literal, a map literal, and a
+        # regex literal -- each declared, used, and freed with no
+        # crash and the expected values.
+        source = """
+        struct Circle { x:int y:int }
+        Circle func make() { Circle c\nc.x = 7\nreturn c }
+
+        void func run() {
+            Circle? c = make()
+            log(c.x)
+            free c
+
+            arr[int]? xs = [1, 2, 3]
+            log(xs.length)
+            free xs
+
+            map[int]? m = {'a': 5}
+            log(m['a'])
+            free m
+
+            regex? r = /^ab/
+            log(r.test('abc'))
+            free r
+        }
+        run()
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["7", "3", "5", "true"]

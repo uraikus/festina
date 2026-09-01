@@ -2629,16 +2629,32 @@ Circle? c
 Circle plain = c           // error: cannot assign value of type Circle? to Circle
 ```
 
-There's no conversion between them — a `T?` binding only ever comes
-from another `T?` binding (a declaration with no initializer, an
-aliasing assignment, or a `T?`-declared parameter). A struct's own
-"no literal syntax, fields set individually" shape and `blob`/`img`/
-`aud`'s own text-to-value coercion both still work as the natural way
-to *populate* one; a value with no such escape hatch (`regex`, for
-instance, which only ever comes from a `/pattern/` literal or `regex()`,
-both always plain `regex`) currently has no way to become manually-
-managed other than through a parameter or another already-manually-
-managed binding — a known, narrow gap, not a bug.
+There's no conversion between them — but a `T?` declaration's own
+initializer may be a **fresh construction** of the matching plain
+type: a literal (`regex`/`arr[T]`/`map[T]`), a `regex()` call, or any
+function call at all (including one returning a plain struct):
+
+```festina
+regex? pattern = /^[a-z]+$/       // a fresh literal -- fine
+arr[int]? xs = [1, 2, 3]          // a fresh array literal -- fine
+
+Circle func makeCircle() { Circle c\nc.x = 1\nreturn c }
+Circle? c = makeCircle()          // a fresh call result -- fine
+
+Circle plain
+Circle? alias = plain             // error: cannot assign value of type Circle to Circle?
+```
+
+This is safe specifically *because* the value is fresh — nothing else
+could already hold a reference to something just constructed right
+here, so there's no aliasing hazard for "no implicit decay" to guard
+against. Reading an **existing** binding of the plain type (`alias`
+above) is still rejected: that value's own lifecycle is already
+someone else's automatic responsibility. Once a value is bound as
+`T?`, it only ever spreads to further `T?` bindings the ordinary way
+(another declaration with no initializer, an aliasing assignment from
+an existing `T?`, or a `T?`-declared parameter) — the fresh-
+construction allowance only ever applies at the birth point.
 
 **`free`/`delete` work on a `T?` value exactly as documented above** —
 same reference-count decrement, same "an alias survives" behavior,

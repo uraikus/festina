@@ -284,6 +284,41 @@ def apply_manually_managed(resolved_type, manually_managed):
         return types_mod.PrimitiveType("blob", manually_managed=True)
     return resolved_type
 
+
+def _is_fresh_construction(expr):
+    """claude.md #204: mirrors codegen._is_owning_refcounted_source's
+    own "nothing else could already reference this value" reasoning
+    (a plain Call/ArrayLit/MapLit is "owning" there for exactly this
+    reason), at the semantic-analysis level, for one purpose: deciding
+    whether a manually-managed declaration's own initializer may adopt
+    manually-managed-ness from the BARE type its expression naturally
+    infers as.
+
+    Without this, `T?` had only two escape hatches for actually
+    getting a value into a fresh declaration -- struct's own "no
+    literal syntax, fields set individually" shape, and blob/img/aud's
+    text-coercion -- and every OTHER eligible type (arr[T]/map[T]/
+    regex, and even a STRUCT built by a factory function rather than
+    field-by-field) had none at all: `regex? r = /pattern/`,
+    `arr[int]? xs = [1, 2, 3]`, and `Circle? c = makeCircle()` were all
+    compile errors, since a fresh array/map/regex literal or any
+    function call's own return value always infers as the plain,
+    unflagged type -- there being no `?`-producing expression syntax
+    anywhere in the language.
+
+    Deliberately narrower than codegen's own version (no ternary, no
+    member-chain-off-a-call tracking) -- this only ever needs to
+    recognize the plain shapes that can appear directly as a
+    declaration's own initializer expression; codegen's fuller version
+    already handles anything more deeply nested correctly regardless,
+    since its own retain-skip for a manually-managed declaration
+    (`stmt.manually_managed`) is unconditional on freshness in the
+    first place (see _emit_stmt's own VarDecl branches) -- this
+    predicate only ever gates whether semantic.py's own type check
+    ACCEPTS the combination at all, never anything about codegen's own
+    bookkeeping."""
+    return isinstance(expr, (ast.Call, ast.ArrayLit, ast.MapLit, ast.RegexLit))
+
 # See the placeholder above for what this is and why. Defined here
 # rather than there because it needs _TEXT/_BOOL.
 _BLOB_METHODS = {
@@ -3841,6 +3876,26 @@ def analyze(program, filename="<string>"):
                 # literal just built also gets sent."
                 lit = decl.init if isinstance(decl.init, ast.MapLit) else _http_send_lit_receiver(decl.init)
                 _validate_http_lit(lit, scope, filename, infer)
+            elif decl.manually_managed and _is_fresh_construction(decl.init):
+                # claude.md #204: a manually-managed declaration's own
+                # initializer may adopt manually-managed-ness from a
+                # FRESH construction (a Call/ArrayLit/MapLit/RegexLit)
+                # of the matching BARE type -- see
+                # _is_fresh_construction's own doc comment for why this
+                # is needed at all and why it's safe: nothing else can
+                # already reference a value that was JUST constructed
+                # right here, so there is no aliasing hazard the
+                # ordinary "no implicit decay" rule exists to prevent.
+                # Checks against the BARE (unflagged) declared type,
+                # since that's what a fresh construction always infers
+                # as; `declared_type` itself (already manually-managed)
+                # is what actually gets bound below, same as every
+                # other branch here.
+                actual_type = infer(decl.init, scope)
+                bare_declared = (dataclasses.replace(declared_type, manually_managed=False)
+                                  if isinstance(declared_type, _MANUALLY_MANAGEABLE_TYPES)
+                                  else declared_type)
+                check_assignable(bare_declared, actual_type, decl)
             else:
                 actual_type = infer(decl.init, scope)
                 check_assignable(declared_type, actual_type, decl)
