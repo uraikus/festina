@@ -2592,6 +2592,138 @@ says** (all of it applies here too):
 Memory is automatic — but `free` and `delete` exist for the moments you
 know better than the compiler does.
 
+### <a name="t-manually-managed-values"></a>`T?` — manually-managed values
+
+```festina
+struct Circle { x:int y:int }
+
+Circle? c
+c.x = 1
+c.y = 2
+useCircle(c)
+free c                     // the ONLY release this ever gets
+```
+
+A trailing `?` right after a type — at a variable declaration or a
+function/thread-handler parameter — opts that one binding **out of
+automatic memory management entirely**. An ordinary `Circle` local is
+retained on alias and released at scope exit without you writing
+anything; a `Circle?` local gets none of that — nothing ever calls
+`free` on it but you. Skip that call and it leaks, on purpose: that is
+what "manually managed" means.
+
+`?` applies to the same types `free`/`delete` already know how to
+release — struct, `arr[T]`, `map[T]`, `enum`, `blob`, `img`, `aud`,
+`http`, `socket`, `url`, `regex` — plus `int`/`float`/`bool`/`text`/
+`color`/`font`/`table`, where it's accepted but has no effect at all
+(none of those are automatically managed to begin with, so `int? count
+= 1` behaves exactly like `int count = 1`).
+
+**`T?` is a genuinely different type from `T`, not a looser version of
+it** — the same relationship `amor arr[T]` has to plain `arr[T]`.
+Assigning one where the other is expected, in either direction, is a
+compile error:
+
+```festina
+Circle? c
+Circle plain = c           // error: cannot assign value of type Circle? to Circle
+```
+
+There's no conversion between them — but a `T?` declaration's own
+initializer may be a **fresh construction** of the matching plain
+type: a literal (`regex`/`arr[T]`/`map[T]`), a `regex()` call, or any
+function call at all (including one returning a plain struct):
+
+```festina
+regex? pattern = /^[a-z]+$/       // a fresh literal -- fine
+arr[int]? xs = [1, 2, 3]          // a fresh array literal -- fine
+
+Circle func makeCircle() { Circle c\nc.x = 1\nreturn c }
+Circle? c = makeCircle()          // a fresh call result -- fine
+
+Circle plain
+Circle? alias = plain             // error: cannot assign value of type Circle to Circle?
+```
+
+This is safe specifically *because* the value is fresh — nothing else
+could already hold a reference to something just constructed right
+here, so there's no aliasing hazard for "no implicit decay" to guard
+against. Reading an **existing** binding of the plain type (`alias`
+above) is still rejected: that value's own lifecycle is already
+someone else's automatic responsibility. Once a value is bound as
+`T?`, it only ever spreads to further `T?` bindings the ordinary way
+(another declaration with no initializer, an aliasing assignment from
+an existing `T?`, or a `T?`-declared parameter) — the fresh-
+construction allowance only ever applies at the birth point.
+
+**`free`/`delete` work on a `T?` value exactly as documented above** —
+same reference-count decrement, same "an alias survives" behavior,
+same everything. They are simply the *only* release a manually-managed
+value ever gets: nothing else will ever call them for you. Because of
+that, `const T? x` isn't allowed (a `const` you could never mutate but
+also could never manually release would be a permanent, unavoidable
+leak) and `?` can't appear inside another type (`arr[T?]`, a struct
+field typed `T?`, a function's `T?` return type) — a manually-managed
+value only ever lives in a variable or parameter binding directly, so
+there's always exactly one place responsible for freeing it.
+
+**A manually-managed parameter can be `free`d, unlike an ordinary
+one.** Freeing an ordinary parameter is a compile error — it borrows
+its caller's value, and the caller is the one that releases it. A
+`T?` parameter has no such caller-side release waiting to happen
+(nothing ever auto-manages it, on either side of a call), so `free`ing
+it is exactly as legitimate as freeing any other `T?` binding:
+
+```festina
+void func consume(c:Circle?) {
+    log(c.x)
+    free c                     // fine -- c was never "borrowed"
+}
+```
+
+**Crossing a `thread` boundary shares the reference, never clones
+it** — `postMessage`/`on message` deep-clone every other value type
+(claude.md #195), but a manually-managed one crosses by handing the
+raw reference straight to the other side, exactly like an ordinary
+alias within one thread does. Both directions work the same way:
+
+```festina
+struct Circle { x:int y:int }
+
+thread Worker {
+    on message(p:Circle?) {
+        p.x = 99                   // mutates the SAME value the sender holds
+        postMessage(p)              // echoes the same reference back, no clone
+    }
+}
+
+Circle? c
+void func onReply(x:Circle?) {
+    log(x.x)                       // 99
+    log(c.x)                       // 99 -- c itself changed, proving no clone happened
+}
+Worker.onMessage(void (x:Circle?) => onReply(x))
+c.x = 1
+Worker.postMessage(c)
+```
+
+This is sound for the identical reason `T?`'s own automatic-management
+opt-out is sound in the first place: the whole safety argument behind
+deep-cloning everything else (claude.md #195) is that this runtime's
+retain/release counters are non-atomic, correct only because exactly
+one thread ever touches a given value's refcount. A manually-managed
+value's refcount is *never* touched by either side's automatic
+bookkeeping — nothing here can race on the mechanism a shared,
+ordinary value's clone exists specifically to avoid racing on. What's
+left is exactly what "manually managed" already means, now spanning
+two threads instead of one: don't read and write the same value from
+both sides at the same instant without your own synchronization, and
+call `free`/`delete` exactly once, from whichever side is provably
+done with it. Aliasing a manually-managed value never bumps its
+refcount, on either side of a `postMessage` — two bindings (a sender's
+and a receiver's) referencing the same value share exactly one
+reference, and `free`ing it through either one frees it for both.
+
 ### `free`
 
 ```festina
@@ -2864,6 +2996,154 @@ The program keeps running as long as a `setTimeout`
 is pending or a `setInterval` is uncleared. Combines with graphics: if a
 program uses both, one event loop multiplexes X11 events and timer
 deadlines together so neither blocks the other.
+
+## Threads
+
+```festina
+thread worker {
+    on load() {
+        log('worker: ready')
+    }
+    on message(p:int) {
+        postMessage(p * 2)
+    }
+}
+
+void func onReply(x:int) {
+    log(`main got: ${x}`)
+}
+
+worker.onMessage(void (x:int) => onReply(x))
+worker.postMessage(21)
+```
+
+`thread NAME { ... }` declares an isolated background worker: its own
+OS thread, its own private state, and message queues to and from the
+main program. It starts (and runs `on load()`, if declared) as soon as
+the program starts, and idles until it either receives a message or is
+killed. **A thread's own body can see only its own state/locals,
+function names, and type names — never a global variable or constant,
+and it cannot call an ordinary top-level function** (see "Isolation"
+below).
+
+**Sending and receiving.** `on message(p:T)` declares the type a
+thread accepts (a thread with no `on message` accepts no messages at
+all, and `NAME.postMessage(x)` anywhere is a compile error). From the
+main program, `NAME.postMessage(x)` sends `x` to the thread; from
+inside the thread's own body, the bare `postMessage(x)` sends `x` back
+out to the main program. The main program registers
+`NAME.onMessage(callback)` to receive those: `callback` is checked
+against whatever type the thread's own `postMessage(x)` call sites
+actually send, which must be a single, consistent type — sending more
+than one shape from the same thread is a compile error that says to
+pre-declare a named `enum` covering both (the same convention `on
+message` itself already uses for multiple inbound types). A thread
+that never calls `postMessage` needs no `NAME.onMessage(...)`
+registration at all.
+
+**Every message is a deep, independent copy** — two threads (or a
+thread and the main program) never share a mutable value, which is
+what makes running Festina code on more than one thread safe at all.
+Sendable types today: `int`, `float`, `bool`, `text`, `color`,
+`font`, `blob`, `img`, `aud`, `url`, and `struct`/`arr[T]`/`map[T]`/
+`enum` built recursively from any of those (a self-referencing
+`struct`/`arr[T]`/`map[T]` type is rejected at compile time — cloning
+it could loop forever on a genuinely cyclic value). `func`,
+`http`/`socket`, `regex`, and `table` never will be (see
+"Limitations" below).
+
+**Lifecycle.**
+
+```festina
+log(worker.isAlive())        // true
+worker.kill()                 // blocks until the thread has stopped
+log(worker.isAlive())        // false
+worker.live(void (ok:bool) => log(ok))   // respawns it; runs on load() again
+log(worker.isAlive())        // true
+```
+
+- `NAME.kill()` stops the thread (running `on exit(code:int)` first,
+  if declared) and blocks until it has actually stopped. `code` is
+  always `0` here — a thread's own `kill()` carries no exit code of
+  its own to pass through (unlike the main program's own
+  `on exit(code:int)`, which does — see [Graceful shutdown](#graceful-shutdown)).
+- `NAME.live(callback)` respawns a killed thread and calls
+  `callback(true)` once it's running again.
+- `NAME.isAlive()` reads whether the thread is currently running.
+
+If the main program exits (including via `close(code)` or a
+SIGINT/SIGTERM-driven [graceful shutdown](#graceful-shutdown)), every
+still-alive thread is killed first (each thread's own
+`on exit(code:int)`, if declared, runs with `code` `0`, the identical
+`kill()` behavior above — the main program's own real exit code isn't
+threaded through), so a declared thread never survives as an orphaned
+process.
+
+**Thread-private state:**
+
+```festina
+thread counter {
+    int total = 0
+    on message(p:int) {
+        total = total + p
+        postMessage(total)
+    }
+}
+```
+
+A variable declared directly in a thread's own body (`int total = 0`
+above) is visible to every handler in that one thread and invisible
+everywhere else, including other threads and the main program — it
+persists across messages the same way a global would, just scoped to
+this one thread.
+
+**Isolation.** A thread's body may call `log`/`fail`,
+string/array/map/struct/enum operations, `Math`, time functions, and
+`blankImage()` plus `img`-method drawing/clip/resize/pixel calls (each
+touches only that one private image, never shared state). It may
+**not** call any canvas/window builtin (`drawRect`, `render`,
+`saveCanvas`, ...), `setTimeout`/`setInterval`, `exec()`,
+`mkdir()`/`ls()`, `openPort()`/`openSecurePort()`, or any ordinary
+top-level `func` declared outside the thread. `sqlite()`/`sqliteInt()`/
+`sqliteFloat()`/`sqliteText()` are allowed **only** for a thread that
+declared its own `DatabaseURL` — see below.
+
+**Per-thread SQLite.** A thread's own first statement may be
+`DatabaseURL = '<literal>'` — a plain string literal only, unlike the
+main program's own `DatabaseURL` (which may be any `text` expression):
+
+```festina
+thread logger {
+    DatabaseURL = './logs.sqlite'
+    table LogEntry { message:text }
+    on message(p:text) {
+        sqlite('INSERT INTO LogEntry (message) VALUES (?)', [p])
+    }
+}
+logger.postMessage('started up')
+```
+
+A thread with its own `DatabaseURL` gets its own private sqlite handle
+— never shared with the main program or any other thread — and may
+call `sqlite()`/`sqliteInt()`/`sqliteFloat()`/`sqliteText()`; every
+`table` declared anywhere in the program is synced against it, the
+same as the main program's own database. A thread that did **not**
+declare its own `DatabaseURL` may not call any of the four at all — a
+clear compile error naming the fix. **Two contexts (a thread and the
+main program, or two threads) may never resolve to the same literal
+database file** — checked at compile time across the whole program,
+including the main program's own default (`'festina.sqlite'`, when it
+declares no `DatabaseURL` of its own); a non-literal main `DatabaseURL`
+(an expression the compiler can't prove anything about) skips this
+check rather than guessing.
+
+**Limitations.** Threads are singletons, declared once by name — there
+is no way to spawn more than one instance of the same `thread` block
+(a worker pool, say). There is also no way to declare a thread-private
+*helper function* — every top-level `func` is either callable from
+every thread (if it never touches a global or an impure builtin) or
+from none at all; a `func` scoped to one particular thread's own body,
+closing over that thread's own state, isn't supported.
 
 ## Audio
 

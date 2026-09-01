@@ -1847,6 +1847,39 @@ void festina_image_free(void *img) {
     free((char *)img - sizeof(int64_t));
 }
 
+/* claude.md #198 Phase 4: `thread`'s own deep-clone of an img message/
+ * field -- deliberately NOT a Cairo surface copy (cairo_surface_t has
+ * no portable "duplicate this" call, and hand-rolling one per surface
+ * TYPE would be real new Cairo-API risk this project has no reason to
+ * take on). Instead round-trips through the SAME encode/decode pair
+ * `.save()` and a database `img` column already use and this project
+ * already has real coverage of -- festina_image_bytes (PNG-encodes on
+ * demand, cached) and festina_image_from_bytes (the decoder every
+ * loadImage()-equivalent entry point already shares) -- lossless
+ * (PNG is lossless regardless of the source format) and, since the
+ * clone never touches the source surface at all, safe to call from a
+ * thread OTHER than whichever one owns the source image (Cairo's own
+ * documented thread-safety model permits concurrent use of DIFFERENT
+ * surfaces on different threads; this never even reaches that surface
+ * concurrently -- festina_image_bytes only WRITES the source's own
+ * lazily-cached PNG bytes if they aren't already cached, which the
+ * codegen-side clone dispatch never races against anything else that
+ * could also be encoding the SAME image at the SAME time). `path` is
+ * copied across afterward, same as festina_load_image's own post-decode
+ * step -- festina_image_from_bytes itself never sets it. */
+void *festina_image_clone(void *img) {
+    if (!img) return NULL;
+    FestinaImageBox *src = (FestinaImageBox *)img;
+    int64_t len = 0;
+    const void *data = festina_image_bytes(img, &len);
+    void *clone = festina_image_from_bytes(data, len, "<thread clone>");
+    FestinaImageBox *dst = (FestinaImageBox *)clone;
+    free(dst->path);
+    dst->path = strdup(src->path ? src->path : "");
+    if (!dst->path) festina_fail("out of memory cloning an image");
+    return clone;
+}
+
 /* claude.md #183 (see uraikus/festina#78): drawImage used to always
  * `cairo_paint`, unconditionally full opacity, completely ignoring
  * `g_fill_alpha` -- every OTHER draw path already carries it (see
@@ -2228,6 +2261,21 @@ void festina_run_event_loop(void) {
         if (festina_async_io_outstanding() > 0 && (timeout < 0.0 || timeout > 0.02)) {
             timeout = 0.02;
         }
+        /* claude.md #195 Phase 2: same bounded-wait treatment, for the
+         * same reason -- a completed thread outbound message should
+         * fire its onMessage() callback promptly rather than waiting
+         * for the next real window/timer event. Unlike
+         * festina_run_timer_loop this loop's own lifetime is still
+         * governed purely by the window (see this loop's own doc
+         * comment on festina_async_io_outstanding just above), so a
+         * live idling thread does not, on its own, keep a GRAPHICS
+         * program's window-driven loop running -- closing the window
+         * still ends it, and festina_program_exit's own
+         * festina_thread_kill_all() cleans up any thread still alive
+         * at that point regardless. */
+        if (festina_thread_outstanding() > 0 && (timeout < 0.0 || timeout > 0.02)) {
+            timeout = 0.02;
+        }
         /* claude.md #166: an open openPort()/openSecurePort() listener
          * (or a live connection, or a pending background client
          * request) gets exactly the same bounded-wait treatment --
@@ -2245,6 +2293,7 @@ void festina_run_event_loop(void) {
         festina_fire_expired_timers();
         festina_async_io_drain();
         festina_http_service_ready();
+        festina_thread_drain();
     }
     cairo_surface_destroy(g_backing_surface);
     g_backing_surface = NULL;

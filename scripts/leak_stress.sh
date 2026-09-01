@@ -112,6 +112,10 @@ build_runtime core festina_runtime.c $(pkg-config --cflags sqlite3) || exit 1
 # linked unconditionally, same as core, rather than probed like
 # graphics/audio below.
 build_runtime async festina_runtime_async.c || exit 1
+# claude.md #195 Phase 2: `thread NAME { ... }` -- same shape as
+# "async" just above (pure POSIX pthread, no pkg-config dependency),
+# its own separate translation unit.
+build_runtime thread festina_runtime_thread.c || exit 1
 GFX_OK=0; AUD_OK=0
 if pkg-config --exists cairo-xlib x11 libjpeg; then
     build_runtime graphics festina_runtime_graphics.c $(pkg-config --cflags cairo-xlib x11 libjpeg) && GFX_OK=1
@@ -121,7 +125,7 @@ if pkg-config --exists alsa libmpg123; then
 fi
 
 LIBS=(-lsqlite3 -lm -pthread)
-OBJS=("$WORK/rt_core.o" "$WORK/rt_async.o")
+OBJS=("$WORK/rt_core.o" "$WORK/rt_async.o" "$WORK/rt_thread.o")
 [ $GFX_OK = 1 ] && { OBJS+=("$WORK/rt_graphics.o"); LIBS+=($(pkg-config --libs cairo-xlib x11 libjpeg)); }
 [ $AUD_OK = 1 ] && { OBJS+=("$WORK/rt_audio.o"); LIBS+=($(pkg-config --libs alsa libmpg123)); }
 

@@ -211,3 +211,147 @@ class TestNoRegression:
         process.send_signal(signal.SIGTERM)
         process.wait(timeout=3)  # would time out (and fail the test) if unkillable
         assert "should not print" not in (process.stdout.read() or "")
+
+
+class TestThreadGracefulShutdown:
+    """claude.md #195 Phase 2/#200 Phase 6: SIGINT/SIGTERM and
+    close(code) both eventually reach festina_program_exit, which is
+    what actually tears down every declared `thread`
+    (festina_thread_kill_all -- see claude.md #195's own "if the main
+    thread dies, kill all child threads" design note) -- gated into the
+    shutdown-handler-install condition above the same way
+    uses_timers/uses_http/uses_graphics already are (`self.uses_threads`,
+    codegen.py's own `_emit_main_and_entry`), so a thread-only program
+    (no http/timers/graphics at all) is exactly as gracefully killable
+    as any other kind. `TestThreads.test_main_thread_death_kills_a_
+    still_idle_child_thread` (test_codegen.py) already covers the
+    close()-with-an-IDLE-thread shape; this class covers what's
+    genuinely different here: a thread ACTIVELY busy (not blocked on
+    its own inbound condvar) when the signal arrives, a DatabaseURL-
+    declared thread's own private handle, exit-code correctness, and a
+    real /proc-based check that nothing survives the parent -- not just
+    that subprocess.wait()'s own timeout didn't fire."""
+
+    def _run_background(self, tmp_path, cli_mod, source):
+        from tests.conftest import compile_file_or_skip
+        src_path = tmp_path / "main.f"
+        src_path.write_text(source, encoding="utf-8")
+        out_path = tmp_path / "program"
+        compile_file_or_skip(cli_mod, str(src_path), str(out_path))
+        return subprocess.Popen(
+            [str(out_path)], cwd=tmp_path,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    def test_sigterm_tears_down_a_thread_actively_processing_a_message(
+            self, tmp_path, cli_mod):
+        # Unlike the still-IDLE thread claude.md #195's own test
+        # covers, this worker is deep inside its own on_message's own
+        # ~1.5s busy-wait -- NOT blocked on the inbound condvar -- when
+        # the signal arrives. The worker loop only ever checks its own
+        # kill flag BETWEEN messages (see festina_runtime_thread.c's
+        # own worker loop), never preempting an in-flight on_message,
+        # so kill()'s own pthread_join genuinely has to wait for this
+        # one to run to completion before the process can exit at all
+        # -- confirmed by 'worker finished a slow message' actually
+        # appearing (not skipped/interrupted) even though the signal
+        # arrived well before the busy-wait's own deadline. Bounded by
+        # the 15s subprocess.wait() timeout, which is what would catch
+        # a real hang. `on exit(code:int)`'s own `code` is always 0
+        # here (see api.md's own note on `NAME.kill()`) -- the THREAD's
+        # exit code, unrelated to the PROCESS's real one (143 below).
+        process = self._run_background(tmp_path, cli_mod, """
+        thread worker {
+            on message(p:int) {
+                int start = now()
+                while now() - start < 1500 {
+                }
+                log('worker finished a slow message')
+            }
+            on exit(code:int) {
+                log(`worker exit code: ${code}`)
+            }
+        }
+        worker.postMessage(1)
+        """)
+        time.sleep(0.3)  # well inside the worker's own 1.5s busy-wait
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=15)
+        assert process.returncode == 143
+        out = process.stdout.read()
+        assert "worker finished a slow message" in out
+        assert "worker exit code: 0" in out
+
+    def test_close_with_a_live_thread_preserves_the_real_exit_code(self, compile_and_run):
+        # A live thread's own teardown must never override or corrupt
+        # whatever exit code the main program actually asked for.
+        source = """
+        thread worker {
+        }
+        close(42)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 42
+
+    def test_sigterm_tears_down_a_database_url_thread_without_hanging_or_crashing(
+            self, tmp_path, cli_mod):
+        # claude.md #199 Phase 5's own private sqlite handle is
+        # deliberately never explicitly closed on kill() (a documented,
+        # accepted gap -- see that entry's own comment) -- which must
+        # not translate into a HANG or crash on exit either:
+        # festina_thread_kill_all() joins the thread the same way
+        # regardless of what OS resources it still holds open, and the
+        # process exits normally, the handle simply reclaimed by the OS.
+        process = self._run_background(tmp_path, cli_mod, """
+        thread worker {
+            DatabaseURL = 'shutdown_worker.sqlite'
+            on message(p:int) {
+                sqlite('SELECT 1')
+            }
+            on exit(code:int) {
+                log('worker exiting')
+            }
+        }
+        worker.postMessage(1)
+        """)
+        time.sleep(0.2)
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=5)
+        assert process.returncode == 143
+        assert "worker exiting" in process.stdout.read()
+
+    def test_no_orphaned_thread_survives_after_the_parent_exits(self, tmp_path, cli_mod):
+        # A declared `thread` is an OS thread INSIDE the same process,
+        # not a separate one -- the only way it could "survive" the
+        # parent is if festina_thread_kill_all()'s own pthread_join
+        # never actually returned, which would show up as this exact
+        # process still lingering in the OS's own process table well
+        # past when it reported exiting. Checked directly against
+        # /proc rather than just trusting subprocess.wait() to have
+        # returned in time -- first confirming the declared thread
+        # really did show up as a second, distinct OS thread (not just
+        # trusting that it would), then confirming /proc/<pid> is fully
+        # gone once wait() reaps it.
+        process = self._run_background(tmp_path, cli_mod, """
+        thread worker {
+        }
+        log('ready')
+        """)
+        task_dir = f"/proc/{process.pid}/task"
+        deadline = time.time() + 5
+        thread_count = 1
+        while time.time() < deadline:
+            try:
+                thread_count = len(os.listdir(task_dir))
+            except OSError:
+                break
+            if thread_count > 1:
+                break
+            time.sleep(0.05)
+        assert thread_count > 1, "the declared thread never showed up as a real OS thread"
+
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=5)
+        assert process.returncode == 143
+        assert not os.path.exists(f"/proc/{process.pid}"), (
+            "the process (and every one of its threads) should be fully gone "
+            "from the OS's own process table once wait() has reaped it")
