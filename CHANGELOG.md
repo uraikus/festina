@@ -9,6 +9,26 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.28] - 2026-09-01
+
+### Added
+
+- **`examples/threaded_http_server.f`** and **`benchmarks/http_threaded/`**
+  -- a real example and a `wrk`-based benchmark showing `thread pool[N]`
+  + `NAME.giveRequest(r)` computing genuine per-request CPU-bound work
+  across more than one OS thread at once, with a single-threaded
+  baseline for comparison. See benchmark.md's new "HTTP:
+  single-threaded vs. thread pool" section for measured numbers.
+
+### Fixed
+
+- **A `thread pool[N]` can no longer declare its own `DatabaseURL`.**
+  Every instance in a pool shares one declared body, so this would have
+  meant `N` independent, uncoordinated sqlite connections into the
+  identical literal file at once -- now a compile error naming the fix.
+
+See claude.md #215.
+
 ## [0.27] - 2026-09-01
 
 ### Changed

@@ -750,6 +750,35 @@ class TestThreadPools:
         """
         semantic.analyze(parser.parse(source))
 
+    def test_a_pool_declaring_its_own_databaseurl_is_rejected(self, parser, semantic, errors):
+        # claude.md #215: a pool shares ONE _ThreadInfo (and therefore
+        # one database_url) across every instance -- every instance
+        # would open its own independent, uncoordinated connection to
+        # the SAME literal file at the same time, a genuine hazard an
+        # ordinary singleton thread's own DatabaseURL never has.
+        source = """
+        thread pool[3] {
+            DatabaseURL = './pool.sqlite'
+            on load() { }
+        }
+        """
+        with pytest.raises(errors.CompileError,
+                            match="thread pool 'pool\\[3\\]' cannot declare its own DatabaseURL"):
+            semantic.analyze(parser.parse(source))
+
+    def test_a_pool_instance_still_cannot_call_sqlite_without_a_database(
+            self, parser, semantic, errors):
+        # claude.md #199 Phase 5's own existing gate (database_url is
+        # None) already covers a pool for free, since a pool's own
+        # database_url can now never be set at all (the check above).
+        source = """
+        thread pool[3] {
+            on load() { sqlite('SELECT 1', []) }
+        }
+        """
+        with pytest.raises(errors.CompileError, match="hasn't declared its own database"):
+            semantic.analyze(parser.parse(source))
+
 
 class TestThreadPrivateFunctions:
     """claude.md #210: a `func` declared directly in a thread's own

@@ -370,3 +370,102 @@ _Last run: 2026-09-01 on this machine, `wrk -t4 -c50 -d5s` per route -- see benc
   has a very different shape (persistent connections, small frequent
   frames) from a request/response load test, and would need its own
   methodology rather than reusing `wrk`'s HTTP-request model.
+
+## HTTP: single-threaded vs. thread pool
+
+The section above measures Festina's single HTTP event loop against
+other languages' own single-threaded raw-socket servers -- a
+deliberately fair, apples-to-apples comparison. This section instead
+compares Festina against **itself**: what a `thread pool[N] { on
+request(req:http) { ... } }` (claude.md #212's own private per-thread
+HTTP context) plus `NAME.giveRequest(r)` (claude.md #213's own live
+connection hand-off) actually buys a program that does real CPU-bound
+work per request, the pattern `examples/threaded_http_server.f`
+demonstrates.
+
+Two servers (source in
+[`benchmarks/http_threaded/`](benchmarks/http_threaded/)), both
+answering the same two routes -- `/` (no work, a control) and `/slow`
+(a closed-form-resistant polynomial-hash loop, the same technique
+`loop_sum.f` above uses, tuned to ~2,000,000 iterations so a single
+request takes a few milliseconds of real CPU time):
+
+- **single-threaded** (`server_single.f`) does `/slow`'s own work
+  directly in the one top-level `on request` handler, on Festina's
+  single HTTP event-loop thread -- every concurrent `/slow` request
+  queues up behind whichever one is currently computing.
+- **thread pool[N]** (`server_pool.f`, `N` = this machine's own CPU
+  count by default) hands every `/slow` request off to the next of
+  `N` worker threads via `giveRequest`, so up to `N` requests are
+  genuinely computed in parallel, on `N` different CPU cores, before
+  any of them respond. `/` is answered directly by main in both
+  servers, unchanged -- it's included to confirm the pool's own
+  round-robin dispatch adds no meaningful overhead to a REQUEST THAT
+  never needed handing off in the first place.
+
+Each `wrk` run: 4 threads, 50 open connections, 5 seconds, against one
+route at a time -- otherwise the identical methodology the section
+above already uses (no explicit `Connection: close` forcing here,
+since both servers are the same language/runtime with the same
+keep-alive behavior; there's no cross-language asymmetry to correct
+for).
+
+Reproduce locally:
+
+```bash
+python3 benchmarks/http_threaded/run_http_threaded_benchmark.py
+python3 benchmarks/http_threaded/run_http_threaded_benchmark.py --update-doc
+python3 benchmarks/http_threaded/run_http_threaded_benchmark.py --pool-size 8 --duration 10s
+```
+
+<!-- HTTP_THREADED_BENCHMARK_RESULTS_START -->
+_Last run: 2026-09-01 on this machine (4 CPUs), `wrk -t4 -c50 -d5s` per route, pool size 4 -- see benchmark.md's own "HTTP: single-threaded vs. thread pool" Methodology for how to reproduce; absolute numbers vary by hardware and load, relative ordering is the point._
+
+### `no work (control)` (`/`)
+
+| Server | Requests/sec | Avg latency | Transfer/sec |
+|---|---|---|---|
+| single-threaded | 74,673 | 0.66 ms | 8.19 MB/s |
+| thread pool[4] | 49,093 | 1.03 ms | 5.38 MB/s |
+
+### `CPU-bound work` (`/slow`)
+
+| Server | Requests/sec | Avg latency | Transfer/sec |
+|---|---|---|---|
+| single-threaded | 92 | 491.28 ms | 0.01 MB/s |
+| thread pool[4] | 256 | 185.33 ms | 0.03 MB/s |
+
+`/slow` speedup from the pool: **2.77x** (pool size 4, this machine has 4 CPUs).
+
+<!-- HTTP_THREADED_BENCHMARK_RESULTS_END -->
+
+### Reading these numbers
+
+- **`/` (no work) should perform about the same on both servers** --
+  neither variant's own connection-accept/parse/respond path changed
+  at all; only whether `/slow`'s own CPU-bound work is serialized or
+  parallelized did. A meaningful gap here would mean the pool's own
+  round-robin dispatch itself is expensive, not that the pool is
+  "working" -- it shouldn't be, since `/` never goes through
+  `giveRequest` in either server.
+- **`/slow`'s own speedup is bounded by real CPU core count, not
+  `N`** -- a pool bigger than the machine's own core count just adds
+  contention, not more genuine parallelism; `--pool-size` defaults to
+  `os.cpu_count()` for exactly this reason.
+- **Every handed-off request pays a small, real hand-off latency** --
+  a receive-only worker thread's own combined loop polls on a bounded
+  timeout (claude.md #212's own `FESTINA_THREAD_HTTP_POLL_MS`, 20ms)
+  rather than waking instantly the way a dedicated OS thread blocked
+  on `accept()` would, so under LOW concurrency (one request at a
+  time, nothing else queued) a handed-off request can be slightly
+  SLOWER end-to-end than the single-threaded baseline answering it
+  directly -- the pool's own advantage only shows up once there's
+  more concurrent CPU-bound work than one thread can get through
+  serially, which is exactly what these numbers measure.
+- This is a same-machine, same-process-family comparison (no network
+  hop) measuring exactly one thing -- how much a real, additional
+  workload on the SAME hardware benefits from being spread across
+  more than one of Festina's own execution threads -- not a general
+  claim about optimal pool sizing for a production workload, which
+  depends heavily on how CPU-bound (vs. I/O-bound) the real work
+  actually is.

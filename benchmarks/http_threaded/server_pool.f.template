@@ -1,0 +1,56 @@
+// claude.md #215: the thread-pool counterpart to server_single.f --
+// IDENTICAL per-request work (the same polynomial-hash loop, same
+// iteration count), but computed on a `thread pool[N] { on
+// request(req:http) { ... } }` (claude.md #212's own private
+// per-thread HTTP context) instead of Festina's single HTTP event
+// loop. The main program still accepts every connection on the one
+// real listening port; it hands each live '/slow' request straight
+// to the next worker in line via `NAME.giveRequest(r)` (claude.md
+// #213's own live connection hand-off), so up to N requests are
+// genuinely computed in parallel, on N different CPU cores, before
+// any of them respond -- throughput should scale with N (bounded by
+// real CPU core count), not stay flat the way server_single.f's does.
+//
+// __POOL_SIZE__ is replaced with a real literal by
+// run_http_threaded_benchmark.py before compiling -- `thread NAME[N]`
+// requires N to be a compile-time literal (api.md's own "Thread
+// pools" section), so this can't be read from argv the way the port
+// is; the runner substitutes it the same plain-token way
+// tests/conftest.py's own __PORT__ substitution already works (see
+// that fixture's own comment on why not str.format() -- Festina
+// source is full of its own bare `{`/`}`).
+
+thread pool[__POOL_SIZE__] {
+    int workIterations = 2000000
+    on request(req:http) {
+        int total = 0
+        int i = 0
+        while i < workIterations {
+            total = (total * 1000003 + i) % 1000000007
+            i = i + 1
+        }
+        map[text] headers = {}
+        headers['Content-Type'] = 'text/plain'
+        req.send({'code': 200, 'body': `computed ${total}\n`, 'headers': headers})
+    }
+}
+
+int nextWorker = 0
+
+on request(req:http?) {
+    url u = parseURL(req.url)
+    if u.pathname == '/slow' {
+        pool[nextWorker].giveRequest(req)
+        nextWorker = (nextWorker + 1) % __POOL_SIZE__
+    } else {
+        map[text] headers = {}
+        headers['Content-Type'] = 'text/plain'
+        req.send({'code': 200, 'body': 'instant -- try /slow\n', 'headers': headers})
+    }
+}
+
+int port = 8080
+if argv.length > 1 {
+    port = argv[1].toInt()
+}
+openPort(port)

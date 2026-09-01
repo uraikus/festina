@@ -3190,6 +3190,18 @@ pool must always be indexed. There is no `pool.length` — the size is
 whatever `N` the declaration itself used, known at every call site
 already.
 
+**A pool may not declare its own `DatabaseURL`.** Every instance in a
+pool runs the identical body, so a `DatabaseURL = '<literal>'` there
+would be the SAME literal path for all `N` of them — unlike an
+ordinary singleton thread's own `DatabaseURL` (always private to that
+one thread), `N` pool instances would each open their own independent
+sqlite connection into the identical file, concurrently, with no
+coordination between them. This is a compile error naming the fix; give
+each instance a genuinely distinct database with an ordinary
+(non-pool) thread declared per instance instead, or have pool workers
+message a single dedicated database thread rather than querying
+`sqlite()` directly from inside the pool.
+
 **Thread-private functions.** A `func` declared directly in a thread's
 own body (a sibling of its state vars/`on load`/`on message`/
 `on exit`) is callable only from that one thread's own handlers and

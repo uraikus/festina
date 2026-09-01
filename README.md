@@ -201,6 +201,7 @@ bin/festina compile examples/tic_tac_toe.f -o tic_tac_toe && ./tic_tac_toe
 | [`files.f`](examples/files.f) | `blob` — a file's bytes, its methods, `save`/`saveCopy`, and what sharing one means |
 | [`tic_tac_toe.f`](examples/tic_tac_toe.f) | The game above — graphics, global game state, and win-checking logic together |
 | [`layers.f`](examples/layers.f) | `arr[img]` as a layer stack — each layer modified by its own drawing methods, one function compositing all of them every frame |
+| [`threaded_http_server.f`](examples/threaded_http_server.f) | `thread pool[N]` + `NAME.giveRequest(r)` — an HTTP server that computes real, CPU-bound per-request work across more than one OS thread at once |
 
 Every one of these is compiled and checked by the test suite on every
 change (`tests/test_examples.py` and, for the three needing a display,

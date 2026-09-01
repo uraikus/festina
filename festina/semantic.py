@@ -4453,6 +4453,38 @@ def analyze(program, filename="<string>"):
         for i, stmt in enumerate(thread_body):
             if not _is_thread_database_url_stmt(stmt):
                 continue
+            if decl.pool_size is not None:
+                # claude.md #215: a `thread NAME[N] { ... }` pool
+                # shares ONE `_ThreadInfo` (and therefore one
+                # `database_url`) across every instance -- the body is
+                # textually identical, so a `DatabaseURL = '<literal>'`
+                # here would be the SAME literal path for all N of
+                # them. Each instance still gets its OWN sqlite3*
+                # handle (festina_db_open runs once per instance, in
+                # that instance's own on_load), so N instances would
+                # mean N independent, uncoordinated connections into
+                # the identical file, at the same time, from N real OS
+                # threads -- not the "never shared" isolation
+                # `DatabaseURL` gives an ordinary singleton thread at
+                # all. Rejected outright, the same "don't allow a
+                # construction that's a genuine hazard, not just an
+                # unusual one" call the whole-program DatabaseURL
+                # conflict check below already makes for two ordinary
+                # threads naming the same file.
+                raise CompileError(
+                    f"thread pool '{decl.name}[{decl.pool_size}]' cannot declare "
+                    f"its own DatabaseURL -- every instance in the pool would open "
+                    f"its own independent connection to the SAME literal file "
+                    f"concurrently, with no coordination between them (unlike an "
+                    f"ordinary singleton thread's own DatabaseURL, which is always "
+                    f"private to that one thread). Give each instance a genuinely "
+                    f"distinct database of its own with an ordinary (non-pool) "
+                    f"thread declared per instance instead, or have pool workers "
+                    f"message a single dedicated database thread rather than "
+                    f"querying sqlite directly.",
+                    file=filename, line=stmt.expr.line, column=stmt.expr.column,
+                    category="invalid declaration",
+                )
             if i != 0:
                 raise CompileError(
                     f"thread '{decl.name}': DatabaseURL = ... must be the "
