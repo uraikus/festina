@@ -71,52 +71,52 @@ failing — see [setup.md](setup.md) for what each one needs.
 ## Results
 
 <!-- BENCHMARK_RESULTS_START -->
-_Last run: 2026-08-26 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
+_Last run: 2026-09-01 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
 
 ### `hello`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 1.2 ms | 66.3 ms | 1.48 MB |
-| Rust | 1.2 ms | 70.0 ms | 3.77 MB |
-| Go | 1.2 ms | 128.0 ms | 2.11 MB |
-| Bun | 7.7 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 1.4 ms | 67.0 ms | 1.49 MB |
+| Rust | 1.5 ms | 80.5 ms | 3.77 MB |
+| Go | 1.3 ms | 159.7 ms | 2.11 MB |
+| Bun | 11.3 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `fib`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 6.2 ms | 71.6 ms | 1.48 MB |
-| Rust | 6.9 ms | 70.6 ms | 3.77 MB |
-| Go | 9.7 ms | 117.4 ms | 2.11 MB |
-| Bun | 20.2 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 7.7 ms | 71.8 ms | 1.49 MB |
+| Rust | 8.2 ms | 96.6 ms | 3.77 MB |
+| Go | 14.0 ms | 162.3 ms | 2.11 MB |
+| Bun | 31.3 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `loop_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 370.8 ms | 89.0 ms | 1.48 MB |
-| Rust | 444.0 ms | 70.2 ms | 3.77 MB |
-| Go | 368.9 ms | 122.6 ms | 2.11 MB |
-| Bun | 7438.6 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 519.0 ms | 76.9 ms | 1.49 MB |
+| Rust | 526.5 ms | 89.1 ms | 3.77 MB |
+| Go | 461.3 ms | 159.4 ms | 2.11 MB |
+| Bun | 9024.2 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `array_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 72.3 ms | 90.1 ms | 1.48 MB |
-| Rust | 69.5 ms | 103.8 ms | 3.77 MB |
-| Go | 68.7 ms | 120.4 ms | 2.11 MB |
-| Bun | 1866.8 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 92.3 ms | 88.2 ms | 1.49 MB |
+| Rust | 91.0 ms | 103.4 ms | 3.77 MB |
+| Go | 88.7 ms | 180.5 ms | 2.11 MB |
+| Bun | 2345.7 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `string_concat`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 2.9 ms | 71.9 ms | 1.48 MB |
-| Rust | 1.1 ms | 94.5 ms | 3.77 MB |
-| Go | 29.7 ms | 128.0 ms | 2.11 MB |
-| Bun | 10.0 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 3.7 ms | 72.9 ms | 1.49 MB |
+| Rust | 1.6 ms | 109.3 ms | 3.77 MB |
+| Go | 35.9 ms | 193.9 ms | 2.11 MB |
+| Bun | 12.4 ms | n/a (JIT, no separate build step) | n/a |
 
 <!-- BENCHMARK_RESULTS_END -->
 
@@ -192,7 +192,7 @@ _Last run: 2026-08-26 on this machine -- see benchmark.md's "Methodology" sectio
 ## Canvas: Festina vs an HTML `<canvas>` vs MonoGame
 
 <!-- CANVAS_RESULTS_START -->
-_Last run: 2026-08-24 on this machine. Chromium 141.0.7390.37._
+_Last run: 2026-09-01 on this machine. Chromium 141.0.7390.37._
 
 20,000 filled rectangles and 20,000 filled circles, fill colour changed
 between every shape, into an 800x600 surface. Both sides draw
@@ -204,9 +204,9 @@ which documents what each one cost when it was measured the other way.
 
 | | Frame (min) | Frame (median) | First frame |
 |---|---|---|---|
-| Festina (Cairo) | 37 ms | 39 ms | 24 ms (process start + PNG encode) |
-| HTML `<canvas>` (Chromium/Skia) | 97 ms | 110 ms | 429 ms (browser launch) |
-| MonoGame (SpriteBatch, **software** GL) | 252 ms | 270 ms | 181 ms (.NET runtime + GL context) |
+| Festina (Cairo) | 35 ms | 37 ms | 25 ms (process start + PNG encode) |
+| HTML `<canvas>` (Chromium/Skia) | 68 ms | 108 ms | 1279 ms (browser launch) |
+| MonoGame (SpriteBatch, **software** GL) | 231 ms | 237 ms | 177 ms (.NET runtime + GL context) |
 
 > **The MonoGame row needs its caveat read before its number.**
 > MonoGame is a GPU framework, and this machine has no GPU — its GL
@@ -228,22 +228,25 @@ which documents what each one cost when it was measured the other way.
 > not as a figure precise to the millisecond the way the other two
 > rows are.
 
-On this workload **Festina draws it 2.6x faster**.
+On this workload **Festina draws it 1.9x faster**.
 
-Circles account for the overwhelming majority of frame cost: 20,000
-rectangles cost about 10 ms, but 20,000 circles cost about 76 ms
-uncached, because `cairo_arc` + `cairo_fill` tessellates the curve into
-Beziers and scan-converts a general polygon every single time.
-Rasterizing each radius once into an alpha mask and stamping it
-thereafter -- what a glyph cache does -- brings circles down to about
-20 ms and the whole frame to about 31 ms. The remaining split is 11 ms
-of rectangles, 20 ms of circles, and setting the fill colour 20,000
-times is too cheap to measure.
+That took one change, and finding it took measuring rather than
+guessing. The first version of this benchmark had Festina 1.4x SLOWER,
+and the obvious culprit -- a fresh Cairo context per draw call -- turned
+out to account for 4 ms of 90. Splitting the frame by shape type found
+the real one immediately: 20,000 rectangles cost 10 ms and 20,000
+circles cost 76 ms, because `cairo_arc` + `cairo_fill` tessellates the
+curve into Beziers and scan-converts a general polygon every single
+time. Rasterizing each radius once into an alpha mask and stamping it
+thereafter -- what a glyph cache does -- took circles to 20 ms and the
+frame from 90 ms to 31 ms (claude.md #104). The remaining split is
+11 ms of rectangles, 20 ms of circles, and setting the fill colour
+20,000 times is too cheap to measure.
 
 Two things are worth reading alongside the headline. The browser's frame
-time is far noisier -- 97 ms at best against a 110 ms median here, and
+time is far noisier -- 68 ms at best against a 108 ms median here, and
 the median moves by 20+ ms between runs of this same script, while
-Festina's two numbers (37 and 39 ms) sit on top of each other. For a
+Festina's two numbers (35 and 37 ms) sit on top of each other. For a
 frame budget, predictability is not a footnote. And getting to the
 *first* frame differs by more than an order of magnitude in the same
 direction, because one side starts a process and the other starts a
@@ -253,11 +256,15 @@ Both outputs were compared cell-by-cell over a 16x16 grid to confirm
 they drew the same scene -- worst per-channel difference 0.2 out
 of 255. Not byte-for-byte: Cairo and Skia disagree about antialiasing on
 every curve, and demanding identical bytes would only prove the two
-rasterizers are the same program. Festina's own offscreen canvas starts
+rasterizers are the same program. The check has earned itself twice
+now: once catching a bug in this very script that left one side
+comparing a blank canvas, and again catching itself comparing raw RGB
+without accounting for alpha -- Festina's own offscreen canvas starts
 transparent (api.md's own "a fresh or cleared canvas is transparent,
-not white"), so both sides are composited onto the same opaque white
-background before comparing pixels, to avoid a false mismatch from
-alpha handling alone.
+not white"), so a background pixel neither side actually drew on read
+as black here against the browser harness's own opaque white fill,
+which the comparison mistook for a real rendering difference until it
+started compositing both sides onto the same white background first.
 <!-- CANVAS_RESULTS_END -->
 
 ## HTTP: Festina vs Rust vs Go vs Bun
@@ -312,25 +319,25 @@ python3 benchmarks/http/run_http_benchmarks.py --duration 10s --connections 100 
 ```
 
 <!-- HTTP_BENCHMARK_RESULTS_START -->
-_Last run: 2026-08-26 on this machine, `wrk -t4 -c50 -d5s` per route -- see benchmark.md's HTTP "Methodology" for how to reproduce; absolute numbers vary by hardware and load, relative ordering is the point._
+_Last run: 2026-09-01 on this machine, `wrk -t4 -c50 -d5s` per route -- see benchmark.md's HTTP "Methodology" for how to reproduce; absolute numbers vary by hardware and load, relative ordering is the point._
 
 ### `plaintext` (`/`)
 
 | Language | Requests/sec | Avg latency | Transfer/sec |
 |---|---|---|---|
-| Festina | 43,652 | 1.05 ms | 4.25 MB/s |
-| Rust | 63,513 | 0.69 ms | 5.88 MB/s |
-| Go | 35,457 | 1.30 ms | 3.28 MB/s |
-| Bun | 41,798 | 1.09 ms | 5.34 MB/s |
+| Festina | 31,264 | 1.46 ms | 3.04 MB/s |
+| Rust | 47,327 | 0.88 ms | 4.38 MB/s |
+| Go | 26,873 | 1.68 ms | 2.49 MB/s |
+| Bun | 26,618 | 1.73 ms | 3.40 MB/s |
 
 ### `json` (`/json`)
 
 | Language | Requests/sec | Avg latency | Transfer/sec |
 |---|---|---|---|
-| Festina | 41,482 | 1.33 ms | 4.83 MB/s |
-| Rust | 59,877 | 0.73 ms | 6.68 MB/s |
-| Go | 35,441 | 1.27 ms | 3.95 MB/s |
-| Bun | 39,580 | 1.15 ms | 5.81 MB/s |
+| Festina | 31,353 | 1.47 ms | 3.65 MB/s |
+| Rust | 45,013 | 0.93 ms | 5.02 MB/s |
+| Go | 24,138 | 1.87 ms | 2.69 MB/s |
+| Bun | 26,725 | 1.75 ms | 3.92 MB/s |
 
 <!-- HTTP_BENCHMARK_RESULTS_END -->
 

@@ -1049,6 +1049,16 @@ static int festina_chunk_decode_step(const uint8_t *data, size_t len, size_t *co
         char *endptr;
         unsigned long long chunk_size = strtoull(size_buf, &endptr, 16);
         if (endptr == size_buf || *endptr != '\0') { *ok = 0; return 0; } /* not valid hex */
+        /* claude.md #192: cap the chunk size before it is used in any
+         * size arithmetic. Without this a hostile chunk-size line (up
+         * to 16 hex digits = almost 2^64) makes `data_start +
+         * chunk_size + 2` wrap below `len` -- passing the "wait for
+         * the rest" guard below -- and drives `new_cap *= 2` to
+         * overflow to 0, an infinite growth loop that hangs the whole
+         * single-threaded server on one unauthenticated request. No
+         * legitimate chunk can exceed the buffer cap every other body
+         * path already enforces. */
+        if (chunk_size > (unsigned long long)FESTINA_HTTP_MAX_BUFFER) { *ok = 0; return 0; }
         size_t data_start = i + 2; /* right past the chunk-size line's own CRLF */
         if (chunk_size == 0) {
             /* Last-chunk -- what follows is zero or more trailer header
@@ -1417,6 +1427,17 @@ static int festina_ws_try_parse_frame(FestinaConn *c, int *fin_out, uint8_t *opc
         len = 0;
         for (int i = 0; i < 8; i++) len = (len << 8) | c->buf[pos + i];
         pos += 8;
+    }
+    /* claude.md #192: reject an oversized declared length before it is
+     * used in `pos + len` (which would otherwise wrap a 64-bit length
+     * like 0xFFFFFFFFFFFFFF00 below buf_len, bypassing the "not fully
+     * arrived" guard) or in malloc() below (a ~16-exabyte request that
+     * fails and aborts the process). One crafted frame would otherwise
+     * kill any server accepting websocket upgrades. The cap is the same
+     * FESTINA_HTTP_MAX_BUFFER every other buffered path enforces. */
+    if (len > (uint64_t)FESTINA_HTTP_MAX_BUFFER) {
+        festina_conn_teardown(c); /* malformed -- drop it, as the request parser does */
+        return 0;
     }
     uint8_t mask_key[4] = {0, 0, 0, 0};
     if (masked) {
@@ -2200,8 +2221,14 @@ void festina_run_http_loop(void) {
          * have this kind of work outstanding (e.g. `on request`
          * loading a file in the background while also serving http). */
         int64_t async_io_outstanding = festina_async_io_outstanding();
+        /* claude.md #195 Phase 2: same reasoning as
+         * festina_run_timer_loop's own thread_outstanding check -- a
+         * live, idling `thread` has to keep THIS loop alive too, for a
+         * program that combines http with a `thread` declaration. */
+        int64_t thread_outstanding = festina_thread_outstanding();
         if (nfds == 0 && festina_next_timer_deadline() < 0.0
-                && g_async_outstanding == 0 && async_io_outstanding == 0) {
+                && g_async_outstanding == 0 && async_io_outstanding == 0
+                && thread_outstanding == 0) {
             return; /* nothing left to wait for at all */
         }
 
@@ -2254,7 +2281,7 @@ void festina_run_http_loop(void) {
          * the poll set above) -- bounding the timeout is the only way
          * to notice a completed background blob/img/aud load promptly.
          * Same 20ms granularity festina_run_timer_loop uses. */
-        if (async_io_outstanding > 0 && (timeout_ms < 0 || timeout_ms > 20)) {
+        if ((async_io_outstanding > 0 || thread_outstanding > 0) && (timeout_ms < 0 || timeout_ms > 20)) {
             timeout_ms = 20;
         }
 
@@ -2289,6 +2316,9 @@ void festina_run_http_loop(void) {
         /* claude.md #165: the generic blob/img/aud pool's own drain --
          * a no-op when festina_runtime_async.c was never linked. */
         festina_async_io_drain();
+        /* claude.md #195 Phase 2: same shape, for `thread` -- a no-op
+         * when no `thread` was ever declared. */
+        festina_thread_drain();
         /* claude.md #167: reap any keep-alive connection that's been
          * idle too long -- see its own doc comment. Cheap (a linear
          * scan already the same size as the poll-set-building one just
@@ -2851,22 +2881,32 @@ static void festina_client_read_all(FestinaClientTransport *t, uint8_t **buf, si
  * treated as an error -- whatever arrived is just what the caller
  * gets, the same lenient spirit claude.md #159's own JSON parser
  * applies to shapes that are unusual but not actually broken. */
-static void festina_parse_http_response(const uint8_t *data, size_t len,
+/* claude.md #192: takes OWNERSHIP of `data` and frees it on every exit
+ * path -- the three catchable throws below, the chunked early return,
+ * and the normal end. Previously the caller freed it after this
+ * returned, so any of the throws (a short or malformed response -- a
+ * realistic dropped-connection case a program catches and retries)
+ * leaked the whole read buffer, up to the 8MB cap, on every failed
+ * request; in the async callback path that repeats for every failed
+ * background fetch in a polling loop. Bodies are always copied out into
+ * fresh buffers before these frees, so freeing `data` here is safe. */
+static void festina_parse_http_response(uint8_t *data, size_t len,
                                         int64_t *out_code, void **out_headers,
                                         uint8_t **out_body, int64_t *out_body_len) {
     const char *p = (const char *)data;
     const char *end = (const char *)data + len;
     if (len < 12 || memcmp(p, "HTTP/1.", 7) != 0) {
+        free(data);
         festina_throw(festina_text_own("fetch: the server's response didn't start with a "
                                        "valid HTTP status line"));
         return; /* unreachable */
     }
     const char *sp1 = memchr(p, ' ', (size_t)(end - p));
-    if (!sp1) { festina_throw(festina_text_own("fetch: malformed HTTP status line")); return; }
+    if (!sp1) { free(data); festina_throw(festina_text_own("fetch: malformed HTTP status line")); return; }
     *out_code = strtoll(sp1 + 1, NULL, 10);
 
     const char *hdr_start = memchr(p, '\n', (size_t)(end - p));
-    if (!hdr_start) { festina_throw(festina_text_own("fetch: malformed HTTP response (no headers)")); return; }
+    if (!hdr_start) { free(data); festina_throw(festina_text_own("fetch: malformed HTTP response (no headers)")); return; }
     hdr_start++;
 
     void *headers = festina_new_empty_text_map();
@@ -2924,6 +2964,7 @@ static void festina_parse_http_response(const uint8_t *data, size_t len,
         festina_chunk_decode_step(data, len, &consumed, &decoded, &decoded_len, &decoded_cap, &ok);
         *out_body = decoded;
         *out_body_len = (int64_t)decoded_len;
+        free(data); /* claude.md #192: decoded is its own buffer */
         return;
     }
 
@@ -2939,6 +2980,7 @@ static void festina_parse_http_response(const uint8_t *data, size_t len,
         *out_body = NULL;
         *out_body_len = 0;
     }
+    free(data); /* claude.md #192: body copied out above */
 }
 
 void festina_http_send_client(void *payload) {
@@ -3078,8 +3120,11 @@ void festina_http_send_client(void *payload) {
     void *new_headers = NULL;
     uint8_t *new_body = NULL;
     int64_t new_body_len = 0;
+    /* claude.md #192: festina_parse_http_response now OWNS resp_data and
+     * frees it on every path (including its catchable throws), so there
+     * is no free here -- the previous free here was skipped by those
+     * throws, leaking the whole buffer per failed request. */
     festina_parse_http_response(resp_data, resp_len, &new_code, &new_headers, &new_body, &new_body_len);
-    free(resp_data);
 
     /* claude.md #162: url/method are left alone -- they still
      * describe what was SENT. code/headers/body are overwritten with

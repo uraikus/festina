@@ -63,9 +63,16 @@ class FuncTypeExpr(Node):
 
 
 class Param(Node):
-    def __init__(self, name, type_expr):
+    def __init__(self, name, type_expr, manually_managed=False):
         self.name = name
         self.type_expr = type_expr
+        # claude.md #202: `T?` -- a trailing '?' consumed right after
+        # parse_type() at this ONE call site (parse_typed_params), never
+        # inside parse_type() itself, so a struct field/array element/
+        # return type's own nested parse_type() call has no idea '?' is
+        # a type-position token at all -- see VarDecl's own matching
+        # comment for the full "no nesting, by construction" reasoning.
+        self.manually_managed = manually_managed
 
 
 class FieldDecl(Node):
@@ -75,11 +82,23 @@ class FieldDecl(Node):
 
 
 class VarDecl(Node):
-    def __init__(self, type_expr, name, init, is_const=False, line=0, column=0):
+    def __init__(self, type_expr, name, init, is_const=False, manually_managed=False,
+                 line=0, column=0):
         self.type_expr = type_expr
         self.name = name
         self.init = init
         self.is_const = is_const
+        # claude.md #202: `T?` -- true when this declaration's own type
+        # was written with a trailing '?' (parse_var_decl consumes it
+        # right after parse_type() returns; parse_const_decl
+        # deliberately does NOT, so `const T? x` stays a plain parse
+        # error rather than needing const-ness and manual-management to
+        # be reasoned about together this round). Threaded through
+        # semantic.py's analyze_var_decl into a real
+        # `manually_managed=True` flag on the RESOLVED type itself
+        # (types.py) for every type that flag means something for;
+        # inert (parses, does nothing) for every other type.
+        self.manually_managed = manually_managed
         self.line = line
         self.column = column
 
@@ -127,6 +146,28 @@ class EventHandler(Node):
     def __init__(self, name, params, body, line=0, column=0):
         self.name = name
         self.params = params
+        self.body = body
+        self.line = line
+        self.column = column
+
+
+class ThreadDecl(Node):
+    """claude.md #195: `thread NAME { ... }` -- an isolated background
+    worker: its own OS thread, its own private state, and message
+    queues to/from the main program. No signature of its own (no
+    parens) -- `body` is an ordinary block that may contain nested
+    `on load()`/`on message(p:T)`/`on exit(code:int)` handlers (parsed
+    as ordinary EventHandler nodes, same as anywhere else) and
+    thread-private state VarDecls. `NAME` itself becomes a global
+    value semantic.py registers with a `ThreadType`, supporting
+    `.postMessage(x)`/`.onMessage(callback)`/`.kill()`/`.live(callback)`/
+    `.isAlive()`. The thread's inbound message type is whatever its own
+    `on message(p:T)` (if any) declares -- found by semantic analysis,
+    not stored here; there is deliberately no place in this node for a
+    message type, since one would only ever be checked against that
+    handler's own parameter and never used for anything else."""
+    def __init__(self, name, body, line=0, column=0):
+        self.name = name
         self.body = body
         self.line = line
         self.column = column

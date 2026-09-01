@@ -93,3 +93,22 @@ while i < 2000 {
 }
 log(a.radius)
 log(b.radius)
+
+// claude.md #197: a fresh, WITH-INITIALIZER enum-typed local declared
+// INSIDE the loop (not an already-declared variable being reassigned,
+// which the churn above already exercises) -- found leaking here, not
+// in a thread-related program at all, since _emit_block's own
+// scope-exit tracking never scheduled EnumType for release despite
+// claude.md #176's own comment on _is_refcounted saying no such
+// special-casing was needed. Exercises the mixed representation (a
+// fresh box, its own boxed text buffer) at real volume.
+int freshTotal = 0
+i = 0
+while i < 3000 {
+    Choice fresh = `fresh${i}`
+    if typeof fresh == 'text' {
+        freshTotal = freshTotal + 1
+    }
+    i = i + 1
+}
+log(freshTotal)

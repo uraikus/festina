@@ -171,6 +171,26 @@ def _walk_stmt(stmt, escaping, escaping_params):
         _walk_stmts(stmt.body.body, escaping, escaping_params)
     elif isinstance(stmt, ast.Block):
         _walk_stmts(stmt.body, escaping, escaping_params)
+    elif isinstance(stmt, ast.TryStmt):
+        # claude.md #192: try/catch are ORDINARY function-body
+        # statements (claude.md #157), and codegen emits their bodies
+        # under this same escaping set -- so a value escaping only
+        # inside a try or catch body (`try { g = xs }`) must be seen
+        # here too. Missing them made such a value stack-allocated and
+        # freed at scope exit while still referenced through the escape
+        # -- a real use-after-free (a `g = xs` inside a try left the
+        # global `g` pointing at reclaimed frame storage). Both bodies
+        # are walked; the catch variable is a fresh text binding that
+        # shadows within catch_body, and walking its uses can only ADD
+        # names to the escaping set, never wrongly clear one, so the
+        # conservative direction (claude.md #74) is preserved.
+        _walk_stmts(stmt.try_body.body, escaping, escaping_params)
+        _walk_stmts(stmt.catch_body.body, escaping, escaping_params)
+    elif isinstance(stmt, ast.ThrowStmt):
+        # claude.md #192: `throw <expr>` -- its expression is evaluated
+        # and can carry an escaping use (`throw f(xs)`), same as any
+        # other statement expression.
+        _walk_expr(stmt.expr, escaping, escaping_params)
     # BreakStmt/ContinueStmt: no expressions to walk. Everything else
     # (see the module docstring's last paragraph): silent no-op.
 

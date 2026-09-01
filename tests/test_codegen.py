@@ -154,6 +154,26 @@ class TestArithmeticAndControlFlow:
         result = compile_and_run(source)
         assert result.stdout.strip() == "big"
 
+    def test_ternary_with_a_null_branch(self, compile_and_run):
+        # claude.md #192: a bare `null` branch is emitted AS the other
+        # branch's type -- `c ? 1 : null` used to phi a raw "null"
+        # against i64 (invalid IR) and `c ? null : 7` crashed the
+        # compiler on a None type. The taken null branch yields the
+        # int-null sentinel; the taken concrete branch yields its value.
+        source = """
+        log(true ? 1 : null)
+        log(false ? 1 : null)
+        log(false ? null : 7)
+        log(true ? null : 7)
+        """
+        result = compile_and_run(source)
+        lines = result.stdout.splitlines()
+        assert lines[0] == "1"
+        assert lines[2] == "7"
+        # the null-branch cases print int's own null sentinel
+        assert lines[1] == lines[3]
+        assert lines[1] != "1" and lines[1] != "7"
+
     def test_logical_and_or_short_circuit(self, compile_and_run):
         # claude.md doesn't spell out short-circuit evaluation explicitly,
         # but it's the JavaScript-familiar behavior claude.md #45 asks for
@@ -1892,18 +1912,20 @@ class TestAutomaticMemoryReclamation:
 
     def test_loop_local_struct_is_stack_allocated_and_reused_across_iterations(
             self, parser, semantic, codegen):
-        # claude.md #43/#74/#75: the loop-body/break/continue-scoped
-        # freeing machinery still applies to *when* a struct local's
-        # storage is considered dead, even though "dead" no longer
-        # means "call free() here" for a struct -- it means the very
-        # next textual reach of the same VarDecl (the next iteration)
-        # re-zeros the *same* stack address rather than allocating a
-        # fresh one, since LLVM's alloca reserves one fixed slot for
-        # the whole enclosing function regardless of which basic block
-        # contains it. The alloca and its zeroinitializer store must
-        # both be inside the loop body (so re-zeroing genuinely
-        # happens every iteration, not just once before the loop), and
-        # there must be no calloc/free anywhere in the function at all.
+        # claude.md #43/#74/#75, corrected by #191: a loop-body struct
+        # local reuses ONE stack slot across iterations. This test
+        # originally asserted the alloca itself sat inside the loop
+        # body, on the belief that LLVM reserves one fixed slot per
+        # alloca regardless of block -- that belief was wrong: an
+        # alloca EXECUTES each time it's reached, growing the stack
+        # every iteration until the function returns (measured: a
+        # six-field struct declared in a while body overflowed the
+        # 8MB stack and segfaulted at ~150k-300k iterations). The
+        # alloca now lives in the function's ENTRY block (one slot per
+        # call, genuinely reused), while the zeroinitializer store
+        # stays inside the loop body so each iteration still sees a
+        # fresh zeroed struct -- and there is still no calloc/free
+        # anywhere in the function at all.
         source = """
         struct Point { x:int y:int }
         void func f() {
@@ -1916,13 +1938,54 @@ class TestAutomaticMemoryReclamation:
         """
         ir = self._ir(parser, semantic, codegen, source)
         lines = ir.splitlines()
-        body_start = next(i for i, l in enumerate(lines) if l.strip().startswith("for.body"))
-        body_end = next(i for i in range(body_start, len(lines)) if lines[i].strip().startswith("br label %for.update"))
+        f_start = next(i for i, l in enumerate(lines) if l.startswith("define void @f("))
+        f_end = next(i for i in range(f_start, len(lines)) if lines[i] == "}")
+        body_start = next(i for i in range(f_start, f_end) if lines[i].strip().startswith("for.body"))
+        body_end = next(i for i in range(body_start, f_end) if lines[i].strip().startswith("br label %for.update"))
+        entry_lines = lines[f_start:body_start]
         body_lines = lines[body_start:body_end]
-        assert any("alloca %struct.Point" in l for l in body_lines)
+        # one slot, allocated up front...
+        assert any("alloca %struct.Point" in l for l in entry_lines)
+        assert not any("alloca" in l for l in body_lines)
+        # ...re-zeroed at the declaration site, every iteration.
         assert any("store %struct.Point zeroinitializer" in l for l in body_lines)
         assert "call ptr @calloc(" not in ir
         assert "call void @free(" not in ir
+
+    def test_a_long_running_loop_declaring_locals_does_not_grow_the_stack(
+            self, compile_and_run):
+        # claude.md #191: the regression this whole hoist exists for.
+        # Before it, each iteration's allocas (the struct's storage,
+        # its pointer slot, every scratch temporary) pushed fresh
+        # stack that never popped until function return -- this exact
+        # program segfaulted between 150k and 300k iterations with
+        # completely flat heap usage. 500k iterations now run in a
+        # fixed-size frame.
+        source = '''
+        struct Item {
+            id:int
+            name:text
+            description:text
+            price:float
+            inStock:bool
+            tags:arr[text]
+        }
+        int i = 0
+        while i < 500000 {
+            Item it
+            it.id = i
+            it.name = `item number ${i}`
+            it.description = 'A "quoted" description with\\na newline'
+            it.price = 19.99
+            it.inStock = i % 2 == 0
+            it.tags = ['alpha', 'beta', `gamma-${i}`]
+            i = i + 1
+        }
+        log(i)
+        '''
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == '500000'
 
     def test_nested_if_declared_struct_is_stack_allocated(self, parser, semantic, codegen):
         source = """
@@ -8507,6 +8570,36 @@ class TestJsonRendering:
         assert result.stdout.strip() == (
             '{"name":"has \\"quotes\\" and\\ttab","score":null,"missing":0}')
 
+    def test_escape_run_boundaries_render_correctly(self, compile_and_run):
+        # claude.md #190: festina_sb_append_json_text now bulk-copies
+        # a "safe run" of bytes instead of handling one byte at a
+        # time, so the exact boundary where a run starts/ends/never-
+        # exists is exactly where a bug would hide: a string starting
+        # AND ending on an escape-needing byte (no leading/trailing
+        # safe run at all), a string of NOTHING but escape-needing
+        # bytes back-to-back (every "run" is zero-length), and an
+        # empty string (no bytes to scan at all).
+        source = r'''
+        struct P {
+            leading:text
+            trailing:text
+            onlyEscapes:text
+            empty:text
+        }
+        P p
+        p.leading = '"start and end with quotes"'
+        p.trailing = 'ab\\'
+        p.onlyEscapes = '"\\\n\t\r'
+        p.empty = ''
+        log(p)
+        '''
+        result = compile_and_run(source)
+        assert result.stdout.strip() == (
+            '{"leading":"\\"start and end with quotes\\"",'
+            '"trailing":"ab\\\\",'
+            '"onlyEscapes":"\\"\\\\\\n\\t\\r",'
+            '"empty":""}')
+
     def test_a_table_row_renders_with_database_null_and_omits_undefined(
             self, compile_and_run, tmp_path):
         # A database NULL is the JSON null; a column the query never
@@ -8541,6 +8634,30 @@ class TestJsonRendering:
         '''
         result = compile_and_run(source)
         assert result.stdout.splitlines() == ['[1,2]', '{"n":5}']
+
+    def test_interpolating_a_fresh_container_does_not_leak(self, compile_and_run):
+        # claude.md #192: `${make()}` renders a fresh array/struct/map to
+        # text and is then done with the container, but _emit_template
+        # released only the text pieces, never the container itself -- a
+        # leak per evaluation. This pins the OBSERVABLE result (the
+        # rendering is correct); the leak itself is ASan-verified
+        # separately. A tight loop makes a missed release matter.
+        source = '''
+        arr[int] func makeArr() {
+            arr[int] xs = [1, 2, 3]
+            return xs
+        }
+        int i = 0
+        text last = ''
+        while i < 50 {
+            last = `v: ${makeArr()} and ${[9, 8]}`
+            i = i + 1
+        }
+        log(last)
+        '''
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == 'v: [1,2,3] and [9,8]'
 
     def test_a_null_container_renders_as_null(self, compile_and_run):
         source = '''
@@ -15703,3 +15820,641 @@ class TestEnums:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip() == "text"
+
+    def test_a_fresh_with_initializer_enum_local_declared_in_a_loop_is_freed(self, compile_and_run):
+        # claude.md #197: a genuine, pre-existing gap found while
+        # building thread Phase 3 (no thread code involved at all) --
+        # unlike REASSIGNING an already-declared enum-typed variable
+        # (the two tests just above, both go through
+        # _emit_local_retain_release, which already dispatched through
+        # _is_refcounted correctly), DECLARING a fresh, WITH-
+        # INITIALIZER enum-typed local was never scheduled for release
+        # at scope exit at all (_emit_block's own tracking dispatch
+        # only listed BLOB/REGEX/ImageType/AudioType, not EnumType --
+        # claude.md #176's own comment on _is_refcounted claimed "no
+        # special-casing needed anywhere else", which turned out not
+        # to be true here) -- so a fresh mixed-enum box, and the text
+        # buffer boxed inside it, leaked every single iteration. This
+        # only checks correct behavior; the leak itself is verified
+        # via scripts/leak_stress.sh (see tests/test_leak_stress.py's
+        # own ASan/LeakSanitizer coverage, not duplicated here).
+        source = """
+        enum DataPacket = int, text
+        int i = 0
+        while i < 200 {
+            DataPacket p = `hello${i}`
+            i = i + 1
+        }
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "done"
+
+
+class TestThreads:
+    """claude.md #195 Phase 2: `thread NAME { ... }` -- the real,
+    compiled-and-run counterpart to tests/test_threads.py's parser/
+    semantic coverage (that file explicitly defers this class of test
+    here, mirroring TestEnums' own split at the top of this file).
+    Every test drives itself to a deterministic close(0) from inside
+    an onMessage()/live() callback (an ordinary main-thread function
+    call -- ending the process is the only reliable way a test can
+    observe the reply side of a message round trip at all, since no
+    top-level statement ever runs concurrently with the drain step
+    that would deliver one -- see codegen.py's own _emit_main_and_entry
+    doc comment on loop selection)."""
+
+    def test_int_message_round_trip(self, compile_and_run):
+        source = """
+        thread worker {
+            on message(p:int) {
+                postMessage(p * 2)
+            }
+        }
+        void func onReply(x:int) {
+            log(x)
+            close(0)
+        }
+        worker.onMessage(void (x:int) => onReply(x))
+        worker.postMessage(21)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "42"
+
+    def test_text_message_round_trip(self, compile_and_run):
+        source = """
+        thread echoer {
+            on message(p:text) {
+                postMessage(`echo:${p}`)
+            }
+        }
+        void func onReply(x:text) {
+            log(x)
+            close(0)
+        }
+        echoer.onMessage(void (x:text) => onReply(x))
+        echoer.postMessage('hi')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "echo:hi"
+
+    def test_float_message_round_trip(self, compile_and_run):
+        source = """
+        thread worker {
+            on message(p:float) {
+                postMessage(p + 0.5)
+            }
+        }
+        void func onReply(x:float) {
+            log(x)
+            close(0)
+        }
+        worker.onMessage(void (x:float) => onReply(x))
+        worker.postMessage(1.5)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "2"
+
+    def test_bool_message_round_trip(self, compile_and_run):
+        source = """
+        thread worker {
+            on message(p:bool) {
+                postMessage(!p)
+            }
+        }
+        void func onReply(x:bool) {
+            log(x)
+            close(0)
+        }
+        worker.onMessage(void (x:bool) => onReply(x))
+        worker.postMessage(true)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "false"
+
+    def test_on_load_fires_before_any_inbound_message_and_can_post_on_its_own(self, compile_and_run):
+        source = """
+        thread worker {
+            on load() {
+                postMessage('ready')
+            }
+        }
+        void func onReply(x:text) {
+            log(x)
+            close(0)
+        }
+        worker.onMessage(void (x:text) => onReply(x))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "ready"
+
+    def test_thread_private_state_persists_and_accumulates_across_messages(self, compile_and_run):
+        # claude.md #195 Phase 1: `int total = 0` is this thread's own
+        # private state, invisible to the main program -- this proves
+        # it's also real, per-thread, PERSISTENT storage at runtime
+        # (not re-zeroed per message), by summing three messages
+        # in order and checking the final accumulated total. Delivery
+        # order is guaranteed here: both queues are plain FIFOs, and
+        # everything on each side runs on exactly one OS thread (this
+        # thread's own single worker; the main program's own single
+        # thread), so three sends from main arrive, and are answered,
+        # in the order they were sent.
+        source = """
+        thread counter {
+            int total = 0
+            on message(p:int) {
+                total = total + p
+                postMessage(total)
+            }
+        }
+        int repliesSeen = 0
+        int lastVal = 0
+        void func onReply(x:int) {
+            repliesSeen = repliesSeen + 1
+            lastVal = x
+            if repliesSeen == 3 {
+                log(lastVal)
+                close(0)
+            }
+        }
+        counter.onMessage(void (x:int) => onReply(x))
+        counter.postMessage(1)
+        counter.postMessage(2)
+        counter.postMessage(3)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "6"
+
+    def test_kill_then_isalive_is_false_then_live_revives_it(self, compile_and_run):
+        # No `on load`/`on message` handler at all here, deliberately --
+        # this test's own stdout needs to be fully deterministic, and a
+        # worker-thread log() would interleave with the main thread's
+        # own unpredictably (real concurrency, not a bug -- see
+        # test_int_message_round_trip and friends for why every OTHER
+        # test here routes its own assertion through a close()-from-
+        # inside-onMessage() callback instead). kill()/live() are both
+        # BLOCKING (kill() pthread_joins; live() spawns and only then
+        # calls its own callback), so this sequence is deterministic
+        # with no message-passing involved at all.
+        source = """
+        thread worker {
+        }
+        log(worker.isAlive())
+        worker.kill()
+        log(worker.isAlive())
+        worker.live(void (ok:bool) => log(ok))
+        log(worker.isAlive())
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["true", "false", "true", "true"]
+
+    def test_main_thread_death_kills_a_still_idle_child_thread(self, compile_and_run):
+        # claude.md #195: "if the main thread dies, kill all child
+        # threads" -- festina_program_exit runs the exit handler (if
+        # any -- none here) and THEN festina_thread_kill_all()
+        # (synchronous, joins every thread), so 'worker exiting' is
+        # guaranteed to print after 'main done', and this process must
+        # exit cleanly rather than hang on an orphaned OS thread (the
+        # 15s subprocess timeout this fixture's own `compile_and_run`
+        # applies is exactly what would catch a regression here).
+        source = """
+        thread worker {
+            on exit(code:int) {
+                log('worker exiting')
+            }
+        }
+        log('main done')
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "main done\nworker exiting\n"
+
+    def test_two_independent_threads_do_not_collide(self, compile_and_run):
+        source = """
+        thread a {
+            on message(p:int) {
+                postMessage(p + 1)
+            }
+        }
+        thread b {
+            on message(p:int) {
+                postMessage(p + 10)
+            }
+        }
+        int seenA = 0
+        int seenB = 0
+        void func checkDone() {
+            if seenA != 0 && seenB != 0 {
+                log(seenA)
+                log(seenB)
+                close(0)
+            }
+        }
+        void func onA(x:int) {
+            seenA = x
+            checkDone()
+        }
+        void func onB(x:int) {
+            seenB = x
+            checkDone()
+        }
+        a.onMessage(void (x:int) => onA(x))
+        b.onMessage(void (x:int) => onB(x))
+        a.postMessage(1)
+        b.postMessage(1)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["2", "11"]
+
+    def test_a_self_referencing_struct_message_type_is_a_clear_not_yet_error(self, parser, semantic, codegen, errors):
+        # claude.md #197 Phase 3: struct/arr[T]/map[T] are clonable
+        # now, but only when ACYCLIC -- a self-referencing struct type
+        # is rejected outright (cloning it could loop forever on a
+        # genuinely cyclic runtime value, unlike release's own
+        # refcount-bounded cascade), with the identical "not supported
+        # yet" shape a still-unimplemented type gets, rather than a
+        # stack overflow or hang.
+        source = """
+        struct Node { val:int next:Node }
+        thread worker {
+            on message(p:Node) {
+                log(p.val)
+            }
+        }
+        Node n
+        worker.postMessage(n)
+        """
+        program = parser.parse(source)
+        analyzed = semantic.analyze(program)
+        with pytest.raises(errors.CompileError, match="not supported yet"):
+            codegen.generate_ir(program, analyzed)
+
+    def test_struct_message_round_trip(self, compile_and_run):
+        source = """
+        struct Point { x:int y:int label:text }
+        thread worker {
+            on message(p:Point) {
+                Point out = p
+                out.x = p.x + 1
+                postMessage(out)
+            }
+        }
+        void func onReply(x:Point) {
+            log(x.x)
+            log(x.y)
+            log(x.label)
+            close(0)
+        }
+        worker.onMessage(void (x:Point) => onReply(x))
+        Point pt
+        pt.x = 10
+        pt.y = 20
+        pt.label = 'hello'
+        worker.postMessage(pt)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["11", "20", "hello"]
+
+    def test_array_message_round_trip(self, compile_and_run):
+        source = """
+        thread worker {
+            on message(p:arr[text]) {
+                arr[text] out = []
+                int i = 0
+                while i < p.length {
+                    out.push(`echo:${p[i]}`)
+                    i = i + 1
+                }
+                postMessage(out)
+            }
+        }
+        void func onReply(x:arr[text]) {
+            int i = 0
+            while i < x.length {
+                log(x[i])
+                i = i + 1
+            }
+            close(0)
+        }
+        worker.onMessage(void (x:arr[text]) => onReply(x))
+        arr[text] xs = ['a', 'b', 'c']
+        worker.postMessage(xs)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["echo:a", "echo:b", "echo:c"]
+
+    def test_map_message_round_trip(self, compile_and_run):
+        source = """
+        thread worker {
+            on message(p:map[int]) {
+                map[int] out = {}
+                out['a'] = p['a'] * 2
+                out['b'] = p['b'] * 2
+                postMessage(out)
+            }
+        }
+        void func onReply(x:map[int]) {
+            log(x['a'])
+            log(x['b'])
+            close(0)
+        }
+        worker.onMessage(void (x:map[int]) => onReply(x))
+        map[int] m = {}
+        m['a'] = 5
+        m['b'] = 7
+        worker.postMessage(m)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["10", "14"]
+
+    def test_mixed_enum_message_round_trip(self, compile_and_run):
+        source = """
+        enum DataPacket = int, text
+        thread worker {
+            on message(p:DataPacket) {
+                log(typeof p)
+                DataPacket out = 'echoed'
+                postMessage(out)
+            }
+        }
+        void func onReply(x:DataPacket) {
+            log(typeof x)
+            close(0)
+        }
+        worker.onMessage(void (x:DataPacket) => onReply(x))
+        DataPacket p = 42
+        worker.postMessage(p)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["int", "text"]
+
+    def test_pure_struct_enum_message_round_trip(self, compile_and_run):
+        source = """
+        struct Circle { radius:int }
+        struct Square { side:int }
+        enum Shape = Circle, Square
+        thread worker {
+            on message(p:Shape) {
+                postMessage(p)
+            }
+        }
+        void func onReply(x:Shape) {
+            log(typeof x)
+            if typeof x == 'Circle' {
+                log(x.radius)
+            }
+            close(0)
+        }
+        worker.onMessage(void (x:Shape) => onReply(x))
+        Circle c
+        c.radius = 99
+        Shape s = c
+        worker.postMessage(s)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["Circle", "99"]
+
+    def test_blob_message_round_trip(self, compile_and_run, tmp_path):
+        # claude.md #198 Phase 4: festina_blob_clone. `b.write(...)`
+        # happens right after postMessage(b) returns -- since
+        # postMessage's own clone runs synchronously on the MAIN
+        # thread before it ever returns (see _emit_thread_box), the
+        # worker's own copy is already fully independent by then,
+        # regardless of how the two threads actually interleave --
+        # proving a genuine deep clone, not a shared handle.
+        (tmp_path / "source.txt").write_text("blob-payload")
+        source = """
+        thread worker {
+            on message(p:blob) {
+                postMessage(p)
+            }
+        }
+        void func onReply(x:blob) {
+            log(x.toText())
+            close(0)
+        }
+        worker.onMessage(void (x:blob) => onReply(x))
+        blob b = 'source.txt'
+        worker.postMessage(b)
+        b.write('mutated-after-send')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "blob-payload"
+
+    def test_image_message_round_trip(self, compile_and_run):
+        # claude.md #198 Phase 4: festina_image_clone (the bytes-round-
+        # trip reuse), plus verifies the img-method allow-list actually
+        # works end to end -- p.drawRect(...) runs INSIDE the thread
+        # body, on that thread's own private clone of the surface, and
+        # the drawn pixels survive the clone back out to the main
+        # thread.
+        source = """
+        thread worker {
+            on message(p:img) {
+                color blue = 'blue'
+                p.drawRect(0, 0, 20, 20, blue)
+                postMessage(p)
+            }
+        }
+        void func onReply(x:img) {
+            color blue = 'blue'
+            log(x.getPixelColor(5, 5) == blue)
+            close(0)
+        }
+        worker.onMessage(void (x:img) => onReply(x))
+        img pic = blankImage(20, 20)
+        worker.postMessage(pic)
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_audio_message_round_trip(self, compile_and_run, tmp_path):
+        # claude.md #198 Phase 4: festina_audio_clone (a direct field-
+        # by-field copy, unlike img's bytes round trip -- see its own
+        # doc comment in festina_runtime_audio.c for why). saveCopy()
+        # writing real, non-empty bytes back out on the MAIN thread
+        # proves the clone that crossed back out of the worker still
+        # carries real, correctly-cloned audio data.
+        _write_wav(tmp_path / "clip.wav", duration_s=0.05)
+        source = """
+        thread worker {
+            on message(p:aud) {
+                postMessage(p)
+            }
+        }
+        void func onReply(x:aud) {
+            x.saveCopy('echo.wav')
+            close(0)
+        }
+        worker.onMessage(void (x:aud) => onReply(x))
+        aud clip = 'clip.wav'
+        worker.postMessage(clip)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        echo = tmp_path / "echo.wav"
+        assert echo.exists()
+        assert echo.stat().st_size > 0
+
+    def test_url_message_round_trip(self, compile_and_run):
+        # claude.md #198 Phase 4: festina_url_clone, including its own
+        # nested map[text] searchParams clone (via the Phase 3-built
+        # festina_map_clone, through the new festina_clone_text_map_
+        # value trampoline).
+        source = """
+        thread worker {
+            on message(p:url) {
+                postMessage(p)
+            }
+        }
+        void func onReply(x:url) {
+            log(x.hostname)
+            log(x.pathname)
+            log(x.searchParams['a'])
+            close(0)
+        }
+        worker.onMessage(void (x:url) => onReply(x))
+        url u = parseURL('https://example.com/path?a=1')
+        worker.postMessage(u)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["example.com", "/path", "1"]
+
+    def test_a_thread_with_its_own_database_url_has_a_genuinely_private_sqlite_handle(
+            self, compile_and_run, tmp_path):
+        # claude.md #199 Phase 5: `DatabaseURL = '<literal>'` as a
+        # thread's own first statement -- its own INSERT/SELECT round
+        # trips correctly through its own private handle, and the main
+        # program's own separate database (a different literal file)
+        # ends up as a genuinely distinct file on disk, with neither
+        # program's own rows visible in the other's file -- not just
+        # "the query returned the right answer" (which a single shared
+        # handle would also satisfy), but "the actual bytes on disk are
+        # two separate databases."
+        source = """
+        DatabaseURL = 'main_only.sqlite'
+        table MainItem { id:int }
+        sqlite('INSERT INTO MainItem (id) VALUES (1)')
+
+        table WorkerItem { id:int label:text }
+        thread worker {
+            DatabaseURL = 'worker_only.sqlite'
+            on message(p:int) {
+                sqlite('INSERT INTO WorkerItem (id, label) VALUES (?, ?)',
+                       [p, `from-worker-${p}`])
+                arr[WorkerItem] rows = sqlite('SELECT * FROM WorkerItem')
+                postMessage(rows[0].label)
+            }
+        }
+        void func onReply(x:text) {
+            log(x)
+            close(0)
+        }
+        worker.onMessage(void (x:text) => onReply(x))
+        worker.postMessage(42)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "from-worker-42"
+        assert (tmp_path / "main_only.sqlite").exists()
+        assert (tmp_path / "worker_only.sqlite").exists()
+        # claude.md #28's own schema-sync unconditionally creates every
+        # declared table in EVERY database that gets opened (main's own
+        # prologue, and this thread's own on_load, both sync the whole
+        # self.tables set) -- but only the context that actually
+        # QUERIED a table ever puts a ROW in it. WorkerItem exists as an
+        # empty table in main's own file; MainItem exists as an empty
+        # table in the worker's own file. Neither file's own MainItem/
+        # WorkerItem row count crosses into the other's.
+        import sqlite3 as _sqlite3
+        main_conn = _sqlite3.connect(str(tmp_path / "main_only.sqlite"))
+        worker_conn = _sqlite3.connect(str(tmp_path / "worker_only.sqlite"))
+        try:
+            assert main_conn.execute("SELECT count(*) FROM MainItem").fetchone() == (1,)
+            assert main_conn.execute("SELECT count(*) FROM WorkerItem").fetchone() == (0,)
+            assert worker_conn.execute("SELECT count(*) FROM WorkerItem").fetchone() == (1,)
+            assert worker_conn.execute("SELECT count(*) FROM MainItem").fetchone() == (0,)
+        finally:
+            main_conn.close()
+            worker_conn.close()
+
+    def test_a_thread_sharing_the_main_programs_database_url_is_a_clear_compile_error(
+            self, compile_and_run, errors):
+        # claude.md #199 Phase 5's own whole-program conflict check,
+        # exercised through the real, file-based compile pipeline (see
+        # test_threads.py's own TestThreadDatabaseUrl for the same
+        # check's unit-level coverage) -- festina.imports.build_program
+        # is what actually sets Program.database_url from the entry
+        # file's own leading `DatabaseURL = ...` statement, so this is
+        # the one scenario that genuinely needs a real compile, not
+        # just parser.parse()+semantic.analyze().
+        source = """
+        DatabaseURL = 'shared.sqlite'
+        thread worker {
+            DatabaseURL = 'shared.sqlite'
+            on load() { sqlite('SELECT 1') }
+        }
+        """
+        with pytest.raises(errors.CompileError,
+                            match="the main program and thread 'worker' would both "
+                                  "open the same database file"):
+            compile_and_run(source)
+
+    def test_postmessage_of_a_fresh_enum_coercion_does_not_leak_or_double_free(self, compile_and_run):
+        # Regression coverage for a real bug found and fixed while
+        # building this: postMessage(x)'s own cleanup used to always
+        # call _free_text_temp with the PRE-coercion vtype, which is
+        # only correct when the coercion is a no-op (TEXT -> TEXT).
+        # Posting a bare text literal directly into a mixed-enum
+        # inbound type coerces it into a freshly boxed enum value
+        # (claude.md #176) -- the old code would have freed that box
+        # as if it were a plain text buffer. ASan-verified separately
+        # (see claude.md #197); this just checks the program still
+        # runs correctly end to end.
+        source = """
+        enum DataPacket = int, text
+        thread worker {
+            on message(p:DataPacket) {
+                log(typeof p)
+            }
+        }
+        worker.postMessage('direct-literal-hello')
+        worker.postMessage(123)
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+
+    def test_a_thread_with_no_onmessage_registration_still_lets_the_process_exit_cleanly(self, compile_and_run):
+        # A `peopleWorker`-style thread -- declared, idling, never
+        # posting or receiving anything -- must not keep the process
+        # alive past an explicit close(), and must not need
+        # festina_run_timer_loop to hang waiting on it either.
+        source = """
+        thread idler {
+        }
+        log('main done')
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "main done"

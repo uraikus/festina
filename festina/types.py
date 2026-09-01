@@ -11,22 +11,41 @@ PRIMITIVE_NAMES = frozenset({"int", "float", "bool", "text", "blob"})
 
 @dataclass(frozen=True)
 class PrimitiveType:
+    """claude.md #202: `manually_managed` (default False) is only ever
+    actually SET True for `name == "blob"` -- the one primitive that
+    carries a refcount header (see codegen._is_refcounted) and so is
+    the one primitive `T?` means anything real for. For
+    `int`/`float`/`bool`/`text`, semantic.py's own resolution never
+    sets this field at all regardless of whether the source wrote `?`
+    -- `int?`/`int` both resolve to the identical `PrimitiveType("int")`
+    (this field stays its own default, False), fully interchangeable,
+    so `?` on a scalar is accepted grammar with zero type-level effect,
+    matching claude.md #202's own worked example (`int? count = 1`)."""
     name: str
+    manually_managed: bool = False
 
     def __post_init__(self):
         if self.name not in PRIMITIVE_NAMES:
             raise ValueError(f"not a primitive type name: {self.name!r}")
 
     def __repr__(self):
-        return f"PrimitiveType({self.name})"
+        suffix = "?" if self.manually_managed else ""
+        return f"PrimitiveType({self.name}{suffix})"
 
 
 @dataclass(frozen=True)
 class StructType:
+    """claude.md #202: `manually_managed` (default False) -- see
+    ArrayType's own doc comment for the full "genuinely different,
+    non-interchangeable type, mirroring `amor`'s own precedent"
+    reasoning, shared identically by every dataclass this field is
+    added to."""
     name: str
+    manually_managed: bool = False
 
     def __repr__(self):
-        return f"StructType({self.name})"
+        suffix = "?" if self.manually_managed else ""
+        return f"StructType({self.name}{suffix})"
 
 
 @dataclass(frozen=True)
@@ -52,11 +71,33 @@ class EnumType:
     typeof on an EnumType-typed value never returns the enum's OWN
     name -- it always returns the concrete runtime member's name (the
     whole reason a runtime tag exists at all). "Shape" itself is never
-    a typeof result; "Circle"/"Square" are."""
+    a typeof result; "Circle"/"Square" are.
+
+    claude.md #202: `manually_managed` (default False) -- see
+    ArrayType's own doc comment for the shared reasoning."""
+    name: str
+    manually_managed: bool = False
+
+    def __repr__(self):
+        suffix = "?" if self.manually_managed else ""
+        return f"EnumType({self.name}{suffix})"
+
+
+@dataclass(frozen=True)
+class ThreadType:
+    """claude.md #195: `thread NAME { ... }` -- name-only, exactly like
+    StructType/TableType/EnumType above. `NAME` itself becomes a global
+    value of this type, supporting exactly five methods: `.postMessage(x)`,
+    `.onMessage(callback)`, `.kill()`, `.live(callback)`, `.isAlive()`.
+    The real inbound/outbound message types (both INFERRED, never
+    declared -- see semantic.py's own thread-analysis comments) live in
+    a separate `threads` dict (semantic.py's AnalyzedProgram, mirrored
+    in codegen.py's self.threads), the same split every other name-only
+    type here already uses."""
     name: str
 
     def __repr__(self):
-        return f"EnumType({self.name})"
+        return f"ThreadType({self.name})"
 
 
 @dataclass(frozen=True)
@@ -75,25 +116,47 @@ class ArrayType:
     type's real identity, not a comparison-transparent modifier: an
     `amor arr[T]` and a plain `arr[T]` of the same element type are
     genuinely different, non-interchangeable representations, and
-    assignment between them is a compile error."""
+    assignment between them is a compile error.
+
+    claude.md #202: `manually_managed` (default False) is a SECOND,
+    independent field of this exact same shape -- set by a trailing
+    `?` (`arr[int]?`), meaning this array's own header/backing buffer
+    is never automatically retained/released, only ever reclaimed by
+    an explicit `free`/`delete`. Composes freely with `amortized` (an
+    `amor arr[T]?` is both amortized-growth AND manually-managed at
+    once) -- the two are orthogonal representation questions, unlike
+    `amortized` vs. plain, which are mutually exclusive variants of the
+    SAME question."""
     element: object  # another Type instance
     amortized: bool = False
+    manually_managed: bool = False
 
     def __repr__(self):
         prefix = "amor " if self.amortized else ""
-        return f"{prefix}ArrayType({self.element!r})"
+        suffix = "?" if self.manually_managed else ""
+        return f"{prefix}ArrayType({self.element!r}){suffix}"
 
 
 @dataclass(frozen=True)
 class ImageType:
+    """claude.md #202: `manually_managed` (default False) -- see
+    ArrayType's own doc comment for the shared reasoning."""
+    manually_managed: bool = False
+
     def __repr__(self):
-        return "ImageType()"
+        suffix = "?" if self.manually_managed else ""
+        return f"ImageType(){suffix}"
 
 
 @dataclass(frozen=True)
 class AudioType:
+    """claude.md #202: `manually_managed` (default False) -- see
+    ArrayType's own doc comment for the shared reasoning."""
+    manually_managed: bool = False
+
     def __repr__(self):
-        return "AudioType()"
+        suffix = "?" if self.manually_managed else ""
+        return f"AudioType(){suffix}"
 
 
 @dataclass(frozen=True)
@@ -103,10 +166,15 @@ class HttpType:
     only one shape of this type -- the request's own method/headers/
     body all live in the runtime value (a small refcounted handle
     wrapping a connection id, see festina_runtime_http.c), never the
-    static type."""
+    static type.
+
+    claude.md #202: `manually_managed` (default False) -- see
+    ArrayType's own doc comment for the shared reasoning."""
+    manually_managed: bool = False
 
     def __repr__(self):
-        return "HttpType()"
+        suffix = "?" if self.manually_managed else ""
+        return f"HttpType(){suffix}"
 
 
 @dataclass(frozen=True)
@@ -117,10 +185,15 @@ class UrlType:
     every field lives in the runtime value (a small refcounted struct,
     see festina_runtime_url.c), never the static type -- there's
     nothing here to distinguish one url from another at the type
-    level, unlike StructType/TableType."""
+    level, unlike StructType/TableType.
+
+    claude.md #202: `manually_managed` (default False) -- see
+    ArrayType's own doc comment for the shared reasoning."""
+    manually_managed: bool = False
 
     def __repr__(self):
-        return "UrlType()"
+        suffix = "?" if self.manually_managed else ""
+        return f"UrlType(){suffix}"
 
 
 @dataclass(frozen=True)
@@ -130,10 +203,15 @@ class SocketType:
     socketClose(s:socket)`. Same one-shape-only reasoning as HttpType
     -- the connection this wraps is looked up by id at every runtime
     call, never held as a live pointer past a single call (see
-    festina_runtime_http.c's own doc comment on why)."""
+    festina_runtime_http.c's own doc comment on why).
+
+    claude.md #202: `manually_managed` (default False) -- see
+    ArrayType's own doc comment for the shared reasoning."""
+    manually_managed: bool = False
 
     def __repr__(self):
-        return "SocketType()"
+        suffix = "?" if self.manually_managed else ""
+        return f"SocketType(){suffix}"
 
 
 @dataclass(frozen=True)
@@ -142,10 +220,15 @@ class RegexType:
     runtime pointer value (see festina_regex_compile), never the static
     type, whether created via a /pattern/flags literal or the regex()
     builtin -- so (unlike StructType/TableType) there's only ever one
-    shape of this type; no fields to distinguish."""
+    shape of this type; no fields to distinguish.
+
+    claude.md #202: `manually_managed` (default False) -- see
+    ArrayType's own doc comment for the shared reasoning."""
+    manually_managed: bool = False
 
     def __repr__(self):
-        return "RegexType()"
+        suffix = "?" if self.manually_managed else ""
+        return f"RegexType(){suffix}"
 
 
 @dataclass(frozen=True)
@@ -203,11 +286,16 @@ class MapType:
     variant used to bolt on separately; there is no distinct amortized
     map type left to give this a second field for (unlike ArrayType,
     which still has one -- `amor arr[T]` is unaffected by this
-    change)."""
+    change).
+
+    claude.md #202: `manually_managed` (default False) -- see
+    ArrayType's own doc comment for the shared reasoning."""
     value: object  # another Type instance
+    manually_managed: bool = False
 
     def __repr__(self):
-        return f"MapType({self.value!r})"
+        suffix = "?" if self.manually_managed else ""
+        return f"MapType({self.value!r}){suffix}"
 
 
 @dataclass(frozen=True)
@@ -243,38 +331,50 @@ class FuncType:
 
 
 def type_name(t):
-    """Readable name for error messages, e.g. `arr[int]`, `User`, `int`."""
+    """Readable name for error messages, e.g. `arr[int]`, `User`, `int`.
+
+    claude.md #202: every branch below that can carry `manually_managed`
+    appends a trailing `?` when it's set, matching the surface syntax
+    exactly (`Circle?`, `arr[int]?`, ...) -- this is NOT just cosmetic:
+    codegen.py's own generated-function caches for struct/array/map/enum
+    release cascades are keyed by THIS string, not by the raw Type
+    instance's own `__eq__`/`__hash__` (`amor`'s own `"amor "` prefix
+    just below is the existing precedent this mirrors exactly) -- so a
+    manually-managed type colliding with its ordinary counterpart here
+    would be a silent cache-collision bug, two genuinely different
+    types sharing one generated release function."""
     if t is None:
         return "unknown"
+    mm = "?" if getattr(t, "manually_managed", False) else ""
     if isinstance(t, PrimitiveType):
-        return t.name
+        return f"{t.name}{mm}"
     if isinstance(t, StructType):
-        return t.name
+        return f"{t.name}{mm}"
     if isinstance(t, TableType):
         return t.name
     if isinstance(t, EnumType):
-        return t.name
+        return f"{t.name}{mm}"
     if isinstance(t, ArrayType):
         prefix = "amor " if t.amortized else ""
-        return f"{prefix}arr[{type_name(t.element)}]"
+        return f"{prefix}arr[{type_name(t.element)}]{mm}"
     if isinstance(t, ImageType):
-        return "img"
+        return f"img{mm}"
     if isinstance(t, AudioType):
-        return "aud"
+        return f"aud{mm}"
     if isinstance(t, RegexType):
-        return "regex"
+        return f"regex{mm}"
     if isinstance(t, HttpType):
-        return "http"
+        return f"http{mm}"
     if isinstance(t, UrlType):
-        return "url"
+        return f"url{mm}"
     if isinstance(t, SocketType):
-        return "socket"
+        return f"socket{mm}"
     if isinstance(t, ColorType):
         return "color"
     if isinstance(t, FontType):
         return "font"
     if isinstance(t, MapType):
-        return f"map[{type_name(t.value)}]"
+        return f"map[{type_name(t.value)}]{mm}"
     if isinstance(t, FuncType):
         params = ",".join(type_name(p) for p in t.param_types)
         ret = "void" if t.return_type is None else type_name(t.return_type)

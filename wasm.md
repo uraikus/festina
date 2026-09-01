@@ -281,47 +281,47 @@ Needs a wasm32-wasi-capable clang (see [Setup](#setup) above), Go
 than failing the run, same spirit as `run_benchmarks.py`.
 
 <!-- WASM_BENCHMARK_RESULTS_START -->
-_Last run: 2026-08-24 on this machine -- see wasm.md's "Benchmark methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
+_Last run: 2026-09-01 on this machine -- see wasm.md's "Benchmark methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
 
 ### `hello` (wasm32-wasi, run via Node's WASI host)
 
 | Language | Run time (min of 7 runs) | Build time | .wasm size |
 |---|---|---|---|
-| Festina | 49.9 ms | 76.0 ms | 1.45 MB |
-| C | 41.7 ms | 62.9 ms | 45.8 KB |
-| Go | 67.7 ms | 124.8 ms | 2.31 MB |
+| Festina | 50.4 ms | 82.0 ms | 1.47 MB |
+| C | 43.7 ms | 72.3 ms | 45.8 KB |
+| Go | 70.4 ms | 142.8 ms | 2.31 MB |
 
 ### `fib` (wasm32-wasi, run via Node's WASI host)
 
 | Language | Run time (min of 7 runs) | Build time | .wasm size |
 |---|---|---|---|
-| Festina | 59.5 ms | 82.5 ms | 1.45 MB |
-| C | 53.0 ms | 72.6 ms | 92.1 KB |
-| Go | 105.7 ms | 140.2 ms | 2.31 MB |
+| Festina | 61.2 ms | 84.3 ms | 1.47 MB |
+| C | 54.0 ms | 118.8 ms | 92.1 KB |
+| Go | 106.6 ms | 151.8 ms | 2.31 MB |
 
 ### `loop_sum` (wasm32-wasi, run via Node's WASI host)
 
 | Language | Run time (min of 7 runs) | Build time | .wasm size |
 |---|---|---|---|
-| Festina | 914.4 ms | 86.7 ms | 1.45 MB |
-| C | 891.7 ms | 76.0 ms | 92.1 KB |
-| Go | 896.6 ms | 119.7 ms | 2.31 MB |
+| Festina | 783.2 ms | 86.5 ms | 1.47 MB |
+| C | 824.6 ms | 79.1 ms | 92.1 KB |
+| Go | 972.8 ms | 157.9 ms | 2.31 MB |
 
 ### `array_sum` (wasm32-wasi, run via Node's WASI host)
 
 | Language | Run time (min of 7 runs) | Build time | .wasm size |
 |---|---|---|---|
-| Festina | 210.1 ms | 96.8 ms | 1.45 MB |
-| C | 237.3 ms | 81.6 ms | 92.2 KB |
-| Go | 279.4 ms | 120.1 ms | 2.31 MB |
+| Festina | 189.5 ms | 96.9 ms | 1.47 MB |
+| C | 211.8 ms | 83.5 ms | 92.2 KB |
+| Go | 268.8 ms | 182.1 ms | 2.31 MB |
 
 ### `string_concat` (wasm32-wasi, run via Node's WASI host)
 
 | Language | Run time (min of 7 runs) | Build time | .wasm size |
 |---|---|---|---|
-| Festina | 71.6 ms | 86.3 ms | 1.45 MB |
-| C | 51.6 ms | 79.1 ms | 93.8 KB |
-| Go | 121.2 ms | 119.6 ms | 2.31 MB |
+| Festina | 72.0 ms | 85.8 ms | 1.47 MB |
+| C | 50.4 ms | 87.8 ms | 93.8 KB |
+| Go | 125.1 ms | 163.7 ms | 2.31 MB |
 
 <!-- WASM_BENCHMARK_RESULTS_END -->
 

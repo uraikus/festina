@@ -652,7 +652,16 @@ static int festina_decode_wav(const unsigned char *data, size_t len,
         pos += 8 + chunk_size + (chunk_size % 2);
     }
 
-    if (!have_fmt || !is_pcm || !audio || bits_per_sample != 16 || channels < 1) return 0;
+    /* claude.md #192: also reject a zero (or absurd) sample rate. A
+     * fmt chunk claiming rate 0 used to "load" fine, then play() passed
+     * it to the audio device open, which fails -- and the EBUSY-retry
+     * loop misreads every open failure as device contention, halting
+     * every other playing channel one by one before dying with a
+     * misleading "is any audio device available?" fatal. Rejecting it
+     * here turns one malformed asset into a normal load failure instead
+     * of taking down all audio with the wrong diagnosis. */
+    if (!have_fmt || !is_pcm || !audio || bits_per_sample != 16
+            || channels < 1 || channels > 8 || sample_rate < 1) return 0;
 
     int16_t *samples = malloc(audio_size ? audio_size : 1);
     if (!samples) festina_fail("out of memory loading audio");
@@ -838,6 +847,43 @@ void festina_audio_free(void *audio) {
     free(a->bytes);
     free(a->path);   /* claude.md #110 */
     free((char *)audio - sizeof(int64_t));
+}
+
+/* claude.md #198 Phase 4: `thread`'s own deep-clone of an aud message/
+ * field -- a plain field-by-field copy (samples/bytes/path all
+ * malloc'd afresh), unlike img's own bytes-round-trip clone: FestinaAudio
+ * is already exactly "decoded PCM plus the bytes it came from plus a
+ * path", with no Cairo-surface-shaped live resource to avoid touching
+ * directly, and no lazy on-demand re-encode step the way
+ * festina_image_bytes has (festina_audio_bytes always just returns
+ * the already-decoded-from bytes) -- so a direct copy is both simpler
+ * and cheaper than round-tripping through festina_audio_from_bytes'
+ * own full WAV/MP3 re-decode would be. Never touches the channel pool
+ * (g_channels) at all: a freshly cloned clip has never been played,
+ * so there is nothing there that could reference it yet. */
+void *festina_audio_clone(void *audio) {
+    if (!audio) return NULL;
+    FestinaAudio *a = (FestinaAudio *)audio;
+    char *raw = calloc(1, sizeof(int64_t) + sizeof(FestinaAudio));
+    if (!raw) festina_fail("out of memory cloning an audio clip");
+    *(int64_t *)raw = 1;
+    FestinaAudio *clone = (FestinaAudio *)(raw + sizeof(int64_t));
+    clone->frame_count = a->frame_count;
+    clone->channels = a->channels;
+    clone->sample_rate = a->sample_rate;
+    size_t sample_count = a->frame_count * (size_t)(a->channels > 0 ? a->channels : 1);
+    if (sample_count > 0) {
+        clone->samples = malloc(sample_count * sizeof(int16_t));
+        if (!clone->samples) festina_fail("out of memory cloning an audio clip");
+        memcpy(clone->samples, a->samples, sample_count * sizeof(int16_t));
+    }
+    clone->bytes = malloc(a->byte_count ? a->byte_count : 1);
+    if (!clone->bytes) festina_fail("out of memory cloning an audio clip");
+    memcpy(clone->bytes, a->bytes, a->byte_count);
+    clone->byte_count = a->byte_count;
+    clone->path = strdup(a->path ? a->path : "");
+    if (!clone->path) festina_fail("out of memory cloning an audio clip");
+    return clone;
 }
 
 /* claude.md #110: writes the clip's own encoded bytes -- so an MP3 saves

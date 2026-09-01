@@ -36,6 +36,7 @@
  */
 #include <ctype.h>   /* isdigit/tolower -- claude.md #159's JSON parser */
 #include <errno.h>
+#include <float.h>   /* DBL_MAX -- claude.md #192's JSON float render bound */
 #include <regex.h>
 #if !defined(__wasi__)
 #include <signal.h>  /* sig_atomic_t/signal/SIGINT/SIGTERM -- claude.md #161's
@@ -464,7 +465,18 @@ typedef struct FestinaJsonCursor {
     const char *s;
     int64_t len;
     int64_t pos;
+    int depth; /* claude.md #192: nesting seen by festina_json_skip_value */
 } FestinaJsonCursor;
+
+/* claude.md #192: the deepest object/array nesting festina_json_skip_value
+ * will descend before throwing rather than recursing further. An unknown
+ * struct field's value is skipped by unbounded C recursion (one frame per
+ * '{'/'['), so hostile input like `{"x":[[[[...` -- reachable through
+ * req.toStruct() on a network body -- would otherwise overflow the C
+ * stack and SIGSEGV instead of throwing the catchable error this parser
+ * promises. 1000 is far past any real document and well short of an 8MB
+ * stack at this function's small frame. */
+#define FESTINA_JSON_MAX_DEPTH 1000
 
 static void festina_json_throwf(const char *fmt, ...) {
     char buf[256];
@@ -644,8 +656,10 @@ static void festina_json_skip_value(FestinaJsonCursor *c) {
     if (p == '"') { char *s = festina_json_parse_string(c); free(s); return; }
     if (p == 't' || p == 'f') { festina_json_parse_bool(c); return; }
     if (p == '{') {
+        if (++c->depth > FESTINA_JSON_MAX_DEPTH)
+            festina_json_throwf("JSON nested too deeply");
         c->pos++;
-        if (festina_json_try_eat(c, '}')) return;
+        if (festina_json_try_eat(c, '}')) { c->depth--; return; }
         for (;;) {
             char *k = festina_json_parse_string(c);
             free(k);
@@ -653,16 +667,20 @@ static void festina_json_skip_value(FestinaJsonCursor *c) {
             festina_json_skip_value(c);
             if (festina_json_try_eat(c, ',')) continue;
             festina_json_expect(c, '}');
+            c->depth--;
             return;
         }
     }
     if (p == '[') {
+        if (++c->depth > FESTINA_JSON_MAX_DEPTH)
+            festina_json_throwf("JSON nested too deeply");
         c->pos++;
-        if (festina_json_try_eat(c, ']')) return;
+        if (festina_json_try_eat(c, ']')) { c->depth--; return; }
         for (;;) {
             festina_json_skip_value(c);
             if (festina_json_try_eat(c, ',')) continue;
             festina_json_expect(c, ']');
+            c->depth--;
             return;
         }
     }
@@ -691,6 +709,7 @@ void *festina_json_cursor_new(const char *text) {
     c->s = text ? text : "";
     c->len = (int64_t)strlen(c->s);
     c->pos = 0;
+    c->depth = 0;
     return c;
 }
 
@@ -748,7 +767,37 @@ void festina_json_skip_field_value(void *cursor) { festina_json_skip_value((Fest
 int64_t festina_json_read_int(void *cursor) {
     FestinaJsonCursor *c = cursor;
     if (festina_json_try_null(c)) return festina_null_int();
-    return (int64_t)festina_json_parse_number(c);
+    /* claude.md #192: parse the token, but for an integer-shaped one
+     * (no '.', 'e', or 'E') read the digits directly with strtoll
+     * rather than going through the double festina_json_parse_number
+     * returns. A double carries only 53 bits of mantissa, so routing
+     * a large int field through it silently corrupts any |n| > 2^53
+     * -- and the specific value INT64_MAX rounds to 2^63, whose
+     * double->int64 conversion is UB that lands on INT64_MIN, which
+     * is exactly festina_null_int(): a valid max-int field would read
+     * back as null. */
+    festina_json_skip_ws(c);
+    int64_t start = c->pos;
+    double as_double = festina_json_parse_number(c);
+    int is_integer_shaped = 1;
+    for (int64_t i = start; i < c->pos; i++) {
+        char ch = c->s[i];
+        if (ch == '.' || ch == 'e' || ch == 'E') { is_integer_shaped = 0; break; }
+    }
+    if (is_integer_shaped) {
+        char buf[64];
+        int64_t n = c->pos - start;
+        if (n < (int64_t)sizeof(buf)) {
+            memcpy(buf, c->s + start, (size_t)n);
+            buf[n] = 0;
+            errno = 0;
+            char *endp = NULL;
+            long long v = strtoll(buf, &endp, 10);
+            if (endp != buf && *endp == '\0' && errno != ERANGE)
+                return (int64_t)v;
+        }
+    }
+    return (int64_t)as_double;
 }
 
 double festina_json_read_float(void *cursor) {
@@ -984,6 +1033,17 @@ void *festina_parse_url(const char *text) {
                 char msg[256];
                 snprintf(msg, sizeof(msg), "parseURL: '%s' has an invalid port", text);
                 free(port_text);
+                /* claude.md #192: a parseURL throw is catchable (claude.md
+                 * #157), so this path can run repeatedly in a retry loop --
+                 * free the half-built value first rather than leaking ~5
+                 * allocations per bad port. protocol/username/password/
+                 * hostname are set by here; pathname/hash/search_params are
+                 * still NULL from calloc (free(NULL) is a no-op). */
+                free(u->protocol);
+                free(u->username);
+                free(u->password);
+                free(u->hostname);
+                free(u);
                 festina_throw(festina_text_own(msg));
                 return NULL; /* unreachable */
             }
@@ -1051,6 +1111,49 @@ void festina_release_url(void *payload) {
     free(u);
 }
 
+/* claude.md #198 Phase 4: `thread`'s own deep-clone of a url message/
+ * field -- a fresh {refcount=1, ...} value with every text field
+ * strdup'd and `search_params` cloned into its own genuinely
+ * independent map[text] (via the generic festina_map_clone --
+ * festina_clone_text_map_value below reinterprets each raw i64 slot
+ * as owned text the same way festina_map_value_to_i64/
+ * _i64_to_map_value already do on the codegen side) rather than
+ * shared -- a url owns no live OS resource, so nothing here needs
+ * anything beyond plain string/map copying. */
+static int64_t festina_clone_text_map_value(int64_t raw) {
+    char *cloned = festina_text_own((const char *)(intptr_t)raw);
+    return (int64_t)(intptr_t)cloned;
+}
+
+void *festina_url_clone(void *payload) {
+    if (!payload) return NULL;
+    FestinaUrlValue *u = FESTINA_URL_FROM_PAYLOAD(payload);
+    FestinaUrlValue *clone = calloc(1, sizeof(FestinaUrlValue));
+    if (!clone) festina_fail("out of memory cloning a url");
+    clone->refcount = 1;
+    clone->protocol = strdup(u->protocol ? u->protocol : "");
+    clone->username = strdup(u->username ? u->username : "");
+    clone->password = strdup(u->password ? u->password : "");
+    clone->hostname = strdup(u->hostname ? u->hostname : "");
+    clone->port = u->port;
+    clone->pathname = strdup(u->pathname ? u->pathname : "");
+    clone->hash = strdup(u->hash ? u->hash : "");
+    if (!clone->protocol || !clone->username || !clone->password || !clone->hostname
+            || !clone->pathname || !clone->hash) {
+        festina_fail("out of memory cloning a url");
+    }
+    FestinaMapBlockCore *src_block =
+        (FestinaMapBlockCore *)((char *)u->search_params - sizeof(int64_t));
+    void *dst_map = festina_new_empty_text_map();
+    FestinaMapBlockCore *dst_block = (FestinaMapBlockCore *)((char *)dst_map - sizeof(int64_t));
+    festina_map_clone(src_block->entries, src_block->capacity,
+                      &dst_block->count, &dst_block->entries,
+                      &dst_block->capacity, &dst_block->tombstones,
+                      festina_clone_text_map_value);
+    clone->search_params = dst_map;
+    return &clone->protocol;
+}
+
 /* claude.md #131: close(code)/`on exit(code:int)`. Lives in the CORE
  * runtime (not festina_runtime_graphics.c, where g_close_handler and
  * the window-close event live) precisely because close() has to work
@@ -1071,6 +1174,14 @@ void festina_register_exit_handler(void (*handler)(int64_t)) {
 
 void festina_program_exit(int64_t code) {
     if (g_exit_handler) g_exit_handler(code);
+    /* claude.md #195 Phase 2: "if the main thread dies, kill all child
+     * threads" -- run after the program's own exit handler (so that
+     * handler still sees every thread it might itself want to talk to
+     * as alive) and before the real exit() below, so no declared
+     * `thread` ever survives as an orphaned OS thread once the process
+     * is on its way out. A no-op (the hook defaults to unregistered)
+     * for a program with no `thread` declaration at all. */
+    festina_thread_kill_all();
     exit((int)code);
 }
 
@@ -1243,40 +1354,90 @@ static void festina_sb_grow(FestinaSB *sb, size_t add) {
     sb->data = grown;
 }
 
+/* claude.md #190: the shared "grow, then copy exactly n bytes, then
+ * keep the buffer NUL-terminated" step both festina_sb_append and
+ * festina_sb_append_n are built from -- the only difference between
+ * them is where n comes from (a runtime strlen() scan vs. a length
+ * the CALLER already knows). Doesn't itself NUL-terminate mid-string
+ * the way festina_sb_append's own old inline version incidentally did
+ * (copying s's own trailing NUL along with it) -- callers that build a
+ * string out of several appends (every one of the JSON-rendering ones)
+ * only need the final byte terminated once, not after every single
+ * piece, so this terminates unconditionally at the new length instead,
+ * which is cheap (one store) and correct for both single-call and
+ * multi-call use. */
+static void festina_sb_append_bytes(FestinaSB *sb, const char *s, size_t n) {
+    festina_sb_grow(sb, n);
+    memcpy(sb->data + sb->len, s, n);
+    sb->len += n;
+    sb->data[sb->len] = '\0';
+}
+
 void festina_sb_append(void *sbv, const char *s) {
     if (!s) return;
-    FestinaSB *sb = (FestinaSB *)sbv;
-    size_t n = strlen(s);
-    festina_sb_grow(sb, n);
-    memcpy(sb->data + sb->len, s, n + 1);
-    sb->len += n;
+    festina_sb_append_bytes((FestinaSB *)sbv, s, strlen(s));
+}
+
+/* claude.md #190: same as festina_sb_append, but for a caller that
+ * already knows the byte length -- every codegen-emitted JSON
+ * punctuation/field-key append (_json_fn_for's own generated IR) comes
+ * from a compile-time string constant, whose exact length is already
+ * known in Python at codegen time (the same count _encode_c_string
+ * computes for the constant's own storage) and was previously thrown
+ * away, forcing this exact runtime strlen() rescan on every call --
+ * once per struct field, per row, in a loop rendering many values.
+ * `len <= 0` is a no-op, matching festina_sb_append's own NULL-is-a-
+ * no-op contract (an empty/negative length has nothing to copy). */
+void festina_sb_append_n(void *sbv, const char *s, int64_t len) {
+    if (!s || len <= 0) return;
+    festina_sb_append_bytes((FestinaSB *)sbv, s, (size_t)len);
 }
 
 /* A JSON string: quoted, with the escapes JSON requires. A NULL text
  * renders as the JSON null literal, unquoted -- the same three-way
- * honesty festina_str_from_bool already applies. */
+ * honesty festina_str_from_bool already applies.
+ *
+ * claude.md #190: scans forward for a RUN of bytes needing no escape
+ * (the overwhelmingly common case -- ordinary printable ASCII, and any
+ * valid UTF-8 continuation/lead byte, both >= 0x20 and neither quote
+ * nor backslash) and copies the whole run in one festina_sb_append_
+ * bytes call, rather than the byte-at-a-time switch/snprintf/strlen/
+ * memcpy sequence the previous version ran unconditionally for EVERY
+ * byte, escaped or not. Falls into the single-character path only for
+ * a byte that actually needs escaping; behavior (including the exact
+ * `\uXXXX` fallback for control characters below 0x20 other than \n/
+ * \r/\t) is unchanged from before -- this only changes how many bytes
+ * move per underlying copy. */
 void festina_sb_append_json_text(void *sbv, const char *s) {
     FestinaSB *sb = (FestinaSB *)sbv;
     if (!s) { festina_sb_append(sb, "null"); return; }
     festina_sb_grow(sb, 2);
     sb->data[sb->len++] = '"';
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+    const unsigned char *p = (const unsigned char *)s;
+    const unsigned char *run_start = p;
+    for (; *p; p++) {
+        unsigned char c = *p;
+        if (c >= 0x20 && c != '"' && c != '\\') continue;  /* safe run continues */
+        if (p > run_start) {
+            festina_sb_append_bytes(sb, (const char *)run_start, (size_t)(p - run_start));
+        }
         char esc[8];
-        const char *out = esc;
-        switch (*p) {
+        const char *out;
+        switch (c) {
         case '"':  out = "\\\""; break;
         case '\\': out = "\\\\"; break;
         case '\n': out = "\\n"; break;
         case '\r': out = "\\r"; break;
         case '\t': out = "\\t"; break;
         default:
-            if (*p < 0x20) { snprintf(esc, sizeof(esc), "\\u%04x", *p); }
-            else { esc[0] = (char)*p; esc[1] = '\0'; }
+            snprintf(esc, sizeof(esc), "\\u%04x", c);
+            out = esc;
         }
-        size_t n = strlen(out);
-        festina_sb_grow(sb, n);
-        memcpy(sb->data + sb->len, out, n);
-        sb->len += n;
+        festina_sb_append_bytes(sb, out, strlen(out));
+        run_start = p + 1;
+    }
+    if (p > run_start) {
+        festina_sb_append_bytes(sb, (const char *)run_start, (size_t)(p - run_start));
     }
     festina_sb_grow(sb, 1);
     sb->data[sb->len++] = '"';
@@ -1292,8 +1453,12 @@ void festina_sb_append_json_int(void *sbv, int64_t v) {
 
 void festina_sb_append_json_float(void *sbv, double v) {
     /* JSON has no NaN/Infinity, and Festina's float null IS a NaN --
-     * both render as null, which is also what JSON.stringify does. */
-    if (v != v || v > 1.7e308 || v < -1.7e308) {
+     * both render as null, which is also what JSON.stringify does.
+     * claude.md #192: the bound is DBL_MAX, not a hand-typed 1.7e308 --
+     * infinity is the only value strictly past DBL_MAX, whereas the old
+     * literal ALSO caught the finite doubles in (1.7e308, DBL_MAX],
+     * rendering a legitimate ~1.7977e308 as null. */
+    if (v != v || v > DBL_MAX || v < -DBL_MAX) {
         festina_sb_append(sbv, "null");
         return;
     }
@@ -2082,6 +2247,26 @@ void festina_blob_release(void *payload) {
     free((char *)payload - sizeof(int64_t));
 }
 
+/* claude.md #198 Phase 4: `thread`'s own deep-clone of a blob message/
+ * field -- malloc a fresh {refcount=1, path, bytes, length} exactly
+ * the way festina_blob_open/_from_bytes already do (via
+ * festina_blob_alloc), with `path`/`bytes` strdup'd/memcpy'd rather
+ * than shared, so the clone is a genuinely independent value with no
+ * live OS resource (a blob owns no open file handle -- it's read
+ * once, at construction) and never touches the source's own refcount
+ * at all. */
+void *festina_blob_clone(void *payload) {
+    if (!payload) return NULL;
+    FestinaBlob *b = (FestinaBlob *)payload;
+    char *path = strdup(b->path ? b->path : "");
+    if (!path) festina_fail("out of memory cloning a blob");
+    char *bytes = malloc((size_t)b->length + 1);
+    if (!bytes) festina_fail("out of memory cloning a blob");
+    memcpy(bytes, b->bytes, (size_t)b->length);
+    bytes[b->length] = '\0';
+    return festina_blob_alloc(path, bytes, b->length);
+}
+
 /* A fresh copy, because every text this runtime hands back is owned by
  * the caller (claude.md #83) -- returning b->bytes directly would let a
  * text binding free a buffer the blob still owns. */
@@ -2361,10 +2546,37 @@ sqlite3 *festina_db_open(const char *path) {
  * cleared) and finalizes an unregistered one exactly as before. The
  * registry is a linear array scanned per finish -- its size is the
  * number of distinct literal sqlite() call sites in the program, a
- * few dozen at the outside, not a per-row or per-call quantity. */
+ * few dozen at the outside, not a per-row or per-call quantity.
+ *
+ * claude.md #199 Phase 5: this registry is process-wide, shared state --
+ * fine as long as sqlite() only ever ran on the one main thread, which
+ * was true of every program until a `thread` could open its own private
+ * database and call sqlite() from its own OS thread, concurrently with
+ * main's own queries (or another such thread's own). g_stmt_cache_lock/
+ * _unlock (NULL by default -- a program with no `thread` declaration at
+ * all pays nothing) are registered by festina_register_thread_hooks
+ * (festina_runtime_thread.c) whenever CodeGen.uses_threads is set --
+ * the same "core declares a NULL-by-default hook pair, an optional
+ * translation unit registers the real one" seam
+ * festina_set_thread_hooks/_async_io_hooks/_audio_decoder already use,
+ * kept here rather than a real pthread_mutex_t directly so this
+ * (always-linked) translation unit never needs -pthread linked for a
+ * program that never declares a `thread` at all. Deliberately NOT
+ * guarding the `*slot` fast path in festina_sqlite_prepare_cached below
+ * -- that global is lexically private to whichever ONE thread's own
+ * generated code contains that call site (a thread's own handler body
+ * never shares an LLVM global with another thread's, or with main's),
+ * so it is never actually touched by two threads and needs no lock. */
 static sqlite3_stmt **g_cached_stmts = NULL;
 static int g_cached_stmt_count = 0;
 static int g_cached_stmt_cap = 0;
+static void (*g_stmt_cache_lock)(void) = NULL;
+static void (*g_stmt_cache_unlock)(void) = NULL;
+
+void festina_set_stmt_cache_hooks(void (*lock_fn)(void), void (*unlock_fn)(void)) {
+    g_stmt_cache_lock = lock_fn;
+    g_stmt_cache_unlock = unlock_fn;
+}
 
 sqlite3_stmt *festina_sqlite_prepare_cached(sqlite3 *db, const char *sql,
                                             void **slot) {
@@ -2375,6 +2587,7 @@ sqlite3_stmt *festina_sqlite_prepare_cached(sqlite3 *db, const char *sql,
         return stmt;
     }
     sqlite3_stmt *stmt = festina_sqlite_prepare(db, sql);
+    if (g_stmt_cache_lock) g_stmt_cache_lock();
     if (g_cached_stmt_count == g_cached_stmt_cap) {
         g_cached_stmt_cap = g_cached_stmt_cap ? g_cached_stmt_cap * 2 : 16;
         sqlite3_stmt **grown = realloc(g_cached_stmts,
@@ -2383,19 +2596,31 @@ sqlite3_stmt *festina_sqlite_prepare_cached(sqlite3 *db, const char *sql,
         g_cached_stmts = grown;
     }
     g_cached_stmts[g_cached_stmt_count++] = stmt;
+    if (g_stmt_cache_unlock) g_stmt_cache_unlock();
     *slot = stmt;
     return stmt;
 }
 
 /* Finalize -- unless the statement is one of the cached ones, in which
  * case reset it for its next use. Every statement consumer ends its
- * statement through this. */
+ * statement through this. claude.md #199 Phase 5: the registry scan
+ * itself runs under the same lock pair festina_sqlite_prepare_cached
+ * uses above, released again before sqlite3_reset/_finalize run (both
+ * operate on `stmt`, never on the shared registry, so neither needs the
+ * lock held). */
 static void festina_sqlite_finish(sqlite3_stmt *stmt) {
+    if (g_stmt_cache_lock) g_stmt_cache_lock();
+    int cached = 0;
     for (int i = 0; i < g_cached_stmt_count; i++) {
         if (g_cached_stmts[i] == stmt) {
-            sqlite3_reset(stmt);
-            return;
+            cached = 1;
+            break;
         }
+    }
+    if (g_stmt_cache_unlock) g_stmt_cache_unlock();
+    if (cached) {
+        sqlite3_reset(stmt);
+        return;
     }
     sqlite3_finalize(stmt);
 }
@@ -3653,6 +3878,32 @@ void festina_http_service_ready(void) {
     if (g_http_service_ready_fn) g_http_service_ready_fn();
 }
 
+/* claude.md #195 Phase 2: the thread hook seam -- see this trio's own
+ * doc comment in festina_runtime.h for the full reasoning. Mirrors
+ * festina_set_async_io_hooks/festina_set_http_service_hooks exactly. */
+static int64_t (*g_thread_outstanding_fn)(void) = NULL;
+static void (*g_thread_drain_fn)(void) = NULL;
+static void (*g_thread_kill_all_fn)(void) = NULL;
+
+void festina_set_thread_hooks(int64_t (*outstanding_fn)(void), void (*drain_fn)(void),
+                              void (*kill_all_fn)(void)) {
+    g_thread_outstanding_fn = outstanding_fn;
+    g_thread_drain_fn = drain_fn;
+    g_thread_kill_all_fn = kill_all_fn;
+}
+
+int64_t festina_thread_outstanding(void) {
+    return g_thread_outstanding_fn ? g_thread_outstanding_fn() : 0;
+}
+
+void festina_thread_drain(void) {
+    if (g_thread_drain_fn) g_thread_drain_fn();
+}
+
+void festina_thread_kill_all(void) {
+    if (g_thread_kill_all_fn) g_thread_kill_all_fn();
+}
+
 /* claude.md #165: bounds a sleep/poll timeout that would otherwise be
  * "block forever" (no active timer) to a short, regular wake -- the
  * only way festina_run_timer_loop's own plain nanosleep (no fd to
@@ -3694,14 +3945,21 @@ void festina_run_timer_loop(void) {
         }
         double earliest = festina_next_timer_deadline();
         int64_t async_io_outstanding = festina_async_io_outstanding();
-        if (earliest < 0.0 && async_io_outstanding == 0) {
+        /* claude.md #195 Phase 2: a live, idling `thread` (nothing else
+         * async or timed happening at all -- exactly the `peopleWorker`-
+         * style "declare it and let it idle" case) has to keep this
+         * loop running too, or the process would exit right out from
+         * under it the moment __festina_main()'s own top-level
+         * statements finish. */
+        int64_t thread_outstanding = festina_thread_outstanding();
+        if (earliest < 0.0 && async_io_outstanding == 0 && thread_outstanding == 0) {
             return; /* nothing left to wait for */
         }
         double remaining = earliest;
         if (earliest >= 0.0) {
             remaining = earliest - festina_now_seconds();
         }
-        if (async_io_outstanding > 0
+        if ((async_io_outstanding > 0 || thread_outstanding > 0)
                 && (earliest < 0.0 || remaining > FESTINA_ASYNC_IO_POLL_SECONDS)) {
             remaining = FESTINA_ASYNC_IO_POLL_SECONDS;
         }
@@ -3713,6 +3971,11 @@ void festina_run_timer_loop(void) {
         }
         festina_fire_expired_timers();
         festina_async_io_drain();
+        /* claude.md #195 Phase 2: delivers any thread's own pending
+         * outbound message(s) to its registered onMessage() callback,
+         * same placement as festina_async_io_drain just above -- a
+         * no-op for a program with no `thread` declaration at all. */
+        festina_thread_drain();
     }
 }
 
@@ -3796,6 +4059,21 @@ void festina_release(void *payload) {
     if (festina_release_check(payload)) {
         free((char *)payload - sizeof(int64_t));
     }
+}
+
+/* claude.md #202 Phase 2: the release function `T?` crossing a
+ * `thread` boundary gets on the RECEIVING side, in place of a real
+ * festina_release/_release_fn_for cascade -- a manually-managed
+ * value's payload is the sender's own shared raw pointer, never a
+ * clone (see festina/codegen.py's _emit_thread_clone_value), so
+ * neither side owns an independent reference to release: the sender
+ * never touched its own refcount posting it, and the receiver must
+ * not touch it either, once its handler/callback returns. The whole
+ * safety argument is that NEITHER side's automatic bookkeeping ever
+ * looks at this payload's refcount at all -- only an explicit
+ * free()/delete() the program itself calls does. */
+void festina_noop_release(void *payload) {
+    (void)payload;
 }
 
 
@@ -3970,6 +4248,30 @@ void festina_map_set(int64_t *count, void **entries, int64_t *capacity, int64_t 
     if (!slot->key) festina_fail("out of memory growing a map");
     slot->value = value;
     (*count)++;
+}
+
+/* claude.md #197 Phase 3: the clone-side mirror of festina_map_for_each
+ * -- see this function's own doc comment in festina_runtime.h. Scans
+ * `src_entries` directly (rather than going through
+ * festina_map_for_each's own callback, whose fixed `void(int64_t,
+ * const char*)` signature has no room for the destination's own
+ * count/entries/capacity/tombstones out-parameters) since building the
+ * fresh table is this function's own job, not a per-entry callback's. */
+void festina_map_clone(void *src_entries, int64_t src_capacity,
+                       int64_t *dst_count, void **dst_entries, int64_t *dst_capacity,
+                       int64_t *dst_tombstones, int64_t (*value_clone_fn)(int64_t)) {
+    *dst_count = 0;
+    *dst_entries = NULL;
+    *dst_capacity = 0;
+    *dst_tombstones = 0;
+    if (!src_entries) return;
+    FestinaMapEntry *buckets = (FestinaMapEntry *)src_entries;
+    for (int64_t i = 0; i < src_capacity; i++) {
+        char *k = buckets[i].key;
+        if (k == NULL || k == FESTINA_MAP_TOMBSTONE) continue;
+        int64_t cloned_value = value_clone_fn(buckets[i].value);
+        festina_map_set(dst_count, dst_entries, dst_capacity, dst_tombstones, k, cloned_value);
+    }
 }
 
 /* claude.md #111/#175: `delete m.key` / `delete m['key']` -- remove

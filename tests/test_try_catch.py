@@ -234,3 +234,65 @@ class TestRuntimeBehavior:
         """
         result = compile_and_run(source)
         assert result.stdout.strip() == "caught: hello direct"
+
+    def test_a_value_escaping_only_inside_a_try_body_survives(self, compile_and_run):
+        # claude.md #192: escape_analysis never walked try/catch bodies,
+        # so a value assigned to an escaping target (here the global g)
+        # only inside a try was judged non-escaping -- stack-allocated
+        # and freed at scope exit while g still pointed into f's
+        # reclaimed frame. Reading g after f returns crashed (a real
+        # use-after-free, verified under ASan). g must now hold the live
+        # array.
+        source = """
+        arr[int] g = []
+        void func f() {
+            arr[int] xs = [10, 20, 30]
+            try { g = xs } catch (e:text) { log(e) }
+        }
+        f()
+        log(g.length)
+        log(g[2])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["3", "30"]
+
+    def test_a_refcounted_local_before_a_throwing_try_is_not_double_freed(
+            self, compile_and_run):
+        # claude.md #192: a throw freed every active local down to the
+        # function base, but a throw CAUGHT in the same function keeps
+        # running afterward, and a local declared BEFORE the try is
+        # still live then -- its ordinary scope-exit release runs after
+        # the catch. Freeing it in the throw too double-freed it (glibc
+        # aborts with "double free detected"). The throw now frees only
+        # down to the nearest enclosing try. `xs` must survive to be read
+        # after the try, and the program must exit cleanly.
+        source = """
+        void func f() {
+            arr[int] xs = [1, 2, 3]
+            try { throw 'boom' } catch (e:text) { log(e) }
+            log(xs[0])
+        }
+        f()
+        log('ok')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["boom", "1", "ok"]
+
+    def test_a_value_escaping_inside_a_catch_body_survives(self, compile_and_run):
+        # The catch-body counterpart of the above -- the escaping
+        # assignment happens on the throwing path.
+        source = """
+        arr[int] g = []
+        void func f() {
+            arr[int] xs = [7, 8, 9]
+            try { throw 'boom' } catch (e:text) { g = xs }
+        }
+        f()
+        log(g.length)
+        log(g[0])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["3", "7"]

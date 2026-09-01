@@ -9,6 +9,279 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.17] - 2026-09-01
+
+### Fixed
+
+- A manually-managed (`T?`) declaration's own initializer can now be a
+  **fresh construction** of the matching plain type — a `regex`/
+  `arr[T]`/`map[T]` literal, a `regex()` call, or any function call at
+  all (including a struct-returning factory function). Previously
+  `regex? r = /pattern/`, `arr[int]? xs = [1, 2, 3]`, and
+  `Circle? c = makeCircle()` were all compile errors, since a fresh
+  literal or a call's own return value always infers as the plain,
+  unflagged type and `T?`/`T` are genuinely non-interchangeable. Safe
+  because a freshly-constructed value has no other binding referencing
+  it yet — reading an *existing* plain binding into a `T?` position is
+  still, correctly, rejected. See
+  [api.md](api.md#t-manually-managed-values).
+
+## [0.16] - 2026-09-01
+
+### Added
+
+- `postMessage`/`on message` now share the raw reference for a
+  manually-managed (`T?`) value crossing a `thread` boundary, instead
+  of deep-cloning it like every other value type — a mutation made on
+  one side is visible on the other, since it's the identical
+  underlying value, not a copy. Sound because nothing on either side's
+  automatic bookkeeping ever touches a manually-managed value's
+  refcount, so there is nothing for two threads to race on.
+- A manually-managed parameter can now be `free`d — it was never
+  "borrowed" the way an ordinary parameter is, since nothing
+  auto-manages it on either side of a call.
+
+See [claude.md #203](claude.md) for the full design and implementation
+record.
+
+## [0.15] - 2026-09-01
+
+### Added
+
+- `T?` — a trailing `?` after a type at a variable/parameter
+  declaration opts that one binding out of automatic memory management
+  entirely (no retain on alias, no release at scope exit or
+  reassignment). `free`/`delete` work unchanged and become the *only*
+  release it ever gets. A genuinely distinct type from `T` (mirroring
+  `amor arr[T]`'s own relationship to plain `arr[T]`) — no implicit
+  decay either direction. Applies to struct/`arr[T]`/`map[T]`/`enum`/
+  `blob`/`img`/`aud`/`http`/`socket`/`url`/`regex`; accepted but inert
+  on `int`/`float`/`bool`/`text`/`color`/`font`/`table`. `arr[T?]`, a
+  `T?` struct field, a `T?` return type, and `const T? x` are all
+  compile errors this round. See [api.md](api.md#t-manually-managed-values).
+
+### Fixed
+
+- A user-defined function with a manually-managed parameter
+  (`func f(p:Circle?)`) was permanently uncallable — the call-site
+  argument check re-derived the parameter's type without its own `?`,
+  rejecting the one argument type that could ever match it.
+- `blob?`/`img?`/`aud?` failed to parse at all, misrouted into the
+  unrelated anonymous `.callback()` form.
+- `.test()`/`.play()`/`.playLoop()`/`.stop()`/`.isPlaying()`/`.send()`/
+  `.clip()`/`.resize()`/`.getPixelColor()`/`.save()`/`.saveCopy()` and
+  the `text -> blob` coercion stopped recognizing a manually-managed
+  receiver of the matching type, via several pre-existing exact-equality
+  type checks never meant to distinguish more than one shape of blob/
+  regex/img/aud/http/socket.
+- A grammar-ambiguity disambiguation helper (`Circle? c` vs. a bare
+  ternary statement) used an absolute token index where a relative
+  offset was passed in, silently misrouting a `T?` declaration found
+  anywhere but the very first statement of a file.
+
+See [claude.md #202](claude.md) for the full design and implementation
+record. Crossing a `thread` boundary with a manually-managed value
+(`on message`/`postMessage`) is not yet supported — planned follow-up
+work, not a permanent restriction.
+
+## [0.14] - 2026-08-31
+
+### Documentation
+
+- Final consolidation pass closing out `thread NAME { ... }` (claude.md
+  #195-#201): api.md's own "Threads" section no longer calls itself
+  "an early phase" and now documents the thread-private-helper-function
+  restriction it was missing; `todo.md` gains three previously-untracked,
+  already-true open items (singleton threads, no thread-private helper
+  functions, a thread's own sqlite handle not explicitly closed on
+  `kill()`); `README.md`'s own stale top-level test count corrected.
+  No functional changes. See [claude.md #201](claude.md).
+
+## [0.13] - 2026-08-31
+
+### Fixed
+
+- Documented that a `thread`'s own `on exit(code:int)` always receives
+  `code` `0` — including when torn down by main-thread death — never
+  the process's own real exit code. Not a behavior change (this is
+  what the runtime already did); found and clarified while verifying
+  `thread` process-exit interaction end to end. See
+  [api.md](api.md#threads) and [claude.md #200](claude.md).
+
+## [0.12] - 2026-08-31
+
+### Added
+
+- A `thread`'s own first statement may be `DatabaseURL = '<literal>'`,
+  giving it a private SQLite handle — never shared with the main
+  program or any other thread — so it may call `sqlite()`/
+  `sqliteInt()`/`sqliteFloat()`/`sqliteText()` (a thread that didn't
+  declare one still may not). A compile-time check rejects two
+  contexts (a thread and the main program, or two threads) that would
+  resolve to the same database file, main program's own default
+  included. See [api.md](api.md#threads) and
+  [claude.md #199](claude.md).
+
+### Fixed
+
+- A real (if narrow) data race, found while building the above: the
+  media-decoder registration in `main()`'s own prologue used to run
+  after every declared `thread` was already spawned, and the literal-
+  SQL prepared-statement cache (claude.md #113) had no synchronization
+  at all — both harmless as long as only the main thread ever queried
+  SQLite, which per-thread `DatabaseURL` is what first breaks. Fixed
+  before either was ever reachable; verified race-free under
+  ThreadSanitizer.
+
+## [0.11] - 2026-08-31
+
+### Added
+
+- `thread`'s own message types widen to include `blob`/`img`/`aud`/
+  `url` — each deep-cloned (never shared) across the boundary, the
+  same guarantee `struct`/`arr[T]`/`map[T]`/`enum` already got.
+  Drawing/clip/resize/pixel methods on an `img` value (e.g.
+  `pic.drawRect(...)`) work from inside a thread body, verified
+  race-free under ThreadSanitizer. See [api.md](api.md#threads) and
+  [claude.md #198](claude.md).
+
+## [0.10] - 2026-08-31
+
+### Added
+
+- `thread`'s own message types widen to `struct`/`arr[T]`/`map[T]`/
+  `enum` — each deep-cloned (never shared) across the boundary,
+  built recursively from any mix of `int`/`float`/`bool`/`text`/
+  `color`/`font`. A self-referencing (cyclic) `struct`/`arr[T]`/
+  `map[T]` type is rejected with a clear error, not a hang; `blob`/
+  `img`/`aud`/`url` message types remain not yet implemented. See
+  [api.md](api.md#threads) and [claude.md #197](claude.md).
+
+### Fixed
+
+- A fresh, with-initializer `enum`-typed local variable — `Choice c
+  = someExpr` declared directly inside a loop or function body, as
+  opposed to reassigning an already-declared one — was never freed
+  at scope exit, leaking its own box (and, for a boxed `text`
+  member, that buffer too) on every declaration. The identical gap
+  is fixed for `http`/`socket`/`url`-typed locals, found by the same
+  audit.
+- `NAME.postMessage(x)`, when `x` coerces into a compound message
+  type (e.g. a `text` literal posted against an `enum` inbound
+  type), no longer frees the coerced result with the wrong release
+  function.
+
+## [0.9] - 2026-08-31
+
+### Added
+
+- `thread NAME { ... }`: an isolated background worker with its own
+  OS thread, its own private state, and message queues to and from
+  the main program. `on load()`/`on message(p:T)`/`on exit(code:int)`
+  handlers; `NAME.postMessage(x)`/`NAME.onMessage(callback)` for
+  message passing (`int`/`float`/`bool`/`text` today); `NAME.kill()`/
+  `NAME.live(callback)`/`NAME.isAlive()` for lifecycle control. Every
+  message crossing the boundary is a deep, independent copy — no two
+  threads ever share a mutable value. A thread's own body can see
+  only its own state/locals, function names, and type names, never a
+  global variable/constant or an ordinary top-level function call.
+  See [api.md](api.md#threads) and
+  [claude.md #195](claude.md)/[#196](claude.md).
+
+## [0.8] - 2026-08-31
+
+### Security
+
+- The HTTP server no longer hangs or aborts on two malformed inputs
+  reachable from a single unauthenticated request: a chunked
+  `chunk-size` near 2^64 (which overflowed size arithmetic into an
+  infinite buffer-growth loop) and a WebSocket frame declaring a
+  ~16-exabyte payload (which reached a failing `malloc` that aborted
+  the process). Both are now rejected against the existing 8MB cap.
+  The chunked-decoder fix also protects the `req.send()` client
+  parsing a hostile server's response.
+- `.toStruct()` no longer overflows the stack on deeply nested JSON in
+  an unknown field (reachable via `req.toStruct()` on a network body);
+  nesting past 1000 levels now throws the same catchable error every
+  other malformed input does.
+
+### Fixed
+
+- A value assigned to a global (or otherwise escaping) only inside a
+  `try` or `catch` body is no longer freed while still referenced —
+  escape analysis didn't look inside try/catch bodies, so such a value
+  was stack-allocated and reclaimed at scope exit (a use-after-free).
+- A refcounted local (array, map, struct, text) declared before a
+  `try` that throws is no longer double-freed. A throw caught in the
+  same function freed that local, and the normal scope exit after the
+  catch freed it again (glibc aborted with "double free detected").
+- The two branches of a `?:` are now required to have the same type;
+  a mismatch (e.g. `c ? 'text' : someBlob`) used to compile and render
+  garbage at runtime. `null` is still allowed in either branch.
+- `&&` and `||` now require bool operands, matching `if`/`while`
+  conditions; `1 && 2` used to compile and print `null`.
+- A `?:` with a `null` branch (`c ? 1 : null`, `c ? null : 7`) now
+  compiles — it produced invalid IR or crashed the compiler before.
+- Passing a text literal or template to an `img`/`blob`/`aud`
+  parameter (`show(`sprite${n}.png`)`) no longer corrupts the heap or
+  leaks the loaded handle — the argument coercion mishandled the
+  freshly minted handle's ownership.
+- An `arr[blob]`, `arr[img]`, or `arr[aud]` no longer leaks its
+  elements when the array is released — element handles were freed as
+  a plain buffer with no per-element release.
+- `.push()`/`.unshift()`/`.indexOf()` of a path string into an
+  `arr[blob]`/`arr[img]`/`arr[aud]` no longer leaks the loaded handle.
+- Interpolating a freshly built container into a template
+  (`` `${make()}` ``, `` `${[1,2,3]}` ``) no longer leaks the
+  container — only the rendered text was being freed.
+
+- Integer fields in `.toStruct()` keep full 64-bit precision. They
+  were parsed through a `double`, silently corrupting any value past
+  2^53 — and `INT64_MAX` in particular read back as `null`.
+- A finite float equal to nearly `DBL_MAX` renders as its own value in
+  JSON output instead of `null` (the NaN/Infinity guard used a literal
+  slightly below `DBL_MAX`).
+- `img.getPixelColor()` on a JPEG-loaded image returns the real color
+  instead of `null` for every pixel (JPEG surfaces store no alpha
+  channel; the reader had treated the unused byte as alpha 0).
+- A malformed WAV file (sample-rate 0) is now a normal load failure
+  instead of cascading into a shutdown of all other playing audio with
+  a misleading "no audio device" error.
+- Several catchable-error paths no longer leak: a failed `fetch`
+  response (up to 8MB per failed request, once per retry), an invalid
+  `parseURL` port (~5 allocations per call), and a corrupt JPEG
+  decode (its decoded surface, via a `setjmp`-clobbered local).
+
+- Long-running loops that declare locals (a struct, an array, any
+  variable) no longer overflow the stack. Codegen emitted each
+  `alloca` at its declaration site — inside the loop body — so every
+  iteration permanently grew the stack until the function returned;
+  a loop declaring a six-field struct segfaulted at roughly
+  150,000–300,000 iterations with flat heap usage. Every static
+  alloca is now hoisted to its function's entry block: one slot per
+  declaration, reused each iteration (verified to 3,000,000
+  iterations). Locals are still re-zeroed at their declaration site
+  every iteration, so behavior is otherwise unchanged.
+
+See [claude.md #191](claude.md) for the full diagnosis.
+
+## [0.7] - 2026-08-29
+
+### Changed
+
+- `.toText()` JSON-style rendering (`log()`/template interpolation of a
+  struct, table row, `arr[T]`, or `map[T]`, and explicit `.toText()`
+  calls on any of them) is faster, with no change in output. Every
+  compile-time-known literal the renderer appends (JSON punctuation, a
+  struct field's own baked `"name":` key) now skips a runtime
+  `strlen()` rescan of a length the compiler already knew, and string
+  escaping now bulk-copies runs of bytes that don't need escaping
+  instead of handling one byte at a time. Measured ~2.5x faster
+  (~215ms → ~85ms median over 5 runs) on a 100,000-iteration
+  text-heavy struct-rendering benchmark.
+
+See [claude.md #190](claude.md) for the full measurement methodology.
+
 ## [0.6] - 2026-08-29
 
 ### Added
