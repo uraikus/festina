@@ -9,6 +9,34 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.18] - 2026-09-01
+
+### Fixed
+
+- **A real heap-use-after-free**: assigning an ordinary, automatically-
+  managed struct value into a manually-managed (`T?`) enum binding
+  (`enum Shape = Circle; Shape? shape; ...; shape = c` for an existing
+  `Circle c`) compiled without error and left `shape` dangling once
+  `c` went out of scope and its own automatic release freed it —
+  `check_assignable`'s enum member-coercion rule never accounted for
+  `manually_managed`. Now correctly rejected as a type mismatch; a
+  *fresh* member value (`Shape? shape = makeCircle()`) is unaffected.
+- A manually-managed `blob?`/`regex?` thread-message parameter's own
+  method calls (`p.write(...)`, `p.test(...)`) inside `on message`
+  could fail to compile, or compile to invalid LLVM IR — a handful of
+  exact-equality type checks in codegen.py (predating `T?`) never
+  accounted for the flag, and `regex`/`http`/`socket` were never
+  taught that a manually-managed instance can now reach code paths an
+  ordinary one never could. Fixed; see claude.md #205.
+
+### Added
+
+- Real per-type test coverage for a manually-managed value crossing a
+  `thread` boundary — `arr[T]`/`map[T]`/`enum`/`img`/`blob`/`aud`/
+  `regex`/`url` each get a dedicated compile-and-run round-trip proof
+  (`tests/test_manually_managed.py::TestThreadReferenceSharingPerType`),
+  alongside struct's own existing one.
+
 ## [0.17] - 2026-09-01
 
 ### Fixed

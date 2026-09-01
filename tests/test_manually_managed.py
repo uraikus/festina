@@ -15,7 +15,13 @@ lives in tests/test_leak_stress.py, alongside the ordinary "freed
 correctly, no leak" per-type coverage -- both need the real sanitizer
 toolchain this file's own fixtures don't set up.
 """
+import os
+import shutil
+
 import pytest
+
+_FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+_WAV_FIXTURE = os.path.join(_FIXTURES_DIR, "beep.wav")
 
 
 class TestGrammar:
@@ -308,6 +314,91 @@ class TestSemantic:
         with pytest.raises(Exception):
             semantic.analyze(parser.parse(source))
 
+    def test_manually_managed_enum_cannot_alias_an_existing_plain_member_value(
+            self, parser, semantic):
+        # claude.md #205: a real, ASan-confirmed heap-use-after-free,
+        # found while adding per-type thread coverage -- check_
+        # assignable's own EnumType member-coercion bypass (claude.md
+        # #176) used to fire regardless of whether the DECLARED enum
+        # was manually-managed, letting an ORDINARY, automatically-
+        # managed member value (`c` here) flow into a manually-managed
+        # binding with no retain (codegen's own retain-skip for a
+        # manually-managed declaration is unconditional -- claude.md
+        # #202's own codegen section). Once `c` went out of scope and
+        # its own automatic release freed it, `shape` was left pointing
+        # at freed memory. Now correctly rejected as an ordinary type
+        # mismatch, the same as a plain `Circle` flowing into
+        # `Circle?` already was.
+        source = """
+        struct Circle { x:int y:int }
+        enum Shape = Circle
+        Shape? shape
+        void func leakIntoShape() {
+            Circle c
+            c.x = 42
+            shape = c
+        }
+        """
+        with pytest.raises(Exception):
+            semantic.analyze(parser.parse(source))
+
+    def test_manually_managed_enum_fresh_construction_still_works(self, parser, semantic):
+        # claude.md #205: the fix above must not break the ONE
+        # legitimate way to populate a manually-managed enum a fresh
+        # member value already had (claude.md #204's own escape hatch)
+        # -- `check_assignable` here runs against the BARE enum type,
+        # which its own EnumType branch (now gated on `not
+        # declared.manually_managed`) still matches correctly.
+        source = """
+        struct Circle { x:int y:int }
+        enum Shape = Circle
+        Circle func makeCircle() { Circle c\nc.x = 1\nreturn c }
+        void func f() { Shape? shape = makeCircle() }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_manually_managed_ordinary_enum_coercion_is_unaffected(self, parser, semantic):
+        # claude.md #205: the fix is scoped to a manually-managed
+        # DECLARED type only -- an ordinary (non-`?`) enum still
+        # accepts an existing member value exactly as before, since
+        # there is no automatic-management mismatch to guard against
+        # there (both sides are ordinarily managed).
+        source = """
+        struct Circle { x:int y:int }
+        enum Shape = Circle
+        void func f() {
+            Circle c
+            Shape shape = c
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    @pytest.mark.parametrize("decl", [
+        "on message(p:http?) { log('got') }",
+        "on message(p:socket?) { log('got') }",
+    ])
+    def test_manually_managed_http_and_socket_message_types_are_accepted(
+            self, parser, semantic, decl):
+        # claude.md #205: `_is_thread_sendable_type`'s own early
+        # `manually_managed` return (claude.md #202 Phase 2) makes NO
+        # exception for http/socket -- both are ordinarily rejected
+        # outright (claude.md #195: "tied to the single main-thread
+        # connection table"), but a manually-managed one shares its
+        # raw pointer rather than being cloned, so neither of those
+        # ordinary concerns applies. Semantic-only coverage: neither
+        # type is practically constructible as a FRESH, standalone
+        # value outside a live request/connection context (both only
+        # ever come from an event-handler parameter to begin with), so
+        # a full round-trip runtime proof isn't realistically
+        # writable the way the other eight thread-sendable types' own
+        # TestThreadReferenceSharingPerType tests are.
+        source = f"""
+        thread Worker {{
+            {decl}
+        }}
+        """
+        semantic.analyze(parser.parse(source))
+
 
 class TestRuntime:
     """Real compile-and-run coverage for the representation itself --
@@ -454,3 +545,293 @@ class TestRuntime:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.splitlines() == ["7", "3", "5", "true"]
+
+
+class TestThreadReferenceSharingPerType:
+    """claude.md #205: `TestRuntime`'s own
+    `test_manually_managed_thread_message_shares_the_reference_not_a_
+    clone` proves reference-sharing (not cloning) for exactly one type
+    -- struct. Every OTHER manually-manageable, thread-sendable type
+    (`arr[T]`/`map[T]`/`enum`/`img`/`blob`/`aud`/`regex`/`url`) gets
+    its own dedicated proof here, since `_thread_payload_is_
+    passthrough`'s own per-type dispatch (codegen.py) is exactly the
+    kind of thing that can be correct for one type and silently wrong
+    for another -- confirmed directly while writing this class: `blob?`
+    and `regex?` both raised a genuine, previously-unexercised
+    CodegenError/invalid-LLVM-IR failure the very first time either
+    was actually sent across a thread (see this class's own per-test
+    comments, and claude.md #205's own write-up, for the two real bugs
+    those failures led to).
+
+    The shared shape: a thread's `on message` handler mutates (or, for
+    `regex`/`url`, simply reads) the value it received THROUGH its own
+    parameter, then echoes it back via a bare `postMessage`. The
+    receiving callback checks BOTH the echoed value's own property AND
+    the SENDER's ORIGINAL binding (never touched again after the
+    initial `postMessage` call) -- both reflecting the same result is
+    only possible if they are the exact same underlying value, not two
+    independent clones. The echo is also what makes each test race-
+    free: reading the sender's own binding is only safe once the
+    thread's own reply proves it is done touching that value."""
+
+    def test_arr_shares_the_reference_not_a_clone(self, compile_and_run):
+        source = """
+        thread Worker {
+            on message(p:arr[int]?) {
+                p.push(99)
+                postMessage(p)
+            }
+        }
+
+        arr[int]? xs = [1, 2]
+
+        void func onReply(x:arr[int]?) {
+            log(x.length)
+            log(xs.length)
+            close(0)
+        }
+
+        Worker.onMessage(void (x:arr[int]?) => onReply(x))
+        Worker.postMessage(xs)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["3", "3"]
+
+    def test_map_shares_the_reference_not_a_clone(self, compile_and_run):
+        source = """
+        thread Worker {
+            on message(p:map[int]?) {
+                p['k'] = 99
+                postMessage(p)
+            }
+        }
+
+        map[int]? m = {'k': 1}
+
+        void func onReply(x:map[int]?) {
+            log(x['k'])
+            log(m['k'])
+            close(0)
+        }
+
+        Worker.onMessage(void (x:map[int]?) => onReply(x))
+        Worker.postMessage(m)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["99", "99"]
+
+    def test_enum_shares_the_reference_not_a_clone(self, compile_and_run):
+        # claude.md #205: `shape` is populated via the fresh-
+        # construction escape hatch (claude.md #204) -- `Shape? shape =
+        # makeCircle()` -- not `Shape? shape = c` for an EXISTING
+        # Circle local `c`, which check_assignable's own EnumType
+        # branch now correctly rejects (see
+        # TestSemantic.test_manually_managed_enum_cannot_alias_an_
+        # existing_plain_member_value for the real heap-use-after-free
+        # that combination used to compile straight into).
+        source = """
+        struct Circle { x:int y:int }
+        enum Shape = Circle
+
+        Circle func makeCircle() {
+            Circle c
+            c.x = 1
+            return c
+        }
+
+        thread Worker {
+            on message(p:Shape?) {
+                p.x = 99
+                postMessage(p)
+            }
+        }
+
+        Shape? shape = makeCircle()
+
+        void func onReply(x:Shape?) {
+            log(x.x)
+            log(shape.x)
+            close(0)
+        }
+
+        Worker.onMessage(void (x:Shape?) => onReply(x))
+        Worker.postMessage(shape)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["99", "99"]
+
+    def test_img_shares_the_reference_not_a_clone(self, compile_and_run, sprite_sheet_png):
+        # claude.md #189: drawPixel(...)/getPixelColor(...) mutate/read
+        # the image's own in-memory pixel buffer directly -- the same
+        # kind of observable, in-place mutation a struct field gives.
+        source = f"""
+        thread Worker {{
+            on message(p:img?) {{
+                color red = 'red'
+                p.drawPixel(0, 0, red)
+                postMessage(p)
+            }}
+        }}
+
+        img? sheet = '{sprite_sheet_png}'
+        color red = 'red'
+
+        void func onReply(x:img?) {{
+            log(x.getPixelColor(0, 0) == red)
+            log(sheet.getPixelColor(0, 0) == red)
+            close(0)
+        }}
+
+        Worker.onMessage(void (x:img?) => onReply(x))
+        Worker.postMessage(sheet)
+        """
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["true", "true"]
+
+    def test_blob_shares_the_reference_not_a_clone(self, compile_and_run):
+        # claude.md #205: a real, found-and-fixed bug -- `p.write(...)`
+        # inside `on message(p:blob?)` used to raise "cannot access
+        # field 'write' on blob?", a CodegenError -- the thread
+        # handler's own parameter binding stored the FLAGGED
+        # `info.inbound_type` directly into its own `body_env` (unlike
+        # every other declaration/parameter site in this file, which
+        # keep `env` bare -- claude.md #202's own deliberate design),
+        # so blob's own exact-equality (`== BLOB`) method dispatch
+        # stopped recognizing it as blob at all. See codegen.py's
+        # `_bare_type` for the fix.
+        source = """
+        thread Worker {
+            on message(p:blob?) {
+                p.write('mutated')
+                postMessage(p)
+            }
+        }
+
+        blob? b = 'data.bin'
+
+        void func onReply(x:blob?) {
+            log(x.toText())
+            log(b.toText())
+            close(0)
+        }
+
+        Worker.onMessage(void (x:blob?) => onReply(x))
+        Worker.postMessage(b)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["mutated", "mutated"]
+
+    def test_aud_shares_the_reference_not_a_clone(self, compile_and_run, audio_null_env, tmp_path):
+        # claude.md #205: `isPlaying()` is a genuine per-VALUE identity
+        # check at the runtime level (festina_audio_is_playing compares
+        # the channel's own `clip` pointer against the queried value's
+        # own pointer, see festina_runtime_audio.c) -- a CLONE would
+        # have its own, different pointer, so `clip.isPlaying()` true
+        # on the SENDER's own original binding, after only the
+        # RECEIVED parameter ever called `.playLoop()`, is only
+        # possible if they share the identical underlying value.
+        # `.playLoop()`, not `.play()` -- a real, found timing gap:
+        # `.play()` finishes almost immediately (beep.wav is short),
+        # and by the time the round trip through the thread's own
+        # message queue completes, a one-shot play() had already ended
+        # -- observed directly as a false negative before switching to
+        # playLoop(), not assumed.
+        shutil.copy(_WAV_FIXTURE, tmp_path / "beep.wav")
+        source = """
+        thread Worker {
+            on message(p:aud?) {
+                p.playLoop()
+                postMessage(p)
+            }
+        }
+
+        aud? clip = 'beep.wav'
+
+        void func onReply(x:aud?) {
+            log(x.isPlaying())
+            log(clip.isPlaying())
+            x.stop()
+            close(0)
+        }
+
+        Worker.onMessage(void (x:aud?) => onReply(x))
+        Worker.postMessage(clip)
+        """
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["true", "true"]
+
+    def test_regex_shares_the_reference_not_a_clone(self, compile_and_run):
+        # claude.md #205: a second real, found-and-fixed bug, the same
+        # shape as blob's own -- `_thread_payload_is_passthrough`
+        # (codegen.py) never had an answer for regex AT ALL (an
+        # ordinary regex was always rejected upstream by semantic.py's
+        # own `_is_thread_sendable_type`, so this code path was
+        # genuinely unreachable before a manually-managed regex could
+        # cross a thread) -- `on message(p:regex?)` compiled (semantic
+        # analysis correctly allows it) but produced invalid LLVM IR
+        # (`add ptr ..., 0`) at the unboxing step, misrouting a
+        # pointer-shaped payload down the SCALAR unboxing path. `regex`
+        # has no mutable state to prove sharing via mutation the way
+        # struct/arr/map/img/blob do -- `.test()` alone is not a
+        # reference-identity proof (a clone would answer identically)
+        # -- so this is a real round-trip + no-crash proof of the fix,
+        # not a same-address proof; the codegen fix itself is what
+        # matters here, not this test's own assertions.
+        source = """
+        thread Worker {
+            on message(p:regex?) {
+                log(p.test('abc'))
+                postMessage(p)
+            }
+        }
+
+        regex? r = /^ab/
+
+        void func onReply(x:regex?) {
+            log(x.test('abc'))
+            log(r.test('abc'))
+            close(0)
+        }
+
+        Worker.onMessage(void (x:regex?) => onReply(x))
+        Worker.postMessage(r)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["true", "true", "true"]
+
+    def test_url_shares_the_reference_not_a_clone(self, compile_and_run):
+        # claude.md #205: url's own fields are all read-only (claude.md
+        # #162), so there is no mutation to prove sharing with the way
+        # struct/arr/map/img/blob do -- this is a round-trip proof
+        # (compiles, runs, both sides read the identical field) rather
+        # than a same-address proof, same caveat as regex's own test
+        # above, and for the identical underlying reason (an immutable
+        # value's identity is not behaviorally observable in Festina).
+        source = """
+        thread Worker {
+            on message(p:url?) {
+                postMessage(p)
+            }
+        }
+
+        url? u = parseURL('https://example.com/path')
+
+        void func onReply(x:url?) {
+            log(x.hostname)
+            log(u.hostname)
+            close(0)
+        }
+
+        Worker.onMessage(void (x:url?) => onReply(x))
+        Worker.postMessage(u)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["example.com", "example.com"]

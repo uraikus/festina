@@ -1339,7 +1339,30 @@ def analyze(program, filename="<string>"):
         # already gates (var decl, function param/return, struct
         # field, array/map element, ...), the same way the container-
         # null tolerance just above does.
-        if isinstance(declared, types_mod.EnumType):
+        #
+        # claude.md #205: a real, ASan-confirmed heap-use-after-free
+        # was possible here before the `not manually_managed` guard --
+        # this bypass used to fire regardless of whether `declared`
+        # (the enum) was manually-managed, letting an ORDINARY,
+        # automatically-managed member value (`Circle c; ...; Shape?
+        # shape = c`) flow straight into a manually-managed binding
+        # with no retain (codegen's own retain-skip for a manually-
+        # managed declaration is unconditional on `stmt.manually_
+        # managed`, exactly the same as every other eligible type --
+        # see claude.md #202's own codegen section). Once `c` went out
+        # of scope and its own automatic release dropped the last
+        # reference, `shape` was left pointing at freed memory --
+        # confirmed directly, not just reasoned about, with a real
+        # AddressSanitizer heap-use-after-free report. Skipping this
+        # bypass when `declared` is manually-managed falls through to
+        # the strict `declared != actual` check below instead, which
+        # correctly rejects a plain member value the same way it
+        # already rejects a plain `Circle` flowing into `Circle?` --
+        # `analyze_var_decl`'s own fresh-construction escape hatch
+        # (claude.md #204) still lets a FRESH member value in (e.g.
+        # `Shape? shape = makeCircle()`), since it checks against the
+        # BARE enum type, which reaches this exact branch un-flagged.
+        if isinstance(declared, types_mod.EnumType) and not declared.manually_managed:
             info = enums.get(declared.name)
             if info is not None and actual in info.members:
                 return

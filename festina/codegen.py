@@ -318,6 +318,7 @@ sentinels get -- _bool_cond's own comment covers exactly what happens
 (nonzero, so treated as truthy), which is a consistent, documented
 choice rather than proper defined behavior.
 """
+import dataclasses
 import struct
 
 from . import ast
@@ -519,6 +520,39 @@ def _is_manually_managed(t):
     point of `T?` is that the program, not the compiler, decides when
     (if ever) it's released."""
     return getattr(t, "manually_managed", False)
+
+
+def _bare_type(t):
+    """claude.md #205: strips `manually_managed` back off a type that
+    legitimately carries it for ONE narrow purpose -- a thread's own
+    `info.inbound_type` (claude.md #203's own deliberate exception to
+    "codegen keeps every type bare," needed so `_emit_thread_clone_
+    value`/`_thread_payload_release_fn`/`_is_thread_clonable_type` can
+    read `_is_manually_managed` directly off it) -- before it reaches
+    anywhere ELSE that stores a value's type for ordinary dispatch,
+    where it must NOT carry the flag, for the identical reason every
+    other declaration/parameter site in this file already keeps its
+    own type bare (see `_is_manually_managed`'s own doc comment): a
+    manually-managed `blob`/`regex` binding is otherwise silently
+    misdispatched by the handful of exact-equality (`== BLOB`/`==
+    REGEX`) checks elsewhere in this file that predate `T?` and were
+    never taught to look past the flag -- confirmed directly, not
+    just reasoned about: `on message(p:blob?) { p.write(...) }`
+    raised a real "cannot access field 'write' on blob?" CodegenError
+    before this existed, `inbound_type` (flagged) having been passed
+    straight into `_emit_param_bindings`'s own `body_env` binding for
+    the handler's own parameter. A no-op for every OTHER type here
+    (struct/arr[T]/map[T]/enum/img/aud/http/socket/url dispatch by
+    `isinstance`, already flag-agnostic) -- this exists specifically
+    for blob (no dedicated dataclass to `isinstance` against) and
+    regex (compared via `== REGEX` in a few places), and is written
+    generically rather than special-cased to those two so it stays
+    correct if a future exact-equality check joins them."""
+    if not _is_manually_managed(t):
+        return t
+    if isinstance(t, types_mod.PrimitiveType):
+        return types_mod.PrimitiveType(t.name)
+    return dataclasses.replace(t, manually_managed=False)
 
 FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
 # claude.md #174: amor arr[T] -- an "amortized array". Byte-compatible
@@ -2725,7 +2759,25 @@ class CodeGen:
         each) than the generic per-type cascade _clone_fn_for
         generates for the other four -- only their PASSTHROUGH-ness
         (already `ptr`-shaped, no separate box) is shared."""
-        return type_ == BLOB or isinstance(
+        # claude.md #205: `isinstance(..., PrimitiveType) and .name ==
+        # "blob"`, not `type_ == BLOB` -- a manually-managed `blob?` is
+        # a genuinely unequal dataclass instance from the plain `_BLOB`
+        # singleton this used to compare against directly (blob has no
+        # dedicated dataclass of its own for an isinstance check the
+        # way img/aud/url already get, the same reason semantic.py
+        # needed its own `_is_blob_type` helper). This matters here
+        # because this predicate's own callers (_thread_payload_is_
+        # passthrough in particular, reached via _emit_thread_unbox/
+        # _emit_thread_unbox_into, neither of which has an early
+        # _is_manually_managed check of its own -- unboxing a pointer-
+        # shaped payload correctly is unrelated to whether it's
+        # manually managed) would otherwise misclassify a manually-
+        # managed blob thread-message parameter as a SCALAR, producing
+        # invalid `add ptr ..., 0` IR instead of the plain pointer-
+        # alias GEP a passthrough type needs -- confirmed directly with
+        # a real LLVM IR parse failure before this fix, not just
+        # reasoned about.
+        return (isinstance(type_, types_mod.PrimitiveType) and type_.name == "blob") or isinstance(
             type_, (types_mod.ImageType, types_mod.AudioType, types_mod.UrlType))
 
     def _thread_payload_is_passthrough(self, type_):
@@ -2738,9 +2790,40 @@ class CodeGen:
         -- so there is nothing left for a box to wrap), and, as of this
         phase, blob/img/aud/url (same reasoning -- each is already
         `ptr`-shaped, and each's own festina_*_clone already returns a
-        fresh, independent allocation)."""
+        fresh, independent allocation).
+
+        claude.md #205: regex/http/socket, in addition -- a real,
+        previously-UNREACHABLE gap (not a regression): semantic.py's
+        own `_is_thread_sendable_type` rejected all three outright for
+        an ORDINARY value (claude.md #195's own list: "an escaping
+        regex has no retained pattern text to recompile from"; "http/
+        socket are tied to the single main-thread connection table"),
+        so this predicate never needed an answer for them -- until
+        claude.md #202 Phase 2's own early `manually_managed` return in
+        that same function opened the door for a MANUALLY-MANAGED one
+        of the three to cross a thread after all (sharing the pointer,
+        never cloning it, so the connection-table/recompile concerns
+        above don't apply -- see that function's own doc comment).
+        Confirmed missing here directly: `on message(p:regex?)` compiled
+        fine (semantic.py's own gate correctly allows it) but produced
+        invalid LLVM IR at the unboxing step (`add ptr ..., 0`,
+        `add`/`fadd` requiring an INTEGER/float operand) -- this
+        predicate answering False for regex/http/socket sent them down
+        the SCALAR unboxing path instead of the plain pointer-alias GEP
+        a passthrough type needs. All three are already `ptr`-shaped
+        opaque handles per `_llvm_type`, same as blob/img/aud/url --
+        genuinely passthrough, just never exercised until a manually-
+        managed instance of one could reach this code at all. Not
+        folded into `_is_thread_handle_type` (whose own name/doc
+        promise a real `festina_*_clone` function exists for each of
+        its members) -- none of these three has one, and none ever
+        needs one: an ORDINARY instance still can never reach here at
+        all (semantic.py's own rejection stands unchanged for that
+        case), and a manually-managed one is never cloned in the first
+        place (_emit_thread_clone_value's own early return)."""
         return (type_ == TEXT or self._is_thread_handle_type(type_)
-                or isinstance(type_, self._THREAD_PASSTHROUGH_PTR_TYPES))
+                or isinstance(type_, self._THREAD_PASSTHROUGH_PTR_TYPES)
+                or isinstance(type_, (types_mod.RegexType, types_mod.HttpType, types_mod.SocketType)))
 
     def _emit_thread_box(self, val, type_, lines):
         """Turns a thread-sendable value into the single `void *payload`
@@ -3543,7 +3626,19 @@ class CodeGen:
             # parameter register, and stores it into a fresh alloca'd
             # slot in body_env -- no other special-casing needed for
             # "this parameter actually came from a thread queue".
-            escaping = self._emit_param_bindings(on_message_decl, (inbound_type,), body_env, lines)
+            #
+            # claude.md #205: _bare_type(inbound_type), not
+            # inbound_type itself -- see that function's own doc
+            # comment for the real bug (a manually-managed blob
+            # parameter's own `.write()` call inside this exact
+            # handler body, misdispatched by codegen's flag-unaware
+            # `== BLOB` check) this fixes. _emit_param_bindings's own
+            # manually-managed bookkeeping is unaffected: it reads
+            # `on_message_decl.params[0].manually_managed` (the AST
+            # node's own flag) directly, never derives it from this
+            # type argument.
+            escaping = self._emit_param_bindings(
+                on_message_decl, (_bare_type(inbound_type),), body_env, lines)
             saved_ctx = self._current_thread_ctx
             self._current_thread_ctx = thread_ctx
             try:
