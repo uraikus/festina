@@ -34,19 +34,6 @@ and AddressSanitizer/LeakSanitizer coverage for the target.
 - **Media formats** stay PNG/JPEG + WAV/MP3, deliberately: each new
   format is a new system dependency for every machine that compiles a
   media-using program. Revisit only with a concrete need.
-- **`.toStruct(T)`/`.toArr(T)` don't support `\u` unicode string
-  escapes** — raw, un-escaped UTF-8 bytes in a JSON string are
-  unaffected and parse normally; this only affects a producer that
-  specifically chooses to `\u`-escape.
-- **`thread` declarations are singletons** — declared once by name,
-  with no way to spawn more than one instance of the same `thread`
-  block (a worker pool, say). See [api.md](api.md#threads).
-- **A thread-private helper function** (an ordinary `func` callable
-  only from inside one thread's own body, closing over that thread's
-  own state) **isn't supported** — every top-level `func` is checked
-  for purity and either fully callable from any thread or not callable
-  from one at all; there's no way to declare one that's already scoped
-  to a single thread. See [api.md](api.md#threads).
 
 ## Memory model
 
@@ -71,14 +58,6 @@ as the manual override. What remains open:
 - **Text globals are not freed at process exit** — deliberate: they are
   reachable until exit, LeakSanitizer agrees, and freeing them would be
   exit-time busywork.
-- **A `thread` with its own `DatabaseURL` never explicitly closes its
-  private sqlite handle on `kill()`** — a `kill()`/`live()` cycle
-  reopens a fresh handle each time without closing the old one (a
-  real, small, per-cycle leak: one `sqlite3*` plus an open fd), simply
-  reclaimed by the OS at process exit like every other still-open
-  handle. Matches the main program's own database, whose handle
-  likewise isn't closed on the `close(code)`/signal-driven exit path
-  either. See [api.md](api.md#threads).
 - **A `throw` reached from a called function leaks that function's own
   locals**, and, structurally the same issue, **`.toStruct()`/
   `.toArr()` leak whatever they'd already built when a parse fails

@@ -545,6 +545,15 @@ class TestLeakStress:
             # shape needed to catch a leaked/raced prepared-statement
             # cache entry, which no single-threaded sqlite test could.
             "thread_db_churn.f",
+            # claude.md #207: the OTHER half of a thread's own private
+            # sqlite handle thread_db_churn.f can't exercise -- that
+            # file's own worker stays alive for the whole run, so it
+            # never proves a kill()/live() cycle actually closes the
+            # OLD handle before on_load reopens a fresh one. 500 real
+            # kill()/live() cycles (each blocking: kill() joins, live()
+            # spawns), so a leaked sqlite3*/fd pair per cycle is
+            # unmissable.
+            "thread_db_kill_live_churn.f",
             # claude.md #202 Phase 2: `T?` crossing a `thread` boundary
             # -- an ownership shape neither thread_churn.f nor
             # thread_db_churn.f exercises: the payload is the SENDER's
@@ -553,4 +562,49 @@ class TestLeakStress:
             # manages it on either side) -- miss that free and every
             # one of these leaks, unmissable at this volume.
             "thread_manually_managed_churn.f",
+            # claude.md #209: `thread NAME[N] { ... }` -- an ownership
+            # shape none of the files above exercise: N genuinely
+            # independent OS threads all running the IDENTICAL
+            # generated body concurrently, each its own private state/
+            # handle/queue. thread_churn.f's own workers are each a
+            # DIFFERENT body, one instance apiece -- this is the shape
+            # most likely to expose a bug where per-instance codegen
+            # accidentally shared something (a global instead of a
+            # namespaced one, one instance's handle read/written by
+            # another's).
+            "thread_pool_churn.f",
+            # claude.md #210: thread-private helper functions -- every
+            # message is actually processed by a real, separately
+            # mangled per-thread function call (not an inline handler
+            # body), including one private func calling ANOTHER, in
+            # both a plain thread AND a pool (each pool instance's own
+            # private func closing over THAT instance's own state, not
+            # shared with its siblings).
+            "thread_private_func_churn.f",
+            # claude.md #211: exec(args)/regex()/mkdir()/ls(), all
+            # newly unblocked inside a thread body -- two threads each
+            # calling these at their OWN call sites concurrently, at
+            # real volume, so a leaked exec()'d child/fd, a leaked
+            # regex compilation, or a leaked directory-listing
+            # accumulator would show up here.
+            "thread_wider_builtins_churn.f",
+            # claude.md #212: a thread's own private HTTP context --
+            # main and a thread each with their own openPort()'d
+            # listener, plus the thread making real blocking CLIENT
+            # requests (`req.send()`) back to main's own port on every
+            # message, at real volume, so a leaked connection/listener
+            # table entry (or the __thread conversion itself somehow
+            # leaking across contexts) would show up here. This is
+            # also the first stress program to link
+            # festina_runtime_http.c (and, since it uses the client
+            # form, festina_runtime_https.c) at all.
+            "thread_http_context_churn.f",
+            # claude.md #213: NAME.giveRequest(r) -- real, concurrent,
+            # at-volume connection hand-offs (main accepts, detaches,
+            # hands to a thread; a third thread drives real client
+            # requests) -- so a leak in the retain/release accounting
+            # festina_conn_detach's own doc comment works through (or
+            # a leaked FestinaConn/FestinaGiveRequestPayload transfer
+            # block itself) would show up here.
+            "thread_giverequest_churn.f",
         }

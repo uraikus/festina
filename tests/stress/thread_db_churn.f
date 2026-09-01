@@ -20,14 +20,6 @@ DatabaseURL = 'main_db_churn.sqlite'
 table MainCounter { n:int }
 
 table Ping { n:int }
-thread dbWorker {
-    DatabaseURL = 'worker_db_churn.sqlite'
-    on message(p:int) {
-        sqlite('INSERT INTO Ping (n) VALUES (?)', [p])
-        int total = sqliteInt('SELECT count(*) FROM Ping')
-        postMessage(total)
-    }
-}
 
 int DB_TOTAL = 2000
 int dbRepliesSeen = 0
@@ -49,7 +41,19 @@ void func onDbReply(x:int) {
     dbSum = dbSum + x
     maybeDone()
 }
-dbWorker.onMessage(void (x:int) => onDbReply(x))
+
+on message(worker:thread, msg:int) {
+    onDbReply(msg)
+}
+
+thread dbWorker {
+    DatabaseURL = 'worker_db_churn.sqlite'
+    on message(worker:thread, msg:int) {
+        sqlite('INSERT INTO Ping (n) VALUES (?)', [msg])
+        int total = sqliteInt('SELECT count(*) FROM Ping')
+        postMessage(total)
+    }
+}
 
 int i = 0
 while i < DB_TOTAL {

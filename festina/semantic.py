@@ -731,38 +731,120 @@ _EVENT_SIGNATURES = {
     # event_handlers loop. `on request` fires once per accepted
     # connection's parsed HTTP request; `on upgrade` fires once, right
     # after a `req.upgrade()` call inside `on request` completes the
-    # WebSocket handshake for that same connection; `on message` fires
-    # once per complete WebSocket frame received; `on socketClose`
-    # fires once, whenever an upgraded connection ends (the peer
-    # closed it, sent a close frame, or the read failed) -- exactly
-    # once per connection that ever reached `on upgrade`, never for a
-    # plain HTTP connection that never upgraded.
+    # WebSocket handshake for that same connection; `on socketMessage`
+    # fires once per complete WebSocket frame received; `on
+    # socketClose` fires once, whenever an upgraded connection ends
+    # (the peer closed it, sent a close frame, or the read failed) --
+    # exactly once per connection that ever reached `on upgrade`,
+    # never for a plain HTTP connection that never upgraded.
+    #
+    # claude.md #208: renamed from `on message` -- that name is now the
+    # unified thread-messaging handler (see _THREAD_EVENT_SIGNATURES
+    # and analyze_event_handler's own special-cased handling of it,
+    # below), which needed the name free at the top level too, not
+    # just inside a thread body.
     "request": ((_HTTP,), "(req:http)"),
     "upgrade": ((_SOCKET,), "(s:socket)"),
-    "message": ((_SOCKET, _BLOB), "(s:socket, msg:blob)"),
+    "socketMessage": ((_SOCKET, _BLOB), "(s:socket, msg:blob)"),
     "socketClose": ((_SOCKET,), "(s:socket)"),
 }
 
-# claude.md #195: `on load()`/`on message(p:T)`/`on exit(code:int)`
-# nested inside a `thread { ... }` body -- a SEPARATE, closed table
-# from _EVENT_SIGNATURES above, not folded into it, for two reasons:
-# (1) "message" already names a fixed-shape WebSocket event there
-# ((s:socket, msg:blob)) -- a thread's own `on message` has a
-# genuinely different, per-thread-INFERRED shape, so sharing one dict
-# would either collide outright or need per-context branching baked
-# into every lookup; (2) unlike _EVENT_SIGNATURES (where an
-# unrecognized name is deliberately tolerated -- claude.md #40 -- since
-# it might be a not-yet-implemented future event), a thread body is a
-# brand new, closed construct with no such legacy: an unrecognized `on`
-# name inside one is a real mistake worth catching immediately, not
+# claude.md #195/#208: `on load()`/`on message(worker:thread, msg:T)`/
+# `on exit(code:int)` nested inside a `thread { ... }` body -- a
+# SEPARATE, closed table from _EVENT_SIGNATURES above, not folded into
+# it, since (unlike _EVENT_SIGNATURES, where an unrecognized name is
+# deliberately tolerated -- claude.md #40 -- since it might be a
+# not-yet-implemented future event) a thread body is a brand new,
+# closed construct with no such legacy: an unrecognized `on` name
+# inside one is a real mistake worth catching immediately, not
 # silently-dead code. `None` for "message" marks it as the one entry
-# whose param type isn't fixed here -- resolved per-thread instead, in
-# analyze_thread_early below.
+# whose param types aren't fixed here -- both DECLARED, at the point
+# this specific handler is written (see _check_message_handler_params,
+# shared with the top-level `on message` handler below, which follows
+# the identical (worker:thread, msg:T) shape for the SAME reason: both
+# are just "this receiver's own inbound message handler," one written
+# inside a thread body, one written at the top level for main).
 _THREAD_EVENT_SIGNATURES = {
     "load": ((), "no parameters"),
-    "message": (None, "exactly one parameter, matching this thread's own inferred message type"),
+    "message": (None, "(worker:thread, msg:T) -- worker is null when sent by main"),
     "exit": ((_INT,), "(code:int)"),
+    # claude.md #212 (Phase 4 -- private per-thread HTTP context): the
+    # SAME four names/signatures _EVENT_SIGNATURES already declares
+    # for main's own top-level http/websocket handlers -- a thread's
+    # own copy fires from that ONE thread's own private connection
+    # table (see festina_runtime_http.c's __thread conversion), never
+    # main's or another thread's. Declaring one of these here is what
+    # sets info.has_http_handler (below), which in turn gates
+    # openPort()/closePort()/openSecurePort() for this thread (see
+    # _infer_call) -- a thread that calls openPort() but never
+    # declares a handler here would silently sit accepting connections
+    # nothing responds to (see that gate's own comment for why this
+    # matters at RUNTIME, not just style).
+    "request": ((_HTTP,), "(req:http)"),
+    "upgrade": ((_SOCKET,), "(s:socket)"),
+    "socketMessage": ((_SOCKET, _BLOB), "(s:socket, msg:blob)"),
+    "socketClose": ((_SOCKET,), "(s:socket)"),
 }
+
+# claude.md #212: `on request`/`on upgrade`/`on socketMessage`/`on
+# socketClose` -- any one of these declared inside a thread body sets
+# has_http_handler, which _infer_call's own openPort/closePort/
+# openSecurePort gate (below) requires before allowing this thread to
+# call any of the three.
+_THREAD_HTTP_HANDLER_NAMES = frozenset({"request", "upgrade", "socketMessage", "socketClose"})
+
+
+def _check_message_handler_params(params, node, filename, structs, tables, enums, help_text):
+    """claude.md #208: validates an `on message(worker:thread, msg:T)`
+    handler's own parameter list -- shared verbatim between a thread's
+    own inbound handler (inside `analyze_thread`) and the top-level
+    handler receiving everything sent to main (`analyze_event_handler`)
+    -- both are the SAME mechanism, just declared in different places:
+    exactly 2 parameters, the first a bare `thread` (the generic,
+    name=None variant -- see resolve_type_name's own "thread" case),
+    the second any thread-sendable type (the receiver's own choice,
+    T -- see _is_thread_sendable_type). Returns the resolved `msg`
+    type. Every `postMessage()` send targeting this receiver is then
+    `check_assignable`'d against it, exactly the way a struct/array/map
+    field or an ordinary function parameter already is -- no separate
+    inference machinery needed (an earlier design here DID try to
+    INFER this from scattered postMessage() call sites instead of
+    requiring a declaration, and hit the identical dead end
+    _merge_thread_outbound_type's own history already found for the
+    thread-outbound direction: there is no Festina syntax that could
+    ever spell an anonymous, compiler-invented type for a callback/
+    handler parameter to receive -- so this handler DECLARES msg's own
+    type directly, the same way a thread's inbound type always has)."""
+    if len(params) != 2:
+        raise CompileError(
+            f"'on message' must declare {help_text}, got {len(params)}",
+            file=filename, line=node.line, column=node.column,
+            category="invalid function argument type",
+        )
+    worker_type = apply_manually_managed(
+        resolve_type_name(params[0].type_expr, structs, tables, enums, filename, node),
+        params[0].manually_managed)
+    if worker_type != types_mod.ThreadType(None):
+        raise CompileError(
+            f"'on message' must declare {help_text} -- its first parameter "
+            f"must be a bare 'thread' (found "
+            f"{types_mod.type_name(worker_type)})",
+            file=filename, line=node.line, column=node.column,
+            category="invalid function argument type",
+        )
+    msg_type = apply_manually_managed(
+        resolve_type_name(params[1].type_expr, structs, tables, enums, filename, node),
+        params[1].manually_managed)
+    if not _is_thread_sendable_type(msg_type, structs, enums):
+        raise CompileError(
+            f"'on message(worker:thread, msg:{types_mod.type_name(msg_type)})': "
+            f"{types_mod.type_name(msg_type)} cannot cross a thread boundary -- "
+            f"func/http/socket/regex/table values are not sendable (see "
+            f"claude.md #195's own list)",
+            file=filename, line=node.line, column=node.column,
+            category="invalid function argument type",
+        )
+    return msg_type
 
 # claude.md #195: builtins a thread body may never call -- every one
 # tied to exactly one piece of MAIN-thread-only shared state (the X11
@@ -781,7 +863,44 @@ _THREAD_EVENT_SIGNATURES = {
 # since the answer depends on THIS thread's own `database_url` (a
 # thread that declared its own `DatabaseURL` may call them; one that
 # didn't may not), a per-thread question this flat, unconditional set
-# has no way to represent.
+# has no way to represent. `exec` is ALSO deliberately not here
+# (claude.md #211) -- the 1-argument (blocking) form's own fork/
+# execvp/waitpid touches no shared state at all (confirmed directly
+# by reading festina_run_argv), but the 2-argument
+# (`exec(args, callback)`, non-blocking) form's own callback is
+# documented to run on MAIN's OS thread regardless of which thread
+# dispatched it (confirmed directly: festina_process_exec_dispatch's
+# own worker only ever computes the exit code; the trampoline that
+# actually invokes the callback runs from festina_async_io_dispatch's
+# own main-thread drain step) -- a real cross-thread-isolation
+# violation the arity alone can't express as a flat name-only set, so
+# `exec` gets its own dedicated arity-aware check instead, mirroring
+# the sqlite one's own shape. `regex`/`mkdir`/`ls` are NOT here either
+# (claude.md #211) -- confirmed safe by reading each: `regex()`'s own
+# memoization slot is a per-CALL-SITE codegen-generated global
+# (`_regex_memo_slots`, keyed by `id(Call node)`), lexically private
+# to whichever one thread's generated code contains that call site,
+# never shared; `mkdir`/`ls` are thin, purely local POSIX wrappers
+# (`mkdir()`/`opendir()`/`readdir()`/`closedir()`) touching no shared
+# global at all. `openPort`/`closePort`/`openSecurePort` are ALSO NOT
+# here any more (claude.md #212 Phase 4) -- confirmed safe by
+# converting festina_runtime_http.c's own connection/listener/handler
+# state to `__thread` (the SAME storage class this file's own
+# g_http_send_header_buf/festina_runtime.c's catch-frame stack already
+# used), so a thread's own openPort() genuinely never shares so much
+# as one fd with main or another thread's own context. Each is instead
+# gated by its own dedicated check in _infer_call, mirroring the
+# sqlite one's own shape exactly: legal only for a thread that has
+# ALREADY declared at least one HTTP-shaped handler (on request/on
+# upgrade/on socketMessage/on socketClose -- see
+# _THREAD_HTTP_HANDLER_NAMES/info.has_http_handler), since that
+# declaration is what makes codegen give this thread's own worker loop
+# the bounded-poll shape that actually SERVICES a listener at all
+# (festina_thread_set_http_context/festina_thread_http_service_pass) --
+# without it, an accepted connection would just sit forever, nothing
+# ever polling for it. `close` (the close(code) process-exit builtin --
+# entirely unrelated to closePort/a socket's own .close()) stays
+# unconditionally disallowed, unchanged.
 _THREAD_DISALLOWED_BUILTINS = frozenset({
     "drawRect", "drawCircle", "drawText", "drawImage", "drawPixel",
     "clearRect", "clearCircle", "clearPixel", "clearCanvas",
@@ -798,8 +917,7 @@ _THREAD_DISALLOWED_BUILTINS = frozenset({
     "setMaxAudioPlayers", "maxAudioPlayers", "stopAudioPlayer",
     "isAudioPlayerPlaying",
     "setTimeout", "setInterval", "clearTimeout", "clearInterval",
-    "exec", "openPort", "closePort", "openSecurePort", "close",
-    "mkdir", "ls", "regex",
+    "close",
 })
 
 
@@ -949,29 +1067,24 @@ class _EnumInfo:
 
 
 class _ThreadInfo:
-    """claude.md #195: the real data a `thread NAME { ... }` declaration
-    carries -- threads[name] holds one of these, the same "the Type is
-    just a name-handle, the real data lives in a side dict" split
-    _EnumInfo/structs/tables already use. Both message types are
-    INFERRED, never declared (see the ThreadDecl dispatch's own
-    comment for why): `inbound_type` is whatever this thread's own
-    `on message(p:T)` declares (None if it has none -- such a thread
-    accepts no messages at all, and `NAME.postMessage(x)` anywhere in
-    the program is a compile error). `outbound_type` is inferred from
-    every `postMessage(x)` call site found inside this thread's own
-    body (None if it never posts anything; more than one distinct type
-    across those sites is a compile error, not auto-merged -- see
-    _merge_thread_outbound_type's own doc comment). `has_onmessage`
-    and `postmessage_sites` back the symmetric "no dead sends" check at
-    the end of analyze(): a thread that posts anything but is never the
-    target of a `NAME.onMessage(...)` registration anywhere in the
-    program is a compile error too."""
+    """claude.md #195/#208: the real data a `thread NAME { ... }`
+    declaration carries -- threads[name] holds one of these, the same
+    "the Type is just a name-handle, the real data lives in a side
+    dict" split _EnumInfo/structs/tables already use. `inbound_type`
+    is DECLARED, not inferred -- whatever this thread's own `on
+    message(worker:thread, msg:T)` declares its `msg` parameter as
+    (None if it has none -- such a thread accepts no messages at all,
+    and `NAME.postMessage(x)` anywhere in the program is a compile
+    error). There is no separate outbound-type concept any more:
+    claude.md #208 replaced the old `NAME.onMessage(callback)`-plus-
+    inferred-outbound-type mechanism with a single, unified, top-level
+    `on message(worker:thread, msg:T)` handler that every thread's own
+    bare `postMessage(x)` (still meaning "send to main") gets checked
+    against directly -- see `main_message_type`/`_check_bare_send` on
+    AnalyzedProgram, below."""
     def __init__(self, node):
         self.node = node
         self.inbound_type = None
-        self.outbound_type = None
-        self.has_onmessage = False
-        self.postmessage_sites = []
         # claude.md #199 Phase 5: this thread's own resolved
         # `DatabaseURL = '<literal>'` first statement (None if it
         # never declared one) -- a thread with one gets its own
@@ -981,16 +1094,53 @@ class _ThreadInfo:
         # conflict check's own error reporting.
         self.database_url = None
         self.database_url_node = None
+        # claude.md #209: `thread NAME[N] { ... }` -- None for an
+        # ordinary singleton thread, or N (a positive int) for a pool.
+        # ONE _ThreadInfo is shared by every index of a pool -- every
+        # instance runs the identical body, so there is exactly one
+        # `inbound_type`/`database_url` to reason about regardless of
+        # which index a particular send targets.
+        self.pool_size = node.pool_size
+        # claude.md #212 (Phase 4 -- private per-thread HTTP context):
+        # true once this thread's own body declares at least one of
+        # on request/on upgrade/on socketMessage/on socketClose (see
+        # _THREAD_HTTP_HANDLER_NAMES) -- gates openPort()/closePort()/
+        # openSecurePort() for this thread (see _infer_call), the same
+        # "gate the builtin on a per-thread capability" shape
+        # `database_url` already gives sqlite()/sqliteInt()/
+        # sqliteFloat()/sqliteText().
+        self.has_http_handler = False
+        # claude.md #213 (Phase 5 -- giveRequest): WHICH of the four
+        # this thread declared, by name -- has_http_handler alone
+        # can't tell `NAME.giveRequest(r)` (which specifically
+        # requires an `on request`, since that's the one handler it
+        # dispatches) apart from a thread that only declared, say,
+        # `on socketClose`. Populated by the identical hoisting
+        # pre-scan that sets has_http_handler, same reasoning (order-
+        # independent -- a thread declaring `on request` AFTER some
+        # other statement that doesn't care shouldn't matter here
+        # either).
+        self.declared_http_handlers = set()
 
 
 class AnalyzedProgram:
-    def __init__(self, symbols, structs, tables, enums, imports, threads=None):
+    def __init__(self, symbols, structs, tables, enums, imports, threads=None,
+                 main_message_type=None):
         self.symbols = symbols
         self.structs = structs
         self.tables = tables
         self.enums = enums
         self.imports = imports
         self.threads = threads if threads is not None else {}
+        # claude.md #208: the top-level `on message(worker:thread,
+        # msg:T)` handler's own declared `msg` type -- None if the
+        # program never declares one at all (every bare `postMessage(x)`
+        # call site anywhere is then a compile error, "nothing receives
+        # this"). Every OTHER thread's own inbound type stays on its
+        # own `_ThreadInfo.inbound_type` (main is not itself a `thread`
+        # declaration, so it has no `_ThreadInfo` of its own to live
+        # on -- this is its counterpart).
+        self.main_message_type = main_message_type
 
 
 def resolve_type_name(type_expr, structs, tables, enums=None, filename="<string>", node=None):
@@ -1045,6 +1195,17 @@ def resolve_type_name(type_expr, structs, tables, enums=None, filename="<string>
         return types_mod.UrlType()
     if name == "socket":
         return types_mod.SocketType()
+    if name == "thread":
+        # claude.md #208: the GENERIC `thread` type -- the only way
+        # this string ever reaches here is a `worker:thread` parameter
+        # (a specific declared thread's own type, e.g. `myWorker`'s
+        # own ThreadType("myWorker"), is never spelled as a type
+        # expression at all; it only ever exists as the compile-time
+        # type of the bare identifier at a `myWorker.postMessage(...)`
+        # call site). `name=None` deliberately never matches any
+        # specific declared thread's own type (dataclass equality) --
+        # see ThreadType's own doc comment.
+        return types_mod.ThreadType(None)
     if name == "color":
         return types_mod.ColorType()
     if name == "font":
@@ -1226,11 +1387,26 @@ def analyze(program, filename="<string>"):
     # need); the same "a single nonlocal slot, not a parameter
     # everywhere" shape next_arrow_name's own _arrow_counter above
     # already uses. Read by _infer_call's bare `postMessage(x)` handling
-    # (to know which thread's own outbound type to merge into) and its
-    # disallowed-builtins/disallowed-function-call checks (to know
-    # whether the CURRENT call site is inside an isolated thread body at
-    # all).
+    # (to know it's inside a thread body at all -- see claude.md #208,
+    # bare postMessage checks against `_main_message_type[0]` now, not
+    # a per-thread accumulator) and its disallowed-builtins/disallowed-
+    # function-call checks (to know whether the CURRENT call site is
+    # inside an isolated thread body at all).
     _current_thread = [None]
+    # claude.md #208: the top-level `on message(worker:thread, msg:T)`
+    # handler's own declared `msg` type, set once by
+    # analyze_event_handler when it reaches that declaration (None
+    # until then, and forever if the program never declares one at
+    # all) -- every bare `postMessage(x)` call site anywhere checks
+    # against this directly, mirroring exactly how `NAME.postMessage(x)`
+    # already checks against a specific thread's own declared
+    # `inbound_type`. Ordinary "declared before referenced" program-
+    # order rules apply (the same rule a thread's own name already has
+    # -- see analyze_thread's own doc comment): a bare postMessage(x)
+    # textually BEFORE the top-level `on message` declaration is a
+    # compile error, same as referencing any other not-yet-declared
+    # name would be.
+    _main_message_type = [None]
     # claude.md #142: one monotonic counter for every arrow-function
     # expression's own synthesized name (__festina_arrow_N) -- a plain
     # int, not a list-wrapped closure cell, since every read/increment
@@ -1339,7 +1515,30 @@ def analyze(program, filename="<string>"):
         # already gates (var decl, function param/return, struct
         # field, array/map element, ...), the same way the container-
         # null tolerance just above does.
-        if isinstance(declared, types_mod.EnumType):
+        #
+        # claude.md #205: a real, ASan-confirmed heap-use-after-free
+        # was possible here before the `not manually_managed` guard --
+        # this bypass used to fire regardless of whether `declared`
+        # (the enum) was manually-managed, letting an ORDINARY,
+        # automatically-managed member value (`Circle c; ...; Shape?
+        # shape = c`) flow straight into a manually-managed binding
+        # with no retain (codegen's own retain-skip for a manually-
+        # managed declaration is unconditional on `stmt.manually_
+        # managed`, exactly the same as every other eligible type --
+        # see claude.md #202's own codegen section). Once `c` went out
+        # of scope and its own automatic release dropped the last
+        # reference, `shape` was left pointing at freed memory --
+        # confirmed directly, not just reasoned about, with a real
+        # AddressSanitizer heap-use-after-free report. Skipping this
+        # bypass when `declared` is manually-managed falls through to
+        # the strict `declared != actual` check below instead, which
+        # correctly rejects a plain member value the same way it
+        # already rejects a plain `Circle` flowing into `Circle?` --
+        # `analyze_var_decl`'s own fresh-construction escape hatch
+        # (claude.md #204) still lets a FRESH member value in (e.g.
+        # `Shape? shape = makeCircle()`), since it checks against the
+        # BARE enum type, which reaches this exact branch un-flagged.
+        if isinstance(declared, types_mod.EnumType) and not declared.manually_managed:
             info = enums.get(declared.name)
             if info is not None and actual in info.members:
                 return
@@ -1570,6 +1769,22 @@ def analyze(program, filename="<string>"):
                                    for p in decl.params)
                 ret_type = resolve(decl.return_type, decl) if decl.return_type != "void" else None
                 return types_mod.FuncType(param_types, ret_type)
+            if sym.kind == "thread_function":
+                # claude.md #210: unlike an ordinary top-level function,
+                # a thread-private helper has no first-class VALUE form
+                # -- it may only ever be CALLED by name (the branch
+                # above, `sym.kind == "function"`, deliberately doesn't
+                # also match "thread_function"). Never explicitly
+                # requested, and closing over one thread's own private
+                # state makes "hand this function pointer to code
+                # outside that thread" a can of worms (claude.md #195's
+                # own isolation model) this phase doesn't need to open.
+                raise CompileError(
+                    f"'{expr.name}' is a thread-private function -- it can only be "
+                    f"called (e.g. '{expr.name}(...)'), not referenced as a value",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid function argument type",
+                )
             return sym.type
         if isinstance(expr, ast.Member):
             return _infer_member(expr, scope)
@@ -1820,6 +2035,29 @@ def analyze(program, filename="<string>"):
                     # same as every other binary operator.
                     or (left in _NUMERIC_TYPES and right in _NUMERIC_TYPES)
                 )
+                # claude.md #208: `thread == thread` (two genuine,
+                # non-null values) is deliberately NOT supported --
+                # `worker:thread`'s own only sanctioned comparison is
+                # against `null` ("is this from main"), which routes
+                # through codegen's own generic ptr-vs-null fast path
+                # (_emit_binop) and is unaffected by this check (NULL
+                # on either side already made `compatible` True above).
+                # Two real thread values reaching codegen's OTHER,
+                # non-null equality path would hit the identical
+                # pre-existing "icmp eq i64 <a ptr>" invalid-IR bug
+                # struct == struct already has (confirmed directly,
+                # unrelated to this feature, out of scope to fix here)
+                # -- rejected here instead of silently shipping a new
+                # instance of it.
+                if (compatible and isinstance(left, types_mod.ThreadType)
+                        and isinstance(right, types_mod.ThreadType)):
+                    raise CompileError(
+                        f"'{expr.op}' between two thread values is not supported -- "
+                        f"a 'worker:thread' parameter may only be compared against "
+                        f"null (to check whether it was sent by the main program)",
+                        file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                        category="invalid operand type",
+                    )
                 if not compatible:
                     raise CompileError(
                         f"cannot compare {types_mod.type_name(left)} and "
@@ -2164,17 +2402,17 @@ def analyze(program, filename="<string>"):
             # awareness of threads at all.
             if _current_thread[0] is not None:
                 if name == "postMessage":
-                    # claude.md #195: the bare, context-implicit form --
-                    # "send FROM me, TO main" -- the only direction a
-                    # thread's own body can ever initiate (see the
-                    # ThreadType Member-call dispatch above for why the
-                    # named `NAME.postMessage(x)` form is refused from in
-                    # here). Its argument's type is INFERRED, not
-                    # checked against a declaration -- see
-                    # _merge_thread_outbound_type's own doc comment for
-                    # how more than one distinct type across this same
-                    # thread's own postMessage call sites becomes an
-                    # implicit enum.
+                    # claude.md #195/#208: the bare, context-implicit
+                    # form -- "send FROM me, TO main" -- checked against
+                    # the top-level `on message(worker:thread, msg:T)`
+                    # handler's own declared type, the SAME way the
+                    # named `NAME.postMessage(x)` form (ThreadType
+                    # Member-call dispatch, above) checks against a
+                    # specific thread's own declared inbound_type.
+                    # Ordinary "declared before referenced" program-
+                    # order rules apply -- a bare postMessage(x) written
+                    # textually before the top-level `on message`
+                    # handler sees `_main_message_type[0]` still None.
                     if len(expr.args) != 1:
                         raise CompileError(
                             f"postMessage() expects exactly 1 argument, got "
@@ -2182,16 +2420,17 @@ def analyze(program, filename="<string>"):
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid function argument type",
                         )
-                    info = _current_thread[0]
-                    arg_type = infer(expr.args[0], scope)
-                    if arg_type is None or arg_type is NULL:
+                    if _main_message_type[0] is None:
                         raise CompileError(
-                            "postMessage()'s argument type could not be determined",
+                            "postMessage() sends to the main program, but it declares "
+                            "no top-level 'on message(worker:thread, msg:T)' handler "
+                            "(yet) -- nothing would ever receive this",
                             file=filename, line=callee.line, column=callee.column,
-                            category="invalid function argument type",
+                            category="invalid declaration",
                         )
-                    _merge_thread_outbound_type(info, arg_type, callee)
-                    info.postmessage_sites.append((callee.line, callee.column))
+                    arg_type = infer(expr.args[0], scope)
+                    check_assignable(_main_message_type[0], arg_type, expr.args[0],
+                                      what="postMessage() argument")
                     return None
                 if name in _SQLITE_BUILTINS and _current_thread[0].database_url is None:
                     # claude.md #199 Phase 5: unlike every OTHER
@@ -2215,6 +2454,54 @@ def analyze(program, filename="<string>"):
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
+                if name == "exec" and len(expr.args) == 2:
+                    # claude.md #211: unlike the flat _THREAD_DISALLOWED_
+                    # BUILTINS set just below, `exec`'s own safety
+                    # depends on ARITY, not just its name -- the
+                    # blocking 1-argument form is fine (see this
+                    # module's own comment above _THREAD_DISALLOWED_
+                    # BUILTINS for the confirmed-by-reading reasoning);
+                    # the non-blocking 2-argument form's own callback
+                    # always runs on MAIN's OS thread regardless of
+                    # which thread dispatched it, a real cross-thread-
+                    # isolation violation. Checked here, ahead of the
+                    # flat set (which no longer even lists `exec`), so
+                    # this gets its own specific reason instead of the
+                    # generic "touches shared state" one.
+                    raise CompileError(
+                        f"'exec(args, callback)' cannot be called from inside a "
+                        f"thread body -- its callback always runs on the main "
+                        f"program's own OS thread, regardless of which thread "
+                        f"dispatched it; 'exec(args)' (the blocking, 1-argument "
+                        f"form) is fine",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                if (name in ("openPort", "closePort", "openSecurePort")
+                        and not _current_thread[0].has_http_handler):
+                    # claude.md #212: mirrors the sqlite gate just
+                    # above exactly -- legal only for a thread that has
+                    # ALREADY declared at least one HTTP-shaped handler
+                    # (on request/on upgrade/on socketMessage/on
+                    # socketClose), since that declaration is what
+                    # gives this thread's own worker loop the bounded-
+                    # poll shape that actually services a listener at
+                    # all (see festina_thread_set_http_context) --
+                    # without one, an accepted connection would simply
+                    # sit forever, nothing ever polling for it. A
+                    # thread that HAS declared one falls through to
+                    # ordinary openPort()/closePort()/openSecurePort()
+                    # handling below, identical to main's own.
+                    raise CompileError(
+                        f"'{name}()' cannot be called from inside thread "
+                        f"'{_current_thread[0].node.name}' -- it hasn't declared "
+                        f"an HTTP-shaped handler yet (on request(req:http)/"
+                        f"on upgrade(s:socket)/on socketMessage(s:socket, msg:blob)/"
+                        f"on socketClose(s:socket)), so nothing would ever service "
+                        f"a connection accepted here",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
                 if name in _THREAD_DISALLOWED_BUILTINS:
                     raise CompileError(
                         f"'{name}()' cannot be called from inside a thread body -- "
@@ -2228,8 +2515,9 @@ def analyze(program, filename="<string>"):
                     raise CompileError(
                         f"'{name}()' cannot be called from inside a thread body -- "
                         f"functions declared outside a thread aren't isolated the "
-                        f"same way it is (see claude.md #195); thread-private helper "
-                        f"functions aren't supported yet",
+                        f"same way it is (see claude.md #195); declare '{name}' as a "
+                        f"func directly inside this thread's own body instead "
+                        f"(claude.md #210), if it only needs to be called from here",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
@@ -2518,7 +2806,19 @@ def analyze(program, filename="<string>"):
                     check_assignable(expected, arg_type, callee,
                                       what=f"argument {i + 1} of '{name}'")
                 return fn_type.return_type
-            if sym is None or sym.kind != "function":
+            # claude.md #210: "thread_function" (a thread-private
+            # helper) is accepted here on equal footing with an
+            # ordinary "function" -- everything below reads `sym.node`
+            # generically (a plain FuncDecl either way), so no further
+            # branching is needed. This widening is safe EVERYWHERE
+            # this function runs, not just inside a thread body:
+            # `scope.lookup(name)` is what actually enforces privacy
+            # (a thread-private func's own name was only ever defined
+            # in that ONE thread's own thread_functions_scope, never in
+            # global_scope/functions_scope), so a call site outside
+            # that thread's own body can never even find the symbol to
+            # reach this check in the first place.
+            if sym is None or sym.kind not in ("function", "thread_function"):
                 # claude.md #109: a name this language used to have gets
                 # told what replaced it, not merely that it is unknown.
                 # A user-declared function of the same name still wins,
@@ -2560,29 +2860,75 @@ def analyze(program, filename="<string>"):
             # of everything else in this branch, since ThreadType is its
             # own closed namespace no other check here could ever match
             # anyway.
-            if isinstance(callee.obj, ast.Identifier) and callee.obj.name in threads:
-                thread_name = callee.obj.name
-                info = threads[thread_name]
-                if callee.prop not in ("postMessage", "onMessage", "kill", "live", "isAlive"):
+            # claude.md #209: `pool[i].postMessage(...)` -- `pool[i]`
+            # itself is an ordinary computed `Member` (`callee.obj`),
+            # not a bare Identifier, needing no grammar of its own (see
+            # parse_thread_decl's own comment); recognized here by
+            # peeling that one extra layer off before the identical
+            # by-name lookup below, so every check underneath (method
+            # name, main-only lifecycle methods, postMessage's own
+            # inbound-type check) runs completely unchanged for a pool
+            # instance -- `thread_name`/`info` name the POOL as a
+            # whole (one `_ThreadInfo` shared by every index, since
+            # every index runs the identical body), the index itself
+            # only ever matters at codegen's own runtime select.
+            pool_index_expr = None
+            pool_receiver = callee.obj
+            if (isinstance(callee.obj, ast.Member) and callee.obj.computed
+                    and isinstance(callee.obj.obj, ast.Identifier)
+                    and callee.obj.obj.name in threads):
+                if threads[callee.obj.obj.name].pool_size is None:
                     raise CompileError(
-                        f"thread '{thread_name}' has no method '{callee.prop}' -- only "
-                        f"postMessage/onMessage/kill/live/isAlive are supported",
+                        f"'{callee.obj.obj.name}' is an ordinary thread, not a pool -- "
+                        f"'{callee.obj.obj.name}[i]' is only valid for a "
+                        f"'thread {callee.obj.obj.name}[N] {{ ... }}' pool declaration",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid method receiver",
                     )
-                # claude.md #195: every one of these five is a MAIN-
-                # program-only operation -- a thread's own body has no
-                # visibility into (or control over) another thread, or
-                # even over itself this way; its only channel out is the
-                # bare, context-implicit `postMessage(x)` form handled
-                # separately, at the very top of this function.
-                if _current_thread[0] is not None:
+                pool_index_expr = callee.obj.prop
+                pool_receiver = callee.obj.obj
+            if isinstance(pool_receiver, ast.Identifier) and pool_receiver.name in threads:
+                thread_name = pool_receiver.name
+                info = threads[thread_name]
+                if info.pool_size is not None and pool_index_expr is None:
+                    raise CompileError(
+                        f"thread pool '{thread_name}' must be indexed to call a "
+                        f"method -- e.g. '{thread_name}[0].{callee.prop}(...)'",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid method receiver",
+                    )
+                if pool_index_expr is not None:
+                    idx_type = infer(pool_index_expr, scope)
+                    if idx_type != _INT:
+                        raise CompileError(
+                            f"thread pool index must be int, found "
+                            f"{types_mod.type_name(idx_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                if callee.prop not in ("postMessage", "kill", "live", "isAlive", "giveRequest"):
+                    raise CompileError(
+                        f"thread '{thread_name}' has no method '{callee.prop}' -- only "
+                        f"postMessage/kill/live/isAlive/giveRequest are supported",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid method receiver",
+                    )
+                # claude.md #208: `kill`/`live`/`isAlive` stay MAIN-
+                # program-only -- a thread's own body still has no
+                # control over another thread's (or its own) lifecycle.
+                # `postMessage` is the one exception now: threads may
+                # message each other directly (see the bare, context-
+                # implicit form's own comment, above, for "send to
+                # main" specifically -- this named form is "send to a
+                # SPECIFIC thread," legal from main OR from inside any
+                # other thread's own body).
+                if callee.prop != "postMessage" and _current_thread[0] is not None:
                     raise CompileError(
                         f"'{thread_name}.{callee.prop}(...)' cannot be called from "
-                        f"inside a thread body -- threads exchange messages with the "
-                        f"main program only (bare postMessage(x) to send out), never "
-                        f"with each other, and only the main program controls a "
-                        f"thread's own lifecycle",
+                        f"inside a thread body -- only the main program controls a "
+                        f"thread's own lifecycle and hands off live connections "
+                        f"(threads may message each other via postMessage, but not "
+                        f"kill/live/isAlive/giveRequest each other)",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
@@ -2608,40 +2954,67 @@ def analyze(program, filename="<string>"):
                     # enum" rule (claude.md #176) every other parameter/
                     # assignment position already gets, so
                     # `myWorker.postMessage(circleValue)` against an
-                    # `on message(p:Shape)` (Shape = Circle, Square)
-                    # works exactly like passing a Circle to any other
-                    # Shape-typed parameter already does, with no
-                    # special-casing needed here.
+                    # `on message(worker:thread, msg:Shape)` (Shape =
+                    # Circle, Square) works exactly like passing a
+                    # Circle to any other Shape-typed parameter already
+                    # does, with no special-casing needed here.
                     check_assignable(info.inbound_type, arg_type, expr.args[0],
                                       what="postMessage() argument")
                     return None
-                if callee.prop == "onMessage":
-                    if info.outbound_type is None:
+                if callee.prop == "giveRequest":
+                    # claude.md #213 (Phase 5): main-only (already
+                    # enforced above, the same gate kill/live/isAlive
+                    # get), and legal only when the target thread has
+                    # declared its own `on request` -- that's the ONE
+                    # handler giveRequest ever dispatches, so "declared
+                    # SOME http handler" (has_http_handler, Phase 4's
+                    # own gate) isn't specific enough here.
+                    if "request" not in info.declared_http_handlers:
                         raise CompileError(
-                            f"thread '{thread_name}' never calls postMessage(...) from "
-                            f"its own body, so '{thread_name}.onMessage(...)' would "
-                            f"never fire",
+                            f"'{thread_name}.giveRequest(...)' requires thread "
+                            f"'{thread_name}' to have declared its own "
+                            f"'on request(req:http)' handler -- nothing else would "
+                            f"ever receive a handed-off request",
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid declaration",
                         )
                     if len(expr.args) != 1:
                         raise CompileError(
-                            f"onMessage() expects exactly 1 argument (the callback), "
-                            f"got {len(expr.args)}",
+                            f"giveRequest() expects exactly 1 argument, got "
+                            f"{len(expr.args)}",
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid function argument type",
                         )
-                    fn_type = infer(expr.args[0], scope)
-                    expected = types_mod.FuncType((info.outbound_type,), None)
-                    if fn_type != expected:
+                    # claude.md #213: reuses T? (claude.md #202/#203)
+                    # rather than a new compile-time move-checker (per
+                    # explicit follow-up during this feature's design)
+                    # -- legal only when the argument's OWN static type
+                    # is manually-managed `http?`, i.e. it flowed in
+                    # from an `on request(req:http?)` parameter (or
+                    # another http? binding derived from one). A
+                    # manually-managed value is never auto-retained or
+                    # auto-released by design, so handing it away costs
+                    # nothing to make safe from codegen's own side --
+                    # there is no automatic release racing against the
+                    # receiving thread's own use, because there was
+                    # never any automatic release to begin with. Giving
+                    # away an ordinary (auto-managed) `http` -- one NOT
+                    # declared `?` -- is rejected outright: main's own
+                    # end-of-scope cleanup would still release it right
+                    # out from under the thread this just handed it to.
+                    arg_type = infer(expr.args[0], scope)
+                    if (not isinstance(arg_type, types_mod.HttpType)
+                            or not getattr(arg_type, "manually_managed", False)):
                         raise CompileError(
-                            f"onMessage() expects "
-                            f"func[{types_mod.type_name(info.outbound_type)}]:void, "
-                            f"found {types_mod.type_name(fn_type)}",
+                            f"giveRequest() requires a manually-managed 'http?' "
+                            f"value, found {types_mod.type_name(arg_type)} -- declare "
+                            f"the receiving 'on request(req:http?)' handler's own "
+                            f"parameter with '?' (see claude.md #202's own T? "
+                            f"feature): an ordinary, auto-managed 'http' would still "
+                            f"be released out from under the thread this hands it to",
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid function argument type",
                         )
-                    info.has_onmessage = True
                     return None
                 if callee.prop == "kill":
                     if expr.args:
@@ -3974,6 +4347,34 @@ def analyze(program, filename="<string>"):
         # resize/close get a fixed-signature check; any other event name
         # is unconstrained (and simply never fires -- there's no event
         # source claude.md defines for it).
+        #
+        # claude.md #208: `on message(worker:thread, msg:T)` is the one
+        # exception -- the unified handler for everything sent to main
+        # (`NAME.postMessage(x)` from any thread, or bare postMessage(x)
+        # from inside another thread's own body). Not in
+        # _EVENT_SIGNATURES at all (that table only ever holds FIXED
+        # signatures; `msg`'s own type is the receiver's choice, the
+        # same "declared, not inferred" shape a thread's own `on
+        # message` already has) -- checked here instead, via the same
+        # shared helper analyze_thread's own `on message` handling
+        # uses, and its result recorded into `_main_message_type[0]`
+        # for every bare postMessage(x) call site to check against.
+        if decl.name == "message":
+            if _main_message_type[0] is not None:
+                raise CompileError(
+                    "the program already declares a top-level 'on message' handler",
+                    file=filename, line=decl.line, column=decl.column,
+                    category="duplicate declaration",
+                )
+            _main_message_type[0] = _check_message_handler_params(
+                decl.params, decl, filename, structs, tables, enums,
+                "(worker:thread, msg:T) -- worker is null when sent by main")
+            handler_scope = Scope(global_scope)
+            for p in decl.params:
+                ptype = apply_manually_managed(resolve(p.type_expr, decl), p.manually_managed)
+                handler_scope.define(p.name, Symbol(p.name, ptype, "parameter"), decl, filename)
+            analyze_block(decl.body, handler_scope, return_type=None)
+            return
         entry = _EVENT_SIGNATURES.get(decl.name)
         if entry is not None:
             sig, help_text = entry
@@ -3991,53 +4392,6 @@ def analyze(program, filename="<string>"):
             handler_scope.define(p.name, Symbol(p.name, ptype, "parameter"), decl, filename)
         analyze_block(decl.body, handler_scope, return_type=None)
 
-    def _merge_thread_outbound_type(info, new_type, node):
-        """claude.md #195: folds one `postMessage(x)` call site's
-        inferred type into `info`'s own running outbound type -- see
-        _ThreadInfo's own doc comment. None so far means this is the
-        first site seen (validated for sendability, then becomes it
-        outright); an exact match with what is already there is a
-        no-op.
-
-        More than one DISTINCT type posted from the same thread is a
-        compile error, not auto-merged into an invented enum -- an
-        earlier draft of this DID synthesize one, and it was a dead
-        end: `NAME.onMessage(callback)`'s callback parameter has to be
-        WRITTEN somewhere, in real Festina syntax, and there is no
-        syntax that could ever spell an anonymous, compiler-invented
-        type. The fix mirrors the INBOUND direction's own already-
-        working convention exactly: post a value that is ALREADY typed
-        as a real, pre-declared enum (`enum Out = int, text; ... Out o
-        = 1; postMessage(o)`) if more than one shape needs to cross --
-        the enum member's own coercion (claude.md #176, via
-        check_assignable at the assignment INTO `o`) is what unifies
-        the type before it ever reaches postMessage, so this function
-        sees a single, already-consistent EnumType and never needs to
-        invent one itself."""
-        if not _is_thread_sendable_type(new_type, structs, enums):
-            raise CompileError(
-                f"postMessage({types_mod.type_name(new_type)}) -- "
-                f"{types_mod.type_name(new_type)} cannot cross a thread boundary "
-                f"(see claude.md #195's own list)",
-                file=filename, line=getattr(node, "line", 0), column=getattr(node, "column", 0),
-                category="invalid function argument type",
-            )
-        if info.outbound_type is None:
-            info.outbound_type = new_type
-            return
-        if info.outbound_type == new_type:
-            return
-        raise CompileError(
-            f"thread '{info.node.name}' posts more than one type -- "
-            f"{types_mod.type_name(info.outbound_type)} and "
-            f"{types_mod.type_name(new_type)} -- pre-declare a named enum covering "
-            f"both and post a value already typed as that enum instead (e.g. "
-            f"`enum Out = {types_mod.type_name(info.outbound_type)}, "
-            f"{types_mod.type_name(new_type)}`), the same way multiple inbound "
-            f"types already work",
-            file=filename, line=getattr(node, "line", 0), column=getattr(node, "column", 0),
-            category="invalid function argument type",
-        )
 
     def analyze_thread(decl):
         # claude.md #195: analyzed at its own ORDINARY third-pass
@@ -4132,6 +4486,64 @@ def analyze(program, filename="<string>"):
             info.database_url_node = stmt.expr
             thread_body = thread_body[1:]
             break
+        # claude.md #212: has_http_handler is hoisted -- a single scan
+        # for any of the four HTTP-shaped handler names, BEFORE the
+        # main per-statement loop below runs -- rather than set inline
+        # as each is encountered in textual order. Unlike the bare-
+        # postMessage-needs-a-textually-earlier-top-level-`on message`
+        # rule (a real whole-program ordering constraint), there is no
+        # reason to force `on request`/etc to appear before `on
+        # load()` just because openPort() happens to be called from
+        # inside it -- the whole thread body is known in full before
+        # any of it runs, so gating on textual order here would be a
+        # needless, surprising restriction on ordinary code (writing
+        # `on load()` first, `on request(...)` below it, is the most
+        # natural order to write this in).
+        info.declared_http_handlers = {
+            stmt.name for stmt in thread_body
+            if isinstance(stmt, ast.EventHandler) and stmt.name in _THREAD_HTTP_HANDLER_NAMES
+        }
+        info.has_http_handler = bool(info.declared_http_handlers)
+        # claude.md #210: thread-private helper functions -- a `func`
+        # declared directly in a thread's own body (a sibling of its
+        # state vars/on load/on message/on exit, not nested inside one
+        # of THOSE), callable only from this one thread's own handlers
+        # and other private funcs, with read/write access to this
+        # thread's own state. `thread_functions_scope` is this
+        # thread's OWN, separate function-name namespace -- parented
+        # on `thread_state_scope` (so a private func's own body sees
+        # thread state directly, the same "closes over this thread's
+        # own state" a handler already gets), never on the top-level
+        # `functions_scope` (which would leak every private func into
+        # every OTHER thread, and into main). Two-pass, the identical
+        # "hoist every signature before any call checks" shape
+        # `register_func_signature`'s own whole-program pre-pass
+        # already uses -- but deliberately NOT `_iter_func_decls`
+        # itself, since that recurses into the GLOBAL `functions_scope`
+        # and would defeat the whole point of a SEPARATE, private one.
+        thread_functions_scope = Scope(thread_state_scope)
+        for stmt in thread_body:
+            if not isinstance(stmt, ast.FuncDecl):
+                continue
+            if stmt.name in BUILTIN_FUNCTIONS:
+                raise CompileError(
+                    f"'{stmt.name}' is a builtin function name and cannot be used to "
+                    f"declare a function -- a function declared with this name would be "
+                    f"permanently unreachable, since every call to '{stmt.name}(...)' "
+                    f"resolves to the builtin instead",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="duplicate declaration",
+                )
+            if stmt.name in thread_functions_scope.vars:
+                raise CompileError(
+                    f"thread '{decl.name}' already declares a function named "
+                    f"'{stmt.name}'",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="duplicate declaration",
+                )
+            func_return_type = resolve(stmt.return_type, stmt) if stmt.return_type != "void" else None
+            thread_functions_scope.vars[stmt.name] = Symbol(
+                stmt.name, func_return_type, "thread_function", stmt)
         _current_thread[0] = info
         try:
             for stmt in thread_body:
@@ -4142,8 +4554,10 @@ def analyze(program, filename="<string>"):
                     if stmt.name not in _THREAD_EVENT_SIGNATURES:
                         raise CompileError(
                             f"'on {stmt.name}' is not a thread event -- a thread body "
-                            f"may only declare on load()/on message(p:T)/"
-                            f"on exit(code:int)",
+                            f"may only declare on load()/on message(worker:thread, msg:T)/"
+                            f"on exit(code:int), plus (claude.md #212) on request(req:http)/"
+                            f"on upgrade(s:socket)/on socketMessage(s:socket, msg:blob)/"
+                            f"on socketClose(s:socket)",
                             file=filename, line=stmt.line, column=stmt.column,
                             category="invalid declaration",
                         )
@@ -4154,28 +4568,13 @@ def analyze(program, filename="<string>"):
                             category="duplicate declaration",
                         )
                     seen_handlers.add(stmt.name)
+                    # claude.md #212: info.has_http_handler was already
+                    # set by the hoisting pre-scan just above, before
+                    # this loop started -- nothing to do here.
                     sig, help_text = _THREAD_EVENT_SIGNATURES[stmt.name]
                     if stmt.name == "message":
-                        if len(stmt.params) != 1:
-                            raise CompileError(
-                                f"'on message' must declare {help_text}, got "
-                                f"{len(stmt.params)}",
-                                file=filename, line=stmt.line, column=stmt.column,
-                                category="invalid function argument type",
-                            )
-                        msg_type = apply_manually_managed(
-                            resolve(stmt.params[0].type_expr, stmt),
-                            stmt.params[0].manually_managed)
-                        if not _is_thread_sendable_type(msg_type, structs, enums):
-                            raise CompileError(
-                                f"'on message(p:{types_mod.type_name(msg_type)})': "
-                                f"{types_mod.type_name(msg_type)} cannot cross a thread "
-                                f"boundary -- func/http/socket/regex/table values are "
-                                f"not sendable (see claude.md #195's own list)",
-                                file=filename, line=stmt.line, column=stmt.column,
-                                category="invalid function argument type",
-                            )
-                        info.inbound_type = msg_type
+                        info.inbound_type = _check_message_handler_params(
+                            stmt.params, stmt, filename, structs, tables, enums, help_text)
                     else:
                         param_types = tuple(apply_manually_managed(resolve(p.type_expr, stmt), p.manually_managed)
                                              for p in stmt.params)
@@ -4185,17 +4584,41 @@ def analyze(program, filename="<string>"):
                                 file=filename, line=stmt.line, column=stmt.column,
                                 category="invalid function argument type",
                             )
-                    handler_scope = Scope(thread_state_scope)
+                    # claude.md #210: parented on thread_functions_scope
+                    # (not thread_state_scope directly), so a handler
+                    # can call this thread's own private funcs -- which
+                    # transitively still sees thread_state_scope/
+                    # functions_scope too, exactly as before.
+                    handler_scope = Scope(thread_functions_scope)
                     for p in stmt.params:
                         ptype = apply_manually_managed(resolve(p.type_expr, stmt), p.manually_managed)
                         handler_scope.define(p.name, Symbol(p.name, ptype, "parameter"),
                                               stmt, filename)
                     analyze_block(stmt.body, handler_scope, return_type=None)
                     continue
+                if isinstance(stmt, ast.FuncDecl):
+                    # claude.md #210: the BODY half -- the signature was
+                    # already hoisted into thread_functions_scope above,
+                    # the same "hoist first, analyze bodies at their own
+                    # textual position" split register_func_signature/
+                    # analyze_func already use at the top level. Parented
+                    # on thread_functions_scope, not thread_state_scope
+                    # directly, so one private func can call ANOTHER
+                    # (declared anywhere in this thread's body, thanks
+                    # to hoisting -- order among private funcs doesn't
+                    # matter, same as top-level).
+                    func_sym = thread_functions_scope.vars[stmt.name]
+                    func_scope = Scope(thread_functions_scope)
+                    for p in stmt.params:
+                        ptype = apply_manually_managed(resolve(p.type_expr, stmt), p.manually_managed)
+                        func_scope.define(p.name, Symbol(p.name, ptype, "parameter"),
+                                           stmt, filename)
+                    analyze_block(stmt.body, func_scope, return_type=func_sym.type)
+                    continue
                 raise CompileError(
                     f"a thread's own body may only contain state declarations "
-                    f"(e.g. 'map[text] state') and on load()/on message(p:T)/"
-                    f"on exit(code:int) handlers",
+                    f"(e.g. 'map[text] state'), func declarations, and "
+                    f"on load()/on message(p:T)/on exit(code:int) handlers",
                     file=filename, line=getattr(stmt, "line", decl.line),
                     column=getattr(stmt, "column", decl.column),
                     category="invalid declaration",
@@ -4500,28 +4923,14 @@ def analyze(program, filename="<string>"):
                 category="invalid assignment",
             )
 
-    # claude.md #195: the symmetric "no dead sends" check -- a thread
-    # whose body posts anything (info.outbound_type is not None) but is
-    # never the target of a `NAME.onMessage(...)` registration anywhere
-    # in the program is a compile error, the mirror of
-    # `NAME.postMessage(x)` against a thread with no `on message`
-    # handler (checked immediately, inline, at that call site itself --
-    # see _infer_call's ThreadType dispatch). This one genuinely can't
-    # be checked until the WHOLE program has been walked, since
-    # `.onMessage(...)` may be registered anywhere, including textually
-    # before the thread's own declaration. A thread that never posts
-    # anything needs no `.onMessage()` registration at all (nothing
-    # would ever arrive) and is not an error.
-    for name, info in threads.items():
-        if info.outbound_type is not None and not info.has_onmessage:
-            line, column = (info.postmessage_sites[0] if info.postmessage_sites
-                             else (info.node.line, info.node.column))
-            raise CompileError(
-                f"thread '{name}' calls postMessage(...) but nothing ever "
-                f"registers '{name}.onMessage(...)' anywhere in the program",
-                file=filename, line=line, column=column,
-                category="invalid declaration",
-            )
+    # claude.md #208: the old "no dead sends" whole-program check
+    # (a thread that posts but nothing ever registers .onMessage(...)
+    # for it) is gone along with .onMessage(...) itself -- bare
+    # postMessage(x) now checks `_main_message_type[0]` directly, at
+    # its own call site, the moment it's compiled (see _infer_call),
+    # the same "declared before referenced" program-order rule every
+    # other name in this language already has, needing no separate
+    # end-of-program pass.
 
     # claude.md #199 Phase 5: a thread's own private database and the
     # main program's are each just a path on disk -- nothing stops one
@@ -4575,4 +4984,5 @@ def analyze(program, filename="<string>"):
                     category="invalid declaration",
                 )
 
-    return AnalyzedProgram(global_scope.vars, structs, tables, enums, imports, threads)
+    return AnalyzedProgram(global_scope.vars, structs, tables, enums, imports, threads,
+                            main_message_type=_main_message_type[0])

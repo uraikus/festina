@@ -85,16 +85,29 @@ class EnumType:
 
 @dataclass(frozen=True)
 class ThreadType:
-    """claude.md #195: `thread NAME { ... }` -- name-only, exactly like
-    StructType/TableType/EnumType above. `NAME` itself becomes a global
-    value of this type, supporting exactly five methods: `.postMessage(x)`,
-    `.onMessage(callback)`, `.kill()`, `.live(callback)`, `.isAlive()`.
-    The real inbound/outbound message types (both INFERRED, never
-    declared -- see semantic.py's own thread-analysis comments) live in
+    """claude.md #195/#208: `thread NAME { ... }` -- name-only, exactly
+    like StructType/TableType/EnumType above. `NAME` itself becomes a
+    global value of this type, supporting `.postMessage(x)`, `.kill()`,
+    `.live(callback)`, `.isAlive()`. The real inbound message type
+    (DECLARED, on this thread's own `on message(worker:thread, msg:T)`
+    handler -- see semantic.py's own thread-analysis comments) lives in
     a separate `threads` dict (semantic.py's AnalyzedProgram, mirrored
     in codegen.py's self.threads), the same split every other name-only
-    type here already uses."""
-    name: str
+    type here already uses.
+
+    claude.md #208: `name` is `None` for the GENERIC variant -- the
+    type spelled by the bare `thread` keyword in a parameter position
+    (`on message(worker:thread, msg:T)`), resolved once, in
+    resolve_type_name, alongside every other builtin type keyword.
+    This is deliberately a DIFFERENT value from any specific declared
+    thread's own `ThreadType("someName")` (dataclass equality means the
+    two never compare equal) -- there is no way for ordinary Festina
+    code to construct a `thread`-typed value itself; `worker`'s own
+    value only ever arrives via message delivery (the sender's own
+    handle, boxed by the runtime at every postMessage/bare-postMessage
+    send site), so no widening/narrowing conversion between the named
+    and generic forms is needed anywhere in this compiler."""
+    name: str | None
 
     def __repr__(self):
         return f"ThreadType({self.name})"

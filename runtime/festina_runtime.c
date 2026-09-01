@@ -539,6 +539,28 @@ static int festina_json_try_null(FestinaJsonCursor *c) {
     return 0;
 }
 
+/* claude.md #206: reads exactly 4 hex digits (the payload of a JSON
+ * `\uXXXX` escape) and returns the 16-bit value they encode; throws on
+ * anything else (running past the end of input, or a non-hex
+ * character) -- the same "malformed input is a real error, never
+ * silently guessed at" convention every other JSON parsing helper here
+ * already follows. */
+static int festina_json_read_hex4(FestinaJsonCursor *c) {
+    int value = 0;
+    for (int i = 0; i < 4; i++) {
+        if (c->pos >= c->len) festina_json_throwf("unterminated \\u escape");
+        char ch = c->s[c->pos];
+        int digit;
+        if (ch >= '0' && ch <= '9') digit = ch - '0';
+        else if (ch >= 'a' && ch <= 'f') digit = ch - 'a' + 10;
+        else if (ch >= 'A' && ch <= 'F') digit = ch - 'A' + 10;
+        else { festina_json_throwf("invalid \\u escape at position %lld", (long long)c->pos); return 0; }
+        value = (value << 4) | digit;
+        c->pos++;
+    }
+    return value;
+}
+
 static char *festina_json_parse_string(FestinaJsonCursor *c) {
     festina_json_skip_ws(c);
     if (c->pos >= c->len || c->s[c->pos] != '"') {
@@ -565,16 +587,72 @@ static char *festina_json_parse_string(FestinaJsonCursor *c) {
                 case 'n': decoded = '\n'; break;
                 case 'r': decoded = '\r'; break;
                 case 't': decoded = '\t'; break;
+                case 'u': {
+                    /* claude.md #206: closes the gap claude.md #159
+                     * left documented ("\u unicode escapes are not yet
+                     * supported") -- decodes the escape to a Unicode
+                     * codepoint (combining a UTF-16 surrogate pair into
+                     * one codepoint outside the Basic Multilingual
+                     * Plane when the input calls for it, exactly as
+                     * JSON's own \u encoding requires) and UTF-8
+                     * encodes it directly into `out`, growing capacity
+                     * for however many bytes that codepoint needs (1-4)
+                     * -- a genuinely variable-width write the single
+                     * shared `decoded`-then-append path below can't
+                     * express, so this case writes `out` itself and
+                     * `continue`s the outer loop rather than falling
+                     * through to that path. */
+                    int cp = festina_json_read_hex4(c);
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {
+                        if (c->pos + 1 >= c->len || c->s[c->pos] != '\\' || c->s[c->pos + 1] != 'u') {
+                            free(out);
+                            festina_json_throwf("unpaired UTF-16 surrogate \\u%04x", cp);
+                        }
+                        c->pos += 2;
+                        int low = festina_json_read_hex4(c);
+                        if (low < 0xDC00 || low > 0xDFFF) {
+                            free(out);
+                            festina_json_throwf("expected a low surrogate after \\u%04x, found \\u%04x", cp, low);
+                        }
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                        free(out);
+                        festina_json_throwf("unpaired UTF-16 surrogate \\u%04x", cp);
+                    }
+                    unsigned char utf8[4];
+                    int n;
+                    if (cp < 0x80) {
+                        utf8[0] = (unsigned char)cp;
+                        n = 1;
+                    } else if (cp < 0x800) {
+                        utf8[0] = (unsigned char)(0xC0 | (cp >> 6));
+                        utf8[1] = (unsigned char)(0x80 | (cp & 0x3F));
+                        n = 2;
+                    } else if (cp < 0x10000) {
+                        utf8[0] = (unsigned char)(0xE0 | (cp >> 12));
+                        utf8[1] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+                        utf8[2] = (unsigned char)(0x80 | (cp & 0x3F));
+                        n = 3;
+                    } else {
+                        utf8[0] = (unsigned char)(0xF0 | (cp >> 18));
+                        utf8[1] = (unsigned char)(0x80 | ((cp >> 12) & 0x3F));
+                        utf8[2] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+                        utf8[3] = (unsigned char)(0x80 | (cp & 0x3F));
+                        n = 4;
+                    }
+                    if (len + n + 1 > cap) {
+                        while (len + n + 1 > cap) cap *= 2;
+                        char *grown = realloc(out, cap);
+                        if (!grown) { free(out); festina_json_throwf("out of memory parsing a JSON string"); }
+                        out = grown;
+                    }
+                    memcpy(out + len, utf8, n);
+                    len += n;
+                    continue;
+                }
                 default:
                     free(out);
-                    /* claude.md #159: \u unicode escapes are a
-                     * documented v1 scope cut, not silently mishandled
-                     * -- raw (unescaped) non-ASCII UTF-8 bytes in a
-                     * string are unaffected and parse completely
-                     * normally; this only affects a producer that
-                     * specifically chooses to \u-escape. */
-                    if (esc == 'u') festina_json_throwf("\\u unicode escapes are not yet supported");
-                    else festina_json_throwf("invalid escape sequence '\\%c'", esc);
+                    festina_json_throwf("invalid escape sequence '\\%c'", esc);
                     return NULL; /* unreachable */
             }
         } else if (ch < 0x20) {
@@ -2568,6 +2646,17 @@ sqlite3 *festina_db_open(const char *path) {
  * never shares an LLVM global with another thread's, or with main's),
  * so it is never actually touched by two threads and needs no lock. */
 static sqlite3_stmt **g_cached_stmts = NULL;
+/* claude.md #207: parallel to g_cached_stmts (same index, same count/
+ * cap, grown and shrunk together) -- the sqlite3* each cached
+ * statement was PREPARED AGAINST. Added specifically so
+ * festina_thread_db_close (below) can finalize only the entries that
+ * belong to the one connection it's closing, leaving every other
+ * thread's -- and main's own -- still-live cached statements alone;
+ * festina_db_close's own indiscriminate "finalize everything" loop
+ * predates this and is intentionally left as-is (it only ever runs
+ * once, at real process shutdown, when nothing else is still using
+ * the registry). */
+static sqlite3 **g_cached_stmt_dbs = NULL;
 static int g_cached_stmt_count = 0;
 static int g_cached_stmt_cap = 0;
 static void (*g_stmt_cache_lock)(void) = NULL;
@@ -2594,8 +2683,14 @@ sqlite3_stmt *festina_sqlite_prepare_cached(sqlite3 *db, const char *sql,
                                        (size_t)g_cached_stmt_cap * sizeof(*grown));
         if (!grown) festina_fail("out of memory caching a statement");
         g_cached_stmts = grown;
+        sqlite3 **dbs_grown = realloc(g_cached_stmt_dbs,
+                                      (size_t)g_cached_stmt_cap * sizeof(*dbs_grown));
+        if (!dbs_grown) festina_fail("out of memory caching a statement");
+        g_cached_stmt_dbs = dbs_grown;
     }
-    g_cached_stmts[g_cached_stmt_count++] = stmt;
+    g_cached_stmts[g_cached_stmt_count] = stmt;
+    g_cached_stmt_dbs[g_cached_stmt_count] = db;
+    g_cached_stmt_count++;
     if (g_stmt_cache_unlock) g_stmt_cache_unlock();
     *slot = stmt;
     return stmt;
@@ -2899,6 +2994,47 @@ void festina_db_close(sqlite3 *db) {
     int rc = sqlite3_close(db);
     if (rc != SQLITE_OK) {
         fprintf(stderr, "festina_db_close: sqlite3_close returned %d (%s) -- "
+                "a statement or blob handle was still open\n", rc, sqlite3_errmsg(db));
+    }
+}
+
+/* claude.md #207: closes ONE thread's own private sqlite handle, at the
+ * point that thread's own worker actually stops (see
+ * festina_runtime_thread.c's own festina_thread_main and
+ * festina_thread_set_db_close) -- deliberately NOT festina_db_close
+ * reused as-is, because that function's own finalize loop walks the
+ * ENTIRE process-wide g_cached_stmts registry unconditionally, which
+ * is only safe to do once, at real process shutdown, when nothing
+ * else is still running. Calling it from a thread that's merely being
+ * killed (a `kill()`/`live()` cycle, or one thread exiting while
+ * others -- or main -- are still alive and querying their OWN,
+ * different connections) would finalize every OTHER live thread's
+ * cached prepared statements out from under it, corrupting state a
+ * still-running thread has no reason to expect changed.
+ *
+ * Scoped correctly instead: only finalizes the registry entries this
+ * DB's own connection actually owns (g_cached_stmt_dbs tracks that
+ * per entry, added specifically for this), compacting the arrays in
+ * place, then closes -- leaving every other connection's own cached
+ * statements untouched. */
+void festina_thread_db_close(sqlite3 *db) {
+    if (!db) return;
+    if (g_stmt_cache_lock) g_stmt_cache_lock();
+    int w = 0;
+    for (int i = 0; i < g_cached_stmt_count; i++) {
+        if (g_cached_stmt_dbs[i] == db) {
+            sqlite3_finalize(g_cached_stmts[i]);
+            continue;
+        }
+        g_cached_stmts[w] = g_cached_stmts[i];
+        g_cached_stmt_dbs[w] = g_cached_stmt_dbs[i];
+        w++;
+    }
+    g_cached_stmt_count = w;
+    if (g_stmt_cache_unlock) g_stmt_cache_unlock();
+    int rc = sqlite3_close(db);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "festina_thread_db_close: sqlite3_close returned %d (%s) -- "
                 "a statement or blob handle was still open\n", rc, sqlite3_errmsg(db));
     }
 }
@@ -3971,10 +4107,12 @@ void festina_run_timer_loop(void) {
         }
         festina_fire_expired_timers();
         festina_async_io_drain();
-        /* claude.md #195 Phase 2: delivers any thread's own pending
-         * outbound message(s) to its registered onMessage() callback,
-         * same placement as festina_async_io_drain just above -- a
-         * no-op for a program with no `thread` declaration at all. */
+        /* claude.md #195/#208: delivers any thread's own pending
+         * outbound message(s) to the ONE registered top-level `on
+         * message` handler, same placement as festina_async_io_drain
+         * just above -- a no-op for a program with no `thread`
+         * declaration at all, or one that declares threads but never
+         * a top-level `on message` handler. */
         festina_thread_drain();
     }
 }

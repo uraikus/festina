@@ -116,18 +116,38 @@ build_runtime async festina_runtime_async.c || exit 1
 # "async" just above (pure POSIX pthread, no pkg-config dependency),
 # its own separate translation unit.
 build_runtime thread festina_runtime_thread.c || exit 1
-GFX_OK=0; AUD_OK=0
+# claude.md #151/#212: openPort()/on request/... -- same shape as
+# "thread"/"async" just above (pure POSIX, no pkg-config dependency of
+# its own), so this is also linked unconditionally rather than probed.
+# Previously absent from this script entirely -- no stress test could
+# exercise http at all until claude.md #212 (a thread's own private
+# HTTP context) needed one.
+build_runtime http festina_runtime_http.c || exit 1
+GFX_OK=0; AUD_OK=0; HTTPS_OK=0
 if pkg-config --exists cairo-xlib x11 libjpeg; then
     build_runtime graphics festina_runtime_graphics.c $(pkg-config --cflags cairo-xlib x11 libjpeg) && GFX_OK=1
 fi
 if pkg-config --exists alsa libmpg123; then
     build_runtime audio festina_runtime_audio.c $(pkg-config --cflags alsa libmpg123) && AUD_OK=1
 fi
+# claude.md #212: mbedTLS-backed -- probed the same way graphics/audio
+# are, a real, routinely-absent system dependency, unlike core/async/
+# thread/http just above. Needed by any stress program that calls
+# `req.send()` (the http CLIENT form) at all, not just one that calls
+# openSecurePort() -- api.md's own note on `req.send()`: the scheme is
+# read from the url value at RUNTIME, so both plain and TLS codepaths
+# are always linked into any program using the client form, exactly
+# the same way festina/cli.py's own per-feature object file selection
+# already does for a normally-compiled program.
+if pkg-config --exists mbedtls mbedx509 mbedcrypto; then
+    build_runtime https festina_runtime_https.c $(pkg-config --cflags mbedtls mbedx509 mbedcrypto) && HTTPS_OK=1
+fi
 
 LIBS=(-lsqlite3 -lm -pthread)
-OBJS=("$WORK/rt_core.o" "$WORK/rt_async.o" "$WORK/rt_thread.o")
+OBJS=("$WORK/rt_core.o" "$WORK/rt_async.o" "$WORK/rt_thread.o" "$WORK/rt_http.o")
 [ $GFX_OK = 1 ] && { OBJS+=("$WORK/rt_graphics.o"); LIBS+=($(pkg-config --libs cairo-xlib x11 libjpeg)); }
 [ $AUD_OK = 1 ] && { OBJS+=("$WORK/rt_audio.o"); LIBS+=($(pkg-config --libs alsa libmpg123)); }
+[ $HTTPS_OK = 1 ] && { OBJS+=("$WORK/rt_https.o"); LIBS+=($(pkg-config --libs mbedtls mbedx509 mbedcrypto)); }
 
 failures=0
 for src in "${PROGRAMS[@]}"; do

@@ -318,6 +318,7 @@ sentinels get -- _bool_cond's own comment covers exactly what happens
 (nonzero, so treated as truthy), which is a consistent, documented
 choice rather than proper defined behavior.
 """
+import dataclasses
 import struct
 
 from . import ast
@@ -519,6 +520,39 @@ def _is_manually_managed(t):
     point of `T?` is that the program, not the compiler, decides when
     (if ever) it's released."""
     return getattr(t, "manually_managed", False)
+
+
+def _bare_type(t):
+    """claude.md #205: strips `manually_managed` back off a type that
+    legitimately carries it for ONE narrow purpose -- a thread's own
+    `info.inbound_type` (claude.md #203's own deliberate exception to
+    "codegen keeps every type bare," needed so `_emit_thread_clone_
+    value`/`_thread_payload_release_fn`/`_is_thread_clonable_type` can
+    read `_is_manually_managed` directly off it) -- before it reaches
+    anywhere ELSE that stores a value's type for ordinary dispatch,
+    where it must NOT carry the flag, for the identical reason every
+    other declaration/parameter site in this file already keeps its
+    own type bare (see `_is_manually_managed`'s own doc comment): a
+    manually-managed `blob`/`regex` binding is otherwise silently
+    misdispatched by the handful of exact-equality (`== BLOB`/`==
+    REGEX`) checks elsewhere in this file that predate `T?` and were
+    never taught to look past the flag -- confirmed directly, not
+    just reasoned about: `on message(p:blob?) { p.write(...) }`
+    raised a real "cannot access field 'write' on blob?" CodegenError
+    before this existed, `inbound_type` (flagged) having been passed
+    straight into `_emit_param_bindings`'s own `body_env` binding for
+    the handler's own parameter. A no-op for every OTHER type here
+    (struct/arr[T]/map[T]/enum/img/aud/http/socket/url dispatch by
+    `isinstance`, already flag-agnostic) -- this exists specifically
+    for blob (no dedicated dataclass to `isinstance` against) and
+    regex (compared via `== REGEX` in a few places), and is written
+    generically rather than special-cased to those two so it stays
+    correct if a future exact-equality check joins them."""
+    if not _is_manually_managed(t):
+        return t
+    if isinstance(t, types_mod.PrimitiveType):
+        return types_mod.PrimitiveType(t.name)
+    return dataclasses.replace(t, manually_managed=False)
 
 FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
 # claude.md #174: amor arr[T] -- an "amortized array". Byte-compatible
@@ -741,6 +775,17 @@ def _llvm_type(t):
         # through dedicated accessor calls" shape http/socket already
         # have.
         return "ptr"
+    if isinstance(t, types_mod.ThreadType):
+        # claude.md #208: a bare FestinaThreadHandle*, opaque to
+        # codegen, never allocated or freed by ordinary Festina code --
+        # every declared thread's own handle is registered exactly
+        # once, in main()'s own prologue, and lives for the process's
+        # whole lifetime, the identical "immortal, no refcount needed"
+        # shape FuncType/FontType already have just below. Applies
+        # equally to the generic `worker:thread` parameter type
+        # (name=None) and any specific declared thread's own type --
+        # both are the same one-word pointer at this level.
+        return "ptr"
     if isinstance(t, types_mod.ColorType):
         # claude.md #91: a packed 0xRRGGBB integer (negative for 'none')
         # -- see _pack_color. One register, and an integer compare is
@@ -952,14 +997,16 @@ class CodeGen:
         self.threads = {}                      # thread name -> dict of codegen-owned symbols,
                                                 # populated by _emit_thread_decl: handle_global
                                                 # (the `ptr` global holding this thread's own
-                                                # FestinaThreadHandle*), inbound_type/
-                                                # outbound_type (copied from
-                                                # self.analyzed.threads[name] for convenience),
-                                                # onmessage_cb_global/out_trampoline (both None
-                                                # until the first `NAME.onMessage(...)` call site
-                                                # is emitted -- see that dispatch below)
-        self._current_thread_ctx = None        # claude.md #195 Phase 2 (widened by #199 Phase 5):
-                                                # (thread_name, handle_global, outbound_type,
+                                                # FestinaThreadHandle*), inbound_type (copied
+                                                # from self.analyzed.threads[name] for
+                                                # convenience), db_global. claude.md #208: no
+                                                # more onmessage_cb_global/out_trampoline -- the
+                                                # per-thread NAME.onMessage(callback) mechanism
+                                                # is gone, replaced by one program-wide top-level
+                                                # `on message` handler (self.main_message_handler_
+                                                # symbol, below).
+        self._current_thread_ctx = None        # claude.md #195 Phase 2 (widened by #199 Phase 5,
+                                                # narrowed by #208): (thread_name, handle_global,
                                                 # db_global) while emitting a thread's own
                                                 # on_load/on_message/on_exit body, else None --
                                                 # mirrors semantic.py's own _current_thread[0]
@@ -971,6 +1018,22 @@ class CodeGen:
                                                 # bare `postMessage(x)`
                                                 # dispatch (the only thing that needs to know "am
                                                 # I inside a thread body right now") consults.
+        self.thread_pools = {}                 # claude.md #209: pool thread NAME -> dict of
+                                                # {"pool_size", "inbound_type",
+                                                # "handle_globals" (a list of N handle_global
+                                                # names, index-order)}. Kept PARALLEL to
+                                                # self.threads rather than making that dict
+                                                # polymorphic -- a pool's own N instances are each
+                                                # emitted through the ordinary, unchanged
+                                                # _emit_thread_decl/_emit_thread_on_load/etc. path,
+                                                # one per mangled instance name (`NAME$0`...
+                                                # `NAME$N-1`), each getting its own real entry in
+                                                # self.threads (so the existing startup
+                                                # registration loop, which just iterates
+                                                # self.threads.items(), needs no changes at all).
+                                                # This dict exists only so a USE site
+                                                # (`pool[i].postMessage(...)`) can find the N
+                                                # handle globals to runtime-select among.
         self._struct_clone_fns = {}            # claude.md #197 Phase 3: struct name -> LLVM
                                                 # function name of its own lazily-generated
                                                 # deep-clone wrapper -- see _clone_fn_for_struct's
@@ -1046,8 +1109,22 @@ class CodeGen:
                                                 # already do -- see _check_platform_feature_supported.
         self.http_request_handler_symbol = None
         self.http_upgrade_handler_symbol = None
-        self.http_message_handler_symbol = None
+        self.http_message_handler_symbol = None   # claude.md #151/#208: WebSocket frames --
+                                                    # `on socketMessage(s:socket, msg:blob)`
+                                                    # (renamed from `on message`, which now
+                                                    # names the unified thread-messaging handler
+                                                    # below).
         self.http_socketclose_handler_symbol = None
+        self.main_message_handler_symbol = None    # claude.md #208: the ONE top-level
+                                                    # `on message(worker:thread, msg:T)` handler
+                                                    # -- everything sent to main (from any
+                                                    # thread) is delivered here. Replaces the old
+                                                    # per-thread onmessage_cb_global/out_trampoline
+                                                    # dynamic-callback-registration mechanism
+                                                    # entirely -- this is a single, statically-
+                                                    # known symbol, registered once, the same
+                                                    # shape http_request_handler_symbol already
+                                                    # has.
         self.uses_https = False                # claude.md #160: openSecurePort() specifically --
                                                 # narrower than uses_http (set alongside it, see
                                                 # openSecurePort's own dispatch branch below): a
@@ -1476,9 +1553,47 @@ class CodeGen:
             # claude.md #195 Phase 2: `thread NAME { ... }`.
             "declare ptr @festina_thread_register(ptr, ptr, ptr, ptr, ptr)",
             "declare void @festina_thread_spawn(ptr)",
-            "declare void @festina_thread_post(ptr, ptr)",
+            # claude.md #208: festina_thread_post's own `sender` param
+            # (2nd) -- `null` when called from main, or the calling
+            # thread's own handle when a thread messages another
+            # thread directly (see the ThreadType Member-call
+            # postMessage codegen, above).
+            "declare void @festina_thread_post(ptr, ptr, ptr)",
             "declare void @festina_thread_post_outbound(ptr, ptr)",
-            "declare void @festina_thread_set_out_callback(ptr, ptr)",
+            # claude.md #208: replaces the old per-thread
+            # festina_thread_set_out_callback -- ONE handler,
+            # registered once, receives every thread's own outbound
+            # queue drain (see festina_thread_drain_impl's own
+            # rewritten dispatch).
+            "declare void @festina_set_global_message_handler(ptr)",
+            # claude.md #207: closes a thread's own private sqlite
+            # handle when its worker actually stops (kill()/process
+            # teardown) -- see _emit_thread_db_close_trampoline.
+            "declare void @festina_thread_set_db_close(ptr, ptr)",
+            "declare void @festina_thread_db_close(ptr)",
+            # claude.md #212 (Phase 4): the db_close hook's own shape,
+            # for a thread's own private HTTP context -- see
+            # festina_thread_set_http_context's own doc comment in
+            # festina_runtime.h. festina_thread_http_service_pass/
+            # _teardown are festina_runtime_http.c's own real
+            # functions, passed here purely as `ptr` values (never
+            # called by name from generated IR) -- declaring them
+            # non-opaque (with their real C parameter shape) would add
+            # nothing, so they're declared the same `ptr`-typed way
+            # every other function-pointer-valued argument already is
+            # in this file.
+            "declare void @festina_thread_set_http_context(ptr, ptr, ptr, ptr)",
+            "declare void @festina_thread_http_service_pass(i32)",
+            "declare void @festina_thread_http_teardown()",
+            # claude.md #213 (Phase 5 -- giveRequest): festina_conn_detach
+            # lives in festina_runtime_http.c (it needs http internals);
+            # festina_thread_give_request lives in
+            # festina_runtime_thread.c (it treats the detached
+            # connection as an opaque ptr, never looking inside it) --
+            # see each one's own doc comment for the full split.
+            "declare ptr @festina_conn_detach(ptr)",
+            "declare void @festina_thread_give_request(ptr, ptr, ptr)",
+            "declare void @festina_thread_deliver_given_request(ptr)",
             "declare void @festina_thread_kill(ptr)",
             "declare void @festina_thread_live(ptr, ptr)",
             "declare i8 @festina_thread_is_alive(ptr)",
@@ -2100,10 +2215,26 @@ class CodeGen:
             self._emit_func(stmt)
             return
         if isinstance(stmt, ast.EventHandler):
-            self._emit_event_handler(stmt)
+            if stmt.name == "message":
+                # claude.md #208: the unified top-level `on message(
+                # worker:thread, msg:T)` handler is NOT an ordinary
+                # event handler -- its own parameters arrive as a
+                # boxed thread-queue payload (sender, payload), the
+                # identical shape a thread's own on_message adapter
+                # unboxes (_emit_thread_on_message), not two plain
+                # already-typed LLVM parameters the way _emit_event_
+                # handler's generic body-emission assumes every other
+                # `on NAME(...)` handler has -- so this is dispatched
+                # to its own dedicated emitter instead.
+                self._emit_main_on_message(stmt)
+            else:
+                self._emit_event_handler(stmt)
             return
         if isinstance(stmt, ast.ThreadDecl):
-            self._emit_thread_decl(stmt)
+            if stmt.pool_size is not None:
+                self._emit_thread_pool_decl(stmt)
+            else:
+                self._emit_thread_decl(stmt)
             return
         if isinstance(stmt, ast.VarDecl):
             # claude.md #202: `type_` here is deliberately the BARE
@@ -2542,7 +2673,7 @@ class CodeGen:
             elif isinstance(stmt, (ast.WhileStmt, ast.ForStmt)):
                 self._register_all_func_signatures(stmt.body.body)
 
-    def _emit_func(self, decl):
+    def _emit_func(self, decl, symbol=None, outer_env=None, thread_ctx=None):
         # claude.md #140: signature already registered by generate()'s
         # own pre-pass (_register_all_func_signatures) before this ever
         # runs -- re-resolving return_type here is cheap and side-effect
@@ -2552,12 +2683,26 @@ class CodeGen:
         # self.func_decls (which stores the raw ast.FuncDecl, not its
         # resolved return type) into this still fully self-contained
         # function.
+        #
+        # claude.md #210: `symbol`/`outer_env`/`thread_ctx` are all
+        # None for an ordinary top-level function (the only caller
+        # before this phase) -- reused, not duplicated, for a thread-
+        # private helper: `symbol` is its own mangled name, `outer_env`
+        # is that thread's own `state_env` (so the body sees thread
+        # state directly, the same "closes over this thread's own
+        # state" a handler already gets), and `thread_ctx` is set as
+        # `self._current_thread_ctx` around the BODY only (mirroring
+        # `_emit_thread_on_load`/`_on_message`/`_on_exit`'s own
+        # identical save/set/restore pattern exactly), so a private
+        # func's own body may call bare `postMessage(x)` or another
+        # thread's `NAME.postMessage(x)` exactly like a handler can.
+        symbol = symbol if symbol is not None else f"@{decl.name}"
         return_type = None if decl.return_type == "void" else self._resolve(decl.return_type, decl)
         param_types = [self._resolve(p.type_expr, decl) for p in decl.params]
         llvm_ret = "void" if return_type is None else _llvm_type(return_type)
         params_ir = ", ".join(f"{_llvm_type(t)} %arg.{p.name}" for t, p in zip(param_types, decl.params))
 
-        body_env = Env(self.global_env)
+        body_env = Env(outer_env if outer_env is not None else self.global_env)
         body_lines = []
         entry_label = self.label("entry")
         self._start_block(entry_label, body_lines)
@@ -2594,7 +2739,13 @@ class CodeGen:
         self._active_free_locals.append([])
         escaping = self._emit_param_bindings(decl, param_types, body_env, body_lines)
 
-        block = self._emit_analyzed_func_body(decl, body_env, return_type, body_lines, escaping)
+        saved_ctx = self._current_thread_ctx
+        if thread_ctx is not None:
+            self._current_thread_ctx = thread_ctx
+        try:
+            block = self._emit_analyzed_func_body(decl, body_env, return_type, body_lines, escaping)
+        finally:
+            self._current_thread_ctx = saved_ctx
         if not block["terminated"]:
             # claude.md never says whether a non-void function must
             # return a value on every code path (unlike the
@@ -2620,7 +2771,7 @@ class CodeGen:
         self._active_free_locals.pop()
         self._current_func_frame_base = saved_func_frame_base
 
-        func = [f"define {llvm_ret} @{decl.name}({params_ir}) {{"]
+        func = [f"define {llvm_ret} {symbol}({params_ir}) {{"]
         func.extend(block["lines"])
         func.append("}")
         self.func_defs.extend(func)
@@ -2686,8 +2837,8 @@ class CodeGen:
             # not set self.uses_graphics or join event_handlers (whose
             # own registration loop is graphics-gated).
             self.exit_handler_symbol = symbol
-        elif decl.name in ("request", "upgrade", "message", "socketClose"):
-            # claude.md #151: NOT graphics events either -- same
+        elif decl.name in ("request", "upgrade", "socketMessage", "socketClose"):
+            # claude.md #151/#208: NOT graphics events either -- same
             # unconditional-registration shape as `exit` just above,
             # for the same reason (an http/websocket connection has
             # nothing to do with a window). Declaring one of these
@@ -2696,15 +2847,63 @@ class CodeGen:
             # connection), but still sets uses_http so the runtime
             # translation unit these symbols reference is always
             # linked in wherever any of the four is declared.
+            # `socketMessage` (renamed from `message` -- see the
+            # branch just below) is WebSocket frames specifically.
             self.uses_http = True
             if decl.name == "request":
                 self.http_request_handler_symbol = symbol
             elif decl.name == "upgrade":
                 self.http_upgrade_handler_symbol = symbol
-            elif decl.name == "message":
+            elif decl.name == "socketMessage":
                 self.http_message_handler_symbol = symbol
             else:
                 self.http_socketclose_handler_symbol = symbol
+
+    def _emit_main_on_message(self, decl):
+        """claude.md #208: the ONE top-level `on message(worker:thread,
+        msg:T)` handler -- every message sent to main, from any thread
+        (a `NAME.postMessage(x)` call inside that thread's own body, or
+        the bare, context-implicit `postMessage(x)` form -- see
+        _emit_call's own comment on that). Mirrors _emit_thread_on_
+        message closely (the SAME unboxing shape: `%sender` is already
+        a bare `ptr`, no unboxing needed; `%payload` needs the ordinary
+        boxed-value unboxing every thread message payload already
+        gets) -- the two real differences are (1) this runs on MAIN's
+        own OS thread, so its body_env is `Env(self.global_env)`, not a
+        thread's own namespaced state_env, and (2) there is no
+        thread_ctx to set (`self._current_thread_ctx` stays None while
+        this body is emitted -- bare postMessage(x) is illegal from
+        inside it, exactly as it already is anywhere else outside a
+        thread body, since main has no "send to whoever's listening to
+        ME" concept of its own)."""
+        symbol = f"@__festina_on_{decl.name}"
+        msg_type = self.analyzed.main_message_type
+        self._check_thread_clonable_type(msg_type, "a postMessage() argument", decl)
+        worker_param, msg_param = decl.params
+        lines = []
+        self._start_block(self.label("entry"), lines)
+        worker_ref = f"%arg.{worker_param.name}"
+        lines.append(f"  {worker_ref} = getelementptr i8, ptr %sender, i64 0")
+        msg_ref = f"%arg.{msg_param.name}"
+        self._emit_thread_unbox_into("%payload", msg_type, msg_ref, lines)
+        body_env = Env(self.global_env)
+        self._active_free_locals.append([])
+        escaping = self._emit_param_bindings(
+            decl, (types_mod.ThreadType(None), _bare_type(msg_type)), body_env, lines)
+        block = self._emit_analyzed_func_body(decl, body_env, None, lines, escaping)
+        if not block["terminated"]:
+            self._emit_free_active_locals(block["lines"], down_to=len(self._active_free_locals) - 1)
+            block["lines"].append("  ret void")
+        self._active_free_locals.pop()
+
+        func = [f"define void {symbol}(ptr %sender, ptr %payload) {{"]
+        func.extend(block["lines"])
+        func.append("}")
+        self.func_defs.extend(func)
+        self.func_defs.append("")
+
+        self.uses_threads = True
+        self.main_message_handler_symbol = symbol
 
     # ---- claude.md #195 Phase 2: `thread NAME { ... }` ----
 
@@ -2725,7 +2924,25 @@ class CodeGen:
         each) than the generic per-type cascade _clone_fn_for
         generates for the other four -- only their PASSTHROUGH-ness
         (already `ptr`-shaped, no separate box) is shared."""
-        return type_ == BLOB or isinstance(
+        # claude.md #205: `isinstance(..., PrimitiveType) and .name ==
+        # "blob"`, not `type_ == BLOB` -- a manually-managed `blob?` is
+        # a genuinely unequal dataclass instance from the plain `_BLOB`
+        # singleton this used to compare against directly (blob has no
+        # dedicated dataclass of its own for an isinstance check the
+        # way img/aud/url already get, the same reason semantic.py
+        # needed its own `_is_blob_type` helper). This matters here
+        # because this predicate's own callers (_thread_payload_is_
+        # passthrough in particular, reached via _emit_thread_unbox/
+        # _emit_thread_unbox_into, neither of which has an early
+        # _is_manually_managed check of its own -- unboxing a pointer-
+        # shaped payload correctly is unrelated to whether it's
+        # manually managed) would otherwise misclassify a manually-
+        # managed blob thread-message parameter as a SCALAR, producing
+        # invalid `add ptr ..., 0` IR instead of the plain pointer-
+        # alias GEP a passthrough type needs -- confirmed directly with
+        # a real LLVM IR parse failure before this fix, not just
+        # reasoned about.
+        return (isinstance(type_, types_mod.PrimitiveType) and type_.name == "blob") or isinstance(
             type_, (types_mod.ImageType, types_mod.AudioType, types_mod.UrlType))
 
     def _thread_payload_is_passthrough(self, type_):
@@ -2738,9 +2955,40 @@ class CodeGen:
         -- so there is nothing left for a box to wrap), and, as of this
         phase, blob/img/aud/url (same reasoning -- each is already
         `ptr`-shaped, and each's own festina_*_clone already returns a
-        fresh, independent allocation)."""
+        fresh, independent allocation).
+
+        claude.md #205: regex/http/socket, in addition -- a real,
+        previously-UNREACHABLE gap (not a regression): semantic.py's
+        own `_is_thread_sendable_type` rejected all three outright for
+        an ORDINARY value (claude.md #195's own list: "an escaping
+        regex has no retained pattern text to recompile from"; "http/
+        socket are tied to the single main-thread connection table"),
+        so this predicate never needed an answer for them -- until
+        claude.md #202 Phase 2's own early `manually_managed` return in
+        that same function opened the door for a MANUALLY-MANAGED one
+        of the three to cross a thread after all (sharing the pointer,
+        never cloning it, so the connection-table/recompile concerns
+        above don't apply -- see that function's own doc comment).
+        Confirmed missing here directly: `on message(p:regex?)` compiled
+        fine (semantic.py's own gate correctly allows it) but produced
+        invalid LLVM IR at the unboxing step (`add ptr ..., 0`,
+        `add`/`fadd` requiring an INTEGER/float operand) -- this
+        predicate answering False for regex/http/socket sent them down
+        the SCALAR unboxing path instead of the plain pointer-alias GEP
+        a passthrough type needs. All three are already `ptr`-shaped
+        opaque handles per `_llvm_type`, same as blob/img/aud/url --
+        genuinely passthrough, just never exercised until a manually-
+        managed instance of one could reach this code at all. Not
+        folded into `_is_thread_handle_type` (whose own name/doc
+        promise a real `festina_*_clone` function exists for each of
+        its members) -- none of these three has one, and none ever
+        needs one: an ORDINARY instance still can never reach here at
+        all (semantic.py's own rejection stands unchanged for that
+        case), and a manually-managed one is never cloned in the first
+        place (_emit_thread_clone_value's own early return)."""
         return (type_ == TEXT or self._is_thread_handle_type(type_)
-                or isinstance(type_, self._THREAD_PASSTHROUGH_PTR_TYPES))
+                or isinstance(type_, self._THREAD_PASSTHROUGH_PTR_TYPES)
+                or isinstance(type_, (types_mod.RegexType, types_mod.HttpType, types_mod.SocketType)))
 
     def _emit_thread_box(self, val, type_, lines):
         """Turns a thread-sendable value into the single `void *payload`
@@ -3382,14 +3630,10 @@ class CodeGen:
         self.threads[decl.name] = {
             "handle_global": handle_global,
             "inbound_type": info.inbound_type,
-            "outbound_type": info.outbound_type,
-            "onmessage_cb_global": None,   # set the first time NAME.onMessage(...) is emitted
-            "out_trampoline": None,        # set the first time NAME.onMessage(...) is emitted
+            "db_global": None,             # set below, only if this thread declared its own DatabaseURL
         }
         if info.inbound_type is not None:
             self._check_thread_clonable_type(info.inbound_type, "an 'on message' parameter", decl)
-        if info.outbound_type is not None:
-            self._check_thread_clonable_type(info.outbound_type, "a postMessage() argument", decl)
 
         # claude.md #195 Phase 1: state_env holds this thread's own
         # top-of-body VarDecls, backed by the namespaced globals above
@@ -3400,6 +3644,14 @@ class CodeGen:
         state_env = Env(self.global_env)
         state_inits = []  # [(ref, type_, ast.VarDecl)] needing a store, once, in on_load
         on_load_decl = on_message_decl = on_exit_decl = None
+        # claude.md #212 (Phase 4): the four HTTP-shaped handlers --
+        # collected the same way on_load/on_message/on_exit already
+        # are, just kept separate (rather than reusing those three
+        # names) since they're emitted through a different helper
+        # (_emit_thread_http_handler, below -- ordinary function-call
+        # parameter shape, no thread-queue unboxing) and registered
+        # conditionally, only for a thread that declares at least one.
+        on_request_decl = on_upgrade_decl = on_socketmessage_decl = on_socketclose_decl = None
         for stmt in decl.body.body:
             if isinstance(stmt, ast.VarDecl):
                 # claude.md #202: bare (unflagged) type -- see the
@@ -3419,6 +3671,14 @@ class CodeGen:
                     on_message_decl = stmt
                 elif stmt.name == "exit":
                     on_exit_decl = stmt
+                elif stmt.name == "request":
+                    on_request_decl = stmt
+                elif stmt.name == "upgrade":
+                    on_upgrade_decl = stmt
+                elif stmt.name == "socketMessage":
+                    on_socketmessage_decl = stmt
+                elif stmt.name == "socketClose":
+                    on_socketclose_decl = stmt
             # Nothing else can legally appear here EXCEPT a leading
             # `DatabaseURL = '<literal>'` (claude.md #199 Phase 5) --
             # semantic.py's own analyze_thread already validated and
@@ -3433,8 +3693,62 @@ class CodeGen:
         if info.database_url is not None:
             db_global = f"@__festina_thread_{decl.name}_db"
             self.extra_globals.append(f"{db_global} = global ptr null")
-        thread_ctx = (decl.name, handle_global, info.outbound_type, db_global)
-        on_load_symbol = self._emit_thread_on_load(decl.name, state_inits, on_load_decl, state_env, thread_ctx)
+            self.threads[decl.name]["db_global"] = db_global
+        # claude.md #208: no more per-thread outbound_type -- bare
+        # postMessage(x) now checks/boxes against
+        # self.analyzed.main_message_type directly (the ONE, program-
+        # wide, declared top-level `on message` type), so thread_ctx
+        # only needs to carry the two things still genuinely per-thread.
+        thread_ctx = (decl.name, handle_global, db_global)
+        # claude.md #210: thread-private helper functions -- registered
+        # (signature only) BEFORE any body is emitted, the identical
+        # "hoist first" split semantic.py's own thread_functions_scope
+        # pre-pass already uses, so a handler or another private func
+        # may call one declared anywhere in this thread's own body,
+        # regardless of textual order. Each gets a real, separately
+        # mangled LLVM function (`@__festina_thread_NAME_func_fname`),
+        # emitted via the ordinary `_emit_func` -- `outer_env=state_env`
+        # gives its own body direct access to this thread's own state
+        # (the "closes over this thread's own state" requirement),
+        # `thread_ctx=thread_ctx` lets it call bare `postMessage(x)`/
+        # another thread's `NAME.postMessage(x)` exactly like a handler
+        # already can.
+        self.threads[decl.name]["funcs"] = {}
+        private_func_decls = [stmt for stmt in decl.body.body if isinstance(stmt, ast.FuncDecl)]
+        for stmt in private_func_decls:
+            func_ret_type = None if stmt.return_type == "void" else self._resolve(stmt.return_type, stmt)
+            self.threads[decl.name]["funcs"][stmt.name] = {
+                "symbol": f"@__festina_thread_{decl.name}_func_{stmt.name}",
+                "decl": stmt,
+                "ret_type": func_ret_type,
+            }
+        for stmt in private_func_decls:
+            finfo = self.threads[decl.name]["funcs"][stmt.name]
+            self._emit_func(stmt, symbol=finfo["symbol"], outer_env=state_env, thread_ctx=thread_ctx)
+        # claude.md #212 (Phase 4): the four HTTP-shaped handlers --
+        # emitted BEFORE on_load (whose own registration prologue,
+        # below, needs their symbols), via a dedicated helper rather
+        # than the top-level _emit_event_handler (which hardcodes
+        # `body_env = Env(self.global_env)` and never sets
+        # _current_thread_ctx -- this thread's own state_env/thread_ctx
+        # need the identical wiring on_load/on_message/on_exit already
+        # get). None (not emitted at all) for a handler this thread
+        # never declared -- has_http_context (just below) is what
+        # decides whether ANY registration/combined-loop wiring
+        # happens at all, so an undeclared individual handler simply
+        # stays unregistered, the same "stays NULL, never called"
+        # no-op shape main's own four already have.
+        http_handler_symbols = {}
+        for handler_name, handler_decl in (
+                ("request", on_request_decl), ("upgrade", on_upgrade_decl),
+                ("socketMessage", on_socketmessage_decl), ("socketClose", on_socketclose_decl)):
+            if handler_decl is not None:
+                http_handler_symbols[handler_name] = self._emit_thread_http_handler(
+                    decl.name, handler_decl, state_env, thread_ctx)
+        has_http_context = bool(http_handler_symbols)
+        self.threads[decl.name]["has_http_context"] = has_http_context
+        on_load_symbol = self._emit_thread_on_load(
+            decl.name, state_inits, on_load_decl, state_env, thread_ctx, http_handler_symbols)
         on_message_symbol = self._emit_thread_on_message(
             decl.name, on_message_decl, info.inbound_type, state_env, thread_ctx)
         on_exit_symbol = self._emit_thread_on_exit(decl.name, on_exit_decl, state_env, thread_ctx)
@@ -3442,10 +3756,136 @@ class CodeGen:
         self.threads[decl.name]["on_message_symbol"] = on_message_symbol
         self.threads[decl.name]["on_exit_symbol"] = on_exit_symbol
 
-    def _emit_thread_on_load(self, thread_name, state_inits, on_load_decl, state_env, thread_ctx):
+    def _emit_thread_http_handler(self, thread_name, decl, state_env, thread_ctx):
+        """claude.md #212: one of this thread's own on request/on
+        upgrade/on socketMessage/on socketClose -- structurally
+        _emit_event_handler's own shape (an ordinary void function
+        taking plain parameters, no thread-queue unboxing -- these
+        fire from festina_runtime_http.c's own dispatch calling
+        straight into this generated function, exactly like main's own
+        four do), but with `body_env = Env(state_env)` (this thread's
+        own state, not self.global_env) and `_current_thread_ctx` set
+        for the duration (so a bare postMessage(x)/private-func call
+        inside the body works, the same wiring on_load/on_message/
+        on_exit already get). Registered into festina_runtime_http.c's
+        own (now `__thread`) g_request_handler/etc only from THIS
+        thread's own on_load, via festina_register_request_handler and
+        friends -- see _emit_thread_on_load's own registration block."""
+        symbol = f"@__festina_thread_{thread_name}_on_{decl.name}"
+        param_types = [self._resolve(p.type_expr, decl) for p in decl.params]
+        params_ir = ", ".join(f"{_llvm_type(t)} %arg.{p.name}" for t, p in zip(param_types, decl.params))
+
+        body_env = Env(state_env)
+        body_lines = []
+        self._start_block(self.label("entry"), body_lines)
+        self._active_free_locals.append([])
+        escaping = self._emit_param_bindings(decl, param_types, body_env, body_lines)
+        saved_ctx = self._current_thread_ctx
+        self._current_thread_ctx = thread_ctx
+        try:
+            block = self._emit_analyzed_func_body(decl, body_env, None, body_lines, escaping)
+        finally:
+            self._current_thread_ctx = saved_ctx
+        if not block["terminated"]:
+            self._emit_free_active_locals(block["lines"], down_to=len(self._active_free_locals) - 1)
+            block["lines"].append("  ret void")
+        self._active_free_locals.pop()
+
+        func = [f"define void {symbol}({params_ir}) {{"]
+        func.extend(block["lines"])
+        func.append("}")
+        self.func_defs.extend(func)
+        self.func_defs.append("")
+        self.uses_http = True
+        return symbol
+
+    def _emit_thread_pool_decl(self, decl):
+        """claude.md #209: `thread NAME[N] { ... }` -- N fully
+        independent instances of the identical body, each with its own
+        real OS thread, private state, and message queues, exactly like
+        N separate ordinary `thread` declarations would have (nothing
+        about the runtime registry itself -- confirmed by a full read
+        of runtime/festina_runtime_thread.c -- stores a name or index
+        anywhere, so N independent registrations already work today).
+
+        Implemented as a compile-time-unrolled loop calling the
+        ordinary, completely unchanged `_emit_thread_decl` once per
+        index, over a synthesized per-instance ThreadDecl whose own
+        `.name` is mangled (`NAME$0`...`NAME$N-1`, `$` being a valid
+        unquoted LLVM identifier character) -- every global/symbol
+        `_emit_thread_decl` and its own on_load/on_message/on_exit
+        helpers derive from `decl.name` comes out already, correctly,
+        namespaced per instance, with zero changes needed to any of
+        that machinery. The one thing those functions read OUTSIDE
+        `decl.name` itself is `self.analyzed.threads[thread_name]`
+        (`_emit_thread_decl`'s own `info` lookup, and
+        `_emit_thread_on_load`'s own `database_url` read) -- aliased
+        here, once, so every mangled name resolves to the SAME shared
+        `_ThreadInfo` semantic.py already built for the pool as a whole
+        (one declared `on message`/`DatabaseURL` applies identically to
+        every instance).
+        """
+        info = self.analyzed.threads[decl.name]
+        handle_globals = []
+        for i in range(decl.pool_size):
+            instance_name = f"{decl.name}${i}"
+            self.analyzed.threads[instance_name] = info
+            instance_decl = ast.ThreadDecl(instance_name, decl.body, decl.line, decl.column)
+            self._emit_thread_decl(instance_decl)
+            handle_globals.append(self.threads[instance_name]["handle_global"])
+        # claude.md #209: one extra global -- a genuinely CONSTANT
+        # `[N x ptr]` array whose own N elements are each the compile-
+        # time ADDRESS of one instance's own `handle_global` (each of
+        # those is itself an ordinary `global ptr null`, populated at
+        # runtime by the startup registration loop below, completely
+        # unaware anything pool-shaped is going on). A use site
+        # (`pool[i].postMessage(...)`) GEPs into this array at a
+        # RUNTIME index to pick the right slot, loads it to recover
+        # WHICH handle_global that index names, then loads THAT to get
+        # the actual FestinaThreadHandle* -- one extra indirection
+        # versus a singleton's own direct `load ptr, ptr {handle_
+        # global}`, in exchange for never needing an emitted N-way
+        # switch/chain of branches at every call site.
+        handles_array_global = f"@__festina_thread_pool_{decl.name}_handles"
+        elems = ", ".join(f"ptr {g}" for g in handle_globals)
+        self.extra_globals.append(
+            f"{handles_array_global} = global [{decl.pool_size} x ptr] [{elems}]")
+        self.thread_pools[decl.name] = {
+            "pool_size": decl.pool_size,
+            "inbound_type": info.inbound_type,
+            "handle_globals": handle_globals,
+            "handles_array_global": handles_array_global,
+        }
+
+    def _emit_thread_on_load(self, thread_name, state_inits, on_load_decl, state_env, thread_ctx,
+                             http_handler_symbols=None):
         symbol = f"@__festina_thread_{thread_name}_on_load"
         lines = []
         self._start_block(self.label("entry"), lines)
+        # claude.md #212 (Phase 4): this thread's own HTTP handler
+        # pointers -- registered here, FIRST, before EVERYTHING else in
+        # this adapter (even the db_open block just below), on this
+        # thread's own OS thread, so festina_runtime_http.c's own
+        # (now `__thread`) g_request_handler/etc are never NULL for
+        # even a moment this thread could conceivably start accepting
+        # a connection (were openPort() itself allowed before this
+        # point -- it isn't, by construction, since openPort()/
+        # openSecurePort() only ever appear inside a handler/private
+        # func body, which can't run before on_load starts). Mirrors
+        # main()'s own prologue registration exactly (same four
+        # festina_register_*_handler calls, same "only emit the ones
+        # actually declared" conditionality), just placed on this
+        # thread's own OS thread instead of main's. A thread with no
+        # HTTP-shaped handler at all (http_handler_symbols empty/None)
+        # emits none of this, unchanged from before this phase.
+        for handler_name, register_fn in (
+                ("request", "festina_register_request_handler"),
+                ("upgrade", "festina_register_upgrade_handler"),
+                ("socketMessage", "festina_register_message_handler"),
+                ("socketClose", "festina_register_socketclose_handler")):
+            handler_symbol = (http_handler_symbols or {}).get(handler_name)
+            if handler_symbol is not None:
+                lines.append(f"  call void @{register_fn}(ptr {handler_symbol})")
         # claude.md #199 Phase 5: this thread's own private sqlite
         # handle -- opened here, once, on this thread's own OS thread,
         # before EVERYTHING else in this adapter (state var
@@ -3463,7 +3903,7 @@ class CodeGen:
         # here -- main's own prologue already did that, unconditionally,
         # BEFORE spawning any thread (see that call site's own comment
         # for why the ordering matters).
-        db_global = thread_ctx[3]
+        db_global = thread_ctx[2]
         if db_global is not None:
             url_literal = self.analyzed.threads[thread_name].database_url
             url_val = self.string_const(url_literal)
@@ -3524,7 +3964,7 @@ class CodeGen:
         lines = []
         self._start_block(self.label("entry"), lines)
         if on_message_decl is not None:
-            # claude.md #195 Phase 2: unboxes %payload into a register
+            # claude.md #195/#208: unboxes %payload into a register
             # literally named `%arg.<param>` -- the exact name/shape
             # _emit_param_bindings expects an ordinary function's own
             # parameter register to already have -- so the rest of the
@@ -3532,18 +3972,43 @@ class CodeGen:
             # retain-on-escape for an escaping text argument, ...)
             # applies completely unchanged, with no special-casing for
             # "this parameter actually came from a thread queue" needed
-            # anywhere past this one unboxing step.
-            param_name = on_message_decl.params[0].name
-            arg_ref = f"%arg.{param_name}"
-            self._emit_thread_unbox_into("%payload", inbound_type, arg_ref, lines)
+            # anywhere past this one unboxing step. `%sender` needs no
+            # unboxing at all (it's already a bare `ptr`, exactly the
+            # same "no-op pointer alias under the required register
+            # name" trick _emit_thread_unbox_into itself uses for a
+            # passthrough (`ptr`-shaped) payload type -- see that
+            # function's own comment; ThreadType isn't taught to
+            # _thread_payload_is_passthrough at all since %sender was
+            # never boxed in the first place, so this is done directly
+            # here rather than routing through that helper).
+            worker_param, msg_param = on_message_decl.params
+            worker_ref = f"%arg.{worker_param.name}"
+            lines.append(f"  {worker_ref} = getelementptr i8, ptr %sender, i64 0")
+            msg_ref = f"%arg.{msg_param.name}"
+            self._emit_thread_unbox_into("%payload", inbound_type, msg_ref, lines)
             body_env = Env(state_env)
             self._active_free_locals.append([])
-            # _emit_param_bindings reads `%arg.<param>` (arg_ref, just
-            # produced above) exactly as if it were a real function
-            # parameter register, and stores it into a fresh alloca'd
-            # slot in body_env -- no other special-casing needed for
-            # "this parameter actually came from a thread queue".
-            escaping = self._emit_param_bindings(on_message_decl, (inbound_type,), body_env, lines)
+            # _emit_param_bindings reads `%arg.<param>` (the registers
+            # just produced above) exactly as if each were a real
+            # function parameter register, and stores it into a fresh
+            # alloca'd slot in body_env -- no other special-casing
+            # needed for "this parameter actually came from a thread
+            # queue".
+            #
+            # claude.md #205: _bare_type(inbound_type), not
+            # inbound_type itself -- see that function's own doc
+            # comment for the real bug (a manually-managed blob
+            # parameter's own `.write()` call inside this exact
+            # handler body, misdispatched by codegen's flag-unaware
+            # `== BLOB` check) this fixes. _emit_param_bindings's own
+            # manually-managed bookkeeping is unaffected: it reads
+            # `on_message_decl.params[1].manually_managed` (the AST
+            # node's own flag) directly, never derives it from this
+            # type argument. ThreadType never carries manually_managed
+            # at all, so _bare_type is a plain no-op on it.
+            escaping = self._emit_param_bindings(
+                on_message_decl, (types_mod.ThreadType(None), _bare_type(inbound_type)),
+                body_env, lines)
             saved_ctx = self._current_thread_ctx
             self._current_thread_ctx = thread_ctx
             try:
@@ -3557,7 +4022,7 @@ class CodeGen:
             self._active_free_locals.pop()
         else:
             lines.append("  ret void")
-        func = [f"define void {symbol}(ptr %payload) {{"]
+        func = [f"define void {symbol}(ptr %sender, ptr %payload) {{"]
         func.extend(lines)
         func.append("}")
         self.func_defs.extend(func)
@@ -3594,34 +4059,39 @@ class CodeGen:
         self.func_defs.append("")
         return symbol
 
-    def _emit_thread_out_trampoline(self, thread_name, outbound_type, cb_global):
-        """claude.md #195 Phase 2: bridges festina_thread_drain's fixed
-        `void(*)(void*)` outbound-callback ABI to the real
-        `func[T]:void` value `NAME.onMessage(callback)` was last called
-        with -- the identical two-part shape
-        _emit_exec_callback_trampoline already established (a fixed
-        adapter signature, reading the REAL callback back out of a
-        global rather than hardcoding it, since the call site's own
-        callback argument is an arbitrary expression, not necessarily a
-        compile-time constant). Unlike that one, this needs a per-
-        OUTBOUND-TYPE decode step (`_emit_thread_unbox`, mirroring
-        _emit_sort_comparator_trampoline's own per-element-type
-        reasoning), so it's generated once per thread (cached in
-        self.threads[thread_name]["out_trampoline"]) rather than shared
-        across the whole program the way _exec_callback_trampoline is."""
-        uid = self._unique()
-        trampoline_name = f"@__festina_thread_{thread_name}_out_trampoline_{uid}"
-        body = [f"define void {trampoline_name}(ptr %payload) {{", "entry:"]
-        cb = self.tmp()
-        body.append(f"  {cb} = load ptr, ptr {cb_global}")
-        arg_val = self._emit_thread_unbox("%payload", outbound_type, body)
-        llvm_ty = _llvm_type(outbound_type)
-        body.append(f"  call void {cb}({llvm_ty} {arg_val})")
+    def _emit_thread_db_close_trampoline(self, thread_name, db_global):
+        """claude.md #207: a zero-argument closure registered with
+        festina_thread_set_db_close, called from festina_thread_main
+        itself right as this thread's own worker stops (an explicit
+        NAME.kill() or process teardown alike) -- see that call site's
+        own doc comment in festina_runtime_thread.c. Reads this
+        thread's own `db_global` (an LLVM global, only reachable from
+        generated code, which is exactly why this trampoline needs to
+        exist at all rather than the runtime just being handed the
+        pointer directly: the runtime registers the closure once, at
+        thread setup, long before the actual sqlite3* value exists),
+        closes it through festina_thread_db_close (NOT festina_db_close
+        -- see that function's own doc comment in festina_runtime.c for
+        why reusing the real-process-shutdown one here would corrupt
+        every other thread's/main's own still-live cached statements),
+        then stores null back -- defensive tidiness only (a later
+        NAME.live() reopens a fresh handle via on_load regardless of
+        what's currently in db_global), matching the "leave no stale
+        pointer behind" convention every other release call site in
+        this file already follows. Emitted once per thread that
+        declared its own DatabaseURL (never for one that didn't --
+        db_global is None there, and this is simply never called)."""
+        symbol = f"@__festina_thread_{thread_name}_db_close_trampoline"
+        body = [f"define void {symbol}() {{", "entry:"]
+        db_val = self.tmp()
+        body.append(f"  {db_val} = load ptr, ptr {db_global}")
+        body.append(f"  call void @festina_thread_db_close(ptr {db_val})")
+        body.append(f"  store ptr null, ptr {db_global}")
         body.append("  ret void")
         body.append("}")
         self.func_defs.extend(body)
         self.func_defs.append("")
-        return trampoline_name
+        return symbol
 
     # ---- statements ----
     def _emit_free(self, stmt, env, lines):
@@ -9844,19 +10314,24 @@ class CodeGen:
         if isinstance(callee, ast.Identifier):
             name = callee.name
             if name == "postMessage" and self._current_thread_ctx is not None:
-                # claude.md #195 Phase 2: the bare, context-implicit
-                # form -- "send FROM the thread currently being
-                # emitted, TO the main program" -- semantic.py already
-                # proved this call site is inside exactly one thread's
-                # own body, that its argument's inferred type matches
-                # this thread's own single outbound type, and that
-                # SOME `NAME.onMessage(...)` registration exists
-                # somewhere in the program (the "no dead sends" check,
-                # end of analyze()) -- codegen only has to box the
-                # value and hand it to the runtime's own outbound
-                # queue for whichever thread self._current_thread_ctx
-                # names.
-                thread_name, handle_global, outbound_type, _db_global = self._current_thread_ctx
+                # claude.md #195/#208: the bare, context-implicit form
+                # -- "send FROM the thread currently being emitted, TO
+                # the main program" -- semantic.py already proved this
+                # call site is inside exactly one thread's own body and
+                # that its argument's inferred type matches the
+                # program's own top-level `on message` declared type
+                # (self.analyzed.main_message_type -- ONE program-wide
+                # type now, not a per-thread one; see claude.md #208's
+                # own note on why the old per-thread outbound_type/
+                # onMessage(callback) mechanism is gone). Codegen only
+                # has to box the value and hand it to the runtime's own
+                # outbound queue for whichever thread
+                # self._current_thread_ctx names -- festina_thread_
+                # post_outbound sets the SENDER field on the queued
+                # item to the handle it's called with itself, so no
+                # separate sender argument is needed here.
+                _thread_name, handle_global, _db_global = self._current_thread_ctx
+                outbound_type = self.analyzed.main_message_type
                 val, vtype = self._emit_expr(expr.args[0], env, lines)
                 val = self._coerce(val, vtype, outbound_type, lines, source_expr=expr.args[0])
                 handle = self.tmp()
@@ -10278,6 +10753,49 @@ class CodeGen:
                     else:
                         self._free_text_temp(arg_expr, val, vtype, lines)
                 return out, ret_type
+            # claude.md #210: a thread-private helper function -- only
+            # reachable when this call site is itself inside a thread
+            # body (`self._current_thread_ctx` set) AND that thread
+            # declared a private func of this name, checked BEFORE the
+            # flat global self.func_decls just below, mirroring
+            # semantic.py's own identical shadowing (a thread's own
+            # `thread_functions_scope` is a CHILD of the top-level
+            # `functions_scope`, so a same-named private func always
+            # wins over a same-named global one for a call site inside
+            # that thread's own body).
+            if self._current_thread_ctx is not None:
+                tfuncs = self.threads[self._current_thread_ctx[0]].get("funcs", {})
+                if name in tfuncs:
+                    finfo = tfuncs[name]
+                    decl = finfo["decl"]
+                    symbol = finfo["symbol"]
+                    ret_type = finfo["ret_type"]
+                    arg_vals = []
+                    arg_temps = []
+                    for arg_expr, param in zip(expr.args, decl.params):
+                        ptype = self._resolve(param.type_expr, decl)
+                        val, vtype = self._emit_value_for(arg_expr, env, lines, ptype)
+                        val = self._coerce(val, vtype, ptype, lines, source_expr=arg_expr)
+                        arg_vals.append(f"{_llvm_type(ptype)} {val}")
+                        arg_temps.append((arg_expr, val, vtype, ptype))
+                    args_ir = ", ".join(arg_vals)
+                    if ret_type is None:
+                        lines.append(f"  call void {symbol}({args_ir})")
+                        out = "0"
+                    else:
+                        out = self.tmp()
+                        lines.append(f"  {out} = call {_llvm_type(ret_type)} {symbol}({args_ir})")
+                    # claude.md #83/#119/#192: identical post-call
+                    # argument cleanup to the ordinary direct-call path
+                    # just below -- see its own comment.
+                    for arg_expr, val, vtype, ptype in arg_temps:
+                        if (_is_refcounted(ptype)
+                                and self._refcounted_source_is_fresh(arg_expr, vtype, ptype)):
+                            lines.append(
+                                f"  call void {self._release_fn_for(ptype)}(ptr {val})")
+                        else:
+                            self._free_text_temp(arg_expr, val, vtype, lines)
+                    return out, ret_type
             if name in self.func_decls:
                 decl = self.func_decls[name]
                 arg_vals = []
@@ -10340,55 +10858,154 @@ class CodeGen:
                 return out, ret_type
             raise CodegenError(f"unknown function '{name}'", file=self.filename, line=callee.line)
         if isinstance(callee, ast.Member) and not callee.computed:
-            # claude.md #195 Phase 2: NAME.postMessage/onMessage/kill/
-            # live/isAlive -- checked first, ahead of everything else in
-            # this branch, since a declared thread's own name is its
-            # own closed namespace (semantic.py already proved
-            # callee.prop is one of these five and that this call site
-            # is NOT itself inside any thread body -- these five are
-            # main-program-only operations).
-            if isinstance(callee.obj, ast.Identifier) and callee.obj.name in self.threads:
-                thread_name = callee.obj.name
-                tinfo = self.threads[thread_name]
-                handle_global = tinfo["handle_global"]
-                if callee.prop == "postMessage":
+            # claude.md #195 Phase 2 (widened by #209): NAME.postMessage/
+            # kill/live/isAlive, and now ALSO pool[i].<same four> --
+            # checked first, ahead of everything else in this branch,
+            # since a declared thread's (or thread pool's) own name is
+            # its own closed namespace (semantic.py already proved
+            # callee.prop is one of these four, that this call site is
+            # NOT itself inside any thread body for kill/live/isAlive,
+            # and -- for a pool -- that the index expression is int).
+            #
+            # claude.md #209: `pool[i]` is peeled off here into
+            # `pool_index_expr` (an ordinary expression, evaluated
+            # below) plus `receiver` (the bare pool NAME) -- mirroring
+            # semantic.py's own identical peel in `_infer_call`.
+            pool_index_expr = None
+            receiver = callee.obj
+            if (isinstance(callee.obj, ast.Member) and callee.obj.computed
+                    and isinstance(callee.obj.obj, ast.Identifier)
+                    and callee.obj.obj.name in self.thread_pools):
+                pool_index_expr = callee.obj.prop
+                receiver = callee.obj.obj
+            if isinstance(receiver, ast.Identifier) and (
+                    receiver.name in self.threads or receiver.name in self.thread_pools):
+                # claude.md #209: an out-of-range pool index is a
+                # SILENT NO-OP (this language's own established "test,
+                # don't fail" convention -- claude.md #195's own
+                # `NAME.isAlive()` already returns a plain bool rather
+                # than ever raising) -- `handle` is only ever loaded,
+                # and the real op only ever runs, inside a bounds-
+                # checked block; `end_label`/`oob_pred` are None for an
+                # ordinary (non-pool) receiver, where none of this
+                # applies and the op runs completely unconditionally,
+                # exactly as before.
+                end_label = None
+                oob_pred = None
+                if pool_index_expr is not None:
+                    pinfo = self.thread_pools[receiver.name]
+                    inbound_type = pinfo["inbound_type"]
+                    n = pinfo["pool_size"]
+                    idx_val, _ = self._emit_expr(pool_index_expr, env, lines)
+                    in_range = self.tmp()
+                    lines.append(f"  {in_range} = icmp ult i64 {idx_val}, {n}")
+                    oob_pred = self.cur_block
+                    in_range_label = self.label("pool.inrange")
+                    end_label = self.label("pool.end")
+                    lines.append(f"  br i1 {in_range}, label %{in_range_label}, label %{end_label}")
+                    self._start_block(in_range_label, lines)
+                    # claude.md #209: double indirection -- the pool's
+                    # own `[N x ptr]` global holds N compile-time-
+                    # constant handle-global ADDRESSES (one per
+                    # instance, built once in _emit_thread_pool_decl);
+                    # GEP selects the SLOT at the runtime index, the
+                    # first load reads which handle global that slot
+                    # names, the second reads that instance's own
+                    # actual (runtime-registered) FestinaThreadHandle*
+                    # -- the same value a singleton's own single `load
+                    # ptr, ptr {handle_global}` reads directly below.
+                    slot = self.tmp()
+                    lines.append(
+                        f"  {slot} = getelementptr inbounds [{n} x ptr], ptr "
+                        f"{pinfo['handles_array_global']}, i64 0, i64 {idx_val}")
+                    handle_global_addr = self.tmp()
+                    lines.append(f"  {handle_global_addr} = load ptr, ptr {slot}")
+                    handle = self.tmp()
+                    lines.append(f"  {handle} = load ptr, ptr {handle_global_addr}")
+                else:
+                    tinfo = self.threads[receiver.name]
                     inbound_type = tinfo["inbound_type"]
+                    handle_global = tinfo["handle_global"]
+                    handle = self.tmp()
+                    lines.append(f"  {handle} = load ptr, ptr {handle_global}")
+                if callee.prop == "postMessage":
+                    # claude.md #208: legal from main OR from inside
+                    # ANOTHER thread's own body now -- the sender
+                    # passed to festina_thread_post is `null` for main,
+                    # or the CALLING thread's own handle (loaded from
+                    # self._current_thread_ctx, which is set while
+                    # emitting a thread's own on_load/on_message/
+                    # on_exit body -- see _emit_call's bare postMessage
+                    # branch for the identical pattern) when this call
+                    # site is itself inside another thread's body.
                     val, vtype = self._emit_expr(expr.args[0], env, lines)
                     val = self._coerce(val, vtype, inbound_type, lines, source_expr=expr.args[0])
-                    handle = self.tmp()
-                    lines.append(f"  {handle} = load ptr, ptr {handle_global}")
                     box = self._emit_thread_box(val, inbound_type, lines)
-                    lines.append(f"  call void @festina_thread_post(ptr {handle}, ptr {box})")
+                    if self._current_thread_ctx is not None:
+                        sender = self.tmp()
+                        lines.append(f"  {sender} = load ptr, ptr {self._current_thread_ctx[1]}")
+                    else:
+                        sender = "null"
+                    lines.append(f"  call void @festina_thread_post(ptr {handle}, ptr {sender}, ptr {box})")
                     self._emit_thread_postmessage_cleanup(expr.args[0], val, vtype, inbound_type, lines)
+                    if end_label is not None:
+                        lines.append(f"  br label %{end_label}")
+                        self._start_block(end_label, lines)
                     return "0", None
-                if callee.prop == "onMessage":
-                    # claude.md #195 Phase 2: the callback argument is
-                    # an arbitrary expression (not necessarily a
-                    # compile-time constant), so it's stashed in a
-                    # per-thread global the lazily-built trampoline
-                    # reads back out of -- the identical two-part shape
-                    # _emit_exec_callback_trampoline's own doc comment
-                    # describes.
-                    outbound_type = tinfo["outbound_type"]
-                    cb_val, _ = self._emit_expr(expr.args[0], env, lines)
-                    cb_global = tinfo["onmessage_cb_global"]
-                    if cb_global is None:
-                        cb_global = f"@__festina_thread_{thread_name}_onmessage_cb"
-                        self.extra_globals.append(f"{cb_global} = global ptr null")
-                        tinfo["onmessage_cb_global"] = cb_global
-                    lines.append(f"  store ptr {cb_val}, ptr {cb_global}")
-                    trampoline = tinfo["out_trampoline"]
-                    if trampoline is None:
-                        trampoline = self._emit_thread_out_trampoline(thread_name, outbound_type, cb_global)
-                        tinfo["out_trampoline"] = trampoline
-                    handle = self.tmp()
-                    lines.append(f"  {handle} = load ptr, ptr {handle_global}")
-                    lines.append(f"  call void @festina_thread_set_out_callback(ptr {handle}, ptr {trampoline})")
+                if callee.prop == "giveRequest":
+                    # claude.md #213: `val` is a bare `ptr` -- the raw,
+                    # never-cloned FestinaHttpValue payload semantic.py
+                    # already proved is manually-managed (http?), so no
+                    # coercion/box/retain-release cleanup is needed at
+                    # all here (the identical "never touched again"
+                    # reasoning _emit_thread_postmessage_cleanup's own
+                    # manually-managed early return already relies on
+                    # for postMessage -- this is that same case, just
+                    # with no cleanup call to make since there's
+                    # nothing left for it to skip). festina_conn_detach
+                    # resolves `val`'s own conn_id, verifies it's still
+                    # a live, plain (non-TLS), not-yet-responded-to,
+                    # non-upgraded connection, and returns a heap copy
+                    # of that connection's own state with ownership of
+                    # every field inside it (fd included) -- or NULL,
+                    # a silent no-op (this runtime's own established
+                    # "test, don't fail" convention for anything thread-
+                    # related), if any of that isn't true any more.
+                    val, _vtype = self._emit_expr(expr.args[0], env, lines)
+                    detached = self.tmp()
+                    lines.append(f"  {detached} = call ptr @festina_conn_detach(ptr {val})")
+                    is_null = self.tmp()
+                    lines.append(f"  {is_null} = icmp eq ptr {detached}, null")
+                    give_label = self.label("giverequest.ok")
+                    skip_label = self.label("giverequest.skip")
+                    lines.append(f"  br i1 {is_null}, label %{skip_label}, label %{give_label}")
+                    self._start_block(give_label, lines)
+                    # claude.md #213: festina_thread_give_request lives
+                    # in festina_runtime_thread.c, not http.c -- it
+                    # never looks inside `detached` (an opaque `ptr` as
+                    # far as that translation unit is concerned),
+                    # enqueuing it as a distinct message KIND on the
+                    # target's own inbound queue, dispatched via a
+                    # hook (festina_thread_deliver_given_request) this
+                    # thread's own on_load already wired in (see
+                    # festina_thread_set_http_context, widened for
+                    # this phase) -- the same opaque-hook shape
+                    # festina_thread_http_service_pass/_teardown
+                    # already established in claude.md #212.
+                    lines.append(
+                        f"  call void @festina_thread_give_request(ptr {handle}, "
+                        f"ptr {detached}, ptr {val})")
+                    lines.append(f"  br label %{skip_label}")
+                    self._start_block(skip_label, lines)
+                    if end_label is not None:
+                        lines.append(f"  br label %{end_label}")
+                        self._start_block(end_label, lines)
                     return "0", None
                 if callee.prop == "kill":
-                    handle = self.tmp()
-                    lines.append(f"  {handle} = load ptr, ptr {handle_global}")
                     lines.append(f"  call void @festina_thread_kill(ptr {handle})")
+                    if end_label is not None:
+                        lines.append(f"  br label %{end_label}")
+                        self._start_block(end_label, lines)
                     return "0", None
                 if callee.prop == "live":
                     # claude.md #195 Phase 2: the callback's own real
@@ -10400,15 +11017,23 @@ class CodeGen:
                     # thread-queue payload, not a real, already-typed
                     # Festina bool).
                     cb_val, _ = self._emit_expr(expr.args[0], env, lines)
-                    handle = self.tmp()
-                    lines.append(f"  {handle} = load ptr, ptr {handle_global}")
                     lines.append(f"  call void @festina_thread_live(ptr {handle}, ptr {cb_val})")
+                    if end_label is not None:
+                        lines.append(f"  br label %{end_label}")
+                        self._start_block(end_label, lines)
                     return "0", None
                 # callee.prop == "isAlive"
-                handle = self.tmp()
-                lines.append(f"  {handle} = load ptr, ptr {handle_global}")
                 out = self.tmp()
                 lines.append(f"  {out} = call i8 @festina_thread_is_alive(ptr {handle})")
+                if end_label is not None:
+                    in_range_pred = self.cur_block
+                    lines.append(f"  br label %{end_label}")
+                    self._start_block(end_label, lines)
+                    phi_out = self.tmp()
+                    lines.append(
+                        f"  {phi_out} = phi i8 [ {out}, %{in_range_pred} ], "
+                        f"[ 0, %{oob_pred} ]")
+                    return phi_out, BOOL
                 return out, BOOL
             # claude.md #188 (uraikus/festina#76 item 1):
             # Math.floorDiv(a:int, b:int) -> int
@@ -11603,7 +12228,7 @@ class CodeGen:
         blind trust in an already-proven invariant, not a fresh
         runtime check)."""
         if self._current_thread_ctx is not None:
-            db_global = self._current_thread_ctx[3]
+            db_global = self._current_thread_ctx[2]
             if db_global is not None:
                 return db_global
         return "@__festina_db"
@@ -12005,31 +12630,98 @@ class CodeGen:
             # ever reference it (a `NAME.postMessage(x)` as literally
             # the program's first statement, say).
             main_lines.append("  call void @festina_register_thread_hooks()")
+            # claude.md #208: registered exactly once, unconditionally
+            # whenever ANY thread exists -- everything sent to main
+            # (from every thread's own outbound queue) is now delivered
+            # through this ONE handler, not a per-thread callback. A
+            # program with at least one `thread` but no top-level `on
+            # message` at all still reaches here with
+            # main_message_handler_symbol None (a thread that never
+            # calls bare postMessage(x) needs no receiver at all --
+            # semantic.py already rejects the OTHER case, a bare send
+            # with nothing declared to receive it, at its own call
+            # site) -- skip registration entirely rather than pass a
+            # null function pointer the drain step would then have to
+            # null-check on every single iteration.
+            if self.main_message_handler_symbol is not None:
+                main_lines.append(
+                    f"  call void @festina_set_global_message_handler(ptr "
+                    f"{self.main_message_handler_symbol})")
+            # claude.md #197 Phase 3 (widened by #208): the two
+            # release-function pointers festina_thread_register now
+            # also takes -- `_thread_payload_release_fn` picks `@free`
+            # for a plain box/owned-text payload or a real Festina
+            # release cascade for a struct/arr[T]/map[T]/enum one, so
+            # the runtime worker/drain loops never need to know which
+            # kind of payload they're holding, only that calling this
+            # one function on it is always correct. `out_release` is
+            # now the SAME program-wide main_message_type for every
+            # thread (there is only ONE receiver for the outbound
+            # direction now -- main, via the one handler above), so
+            # it's computed once, outside the loop, rather than per
+            # thread the way it used to be when each thread's own
+            # outbound_type could differ.
+            main_out_release = (self._thread_payload_release_fn(self.analyzed.main_message_type)
+                                if self.analyzed.main_message_type is not None else "@free")
             for tname, tinfo in self.threads.items():
                 handle_global = tinfo["handle_global"]
                 on_load_sym = tinfo["on_load_symbol"]
                 on_message_sym = tinfo["on_message_symbol"]
                 on_exit_sym = tinfo["on_exit_symbol"]
-                # claude.md #197 Phase 3: the two release-function
-                # pointers festina_thread_register now also takes --
-                # `_thread_payload_release_fn` picks `@free` for a
-                # plain box/owned-text payload or a real Festina
-                # release cascade for a struct/arr[T]/map[T]/enum one,
-                # so the runtime worker/drain loops never need to know
-                # which kind of payload they're holding, only that
-                # calling this one function on it is always correct.
-                # A thread with no inbound/outbound type at all still
-                # gets a real (never-called) function pointer here --
-                # `@free` is harmless and avoids a NULL check in C.
+                # A thread with no inbound type at all still gets a
+                # real (never-called) function pointer here -- `@free`
+                # is harmless and avoids a NULL check in C.
                 in_release = (self._thread_payload_release_fn(tinfo["inbound_type"])
                              if tinfo["inbound_type"] is not None else "@free")
-                out_release = (self._thread_payload_release_fn(tinfo["outbound_type"])
-                              if tinfo["outbound_type"] is not None else "@free")
+                out_release = main_out_release
                 main_lines.append(
                     f"  %__thread_{tname} = call ptr @festina_thread_register("
                     f"ptr {on_load_sym}, ptr {on_message_sym}, ptr {on_exit_sym}, "
                     f"ptr {in_release}, ptr {out_release})")
                 main_lines.append(f"  store ptr %__thread_{tname}, ptr {handle_global}")
+                # claude.md #207: registered BEFORE spawn, same as
+                # in_release/out_release just above (festina_thread_
+                # register's own parameters) -- set once, here, never
+                # touched again, so there's no window after the OS
+                # thread actually starts where db_close could still be
+                # NULL. Only for a thread that declared its own
+                # DatabaseURL; db_global stays None for one that
+                # didn't, and this is simply skipped for it (its
+                # db_close stays NULL, the same no-op every other
+                # undeclared handler already is).
+                db_global = tinfo["db_global"]
+                if db_global is not None:
+                    db_close_sym = self._emit_thread_db_close_trampoline(tname, db_global)
+                    main_lines.append(
+                        f"  call void @festina_thread_set_db_close(ptr %__thread_{tname}, "
+                        f"ptr {db_close_sym})")
+                # claude.md #212 (Phase 4): the db_close hook's own
+                # shape, registered the identical way -- only for a
+                # thread that declared at least one HTTP-shaped
+                # handler (tinfo["has_http_context"], set by
+                # _emit_thread_decl). festina_thread_http_service_pass/
+                # _teardown are festina_runtime_http.c's own real,
+                # non-static entry points -- codegen never names them
+                # anywhere else, so a program with threads but no http
+                # at all never references either symbol (see that
+                # file's own top-of-conversion note on why this is
+                # what keeps the two translation units independently
+                # linkable).
+                if tinfo.get("has_http_context"):
+                    # claude.md #213 (Phase 5): the third hook,
+                    # festina_thread_deliver_given_request -- wired the
+                    # identical unconditional way as the other two
+                    # (every http-context thread gets it, regardless of
+                    # whether it specifically declared `on request`;
+                    # the hook itself no-ops safely if this thread's
+                    # own g_request_handler happens to be NULL, though
+                    # semantic.py's own giveRequest gate already
+                    # guarantees the SENDING side only ever targets a
+                    # thread that did declare one).
+                    main_lines.append(
+                        f"  call void @festina_thread_set_http_context(ptr %__thread_{tname}, "
+                        f"ptr @festina_thread_http_service_pass, ptr @festina_thread_http_teardown, "
+                        f"ptr @festina_thread_deliver_given_request)")
                 main_lines.append(f"  call void @festina_thread_spawn(ptr %__thread_{tname})")
         # self.uses_sqlite/self.uses_graphics are only reliably set by
         # this point because every function body (self.func_defs) and

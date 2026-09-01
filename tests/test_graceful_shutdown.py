@@ -261,7 +261,7 @@ class TestThreadGracefulShutdown:
         # exit code, unrelated to the PROCESS's real one (143 below).
         process = self._run_background(tmp_path, cli_mod, """
         thread worker {
-            on message(p:int) {
+            on message(worker:thread, msg:int) {
                 int start = now()
                 while now() - start < 1500 {
                 }
@@ -304,7 +304,7 @@ class TestThreadGracefulShutdown:
         process = self._run_background(tmp_path, cli_mod, """
         thread worker {
             DatabaseURL = 'shutdown_worker.sqlite'
-            on message(p:int) {
+            on message(worker:thread, msg:int) {
                 sqlite('SELECT 1')
             }
             on exit(code:int) {

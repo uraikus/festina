@@ -9,6 +9,198 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.27] - 2026-09-01
+
+### Changed
+
+- **Docs/tests/release consolidation for the `thread` extensions
+  plan** (thread pools, thread-private functions, wider builtin
+  access, private per-thread HTTP contexts, live connection
+  hand-off -- 0.22 through 0.26). Audited api.md's Threads/HTTP
+  sections end to end; clarified the "Sendable types" paragraph's own
+  wording now that a live `http` request can be handed off (not
+  cloned, not sent through `postMessage`) via `giveRequest`. Full,
+  unfiltered `scripts/leak_stress.sh` and `scripts/thread_tsan_
+  stress.sh` runs (every stress program, not just this plan's own
+  additions) both clean.
+
+See claude.md #214.
+
+## [0.26] - 2026-09-01
+
+### Added
+
+- **Live connection hand-off: `NAME.giveRequest(r)`.** The main
+  program, having accepted a live request on its own port, may hand
+  it directly to a thread -- that thread's own `on request` fires for
+  it, on the connection's own live socket. Legal only from main, only
+  onto a thread that has declared its own `on request`, and only for
+  a manually-managed `http?` value (reusing `T?` rather than a new
+  compile-time move-checker). First cut: plain (non-TLS) connections
+  only.
+
+See claude.md #213 for the full design, including a real
+ThreadSanitizer-caught data race found and fixed during this phase's
+own verification.
+
+## [0.25] - 2026-09-01
+
+### Added
+
+- **Private per-thread HTTP context.** A `thread { }` may now declare
+  `on request(req:http)`/`on upgrade(s:socket)`/
+  `on socketMessage(s:socket, msg:blob)`/`on socketClose(s:socket)` --
+  the identical four handlers the main program's own top-level HTTP/
+  WebSocket support already has -- and, once it has declared at least
+  one, call `openPort()`/`closePort()`/`openSecurePort()`. This gives
+  the thread a fully private connection table and listener set, never
+  shared with the main program's own HTTP context or with any other
+  thread's, so a program can serve real, concurrent traffic on more
+  than one port from more than one OS thread with no coordination
+  needed between them. The blocking http client form (`req.send()`
+  with zero arguments) also works from inside a thread body, targeting
+  any other context's port; a thread must never target its own
+  listener from inside that same thread (a documented, structural
+  deadlock, not a bug) -- see api.md's new "Per-thread HTTP context"
+  section.
+
+See claude.md #212 for the full design, including the `__thread`
+conversion of `festina_runtime_http.c`'s own connection/listener/
+handler state and a real leak this phase's own sanitizer verification
+caught and fixed.
+
+## [0.24] - 2026-09-01
+
+### Added
+
+- **Wider builtin access inside a `thread { }` body.** `regex()`,
+  `mkdir()`, and `ls()` are now callable from inside a thread's own
+  handlers and private funcs, alongside the blocking, 1-argument
+  `exec(args)`. Each is safe with zero runtime changes: `regex()`'s
+  memoization slot is a per-call-site codegen global, never shared
+  between threads; `mkdir()`/`ls()` are thin, purely local POSIX
+  wrappers; `exec(args)`'s `fork()`/`execvp()`/`waitpid()` only ever
+  touches the calling thread. The non-blocking, 2-argument
+  `exec(args, callback)` form stays rejected inside a thread body —
+  its callback always runs on the main program's own OS thread
+  regardless of which thread dispatched it, a genuine cross-thread
+  isolation violation if allowed.
+
+See claude.md #211 for the full design, including how this was
+verified against the actual C runtime rather than assumed from names
+alone.
+
+## [0.23] - 2026-09-01
+
+### Added
+
+- **Thread-private helper functions.** A `func` declared directly in a
+  `thread { }` body's own top level (a sibling of its state vars/
+  `on load`/`on message`/`on exit`) is now callable from that one
+  thread's own handlers and other private funcs, with direct read/
+  write access to that thread's own state. Two private funcs may call
+  each other regardless of declaration order. An ordinary top-level
+  `func` remains completely uncallable from inside a thread body,
+  unchanged. Each thread pool instance gets its own independent copy
+  of every private func, closing over that one instance's own state.
+
+See claude.md #210 for the full design.
+
+## [0.22] - 2026-09-01
+
+### Added
+
+- **`thread NAME[N] { ... }` -- thread pools.** Declares `N` fully
+  independent instances of the same thread body, each its own OS
+  thread, private state, and inbound queue. Addressed with `NAME[i]`
+  (any `int` expression) everywhere a singleton thread's own bare
+  `NAME` would be used — `pool[i].postMessage(x)`/`.kill()`/
+  `.live(callback)`/`.isAlive()` all work identically to the singleton
+  form, just per-instance. An out-of-range index is a silent no-op,
+  matching `NAME.isAlive()`'s own established "test, don't fail"
+  convention rather than crashing or raising.
+
+See claude.md #209 for the full design.
+
+## [0.21] - 2026-09-01
+
+### Changed
+
+- **`thread` messaging is now a single, unified model** — replaces
+  per-thread `NAME.onMessage(callback)` registration with one global
+  top-level `on message(worker:thread, msg:T)` handler that declares
+  its own message type directly. A thread's own inbound handler now
+  uses the identical `(worker:thread, msg:T)` shape (previously
+  `on message(p:T)`); `worker` identifies the sender and is `null`
+  when the message was sent by the main program. Threads may now
+  message each other directly via `NAME.postMessage(x)` from inside
+  another thread's own body (lifecycle control — `kill()`/`live()`/
+  `isAlive()` — remains main-program-only). **Breaking:** any program
+  using `NAME.onMessage(...)` or a thread's old single-parameter
+  `on message(p:T)` needs updating to the new form.
+- **The top-level WebSocket frame handler is renamed from
+  `on message(s:socket, msg:blob)` to `on socketMessage(s:socket,
+  msg:blob)`** — frees the `on message` name for the unified messaging
+  model above; behavior is unchanged, only the name. **Breaking:**
+  update any `on message(s:socket, ...)` declaration to
+  `on socketMessage`.
+
+See claude.md #208 for the full design and migration notes.
+
+## [0.20] - 2026-09-01
+
+### Fixed
+
+- **A `thread` with its own `DatabaseURL` now closes its private
+  sqlite handle on `kill()`** — previously, a `kill()`/`live()` cycle
+  reopened a fresh handle every time without closing the old one (a
+  real, small, per-cycle leak: one `sqlite3*` plus an open fd).
+  Confirmed via a real LeakSanitizer report before the fix and a clean
+  one after (`tests/stress/thread_db_kill_live_churn.f`). See
+  claude.md #207.
+
+## [0.19] - 2026-09-01
+
+### Fixed
+
+- **`.toStruct(T)`/`.toArr(T)` now decode `\u` unicode escapes** —
+  previously threw `"... not yet supported"` on any JSON string
+  containing a `\uXXXX` escape, including a UTF-16 surrogate pair
+  (astral-plane codepoints); raw, un-escaped UTF-8 bytes were always
+  fine, but a producer that specifically `\u`-escaped non-ASCII text
+  could never be parsed. Now decodes both BMP codepoints and surrogate
+  pairs into their real UTF-8 encoding, with a clear, catchable throw
+  for malformed input (an unpaired surrogate, invalid hex, a truncated
+  escape). See claude.md #206.
+
+## [0.18] - 2026-09-01
+
+### Fixed
+
+- **A real heap-use-after-free**: assigning an ordinary, automatically-
+  managed struct value into a manually-managed (`T?`) enum binding
+  (`enum Shape = Circle; Shape? shape; ...; shape = c` for an existing
+  `Circle c`) compiled without error and left `shape` dangling once
+  `c` went out of scope and its own automatic release freed it —
+  `check_assignable`'s enum member-coercion rule never accounted for
+  `manually_managed`. Now correctly rejected as a type mismatch; a
+  *fresh* member value (`Shape? shape = makeCircle()`) is unaffected.
+- A manually-managed `blob?`/`regex?` thread-message parameter's own
+  method calls (`p.write(...)`, `p.test(...)`) inside `on message`
+  could fail to compile, or compile to invalid LLVM IR — a handful of
+  exact-equality type checks in codegen.py (predating `T?`) never
+  accounted for the flag, and `regex`/`http`/`socket` were never
+  taught that a manually-managed instance can now reach code paths an
+  ordinary one never could. Fixed; see claude.md #205.
+
+### Added
+
+- Real per-type test coverage for a manually-managed value crossing a
+  `thread` boundary — `arr[T]`/`map[T]`/`enum`/`img`/`blob`/`aud`/
+  `regex`/`url` each get a dedicated compile-and-run round-trip proof
+  (`tests/test_manually_managed.py::TestThreadReferenceSharingPerType`),
+  alongside struct's own existing one.
+
 ## [0.17] - 2026-09-01
 
 ### Fixed

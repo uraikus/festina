@@ -15867,16 +15867,15 @@ class TestThreads:
 
     def test_int_message_round_trip(self, compile_and_run):
         source = """
-        thread worker {
-            on message(p:int) {
-                postMessage(p * 2)
-            }
-        }
-        void func onReply(x:int) {
-            log(x)
+        on message(worker:thread, msg:int) {
+            log(msg)
             close(0)
         }
-        worker.onMessage(void (x:int) => onReply(x))
+        thread worker {
+            on message(worker:thread, msg:int) {
+                postMessage(msg * 2)
+            }
+        }
         worker.postMessage(21)
         """
         result = compile_and_run(source)
@@ -15885,16 +15884,15 @@ class TestThreads:
 
     def test_text_message_round_trip(self, compile_and_run):
         source = """
-        thread echoer {
-            on message(p:text) {
-                postMessage(`echo:${p}`)
-            }
-        }
-        void func onReply(x:text) {
-            log(x)
+        on message(worker:thread, msg:text) {
+            log(msg)
             close(0)
         }
-        echoer.onMessage(void (x:text) => onReply(x))
+        thread echoer {
+            on message(worker:thread, msg:text) {
+                postMessage(`echo:${msg}`)
+            }
+        }
         echoer.postMessage('hi')
         """
         result = compile_and_run(source)
@@ -15903,16 +15901,15 @@ class TestThreads:
 
     def test_float_message_round_trip(self, compile_and_run):
         source = """
-        thread worker {
-            on message(p:float) {
-                postMessage(p + 0.5)
-            }
-        }
-        void func onReply(x:float) {
-            log(x)
+        on message(worker:thread, msg:float) {
+            log(msg)
             close(0)
         }
-        worker.onMessage(void (x:float) => onReply(x))
+        thread worker {
+            on message(worker:thread, msg:float) {
+                postMessage(msg + 0.5)
+            }
+        }
         worker.postMessage(1.5)
         """
         result = compile_and_run(source)
@@ -15921,16 +15918,15 @@ class TestThreads:
 
     def test_bool_message_round_trip(self, compile_and_run):
         source = """
-        thread worker {
-            on message(p:bool) {
-                postMessage(!p)
-            }
-        }
-        void func onReply(x:bool) {
-            log(x)
+        on message(worker:thread, msg:bool) {
+            log(msg)
             close(0)
         }
-        worker.onMessage(void (x:bool) => onReply(x))
+        thread worker {
+            on message(worker:thread, msg:bool) {
+                postMessage(!msg)
+            }
+        }
         worker.postMessage(true)
         """
         result = compile_and_run(source)
@@ -15939,16 +15935,15 @@ class TestThreads:
 
     def test_on_load_fires_before_any_inbound_message_and_can_post_on_its_own(self, compile_and_run):
         source = """
+        on message(worker:thread, msg:text) {
+            log(msg)
+            close(0)
+        }
         thread worker {
             on load() {
                 postMessage('ready')
             }
         }
-        void func onReply(x:text) {
-            log(x)
-            close(0)
-        }
-        worker.onMessage(void (x:text) => onReply(x))
         """
         result = compile_and_run(source)
         assert result.returncode == 0
@@ -15966,24 +15961,23 @@ class TestThreads:
         # thread), so three sends from main arrive, and are answered,
         # in the order they were sent.
         source = """
-        thread counter {
-            int total = 0
-            on message(p:int) {
-                total = total + p
-                postMessage(total)
-            }
-        }
         int repliesSeen = 0
         int lastVal = 0
-        void func onReply(x:int) {
+        on message(worker:thread, msg:int) {
             repliesSeen = repliesSeen + 1
-            lastVal = x
+            lastVal = msg
             if repliesSeen == 3 {
                 log(lastVal)
                 close(0)
             }
         }
-        counter.onMessage(void (x:int) => onReply(x))
+        thread counter {
+            int total = 0
+            on message(worker:thread, msg:int) {
+                total = total + msg
+                postMessage(total)
+            }
+        }
         counter.postMessage(1)
         counter.postMessage(2)
         counter.postMessage(3)
@@ -16017,6 +16011,53 @@ class TestThreads:
         assert result.returncode == 0
         assert result.stdout.strip().splitlines() == ["true", "false", "true", "true"]
 
+    def test_kill_then_live_reopens_a_genuinely_working_database_handle(
+            self, compile_and_run, tmp_path):
+        # claude.md #207: a kill()/live() cycle used to leak the old
+        # sqlite3*/fd pair (on_load unconditionally opened a fresh
+        # handle over the top of one never closed on kill()) -- this
+        # pins the BEHAVIORAL half (leak-freedom itself is an ASan/
+        # LeakSanitizer question, covered by
+        # tests/stress/thread_db_kill_live_churn.f under
+        # scripts/leak_stress.sh): several kill()/live() cycles in a
+        # row, each blocking and deterministic exactly like
+        # test_kill_then_isalive_is_false_then_live_revives_it just
+        # above, then a real on message() round trip against the
+        # THREAD's OWN database proves the handle live() just reopened
+        # actually works, not just that the process didn't crash.
+        db = tmp_path / "worker.sqlite"
+        source = f"""
+        on message(worker:thread, msg:int) {{
+            log(msg)
+            close(0)
+        }}
+        table Hits {{ n:int }}
+        thread worker {{
+            DatabaseURL = '{db}'
+            on message(worker:thread, msg:int) {{
+                sqlite('INSERT INTO Hits (n) VALUES (?)', [msg])
+                int total = sqliteInt('SELECT count(*) FROM Hits')
+                postMessage(total)
+            }}
+        }}
+        int cycle = 0
+        while cycle < 5 {{
+            worker.kill()
+            worker.live(void (ok:bool) => log(ok))
+            cycle = cycle + 1
+        }}
+        worker.postMessage(1)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        lines = result.stdout.strip().splitlines()
+        assert lines[:5] == ["true"] * 5
+        # A fresh db file, one INSERT total (the single postMessage
+        # after the cycles) -- proves the handle live() reopened the
+        # LAST time is a real, working connection against the thread's
+        # own database, not a stale or reused one.
+        assert lines[5] == "1"
+
     def test_main_thread_death_kills_a_still_idle_child_thread(self, compile_and_run):
         # claude.md #195: "if the main thread dies, kill all child
         # threads" -- festina_program_exit runs the exit handler (if
@@ -16040,17 +16081,19 @@ class TestThreads:
         assert result.stdout == "main done\nworker exiting\n"
 
     def test_two_independent_threads_do_not_collide(self, compile_and_run):
+        # claude.md #208: ONE global top-level `on message` handler now
+        # receives everything sent to main from EITHER thread -- there
+        # is no per-thread `.onMessage()` registration any more to keep
+        # the two replies apart by callback identity, so which of the
+        # two real OS threads actually FINISHES first (and so posts
+        # its reply first) is genuine, unordered concurrency, not a
+        # FIFO-drain-order guarantee -- confirmed directly (an earlier
+        # draft of this test asserted a fixed arrival order and failed
+        # intermittently). Sorted into seenA/seenB by VALUE instead
+        # (thread a's reply is always < 10, thread b's is always >=
+        # 10), so the assertion is independent of which one arrives
+        # first.
         source = """
-        thread a {
-            on message(p:int) {
-                postMessage(p + 1)
-            }
-        }
-        thread b {
-            on message(p:int) {
-                postMessage(p + 10)
-            }
-        }
         int seenA = 0
         int seenB = 0
         void func checkDone() {
@@ -16060,16 +16103,24 @@ class TestThreads:
                 close(0)
             }
         }
-        void func onA(x:int) {
-            seenA = x
+        on message(worker:thread, msg:int) {
+            if msg < 10 {
+                seenA = msg
+            } else {
+                seenB = msg
+            }
             checkDone()
         }
-        void func onB(x:int) {
-            seenB = x
-            checkDone()
+        thread a {
+            on message(worker:thread, msg:int) {
+                postMessage(msg + 1)
+            }
         }
-        a.onMessage(void (x:int) => onA(x))
-        b.onMessage(void (x:int) => onB(x))
+        thread b {
+            on message(worker:thread, msg:int) {
+                postMessage(msg + 10)
+            }
+        }
         a.postMessage(1)
         b.postMessage(1)
         """
@@ -16088,8 +16139,8 @@ class TestThreads:
         source = """
         struct Node { val:int next:Node }
         thread worker {
-            on message(p:Node) {
-                log(p.val)
+            on message(worker:thread, msg:Node) {
+                log(msg.val)
             }
         }
         Node n
@@ -16103,20 +16154,19 @@ class TestThreads:
     def test_struct_message_round_trip(self, compile_and_run):
         source = """
         struct Point { x:int y:int label:text }
+        on message(worker:thread, msg:Point) {
+            log(msg.x)
+            log(msg.y)
+            log(msg.label)
+            close(0)
+        }
         thread worker {
-            on message(p:Point) {
-                Point out = p
-                out.x = p.x + 1
+            on message(worker:thread, msg:Point) {
+                Point out = msg
+                out.x = msg.x + 1
                 postMessage(out)
             }
         }
-        void func onReply(x:Point) {
-            log(x.x)
-            log(x.y)
-            log(x.label)
-            close(0)
-        }
-        worker.onMessage(void (x:Point) => onReply(x))
         Point pt
         pt.x = 10
         pt.y = 20
@@ -16129,26 +16179,25 @@ class TestThreads:
 
     def test_array_message_round_trip(self, compile_and_run):
         source = """
+        on message(worker:thread, msg:arr[text]) {
+            int i = 0
+            while i < msg.length {
+                log(msg[i])
+                i = i + 1
+            }
+            close(0)
+        }
         thread worker {
-            on message(p:arr[text]) {
+            on message(worker:thread, msg:arr[text]) {
                 arr[text] out = []
                 int i = 0
-                while i < p.length {
-                    out.push(`echo:${p[i]}`)
+                while i < msg.length {
+                    out.push(`echo:${msg[i]}`)
                     i = i + 1
                 }
                 postMessage(out)
             }
         }
-        void func onReply(x:arr[text]) {
-            int i = 0
-            while i < x.length {
-                log(x[i])
-                i = i + 1
-            }
-            close(0)
-        }
-        worker.onMessage(void (x:arr[text]) => onReply(x))
         arr[text] xs = ['a', 'b', 'c']
         worker.postMessage(xs)
         """
@@ -16158,20 +16207,19 @@ class TestThreads:
 
     def test_map_message_round_trip(self, compile_and_run):
         source = """
+        on message(worker:thread, msg:map[int]) {
+            log(msg['a'])
+            log(msg['b'])
+            close(0)
+        }
         thread worker {
-            on message(p:map[int]) {
+            on message(worker:thread, msg:map[int]) {
                 map[int] out = {}
-                out['a'] = p['a'] * 2
-                out['b'] = p['b'] * 2
+                out['a'] = msg['a'] * 2
+                out['b'] = msg['b'] * 2
                 postMessage(out)
             }
         }
-        void func onReply(x:map[int]) {
-            log(x['a'])
-            log(x['b'])
-            close(0)
-        }
-        worker.onMessage(void (x:map[int]) => onReply(x))
         map[int] m = {}
         m['a'] = 5
         m['b'] = 7
@@ -16184,18 +16232,17 @@ class TestThreads:
     def test_mixed_enum_message_round_trip(self, compile_and_run):
         source = """
         enum DataPacket = int, text
+        on message(worker:thread, msg:DataPacket) {
+            log(typeof msg)
+            close(0)
+        }
         thread worker {
-            on message(p:DataPacket) {
-                log(typeof p)
+            on message(worker:thread, msg:DataPacket) {
+                log(typeof msg)
                 DataPacket out = 'echoed'
                 postMessage(out)
             }
         }
-        void func onReply(x:DataPacket) {
-            log(typeof x)
-            close(0)
-        }
-        worker.onMessage(void (x:DataPacket) => onReply(x))
         DataPacket p = 42
         worker.postMessage(p)
         """
@@ -16208,19 +16255,18 @@ class TestThreads:
         struct Circle { radius:int }
         struct Square { side:int }
         enum Shape = Circle, Square
-        thread worker {
-            on message(p:Shape) {
-                postMessage(p)
-            }
-        }
-        void func onReply(x:Shape) {
-            log(typeof x)
-            if typeof x == 'Circle' {
-                log(x.radius)
+        on message(worker:thread, msg:Shape) {
+            log(typeof msg)
+            if typeof msg == 'Circle' {
+                log(msg.radius)
             }
             close(0)
         }
-        worker.onMessage(void (x:Shape) => onReply(x))
+        thread worker {
+            on message(worker:thread, msg:Shape) {
+                postMessage(msg)
+            }
+        }
         Circle c
         c.radius = 99
         Shape s = c
@@ -16240,16 +16286,15 @@ class TestThreads:
         # proving a genuine deep clone, not a shared handle.
         (tmp_path / "source.txt").write_text("blob-payload")
         source = """
-        thread worker {
-            on message(p:blob) {
-                postMessage(p)
-            }
-        }
-        void func onReply(x:blob) {
-            log(x.toText())
+        on message(worker:thread, msg:blob) {
+            log(msg.toText())
             close(0)
         }
-        worker.onMessage(void (x:blob) => onReply(x))
+        thread worker {
+            on message(worker:thread, msg:blob) {
+                postMessage(msg)
+            }
+        }
         blob b = 'source.txt'
         worker.postMessage(b)
         b.write('mutated-after-send')
@@ -16266,19 +16311,18 @@ class TestThreads:
         # the drawn pixels survive the clone back out to the main
         # thread.
         source = """
-        thread worker {
-            on message(p:img) {
-                color blue = 'blue'
-                p.drawRect(0, 0, 20, 20, blue)
-                postMessage(p)
-            }
-        }
-        void func onReply(x:img) {
+        on message(worker:thread, msg:img) {
             color blue = 'blue'
-            log(x.getPixelColor(5, 5) == blue)
+            log(msg.getPixelColor(5, 5) == blue)
             close(0)
         }
-        worker.onMessage(void (x:img) => onReply(x))
+        thread worker {
+            on message(worker:thread, msg:img) {
+                color blue = 'blue'
+                msg.drawRect(0, 0, 20, 20, blue)
+                postMessage(msg)
+            }
+        }
         img pic = blankImage(20, 20)
         worker.postMessage(pic)
         """
@@ -16295,16 +16339,15 @@ class TestThreads:
         # carries real, correctly-cloned audio data.
         _write_wav(tmp_path / "clip.wav", duration_s=0.05)
         source = """
-        thread worker {
-            on message(p:aud) {
-                postMessage(p)
-            }
-        }
-        void func onReply(x:aud) {
-            x.saveCopy('echo.wav')
+        on message(worker:thread, msg:aud) {
+            msg.saveCopy('echo.wav')
             close(0)
         }
-        worker.onMessage(void (x:aud) => onReply(x))
+        thread worker {
+            on message(worker:thread, msg:aud) {
+                postMessage(msg)
+            }
+        }
         aud clip = 'clip.wav'
         worker.postMessage(clip)
         """
@@ -16320,18 +16363,17 @@ class TestThreads:
         # festina_map_clone, through the new festina_clone_text_map_
         # value trampoline).
         source = """
-        thread worker {
-            on message(p:url) {
-                postMessage(p)
-            }
-        }
-        void func onReply(x:url) {
-            log(x.hostname)
-            log(x.pathname)
-            log(x.searchParams['a'])
+        on message(worker:thread, msg:url) {
+            log(msg.hostname)
+            log(msg.pathname)
+            log(msg.searchParams['a'])
             close(0)
         }
-        worker.onMessage(void (x:url) => onReply(x))
+        thread worker {
+            on message(worker:thread, msg:url) {
+                postMessage(msg)
+            }
+        }
         url u = parseURL('https://example.com/path?a=1')
         worker.postMessage(u)
         """
@@ -16356,20 +16398,19 @@ class TestThreads:
         sqlite('INSERT INTO MainItem (id) VALUES (1)')
 
         table WorkerItem { id:int label:text }
+        on message(worker:thread, msg:text) {
+            log(msg)
+            close(0)
+        }
         thread worker {
             DatabaseURL = 'worker_only.sqlite'
-            on message(p:int) {
+            on message(worker:thread, msg:int) {
                 sqlite('INSERT INTO WorkerItem (id, label) VALUES (?, ?)',
-                       [p, `from-worker-${p}`])
+                       [msg, `from-worker-${msg}`])
                 arr[WorkerItem] rows = sqlite('SELECT * FROM WorkerItem')
                 postMessage(rows[0].label)
             }
         }
-        void func onReply(x:text) {
-            log(x)
-            close(0)
-        }
-        worker.onMessage(void (x:text) => onReply(x))
         worker.postMessage(42)
         """
         result = compile_and_run(source)
@@ -16433,8 +16474,8 @@ class TestThreads:
         source = """
         enum DataPacket = int, text
         thread worker {
-            on message(p:DataPacket) {
-                log(typeof p)
+            on message(worker:thread, msg:DataPacket) {
+                log(typeof msg)
             }
         }
         worker.postMessage('direct-literal-hello')
@@ -16458,3 +16499,400 @@ class TestThreads:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip() == "main done"
+
+
+class TestThreadPools:
+    """claude.md #209: `thread NAME[N] { ... }` -- real, compiled-and-
+    run proof that N pool instances are genuinely independent (private
+    state, correct per-instance message routing) and that an out-of-
+    range index is a real, silent no-op at runtime, not just a
+    semantic-analysis-time claim."""
+
+    def test_two_pool_instances_have_genuinely_independent_private_state(self, compile_and_run):
+        # Each instance accumulates its OWN total -- if state were
+        # accidentally shared (e.g. both instances aliasing the same
+        # global), pool[0]'s own total would include pool[1]'s posts
+        # too, and vice versa.
+        source = """
+        int seenA = 0
+        int seenB = 0
+        void func checkDone() {
+            if seenA != 0 && seenB != 0 {
+                log(seenA)
+                log(seenB)
+                close(0)
+            }
+        }
+        on message(worker:thread, msg:int) {
+            if msg < 100 {
+                seenA = msg
+            } else {
+                seenB = msg
+            }
+            checkDone()
+        }
+        thread pool[2] {
+            int total = 0
+            on message(worker:thread, msg:int) {
+                total = total + msg
+                postMessage(total)
+            }
+        }
+        pool[0].postMessage(1)
+        pool[0].postMessage(2)
+        pool[1].postMessage(200)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # pool[0]'s own total after two posts (1, then 1+2=3) --
+        # checkDone only fires once BOTH seenA/seenB are non-zero, so
+        # the observed seenA is whichever reply arrived MOST recently
+        # before pool[1]'s own reply also landed; either 1 or 3 proves
+        # independence (pool[1]'s reply is always >= 200, so it can
+        # never leak into seenA).
+        lines = result.stdout.strip().splitlines()
+        assert lines[0] in ("1", "3")
+        assert lines[1] == "200"
+
+    def test_an_out_of_range_pool_index_is_a_real_silent_noop(self, compile_and_run):
+        source = """
+        thread pool[2] {
+            on message(worker:thread, msg:int) {
+                log('should never run')
+            }
+        }
+        log(pool[0].isAlive())
+        log(pool[99].isAlive())
+        int negIdx = -1
+        log(pool[negIdx].isAlive())
+        pool[99].postMessage(1)
+        pool[99].kill()
+        log('still alive')
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == [
+            "true", "false", "false", "still alive",
+        ]
+
+    def test_killing_one_pool_instance_does_not_affect_another(self, compile_and_run):
+        source = """
+        thread pool[2] {
+        }
+        pool[0].kill()
+        log(pool[0].isAlive())
+        log(pool[1].isAlive())
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["false", "true"]
+
+
+class TestThreadPrivateFunctions:
+    """claude.md #210: real, compiled-and-run proof that a thread-
+    private function actually runs, actually mutates the state it
+    closes over, and two pool instances' own private-func-mutated
+    state stays genuinely independent."""
+
+    def test_a_private_function_computes_correctly_and_can_call_another(
+            self, compile_and_run):
+        source = """
+        on message(worker:thread, msg:int) {
+            log(msg)
+            close(0)
+        }
+        thread worker {
+            int func helper(x:int) { return x + 1 }
+            int func triple(x:int) { return helper(x) * 3 }
+            on message(worker:thread, msg:int) {
+                postMessage(triple(msg))
+            }
+        }
+        worker.postMessage(2)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # triple(2) = helper(2) * 3 = (2 + 1) * 3 = 9
+        assert result.stdout.strip() == "9"
+
+    def test_a_private_function_mutates_the_thread_state_it_closes_over(
+            self, compile_and_run):
+        source = """
+        on message(worker:thread, msg:int) {
+            log(msg)
+            close(0)
+        }
+        thread counter {
+            int total = 0
+            void func addToTotal(x:int) {
+                total = total + x
+            }
+            on message(worker:thread, msg:int) {
+                addToTotal(msg)
+                addToTotal(msg)
+                postMessage(total)
+            }
+        }
+        counter.postMessage(5)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "10"
+
+    def test_a_private_function_can_postmessage_another_thread(self, compile_and_run):
+        source = """
+        on message(worker:thread, msg:int) {
+            log(msg)
+            close(0)
+        }
+        thread relay {
+            on message(worker:thread, msg:int) {
+                postMessage(msg + 100)
+            }
+        }
+        thread worker {
+            void func forward(x:int) {
+                relay.postMessage(x)
+            }
+            on message(worker:thread, msg:int) {
+                forward(msg)
+            }
+        }
+        worker.postMessage(9)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "109"
+
+    def test_two_pool_instances_private_functions_mutate_independent_state(
+            self, compile_and_run):
+        source = """
+        int seenA = 0
+        int seenB = 0
+        void func checkDone() {
+            if seenA != 0 && seenB != 0 {
+                log(seenA)
+                log(seenB)
+                close(0)
+            }
+        }
+        on message(worker:thread, msg:int) {
+            if msg < 100 {
+                seenA = msg
+            } else {
+                seenB = msg
+            }
+            checkDone()
+        }
+        thread pool[2] {
+            int total = 0
+            void func addToTotal(x:int) {
+                total = total + x
+            }
+            on message(worker:thread, msg:int) {
+                addToTotal(msg)
+                postMessage(total)
+            }
+        }
+        pool[0].postMessage(3)
+        pool[1].postMessage(200)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["3", "200"]
+
+
+class TestThreadWiderBuiltinAccess:
+    """claude.md #211: real, compiled-and-run proof that
+    exec(args)/regex()/mkdir()/ls() all actually work from inside a
+    thread body, not just that semantic.py accepts them."""
+
+    def test_exec_regex_mkdir_ls_all_work_inside_a_thread(
+            self, compile_and_run, tmp_path):
+        source = """
+        on message(worker:thread, msg:text) {
+            log(msg)
+            close(0)
+        }
+        thread worker {
+            on load() {
+                mkdir('subdir')
+                arr[text] entries = ls('.')
+                bool foundDir = false
+                int i = 0
+                while i < entries.length {
+                    if entries[i] == 'subdir' {
+                        foundDir = true
+                    }
+                    i = i + 1
+                }
+                regex r = /^ab/
+                bool matched = r.test('abc')
+                int code = exec(['true'])
+                if foundDir && matched && code == 0 {
+                    postMessage('all good')
+                } else {
+                    postMessage('failed')
+                }
+            }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "all good"
+        assert (tmp_path / "subdir").is_dir()
+
+
+class TestThreadHttpContext:
+    """claude.md #212: real, compiled-and-run proof that a thread's
+    own private HTTP context (openPort()/on request/...) genuinely
+    works and stays isolated from main's -- driven entirely from
+    inside the compiled program itself (a thread's own `on message`,
+    triggered by main, makes a real blocking client request --
+    `req.send()` with zero arguments -- back to MAIN's own port; the
+    response is checked byte-for-byte), the same self-contained
+    pattern tests/stress/thread_http_context_churn.f uses at volume
+    under ASan/TSan."""
+
+    def test_a_thread_serves_real_requests_on_its_own_private_port(
+            self, compile_and_run_server):
+        source = """
+        thread server {
+            on load() { openPort(__PORT__) }
+            on request(req:http) {
+                req.send({'code': 200, 'body': 'from the thread'})
+            }
+        }
+        """
+        server = compile_and_run_server(source)
+        status, _headers, body = server.http_get("/")
+        assert status == 200
+        assert body == b"from the thread"
+
+    def test_a_thread_client_request_reaches_mains_own_port_and_back(
+            self, compile_and_run):
+        # claude.md #212: main and a thread each open their OWN
+        # private port; the thread's own `on message` (driven by
+        # main) makes a real blocking client request BACK to main's
+        # port -- proving both contexts run concurrently, each
+        # genuinely serving its own traffic, with the response
+        # correctly attributed to the right one (a mix-up between the
+        # two __thread-backed connection tables would show up as a
+        # wrong body here, not a crash).
+        source = """
+        int TOTAL = 3
+        int done = 0
+        int failures = 0
+
+        on request(req:http) {
+            req.send({'code': 200, 'body': 'main-body'})
+        }
+
+        on message(worker:thread, msg:int) {
+            done = done + 1
+            if msg == 0 { failures = failures + 1 }
+            if done >= TOTAL {
+                if failures > 0 {
+                    close(1)
+                }
+                close(0)
+            }
+        }
+
+        thread client {
+            on message(sender:thread, msg:int) {
+                http req = {'url': 'http://127.0.0.1:18299/', 'method': 'GET'}
+                req.send()
+                bool ok = req.code == 200 && req.toText() == 'main-body'
+                if ok {
+                    postMessage(1)
+                } else {
+                    postMessage(0)
+                }
+            }
+        }
+
+        openPort(18299)
+        int i = 0
+        while i < TOTAL {
+            client.postMessage(i)
+            i = i + 1
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_a_thread_with_no_openPort_call_still_gets_a_receive_only_context(
+            self, compile_and_run):
+        # claude.md #212 (Phase 4's own forward note, needed by Phase
+        # 5's giveRequest): declaring an HTTP-shaped handler WITHOUT
+        # ever calling openPort() is legal and simply idles -- proof
+        # this doesn't busy-loop or hang is the process actually
+        # exiting cleanly within the test harness's own timeout.
+        source = """
+        thread receiver {
+            on request(req:http) { req.ok() }
+        }
+        log('started')
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "started" in result.stdout
+
+
+class TestGiveRequest:
+    """claude.md #213 (Phase 5): real, compiled-and-run proof that
+    `NAME.giveRequest(r)` -- live connection hand-off -- genuinely
+    works end to end: a real external client connects to MAIN's own
+    port, main hands the live connection to a thread via giveRequest,
+    and that THREAD's own `on request` -- running on a different OS
+    thread than the one that accepted the connection -- answers it
+    directly on the same underlying socket."""
+
+    def test_a_handed_off_request_is_answered_by_the_receiving_thread(
+            self, compile_and_run_server):
+        source = """
+        thread worker {
+            on request(req:http) {
+                req.send({'code': 200, 'body': 'handled by worker'})
+            }
+        }
+
+        on request(req:http?) {
+            worker.giveRequest(req)
+        }
+
+        openPort(__PORT__)
+        """
+        server = compile_and_run_server(source)
+        status, _headers, body = server.http_get("/")
+        assert status == 200
+        assert body == b"handled by worker"
+
+    def test_a_thread_forgetting_to_respond_still_gets_the_default_200(
+            self, compile_and_run_server):
+        # claude.md #213: a handed-off request goes through the exact
+        # same festina_finish_request_dispatch fallback path an
+        # ordinarily-accepted one does -- proof this ISN'T a narrower,
+        # hand-off-specific dispatch that forgot the fallback.
+        source = """
+        thread worker {
+            int served = 0
+            on request(req:http) {
+                served = served + 1
+            }
+        }
+
+        on request(req:http?) {
+            worker.giveRequest(req)
+        }
+
+        openPort(__PORT__)
+        """
+        server = compile_and_run_server(source)
+        status, _headers, body = server.http_get("/")
+        assert status == 200
+        assert body == b""
